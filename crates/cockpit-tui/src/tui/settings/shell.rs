@@ -449,7 +449,8 @@ pub(super) fn push_text_field_at_cursor(
     cursor: usize,
     focused: bool,
     placeholder: Option<&str>,
-) {
+) -> std::ops::Range<usize> {
+    let start = lines.len();
     let prompt = format!("{label}: ");
     if focused {
         let mut spans = vec![Span::styled(prompt, muted_style())];
@@ -462,7 +463,7 @@ pub(super) fn push_text_field_at_cursor(
                 ));
             }
             lines.push(Line::from(spans));
-            return;
+            return start..lines.len();
         }
         let cursor = cockpit_core::text::floor_char_boundary(value, cursor);
         let (before, after) = value.split_at(cursor);
@@ -470,7 +471,7 @@ pub(super) fn push_text_field_at_cursor(
         spans.push(cursor_marker_span());
         spans.push(Span::styled(after.to_string(), focused_field_style()));
         lines.push(Line::from(spans));
-        return;
+        return start..lines.len();
     }
 
     let shown = if value.is_empty() {
@@ -495,6 +496,7 @@ pub(super) fn push_text_field_at_cursor(
         shown,
         value_style,
     );
+    start..lines.len()
 }
 
 pub(super) fn push_wrapped_text(

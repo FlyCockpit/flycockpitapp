@@ -10,7 +10,7 @@
 //!   - **Add**: name + cycled transport / auth + endpoint-or-command
 //!     text field, with a warning when auth is `none`.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -25,8 +25,8 @@ use cockpit_core::mcp::config::{
 
 use super::secret_display;
 use super::shell::{
-    error_style, marker, muted_style, push_text_field_at_cursor, selected_line_from_marker,
-    selected_style, warning_style,
+    SettingsControlId, SettingsScrollRegionId, error_style, marker, muted_style,
+    push_text_field_at_cursor, selected_line_from_marker, selected_style, warning_style,
 };
 use super::{Nav, SettingsCx, SettingsPage, save_button_line, save_status};
 
@@ -431,6 +431,7 @@ impl SettingsCx {
             )),
             Line::from(""),
         ];
+        let mut bindings = Vec::new();
         let names: Vec<&String> = cfg.servers.keys().collect();
         for (i, name) in names.iter().enumerate() {
             let server = &cfg.servers[*name];
@@ -447,16 +448,23 @@ impl SettingsCx {
                 server.auth.kind_str(),
                 lifecycle_label(name, server),
             );
+            bindings.push((lines.len(), SettingsControlId(i as u64)));
             lines.push(Line::from(Span::styled(text, Style::default().fg(color))));
         }
         // [+ add server] row.
         let add_marker = marker(s.cursor == names.len());
+        bindings.push((lines.len(), SettingsControlId(names.len() as u64)));
         lines.push(Line::from(Span::styled(
             format!("{add_marker}[+ add server]"),
             Style::default().add_modifier(Modifier::BOLD),
         )));
         if names.is_empty() {
             lines.insert(2, Line::from("No MCP servers configured."));
+            for (line, _) in &mut bindings {
+                if *line >= 2 {
+                    *line += 1;
+                }
+            }
         }
         if let Some(status) = &s.status {
             lines.push(Line::from(""));
@@ -466,8 +474,16 @@ impl SettingsCx {
             )));
         }
         let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states
-            .render_lines(frame, area, "mcp:list", lines, selected_line);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "mcp:list",
+            lines,
+            selected_line,
+            bindings,
+            &self.pointer_surface,
+            SettingsScrollRegionId("mcp:list"),
+        );
     }
 
     fn render_mcp_add(&self, frame: &mut Frame, area: Rect, s: &AddState) {
@@ -682,8 +698,16 @@ impl SettingsCx {
             lines.push(Line::from(Span::styled(status.clone(), error_style())));
         }
         let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states
-            .render_lines(frame, area, "mcp:add", lines, selected_line);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "mcp:add",
+            lines,
+            selected_line,
+            std::iter::empty(),
+            &self.pointer_surface,
+            SettingsScrollRegionId("mcp:add"),
+        );
     }
 }
 
@@ -1079,6 +1103,50 @@ impl SettingsPage for McpPage {
 
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         cx.render_mcp_page(frame, area, self);
+    }
+
+    fn handle_pointer_control(&mut self, cx: &mut SettingsCx, control: SettingsControlId) -> Nav {
+        let index = control.0 as usize;
+        match self {
+            McpPage::List(state) => {
+                if index > cx.load_mcp().servers.len() {
+                    return Nav::Stay;
+                }
+                state.cursor = index;
+            }
+            McpPage::Add(state) => {
+                if index >= ADD_FIELDS {
+                    return Nav::Stay;
+                }
+                state.cursor = index;
+            }
+        }
+        self.handle_key(cx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    }
+
+    fn handle_pointer_scroll(
+        &mut self,
+        cx: &mut SettingsCx,
+        region: SettingsScrollRegionId,
+        delta: isize,
+    ) -> Nav {
+        match self {
+            McpPage::List(state) if region == SettingsScrollRegionId("mcp:list") => {
+                state.delete_pending = false;
+                state.cursor = state
+                    .cursor
+                    .saturating_add_signed(delta)
+                    .min(cx.load_mcp().servers.len());
+            }
+            McpPage::Add(state) if region == SettingsScrollRegionId("mcp:add") => {
+                state.cursor = state
+                    .cursor
+                    .saturating_add_signed(delta)
+                    .min(ADD_FIELDS - 1);
+            }
+            _ => {}
+        }
+        Nav::Stay
     }
 
     fn title(&self, cx: &SettingsCx) -> String {

@@ -4123,6 +4123,26 @@ pub(super) fn validate_pasted_images_for_submit(images: &[Vec<u8>]) -> Result<()
     if images.is_empty() {
         return Ok(());
     }
+    validate_pasted_image_sizes(images)?;
+    for (idx, png) in images.iter().enumerate() {
+        let display_idx = idx + 1;
+        let image = image::load_from_memory_with_format(png, image::ImageFormat::Png)
+            .map_err(|_| format!("Pasted image #{display_idx} is not a valid PNG."))?;
+        if image.width() > cockpit_core::daemon::proto::MAX_IMAGE_DIMENSION_PIXELS
+            || image.height() > cockpit_core::daemon::proto::MAX_IMAGE_DIMENSION_PIXELS
+        {
+            return Err(format!(
+                "Pasted image #{display_idx} is too large: {}x{} exceeds the {} pixel dimension limit.",
+                image.width(),
+                image.height(),
+                cockpit_core::daemon::proto::MAX_IMAGE_DIMENSION_PIXELS
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_pasted_image_sizes(images: &[Vec<u8>]) -> Result<(), String> {
     if images.len() > cockpit_core::daemon::proto::MAX_IMAGES_PER_USER_MESSAGE {
         return Err(format!(
             "Too many pasted images: {} exceeds the {} image limit.",
@@ -4143,24 +4163,14 @@ pub(super) fn validate_pasted_images_for_submit(images: &[Vec<u8>]) -> Result<()
                 cockpit_core::daemon::proto::MAX_SINGLE_IMAGE_BYTES
             ));
         }
-        total = total.saturating_add(png.len());
+        total = total
+            .checked_add(png.len())
+            .ok_or_else(|| "Pasted image byte count overflowed.".to_string())?;
         if total > cockpit_core::daemon::proto::MAX_TOTAL_IMAGE_BYTES {
             return Err(format!(
                 "Pasted images are too large: {} total bytes exceeds the {} byte limit.",
                 total,
                 cockpit_core::daemon::proto::MAX_TOTAL_IMAGE_BYTES
-            ));
-        }
-        let image = image::load_from_memory_with_format(png, image::ImageFormat::Png)
-            .map_err(|_| format!("Pasted image #{display_idx} is not a valid PNG."))?;
-        if image.width() > cockpit_core::daemon::proto::MAX_IMAGE_DIMENSION_PIXELS
-            || image.height() > cockpit_core::daemon::proto::MAX_IMAGE_DIMENSION_PIXELS
-        {
-            return Err(format!(
-                "Pasted image #{display_idx} is too large: {}x{} exceeds the {} pixel dimension limit.",
-                image.width(),
-                image.height(),
-                cockpit_core::daemon::proto::MAX_IMAGE_DIMENSION_PIXELS
             ));
         }
     }
@@ -4169,7 +4179,7 @@ pub(super) fn validate_pasted_images_for_submit(images: &[Vec<u8>]) -> Result<()
 
 #[cfg(test)]
 mod image_submit_validation_tests {
-    use super::validate_pasted_images_for_submit;
+    use super::{validate_pasted_image_sizes, validate_pasted_images_for_submit};
 
     fn sample_png() -> Vec<u8> {
         let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
@@ -4206,6 +4216,22 @@ mod image_submit_validation_tests {
         let err = validate_pasted_images_for_submit(&images).expect_err("oversized");
         assert!(err.contains("too large"));
         assert!(err.contains("byte limit"));
+    }
+
+    #[test]
+    fn exact_image_count_and_byte_boundaries() {
+        let count = cockpit_core::daemon::proto::MAX_IMAGES_PER_USER_MESSAGE;
+        let single = cockpit_core::daemon::proto::MAX_SINGLE_IMAGE_BYTES;
+        let total = cockpit_core::daemon::proto::MAX_TOTAL_IMAGE_BYTES;
+        assert!(validate_pasted_image_sizes(&vec![vec![1]; count]).is_ok());
+        assert!(validate_pasted_image_sizes(&vec![vec![1]; count + 1]).is_err());
+        assert!(validate_pasted_image_sizes(&[vec![1; single]]).is_ok());
+        assert!(validate_pasted_image_sizes(&[vec![1; single + 1]]).is_err());
+        let first = single.min(total);
+        assert!(validate_pasted_image_sizes(&[vec![1; first], vec![1; total - first]]).is_ok());
+        assert!(
+            validate_pasted_image_sizes(&[vec![1; first], vec![1; total - first + 1]]).is_err()
+        );
     }
 
     #[test]

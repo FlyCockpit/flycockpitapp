@@ -118,10 +118,8 @@ fn browser_format(bytes: &[u8]) -> Result<ImageFormat, ImageProbeError> {
 
 fn reject_animation(format: ImageFormat, bytes: &[u8]) -> Result<(), ImageProbeError> {
     let animated = match format {
-        ImageFormat::Png => bytes.windows(4).any(|chunk| chunk == b"acTL"),
-        ImageFormat::WebP => bytes
-            .windows(4)
-            .any(|chunk| chunk == b"ANIM" || chunk == b"ANMF"),
+        ImageFormat::Png => png_has_animation_or_is_malformed(bytes),
+        ImageFormat::WebP => webp_has_animation_or_is_malformed(bytes),
         ImageFormat::Gif => gif_has_multiple_frames(bytes),
         ImageFormat::Jpeg => false,
         _ => true,
@@ -131,6 +129,62 @@ fn reject_animation(format: ImageFormat, bytes: &[u8]) -> Result<(), ImageProbeE
     } else {
         Ok(())
     }
+}
+
+fn png_has_animation_or_is_malformed(bytes: &[u8]) -> bool {
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return true;
+    }
+    let mut cursor = 8usize;
+    loop {
+        let Some(header) = bytes.get(cursor..cursor + 8) else {
+            return true;
+        };
+        let length = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+        let chunk_type = &header[4..8];
+        if chunk_type == b"acTL" {
+            return true;
+        }
+        cursor = match cursor
+            .checked_add(12)
+            .and_then(|value| value.checked_add(length))
+        {
+            Some(next) if next <= bytes.len() => next,
+            _ => return true,
+        };
+        if chunk_type == b"IEND" {
+            return cursor != bytes.len();
+        }
+    }
+}
+
+fn webp_has_animation_or_is_malformed(bytes: &[u8]) -> bool {
+    if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
+        return true;
+    }
+    let declared = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    if declared.checked_add(8) != Some(bytes.len()) {
+        return true;
+    }
+    let mut cursor = 12usize;
+    while cursor < bytes.len() {
+        let Some(header) = bytes.get(cursor..cursor + 8) else {
+            return true;
+        };
+        if matches!(&header[..4], b"ANIM" | b"ANMF") {
+            return true;
+        }
+        let length = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+        cursor = match cursor
+            .checked_add(8)
+            .and_then(|value| value.checked_add(length))
+            .and_then(|value| value.checked_add(length & 1))
+        {
+            Some(next) if next <= bytes.len() => next,
+            _ => return true,
+        };
+    }
+    cursor != bytes.len()
 }
 
 fn gif_has_multiple_frames(bytes: &[u8]) -> bool {

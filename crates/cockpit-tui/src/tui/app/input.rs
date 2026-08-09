@@ -3065,7 +3065,6 @@ pub(super) enum QueueEditOutcome {
     Edited { text: String, partial: bool },
     AlreadyStarted,
     Fallthrough,
-    NotConnected,
     TransportError,
 }
 
@@ -3131,10 +3130,6 @@ impl App {
                 true
             }
             QueueEditOutcome::Fallthrough => false,
-            QueueEditOutcome::NotConnected => {
-                self.push_queue_edit_notice("not connected to the session");
-                true
-            }
             QueueEditOutcome::TransportError => {
                 self.push_queue_edit_notice("could not reach the session");
                 true

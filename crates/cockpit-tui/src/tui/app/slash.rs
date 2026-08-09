@@ -1968,7 +1968,7 @@ impl App {
         );
     }
 
-    fn doctor_snapshot_input(&self) -> cockpit_core::diagnostics::DiagnosticsInput {
+    pub(super) fn doctor_snapshot_input(&self) -> cockpit_core::diagnostics::DiagnosticsInput {
         cockpit_core::diagnostics::DiagnosticsInput {
             cwd: self.launch.cwd.clone(),
             session_id: self.launch.session_id,

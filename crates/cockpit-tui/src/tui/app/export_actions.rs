@@ -721,15 +721,11 @@ mod tests {
     async fn export_handlers_report_unexpected_payloads() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(Some(tmp.path()), false);
+        let transcript_action = app.export_transcript_action_name();
+        let debug_action = app.export_debug_action_name();
         for (action, expected) in [
-            (
-                EXPORT_TRANSCRIPT_ACTION,
-                "/export: unexpected async response",
-            ),
-            (
-                EXPORT_DEBUG_ACTION,
-                "/export debug: unexpected async response",
-            ),
+            (transcript_action, "/export: unexpected async response"),
+            (debug_action, "/export debug: unexpected async response"),
         ] {
             let id = app
                 .async_actions

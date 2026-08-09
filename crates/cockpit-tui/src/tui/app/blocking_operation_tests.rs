@@ -3,15 +3,9 @@ use super::*;
 
 #[test]
 fn blocking_operation_manifest_is_complete() {
-    use super::blocking_operations::{
-        BLOCKING_OPERATION_KINDS, BLOCKING_OPERATION_MANIFEST, BlockingOperationKind,
-    };
+    use super::blocking_operations::{BLOCKING_OPERATION_MANIFEST, BlockingOperationKind};
 
     assert_eq!(BLOCKING_OPERATION_MANIFEST.len(), 6);
-    assert_eq!(
-        BLOCKING_OPERATION_MANIFEST.len(),
-        BLOCKING_OPERATION_KINDS.len()
-    );
     let expected = [
         ("slash:/curator", BlockingOperationKind::CuratorMaintenance),
         ("slash:/doctor", BlockingOperationKind::DoctorSnapshot),
@@ -82,7 +76,8 @@ async fn no_owned_blocking_command_runs_on_event_loop() {
     app.composer.set("@src".to_string());
     app.reset_at_window();
     app.composer.clear();
-    app.queue.push(optimistic_queue_item("queued".to_string()));
+    app.queue
+        .push(input::optimistic_queue_item("queued".to_string()));
     app.history_up();
 
     app.handle_terminal_event(crossterm::event::Event::Key(
@@ -198,7 +193,8 @@ async fn cancelled_app_with_live_export_owner_reaps_before_drop_returns() {
 async fn queue_edit_does_not_block_key_handler() {
     let barrier = owned_barrier(BlockingOperationKind::QueueMutation);
     let mut app = App::new(None, false);
-    app.queue.push(optimistic_queue_item("queued".to_string()));
+    app.queue
+        .push(input::optimistic_queue_item("queued".to_string()));
     app.history_up();
     app.handle_terminal_event(crossterm::event::Event::Key(
         crossterm::event::KeyEvent::new(

@@ -1,6 +1,6 @@
 use super::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub(super) struct BlockingOperationRegistration {
     pub(super) site: &'static str,
     pub(super) binding: fn(&App) -> BlockingOperationKind,
@@ -13,9 +13,6 @@ macro_rules! blocking_operation_manifest {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         #[repr(u8)]
         pub(super) enum BlockingOperationKind { $( $kind ),+ }
-
-        pub(super) const BLOCKING_OPERATION_KINDS: &[BlockingOperationKind] =
-            &[$(BlockingOperationKind::$kind),+];
 
         pub(super) const BLOCKING_OPERATION_MANIFEST: &[BlockingOperationRegistration] = &[
             $(BlockingOperationRegistration {

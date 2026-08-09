@@ -3323,6 +3323,8 @@ impl SettingsCx {
                         .to_string(),
                     muted,
                 )));
+                controls.push((lines.len(), 0));
+                lines.push(Line::from("[Continue]"));
             }
             Some("saving" | "fetching" | "test-key") => {
                 lines.push(Line::from(Span::styled(
@@ -4963,9 +4965,11 @@ fn provider_add_pointer_action(
         | WizardStepId::ApiKey
         | WizardStepId::EnvVar => WizardControlId::EditText,
         WizardStepId::CopilotAuth => (index == 0).then_some(WizardControlId::CopilotContinue)?,
+        WizardStepId::TestSkipped => {
+            (index == 0).then_some(WizardControlId::TestSkippedContinue)?
+        }
         WizardStepId::Saving
         | WizardStepId::TestKey
-        | WizardStepId::TestSkipped
         | WizardStepId::Fetching
         | WizardStepId::Done => return None,
     };
@@ -5563,6 +5567,7 @@ impl SettingsPage for ProvidersPage {
                 }
                 Some("test-key-choice") if index < 2 => state.test_choice_cursor = index,
                 Some("copilot-auth") if index == 0 => {}
+                Some("test-skipped") if index == 0 => {}
                 Some("grok-oauth" | "codex-oauth")
                     if state.oauth_auth.as_ref().is_some_and(|oauth| {
                         !oauth.paste_focused && index < oauth.option_count(OAuthHost::AddWizard)

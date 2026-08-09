@@ -211,7 +211,7 @@ fixture_enum!(ProvidersFixture {
     WizardCodexAcknowledge,
     WizardCopilotContinue,
     WizardCopilotNoControl,
-    WizardTestSkippedNoControl,
+    WizardTestSkippedContinue,
     WizardFetchingNoControl,
     WizardDoneNoControl,
     RowHeaderOpen,
@@ -324,7 +324,6 @@ impl PayloadFixtureKey {
             Self::WizardStep(
                 ProviderWizardStep::Saving
                     | ProviderWizardStep::TestKey
-                    | ProviderWizardStep::TestSkipped
                     | ProviderWizardStep::Fetching
                     | ProviderWizardStep::Done
             )
@@ -349,6 +348,7 @@ fixture_enum!(WizardPayloadControlKey {
     AddHeader,
     ContinueHeaders,
     CopilotContinue,
+    TestSkippedContinue,
     EditText
 });
 
@@ -384,6 +384,7 @@ fn wizard_payload_key(control: &WizardControlId) -> WizardPayloadControlKey {
         WizardControlId::AddHeader => WizardPayloadControlKey::AddHeader,
         WizardControlId::ContinueHeaders => WizardPayloadControlKey::ContinueHeaders,
         WizardControlId::CopilotContinue => WizardPayloadControlKey::CopilotContinue,
+        WizardControlId::TestSkippedContinue => WizardPayloadControlKey::TestSkippedContinue,
         WizardControlId::EditText => WizardPayloadControlKey::EditText,
     }
 }
@@ -533,7 +534,6 @@ impl ActionFixtureKey {
             }
             Self::Providers(
                 ProvidersFixture::WizardCopilotNoControl
-                | ProvidersFixture::WizardTestSkippedNoControl
                 | ProvidersFixture::WizardFetchingNoControl
                 | ProvidersFixture::WizardDoneNoControl,
             ) => ExpectedReducerOutcome::NoPointerControl,
@@ -848,6 +848,7 @@ enum WizardControlKind {
     AddHeader,
     ContinueHeaders,
     CopilotContinue,
+    TestSkippedContinue,
     EditText,
 }
 
@@ -866,6 +867,7 @@ fn wizard_control_kind(control: &WizardControlId) -> WizardControlKind {
         WizardControlId::AddHeader => WizardControlKind::AddHeader,
         WizardControlId::ContinueHeaders => WizardControlKind::ContinueHeaders,
         WizardControlId::CopilotContinue => WizardControlKind::CopilotContinue,
+        WizardControlId::TestSkippedContinue => WizardControlKind::TestSkippedContinue,
         WizardControlId::EditText => WizardControlKind::EditText,
     }
 }
@@ -914,6 +916,11 @@ fn wizard_key(step: ProviderWizardStep, control: &WizardControlId) -> ProvidersF
         ProviderWizardStep::TestKeyChoice if matches!(control, WizardControlKind::SkipTest) => {
             ProvidersFixture::WizardSkipTest
         }
+        ProviderWizardStep::TestSkipped
+            if matches!(control, WizardControlKind::TestSkippedContinue) =>
+        {
+            ProvidersFixture::WizardTestSkippedContinue
+        }
         ProviderWizardStep::GrokOAuth => {
             let WizardControlKind::OAuth(option) = control else {
                 unreachable!("wizard control does not belong to Grok OAuth")
@@ -933,7 +940,6 @@ fn wizard_key(step: ProviderWizardStep, control: &WizardControlId) -> ProvidersF
         }
         ProviderWizardStep::Saving
         | ProviderWizardStep::TestKey
-        | ProviderWizardStep::TestSkipped
         | ProviderWizardStep::Fetching
         | ProviderWizardStep::Done => {
             unreachable!("non-interactive provider wizard step cannot publish a pointer control")
@@ -946,6 +952,7 @@ fn wizard_key(step: ProviderWizardStep, control: &WizardControlId) -> ProvidersF
         | ProviderWizardStep::ApiKey
         | ProviderWizardStep::EnvVar
         | ProviderWizardStep::CopilotAuth
+        | ProviderWizardStep::TestSkipped
         | ProviderWizardStep::TestKeyChoice => {
             unreachable!("wizard control does not belong to its sealed source step")
         }

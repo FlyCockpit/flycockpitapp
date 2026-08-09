@@ -168,6 +168,7 @@ pub(super) enum WizardControlId {
     AddHeader,
     ContinueHeaders,
     CopilotContinue,
+    TestSkippedContinue,
     EditText,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

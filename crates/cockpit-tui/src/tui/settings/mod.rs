@@ -47,6 +47,8 @@ mod mcp_page;
 mod multimodal_capability_editor;
 #[cfg(test)]
 mod pointer_acceptance_tests;
+#[cfg(test)]
+mod pointer_action_fixtures;
 #[allow(dead_code)] // The registry is consumed incrementally by page fixture matrices.
 mod pointer_actions;
 mod providers;

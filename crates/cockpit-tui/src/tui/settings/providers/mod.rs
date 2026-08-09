@@ -3040,6 +3040,10 @@ impl SettingsCx {
         s: &AddState,
         links: Option<&mut crate::tui::links::LinkRegistry>,
     ) {
+        #[cfg(test)]
+        if let Some(step) = s.run.current_provider_step() {
+            super::pointer_acceptance_tests::record_rendered_wizard_step(step);
+        }
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
         let yellow = Style::default().fg(Color::Yellow);
         let red = Style::default().fg(Color::Red);

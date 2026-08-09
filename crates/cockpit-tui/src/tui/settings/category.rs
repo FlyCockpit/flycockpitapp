@@ -441,7 +441,7 @@ pub(super) enum SettingId {
     Name,
 }
 
-const ALL_SETTING_IDS: &[SettingId] = &[
+pub(super) const ALL_SETTING_IDS: &[SettingId] = &[
     SettingId::VimMode,
     SettingId::Thinking,
     SettingId::RenderAgentMarkdown,

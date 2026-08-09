@@ -377,6 +377,24 @@ pub enum ProviderWizardStep {
 }
 
 impl ProviderWizardStep {
+    pub const ALL: [Self; 16] = [
+        Self::Template,
+        Self::ProviderId,
+        Self::Url,
+        Self::Headers,
+        Self::AuthMethod,
+        Self::ApiKey,
+        Self::EnvVar,
+        Self::CopilotAuth,
+        Self::GrokOAuth,
+        Self::CodexOAuth,
+        Self::Saving,
+        Self::TestKeyChoice,
+        Self::TestKey,
+        Self::TestSkipped,
+        Self::Fetching,
+        Self::Done,
+    ];
     pub const fn source_id(self) -> &'static str {
         match self {
             Self::Template => "template",

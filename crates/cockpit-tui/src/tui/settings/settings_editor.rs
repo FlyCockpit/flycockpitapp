@@ -153,7 +153,7 @@ pub(super) enum ProviderSettingId {
     XaiMultiAgentToolsBeta,
 }
 
-const ALL_PROVIDER_SETTING_IDS: &[ProviderSettingId] = &[
+pub(super) const ALL_PROVIDER_SETTING_IDS: &[ProviderSettingId] = &[
     ProviderSettingId::AllowInsecureHttp,
     ProviderSettingId::TrustPolicy,
     ProviderSettingId::Location,

@@ -20,6 +20,22 @@ thread_local! {
         HashSet<SettingsPointerAction>,
         HashSet<SettingsPointerSurfaceKind>,
     )> = RefCell::default();
+    static FIXTURE_COVERAGE: RefCell<(
+        HashSet<super::pointer_action_fixtures::ActionFixtureKey>,
+        HashSet<super::pointer_action_fixtures::ActionFixtureKey>,
+        HashSet<super::pointer_action_fixtures::ActionFixtureKey>,
+    )> = RefCell::default();
+    static PAYLOAD_COVERAGE: RefCell<(
+        HashSet<super::pointer_action_fixtures::PayloadFixtureKey>,
+        HashSet<super::pointer_action_fixtures::PayloadFixtureKey>,
+    )> = RefCell::default();
+    static WIZARD_SOURCE_COVERAGE: RefCell<HashSet<cockpit_core::wizard::ProviderWizardStep>> = RefCell::default();
+}
+
+pub(super) fn record_rendered_wizard_step(step: cockpit_core::wizard::ProviderWizardStep) {
+    WIZARD_SOURCE_COVERAGE.with(|coverage| {
+        coverage.borrow_mut().insert(step);
+    });
 }
 
 pub(super) fn record_rendered_surface(surface: SettingsPointerSurfaceKind) {
@@ -30,9 +46,10 @@ pub(super) fn record_rendered_surface(surface: SettingsPointerSurfaceKind) {
 
 pub(super) fn record_rendered_action(action: &SettingsPointerAction, enabled: bool) {
     assert_eq!(
-        source_action_fixture_is_enabled(action),
+        super::pointer_action_fixtures::key_for(action).expected()
+            == super::pointer_action_fixtures::ExpectedReducerOutcome::Enabled,
         enabled,
-        "source action fixture disagrees with rendered reducer outcome"
+        "typed source fixture disagrees with rendered reducer outcome"
     );
     ACTION_COVERAGE.with(|coverage| {
         let mut coverage = coverage.borrow_mut();
@@ -43,11 +60,41 @@ pub(super) fn record_rendered_action(action: &SettingsPointerAction, enabled: bo
         }
         .insert(action.clone());
     });
+    FIXTURE_COVERAGE.with(|coverage| {
+        let key = super::pointer_action_fixtures::key_for(action);
+        let mut coverage = coverage.borrow_mut();
+        if enabled {
+            &mut coverage.0
+        } else {
+            &mut coverage.1
+        }
+        .insert(key);
+    });
+    if enabled {
+        PAYLOAD_COVERAGE.with(|coverage| {
+            coverage
+                .borrow_mut()
+                .0
+                .extend(super::pointer_action_fixtures::payload_keys_for(action));
+        });
+    }
 }
 
 pub(super) fn record_dispatched_action(action: &SettingsPointerAction) {
     ACTION_COVERAGE.with(|coverage| {
         coverage.borrow_mut().1.insert(action.clone());
+    });
+    FIXTURE_COVERAGE.with(|coverage| {
+        coverage
+            .borrow_mut()
+            .2
+            .insert(super::pointer_action_fixtures::key_for(action));
+    });
+    PAYLOAD_COVERAGE.with(|coverage| {
+        coverage
+            .borrow_mut()
+            .1
+            .extend(super::pointer_action_fixtures::payload_keys_for(action));
     });
 }
 
@@ -372,6 +419,9 @@ fn settings_pointer_hover_and_help_are_truthful() {
 #[test]
 fn settings_pointer_action_registry_is_exhaustive_and_operable() {
     ACTION_COVERAGE.with(|coverage| *coverage.borrow_mut() = Default::default());
+    FIXTURE_COVERAGE.with(|coverage| *coverage.borrow_mut() = Default::default());
+    PAYLOAD_COVERAGE.with(|coverage| *coverage.borrow_mut() = Default::default());
+    WIZARD_SOURCE_COVERAGE.with(|coverage| coverage.borrow_mut().clear());
     super::tests::run_pointer_dialog_regression_matrix();
     super::providers::tests::run_pointer_provider_regression_matrix();
     super::agents_page::tests::run_pointer_external_edit_exactly_once_regression();
@@ -429,6 +479,77 @@ fn settings_pointer_action_registry_is_exhaustive_and_operable() {
                     _ => false,
                 }),
                 "disabled/read-only {expected} source payload was not rendered"
+            );
+        }
+    });
+    FIXTURE_COVERAGE.with(|coverage| {
+        use super::pointer_action_fixtures::ExpectedReducerOutcome;
+        let coverage = coverage.borrow();
+        for key in super::pointer_action_fixtures::all_keys() {
+            match key.expected() {
+                ExpectedReducerOutcome::Enabled => {
+                    assert!(
+                        coverage.0.contains(&key),
+                        "enabled source fixture was not rendered: {key:?}"
+                    );
+                    assert!(
+                        coverage.2.contains(&key),
+                        "enabled source fixture did not reach reducer: {key:?}"
+                    );
+                }
+                ExpectedReducerOutcome::Disabled => {
+                    assert!(
+                        coverage.1.contains(&key),
+                        "disabled source fixture was not rendered: {key:?}"
+                    );
+                    assert!(
+                        !coverage.2.contains(&key),
+                        "disabled source fixture reached reducer: {key:?}"
+                    );
+                }
+                ExpectedReducerOutcome::NoPointerControl => {
+                    assert!(
+                        !coverage.0.contains(&key) && !coverage.1.contains(&key),
+                        "non-interactive source step published a pointer target: {key:?}"
+                    );
+                    assert!(
+                        !coverage.2.contains(&key),
+                        "non-interactive source step reached a pointer reducer: {key:?}"
+                    );
+                }
+            }
+        }
+    });
+    PAYLOAD_COVERAGE.with(|coverage| {
+        let coverage = coverage.borrow();
+        for key in super::pointer_action_fixtures::all_payload_keys() {
+            if key.expects_pointer_control() {
+                assert!(
+                    coverage.0.contains(&key),
+                    "source payload was not rendered: {key:?}"
+                );
+                assert!(
+                    coverage.1.contains(&key),
+                    "source payload did not reach reducer: {key:?}"
+                );
+            } else {
+                assert!(
+                    !coverage.0.contains(&key),
+                    "non-interactive source payload rendered a pointer control: {key:?}"
+                );
+                assert!(
+                    !coverage.1.contains(&key),
+                    "non-interactive source payload reached pointer reducer: {key:?}"
+                );
+            }
+        }
+    });
+    WIZARD_SOURCE_COVERAGE.with(|coverage| {
+        let coverage = coverage.borrow();
+        for step in cockpit_core::wizard::ProviderWizardStep::ALL {
+            assert!(
+                coverage.contains(&step),
+                "provider wizard source step was not rendered: {step:?}"
             );
         }
     });
@@ -495,174 +616,6 @@ fn assert_source_list_action_is_covered(action: &ListAction) {
         | ListAction::Save
         | ListAction::Cancel => {}
     }
-}
-
-#[allow(clippy::too_many_lines)]
-fn source_action_fixture_is_enabled(action: &SettingsPointerAction) -> bool {
-    match action {
-        SettingsPointerAction::Root(action) => match action {
-            RootAction::Open(_) => {}
-        },
-        SettingsPointerAction::Category(action) => match action {
-            CategoryAction::DescriptorActivate(_)
-            | CategoryAction::InlineEditBegin(_)
-            | CategoryAction::InlineEditCommit(_)
-            | CategoryAction::InlineEditCancel(_)
-            | CategoryAction::PathEditBegin(_)
-            | CategoryAction::PathEditCommit(_)
-            | CategoryAction::PathEditCancel(_)
-            | CategoryAction::SuggestionSelect(_, _)
-            | CategoryAction::TextEditorSave(_)
-            | CategoryAction::TextEditorCancel(_)
-            | CategoryAction::PickerSelect(_, _)
-            | CategoryAction::Confirm(_, _)
-            | CategoryAction::Reset
-            | CategoryAction::ExternalEditBegin(_, _)
-            | CategoryAction::ExternalEditResult(_, _) => {}
-        },
-        SettingsPointerAction::Agents(action) => match action {
-            AgentsAction::Open(_)
-            | AgentsAction::Edit(_)
-            | AgentsAction::Delete(_)
-            | AgentsAction::Reset(_)
-            | AgentsAction::ResetAll
-            | AgentsAction::ToggleTool(_, _)
-            | AgentsAction::CycleTier(_, _)
-            | AgentsAction::Save(_)
-            | AgentsAction::OpenRawEditor(_)
-            | AgentsAction::EditText(_)
-            | AgentsAction::Cancel(_)
-            | AgentsAction::ExternalEditBegin(_)
-            | AgentsAction::ExternalEditResult(_, _) => {}
-        },
-        SettingsPointerAction::Tools(action) => match action {
-            ToolsAction::CycleWebProvider
-            | ToolsAction::EditFirecrawlBaseUrl
-            | ToolsAction::EditCredential(_)
-            | ToolsAction::EditWebFetchCommand
-            | ToolsAction::EditWebSearchCommand
-            | ToolsAction::EditUserToolCommand(_)
-            | ToolsAction::AddUserTool
-            | ToolsAction::ToggleUserTool(_)
-            | ToolsAction::ResetToolField(_)
-            | ToolsAction::McpJump
-            | ToolsAction::Reset
-            | ToolsAction::DeleteUserTool(_)
-            | ToolsAction::ReadOnlyBuiltin(_)
-            | ToolsAction::ReadOnlyMcpTool(_, _) => {}
-        },
-        SettingsPointerAction::Harnesses(action) => match action {
-            HarnessesAction::Open(_)
-            | HarnessesAction::Add
-            | HarnessesAction::Delete(_)
-            | HarnessesAction::SeedInstalledPresets
-            | HarnessesAction::ResetAndSeedPresets
-            | HarnessesAction::EditField(_)
-            | HarnessesAction::Save
-            | HarnessesAction::Cancel => {}
-        },
-        SettingsPointerAction::Skills(action) => match action {
-            SkillsAction::ToggleAutoBangCommands
-            | SkillsAction::ToggleAncestorWalk
-            | SkillsAction::AddScanDirectory
-            | SkillsAction::EditScanDirectory(_)
-            | SkillsAction::DeleteScanDirectory(_)
-            | SkillsAction::ConfirmDeleteScanDirectory(_, _)
-            | SkillsAction::Reset => {}
-        },
-        SettingsPointerAction::Mcp(action) => match action {
-            McpAction::Open(_)
-            | McpAction::Add
-            | McpAction::ToggleEnabled(_)
-            | McpAction::Authenticate(_)
-            | McpAction::Delete(_)
-            | McpAction::EditName
-            | McpAction::ToggleEditorEnabled
-            | McpAction::CycleTransport
-            | McpAction::EditEndpoint
-            | McpAction::EditCommand
-            | McpAction::EditArgs
-            | McpAction::EditBaseEnv
-            | McpAction::CycleAuth
-            | McpAction::EditHeaderName
-            | McpAction::EditHeaderValue
-            | McpAction::EditAuthEnv
-            | McpAction::EditOauthAuthorizeUrl
-            | McpAction::EditOauthTokenUrl
-            | McpAction::EditOauthClientId
-            | McpAction::EditOauthScopes
-            | McpAction::EditCacheTtl
-            | McpAction::EditConnectTimeout
-            | McpAction::EditRequestTimeout
-            | McpAction::Save
-            | McpAction::Cancel => {}
-        },
-        SettingsPointerAction::Providers(action) => match action {
-            ProvidersAction::Open(_)
-            | ProvidersAction::Add
-            | ProvidersAction::EditField(_, _)
-            | ProvidersAction::EditHeaders(_)
-            | ProvidersAction::CopilotSetup(_)
-            | ProvidersAction::BeginOAuth(_, _)
-            | ProvidersAction::OAuthOption(_, _)
-            | ProvidersAction::ManageModels(_)
-            | ProvidersAction::ProviderSettings(_)
-            | ProvidersAction::Favorite(_)
-            | ProvidersAction::Refetch(_)
-            | ProvidersAction::RefetchAll
-            | ProvidersAction::CycleUnlistedPolicy
-            | ProvidersAction::DeepFetchConfirm(_)
-            | ProvidersAction::BeginDelete(_)
-            | ProvidersAction::Delete(_, _)
-            | ProvidersAction::SaveProvider(_)
-            | ProvidersAction::LocalBack
-            | ProvidersAction::AddModel(_)
-            | ProvidersAction::RenameModel(_, _)
-            | ProvidersAction::DeleteModel(_, _)
-            | ProvidersAction::ModelSettings(_, _)
-            | ProvidersAction::FetchAllConfirm(_)
-            | ProvidersAction::FetchOneConfirm(_, _)
-            | ProvidersAction::FetchFallbackConfirm(_, _)
-            | ProvidersAction::DeepFetchChoice(_, _)
-            | ProvidersAction::WizardControl(_, _)
-            | ProvidersAction::RowEditor(_)
-            | ProvidersAction::ModelLifecycle(_)
-            | ProvidersAction::CopyOAuth(_, _)
-            | ProvidersAction::CopilotConfirm(_, _) => {}
-        },
-        SettingsPointerAction::Lsp(action) => match action {
-            LspAction::ToggleEnabled
-            | LspAction::CycleAutoInstall
-            | LspAction::ToggleDiagnostics
-            | LspAction::Edit(_)
-            | LspAction::SaveEdit(_)
-            | LspAction::CancelEdit(_)
-            | LspAction::Reset
-            | LspAction::Check(_)
-            | LspAction::Install(_)
-            | LspAction::Uninstall(_)
-            | LspAction::Restart(_) => {}
-        },
-        SettingsPointerAction::List(action) => assert_source_list_action_is_covered(action),
-        SettingsPointerAction::UtilityModel(action) => match action {
-            UtilityModelAction::Select(_)
-            | UtilityModelAction::Clear
-            | UtilityModelAction::OpenCustom
-            | UtilityModelAction::Back
-            | UtilityModelAction::EditCustom
-            | UtilityModelAction::CommitCustom
-            | UtilityModelAction::CancelCustom => {}
-        },
-        SettingsPointerAction::DefaultModel(action) => match action {
-            DefaultModelAction::Choose | DefaultModelAction::Clear => {}
-        },
-    }
-    !matches!(
-        action,
-        SettingsPointerAction::Tools(
-            ToolsAction::ReadOnlyBuiltin(_) | ToolsAction::ReadOnlyMcpTool(_, _)
-        )
-    )
 }
 
 #[test]

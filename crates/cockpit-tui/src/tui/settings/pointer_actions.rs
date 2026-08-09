@@ -21,7 +21,7 @@ pub(super) struct LspServerId(pub String);
 pub(super) type SettingId = super::category::SettingId;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct UtilityModelId(pub String);
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum RootNodeId {
     DefaultModel,
     Providers,
@@ -39,6 +39,21 @@ pub(super) enum RootNodeId {
     Lsp,
 }
 impl RootNodeId {
+    pub(super) const ALL: [Self; 13] = [
+        Self::DefaultModel,
+        Self::Providers,
+        Self::Agents,
+        Self::Interface,
+        Self::Behavior,
+        Self::Privacy,
+        Self::Translation,
+        Self::Tools,
+        Self::Harnesses,
+        Self::Skills,
+        Self::Profile,
+        Self::Mcp,
+        Self::Lsp,
+    ];
     pub(super) fn title(&self) -> &'static str {
         match self {
             Self::DefaultModel => super::DEFAULT_MODEL_TITLE,

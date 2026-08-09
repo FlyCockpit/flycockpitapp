@@ -80,11 +80,8 @@ impl BlockingOperationKind {
 impl App {
     #[cfg(test)]
     pub(super) fn dispatch_owned_test_barrier(&mut self, operation: BlockingOperationKind) -> bool {
-        let Some(barrier) = TEST_OWNED_BARRIERS
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap()
-            .remove(&operation)
+        let Some(barrier) =
+            TEST_OWNED_BARRIERS.with(|barriers| barriers.borrow_mut().remove(&operation))
         else {
             return false;
         };
@@ -114,20 +111,16 @@ impl App {
 }
 
 #[cfg(test)]
-static TEST_OWNED_BARRIERS: std::sync::OnceLock<
-    std::sync::Mutex<
-        std::collections::HashMap<BlockingOperationKind, std::sync::Arc<std::sync::Barrier>>,
-    >,
-> = std::sync::OnceLock::new();
+thread_local! {
+    static TEST_OWNED_BARRIERS: std::cell::RefCell<
+        std::collections::HashMap<BlockingOperationKind, std::sync::Arc<std::sync::Barrier>>
+    > = Default::default();
+}
 
 #[cfg(test)]
 pub(super) fn install_owned_test_barrier(
     operation: BlockingOperationKind,
     barrier: std::sync::Arc<std::sync::Barrier>,
 ) {
-    TEST_OWNED_BARRIERS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap()
-        .insert(operation, barrier);
+    TEST_OWNED_BARRIERS.with(|barriers| barriers.borrow_mut().insert(operation, barrier));
 }

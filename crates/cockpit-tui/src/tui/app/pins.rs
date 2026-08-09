@@ -1025,6 +1025,7 @@ mod tests {
             copy_fragments: std::rc::Rc::new(Vec::new()),
             copy_newlines_before: 0,
             copy_fallback_if_unmapped: false,
+            copy_provenance_present: false,
         };
         app.chat_row_meta = vec![
             empty.clone(),

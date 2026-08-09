@@ -738,6 +738,9 @@ pub(crate) struct ChatRowMeta {
     /// This selectable message row is visible plaintext outside the mapped
     /// Markdown body (for example Markdown-disabled text or reasoning).
     pub copy_fallback_if_unmapped: bool,
+    /// The row belongs to a Markdown body whose renderer emitted an
+    /// authoritative provenance map, even when the selected cells are chrome.
+    pub copy_provenance_present: bool,
 }
 
 impl ChatRowMeta {
@@ -762,6 +765,7 @@ impl ChatRowMeta {
             copy_fragments: Rc::new(Vec::new()),
             copy_newlines_before: 0,
             copy_fallback_if_unmapped: false,
+            copy_provenance_present: false,
         }
     }
 
@@ -2459,6 +2463,9 @@ impl App {
                             .and_then(|copy| copy.incomplete.get(i))
                             .copied()
                             .unwrap_or(false)),
+                copy_provenance_present: copy_body_start
+                    .as_ref()
+                    .is_some_and(|copy| i >= copy.start),
             });
         }
 
@@ -4835,6 +4842,11 @@ pub(super) fn extract_selection_semantic(
             continue;
         };
         if meta.copy_target.is_some() {
+            if !meta.copy_provenance_present {
+                // Legacy/caller-supplied message rows have substantive
+                // visible plaintext but no authoritative semantic map.
+                return None;
+            }
             saw_semantic_row = true;
         } else if meta.selectable {
             // A mixed selection must fall back as a whole; silently omitting

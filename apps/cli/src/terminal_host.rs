@@ -965,12 +965,12 @@ impl TerminalHost {
             .get(&binding.binding_id)
             .cloned()
             .ok_or_else(invalid_ingress)?;
-        std::fs::create_dir_all(&binding_dir).map_err(internal)?;
-        set_private_dir_permissions(&binding_dir).map_err(internal)?;
         let name = format!("{}.{}", random_base32(), metadata.media_type.extension());
         let final_path = binding_dir.join(name);
         let path_text = final_path.to_str().ok_or_else(ingress_path_unavailable)?;
         validate_path_text(path_text)?;
+        std::fs::create_dir_all(&binding_dir).map_err(internal)?;
+        set_private_dir_permissions(&binding_dir).map_err(internal)?;
         #[cfg(not(windows))]
         let temporary = binding_dir.join(format!(".{}.tmp", random_base32()));
         #[cfg(not(windows))]

@@ -1908,7 +1908,7 @@ impl Db {
         input: &CommitAcceptedImageResponseFailure<'_>,
     ) -> Result<()> {
         atomic_conn(conn, "image_generation_accepted_response_failure", || {
-            let bound: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM image_generation_response_fetch_outcomes WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND outcome='definitive_failure' AND safe_reason=?4)",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),input.safe_reason],|row|row.get(0))?;
+            let bound: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM image_generation_response_fetch_outcomes WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND outcome='definitive_failure' AND safe_reason=?4) OR EXISTS(SELECT 1 FROM image_generation_response_reconciliations WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND outcome='definitive_failure' AND safe_reason=?4)",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),input.safe_reason],|row|row.get(0))?;
             ensure!(bound, "accepted response failure evidence is absent");
             match transition_external_operation_conn(
                 conn,

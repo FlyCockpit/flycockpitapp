@@ -175,6 +175,11 @@ pub trait AcceptedImageResponseFetcher:
         &self,
         request: &AcceptedImageResponseFetchRequest,
     ) -> AcceptedImageResponseFetchOutcome;
+    async fn reconcile(
+        &self,
+        request: &AcceptedImageResponseFetchRequest,
+        prior_evidence: &[u8],
+    ) -> AcceptedImageResponseFetchOutcome;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2537,6 +2542,103 @@ pub async fn fetch_accepted_image_response<F: AcceptedImageResponseFetcher>(
             }
             tx.commit()?; Ok(())
         }).await?;
+    if let AcceptedImageResponseFetchOutcome::DefinitiveFailure { safe_reason, .. } = &outcome {
+        terminalize_accepted_response_failure(
+            &db,
+            job_id,
+            slot_id,
+            attempt_number,
+            safe_reason.clone(),
+            now_unix_ms,
+        )
+        .await?;
+    }
+    Ok(outcome)
+}
+
+pub async fn reconcile_unknown_accepted_image_response<F: AcceptedImageResponseFetcher>(
+    db: cockpit_db::Db,
+    fetcher: &F,
+    job_id: Uuid,
+    slot_id: Uuid,
+    attempt_number: u32,
+    worker_boot_id: Uuid,
+    now_unix_ms: i64,
+) -> Result<AcceptedImageResponseFetchOutcome> {
+    ensure!(
+        !worker_boot_id.is_nil(),
+        "response reconciliation boot is nil"
+    );
+    let authority=db.write(move|conn|{
+        let (provider,evidence):(String,Vec<u8>)=conn.query_row("SELECT a.provider_request_identity,o.evidence FROM image_generation_attempts a JOIN image_generation_response_fetch_outcomes o USING(job_id,slot_id,attempt_number) WHERE a.job_id=?1 AND a.slot_id=?2 AND a.attempt_number=?3 AND o.outcome='outcome_unknown'",params![job_id.to_string(),slot_id.to_string(),i64::from(attempt_number)],|row|Ok((row.get(0)?,row.get(1)?)))?;
+        if let Some(row)=conn.query_row("SELECT outcome,safe_reason,evidence,response_bytes FROM image_generation_response_reconciliations WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND outcome!='outcome_unknown' ORDER BY claim_generation DESC LIMIT 1",params![job_id.to_string(),slot_id.to_string(),i64::from(attempt_number)],|row|Ok((row.get::<_,String>(0)?,row.get::<_,Option<String>>(1)?,row.get::<_,Vec<u8>>(2)?,row.get::<_,Option<Vec<u8>>>(3)?))).optional()? { return Ok((provider,evidence,0,Some(row))); }
+        let generation:i64=conn.query_row("SELECT COALESCE(MAX(claim_generation),0)+1 FROM image_generation_response_reconciliation_claims WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3",params![job_id.to_string(),slot_id.to_string(),i64::from(attempt_number)],|row|row.get(0))?;
+        let inserted=conn.execute("INSERT INTO image_generation_response_reconciliation_claims(job_id,slot_id,attempt_number,claim_generation,worker_boot_id,claimed_at_unix_ms,expires_at_unix_ms) SELECT ?1,?2,?3,?4,?5,?6,?6+60000 WHERE NOT EXISTS(SELECT 1 FROM image_generation_response_reconciliation_claims c WHERE c.job_id=?1 AND c.slot_id=?2 AND c.attempt_number=?3 AND c.expires_at_unix_ms>?6)",params![job_id.to_string(),slot_id.to_string(),i64::from(attempt_number),generation,worker_boot_id.to_string(),now_unix_ms])?;
+        ensure!(inserted==1,"response reconciliation is already claimed"); Ok((provider,evidence,generation,None))
+    }).await?;
+    if let Some((kind, reason, evidence, bytes)) = authority.3 {
+        return Ok(match kind.as_str() {
+            "fetched" => AcceptedImageResponseFetchOutcome::Fetched {
+                bytes: bytes.context("reconciled response bytes absent")?,
+                evidence,
+            },
+            "definitive_failure" => AcceptedImageResponseFetchOutcome::DefinitiveFailure {
+                safe_reason: reason.context("reconciled failure reason absent")?,
+                evidence,
+            },
+            _ => anyhow::bail!("invalid terminal response reconciliation"),
+        });
+    }
+    let request = AcceptedImageResponseFetchRequest {
+        job_id,
+        slot_id,
+        attempt_number,
+        provider_request_identity: authority.0,
+    };
+    let outcome = fetcher.reconcile(&request, &authority.1).await;
+    let (kind, reason, evidence, bytes) = match &outcome {
+        AcceptedImageResponseFetchOutcome::Fetched { bytes, evidence } => {
+            ("fetched", None, evidence.clone(), Some(bytes.clone()))
+        }
+        AcceptedImageResponseFetchOutcome::DefinitiveFailure {
+            safe_reason,
+            evidence,
+        } => (
+            "definitive_failure",
+            Some(safe_reason.clone()),
+            evidence.clone(),
+            None,
+        ),
+        AcceptedImageResponseFetchOutcome::OutcomeUnknown { evidence } => {
+            ("outcome_unknown", None, evidence.clone(), None)
+        }
+    };
+    if let Some(reason) = &reason {
+        ensure!(
+            !reason.is_empty()
+                && reason.len() <= 128
+                && reason
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
+            "response reconciliation failure reason is invalid"
+        );
+    }
+    if let Some(bytes) = &bytes {
+        ensure!(
+            !bytes.is_empty() && bytes.len() <= 64 * 1024 * 1024,
+            "reconciled response bytes exceed bound"
+        );
+    }
+    ensure!(
+        !evidence.is_empty() && evidence.len() <= MAX_PROVIDER_HANDOFF_EVIDENCE_BYTES,
+        "response reconciliation evidence exceeds bound"
+    );
+    let evidence_digest = crate::intel::hex_lower(&Sha256::digest(&evidence));
+    let response_digest = bytes
+        .as_ref()
+        .map(|value| crate::intel::hex_lower(&Sha256::digest(value)));
+    let generation = authority.2;
+    db.write(move|conn|{conn.execute("INSERT INTO image_generation_response_reconciliations(job_id,slot_id,attempt_number,claim_generation,outcome,safe_reason,evidence,evidence_digest,response_digest,response_bytes,recorded_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![job_id.to_string(),slot_id.to_string(),i64::from(attempt_number),generation,kind,reason,evidence,evidence_digest,response_digest,bytes,now_unix_ms])?;Ok(())}).await?;
     if let AcceptedImageResponseFetchOutcome::DefinitiveFailure { safe_reason, .. } = &outcome {
         terminalize_accepted_response_failure(
             &db,

@@ -2558,7 +2558,7 @@ CREATE TABLE image_spend_reservations (
     policy_version INTEGER NOT NULL CHECK(policy_version >= 1),
     epoch_policy_version INTEGER NOT NULL CHECK(epoch_policy_version >= 1),
     epoch_sequence INTEGER NOT NULL CHECK(epoch_sequence >= 0),
-    reserved_usd_micros INTEGER CHECK(reserved_usd_micros >= 0),
+    reserved_usd_micros BLOB CHECK(reserved_usd_micros IS NULL OR length(reserved_usd_micros)=8),
     cost_unknown INTEGER NOT NULL CHECK(cost_unknown IN (0,1)),
     state TEXT NOT NULL CHECK(state IN ('reserved','released','reconciled','budget_violation')),
     release_proof_identity TEXT,
@@ -2571,7 +2571,7 @@ CREATE TABLE image_spend_reservations (
 CREATE TABLE image_spend_attempts (
     reservation_id TEXT NOT NULL,
     attempt_id TEXT NOT NULL,
-    maximum_usd_micros INTEGER CHECK(maximum_usd_micros >= 0),
+    maximum_usd_micros BLOB CHECK(maximum_usd_micros IS NULL OR length(maximum_usd_micros)=8),
     PRIMARY KEY(reservation_id,attempt_id),
     FOREIGN KEY(reservation_id) REFERENCES image_spend_reservations(reservation_id) ON DELETE RESTRICT
 );
@@ -2583,9 +2583,9 @@ CREATE TABLE image_spend_scope_usage (
     policy_version INTEGER NOT NULL,
     epoch_policy_version INTEGER NOT NULL CHECK(epoch_policy_version >= 0),
     epoch_sequence INTEGER NOT NULL CHECK(epoch_sequence >= 0),
-    reserved_usd_micros INTEGER NOT NULL CHECK(reserved_usd_micros >= 0),
-    charged_usd_micros INTEGER NOT NULL CHECK(charged_usd_micros >= 0),
-    debt_usd_micros INTEGER NOT NULL CHECK(debt_usd_micros >= 0),
+    reserved_usd_micros BLOB NOT NULL CHECK(length(reserved_usd_micros)=8),
+    charged_usd_micros BLOB NOT NULL CHECK(length(charged_usd_micros)=8),
+    debt_usd_micros BLOB NOT NULL CHECK(length(debt_usd_micros)=8),
     PRIMARY KEY(reservation_id,scope_kind),
     FOREIGN KEY(reservation_id) REFERENCES image_spend_reservations(reservation_id) ON DELETE RESTRICT
 );
@@ -2598,7 +2598,7 @@ CREATE TABLE image_spend_cost_events (
     cost_identity TEXT PRIMARY KEY,
     reservation_id TEXT NOT NULL,
     attempt_id TEXT NOT NULL,
-    actual_usd_micros INTEGER NOT NULL CHECK(actual_usd_micros >= 0),
+    actual_usd_micros BLOB NOT NULL CHECK(length(actual_usd_micros)=8),
     evidence_ref TEXT NOT NULL,
     recorded_at_ms INTEGER NOT NULL,
     FOREIGN KEY(reservation_id,attempt_id) REFERENCES image_spend_attempts(reservation_id,attempt_id) ON DELETE RESTRICT
@@ -2609,7 +2609,7 @@ CREATE UNIQUE INDEX uq_image_spend_cost_attempt ON image_spend_cost_events(reser
 CREATE TABLE image_spend_debt_resolutions (
     reservation_id TEXT NOT NULL,
     resolution_ref TEXT NOT NULL,
-    resolved_debt_usd_micros INTEGER NOT NULL CHECK(resolved_debt_usd_micros > 0),
+    resolved_debt_usd_micros BLOB NOT NULL CHECK(length(resolved_debt_usd_micros)=8 AND resolved_debt_usd_micros <> X'0000000000000000'),
     resolved_at_ms INTEGER NOT NULL,
     PRIMARY KEY(reservation_id,resolution_ref),
     FOREIGN KEY(reservation_id) REFERENCES image_spend_reservations(reservation_id) ON DELETE RESTRICT

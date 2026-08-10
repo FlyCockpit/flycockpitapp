@@ -21,6 +21,25 @@ fn read_u64(value: i64) -> rusqlite::Result<u64> {
     })
 }
 
+fn money_blob(value: u64) -> Vec<u8> {
+    value.to_be_bytes().to_vec()
+}
+
+fn read_money(value: Vec<u8>) -> rusqlite::Result<u64> {
+    let bytes: [u8; 8] = value.try_into().map_err(|value: Vec<u8>| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Blob,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("money value must be 8 bytes, got {}", value.len()),
+            )
+            .into(),
+        )
+    })?;
+    Ok(u64::from_be_bytes(bytes))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BudgetPolicy {
@@ -627,10 +646,16 @@ impl Db {
         &self,
         reservation_id: String,
     ) -> Result<Option<SpendLedgerDiagnostic>> {
-        self.read(move |conn| conn.query_row("SELECT r.policy_version,r.epoch_policy_version,r.epoch_sequence,r.state,r.reserved_usd_micros,COALESCE((SELECT SUM(e.actual_usd_micros) FROM image_spend_cost_events e WHERE e.reservation_id=r.reservation_id),0),COALESCE(MAX(u.debt_usd_micros),0) FROM image_spend_reservations r LEFT JOIN image_spend_scope_usage u ON u.reservation_id=r.reservation_id WHERE r.reservation_id=?1 GROUP BY r.reservation_id",[&reservation_id],|row| {
-            let convert=|v:i64| u64::try_from(v).map_err(|e|rusqlite::Error::FromSqlConversionFailure(0,rusqlite::types::Type::Integer,Box::new(e)));
-            Ok(SpendLedgerDiagnostic { reservation_id:reservation_id.clone(),policy_version:convert(row.get(0)?)?,epoch_policy_version:convert(row.get(1)?)?,epoch_sequence:convert(row.get(2)?)?,state:row.get(3)?,reserved_usd_micros:row.get::<_,Option<i64>>(4)?.map(convert).transpose()?,charged_usd_micros:convert(row.get(5)?)?,debt_usd_micros:convert(row.get(6)?)? })
-        }).optional().map_err(Into::into)).await
+        self.read(move |conn| {
+            let base: Option<(i64,i64,i64,String,Option<Vec<u8>>)> = conn.query_row(
+                "SELECT policy_version,epoch_policy_version,epoch_sequence,state,reserved_usd_micros FROM image_spend_reservations WHERE reservation_id=?1",
+                [&reservation_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+            ).optional()?;
+            let Some((policy,epoch_policy,epoch,state,reserved))=base else{return Ok(None)};
+            let sum = |sql:&str| -> Result<u64> { let mut statement=conn.prepare(sql)?; let values=statement.query_map([&reservation_id],|row|row.get::<_,Vec<u8>>(0))?.collect::<rusqlite::Result<Vec<_>>>()?; values.into_iter().try_fold(0u64,|total,value|total.checked_add(read_money(value)?).ok_or_else(||anyhow::Error::new(BudgetBlockReason::ArithmeticOverflow))) };
+            let debt = { let mut statement=conn.prepare("SELECT debt_usd_micros FROM image_spend_scope_usage WHERE reservation_id=?1")?; let values=statement.query_map([&reservation_id],|row|row.get::<_,Vec<u8>>(0))?.collect::<rusqlite::Result<Vec<_>>>()?; values.into_iter().map(read_money).collect::<rusqlite::Result<Vec<_>>>()?.into_iter().max().unwrap_or(0) };
+            Ok(Some(SpendLedgerDiagnostic { reservation_id, policy_version:read_u64(policy)?, epoch_policy_version:read_u64(epoch_policy)?, epoch_sequence:read_u64(epoch)?, state, reserved_usd_micros:reserved.map(read_money).transpose()?, charged_usd_micros:sum("SELECT actual_usd_micros FROM image_spend_cost_events WHERE reservation_id=?1")?, debt_usd_micros:debt }))
+        }).await
     }
     /// Resolve a caller-derived calendar/rolling membership to a durable,
     /// monotonic sequence. A changed wall-clock label can only advance; it can
@@ -690,12 +715,12 @@ impl Db {
         created_at_ms: i64,
     ) -> Result<SpendReservation> {
         self.transaction(move |conn| {
-            if let Some((existing,state,plan,session,project)) = conn.query_row("SELECT reserved_usd_micros,cost_unknown,policy_version,state,plan_digest,session_id,project_key FROM image_spend_reservations WHERE reservation_id=?1", [&reservation_id], |r| Ok((SpendReservation { reservation_id: reservation_id.clone(), reserved_usd_micros: r.get::<_,Option<i64>>(0)?.map(read_u64).transpose()?, cost_unknown: r.get::<_,i64>(1)? != 0, policy_version: read_u64(r.get(2)?)? },r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?))).optional()? {
+            if let Some((existing,state,plan,session,project)) = conn.query_row("SELECT reserved_usd_micros,cost_unknown,policy_version,state,plan_digest,session_id,project_key FROM image_spend_reservations WHERE reservation_id=?1", [&reservation_id], |r| Ok((SpendReservation { reservation_id: reservation_id.clone(), reserved_usd_micros: r.get::<_,Option<Vec<u8>>>(0)?.map(read_money).transpose()?, cost_unknown: r.get::<_,i64>(1)? != 0, policy_version: read_u64(r.get(2)?)? },r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?))).optional()? {
                 if state != "reserved" { return Err(BudgetBlockReason::ReservationTerminal.into()); }
                 if plan != keys.plan_digest || session != keys.session_id || project != keys.project_key || existing.policy_version != expected_policy_version { bail!("reservation replay does not match active immutable plan"); }
-                let stored: Vec<(String,Option<i64>)> = { let mut statement=conn.prepare("SELECT attempt_id,maximum_usd_micros FROM image_spend_attempts WHERE reservation_id=?1 ORDER BY attempt_id")?; statement.query_map([&reservation_id],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()? };
+                let stored: Vec<(String,Option<Vec<u8>>)> = { let mut statement=conn.prepare("SELECT attempt_id,maximum_usd_micros FROM image_spend_attempts WHERE reservation_id=?1 ORDER BY attempt_id")?; statement.query_map([&reservation_id],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()? };
                 let mut requested: Vec<_> = attempts.iter().map(|a|(a.attempt_id.clone(),a.usd_micros)).collect(); requested.sort();
-                let stored: Vec<_> = stored.into_iter().map(|(id,v)|(id,v.map(u64::try_from).transpose())).map(|(id,v)|Ok((id,v?))).collect::<std::result::Result<_,std::num::TryFromIntError>>()?;
+                let stored: Vec<_> = stored.into_iter().map(|(id,v)| Ok((id,v.map(read_money).transpose()?))).collect::<rusqlite::Result<_>>()?;
                 if stored != requested { bail!("reservation replay attempts do not match immutable plan"); }
                 return Ok(existing);
             }
@@ -712,7 +737,7 @@ impl Db {
                 return Err(BudgetBlockReason::UnknownMaximumWithFinitePolicy.into());
             }
             let total = attempts.iter().try_fold(0u64, |sum,a| a.usd_micros.map_or(Ok(sum), |v| sum.checked_add(v).ok_or(BudgetBlockReason::ArithmeticOverflow)))?;
-            let total_sql = sqlite_u64(total)?;
+            let total_sql = money_blob(total);
             let expected_policy_version_sql = sqlite_u64(expected_policy_version)?;
             let epoch_policy_version_sql = sqlite_u64(epoch_policy_version)?;
             let epoch_sequence_sql = sqlite_u64(keys.project_epoch_sequence)?;
@@ -725,16 +750,15 @@ impl Db {
                 if let BudgetPolicy::Finite { usd_micros: limit } = policy {
                     let epoch = if kind == "project" { keys.project_epoch_sequence } else { 0 };
                     let epoch_policy = if kind == "project" { epoch_policy_version } else { 0 };
-                    let used: i64 = conn.query_row("SELECT COALESCE(SUM(reserved_usd_micros),0) FROM image_spend_scope_usage WHERE scope_kind=?1 AND scope_key=?2 AND (?3!='project' OR (epoch_policy_version=?4 AND epoch_sequence=?5))", params![kind,scope_key,kind,sqlite_u64(epoch_policy)?,sqlite_u64(epoch)?], |r| r.get(0))?;
-                    let debt: i64 = conn.query_row("SELECT COALESCE(SUM(debt_usd_micros),0) FROM image_spend_scope_usage WHERE scope_kind=?1 AND scope_key=?2", params![kind,scope_key], |r| r.get(0))?;
+                    let used = { let mut statement=conn.prepare("SELECT reserved_usd_micros FROM image_spend_scope_usage WHERE scope_kind=?1 AND scope_key=?2 AND (?3!='project' OR (epoch_policy_version=?4 AND epoch_sequence=?5))")?; let values=statement.query_map(params![kind,scope_key,kind,sqlite_u64(epoch_policy)?,sqlite_u64(epoch)?],|r|r.get::<_,Vec<u8>>(0))?.collect::<rusqlite::Result<Vec<_>>>()?; values.into_iter().try_fold(0u64,|sum,value|sum.checked_add(read_money(value)?).ok_or_else(||anyhow::Error::new(BudgetBlockReason::ArithmeticOverflow)))? };
+                    let debt = { let mut statement=conn.prepare("SELECT debt_usd_micros FROM image_spend_scope_usage WHERE scope_kind=?1 AND scope_key=?2")?; let values=statement.query_map(params![kind,scope_key],|r|r.get::<_,Vec<u8>>(0))?.collect::<rusqlite::Result<Vec<_>>>()?; values.into_iter().try_fold(0u64,|sum,value|sum.checked_add(read_money(value)?).ok_or_else(||anyhow::Error::new(BudgetBlockReason::ArithmeticOverflow)))? };
                     let reason = match kind { "request" => if debt > 0 { BudgetBlockReason::RequestDebt } else { BudgetBlockReason::RequestExhausted }, "session" => if debt > 0 { BudgetBlockReason::SessionDebt } else { BudgetBlockReason::SessionExhausted }, _ => if debt > 0 { BudgetBlockReason::ProjectDebt } else { BudgetBlockReason::ProjectExhausted } };
-                    let used = u64::try_from(used).map_err(|_| BudgetBlockReason::ArithmeticOverflow)?;
                     let projected=used.checked_add(total).ok_or(BudgetBlockReason::ArithmeticOverflow)?;
                     if debt > 0 || projected > limit { return Err(reason.into()); }
-                    conn.execute("INSERT INTO image_spend_scope_usage(reservation_id,scope_kind,scope_key,policy_version,epoch_policy_version,epoch_sequence,reserved_usd_micros,charged_usd_micros,debt_usd_micros) VALUES(?1,?2,?3,?4,?5,?6,?7,0,0)", params![reservation_id,kind,scope_key,expected_policy_version_sql,sqlite_u64(epoch_policy)?,sqlite_u64(epoch)?,total_sql])?;
+                    conn.execute("INSERT INTO image_spend_scope_usage(reservation_id,scope_kind,scope_key,policy_version,epoch_policy_version,epoch_sequence,reserved_usd_micros,charged_usd_micros,debt_usd_micros) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8)", params![reservation_id,kind,scope_key,expected_policy_version_sql,sqlite_u64(epoch_policy)?,sqlite_u64(epoch)?,total_sql,money_blob(0)])?;
                 }
             }
-            for attempt in attempts { conn.execute("INSERT INTO image_spend_attempts(reservation_id,attempt_id,maximum_usd_micros) VALUES(?1,?2,?3)",params![reservation_id,attempt.attempt_id,attempt.usd_micros.map(sqlite_u64).transpose()?])?; }
+            for attempt in attempts { conn.execute("INSERT INTO image_spend_attempts(reservation_id,attempt_id,maximum_usd_micros) VALUES(?1,?2,?3)",params![reservation_id,attempt.attempt_id,attempt.usd_micros.map(money_blob)])?; }
             Ok(SpendReservation { reservation_id, reserved_usd_micros: (!unknown).then_some(total), cost_unknown: unknown, policy_version: expected_policy_version })
         }).await
     }
@@ -750,19 +774,19 @@ impl Db {
         evidence_ref: String,
         at_ms: i64,
     ) -> Result<bool> {
-        let actual_usd_micros_sql = sqlite_u64(actual_usd_micros)?;
+        let actual_usd_micros_sql = money_blob(actual_usd_micros);
         self.transaction(move |conn| {
             if conn.query_row("SELECT 1 FROM image_spend_cost_events WHERE cost_identity=?1",[&cost_identity],|r|r.get::<_,i64>(0)).optional()?.is_some() { return Ok(false); }
             conn.execute("INSERT INTO image_spend_cost_events(cost_identity,reservation_id,attempt_id,actual_usd_micros,evidence_ref,recorded_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![cost_identity,reservation_id,attempt_id,actual_usd_micros_sql,evidence_ref,at_ms])?;
-            let (reserved, unknown, prior_state): (Option<i64>,i64,String) = conn.query_row("SELECT reserved_usd_micros,cost_unknown,state FROM image_spend_reservations WHERE reservation_id=?1",[&reservation_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-            let charged: i64 = conn.query_row("SELECT COALESCE(SUM(actual_usd_micros),0) FROM image_spend_cost_events WHERE reservation_id=?1",[&reservation_id],|r|r.get(0))?;
-            let charged = u64::try_from(charged).context("negative image spend charge")?;
-            let resolved: i64=conn.query_row("SELECT COALESCE(SUM(resolved_debt_usd_micros),0) FROM image_spend_debt_resolutions WHERE reservation_id=?1",[&reservation_id],|r|r.get(0))?;
-            let debt = if unknown != 0 { 0 } else { charged.saturating_sub(reserved.map(read_u64).transpose()?.unwrap_or(0)).saturating_sub(u64::try_from(resolved).context("negative resolved debt")?) };
-            let remaining: i64 = if prior_state == "released" { 0 } else { conn.query_row("SELECT COALESCE(SUM(maximum_usd_micros),0) FROM image_spend_attempts a WHERE reservation_id=?1 AND NOT EXISTS(SELECT 1 FROM image_spend_cost_events e WHERE e.reservation_id=a.reservation_id AND e.attempt_id=a.attempt_id)",[&reservation_id],|r|r.get(0))? };
-            let held = charged.checked_add(u64::try_from(remaining).context("negative remaining maximum")?).ok_or(BudgetBlockReason::ArithmeticOverflow)?;
-            conn.execute("UPDATE image_spend_scope_usage SET charged_usd_micros=?2,reserved_usd_micros=?3,debt_usd_micros=?4 WHERE reservation_id=?1",params![reservation_id,sqlite_u64(charged)?,sqlite_u64(held)?,sqlite_u64(debt)?])?;
-            conn.execute("UPDATE image_spend_reservations SET state=CASE WHEN ?3>0 THEN 'budget_violation' WHEN ?2=1 THEN 'reconciled' WHEN ?4='released' AND EXISTS(SELECT 1 FROM image_spend_cost_events e WHERE e.reservation_id=?1) THEN 'reconciled' WHEN EXISTS(SELECT 1 FROM image_spend_cost_events e WHERE e.reservation_id=?1) AND NOT EXISTS(SELECT 1 FROM image_spend_attempts a WHERE a.reservation_id=?1 AND NOT EXISTS(SELECT 1 FROM image_spend_cost_events e WHERE e.reservation_id=a.reservation_id AND e.attempt_id=a.attempt_id)) THEN 'reconciled' WHEN ?4='released' THEN 'released' WHEN EXISTS(SELECT 1 FROM image_spend_attempts a WHERE a.reservation_id=?1 AND NOT EXISTS(SELECT 1 FROM image_spend_cost_events e WHERE e.reservation_id=a.reservation_id AND e.attempt_id=a.attempt_id)) THEN 'reserved' ELSE 'reconciled' END WHERE reservation_id=?1",params![reservation_id,unknown,sqlite_u64(debt)?,prior_state])?;
+            let (reserved, unknown, prior_state): (Option<Vec<u8>>,i64,String) = conn.query_row("SELECT reserved_usd_micros,cost_unknown,state FROM image_spend_reservations WHERE reservation_id=?1",[&reservation_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+            let sum_column = |sql: &str| -> Result<u64> { let mut statement=conn.prepare(sql)?; let values=statement.query_map([&reservation_id],|r|r.get::<_,Vec<u8>>(0))?.collect::<rusqlite::Result<Vec<_>>>()?; values.into_iter().try_fold(0u64,|sum,value|sum.checked_add(read_money(value)?).ok_or_else(||anyhow::Error::new(BudgetBlockReason::ArithmeticOverflow))) };
+            let charged = sum_column("SELECT actual_usd_micros FROM image_spend_cost_events WHERE reservation_id=?1")?;
+            let resolved = sum_column("SELECT resolved_debt_usd_micros FROM image_spend_debt_resolutions WHERE reservation_id=?1")?;
+            let debt = if unknown != 0 { 0 } else { charged.saturating_sub(reserved.map(read_money).transpose()?.unwrap_or(0)).saturating_sub(resolved) };
+            let remaining = if prior_state == "released" { 0 } else { sum_column("SELECT maximum_usd_micros FROM image_spend_attempts a WHERE reservation_id=?1 AND maximum_usd_micros IS NOT NULL AND NOT EXISTS(SELECT 1 FROM image_spend_cost_events e WHERE e.reservation_id=a.reservation_id AND e.attempt_id=a.attempt_id)")? };
+            let held = charged.checked_add(remaining).ok_or(BudgetBlockReason::ArithmeticOverflow)?;
+            conn.execute("UPDATE image_spend_scope_usage SET charged_usd_micros=?2,reserved_usd_micros=?3,debt_usd_micros=?4 WHERE reservation_id=?1",params![reservation_id,money_blob(charged),money_blob(held),money_blob(debt)])?;
+            conn.execute("UPDATE image_spend_reservations SET state=CASE WHEN ?3<>X'0000000000000000' THEN 'budget_violation' WHEN ?2=1 THEN 'reconciled' WHEN ?4='released' AND EXISTS(SELECT 1 FROM image_spend_cost_events e WHERE e.reservation_id=?1) THEN 'reconciled' WHEN EXISTS(SELECT 1 FROM image_spend_cost_events e WHERE e.reservation_id=?1) AND NOT EXISTS(SELECT 1 FROM image_spend_attempts a WHERE a.reservation_id=?1 AND NOT EXISTS(SELECT 1 FROM image_spend_cost_events e WHERE e.reservation_id=a.reservation_id AND e.attempt_id=a.attempt_id)) THEN 'reconciled' WHEN ?4='released' THEN 'released' WHEN EXISTS(SELECT 1 FROM image_spend_attempts a WHERE a.reservation_id=?1 AND NOT EXISTS(SELECT 1 FROM image_spend_cost_events e WHERE e.reservation_id=a.reservation_id AND e.attempt_id=a.attempt_id)) THEN 'reserved' ELSE 'reconciled' END WHERE reservation_id=?1",params![reservation_id,unknown,money_blob(debt),prior_state])?;
             Ok(true)
         }).await
     }
@@ -791,9 +815,9 @@ impl Db {
         at_ms: i64,
     ) -> Result<bool> {
         self.transaction(move |conn| {
-            let amount: i64=conn.query_row("SELECT COALESCE(MAX(debt_usd_micros),0) FROM image_spend_scope_usage WHERE reservation_id=?1",[&reservation_id],|r|r.get(0))?;
-            let changed=conn.execute("UPDATE image_spend_scope_usage SET debt_usd_micros=0 WHERE reservation_id=?1 AND debt_usd_micros>0",[&reservation_id])?;
-            if changed > 0 { conn.execute("INSERT INTO image_spend_debt_resolutions(reservation_id,resolution_ref,resolved_debt_usd_micros,resolved_at_ms) VALUES(?1,?2,?3,?4)",params![reservation_id,resolution_ref,amount,at_ms])?; }
+            let amount = { let mut statement=conn.prepare("SELECT debt_usd_micros FROM image_spend_scope_usage WHERE reservation_id=?1")?; let values=statement.query_map([&reservation_id],|row|row.get::<_,Vec<u8>>(0))?.collect::<rusqlite::Result<Vec<_>>>()?; values.into_iter().map(read_money).collect::<rusqlite::Result<Vec<_>>>()?.into_iter().max().unwrap_or(0) };
+            let changed=conn.execute("UPDATE image_spend_scope_usage SET debt_usd_micros=?2 WHERE reservation_id=?1 AND debt_usd_micros<>?2",params![reservation_id,money_blob(0)])?;
+            if changed > 0 { conn.execute("INSERT INTO image_spend_debt_resolutions(reservation_id,resolution_ref,resolved_debt_usd_micros,resolved_at_ms) VALUES(?1,?2,?3,?4)",params![reservation_id,resolution_ref,money_blob(amount),at_ms])?; }
             Ok(changed > 0)
         }).await
     }

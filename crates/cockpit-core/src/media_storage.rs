@@ -1710,6 +1710,90 @@ fn select_video_dimensions(
         .context("video_dimensions_too_small")
 }
 
+fn classify_iso_bmff(bytes: &[u8], has_video: bool, audio_streams: usize) -> Result<&'static str> {
+    ensure!(bytes.len() >= 16, "ambiguous_or_unsupported_container");
+    let size = u32::from_be_bytes(bytes[..4].try_into()?) as usize;
+    ensure!(
+        size >= 16 && size <= bytes.len() && &bytes[4..8] == b"ftyp" && (size - 16) % 4 == 0,
+        "ambiguous_or_unsupported_container"
+    );
+    let major: [u8; 4] = bytes[8..12].try_into()?;
+    let mut brands = Vec::new();
+    for chunk in bytes[16..size].chunks_exact(4) {
+        let brand: [u8; 4] = chunk.try_into()?;
+        ensure!(
+            !brands.contains(&brand),
+            "ambiguous_or_unsupported_container"
+        );
+        brands.push(brand);
+    }
+    ensure!(!brands.is_empty(), "ambiguous_or_unsupported_container");
+    let all = |allowed: &[[u8; 4]]| {
+        allowed.contains(&major) && brands.iter().all(|brand| allowed.contains(brand))
+    };
+    let mov = all(&[*b"qt  "]) && has_video && !brands.contains(b"M4A ");
+    let m4a = major == *b"M4A "
+        && all(&[*b"M4A ", *b"isom", *b"iso2", *b"mp41", *b"mp42"])
+        && !has_video
+        && audio_streams == 1
+        && !brands.contains(b"qt  ");
+    let mp4 = all(&[
+        *b"isom", *b"iso2", *b"iso4", *b"iso5", *b"iso6", *b"mp41", *b"mp42", *b"avc1", *b"M4V ",
+    ]) && has_video
+        && !brands.contains(b"qt  ")
+        && !brands.contains(b"M4A ");
+    match (mov, m4a, mp4) {
+        (true, false, false) => Ok("mov"),
+        (false, true, false) => Ok("m4a"),
+        (false, false, true) => Ok("mp4"),
+        _ => anyhow::bail!("ambiguous_or_unsupported_container"),
+    }
+}
+
+fn ebml_doctype_is_webm(bytes: &[u8]) -> Result<bool> {
+    ensure!(
+        bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]),
+        "ambiguous_or_unsupported_container"
+    );
+    let mut found = None;
+    let mut index = 4usize;
+    while index + 3 <= bytes.len().min(4096) {
+        if bytes[index] == 0x42 && bytes[index + 1] == 0x82 {
+            let first = bytes[index + 2];
+            let width = first.leading_zeros() as usize + 1;
+            ensure!(
+                width <= 8 && index + 2 + width <= bytes.len(),
+                "ambiguous_or_unsupported_container"
+            );
+            let mask = if width == 8 {
+                0
+            } else {
+                (1u8 << (8 - width)) - 1
+            };
+            let mut length = usize::from(first & mask);
+            for byte in &bytes[index + 3..index + 2 + width] {
+                length = length
+                    .checked_mul(256)
+                    .and_then(|value| value.checked_add(usize::from(*byte)))
+                    .context("ambiguous_or_unsupported_container")?;
+            }
+            let start = index + 2 + width;
+            let end = start
+                .checked_add(length)
+                .context("ambiguous_or_unsupported_container")?;
+            ensure!(
+                end <= bytes.len() && found.is_none(),
+                "ambiguous_or_unsupported_container"
+            );
+            found = Some(&bytes[start..end]);
+            index = end;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(found == Some(b"webm".as_slice()))
+}
+
 struct NormalizedImageDerivatives {
     model_png: Vec<u8>,
     thumbnail_png: Vec<u8>,
@@ -2665,6 +2749,49 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("video_dimensions_too_small")
+        );
+    }
+
+    #[test]
+    fn iso_brand_and_ebml_doctype_classification_is_closed() {
+        let ftyp = |major: [u8; 4], brands: &[[u8; 4]]| {
+            let size = 16 + brands.len() * 4;
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&(size as u32).to_be_bytes());
+            bytes.extend_from_slice(b"ftyp");
+            bytes.extend_from_slice(&major);
+            bytes.extend_from_slice(&512u32.to_be_bytes());
+            for brand in brands {
+                bytes.extend_from_slice(brand);
+            }
+            bytes
+        };
+        assert_eq!(
+            classify_iso_bmff(&ftyp(*b"qt  ", &[*b"qt  "]), true, 1).unwrap(),
+            "mov"
+        );
+        assert_eq!(
+            classify_iso_bmff(&ftyp(*b"M4A ", &[*b"isom", *b"mp42"]), false, 1).unwrap(),
+            "m4a"
+        );
+        assert_eq!(
+            classify_iso_bmff(&ftyp(*b"isom", &[*b"iso2", *b"avc1"]), true, 1).unwrap(),
+            "mp4"
+        );
+        assert!(classify_iso_bmff(&ftyp(*b"isom", &[*b"iso2", *b"iso2"]), true, 0).is_err());
+        assert!(classify_iso_bmff(&ftyp(*b"M4A ", &[*b"isom"]), true, 1).is_err());
+        assert!(
+            ebml_doctype_is_webm(&[
+                0x1a, 0x45, 0xdf, 0xa3, 0x42, 0x82, 0x84, b'w', b'e', b'b', b'm'
+            ])
+            .unwrap()
+        );
+        assert!(
+            !ebml_doctype_is_webm(&[
+                0x1a, 0x45, 0xdf, 0xa3, 0x42, 0x82, 0x88, b'm', b'a', b't', b'r', b'o', b's', b'k',
+                b'a'
+            ])
+            .unwrap()
         );
     }
 

@@ -191,12 +191,14 @@ pub struct DecodedImageGenerationDispatchCandidate {
     pub media_plan: MediaReservationPlan,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct ImageGenerationSchedulerPass {
     pub scanned: u32,
     pub claimed: u32,
     pub dispatched: u32,
     pub skipped: u32,
+    #[cfg(test)]
+    pub trace: Vec<String>,
 }
 
 impl ImageGenerationDispatcher {
@@ -318,20 +320,21 @@ impl ImageGenerationDispatcher {
                 worker_boot_id,
                 claim_generation: candidate.candidate.next_claim_generation,
             };
-            if self
+            if let Err(error) = self
                 .db
                 .transaction(move |conn| {
                     cockpit_db::Db::claim_image_generation_dispatch_conn(conn, &claim)
                 })
                 .await
-                .is_err()
             {
+                #[cfg(test)]
+                pass.trace.push(format!("claim:{error:#}"));
                 pass.skipped += 1;
                 continue;
             }
             pass.claimed += 1;
             let generation = candidate.candidate.next_claim_generation;
-            let Ok((prepared, plans)) = self
+            let prepared_result = self
                 .prepare_claimed_candidate(
                     candidate,
                     worker_boot_id,
@@ -339,12 +342,17 @@ impl ImageGenerationDispatcher {
                     at_unix_ms,
                     now_monotonic_ms,
                 )
-                .await
-            else {
-                pass.skipped += 1;
-                continue;
+                .await;
+            let (prepared, plans) = match prepared_result {
+                Ok(value) => value,
+                Err(error) => {
+                    #[cfg(test)]
+                    pass.trace.push(format!("prepare:{error:#}"));
+                    pass.skipped += 1;
+                    continue;
+                }
             };
-            if self
+            if let Err(error) = self
                 .dispatch_once(
                     adapter,
                     prepared,
@@ -354,11 +362,12 @@ impl ImageGenerationDispatcher {
                     media_wall_ms,
                 )
                 .await
-                .is_ok()
             {
-                pass.dispatched += 1;
-            } else {
+                #[cfg(test)]
+                pass.trace.push(format!("dispatch:{error:#}"));
                 pass.skipped += 1;
+            } else {
+                pass.dispatched += 1;
             }
         }
         Ok(pass)
@@ -2724,13 +2733,13 @@ mod tests {
             .run_scheduler_pass(&adapter, Uuid::now_v7(), 100, 2, 2, 8)
             .await
             .unwrap();
-        assert_eq!(first.dispatched, 1);
+        assert_eq!(first.dispatched, 1, "{first:#?}");
         assert_eq!(adapter.requests().len(), 1);
         let second = dispatcher
             .run_scheduler_pass(&adapter, Uuid::now_v7(), 100, 3, 3, 8)
             .await
             .unwrap();
-        assert_eq!(second.dispatched, 0);
+        assert_eq!(second.dispatched, 0, "{second:#?}");
         assert_eq!(adapter.requests().len(), 1);
     }
 
@@ -2759,14 +2768,11 @@ mod tests {
                 evidence: b"accepted-late".to_vec(),
             },
         ]);
-        assert_eq!(
-            dispatcher
-                .run_scheduler_pass(&adapter, Uuid::now_v7(), 100, 2, 2, 8)
-                .await
-                .unwrap()
-                .dispatched,
-            1
-        );
+        let pass = dispatcher
+            .run_scheduler_pass(&adapter, Uuid::now_v7(), 100, 2, 2, 8)
+            .await
+            .unwrap();
+        assert_eq!(pass.dispatched, 1, "{pass:#?}");
         let request = adapter.requests().into_iter().next().unwrap();
         let job_id = fixture.job_id;
         let slot_id = fixture.slot_id;
@@ -2831,7 +2837,7 @@ mod tests {
             .run_scheduler_pass(&adapter, Uuid::now_v7(), 100, 2, 2, 8)
             .await
             .unwrap();
-        assert_eq!(pass.dispatched, 1);
+        assert_eq!(pass.dispatched, 1, "{pass:#?}");
         let requests = adapter.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].job_id, second.job_id);
@@ -2839,7 +2845,7 @@ mod tests {
             .run_scheduler_pass(&adapter, Uuid::now_v7(), 100, 3, 3, 8)
             .await
             .unwrap();
-        assert_eq!(replay.dispatched, 0);
+        assert_eq!(replay.dispatched, 0, "{replay:#?}");
         assert_eq!(adapter.requests().len(), 1);
     }
 

@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
+use crate::image_generation_runtime::ImageHealthSnapshot;
+use cockpit_db::image_spend::{AttemptMaximum, SpendReservation};
+use cockpit_db::media_attachments::AcquiredMediaComponentLease;
+
 pub const MAX_IMAGE_GENERATION_TARGETS: usize = 16;
 pub const MAX_IMAGE_GENERATION_SLOTS: usize = 256;
 pub const MAX_IMAGE_GENERATION_ATTEMPTS_PER_SLOT: u32 = 8;
@@ -167,6 +171,134 @@ pub struct AttemptPlanV1 {
     pub maximum_usd_micros: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeTargetAuthorityV1 {
+    pub target_id: String,
+    pub target_config_generation: u64,
+    pub normalized_config_digest: String,
+    pub capability_provenance: CapabilityProvenanceV1,
+    pub destination: TargetDestinationV1,
+}
+
+impl RuntimeTargetAuthorityV1 {
+    pub fn from_registry_snapshot(
+        snapshot: &ImageHealthSnapshot,
+        operation_deadline_monotonic_ms: u64,
+    ) -> Result<Self> {
+        ensure!(
+            snapshot.dispatchable_at(snapshot.retrieved_at),
+            "runtime target is not dispatchable"
+        );
+        ensure!(
+            snapshot.expires_at >= operation_deadline_monotonic_ms,
+            "runtime health expires before operation deadline"
+        );
+        let capability = snapshot
+            .capability
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("runtime capability is missing"))?;
+        ensure!(
+            capability.expires_at >= operation_deadline_monotonic_ms,
+            "runtime capability expires before operation deadline"
+        );
+        let credential = snapshot
+            .credential_identity_digest
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("runtime credential identity is missing"))?;
+        Ok(Self {
+            target_id: snapshot.target_id.clone(),
+            target_config_generation: snapshot.config_generation,
+            normalized_config_digest: digest_fields(&[&snapshot.target_immutable_identity]),
+            capability_provenance: CapabilityProvenanceV1 {
+                capability_generation: snapshot.refresh_epoch,
+                capability_digest: digest_fields(&[
+                    &capability.target_id,
+                    &capability.model_or_workflow_digest,
+                ]),
+                health_observed_at_monotonic_ms: snapshot.retrieved_at,
+                health_expires_at_monotonic_ms: snapshot.expires_at.min(capability.expires_at),
+            },
+            destination: TargetDestinationV1 {
+                adapter_kind: match snapshot.adapter_kind {
+                    cockpit_config::config::image_generation::ImageAdapterKind::OpenaiImages => "openai_images",
+                    cockpit_config::config::image_generation::ImageAdapterKind::OpenrouterImages => "openrouter_images",
+                    cockpit_config::config::image_generation::ImageAdapterKind::GeminiImages => "gemini_images",
+                    cockpit_config::config::image_generation::ImageAdapterKind::Comfyui => "comfyui",
+                }.into(),
+                endpoint_identity_digest: digest_fields(&[
+                    &snapshot.endpoint_id,
+                    &snapshot.endpoint_origin,
+                    &snapshot.target_immutable_identity,
+                ]),
+                credential_identity_digest: credential.plan_identity_hex(),
+                destination_generation: snapshot.config_generation,
+            },
+        })
+    }
+}
+
+impl ReferenceArtifactV1 {
+    pub fn from_acquired_media_lease(lease: &AcquiredMediaComponentLease) -> Result<Self> {
+        ensure!(
+            lease.component.lifecycle_state == "ready",
+            "reference component is not ready"
+        );
+        ensure!(
+            lease.component.attachment_id == lease.attachment_id
+                && lease.component.attachment_version == lease.attachment_version,
+            "reference lease identity mismatch"
+        );
+        Ok(Self {
+            attachment_id: lease.attachment_id,
+            attachment_version: lease.attachment_version,
+            component_id: lease.component.component_id,
+            component_generation: lease.component.component_generation,
+            media_kind: lease.component.component_kind.clone(),
+            identity_digest: lease.component.stable_identity_digest.clone(),
+            sha256: lease.component.sha256.clone(),
+            byte_length: lease.component.byte_length,
+        })
+    }
+}
+
+impl SpendReservationPlanV1 {
+    pub fn from_spend_reservation(
+        reservation: &SpendReservation,
+        attempts: &[AttemptMaximum],
+    ) -> Result<Self> {
+        ensure!(!attempts.is_empty(), "spend attempt graph is empty");
+        let maximum =
+            attempts
+                .iter()
+                .try_fold(Some(0_u64), |total, attempt| -> Result<Option<u64>> {
+                    match (total, attempt.usd_micros) {
+                        (Some(total), Some(value)) => {
+                            Ok(Some(total.checked_add(value).ok_or_else(|| {
+                                anyhow::anyhow!("spend maximum overflow")
+                            })?))
+                        }
+                        _ => Ok(None),
+                    }
+                })?;
+        ensure!(
+            reservation.reserved_usd_micros == maximum
+                || reservation.cost_unknown && maximum.is_none(),
+            "spend reservation does not cover attempt graph"
+        );
+        let mut fields = vec![reservation.reservation_id.as_str()];
+        for attempt in attempts {
+            fields.push(attempt.attempt_id.as_str());
+        }
+        Ok(Self {
+            required: maximum.is_none_or(|value| value > 0),
+            policy_version: reservation.policy_version,
+            reservation_id: reservation.reservation_id.clone(),
+            maximum_usd_micros: maximum,
+            plan_digest: digest_fields(&fields),
+        })
+    }
+}
+
 impl ImageGenerationPlanV1 {
     pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
         self.validate()?;
@@ -226,7 +358,8 @@ impl ImageGenerationPlanV1 {
         );
         ensure!(
             valid_path_component(&self.output_authority.filename_prefix)
-                && valid_path_component(&self.output_authority.extension),
+                && valid_path_component(&self.output_authority.extension)
+                && self.output_authority.authority_generation > 0,
             "output authority is incomplete"
         );
         validate_digest(&self.output_authority.canonical_destination_digest)?;
@@ -239,9 +372,19 @@ impl ImageGenerationPlanV1 {
         let mut total_maximum = Some(0_u64);
         let mut slot_ids = std::collections::BTreeSet::new();
         let mut artifact_ids = std::collections::BTreeSet::new();
+        let mut publication_names = std::collections::BTreeSet::new();
+        let mut resource_totals = BTreeMap::<(String, String), u64>::new();
         let mut total_slots = 0_usize;
         for target in &self.targets {
-            target.validate()?;
+            target.validate(self.operation_deadline_monotonic_ms)?;
+            ensure!(
+                target.resolved.format == self.output_authority.extension
+                    || (target.resolved.format == "jpeg"
+                        && self.output_authority.extension == "jpg")
+                    || (target.resolved.format == "jpg"
+                        && self.output_authority.extension == "jpeg"),
+                "resolved format disagrees with publication extension"
+            );
             total_slots = total_slots
                 .checked_add(target.slots.len())
                 .ok_or_else(|| anyhow::anyhow!("slot count overflow"))?;
@@ -250,7 +393,30 @@ impl ImageGenerationPlanV1 {
                     slot_ids.insert(slot.slot_id) && artifact_ids.insert(slot.managed_artifact_id),
                     "slot/artifact identities must be globally unique"
                 );
+                ensure!(
+                    publication_names.insert(slot.publication_name.clone()),
+                    "publication names must be globally unique"
+                );
+                ensure!(
+                    slot.publication_name
+                        .starts_with(&self.output_authority.filename_prefix)
+                        && slot
+                            .publication_name
+                            .ends_with(&format!(".{}", self.output_authority.extension)),
+                    "publication name is outside the sealed output naming contract"
+                );
                 for attempt in &slot.attempts {
+                    for resource in &attempt.resource_maximum {
+                        let total = resource_totals
+                            .entry((
+                                resource.resource_kind.clone(),
+                                resource.reservation_identity.clone(),
+                            ))
+                            .or_default();
+                        *total = total
+                            .checked_add(resource.units)
+                            .ok_or_else(|| anyhow::anyhow!("resource maximum overflow"))?;
+                    }
                     total_maximum = match (total_maximum, attempt.maximum_usd_micros) {
                         (Some(total), Some(value)) => Some(
                             total
@@ -266,20 +432,55 @@ impl ImageGenerationPlanV1 {
             total_slots <= MAX_IMAGE_GENERATION_SLOTS,
             "plan slot count is out of bounds"
         );
+        let central_totals = self
+            .central_resources
+            .iter()
+            .map(|resource| {
+                (
+                    (
+                        resource.resource_kind.clone(),
+                        resource.reservation_identity.clone(),
+                    ),
+                    resource.units,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        ensure!(
+            central_totals == resource_totals,
+            "central resources must cover the complete attempt graph exactly"
+        );
         ensure!(
             self.spend.maximum_usd_micros == total_maximum,
             "spend maximum must cover the complete attempt graph"
         );
         ensure!(
-            self.spend.required || self.spend.maximum_usd_micros.is_none(),
+            self.spend.maximum_usd_micros.unwrap_or(0) == 0 || self.spend.required,
             "known paid maximum requires spend reservation"
         );
         Ok(())
     }
 }
 
+pub fn verify_canonical_image_generation_plan(
+    bytes: &[u8],
+    expected_digest: &str,
+) -> Result<ImageGenerationPlanV1> {
+    validate_digest(expected_digest)?;
+    let plan: ImageGenerationPlanV1 = serde_json::from_slice(bytes)?;
+    plan.validate()?;
+    ensure!(
+        serde_json::to_vec(&plan)? == bytes,
+        "plan bytes are not canonical"
+    );
+    ensure!(
+        crate::intel::hex_lower(&Sha256::digest(bytes)) == expected_digest,
+        "plan digest mismatch"
+    );
+    Ok(plan)
+}
+
 impl TargetPlanV1 {
-    fn validate(&self) -> Result<()> {
+    fn validate(&self, operation_deadline_monotonic_ms: u64) -> Result<()> {
         ensure!(
             valid_string(&self.target_id) && self.target_config_generation > 0,
             "target identity is incomplete"
@@ -289,7 +490,9 @@ impl TargetPlanV1 {
         ensure!(
             self.capability_provenance.capability_generation > 0
                 && self.capability_provenance.health_expires_at_monotonic_ms
-                    > self.capability_provenance.health_observed_at_monotonic_ms,
+                    > self.capability_provenance.health_observed_at_monotonic_ms
+                && self.capability_provenance.health_expires_at_monotonic_ms
+                    >= operation_deadline_monotonic_ms,
             "capability provenance is incomplete"
         );
         validate_digest(&self.destination.endpoint_identity_digest)?;
@@ -315,6 +518,18 @@ impl TargetPlanV1 {
                 && !self.resolved.format.is_empty()
                 && !self.resolved.mime.is_empty(),
             "format resolution is incomplete"
+        );
+        let (expected_mime, requires_vector_sanitizer) = match self.resolved.format.as_str() {
+            "png" => ("image/png", false),
+            "jpeg" | "jpg" => ("image/jpeg", false),
+            "webp" => ("image/webp", false),
+            "svg" => ("image/svg+xml", true),
+            _ => anyhow::bail!("resolved output format is unsupported"),
+        };
+        ensure!(
+            self.resolved.mime == expected_mime
+                && self.resolved.vector_sanitization_required == requires_vector_sanitizer,
+            "resolved format, MIME, and sanitizer contract disagree"
         );
         ensure!(
             self.sample_count > 0
@@ -392,6 +607,15 @@ fn validate_digest(value: &str) -> Result<()> {
         "invalid digest"
     );
     Ok(())
+}
+
+fn digest_fields(fields: &[&str]) -> String {
+    let mut digest = Sha256::new();
+    for field in fields {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field.as_bytes());
+    }
+    crate::intel::hex_lower(&digest.finalize())
 }
 
 fn valid_string(value: &str) -> bool {
@@ -525,6 +749,13 @@ mod tests {
             baseline,
             "3e7894cab2e1fb43b2fdba8b9144e88f1394904130bd177a08c29e06f4a843b4"
         );
+        assert_eq!(
+            verify_canonical_image_generation_plan(&bytes, &baseline).unwrap(),
+            original
+        );
+        let mut noncanonical = bytes.clone();
+        noncanonical.push(b' ');
+        assert!(verify_canonical_image_generation_plan(&noncanonical, &baseline).is_err());
         let mut mutations: Vec<Box<dyn Fn(&mut ImageGenerationPlanV1)>> = vec![
             Box::new(|p| p.job_id = id(4)),
             Box::new(|p| {
@@ -536,7 +767,10 @@ mod tests {
             Box::new(|p| p.enqueue_started_monotonic_ms += 1),
             Box::new(|p| p.operation_deadline_monotonic_ms += 1),
             Box::new(|p| p.required_grants[0].generation += 1),
-            Box::new(|p| p.central_resources[0].units += 1),
+            Box::new(|p| {
+                p.central_resources[0].units += 1;
+                p.targets[0].slots[0].attempts[0].resource_maximum[0].units += 1;
+            }),
             Box::new(|p| p.spend.policy_version += 1),
             Box::new(|p| p.output_authority.authority_generation += 1),
             Box::new(|p| p.targets[0].target_config_generation += 1),
@@ -562,7 +796,7 @@ mod tests {
                     .typed_parameters
                     .insert("seed".into(), TypedParameterV1::Integer(1));
             }),
-            Box::new(|p| p.targets[0].slots[0].publication_name.push('x')),
+            Box::new(|p| p.targets[0].slots[0].publication_name = "generated-x-001.png".into()),
             Box::new(|p| p.targets[0].slots[0].managed_artifact_id = id(7)),
             Box::new(|p| {
                 p.targets[0].slots[0].attempts[0]
@@ -580,5 +814,32 @@ mod tests {
             mutate(&mut changed);
             assert_ne!(changed.digest().unwrap(), baseline);
         }
+    }
+
+    #[test]
+    fn plan_rejects_every_ambiguous_boundary_before_hashing() {
+        let rejects: Vec<Box<dyn Fn(&mut ImageGenerationPlanV1)>> = vec![
+            Box::new(|p| p.output_authority.authority_generation = 0),
+            Box::new(|p| {
+                p.targets[0]
+                    .capability_provenance
+                    .health_expires_at_monotonic_ms = p.operation_deadline_monotonic_ms - 1
+            }),
+            Box::new(|p| p.targets[0].slots[0].publication_name = "../generated.png".into()),
+            Box::new(|p| p.targets[0].resolved.mime = "image/jpeg".into()),
+            Box::new(|p| p.targets[0].resolved.vector_sanitization_required = true),
+            Box::new(|p| p.targets[0].resolved.width = MAX_IMAGE_GENERATION_DIMENSION + 1),
+            Box::new(|p| p.central_resources[0].units += 1),
+            Box::new(|p| p.spend.maximum_usd_micros = Some(9)),
+            Box::new(|p| p.targets[0].max_attempts = MAX_IMAGE_GENERATION_ATTEMPTS_PER_SLOT + 1),
+        ];
+        for reject in rejects {
+            let mut invalid = plan();
+            reject(&mut invalid);
+            assert!(invalid.digest().is_err());
+        }
+        let mut exact = plan();
+        exact.targets[0].resolved.width = MAX_IMAGE_GENERATION_DIMENSION;
+        assert!(exact.digest().is_ok());
     }
 }

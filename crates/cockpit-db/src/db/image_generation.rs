@@ -3,7 +3,7 @@
 //! Transition legality lives here so repository reducers and protocol
 //! projections cannot develop separate interpretations of persisted states.
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};

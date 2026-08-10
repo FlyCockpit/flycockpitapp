@@ -1706,6 +1706,10 @@ macro_rules! command_encode_fcor_params {
             $($pattern => {
                 $(let _: &$fcor_type = $fcor_field;)*
                 let mut out = crate::remote_operation_fcor::CanonicalParamsV1::new();
+                // Resource-only and fieldless variants still share this arm.
+                // Taking the mutable reference keeps the generated binding
+                // uniform without changing canonical bytes.
+                let _: &mut crate::remote_operation_fcor::CanonicalParamsV1 = &mut out;
                 encode_fcor_bound_fields!(out; $($fcor_field: $fcor_type => $fcor_role $(($($fcor_role_arg),*))?),*);
                 Ok(out.into_bytes())
             },)+

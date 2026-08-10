@@ -62,9 +62,45 @@ fn push_fcor_resource(
     resources.push(AuthorizedFcorResource { kind, value });
 }
 
+trait SessionFcorResource {
+    fn push_to(&self, resources: &mut Vec<AuthorizedFcorResource>);
+}
+impl SessionFcorResource for Uuid {
+    fn push_to(&self, resources: &mut Vec<AuthorizedFcorResource>) {
+        push_fcor_resource(
+            resources,
+            proto::remote_operation_fcor::RemoteOperationResourceKind::SessionUuid,
+            self.as_bytes().to_vec(),
+        );
+    }
+}
+impl SessionFcorResource for Option<Uuid> {
+    fn push_to(&self, resources: &mut Vec<AuthorizedFcorResource>) {
+        if let Some(value) = self {
+            value.push_to(resources);
+        }
+    }
+}
+
+trait OptionalFcorText {
+    fn optional_text(&self) -> Option<&str>;
+}
+impl OptionalFcorText for String {
+    fn optional_text(&self) -> Option<&str> {
+        Some(self)
+    }
+}
+impl OptionalFcorText for Option<String> {
+    fn optional_text(&self) -> Option<&str> {
+        self.as_deref()
+    }
+}
+
 macro_rules! resolve_fcor_role {
-    ($resources:ident, $cwd:ident, $name:ident: $ty:ty => param) => {};
-    ($resources:ident, $cwd:ident, $name:ident: ScheduledJobCreate => scheduled) => {{
+    ($resources:ident, $cwd:ident, $name:ident => param) => {
+        let _ = $name;
+    };
+    ($resources:ident, $cwd:ident, $name:ident => scheduled) => {{
         use proto::remote_operation_fcor::RemoteOperationResourceKind as Kind;
         push_fcor_resource(
             &mut $resources,
@@ -80,23 +116,10 @@ macro_rules! resolve_fcor_role {
             );
         }
     }};
-    ($resources:ident, $cwd:ident, $name:ident: Option<Uuid> => session) => {
-        if let Some(value) = $name {
-            push_fcor_resource(
-                &mut $resources,
-                proto::remote_operation_fcor::RemoteOperationResourceKind::SessionUuid,
-                value.as_bytes().to_vec(),
-            );
-        }
+    ($resources:ident, $cwd:ident, $name:ident => session) => {
+        $name.push_to(&mut $resources);
     };
-    ($resources:ident, $cwd:ident, $name:ident: Uuid => session) => {
-        push_fcor_resource(
-            &mut $resources,
-            proto::remote_operation_fcor::RemoteOperationResourceKind::SessionUuid,
-            $name.as_bytes().to_vec(),
-        );
-    };
-    ($resources:ident, $cwd:ident, $name:ident: Option<String> => project_root_effective) => {{
+    ($resources:ident, $cwd:ident, $name:ident => project_root_effective) => {{
         let raw = $name
             .as_deref()
             .unwrap_or_else(|| $cwd.to_str().unwrap_or(""));
@@ -107,7 +130,7 @@ macro_rules! resolve_fcor_role {
             canonical_project_root_bytes(&canonical)?,
         );
     }};
-    ($resources:ident, $cwd:ident, $name:ident: String => project_root) => {{
+    ($resources:ident, $cwd:ident, $name:ident => project_root) => {{
         let canonical = crate::daemon::fs_api::canonical_project_root($name)?;
         push_fcor_resource(
             &mut $resources,
@@ -115,7 +138,7 @@ macro_rules! resolve_fcor_role {
             canonical_project_root_bytes(&canonical)?,
         );
     }};
-    ($resources:ident, $cwd:ident, $name:ident: Option<String> => project) => {
+    ($resources:ident, $cwd:ident, $name:ident => project) => {
         if let Some(value) = $name {
             push_fcor_resource(
                 &mut $resources,
@@ -124,7 +147,7 @@ macro_rules! resolve_fcor_role {
             );
         }
     };
-    ($resources:ident, $cwd:ident, $name:ident: String => file_existing($root:ident)) => {{
+    ($resources:ident, $cwd:ident, $name:ident => file_existing($root:ident)) => {{
         let canonical = crate::daemon::fs_api::resolve_authorized_canonical_path(
             $root,
             $name,
@@ -136,7 +159,7 @@ macro_rules! resolve_fcor_role {
             canonical_project_root_bytes(&canonical)?,
         );
     }};
-    ($resources:ident, $cwd:ident, $name:ident: String => file_write_target($root:ident)) => {{
+    ($resources:ident, $cwd:ident, $name:ident => file_write_target($root:ident)) => {{
         let canonical = crate::daemon::fs_api::resolve_authorized_canonical_path(
             $root,
             $name,
@@ -148,7 +171,7 @@ macro_rules! resolve_fcor_role {
             canonical_project_root_bytes(&canonical)?,
         );
     }};
-    ($resources:ident, $cwd:ident, $name:ident: String => rename_source($root:ident)) => {{
+    ($resources:ident, $cwd:ident, $name:ident => rename_source($root:ident)) => {{
         let canonical = crate::daemon::fs_api::resolve_authorized_canonical_path(
             $root,
             $name,
@@ -160,52 +183,42 @@ macro_rules! resolve_fcor_role {
             canonical_project_root_bytes(&canonical)?,
         );
     }};
-    ($resources:ident, $cwd:ident, $name:ident: Uuid => terminal) => {
+    ($resources:ident, $cwd:ident, $name:ident => terminal) => {
         push_fcor_resource(
             &mut $resources,
             proto::remote_operation_fcor::RemoteOperationResourceKind::TerminalUuid,
             $name.as_bytes().to_vec(),
         );
     };
-    ($resources:ident, $cwd:ident, $name:ident: Uuid => upload) => {
+    ($resources:ident, $cwd:ident, $name:ident => upload) => {
         push_fcor_resource(
             &mut $resources,
             proto::remote_operation_fcor::RemoteOperationResourceKind::UploadUuid,
             $name.as_bytes().to_vec(),
         );
     };
-    ($resources:ident, $cwd:ident, $name:ident: Uuid => interrupt) => {
+    ($resources:ident, $cwd:ident, $name:ident => interrupt) => {
         push_fcor_resource(
             &mut $resources,
             proto::remote_operation_fcor::RemoteOperationResourceKind::InterruptUuid,
             $name.as_bytes().to_vec(),
         );
     };
-    ($resources:ident, $cwd:ident, $name:ident: Uuid => queue) => {
+    ($resources:ident, $cwd:ident, $name:ident => queue) => {
         push_fcor_resource(
             &mut $resources,
             proto::remote_operation_fcor::RemoteOperationResourceKind::QueueUuid,
             $name.as_bytes().to_vec(),
         );
     };
-    ($resources:ident, $cwd:ident, $name:ident: $ty:ty => legacy_message) => {
+    ($resources:ident, $cwd:ident, $name:ident => legacy_message) => {
         let _ = $name;
     };
-    ($resources:ident, $cwd:ident, $name:ident: $ty:ty => provider_model_right($left:ident)) => {};
-    ($resources:ident, $cwd:ident, $name:ident: String => provider_model_left($model:ident)) => {{
-        let value = proto::remote_operation_fcor::encode_provider_model_resource_v1($name, $model)
-            .map_err(|error| ErrorPayload {
-                code: ErrorCode::BadRequest,
-                message: error.to_string(),
-            })?;
-        push_fcor_resource(
-            &mut $resources,
-            proto::remote_operation_fcor::RemoteOperationResourceKind::ProviderModel,
-            value,
-        );
-    }};
-    ($resources:ident, $cwd:ident, $name:ident: Option<String> => provider_model_left($model:ident)) => {{
-        if let (Some(provider), Some(model)) = ($name.as_deref(), $model.as_deref()) {
+    ($resources:ident, $cwd:ident, $name:ident => provider_model_right($left:ident)) => {
+        let _ = ($name, $left);
+    };
+    ($resources:ident, $cwd:ident, $name:ident => provider_model_left($model:ident)) => {{
+        if let (Some(provider), Some(model)) = ($name.optional_text(), $model.optional_text()) {
             let value =
                 proto::remote_operation_fcor::encode_provider_model_resource_v1(provider, model)
                     .map_err(|error| ErrorPayload {
@@ -223,7 +236,13 @@ macro_rules! resolve_fcor_role {
 
 macro_rules! command_resolve_fcor_resources {
     (($request:ident, $cwd:ident) [$(($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
-        match $request { $($pattern => { let mut resources = Vec::new(); $(resolve_fcor_role!(resources, $cwd, $fcor_field: $fcor_type => $fcor_role $(($($fcor_role_arg),*))?);)* Ok(resources) },)+ }
+        match $request { $($pattern => {
+            let mut resources = Vec::new();
+            let _: &mut Vec<AuthorizedFcorResource> = &mut resources;
+            let _ = $cwd;
+            $(resolve_fcor_role!(resources, $cwd, $fcor_field => $fcor_role $(($($fcor_role_arg),*))?);)*
+            Ok(resources)
+        },)+ }
     }};
 }
 

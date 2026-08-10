@@ -102,6 +102,7 @@ impl App {
         }
         if !self.mouse_capture {
             self.link_pointer_gesture.cancel();
+            self.pending_link_activation = None;
         }
         let hit_url = self
             .link_registry
@@ -123,6 +124,29 @@ impl App {
             link_outcome,
             crate::tui::links::LinkGestureOutcome::Consumed
         ) {
+            return;
+        }
+        // Double-click on the same semantic link: cancel activation and
+        // select the URL. This is an explicit selection — no copy here
+        // (the copy-on-release path handles that if enabled).
+        if let crate::tui::links::LinkGestureOutcome::SelectUrl(_url) = &link_outcome {
+            // Create a word selection at the click point. The host's
+            // semantic extraction will resolve the URL text from the
+            // selection.
+            self.selection = Some(Selection {
+                anchor: (mouse.column, mouse.row),
+                focus: (mouse.column, mouse.row),
+                active: false,
+            });
+            return;
+        }
+        // Scheduled activation: the host starts a timer; the actual
+        // activation happens after the 500 ms multi-click window if the
+        // token remains current. We store the pending activation so the
+        // event loop can check it.
+        if let crate::tui::links::LinkGestureOutcome::ScheduleActivation(pa) = &link_outcome {
+            // Store the pending activation for the event loop to check.
+            self.pending_link_activation = Some(pa.clone());
             return;
         }
         if let crate::tui::links::LinkGestureOutcome::Activate(url) = link_outcome {
@@ -442,10 +466,17 @@ impl App {
 
         // Release finalizes the selection. It persists in
         // `self.selection` until cleared (Esc, new click outside chat,
-        // wheel scroll).
+        // wheel scroll). When `copy_on_release` is enabled and the
+        // selection was an active drag, schedule a copy through the
+        // centralized clipboard service. Auto-copy retains the
+        // highlight for every CopyOutcome.
         if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+            let was_active_drag = self.selection.is_some_and(|sel| sel.active);
             if let Some(sel) = self.selection.as_mut() {
                 sel.active = false;
+            }
+            if was_active_drag && self.copy_on_release {
+                self.copy_selection_plaintext_auto();
             }
             return;
         }
@@ -671,6 +702,49 @@ impl App {
             PaneSide::Full => return,
         };
         self.pane_ratio = ratio.clamp(0.15, 0.85);
+    }
+
+    /// Check the pending delayed link activation. Called on every pump
+    /// tick. If the deadline has passed and the token is still current,
+    /// the link is activated (browser open or SSH copy). Returns `true`
+    /// when the activation fired (so the pump knows to redraw).
+    pub(super) fn check_pending_link_activation(&mut self) -> bool {
+        let Some(pa) = self.pending_link_activation.clone() else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        if now < pa.deadline {
+            return false;
+        }
+        // Check the token against the link gesture's current state.
+        let outcome = self.link_pointer_gesture.check_activation(pa.token, now);
+        self.pending_link_activation = None;
+        if let crate::tui::links::LinkGestureOutcome::Activate(url) = outcome {
+            if cockpit_core::sysinfo::is_ssh() {
+                match crate::clipboard::copy_plain(&url, self.clipboard_recovery) {
+                    Ok(result) => {
+                        let (msg, kind) = super::copy_actions::describe_delivered(
+                            &result,
+                            "Link copied (SSH session).".to_string(),
+                        );
+                        self.show_toast(msg, kind);
+                    }
+                    Err(error) => {
+                        self.show_toast(format!("Copy failed: {error}"), ToastKind::Error)
+                    }
+                }
+            } else {
+                match crate::tui::links::open_browser(&url) {
+                    Ok(()) => self.show_toast("Opened link in browser", ToastKind::Success),
+                    Err(error) => {
+                        self.show_toast(format!("Could not open link: {error}"), ToastKind::Error)
+                    }
+                }
+            }
+            true
+        } else {
+            false
+        }
     }
 
     /// Clamp `(col, row)` into the current chat area. Used while

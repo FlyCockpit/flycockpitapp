@@ -243,6 +243,9 @@ fn copy_selection_unmapped_row_falls_back_to_plaintext() {
 fn left_mouse_release_finalizes_selection_without_copy_feedback() {
     let mut app = app_with_selection();
     app.mouse_capture = true;
+    // Disable copy_on_release so the release only finalizes the
+    // selection without scheduling a clipboard copy or toast.
+    app.copy_on_release = false;
     app.selection = Some(Selection {
         anchor: (0, 0),
         focus: (4, 0),
@@ -284,4 +287,114 @@ fn copy_selection_clears_selection_after_accepted_copy() {
 
     assert!(app.selection.is_none());
     assert!(app.toast.is_some());
+}
+
+#[test]
+fn auto_copy_retains_highlight_on_success() {
+    let mut app = app_with_selection();
+
+    app.copy_selection_plaintext_auto_with(|_| Ok(copy_outcome()));
+
+    // Auto-copy retains the highlight for every CopyOutcome — the
+    // selection is NOT cleared after a successful copy.
+    assert!(
+        app.selection.is_some(),
+        "auto-copy retains highlight on success"
+    );
+    assert!(app.toast.is_some(), "auto-copy shows a toast on success");
+}
+
+#[test]
+fn auto_copy_retains_highlight_on_failure() {
+    let mut app = app_with_selection();
+
+    app.copy_selection_plaintext_auto_with(|_| Err(CopyError::Backend));
+
+    // Auto-copy retains the highlight even on hard failure.
+    assert!(
+        app.selection.is_some(),
+        "auto-copy retains highlight on failure"
+    );
+    assert!(
+        matches!(
+            app.toast.as_ref().map(|toast| toast.kind),
+            Some(ToastKind::Error)
+        ),
+        "auto-copy shows an error toast on failure"
+    );
+}
+
+#[test]
+fn auto_copy_with_empty_text_is_noop() {
+    let mut app = app_with_selection();
+    // Replace the grid with all-blank cells so the extracted text is
+    // empty — a deterministic no-copy outcome.
+    app.chat_text_grid = vec![vec![" ".to_string(); 5]];
+    app.selection = Some(Selection {
+        anchor: (0, 0),
+        focus: (4, 0),
+        active: false,
+    });
+
+    app.copy_selection_plaintext_auto_with(|_| panic!("should not copy empty text"));
+
+    // No toast, selection retained (empty selections are no-copy).
+    assert!(app.toast.is_none());
+    assert!(app.selection.is_some());
+}
+
+#[test]
+fn auto_copy_release_with_copy_on_release_copies_and_retains() {
+    let mut app = app_with_selection();
+    app.mouse_capture = true;
+    app.copy_on_release = true;
+    app.selection = Some(Selection {
+        anchor: (0, 0),
+        focus: (4, 0),
+        active: true,
+    });
+
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: 4,
+        row: 0,
+        modifiers: KeyModifiers::empty(),
+    });
+
+    // The selection is finalized (active=false) and retained (not cleared).
+    assert!(matches!(
+        app.selection,
+        Some(Selection { active: false, .. })
+    ));
+    // A toast was shown because copy_on_release triggered the copy.
+    assert!(app.toast.is_some());
+}
+
+#[test]
+fn auto_copy_release_with_copy_on_release_disabled_no_copy() {
+    let mut app = app_with_selection();
+    app.mouse_capture = true;
+    app.copy_on_release = false;
+    app.selection = Some(Selection {
+        anchor: (0, 0),
+        focus: (4, 0),
+        active: true,
+    });
+
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: 4,
+        row: 0,
+        modifiers: KeyModifiers::empty(),
+    });
+
+    // Selection finalized but no copy (copy_on_release disabled).
+    assert!(matches!(
+        app.selection,
+        Some(Selection { active: false, .. })
+    ));
+    assert!(
+        app.toast.is_none(),
+        "no toast when copy_on_release is false"
+    );
 }

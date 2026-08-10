@@ -32,6 +32,7 @@ mod local_commands;
 mod model_controls;
 mod models_refresh;
 mod mouse;
+mod mouse_gesture;
 mod overlay_actions;
 mod panes;
 mod pins;
@@ -1941,6 +1942,20 @@ pub struct App {
     /// committed on release. `Ctrl+Shift+C` copies the underlying
     /// plaintext via `clipboard::copy_plain` (OSC52 → SSH-safe).
     pub(super) selection: Option<Selection>,
+    /// Pure gesture reducer state for explicit mouse selection and
+    /// copy-on-release. Carries press/activation generations and tokens
+    /// so late timer/clipboard results cannot overwrite newer state.
+    /// The pure reducer is unit-tested independently; production mouse
+    /// routing uses the `LinkPointerGesture` and existing handlers.
+    #[allow(dead_code)]
+    pub(super) mouse_gesture_state: mouse_gesture::GestureState,
+    /// Pending delayed link activation, set when a single link click
+    /// release schedules activation through the 500 ms multi-click
+    /// window. The event loop checks this on each tick; if the deadline
+    /// has passed and the token is still current, the link is activated.
+    /// A second click, movement, view change, or cancellation
+    /// tombstones it.
+    pub(super) pending_link_activation: Option<crate::tui::links::PendingActivation>,
     /// Snapshot of the chat area's rendered cells, one row per outer
     /// element, one cell per inner element. Each cell's `String` is
     /// the cell's `symbol()` — typically one char, but multi-byte for
@@ -2249,6 +2264,11 @@ pub struct App {
     /// keybind that copies the last agent message as HTML to the
     /// system clipboard (plan.md T8.g).
     pub(super) rich_text_copy: bool,
+    /// User's `tui.copy_on_release` setting. When true, a finalized drag
+    /// or explicit double/triple selection schedules a copy through the
+    /// centralized clipboard service. When false, the same gestures
+    /// finalize selection without copying.
+    pub(super) copy_on_release: bool,
     /// User's `tui.clipboard_recovery` setting. Passed to every clipboard
     /// delivery call so a failed/unverified copy writes its private
     /// recovery artifact only when explicitly opted in.
@@ -3177,6 +3197,7 @@ impl App {
         let hyperlinks = tui_cfg.hyperlinks;
         let exit_tail_lines = tui_cfg.exit_tail_lines;
         let rich_text_copy = tui_cfg.rich_text_copy;
+        let copy_on_release = tui_cfg.copy_on_release;
         let clipboard_recovery = tui_cfg.clipboard_recovery;
         // Startup reconciliation (spec: "startup retains newest/removes
         // older after containment checks"). `Off` never reaches this
@@ -3388,8 +3409,11 @@ impl App {
             hyperlinks,
             link_registry: crate::tui::links::LinkRegistry::default(),
             link_pointer_gesture: crate::tui::links::LinkPointerGesture::default(),
+            mouse_gesture_state: mouse_gesture::GestureState::new(),
+            pending_link_activation: None,
             exit_tail_lines,
             rich_text_copy,
+            copy_on_release,
             clipboard_recovery,
             copy_file_cancel: None,
             tmux_copy_hint_shown: false,
@@ -3827,6 +3851,7 @@ impl App {
         self.sync_mouse_capture_from_dialog();
         changed |= self.tick_toast();
         changed |= self.tick_ctrl_c_window();
+        changed |= self.check_pending_link_activation();
         self.dialog.tick();
         changed |= self.service_first_run_flow();
         // Auto-close the embedded pane when its child has exited
@@ -3879,6 +3904,7 @@ impl App {
             Event::Resize(_, _) => {
                 self.link_pointer_gesture.cancel();
                 self.link_registry.invalidate_pointer_generation();
+                self.pending_link_activation = None;
                 self.dialog.cancel_settings_pointer_transients();
                 false
             }

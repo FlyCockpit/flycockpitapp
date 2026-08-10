@@ -3728,9 +3728,9 @@ fn mutating_dispatch_happy_cases() -> Vec<MutatingDispatchCase> {
     mutating_dispatch_case_list()
         .into_iter()
         .filter(|case| {
-            dispatch_matrix_rows().into_iter().any(|row| {
-                row.kind == case.kind && row.class == DispatchMatrixClass::Mutating
-            })
+            dispatch_matrix_rows()
+                .into_iter()
+                .any(|row| row.kind == case.kind && row.class == DispatchMatrixClass::Mutating)
         })
         .collect()
 }
@@ -5666,9 +5666,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             range: proto::StatsRange::Last7Days,
             by_role: false,
         },
-        "get_startup_disclosures" => Request::GetStartupDisclosures {
-            project_root: root,
-        },
+        "get_startup_disclosures" => Request::GetStartupDisclosures { project_root: root },
         "get_app_flag" => Request::GetAppFlag {
             key: proto::AppFlagKey::DaemonAutostartNotice,
         },

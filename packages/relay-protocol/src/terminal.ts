@@ -87,6 +87,14 @@ export const terminalIngressStatusFrameSchema = z
   })
   .strict();
 
+export const terminalIngressAbortFrameSchema = z
+  .object({
+    type: z.literal("terminal.ingress_abort"),
+    v: z.literal(TERMINAL_PROTOCOL_VERSION),
+    ...terminalIngressIdentitySchema,
+  })
+  .strict();
+
 export const terminalCloseFrameSchema = z
   .object({
     type: z.literal("terminal.close"),
@@ -105,6 +113,7 @@ export const terminalClientPayloadSchema = z.discriminatedUnion("type", [
   terminalIngressChunkFrameSchema,
   terminalIngressFinishFrameSchema,
   terminalIngressStatusFrameSchema,
+  terminalIngressAbortFrameSchema,
   terminalCloseFrameSchema,
 ]);
 export type TerminalClientPayload = z.infer<typeof terminalClientPayloadSchema>;
@@ -143,7 +152,7 @@ export const terminalIngressStateFrameSchema = z
     type: z.literal("terminal.ingress_state"),
     v: z.literal(TERMINAL_PROTOCOL_VERSION),
     operationId: z.string().uuid(),
-    state: z.enum(["prepared", "committed"]),
+    state: z.enum(["prepared", "committed", "no_operation"]),
     nextOffset: z.number().int().nonnegative(),
     inputSequence: z.number().int().positive().optional(),
     expiresAtUnixMs: z.number().int().nonnegative().optional(),
@@ -198,7 +207,9 @@ export function planTerminalPaste(input: TerminalPasteInput): TerminalPastePlan 
     const file = files[0];
     if (!file) return { kind: "empty" };
     if (!isImageFile(file)) return { kind: "error", code: "unsupported_file", maxBytes };
-    if (file.size > maxBytes) return { kind: "error", code: "image_too_large", maxBytes };
+    if (file.size < 1 || file.size > maxBytes) {
+      return { kind: "error", code: "image_too_large", maxBytes };
+    }
     return {
       kind: "image",
       image: {
@@ -212,7 +223,12 @@ export function planTerminalPaste(input: TerminalPasteInput): TerminalPastePlan 
 }
 
 function isImageFile(file: FileLike) {
-  return Boolean(file.type?.startsWith("image/"));
+  return (
+    file.type === "image/png" ||
+    file.type === "image/jpeg" ||
+    file.type === "image/gif" ||
+    file.type === "image/webp"
+  );
 }
 
 export class ClipboardWriteRateLimiter {

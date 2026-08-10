@@ -72,10 +72,15 @@ export function useBrowserTerminal(options: BrowserTerminalOptions): BrowserTerm
       }
       if (plan.kind !== "image") return;
       const file = plan.image.file as File;
-      await clientRef.current?.uploadImage(file, (sentBytes, totalBytes) => {
-        setUploadProgress({ sentBytes, totalBytes });
-      });
-      setUploadProgress(null);
+      try {
+        await clientRef.current?.uploadImage(file, (sentBytes, totalBytes) => {
+          setUploadProgress({ sentBytes, totalBytes });
+        });
+      } catch (error) {
+        options.onError(sanitizedIngressCode(error));
+      } finally {
+        setUploadProgress(null);
+      }
     },
     [options.onError],
   );
@@ -242,6 +247,27 @@ export function useBrowserTerminal(options: BrowserTerminalOptions): BrowserTerm
     sendInput,
     disconnect,
   };
+}
+
+function sanitizedIngressCode(error: unknown) {
+  if (!(error instanceof Error)) return "UploadFailed";
+  const allowed = new Set([
+    "Busy",
+    "TooManyFiles",
+    "TooLarge",
+    "UnsupportedType",
+    "HashFailed",
+    "Conflict",
+    "UploadFailed",
+    "MaterializationFailed",
+    "Expired",
+    "DeadlineExceeded",
+    "CommitUnknown",
+    "CleanupPending",
+    "Cancelled",
+    "TerminalUnavailable",
+  ]);
+  return allowed.has(error.message) ? error.message : "UploadFailed";
 }
 
 function buildTerminalTheme() {

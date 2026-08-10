@@ -371,7 +371,7 @@ async fn image_generation_runtime_limit_failures_have_stable_results() {
         apply_endpoint_and_target(&registry, &endpoint, 1, 1);
         assert!(matches!(
             registry
-                .refresh(endpoint.clone(), "target".into(), 1, 1, 1, RefreshKind::Health, credential_digest(1))
+                .refresh(endpoint.clone(), "target".into(), ConfigRevision::new(1, 1), 1, RefreshKind::Health, credential_digest(1))
                 .await,
             Err(error) if error.code == code
         ));
@@ -385,8 +385,7 @@ async fn image_generation_runtime_limit_failures_have_stable_results() {
             .refresh(
                 endpoint.clone(),
                 "target".into(),
-                1,
-                1,
+                ConfigRevision::new(1, 1),
                 2,
                 RefreshKind::Health,
                 credential_digest(1),
@@ -416,8 +415,7 @@ async fn image_generation_runtime_enforces_total_deadline_around_connector() {
             .refresh(
                 endpoint,
                 "target".into(),
-                1,
-                1,
+                ConfigRevision::new(1, 1),
                 1,
                 RefreshKind::Health,
                 credential_digest(7),
@@ -469,8 +467,7 @@ async fn image_generation_runtime_coalesces_and_discards_stale() {
         registry.refresh(
             endpoint.clone(),
             "target".into(),
-            1,
-            1,
+            ConfigRevision::new(1, 1),
             10,
             RefreshKind::Capabilities,
             credential_digest(2)
@@ -478,8 +475,7 @@ async fn image_generation_runtime_coalesces_and_discards_stale() {
         registry.refresh(
             endpoint.clone(),
             "target".into(),
-            1,
-            1,
+            ConfigRevision::new(1, 1),
             11,
             RefreshKind::Capabilities,
             credential_digest(2)
@@ -509,8 +505,7 @@ async fn image_generation_runtime_dns_proof_and_dispatch_gate() {
         .refresh(
             endpoint.clone(),
             "target".into(),
-            1,
-            1,
+            ConfigRevision::new(1, 1),
             1,
             RefreshKind::Capabilities,
             credential_digest(3),
@@ -534,8 +529,7 @@ async fn image_generation_runtime_dns_proof_and_dispatch_gate() {
         .refresh(
             endpoint.clone(),
             "target".into(),
-            1,
-            1,
+            ConfigRevision::new(1, 1),
             2,
             RefreshKind::Health,
             credential_digest(3),
@@ -568,8 +562,7 @@ async fn image_generation_runtime_ttls_are_clock_driven_and_stale_is_display_onl
         .refresh(
             endpoint.clone(),
             "target".into(),
-            1,
-            1,
+            ConfigRevision::new(1, 1),
             1,
             RefreshKind::Capabilities,
             credential_digest(4),
@@ -581,8 +574,7 @@ async fn image_generation_runtime_ttls_are_clock_driven_and_stale_is_display_onl
         .refresh(
             endpoint.clone(),
             "target".into(),
-            1,
-            1,
+            ConfigRevision::new(1, 1),
             2,
             RefreshKind::Health,
             credential_digest(4),
@@ -595,8 +587,7 @@ async fn image_generation_runtime_ttls_are_clock_driven_and_stale_is_display_onl
         .refresh(
             endpoint.clone(),
             "target".into(),
-            1,
-            1,
+            ConfigRevision::new(1, 1),
             3,
             RefreshKind::Health,
             credential_digest(4),
@@ -642,8 +633,7 @@ async fn image_generation_capability_cache_is_independent_and_waiters_keep_reque
         .refresh(
             endpoint.clone(),
             "target".into(),
-            1,
-            1,
+            ConfigRevision::new(1, 1),
             41,
             RefreshKind::Capabilities,
             credential_digest(6),
@@ -656,8 +646,7 @@ async fn image_generation_capability_cache_is_independent_and_waiters_keep_reque
         .refresh(
             endpoint,
             "target".into(),
-            1,
-            1,
+            ConfigRevision::new(1, 1),
             42,
             RefreshKind::Capabilities,
             credential_digest(6),
@@ -683,8 +672,7 @@ async fn image_generation_runtime_binds_capability_to_endpoint_and_target() {
         .refresh(
             endpoint.clone(),
             "target".into(),
-            1,
-            1,
+            ConfigRevision::new(1, 1),
             1,
             RefreshKind::Capabilities,
             credential_digest(9),
@@ -697,8 +685,7 @@ async fn image_generation_runtime_binds_capability_to_endpoint_and_target() {
             .refresh(
                 endpoint.clone(),
                 "other-target".into(),
-                1,
-                1,
+                ConfigRevision::new(1, 1),
                 2,
                 RefreshKind::Capabilities,
                 credential_digest(9),
@@ -801,8 +788,7 @@ async fn image_generation_runtime_blocks_rebinding_and_mismatched_socket_proofs(
         .refresh(
             endpoint.clone(),
             "target".into(),
-            1,
-            1,
+            ConfigRevision::new(1, 1),
             1,
             RefreshKind::Capabilities,
             credential_digest(5),
@@ -827,7 +813,7 @@ async fn image_generation_runtime_blocks_rebinding_and_mismatched_socket_proofs(
     apply_endpoint_and_target(&mismatch, &endpoint, 1, 1);
     assert!(matches!(
         mismatch
-            .refresh(endpoint, "target".into(), 1, 1, 1, RefreshKind::Health, credential_digest(5))
+            .refresh(endpoint, "target".into(), ConfigRevision::new(1, 1), 1, RefreshKind::Health, credential_digest(5))
             .await,
         Err(error) if error.code == RuntimeErrorCode::DnsDenied
     ));
@@ -856,8 +842,7 @@ async fn image_generation_runtime_rejects_mixed_dns_location_classes() {
             .refresh(
                 endpoint,
                 "target".into(),
-                1,
-                1,
+                ConfigRevision::new(1, 1),
                 1,
                 RefreshKind::Health,
                 credential_digest(8),
@@ -1002,8 +987,7 @@ async fn image_generation_credential_rotation_prevents_old_flight_commit() {
             .refresh(
                 old_endpoint,
                 "target".into(),
-                1,
-                1,
+                ConfigRevision::new(1, 1),
                 1,
                 RefreshKind::Capabilities,
                 credential_digest(10),
@@ -1018,8 +1002,7 @@ async fn image_generation_credential_rotation_prevents_old_flight_commit() {
             .refresh(
                 new_endpoint,
                 "target".into(),
-                1,
-                1,
+                ConfigRevision::new(1, 1),
                 2,
                 RefreshKind::Capabilities,
                 credential_digest(11),
@@ -1067,8 +1050,7 @@ async fn image_generation_refresh_waiter_drop_cancels_only_the_last_waiter() {
             .refresh(
                 first_endpoint,
                 "target".into(),
-                1,
-                1,
+                ConfigRevision::new(1, 1),
                 20,
                 RefreshKind::Capabilities,
                 credential_digest(12),
@@ -1083,8 +1065,7 @@ async fn image_generation_refresh_waiter_drop_cancels_only_the_last_waiter() {
             .refresh(
                 second_endpoint,
                 "target".into(),
-                1,
-                1,
+                ConfigRevision::new(1, 1),
                 21,
                 RefreshKind::Capabilities,
                 credential_digest(12),
@@ -1147,8 +1128,7 @@ async fn image_generation_refresh_waiter_drop_cancels_only_the_last_waiter() {
             .refresh(
                 cancelled_endpoint,
                 "target".into(),
-                1,
-                1,
+                ConfigRevision::new(1, 1),
                 30,
                 RefreshKind::Capabilities,
                 credential_digest(13),

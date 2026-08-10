@@ -415,6 +415,16 @@ struct PinnedResponse {
     body_bytes: usize,
 }
 
+struct PinnedReadContext<'a> {
+    url: &'a reqwest::Url,
+    ip: IpAddr,
+    limits: ProbeLimits,
+    headers: &'a reqwest::header::HeaderMap,
+    connect_deadline: tokio::time::Instant,
+    header_deadline: tokio::time::Instant,
+    body_deadline: tokio::time::Instant,
+}
+
 impl ReqwestPinnedConnector {
     pub fn new(dns: Arc<dyn DnsResolver>) -> Self {
         Self { dns }
@@ -422,14 +432,17 @@ impl ReqwestPinnedConnector {
 
     async fn pinned_read_only(
         &self,
-        url: &reqwest::Url,
-        ip: IpAddr,
-        limits: ProbeLimits,
-        headers: &reqwest::header::HeaderMap,
-        connect_deadline: tokio::time::Instant,
-        header_deadline: tokio::time::Instant,
-        body_deadline: tokio::time::Instant,
+        context: PinnedReadContext<'_>,
     ) -> Result<PinnedResponse, RuntimeError> {
+        let PinnedReadContext {
+            url,
+            ip,
+            limits,
+            headers,
+            connect_deadline,
+            header_deadline,
+            body_deadline,
+        } = context;
         let hostname = url.host_str().ok_or(RuntimeError::new(
             RuntimeErrorCode::Dns,
             "Correct the endpoint hostname.",
@@ -569,10 +582,10 @@ impl BoundConnector for ReqwestPinnedConnector {
                     &EMPTY
                 };
                 let response = self
-                    .pinned_read_only(
-                        &url,
+                    .pinned_read_only(PinnedReadContext {
+                        url: &url,
                         ip,
-                        ProbeLimits {
+                        limits: ProbeLimits {
                             body_limit: limits.body_limit.saturating_sub(total_body_bytes),
                             ..limits
                         },
@@ -580,7 +593,7 @@ impl BoundConnector for ReqwestPinnedConnector {
                         connect_deadline,
                         header_deadline,
                         body_deadline,
-                    )
+                    })
                     .await?;
                 total_body_bytes = total_body_bytes
                     .checked_add(response.body_bytes)
@@ -841,6 +854,25 @@ struct RefreshKey {
     target: String,
     generation: u64,
     epoch: u64,
+    kind: RefreshKind,
+    credential_identity_digest: CredentialIdentityDigest,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigRevision {
+    generation: u64,
+    epoch: u64,
+}
+impl ConfigRevision {
+    pub const fn new(generation: u64, epoch: u64) -> Self {
+        Self { generation, epoch }
+    }
+}
+
+struct RefreshWork {
+    endpoint: ImageEndpoint,
+    target_id: String,
+    revision: ConfigRevision,
+    request_id: u64,
     kind: RefreshKind,
     credential_identity_digest: CredentialIdentityDigest,
 }
@@ -1199,12 +1231,12 @@ impl ImageRuntimeRegistry {
         &self,
         endpoint: ImageEndpoint,
         target_id: String,
-        generation: u64,
-        epoch: u64,
+        revision: ConfigRevision,
         request_id: u64,
         kind: RefreshKind,
         credential_identity_digest: CredentialIdentityDigest,
     ) -> Result<ImageHealthSnapshot, RuntimeError> {
+        let ConfigRevision { generation, epoch } = revision;
         if !endpoint.enabled {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::Disabled,
@@ -1319,15 +1351,14 @@ impl ImageRuntimeRegistry {
             let key2 = key.clone();
             let flight2 = flight.clone();
             tokio::spawn(async move {
-                let work = AssertUnwindSafe(registry.run_refresh(
+                let work = AssertUnwindSafe(registry.run_refresh(RefreshWork {
                     endpoint,
                     target_id,
-                    generation,
-                    epoch,
+                    revision,
                     request_id,
                     kind,
                     credential_identity_digest,
-                ))
+                }))
                 .catch_unwind();
                 let mut cancelled = Box::pin(flight2.cancel_notify.notified());
                 cancelled.as_mut().enable();
@@ -1379,16 +1410,15 @@ impl ImageRuntimeRegistry {
         result.request_id = request_id;
         Ok(result)
     }
-    async fn run_refresh(
-        &self,
-        endpoint: ImageEndpoint,
-        target_id: String,
-        generation: u64,
-        epoch: u64,
-        request_id: u64,
-        kind: RefreshKind,
-        credential_identity_digest: CredentialIdentityDigest,
-    ) -> Result<ImageHealthSnapshot, RuntimeError> {
+    async fn run_refresh(&self, work: RefreshWork) -> Result<ImageHealthSnapshot, RuntimeError> {
+        let RefreshWork {
+            endpoint,
+            target_id,
+            revision: ConfigRevision { generation, epoch },
+            request_id,
+            kind,
+            credential_identity_digest,
+        } = work;
         let target_current = self
             .inner
             .current_targets
@@ -1541,7 +1571,7 @@ impl ImageRuntimeRegistry {
                 ImageHealthState::DnsDenied.remediation(),
             ));
         }
-        if let Err(error) = Self::validate_connection_hops(&connection, wanted, &allowed) {
+        if let Err(error) = Self::validate_connection_hops(connection, wanted, &allowed) {
             self.commit_failure(
                 &endpoint,
                 &target_id,

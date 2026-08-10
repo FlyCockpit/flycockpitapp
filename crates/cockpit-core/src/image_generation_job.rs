@@ -834,6 +834,16 @@ impl ImageGenerationOwnerContextAuthority {
         Ok(VerifiedExternalCopyRemovalOutcome::RemovedDurably)
     }
 
+    pub fn reconcile_verified_external_copy_removal(
+        &self,
+        conn: &Connection,
+        recorded: RecordedImageArtifactSecurityRecovery,
+        output: &HeldImageGenerationOutputDirectory,
+        recovery: &HeldDirectoryRecovery,
+    ) -> Result<VerifiedExternalCopyRemovalOutcome> {
+        self.remove_verified_external_copy(conn, recorded, output, recovery)
+    }
+
     fn complete_verified_late_publication_inner(
         &self,
         conn: &Connection,

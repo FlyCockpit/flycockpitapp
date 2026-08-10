@@ -558,7 +558,11 @@ mod tests {
         }
         .encode();
         let (events, operation, submission, queue) = db.read(move |conn| {
-            let events = conn.query_row("SELECT COUNT(*) FROM session_events WHERE session_id=?1 AND type='user_message'", [session.session_id.to_string()], |row| row.get(0))?;
+            let events: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM session_events WHERE session_id=?1 AND type='user_message'",
+                [session.session_id.to_string()],
+                |row| row.get(0),
+            )?;
             let operation = conn.query_row("SELECT state,safe_outcome,created_at,updated_at FROM message_operation_receipts WHERE session_id=?1 AND operation_id=?2", params![session.session_id.to_string(),input.operation_id.as_slice()], |row| Ok((row.get::<_,String>(0)?,row.get::<_,Vec<u8>>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?)))?;
             let submission = conn.query_row("SELECT state,safe_outcome,message_seq,fold_ordinal,created_at,updated_at FROM message_submission_receipts WHERE session_id=?1 AND client_submission_id=?2", params![session.session_id.to_string(),input.client_submission_id.as_slice()], |row| Ok((row.get::<_,String>(0)?,row.get::<_,Vec<u8>>(1)?,row.get::<_,Option<i64>>(2)?,row.get::<_,Option<i64>>(3)?,row.get::<_,i64>(4)?,row.get::<_,i64>(5)?)))?;
             let queue = conn.query_row("SELECT state,created_at,updated_at FROM message_queue_items WHERE session_id=?1 AND queue_item_id=?2", params![session.session_id.to_string(),input.queue_item_id.as_slice()], |row| Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?)))?;

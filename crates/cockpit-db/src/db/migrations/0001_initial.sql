@@ -298,6 +298,29 @@ CREATE TABLE media_attachment_references (
 CREATE INDEX idx_media_attachment_references_live
     ON media_attachment_references(attachment_id, released_at_unix_ms);
 
+-- Short-lived held-handle leases serialize every consumer with cleanup.  The
+-- capability generation is captured at acquisition so a daemon authority
+-- rotation invalidates new work without weakening an already-held read.
+CREATE TABLE media_attachment_component_leases (
+    lease_id                       TEXT PRIMARY KEY,
+    attachment_id                  TEXT NOT NULL,
+    attachment_version             TEXT NOT NULL,
+    component_id                   TEXT NOT NULL REFERENCES media_attachment_components(component_id) ON DELETE CASCADE,
+    lease_kind                     TEXT NOT NULL CHECK (lease_kind IN ('preview', 'model')),
+    expected_availability_generation TEXT NOT NULL,
+    captured_capability_generation TEXT NOT NULL,
+    acquired_at_unix_ms            INTEGER NOT NULL,
+    released_at_unix_ms            INTEGER,
+    FOREIGN KEY (attachment_id, attachment_version)
+        REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX idx_media_attachment_component_leases_live_id
+    ON media_attachment_component_leases(lease_id)
+    WHERE released_at_unix_ms IS NULL;
+CREATE INDEX idx_media_attachment_component_leases_live_attachment
+    ON media_attachment_component_leases(attachment_id, attachment_version, released_at_unix_ms);
+
 CREATE TABLE media_attachment_cleanup_intents (
     intent_id                         TEXT PRIMARY KEY,
     attachment_id                    TEXT NOT NULL UNIQUE,

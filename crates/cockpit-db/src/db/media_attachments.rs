@@ -657,6 +657,22 @@ pub struct AcquiredMediaReference {
     pub inserted: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaComponentLeaseKind {
+    Preview,
+    Model,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcquiredMediaComponentLease {
+    pub lease_id: Uuid,
+    pub attachment_id: Uuid,
+    pub attachment_version: u64,
+    pub availability_generation: u64,
+    pub captured_capability_generation: u64,
+    pub component: MediaAttachmentComponent,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaCleanupIntent {
     pub intent_id: Uuid,
@@ -1064,7 +1080,7 @@ impl super::Db {
         else {
             return Ok(None);
         };
-        let live:i64=conn.query_row("SELECT COUNT(*) FROM media_attachment_references WHERE attachment_id=?1 AND attachment_version=?2 AND released_at_unix_ms IS NULL",params![record.attachment_id.to_string(),decimal(record.attachment_version)?],|row|row.get(0))?;
+        let live:i64=conn.query_row("SELECT (SELECT COUNT(*) FROM media_attachment_references WHERE attachment_id=?1 AND attachment_version=?2 AND released_at_unix_ms IS NULL) + (SELECT COUNT(*) FROM media_attachment_component_leases WHERE attachment_id=?1 AND attachment_version=?2 AND released_at_unix_ms IS NULL)",params![record.attachment_id.to_string(),decimal(record.attachment_version)?],|row|row.get(0))?;
         let eligible = matches!(
             record.availability,
             MediaAvailability::Registered
@@ -1251,7 +1267,7 @@ impl super::Db {
                 serde_json::from_str(&receipt_json).context("decoding media recovery receipt")?,
             ));
         }
-        let live_references: i64 = conn.query_row("SELECT COUNT(*) FROM media_attachment_references WHERE attachment_id=?1 AND released_at_unix_ms IS NULL", [request.attachment_id.to_string()], |row| row.get(0))?;
+        let live_references: i64 = conn.query_row("SELECT (SELECT COUNT(*) FROM media_attachment_references WHERE attachment_id=?1 AND released_at_unix_ms IS NULL) + (SELECT COUNT(*) FROM media_attachment_component_leases WHERE attachment_id=?1 AND released_at_unix_ms IS NULL)", [request.attachment_id.to_string()], |row| row.get(0))?;
         let mut statement = conn.prepare("SELECT component_id,component_kind,component_generation,stable_identity_digest,byte_length,sha256,reservation_id,deletion_evidence_digest,storage_id FROM media_attachment_components WHERE attachment_id=?1 AND lifecycle_state <> 'deleted' ORDER BY component_id")?;
         let components = statement
             .query_map([request.attachment_id.to_string()], |row| {
@@ -1544,7 +1560,7 @@ impl super::Db {
             "media cleanup intent requires cleanup-pending or recovery state"
         );
         let live_references: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM media_attachment_references WHERE attachment_id=?1 AND attachment_version=?2 AND released_at_unix_ms IS NULL",
+            "SELECT (SELECT COUNT(*) FROM media_attachment_references WHERE attachment_id=?1 AND attachment_version=?2 AND released_at_unix_ms IS NULL) + (SELECT COUNT(*) FROM media_attachment_component_leases WHERE attachment_id=?1 AND attachment_version=?2 AND released_at_unix_ms IS NULL)",
             params![intent.attachment_id.to_string(), decimal(intent.attachment_version)?],
             |row| row.get(0),
         ).context("counting live media references")?;
@@ -1622,6 +1638,81 @@ impl super::Db {
             "media reference release lost attachment compare-and-swap"
         );
         Ok(next)
+    }
+
+    /// Atomically wins a ready component lease against discard/retention.
+    /// The caller must open and verify the returned component while this row
+    /// remains live; paths are intentionally not exposed here.
+    pub fn acquire_media_component_lease_conn(
+        conn: &Connection,
+        lease_id: Uuid,
+        attachment_id: Uuid,
+        expected_version: u64,
+        expected_availability_generation: u64,
+        expected_capability_generation: u64,
+        kind: MediaComponentLeaseKind,
+        now_unix_ms: i64,
+    ) -> Result<AcquiredMediaComponentLease> {
+        ensure!(is_strict_uuid_v7(lease_id), "lease id must be UUIDv7");
+        let attachment =
+            media_attachment_by_id(conn, attachment_id)?.context("media attachment unavailable")?;
+        ensure!(
+            attachment.availability == MediaAvailability::Ready
+                && attachment.attachment_version == expected_version
+                && attachment.availability_generation == expected_availability_generation
+                && attachment.captured_capability_generation == expected_capability_generation,
+            "media attachment unavailable"
+        );
+        let component_kind = match (kind, attachment.media_kind) {
+            (MediaComponentLeaseKind::Preview, MediaKind::Image) => "browser_thumbnail",
+            (MediaComponentLeaseKind::Model, MediaKind::Image) => "image_model",
+            (MediaComponentLeaseKind::Model, MediaKind::Audio) => "audio_model",
+            (MediaComponentLeaseKind::Model, MediaKind::Video) => "video_model",
+            _ => bail!("media attachment unavailable"),
+        };
+        let component = conn
+            .query_row(
+                "SELECT component_id,storage_id,component_generation,stable_identity_digest,byte_length,sha256,reservation_id,created_at_unix_ms,updated_at_unix_ms FROM media_attachment_components WHERE attachment_id=?1 AND attachment_version=?2 AND component_kind=?3 AND lifecycle_state='ready'",
+                params![attachment_id.to_string(), decimal(expected_version)?, component_kind],
+                |row| {
+                    let uuid = |column| Uuid::parse_str(&row.get::<_, String>(column)?).map_err(|error| rusqlite::Error::FromSqlConversionFailure(column, rusqlite::types::Type::Text, Box::new(error)));
+                    let number = |column, field| parse_decimal(row.get(column)?, field).map_err(|error| rusqlite::Error::FromSqlConversionFailure(column, rusqlite::types::Type::Text, error.into()));
+                    Ok(MediaAttachmentComponent {
+                        component_id: uuid(0)?, attachment_id, attachment_version: expected_version,
+                        component_kind: component_kind.to_owned(), storage_id: uuid(1)?, lifecycle_state: "ready".into(),
+                        component_generation: number(2, "component generation")?, stable_identity_digest: row.get(3)?,
+                        byte_length: number(4, "component byte length")?, sha256: row.get(5)?, reservation_id: row.get(6)?,
+                        created_at_unix_ms: row.get(7)?, updated_at_unix_ms: row.get(8)?,
+                    })
+                },
+            )
+            .optional()?
+            .context("media attachment unavailable")?;
+        conn.execute(
+            "INSERT INTO media_attachment_component_leases(lease_id,attachment_id,attachment_version,component_id,lease_kind,expected_availability_generation,captured_capability_generation,acquired_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![lease_id.to_string(), attachment_id.to_string(), decimal(expected_version)?, component.component_id.to_string(), kind.as_str(), decimal(expected_availability_generation)?, decimal(expected_capability_generation)?, now_unix_ms],
+        ).context("acquiring media component lease")?;
+        Ok(AcquiredMediaComponentLease {
+            lease_id,
+            attachment_id,
+            attachment_version: expected_version,
+            availability_generation: expected_availability_generation,
+            captured_capability_generation: expected_capability_generation,
+            component,
+        })
+    }
+
+    pub fn release_media_component_lease_conn(
+        conn: &Connection,
+        lease_id: Uuid,
+        now_unix_ms: i64,
+    ) -> Result<()> {
+        let changed = conn.execute(
+            "UPDATE media_attachment_component_leases SET released_at_unix_ms=?1 WHERE lease_id=?2 AND released_at_unix_ms IS NULL",
+            params![now_unix_ms, lease_id.to_string()],
+        ).context("releasing media component lease")?;
+        ensure!(changed == 1, "media component lease unavailable");
+        Ok(())
     }
 }
 
@@ -1874,6 +1965,7 @@ macro_rules! text_enum {
 text_enum!(MediaKind, { Image => "image", Audio => "audio", Video => "video" });
 text_enum!(MediaSourceKind, { LocalPath => "local_path", RetainedHttps => "retained_https", AuthenticatedSessionUpload => "authenticated_session_upload" });
 text_enum!(MediaReferenceConsumerKind, { Message => "message", Tool => "tool", Job => "job" });
+text_enum!(MediaComponentLeaseKind, { Preview => "preview", Model => "model" });
 text_enum!(MediaAvailability, {
     Registered => "registered", Quarantined => "quarantined", Probing => "probing", Decoding => "decoding",
     Normalizing => "normalizing", Ready => "ready", ModelDerivativeUnavailable => "model_derivative_unavailable",
@@ -2191,6 +2283,30 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ready_component_lease_serializes_with_cleanup_and_capability_rotation() {
+        let db = super::super::Db::open_in_memory_async().await.unwrap();
+        let session_id = Uuid::now_v7();
+        let attachment_id = Uuid::now_v7();
+        let component_id = Uuid::now_v7();
+        let storage_id = Uuid::now_v7();
+        db.transaction(move |conn| {
+            conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/redacted',1,1)",[session_id.to_string()])?;
+            let record = MediaAttachmentRecord { attachment_id, session_id, canonical_project_digest:"11".repeat(32), media_kind:MediaKind::Image, source_kind:MediaSourceKind::RetainedHttps, canonical_container:"png".into(), canonical_mime:"image/png".into(), availability:MediaAvailability::Ready, attachment_version:1, availability_generation:5, reference_generation:1, captured_capability_generation:9, source_identity_digest:"22".repeat(32), source_byte_length:3, source_sha256:"33".repeat(32), selected_video_stream:None, selected_audio_stream:None, created_at_unix_ms:1, updated_at_unix_ms:1, draft_expires_at_unix_ms:None, first_referenced_at_unix_ms:None };
+            super::super::Db::insert_media_attachment_conn(conn,&record)?;
+            conn.execute("INSERT INTO media_attachment_components(component_id,attachment_id,attachment_version,component_kind,storage_id,lifecycle_state,component_generation,stable_identity_digest,byte_length,sha256,reservation_id,created_at_unix_ms,updated_at_unix_ms) VALUES(?1,?2,'1','browser_thumbnail',?3,'ready','1',?4,'3',?5,'reservation',1,1)",params![component_id.to_string(),attachment_id.to_string(),storage_id.to_string(),"44".repeat(32),"55".repeat(32)])?;
+            assert!(super::super::Db::acquire_media_component_lease_conn(conn,Uuid::now_v7(),attachment_id,1,5,8,MediaComponentLeaseKind::Preview,2).is_err());
+            let lease_id=Uuid::now_v7();
+            let lease=super::super::Db::acquire_media_component_lease_conn(conn,lease_id,attachment_id,1,5,9,MediaComponentLeaseKind::Preview,2)?;
+            assert_eq!(lease.component.component_id,component_id);
+            let live:i64=conn.query_row("SELECT COUNT(*) FROM media_attachment_component_leases WHERE attachment_id=?1 AND released_at_unix_ms IS NULL",[attachment_id.to_string()],|row|row.get(0))?;
+            assert_eq!(live,1);
+            super::super::Db::release_media_component_lease_conn(conn,lease_id,3)?;
+            assert!(super::super::Db::release_media_component_lease_conn(conn,lease_id,4).is_err());
+            Ok(())
+        }).await.unwrap();
     }
 
     #[test]

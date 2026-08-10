@@ -168,3 +168,6 @@ cockpit-config = { path = "../cockpit-config", features = ["test-support"] }
 cockpit-test-support = { path = "../cockpit-test-support" }
 predicates = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+rcgen = "=0.14.8"
+rustls = "=0.23.43"
+tokio-rustls = "=0.26.4"

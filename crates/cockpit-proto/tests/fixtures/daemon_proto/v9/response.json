@@ -1391,6 +1391,126 @@
     },
     "response": "run_invocation_cancel_result"
   },
+  "media_owner_recovery": {
+    "data": {
+      "schemaVersion": 1,
+      "kind": "localMediaOwnerRecovery",
+      "receiptId": "01890f3e-7bcd-7abc-8abc-000000000001",
+      "localRequestId": "01890f3e-7bcd-7abc-8abc-000000000002",
+      "ownerPrincipalDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "attachmentId": "01890f3e-7bcd-7abc-8abc-000000000003",
+      "attachmentVersion": 1,
+      "disposition": "retain_blocked",
+      "requestDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "affectedSetDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "outcome": "retained_blocked",
+      "availabilityGenerationBefore": 2,
+      "availabilityGenerationAfter": 2,
+      "components": [],
+      "committedAtUnixMs": 1700000000000
+    },
+    "response": "media_owner_recovery"
+  },
+  "local_path_media_registration": {
+    "data": {
+      "schemaVersion": 1,
+      "kind": "localPathRegistrationReceipt",
+      "receiptId": "01890f3e-7bcd-7abc-8abc-000000000004",
+      "localOperationId": "01890f3e-7bcd-7abc-8abc-000000000005",
+      "ownerPrincipalDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "sessionId": "01890f3e-7bcd-7abc-8abc-000000000006",
+      "canonicalProjectDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "clientDraftId": "01890f3e-7bcd-7abc-8abc-000000000007",
+      "operationRequestDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "semanticCommandDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "result": { "outcome": "rejected", "reason": "source_unavailable" },
+      "committedAtUnixMs": 1700000000000
+    },
+    "response": "local_path_media_registration"
+  },
+  "retained_https_media": {
+    "data": {
+      "schemaVersion": 1,
+      "kind": "retainedHttpsMediaReceipt",
+      "receiptId": "01890f3e-7bcd-7abc-8abc-000000000008",
+      "localOperationId": "01890f3e-7bcd-7abc-8abc-000000000009",
+      "ownerPrincipalDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "sessionId": "01890f3e-7bcd-7abc-8abc-000000000010",
+      "canonicalProjectDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "clientDraftId": "01890f3e-7bcd-7abc-8abc-000000000011",
+      "operationRequestDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "semanticCommandDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "originScheme": "https",
+      "redirectLocationClasses": [],
+      "pathSegmentCount": 1,
+      "fetchedAtUnixMs": 1700000000000,
+      "result": { "outcome": "rejected", "reason": "source_unavailable" },
+      "committedAtUnixMs": 1700000000001
+    },
+    "response": "retained_https_media"
+  },
+  "media_attachment_status": {
+    "data": {
+      "schemaVersion": 1,
+      "kind": "mediaAttachmentStatus",
+      "attachmentId": "01890f3e-7bcd-7abc-8abc-000000000012",
+      "attachmentVersion": 1,
+      "mediaKind": "image",
+      "availabilityGeneration": 1,
+      "referenceGeneration": 1,
+      "canDiscard": true,
+      "previewAvailable": false,
+      "availabilityState": "registered"
+    },
+    "response": "media_attachment_status"
+  },
+  "media_attachment_preview": {
+    "data": {
+      "schemaVersion": 1,
+      "kind": "mediaAttachmentPreview",
+      "contentType": "image/png",
+      "cacheControl": "private, no-store",
+      "xContentTypeOptions": "nosniff",
+      "contentLength": 3,
+      "body": [1, 2, 3]
+    },
+    "response": "media_attachment_preview"
+  },
+  "local_media_mutation": {
+    "data": {
+      "schemaVersion": 1,
+      "kind": "localMediaMutationReceipt",
+      "receiptId": "01890f3e-7bcd-7abc-8abc-000000000013",
+      "localOperationId": "01890f3e-7bcd-7abc-8abc-000000000014",
+      "actorPrincipalDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "action": "append",
+      "subjectKind": "upload",
+      "subjectId": "01890f3e-7bcd-7abc-8abc-000000000015",
+      "operationRequestDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "semanticCommandDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "outcome": "applied",
+      "transition": { "kind": "upload", "generationBefore": 1, "generationAfter": 2 },
+      "committedAtUnixMs": 1700000000000
+    },
+    "response": "local_media_mutation"
+  },
+  "media_upload_status": {
+    "data": {
+      "schemaVersion": 1,
+      "kind": "mediaUploadStatus",
+      "uploadId": "01890f3e-7bcd-7abc-8abc-000000000016",
+      "uploadGeneration": 1,
+      "clientDraftId": "01890f3e-7bcd-7abc-8abc-000000000017",
+      "mediaKind": "image",
+      "expiresAtUnixMs": 1700086400000,
+      "acknowledgedChunks": 0,
+      "acknowledgedBytes": 0,
+      "lastTransition": { "actor": "system", "action": "startup_reconcile", "outcome": "applied" },
+      "state": "open",
+      "nextChunkIndex": 0
+    },
+    "response": "media_upload_status"
+  },
   "user_message_queued": {
     "data": {
       "item": {

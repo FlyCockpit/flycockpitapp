@@ -20,18 +20,12 @@
 //! permissive umask cannot widen a capsule), and verification of mode, file
 //! type, and link count on every reopen.
 //!
-//! Windows enforcement is **weaker, and this module does not pretend
-//! otherwise**. Real Windows DACL and handle-containment work is deferred to a
-//! dedicated `windows-file-security` prompt; this module must not grow blind
-//! Win32 FFI in the meantime.
-//! [`SPOOL_PERMISSION_POLICY`] reports `windows_dacl_enforced:
-//! false`. What Windows does get: relative opens beneath the resolved root,
+//! Windows applies and verifies the repository's audited protected
+//! current-user-and-SYSTEM-only DACL on every guarded directory and file. It also uses
+//! relative opens beneath the resolved root,
 //! rejection of any entry carrying `FILE_ATTRIBUTE_REPARSE_POINT`, a
 //! regular-file check, and a hard-link (`number_of_links`) check. What it does
-//! not get: an explicit owner-only DACL with inheritance disabled. Nothing in
-//! this repository sets a Windows security descriptor today, so claiming one
-//! would be a lie in a security-critical path; the spool therefore inherits
-//! the ACL of the per-user application data directory. `DirGuard::sync` is
+//! `DirGuard::sync` is
 //! also a documented no-op on Windows because there is no directory fsync,
 //! which means a Windows crash can lose a *newly created* directory entry —
 //! recovery treats a missing capsule as a missing durable medium rather than
@@ -65,10 +59,8 @@ pub struct SpoolPermissionPolicy {
     pub unix_file_mode: u32,
     /// Whether Unix modes are enforced on this build.
     pub unix_mode_enforced: bool,
-    /// Whether an explicit owner-only DACL is written on Windows.
-    ///
-    /// `false`. No code in this repository sets a Windows security descriptor;
-    /// the spool inherits the per-user application data directory ACL.
+    /// Whether an explicit protected current-user-and-SYSTEM-only DACL is written and
+    /// verified on Windows.
     pub windows_dacl_enforced: bool,
     /// Whether reparse points are rejected for every spool entry.
     pub reparse_rejected: bool,
@@ -81,7 +73,7 @@ pub const SPOOL_PERMISSION_POLICY: SpoolPermissionPolicy = SpoolPermissionPolicy
     unix_dir_mode: SPOOL_DIR_MODE,
     unix_file_mode: SPOOL_FILE_MODE,
     unix_mode_enforced: cfg!(unix),
-    windows_dacl_enforced: false,
+    windows_dacl_enforced: cfg!(windows),
     reparse_rejected: true,
     directory_fsync_available: cfg!(unix),
 };
@@ -639,13 +631,25 @@ mod imp {
             let mut resolved = base;
             for name in pending {
                 resolved.push(&name);
-                std::fs::create_dir(&resolved).or_else(|error| match error.kind() {
-                    std::io::ErrorKind::AlreadyExists => Ok(()),
-                    _ => Err(io("creating spool directory", error)),
-                })?;
+                let created = match std::fs::create_dir(&resolved) {
+                    Ok(()) => true,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+                    Err(error) => return Err(io("creating spool directory", error)),
+                };
+                #[cfg(not(windows))]
+                let _ = created;
                 reject_reparse(&resolved)?;
+                #[cfg(windows)]
+                if created {
+                    crate::goal_scratch::set_private(&resolved).map_err(|error| {
+                        ExternalJournalError::InsecurePermissions(error.to_string())
+                    })?;
+                }
             }
             reject_reparse(&resolved)?;
+            #[cfg(windows)]
+            crate::goal_scratch::verify_private_dacl(&resolved)
+                .map_err(|error| ExternalJournalError::InsecurePermissions(error.to_string()))?;
             if !resolved.is_dir() {
                 return Err(ExternalJournalError::Containment(format!(
                     "spool root {} is not a directory",
@@ -663,10 +667,16 @@ mod imp {
             check_component(name)?;
             let path = self.path.join(name);
             if create {
-                std::fs::create_dir(&path).or_else(|error| match error.kind() {
-                    std::io::ErrorKind::AlreadyExists => Ok(()),
-                    _ => Err(io("creating spool directory", error)),
-                })?;
+                match std::fs::create_dir(&path) {
+                    Ok(()) => {
+                        #[cfg(windows)]
+                        crate::goal_scratch::set_private(&path).map_err(|error| {
+                            ExternalJournalError::InsecurePermissions(error.to_string())
+                        })?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(io("creating spool directory", error)),
+                }
             }
             reject_reparse(&path)?;
             if !path.is_dir() {
@@ -675,7 +685,9 @@ mod imp {
                     path.display()
                 )));
             }
-            Ok(Self { path })
+            let guard = Self { path };
+            guard.verify_private()?;
+            Ok(guard)
         }
 
         pub fn path(&self) -> &Path {
@@ -683,7 +695,11 @@ mod imp {
         }
 
         pub fn verify_private(&self) -> Result<(), ExternalJournalError> {
-            reject_reparse(&self.path)
+            reject_reparse(&self.path)?;
+            #[cfg(windows)]
+            crate::goal_scratch::verify_private_dacl(&self.path)
+                .map_err(|error| ExternalJournalError::InsecurePermissions(error.to_string()))?;
+            Ok(())
         }
 
         pub fn create_file_exclusive(&self, name: &str) -> Result<File, ExternalJournalError> {
@@ -697,6 +713,9 @@ mod imp {
                 .map_err(|error| io("creating capsule file", error))?;
             reject_reparse(&path)?;
             verify_open_file(&file, name)?;
+            #[cfg(windows)]
+            crate::goal_scratch::set_private(&path)
+                .map_err(|error| ExternalJournalError::InsecurePermissions(error.to_string()))?;
             Ok(file)
         }
 
@@ -724,6 +743,9 @@ mod imp {
                     }
                 })?;
             verify_open_file(&file, name)?;
+            #[cfg(windows)]
+            crate::goal_scratch::verify_private_dacl(&path)
+                .map_err(|error| ExternalJournalError::InsecurePermissions(error.to_string()))?;
             Ok(file)
         }
 
@@ -814,7 +836,7 @@ mod tests {
         // Honest by construction: nothing in this repository writes a Windows
         // security descriptor, so the policy must not claim one. Compile-time
         // so the claim cannot drift ahead of the implementation.
-        const { assert!(!SPOOL_PERMISSION_POLICY.windows_dacl_enforced) };
+        const { assert!(SPOOL_PERMISSION_POLICY.windows_dacl_enforced == cfg!(windows)) };
         const { assert!(SPOOL_PERMISSION_POLICY.reparse_rejected) };
 
         #[cfg(unix)]
@@ -850,6 +872,29 @@ mod tests {
                     .is_ok()
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_private_dacl_reopen_rejects_broad_directory_and_file_acl() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root_path = tmp.path().join("dacl-root");
+        let root = DirGuard::open_root(&root_path, true).unwrap();
+        let file = root.create_file_exclusive("component.v1").unwrap();
+        drop(file);
+        root.verify_private().unwrap();
+        root.open_file_verified("component.v1").unwrap();
+
+        crate::goal_scratch::apply_test_windows_dacl(&root_path, "D:P(A;;FA;;;WD)").unwrap();
+        assert!(root.verify_private().is_err());
+        crate::goal_scratch::set_private(&root_path).unwrap();
+
+        let file_path = root_path.join("component.v1");
+        crate::goal_scratch::apply_test_windows_dacl(&file_path, "D:P(A;;FA;;;BU)").unwrap();
+        assert!(root.open_file_verified("component.v1").is_err());
+        crate::goal_scratch::set_private(&file_path).unwrap();
+        crate::goal_scratch::apply_test_windows_dacl(&file_path, "D:P(A;;FA;;;AU)").unwrap();
+        assert!(root.open_file_verified("component.v1").is_err());
     }
 
     /// A symlinked ancestor must not break the spool: macOS resolves `/var` to

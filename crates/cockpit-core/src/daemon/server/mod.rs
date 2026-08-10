@@ -157,6 +157,13 @@ fn scrub_history_entry(
 fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTable) {
     match response {
         proto::Response::Ack => {}
+        proto::Response::MediaOwnerRecovery(..)
+        | proto::Response::LocalPathMediaRegistration(..)
+        | proto::Response::RetainedHttpsMedia(..)
+        | proto::Response::MediaAttachmentStatus(..)
+        | proto::Response::MediaAttachmentPreview(..)
+        | proto::Response::LocalMediaMutation(..)
+        | proto::Response::MediaUploadStatus(..) => {}
         proto::Response::ConfigRefreshed {
             applied_generation: _,
             changed: _,
@@ -1762,6 +1769,9 @@ pub struct DaemonContext {
     /// and revalidated recovery capacity; every consumer must treat `None` as
     /// "external dispatch is not enabled".
     pub external_journal: Option<std::sync::Arc<crate::external_journal::ExternalJournal>>,
+    /// Boot-held authority for the fixed private media component root.
+    pub(crate) media_storage_recovery:
+        Option<std::sync::Arc<crate::media_storage::MediaStorageRecovery>>,
     /// Generation-bound descendant containment (`cross-platform-descendant-process-containment`).
     pub process_containment: Option<crate::process_containment::ProcessContainmentHandle>,
     _process_containment_actor: Option<crate::process_containment::ProcessContainmentActor>,
@@ -1860,6 +1870,15 @@ impl DaemonContext {
             db.clone(),
             Arc::new(DaemonMediaClock(started_at)),
         );
+        let media_storage_recovery = (!paths.ephemeral)
+            .then(|| crate::config::resolve::cockpit_data_dir().map(|dir| dir.join("media")))
+            .transpose()
+            .ok()
+            .flatten()
+            .and_then(|root| {
+                crate::media_storage::MediaStorageRecovery::open_or_create(db.clone(), &root).ok()
+            })
+            .map(Arc::new);
         Self {
             db,
             media_ledger,
@@ -1886,6 +1905,7 @@ impl DaemonContext {
             secure_key: None,
             _secure_key_actor: None,
             external_journal: None,
+            media_storage_recovery,
             process_containment: None,
             _process_containment_actor: None,
             write_scope: None,
@@ -2085,6 +2105,25 @@ pub(crate) async fn boot_with_db(
         terminal_factory,
         crate::daemon::config_source::ConfigSource::production(),
     );
+    if let Some(storage) = &ctx.media_storage_recovery {
+        storage
+            .reconcile_abandoned_component_leases(chrono::Utc::now().timestamp_millis())
+            .await
+            .context("reconciling abandoned media component leases")?;
+        storage
+            .reconcile_media_uploads(chrono::Utc::now().timestamp_millis())
+            .await
+            .context("reconciling authenticated media uploads")?;
+        storage
+            .begin_due_retention(chrono::Utc::now().timestamp_millis())
+            .await
+            .context("starting due media retention")?;
+        storage
+            .reconcile_media_cleanup_intents(chrono::Utc::now().timestamp_millis())
+            .await
+            .context("reconciling media cleanup intents")?;
+    }
+    timer.phase("media_upload_reconcile");
     // Installation identity + secure-key actor: under single-instance lock
     // (caller already holds pid/socket). Registration + keyring I/O stay on the
     // dedicated actor OS thread. Boot handshake runs on a short-lived std thread
@@ -2594,6 +2633,7 @@ struct MutableClientState {
     attached: Option<AttachedSession>,
     pending_replay: Vec<proto::Event>,
     pending_uploads: HashMap<Uuid, PendingAttachmentUpload>,
+    #[cfg(test)]
     ready_attachments: HashMap<Uuid, ReadyAttachment>,
     upload_accounting: Arc<StdMutex<UploadAccounting>>,
     upload_limits: AttachmentUploadLimits,
@@ -2677,6 +2717,7 @@ impl MutableClientState {
             attached: None,
             pending_replay: Vec::new(),
             pending_uploads: HashMap::new(),
+            #[cfg(test)]
             ready_attachments: HashMap::new(),
             upload_accounting,
             upload_limits: AttachmentUploadLimits,
@@ -2796,7 +2837,6 @@ fn format_upload_bytes(bytes: usize) -> String {
 #[derive(Debug, Default)]
 struct UploadAccounting {
     pending: HashMap<Uuid, usize>,
-    consumed_message_attachments: HashMap<Uuid, ConsumedMessageAttachment>,
 }
 
 impl UploadAccounting {
@@ -2824,7 +2864,6 @@ where
 struct PendingAttachmentUpload {
     media_reservation: Option<crate::media_reservation::ReservationReceipt>,
     session_id: Option<Uuid>,
-    mime: String,
     byte_len: usize,
     sha256: String,
     purpose: proto::AttachmentPurpose,
@@ -2832,22 +2871,12 @@ struct PendingAttachmentUpload {
     created_at: Instant,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct ReadyAttachment {
-    media_reservation: Option<crate::media_reservation::ReservationReceipt>,
     session_id: Uuid,
-    mime: String,
     bytes: Vec<u8>,
     purpose: proto::AttachmentPurpose,
-    created_at: Instant,
-}
-
-#[derive(Debug)]
-struct ConsumedMessageAttachment {
-    client_submission_id: Uuid,
-    origin_principal: Option<String>,
-    consumed_at: Instant,
-    attachment: ReadyAttachment,
 }
 
 struct AttachedSession {
@@ -3184,21 +3213,35 @@ where
     if !send_writer_envelope(&writer_tx, hello).await {
         return Ok(());
     }
+    let reader_ctx = ctx.clone();
+    let reader_executor_tx = executor_tx.clone();
+    let reader_writer_tx = writer_tx.clone();
     let reader_task = tokio::spawn(run_client_reader(
         reader,
-        executor_tx.clone(),
-        writer_tx.clone(),
-        Some(ctx.caffeinate_state_event()),
+        reader_executor_tx,
+        reader_writer_tx,
+        Some(reader_ctx.caffeinate_state_event()),
     ));
-    let writer_task = tokio::spawn(run_client_writer(writer, writer_rx));
-    let event_task = tokio::spawn(run_client_event_forwarder(
-        ctx.clone(),
-        principal.clone(),
-        ctx.subscribe_global(),
-        event_cmd_rx,
-        executor_tx.clone(),
-        writer_tx.clone(),
-    ));
+    let writer_task = tokio::spawn(async move {
+        run_client_writer(writer, writer_rx).await;
+        Ok::<(), anyhow::Error>(())
+    });
+    let event_ctx = ctx.clone();
+    let event_principal = principal.clone();
+    let event_executor_tx = executor_tx.clone();
+    let event_writer_tx = writer_tx.clone();
+    let event_task = tokio::spawn(async move {
+        run_client_event_forwarder(
+            event_ctx.clone(),
+            event_principal,
+            event_ctx.subscribe_global(),
+            event_cmd_rx,
+            event_executor_tx,
+            event_writer_tx,
+        )
+        .await;
+        Ok::<(), anyhow::Error>(())
+    });
     let executor_task = tokio::spawn(run_client_executor(
         ctx,
         principal,
@@ -3207,23 +3250,55 @@ where
         writer_tx,
     ));
 
-    tokio::pin!(reader_task);
-    tokio::pin!(writer_task);
-    tokio::pin!(event_task);
-    tokio::pin!(executor_task);
+    let mut reader_task = reader_task;
+    let mut writer_task = writer_task;
+    let mut event_task = event_task;
+    let mut executor_task = executor_task;
 
-    tokio::select! {
-        _ = &mut reader_task => {}
-        _ = &mut writer_task => {}
-        _ = &mut event_task => {}
-        _ = &mut executor_task => {}
-    }
+    let completed = select_client_task(
+        &mut reader_task,
+        &mut writer_task,
+        &mut event_task,
+        &mut executor_task,
+    )
+    .await;
 
     reader_task.abort();
     writer_task.abort();
     event_task.abort();
     executor_task.abort();
+    completed?;
     Ok(())
+}
+
+async fn select_client_task(
+    reader: &mut tokio::task::JoinHandle<Result<()>>,
+    writer: &mut tokio::task::JoinHandle<Result<()>>,
+    event: &mut tokio::task::JoinHandle<Result<()>>,
+    executor: &mut tokio::task::JoinHandle<Result<()>>,
+) -> Result<()> {
+    tokio::select! {
+        biased;
+        result = executor => flatten_client_task(result, "client executor task", false),
+        result = reader => flatten_client_task(result, "client reader task", true),
+        result = writer => flatten_client_task(result, "client writer task", false),
+        result = event => flatten_client_task(result, "client event task", false),
+    }
+}
+
+fn flatten_client_task(
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+    label: &str,
+    clean_exit_is_normal: bool,
+) -> Result<()> {
+    let result = result
+        .with_context(|| format!("{label} join failed"))?
+        .with_context(|| format!("{label} failed"));
+    match result {
+        Ok(()) if clean_exit_is_normal => Ok(()),
+        Ok(()) => anyhow::bail!("{label} ended unexpectedly"),
+        Err(error) => Err(error),
+    }
 }
 
 enum ClientExecutorInput {
@@ -3278,7 +3353,8 @@ async fn run_client_reader<R>(
     executor_tx: mpsc::Sender<ClientExecutorInput>,
     writer_tx: mpsc::Sender<ClientWriterMessage>,
     initial_event_after_negotiation: Option<proto::Event>,
-) where
+) -> Result<()>
+where
     R: AsyncRead + Unpin + Send + 'static,
 {
     let mut initial_event_after_negotiation = initial_event_after_negotiation;
@@ -3291,7 +3367,7 @@ async fn run_client_reader<R>(
                         .await
                         .is_err()
                     {
-                        return;
+                        anyhow::bail!("client reader lost writer control channel");
                     }
                     if let Some(event) = initial_event_after_negotiation.take()
                         && writer_tx
@@ -3299,7 +3375,7 @@ async fn run_client_reader<R>(
                             .await
                             .is_err()
                     {
-                        return;
+                        anyhow::bail!("client reader lost writer event channel");
                     }
                 }
                 if executor_tx
@@ -3307,14 +3383,11 @@ async fn run_client_reader<R>(
                     .await
                     .is_err()
                 {
-                    return;
+                    anyhow::bail!("client reader lost executor channel");
                 }
             }
-            Ok(None) => return,
-            Err(e) => {
-                tracing::debug!(error = ?e, "envelope decode failed; closing client");
-                return;
-            }
+            Ok(None) => return Ok(()),
+            Err(error) => return Err(error.context("decoding client envelope")),
         }
     }
 }
@@ -3470,7 +3543,7 @@ async fn run_client_executor(
     mut executor_rx: mpsc::Receiver<ClientExecutorInput>,
     event_cmd_tx: mpsc::Sender<ClientEventCommand>,
     writer_tx: mpsc::Sender<ClientWriterMessage>,
-) {
+) -> Result<()> {
     let mut state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         principal,
@@ -3491,7 +3564,7 @@ async fn run_client_executor(
                     if let Err(error) = attachments::drain_client_attachment_ownership(&mut state, &ctx, "disconnect").await {
                         tracing::warn!(message=%error.message,"attachment ownership drain failed during disconnect; durable charges remain for retry recovery");
                     }
-                    return;
+                    return Ok(());
                 };
                 match input {
                     ClientExecutorInput::Frame(frame) => {
@@ -3504,9 +3577,9 @@ async fn run_client_executor(
                             &writer_tx,
                             &mut concurrent,
                         )
-                        .await
+                        .await?
                         {
-                            return;
+                            return Ok(());
                         }
                     }
                     ClientExecutorInput::SessionEventsClosed => {
@@ -3527,7 +3600,7 @@ async fn handle_client_frame(
     event_cmd_tx: &mpsc::Sender<ClientEventCommand>,
     writer_tx: &mpsc::Sender<ClientWriterMessage>,
     concurrent: &mut ConcurrentRequestRuntime,
-) -> bool {
+) -> Result<bool> {
     match frame {
         RecvFrame::Envelope(env) => handle_envelope(
             *env,
@@ -3539,7 +3612,7 @@ async fn handle_client_frame(
             concurrent,
         )
         .await
-        .is_ok(),
+        .map(|()| true),
         RecvFrame::VersionMismatch { v, kind, id } => {
             if kind == "req"
                 && let Some(id) = id
@@ -3560,7 +3633,7 @@ async fn handle_client_frame(
                     "closing client after protocol version mismatch"
                 );
             }
-            false
+            Ok(false)
         }
         RecvFrame::Unknown { v, kind, tag, id } => {
             if kind == "req"
@@ -3580,7 +3653,7 @@ async fn handle_client_frame(
                     "dropping unknown protocol frame"
                 );
             }
-            true
+            Ok(true)
         }
     }
 }

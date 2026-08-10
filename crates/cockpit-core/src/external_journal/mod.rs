@@ -31,7 +31,7 @@
 //! projection and integration stay with each consumer.
 
 pub mod capsule;
-mod fsguard;
+pub(crate) mod fsguard;
 pub mod keys;
 pub mod projection;
 pub mod spool;

@@ -1461,6 +1461,705 @@ async fn remote_session_writer_cannot_persist_active_model_as_default() {
 }
 
 #[tokio::test]
+async fn media_security_recovery_denial_precedes_operation_table() {
+    let ctx = test_ctx();
+    let state = MutableClientState::detached_with_principal(
+        ctx.upload_accounting.clone(),
+        remote_principal(),
+        ctx.terminal_host.clone(),
+    );
+    let request = Request::RecoverSecurityBlockedMedia(
+        cockpit_db::media_attachments::RecoverSecurityBlockedMediaV1 {
+            schema_version: 1,
+            kind: "recoverSecurityBlockedMedia".into(),
+            local_request_id: Uuid::now_v7(),
+            owner_principal_digest: super::run_invocation::principal_digest(
+                &ClientPrincipal::owner(),
+            ),
+            attachment_id: Uuid::now_v7(),
+            attachment_version: 1,
+            expected_availability_generation: 1,
+            affected_components: vec![],
+            borrowed_source_evidence_digest: None,
+            disposition:
+                cockpit_db::media_attachments::MediaSecurityRecoveryDisposition::RetainBlocked,
+        },
+    );
+    let error = authorize_request(&request, &state, &ctx).await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::Authorization);
+    let rows: i64 = ctx
+        .db
+        .read(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM media_security_recovery_operations",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+        })
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+
+#[tokio::test]
+async fn media_upload_production_dispatch_cancel_finalize_and_status() {
+    use base64::Engine as _;
+    use cockpit_db::media_attachments::{
+        AppendMediaUploadChunkV1, GetMediaUploadStatusV1, LocalMediaActorRoleV1,
+        LocalMediaMutationPayloadV1, LocalMediaMutationV1, MediaUploadStateDetailV1,
+        RequestedLocalPathMediaKind,
+    };
+    use sha2::{Digest as _, Sha256};
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let mut ctx = test_ctx();
+    let db = ctx.db.clone();
+    Arc::get_mut(&mut ctx).unwrap().media_storage_recovery = Some(Arc::new(
+        crate::media_storage::MediaStorageRecovery::open_or_create(db, &temp.path().join("media"))
+            .unwrap(),
+    ));
+    let (mut state, session_id) = attached_state(&ctx, &project).await;
+    let project_digest = crate::intel::hex_lower(&Sha256::digest(
+        state
+            .attached
+            .as_ref()
+            .unwrap()
+            .handle
+            .project_root
+            .to_str()
+            .unwrap()
+            .as_bytes(),
+    ));
+    let principal = super::run_invocation::principal_digest(&state.principal);
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        1,
+        1,
+        image::Rgba([1, 2, 3, 255]),
+    ))
+    .write_to(&mut encoded, image::ImageFormat::Png)
+    .unwrap();
+    let bytes: &[u8] = Box::leak(encoded.into_inner().into_boxed_slice());
+    let policy = cockpit_config::config::media_budget::MediaResourcePolicy::default();
+    let reservation_digest =
+        crate::media_storage::media_upload_reservation_digest(&policy, bytes.len() as u64).unwrap();
+
+    async fn begin_append(
+        ctx: &Arc<DaemonContext>,
+        state: &mut MutableClientState,
+        session_id: Uuid,
+        project_digest: &str,
+        principal: &str,
+        reservation_digest: &str,
+        bytes: &[u8],
+    ) -> (Uuid, Uuid, u64) {
+        let draft = Uuid::now_v7();
+        let begin = LocalMediaMutationV1 {
+            schema_version: 1,
+            kind: "localMediaMutation".into(),
+            local_operation_id: Uuid::now_v7(),
+            actor_principal_digest: principal.into(),
+            actor_role: LocalMediaActorRoleV1::Owner,
+            payload: LocalMediaMutationPayloadV1::Begin {
+                session_id,
+                canonical_project_digest: project_digest.into(),
+                client_draft_id: draft,
+                media_kind: RequestedLocalPathMediaKind::Image,
+                declared_total_bytes: bytes.len() as u64,
+                reservation_digest: reservation_digest.into(),
+            },
+        };
+        let Response::LocalMediaMutation(began) =
+            handle_request(Request::BeginMediaUpload(begin), state, ctx)
+                .await
+                .unwrap()
+        else {
+            panic!("unexpected begin response")
+        };
+        let upload = began.subject_id;
+        let append = AppendMediaUploadChunkV1 {
+            mutation: LocalMediaMutationV1 {
+                schema_version: 1,
+                kind: "localMediaMutation".into(),
+                local_operation_id: Uuid::now_v7(),
+                actor_principal_digest: principal.into(),
+                actor_role: LocalMediaActorRoleV1::Owner,
+                payload: LocalMediaMutationPayloadV1::Append {
+                    session_id,
+                    canonical_project_digest: project_digest.into(),
+                    client_draft_id: draft,
+                    upload_id: upload,
+                    upload_generation: 1,
+                    chunk_index: 0,
+                    chunk_length: bytes.len() as u32,
+                    chunk_sha256: crate::intel::hex_lower(&Sha256::digest(bytes)),
+                },
+            },
+            data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        };
+        let Response::LocalMediaMutation(appended) =
+            handle_request(Request::AppendMediaUploadChunk(append), state, ctx)
+                .await
+                .unwrap()
+        else {
+            panic!("unexpected append response")
+        };
+        (
+            draft,
+            upload,
+            match appended.transition {
+                cockpit_db::media_attachments::LocalMediaMutationTransitionV1::Upload {
+                    generation_after,
+                    ..
+                } => generation_after,
+                _ => panic!("unexpected append transition"),
+            },
+        )
+    }
+
+    let (cancel_draft, cancel_upload, generation) = begin_append(
+        &ctx,
+        &mut state,
+        session_id,
+        &project_digest,
+        &principal,
+        &reservation_digest,
+        bytes,
+    )
+    .await;
+    let cancel = LocalMediaMutationV1 {
+        schema_version: 1,
+        kind: "localMediaMutation".into(),
+        local_operation_id: Uuid::now_v7(),
+        actor_principal_digest: principal.clone(),
+        actor_role: LocalMediaActorRoleV1::Owner,
+        payload: LocalMediaMutationPayloadV1::Cancel {
+            session_id,
+            canonical_project_digest: project_digest.clone(),
+            client_draft_id: cancel_draft,
+            upload_id: cancel_upload,
+            upload_generation: generation,
+        },
+    };
+    let Response::LocalMediaMutation(cancelled) =
+        handle_request(Request::CancelMediaUpload(cancel.clone()), &mut state, &ctx)
+            .await
+            .unwrap()
+    else {
+        panic!("unexpected cancel response")
+    };
+    let Response::LocalMediaMutation(cancel_replay) =
+        handle_request(Request::CancelMediaUpload(cancel), &mut state, &ctx)
+            .await
+            .unwrap()
+    else {
+        panic!("unexpected cancel replay")
+    };
+    assert_eq!(cancel_replay, cancelled);
+
+    let (draft, upload, generation) = begin_append(
+        &ctx,
+        &mut state,
+        session_id,
+        &project_digest,
+        &principal,
+        &reservation_digest,
+        bytes,
+    )
+    .await;
+    let finalize = LocalMediaMutationV1 {
+        schema_version: 1,
+        kind: "localMediaMutation".into(),
+        local_operation_id: Uuid::now_v7(),
+        actor_principal_digest: principal,
+        actor_role: LocalMediaActorRoleV1::Owner,
+        payload: LocalMediaMutationPayloadV1::Finalize {
+            session_id,
+            canonical_project_digest: project_digest.clone(),
+            client_draft_id: draft,
+            upload_id: upload,
+            upload_generation: generation,
+            chunk_count: 1,
+            total_bytes: bytes.len() as u64,
+            object_sha256: crate::intel::hex_lower(&Sha256::digest(bytes)),
+        },
+    };
+    let Response::LocalMediaMutation(finalized) = handle_request(
+        Request::FinalizeMediaUpload(finalize.clone()),
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap() else {
+        panic!("unexpected finalize response")
+    };
+    let Response::LocalMediaMutation(finalize_replay) =
+        handle_request(Request::FinalizeMediaUpload(finalize), &mut state, &ctx)
+            .await
+            .unwrap()
+    else {
+        panic!("unexpected finalize replay")
+    };
+    assert_eq!(finalize_replay, finalized);
+    let Response::MediaUploadStatus(status) = handle_request(
+        Request::GetMediaUploadStatus(GetMediaUploadStatusV1 {
+            schema_version: 1,
+            kind: "getMediaUploadStatus".into(),
+            session_id,
+            canonical_project_digest: project_digest.clone(),
+            client_draft_id: draft,
+            upload_id: upload,
+            upload_generation: generation + 1,
+        }),
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap() else {
+        panic!("unexpected upload status")
+    };
+    assert!(matches!(
+        &status.detail,
+        MediaUploadStateDetailV1::Materialized {
+            attachment_version: 1,
+            ..
+        }
+    ));
+    let cockpit_db::media_attachments::MediaUploadStateDetailV1::Materialized {
+        attachment_id,
+        attachment_version,
+        ..
+    } = status.detail
+    else {
+        unreachable!()
+    };
+    let Response::MediaAttachmentStatus(attachment_status) = handle_request(
+        Request::GetMediaAttachmentStatus(
+            cockpit_db::media_attachments::GetMediaAttachmentStatusV1 {
+                schema_version: 1,
+                kind: "getMediaAttachmentStatus".into(),
+                session_id,
+                canonical_project_digest: project_digest.clone(),
+                attachment_id,
+            },
+        ),
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap() else {
+        panic!("unexpected attachment status")
+    };
+    let cockpit_db::media_attachments::MediaAttachmentStatusDetailV1::Ready {
+        preview: Some(summary),
+        ..
+    } = attachment_status.detail
+    else {
+        panic!("ready image preview missing")
+    };
+    let Response::MediaAttachmentPreview(preview) = handle_request(
+        Request::GetMediaAttachmentPreview(
+            cockpit_db::media_attachments::GetMediaAttachmentPreviewV1 {
+                schema_version: 1,
+                kind: "getMediaAttachmentPreview".into(),
+                session_id,
+                canonical_project_digest: project_digest,
+                attachment_id,
+                attachment_version,
+                availability_generation: attachment_status.availability_generation,
+                preview_generation: summary.generation,
+                preview_checksum: summary.checksum,
+            },
+        ),
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap() else {
+        panic!("unexpected preview response")
+    };
+    assert_eq!(preview.content_type, "image/png");
+    assert_eq!(preview.cache_control, "no-store, private");
+    assert_eq!(preview.x_content_type_options, "nosniff");
+    assert_eq!(preview.content_length, preview.body.len() as u64);
+    assert!(preview.body.starts_with(b"\x89PNG\r\n\x1a\n"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn https_media_ingest_daemon_dispatch_is_owner_bound_ready_and_replayable() {
+    use cockpit_db::media_attachments::{
+        HttpsRetentionResultV1, RequestedLocalPathMediaKind, RetainHttpsMediaV1,
+    };
+    use sha2::{Digest as _, Sha256};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Fetcher {
+        calls: AtomicUsize,
+        bytes: Vec<u8>,
+    }
+    #[async_trait::async_trait]
+    impl crate::media_https::HttpsMediaFetcher for Fetcher {
+        async fn fetch(
+            &self,
+            _: &str,
+            sink: &mut tokio::fs::File,
+            _: &crate::media_https::HttpsFetchLimits,
+        ) -> anyhow::Result<crate::media_https::RetainedHttpsFetchEvidence> {
+            use tokio::io::AsyncWriteExt as _;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            sink.write_all(&self.bytes).await?;
+            Ok(crate::media_https::RetainedHttpsFetchEvidence {
+                byte_length: self.bytes.len() as u64,
+                sha256: crate::intel::hex_lower(&Sha256::digest(&self.bytes)),
+                provenance: crate::media_https::RedactedHttpsProvenance {
+                    redirect_classes: vec![],
+                    path_segment_count: 1,
+                    safe_basename: Some("image.png".into()),
+                },
+            })
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        2,
+        2,
+        image::Rgba([1, 2, 3, 255]),
+    ))
+    .write_to(&mut png, image::ImageFormat::Png)
+    .unwrap();
+    let fetcher = Arc::new(Fetcher {
+        calls: AtomicUsize::new(0),
+        bytes: png.into_inner(),
+    });
+    let mut ctx = test_ctx();
+    let db = ctx.db.clone();
+    Arc::get_mut(&mut ctx).unwrap().media_storage_recovery = Some(Arc::new(
+        crate::media_storage::MediaStorageRecovery::open_or_create(
+            db.clone(),
+            &temp.path().join("media"),
+        )
+        .unwrap()
+        .with_https_fetcher(fetcher.clone()),
+    ));
+    let (mut state, session_id) = attached_state(&ctx, &project).await;
+    let project_digest = crate::intel::hex_lower(&Sha256::digest(
+        state
+            .attached
+            .as_ref()
+            .unwrap()
+            .handle
+            .project_root
+            .to_str()
+            .unwrap()
+            .as_bytes(),
+    ));
+    let request = RetainHttpsMediaV1 {
+        schema_version: 1,
+        kind: "retainHttpsMedia".into(),
+        local_operation_id: Uuid::now_v7(),
+        owner_principal_digest: super::run_invocation::principal_digest(&state.principal),
+        session_id,
+        canonical_project_digest: project_digest,
+        client_draft_id: Uuid::now_v7(),
+        requested_media_kind: RequestedLocalPathMediaKind::Image,
+        url: "https://media.example.test/image.png?secret=redacted".into(),
+    };
+    let first = dispatch_authz_request_after(
+        &ctx,
+        ClientPrincipal::owner(),
+        vec![Request::Attach {
+            session_id: Some(session_id),
+            since_seq: None,
+            project_root: Some(project.to_string_lossy().into_owned()),
+            initial_model: None,
+            no_sandbox: false,
+            interactive: true,
+            model_override: None,
+            client_protocol_version: proto::PROTOCOL_VERSION,
+            env_snapshot: None,
+            env_policy: EnvDriftPolicy::Daemon,
+        }],
+        None,
+        None,
+        Request::RetainHttpsMedia(request.clone()),
+    )
+    .await
+    .unwrap();
+    let Response::RetainedHttpsMedia(receipt) = first else {
+        panic!("unexpected response")
+    };
+    let attachment = match &receipt.result {
+        HttpsRetentionResultV1::Retained { attachment_id, .. } => *attachment_id,
+        _ => panic!("rejected"),
+    };
+    assert_eq!(
+        db.read(move |conn| Ok(conn.query_row(
+            "SELECT availability FROM media_attachments WHERE attachment_id=?1",
+            [attachment.to_string()],
+            |r| r.get::<_, String>(0)
+        )?))
+        .await
+        .unwrap(),
+        "ready"
+    );
+    let replay = handle_request(Request::RetainHttpsMedia(request.clone()), &mut state, &ctx)
+        .await
+        .unwrap();
+    let Response::RetainedHttpsMedia(replay) = replay else {
+        panic!("unexpected replay")
+    };
+    assert_eq!(replay.receipt_id, receipt.receipt_id);
+    assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+    let mut wrong = request;
+    wrong.session_id = Uuid::now_v7();
+    let denied = handle_request(Request::RetainHttpsMedia(wrong), &mut state, &ctx)
+        .await
+        .unwrap_err();
+    assert_eq!(denied.message, "media_attachment_unavailable");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn owner_local_path_registration_dispatch_replays_before_path_and_hides_authority() {
+    use cockpit_db::media_attachments::{
+        LocalPathRegistrationResultV1, MediaAttachmentComponent, MediaAvailability,
+        MediaSecurityRecoveryDisposition, MediaSecurityRecoveryOutcome,
+        RecoverSecurityBlockedComponentV1, RecoverSecurityBlockedMediaV1, RegisterLocalPathMediaV1,
+        RequestedLocalPathMediaKind, VerifiedBlockedComponent,
+    };
+    use sha2::{Digest as _, Sha256};
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(project.join("source.bin"), b"daemon held source").unwrap();
+    let mut ctx = test_ctx();
+    let db = ctx.db.clone();
+    Arc::get_mut(&mut ctx).unwrap().media_storage_recovery = Some(Arc::new(
+        crate::media_storage::MediaStorageRecovery::open_or_create(db, &temp.path().join("media"))
+            .unwrap(),
+    ));
+    let (mut state, session_id) = attached_state(&ctx, &project).await;
+    let project_text = state
+        .attached
+        .as_ref()
+        .unwrap()
+        .handle
+        .project_root
+        .to_str()
+        .unwrap();
+    let project_digest = crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes()));
+    let request = RegisterLocalPathMediaV1 {
+        schema_version: 1,
+        kind: "registerLocalPathMedia".into(),
+        local_operation_id: Uuid::now_v7(),
+        owner_principal_digest: super::run_invocation::principal_digest(&state.principal),
+        session_id,
+        canonical_project_digest: project_digest,
+        client_draft_id: Uuid::now_v7(),
+        requested_media_kind: RequestedLocalPathMediaKind::Image,
+        path: "source.bin".into(),
+    };
+    let first = handle_request(
+        Request::RegisterLocalPathMedia(request.clone()),
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let Response::LocalPathMediaRegistration(first_receipt) = first else {
+        panic!("unexpected registration response")
+    };
+    let LocalPathRegistrationResultV1::Registered {
+        attachment_id,
+        reservation_id,
+        source_evidence_digest,
+        ..
+    } = first_receipt.result.clone()
+    else {
+        panic!("registration rejected")
+    };
+    let status = handle_request(
+        Request::GetMediaAttachmentStatus(
+            cockpit_db::media_attachments::GetMediaAttachmentStatusV1 {
+                schema_version: 1,
+                kind: "getMediaAttachmentStatus".into(),
+                session_id,
+                canonical_project_digest: request.canonical_project_digest.clone(),
+                attachment_id,
+            },
+        ),
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let Response::MediaAttachmentStatus(status) = status else {
+        panic!("unexpected status response")
+    };
+    assert_eq!(status.attachment_id, attachment_id);
+    assert_eq!(status.reference_generation, 1);
+    assert!(status.can_discard);
+    assert!(!status.preview_available);
+    assert!(matches!(
+        status.detail,
+        cockpit_db::media_attachments::MediaAttachmentStatusDetailV1::Registered
+    ));
+    let storage_id = Uuid::now_v7();
+    let component_id = Uuid::now_v7();
+    let component_path = temp.path().join("media").join(storage_id.to_string());
+    std::fs::write(&component_path, b"derived bytes").unwrap();
+    std::fs::set_permissions(&component_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let metadata = std::fs::metadata(&component_path).unwrap();
+    let mut identity_hash = Sha256::new();
+    identity_hash.update(b"unix-file-identity-v1");
+    identity_hash.update(metadata.dev().to_be_bytes());
+    identity_hash.update(metadata.ino().to_be_bytes());
+    let identity = crate::intel::hex_lower(&identity_hash.finalize());
+    let checksum = crate::intel::hex_lower(&Sha256::digest(b"derived bytes"));
+    let component = MediaAttachmentComponent {
+        component_id,
+        attachment_id,
+        attachment_version: 1,
+        component_kind: "image_model".into(),
+        storage_id,
+        lifecycle_state: "security_blocked".into(),
+        component_generation: 1,
+        stable_identity_digest: identity.clone(),
+        byte_length: 13,
+        sha256: checksum.clone(),
+        reservation_id,
+        created_at_unix_ms: 1,
+        updated_at_unix_ms: 1,
+    };
+    let inserted = component.clone();
+    ctx.db
+        .transaction(move |conn| {
+            cockpit_db::Db::transition_media_attachment_conn(
+                conn,
+                attachment_id,
+                1,
+                1,
+                MediaAvailability::SecurityBlocked,
+                2,
+            )?;
+            cockpit_db::Db::insert_media_attachment_component_conn(conn, &inserted)
+        })
+        .await
+        .unwrap();
+    let proof = VerifiedBlockedComponent {
+        component_id,
+        component_kind: "image_model".into(),
+        component_generation: 1,
+        stable_identity_digest: identity,
+        byte_length: 13,
+        sha256: checksum,
+        reservation_id: component.reservation_id,
+        deletion_evidence_digest: None,
+    };
+    fn field(h: &mut Sha256, b: &[u8]) {
+        h.update((b.len() as u64).to_be_bytes());
+        h.update(b)
+    }
+    let mut evidence = Sha256::new();
+    field(&mut evidence, proof.component_id.as_bytes());
+    field(&mut evidence, proof.component_kind.as_bytes());
+    field(&mut evidence, &proof.component_generation.to_be_bytes());
+    field(&mut evidence, proof.stable_identity_digest.as_bytes());
+    field(&mut evidence, &proof.byte_length.to_be_bytes());
+    field(&mut evidence, proof.sha256.as_bytes());
+    field(&mut evidence, proof.reservation_id.as_bytes());
+    field(&mut evidence, b"");
+    let recorded = crate::intel::hex_lower(&evidence.finalize());
+    let recovery = RecoverSecurityBlockedMediaV1 {
+        schema_version: 1,
+        kind: "recoverSecurityBlockedMedia".into(),
+        local_request_id: Uuid::now_v7(),
+        owner_principal_digest: super::run_invocation::principal_digest(&state.principal),
+        attachment_id,
+        attachment_version: 1,
+        expected_availability_generation: 2,
+        affected_components: vec![RecoverSecurityBlockedComponentV1 {
+            component_id,
+            component_kind: "image_model".into(),
+            component_generation: 1,
+            recorded_evidence_digest: recorded,
+        }],
+        borrowed_source_evidence_digest: Some(source_evidence_digest),
+        disposition: MediaSecurityRecoveryDisposition::ResumeVerifiedCleanup,
+    };
+    let recovered = handle_request(
+        Request::RecoverSecurityBlockedMedia(recovery.clone()),
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let Response::MediaOwnerRecovery(recovery_receipt) = recovered else {
+        panic!("unexpected recovery response")
+    };
+    assert_eq!(
+        recovery_receipt.outcome,
+        MediaSecurityRecoveryOutcome::CleanupResumed
+    );
+    let replayed = handle_request(
+        Request::RecoverSecurityBlockedMedia(recovery),
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let Response::MediaOwnerRecovery(replayed_receipt) = replayed else {
+        panic!("unexpected recovery replay")
+    };
+    assert_eq!(replayed_receipt, recovery_receipt);
+    std::fs::remove_file(project.join("source.bin")).unwrap();
+    let replay = handle_request(
+        Request::RegisterLocalPathMedia(request.clone()),
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let Response::LocalPathMediaRegistration(replay_receipt) = replay else {
+        panic!("unexpected replay response")
+    };
+    assert_eq!(replay_receipt, first_receipt);
+    let mut changed = request.clone();
+    changed.requested_media_kind = RequestedLocalPathMediaKind::Audio;
+    assert_eq!(
+        handle_request(Request::RegisterLocalPathMedia(changed), &mut state, &ctx)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
+    let mut detached = MutableClientState::detached_for_test();
+    let detached_error = handle_request(
+        Request::RegisterLocalPathMedia(request.clone()),
+        &mut detached,
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    let mut wrong = request;
+    wrong.session_id = Uuid::now_v7();
+    let wrong_error = handle_request(Request::RegisterLocalPathMedia(wrong), &mut state, &ctx)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (detached_error.code, &detached_error.message),
+        (wrong_error.code, &wrong_error.message)
+    );
+    assert_eq!(wrong_error.message, "media_attachment_unavailable");
+}
+
+#[tokio::test]
 async fn attach_model_recovery_requires_writer_for_cold_and_live_sessions() {
     for live in [false, true] {
         let tmp = tempfile::tempdir().unwrap();
@@ -3728,9 +4427,9 @@ fn mutating_dispatch_happy_cases() -> Vec<MutatingDispatchCase> {
     mutating_dispatch_case_list()
         .into_iter()
         .filter(|case| {
-            dispatch_matrix_rows().into_iter().any(|row| {
-                row.kind == case.kind && row.class == DispatchMatrixClass::Mutating
-            })
+            dispatch_matrix_rows()
+                .into_iter()
+                .any(|row| row.kind == case.kind && row.class == DispatchMatrixClass::Mutating)
         })
         .collect()
 }
@@ -4545,6 +5244,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("get_app_flag"),
         authz_owner_only("mark_app_flag_seen"),
         authz_owner_only("set_workspace_trust"),
+        authz_owner_only("recover_security_blocked_media"),
         authz_project_read("guidance_estimate"),
         authz_owner_only("stop_daemon"),
         authz_owner_only("restart_if_idle"),
@@ -4605,7 +5305,7 @@ async fn dispatch_authz_request_after(
 ) -> std::result::Result<Response, ErrorPayload> {
     let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
     let mut client = ProtoStream::new(client_stream);
-    let server = tokio::spawn(handle_client_transport_as(
+    let mut server = tokio::spawn(handle_client_transport_as(
         server_stream,
         ctx.clone(),
         principal,
@@ -4643,13 +5343,39 @@ async fn dispatch_authz_request_after(
         .send(&Envelope::request(id, request))
         .await
         .expect("send dispatch request");
-    let result = recv_dispatch_matrix_response(&mut client, id).await;
+    let (result, server_ended) =
+        recv_dispatch_matrix_response_or_server(&mut client, id, &mut server).await;
     drop(client);
-    server
-        .await
-        .expect("server task joins")
-        .expect("server task succeeds");
+    if !server_ended {
+        server
+            .await
+            .expect("server task joins")
+            .expect("server task succeeds");
+    }
     result
+}
+
+#[cfg(unix)]
+async fn recv_dispatch_matrix_response_or_server<S>(
+    client: &mut ProtoStream<S>,
+    request_id: Uuid,
+    server: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+) -> (std::result::Result<Response, ErrorPayload>, bool)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    tokio::select! {
+        biased;
+        joined = server => {
+            let message = match joined {
+                Ok(Ok(())) => "daemon server ended unexpectedly before response".to_string(),
+                Ok(Err(error)) => format!("daemon server failed before response: {error:#}"),
+                Err(error) => format!("daemon server task failed before response: {error}"),
+            };
+            (Err(ErrorPayload { code: ErrorCode::Internal, message }), true)
+        }
+        response = recv_dispatch_matrix_response(client, request_id) => (response, false),
+    }
 }
 
 #[cfg(unix)]
@@ -5666,9 +6392,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             range: proto::StatsRange::Last7Days,
             by_role: false,
         },
-        "get_startup_disclosures" => Request::GetStartupDisclosures {
-            project_root: root,
-        },
+        "get_startup_disclosures" => Request::GetStartupDisclosures { project_root: root },
         "get_app_flag" => Request::GetAppFlag {
             key: proto::AppFlagKey::DaemonAutostartNotice,
         },
@@ -10704,11 +11428,28 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             ($($variant:ident),* $(,)?) => {
                 fn request_variant_name(request: &Request) -> &'static str {
                     match request {
+                        Request::RecoverSecurityBlockedMedia(..) => "RecoverSecurityBlockedMedia",
+                        Request::RegisterLocalPathMedia(..) => "RegisterLocalPathMedia",
+                        Request::RetainHttpsMedia(..) => "RetainHttpsMedia",
+                        Request::GetMediaAttachmentStatus(..) => "GetMediaAttachmentStatus",
+                        Request::GetMediaAttachmentPreview(..) => "GetMediaAttachmentPreview",
+                        Request::BeginMediaUpload(..) => "BeginMediaUpload",
+                        Request::AppendMediaUploadChunk(..) => "AppendMediaUploadChunk",
+                        Request::CancelMediaUpload(..) => "CancelMediaUpload",
+                        Request::GetMediaUploadStatus(..) => "GetMediaUploadStatus",
+                        Request::FinalizeMediaUpload(..) => "FinalizeMediaUpload",
+                        Request::DiscardUnreferencedMediaAttachment(..) => "DiscardUnreferencedMediaAttachment",
                         $(Request::$variant { .. } => stringify!($variant),)*
                         Request::Unknown => "Unknown",
                     }
                 }
-                const REQUEST_VARIANT_NAMES: &[&str] = &[$(stringify!($variant)),*, "Unknown"];
+                const REQUEST_VARIANT_NAMES: &[&str] = &[
+                    "RecoverSecurityBlockedMedia", "RegisterLocalPathMedia", "RetainHttpsMedia",
+                    "GetMediaAttachmentStatus", "GetMediaAttachmentPreview", "BeginMediaUpload",
+                    "AppendMediaUploadChunk", "CancelMediaUpload", "GetMediaUploadStatus",
+                    "FinalizeMediaUpload", "DiscardUnreferencedMediaAttachment",
+                    $(stringify!($variant)),*, "Unknown"
+                ];
             };
         }
     request_variants!(
@@ -11160,14 +11901,7 @@ async fn image_submission_exact_retry_case() {
         panic!("expected queued first submission");
     };
     assert_eq!(first.id, client_submission_id);
-    assert!(!state.ready_attachments.contains_key(&image_ref.id));
-    assert_eq!(
-        crate::sync::lock_or_recover(&state.upload_accounting)
-            .consumed_message_attachments
-            .get(&image_ref.id)
-            .map(|consumed| consumed.client_submission_id),
-        Some(client_submission_id)
-    );
+    assert!(state.ready_attachments.contains_key(&image_ref.id));
 
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
@@ -11185,41 +11919,6 @@ async fn image_submission_exact_retry_case() {
     })
     .await
     .expect("the accepted submission becomes durable");
-    // Simulate either consumed-cache TTL expiry or a daemon process restart.
-    // The exact wire fingerprint is durable, so the retry must be acknowledged
-    // before dispatch needs the now-unavailable attachment bytes.
-    crate::sync::lock_or_recover(&state.upload_accounting)
-        .consumed_message_attachments
-        .clear();
-
-    // Drop the entire per-client attachment state, then reconnect. Neither the
-    // old client nor the daemon replay cache has the bytes now; the durable
-    // wire receipt alone must acknowledge the exact request.
-    drop(state);
-    let mut state = MutableClientState::detached_with_principal(
-        ctx.upload_accounting.clone(),
-        ClientPrincipal::owner(),
-        ctx.terminal_host.clone(),
-    );
-    handle_request(
-        Request::Attach {
-            session_id: Some(session_id),
-            since_seq: None,
-            project_root: Some(project.path().to_string_lossy().into_owned()),
-            initial_model: None,
-            no_sandbox: true,
-            interactive: true,
-            model_override: None,
-            client_protocol_version: proto::PROTOCOL_VERSION,
-            env_snapshot: None,
-            env_policy: EnvDriftPolicy::Daemon,
-        },
-        &mut state,
-        &ctx,
-    )
-    .await
-    .expect("reconnect to live worker");
-
     let retry = handle_request(
         request(client_submission_id, "inspect this image"),
         &mut state,
@@ -11259,7 +11958,7 @@ async fn image_submission_exact_retry_case() {
     .await
     .expect("same bytes under a fresh ref dedupe by content");
     assert!(matches!(reuploaded, Response::UserMessageQueued { .. }));
-    assert!(!state.ready_attachments.contains_key(&reuploaded_ref.id));
+    assert!(state.ready_attachments.contains_key(&reuploaded_ref.id));
 
     let conflict = handle_request(
         request(client_submission_id, "different payload"),
@@ -11271,15 +11970,14 @@ async fn image_submission_exact_retry_case() {
     assert_eq!(conflict.code, ErrorCode::BadRequest);
     assert!(conflict.message.contains("different payload"));
 
-    let consumed = handle_request(
+    let reused = handle_request(
         request(Uuid::new_v4(), "inspect this image"),
         &mut state,
         &ctx,
     )
     .await
-    .expect_err("a consumed ref must not be reusable by a new submission");
-    assert_eq!(consumed.code, ErrorCode::BadRequest);
-    assert!(consumed.message.contains("already consumed"));
+    .expect("one immutable attachment version is reusable by another submission");
+    assert!(matches!(reused, Response::UserMessageQueued { .. }));
 
     let user_messages = ctx
         .db
@@ -11289,7 +11987,7 @@ async fn image_submission_exact_retry_case() {
         .into_iter()
         .filter(|event| event.kind == "user_message")
         .count();
-    assert_eq!(user_messages, 1, "exact retry must not duplicate inference");
+    assert_eq!(user_messages, 2, "exact retry must not duplicate inference");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -11335,20 +12033,13 @@ async fn ambiguous_image_submission_binds_ref_to_first_uuid() {
     };
     assert_eq!(submission.client_submissions[0].id, first_id);
 
-    // Dropping the worker response after delivery creates a genuinely
-    // ambiguous outcome: dispatch cannot know whether the worker accepted and
-    // durably recorded the request. The image ref must remain bound.
+    // Dropping the worker response makes only this submission outcome
+    // ambiguous. It never grants exclusive ownership of immutable media.
     drop(respond_to);
     let (mut state, result) = first.await.unwrap();
     let error = result.expect_err("lost worker response is ambiguous");
     assert_eq!(error.code, ErrorCode::Internal);
-    assert_eq!(
-        crate::sync::lock_or_recover(&state.upload_accounting)
-            .consumed_message_attachments
-            .get(&image_ref.id)
-            .map(|consumed| consumed.client_submission_id),
-        Some(first_id)
-    );
+    assert!(state.ready_attachments.contains_key(&image_ref.id));
 
     let competing_ctx = ctx.clone();
     let competing_request = request(Uuid::new_v4());
@@ -11366,17 +12057,31 @@ async fn ambiguous_image_submission_binds_ref_to_first_uuid() {
     respond_to
         .send(Ok(UserMessageProbeResult::Unknown))
         .unwrap();
+    let SessionWork::UserMessage {
+        submission,
+        respond_to,
+    } = work_rx
+        .recv()
+        .await
+        .expect("competing request reaches worker")
+    else {
+        panic!("expected competing UserMessage work");
+    };
+    assert_eq!(submission.images, vec![sample_png()]);
+    let competing_id = submission.client_submissions[0].id;
+    let item = proto::QueueItem {
+        id: competing_id,
+        status: proto::QueueItemStatus::Folding,
+        text: submission.text.clone(),
+        display_text: submission.display_text.clone(),
+        target: proto::QueueTarget::default(),
+    };
+    respond_to.send(Ok((item.clone(), vec![item]))).unwrap();
     let (mut state, competing) = competing.await.unwrap();
-    let competing =
-        competing.expect_err("competing UUID must not reuse an ambiguously delivered ref");
-    assert_eq!(competing.code, ErrorCode::BadRequest);
-    assert!(competing.message.contains("already consumed"));
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(50), work_rx.recv())
-            .await
-            .is_err(),
-        "competing UUID must be rejected before worker delivery"
-    );
+    assert!(matches!(
+        competing.unwrap(),
+        Response::UserMessageQueued { .. }
+    ));
 
     let retry_ctx = ctx.clone();
     let retry_request = request(first_id);
@@ -11420,37 +12125,38 @@ async fn ambiguous_image_submission_binds_ref_to_first_uuid() {
 }
 
 #[tokio::test]
-async fn attachment_upload_consumes_image_refs_exactly_once() {
+async fn attachment_upload_reuses_one_version_for_distinct_committed_references() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, session_id) = attached_state(&ctx, tmp.path()).await;
     let png = sample_png();
     let image_ref = finish_upload_for(&mut state, &png).await;
 
-    let images = consume_image_refs(&mut state, session_id, std::slice::from_ref(&image_ref))
-        .expect("first consume");
-    assert_eq!(images, vec![png]);
-
-    let err = consume_image_refs(&mut state, session_id, &[image_ref])
-        .expect_err("second consume must fail");
-    assert_eq!(err.code, ErrorCode::BadRequest);
-    assert!(err.message.contains("already consumed"));
+    let first = claim_message_image_refs(
+        &mut state,
+        session_id,
+        Uuid::new_v4(),
+        std::slice::from_ref(&image_ref),
+    )
+    .expect("first reference");
+    let second = claim_message_image_refs(
+        &mut state,
+        session_id,
+        Uuid::new_v4(),
+        std::slice::from_ref(&image_ref),
+    )
+    .expect("second distinct reference");
+    assert_eq!(first, vec![png.clone()]);
+    assert_eq!(second, vec![png]);
+    assert!(state.ready_attachments.contains_key(&image_ref.id));
 }
 
 #[tokio::test]
-async fn consumed_image_ref_ttl_starts_when_submission_claims_it() {
+async fn acquiring_image_ref_does_not_start_or_refresh_transport_ttl() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, session_id) = attached_state(&ctx, tmp.path()).await;
     let image_ref = finish_upload_for(&mut state, &sample_png()).await;
-    let ttl = std::time::Duration::from_secs(proto::PENDING_ATTACHMENT_TTL_SECS);
-    state
-        .ready_attachments
-        .get_mut(&image_ref.id)
-        .expect("ready attachment")
-        .created_at = Instant::now() - ttl + std::time::Duration::from_millis(1);
-
-    let claimed_at = Instant::now();
     let client_submission_id = Uuid::new_v4();
     let images = claim_message_image_refs(
         &mut state,
@@ -11460,21 +12166,27 @@ async fn consumed_image_ref_ttl_starts_when_submission_claims_it() {
     )
     .expect("near-expiry ready ref is claimable");
     assert_eq!(images, vec![sample_png()]);
-    assert!(
-        crate::sync::lock_or_recover(&state.upload_accounting)
-            .consumed_message_attachments
-            .get(&image_ref.id)
-            .expect("claimed attachment retained")
-            .consumed_at
-            >= claimed_at
-    );
-
     prune_expired_attachments(&mut state);
     assert!(
-        crate::sync::lock_or_recover(&state.upload_accounting)
-            .consumed_message_attachments
-            .contains_key(&image_ref.id),
-        "claim refreshes replay TTL even when the upload itself was nearly expired"
+        state.ready_attachments.contains_key(&image_ref.id),
+        "published attachments do not use the pending-upload transport TTL"
+    );
+}
+
+#[tokio::test]
+async fn disconnect_drain_preserves_session_owned_published_attachment() {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
+    let image_ref = finish_upload_for(&mut state, &sample_png()).await;
+
+    drain_client_attachment_ownership(&mut state, &ctx, "disconnect")
+        .await
+        .unwrap();
+
+    assert!(
+        state.ready_attachments.contains_key(&image_ref.id),
+        "disconnect cannot exercise durable attachment cleanup authority"
     );
 }
 
@@ -13597,7 +14309,7 @@ async fn serialized_requests_apply_in_receipt_order() {
     assert!(saw_set_ack);
     assert!(saw_message);
     drop(executor_tx);
-    executor.await.unwrap();
+    executor.await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -13656,7 +14368,7 @@ async fn concurrent_requests_may_complete_out_of_order() {
         other => panic!("expected slow response, got {other:?}"),
     }
     drop(executor_tx);
-    executor.await.unwrap();
+    executor.await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -13722,7 +14434,7 @@ async fn slow_request_does_not_block_event_forwarding() {
     }
     event_task.abort();
     drop(executor_tx);
-    executor.await.unwrap();
+    executor.await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -13775,7 +14487,7 @@ async fn concurrent_request_panic_yields_internal_error_and_keeps_connection() {
     assert!(saw_panic_error);
     assert!(saw_status);
     drop(executor_tx);
-    executor.await.unwrap();
+    executor.await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -13831,7 +14543,7 @@ async fn blocking_fs_handler_panic_keeps_client_connection() {
     assert!(saw_fs_error);
     assert!(saw_status);
     drop(executor_tx);
-    executor.await.unwrap();
+    executor.await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -14321,6 +15033,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         secure_key: None,
         _secure_key_actor: None,
         external_journal: None,
+        media_storage_recovery: None,
         process_containment: None,
         write_scope: None,
         _process_containment_actor: None,
@@ -14389,6 +15102,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         secure_key: None,
         _secure_key_actor: None,
         external_journal: None,
+        media_storage_recovery: None,
         process_containment: None,
         write_scope: None,
         _process_containment_actor: None,
@@ -15638,6 +16352,77 @@ async fn server_answers_too_new_request_with_protocol_version_error() {
     }
     assert!(client.recv().await.unwrap().is_none());
     server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn client_transport_task_flattener_preserves_inner_error_and_task_context() {
+    let task = tokio::spawn(async { Err::<(), _>(anyhow::anyhow!("forced child failure")) });
+    let error = super::flatten_client_task(task.await, "client fixture task", false).unwrap_err();
+    assert_eq!(
+        format!("{error:#}"),
+        "client fixture task failed: forced child failure"
+    );
+}
+
+#[tokio::test]
+async fn client_transport_only_accepts_clean_reader_exit() {
+    let reader = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
+    super::flatten_client_task(reader.await, "client reader task", true).unwrap();
+
+    for label in [
+        "client writer task",
+        "client event task",
+        "client executor task",
+    ] {
+        let task = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
+        let error = super::flatten_client_task(task.await, label, false).unwrap_err();
+        assert_eq!(error.to_string(), format!("{label} ended unexpectedly"));
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dispatch_helper_reports_server_failure_before_client_eof() {
+    let (_server_stream, client_stream) = tokio::io::duplex(64);
+    let mut client = ProtoStream::new(client_stream);
+    let mut server =
+        tokio::spawn(async { Err::<(), _>(anyhow::anyhow!("forced transport root cause")) });
+    let (result, server_ended) =
+        recv_dispatch_matrix_response_or_server(&mut client, Uuid::now_v7(), &mut server).await;
+    assert!(server_ended);
+    let error = result.unwrap_err();
+    assert_eq!(error.code, ErrorCode::Internal);
+    assert_eq!(
+        error.message,
+        "daemon server failed before response: forced transport root cause"
+    );
+}
+
+#[tokio::test]
+async fn client_transport_executor_error_wins_over_dependent_clean_writer_exit() {
+    let (writer_lifetime, writer_closed) = tokio::sync::oneshot::channel::<()>();
+    let mut executor = tokio::spawn(async move {
+        drop(writer_lifetime);
+        Err::<(), _>(anyhow::anyhow!("forced executor failure"))
+    });
+    let mut writer = tokio::spawn(async move {
+        let _ = writer_closed.await;
+        Ok::<(), anyhow::Error>(())
+    });
+    let mut reader = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
+    let mut event = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
+
+    let error = super::select_client_task(&mut reader, &mut writer, &mut event, &mut executor)
+        .await
+        .unwrap_err();
+    reader.abort();
+    writer.abort();
+    event.abort();
+    executor.abort();
+    assert_eq!(
+        format!("{error:#}"),
+        "client executor task failed: forced executor failure"
+    );
 }
 
 #[cfg(unix)]

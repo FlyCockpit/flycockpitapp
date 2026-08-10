@@ -1453,7 +1453,7 @@ mod tests {
             applied,
             TransactionalRemoteOperationOutcome::Applied(1)
         ));
-        let replay = db
+        let replay: TransactionalRemoteOperationOutcome<()> = db
             .execute_transactional_remote_operation(request(), |_| {
                 panic!("replay must not execute domain closure")
             })
@@ -1569,7 +1569,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let replay = reopened
+        let replay: TransactionalRemoteOperationOutcome<()> = reopened
             .execute_transactional_remote_operation(request(), |_| {
                 panic!("reopen replay must not repeat goal transition")
             })

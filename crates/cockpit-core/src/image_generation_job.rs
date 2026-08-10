@@ -2300,7 +2300,7 @@ impl HeldImageGenerationOutputDirectory {
     ) -> Result<HeldDirectoryEffectOutcome> {
         self.guard.reconcile(recovery)
     }
-    pub fn delete_recovered_publication(
+    fn delete_recovered_publication(
         &self,
         recovery: &HeldDirectoryRecovery,
     ) -> Result<HeldDirectoryEffectOutcome> {

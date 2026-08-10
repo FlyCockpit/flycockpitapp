@@ -1971,6 +1971,54 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn managed_artifact_root_writes_reopens_and_rejects_mutation() {
+        use std::io::{Read as _, Seek as _, Write as _};
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = tempfile::TempDir::new().unwrap();
+        let root = temporary.path().join("managed");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let held = open_image_generation_artifact_root(&root).unwrap();
+        let mut staged = held.create_component_temporary("component.tmp").unwrap();
+        staged.file_mut().write_all(b"canonical-image").unwrap();
+        let sealed = held.seal_component(staged).unwrap();
+        let retained = held
+            .retain_component_noreplace(sealed, "component.bin")
+            .unwrap();
+        let HeldDirectoryEffectOutcome::AppliedDurable(effect) = retained else {
+            panic!("retention was not durable")
+        };
+        let evidence = effect.artifact().clone();
+        let mut reopened = held
+            .open_verified_component("component.bin", &evidence)
+            .unwrap();
+        let mut bytes = Vec::new();
+        reopened.file_mut().read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"canonical-image");
+        reopened.file_mut().rewind().unwrap();
+        assert!(matches!(
+            held.remove_verified_component(reopened).unwrap(),
+            HeldDirectoryEffectOutcome::AppliedDurable(_)
+        ));
+
+        let mut staged = held.create_component_temporary("mutated.tmp").unwrap();
+        staged.file_mut().write_all(b"trusted").unwrap();
+        let sealed = held.seal_component(staged).unwrap();
+        let evidence = sealed.evidence().clone();
+        assert!(matches!(
+            held.retain_component_noreplace(sealed, "mutated.bin")
+                .unwrap(),
+            HeldDirectoryEffectOutcome::AppliedDurable(_)
+        ));
+        std::fs::write(root.join("mutated.bin"), b"changed").unwrap();
+        assert!(
+            held.open_verified_component("mutated.bin", &evidence)
+                .is_err()
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn output_authority_requires_protected_dacl_and_rejects_reparse() {

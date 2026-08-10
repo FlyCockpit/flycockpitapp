@@ -62,6 +62,9 @@ pub struct HeldSealedArtifact {
 }
 
 impl HeldSealedArtifact {
+    pub fn file_mut(&mut self) -> &mut File {
+        &mut self.file
+    }
     pub fn evidence(&self) -> &HeldArtifactEvidence {
         &self.evidence
     }

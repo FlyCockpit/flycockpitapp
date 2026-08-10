@@ -409,28 +409,194 @@ pub(crate) fn verify_private_dacl(path: &Path) -> Result<()> {
             usize::try_from(sddl_len).unwrap_or(0),
         ));
         LocalFree(sddl_ptr.cast());
-        let owner = sddl
-            .strip_prefix("O:")
-            .and_then(|value| value.split_once("D:"))
-            .map(|(owner, _)| owner);
-        let ace_sids = sddl
-            .split(";;FA;;;")
-            .skip(1)
-            .filter_map(|value| value.split(')').next())
-            .collect::<Vec<_>>();
-        let current_user = current_windows_user_sid()?;
-        if !sddl.contains("D:P")
-            || sddl.matches("(A;").count() != 2
-            || owner.is_none()
-            || owner != Some(current_user.as_str())
-            || !ace_sids.contains(&current_user.as_str())
-            || !ace_sids
-                .iter()
-                .any(|sid| *sid == "SY" || *sid == "S-1-5-18")
-        {
-            bail!("private DACL is not protected current-user-and-SYSTEM-only full control");
-        }
+        validate_private_sddl(&sddl)?;
     }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn verify_private_dacl_handle(file: &std::fs::File) -> Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+    use std::ptr;
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn GetSecurityInfo(
+            handle: *mut core::ffi::c_void,
+            object_type: u32,
+            security_information: u32,
+            owner: *mut *mut core::ffi::c_void,
+            group: *mut *mut core::ffi::c_void,
+            dacl: *mut *mut core::ffi::c_void,
+            sacl: *mut *mut core::ffi::c_void,
+            descriptor: *mut *mut core::ffi::c_void,
+        ) -> u32;
+        fn ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor: *mut core::ffi::c_void,
+            revision: u32,
+            security_information: u32,
+            string_descriptor: *mut *mut u16,
+            string_length: *mut u32,
+        ) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LocalFree(memory: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    }
+    const SE_FILE_OBJECT: u32 = 1;
+    const OWNER_SECURITY_INFORMATION: u32 = 1;
+    const DACL_SECURITY_INFORMATION: u32 = 4;
+    let information = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+    let mut descriptor = ptr::null_mut();
+    let result = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            information,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    ensure!(
+        result == 0 && !descriptor.is_null(),
+        "reading held directory security descriptor failed ({result})"
+    );
+    let mut sddl = ptr::null_mut();
+    let mut length = 0_u32;
+    let converted = unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor,
+            1,
+            information,
+            &mut sddl,
+            &mut length,
+        )
+    };
+    unsafe { LocalFree(descriptor) };
+    ensure!(
+        converted != 0 && !sddl.is_null(),
+        "converting held directory security descriptor failed"
+    );
+    let value = String::from_utf16_lossy(unsafe {
+        std::slice::from_raw_parts(sddl, usize::try_from(length).unwrap_or(0))
+    });
+    unsafe { LocalFree(sddl.cast()) };
+    validate_private_sddl(&value)
+}
+
+#[cfg(windows)]
+pub(crate) fn set_private_dacl_handle(file: &std::fs::File) -> Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+    use std::ptr;
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            value: *const u16,
+            revision: u32,
+            descriptor: *mut *mut core::ffi::c_void,
+            length: *mut u32,
+        ) -> i32;
+        fn GetSecurityDescriptorOwner(
+            descriptor: *mut core::ffi::c_void,
+            owner: *mut *mut core::ffi::c_void,
+            defaulted: *mut i32,
+        ) -> i32;
+        fn GetSecurityDescriptorDacl(
+            descriptor: *mut core::ffi::c_void,
+            present: *mut i32,
+            dacl: *mut *mut core::ffi::c_void,
+            defaulted: *mut i32,
+        ) -> i32;
+        fn SetSecurityInfo(
+            handle: *mut core::ffi::c_void,
+            object_type: u32,
+            information: u32,
+            owner: *mut core::ffi::c_void,
+            group: *mut core::ffi::c_void,
+            dacl: *mut core::ffi::c_void,
+            sacl: *mut core::ffi::c_void,
+        ) -> u32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LocalFree(memory: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    }
+    const SE_FILE_OBJECT: u32 = 1;
+    const OWNER_SECURITY_INFORMATION: u32 = 1;
+    const DACL_SECURITY_INFORMATION: u32 = 4;
+    const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
+    let sid = current_windows_user_sid()?;
+    let sddl = format!("O:{sid}D:P(A;;FA;;;{sid})(A;;FA;;;SY)");
+    let wide = sddl.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+    let mut descriptor = ptr::null_mut();
+    ensure!(
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                1,
+                &mut descriptor,
+                ptr::null_mut(),
+            )
+        } != 0,
+        "building private held-artifact DACL failed"
+    );
+    let mut owner = ptr::null_mut();
+    let mut dacl = ptr::null_mut();
+    let mut ignored = 0;
+    let valid = unsafe {
+        GetSecurityDescriptorOwner(descriptor, &mut owner, &mut ignored) != 0
+            && GetSecurityDescriptorDacl(descriptor, &mut ignored, &mut dacl, &mut ignored) != 0
+    };
+    if !valid || owner.is_null() || dacl.is_null() {
+        unsafe { LocalFree(descriptor) };
+        bail!("extracting private held-artifact DACL failed");
+    }
+    let result = unsafe {
+        SetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            owner,
+            ptr::null_mut(),
+            dacl,
+            ptr::null_mut(),
+        )
+    };
+    unsafe { LocalFree(descriptor) };
+    ensure!(
+        result == 0,
+        "setting private held-artifact DACL failed ({result})"
+    );
+    verify_private_dacl_handle(file)
+}
+
+#[cfg(windows)]
+fn validate_private_sddl(sddl: &str) -> Result<()> {
+    let owner = sddl
+        .strip_prefix("O:")
+        .and_then(|value| value.split_once("D:"))
+        .map(|(owner, _)| owner);
+    let ace_sids = sddl
+        .split(";;FA;;;")
+        .skip(1)
+        .filter_map(|value| value.split(')').next())
+        .collect::<Vec<_>>();
+    let current_user = current_windows_user_sid()?;
+    ensure!(
+        sddl.contains("D:P")
+            && sddl.matches("(A;").count() == 2
+            && owner == Some(current_user.as_str())
+            && ace_sids.contains(&current_user.as_str())
+            && ace_sids
+                .iter()
+                .any(|sid| *sid == "SY" || *sid == "S-1-5-18"),
+        "private DACL is not protected current-user-and-SYSTEM-only full control"
+    );
     Ok(())
 }
 

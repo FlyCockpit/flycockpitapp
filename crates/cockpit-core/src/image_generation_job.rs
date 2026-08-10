@@ -19,6 +19,10 @@ use cockpit_db::db::sealed_scope::SealedActionGrantRow;
 use cockpit_db::image_spend::{AttemptMaximum, SpendReservation};
 use cockpit_db::media_attachments::AcquiredMediaComponentLease;
 
+pub use crate::private_fs::held_directory::{
+    HeldArtifactEvidence, HeldDirectoryEffectEvidence, HeldDirectoryEffectOutcome,
+    HeldDirectoryRecovery, HeldSealedArtifact, HeldTemporaryArtifact,
+};
 pub use cockpit_db::image_generation_plan::{
     AttemptPlanV1, CapabilityProvenanceV1, GrantRequirementV1, ImageGenerationPlanV1,
     MAX_IMAGE_GENERATION_ATTEMPTS_PER_SLOT, MAX_IMAGE_GENERATION_DIMENSION,
@@ -405,7 +409,7 @@ impl VerifiedOutputDirectoryAuthority {
 
 #[derive(Debug)]
 pub struct HeldImageGenerationOutputDirectory {
-    guard: crate::external_journal::fsguard::DirGuard,
+    guard: crate::private_fs::held_directory::HeldDirectoryAuthority,
     authority: VerifiedOutputDirectoryAuthority,
 }
 impl HeldImageGenerationOutputDirectory {
@@ -413,7 +417,38 @@ impl HeldImageGenerationOutputDirectory {
         &self.authority
     }
     pub fn path(&self) -> &Path {
-        self.guard.path()
+        self.guard.diagnostic_path()
+    }
+    pub fn create_temporary_exclusive(&self, name: &str) -> Result<HeldTemporaryArtifact> {
+        self.guard.create_file_exclusive(name)
+    }
+    pub fn seal_temporary(&self, temporary: HeldTemporaryArtifact) -> Result<HeldSealedArtifact> {
+        self.guard.seal(temporary)
+    }
+    pub fn publish_temporary_noreplace(
+        &self,
+        temporary: HeldSealedArtifact,
+        output: &str,
+    ) -> Result<HeldDirectoryEffectOutcome> {
+        self.guard.rename_noreplace(temporary, output)
+    }
+    pub fn remove_temporary(
+        &self,
+        temporary: HeldSealedArtifact,
+    ) -> Result<HeldDirectoryEffectOutcome> {
+        self.guard.unlink(temporary)
+    }
+    pub fn reconcile_publication(
+        &self,
+        recovery: &HeldDirectoryRecovery,
+    ) -> Result<HeldDirectoryEffectOutcome> {
+        self.guard.reconcile(recovery)
+    }
+    pub fn delete_recovered_publication(
+        &self,
+        recovery: &HeldDirectoryRecovery,
+    ) -> Result<HeldDirectoryEffectOutcome> {
+        self.guard.delete_recovered_destination(recovery)
     }
 }
 pub fn open_image_generation_output_directory(
@@ -422,12 +457,12 @@ pub fn open_image_generation_output_directory(
     filename_prefix: String,
     extension: String,
 ) -> Result<HeldImageGenerationOutputDirectory> {
-    let guard = crate::external_journal::fsguard::DirGuard::open_root(path, false)
-        .map_err(anyhow::Error::new)?;
-    guard.verify_private().map_err(anyhow::Error::new)?;
-    let parent_identity_digest = guard.stable_identity_digest().map_err(anyhow::Error::new)?;
-    let canonical_destination_digest =
-        digest_fields(&["held-output-directory-v1", &parent_identity_digest]);
+    let guard = crate::private_fs::held_directory::HeldDirectoryAuthority::open_existing(path)?;
+    let parent_identity_digest = guard.identity().stable_digest.clone();
+    let canonical_destination_digest = digest_fields(&[
+        guard.identity().platform,
+        &guard.identity().canonical_binding_digest,
+    ]);
     let authority = VerifiedOutputDirectoryAuthority::from_held_directory(
         canonical_destination_digest,
         parent_identity_digest,

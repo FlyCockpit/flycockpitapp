@@ -4,6 +4,10 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "check-types": "tsc -p tsconfig.json --noEmit"
+  },
   "exports": {
     ".": {
       "default": "./src/index.ts"
@@ -23,6 +27,7 @@
   "devDependencies": {
     "@flycockpit/config": "workspace:*",
     "@types/node": "catalog:",
-    "typescript": "catalog:"
+    "typescript": "catalog:",
+    "vitest": "catalog:"
   }
 }

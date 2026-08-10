@@ -1664,4 +1664,6 @@ export function createEnvelope(id: string, request: ClientRequest): ClientEnvelo
 
 export * from "./remote-admin-passkey";
 export * from "./remote-protocol-id";
+export * from "./remote-signaling-attempt-store";
+export * from "./remote-signaling-payloads";
 export * from "./remote-transport-lanes";

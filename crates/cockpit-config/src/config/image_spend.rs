@@ -27,31 +27,38 @@ pub async fn activate_saved_policy(
             saved_at_ms,
         )
         .await?;
-    let mut current = db
+    let current = db
         .current_image_spend_policy(project_key.clone())
         .await?
         .ok_or_else(|| anyhow::anyhow!("saved image spend policy disappeared"))?;
     debug_assert_eq!(current.policy_version, version);
-    if matches!(current.settings.project, BudgetPolicy::Finite { .. }) {
-        let epoch = current
-            .settings
-            .project_epoch
-            .as_ref()
-            .ok_or_else(|| anyhow::Error::new(BudgetBlockReason::ProjectEpochUnconfigured))?
-            .resolve_epoch(saved_at_ms)
-            .map_err(anyhow::Error::new)?;
-        current.epoch_sequence = Some(
-            db.resolve_image_spend_epoch(
-                project_key,
-                current.epoch_policy_version,
-                epoch.membership_key,
-                epoch.interval_start_ms,
-                saved_at_ms,
-            )
-            .await?,
-        );
+    if matches!(current.settings.project, BudgetPolicy::Finite { .. })
+        && current.epoch_sequence.is_none()
+    {
+        return Err(anyhow::Error::new(
+            BudgetBlockReason::ProjectEpochUnconfigured,
+        ));
     }
     Ok(current)
+}
+
+/// Persist a reviewed policy through the application-owned database without
+/// exposing the database crate to UI layers.
+pub async fn activate_saved_policy_default(
+    project_key: String,
+    saved: ImageSpendSettings,
+    expected_current_version: Option<u64>,
+    saved_at_ms: i64,
+) -> anyhow::Result<CurrentImageSpendPolicy> {
+    let db = cockpit_db::Db::open_default()?;
+    activate_saved_policy(
+        &db,
+        project_key,
+        saved,
+        expected_current_version,
+        saved_at_ms,
+    )
+    .await
 }
 
 /// Editable UI suggestions. These values are not a default and must never be

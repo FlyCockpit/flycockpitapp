@@ -19,16 +19,15 @@ pub async fn run(cmd: ConfigCommand) -> Result<()> {
 }
 
 async fn image_spend(args: ImageSpendArgs) -> Result<()> {
-    let cwd = std::env::current_dir().context("resolving current directory")?;
+    let project_key = args
+        .project_key
+        .context("--project-key is required to read or save image spend policy")?;
+    let db = cockpit_db::Db::open_default().context("opening cockpit database")?;
     if let Some(file) = args.save {
         let raw = std::fs::read_to_string(&file)
             .with_context(|| format!("reading {}", file.display()))?;
         let settings =
             serde_json::from_str(&raw).with_context(|| format!("parsing {}", file.display()))?;
-        let db = cockpit_db::Db::open_default().context("opening cockpit database")?;
-        let project_key = args
-            .project_key
-            .context("--project-key is required with --save")?;
         let current = db.current_image_spend_policy(project_key.clone()).await?;
         let saved_at_ms = chrono::Utc::now().timestamp_millis();
         let saved = cockpit_config::config::image_spend::activate_saved_policy(
@@ -42,7 +41,11 @@ async fn image_spend(args: ImageSpendArgs) -> Result<()> {
         println!("saved image spend policy version {}", saved.policy_version);
         return Ok(());
     }
-    let settings = crate::config::extended::load_for_cwd(&cwd).image_spend;
+    let settings = db
+        .current_image_spend_policy(project_key)
+        .await?
+        .map(|current| current.settings)
+        .unwrap_or_default();
     println!("{}", serde_json::to_string_pretty(&settings)?);
     if let Err(reason) = settings.validate() {
         println!(

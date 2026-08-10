@@ -114,9 +114,6 @@ mod tests {
         db.save_image_spend_policy("project".into(), finite(10), None, 0)
             .await
             .unwrap();
-        db.resolve_image_spend_epoch("project".into(), 1, "2026-08".into(), 0, 0)
-            .await
-            .unwrap();
         db.reserve_image_spend(
             "r".into(),
             keys("p"),
@@ -135,9 +132,6 @@ mod tests {
     async fn image_spend_budget_atomic() {
         let db = Db::open_in_memory().unwrap();
         db.save_image_spend_policy("project".into(), finite(10), None, 0)
-            .await
-            .unwrap();
-        db.resolve_image_spend_epoch("project".into(), 1, "2026-08".into(), 0, 0)
             .await
             .unwrap();
         let first = db.reserve_image_spend(
@@ -188,9 +182,6 @@ mod tests {
     async fn paid_dispatch_requires_journal_evidence_before_release() {
         let db = Db::open_in_memory().unwrap();
         db.save_image_spend_policy("project".into(), finite(10), None, 0)
-            .await
-            .unwrap();
-        db.resolve_image_spend_epoch("project".into(), 1, "2026-08".into(), 0, 0)
             .await
             .unwrap();
         db.reserve_image_spend(
@@ -262,9 +253,6 @@ mod tests {
         db.save_image_spend_policy("project".into(), finite(10), None, 0)
             .await
             .unwrap();
-        db.resolve_image_spend_epoch("project".into(), 1, "2026-08".into(), 0, 0)
-            .await
-            .unwrap();
         assert!(
             db.reserve_image_spend(
                 "unknown".into(),
@@ -303,7 +291,7 @@ mod tests {
             .unwrap();
         assert!(reservation.cost_unknown);
         assert!(
-            db.release_image_spend_before_acceptance("unknown".into(), "proof".into(), 2)
+            db.cancel_image_spend_before_dispatch("unknown".into(), "proof".into(), 2)
                 .await
                 .unwrap()
         );
@@ -337,9 +325,6 @@ mod tests {
     async fn policy_versions_preserve_original_epoch_attribution() {
         let db = Db::open_in_memory().unwrap();
         db.save_image_spend_policy("project".into(), finite(10), None, 0)
-            .await
-            .unwrap();
-        db.resolve_image_spend_epoch("project".into(), 1, "2026-08".into(), 0, 0)
             .await
             .unwrap();
         db.reserve_image_spend(
@@ -398,9 +383,6 @@ mod tests {
     async fn overage_creates_debt_and_release_late_cost_does_not_resurrect() {
         let db = Db::open_in_memory().unwrap();
         db.save_image_spend_policy("project".into(), finite(20), None, 0)
-            .await
-            .unwrap();
-        db.resolve_image_spend_epoch("project".into(), 1, "2026-08".into(), 0, 0)
             .await
             .unwrap();
         db.reserve_image_spend(
@@ -476,7 +458,7 @@ mod tests {
         )
         .await
         .unwrap();
-        db.release_image_spend_before_acceptance("released".into(), "not-accepted".into(), 5)
+        db.cancel_image_spend_before_dispatch("released".into(), "not-accepted".into(), 5)
             .await
             .unwrap();
         db.reconcile_image_spend(
@@ -514,6 +496,72 @@ mod tests {
         };
         let epoch = valid.resolve_epoch(1_775_000_000_000).unwrap();
         assert_eq!(epoch.membership_key, "2026-04@America/Chicago");
+
+        let before_dst = valid.resolve_epoch(1_772_330_400_000).unwrap();
+        let after_dst = valid.resolve_epoch(1_773_885_600_000).unwrap();
+        assert_eq!(before_dst.membership_key, after_dst.membership_key);
+    }
+
+    #[test]
+    fn rolling_epoch_uses_saved_anchor_and_rejects_clock_rollback() {
+        let rolling = ProjectEpochPolicy::Rolling {
+            duration_seconds: 86_400,
+            anchor: SavedInstant {
+                unix_ms: 1_000,
+                monotonic_sequence: 7,
+            },
+        };
+        assert_eq!(
+            rolling.resolve_epoch(86_401_000).unwrap().membership_key,
+            "rolling:8"
+        );
+        assert_eq!(
+            rolling.resolve_epoch(999),
+            Err(BudgetBlockReason::InvalidProjectEpoch)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_epoch_authority_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spend.db");
+        {
+            let db = Db::open(&path).unwrap();
+            db.save_image_spend_policy("project".into(), finite(10), None, 0)
+                .await
+                .unwrap();
+            db.reserve_image_spend(
+                "cancelled".into(),
+                keys("plan"),
+                vec![AttemptMaximum {
+                    attempt_id: "attempt".into(),
+                    usd_micros: Some(2),
+                }],
+                1,
+                0,
+            )
+            .await
+            .unwrap();
+            db.cancel_image_spend_before_dispatch("cancelled".into(), "cancel".into(), 1)
+                .await
+                .unwrap();
+        }
+        let reopened = Db::open(&path).unwrap();
+        let policy = reopened
+            .current_image_spend_policy("project".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(policy.epoch_sequence, Some(1));
+        assert_eq!(
+            reopened
+                .image_spend_diagnostic("cancelled".into())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "released"
+        );
     }
 
     #[tokio::test]
@@ -521,9 +569,6 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let settings = finite(u64::MAX);
         db.save_image_spend_policy("project".into(), settings, None, 0)
-            .await
-            .unwrap();
-        db.resolve_image_spend_epoch("project".into(), 1, "epoch".into(), 0, 0)
             .await
             .unwrap();
         let reserved = db
@@ -814,6 +859,7 @@ impl Db {
     /// Resolve a caller-derived calendar/rolling membership to a durable,
     /// monotonic sequence. A changed wall-clock label can only advance; it can
     /// never select an older sequence after clock rollback.
+    #[cfg(test)]
     pub async fn resolve_image_spend_epoch(
         &self,
         project_key: String,
@@ -846,14 +892,38 @@ impl Db {
         saved_at_ms: i64,
     ) -> Result<u64> {
         settings.validate().map_err(anyhow::Error::new)?;
+        let resolved_epoch = if matches!(settings.project, BudgetPolicy::Finite { .. }) {
+            Some(
+                settings
+                    .project_epoch
+                    .as_ref()
+                    .ok_or(BudgetBlockReason::ProjectEpochUnconfigured)?
+                    .resolve_epoch(saved_at_ms)?,
+            )
+        } else {
+            None
+        };
         let json = serde_json::to_string(&settings)?;
         self.transaction(move |conn| {
             let current: Option<(u64,String,u64)> = conn.query_row("SELECT version,settings_json,epoch_policy_version FROM image_spend_policy_versions WHERE project_key=?1 ORDER BY version DESC LIMIT 1", [&project_key], |r| Ok((read_u64(r.get(0)?)?,r.get(1)?,read_u64(r.get(2)?)?))).optional()?;
             if current.as_ref().map(|v|v.0) != expected_current_version { return Err(BudgetBlockReason::PolicyVersionChanged.into()); }
-            let version = current.as_ref().map_or(1, |v| v.0.checked_add(1).expect("policy version overflow"));
+            let version = current.as_ref().map_or(Ok(1), |v| v.0.checked_add(1).ok_or(BudgetBlockReason::ArithmeticOverflow))?;
             let previous_epoch = current.as_ref().and_then(|v| serde_json::from_str::<ImageSpendSettings>(&v.1).ok()).and_then(|s|s.project_epoch);
-            let epoch_policy_version = current.as_ref().map_or(1, |v| if previous_epoch == settings.project_epoch { v.2 } else { v.2.checked_add(1).expect("epoch policy version overflow") });
+            let epoch_policy_version = current.as_ref().map_or(Ok(1), |v| if previous_epoch == settings.project_epoch { Ok(v.2) } else { v.2.checked_add(1).ok_or(BudgetBlockReason::ArithmeticOverflow) })?;
             conn.execute("INSERT INTO image_spend_policy_versions(project_key,version,epoch_policy_version,settings_json,saved_at_ms) VALUES(?1,?2,?3,?4,?5)", params![project_key, sqlite_u64(version)?, sqlite_u64(epoch_policy_version)?, json, saved_at_ms])?;
+            if let Some(epoch) = resolved_epoch {
+                let epoch_policy_version_sql = sqlite_u64(epoch_policy_version)?;
+                let current: Option<(i64,String,i64)> = conn.query_row("SELECT epoch_sequence,membership_key,interval_start_ms FROM image_spend_epoch_heads WHERE project_key=?1 AND epoch_policy_version=?2",params![project_key,epoch_policy_version_sql],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+                if let Some((sequence,current_key,current_start)) = current {
+                    if current_key != epoch.membership_key {
+                        if epoch.interval_start_ms <= current_start { bail!("clock rollback cannot reopen an image spend epoch"); }
+                        let next=sequence.checked_add(1).ok_or(BudgetBlockReason::ArithmeticOverflow)?;
+                        conn.execute("UPDATE image_spend_epoch_heads SET epoch_sequence=?3,membership_key=?4,interval_start_ms=?5,resolved_at_ms=?6 WHERE project_key=?1 AND epoch_policy_version=?2 AND epoch_sequence=?7",params![project_key,epoch_policy_version_sql,next,epoch.membership_key,epoch.interval_start_ms,saved_at_ms,sequence])?;
+                    }
+                } else {
+                    conn.execute("INSERT INTO image_spend_epoch_heads(project_key,epoch_policy_version,epoch_sequence,membership_key,interval_start_ms,resolved_at_ms) VALUES(?1,?2,1,?3,?4,?5)",params![project_key,epoch_policy_version_sql,epoch.membership_key,epoch.interval_start_ms,saved_at_ms])?;
+                }
+            }
             Ok(version)
         }).await
     }
@@ -1051,16 +1121,22 @@ impl Db {
         }).await
     }
 
-    /// Legacy characterization helper; production release authority is the
-    /// journal-backed `finish_image_spend_dispatch` transition above.
-    #[cfg(test)]
-    async fn release_image_spend_before_acceptance(
+    /// Release a reservation only while durable journal evidence proves that
+    /// none of its attempts reached provider handoff.
+    pub async fn cancel_image_spend_before_dispatch(
         &self,
         reservation_id: String,
         proof_identity: String,
         at_ms: i64,
     ) -> Result<bool> {
         self.transaction(move |conn| {
+            let possibly_accepted: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM image_spend_attempt_dispatches d JOIN external_journal_operations o ON o.operation_id=d.external_operation_id WHERE d.reservation_id=?1 AND o.state IN ('dispatching','accepted','submission_unknown')",
+                [&reservation_id], |row| row.get(0),
+            )?;
+            if possibly_accepted != 0 {
+                bail!("provider acceptance is possible; retain the image spend reservation");
+            }
             let changed=conn.execute("UPDATE image_spend_reservations SET state='released',release_proof_identity=?2,released_at_ms=?3 WHERE reservation_id=?1 AND state='reserved'",params![reservation_id,proof_identity,at_ms])?;
             if changed != 0 { conn.execute("UPDATE image_spend_scope_usage SET reserved_usd_micros=charged_usd_micros WHERE reservation_id=?1",[reservation_id])?; }
             Ok(changed != 0)

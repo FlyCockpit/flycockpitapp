@@ -429,7 +429,7 @@ pub struct ImageSpendArgs {
     #[arg(long, value_name = "FILE")]
     pub save: Option<std::path::PathBuf>,
     /// Stable project ledger key required when saving.
-    #[arg(long, requires = "save")]
+    #[arg(long)]
     pub project_key: Option<String>,
 }
 

@@ -30,13 +30,11 @@ impl ImageSpendSettingsView {
     /// display-only suggestions never enter this path.
     pub(crate) async fn save(
         &mut self,
-        db: &cockpit_db::Db,
         project_key: String,
         expected_version: Option<u64>,
         saved_at_ms: i64,
     ) -> anyhow::Result<u64> {
-        let current = cockpit_config::config::image_spend::activate_saved_policy(
-            db,
+        let current = cockpit_config::config::image_spend::activate_saved_policy_default(
             project_key,
             self.saved.clone(),
             expected_version,

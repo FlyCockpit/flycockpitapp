@@ -2035,6 +2035,59 @@ pub fn adopt_verified_copy_authorized_publication(
     )
 }
 
+pub fn block_verified_copy_authorized_publication(
+    conn: &Connection,
+    output: &HeldImageGenerationOutputDirectory,
+    input: &AdoptVerifiedCopyAuthorizedPublication<'_>,
+) -> Result<HeldArtifactEvidence> {
+    let HeldDirectoryEffectOutcome::AppliedDurable(effect) =
+        output.reconcile_publication(input.recovery)?
+    else {
+        anyhow::bail!("copy-authorized publication identity is ambiguous")
+    };
+    let destination = effect
+        .destination_name()
+        .context("copy-authorized publication destination is absent")?;
+    let authority = &output.authority.0;
+    let binding: (String, String, i64) = conn
+        .query_row(
+            "SELECT destination_name,output_authority_digest,output_authority_generation FROM image_generation_late_publication_leases WHERE publication_operation_id=?1 AND state='copy_authorized' AND version=?2 AND worker_boot_id=?3 AND claim_generation=?4",
+            params![input.publication_operation_id.to_string(), i64::try_from(input.expected_lease_version)?, input.worker_boot_id.to_string(), i64::try_from(input.claim_generation)?],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?
+        .context("copy-authorized publication authority is unavailable")?;
+    ensure!(
+        binding.0 == destination
+            && binding.1 == authority.canonical_destination_digest
+            && binding.2 == i64::try_from(authority.authority_generation)?,
+        "copy-authorized publication authority differs"
+    );
+    let artifact = effect.artifact().clone();
+    let evidence = ImageGenerationLatePublicationEvidenceV1::OutputDurable {
+        schema_version: 1,
+        identity_digest: artifact.identity_digest().into(),
+        security_digest: artifact.security_digest().into(),
+        byte_length: artifact.byte_length().to_string(),
+        sha256: artifact.sha256().into(),
+        parent_sync_digest: authority.parent_identity_digest.clone(),
+    }
+    .canonical_json()?;
+    cockpit_db::Db::advance_image_generation_late_publication_conn(
+        conn,
+        &AdvanceImageGenerationLatePublication {
+            publication_operation_id: input.publication_operation_id,
+            expected_version: input.expected_lease_version,
+            worker_boot_id: input.worker_boot_id,
+            claim_generation: input.claim_generation,
+            from: ImageGenerationLatePublicationState::CopyAuthorized,
+            to: ImageGenerationLatePublicationState::SecurityBlocked,
+            evidence_json: &evidence,
+        },
+    )?;
+    Ok(artifact)
+}
+
 fn held_artifact_evidence_json(evidence: &HeldArtifactEvidence) -> Result<String> {
     Ok(serde_json::to_string(&serde_json::json!({
         "byteLength": evidence.byte_length().to_string(),

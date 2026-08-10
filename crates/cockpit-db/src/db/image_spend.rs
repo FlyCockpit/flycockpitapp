@@ -47,6 +47,51 @@ fn read_money(value: Vec<u8>) -> rusqlite::Result<u64> {
     Ok(u64::from_be_bytes(bytes))
 }
 
+pub(crate) fn prepare_reserved_image_spend_dispatch_conn(
+    conn: &rusqlite::Connection,
+    reservation_id: &str,
+    attempt_id: &str,
+    journal: &PrepareExternalOperation,
+    at_ms: i64,
+) -> Result<ExternalJournalRecord> {
+    if journal.operation_kind.as_str() != "image_generation" {
+        bail!("image spend dispatch requires image_generation journal kind");
+    }
+    let session_id: String = conn
+        .query_row(
+            "SELECT r.session_id FROM image_spend_attempts a JOIN image_spend_reservations r USING(reservation_id) WHERE a.reservation_id=?1 AND a.attempt_id=?2 AND r.state='reserved'",
+            params![reservation_id, attempt_id],
+            |row| row.get(0),
+        )
+        .context("image spend attempt is absent or no longer reserved")?;
+    if journal.owner_session_id.as_str() != session_id {
+        bail!("journal owner does not match the reserved image session");
+    }
+    let prepared = prepare_external_operation_conn(conn, journal, at_ms)?;
+    let record = prepared.record();
+    if let Some(existing_id) = conn
+        .query_row(
+            "SELECT external_operation_id FROM image_spend_attempt_dispatches WHERE reservation_id=?1 AND attempt_id=?2",
+            params![reservation_id, attempt_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        if existing_id != record.operation_id.to_string() {
+            bail!("image spend attempt is already bound to another external operation");
+        }
+        return Ok(record.clone());
+    }
+    if matches!(&prepared, ExternalPrepareOutcome::Existing(_)) {
+        bail!("existing external operation is not bound to this image spend attempt");
+    }
+    conn.execute(
+        "INSERT INTO image_spend_attempt_dispatches(reservation_id,attempt_id,external_operation_id) VALUES(?1,?2,?3)",
+        params![reservation_id, attempt_id, record.operation_id.to_string()],
+    )?;
+    Ok(record.clone())
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BudgetPolicy {
@@ -1373,33 +1418,15 @@ impl Db {
             bail!("image spend dispatch requires image_generation journal kind");
         }
         self.transaction(move |conn| {
-            let session_id: String = conn.query_row(
-                "SELECT r.session_id FROM image_spend_attempts a JOIN image_spend_reservations r USING(reservation_id) WHERE a.reservation_id=?1 AND a.attempt_id=?2 AND r.state='reserved'",
-                params![reservation_id, attempt_id], |row| row.get(0),
-            ).context("image spend attempt is absent or no longer reserved")?;
-            if journal.owner_session_id.as_str() != session_id {
-                bail!("journal owner does not match the reserved image session");
-            }
-            let prepared = prepare_external_operation_conn(conn, &journal, at_ms)?;
-            let record = prepared.record();
-            if let Some(existing_id) = conn.query_row(
-                "SELECT external_operation_id FROM image_spend_attempt_dispatches WHERE reservation_id=?1 AND attempt_id=?2",
-                params![reservation_id, attempt_id], |row| row.get::<_, String>(0),
-            ).optional()? {
-                if existing_id != record.operation_id.to_string() {
-                    bail!("image spend attempt is already bound to another external operation");
-                }
-                return Ok(record.clone());
-            }
-            if matches!(&prepared, ExternalPrepareOutcome::Existing(_)) {
-                bail!("existing external operation is not bound to this image spend attempt");
-            }
-            conn.execute(
-                "INSERT INTO image_spend_attempt_dispatches(reservation_id,attempt_id,external_operation_id) VALUES(?1,?2,?3)",
-                params![reservation_id, attempt_id, record.operation_id.to_string()],
-            )?;
-            Ok(record.clone())
-        }).await
+            prepare_reserved_image_spend_dispatch_conn(
+                conn,
+                &reservation_id,
+                &attempt_id,
+                &journal,
+                at_ms,
+            )
+        })
+        .await
     }
 
     /// Commit the durable `dispatching` proof immediately before provider

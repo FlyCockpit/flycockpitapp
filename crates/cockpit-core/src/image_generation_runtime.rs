@@ -15,7 +15,7 @@ use std::time::Instant;
 use cockpit_config::config::image_generation::{
     ImageAdapterKind, ImageEndpoint, ImageGenerationConfig, ImageLocationClass, ImageTargetIdentity,
 };
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
@@ -368,17 +368,23 @@ pub struct ReqwestPinnedConnector {
     dns: Arc<dyn DnsResolver>,
 }
 
+struct PinnedResponse {
+    status: reqwest::StatusCode,
+    location: Option<String>,
+    connected_ip: IpAddr,
+}
+
 impl ReqwestPinnedConnector {
     pub fn new(dns: Arc<dyn DnsResolver>) -> Self {
         Self { dns }
     }
 
-    async fn pinned_head(
+    async fn pinned_read_only(
         &self,
         url: &reqwest::Url,
         ip: IpAddr,
         limits: ProbeLimits,
-    ) -> Result<reqwest::Response, RuntimeError> {
+    ) -> Result<PinnedResponse, RuntimeError> {
         let hostname = url.host_str().ok_or(RuntimeError::new(
             RuntimeErrorCode::Dns,
             "Correct the endpoint hostname.",
@@ -399,7 +405,7 @@ impl ReqwestPinnedConnector {
                     "Check the endpoint certificate and configured hostname.",
                 )
             })?;
-        tokio::time::timeout(limits.header_timeout, client.head(url.clone()).send())
+        let response = tokio::time::timeout(limits.header_timeout, client.get(url.clone()).send())
             .await
             .map_err(|_| {
                 RuntimeError::new(
@@ -414,7 +420,56 @@ impl ReqwestPinnedConnector {
                     RuntimeErrorCode::ConnectTimeout
                 };
                 RuntimeError::new(code, health_state_for_error(code).remediation())
-            })
+            })?;
+        let connected_ip =
+            response
+                .remote_addr()
+                .map(|address| address.ip())
+                .ok_or(RuntimeError::new(
+                    RuntimeErrorCode::DnsDenied,
+                    ImageHealthState::DnsDenied.remediation(),
+                ))?;
+        let status = response.status();
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let mut body_bytes = 0usize;
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = tokio::time::timeout(limits.header_timeout, stream.next())
+            .await
+            .map_err(|_| {
+                RuntimeError::new(
+                    RuntimeErrorCode::HeaderTimeout,
+                    "The provider response body did not complete in time.",
+                )
+            })?
+        {
+            let chunk = chunk.map_err(|_| {
+                RuntimeError::new(
+                    RuntimeErrorCode::MalformedResponse,
+                    "The provider returned a malformed inspection response.",
+                )
+            })?;
+            body_bytes = body_bytes
+                .checked_add(chunk.len())
+                .ok_or(RuntimeError::new(
+                    RuntimeErrorCode::BodyLimit,
+                    "The provider response exceeded the inspection limit.",
+                ))?;
+            if body_bytes > limits.body_limit {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::BodyLimit,
+                    "The provider response exceeded the inspection limit.",
+                ));
+            }
+        }
+        Ok(PinnedResponse {
+            status,
+            location,
+            connected_ip,
+        })
     }
 }
 
@@ -440,15 +495,8 @@ impl BoundConnector for ReqwestPinnedConnector {
                     "Correct the endpoint hostname.",
                 ))?;
                 let authority = origin_authority(&url, hostname);
-                let response = self.pinned_head(&url, ip, limits).await?;
-                let connected_ip =
-                    response
-                        .remote_addr()
-                        .map(|address| address.ip())
-                        .ok_or(RuntimeError::new(
-                            RuntimeErrorCode::DnsDenied,
-                            ImageHealthState::DnsDenied.remediation(),
-                        ))?;
+                let response = self.pinned_read_only(&url, ip, limits).await?;
+                let connected_ip = response.connected_ip;
                 if !candidates.contains(&connected_ip)
                     || classify_address(connected_ip) != required_location
                 {
@@ -463,7 +511,7 @@ impl BoundConnector for ReqwestPinnedConnector {
                     connected_ip,
                     location: required_location,
                 });
-                if !response.status().is_redirection() {
+                if !response.status.is_redirection() {
                     let first = &hops[0];
                     return Ok(ConnectionProof {
                         authority: first.authority.clone(),
@@ -479,15 +527,11 @@ impl BoundConnector for ReqwestPinnedConnector {
                         "Use an endpoint with at most three redirects.",
                     ));
                 }
-                let location = response
-                    .headers()
-                    .get(reqwest::header::LOCATION)
-                    .and_then(|value| value.to_str().ok())
-                    .ok_or(RuntimeError::new(
-                        RuntimeErrorCode::MalformedResponse,
-                        "Correct the provider redirect response.",
-                    ))?;
-                url = url.join(location).map_err(|_| {
+                let location = response.location.ok_or(RuntimeError::new(
+                    RuntimeErrorCode::MalformedResponse,
+                    "Correct the provider redirect response.",
+                ))?;
+                url = url.join(&location).map_err(|_| {
                     RuntimeError::new(
                         RuntimeErrorCode::MalformedResponse,
                         "Correct the provider redirect location.",
@@ -630,9 +674,6 @@ pub struct ProbeResult {
     pub capability: Option<CapabilitySnapshot>,
     pub model_or_workflow_digest: Option<String>,
     pub unavailable_reason: Option<RuntimeErrorCode>,
-    /// Bytes consumed from the bounded response body, as counted by the
-    /// transport-owned reader rather than inferred from parsed values.
-    pub body_bytes: usize,
 }
 pub trait ImageRuntimeAdapter: Send + Sync {
     fn kind(&self) -> ImageAdapterKind;
@@ -644,6 +685,36 @@ pub trait ImageRuntimeAdapter: Send + Sync {
         &'a self,
         request: ProbeRequest,
     ) -> Pin<Box<dyn Future<Output = Result<ProbeResult, RuntimeError>> + Send + 'a>>;
+}
+
+/// Exhaustive production registration: adding an adapter kind to config makes
+/// this struct fail to compile until the runtime wiring supplies it exactly
+/// once. Tests that exercise missing-adapter behavior may still use [`ImageRuntimeRegistry::new`].
+pub struct StandardImageRuntimeAdapters {
+    pub openai_images: Arc<dyn ImageRuntimeAdapter>,
+    pub openrouter_images: Arc<dyn ImageRuntimeAdapter>,
+    pub gemini_images: Arc<dyn ImageRuntimeAdapter>,
+    pub comfyui: Arc<dyn ImageRuntimeAdapter>,
+}
+
+impl StandardImageRuntimeAdapters {
+    fn into_checked(self) -> Result<Vec<Arc<dyn ImageRuntimeAdapter>>, RuntimeError> {
+        let adapters = vec![
+            (ImageAdapterKind::OpenaiImages, self.openai_images),
+            (ImageAdapterKind::OpenrouterImages, self.openrouter_images),
+            (ImageAdapterKind::GeminiImages, self.gemini_images),
+            (ImageAdapterKind::Comfyui, self.comfyui),
+        ];
+        for (expected, adapter) in &adapters {
+            if adapter.kind() != *expected {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::Incompatible,
+                    "Register each image adapter in its exact standard slot.",
+                ));
+            }
+        }
+        Ok(adapters.into_iter().map(|(_, adapter)| adapter).collect())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -733,6 +804,16 @@ impl ImageRuntimeRegistry {
             dns,
             connector,
         })
+    }
+    pub fn standard(adapters: StandardImageRuntimeAdapters) -> Result<Self, RuntimeError> {
+        let dns: Arc<dyn DnsResolver> = Arc::new(TokioDnsResolver);
+        let connector: Arc<dyn BoundConnector> = Arc::new(ReqwestPinnedConnector::new(dns.clone()));
+        Self::new(
+            Arc::new(SystemRuntimeClock::default()),
+            dns,
+            connector,
+            adapters.into_checked()?,
+        )
     }
     pub fn adapter(
         &self,
@@ -1205,23 +1286,6 @@ impl ImageRuntimeRegistry {
                 return Err(error);
             }
         };
-        if result.body_bytes > limits.body_limit {
-            let error = RuntimeError::new(
-                RuntimeErrorCode::BodyLimit,
-                "The provider response exceeded the inspection limit.",
-            );
-            self.commit_failure(
-                &endpoint,
-                &target_id,
-                generation,
-                epoch,
-                request_id,
-                ImageHealthState::Unreachable,
-                error.code,
-                &credential_identity_digest,
-            )?;
-            return Err(error);
-        }
         let now = self.clock.now_millis();
         let ttl = if result.state.successful() {
             SUCCESS_TTL

@@ -137,7 +137,6 @@ impl ImageRuntimeAdapter for Adapter {
                 }),
                 model_or_workflow_digest: Some("digest".into()),
                 unavailable_reason: None,
-                body_bytes: 0,
             })
         })
     }
@@ -205,6 +204,42 @@ async fn image_generation_runtime_registry() {
         ],
     );
     assert!(matches!(duplicate, Err(error) if error.code == RuntimeErrorCode::Incompatible));
+}
+
+#[test]
+fn image_generation_standard_registry_requires_every_exact_adapter_slot() {
+    let adapter = |kind| {
+        Arc::new(Adapter {
+            kind,
+            calls: AtomicUsize::new(0),
+        }) as Arc<dyn ImageRuntimeAdapter>
+    };
+    let standard = StandardImageRuntimeAdapters {
+        openai_images: adapter(ImageAdapterKind::OpenaiImages),
+        openrouter_images: adapter(ImageAdapterKind::OpenrouterImages),
+        gemini_images: adapter(ImageAdapterKind::GeminiImages),
+        comfyui: adapter(ImageAdapterKind::Comfyui),
+    };
+    let registry = ImageRuntimeRegistry::standard(standard).unwrap();
+    for kind in [
+        ImageAdapterKind::OpenaiImages,
+        ImageAdapterKind::OpenrouterImages,
+        ImageAdapterKind::GeminiImages,
+        ImageAdapterKind::Comfyui,
+    ] {
+        assert_eq!(registry.adapter(kind).unwrap().kind(), kind);
+    }
+
+    let wrong = StandardImageRuntimeAdapters {
+        openai_images: adapter(ImageAdapterKind::Comfyui),
+        openrouter_images: adapter(ImageAdapterKind::OpenrouterImages),
+        gemini_images: adapter(ImageAdapterKind::GeminiImages),
+        comfyui: adapter(ImageAdapterKind::OpenaiImages),
+    };
+    assert!(matches!(
+        wrong.into_checked(),
+        Err(error) if error.code == RuntimeErrorCode::Incompatible
+    ));
 }
 #[test]
 fn image_generation_runtime_health_states_and_ttls() {
@@ -813,4 +848,41 @@ async fn image_generation_pinned_connector_preserves_authority_and_revalidates_r
     assert_eq!(proof.hops.len(), 2);
     assert_eq!(proof.hops[0].connected_ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
     assert_eq!(proof.hops[1].connected_ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
+}
+
+#[tokio::test]
+async fn image_generation_pinned_connector_enforces_body_limit_while_reading() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 1024];
+        let _ = socket.read(&mut request).await.unwrap();
+        let body = vec![b'x'; HEALTH_BODY_LIMIT + 1];
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        socket.write_all(head.as_bytes()).await.unwrap();
+        let _ = socket.write_all(&body).await;
+    });
+    let dns: Arc<dyn DnsResolver> = Arc::new(Dns(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+    let connector = ReqwestPinnedConnector::new(dns);
+    let origin = reqwest::Url::parse(&format!("http://body.test:{port}/health")).unwrap();
+    assert!(matches!(
+        connector
+            .connect(
+                &origin,
+                &[IpAddr::V4(Ipv4Addr::LOCALHOST)],
+                AddressClass::Loopback,
+                ProbeLimits::health(),
+            )
+            .await,
+        Err(error) if error.code == RuntimeErrorCode::BodyLimit
+    ));
+    server.await.unwrap();
 }

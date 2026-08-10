@@ -379,16 +379,30 @@ pub(super) fn remote_queue_mutation_response(
     }
 }
 
-async fn commit_remote_queue_mutation(
-    session: &Session,
-    queue: &crate::engine::message::UserSubmissionQueue,
+struct RemoteQueueMutationCommit<'a> {
+    session: &'a Session,
+    queue: &'a crate::engine::message::UserSubmissionQueue,
     staged: Option<crate::engine::message::StagedQueueRemoval>,
     result: crate::engine::message::RemoveQueuedMessageResult,
     operation: RemoteQueueOperation,
     outbox_kind: &'static str,
-    event_tx: &EventSender,
-    redaction: &SharedRedactionTable,
+    event_tx: &'a EventSender,
+    redaction: &'a SharedRedactionTable,
+}
+
+async fn commit_remote_queue_mutation(
+    input: RemoteQueueMutationCommit<'_>,
 ) -> std::result::Result<RemoteQueueMutationReceiptV1, proto::ErrorPayload> {
+    let RemoteQueueMutationCommit {
+        session,
+        queue,
+        staged,
+        result,
+        operation,
+        outbox_kind,
+        event_tx,
+        redaction,
+    } = input;
     let disposition = crate::db::session_log::ClientSubmissionTerminalDisposition::Removed;
     let receipts = if let Some(staged) = staged.as_ref() {
         queue.accepted_receipts(staged.ids()).await
@@ -1881,16 +1895,16 @@ pub(super) async fn run_worker(
                             }
                         };
                     if let Some(operation) = remote_operation {
-                        match commit_remote_queue_mutation(
-                            &session,
-                            &driver_input_queue,
+                        match commit_remote_queue_mutation(RemoteQueueMutationCommit {
+                            session: &session,
+                            queue: &driver_input_queue,
                             staged,
                             result,
                             operation,
-                            "remove_newest_queued_user_message",
-                            &event_tx,
-                            &redaction,
-                        )
+                            outbox_kind: "remove_newest_queued_user_message",
+                            event_tx: &event_tx,
+                            redaction: &redaction,
+                        })
                         .await
                         {
                             Ok(receipt) => {
@@ -1963,16 +1977,16 @@ pub(super) async fn run_worker(
                         }
                     };
                     if let Some(operation) = remote_operation {
-                        match commit_remote_queue_mutation(
-                            &session,
-                            &driver_input_queue,
+                        match commit_remote_queue_mutation(RemoteQueueMutationCommit {
+                            session: &session,
+                            queue: &driver_input_queue,
                             staged,
                             result,
                             operation,
-                            "remove_editable_queued_user_messages",
-                            &event_tx,
-                            &redaction,
-                        )
+                            outbox_kind: "remove_editable_queued_user_messages",
+                            event_tx: &event_tx,
+                            redaction: &redaction,
+                        })
                         .await
                         {
                             Ok(receipt) => {

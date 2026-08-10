@@ -521,7 +521,7 @@ pub(super) async fn execute_remote_staged_rename_with_hook(
         .map(|resource| {
             std::str::from_utf8(&resource.value)
                 .map(std::path::PathBuf::from)
-                .map_err(|error| internal(error))
+                .map_err(internal)
         })
         .collect::<std::result::Result<_, _>>()?;
     let [source_path, target_path] = paths.as_slice() else {

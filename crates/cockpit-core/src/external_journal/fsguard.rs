@@ -326,7 +326,7 @@ mod imp {
             }
             let fd = unsafe {
                 libc::open(
-                    b"/\0".as_ptr().cast(),
+                    c"/".as_ptr(),
                     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 )
             };

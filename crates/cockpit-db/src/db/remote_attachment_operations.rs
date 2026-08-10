@@ -287,29 +287,6 @@ impl Db {
         })
         .await
     }
-
-    pub async fn staged_filesystem_remote_evidence(
-        &self,
-        logical_attachment_id: &str,
-        operation_id: &str,
-    ) -> Result<Option<StagedFilesystemEvidence>> {
-        validate_uuid("logical attachment id", logical_attachment_id)?;
-        validate_operation_id(operation_id)?;
-        let attachment = logical_attachment_id.to_owned();
-        let operation = operation_id.to_owned();
-        self.read(move |conn| conn.query_row(
-            "SELECT s.artifact_id,s.state,o.dispatch_generation,s.precondition_digest,s.result_digest
-             FROM remote_staged_filesystem_operations s JOIN remote_attachment_operations o
-             USING(logical_attachment_id,operation_id)
-             WHERE s.logical_attachment_id=?1 AND s.operation_id=?2",
-            params![attachment,operation], |row| {
-                let pre:Vec<u8>=row.get(3)?; let result:Vec<u8>=row.get(4)?;
-                Ok(StagedFilesystemEvidence { artifact_id:row.get(0)?,state:row.get(1)?,
-                    dispatch_generation:row.get::<_,i64>(2)?.try_into().map_err(|e|rusqlite::Error::FromSqlConversionFailure(2,rusqlite::types::Type::Integer,Box::new(e)))?,
-                    precondition_digest:pre.try_into().map_err(|v:Vec<u8>|rusqlite::Error::FromSqlConversionFailure(3,rusqlite::types::Type::Blob,std::io::Error::new(std::io::ErrorKind::InvalidData,format!("invalid digest length {}",v.len())).into()))?,
-                    result_digest:result.try_into().map_err(|v:Vec<u8>|rusqlite::Error::FromSqlConversionFailure(4,rusqlite::types::Type::Blob,std::io::Error::new(std::io::ErrorKind::InvalidData,format!("invalid digest length {}",v.len())).into()))? })
-            }).optional().map_err(Into::into)).await
-    }
     /// Reserves an adapter effect before dispatch. A process restart may claim
     /// the same immutable request again with a higher dispatch generation;
     /// the adapter's durable evidence decides whether to finish or reconcile.

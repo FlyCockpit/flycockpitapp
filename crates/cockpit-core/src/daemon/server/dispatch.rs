@@ -2299,13 +2299,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 let evidence=match prepared {
                     crate::db::remote_attachment_operations::PrepareStagedFilesystemOperationOutcome::Prepared(value)
                     | crate::db::remote_attachment_operations::PrepareStagedFilesystemOperationOutcome::Reconcile(value)=>value,
-                    crate::db::remote_attachment_operations::PrepareStagedFilesystemOperationOutcome::Replay(bytes)=> {
-                        if let Some(stored)=ctx.db.staged_filesystem_remote_evidence(&attachment,&operation_id).await.map_err(internal)? {
-                            let root=project_root.clone(); let to=to_path.clone();
-                            tokio::task::spawn_blocking(move || crate::daemon::fs_api::cleanup_remote_rename_sidecar(&root,&to,&stored.artifact_id)).await.map_err(internal)??;
-                        }
-                        return serde_json::from_slice(&bytes).map_err(internal)
-                    },
+                    crate::db::remote_attachment_operations::PrepareStagedFilesystemOperationOutcome::Replay(bytes)=>return serde_json::from_slice(&bytes).map_err(internal),
                     crate::db::remote_attachment_operations::PrepareStagedFilesystemOperationOutcome::OperationConflict
                     | crate::db::remote_attachment_operations::PrepareStagedFilesystemOperationOutcome::OperationActorConflict=>return Err(ErrorPayload{code:ErrorCode::Conflict,message:"remote operation conflict".into()}),
                     crate::db::remote_attachment_operations::PrepareStagedFilesystemOperationOutcome::AttachmentLedgerCapacity=>return Err(ErrorPayload{code:ErrorCode::Conflict,message:"remote operation capacity reached".into()}),
@@ -2346,7 +2340,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 let pre = evidence.precondition_digest;
                 let result = evidence.result_digest;
                 let fs_ctx = ctx.clone();
-                let (response, _sidecar) = tokio::task::spawn_blocking(move || {
+                let (response, sidecar) = tokio::task::spawn_blocking(move || {
                     crate::daemon::fs_api::apply_or_reconcile_remote_rename_sync(
                         &fs_ctx, &root, &from, &to, &artifact, pre, result,
                     )
@@ -2379,11 +2373,11 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 }
                 let committed =
                     commit_remote_idempotent_adapter(operation, ctx, "fs_rename", response).await?;
-                crate::daemon::fs_api::cleanup_remote_rename_sidecar(
-                    &project_root,
-                    &to_path,
-                    &evidence.artifact_id,
-                )?;
+                if std::fs::remove_file(&sidecar).is_ok()
+                    && let Some(parent) = sidecar.parent()
+                {
+                    let _ = std::fs::File::open(parent).and_then(|dir| dir.sync_all());
+                }
                 return Ok(committed);
             }
             crate::daemon::fs_api::fs_rename(ctx.clone(), project_root, from_path, to_path).await

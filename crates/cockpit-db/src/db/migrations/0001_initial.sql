@@ -3147,6 +3147,8 @@ CREATE TABLE image_generation_slots (
     version INTEGER NOT NULL CHECK(version >= 1),
     applied_cancellation_version INTEGER,
     result_after_cancel INTEGER NOT NULL DEFAULT 0 CHECK(result_after_cancel IN (0,1)),
+    published_disposition TEXT CHECK(published_disposition IN ('ordinary','late_authorized')),
+    published_disposition_generation INTEGER CHECK(published_disposition_generation>=1),
     failure_reason TEXT,
     PRIMARY KEY(job_id,slot_id),
     UNIQUE(job_id,slot_index),
@@ -3160,7 +3162,8 @@ CREATE TABLE image_generation_slots (
       (state IN ('late_quarantined','discarded') AND applied_cancellation_version IS NOT NULL AND result_after_cancel=1) OR
       (state='cancelled' AND applied_cancellation_version IS NOT NULL AND result_after_cancel=0) OR
       (state='failed' AND ((applied_cancellation_version IS NULL AND result_after_cancel=0) OR applied_cancellation_version IS NOT NULL))
-    )
+    ),
+    CHECK((state='published' AND published_disposition IS NOT NULL AND published_disposition_generation=version) OR (state!='published' AND published_disposition IS NULL AND published_disposition_generation IS NULL))
 );
 
 CREATE TABLE image_generation_attempts (
@@ -3487,8 +3490,8 @@ CREATE TRIGGER image_generation_lease_delete_forbidden BEFORE DELETE ON image_ge
 CREATE TRIGGER image_generation_lease_insert_guard BEFORE INSERT ON image_generation_artifact_leases
 WHEN NOT EXISTS(SELECT 1 FROM image_generation_artifacts a JOIN image_generation_jobs j ON j.job_id=a.job_id JOIN image_generation_slots s ON s.job_id=a.job_id AND s.slot_id=a.slot_id JOIN image_generation_artifact_components c ON c.artifact_id=a.artifact_id JOIN image_generation_artifact_authorization_facts f ON f.authorization_digest=NEW.authorization_digest
  WHERE a.artifact_id=NEW.artifact_id AND a.state='retained' AND a.generation=NEW.artifact_generation AND a.component_set_digest=NEW.component_set_digest AND a.active_lease_count=(SELECT count(*) FROM image_generation_artifact_leases l WHERE l.artifact_id=a.artifact_id AND l.released_at IS NULL)
- AND j.job_id=NEW.owning_job_id AND j.version=NEW.owning_job_generation AND s.slot_id=NEW.owning_slot_id AND s.state='published' AND s.version=NEW.owning_slot_generation AND NEW.published_disposition_generation=s.version
- AND ((NEW.published_disposition='ordinary' AND s.result_after_cancel=0) OR (NEW.published_disposition='late_authorized' AND s.result_after_cancel=1 AND s.applied_cancellation_version IS NOT NULL))
+ AND j.job_id=NEW.owning_job_id AND j.version=NEW.owning_job_generation AND s.slot_id=NEW.owning_slot_id AND s.state='published' AND s.version=NEW.owning_slot_generation AND NEW.published_disposition_generation=s.published_disposition_generation AND NEW.published_disposition=s.published_disposition
+ AND ((s.published_disposition='ordinary' AND s.result_after_cancel=0) OR (s.published_disposition='late_authorized' AND s.result_after_cancel=1 AND s.applied_cancellation_version IS NOT NULL))
  AND c.component_id=NEW.component_id AND c.component_kind=NEW.component_kind AND c.state='ready' AND c.generation=NEW.component_generation AND c.sha256=NEW.component_checksum
  AND f.artifact_id=a.artifact_id AND f.artifact_generation=a.generation AND f.job_id=j.job_id AND f.job_generation=j.version AND f.slot_id=s.slot_id AND f.slot_generation=s.version AND f.consumer_purpose=NEW.consumer_purpose AND f.consumer_route=NEW.consumer_route AND f.revoked_at_unix_ms IS NULL
  AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_cleanup_intents i WHERE i.artifact_id=a.artifact_id)

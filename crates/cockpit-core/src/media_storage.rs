@@ -138,6 +138,125 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    pub(crate) async fn discard_media_attachment(
+        &self,
+        mutation: cockpit_db::media_attachments::LocalMediaMutationV1,
+        now_unix_ms: i64,
+    ) -> Result<cockpit_db::media_attachments::LocalMediaMutationReceiptV1> {
+        use cockpit_db::media_attachments::*;
+        let LocalMediaMutationPayloadV1::Discard {
+            session_id,
+            canonical_project_digest,
+            attachment_id,
+            attachment_version,
+            availability_generation,
+            reference_generation,
+            origin_upload,
+        } = &mutation.payload
+        else {
+            anyhow::bail!("local media action mismatch")
+        };
+        let request = DiscardUnreferencedMediaAttachmentV1 {
+            schema_version: 1,
+            kind: "discardUnreferencedMediaAttachment".into(),
+            attachment_id: *attachment_id,
+            attachment_version: *attachment_version,
+            availability_generation: *availability_generation,
+            reference_generation: *reference_generation,
+            origin_upload: origin_upload.clone(),
+        };
+        let domain = format!(
+            "discard:{session_id}:{canonical_project_digest}:{attachment_id}:{attachment_version}:{availability_generation}:{reference_generation}"
+        );
+        let (request_digest, semantic_digest) =
+            cockpit_db::Db::local_media_mutation_digests(&mutation)?;
+        let mutation_for_tx = mutation.clone();
+        let project = canonical_project_digest.clone();
+        let session = *session_id;
+        self.db
+            .transaction(move |conn| {
+                cockpit_db::Db::media_attachment_for_owner_conn(
+                    conn,
+                    request.attachment_id,
+                    session,
+                    &project,
+                )?
+                .context("media_attachment_unavailable")?;
+                if let Some(receipt) = preflight_local_operation(
+                    conn,
+                    mutation_for_tx.local_operation_id,
+                    "discard",
+                    &domain,
+                    &request_digest,
+                    &semantic_digest,
+                    now_unix_ms,
+                )? {
+                    return Ok(receipt);
+                }
+                let decision = cockpit_db::Db::discard_unreferenced_media_attachment_conn(
+                    conn,
+                    &request,
+                    now_unix_ms,
+                )?;
+                let result = MediaDiscardResultV1::Local {
+                    schema_version: 1,
+                    kind: "mediaDiscardResult".into(),
+                    result_id: Uuid::now_v7(),
+                    local_operation_id: mutation_for_tx.local_operation_id,
+                    operation_request_digest: request_digest.clone(),
+                    semantic_command_digest: semantic_digest.clone(),
+                    attachment_id: decision.attachment_id,
+                    requested_attachment_version: request.attachment_version,
+                    attachment_version_before: decision.attachment_version_before,
+                    requested_availability_generation: request.availability_generation,
+                    availability_generation_before: decision.availability_generation_before,
+                    availability_generation_after: decision.availability_generation_after,
+                    requested_reference_generation: request.reference_generation,
+                    reference_generation_before: decision.reference_generation_before,
+                    reference_generation_after: decision.reference_generation_after,
+                    outcome: decision.outcome,
+                    reason: decision.reason,
+                };
+                let result_digest = crate::intel::hex_lower(&Sha256::digest(result.encode_fcdr()?));
+                let receipt = LocalMediaMutationReceiptV1 {
+                    schema_version: 1,
+                    kind: "localMediaMutationReceipt".into(),
+                    receipt_id: Uuid::now_v7(),
+                    local_operation_id: mutation_for_tx.local_operation_id,
+                    actor_principal_digest: mutation_for_tx.actor_principal_digest,
+                    action: "discard".into(),
+                    subject_kind: LocalMediaSubjectKindV1::Attachment,
+                    subject_id: request.attachment_id,
+                    operation_request_digest: request_digest.clone(),
+                    semantic_command_digest: semantic_digest.clone(),
+                    outcome: if decision.outcome == MediaDiscardOutcomeV1::Applied {
+                        LocalMediaMutationOutcomeV1::Applied
+                    } else {
+                        LocalMediaMutationOutcomeV1::Rejected
+                    },
+                    transition: LocalMediaMutationTransitionV1::Attachment {
+                        generation_before: decision.availability_generation_before,
+                        generation_after: decision.availability_generation_after,
+                        reference_generation_before: decision.reference_generation_before,
+                        reference_generation_after: decision.reference_generation_after,
+                    },
+                    discard_result: Some(result),
+                    discard_result_digest: Some(result_digest),
+                    committed_at_unix_ms: now_unix_ms,
+                };
+                commit_local_operation(
+                    conn,
+                    &receipt,
+                    "discard",
+                    &domain,
+                    &request_digest,
+                    &semantic_digest,
+                    now_unix_ms,
+                )?;
+                Ok(receipt)
+            })
+            .await
+    }
     pub(crate) async fn acquire_message_images_bound(
         &self,
         attachment_ids: Vec<Uuid>,

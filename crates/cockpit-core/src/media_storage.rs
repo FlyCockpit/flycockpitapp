@@ -3024,6 +3024,49 @@ struct AvNormalizationEvidence {
     derivative_checksum: String,
 }
 
+/// Owned input boundary shared by authenticated-upload Finalize and retained
+/// HTTPS processing. Bytes have already passed the caller-specific held-file
+/// identity/length/full-checksum proof; the helper never accepts a path.
+struct AvNormalizationInput {
+    bytes: Vec<u8>,
+    initial_container: String,
+    initial_mime: String,
+}
+
+type AvDerivativePlan = (&'static str, Uuid, Vec<u8>, Option<(u32, u32)>);
+
+/// Complete, transport-independent outcome of A/V preparation. Publication,
+/// reservation ownership and attachment-generation CAS remain with callers.
+struct PreparedAvNormalization {
+    canonical_container: String,
+    canonical_mime: String,
+    selected_video_stream: Option<SelectedMediaStream>,
+    selected_audio_stream: Option<SelectedMediaStream>,
+    derivatives: Vec<AvDerivativePlan>,
+    terminal_availability: Option<MediaAvailability>,
+    evidence: Option<AvNormalizationEvidence>,
+}
+
+impl PreparedAvNormalization {
+    fn successful(
+        input: AvNormalizationInput,
+        selected_video_stream: Option<SelectedMediaStream>,
+        selected_audio_stream: Option<SelectedMediaStream>,
+        derivatives: Vec<AvDerivativePlan>,
+        evidence: AvNormalizationEvidence,
+    ) -> Self {
+        Self {
+            canonical_container: input.initial_container,
+            canonical_mime: input.initial_mime,
+            selected_video_stream,
+            selected_audio_stream,
+            derivatives,
+            terminal_availability: None,
+            evidence: Some(evidence),
+        }
+    }
+}
+
 fn av_plan_digest(runtime_fingerprint: &str, argv: &[String]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"media-av-derivative-plan-v1\0");

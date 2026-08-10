@@ -713,8 +713,10 @@ mod tests {
         let epoch = valid.resolve_epoch(1_775_000_000_000).unwrap();
         assert_eq!(epoch.membership_key, "2026-03@America/Chicago");
 
-        let before_dst = valid.resolve_epoch(1_772_330_400_000).unwrap();
-        let after_dst = valid.resolve_epoch(1_773_885_600_000).unwrap();
+        // 2026-03-08 01:00 CST and 04:00 CDT bracket Chicago's spring
+        // transition while remaining in the same local calendar month.
+        let before_dst = valid.resolve_epoch(1_772_953_200_000).unwrap();
+        let after_dst = valid.resolve_epoch(1_772_960_400_000).unwrap();
         assert_eq!(before_dst.membership_key, after_dst.membership_key);
     }
 

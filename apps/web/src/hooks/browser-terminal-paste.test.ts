@@ -86,9 +86,9 @@ describe("browser terminal paste source contracts", () => {
     expect(packageJson.scripts.test).toBe("pnpm run test:node && pnpm run test:browser");
     expect(JSON.stringify(packageJson.scripts)).not.toContain("passWithNoTests");
     expect(hook.indexOf("terminal.open(element)")).toBeLessThan(
-      hook.indexOf("installTerminalPasteInterceptor"),
+      hook.indexOf("installTerminalPasteInterceptor(textarea"),
     );
-    expect(hook.indexOf("installTerminalPasteInterceptor")).toBeLessThan(
+    expect(hook.indexOf("installTerminalPasteInterceptor(textarea")).toBeLessThan(
       hook.indexOf("terminal.onData"),
     );
     expect(hook.indexOf("terminal.onData")).toBeLessThan(hook.indexOf("client.connect()"));
@@ -118,9 +118,9 @@ describe("browser terminal paste source contracts", () => {
     );
     expect(hook).toContain("const textarea = terminal.textarea");
     expect(hook.indexOf("terminal.open(element)")).toBeLessThan(
-      hook.indexOf("installTerminalPasteInterceptor"),
+      hook.indexOf("installTerminalPasteInterceptor(textarea"),
     );
-    expect(hook.indexOf("installTerminalPasteInterceptor")).toBeLessThan(
+    expect(hook.indexOf("installTerminalPasteInterceptor(textarea")).toBeLessThan(
       hook.indexOf("client.connect()"),
     );
     expect(interceptor).toContain("event.stopImmediatePropagation()");

@@ -744,10 +744,6 @@ pub(super) fn claim_message_image_refs(
     client_submission_id: Uuid,
     refs: &[proto::ImageAttachmentRef],
 ) -> std::result::Result<Vec<Vec<u8>>, ErrorPayload> {
-    #[cfg(test)]
-    if ctx.media_storage_recovery.is_none() {
-        return claim_message_image_refs(state, session_id, client_submission_id, refs);
-    }
     validate_image_ref_shape(refs)?;
 
     let mut total = 0usize;

@@ -2153,8 +2153,8 @@ async fn owner_local_path_registration_dispatch_replays_before_path_and_hides_au
         .await
         .unwrap_err();
     assert_eq!(
-        (detached_error.code, detached_error.message),
-        (wrong_error.code, wrong_error.message)
+        (detached_error.code, &detached_error.message),
+        (wrong_error.code, &wrong_error.message)
     );
     assert_eq!(wrong_error.message, "media_attachment_unavailable");
 }
@@ -11402,11 +11402,28 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             ($($variant:ident),* $(,)?) => {
                 fn request_variant_name(request: &Request) -> &'static str {
                     match request {
+                        Request::RecoverSecurityBlockedMedia(..) => "RecoverSecurityBlockedMedia",
+                        Request::RegisterLocalPathMedia(..) => "RegisterLocalPathMedia",
+                        Request::RetainHttpsMedia(..) => "RetainHttpsMedia",
+                        Request::GetMediaAttachmentStatus(..) => "GetMediaAttachmentStatus",
+                        Request::GetMediaAttachmentPreview(..) => "GetMediaAttachmentPreview",
+                        Request::BeginMediaUpload(..) => "BeginMediaUpload",
+                        Request::AppendMediaUploadChunk(..) => "AppendMediaUploadChunk",
+                        Request::CancelMediaUpload(..) => "CancelMediaUpload",
+                        Request::GetMediaUploadStatus(..) => "GetMediaUploadStatus",
+                        Request::FinalizeMediaUpload(..) => "FinalizeMediaUpload",
+                        Request::DiscardUnreferencedMediaAttachment(..) => "DiscardUnreferencedMediaAttachment",
                         $(Request::$variant { .. } => stringify!($variant),)*
                         Request::Unknown => "Unknown",
                     }
                 }
-                const REQUEST_VARIANT_NAMES: &[&str] = &[$(stringify!($variant)),*, "Unknown"];
+                const REQUEST_VARIANT_NAMES: &[&str] = &[
+                    "RecoverSecurityBlockedMedia", "RegisterLocalPathMedia", "RetainHttpsMedia",
+                    "GetMediaAttachmentStatus", "GetMediaAttachmentPreview", "BeginMediaUpload",
+                    "AppendMediaUploadChunk", "CancelMediaUpload", "GetMediaUploadStatus",
+                    "FinalizeMediaUpload", "DiscardUnreferencedMediaAttachment",
+                    $(stringify!($variant)),*, "Unknown"
+                ];
             };
         }
     request_variants!(

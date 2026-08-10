@@ -485,8 +485,10 @@ mod tests {
         assert_eq!(
             hop.socket_addrs(),
             &[
-                "93.184.216.34:443".parse().unwrap(),
-                "[2606:2800:220:1:248:1893:25c8:1946]:443".parse().unwrap()
+                "93.184.216.34:443".parse::<std::net::SocketAddr>().unwrap(),
+                "[2606:2800:220:1:248:1893:25c8:1946]:443"
+                    .parse::<std::net::SocketAddr>()
+                    .unwrap()
             ]
         );
         assert_eq!(hop.url().host_str(), Some("media.example.test"));
@@ -816,8 +818,16 @@ mod tests {
         assert_eq!(
             *executor.vetted.lock().unwrap(),
             vec![
-                vec![format!("93.184.216.34:{}", ap.port()).parse().unwrap()],
-                vec![format!("93.184.216.35:{}", bp.port()).parse().unwrap()]
+                vec![
+                    format!("93.184.216.34:{}", ap.port())
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap()
+                ],
+                vec![
+                    format!("93.184.216.35:{}", bp.port())
+                        .parse::<std::net::SocketAddr>()
+                        .unwrap()
+                ]
             ]
         );
         sa.await.unwrap();

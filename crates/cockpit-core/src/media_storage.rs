@@ -76,8 +76,7 @@ impl HeldMediaComponentLease {
             );
             self.file.seek(SeekFrom::Start(0))?;
             let mut bytes = Vec::new();
-            self.file
-                .by_ref()
+            Read::by_ref(&mut self.file)
                 .take(self.authority.component.byte_length.saturating_add(1))
                 .read_to_end(&mut bytes)?;
             ensure!(
@@ -500,11 +499,9 @@ impl MediaStorageRecovery {
         drop(async_file);
         held.seek(SeekFrom::Start(0))?;
         let identity = stable_identity_digest(&held)?;
-        let mut reread = Sha256::new();
-        let reread_length = std::io::copy(&mut held, &mut reread)?;
+        let (reread_length, reread_checksum) = read_full_digest(&mut held)?;
         ensure!(
-            reread_length == fetch.byte_length
-                && crate::intel::hex_lower(&reread.finalize()) == fetch.sha256,
+            reread_length == fetch.byte_length && reread_checksum == fetch.sha256,
             "storage_security_violation"
         );
         ensure!(
@@ -772,6 +769,7 @@ impl MediaStorageRecovery {
             AcquiredMediaReference, MediaComponentLeaseKind, MediaKind, MediaReferenceConsumerKind,
         };
         ensure!(!attachment_ids.is_empty(), "media_attachment_unavailable");
+        let db_consumer_id = consumer_id.clone();
         let acquired = self
             .db
             .transaction(move |conn| {
@@ -797,7 +795,7 @@ impl MediaStorageRecovery {
                         session_id,
                         &project_digest,
                         MediaReferenceConsumerKind::Message,
-                        &consumer_id,
+                        &db_consumer_id,
                         now_unix_ms,
                     )?;
                     let authority = cockpit_db::Db::acquire_media_component_lease_conn(
@@ -979,7 +977,7 @@ impl MediaStorageRecovery {
             },
         };
         let upload = self
-            .begin_media_upload(begin, policy, now_unix_ms, now_monotonic_ms)
+            .begin_media_upload(begin, policy, now_monotonic_ms, now_unix_ms)
             .await?
             .subject_id;
         self.append_media_upload_chunk(
@@ -1745,7 +1743,7 @@ impl MediaStorageRecovery {
                                 .iter()
                                 .find(|stream| stream.index == selected.index)
                                 .context("invalid_media")?;
-                            Ok((
+                            Ok::<(u32, u32), anyhow::Error>((
                                 stream
                                     .sample_rate
                                     .as_deref()
@@ -1958,7 +1956,7 @@ impl MediaStorageRecovery {
         let normalized = if media_kind == MediaKind::Image {
             held.seek(SeekFrom::Start(0))?;
             let mut bytes = Vec::new();
-            held.by_ref()
+            Read::by_ref(&mut held)
                 .take(10 * 1024 * 1024 + 1)
                 .read_to_end(&mut bytes)?;
             ensure!(bytes.len() <= 10 * 1024 * 1024, "resource_limit");
@@ -2523,10 +2521,8 @@ impl MediaStorageRecovery {
         );
         let identity = stable_identity_digest(&source)?;
         let mtime_ns = modified_ns(&before)?;
-        let mut hasher = Sha256::new();
-        std::io::copy(&mut source, &mut hasher)?;
+        let (_, sha256) = read_full_digest(&mut source)?;
         source.seek(SeekFrom::Start(0))?;
-        let sha256 = crate::intel::hex_lower(&hasher.finalize());
         let after = source.metadata()?;
         ensure!(
             before.len() == after.len()
@@ -3292,8 +3288,8 @@ async fn run_bounded_runtime(
         .kill_on_drop(true);
     let mut child = command.spawn().context("model_runtime_unavailable")?;
     let mut stdin = child.stdin.take().context("model_runtime_unavailable")?;
-    let mut stdout = child.stdout.take().context("model_runtime_unavailable")?;
-    let mut stderr = child.stderr.take().context("model_runtime_unavailable")?;
+    let stdout = child.stdout.take().context("model_runtime_unavailable")?;
+    let stderr = child.stderr.take().context("model_runtime_unavailable")?;
     let work = async move {
         let writer = async move {
             stdin.write_all(&input).await?;
@@ -3489,7 +3485,7 @@ fn selected_video_timestamps(
 ) -> Result<Vec<(u64, u64)>> {
     let (time_num, time_den) =
         parse_positive_ratio(stream.time_base.as_deref().context("invalid_media")?)?;
-    let mut timestamps = document
+    let timestamps = document
         .frames
         .iter()
         .filter(|frame| frame.media_type == "video" && frame.stream_index == stream.index)
@@ -4330,9 +4326,7 @@ struct NormalizedImageDerivatives {
 }
 
 fn normalize_image(bytes: &[u8], container: &str) -> Result<NormalizedImageDerivatives> {
-    use image::{
-        DynamicImage, GenericImageView as _, ImageDecoder as _, ImageFormat, ImageReader, Limits,
-    };
+    use image::{DynamicImage, ImageDecoder as _, ImageFormat, ImageReader, Limits};
     let (format, exif_orientation) = match container {
         "png" => {
             reject_png_color_metadata(bytes)?;
@@ -5890,7 +5884,7 @@ mod tests {
                 .contains("idempotency_conflict")
         );
         let counts = db
-            .read(|conn| {
+            .read(move |conn| {
                 Ok((
                     conn.query_row("SELECT COUNT(*) FROM media_attachments", [], |r| {
                         r.get::<_, i64>(0)
@@ -5958,7 +5952,7 @@ mod tests {
             _ => unreachable!(),
         };
         let job_id = db
-            .read(|conn| {
+            .read(move |conn| {
                 Ok(conn.query_row(
                     "SELECT job_id FROM media_attachment_processing_jobs WHERE attachment_id=?1",
                     [attachment_id.to_string()],
@@ -7097,7 +7091,7 @@ mod tests {
                 .contains("injected upload attachment failure")
         );
         let failed_counts = db
-            .read(|conn| {
+            .read(move |conn| {
                 Ok((
                     conn.query_row("SELECT COUNT(*) FROM media_attachments", [], |row| {
                         row.get::<_, i64>(0)
@@ -7385,7 +7379,7 @@ mod tests {
                 },
             };
             let upload = recovery
-                .begin_media_upload(begin, policy, now, now as u64)
+                .begin_media_upload(begin, policy, now as u64, now)
                 .await
                 .unwrap()
                 .subject_id;
@@ -7589,10 +7583,12 @@ mod tests {
         let attachment = Uuid::now_v7();
         let fault_attachment = Uuid::now_v7();
         let project = "11".repeat(32);
-        let record = |id| MediaAttachmentRecord {
+        let record_session = session;
+        let record_project = project.clone();
+        let record = move |id| MediaAttachmentRecord {
             attachment_id: id,
-            session_id: session,
-            canonical_project_digest: project.clone(),
+            session_id: record_session,
+            canonical_project_digest: record_project.clone(),
             media_kind: MediaKind::Image,
             source_kind: MediaSourceKind::LocalPath,
             canonical_container: "png".into(),

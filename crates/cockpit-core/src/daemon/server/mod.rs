@@ -157,6 +157,13 @@ fn scrub_history_entry(
 fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTable) {
     match response {
         proto::Response::Ack => {}
+        proto::Response::MediaOwnerRecovery(..)
+        | proto::Response::LocalPathMediaRegistration(..)
+        | proto::Response::RetainedHttpsMedia(..)
+        | proto::Response::MediaAttachmentStatus(..)
+        | proto::Response::MediaAttachmentPreview(..)
+        | proto::Response::LocalMediaMutation(..)
+        | proto::Response::MediaUploadStatus(..) => {}
         proto::Response::ConfigRefreshed {
             applied_generation: _,
             changed: _,

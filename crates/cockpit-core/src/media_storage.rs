@@ -6412,6 +6412,29 @@ mod tests {
             state,
             ("model_derivative_unavailable".into(), "5".into(), 1, 3)
         );
+        db.transaction(|conn| {
+            let error = conn
+                .execute(
+                    "UPDATE media_attachment_processing_failure_evidence SET reason='unknown_runtime_reason'",
+                    [],
+                )
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("CHECK constraint failed"),
+                "{error}"
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT reason FROM media_attachment_processing_failure_evidence",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )?,
+                "model_runtime_unavailable"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

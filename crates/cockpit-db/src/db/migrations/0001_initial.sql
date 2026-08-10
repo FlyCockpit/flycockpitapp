@@ -552,7 +552,7 @@ CREATE TABLE media_attachment_processing_cleanup_evidence (
 CREATE TABLE media_attachment_processing_failure_evidence (
     job_id TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE,
     attachment_id TEXT NOT NULL,
-    reason TEXT NOT NULL CHECK(reason='processing_failed'),
+    reason TEXT NOT NULL CHECK(reason IN ('processing_failed','model_runtime_unavailable')),
     recorded_at_unix_ms INTEGER NOT NULL,
     FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE
 );

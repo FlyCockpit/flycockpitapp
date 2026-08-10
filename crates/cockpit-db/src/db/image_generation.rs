@@ -15,6 +15,16 @@ use super::external_journal::{
 };
 use super::image_generation_plan::ImageGenerationPlanV1;
 
+const MAX_IMAGE_GENERATION_RECONCILIATION_EVIDENCE_BYTES: usize = 64 * 1024;
+
+fn reconciliation_evidence_digest(bytes: &[u8]) -> Result<String> {
+    ensure!(
+        !bytes.is_empty() && bytes.len() <= MAX_IMAGE_GENERATION_RECONCILIATION_EVIDENCE_BYTES,
+        "reconciliation evidence length is invalid"
+    );
+    Ok(hex_lower(&Sha256::digest(bytes)))
+}
+
 macro_rules! state_enum {
     ($name:ident { $($variant:ident => $text:literal),+ $(,)? }) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -632,11 +642,7 @@ impl Db {
         conn: &Connection,
         input: &ReconcileImageGenerationAttempt<'_>,
     ) -> Result<ImageGenerationCasOutcome> {
-        ensure!(
-            !input.evidence_bytes.is_empty(),
-            "reconciliation evidence is empty"
-        );
-        let evidence_digest = hex_lower(&Sha256::digest(input.evidence_bytes));
+        let evidence_digest = reconciliation_evidence_digest(input.evidence_bytes)?;
         let cancellation: Option<i64> = conn.query_row(
             "SELECT applied_cancellation_version FROM image_generation_attempts WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3",
             params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number)],
@@ -1465,6 +1471,34 @@ fn reject_duplicate_json_keys(bytes: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
     use crate::db::image_generation_plan::*;
+
+    #[test]
+    fn reconciliation_evidence_has_exact_closed_bounds() {
+        assert!(reconciliation_evidence_digest(&[]).is_err());
+        assert!(
+            reconciliation_evidence_digest(&vec![
+                0;
+                MAX_IMAGE_GENERATION_RECONCILIATION_EVIDENCE_BYTES
+                    - 1
+            ])
+            .is_ok()
+        );
+        assert!(
+            reconciliation_evidence_digest(&vec![
+                0;
+                MAX_IMAGE_GENERATION_RECONCILIATION_EVIDENCE_BYTES
+            ])
+            .is_ok()
+        );
+        assert!(
+            reconciliation_evidence_digest(&vec![
+                0;
+                MAX_IMAGE_GENERATION_RECONCILIATION_EVIDENCE_BYTES
+                    + 1
+            ])
+            .is_err()
+        );
+    }
 
     fn canonical_test_plan(
         job_id: Uuid,

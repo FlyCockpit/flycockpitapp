@@ -46,6 +46,7 @@ pub struct RuntimeTargetAuthorityV1 {
     maximum_height: u32,
     allowed_parameters: BTreeMap<String, String>,
     max_attempts: u32,
+    required_grant: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +57,7 @@ pub struct ImageGenerationRequestV1 {
     pub samples_per_target: u32,
     pub target_ids: Vec<String>,
     pub parameters: BTreeMap<String, TypedParameterV1>,
+    pub reference_attachment_ids: Vec<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +165,13 @@ impl ImageGenerationResolutionAuthorityV1 {
             .iter()
             .map(reference_artifact_from_acquired_media_lease)
             .collect::<Result<Vec<_>>>()?;
+        ensure!(
+            references
+                .iter()
+                .map(|reference| reference.attachment_id)
+                .eq(request.reference_attachment_ids.iter().copied()),
+            "retained media proof set does not exactly match requested model inputs"
+        );
         let mut runtimes = proofs
             .runtime_snapshots
             .iter()
@@ -180,6 +189,18 @@ impl ImageGenerationResolutionAuthorityV1 {
                 .map(|runtime| &runtime.target_id)
                 .eq(request.target_ids.iter()),
             "runtime target authority does not exactly match request"
+        );
+        let expected_grants = runtimes
+            .iter()
+            .map(|runtime| runtime.required_grant.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let actual_grants = grants
+            .iter()
+            .map(|grant| grant.grant_kind.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        ensure!(
+            expected_grants == actual_grants && grants.len() == expected_grants.len(),
+            "image generation grant set does not exactly match target requirements"
         );
         let attempts_per_slot = runtimes
             .iter()
@@ -284,6 +305,13 @@ pub fn resolve_image_generation(
     ensure!(
         request.target_ids.windows(2).all(|pair| pair[0] < pair[1]),
         "requested targets must be unique and sorted"
+    );
+    ensure!(
+        request
+            .reference_attachment_ids
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]),
+        "requested references must be unique and sorted"
     );
     let mut alternatives = Vec::new();
     let mut targets = Vec::new();
@@ -625,7 +653,12 @@ impl RuntimeTargetAuthorityV1 {
         ensure!(
             capability.constraints.keys().all(|key| matches!(
                 key.as_str(),
-                "formats" | "max_width" | "max_height" | "parameters" | "max_attempts"
+                "formats"
+                    | "max_width"
+                    | "max_height"
+                    | "parameters"
+                    | "max_attempts"
+                    | "required_grant"
             )),
             "capability contains an unknown constraint"
         );
@@ -708,6 +741,12 @@ impl RuntimeTargetAuthorityV1 {
                 .get("max_attempts")
                 .ok_or_else(|| anyhow::anyhow!("capability attempt bound is missing"))?
                 .parse::<u32>()?,
+            required_grant: capability
+                .constraints
+                .get("required_grant")
+                .filter(|grant| valid_string(grant))
+                .ok_or_else(|| anyhow::anyhow!("capability required grant is missing"))?
+                .clone(),
         })
     }
 }
@@ -971,6 +1010,7 @@ mod tests {
                 samples_per_target: 1,
                 target_ids: vec![target.target_id.clone()],
                 parameters: target.typed_parameters.clone(),
+                reference_attachment_ids: vec![],
             },
             ImageGenerationResolutionAuthorityV1 {
                 job_id: sealed.job_id,
@@ -998,6 +1038,7 @@ mod tests {
                         maximum_height: 512,
                         allowed_parameters: BTreeMap::from([("quality".into(), "integer".into())]),
                         max_attempts: 1,
+                        required_grant: "image_generation".into(),
                     },
                     references: target.reference_artifacts.clone(),
                     slot_artifact_ids: vec![(

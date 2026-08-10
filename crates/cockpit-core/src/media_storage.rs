@@ -5987,6 +5987,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn https_media_ingest_semantic_failure_is_terminal_not_reclaimed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
+        let session_id = Uuid::now_v7();
+        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/redacted',1,1)",[session_id.to_string()])?;Ok(())}).await.unwrap();
+        let recovery = MediaStorageRecovery::open_or_create(db.clone(), &temp.path().join("media"))
+            .unwrap()
+            .with_https_fetcher(std::sync::Arc::new(ScriptedHttpsFetcher {
+                calls: AtomicUsize::new(0),
+                bytes: b"not media".to_vec(),
+            }));
+        let request = RetainHttpsMediaV1 {
+            schema_version: 1,
+            kind: "retainHttpsMedia".into(),
+            local_operation_id: Uuid::now_v7(),
+            owner_principal_digest: "22".repeat(32),
+            session_id,
+            canonical_project_digest: "11".repeat(32),
+            client_draft_id: Uuid::now_v7(),
+            requested_media_kind: RequestedLocalPathMediaKind::Image,
+            url: "https://media.example.test/bad".into(),
+        };
+        recovery
+            .retain_https_media(
+                request,
+                &cockpit_config::config::media_budget::MediaResourcePolicy::default(),
+                1,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovery.process_retained_https_jobs(11).await.unwrap(), 1);
+        assert_eq!(
+            recovery
+                .process_retained_https_jobs(1_000_000)
+                .await
+                .unwrap(),
+            0
+        );
+        let state = db
+            .read(|conn| {
+                Ok((
+                    conn.query_row("SELECT availability FROM media_attachments", [], |r| {
+                        r.get::<_, String>(0)
+                    })?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM media_attachment_processing_failure_evidence",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(state, ("failed".into(), 1));
+    }
+
+    #[tokio::test]
     async fn local_path_registration_fault_rolls_back_reservation_and_attachment() {
         let temp = tempfile::TempDir::new().unwrap();
         let project = temp.path().join("project");

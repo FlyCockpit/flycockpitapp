@@ -330,7 +330,7 @@ thread_local! { static FORCE_SOURCE_CLEANUP_FAILURE: std::cell::Cell<bool> = con
 thread_local! { static FORCE_POST_CLEANUP_METADATA_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 #[cfg(test)]
 fn sync_failure_forced() -> bool {
-    FORCE_DIRECTORY_SYNC_FAILURE.get()
+    FORCE_DIRECTORY_SYNC_FAILURE.replace(false)
 }
 #[cfg(not(test))]
 fn sync_failure_forced() -> bool {
@@ -1925,7 +1925,6 @@ mod tests {
         else {
             panic!("sync cut must return recovery authority")
         };
-        FORCE_DIRECTORY_SYNC_FAILURE.set(false);
         assert_eq!(
             std::fs::read(temp.path().join("published")).unwrap(),
             b"exact"
@@ -2003,7 +2002,6 @@ mod tests {
         else {
             panic!("post-delete sync failure must retain recovery authority")
         };
-        FORCE_DIRECTORY_SYNC_FAILURE.set(false);
         assert!(matches!(
             held.reconcile(&recovery).unwrap(),
             HeldDirectoryEffectOutcome::AppliedDurable(_)
@@ -2255,7 +2253,6 @@ mod windows_tests {
         else {
             panic!("sync cut must be recoverable")
         };
-        FORCE_DIRECTORY_SYNC_FAILURE.set(false);
         assert!(matches!(
             held.reconcile(&recovery).unwrap(),
             HeldDirectoryEffectOutcome::AppliedDurable(_)
@@ -2315,7 +2312,6 @@ mod windows_tests {
         else {
             panic!("directory sync failure after delete must be recoverable")
         };
-        FORCE_DIRECTORY_SYNC_FAILURE.set(false);
         assert!(matches!(
             held.reconcile(&recovery).unwrap(),
             HeldDirectoryEffectOutcome::AppliedDurable(_)

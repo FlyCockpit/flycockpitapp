@@ -340,8 +340,8 @@ impl Db {
             ReserveRemoteOperationOutcome::Replay(replay) if replay.state=="committed" => Ok(PrepareRemoteRenameOutcome::Replay(replay.safe_response.context("committed rename lacks response")?)),
             ReserveRemoteOperationOutcome::Replay(replay) if replay.state=="dispatched" => {
                 let stored=load_remote_rename_evidence(conn,&owned.logical_attachment_id,&owned.operation_id)?;
-                let next:i64=conn.query_row("UPDATE remote_attachment_operations SET dispatch_generation=dispatch_generation+1,updated_at_ms=?3 WHERE logical_attachment_id=?1 AND operation_id=?2 AND dispatch_generation=?4 RETURNING dispatch_generation",params![owned.logical_attachment_id,owned.operation_id,owned.now_ms,i64::try_from(stored.dispatch_generation)?],|row|row.get(0))?;
-                let changed=conn.execute("UPDATE remote_rename_journal SET dispatch_generation=?3,updated_at_ms=?4 WHERE logical_attachment_id=?1 AND operation_id=?2 AND dispatch_generation=?5",params![owned.logical_attachment_id,owned.operation_id,next,owned.now_ms,i64::try_from(stored.dispatch_generation)?])?;
+                let next:i64=conn.query_row("UPDATE remote_attachment_operations SET dispatch_generation=dispatch_generation+1,updated_at_ms=MAX(updated_at_ms,?3) WHERE logical_attachment_id=?1 AND operation_id=?2 AND dispatch_generation=?4 RETURNING dispatch_generation",params![owned.logical_attachment_id,owned.operation_id,owned.now_ms,i64::try_from(stored.dispatch_generation)?],|row|row.get(0))?;
+                let changed=conn.execute("UPDATE remote_rename_journal SET dispatch_generation=?3,updated_at_ms=MAX(updated_at_ms,?4) WHERE logical_attachment_id=?1 AND operation_id=?2 AND dispatch_generation=?5",params![owned.logical_attachment_id,owned.operation_id,next,owned.now_ms,i64::try_from(stored.dispatch_generation)?])?;
                 ensure!(changed==1,"rename journal generation CAS lost");
                 Ok(PrepareRemoteRenameOutcome::Reconcile(load_remote_rename_evidence(conn,&owned.logical_attachment_id,&owned.operation_id)?))
             }
@@ -2519,6 +2519,17 @@ mod tests {
         assert_eq!(evidence.artifact_id, artifact);
         assert_eq!(evidence.dispatch_generation, 2);
         assert_eq!(evidence.state, "artifact_synced");
+        assert_eq!(
+            db.read(|conn| Ok(conn.query_row(
+                "SELECT updated_at_ms FROM remote_rename_journal WHERE logical_attachment_id=?1 AND operation_id=?2",
+                params![ATTACHMENT, operation],
+                |row| row.get::<_, i64>(0),
+            )?))
+            .await
+            .unwrap(),
+            11,
+            "reconciliation generation advance cannot regress durable barrier time"
+        );
         assert!(
             !db.advance_remote_rename_operation(
                 ATTACHMENT,
@@ -3017,11 +3028,12 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(
+        assert_eq!(
             db.compact_closed_remote_attachment_operation_ledger(ATTACHMENT, 0, 1, deadline)
                 .await
-                .is_err(),
-            "an uncovered event FK prevents premature retirement"
+                .unwrap(),
+            0,
+            "an uncovered event remains authoritative and prevents retirement"
         );
         assert!(
             db.remote_operation_status(ATTACHMENT, operation)
@@ -3029,6 +3041,29 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        let (events, operations, cursor): (i64, i64, i64) = db
+            .read(|conn| {
+                Ok((
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM remote_attachment_outbox WHERE logical_attachment_id=?1",
+                        [ATTACHMENT],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM remote_attachment_operations WHERE logical_attachment_id=?1",
+                        [ATTACHMENT],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT compacted_through_event_seq FROM remote_attachment_outbox_snapshots WHERE logical_attachment_id=?1",
+                        [ATTACHMENT],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!((events, operations, cursor), (1, 1, 0));
     }
 
     #[tokio::test]

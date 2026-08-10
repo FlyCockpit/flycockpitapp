@@ -3283,20 +3283,26 @@ async fn select_client_task(
 ) -> Result<()> {
     tokio::select! {
         biased;
-        result = executor => flatten_client_task(result, "client executor task"),
-        result = reader => flatten_client_task(result, "client reader task"),
-        result = writer => flatten_client_task(result, "client writer task"),
-        result = event => flatten_client_task(result, "client event task"),
+        result = executor => flatten_client_task(result, "client executor task", false),
+        result = reader => flatten_client_task(result, "client reader task", true),
+        result = writer => flatten_client_task(result, "client writer task", false),
+        result = event => flatten_client_task(result, "client event task", false),
     }
 }
 
 fn flatten_client_task(
     result: std::result::Result<Result<()>, tokio::task::JoinError>,
     label: &str,
+    clean_exit_is_normal: bool,
 ) -> Result<()> {
-    result
+    let result = result
         .with_context(|| format!("{label} join failed"))?
-        .with_context(|| format!("{label} failed"))
+        .with_context(|| format!("{label} failed"));
+    match result {
+        Ok(()) if clean_exit_is_normal => Ok(()),
+        Ok(()) => anyhow::bail!("{label} ended unexpectedly"),
+        Err(error) => Err(error),
+    }
 }
 
 enum ClientExecutorInput {

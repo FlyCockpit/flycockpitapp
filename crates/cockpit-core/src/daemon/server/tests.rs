@@ -16331,11 +16331,27 @@ async fn server_answers_too_new_request_with_protocol_version_error() {
 #[tokio::test]
 async fn client_transport_task_flattener_preserves_inner_error_and_task_context() {
     let task = tokio::spawn(async { Err::<(), _>(anyhow::anyhow!("forced child failure")) });
-    let error = super::flatten_client_task(task.await, "client fixture task").unwrap_err();
+    let error = super::flatten_client_task(task.await, "client fixture task", false).unwrap_err();
     assert_eq!(
         format!("{error:#}"),
         "client fixture task failed: forced child failure"
     );
+}
+
+#[tokio::test]
+async fn client_transport_only_accepts_clean_reader_exit() {
+    let reader = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
+    super::flatten_client_task(reader.await, "client reader task", true).unwrap();
+
+    for label in [
+        "client writer task",
+        "client event task",
+        "client executor task",
+    ] {
+        let task = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
+        let error = super::flatten_client_task(task.await, label, false).unwrap_err();
+        assert_eq!(error.to_string(), format!("{label} ended unexpectedly"));
+    }
 }
 
 #[tokio::test]

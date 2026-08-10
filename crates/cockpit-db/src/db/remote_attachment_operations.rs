@@ -1099,12 +1099,22 @@ impl Db {
             now_ms: request.now_ms,
         };
         self.transaction(move |conn| {
+            let effective_now: i64 = conn.query_row(
+                "SELECT MAX(?3,o.updated_at_ms,j.updated_at_ms)
+                 FROM remote_attachment_operations o
+                 JOIN remote_rename_journal j USING(logical_attachment_id,operation_id)
+                 WHERE o.logical_attachment_id=?1 AND o.operation_id=?2",
+                params![owned.logical_attachment_id, owned.operation_id, owned.now_ms],
+                |row| row.get(0),
+            )?;
+            let mut owned = owned;
+            owned.now_ms = effective_now;
             let outcome = commit_conn_with_policy(conn, &owned, true)?;
             if !matches!(outcome, CommitRemoteOperationOutcome::Committed { .. }) {
                 return Ok(outcome);
             }
             let changed = conn.execute(
-                "UPDATE remote_rename_journal SET state='ledger_committed',updated_at_ms=?4
+                "UPDATE remote_rename_journal SET state='ledger_committed',updated_at_ms=MAX(updated_at_ms,?4)
                  WHERE logical_attachment_id=?1 AND operation_id=?2 AND state='applied'
                    AND dispatch_generation=?3
                    AND dispatch_generation=(SELECT dispatch_generation FROM remote_attachment_operations
@@ -2617,11 +2627,26 @@ mod tests {
         ));
         drop(db);
         let db = Db::open(&path).unwrap();
-        let (journal_state, outbox_count): (String, i64) = db
+        let (journal_state, journal_updated_at, operation_updated_at, outbox_created_at, outbox_count): (String, i64, i64, i64, i64) = db
             .transaction(move |conn| {
                 Ok((
                     conn.query_row(
                         "SELECT state FROM remote_rename_journal WHERE logical_attachment_id=?1 AND operation_id=?2",
+                        params![ATTACHMENT, operation],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT updated_at_ms FROM remote_rename_journal WHERE logical_attachment_id=?1 AND operation_id=?2",
+                        params![ATTACHMENT, operation],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT updated_at_ms FROM remote_attachment_operations WHERE logical_attachment_id=?1 AND operation_id=?2",
+                        params![ATTACHMENT, operation],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT created_at_ms FROM remote_attachment_outbox WHERE logical_attachment_id=?1 AND operation_seq=(SELECT operation_seq FROM remote_attachment_operations WHERE logical_attachment_id=?1 AND operation_id=?2)",
                         params![ATTACHMENT, operation],
                         |row| row.get(0),
                     )?,
@@ -2635,6 +2660,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(journal_state, "ledger_committed");
+        assert_eq!(
+            (journal_updated_at, operation_updated_at, outbox_created_at),
+            (21, 21, 21)
+        );
         assert_eq!(outbox_count, 1);
         assert!(
             db.commit_remote_rename_operation(commit(), 2)

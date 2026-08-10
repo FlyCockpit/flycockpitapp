@@ -1841,6 +1841,18 @@ impl Db {
         Ok(())
     }
 
+    pub fn set_session_llm_mode_conn(
+        conn: &rusqlite::Connection,
+        session_id: Uuid,
+        mode: &str,
+    ) -> Result<()> {
+        conn.execute(
+            "UPDATE sessions SET session_llm_mode = ?1 WHERE session_id = ?2",
+            params![mode, session_id.to_string()],
+        )?;
+        Ok(())
+    }
+
     pub async fn set_session_llm_mode(&self, session_id: Uuid, mode: Option<&str>) -> Result<()> {
         let mode = mode.map(str::to_owned);
         self.write(move |conn| {

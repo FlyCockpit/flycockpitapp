@@ -1869,9 +1869,27 @@ async fn https_media_ingest_daemon_dispatch_is_owner_bound_ready_and_replayable(
         requested_media_kind: RequestedLocalPathMediaKind::Image,
         url: "https://media.example.test/image.png?secret=redacted".into(),
     };
-    let first = handle_request(Request::RetainHttpsMedia(request.clone()), &mut state, &ctx)
-        .await
-        .unwrap();
+    let first = dispatch_authz_request_after(
+        &ctx,
+        ClientPrincipal::owner(),
+        vec![Request::Attach {
+            session_id: Some(session_id),
+            since_seq: None,
+            project_root: Some(project.to_string_lossy().into_owned()),
+            initial_model: None,
+            no_sandbox: false,
+            interactive: true,
+            model_override: None,
+            client_protocol_version: proto::PROTOCOL_VERSION,
+            env_snapshot: None,
+            env_policy: EnvDriftPolicy::Daemon,
+        }],
+        None,
+        None,
+        Request::RetainHttpsMedia(request.clone()),
+    )
+    .await
+    .unwrap();
     let Response::RetainedHttpsMedia(receipt) = first else {
         panic!("unexpected response")
     };

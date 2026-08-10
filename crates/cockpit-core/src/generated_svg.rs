@@ -266,8 +266,14 @@ pub fn sanitize_generated_svg(raw: &[u8]) -> Result<SanitizedSvgArtifact> {
         ));
     }
     let mut hush = BoundedBytes::new(MAX_CANONICAL_BYTES);
-    svg_hush::Filter::new()
-        .filter(canonical.as_slice(), &mut hush)
+    let defense_result = svg_hush::Filter::new().filter(canonical.as_slice(), &mut hush);
+    if hush.overflowed {
+        return Err(SvgSanitizeError::new(
+            SvgSanitizeCode::CanonicalBytes,
+            "svg-hush",
+        ));
+    }
+    defense_result
         .map_err(|_| SvgSanitizeError::new(SvgSanitizeCode::DefenseMismatch, "svg-hush"))?;
     verify_defense_output(&canonical, hush.as_slice())?;
     verify::verify_canonical_svg(&canonical)?;
@@ -287,6 +293,7 @@ pub fn sanitize_generated_svg(raw: &[u8]) -> Result<SanitizedSvgArtifact> {
 struct BoundedBytes {
     bytes: Vec<u8>,
     limit: usize,
+    overflowed: bool,
 }
 
 impl BoundedBytes {
@@ -294,6 +301,7 @@ impl BoundedBytes {
         Self {
             bytes: Vec::new(),
             limit,
+            overflowed: false,
         }
     }
 
@@ -310,6 +318,7 @@ impl Write for BoundedBytes {
             .checked_add(bytes.len())
             .is_none_or(|len| len > self.limit)
         {
+            self.overflowed = true;
             return Err(io::Error::new(
                 io::ErrorKind::FileTooLarge,
                 "generated SVG defense output exceeds limit",
@@ -352,24 +361,12 @@ fn parse_validate(raw: &[u8], canonical_pass: bool, allow_declaration: bool) -> 
             .read_event()
             .map_err(|_| SvgSanitizeError::new(SvgSanitizeCode::Xml, "document"))?
         {
-            Event::Start(e) => start_node(
-                &reader,
-                &e,
-                &mut stack,
-                &mut root,
-                &mut counts,
-                &mut saw_root,
-                false,
-            )?,
-            Event::Empty(e) => start_node(
-                &reader,
-                &e,
-                &mut stack,
-                &mut root,
-                &mut counts,
-                &mut saw_root,
-                true,
-            )?,
+            Event::Start(e) => {
+                start_node(&e, &mut stack, &mut root, &mut counts, &mut saw_root, false)?
+            }
+            Event::Empty(e) => {
+                start_node(&e, &mut stack, &mut root, &mut counts, &mut saw_root, true)?
+            }
             Event::End(_) => {
                 let node = stack
                     .pop()
@@ -377,12 +374,14 @@ fn parse_validate(raw: &[u8], canonical_pass: bool, allow_declaration: bool) -> 
                 attach(node, &mut stack, &mut root)?;
             }
             Event::Text(t) => {
-                let decoded = t
-                    .decode()
-                    .map_err(|_| SvgSanitizeError::new(SvgSanitizeCode::Xml, "text"))?;
-                let text = quick_xml::escape::unescape(&decoded)
-                    .map_err(|_| SvgSanitizeError::new(SvgSanitizeCode::Xml, "entity"))?
-                    .into_owned();
+                let text = decode_attribute_bounded(t.as_ref(), 4096).map_err(|error| {
+                    if error.code() == SvgSanitizeCode::AttributeBytes {
+                        SvgSanitizeError::new(SvgSanitizeCode::TextBytes, "text-node")
+                    } else {
+                        error
+                    }
+                })?;
+                let text = text.replace("\r\n", "\n").replace('\r', "\n");
                 add_text(&text, &mut stack, &mut counts)?;
             }
             Event::GeneralRef(reference) => {
@@ -411,7 +410,6 @@ fn parse_validate(raw: &[u8], canonical_pass: bool, allow_declaration: bool) -> 
 }
 
 fn start_node(
-    reader: &Reader<&[u8]>,
     e: &BytesStart<'_>,
     stack: &mut Vec<Node>,
     root: &mut Option<Node>,
@@ -478,21 +476,12 @@ fn start_node(
         }
         let name = std::str::from_utf8(a.key.as_ref())
             .map_err(|_| SvgSanitizeError::new(SvgSanitizeCode::Attribute, "attribute"))?;
-        let value = a
-            .decode_and_unescape_value(reader.decoder())
-            .map_err(|_| SvgSanitizeError::new(SvgSanitizeCode::Xml, "attribute"))?
-            .into_owned();
         let limit = if name == "d" {
             MAX_PATH_ATTRIBUTE_BYTES
         } else {
             MAX_ATTRIBUTE_BYTES
         };
-        if value.len() > limit {
-            return Err(SvgSanitizeError::new(
-                SvgSanitizeCode::AttributeBytes,
-                "attribute",
-            ));
-        }
+        let value = decode_attribute_bounded(a.value.as_ref(), limit)?;
         if name == "xmlns" {
             if kind != ElementKind::Svg || !stack.is_empty() || xmlns.is_some() || value != SVG_NS {
                 return Err(SvgSanitizeError::new(SvgSanitizeCode::Namespace, "xmlns"));
@@ -524,6 +513,40 @@ fn start_node(
     } else {
         stack.push(node);
     }
+    Ok(())
+}
+
+fn decode_attribute_bounded(raw: &[u8], limit: usize) -> Result<String> {
+    let raw = std::str::from_utf8(raw)
+        .map_err(|_| SvgSanitizeError::new(SvgSanitizeCode::Xml, "attribute"))?;
+    let mut output = String::with_capacity(raw.len().min(limit));
+    let mut rest = raw;
+    while let Some(index) = rest.find('&') {
+        push_attribute_fragment(&mut output, &rest[..index], limit)?;
+        let after = &rest[index + 1..];
+        let end = after
+            .find(';')
+            .ok_or_else(|| SvgSanitizeError::new(SvgSanitizeCode::Xml, "entity"))?;
+        let decoded = decode_reference(&after[..end])?;
+        push_attribute_fragment(&mut output, &decoded, limit)?;
+        rest = &after[end + 1..];
+    }
+    push_attribute_fragment(&mut output, rest, limit)?;
+    Ok(output)
+}
+
+fn push_attribute_fragment(output: &mut String, value: &str, limit: usize) -> Result<()> {
+    if output
+        .len()
+        .checked_add(value.len())
+        .is_none_or(|length| length > limit)
+    {
+        return Err(SvgSanitizeError::new(
+            SvgSanitizeCode::AttributeBytes,
+            "attribute",
+        ));
+    }
+    output.push_str(value);
     Ok(())
 }
 
@@ -630,9 +653,7 @@ fn add_text(text: &str, stack: &mut [Node], counts: &mut Counts) -> Result<()> {
     if counts.text_scalars > MAX_TEXT_SCALARS {
         return Err(SvgSanitizeError::new(SvgSanitizeCode::TextScalars, "text"));
     }
-    parent
-        .children
-        .push(Child::Text(text.replace("\r\n", "\n").replace('\r', "\n")));
+    parent.children.push(Child::Text(text.to_owned()));
     Ok(())
 }
 fn validate_text(s: &str) -> Result<()> {

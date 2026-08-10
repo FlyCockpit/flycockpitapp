@@ -2056,6 +2056,30 @@ mod tests {
         };
         assert!(invalid.validate_semantics().is_err());
     }
+
+    #[test]
+    fn retained_https_wire_accepts_production_uuid_v4_session_authority() {
+        use cockpit_db::media_attachments::{RequestedLocalPathMediaKind, RetainHttpsMediaV1};
+
+        let session_id = Uuid::new_v4();
+        let request = Request::RetainHttpsMedia(RetainHttpsMediaV1 {
+            schema_version: 1,
+            kind: "retainHttpsMedia".into(),
+            local_operation_id: Uuid::now_v7(),
+            owner_principal_digest: "11".repeat(32),
+            session_id,
+            canonical_project_digest: "22".repeat(32),
+            client_draft_id: Uuid::now_v7(),
+            requested_media_kind: RequestedLocalPathMediaKind::Image,
+            url: "https://media.example.test/image.png".into(),
+        });
+        let encoded = serde_json::to_string(&request).unwrap();
+        let decoded: Request = serde_json::from_str(&encoded).unwrap();
+        let Request::RetainHttpsMedia(decoded) = decoded else {
+            panic!("wrong typed-media wire variant")
+        };
+        assert_eq!(decoded.session_id, session_id);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

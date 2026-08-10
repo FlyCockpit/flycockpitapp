@@ -49,7 +49,6 @@ pub enum LocalMediaActorRoleV1 {
 )]
 pub enum LocalMediaMutationPayloadV1 {
     Begin {
-        #[serde(with = "strict_uuid_v7")]
         session_id: Uuid,
         canonical_project_digest: String,
         #[serde(with = "strict_uuid_v7")]
@@ -59,7 +58,6 @@ pub enum LocalMediaMutationPayloadV1 {
         reservation_digest: String,
     },
     Append {
-        #[serde(with = "strict_uuid_v7")]
         session_id: Uuid,
         canonical_project_digest: String,
         #[serde(with = "strict_uuid_v7")]
@@ -72,7 +70,6 @@ pub enum LocalMediaMutationPayloadV1 {
         chunk_sha256: String,
     },
     Finalize {
-        #[serde(with = "strict_uuid_v7")]
         session_id: Uuid,
         canonical_project_digest: String,
         #[serde(with = "strict_uuid_v7")]
@@ -85,7 +82,6 @@ pub enum LocalMediaMutationPayloadV1 {
         object_sha256: String,
     },
     Cancel {
-        #[serde(with = "strict_uuid_v7")]
         session_id: Uuid,
         canonical_project_digest: String,
         #[serde(with = "strict_uuid_v7")]
@@ -95,7 +91,6 @@ pub enum LocalMediaMutationPayloadV1 {
         upload_generation: u64,
     },
     Discard {
-        #[serde(with = "strict_uuid_v7")]
         session_id: Uuid,
         canonical_project_digest: String,
         #[serde(with = "strict_uuid_v7")]
@@ -552,7 +547,6 @@ pub struct MediaUploadStatusV1 {
 pub struct GetMediaUploadStatusV1 {
     pub schema_version: u8,
     pub kind: String,
-    #[serde(with = "strict_uuid_v7")]
     pub session_id: Uuid,
     pub canonical_project_digest: String,
     #[serde(with = "strict_uuid_v7")]
@@ -633,7 +627,6 @@ pub struct RegisterLocalPathMediaV1 {
     #[serde(with = "strict_uuid_v7")]
     pub local_operation_id: Uuid,
     pub owner_principal_digest: String,
-    #[serde(with = "strict_uuid_v7")]
     pub session_id: Uuid,
     pub canonical_project_digest: String,
     #[serde(with = "strict_uuid_v7")]
@@ -653,7 +646,6 @@ pub struct RetainHttpsMediaV1 {
     #[serde(with = "strict_uuid_v7")]
     pub local_operation_id: Uuid,
     pub owner_principal_digest: String,
-    #[serde(with = "strict_uuid_v7")]
     pub session_id: Uuid,
     pub canonical_project_digest: String,
     #[serde(with = "strict_uuid_v7")]
@@ -709,7 +701,6 @@ pub struct RetainedHttpsMediaReceiptV1 {
     #[serde(with = "strict_uuid_v7")]
     pub local_operation_id: Uuid,
     pub owner_principal_digest: String,
-    #[serde(with = "strict_uuid_v7")]
     pub session_id: Uuid,
     pub canonical_project_digest: String,
     #[serde(with = "strict_uuid_v7")]
@@ -764,7 +755,6 @@ pub struct LocalPathRegistrationReceiptV1 {
     #[serde(with = "strict_uuid_v7")]
     pub local_operation_id: Uuid,
     pub owner_principal_digest: String,
-    #[serde(with = "strict_uuid_v7")]
     pub session_id: Uuid,
     pub canonical_project_digest: String,
     #[serde(with = "strict_uuid_v7")]
@@ -780,7 +770,6 @@ pub struct LocalPathRegistrationReceiptV1 {
 pub struct GetMediaAttachmentStatusV1 {
     pub schema_version: u8,
     pub kind: String,
-    #[serde(with = "strict_uuid_v7")]
     pub session_id: Uuid,
     pub canonical_project_digest: String,
     #[serde(with = "strict_uuid_v7")]
@@ -792,7 +781,6 @@ pub struct GetMediaAttachmentStatusV1 {
 pub struct GetMediaAttachmentPreviewV1 {
     pub schema_version: u8,
     pub kind: String,
-    #[serde(with = "strict_uuid_v7")]
     pub session_id: Uuid,
     pub canonical_project_digest: String,
     #[serde(with = "strict_uuid_v7")]
@@ -1273,7 +1261,7 @@ impl super::Db {
         ensure!(
             request.schema_version == 1
                 && request.kind == "getMediaUploadStatus"
-                && is_strict_uuid_v7(request.session_id)
+                && !request.session_id.is_nil()
                 && is_strict_uuid_v7(request.client_draft_id)
                 && is_strict_uuid_v7(request.upload_id)
                 && request.upload_generation > 0,
@@ -1458,7 +1446,7 @@ impl super::Db {
                 (*session_id, canonical_project_digest)
             }
         };
-        ensure!(is_strict_uuid_v7(session), "session id must be UUIDv7");
+        ensure!(!session.is_nil(), "session id must be non-nil");
         validate_digest(project, "project digest")?;
         Ok(())
     }
@@ -1488,8 +1476,8 @@ impl super::Db {
             "invalid media attachment status request"
         );
         ensure!(
-            is_strict_uuid_v7(request.session_id) && is_strict_uuid_v7(request.attachment_id),
-            "status ids must be UUIDv7"
+            !request.session_id.is_nil() && is_strict_uuid_v7(request.attachment_id),
+            "status ids are invalid"
         );
         validate_digest(&request.canonical_project_digest, "project digest")?;
         let Some(record) = Self::media_attachment_for_owner_conn(
@@ -2552,7 +2540,10 @@ mod tests {
     #[test]
     fn https_media_ingest_request_and_redacted_receipt_are_closed() {
         let operation_id = Uuid::now_v7();
-        let session_id = Uuid::now_v7();
+        // Session authority predates typed media and production currently
+        // issues UUIDv4 session IDs. Media-owned operation/draft/receipt IDs
+        // remain strict UUIDv7.
+        let session_id = Uuid::new_v4();
         let draft_id = Uuid::now_v7();
         let request_json = serde_json::json!({
             "schemaVersion": 1,

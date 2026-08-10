@@ -633,7 +633,11 @@ impl Db {
         input: &ReconcileImageGenerationAttempt<'_>,
     ) -> Result<ImageGenerationCasOutcome> {
         ensure!(
-            input.evidence_digest.len() == 64,
+            input.evidence_digest.len() == 64
+                && input
+                    .evidence_digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
             "reconciliation evidence digest is invalid"
         );
         let (journal_next, attempt_next, outcome) = match input.outcome {
@@ -662,7 +666,11 @@ impl Db {
             .expected_journal_version
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("journal version overflow"))?;
-        conn.execute("INSERT INTO image_generation_reconciliation_evidence(job_id,slot_id,attempt_number,journal_version,evidence_digest,outcome) VALUES(?1,?2,?3,?4,?5,?6)",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(journal_version)?,input.evidence_digest,outcome])?;
+        let evidence_inserted=conn.execute("INSERT INTO image_generation_reconciliation_evidence(job_id,slot_id,attempt_number,journal_version,evidence_digest,provider_request_identity,provider_idempotency_identity,journal_payload_digest,outcome) SELECT a.job_id,a.slot_id,a.attempt_number,?1,?2,a.provider_request_identity,a.provider_idempotency_identity,j.payload_digest,?3 FROM image_generation_attempts a JOIN external_journal_operations j ON j.operation_id=a.external_operation_id WHERE a.job_id=?4 AND a.slot_id=?5 AND a.attempt_number=?6 AND a.external_operation_id=?7",params![i64::try_from(journal_version)?,input.evidence_digest,outcome,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),input.external_operation_id.to_string()])?;
+        ensure!(
+            evidence_inserted == 1,
+            "reconciliation evidence identity is not bound"
+        );
         let attempt_changed=conn.execute("UPDATE image_generation_attempts SET state=?1,version=?2,observed_journal_version=?3,nonacceptance_evidence_digest=CASE WHEN ?4='authoritative_nonacceptance' THEN ?5 ELSE NULL END WHERE job_id=?6 AND slot_id=?7 AND attempt_number=?8 AND state='reconciling' AND version=?9 AND external_operation_id=?10",params![attempt_next.as_str(),i64::try_from(input.expected_attempt_version+1)?,i64::try_from(journal_version)?,outcome,input.evidence_digest,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?,input.external_operation_id.to_string()])?;
         ensure!(
             attempt_changed == 1,
@@ -688,7 +696,7 @@ impl Db {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         if let Some(terminal) = reduce_terminal_job_facts(&projection) {
-            let changed=conn.execute("UPDATE image_generation_jobs SET state=?1,version=version+1,updated_at_unix_ms=?2 WHERE job_id=?3 AND state='submission_unknown'",params![terminal.as_str(),input.now_unix_ms,input.job_id.to_string()])?;
+            let changed=conn.execute("UPDATE image_generation_jobs SET state=?1,version=version+1,updated_at_unix_ms=?2 WHERE job_id=?3 AND state IN ('submission_unknown','cancellation_requested')",params![terminal.as_str(),input.now_unix_ms,input.job_id.to_string()])?;
             ensure!(changed == 1, "reconciliation lost job compare-and-set");
         }
         Ok(ImageGenerationCasOutcome::Applied {

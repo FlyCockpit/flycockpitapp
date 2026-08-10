@@ -41,6 +41,7 @@ pub struct RuntimeTargetAuthorityV1 {
     maximum_width: u32,
     maximum_height: u32,
     allowed_parameters: BTreeMap<String, String>,
+    max_attempts: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,7 +61,8 @@ pub struct ImageGenerationTargetResolutionAuthorityV1 {
     slot_artifact_ids: Vec<(Uuid, Uuid)>,
     max_attempts: u32,
     attempt_resources: Vec<ResourceReservationV1>,
-    attempt_maximum_usd_micros: Option<u64>,
+    attempt_maximum_usd_micros: Vec<Option<u64>>,
+    spend_attempt_identities: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +81,7 @@ pub struct ImageGenerationResolutionAuthorityV1 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageGenerationOwnerContextAuthority {
     session_id: Uuid,
+    project_id: String,
     principal_digest: String,
     project_identity_digest: String,
     config_generation: u64,
@@ -103,6 +106,7 @@ impl ImageGenerationOwnerContextAuthority {
         let principal_json = serde_json::to_vec(principal)?;
         Ok(Self {
             session_id,
+            project_id: session.project_id.clone(),
             principal_digest: crate::intel::hex_lower(&Sha256::digest(principal_json)),
             project_identity_digest: digest_fields(&[
                 "image-generation-project-v1",
@@ -110,6 +114,146 @@ impl ImageGenerationOwnerContextAuthority {
                 &session.project_root,
             ]),
             config_generation,
+        })
+    }
+}
+
+pub struct ImageGenerationResolutionProofs<'a> {
+    pub runtime_snapshots: &'a [ImageHealthSnapshot],
+    pub grants: &'a [SealedActionGrantRow],
+    pub central_reservation: &'a MediaReservationPlan,
+    pub spend_reservation: &'a SpendReservation,
+    pub spend_attempts: &'a [AttemptMaximum],
+    pub reference_leases: &'a [AcquiredMediaComponentLease],
+    pub output: &'a HeldImageGenerationOutputDirectory,
+    pub enqueue_started_monotonic_ms: u64,
+    pub operation_deadline_monotonic_ms: u64,
+    pub now_unix_ms: i64,
+}
+
+impl ImageGenerationResolutionAuthorityV1 {
+    pub fn from_proofs(
+        owner: ImageGenerationOwnerContextAuthority,
+        request: &ImageGenerationRequestV1,
+        proofs: ImageGenerationResolutionProofs<'_>,
+    ) -> Result<Self> {
+        ensure!(
+            !request.target_ids.is_empty() && request.samples_per_target > 0,
+            "image generation request has no outputs"
+        );
+        let mut grants = proofs
+            .grants
+            .iter()
+            .map(|grant| {
+                ensure!(
+                    grant.session_id == owner.session_id.to_string()
+                        && grant.project_key == owner.project_id,
+                    "grant authority does not belong to owner context"
+                );
+                grant_requirement_from_sealed_grant(grant, proofs.now_unix_ms)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        grants.sort();
+        let references = proofs
+            .reference_leases
+            .iter()
+            .map(reference_artifact_from_acquired_media_lease)
+            .collect::<Result<Vec<_>>>()?;
+        let mut runtimes = proofs
+            .runtime_snapshots
+            .iter()
+            .map(|snapshot| {
+                RuntimeTargetAuthorityV1::from_registry_snapshot(
+                    snapshot,
+                    proofs.operation_deadline_monotonic_ms,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        runtimes.sort_by(|left, right| left.target_id.cmp(&right.target_id));
+        ensure!(
+            runtimes
+                .iter()
+                .map(|runtime| &runtime.target_id)
+                .eq(request.target_ids.iter()),
+            "runtime target authority does not exactly match request"
+        );
+        let attempts_per_slot = runtimes
+            .iter()
+            .map(|runtime| runtime.max_attempts)
+            .collect::<Vec<_>>();
+        let total_attempts = attempts_per_slot
+            .iter()
+            .try_fold(0_usize, |total, attempts| {
+                total
+                    .checked_add(*attempts as usize * request.samples_per_target as usize)
+                    .ok_or_else(|| anyhow::anyhow!("attempt graph overflow"))
+            })?;
+        ensure!(
+            proofs.spend_attempts.len() == total_attempts,
+            "spend proof does not match attempt graph"
+        );
+        ensure!(
+            proofs.central_reservation.requested % total_attempts as u64 == 0,
+            "central reservation cannot be allocated exactly"
+        );
+        let per_attempt_units = proofs.central_reservation.requested / total_attempts as u64;
+        let reservation_identity = digest_fields(&[
+            "image-generation-resource-v1",
+            &owner.project_identity_digest,
+            &serde_json::to_string(proofs.central_reservation)?,
+        ]);
+        let per_attempt_resource = resource_reservation_from_media_reservation(
+            &MediaReservationPlan {
+                requested: per_attempt_units,
+                ..proofs.central_reservation.clone()
+            },
+            reservation_identity,
+        )?;
+        let central_resources = vec![resource_reservation_from_media_reservation(
+            proofs.central_reservation,
+            per_attempt_resource.reservation_identity.clone(),
+        )?];
+        let spend =
+            spend_plan_from_spend_reservation(proofs.spend_reservation, proofs.spend_attempts)?;
+        let mut spend_index = 0_usize;
+        let mut targets = Vec::new();
+        for (runtime, max_attempts) in runtimes.into_iter().zip(attempts_per_slot) {
+            let mut slot_artifact_ids = Vec::new();
+            for _ in 0..request.samples_per_target {
+                slot_artifact_ids.push((Uuid::now_v7(), Uuid::now_v7()));
+                spend_index += max_attempts as usize;
+            }
+            let first_attempt =
+                spend_index - max_attempts as usize * request.samples_per_target as usize;
+            let sealed_spend_attempts = &proofs.spend_attempts[first_attempt..spend_index];
+            let attempt_maximum_usd_micros = sealed_spend_attempts
+                .iter()
+                .map(|attempt| attempt.usd_micros)
+                .collect();
+            let spend_attempt_identities = sealed_spend_attempts
+                .iter()
+                .map(|attempt| attempt.attempt_id.clone())
+                .collect();
+            targets.push(ImageGenerationTargetResolutionAuthorityV1 {
+                runtime,
+                references: references.clone(),
+                slot_artifact_ids,
+                max_attempts,
+                attempt_resources: vec![per_attempt_resource.clone()],
+                attempt_maximum_usd_micros,
+                spend_attempt_identities,
+            });
+        }
+        Ok(Self {
+            job_id: Uuid::now_v7(),
+            owner,
+            enqueue_started_monotonic_ms: proofs.enqueue_started_monotonic_ms,
+            operation_deadline_monotonic_ms: proofs.operation_deadline_monotonic_ms,
+            required_grants: grants,
+            central_resources,
+            spend,
+            output_authority: proofs.output.authority().clone(),
+            targets,
         })
     }
 }
@@ -349,17 +493,23 @@ pub(crate) fn plan_image_generation(
             );
             let attempts = (1..=target.max_attempts)
                 .map(|attempt_number| {
+                    let spend_identity = &target.spend_attempt_identities
+                        [sample_index * target.max_attempts as usize + attempt_number as usize - 1];
                     let identity = digest_fields(&[
                         &input.job_id.to_string(),
                         &slot_id.to_string(),
                         &attempt_number.to_string(),
+                        spend_identity,
                     ]);
                     AttemptPlanV1 {
                         attempt_number,
                         provider_request_identity: format!("request:{identity}"),
-                        provider_idempotency_identity: format!("idempotency:{identity}"),
+                        provider_idempotency_identity: spend_identity.clone(),
                         resource_maximum: target.attempt_resource_maximum.clone(),
-                        maximum_usd_micros: target.attempt_maximum_usd_micros,
+                        maximum_usd_micros: target.attempt_maximum_usd_micros[sample_index
+                            * target.max_attempts as usize
+                            + attempt_number as usize
+                            - 1],
                     }
                 })
                 .collect();
@@ -440,7 +590,7 @@ impl RuntimeTargetAuthorityV1 {
         ensure!(
             capability.constraints.keys().all(|key| matches!(
                 key.as_str(),
-                "formats" | "max_width" | "max_height" | "parameters"
+                "formats" | "max_width" | "max_height" | "parameters" | "max_attempts"
             )),
             "capability contains an unknown constraint"
         );
@@ -518,6 +668,11 @@ impl RuntimeTargetAuthorityV1 {
                     Ok((name.to_owned(), kind.to_owned()))
                 })
                 .collect::<Result<_>>()?,
+            max_attempts: capability
+                .constraints
+                .get("max_attempts")
+                .ok_or_else(|| anyhow::anyhow!("capability attempt bound is missing"))?
+                .parse::<u32>()?,
         })
     }
 }
@@ -807,6 +962,7 @@ mod tests {
                         maximum_width: 512,
                         maximum_height: 512,
                         allowed_parameters: BTreeMap::from([("quality".into(), "integer".into())]),
+                        max_attempts: 1,
                     },
                     references: target.reference_artifacts.clone(),
                     slot_artifact_ids: vec![(
@@ -815,7 +971,8 @@ mod tests {
                     )],
                     max_attempts: 1,
                     attempt_resources: target.slots[0].attempts[0].resource_maximum.clone(),
-                    attempt_maximum_usd_micros: Some(10),
+                    attempt_maximum_usd_micros: vec![Some(10)],
+                    spend_attempt_identities: vec!["idem:1".into()],
                 }],
             },
         )

@@ -2766,7 +2766,22 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             from_path,
             to_path,
         } => {
-            if remote_operation.is_some() {
+            if let Some(operation) = remote_operation {
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                if ctx.external_journal.is_some() {
+                    let request = Request::FsRename {
+                        project_root,
+                        from_path,
+                        to_path,
+                    };
+                    return execute_remote_staged_rename(
+                        &request,
+                        &authorized_request,
+                        operation,
+                        ctx,
+                    )
+                    .await;
+                }
                 return Err(ErrorPayload {
                     code: ErrorCode::Unavailable,
                     message: if cfg!(any(target_os = "linux", target_os = "macos")) {

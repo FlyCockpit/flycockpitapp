@@ -5854,6 +5854,99 @@ async fn remote_fs_rename_fails_closed_before_reservation_until_held_recovery_is
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
+async fn remote_fs_rename_real_ingress_applies_replays_and_conflicts_without_second_effect() {
+    let tmp = tempfile::tempdir().unwrap();
+    let durable = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("from.txt"), b"value").unwrap();
+    let ctx = disk_test_ctx(
+        &durable.path().join("daemon.db"),
+        &durable.path().join("spool"),
+    );
+    let attachment = Uuid::parse_str("22222222-2222-4222-8222-2222222222bb").unwrap();
+    let operation_id = Uuid::parse_str("018f3f24-7a10-7cc2-8f55-1111111111bb").unwrap();
+    let mut state = remote_state_with_grants(vec![project_files_grant(tmp.path())]);
+    let ClientPrincipal::Remote(principal) = &mut state.principal else {
+        panic!("remote")
+    };
+    principal.actor_binding = Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+        schema_version: 1,
+        device_id: Uuid::parse_str("33333333-3333-4333-8333-3333333333bb").unwrap(),
+        device_generation: 1,
+        logical_attachment_id: attachment,
+    });
+    let mut shared = state.shared_snapshot();
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_tx, _) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let mut concurrent = ConcurrentRequestRuntime::new();
+    let request = Request::FsRename {
+        project_root: tmp.path().to_string_lossy().into_owned(),
+        from_path: "from.txt".into(),
+        to_path: "to.txt".into(),
+    };
+    for _ in 0..2 {
+        let request_id = Uuid::new_v4();
+        handle_envelope(
+            Envelope::remote_request(
+                request_id,
+                proto::RemoteOperationIdentityV1::new(attachment, operation_id).unwrap(),
+                request.clone(),
+            ),
+            &mut state,
+            &mut shared,
+            &ctx,
+            &event_tx,
+            &writer_tx,
+            &mut concurrent,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(recv_writer_body(&mut writer_rx, "rename ack").await,
+            Body::Response { id, response } if id == request_id && matches!(*response, Response::Ack))
+        );
+    }
+    assert!(!tmp.path().join("from.txt").exists());
+    assert_eq!(std::fs::read(tmp.path().join("to.txt")).unwrap(), b"value");
+    let conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            conflict_id,
+            proto::RemoteOperationIdentityV1::new(attachment, operation_id).unwrap(),
+            Request::FsRename {
+                project_root: tmp.path().to_string_lossy().into_owned(),
+                from_path: "from.txt".into(),
+                to_path: "other.txt".into(),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(recv_writer_body(&mut writer_rx, "rename conflict").await,
+        Body::Error { id: Some(id), error } if id == conflict_id && error.code == ErrorCode::Conflict)
+    );
+    let events: i64 = ctx
+        .db
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM remote_attachment_outbox WHERE kind='fs_rename'",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(events, 1);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
 async fn staged_rename_executor_applies_commits_and_replays_without_second_effect() {
     let tmp = tempfile::tempdir().unwrap();
     let spool = tempfile::tempdir().unwrap();
@@ -6184,6 +6277,48 @@ async fn staged_rename_executor_recovers_every_durability_barrier_cut() {
                 .unwrap()
                 .unwrap();
             assert_eq!(status.state, "outcome_unknown");
+            if cut == "source_identity_swap" {
+                let mut remote_state =
+                    remote_state_with_grants(vec![project_files_grant(tmp.path())]);
+                let ClientPrincipal::Remote(principal) = &mut remote_state.principal else {
+                    panic!("remote")
+                };
+                principal.actor_binding =
+                    Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+                        schema_version: 1,
+                        device_id: operation.authenticated_device_id,
+                        device_generation: operation.authenticated_device_generation,
+                        logical_attachment_id: operation.logical_attachment_id,
+                    });
+                let mut remote_shared = remote_state.shared_snapshot();
+                let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+                let (event_tx, _) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+                let mut concurrent = ConcurrentRequestRuntime::new();
+                let ingress_id = Uuid::new_v4();
+                handle_envelope(
+                    Envelope::remote_request(
+                        ingress_id,
+                        proto::RemoteOperationIdentityV1::new(
+                            operation.logical_attachment_id,
+                            operation.operation_id,
+                        )
+                        .unwrap(),
+                        request.clone(),
+                    ),
+                    &mut remote_state,
+                    &mut remote_shared,
+                    &ctx,
+                    &event_tx,
+                    &writer_tx,
+                    &mut concurrent,
+                )
+                .await
+                .unwrap();
+                assert!(
+                    matches!(recv_writer_body(&mut writer_rx, "rename outcome unknown").await,
+                    Body::Error { id: Some(id), error } if id == ingress_id && error.code == ErrorCode::Conflict)
+                );
+            }
             if cut == "source_identity_swap" {
                 assert_eq!(
                     std::fs::read(tmp.path().join("from.txt")).unwrap(),

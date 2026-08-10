@@ -10,7 +10,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -45,6 +47,7 @@ const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 const INGRESS_JOURNAL_CAP: usize = 64;
 const INGRESS_TTL: Duration = Duration::from_secs(10 * 60);
+#[cfg(test)]
 static NEXT_LOCAL_TERMINAL_CONNECTION_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
@@ -125,6 +128,7 @@ pub struct TerminalHost {
     temp_root: PathBuf,
     idle_ttl: Duration,
     #[cfg(test)]
+    #[allow(clippy::type_complexity)]
     ingress_barrier: Arc<Mutex<Option<Arc<dyn Fn(IngressMutationEdge, &Path) + Send + Sync>>>>,
 }
 
@@ -647,6 +651,7 @@ impl TerminalHost {
         Self::new(event_tx, redaction, temp_root)
     }
 
+    #[cfg(test)]
     pub fn open(
         &self,
         cwd: Option<String>,
@@ -701,6 +706,7 @@ impl TerminalHost {
         })
     }
 
+    #[cfg(test)]
     pub fn attach(
         &self,
         terminal_id: Uuid,
@@ -763,7 +769,11 @@ impl TerminalHost {
         };
         let count = {
             let mut state = crate::sync::lock_or_recover(&terminal);
-            if state.bindings.get(&binding.binding_id) != Some(&binding.binding_epoch) {
+            if !state
+                .bindings
+                .get(&binding.binding_id)
+                .is_some_and(|record| record.epoch == binding.binding_epoch)
+            {
                 return;
             }
             state.bindings.remove(&binding.binding_id);
@@ -776,6 +786,7 @@ impl TerminalHost {
         self.emit(proto::Event::TerminalViewers { terminal_id, count });
     }
 
+    #[cfg(test)]
     pub fn input(
         &self,
         terminal_id: Uuid,
@@ -788,7 +799,7 @@ impl TerminalHost {
             )));
         }
         let terminal = self.get_terminal(terminal_id)?;
-        let mut state = crate::sync::lock_or_recover(&terminal);
+        let state = crate::sync::lock_or_recover(&terminal);
         ensure_open(&state, terminal_id)?;
         reserve_input_locked(&state, bytes).map_err(internal)?;
         Ok(Response::Ack)
@@ -801,7 +812,7 @@ impl TerminalHost {
         bytes: Vec<u8>,
     ) -> std::result::Result<Response, ErrorPayload> {
         let terminal = self.get_terminal(terminal_id)?;
-        let mut state = crate::sync::lock_or_recover(&terminal);
+        let state = crate::sync::lock_or_recover(&terminal);
         authorize_binding(&state, binding)?;
         if bytes.len() > TERMINAL_INPUT_CAP {
             return Err(invalid_ingress());
@@ -834,6 +845,7 @@ impl TerminalHost {
         self.close(terminal_id)
     }
 
+    #[cfg(test)]
     pub fn resize(
         &self,
         terminal_id: Uuid,
@@ -1707,6 +1719,7 @@ fn bracketed_paste_bytes(text: &str) -> Vec<u8> {
     out
 }
 
+#[cfg(test)]
 fn test_local_terminal_context() -> AuthenticatedTerminalContext {
     AuthenticatedTerminalContext {
         principal_id: "local-owner".to_string(),
@@ -1812,13 +1825,20 @@ fn is_sha256_hex(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for byte in digest.iter() {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
 fn validate_image(
     metadata: &TerminalIngressMetadata,
     bytes: &[u8],
 ) -> std::result::Result<(), ErrorPayload> {
-    if bytes.len() as u64 != metadata.size
-        || format!("{:x}", Sha256::digest(bytes)) != metadata.sha256
-    {
+    if bytes.len() as u64 != metadata.size || sha256_hex(bytes) != metadata.sha256 {
         return Err(invalid_ingress());
     }
     let magic = match metadata.media_type {
@@ -1857,7 +1877,9 @@ fn posix_literal(path: &str) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IngressShellDialect {
     Posix,
+    #[allow(dead_code)]
     PowerShell,
+    #[allow(dead_code)]
     Cmd,
 }
 
@@ -1966,6 +1988,7 @@ fn set_private_dir_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 #[cfg(unix)]
 fn set_private_open_file_permissions(file: &std::fs::File) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -1973,6 +1996,7 @@ fn set_private_open_file_permissions(file: &std::fs::File) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 #[cfg(all(not(unix), not(windows)))]
 fn set_private_open_file_permissions(_file: &std::fs::File) -> Result<()> {
     Ok(())
@@ -2834,7 +2858,7 @@ mod tests {
             operation_id,
             size: bytes.len() as u64,
             media_type: TerminalImageType::Png,
-            sha256: format!("{:x}", Sha256::digest(bytes)),
+            sha256: sha256_hex(bytes),
         };
         host.ingress_begin(terminal_id, binding, metadata).unwrap();
         host.ingress_chunk(terminal_id, binding, operation_id, 0, bytes.to_vec())
@@ -2884,7 +2908,7 @@ mod tests {
                 operation_id,
                 size: bytes.len() as u64,
                 media_type: *media_type,
-                sha256: format!("{:x}", Sha256::digest(bytes)),
+                sha256: sha256_hex(bytes),
             };
             host.ingress_begin(terminal_id, binding, metadata).unwrap();
             host.ingress_chunk(terminal_id, binding, operation_id, 0, bytes.to_vec())
@@ -3039,7 +3063,7 @@ mod tests {
                 operation_id: Uuid::new_v4(),
                 size: bytes.len() as u64,
                 media_type,
-                sha256: format!("{:x}", Sha256::digest(bytes)),
+                sha256: sha256_hex(bytes),
             };
             assert!(validate_image(&metadata, bytes).is_ok());
             let mut changed = bytes.to_vec();
@@ -3101,7 +3125,7 @@ mod tests {
             operation_id: Uuid::new_v4(),
             size: bytes.len() as u64,
             media_type: TerminalImageType::Png,
-            sha256: format!("{:x}", Sha256::digest(bytes)),
+            sha256: sha256_hex(bytes),
         };
         host.release_viewer(terminal_id, second);
         assert!(
@@ -3191,7 +3215,7 @@ mod tests {
             operation_id,
             size: bytes.len() as u64,
             media_type: TerminalImageType::Gif,
-            sha256: format!("{:x}", Sha256::digest(bytes)),
+            sha256: sha256_hex(bytes),
         };
         host.ingress_begin(terminal_id, binding, metadata.clone())
             .unwrap();
@@ -3251,7 +3275,7 @@ mod tests {
             operation_id,
             size: bytes.len() as u64,
             media_type: TerminalImageType::Gif,
-            sha256: format!("{:x}", Sha256::digest(bytes)),
+            sha256: sha256_hex(bytes),
         };
         host.ingress_begin(terminal_id, binding, metadata).unwrap();
         host.ingress_chunk(terminal_id, binding, operation_id, 0, bytes.to_vec())
@@ -3276,7 +3300,7 @@ mod tests {
             operation_id: second_id,
             size: bytes.len() as u64,
             media_type: TerminalImageType::Gif,
-            sha256: format!("{:x}", Sha256::digest(bytes)),
+            sha256: sha256_hex(bytes),
         };
         // The failed Prepared operation still owns the binding budget. A fresh
         // authenticated binding gets an independent bounded operation.

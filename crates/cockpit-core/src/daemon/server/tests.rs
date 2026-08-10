@@ -3535,6 +3535,8 @@ async fn client_state_split_concurrent_entry_point_authorizes_before_work() {
         ctx.upload_accounting.clone(),
         remote_principal(),
         ctx.terminal_host.clone(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
     );
     let shared = state.shared_snapshot();
     let request = Request::FsRead {
@@ -3610,6 +3612,7 @@ fn dispatch_matrix_class_for_command(
         ("attach_terminal", "terminal", false)
         | ("terminal_input", "terminal", false)
         | ("terminal_resize", "terminal", false)
+        | ("terminal_ingress_status", "terminal", false)
         | ("subagent_transcript", "custom", false) => DispatchMatrixClass::AccessControlled,
         ("count_pinned_messages", "session_row_reader", false)
         | ("list_pinned_message_seqs", "session_row_reader", false)
@@ -3743,9 +3746,9 @@ fn mutating_dispatch_happy_cases() -> Vec<MutatingDispatchCase> {
     mutating_dispatch_case_list()
         .into_iter()
         .filter(|case| {
-            dispatch_matrix_rows().into_iter().any(|row| {
-                row.kind == case.kind && row.class == DispatchMatrixClass::Mutating
-            })
+            dispatch_matrix_rows()
+                .into_iter()
+                .any(|row| row.kind == case.kind && row.class == DispatchMatrixClass::Mutating)
         })
         .collect()
 }
@@ -3951,6 +3954,21 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             kind: "close_terminal",
             effect_class: InMemory,
             observation: "closed terminal rejects later attachment",
+        },
+        MutatingDispatchCase {
+            kind: "terminal_ingress_begin",
+            effect_class: InMemory,
+            observation: "ingress begin accepts a prepared operation",
+        },
+        MutatingDispatchCase {
+            kind: "terminal_ingress_chunk",
+            effect_class: InMemory,
+            observation: "ingress chunk appends bytes at the acknowledged offset",
+        },
+        MutatingDispatchCase {
+            kind: "terminal_ingress_finish",
+            effect_class: InMemory,
+            observation: "ingress finish commits a prepared operation",
         },
         MutatingDispatchCase {
             kind: "lsp_control",
@@ -4389,9 +4407,6 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "git_status"
         | "git_diff_file"
         | "attach_terminal"
-        | "terminal_input"
-        | "terminal_resize"
-        | "close_terminal"
         | "create_scheduled_job"
         | "list_scheduled_jobs"
         | "delete_scheduled_job"
@@ -4406,6 +4421,15 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "import_session_archive"
         // An unstaged transfer reference is a bad request, not an authz failure.
         | "read_bulk_transfer_chunk" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        "terminal_ingress_begin"
+        | "terminal_ingress_chunk"
+        | "terminal_ingress_finish"
+        | "terminal_ingress_status"
+        | "terminal_input"
+        | "terminal_resize"
+        | "close_terminal" => {
+            AuthzAllowedOutcome::Error(ErrorCode::InvalidIngress)
+        }
         "set_project_note_content" | "rename_project_note" | "delete_project_note" => {
             AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
         }
@@ -4504,6 +4528,10 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_terminal("terminal_input"),
         authz_terminal("terminal_resize"),
         authz_terminal("close_terminal"),
+        authz_terminal("terminal_ingress_begin"),
+        authz_terminal("terminal_ingress_chunk"),
+        authz_terminal("terminal_ingress_finish"),
+        authz_terminal("terminal_ingress_status"),
         authz_terminal("lsp_control"),
         authz_session_writer("resolve_interrupt"),
         authz_session_reader("read_session_messages"),
@@ -4624,6 +4652,7 @@ async fn dispatch_authz_request_after(
         server_stream,
         ctx.clone(),
         principal,
+        Uuid::new_v4(),
     ));
     match recv_body(&mut client).await {
         Body::Response { id, response } => {
@@ -5193,8 +5222,15 @@ fn authz_matrix_principal(level: AuthzLevel, project_root: &Path, kind: &str) ->
                         project_root: Some(project_root),
                     }]
                 }
-                "open_terminal" | "attach_terminal" | "terminal_input" | "terminal_resize"
-                | "close_terminal" => {
+                "open_terminal"
+                | "attach_terminal"
+                | "terminal_input"
+                | "terminal_resize"
+                | "close_terminal"
+                | "terminal_ingress_begin"
+                | "terminal_ingress_chunk"
+                | "terminal_ingress_finish"
+                | "terminal_ingress_status" => {
                     vec![principal::PrincipalGrant {
                         scope: principal::PrincipalScope::Terminal,
                         project_root: None,
@@ -5477,6 +5513,45 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "close_terminal" => Request::CloseTerminal {
             terminal_id: Uuid::new_v4(),
         },
+        "terminal_ingress_begin" => Request::TerminalIngressBegin {
+            terminal_id: Uuid::new_v4(),
+            binding: proto::terminal::TerminalBinding {
+                binding_id: Uuid::new_v4(),
+                binding_epoch: 0,
+            },
+            metadata: proto::terminal::TerminalIngressMetadata {
+                operation_id: Uuid::new_v4(),
+                size: 1,
+                media_type: proto::terminal::TerminalImageType::Png,
+                sha256: "0".repeat(64),
+            },
+        },
+        "terminal_ingress_chunk" => Request::TerminalIngressChunk {
+            terminal_id: Uuid::new_v4(),
+            binding: proto::terminal::TerminalBinding {
+                binding_id: Uuid::new_v4(),
+                binding_epoch: 0,
+            },
+            operation_id: Uuid::new_v4(),
+            offset: 0,
+            data_base64: "AA==".into(),
+        },
+        "terminal_ingress_finish" => Request::TerminalIngressFinish {
+            terminal_id: Uuid::new_v4(),
+            binding: proto::terminal::TerminalBinding {
+                binding_id: Uuid::new_v4(),
+                binding_epoch: 0,
+            },
+            operation_id: Uuid::new_v4(),
+        },
+        "terminal_ingress_status" => Request::TerminalIngressStatus {
+            terminal_id: Uuid::new_v4(),
+            binding: proto::terminal::TerminalBinding {
+                binding_id: Uuid::new_v4(),
+                binding_epoch: 0,
+            },
+            operation_id: Uuid::new_v4(),
+        },
         "lsp_control" => Request::LspControl {
             project_root: root,
             server_id: "rust-analyzer".into(),
@@ -5681,9 +5756,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             range: proto::StatsRange::Last7Days,
             by_role: false,
         },
-        "get_startup_disclosures" => Request::GetStartupDisclosures {
-            project_root: root,
-        },
+        "get_startup_disclosures" => Request::GetStartupDisclosures { project_root: root },
         "get_app_flag" => Request::GetAppFlag {
             key: proto::AppFlagKey::DaemonAutostartNotice,
         },
@@ -6619,6 +6692,9 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
                 proto::RunInvocationCancelOutcome::CancellationRequested
             );
         }
+        "terminal_ingress_begin" | "terminal_ingress_chunk" | "terminal_ingress_finish" => {
+            assert_terminal_ingress_mutating_happy(case.kind).await;
+        }
         other => panic!("unhandled mutating happy case {other}"),
     }
 }
@@ -6879,6 +6955,9 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
             .await
             .expect_err("nil client_submission_id is rejected");
             assert_eq!(err.code, ErrorCode::BadRequest);
+        }
+        "terminal_ingress_begin" | "terminal_ingress_chunk" | "terminal_ingress_finish" => {
+            assert_terminal_ingress_mutating_malformed(case.kind).await;
         }
         other => panic!("unhandled mutating malformed case {other}"),
     }
@@ -7872,56 +7951,96 @@ async fn assert_attachment_mutating_malformed(kind: &str) {
 }
 
 #[cfg(unix)]
+async fn open_terminal_on_socket(
+    ctx: &Arc<DaemonContext>,
+    cwd: Option<String>,
+) -> (Uuid, proto::terminal::TerminalBinding) {
+    let response = dispatch_matrix_request(
+        ctx,
+        Request::OpenTerminal {
+            cwd,
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await
+    .expect("open terminal");
+    let Response::TerminalOpened {
+        terminal_id,
+        binding,
+        ..
+    } = response
+    else {
+        panic!("expected TerminalOpened");
+    };
+    (terminal_id, binding)
+}
+
+#[cfg(unix)]
 async fn assert_terminal_mutating_happy(kind: &str) {
     let ctx = test_ctx();
     match kind {
         "open_terminal" => {
-            let response = dispatch_matrix_request(
-                &ctx,
-                Request::OpenTerminal {
-                    cwd: None,
-                    cols: 80,
-                    rows: 24,
+            let (terminal_id, _binding) = open_terminal_on_socket(&ctx, None).await;
+            assert!(ctx.terminal_host.contains(terminal_id));
+            let _ = ctx.terminal_host.close(
+                terminal_id,
+                proto::terminal::TerminalBinding {
+                    binding_id: Uuid::nil(),
+                    binding_epoch: 0,
                 },
-            )
-            .await
-            .expect("open terminal");
+            );
+        }
+        "close_terminal" => {
+            // Open and close on the same connection so the dispatch layer
+            // has the binding in terminal_views.
+            let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+            let mut client = ProtoStream::new(client_stream);
+            let server = tokio::spawn(handle_client_transport_as(
+                server_stream,
+                ctx.clone(),
+                ClientPrincipal::owner(),
+                Uuid::new_v4(),
+            ));
+            match recv_body(&mut client).await {
+                Body::Response { id, response } => {
+                    assert_eq!(id, Uuid::nil());
+                    assert!(matches!(*response, Response::DaemonStatus { .. }));
+                }
+                other => panic!("expected daemon hello, got {other:?}"),
+            }
+            let open_id = Uuid::new_v4();
+            client
+                .send(&Envelope::request(
+                    open_id,
+                    Request::OpenTerminal {
+                        cwd: None,
+                        cols: 80,
+                        rows: 24,
+                    },
+                ))
+                .await
+                .expect("send open terminal");
+            let response = recv_dispatch_matrix_response(&mut client, open_id)
+                .await
+                .expect("open terminal");
             let Response::TerminalOpened { terminal_id, .. } = response else {
                 panic!("expected TerminalOpened");
             };
-            let response = dispatch_matrix_request(&ctx, Request::CloseTerminal { terminal_id })
+            let close_id = Uuid::new_v4();
+            client
+                .send(&Envelope::request(
+                    close_id,
+                    Request::CloseTerminal { terminal_id },
+                ))
                 .await
-                .expect("close opened terminal");
-            assert!(matches!(response, Response::Ack));
-        }
-        "close_terminal" => {
-            let Response::TerminalOpened { terminal_id, .. } = dispatch_matrix_request(
-                &ctx,
-                Request::OpenTerminal {
-                    cwd: None,
-                    cols: 80,
-                    rows: 24,
-                },
-            )
-            .await
-            .expect("open terminal") else {
-                panic!("expected TerminalOpened");
-            };
-            let response = dispatch_matrix_request(&ctx, Request::CloseTerminal { terminal_id })
+                .expect("send close terminal");
+            let response = recv_dispatch_matrix_response(&mut client, close_id)
                 .await
-                .expect("close terminal");
+                .expect("close terminal on same connection");
             assert!(matches!(response, Response::Ack));
-            let err = dispatch_matrix_request(
-                &ctx,
-                Request::AttachTerminal {
-                    terminal_id,
-                    cols: 80,
-                    rows: 24,
-                },
-            )
-            .await
-            .expect_err("closed terminal is absent");
-            assert_eq!(err.code, ErrorCode::BadRequest);
+            drop(client);
+            let _ = server.await;
         }
         _ => unreachable!(),
     }
@@ -7946,8 +8065,219 @@ async fn assert_terminal_mutating_malformed(kind: &str) {
         .expect_err("terminal invalid state rejected");
     assert!(matches!(
         err.code,
-        ErrorCode::BadRequest | ErrorCode::RootMissing
+        ErrorCode::BadRequest | ErrorCode::RootMissing | ErrorCode::InvalidIngress
     ));
+}
+
+#[cfg(unix)]
+async fn assert_terminal_ingress_mutating_happy(kind: &str) {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+    let mut client = ProtoStream::new(client_stream);
+    let server = tokio::spawn(handle_client_transport_as(
+        server_stream,
+        ctx.clone(),
+        ClientPrincipal::owner(),
+        Uuid::new_v4(),
+    ));
+    // Consume hello.
+    match recv_body(&mut client).await {
+        Body::Response { id, response } => {
+            assert_eq!(id, Uuid::nil());
+            assert!(matches!(*response, Response::DaemonStatus { .. }));
+        }
+        other => panic!("expected daemon hello, got {other:?}"),
+    }
+    // Open terminal on this connection.
+    let open_id = Uuid::new_v4();
+    client
+        .send(&Envelope::request(
+            open_id,
+            Request::OpenTerminal {
+                cwd: Some(tmp.path().to_string_lossy().into_owned()),
+                cols: 80,
+                rows: 24,
+            },
+        ))
+        .await
+        .expect("send open terminal");
+    let response = recv_dispatch_matrix_response(&mut client, open_id)
+        .await
+        .expect("open terminal");
+    let Response::TerminalOpened {
+        terminal_id,
+        binding,
+        ..
+    } = response
+    else {
+        panic!("expected TerminalOpened");
+    };
+    let bytes = b"GIF89a";
+    let operation_id = Uuid::new_v4();
+    let metadata = proto::terminal::TerminalIngressMetadata {
+        operation_id,
+        size: bytes.len() as u64,
+        media_type: proto::terminal::TerminalImageType::Gif,
+        sha256: "0".repeat(64),
+    };
+    macro_rules! send_and_recv {
+        ($client:expr, $request:expr) => {{
+            let id = Uuid::new_v4();
+            $client
+                .send(&Envelope::request(id, $request))
+                .await
+                .expect("send ingress request");
+            recv_dispatch_matrix_response($client, id)
+                .await
+                .expect("ingress response")
+        }};
+    }
+    match kind {
+        "terminal_ingress_begin" => {
+            let response = send_and_recv!(
+                &mut client,
+                Request::TerminalIngressBegin {
+                    terminal_id,
+                    binding,
+                    metadata,
+                }
+            );
+            assert!(matches!(response, Response::TerminalIngress { .. }));
+        }
+        "terminal_ingress_chunk" => {
+            send_and_recv!(
+                &mut client,
+                Request::TerminalIngressBegin {
+                    terminal_id,
+                    binding,
+                    metadata,
+                }
+            );
+            let response = send_and_recv!(
+                &mut client,
+                Request::TerminalIngressChunk {
+                    terminal_id,
+                    binding,
+                    operation_id,
+                    offset: 0,
+                    data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                }
+            );
+            assert!(matches!(response, Response::TerminalIngress { .. }));
+        }
+        "terminal_ingress_finish" => {
+            send_and_recv!(
+                &mut client,
+                Request::TerminalIngressBegin {
+                    terminal_id,
+                    binding,
+                    metadata: proto::terminal::TerminalIngressMetadata {
+                        sha256: sha256_hex_terminal(bytes),
+                        ..metadata
+                    },
+                }
+            );
+            send_and_recv!(
+                &mut client,
+                Request::TerminalIngressChunk {
+                    terminal_id,
+                    binding,
+                    operation_id,
+                    offset: 0,
+                    data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                }
+            );
+            let response = send_and_recv!(
+                &mut client,
+                Request::TerminalIngressFinish {
+                    terminal_id,
+                    binding,
+                    operation_id,
+                }
+            );
+            assert!(matches!(response, Response::TerminalIngress { .. }));
+        }
+        _ => unreachable!(),
+    }
+    drop(client);
+    let _ = server.await;
+    let _ = ctx.terminal_host.close(
+        terminal_id,
+        proto::terminal::TerminalBinding {
+            binding_id: Uuid::nil(),
+            binding_epoch: 0,
+        },
+    );
+}
+
+#[cfg(unix)]
+async fn assert_terminal_ingress_mutating_malformed(kind: &str) {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    let response = dispatch_matrix_request(
+        &ctx,
+        Request::OpenTerminal {
+            cwd: Some(tmp.path().to_string_lossy().into_owned()),
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await
+    .expect("open terminal for ingress malformed");
+    let Response::TerminalOpened {
+        terminal_id,
+        binding,
+        ..
+    } = response
+    else {
+        panic!("expected TerminalOpened");
+    };
+    let wrong_binding = proto::terminal::TerminalBinding {
+        binding_id: Uuid::new_v4(),
+        binding_epoch: binding.binding_epoch,
+    };
+    let request = match kind {
+        "terminal_ingress_begin" => Request::TerminalIngressBegin {
+            terminal_id,
+            binding: wrong_binding,
+            metadata: proto::terminal::TerminalIngressMetadata {
+                operation_id: Uuid::new_v4(),
+                size: 1,
+                media_type: proto::terminal::TerminalImageType::Png,
+                sha256: "0".repeat(64),
+            },
+        },
+        "terminal_ingress_chunk" => Request::TerminalIngressChunk {
+            terminal_id,
+            binding: wrong_binding,
+            operation_id: Uuid::new_v4(),
+            offset: 0,
+            data_base64: "AA==".into(),
+        },
+        "terminal_ingress_finish" => Request::TerminalIngressFinish {
+            terminal_id,
+            binding: wrong_binding,
+            operation_id: Uuid::new_v4(),
+        },
+        _ => unreachable!(),
+    };
+    let err = dispatch_matrix_request(&ctx, request)
+        .await
+        .expect_err("wrong binding ingress rejected");
+    assert_eq!(err.code, ErrorCode::InvalidIngress);
+    let _ = dispatch_matrix_request(&ctx, Request::CloseTerminal { terminal_id }).await;
+}
+
+#[cfg(unix)]
+fn sha256_hex_terminal(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for byte in digest.iter() {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 #[cfg(unix)]
@@ -10012,6 +10342,69 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             mutating: true,
         },
         CommandMetadataCase {
+            request: Request::TerminalIngressBegin {
+                terminal_id,
+                binding: proto::terminal::TerminalBinding {
+                    binding_id: Uuid::nil(),
+                    binding_epoch: 0,
+                },
+                metadata: proto::terminal::TerminalIngressMetadata {
+                    operation_id: Uuid::nil(),
+                    size: 1,
+                    media_type: proto::terminal::TerminalImageType::Png,
+                    sha256: "0".repeat(64),
+                },
+            },
+            kind: "terminal_ingress_begin",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::TerminalIngressChunk {
+                terminal_id,
+                binding: proto::terminal::TerminalBinding {
+                    binding_id: Uuid::nil(),
+                    binding_epoch: 0,
+                },
+                operation_id: Uuid::nil(),
+                offset: 0,
+                data_base64: "AA==".to_string(),
+            },
+            kind: "terminal_ingress_chunk",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::TerminalIngressFinish {
+                terminal_id,
+                binding: proto::terminal::TerminalBinding {
+                    binding_id: Uuid::nil(),
+                    binding_epoch: 0,
+                },
+                operation_id: Uuid::nil(),
+            },
+            kind: "terminal_ingress_finish",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::TerminalIngressStatus {
+                terminal_id,
+                binding: proto::terminal::TerminalBinding {
+                    binding_id: Uuid::nil(),
+                    binding_epoch: 0,
+                },
+                operation_id: Uuid::nil(),
+            },
+            kind: "terminal_ingress_status",
+            session_id: None,
+            audit_path: None,
+            mutating: false,
+        },
+        CommandMetadataCase {
             request: Request::LspControl {
                 project_root: project_root.clone(),
                 server_id: "rust-analyzer".into(),
@@ -10790,6 +11183,10 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         TerminalInput,
         TerminalResize,
         CloseTerminal,
+        TerminalIngressBegin,
+        TerminalIngressChunk,
+        TerminalIngressFinish,
+        TerminalIngressStatus,
         LspControl,
         ResolveInterrupt,
         ListSessions,
@@ -10973,6 +11370,8 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
         ctx.upload_accounting.clone(),
         ClientPrincipal::owner(),
         ctx.terminal_host.clone(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
     );
     let attached = handle_request(
         Request::Attach {
@@ -11120,6 +11519,8 @@ async fn image_submission_exact_retry_case() {
         ctx.upload_accounting.clone(),
         ClientPrincipal::owner(),
         ctx.terminal_host.clone(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
     );
     let attached = handle_request(
         Request::Attach {
@@ -11215,6 +11616,8 @@ async fn image_submission_exact_retry_case() {
         ctx.upload_accounting.clone(),
         ClientPrincipal::owner(),
         ctx.terminal_host.clone(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
     );
     handle_request(
         Request::Attach {
@@ -13471,6 +13874,8 @@ async fn serialized_requests_apply_in_receipt_order() {
     let executor = tokio::spawn(run_client_executor(
         ctx.clone(),
         ClientPrincipal::owner(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
         executor_rx,
         event_cmd_tx,
         writer_tx,
@@ -13634,6 +14039,8 @@ async fn concurrent_requests_may_complete_out_of_order() {
     let executor = tokio::spawn(run_client_executor(
         ctx,
         ClientPrincipal::owner(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
         executor_rx,
         event_cmd_tx,
         writer_tx,
@@ -13702,6 +14109,8 @@ async fn slow_request_does_not_block_event_forwarding() {
     let executor = tokio::spawn(run_client_executor(
         ctx,
         ClientPrincipal::owner(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
         executor_rx,
         event_cmd_tx,
         writer_tx,
@@ -13752,6 +14161,8 @@ async fn concurrent_request_panic_yields_internal_error_and_keeps_connection() {
     let executor = tokio::spawn(run_client_executor(
         ctx,
         ClientPrincipal::owner(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
         executor_rx,
         event_cmd_tx,
         writer_tx,
@@ -13807,6 +14218,8 @@ async fn blocking_fs_handler_panic_keeps_client_connection() {
     let executor = tokio::spawn(run_client_executor(
         ctx,
         ClientPrincipal::owner(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
         executor_rx,
         event_cmd_tx,
         writer_tx,
@@ -13952,6 +14365,7 @@ async fn client_io_split_reader_eof_tears_down_all_tasks() {
         server,
         ctx,
         ClientPrincipal::owner(),
+        Uuid::new_v4(),
     ));
     drop(client);
     tokio::time::timeout(std::time::Duration::from_secs(2), task)

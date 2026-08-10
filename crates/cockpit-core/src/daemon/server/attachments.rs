@@ -726,21 +726,6 @@ pub(super) async fn finish_attachment_upload_admitted(
             abandon.reservation_id = None;
             Ok(Response::AttachmentUploaded { image_ref })
         }
-        proto::AttachmentPurpose::TerminalPasteImage { terminal_id } => {
-            let response = state.terminal_host.paste_image(terminal_id, &bytes);
-            let checksum = format!("terminal-paste-buffer-destroyed:{upload_id}");
-            ctx.media_ledger
-                .destroy_local_artifacts(
-                    &completed.reservation_id,
-                    completed.version,
-                    &checksum,
-                    wall_ms,
-                )
-                .await
-                .map_err(internal)?;
-            abandon.reservation_id = None;
-            response
-        }
     }
 }
 

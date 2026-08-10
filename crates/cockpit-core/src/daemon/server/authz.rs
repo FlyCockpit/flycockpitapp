@@ -581,7 +581,7 @@ pub(super) async fn authorize_shared_custom(
                 Err(e) => Err(internal(e)),
             }
         }
-        Request::BeginAttachmentUpload { purpose: _, .. } => {
+        Request::BeginAttachmentUpload { .. } => {
             require_remote_shared_session_writer(principal, shared, ctx).await
         }
         Request::UploadAttachmentChunk { .. }

@@ -240,6 +240,9 @@ pub struct RecordImageArtifactSecurityRecovery {
 pub struct RecordedImageArtifactSecurityRecovery {
     operation_id: Uuid,
     disposition: ImageArtifactSecurityRecoveryDisposition,
+    artifact_id: Uuid,
+    artifact_generation: u64,
+    component_set_digest: String,
 }
 
 impl ImageGenerationOwnerContextAuthority {
@@ -289,6 +292,9 @@ impl ImageGenerationOwnerContextAuthority {
         Ok(RecordedImageArtifactSecurityRecovery {
             operation_id: input.operation_id,
             disposition: input.disposition,
+            artifact_id: input.artifact_id,
+            artifact_generation: input.artifact_generation,
+            component_set_digest: input.component_set_digest.clone(),
         })
     }
 
@@ -311,6 +317,104 @@ impl ImageGenerationOwnerContextAuthority {
             recorded.operation_id, self.principal_digest
         )));
         ensure!(conn.execute("UPDATE image_generation_artifact_security_recovery_audits SET state='applied',outcome_digest=?1,decided_at_unix_ms=?2 WHERE recovery_operation_id=?3 AND principal_digest=?4 AND state='recorded'",params![outcome,now,recorded.operation_id.to_string(),self.principal_digest])?==1,"security recovery audit is unavailable");
+        Ok(())
+    }
+
+    pub fn resume_verified_image_artifact_cleanup(
+        &self,
+        conn: &Connection,
+        recorded: RecordedImageArtifactSecurityRecovery,
+        cleanup_operation_id: Uuid,
+        components: &[VerifiedManagedComponentForRecovery],
+    ) -> Result<()> {
+        let operation_id = recorded.operation_id;
+        let result = self.resume_verified_image_artifact_cleanup_inner(
+            conn,
+            &recorded,
+            cleanup_operation_id,
+            components,
+        );
+        if let Err(error) = result {
+            let _ = self.close_security_recovery_audit(
+                conn,
+                operation_id,
+                "proof_failed",
+                format!("proof_failed:{operation_id}").as_bytes(),
+            );
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn resume_verified_image_artifact_cleanup_inner(
+        &self,
+        conn: &Connection,
+        recorded: &RecordedImageArtifactSecurityRecovery,
+        cleanup_operation_id: Uuid,
+        components: &[VerifiedManagedComponentForRecovery],
+    ) -> Result<()> {
+        ensure!(
+            recorded.disposition == ImageArtifactSecurityRecoveryDisposition::ResumeVerifiedCleanup,
+            "security recovery disposition differs"
+        );
+        let expected:i64=conn.query_row("SELECT expected_component_count FROM image_generation_artifacts WHERE artifact_id=?1 AND generation=?2 AND state='security_blocked' AND component_set_digest=?3 AND active_lease_count=0 AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_references r WHERE r.artifact_id=image_generation_artifacts.artifact_id AND r.released_at_unix_ms IS NULL) AND NOT EXISTS(SELECT 1 FROM image_generation_late_publication_leases p WHERE p.artifact_id=image_generation_artifacts.artifact_id AND p.state IN ('reserved','copy_authorized','copy_committed'))",params![recorded.artifact_id.to_string(),i64::try_from(recorded.artifact_generation)?,recorded.component_set_digest],|row|row.get(0))?;
+        ensure!(
+            usize::try_from(expected)? == components.len(),
+            "security recovery component set differs"
+        );
+        let mut ids = std::collections::BTreeSet::new();
+        for component in components {
+            ensure!(
+                ids.insert(component.component_id),
+                "security recovery component is duplicated"
+            );
+            let (hi,lo,checksum,state):(i64,i64,String,String)=conn.query_row("SELECT byte_length_hi,byte_length_lo,sha256,state FROM image_generation_artifact_components WHERE artifact_id=?1 AND component_id=?2",params![recorded.artifact_id.to_string(),component.component_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
+            let length = (u64::try_from(hi)? << 32) | u64::try_from(lo)?;
+            ensure!(
+                matches!(state.as_str(), "ready" | "security_blocked")
+                    && component.held.evidence().byte_length() == length
+                    && component.held.evidence().sha256() == checksum,
+                "security recovery held component differs"
+            );
+        }
+        let tx = conn.unchecked_transaction()?;
+        let now: i64 = tx.query_row(
+            "SELECT CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)",
+            [],
+            |row| row.get(0),
+        )?;
+        let next_generation = recorded
+            .artifact_generation
+            .checked_add(1)
+            .context("security recovery generation overflow")?;
+        tx.execute("INSERT INTO image_generation_artifact_cleanup_intents(cleanup_operation_id,artifact_id,expected_artifact_generation,reason,state,version,created_at_unix_ms) VALUES(?1,?2,?3,'owner_recovery','pending',1,?4)",params![cleanup_operation_id.to_string(),recorded.artifact_id.to_string(),i64::try_from(next_generation)?,now])?;
+        ensure!(tx.execute("UPDATE image_generation_artifacts SET state='cleanup_pending',generation=generation+1,updated_at_unix_ms=?1 WHERE artifact_id=?2 AND state='security_blocked' AND generation=?3 AND active_lease_count=0",params![now,recorded.artifact_id.to_string(),i64::try_from(recorded.artifact_generation)?])?==1,"security recovery artifact compare-and-set lost");
+        for component in components {
+            ensure!(tx.execute("UPDATE image_generation_artifact_components SET state='cleanup_pending',generation=generation+1 WHERE artifact_id=?1 AND component_id=?2 AND state IN ('ready','security_blocked')",params![recorded.artifact_id.to_string(),component.component_id.to_string()])?==1,"security recovery component compare-and-set lost");
+        }
+        let outcome = crate::intel::hex_lower(&Sha256::digest(format!(
+            "cleanup:{}:{}",
+            recorded.operation_id, recorded.component_set_digest
+        )));
+        ensure!(tx.execute("UPDATE image_generation_artifact_security_recovery_audits SET state='applied',outcome_digest=?1,decided_at_unix_ms=?2 WHERE recovery_operation_id=?3 AND principal_digest=?4 AND state='recorded'",params![outcome,now,recorded.operation_id.to_string(),self.principal_digest])?==1,"security recovery audit compare-and-set lost");
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn close_security_recovery_audit(
+        &self,
+        conn: &Connection,
+        operation_id: Uuid,
+        state: &str,
+        evidence: &[u8],
+    ) -> Result<()> {
+        let now: i64 = conn.query_row(
+            "SELECT CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)",
+            [],
+            |row| row.get(0),
+        )?;
+        let digest = crate::intel::hex_lower(&Sha256::digest(evidence));
+        ensure!(conn.execute("UPDATE image_generation_artifact_security_recovery_audits SET state=?1,outcome_digest=?2,decided_at_unix_ms=?3 WHERE recovery_operation_id=?4 AND principal_digest=?5 AND state='recorded'",params![state,digest,now,operation_id.to_string(),self.principal_digest])?==1,"security recovery audit is unavailable");
         Ok(())
     }
 }
@@ -680,6 +784,17 @@ impl HeldImageGenerationArtifactRoot {
     ) -> Result<HeldSealedArtifact> {
         self.guard.open_verified(name, evidence)
     }
+    pub fn open_component_for_owner_recovery(
+        &self,
+        component_id: Uuid,
+        name: &str,
+        evidence: &HeldArtifactEvidence,
+    ) -> Result<VerifiedManagedComponentForRecovery> {
+        Ok(VerifiedManagedComponentForRecovery {
+            component_id,
+            held: self.guard.open_verified(name, evidence)?,
+        })
+    }
     pub fn remove_verified_component(
         &self,
         component: HeldSealedArtifact,
@@ -692,6 +807,12 @@ impl HeldImageGenerationArtifactRoot {
     ) -> Result<HeldDirectoryEffectOutcome> {
         self.guard.reconcile(recovery)
     }
+}
+
+#[derive(Debug)]
+pub struct VerifiedManagedComponentForRecovery {
+    component_id: Uuid,
+    held: HeldSealedArtifact,
 }
 
 pub fn open_image_generation_artifact_root(path: &Path) -> Result<HeldImageGenerationArtifactRoot> {

@@ -2995,8 +2995,7 @@ mod tests {
         run_real_ledger_scheduler_fixture("once").await;
     }
 
-    #[tokio::test]
-    async fn accepted_result_cancelled_during_validation_is_late_quarantined() {
+    async fn run_accepted_late_publication_restart_fixture() {
         use cockpit_db::db::image_generation::{
             AdoptImageGenerationResponse, AdvanceImageGenerationLatePublication,
             BeginImageGenerationDownload, ClaimImageGenerationLatePublication,
@@ -3177,6 +3176,11 @@ mod tests {
             std::fs::read(output_path.join("generated-late.png")).unwrap(),
             b"late publication bytes"
         );
+    }
+
+    #[tokio::test]
+    async fn accepted_result_cancelled_during_validation_is_late_quarantined() {
+        run_accepted_late_publication_restart_fixture().await;
     }
 
     #[tokio::test]

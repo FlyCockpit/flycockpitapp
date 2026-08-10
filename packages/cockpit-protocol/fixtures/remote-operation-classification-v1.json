@@ -1169,7 +1169,7 @@
         {
           "field": "from_path",
           "type": "String",
-          "role": "file_existing(project_root)"
+          "role": "rename_source(project_root)"
         },
         {
           "field": "to_path",

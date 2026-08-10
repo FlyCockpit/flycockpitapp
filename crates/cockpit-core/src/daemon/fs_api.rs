@@ -715,6 +715,7 @@ pub(crate) fn canonical_project_root(project_root: &str) -> Result<PathBuf, Erro
 pub(crate) enum AuthorizedCanonicalPathMode {
     Existing,
     WriteTarget,
+    RenameSource,
 }
 
 /// Resolve an already-authorized request path through the same symlink-aware
@@ -728,7 +729,21 @@ pub(crate) fn resolve_authorized_canonical_path(
     match mode {
         AuthorizedCanonicalPathMode::Existing => resolve_existing_path(&root, path),
         AuthorizedCanonicalPathMode::WriteTarget => resolve_existing_or_parent_path(&root, path),
+        AuthorizedCanonicalPathMode::RenameSource => resolve_rename_source(&root, path),
     }
+}
+
+fn resolve_rename_source(root: &Path, path: &str) -> Result<PathBuf, ErrorPayload> {
+    let rel = clean_relative_path(path)?;
+    let name = rel
+        .file_name()
+        .ok_or_else(|| bad_request("rename source must name an entry"))?;
+    let parent_rel = rel.parent().unwrap_or_else(|| Path::new(""));
+    let parent = resolve_existing_path(root, parent_rel.to_str().unwrap_or(""))?;
+    if !parent.is_dir() {
+        return Err(bad_request("rename source parent is not a directory"));
+    }
+    Ok(parent.join(name))
 }
 
 fn resolve_existing_path(root: &Path, path: &str) -> Result<PathBuf, ErrorPayload> {
@@ -940,6 +955,29 @@ mod tests {
             .unwrap(),
             root.canonicalize().unwrap().join("missing.txt")
         );
+    }
+
+    #[test]
+    fn rename_source_identity_is_stable_after_entry_disappears() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("nested/from.txt"), b"value").unwrap();
+        let root_text = root.to_str().unwrap();
+        let before = resolve_authorized_canonical_path(
+            root_text,
+            "nested/from.txt",
+            AuthorizedCanonicalPathMode::RenameSource,
+        )
+        .unwrap();
+        std::fs::rename(root.join("nested/from.txt"), root.join("nested/to.txt")).unwrap();
+        let after = resolve_authorized_canonical_path(
+            root_text,
+            "nested/from.txt",
+            AuthorizedCanonicalPathMode::RenameSource,
+        )
+        .unwrap();
+        assert_eq!(before, after);
     }
 
     #[test]

@@ -1408,7 +1408,7 @@ macro_rules! command {
             (Request::FsRead { project_root, path, base64 }, "fs_read", project_files(project_root), none, false, read_only, none, concurrent, none, "project_root:String|path:String|base64:bool", [project_root: String => project_root, path: String => file_existing(project_root), base64: bool => param]);
             (Request::FsWrite { project_root, path, content, base_hash }, "fs_write", project_files(project_root), none, true, idempotent_adapter_mutation, staged_filesystem_commit(staged_artifact_fingerprints_and_fsync_barriers), serialized, path(path), "project_root:String|path:String|content:String|base_hash:Option<String>", [project_root: String => project_root, path: String => file_write_target(project_root), content: String => param, base_hash: Option<String> => param]);
             (Request::FsCreateDir { project_root, path }, "fs_create_dir", project_files(project_root), none, true, idempotent_adapter_mutation, staged_filesystem_commit(staged_artifact_fingerprints_and_fsync_barriers), serialized, path(path), "project_root:String|path:String", [project_root: String => project_root, path: String => file_write_target(project_root)]);
-            (Request::FsRename { project_root, from_path, to_path }, "fs_rename", project_files(project_root), none, true, idempotent_adapter_mutation, staged_filesystem_commit(staged_artifact_fingerprints_and_fsync_barriers), serialized, rename(from_path, to_path), "project_root:String|from_path:String|to_path:String", [project_root: String => project_root, from_path: String => file_existing(project_root), to_path: String => file_write_target(project_root)]);
+            (Request::FsRename { project_root, from_path, to_path }, "fs_rename", project_files(project_root), none, true, idempotent_adapter_mutation, staged_filesystem_commit(staged_artifact_fingerprints_and_fsync_barriers), serialized, rename(from_path, to_path), "project_root:String|from_path:String|to_path:String", [project_root: String => project_root, from_path: String => rename_source(project_root), to_path: String => file_write_target(project_root)]);
             (Request::FsDelete { project_root, path }, "fs_delete", owner_only, none, true, local_only, none, serialized, path(path), "project_root:String|path:String", [project_root: String => project_root, path: String => file_existing(project_root)]);
             (Request::GitStatus { project_root }, "git_status", project_files(project_root), none, false, read_only, none, concurrent, none, "project_root:String", [project_root: String => project_root]);
             (Request::GitDiffFile { project_root, path }, "git_diff_file", project_files(project_root), none, false, read_only, none, concurrent, path(path), "project_root:String|path:String", [project_root: String => project_root, path: String => file_existing(project_root)]);
@@ -2119,7 +2119,7 @@ mod tests {
                     "project" => *ty == "Option<String>",
                     "project_root" => *ty == "String",
                     "project_root_effective" => *ty == "Option<String>",
-                    "file_existing" | "file_write_target" => *ty == "String",
+                    "file_existing" | "file_write_target" | "rename_source" => *ty == "String",
                     "terminal" | "upload" | "interrupt" | "queue" => *ty == "Uuid",
                     "provider_model_left" | "provider_model_right" => {
                         matches!(*ty, "String" | "Option<String>")

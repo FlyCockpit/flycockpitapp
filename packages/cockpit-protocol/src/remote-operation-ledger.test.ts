@@ -10,15 +10,25 @@ describe("remote operation classification fixture", () => {
     expect(fixture.rows.every((row) => typeof row.fcorSchema === "string")).toBe(true);
     expect(fixture.rows.every((row) => typeof row.fcorCanonicalSchema === "string")).toBe(true);
     const allowedRoles = new Set([
-      "param", "legacy_message", "session", "project", "project_root",
-      "project_root_effective", "terminal", "upload", "interrupt", "queue", "scheduled",
-      "file_existing(project_root)", "file_write_target(project_root)",
-      "provider_model_left(model)", "provider_model_right(provider)",
+      "param",
+      "legacy_message",
+      "session",
+      "project",
+      "project_root",
+      "project_root_effective",
+      "terminal",
+      "upload",
+      "interrupt",
+      "queue",
+      "scheduled",
+      "file_existing(project_root)",
+      "file_write_target(project_root)",
+      "rename_source(project_root)",
+      "provider_model_left(model)",
+      "provider_model_right(provider)",
     ]);
     expect(
-      fixture.rows.every((row) =>
-        row.fcorRoles.every((entry) => allowedRoles.has(entry.role)),
-      ),
+      fixture.rows.every((row) => row.fcorRoles.every((entry) => allowedRoles.has(entry.role))),
     ).toBe(true);
     const byTag = new Map(fixture.rows.map((row) => [row.tag, row]));
     for (const tag of [
@@ -54,7 +64,7 @@ describe("remote operation classification fixture", () => {
     );
     expect(byTag.get("fs_rename")?.fcorRoles).toEqual([
       { field: "project_root", type: "String", role: "project_root" },
-      { field: "from_path", type: "String", role: "file_existing(project_root)" },
+      { field: "from_path", type: "String", role: "rename_source(project_root)" },
       { field: "to_path", type: "String", role: "file_write_target(project_root)" },
     ]);
     expect(byTag.get("attach")?.fcorRoles.slice(0, 3)).toEqual([

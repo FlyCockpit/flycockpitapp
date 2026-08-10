@@ -148,6 +148,18 @@ macro_rules! resolve_fcor_role {
             canonical_project_root_bytes(&canonical)?,
         );
     }};
+    ($resources:ident, $cwd:ident, $name:ident: String => rename_source($root:ident)) => {{
+        let canonical = crate::daemon::fs_api::resolve_authorized_canonical_path(
+            $root,
+            $name,
+            crate::daemon::fs_api::AuthorizedCanonicalPathMode::RenameSource,
+        )?;
+        push_fcor_resource(
+            &mut $resources,
+            proto::remote_operation_fcor::RemoteOperationResourceKind::FilePath,
+            canonical_project_root_bytes(&canonical)?,
+        );
+    }};
     ($resources:ident, $cwd:ident, $name:ident: Uuid => terminal) => {
         push_fcor_resource(
             &mut $resources,

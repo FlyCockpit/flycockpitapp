@@ -1081,7 +1081,6 @@ dependencies = [
  "cockpit-test-support",
  "cockpit-tokenizer",
  "dirs",
- "jiff",
  "libc",
  "reqwest 0.13.4",
  "serde",

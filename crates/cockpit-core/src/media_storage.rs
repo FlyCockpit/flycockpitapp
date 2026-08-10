@@ -280,37 +280,47 @@ impl MediaStorageRecovery {
                     .collect::<Vec<_>>(),
             )?;
             let intent_job = job_id.to_string();
+            let security_outputs = intent_outputs.clone();
             self.db.transaction(move|conn|{conn.execute("INSERT OR IGNORE INTO media_attachment_processing_publication_intents(job_id,output_ids_json,created_at_unix_ms) VALUES(?1,?2,?3)",params![intent_job,intent_outputs,now_unix_ms])?;Ok(())}).await?;
             let mut components = Vec::new();
             let mut names = Vec::new();
-            for (kind, id, bytes, width, height) in outputs {
-                let name = id.to_string();
-                let mut file = self
-                    .owned_root
-                    .create_file_exclusive(&name)
-                    .map_err(anyhow::Error::new)?;
-                file.write_all(&bytes)?;
-                file.sync_all()?;
-                let output_identity = stable_identity_digest(&file)?;
-                let (output_length, output_checksum) = read_full_digest(&mut file)?;
-                ensure!(
-                    output_length == bytes.len() as u64
-                        && output_checksum == crate::intel::hex_lower(&Sha256::digest(&bytes))
-                        && stable_identity_digest(&file)? == output_identity,
-                    "storage_security_violation"
-                );
-                names.push(name);
-                components.push((
-                    kind,
-                    id,
-                    output_identity,
-                    output_length,
-                    output_checksum,
-                    width,
-                    height,
-                ));
+            let output_proof = (|| -> Result<()> {
+                for (kind, id, bytes, width, height) in outputs {
+                    let name = id.to_string();
+                    let mut file = self
+                        .owned_root
+                        .create_file_exclusive(&name)
+                        .map_err(anyhow::Error::new)?;
+                    file.write_all(&bytes)?;
+                    file.sync_all()?;
+                    let output_identity = stable_identity_digest(&file)?;
+                    let (output_length, output_checksum) = read_full_digest(&mut file)?;
+                    ensure!(
+                        output_length == bytes.len() as u64
+                            && output_checksum == crate::intel::hex_lower(&Sha256::digest(&bytes))
+                            && stable_identity_digest(&file)? == output_identity,
+                        "storage_security_violation"
+                    );
+                    names.push(name);
+                    components.push((
+                        kind,
+                        id,
+                        output_identity,
+                        output_length,
+                        output_checksum,
+                        width,
+                        height,
+                    ));
+                }
+                self.owned_root.sync().map_err(anyhow::Error::new)?;
+                Ok(())
+            })();
+            if output_proof.is_err() {
+                self.reconcile_media_uploads(now_unix_ms).await?;
+                self.db.transaction(move|conn|{let blocked=expected_generation.checked_add(2).context("availability generation overflow")?;cockpit_db::Db::transition_media_attachment_conn(conn,attachment_id,expected_version,expected_generation+1,MediaAvailability::SecurityBlocked,now_unix_ms)?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,'probing','security_blocked',?3,?4)",params![attachment_id.to_string(),blocked.to_string(),job_id.to_string(),now_unix_ms])?;conn.execute("INSERT INTO media_attachment_processing_output_security_evidence(job_id,attachment_id,output_ids_json,reason,recorded_at_unix_ms) VALUES(?1,?2,?3,'storage_security_violation',?4)",params![job_id.to_string(),attachment_id.to_string(),security_outputs,now_unix_ms])?;conn.execute("UPDATE media_attachment_processing_jobs SET state='completed',completed_at_unix_ms=?1 WHERE job_id=?2",params![now_unix_ms,job_id.to_string()])?;Ok(())}).await?;
+                completed += 1;
+                continue;
             }
-            self.owned_root.sync().map_err(anyhow::Error::new)?;
             let names_on_error = names.clone();
             let result=self.db.transaction(move|conn|{for(kind,id,identity,length,checksum,width,height)in components{let component=cockpit_db::media_attachments::MediaAttachmentComponent{component_id:id,attachment_id,attachment_version:expected_version,component_kind:kind.into(),storage_id:id,lifecycle_state:"ready".into(),component_generation:1,stable_identity_digest:identity,byte_length:length,sha256:checksum,reservation_id:reservation.clone(),created_at_unix_ms:now_unix_ms,updated_at_unix_ms:now_unix_ms};cockpit_db::Db::insert_media_attachment_component_conn(conn,&component)?;conn.execute("INSERT INTO media_image_component_dimensions(component_id,width,height) VALUES(?1,?2,?3)",params![id.to_string(),width,height])?;}conn.execute("UPDATE media_attachments SET canonical_container=?1,canonical_mime=?2 WHERE attachment_id=?3",params![container,mime,attachment_id.to_string()])?;let mut current=expected_generation+1;for next in[MediaAvailability::Decoding,MediaAvailability::Normalizing,MediaAvailability::Ready]{cockpit_db::Db::transition_media_attachment_conn(conn,attachment_id,expected_version,current,next,now_unix_ms)?;let after=current+1;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![attachment_id.to_string(),after.to_string(),if current==2{"probing"}else if current==3{"decoding"}else{"normalizing"},next.as_str(),job_id.to_string(),now_unix_ms])?;current=after;}conn.execute("UPDATE media_attachment_processing_jobs SET state='completed',completed_at_unix_ms=?1 WHERE job_id=?2 AND state='claimed' AND source_evidence_digest=?3",params![now_unix_ms,job_id.to_string(),source_evidence])?;conn.execute("DELETE FROM media_attachment_processing_publication_intents WHERE job_id=?1",[job_id.to_string()])?;Ok(())}).await;
             if let Err(error) = result {

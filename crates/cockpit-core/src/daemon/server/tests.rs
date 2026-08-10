@@ -1623,6 +1623,46 @@ async fn remote_cancel_turn_dispatches_once_then_replays_or_conflicts() {
             .active_agent,
         "Plan"
     );
+    let env_operation = proto::RemoteOperationIdentityV1::new(
+        logical_attachment_id,
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-abababababab").unwrap(),
+    )
+    .unwrap();
+    let env_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            env_id,
+            env_operation,
+            Request::RefreshEnv {
+                vars: HashMap::from([("TOKEN".into(), "supersecret".into())]),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(recv_writer_body(&mut writer_rx, "secret env apply").await,
+        Body::Response { id, response } if id == env_id && matches!(*response, Response::Ack))
+    );
+    let leaked = ctx.db.read(|conn| {
+        let operation: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM remote_attachment_operations WHERE instr(CAST(safe_response AS TEXT),'supersecret')>0", [], |row| row.get(0),
+        )?;
+        let outbox: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM remote_attachment_outbox WHERE instr(CAST(canonical_payload AS TEXT),'supersecret')>0", [], |row| row.get(0),
+        )?;
+        Ok(operation + outbox)
+    }).await.unwrap();
+    assert_eq!(
+        leaked, 0,
+        "secret env values must be hash-bound but absent from ledger/outbox"
+    );
     state.principal = ClientPrincipal::Remote(principal::RemotePrincipal {
         user_id: "cancel-writer".into(),
         grants: vec![principal::PrincipalGrant {

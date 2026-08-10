@@ -1986,9 +1986,9 @@
       "tag": "set_llm_mode",
       "fcorSchema": "mode:Option<LlmMode>",
       "fcorCanonicalSchema": "mode:option<enum16:LlmMode>",
-      "class": "idempotent_adapter_mutation",
-      "strategy": "durable_desired_state",
-      "evidence": "desired_state_generation_and_observed_digest",
+      "class": "nonrepeatable_mutation",
+      "strategy": "nonrepeatable_dispatch",
+      "evidence": null,
       "fcorRoles": [
         {
           "field": "mode",
@@ -2016,9 +2016,9 @@
       "tag": "set_tool_surface_override",
       "fcorSchema": "override_json:String|persist_session:bool|prune_after_switch:bool|monty_nudge:Option<String>",
       "fcorCanonicalSchema": "override_json:string|persist_session:bool|prune_after_switch:bool|monty_nudge:option<string>",
-      "class": "idempotent_adapter_mutation",
-      "strategy": "durable_desired_state",
-      "evidence": "desired_state_generation_and_observed_digest",
+      "class": "nonrepeatable_mutation",
+      "strategy": "nonrepeatable_dispatch",
+      "evidence": null,
       "fcorRoles": [
         {
           "field": "override_json",
@@ -2046,9 +2046,9 @@
       "tag": "set_goal_settings_override",
       "fcorSchema": "override_json:Option<String>|persist_session:bool",
       "fcorCanonicalSchema": "override_json:option<string>|persist_session:bool",
-      "class": "idempotent_adapter_mutation",
-      "strategy": "durable_desired_state",
-      "evidence": "desired_state_generation_and_observed_digest",
+      "class": "nonrepeatable_mutation",
+      "strategy": "nonrepeatable_dispatch",
+      "evidence": null,
       "fcorRoles": [
         {
           "field": "override_json",
@@ -2066,9 +2066,9 @@
       "tag": "set_approval_mode",
       "fcorSchema": "mode:ApprovalMode",
       "fcorCanonicalSchema": "mode:enum16:ApprovalMode",
-      "class": "idempotent_adapter_mutation",
-      "strategy": "durable_desired_state",
-      "evidence": "desired_state_generation_and_observed_digest",
+      "class": "nonrepeatable_mutation",
+      "strategy": "nonrepeatable_dispatch",
+      "evidence": null,
       "fcorRoles": [
         {
           "field": "mode",
@@ -2081,9 +2081,9 @@
       "tag": "set_delegation_recursion",
       "fcorSchema": "enabled:bool|default_depth:u32",
       "fcorCanonicalSchema": "enabled:bool|default_depth:u32",
-      "class": "idempotent_adapter_mutation",
-      "strategy": "durable_desired_state",
-      "evidence": "desired_state_generation_and_observed_digest",
+      "class": "nonrepeatable_mutation",
+      "strategy": "nonrepeatable_dispatch",
+      "evidence": null,
       "fcorRoles": [
         {
           "field": "enabled",
@@ -2101,9 +2101,9 @@
       "tag": "set_sandbox",
       "fcorSchema": "mode:Option<SandboxMode>|container_network_enabled:Option<bool>",
       "fcorCanonicalSchema": "mode:option<enum16:SandboxMode>|container_network_enabled:option<bool>",
-      "class": "idempotent_adapter_mutation",
-      "strategy": "durable_desired_state",
-      "evidence": "desired_state_generation_and_observed_digest",
+      "class": "nonrepeatable_mutation",
+      "strategy": "nonrepeatable_dispatch",
+      "evidence": null,
       "fcorRoles": [
         {
           "field": "mode",
@@ -2121,9 +2121,9 @@
       "tag": "set_sandbox_escalation",
       "fcorSchema": "enabled:bool",
       "fcorCanonicalSchema": "enabled:bool",
-      "class": "idempotent_adapter_mutation",
-      "strategy": "durable_desired_state",
-      "evidence": "desired_state_generation_and_observed_digest",
+      "class": "nonrepeatable_mutation",
+      "strategy": "nonrepeatable_dispatch",
+      "evidence": null,
       "fcorRoles": [
         {
           "field": "enabled",
@@ -2136,9 +2136,9 @@
       "tag": "set_preflight",
       "fcorSchema": "enabled:Option<bool>",
       "fcorCanonicalSchema": "enabled:option<bool>",
-      "class": "idempotent_adapter_mutation",
-      "strategy": "durable_desired_state",
-      "evidence": "desired_state_generation_and_observed_digest",
+      "class": "nonrepeatable_mutation",
+      "strategy": "nonrepeatable_dispatch",
+      "evidence": null,
       "fcorRoles": [
         {
           "field": "enabled",
@@ -2151,9 +2151,9 @@
       "tag": "set_longcache",
       "fcorSchema": "enabled:Option<bool>",
       "fcorCanonicalSchema": "enabled:option<bool>",
-      "class": "idempotent_adapter_mutation",
-      "strategy": "durable_desired_state",
-      "evidence": "desired_state_generation_and_observed_digest",
+      "class": "nonrepeatable_mutation",
+      "strategy": "nonrepeatable_dispatch",
+      "evidence": null,
       "fcorRoles": [
         {
           "field": "enabled",
@@ -2166,9 +2166,9 @@
       "tag": "set_redaction",
       "fcorSchema": "scan_environment:Option<bool>|scan_dotenv:Option<bool>|scan_ssh_keys:Option<bool>",
       "fcorCanonicalSchema": "scan_environment:option<bool>|scan_dotenv:option<bool>|scan_ssh_keys:option<bool>",
-      "class": "idempotent_adapter_mutation",
-      "strategy": "durable_desired_state",
-      "evidence": "desired_state_generation_and_observed_digest",
+      "class": "nonrepeatable_mutation",
+      "strategy": "nonrepeatable_dispatch",
+      "evidence": null,
       "fcorRoles": [
         {
           "field": "scan_environment",
@@ -2191,9 +2191,9 @@
       "tag": "set_tandem_models",
       "fcorSchema": "models:Vec<(String,String)>",
       "fcorCanonicalSchema": "models:list<tuple<string,string>>",
-      "class": "idempotent_adapter_mutation",
-      "strategy": "durable_desired_state",
-      "evidence": "desired_state_generation_and_observed_digest",
+      "class": "nonrepeatable_mutation",
+      "strategy": "nonrepeatable_dispatch",
+      "evidence": null,
       "fcorRoles": [
         {
           "field": "models",
@@ -2302,9 +2302,9 @@
       "tag": "refresh_env",
       "fcorSchema": "vars:HashMap<String,String>",
       "fcorCanonicalSchema": "vars:map<string,string>",
-      "class": "idempotent_adapter_mutation",
-      "strategy": "durable_desired_state",
-      "evidence": "desired_state_generation_and_observed_digest",
+      "class": "nonrepeatable_mutation",
+      "strategy": "nonrepeatable_dispatch",
+      "evidence": null,
       "fcorRoles": [
         {
           "field": "vars",
@@ -2317,9 +2317,9 @@
       "tag": "refresh_config",
       "fcorSchema": "-",
       "fcorCanonicalSchema": "-",
-      "class": "idempotent_adapter_mutation",
-      "strategy": "durable_desired_state",
-      "evidence": "desired_state_generation_and_observed_digest",
+      "class": "nonrepeatable_mutation",
+      "strategy": "nonrepeatable_dispatch",
+      "evidence": null,
       "fcorRoles": []
     },
     {

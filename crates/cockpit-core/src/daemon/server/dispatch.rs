@@ -2933,11 +2933,27 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
 
         Request::SetLlmMode { mode } => {
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation
+                && let Some(response) = begin_remote_nonrepeatable(
+                    &Request::SetLlmMode { mode },
+                    &authorized_request,
+                    operation,
+                    ctx,
+                )
+                .await?
+            {
+                return Ok(response);
+            }
             att.handle
                 .send_work(SessionWork::SetLlmMode { mode })
                 .await
                 .map_err(internal)?;
-            Ok(Response::Ack)
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "set_llm_mode", Response::Ack).await
+                }
+                None => Ok(Response::Ack),
+            }
         }
 
         Request::SetSessionLlmMode { mode } => {
@@ -3000,6 +3016,20 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             monty_nudge,
         } => {
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation {
+                let request = Request::SetToolSurfaceOverride {
+                    override_json: override_json.clone(),
+                    persist_session,
+                    prune_after_switch,
+                    monty_nudge: monty_nudge.clone(),
+                };
+                if let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+                {
+                    return Ok(response);
+                }
+            }
             serde_json::from_str::<crate::agents::ToolSurfaceSelection>(&override_json)
                 .map_err(|error| bad_request(format!("invalid tool surface override: {error}")))?;
             att.handle
@@ -3011,7 +3041,18 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 })
                 .await
                 .map_err(internal)?;
-            Ok(Response::Ack)
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(
+                        operation,
+                        ctx,
+                        "set_tool_surface_override",
+                        Response::Ack,
+                    )
+                    .await
+                }
+                None => Ok(Response::Ack),
+            }
         }
 
         Request::SetGoalSettingsOverride {
@@ -3019,6 +3060,18 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             persist_session,
         } => {
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation {
+                let request = Request::SetGoalSettingsOverride {
+                    override_json: override_json.clone(),
+                    persist_session,
+                };
+                if let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+                {
+                    return Ok(response);
+                }
+            }
             if let Some(raw) = override_json.as_deref() {
                 crate::agents::parse_goal_settings_override_json(raw).map_err(|error| {
                     bad_request(format!("invalid goal settings override: {error}"))
@@ -3031,13 +3084,41 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 })
                 .await
                 .map_err(internal)?;
-            Ok(Response::Ack)
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(
+                        operation,
+                        ctx,
+                        "set_goal_settings_override",
+                        Response::Ack,
+                    )
+                    .await
+                }
+                None => Ok(Response::Ack),
+            }
         }
 
         Request::SetApprovalMode { mode } => {
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation
+                && let Some(response) = begin_remote_nonrepeatable(
+                    &Request::SetApprovalMode { mode },
+                    &authorized_request,
+                    operation,
+                    ctx,
+                )
+                .await?
+            {
+                return Ok(response);
+            }
             let mode = att.handle.set_approval_mode(mode);
-            Ok(Response::ApprovalModeState { mode })
+            let response = Response::ApprovalModeState { mode };
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "set_approval_mode", response).await
+                }
+                None => Ok(response),
+            }
         }
 
         Request::SetDelegationRecursion {
@@ -3045,6 +3126,20 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             default_depth,
         } => {
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation
+                && let Some(response) = begin_remote_nonrepeatable(
+                    &Request::SetDelegationRecursion {
+                        enabled,
+                        default_depth,
+                    },
+                    &authorized_request,
+                    operation,
+                    ctx,
+                )
+                .await?
+            {
+                return Ok(response);
+            }
             att.handle
                 .send_work(SessionWork::SetDelegationRecursion {
                     enabled,
@@ -3052,10 +3147,22 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 })
                 .await
                 .map_err(internal)?;
-            Ok(Response::DelegationRecursionState {
+            let response = Response::DelegationRecursionState {
                 enabled,
                 default_depth,
-            })
+            };
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(
+                        operation,
+                        ctx,
+                        "set_delegation_recursion",
+                        response,
+                    )
+                    .await
+                }
+                None => Ok(response),
+            }
         }
 
         Request::SetCaffeinate { mode } => set_caffeinate(state, ctx, mode),
@@ -3078,22 +3185,58 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             // broadcasts a `SandboxState` event so every attached client
             // stays in sync.
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation {
+                let request = Request::SetSandbox {
+                    mode,
+                    container_network_enabled,
+                };
+                if let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+                {
+                    return Ok(response);
+                }
+            }
             let new = att
                 .handle
                 .set_sandbox(mode, container_network_enabled)
                 .map_err(bad_request)?;
-            Ok(Response::SandboxState {
+            let response = Response::SandboxState {
                 mode: new,
                 enabled: new.enabled(),
                 container_network_enabled: att.handle.container_network_enabled(),
                 container_availability: crate::container::availability_snapshot(),
-            })
+            };
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "set_sandbox", response).await
+                }
+                None => Ok(response),
+            }
         }
 
         Request::SetSandboxEscalation { enabled } => {
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation
+                && let Some(response) = begin_remote_nonrepeatable(
+                    &Request::SetSandboxEscalation { enabled },
+                    &authorized_request,
+                    operation,
+                    ctx,
+                )
+                .await?
+            {
+                return Ok(response);
+            }
             let enabled = att.handle.set_sandbox_escalation(enabled);
-            Ok(Response::SandboxEscalationState { enabled })
+            let response = Response::SandboxEscalationState { enabled };
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "set_sandbox_escalation", response)
+                        .await
+                }
+                None => Ok(response),
+            }
         }
 
         Request::SetPreflight { enabled } => {
@@ -3102,6 +3245,17 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             // the resulting state (→ toast + mirror). Session-only — no
             // config-file write.
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation
+                && let Some(response) = begin_remote_nonrepeatable(
+                    &Request::SetPreflight { enabled },
+                    &authorized_request,
+                    operation,
+                    ctx,
+                )
+                .await?
+            {
+                return Ok(response);
+            }
             let (respond_to, response_rx) = tokio::sync::oneshot::channel();
             att.handle
                 .send_work(SessionWork::SetPreflight {
@@ -3110,16 +3264,33 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 })
                 .await
                 .map_err(internal)?;
-            Ok(Response::PreflightState {
+            let response = Response::PreflightState {
                 enabled: response_rx
                     .await
                     .map_err(internal)?
                     .map_err(|error| internal(anyhow::anyhow!(error)))?,
-            })
+            };
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "set_preflight", response).await
+                }
+                None => Ok(response),
+            }
         }
 
         Request::SetLongcache { enabled } => {
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation
+                && let Some(response) = begin_remote_nonrepeatable(
+                    &Request::SetLongcache { enabled },
+                    &authorized_request,
+                    operation,
+                    ctx,
+                )
+                .await?
+            {
+                return Ok(response);
+            }
             let (respond_to, response_rx) = tokio::sync::oneshot::channel();
             att.handle
                 .send_work(SessionWork::SetLongcache {
@@ -3128,12 +3299,18 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 })
                 .await
                 .map_err(internal)?;
-            Ok(Response::LongcacheState {
+            let response = Response::LongcacheState {
                 enabled: response_rx
                     .await
                     .map_err(internal)?
                     .map_err(|error| internal(anyhow::anyhow!(error)))?,
-            })
+            };
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "set_longcache", response).await
+                }
+                None => Ok(response),
+            }
         }
 
         Request::SetRedaction {
@@ -3147,6 +3324,19 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             // broadcasts the resulting state (→ toast). Session-only — no
             // config-file write. `scrub()` stays non-bypassable.
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation {
+                let request = Request::SetRedaction {
+                    scan_environment,
+                    scan_dotenv,
+                    scan_ssh_keys,
+                };
+                if let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+                {
+                    return Ok(response);
+                }
+            }
             let (respond_to, response_rx) = tokio::sync::oneshot::channel();
             att.handle
                 .send_work(SessionWork::SetRedaction {
@@ -3161,11 +3351,17 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 .await
                 .map_err(internal)?
                 .map_err(|error| internal(anyhow::anyhow!(error)))?;
-            Ok(Response::RedactionState {
+            let response = Response::RedactionState {
                 scan_environment,
                 scan_dotenv,
                 scan_ssh_keys,
-            })
+            };
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "set_redaction", response).await
+                }
+                None => Ok(response),
+            }
         }
 
         Request::SetTandemModels { models } => {
@@ -3175,11 +3371,28 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             // state (+ token-burn warning) via `Event::TandemState`.
             // Session-only — no config-file write.
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation {
+                let request = Request::SetTandemModels {
+                    models: models.clone(),
+                };
+                if let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+                {
+                    return Ok(response);
+                }
+            }
             att.handle
                 .send_work(SessionWork::SetTandemModels { models })
                 .await
                 .map_err(internal)?;
-            Ok(Response::Ack)
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "set_tandem_models", Response::Ack)
+                        .await
+                }
+                None => Ok(Response::Ack),
+            }
         }
 
         Request::Prune => {
@@ -3297,12 +3510,37 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
 
         Request::RefreshEnv { vars } => {
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation {
+                let request = Request::RefreshEnv { vars: vars.clone() };
+                if let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+                {
+                    return Ok(response);
+                }
+            }
             att.handle.set_env_overlay(vars);
-            Ok(Response::Ack)
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "refresh_env", Response::Ack).await
+                }
+                None => Ok(Response::Ack),
+            }
         }
 
         Request::RefreshConfig => {
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation
+                && let Some(response) = begin_remote_nonrepeatable(
+                    &Request::RefreshConfig,
+                    &authorized_request,
+                    operation,
+                    ctx,
+                )
+                .await?
+            {
+                return Ok(response);
+            }
             let refreshed = crate::daemon::config_refresh::refresh_session_config_explicit(
                 &ctx.db,
                 ctx.config_source(),
@@ -3310,10 +3548,16 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             )
             .await
             .map_err(explicit_config_refresh_error)?;
-            Ok(Response::ConfigRefreshed {
+            let response = Response::ConfigRefreshed {
                 applied_generation: refreshed.applied_generation,
                 changed: refreshed.changed,
-            })
+            };
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "refresh_config", response).await
+                }
+                None => Ok(response),
+            }
         }
 
         Request::RecordUsage {

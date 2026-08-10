@@ -21,12 +21,13 @@ use cockpit_db::db::external_journal::{
 };
 use cockpit_db::db::image_generation::{
     image_generation_component_set_binding, AcquireImageGenerationArtifactLease,
-    AdvanceImageGenerationLatePublication, BlockVerifiedImageGenerationLatePublication,
-    CreateImageGenerationArtifact, CreateImageGenerationArtifactComponent,
-    DispatchingImageGenerationAttempt, ImageGenerationArtifactComponentKind,
-    ImageGenerationArtifactComponentState, ImageGenerationArtifactConsumerPurpose,
-    ImageGenerationArtifactConsumerRoute, ImageGenerationArtifactState,
-    ImageGenerationDispatchCandidate, ImageGenerationHandoffFinishDisposition,
+    AcquiredImageGenerationArtifactLease, AdvanceImageGenerationLatePublication,
+    BlockVerifiedImageGenerationLatePublication, CreateImageGenerationArtifact,
+    CreateImageGenerationArtifactComponent, DispatchingImageGenerationAttempt,
+    ImageGenerationArtifactComponentKind, ImageGenerationArtifactComponentState,
+    ImageGenerationArtifactConsumerPurpose, ImageGenerationArtifactConsumerRoute,
+    ImageGenerationArtifactState, ImageGenerationDispatchCandidate,
+    ImageGenerationHandoffFinishDisposition,
     ImageGenerationLatePublicationEvidenceV1, ImageGenerationLatePublicationState,
     PreparedImageGenerationDispatch, ReserveImageGenerationLatePublication,
     TransitionImageGenerationArtifact, TransitionImageGenerationArtifactComponent,
@@ -2143,6 +2144,32 @@ fn decode_held_artifact_evidence(value: &str) -> Result<HeldArtifactEvidence> {
     })
 }
 
+fn write_verified_artifact_component<W: Write>(
+    root: &HeldImageGenerationArtifactRoot,
+    lease: &AcquiredImageGenerationArtifactLease,
+    expected_checksum: &str,
+    writer: &mut W,
+) -> Result<()> {
+    let evidence = decode_held_artifact_evidence(&lease.stable_identity_json)?;
+    ensure!(
+        evidence.byte_length() == lease.byte_length && evidence.sha256() == expected_checksum,
+        "component held evidence differs from lease"
+    );
+    let mut held = root.open_verified_component(&lease.relative_storage_key, &evidence)?;
+    ensure!(held.evidence() == &evidence, "component held proof differs");
+    held.file_mut().seek(SeekFrom::Start(lease.range_start))?;
+    let mut remaining = lease.requested_length;
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining != 0 {
+        let wanted = usize::try_from(remaining.min(buffer.len() as u64))?;
+        let count = held.file_mut().read(&mut buffer[..wanted])?;
+        ensure!(count != 0, "component ended before leased range");
+        writer.write_all(&buffer[..count])?;
+        remaining -= u64::try_from(count)?;
+    }
+    Ok(())
+}
+
 /// Acquires the durable route lease, proves and reads one no-follow held
 /// component, then releases the lease exactly once even when the consumer
 /// disconnects (`Write::write` returns an error).
@@ -2162,27 +2189,8 @@ pub fn serve_image_generation_artifact_component<W: Write>(
     )?;
     ensure!(authenticated, "image artifact route is unavailable");
     let lease = cockpit_db::Db::acquire_image_generation_artifact_lease_conn(conn, input)?;
-    let served = (|| -> Result<()> {
-        let evidence = decode_held_artifact_evidence(&lease.stable_identity_json)?;
-        ensure!(
-            evidence.byte_length() == lease.byte_length
-                && evidence.sha256() == input.expected_component_checksum,
-            "component held evidence differs from lease"
-        );
-        let mut held = root.open_verified_component(&lease.relative_storage_key, &evidence)?;
-        ensure!(held.evidence() == &evidence, "component held proof differs");
-        held.file_mut().seek(SeekFrom::Start(lease.range_start))?;
-        let mut remaining = lease.requested_length;
-        let mut buffer = [0_u8; 64 * 1024];
-        while remaining != 0 {
-            let wanted = usize::try_from(remaining.min(buffer.len() as u64))?;
-            let count = held.file_mut().read(&mut buffer[..wanted])?;
-            ensure!(count != 0, "component ended before leased range");
-            writer.write_all(&buffer[..count])?;
-            remaining -= u64::try_from(count)?;
-        }
-        Ok(())
-    })();
+    let served =
+        write_verified_artifact_component(root, &lease, input.expected_component_checksum, writer);
     let released = cockpit_db::Db::release_image_generation_artifact_lease_conn(
         conn,
         lease.lease_id,
@@ -4660,6 +4668,50 @@ mod tests {
             panic!("retention was not durable")
         };
         let evidence = effect.artifact().clone();
+        let evidence_json = held_artifact_evidence_json(&evidence).unwrap();
+        let full = AcquiredImageGenerationArtifactLease {
+            lease_id: Uuid::now_v7(),
+            relative_storage_key: "component.bin".into(),
+            stable_identity_json: evidence_json.clone(),
+            byte_length: evidence.byte_length(),
+            range_start: 0,
+            requested_length: evidence.byte_length(),
+        };
+        let mut full_bytes = Vec::new();
+        write_verified_artifact_component(&held, &full, evidence.sha256(), &mut full_bytes)
+            .unwrap();
+        assert_eq!(full_bytes, b"canonical-image");
+        let range = AcquiredImageGenerationArtifactLease {
+            lease_id: Uuid::now_v7(),
+            relative_storage_key: "component.bin".into(),
+            stable_identity_json: evidence_json,
+            byte_length: evidence.byte_length(),
+            range_start: 10,
+            requested_length: 5,
+        };
+        let mut range_bytes = Vec::new();
+        write_verified_artifact_component(&held, &range, evidence.sha256(), &mut range_bytes)
+            .unwrap();
+        assert_eq!(range_bytes, b"image");
+        struct Disconnected;
+        impl std::io::Write for Disconnected {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "disconnected",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        assert!(write_verified_artifact_component(
+            &held,
+            &full,
+            evidence.sha256(),
+            &mut Disconnected,
+        )
+        .is_err());
         let mut reopened = held
             .open_verified_component("component.bin", &evidence)
             .unwrap();

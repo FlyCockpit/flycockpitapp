@@ -807,7 +807,8 @@ impl Db {
             let Some((policy,epoch_policy,epoch,state,reserved))=base else{return Ok(None)};
             let sum = |sql:&str| -> Result<u64> { let mut statement=conn.prepare(sql)?; let values=statement.query_map([&reservation_id],|row|row.get::<_,Vec<u8>>(0))?.collect::<rusqlite::Result<Vec<_>>>()?; values.into_iter().try_fold(0u64,|total,value|total.checked_add(read_money(value)?).ok_or_else(||anyhow::Error::new(BudgetBlockReason::ArithmeticOverflow))) };
             let debt = { let mut statement=conn.prepare("SELECT debt_usd_micros FROM image_spend_scope_usage WHERE reservation_id=?1")?; let values=statement.query_map([&reservation_id],|row|row.get::<_,Vec<u8>>(0))?.collect::<rusqlite::Result<Vec<_>>>()?; values.into_iter().map(read_money).collect::<rusqlite::Result<Vec<_>>>()?.into_iter().max().unwrap_or(0) };
-            Ok(Some(SpendLedgerDiagnostic { reservation_id, policy_version:read_u64(policy)?, epoch_policy_version:read_u64(epoch_policy)?, epoch_sequence:read_u64(epoch)?, state, reserved_usd_micros:reserved.map(read_money).transpose()?, charged_usd_micros:sum("SELECT actual_usd_micros FROM image_spend_cost_events WHERE reservation_id=?1")?, debt_usd_micros:debt }))
+            let charged = sum("SELECT actual_usd_micros FROM image_spend_cost_events WHERE reservation_id=?1")?;
+            Ok(Some(SpendLedgerDiagnostic { reservation_id, policy_version:read_u64(policy)?, epoch_policy_version:read_u64(epoch_policy)?, epoch_sequence:read_u64(epoch)?, state, reserved_usd_micros:reserved.map(read_money).transpose()?, charged_usd_micros:charged, debt_usd_micros:debt }))
         }).await
     }
     /// Resolve a caller-derived calendar/rolling membership to a durable,
@@ -898,7 +899,7 @@ impl Db {
                 let head: Option<i64> = conn.query_row("SELECT epoch_sequence FROM image_spend_epoch_heads WHERE project_key=?1 AND epoch_policy_version=?2",params![keys.project_key,epoch_policy_version_sql],|r|r.get(0)).optional()?;
                 if head != Some(epoch_sequence_sql) { return Err(BudgetBlockReason::InvalidProjectEpoch.into()); }
             }
-            conn.execute("INSERT INTO image_spend_reservations(reservation_id,plan_digest,session_id,project_key,policy_version,epoch_policy_version,epoch_sequence,reserved_usd_micros,cost_unknown,state,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'reserved',?10)", params![reservation_id,keys.plan_digest,keys.session_id,keys.project_key,expected_policy_version_sql,epoch_policy_version_sql,epoch_sequence_sql,if unknown { None } else { Some(total_sql) },unknown,created_at_ms])?;
+            conn.execute("INSERT INTO image_spend_reservations(reservation_id,plan_digest,session_id,project_key,policy_version,epoch_policy_version,epoch_sequence,reserved_usd_micros,cost_unknown,state,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'reserved',?10)", params![reservation_id,keys.plan_digest,keys.session_id,keys.project_key,expected_policy_version_sql,epoch_policy_version_sql,epoch_sequence_sql,if unknown { None } else { Some(total_sql.clone()) },unknown,created_at_ms])?;
             for (kind, scope_key, policy) in [("request", keys.plan_digest.as_str(), settings.request), ("session", keys.session_id.as_str(), settings.session), ("project", keys.project_key.as_str(), settings.project)] {
                 if let BudgetPolicy::Finite { usd_micros: limit } = policy {
                     let epoch = if kind == "project" { keys.project_epoch_sequence } else { 0 };

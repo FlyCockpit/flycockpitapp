@@ -1794,6 +1794,161 @@ fn ebml_doctype_is_webm(bytes: &[u8]) -> Result<bool> {
     Ok(found == Some(b"webm".as_slice()))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ApprovedAvRuntime {
+    ffmpeg: std::path::PathBuf,
+    ffprobe: std::path::PathBuf,
+    fingerprint: String,
+}
+
+fn approved_av_runtime(
+    snapshot: &crate::external_runtime::ExternalRuntimeSnapshot,
+) -> Result<ApprovedAvRuntime> {
+    use crate::external_runtime::{
+        HealthState, ID_MEDIA_FFMPEG, ID_MEDIA_FFPROBE, select_media_runtime_pair,
+    };
+    let (ffmpeg, ffprobe) = select_media_runtime_pair(snapshot).map_err(anyhow::Error::msg)?;
+    let evidence = |id| match &snapshot.get(id).context("model_runtime_unavailable")?.state {
+        HealthState::Available {
+            version_evidence: Some(value),
+            ..
+        } => Ok(value.as_str()),
+        _ => anyhow::bail!("model_runtime_unavailable"),
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(b"media-av-runtime-v1\0");
+    hasher.update(snapshot.generation.to_be_bytes());
+    for value in [
+        ffmpeg.as_os_str().as_encoded_bytes(),
+        ffprobe.as_os_str().as_encoded_bytes(),
+        evidence(ID_MEDIA_FFMPEG)?.as_bytes(),
+        evidence(ID_MEDIA_FFPROBE)?.as_bytes(),
+    ] {
+        hasher.update(value);
+        hasher.update([0]);
+    }
+    Ok(ApprovedAvRuntime {
+        ffmpeg: ffmpeg.to_owned(),
+        ffprobe: ffprobe.to_owned(),
+        fingerprint: crate::intel::hex_lower(&hasher.finalize()),
+    })
+}
+
+fn audio_normalization_argv(stream: u32, source_rate: u32, channels: u32) -> Result<Vec<String>> {
+    ensure!(source_rate > 0 && channels > 0, "invalid_media");
+    let rate = source_rate.min(48_000);
+    let output_channels = if channels == 1 { 1 } else { 2 };
+    let mut argv = [
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-threads",
+        "1",
+        "-i",
+        "pipe:0",
+        "-map",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    argv.push(format!("0:{stream}"));
+    argv.extend(["-vn","-map_metadata","-1","-map_chapters","-1","-af","aresample=resampler=swr:filter_size=32:phase_shift=10:linear_interp=0:exact_rational=1:dither_method=none","-ac"].map(str::to_owned));
+    argv.push(output_channels.to_string());
+    argv.push("-ar".into());
+    argv.push(rate.to_string());
+    argv.extend(["-c:a", "pcm_s16le", "-f", "wav", "pipe:1"].map(str::to_owned));
+    Ok(argv)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn video_normalization_argv(
+    video_stream: u32,
+    audio_stream: Option<u32>,
+    width: u32,
+    height: u32,
+    fps_num: u32,
+    fps_den: u32,
+    gop: u32,
+    min_keyint: u32,
+) -> Result<Vec<String>> {
+    ensure!(
+        width >= 2
+            && height >= 2
+            && width % 2 == 0
+            && height % 2 == 0
+            && fps_num > 0
+            && fps_den > 0
+            && gop > 0
+            && min_keyint > 0
+            && min_keyint <= gop,
+        "invalid_media"
+    );
+    let mut argv = [
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-threads",
+        "1",
+        "-i",
+        "pipe:0",
+        "-map",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    argv.push(format!("0:{video_stream}"));
+    if let Some(audio) = audio_stream {
+        argv.extend(["-map".into(), format!("0:{audio}")]);
+    }
+    argv.extend(
+        [
+            "-map_metadata",
+            "-1",
+            "-map_chapters",
+            "-1",
+            "-fflags",
+            "+bitexact",
+            "-vf",
+        ]
+        .map(str::to_owned),
+    );
+    argv.push(format!("scale={width}:{height}:flags=lanczos,fps={fps_num}/{fps_den}:start_time=0:round=down,format=yuv420p"));
+    argv.extend(
+        [
+            "-c:v",
+            "libx264",
+            "-profile:v",
+            "high",
+            "-preset",
+            "medium",
+            "-crf",
+            "23",
+            "-x264-params",
+        ]
+        .map(str::to_owned),
+    );
+    argv.push(format!(
+        "threads=1:scenecut=0:keyint={gop}:min-keyint={min_keyint}:bframes=3:ref=3"
+    ));
+    argv.extend(
+        [
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+            "-brand",
+            "isom",
+            "-f",
+            "mp4",
+            "pipe:1",
+        ]
+        .map(str::to_owned),
+    );
+    Ok(argv)
+}
+
 struct NormalizedImageDerivatives {
     model_png: Vec<u8>,
     thumbnail_png: Vec<u8>,
@@ -2792,6 +2947,37 @@ mod tests {
                 b'a'
             ])
             .unwrap()
+        );
+    }
+
+    #[test]
+    fn av_normalization_argv_is_exact_and_shell_free() {
+        let mono = audio_normalization_argv(3, 96_000, 1).unwrap();
+        assert!(
+            mono.windows(2)
+                .any(|pair| pair[0] == "-map" && pair[1] == "0:3")
+        );
+        assert!(
+            mono.windows(2)
+                .any(|pair| pair[0] == "-ac" && pair[1] == "1")
+        );
+        assert!(
+            mono.windows(2)
+                .any(|pair| pair[0] == "-ar" && pair[1] == "48000")
+        );
+        assert!(mono.iter().any(|arg| arg.contains("dither_method=none")));
+        let video = video_normalization_argv(2, Some(9), 1280, 720, 24, 1, 240, 24).unwrap();
+        for exact in [
+            "scale=1280:720:flags=lanczos,fps=24/1:start_time=0:round=down,format=yuv420p",
+            "threads=1:scenecut=0:keyint=240:min-keyint=24:bframes=3:ref=3",
+            "+faststart",
+        ] {
+            assert!(video.iter().any(|arg| arg == exact));
+        }
+        assert!(
+            !video
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "sh" | "-c" | "cmd.exe"))
         );
     }
 

@@ -8,9 +8,11 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Result, ensure};
+use rusqlite::Connection;
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
+use crate::daemon::principal::ClientPrincipal;
 use crate::image_generation_runtime::ImageHealthSnapshot;
 use cockpit_config::config::media_budget::MediaReservationPlan;
 use cockpit_db::db::sealed_scope::SealedActionGrantRow;
@@ -64,10 +66,7 @@ pub struct ImageGenerationTargetResolutionAuthorityV1 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageGenerationResolutionAuthorityV1 {
     job_id: Uuid,
-    owner_session_id: Uuid,
-    owner_principal_digest: String,
-    project_identity_digest: String,
-    config_generation: u64,
+    owner: ImageGenerationOwnerContextAuthority,
     enqueue_started_monotonic_ms: u64,
     operation_deadline_monotonic_ms: u64,
     required_grants: Vec<GrantRequirementV1>,
@@ -75,6 +74,44 @@ pub struct ImageGenerationResolutionAuthorityV1 {
     spend: SpendReservationPlanV1,
     output_authority: VerifiedOutputDirectoryAuthority,
     targets: Vec<ImageGenerationTargetResolutionAuthorityV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageGenerationOwnerContextAuthority {
+    session_id: Uuid,
+    principal_digest: String,
+    project_identity_digest: String,
+    config_generation: u64,
+}
+
+impl ImageGenerationOwnerContextAuthority {
+    pub fn from_attached_session(
+        conn: &Connection,
+        session_id: Uuid,
+        principal: &ClientPrincipal,
+        config_generation: u64,
+    ) -> Result<Self> {
+        let unavailable = || anyhow::anyhow!("image generation unavailable");
+        ensure!(config_generation > 0, unavailable());
+        let session =
+            cockpit_db::Db::get_session_conn(conn, session_id)?.ok_or_else(unavailable)?;
+        ensure!(session.ended_at.is_none(), unavailable());
+        ensure!(
+            principal.can_agent_write_project(&session.project_root),
+            unavailable()
+        );
+        let principal_json = serde_json::to_vec(principal)?;
+        Ok(Self {
+            session_id,
+            principal_digest: crate::intel::hex_lower(&Sha256::digest(principal_json)),
+            project_identity_digest: digest_fields(&[
+                "image-generation-project-v1",
+                &session.project_id,
+                &session.project_root,
+            ]),
+            config_generation,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,10 +215,10 @@ pub fn resolve_image_generation(
     }
     let plan = plan_image_generation(ImageGenerationPreflightInputV1 {
         job_id: authority.job_id,
-        owner_session_id: authority.owner_session_id,
-        owner_principal_digest: authority.owner_principal_digest,
-        project_identity_digest: authority.project_identity_digest,
-        config_generation: authority.config_generation,
+        owner_session_id: authority.owner.session_id,
+        owner_principal_digest: authority.owner.principal_digest,
+        project_identity_digest: authority.owner.project_identity_digest,
+        config_generation: authority.owner.config_generation,
         enqueue_started_monotonic_ms: authority.enqueue_started_monotonic_ms,
         operation_deadline_monotonic_ms: authority.operation_deadline_monotonic_ms,
         required_grants: authority.required_grants,
@@ -747,10 +784,12 @@ mod tests {
             },
             ImageGenerationResolutionAuthorityV1 {
                 job_id: sealed.job_id,
-                owner_session_id: sealed.owner_session_id,
-                owner_principal_digest: sealed.owner_principal_digest,
-                project_identity_digest: sealed.project_identity_digest,
-                config_generation: sealed.config_generation,
+                owner: ImageGenerationOwnerContextAuthority {
+                    session_id: sealed.owner_session_id,
+                    principal_digest: sealed.owner_principal_digest,
+                    project_identity_digest: sealed.project_identity_digest,
+                    config_generation: sealed.config_generation,
+                },
                 enqueue_started_monotonic_ms: sealed.enqueue_started_monotonic_ms,
                 operation_deadline_monotonic_ms: sealed.operation_deadline_monotonic_ms,
                 required_grants: sealed.required_grants,
@@ -908,6 +947,34 @@ mod tests {
                 "resolver acquired side-effect seam: {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn owner_context_hides_missing_and_invalid_authority() {
+        let db = cockpit_db::Db::open_in_memory().unwrap();
+        db.blocking_for_sync_cli(|conn| {
+            let principal = ClientPrincipal::owner();
+            let missing = ImageGenerationOwnerContextAuthority::from_attached_session(
+                conn,
+                id(90),
+                &principal,
+                1,
+            )
+            .unwrap_err()
+            .to_string();
+            let invalid = ImageGenerationOwnerContextAuthority::from_attached_session(
+                conn,
+                id(90),
+                &principal,
+                0,
+            )
+            .unwrap_err()
+            .to_string();
+            assert_eq!(missing, "image generation unavailable");
+            assert_eq!(invalid, missing);
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]

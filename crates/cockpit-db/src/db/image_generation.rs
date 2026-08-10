@@ -637,13 +637,23 @@ impl Db {
             "reconciliation evidence is empty"
         );
         let evidence_digest = hex_lower(&Sha256::digest(input.evidence_bytes));
-        let (journal_next, attempt_next, outcome) = match input.outcome {
-            ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance => (
+        let cancellation: Option<i64> = conn.query_row(
+            "SELECT applied_cancellation_version FROM image_generation_attempts WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3",
+            params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number)],
+            |row| row.get(0),
+        )?;
+        let (journal_next, attempt_next, outcome) = match (input.outcome, cancellation.is_some()) {
+            (ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance, true) => (
+                ExternalJournalState::Cancelled,
+                ImageGenerationAttemptState::Cancelled,
+                "authoritative_nonacceptance",
+            ),
+            (ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance, false) => (
                 ExternalJournalState::Rejected,
                 ImageGenerationAttemptState::RejectedNotAccepted,
                 "authoritative_nonacceptance",
             ),
-            ImageGenerationReconciliationOutcome::AuthoritativeFailure => (
+            (ImageGenerationReconciliationOutcome::AuthoritativeFailure, _) => (
                 ExternalJournalState::Failed,
                 ImageGenerationAttemptState::FailedAfterAcceptance,
                 "authoritative_failure",
@@ -668,12 +678,21 @@ impl Db {
             evidence_inserted == 1,
             "reconciliation evidence identity is not bound"
         );
-        let attempt_changed=conn.execute("UPDATE image_generation_attempts SET state=?1,version=?2,observed_journal_version=?3,nonacceptance_evidence_digest=CASE WHEN ?4='authoritative_nonacceptance' THEN ?5 ELSE NULL END WHERE job_id=?6 AND slot_id=?7 AND attempt_number=?8 AND state='reconciling' AND version=?9 AND external_operation_id=?10",params![attempt_next.as_str(),i64::try_from(input.expected_attempt_version+1)?,i64::try_from(journal_version)?,outcome,&evidence_digest,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?,input.external_operation_id.to_string()])?;
+        let attempt_changed=conn.execute("UPDATE image_generation_attempts SET state=?1,version=?2,observed_journal_version=?3,nonacceptance_evidence_digest=CASE WHEN ?4='authoritative_nonacceptance' THEN ?5 ELSE NULL END WHERE job_id=?6 AND slot_id=?7 AND attempt_number=?8 AND state IN ('reconciling','cancellation_requested') AND version=?9 AND external_operation_id=?10",params![attempt_next.as_str(),i64::try_from(input.expected_attempt_version+1)?,i64::try_from(journal_version)?,outcome,&evidence_digest,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?,input.external_operation_id.to_string()])?;
         ensure!(
             attempt_changed == 1,
             "reconciliation lost attempt compare-and-set"
         );
-        let slot_changed=conn.execute("UPDATE image_generation_slots SET state='failed',version=?1,failure_reason=?2 WHERE job_id=?3 AND slot_id=?4 AND state='submission_unknown' AND version=?5",params![i64::try_from(input.expected_slot_version+1)?,outcome,input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.expected_slot_version)?])?;
+        let slot_next = if cancellation.is_some()
+            && matches!(
+                input.outcome,
+                ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance
+            ) {
+            "cancelled"
+        } else {
+            "failed"
+        };
+        let slot_changed=conn.execute("UPDATE image_generation_slots SET state=?1,version=?2,failure_reason=CASE WHEN ?1='failed' THEN ?3 ELSE NULL END WHERE job_id=?4 AND slot_id=?5 AND state IN ('submission_unknown','cancellation_requested') AND version=?6",params![slot_next,i64::try_from(input.expected_slot_version+1)?,outcome,input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.expected_slot_version)?])?;
         ensure!(
             slot_changed == 1,
             "reconciliation lost slot compare-and-set"

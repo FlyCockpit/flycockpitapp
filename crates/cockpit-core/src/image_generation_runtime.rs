@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::fmt::Write as _;
 use std::future::Future;
 use std::net::IpAddr;
 use std::panic::AssertUnwindSafe;
@@ -1036,7 +1037,11 @@ impl ImageRuntimeRegistry {
             })?;
             let model_or_workflow_digest = match &target.identity {
                 ImageTargetIdentity::HostedModel { model } => {
-                    format!("{:x}", Sha256::digest(model.as_bytes()))
+                    let mut encoded = String::with_capacity(64);
+                    for byte in Sha256::digest(model.as_bytes()) {
+                        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+                    }
+                    encoded
                 }
                 ImageTargetIdentity::Workflow {
                     workflow_digest, ..
@@ -1131,8 +1136,7 @@ impl ImageRuntimeRegistry {
                 ImageHealthState::Disabled.remediation(),
             ));
         }
-        let target_current = self
-            .inner
+        self.inner
             .current_targets
             .lock()
             .unwrap()
@@ -1247,6 +1251,23 @@ impl ImageRuntimeRegistry {
         credential_identity_digest: CredentialIdentityDigest,
     ) -> Result<ImageHealthSnapshot, RuntimeError> {
         let header_deadline = tokio::time::Instant::now() + HEADER_TIMEOUT;
+        let target_current = self
+            .inner
+            .current_targets
+            .lock()
+            .unwrap()
+            .get(&target_id)
+            .cloned()
+            .filter(|target| {
+                target.endpoint == endpoint.id
+                    && target.generation == generation
+                    && target.epoch == epoch
+                    && target.enabled
+            })
+            .ok_or(RuntimeError::new(
+                RuntimeErrorCode::Obsolete,
+                "Refresh after target configuration changes.",
+            ))?;
         let adapter = self.adapter(endpoint.adapter)?;
         let url = reqwest::Url::parse(&endpoint.origin).map_err(|_| {
             RuntimeError::new(

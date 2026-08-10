@@ -1553,6 +1553,76 @@ async fn remote_cancel_turn_dispatches_once_then_replays_or_conflicts() {
         work_rx.try_recv().is_err(),
         "replay must not dispatch a second cancel"
     );
+    let agent_operation = proto::RemoteOperationIdentityV1::new(
+        logical_attachment_id,
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-ffffffffffff").unwrap(),
+    )
+    .unwrap();
+    for label in ["agent apply", "agent replay"] {
+        let id = Uuid::new_v4();
+        handle_envelope(
+            Envelope::remote_request(
+                id,
+                agent_operation,
+                Request::SetAgent {
+                    name: "Plan".into(),
+                },
+            ),
+            &mut state,
+            &mut shared,
+            &ctx,
+            &event_cmd_tx,
+            &writer_tx,
+            &mut concurrent,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(recv_writer_body(&mut writer_rx, label).await,
+            Body::Response { id: response_id, response } if response_id == id && matches!(*response, Response::Ack)));
+    }
+    assert!(matches!(work_rx.try_recv(), Ok(SessionWork::SetAgent { name }) if name == "Plan"));
+    assert!(matches!(work_rx.try_recv(), Ok(SessionWork::SetAgent { name }) if name == "Plan"));
+    assert_eq!(
+        ctx.db
+            .get_session(session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .active_agent,
+        "Plan"
+    );
+    let agent_conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            agent_conflict_id,
+            agent_operation,
+            Request::SetAgent {
+                name: "Build".into(),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(recv_writer_body(&mut writer_rx, "agent conflict").await,
+        Body::Error { id: Some(id), error } if id == agent_conflict_id && error.code == ErrorCode::Conflict)
+    );
+    assert!(work_rx.try_recv().is_err());
+    assert_eq!(
+        ctx.db
+            .get_session(session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .active_agent,
+        "Plan"
+    );
     state.principal = ClientPrincipal::Remote(principal::RemotePrincipal {
         user_id: "cancel-writer".into(),
         grants: vec![principal::PrincipalGrant {

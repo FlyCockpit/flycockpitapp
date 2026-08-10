@@ -5865,13 +5865,14 @@ mod tests {
             .unwrap();
         let orphan_ids = vec![Uuid::now_v7().to_string(), Uuid::now_v7().to_string()];
         for id in &orphan_ids {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(temp.path().join("media").join(id))
-                .unwrap();
+            let mut file = recovery.owned_root.create_file_exclusive(id).unwrap();
             file.write_all(b"crashed derivative").unwrap();
             file.sync_all().unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+            }
         }
         let orphan_json = serde_json::to_string(&orphan_ids).unwrap();
         let intent_job = job_id.clone();
@@ -5901,6 +5902,32 @@ mod tests {
         );
         let ready = db.read(move|conn|Ok(conn.query_row("SELECT availability,(SELECT COUNT(*) FROM media_attachment_components c WHERE c.attachment_id=a.attachment_id AND c.component_kind IN ('image_model','browser_thumbnail')) FROM media_attachments a WHERE attachment_id=?1",[attachment_id.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?)))?)).await.unwrap();
         assert_eq!(ready, ("ready".into(), 2));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let storage_ids = db
+                .read(move |conn| {
+                    let mut statement = conn.prepare(
+                        "SELECT storage_id FROM media_attachment_components WHERE attachment_id=?1 ORDER BY component_kind",
+                    )?;
+                    Ok(statement
+                        .query_map([attachment_id.to_string()], |row| row.get::<_, String>(0))?
+                        .collect::<std::result::Result<Vec<_>, _>>()?)
+                })
+                .await
+                .unwrap();
+            assert_eq!(storage_ids.len(), 3);
+            for storage_id in storage_ids {
+                assert_eq!(
+                    std::fs::metadata(temp.path().join("media").join(storage_id))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
+        }
         assert_eq!(
             recovery
                 .retain_https_media(request.clone(), &policy, 2, 11)
@@ -6002,7 +6029,27 @@ mod tests {
                             r.get::<_, i64>(0)
                         })?,
                         conn.query_row(
+                            "SELECT COUNT(*) FROM media_attachment_components",
+                            [],
+                            |r| r.get::<_, i64>(0),
+                        )?,
+                        conn.query_row(
+                            "SELECT COUNT(*) FROM media_retained_https_evidence",
+                            [],
+                            |r| r.get::<_, i64>(0),
+                        )?,
+                        conn.query_row(
+                            "SELECT COUNT(*) FROM media_attachment_processing_jobs",
+                            [],
+                            |r| r.get::<_, i64>(0),
+                        )?,
+                        conn.query_row(
                             "SELECT COUNT(*) FROM media_retained_https_operations",
+                            [],
+                            |r| r.get::<_, i64>(0),
+                        )?,
+                        conn.query_row(
+                            "SELECT COUNT(*) FROM media_retained_https_audit",
                             [],
                             |r| r.get::<_, i64>(0),
                         )?,
@@ -6015,8 +6062,19 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            assert_eq!(counts, (0, 0, 0, 1), "{table}");
+            assert_eq!(counts, (0, 0, 0, 0, 0, 0, 0, 1), "{table}");
             assert_eq!(recovery.reconcile_media_uploads(11).await.unwrap(), 1);
+            assert_eq!(
+                db.read(|conn| Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM media_retained_https_publication_intents",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )?))
+                .await
+                .unwrap(),
+                0,
+                "{table}"
+            );
         }
     }
 

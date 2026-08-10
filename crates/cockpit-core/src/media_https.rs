@@ -474,6 +474,20 @@ mod tests {
         value.parse().unwrap()
     }
 
+    fn request_header_values<'a>(request: &'a str, name: &str) -> Vec<&'a str> {
+        request
+            .split("\r\n")
+            .skip(1)
+            .take_while(|line| !line.is_empty())
+            .filter_map(|line| line.split_once(':'))
+            .filter_map(|(header_name, value)| {
+                header_name
+                    .eq_ignore_ascii_case(name)
+                    .then_some(value.trim())
+            })
+            .collect()
+    }
+
     #[test]
     fn https_media_ingest_binds_every_vetted_dns_answer_to_socket_plan() {
         let hop = initial_https_hop(
@@ -658,9 +672,12 @@ mod tests {
             let mut request = vec![0; 4096];
             let length = tls.read(&mut request).await.unwrap();
             let request = String::from_utf8(request[..length].to_vec()).unwrap();
-            assert!(request.contains("\r\nHost: pinned.example.test:"));
-            assert!(!request.to_ascii_lowercase().contains("authorization:"));
-            assert!(!request.to_ascii_lowercase().contains("cookie:"));
+            assert_eq!(
+                request_header_values(&request, "host"),
+                [format!("pinned.example.test:{}", peer.port())]
+            );
+            assert!(request_header_values(&request, "authorization").is_empty());
+            assert!(request_header_values(&request, "cookie").is_empty());
             tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
                 .await
                 .unwrap();
@@ -765,6 +782,7 @@ mod tests {
                      config: rustls::ServerConfig,
                      name: &'static str,
                      response: String| {
+            let port = listener.local_addr().unwrap().port();
             tokio::spawn(async move {
                 let (socket, _) = listener.accept().await.unwrap();
                 let mut tls = TlsAcceptor::from(Arc::new(config))
@@ -775,9 +793,12 @@ mod tests {
                 let mut bytes = vec![0; 4096];
                 let n = tls.read(&mut bytes).await.unwrap();
                 let text = String::from_utf8(bytes[..n].to_vec()).unwrap();
-                assert!(text.contains(&format!("Host: {name}:")));
-                assert!(!text.to_ascii_lowercase().contains("authorization:"));
-                assert!(!text.to_ascii_lowercase().contains("cookie:"));
+                assert_eq!(
+                    request_header_values(&text, "host"),
+                    [format!("{name}:{port}")]
+                );
+                assert!(request_header_values(&text, "authorization").is_empty());
+                assert!(request_header_values(&text, "cookie").is_empty());
                 tls.write_all(response.as_bytes()).await.unwrap()
             })
         };

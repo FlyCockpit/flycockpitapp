@@ -47,11 +47,14 @@ fn read_money(value: Vec<u8>) -> rusqlite::Result<u64> {
     Ok(u64::from_be_bytes(bytes))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BudgetPolicy {
+    #[default]
     Unconfigured,
-    Finite { usd_micros: u64 },
+    Finite {
+        usd_micros: u64,
+    },
     Unlimited,
 }
 
@@ -868,12 +871,6 @@ mod tests {
     }
 }
 
-impl Default for BudgetPolicy {
-    fn default() -> Self {
-        Self::Unconfigured
-    }
-}
-
 impl<'de> Deserialize<'de> for BudgetPolicy {
     fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
         #[derive(Deserialize)]
@@ -1114,6 +1111,14 @@ pub struct SpendLedgerDiagnostic {
     pub debt_usd_micros: u64,
 }
 
+struct SpendLedgerDiagnosticRow {
+    policy_version: i64,
+    epoch_policy_version: i64,
+    epoch_sequence: i64,
+    state: String,
+    reserved_usd_micros: Option<Vec<u8>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CurrentImageSpendPolicy {
     pub settings: ImageSpendSettings,
@@ -1134,15 +1139,21 @@ impl Db {
         reservation_id: String,
     ) -> Result<Option<SpendLedgerDiagnostic>> {
         self.read(move |conn| {
-            let base: Option<(i64,i64,i64,String,Option<Vec<u8>>)> = conn.query_row(
+            let base: Option<SpendLedgerDiagnosticRow> = conn.query_row(
                 "SELECT policy_version,epoch_policy_version,epoch_sequence,state,reserved_usd_micros FROM image_spend_reservations WHERE reservation_id=?1",
-                [&reservation_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+                [&reservation_id], |row| Ok(SpendLedgerDiagnosticRow {
+                    policy_version: row.get(0)?,
+                    epoch_policy_version: row.get(1)?,
+                    epoch_sequence: row.get(2)?,
+                    state: row.get(3)?,
+                    reserved_usd_micros: row.get(4)?,
+                }),
             ).optional()?;
-            let Some((policy,epoch_policy,epoch,state,reserved))=base else{return Ok(None)};
+            let Some(base)=base else{return Ok(None)};
             let sum = |sql:&str| -> Result<u64> { let mut statement=conn.prepare(sql)?; let values=statement.query_map([&reservation_id],|row|row.get::<_,Vec<u8>>(0))?.collect::<rusqlite::Result<Vec<_>>>()?; values.into_iter().try_fold(0u64,|total,value|total.checked_add(read_money(value)?).ok_or_else(||anyhow::Error::new(BudgetBlockReason::ArithmeticOverflow))) };
             let debt = { let mut statement=conn.prepare("SELECT debt_usd_micros FROM image_spend_scope_usage WHERE reservation_id=?1")?; let values=statement.query_map([&reservation_id],|row|row.get::<_,Vec<u8>>(0))?.collect::<rusqlite::Result<Vec<_>>>()?; values.into_iter().map(read_money).collect::<rusqlite::Result<Vec<_>>>()?.into_iter().max().unwrap_or(0) };
             let charged = sum("SELECT actual_usd_micros FROM image_spend_cost_events WHERE reservation_id=?1")?;
-            Ok(Some(SpendLedgerDiagnostic { reservation_id, policy_version:read_u64(policy)?, epoch_policy_version:read_u64(epoch_policy)?, epoch_sequence:read_u64(epoch)?, state, reserved_usd_micros:reserved.map(read_money).transpose()?, charged_usd_micros:charged, debt_usd_micros:debt }))
+            Ok(Some(SpendLedgerDiagnostic { reservation_id, policy_version:read_u64(base.policy_version)?, epoch_policy_version:read_u64(base.epoch_policy_version)?, epoch_sequence:read_u64(base.epoch_sequence)?, state:base.state, reserved_usd_micros:base.reserved_usd_micros.map(read_money).transpose()?, charged_usd_micros:charged, debt_usd_micros:debt }))
         }).await
     }
     /// Resolve a caller-derived calendar/rolling membership to a durable,

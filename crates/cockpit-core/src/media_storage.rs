@@ -135,6 +135,30 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    /// Starts every due 24-hour orphan-draft or 30-day completed-session
+    /// cleanup with one writer CAS. Files are untouched until the exact
+    /// component-set intent is durable.
+    pub(crate) async fn begin_due_retention(&self, now_unix_ms: i64) -> Result<usize> {
+        const COMPLETED_SESSION_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
+        self.db.transaction(move |conn| {
+            let candidates={let mut statement=conn.prepare("SELECT a.attachment_id,a.attachment_version,a.availability_generation,a.reference_generation,a.source_kind,a.availability,CASE WHEN a.draft_expires_at_unix_ms IS NOT NULL AND a.first_referenced_at_unix_ms IS NULL AND a.draft_expires_at_unix_ms<=?1 THEN 'draft_expired' ELSE 'session_retention' END FROM media_attachments a JOIN sessions s ON s.session_id=a.session_id WHERE a.availability IN ('registered','quarantined','probing','decoding','normalizing','ready','model_derivative_unavailable','source_changed','failed') AND NOT EXISTS(SELECT 1 FROM media_attachment_cleanup_intents i WHERE i.attachment_id=a.attachment_id) AND NOT EXISTS(SELECT 1 FROM media_attachment_references r WHERE r.attachment_id=a.attachment_id AND r.released_at_unix_ms IS NULL) AND NOT EXISTS(SELECT 1 FROM media_attachment_component_leases l WHERE l.attachment_id=a.attachment_id AND l.released_at_unix_ms IS NULL) AND ((a.draft_expires_at_unix_ms IS NOT NULL AND a.first_referenced_at_unix_ms IS NULL AND a.draft_expires_at_unix_ms<=?1) OR (s.ended_at IS NOT NULL AND ?1>=s.ended_at*1000+?2)) ORDER BY a.attachment_id")?;statement.query_map(params![now_unix_ms,COMPLETED_SESSION_RETENTION_MS],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,String>(6)?)))?.collect::<std::result::Result<Vec<_>,_>>()?};
+            let mut started=0;
+            for (attachment,version,generation,reference_generation,source_kind,from_state,reason) in candidates {
+                let components={let mut statement=conn.prepare("SELECT component_id,component_kind,component_generation FROM media_attachment_components WHERE attachment_id=?1 AND lifecycle_state<>'deleted' ORDER BY component_id")?;statement.query_map([&attachment],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>()?};
+                let mut hasher=Sha256::new();hasher.update(b"media-cleanup-component-set-v1\0");for (id,kind,component_generation) in &components {hasher.update(id.as_bytes());hasher.update([0]);hasher.update(kind.as_bytes());hasher.update([0]);hasher.update(component_generation.as_bytes());hasher.update([0]);}let set_digest=crate::intel::hex_lower(&hasher.finalize());
+                let generation_number=generation.parse::<u64>()?;let next=generation_number.checked_add(1).context("availability generation overflow")?.to_string();
+                let pending=if source_kind=="local_path"{"borrowed_cleanup_pending"}else{"owned_cleanup_pending"};
+                let changed=conn.execute("UPDATE media_attachments SET availability=?1,availability_generation=?2,updated_at_unix_ms=?3 WHERE attachment_id=?4 AND availability_generation=?5 AND availability NOT IN ('security_blocked','owned_cleanup_pending','borrowed_cleanup_pending')",params![pending,next,now_unix_ms,attachment,generation])?;
+                ensure!(changed==1,"retention cleanup lost compare-and-swap");
+                for (component_id,_,component_generation) in &components {let component_next=component_generation.parse::<u64>()?.checked_add(1).context("component generation overflow")?.to_string();ensure!(conn.execute("UPDATE media_attachment_components SET lifecycle_state='cleanup_pending',component_generation=?1,updated_at_unix_ms=?2 WHERE component_id=?3 AND component_generation=?4 AND lifecycle_state<>'deleted'",params![component_next,now_unix_ms,component_id,component_generation])?==1,"retention component cleanup lost compare-and-swap");}
+                conn.execute("INSERT INTO media_attachment_cleanup_intents(intent_id,attachment_id,attachment_version,expected_availability_generation,expected_reference_generation,component_set_digest,reason,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![Uuid::now_v7().to_string(),attachment,version,next,reference_generation,set_digest,reason,now_unix_ms])?;
+                conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![attachment,next,from_state,pending,Uuid::now_v7().to_string(),now_unix_ms])?;
+                started+=1;
+            }
+            Ok(started)
+        }).await
+    }
+
     /// Process-local handles cannot survive daemon restart. Boot records that
     /// fact before releasing every leftover durable lease, and must call this
     /// before exposing any media request handler.

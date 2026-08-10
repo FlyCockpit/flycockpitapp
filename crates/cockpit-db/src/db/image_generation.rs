@@ -718,7 +718,81 @@ pub struct ClaimImageGenerationDispatch {
     pub claim_generation: u64,
 }
 
+pub struct ImageGenerationDispatchCandidate {
+    pub job_id: Uuid,
+    pub slot_id: Uuid,
+    pub attempt_number: u32,
+    pub job_version: u64,
+    pub slot_version: u64,
+    pub attempt_version: u64,
+    pub canonical_plan: Vec<u8>,
+    pub plan_digest: String,
+    pub canonical_media_plan: Vec<u8>,
+    pub media_plan_digest: String,
+}
+
+struct ImageGenerationDispatchCandidateRow {
+    job_id: String,
+    slot_id: String,
+    attempt_number: i64,
+    job_version: i64,
+    slot_version: i64,
+    attempt_version: i64,
+    canonical_plan: Vec<u8>,
+    plan_digest: String,
+    canonical_media_plan: Vec<u8>,
+    media_plan_digest: String,
+}
+
 impl Db {
+    pub fn scan_image_generation_dispatch_candidates_conn(
+        conn: &Connection,
+        now_monotonic_ms: u64,
+        limit: u32,
+    ) -> Result<Vec<ImageGenerationDispatchCandidate>> {
+        ensure!((1..=64).contains(&limit), "invalid scheduler scan limit");
+        let database_now = database_now_unix_ms(conn)?;
+        let mut statement=conn.prepare("SELECT j.job_id,s.slot_id,a.attempt_number,j.version,s.version,a.version,p.canonical_plan,p.plan_digest,m.canonical_media_plan,m.media_plan_digest FROM image_generation_jobs j JOIN image_generation_slots s ON s.job_id=j.job_id JOIN image_generation_attempts a ON a.job_id=s.job_id AND a.slot_id=s.slot_id JOIN image_generation_plans p ON p.job_id=j.job_id JOIN image_generation_attempt_media_snapshots m ON m.job_id=a.job_id AND m.slot_id=a.slot_id AND m.attempt_number=a.attempt_number LEFT JOIN image_generation_scheduler_claims c ON c.job_id=s.job_id AND c.slot_id=s.slot_id AND c.expires_at_unix_ms>?1 WHERE j.state='queued' AND s.state='queued' AND a.state='planned' AND p.operation_deadline_monotonic_ms>?2 AND c.job_id IS NULL AND NOT EXISTS(SELECT 1 FROM image_generation_cancellation_facts x WHERE x.job_id=j.job_id) ORDER BY j.created_at_unix_ms,j.job_id,s.slot_index,a.attempt_number LIMIT ?3")?;
+        let rows = statement.query_map(
+            params![
+                database_now,
+                i64::try_from(now_monotonic_ms)?,
+                i64::from(limit)
+            ],
+            |row| {
+                Ok(ImageGenerationDispatchCandidateRow {
+                    job_id: row.get(0)?,
+                    slot_id: row.get(1)?,
+                    attempt_number: row.get(2)?,
+                    job_version: row.get(3)?,
+                    slot_version: row.get(4)?,
+                    attempt_version: row.get(5)?,
+                    canonical_plan: row.get(6)?,
+                    plan_digest: row.get(7)?,
+                    canonical_media_plan: row.get(8)?,
+                    media_plan_digest: row.get(9)?,
+                })
+            },
+        )?;
+        rows.map(|row| {
+            let row = row?;
+            ImageGenerationPlanV1::from_canonical(&row.canonical_plan, &row.plan_digest)?;
+            Ok(ImageGenerationDispatchCandidate {
+                job_id: Uuid::parse_str(&row.job_id)?,
+                slot_id: Uuid::parse_str(&row.slot_id)?,
+                attempt_number: u32::try_from(row.attempt_number)?,
+                job_version: u64::try_from(row.job_version)?,
+                slot_version: u64::try_from(row.slot_version)?,
+                attempt_version: u64::try_from(row.attempt_version)?,
+                canonical_plan: row.canonical_plan,
+                plan_digest: row.plan_digest,
+                canonical_media_plan: row.canonical_media_plan,
+                media_plan_digest: row.media_plan_digest,
+            })
+        })
+        .collect()
+    }
+
     pub fn claim_image_generation_dispatch_conn(
         conn: &Connection,
         input: &ClaimImageGenerationDispatch,
@@ -741,7 +815,9 @@ fn claim_image_generation_dispatch_at_conn(
             "invalid scheduler claim"
         );
         ensure!(conn.query_row("SELECT EXISTS(SELECT 1 FROM image_generation_jobs j JOIN image_generation_slots s ON s.job_id=j.job_id JOIN image_generation_attempts a ON a.job_id=s.job_id AND a.slot_id=s.slot_id WHERE j.job_id=?1 AND s.slot_id=?2 AND a.attempt_number=?3 AND j.state='queued' AND s.state='queued' AND a.state='planned' AND NOT EXISTS(SELECT 1 FROM image_generation_cancellation_facts c WHERE c.job_id=j.job_id))",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number)],|row|row.get::<_,bool>(0))?,"image generation dispatch is not claimable");
+        conn.execute("INSERT OR IGNORE INTO image_generation_scheduler_claim_mutation_authority(job_id,slot_id,from_generation,to_generation) VALUES(?1,?2,?3,?4)",params![input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.claim_generation.saturating_sub(1))?,i64::try_from(input.claim_generation)?])?;
         let reclaimed=conn.execute("UPDATE image_generation_scheduler_claims SET worker_boot_id=?1,claim_generation=?2,claimed_at_unix_ms=?3,expires_at_unix_ms=?4 WHERE job_id=?5 AND slot_id=?6 AND attempt_number=?7 AND expires_at_unix_ms<=?3 AND claim_generation+1=?2",params![input.worker_boot_id.to_string(),i64::try_from(input.claim_generation)?,now,expires,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number)])?;
+        conn.execute("DELETE FROM image_generation_scheduler_claim_mutation_authority WHERE job_id=?1 AND slot_id=?2",params![input.job_id.to_string(),input.slot_id.to_string()])?;
         let inserted = if reclaimed == 0 && input.claim_generation == 1 {
             conn.execute("INSERT OR IGNORE INTO image_generation_scheduler_claims(job_id,slot_id,attempt_number,worker_boot_id,claim_generation,claimed_at_unix_ms,expires_at_unix_ms) VALUES(?1,?2,?3,?4,1,?5,?6)",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),input.worker_boot_id.to_string(),now,expires])?
         } else {

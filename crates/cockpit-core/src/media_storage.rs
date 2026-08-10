@@ -2961,8 +2961,14 @@ fn walk_mp4_atoms(bytes: &[u8], proof: &mut Mp4StructuralProof) -> Result<()> {
                     "invalid_media"
                 );
                 match &payload[entry + 4..entry + 8] {
-                    b"avc1" => proof.avc1_entries += 1,
-                    b"mp4a" => proof.mp4a_entries += 1,
+                    b"avc1" => {
+                        verify_avc1_sample_entry(&payload[entry..entry + size])?;
+                        proof.avc1_entries += 1;
+                    }
+                    b"mp4a" => {
+                        verify_mp4a_sample_entry(&payload[entry..entry + size])?;
+                        proof.mp4a_entries += 1;
+                    }
                     _ => anyhow::bail!("invalid_media"),
                 }
                 entry += size;
@@ -2972,6 +2978,104 @@ fn walk_mp4_atoms(bytes: &[u8], proof: &mut Mp4StructuralProof) -> Result<()> {
         offset = end;
     }
     ensure!(offset == bytes.len(), "invalid_media");
+    Ok(())
+}
+
+fn sample_entry_child<'a>(
+    entry: &'a [u8],
+    child_offset: usize,
+    wanted: &[u8; 4],
+) -> Result<&'a [u8]> {
+    ensure!(entry.len() >= child_offset, "invalid_media");
+    let mut offset = child_offset;
+    let mut found = None;
+    while offset < entry.len() {
+        ensure!(offset + 8 <= entry.len(), "invalid_media");
+        let size = u32::from_be_bytes(entry[offset..offset + 4].try_into()?) as usize;
+        ensure!(
+            size >= 8
+                && offset
+                    .checked_add(size)
+                    .is_some_and(|end| end <= entry.len()),
+            "invalid_media"
+        );
+        if &entry[offset + 4..offset + 8] == wanted {
+            ensure!(found.is_none(), "invalid_media");
+            found = Some(&entry[offset + 8..offset + size]);
+        }
+        offset += size;
+    }
+    found.context("invalid_media")
+}
+
+fn verify_avc1_sample_entry(entry: &[u8]) -> Result<()> {
+    ensure!(
+        entry.len() >= 86 && &entry[4..8] == b"avc1",
+        "invalid_media"
+    );
+    let avcc = sample_entry_child(entry, 86, b"avcC")?;
+    ensure!(
+        avcc.len() >= 7
+            && avcc[0] == 1
+            && avcc[1] == 100
+            && avcc[4] & 0xfc == 0xfc
+            && avcc[4] & 3 == 3
+            && avcc[5] & 0xe0 == 0xe0
+            && avcc[5] & 0x1f > 0,
+        "invalid_media"
+    );
+    Ok(())
+}
+
+fn descriptor_length(bytes: &[u8], offset: &mut usize) -> Result<usize> {
+    let mut length = 0usize;
+    for index in 0..4 {
+        let value = *bytes.get(*offset).context("invalid_media")?;
+        *offset += 1;
+        length = length.checked_mul(128).context("invalid_media")? + usize::from(value & 0x7f);
+        if value & 0x80 == 0 {
+            return Ok(length);
+        }
+        ensure!(index < 3, "invalid_media");
+    }
+    anyhow::bail!("invalid_media")
+}
+
+fn verify_mp4a_sample_entry(entry: &[u8]) -> Result<()> {
+    ensure!(
+        entry.len() >= 36 && &entry[4..8] == b"mp4a",
+        "invalid_media"
+    );
+    let esds = sample_entry_child(entry, 36, b"esds")?;
+    ensure!(esds.len() >= 8, "invalid_media");
+    let descriptors = &esds[4..];
+    let decoder = descriptors
+        .iter()
+        .position(|value| *value == 0x04)
+        .context("invalid_media")?;
+    let mut offset = decoder + 1;
+    let decoder_length = descriptor_length(descriptors, &mut offset)?;
+    ensure!(
+        decoder_length >= 13
+            && offset + decoder_length <= descriptors.len()
+            && descriptors[offset] == 0x40,
+        "invalid_media"
+    );
+    let decoder_end = offset + decoder_length;
+    let asc = descriptors[offset + 13..decoder_end]
+        .iter()
+        .position(|value| *value == 0x05)
+        .context("invalid_media")?
+        + offset
+        + 13;
+    let mut asc_offset = asc + 1;
+    let asc_length = descriptor_length(descriptors, &mut asc_offset)?;
+    ensure!(
+        asc_length >= 2
+            && asc_offset + asc_length <= decoder_end
+            && descriptors[asc_offset] >> 3 == 2,
+        "invalid_media"
+    );
     Ok(())
 }
 
@@ -3934,6 +4038,65 @@ mod tests {
     }
 
     #[test]
+    fn display_matrix_accepts_exact_rotation_and_mirror_only() {
+        let matrix = |values: [i64; 9]| {
+            format!(
+                "00000000: {} {} {}\n00000001: {} {} {}\n00000002: {} {} {}",
+                values[0],
+                values[1],
+                values[2],
+                values[3],
+                values[4],
+                values[5],
+                values[6],
+                values[7],
+                values[8]
+            )
+        };
+        let stream = |rotation, values| FfprobeStream {
+            index: 0,
+            codec_type: "video".into(),
+            codec_name: "h264".into(),
+            disposition: None,
+            sample_rate: None,
+            channels: None,
+            width: Some(640),
+            height: Some(360),
+            sample_aspect_ratio: Some("1:1".into()),
+            time_base: Some("1/24".into()),
+            profile: Some("High".into()),
+            pix_fmt: Some("yuv420p".into()),
+            side_data_list: vec![FfprobeSideData {
+                rotation: Some(rotation),
+                displaymatrix: Some(matrix(values)),
+            }],
+        };
+        assert_eq!(
+            oriented_video_dimensions(&stream(
+                90,
+                [0, -65_536, 0, 65_536, 0, 0, 0, 0, 1_073_741_824]
+            ))
+            .unwrap(),
+            (360, 640)
+        );
+        assert_eq!(
+            oriented_video_dimensions(&stream(
+                0,
+                [-65_536, 0, 0, 0, 65_536, 0, 0, 0, 1_073_741_824]
+            ))
+            .unwrap(),
+            (640, 360)
+        );
+        assert!(
+            oriented_video_dimensions(&stream(
+                0,
+                [32_768, 0, 0, 0, 65_536, 0, 0, 0, 1_073_741_824]
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn iso_brand_and_ebml_doctype_classification_is_closed() {
         let ftyp = |major: [u8; 4], brands: &[[u8; 4]]| {
             let size = 16 + brands.len() * 4;
@@ -4061,8 +4224,12 @@ mod tests {
         let dinf = atom(b"dinf", &atom(b"dref", &dref));
         let mut stsd = vec![0, 0, 0, 0];
         stsd.extend_from_slice(&1u32.to_be_bytes());
-        stsd.extend_from_slice(&8u32.to_be_bytes());
-        stsd.extend_from_slice(b"avc1");
+        let avcc = atom(b"avcC", &[1, 100, 0, 31, 0xff, 0xe1, 0]);
+        let mut avc1 = vec![0; 86];
+        avc1[0..4].copy_from_slice(&u32::try_from(86 + avcc.len()).unwrap().to_be_bytes());
+        avc1[4..8].copy_from_slice(b"avc1");
+        avc1.extend_from_slice(&avcc);
+        stsd.extend_from_slice(&avc1);
         let stbl = atom(b"stbl", &atom(b"stsd", &stsd));
         let mut minf_payload = dinf;
         minf_payload.extend_from_slice(&stbl);

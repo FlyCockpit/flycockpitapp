@@ -2722,8 +2722,6 @@ async fn remote_scheduler_mutation_is_local_only_before_ledger_or_domain_write()
             .remote_operation_status(
                 &logical_attachment_id.to_string(),
                 &operation_id.to_string(),
-                "33333333-3333-4333-8333-333333333336",
-                1,
             )
             .await
             .unwrap()

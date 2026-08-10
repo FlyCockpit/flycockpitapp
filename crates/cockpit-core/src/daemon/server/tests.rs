@@ -5912,6 +5912,107 @@ async fn staged_rename_executor_applies_commits_and_replays_without_second_effec
     assert_eq!(events, 1);
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn staged_rename_executor_recovers_every_durability_barrier_cut() {
+    for (index, cut) in [
+        "artifact_durable",
+        "rename_effect",
+        "source_parent_fsync",
+        "target_parent_fsync",
+        "applied_journal",
+        "ledger_committed",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("from.txt"), format!("value-{index}")).unwrap();
+        let base = test_ctx();
+        let mut owned = match Arc::try_unwrap(base) {
+            Ok(value) => value,
+            Err(_) => panic!("test context unexpectedly shared"),
+        };
+        owned.external_journal = Some(Arc::new(
+            crate::external_journal::ExternalJournal::for_test_at(owned.db.clone(), spool.path()),
+        ));
+        let ctx = Arc::new(owned);
+        let request = Request::FsRename {
+            project_root: tmp.path().to_string_lossy().into_owned(),
+            from_path: "from.txt".into(),
+            to_path: "to.txt".into(),
+        };
+        let root = tmp.path().canonicalize().unwrap();
+        let authorized = AuthorizedRequestContext {
+            fcor_resources: vec![
+                AuthorizedFcorResource {
+                    kind: proto::remote_operation_fcor::RemoteOperationResourceKind::ProjectRoot,
+                    value: root.to_string_lossy().as_bytes().to_vec(),
+                },
+                AuthorizedFcorResource {
+                    kind: proto::remote_operation_fcor::RemoteOperationResourceKind::FilePath,
+                    value: root.join("from.txt").to_string_lossy().as_bytes().to_vec(),
+                },
+                AuthorizedFcorResource {
+                    kind: proto::remote_operation_fcor::RemoteOperationResourceKind::FilePath,
+                    value: root.join("to.txt").to_string_lossy().as_bytes().to_vec(),
+                },
+            ],
+        };
+        let operation = RemoteOperationContext {
+            request_id: Uuid::new_v4(),
+            logical_attachment_id: Uuid::parse_str(&format!(
+                "22222222-2222-4222-8222-{:012x}",
+                0x230 + index
+            ))
+            .unwrap(),
+            operation_id: Uuid::parse_str(&format!(
+                "018f3f24-7a10-7cc2-8f55-{:012x}",
+                0x120 + index
+            ))
+            .unwrap(),
+            authenticated_device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333337")
+                .unwrap(),
+            authenticated_device_generation: 1,
+        };
+        let mut fired = false;
+        assert!(
+            execute_remote_staged_rename_with_hook(
+                &request,
+                &authorized,
+                &operation,
+                &ctx,
+                |barrier| {
+                    if !fired && barrier == cut {
+                        fired = true;
+                        return Err(ErrorPayload {
+                            code: ErrorCode::Unavailable,
+                            message: format!("injected crash after {cut}"),
+                        });
+                    }
+                    Ok(())
+                },
+            )
+            .await
+            .is_err()
+        );
+        assert!(fired, "cut {cut} was not reached");
+        assert_eq!(
+            execute_remote_staged_rename(&request, &authorized, &operation, &ctx)
+                .await
+                .unwrap(),
+            Response::Ack,
+            "recovery failed after {cut}"
+        );
+        assert!(!tmp.path().join("from.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("to.txt")).unwrap(),
+            format!("value-{index}")
+        );
+    }
+}
+
 #[tokio::test]
 async fn resource_scheduler_is_shared_only_for_persistent_daemons() {
     let persistent_db = Db::open_in_memory().expect("in-memory db");

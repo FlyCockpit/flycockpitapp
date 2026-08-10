@@ -447,6 +447,17 @@ pub(crate) async fn execute_remote_staged_rename(
     operation: &super::RemoteOperationContext,
     ctx: &DaemonContext,
 ) -> std::result::Result<Response, ErrorPayload> {
+    execute_remote_staged_rename_with_hook(request, authorized, operation, ctx, |_| Ok(())).await
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn execute_remote_staged_rename_with_hook(
+    request: &Request,
+    authorized: &AuthorizedRequestContext,
+    operation: &super::RemoteOperationContext,
+    ctx: &DaemonContext,
+    mut after_barrier: impl FnMut(&'static str) -> std::result::Result<(), ErrorPayload>,
+) -> std::result::Result<Response, ErrorPayload> {
     use crate::db::remote_attachment_operations::{
         CommitRemoteOperation, CommitRemoteOperationOutcome, PrepareRemoteRenameOutcome,
         RemoteOperationClass, ReserveRemoteOperation,
@@ -505,6 +516,14 @@ pub(crate) async fn execute_remote_staged_rename(
     let operation_id = operation.operation_id.to_string();
     let device = operation.authenticated_device_id.to_string();
     let source_observed = source_parent.open_entry_identity(&source_name).ok();
+    if source_observed.is_some() {
+        target_parent
+            .require_entry_absent(&target_name)
+            .map_err(|_| ErrorPayload {
+                code: ErrorCode::Conflict,
+                message: "remote rename target already exists".into(),
+            })?;
+    }
     let source_parent_identity =
         db_filesystem_identity(source_parent.held_identity().map_err(internal)?);
     let target_parent_identity =
@@ -626,6 +645,7 @@ pub(crate) async fn execute_remote_staged_rename(
             return Err(internal(error));
         }
     }
+    after_barrier("artifact_durable")?;
     if evidence.state == "prepared" {
         if source_observed.map(db_filesystem_identity) != Some(evidence.source_identity) {
             return Err(ErrorPayload {
@@ -668,15 +688,29 @@ pub(crate) async fn execute_remote_staged_rename(
                 target_parent
                     .require_entry_absent(&target_name)
                     .map_err(internal)?;
-                match source_parent
-                    .rename_entry_noreplace_atomic(
-                        &source_name,
-                        &target_parent,
-                        &target_name,
-                        source,
-                    )
-                    .map_err(internal)?
-                {
+                let rename_effect = match source_parent.rename_entry_noreplace_atomic(
+                    &source_name,
+                    &target_parent,
+                    &target_name,
+                    source,
+                ) {
+                    Ok(effect) => effect,
+                    Err(crate::external_journal::ExternalJournalError::QuarantineNameTaken(_)) => {
+                        ctx.db
+                            .record_remote_rename_effect_unknown(
+                                &attachment,
+                                &operation_id,
+                                evidence.dispatch_generation,
+                                b"{\"outcome\":\"unknown\"}",
+                                chrono::Utc::now().timestamp_millis(),
+                            )
+                            .await
+                            .map_err(internal)?;
+                        return Err(ErrorPayload { code: ErrorCode::Conflict, message: "rename target appeared during dispatch; outcome is closed as unknown".into() });
+                    }
+                    Err(error) => return Err(internal(error)),
+                };
+                match rename_effect {
                     HeldRenameEffect::Applied(_) => {}
                     HeldRenameEffect::AppliedIdentityMismatch { observed, .. } => {
                         ctx.db
@@ -698,6 +732,7 @@ pub(crate) async fn execute_remote_staged_rename(
                         });
                     }
                 }
+                after_barrier("rename_effect")?;
             }
             (Err(_), Ok(target)) if db_filesystem_identity(target) == evidence.source_identity => {}
             _ => {
@@ -732,6 +767,7 @@ pub(crate) async fn execute_remote_staged_rename(
     }
     if state == "renamed" {
         source_parent.sync().map_err(internal)?;
+        after_barrier("source_parent_fsync")?;
         ctx.db
             .advance_remote_rename_operation(
                 &attachment,
@@ -747,6 +783,7 @@ pub(crate) async fn execute_remote_staged_rename(
     }
     if state == "source_parent_synced" {
         target_parent.sync().map_err(internal)?;
+        after_barrier("target_parent_fsync")?;
         ctx.db
             .advance_remote_rename_operation(
                 &attachment,
@@ -772,6 +809,7 @@ pub(crate) async fn execute_remote_staged_rename(
             )
             .await
             .map_err(internal)?;
+        after_barrier("applied_journal")?;
     }
     let response = Response::Ack;
     let bytes = serde_json::to_vec(&response).map_err(internal)?;
@@ -794,6 +832,7 @@ pub(crate) async fn execute_remote_staged_rename(
         .map_err(internal)?
     {
         CommitRemoteOperationOutcome::Committed { .. } => {
+            after_barrier("ledger_committed")?;
             let _ = journal.remove_all_remote_rename_artifacts(artifact_id);
             Ok(response)
         }

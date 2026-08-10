@@ -1961,7 +1961,8 @@ impl Db {
                 "component reservation is empty"
             );
         }
-        let (component_set_json, component_set_digest) = component_set_binding(&input.components)?;
+        let (component_set_json, component_set_digest) =
+            image_generation_component_set_binding(&input.components)?;
         ensure!(
             input.component_set_digest == component_set_digest,
             "component set digest does not bind exact graph"
@@ -2677,7 +2678,7 @@ fn ensure_digest(value: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn component_set_binding(
+pub fn image_generation_component_set_binding(
     components: &[CreateImageGenerationArtifactComponent],
 ) -> Result<(String, String)> {
     let mut rows = components
@@ -3769,14 +3770,14 @@ mod tests {
             let fixture=race_fixture(conn,false)?;
             let artifact_id=Uuid::parse_str(&conn.query_row::<String,_,_>("SELECT managed_artifact_id FROM image_generation_slots WHERE job_id=?1 AND slot_id=?2",params![fixture.job_id.to_string(),fixture.slot_id.to_string()],|row|row.get(0))?)?;
             let component=CreateImageGenerationArtifactComponent{component_id:Uuid::now_v7(),kind:ImageGenerationArtifactComponentKind::Primary,relative_storage_key:format!("{artifact_id}/primary"),byte_length:u64::MAX,sha256:"a".repeat(64),resource_reservation_id:"resource_1".into(),release_operation_id:Uuid::now_v7()};
-            let component_set_digest=component_set_binding(std::slice::from_ref(&component))?.1;
+            let component_set_digest=image_generation_component_set_binding(std::slice::from_ref(&component))?.1;
             Db::create_image_generation_artifact_conn(conn,&CreateImageGenerationArtifact{artifact_id,job_id:fixture.job_id,slot_id:fixture.slot_id,component_set_digest,components:vec![component],now_unix_ms:1})?;
             let row:(String,i64,i64)=conn.query_row("SELECT state,generation,expected_component_count FROM image_generation_artifacts WHERE artifact_id=?1",[artifact_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
             assert_eq!(row,("allocating".into(),1,1));
             let byte_length:(i64,i64)=conn.query_row("SELECT byte_length_hi,byte_length_lo FROM image_generation_artifact_components WHERE artifact_id=?1",[artifact_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?)))?;
             assert_eq!(byte_length,(i64::from(u32::MAX),i64::from(u32::MAX)));
             let forged_component=CreateImageGenerationArtifactComponent{component_id:Uuid::now_v7(),kind:ImageGenerationArtifactComponentKind::Primary,relative_storage_key:"forged/primary".into(),byte_length:1,sha256:"d".repeat(64),resource_reservation_id:"resource_2".into(),release_operation_id:Uuid::now_v7()};
-            let forged=CreateImageGenerationArtifact{artifact_id:Uuid::now_v7(),job_id:fixture.job_id,slot_id:fixture.slot_id,component_set_digest:component_set_binding(std::slice::from_ref(&forged_component))?.1,components:vec![forged_component],now_unix_ms:2};
+            let forged=CreateImageGenerationArtifact{artifact_id:Uuid::now_v7(),job_id:fixture.job_id,slot_id:fixture.slot_id,component_set_digest:image_generation_component_set_binding(std::slice::from_ref(&forged_component))?.1,components:vec![forged_component],now_unix_ms:2};
             assert!(Db::create_image_generation_artifact_conn(conn,&forged).is_err());
             let count:i64=conn.query_row("SELECT count(*) FROM image_generation_artifacts",[],|row|row.get(0))?;
             assert_eq!(count,1);
@@ -3793,7 +3794,7 @@ mod tests {
             let component_id=Uuid::now_v7();
             let release_operation_id=Uuid::now_v7();
             let component=CreateImageGenerationArtifactComponent{component_id,kind:ImageGenerationArtifactComponentKind::Primary,relative_storage_key:format!("{artifact_id}/primary"),byte_length:9,sha256:"a".repeat(64),resource_reservation_id:"resource_1".into(),release_operation_id};
-            let component_set_digest=component_set_binding(std::slice::from_ref(&component))?.1;
+            let component_set_digest=image_generation_component_set_binding(std::slice::from_ref(&component))?.1;
             Db::create_image_generation_artifact_conn(conn,&CreateImageGenerationArtifact{artifact_id,job_id:fixture.job_id,slot_id:fixture.slot_id,component_set_digest,components:vec![component],now_unix_ms:1})?;
             Db::transition_image_generation_artifact_conn(conn,&TransitionImageGenerationArtifact{artifact_id,expected_generation:1,from:ImageGenerationArtifactState::Allocating,to:ImageGenerationArtifactState::Writing,now_unix_ms:2,terminal_reason:None})?;
             Db::transition_image_generation_artifact_component_conn(conn,&TransitionImageGenerationArtifactComponent{artifact_id,component_id,expected_generation:1,from:ImageGenerationArtifactComponentState::Planned,to:ImageGenerationArtifactComponentState::Writing,stable_identity_json:None,deletion_evidence_digest:None})?;
@@ -3853,7 +3854,7 @@ mod tests {
             let artifact_id=Uuid::parse_str(&conn.query_row::<String,_,_>("SELECT managed_artifact_id FROM image_generation_slots WHERE job_id=?1 AND slot_id=?2",params![fixture.job_id.to_string(),fixture.slot_id.to_string()],|row|row.get(0))?)?;
             let component_id=Uuid::now_v7(); let release_operation_id=Uuid::now_v7();
             let component=CreateImageGenerationArtifactComponent{component_id,kind:ImageGenerationArtifactComponentKind::Primary,relative_storage_key:format!("{artifact_id}/primary"),byte_length:9,sha256:"a".repeat(64),resource_reservation_id:"resource".into(),release_operation_id};
-            let component_set_digest=component_set_binding(std::slice::from_ref(&component))?.1;
+            let component_set_digest=image_generation_component_set_binding(std::slice::from_ref(&component))?.1;
             Db::create_image_generation_artifact_conn(conn,&CreateImageGenerationArtifact{artifact_id,job_id:fixture.job_id,slot_id:fixture.slot_id,component_set_digest:component_set_digest.clone(),components:vec![component],now_unix_ms:1})?;
             Db::transition_image_generation_artifact_conn(conn,&TransitionImageGenerationArtifact{artifact_id,expected_generation:1,from:ImageGenerationArtifactState::Allocating,to:ImageGenerationArtifactState::Writing,now_unix_ms:2,terminal_reason:None})?;
             Db::transition_image_generation_artifact_component_conn(conn,&TransitionImageGenerationArtifactComponent{artifact_id,component_id,expected_generation:1,from:ImageGenerationArtifactComponentState::Planned,to:ImageGenerationArtifactComponentState::Writing,stable_identity_json:None,deletion_evidence_digest:None})?;
@@ -3887,7 +3888,7 @@ mod tests {
             let artifact_id=Uuid::parse_str(&conn.query_row::<String,_,_>("SELECT managed_artifact_id FROM image_generation_slots WHERE job_id=?1 AND slot_id=?2",params![fixture.job_id.to_string(),fixture.slot_id.to_string()],|row|row.get(0))?)?;
             let component_id=Uuid::now_v7();
             let component=CreateImageGenerationArtifactComponent{component_id,kind:ImageGenerationArtifactComponentKind::Primary,relative_storage_key:format!("{artifact_id}/primary"),byte_length:9,sha256:"a".repeat(64),resource_reservation_id:"resource".into(),release_operation_id:Uuid::now_v7()};
-            let (component_set_json,component_set_digest)=component_set_binding(std::slice::from_ref(&component))?;
+            let (component_set_json,component_set_digest)=image_generation_component_set_binding(std::slice::from_ref(&component))?;
             Db::create_image_generation_artifact_conn(conn,&CreateImageGenerationArtifact{artifact_id,job_id:fixture.job_id,slot_id:fixture.slot_id,component_set_digest:component_set_digest.clone(),components:vec![component],now_unix_ms:2})?;
             Db::transition_image_generation_artifact_conn(conn,&TransitionImageGenerationArtifact{artifact_id,expected_generation:1,from:ImageGenerationArtifactState::Allocating,to:ImageGenerationArtifactState::Writing,now_unix_ms:3,terminal_reason:None})?;
             Db::transition_image_generation_artifact_component_conn(conn,&TransitionImageGenerationArtifactComponent{artifact_id,component_id,expected_generation:1,from:ImageGenerationArtifactComponentState::Planned,to:ImageGenerationArtifactComponentState::Writing,stable_identity_json:None,deletion_evidence_digest:None})?;

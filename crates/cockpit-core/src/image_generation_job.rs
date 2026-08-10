@@ -16,7 +16,11 @@ use crate::daemon::principal::ClientPrincipal;
 use crate::image_generation_runtime::ImageHealthSnapshot;
 use cockpit_config::config::media_budget::MediaReservationPlan;
 use cockpit_db::db::image_generation::{
+    CreateImageGenerationArtifact, CreateImageGenerationArtifactComponent,
+    ImageGenerationArtifactComponentKind, ImageGenerationArtifactComponentState,
     ImageGenerationArtifactConsumerPurpose, ImageGenerationArtifactConsumerRoute,
+    ImageGenerationArtifactState, TransitionImageGenerationArtifact,
+    TransitionImageGenerationArtifactComponent, image_generation_component_set_binding,
 };
 use cockpit_db::db::sealed_scope::SealedActionGrantRow;
 use cockpit_db::image_spend::{AttemptMaximum, SpendReservation};
@@ -213,6 +217,18 @@ pub enum ImageArtifactSecurityRecoveryDisposition {
     ResumeVerifiedCleanup,
     CompleteVerifiedLatePublication,
 }
+
+#[derive(Debug)]
+pub struct DaemonLocalOwnerRecoveryAuthority(());
+impl DaemonLocalOwnerRecoveryAuthority {
+    pub(crate) fn from_local_direct(principal: &ClientPrincipal) -> Result<Self> {
+        ensure!(
+            principal.is_owner(),
+            "image artifact recovery is unavailable"
+        );
+        Ok(Self(()))
+    }
+}
 impl ImageArtifactSecurityRecoveryDisposition {
     fn as_str(self) -> &'static str {
         match self {
@@ -250,11 +266,19 @@ impl ImageGenerationOwnerContextAuthority {
     pub fn record_image_artifact_security_recovery(
         &self,
         conn: &Connection,
+        _local_owner: &DaemonLocalOwnerRecoveryAuthority,
         input: &RecordImageArtifactSecurityRecovery,
     ) -> Result<RecordedImageArtifactSecurityRecovery> {
         ensure!(
             conn.is_autocommit(),
             "security recovery must begin outside a transaction"
+        );
+        let owner_digest = crate::intel::hex_lower(&Sha256::digest(serde_json::to_vec(
+            &ClientPrincipal::Owner,
+        )?));
+        ensure!(
+            self.principal_digest == owner_digest,
+            "image artifact recovery is unavailable"
         );
         let row=conn.query_row("SELECT a.state,a.component_set_digest,p.canonical_plan,p.plan_digest,COALESCE(lp.state,'') FROM image_generation_artifacts a JOIN image_generation_slots s ON s.job_id=a.job_id AND s.slot_id=a.slot_id JOIN image_generation_plans p ON p.job_id=a.job_id LEFT JOIN image_generation_late_publication_leases lp ON lp.publication_operation_id=?1 WHERE a.artifact_id=?2 AND a.generation=?3 AND a.job_id=?4 AND a.slot_id=?5 AND s.version=?6",params![input.publication_operation_id.map(|id|id.to_string()),input.artifact_id.to_string(),i64::try_from(input.artifact_generation)?,input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.slot_generation)?],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Vec<u8>>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?))).optional()?.ok_or_else(||anyhow::anyhow!("image artifact recovery is unavailable"))?;
         let plan = ImageGenerationPlanV1::from_canonical(&row.2, &row.3)?;
@@ -893,6 +917,174 @@ pub fn open_image_generation_artifact_root(path: &Path) -> Result<HeldImageGener
     Ok(HeldImageGenerationArtifactRoot {
         guard: crate::private_fs::held_directory::HeldDirectoryAuthority::open_existing(path)?,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeneratedImageArtifactFormat {
+    Png,
+    Jpeg,
+    Webp,
+    Svg,
+}
+
+pub struct RetainGeneratedImageArtifact<'a> {
+    pub artifact_id: Uuid,
+    pub job_id: Uuid,
+    pub slot_id: Uuid,
+    pub component_id: Uuid,
+    pub format: GeneratedImageArtifactFormat,
+    pub expected_width: u32,
+    pub expected_height: u32,
+    pub bytes: &'a [u8],
+    pub resource_reservation_id: String,
+    pub release_operation_id: Uuid,
+    pub late_quarantined: bool,
+    pub now_unix_ms: i64,
+}
+
+pub fn retain_generated_image_artifact(
+    conn: &Connection,
+    root: &HeldImageGenerationArtifactRoot,
+    input: &RetainGeneratedImageArtifact<'_>,
+) -> Result<HeldArtifactEvidence> {
+    let canonical = validate_generated_image_bytes(
+        input.format,
+        input.expected_width,
+        input.expected_height,
+        input.bytes,
+    )?;
+    let checksum = crate::intel::hex_lower(&Sha256::digest(&canonical));
+    let final_name = format!("{}-{}.artifact", input.artifact_id, input.component_id);
+    let temporary_name = format!(".{}-{}.partial", input.artifact_id, input.component_id);
+    let component = CreateImageGenerationArtifactComponent {
+        component_id: input.component_id,
+        kind: ImageGenerationArtifactComponentKind::Primary,
+        relative_storage_key: final_name.clone(),
+        byte_length: u64::try_from(canonical.len())?,
+        sha256: checksum,
+        resource_reservation_id: input.resource_reservation_id.clone(),
+        release_operation_id: input.release_operation_id,
+    };
+    let component_set_digest =
+        image_generation_component_set_binding(std::slice::from_ref(&component))?.1;
+    cockpit_db::Db::create_image_generation_artifact_conn(
+        conn,
+        &CreateImageGenerationArtifact {
+            artifact_id: input.artifact_id,
+            job_id: input.job_id,
+            slot_id: input.slot_id,
+            component_set_digest,
+            components: vec![component],
+            now_unix_ms: input.now_unix_ms,
+        },
+    )?;
+    cockpit_db::Db::transition_image_generation_artifact_conn(
+        conn,
+        &TransitionImageGenerationArtifact {
+            artifact_id: input.artifact_id,
+            expected_generation: 1,
+            from: ImageGenerationArtifactState::Allocating,
+            to: ImageGenerationArtifactState::Writing,
+            now_unix_ms: input.now_unix_ms,
+            terminal_reason: None,
+        },
+    )?;
+    cockpit_db::Db::transition_image_generation_artifact_component_conn(
+        conn,
+        &TransitionImageGenerationArtifactComponent {
+            artifact_id: input.artifact_id,
+            component_id: input.component_id,
+            expected_generation: 1,
+            from: ImageGenerationArtifactComponentState::Planned,
+            to: ImageGenerationArtifactComponentState::Writing,
+            stable_identity_json: None,
+            deletion_evidence_digest: None,
+        },
+    )?;
+    let mut temporary = root.create_component_temporary(&temporary_name)?;
+    use std::io::Write as _;
+    temporary.file_mut().write_all(&canonical)?;
+    let sealed = root.seal_component(temporary)?;
+    let HeldDirectoryEffectOutcome::AppliedDurable(effect) =
+        root.retain_component_noreplace(sealed, &final_name)?
+    else {
+        anyhow::bail!("managed artifact publication requires reconciliation")
+    };
+    let evidence = effect.artifact().clone();
+    let evidence_json = serde_json::to_string(
+        &serde_json::json!({"byteLength":evidence.byte_length().to_string(),"identityDigest":evidence.identity_digest(),"securityDigest":evidence.security_digest(),"sha256":evidence.sha256()}),
+    )?;
+    cockpit_db::Db::transition_image_generation_artifact_component_conn(
+        conn,
+        &TransitionImageGenerationArtifactComponent {
+            artifact_id: input.artifact_id,
+            component_id: input.component_id,
+            expected_generation: 2,
+            from: ImageGenerationArtifactComponentState::Writing,
+            to: ImageGenerationArtifactComponentState::Ready,
+            stable_identity_json: Some(evidence_json),
+            deletion_evidence_digest: None,
+        },
+    )?;
+    cockpit_db::Db::transition_image_generation_artifact_conn(
+        conn,
+        &TransitionImageGenerationArtifact {
+            artifact_id: input.artifact_id,
+            expected_generation: 2,
+            from: ImageGenerationArtifactState::Writing,
+            to: if input.late_quarantined {
+                ImageGenerationArtifactState::LateQuarantined
+            } else {
+                ImageGenerationArtifactState::Retained
+            },
+            now_unix_ms: input.now_unix_ms,
+            terminal_reason: None,
+        },
+    )?;
+    Ok(evidence)
+}
+
+fn validate_generated_image_bytes(
+    format: GeneratedImageArtifactFormat,
+    width: u32,
+    height: u32,
+    bytes: &[u8],
+) -> Result<Vec<u8>> {
+    ensure!(
+        width > 0
+            && height > 0
+            && width <= MAX_IMAGE_GENERATION_DIMENSION
+            && height <= MAX_IMAGE_GENERATION_DIMENSION,
+        "generated image dimensions exceed plan limits"
+    );
+    if format == GeneratedImageArtifactFormat::Svg {
+        return Ok(crate::generated_svg::sanitize_generated_svg(bytes)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?
+            .into_bytes());
+    }
+    use image::{ImageDecoder as _, ImageFormat, ImageReader, Limits};
+    let image_format = match format {
+        GeneratedImageArtifactFormat::Png => ImageFormat::Png,
+        GeneratedImageArtifactFormat::Jpeg => ImageFormat::Jpeg,
+        GeneratedImageArtifactFormat::Webp => ImageFormat::WebP,
+        GeneratedImageArtifactFormat::Svg => unreachable!(),
+    };
+    let mut reader = ImageReader::with_format(std::io::Cursor::new(bytes), image_format);
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_GENERATION_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_GENERATION_DIMENSION);
+    limits.max_alloc = Some(160_000_000);
+    reader.limits(limits);
+    let decoder = reader
+        .into_decoder()
+        .context("generated raster decode failed")?;
+    ensure!(
+        decoder.dimensions() == (width, height),
+        "generated raster dimensions differ from sealed plan"
+    );
+    let _ = image::DynamicImage::from_decoder(decoder)
+        .context("generated raster pixels are invalid")?;
+    Ok(bytes.to_vec())
 }
 impl HeldImageGenerationOutputDirectory {
     pub fn authority(&self) -> &VerifiedOutputDirectoryAuthority {

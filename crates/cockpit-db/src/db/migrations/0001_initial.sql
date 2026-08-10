@@ -3162,6 +3162,8 @@ CREATE TABLE image_generation_attempts (
     job_id TEXT NOT NULL,
     slot_id TEXT NOT NULL,
     attempt_number INTEGER NOT NULL CHECK(attempt_number >= 1),
+    provider_request_identity TEXT NOT NULL,
+    provider_idempotency_identity TEXT NOT NULL,
     state TEXT NOT NULL CHECK(state IN ('planned','preparing','prepared','dispatching','accepted','submission_unknown','reconciling','running','downloading','cancellation_requested','response_adopted','failed_not_submitted','rejected_not_accepted','cancelled','succeeded','completed_after_cancel','failed_after_acceptance')),
     version INTEGER NOT NULL CHECK(version >= 1),
     external_operation_id TEXT UNIQUE,
@@ -3170,6 +3172,8 @@ CREATE TABLE image_generation_attempts (
     response_digest TEXT CHECK(response_digest IS NULL OR length(response_digest)=64),
     nonacceptance_evidence_digest TEXT CHECK(nonacceptance_evidence_digest IS NULL OR length(nonacceptance_evidence_digest)=64),
     PRIMARY KEY(job_id,slot_id,attempt_number),
+    UNIQUE(provider_request_identity),
+    UNIQUE(provider_idempotency_identity),
     FOREIGN KEY(job_id,slot_id) REFERENCES image_generation_slots(job_id,slot_id) ON DELETE RESTRICT,
     FOREIGN KEY(external_operation_id) REFERENCES external_journal_operations(operation_id) ON DELETE RESTRICT,
     CHECK((external_operation_id IS NULL AND observed_journal_version IS NULL) OR (external_operation_id IS NOT NULL AND observed_journal_version >= 1))

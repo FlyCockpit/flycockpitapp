@@ -330,6 +330,22 @@ pub struct CreateImageGenerationJob<'a> {
     enqueue_started_monotonic_ms: u64,
     operation_deadline_monotonic_ms: u64,
     created_at_unix_ms: i64,
+    sealed_slots: Vec<SealedSlot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SealedSlot {
+    slot_id: Uuid,
+    slot_index: u32,
+    sample_index: u32,
+    managed_artifact_id: Uuid,
+    attempts: Vec<SealedAttempt>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SealedAttempt {
+    attempt_number: u32,
+    provider_request_identity: String,
+    provider_idempotency_identity: String,
 }
 
 impl<'a> CreateImageGenerationJob<'a> {
@@ -345,6 +361,28 @@ impl<'a> CreateImageGenerationJob<'a> {
             "plan JSON is not canonical"
         );
         reject_duplicate_json_keys(canonical_plan)?;
+        ensure!(
+            json_keys_are_ordered(
+                canonical_plan,
+                &[
+                    "schemaVersion",
+                    "kind",
+                    "jobId",
+                    "ownerSessionId",
+                    "ownerPrincipalDigest",
+                    "projectIdentityDigest",
+                    "configGeneration",
+                    "enqueueStartedMonotonicMs",
+                    "operationDeadlineMonotonicMs",
+                    "requiredGrants",
+                    "centralResources",
+                    "spend",
+                    "outputAuthority",
+                    "targets"
+                ]
+            ),
+            "plan JSON field order is not canonical"
+        );
         let computed = hex_lower(&Sha256::digest(canonical_plan));
         ensure!(computed == plan_digest, "sealed plan digest mismatch");
         let plan: serde_json::Value = serde_json::from_slice(canonical_plan)?;
@@ -359,6 +397,7 @@ impl<'a> CreateImageGenerationJob<'a> {
             .ok_or_else(|| anyhow::anyhow!("sealed plan targets missing"))?;
         let mut slot_count = 0_u32;
         let mut max_attempt_count = None;
+        let mut sealed_slots = Vec::new();
         for target in targets {
             let attempts = u32::try_from(
                 target
@@ -371,15 +410,69 @@ impl<'a> CreateImageGenerationJob<'a> {
                 "target retry bounds disagree"
             );
             max_attempt_count = Some(attempts);
+            let slots = target
+                .get("slots")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| anyhow::anyhow!("sealed slots missing"))?;
             slot_count = slot_count
-                .checked_add(u32::try_from(
-                    target
-                        .get("slots")
-                        .and_then(serde_json::Value::as_array)
-                        .ok_or_else(|| anyhow::anyhow!("sealed slots missing"))?
-                        .len(),
-                )?)
+                .checked_add(u32::try_from(slots.len())?)
                 .ok_or_else(|| anyhow::anyhow!("slot count overflow"))?;
+            for slot in slots {
+                let attempt_values = slot
+                    .get("attempts")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| anyhow::anyhow!("sealed attempts missing"))?;
+                let attempts = attempt_values
+                    .iter()
+                    .map(|attempt| {
+                        Ok(SealedAttempt {
+                            attempt_number: u32::try_from(
+                                attempt
+                                    .get("attemptNumber")
+                                    .and_then(serde_json::Value::as_u64)
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!("sealed attempt number missing")
+                                    })?,
+                            )?,
+                            provider_request_identity: attempt
+                                .get("providerRequestIdentity")
+                                .and_then(serde_json::Value::as_str)
+                                .ok_or_else(|| anyhow::anyhow!("sealed provider request missing"))?
+                                .to_owned(),
+                            provider_idempotency_identity: attempt
+                                .get("providerIdempotencyIdentity")
+                                .and_then(serde_json::Value::as_str)
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("sealed provider idempotency missing")
+                                })?
+                                .to_owned(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                sealed_slots.push(SealedSlot {
+                    slot_id: Uuid::parse_str(
+                        slot.get("slotId")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or_else(|| anyhow::anyhow!("sealed slot id missing"))?,
+                    )?,
+                    slot_index: u32::try_from(
+                        slot.get("slotIndex")
+                            .and_then(serde_json::Value::as_u64)
+                            .ok_or_else(|| anyhow::anyhow!("sealed slot index missing"))?,
+                    )?,
+                    sample_index: u32::try_from(
+                        slot.get("sampleIndex")
+                            .and_then(serde_json::Value::as_u64)
+                            .ok_or_else(|| anyhow::anyhow!("sealed sample index missing"))?,
+                    )?,
+                    managed_artifact_id: Uuid::parse_str(
+                        slot.get("managedArtifactId")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or_else(|| anyhow::anyhow!("sealed artifact id missing"))?,
+                    )?,
+                    attempts,
+                });
+            }
         }
         Ok(Self {
             job_id,
@@ -397,6 +490,7 @@ impl<'a> CreateImageGenerationJob<'a> {
                 .and_then(serde_json::Value::as_u64)
                 .ok_or_else(|| anyhow::anyhow!("deadline missing"))?,
             created_at_unix_ms,
+            sealed_slots,
         })
     }
 }
@@ -413,6 +507,8 @@ pub struct CreateImageGenerationSlot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateImageGenerationAttempt {
     pub attempt_number: u32,
+    pub provider_request_identity: String,
+    pub provider_idempotency_identity: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -602,6 +698,24 @@ impl Db {
         );
         Self::create_image_generation_job_inner(conn, input)?;
         for (slot_index, slot) in slots.iter().enumerate() {
+            let sealed = input
+                .sealed_slots
+                .get(slot_index)
+                .ok_or_else(|| anyhow::anyhow!("slot is absent from sealed plan"))?;
+            ensure!(
+                (
+                    slot.slot_id,
+                    slot.slot_index,
+                    slot.sample_index,
+                    slot.managed_artifact_id
+                ) == (
+                    sealed.slot_id,
+                    sealed.slot_index,
+                    sealed.sample_index,
+                    sealed.managed_artifact_id
+                ),
+                "slot identity differs from sealed plan"
+            );
             ensure!(
                 slot.slot_index as usize == slot_index,
                 "slot graph is not canonical"
@@ -615,13 +729,25 @@ impl Db {
                 params![input.job_id.to_string(), slot.slot_id.to_string(), i64::from(slot.slot_index), i64::from(slot.sample_index), slot.managed_artifact_id.to_string()],
             )?;
             for (attempt_index, attempt) in slot.attempts.iter().enumerate() {
+                let sealed_attempt = sealed
+                    .attempts
+                    .get(attempt_index)
+                    .ok_or_else(|| anyhow::anyhow!("attempt is absent from sealed plan"))?;
+                ensure!(
+                    attempt.attempt_number == sealed_attempt.attempt_number
+                        && attempt.provider_request_identity
+                            == sealed_attempt.provider_request_identity
+                        && attempt.provider_idempotency_identity
+                            == sealed_attempt.provider_idempotency_identity,
+                    "attempt identity differs from sealed plan"
+                );
                 ensure!(
                     attempt.attempt_number as usize == attempt_index + 1,
                     "attempt numbers must be contiguous from one"
                 );
                 conn.execute(
-                    "INSERT INTO image_generation_attempts(job_id,slot_id,attempt_number,state,version) VALUES(?1,?2,?3,'planned',1)",
-                    params![input.job_id.to_string(), slot.slot_id.to_string(), i64::from(attempt.attempt_number)],
+                    "INSERT INTO image_generation_attempts(job_id,slot_id,attempt_number,provider_request_identity,provider_idempotency_identity,state,version) VALUES(?1,?2,?3,?4,?5,'planned',1)",
+                    params![input.job_id.to_string(), slot.slot_id.to_string(), i64::from(attempt.attempt_number),&attempt.provider_request_identity,&attempt.provider_idempotency_identity],
                 )?;
             }
         }
@@ -1201,6 +1327,23 @@ fn json_has_unquoted_whitespace(bytes: &[u8]) -> bool {
     quoted || escaped
 }
 
+fn json_keys_are_ordered(bytes: &[u8], keys: &[&str]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let mut last = None;
+    for key in keys {
+        let needle = format!("\"{key}\":");
+        if let Some(position) = text.find(&needle) {
+            if last.is_some_and(|prior| position <= prior) {
+                return false;
+            }
+            last = Some(position);
+        }
+    }
+    true
+}
+
 fn reject_duplicate_json_keys(bytes: &[u8]) -> Result<()> {
     struct Checked;
     impl<'de> serde::Deserialize<'de> for Checked {
@@ -1287,28 +1430,26 @@ mod tests {
         let job_id = Uuid::now_v7();
         let slot_id = Uuid::now_v7();
         let operation_id = Uuid::now_v7();
+        let artifact_id = Uuid::now_v7();
         let plan = format!(
-            r#"{{"schemaVersion":1,"jobId":"{job_id}","targets":[{{"maxAttempts":1,"slots":[{{"attempts":[{{}}]}}]}}]}}"#
+            r#"{{"schemaVersion":1,"jobId":"{job_id}","enqueueStartedMonotonicMs":1,"operationDeadlineMonotonicMs":100,"targets":[{{"maxAttempts":1,"slots":[{{"slotId":"{slot_id}","slotIndex":0,"sampleIndex":0,"managedArtifactId":"{artifact_id}","attempts":[{{"attemptNumber":1,"providerRequestIdentity":"request:1","providerIdempotencyIdentity":"idem:1"}}]}}]}}]}}"#
         );
         let digest = hex_lower(&Sha256::digest(plan.as_bytes()));
+        let verified =
+            CreateImageGenerationJob::from_verified_canonical_plan(plan.as_bytes(), &digest, 1)?;
         Db::create_image_generation_graph_conn(
             conn,
-            &CreateImageGenerationJob {
-                job_id,
-                plan_digest: &digest,
-                canonical_plan: plan.as_bytes(),
-                slot_count: 1,
-                max_attempt_count: 1,
-                enqueue_started_monotonic_ms: 1,
-                operation_deadline_monotonic_ms: 100,
-                created_at_unix_ms: 1,
-            },
+            &verified,
             &[CreateImageGenerationSlot {
                 slot_id,
                 slot_index: 0,
                 sample_index: 0,
-                managed_artifact_id: Uuid::now_v7(),
-                attempts: vec![CreateImageGenerationAttempt { attempt_number: 1 }],
+                managed_artifact_id: artifact_id,
+                attempts: vec![CreateImageGenerationAttempt {
+                    attempt_number: 1,
+                    provider_request_identity: "request:1".into(),
+                    provider_idempotency_identity: "idem:1".into(),
+                }],
             }],
         )?;
         let journal_state = if adopted { "succeeded" } else { "accepted" };
@@ -1503,8 +1644,10 @@ mod tests {
     #[test]
     fn sealed_plan_token_rejects_duplicate_and_noncanonical_json() {
         let job_id = Uuid::now_v7();
+        let slot_id = Uuid::now_v7();
+        let artifact_id = Uuid::now_v7();
         let canonical = format!(
-            r#"{{"jobId":"{job_id}","enqueueStartedMonotonicMs":1,"operationDeadlineMonotonicMs":2,"targets":[{{"maxAttempts":1,"slots":[{{"attempts":[{{}}]}}]}}]}}"#
+            r#"{{"jobId":"{job_id}","enqueueStartedMonotonicMs":1,"operationDeadlineMonotonicMs":2,"targets":[{{"maxAttempts":1,"slots":[{{"slotId":"{slot_id}","slotIndex":0,"sampleIndex":0,"managedArtifactId":"{artifact_id}","attempts":[{{"attemptNumber":1,"providerRequestIdentity":"request:1","providerIdempotencyIdentity":"idem:1"}}]}}]}}]}}"#
         );
         let digest = hex_lower(&Sha256::digest(canonical.as_bytes()));
         assert!(
@@ -1539,6 +1682,20 @@ mod tests {
             )
             .is_err()
         );
+        let reordered = canonical.replacen(
+            &format!(r#""jobId":"{job_id}","enqueueStartedMonotonicMs":1"#),
+            &format!(r#""enqueueStartedMonotonicMs":1,"jobId":"{job_id}""#),
+            1,
+        );
+        let reordered_digest = hex_lower(&Sha256::digest(reordered.as_bytes()));
+        assert!(
+            CreateImageGenerationJob::from_verified_canonical_plan(
+                reordered.as_bytes(),
+                &reordered_digest,
+                1
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1547,22 +1704,15 @@ mod tests {
         let job_id = Uuid::now_v7();
         let slot_id = Uuid::now_v7();
         db.blocking_for_sync_cli(move |conn| {
+            let artifact_id=Uuid::now_v7();
             let canonical_plan = format!(
-                r#"{{"schemaVersion":1,"jobId":"{job_id}","targets":[{{"maxAttempts":1,"slots":[{{"attempts":[{{}}]}}]}}]}}"#
+                r#"{{"schemaVersion":1,"jobId":"{job_id}","enqueueStartedMonotonicMs":10,"operationDeadlineMonotonicMs":20,"targets":[{{"maxAttempts":1,"slots":[{{"slotId":"{slot_id}","slotIndex":0,"sampleIndex":0,"managedArtifactId":"{artifact_id}","attempts":[{{"attemptNumber":1,"providerRequestIdentity":"request:1","providerIdempotencyIdentity":"idem:1"}}]}}]}}]}}"#
             );
             let plan_digest = hex_lower(&Sha256::digest(canonical_plan.as_bytes()));
+            let verified=CreateImageGenerationJob::from_verified_canonical_plan(canonical_plan.as_bytes(),&plan_digest,30)?;
             Db::create_image_generation_job_conn(
                 conn,
-                &CreateImageGenerationJob {
-                    job_id,
-                    plan_digest: &plan_digest,
-                    canonical_plan: canonical_plan.as_bytes(),
-                    slot_count: 1,
-                    max_attempt_count: 1,
-                    enqueue_started_monotonic_ms: 10,
-                    operation_deadline_monotonic_ms: 20,
-                    created_at_unix_ms: 30,
-                },
+                &verified,
             )?;
             conn.execute(
                 "INSERT INTO image_generation_slots(job_id,slot_id,slot_index,sample_index,managed_artifact_id,state,version) VALUES(?1,?2,0,0,?3,'planned',1)",
@@ -1587,9 +1737,11 @@ mod tests {
         let job_id = Uuid::now_v7();
         let slot_id = Uuid::now_v7();
         db.blocking_for_sync_cli(move|conn|{
-            let canonical_plan=format!(r#"{{"schemaVersion":1,"jobId":"{job_id}","targets":[{{"maxAttempts":2,"slots":[{{"attempts":[{{}},{{}}]}}]}}]}}"#);
+            let artifact_id=Uuid::now_v7();
+            let canonical_plan=format!(r#"{{"schemaVersion":1,"jobId":"{job_id}","enqueueStartedMonotonicMs":1,"operationDeadlineMonotonicMs":10,"targets":[{{"maxAttempts":2,"slots":[{{"slotId":"{slot_id}","slotIndex":0,"sampleIndex":0,"managedArtifactId":"{artifact_id}","attempts":[{{"attemptNumber":1,"providerRequestIdentity":"request:1","providerIdempotencyIdentity":"idem:1"}},{{"attemptNumber":2,"providerRequestIdentity":"request:2","providerIdempotencyIdentity":"idem:2"}}]}}]}}]}}"#);
             let digest=hex_lower(&Sha256::digest(canonical_plan.as_bytes()));
-            Db::create_image_generation_graph_conn(conn,&CreateImageGenerationJob{job_id,plan_digest:&digest,canonical_plan:canonical_plan.as_bytes(),slot_count:1,max_attempt_count:2,enqueue_started_monotonic_ms:1,operation_deadline_monotonic_ms:10,created_at_unix_ms:1},&[CreateImageGenerationSlot{slot_id,slot_index:0,sample_index:0,managed_artifact_id:Uuid::now_v7(),attempts:vec![CreateImageGenerationAttempt{attempt_number:1},CreateImageGenerationAttempt{attempt_number:2}]}])?;
+            let verified=CreateImageGenerationJob::from_verified_canonical_plan(canonical_plan.as_bytes(),&digest,1)?;
+            Db::create_image_generation_graph_conn(conn,&verified,&[CreateImageGenerationSlot{slot_id,slot_index:0,sample_index:0,managed_artifact_id:artifact_id,attempts:vec![CreateImageGenerationAttempt{attempt_number:1,provider_request_identity:"request:1".into(),provider_idempotency_identity:"idem:1".into()},CreateImageGenerationAttempt{attempt_number:2,provider_request_identity:"request:2".into(),provider_idempotency_identity:"idem:2".into()}]}])?;
             assert!(matches!(Db::cas_image_generation_job_state_conn(conn,job_id,ImageGenerationJobState::Created,1,ImageGenerationJobState::Validating,2)?,ImageGenerationCasOutcome::Applied{..}));
             assert!(matches!(Db::cas_image_generation_job_state_conn(conn,job_id,ImageGenerationJobState::Validating,2,ImageGenerationJobState::Queued,3)?,ImageGenerationCasOutcome::Applied{..}));
             assert!(matches!(Db::cas_image_generation_slot_state_conn(conn,job_id,slot_id,ImageGenerationSlotState::Planned,1,ImageGenerationSlotState::Queued)?,ImageGenerationCasOutcome::Applied{..}));

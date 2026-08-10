@@ -183,6 +183,153 @@ pub struct RuntimeTargetAuthorityV1 {
     pub destination: TargetDestinationV1,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedOutputDirectoryAuthority(OutputDirectoryAuthorityV1);
+impl VerifiedOutputDirectoryAuthority {
+    pub(crate) fn from_held_directory(
+        canonical_destination_digest: String,
+        parent_identity_digest: String,
+        authority_generation: u64,
+        filename_prefix: String,
+        extension: String,
+    ) -> Result<Self> {
+        let value = OutputDirectoryAuthorityV1 {
+            canonical_destination_digest,
+            parent_identity_digest,
+            authority_generation,
+            filename_prefix,
+            extension,
+        };
+        validate_digest(&value.canonical_destination_digest)?;
+        validate_digest(&value.parent_identity_digest)?;
+        ensure!(
+            value.authority_generation > 0
+                && valid_path_component(&value.filename_prefix)
+                && valid_path_component(&value.extension),
+            "output directory authority is invalid"
+        );
+        Ok(Self(value))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageGenerationPreflightTargetV1 {
+    pub authority: RuntimeTargetAuthorityV1,
+    pub reference_artifacts: Vec<ReferenceArtifactV1>,
+    pub requested: RequestedOutputV1,
+    pub resolved: ResolvedOutputV1,
+    pub typed_parameters: BTreeMap<String, TypedParameterV1>,
+    pub slot_ids: Vec<(Uuid, Uuid)>,
+    pub max_attempts: u32,
+    pub attempt_resource_maximum: Vec<ResourceReservationV1>,
+    pub attempt_maximum_usd_micros: Option<u64>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageGenerationPreflightInputV1 {
+    pub job_id: Uuid,
+    pub owner_session_id: Uuid,
+    pub owner_principal_digest: String,
+    pub project_identity_digest: String,
+    pub config_generation: u64,
+    pub enqueue_started_monotonic_ms: u64,
+    pub operation_deadline_monotonic_ms: u64,
+    pub required_grants: Vec<GrantRequirementV1>,
+    pub central_resources: Vec<ResourceReservationV1>,
+    pub spend: SpendReservationPlanV1,
+    pub output_authority: VerifiedOutputDirectoryAuthority,
+    pub targets: Vec<ImageGenerationPreflightTargetV1>,
+}
+
+pub fn plan_image_generation(
+    input: ImageGenerationPreflightInputV1,
+) -> Result<ImageGenerationPlanV1> {
+    ensure!(
+        input
+            .targets
+            .windows(2)
+            .all(|pair| pair[0].authority.target_id < pair[1].authority.target_id),
+        "preflight targets must be unique and sorted"
+    );
+    let mut global_slot_index = 0_u32;
+    let mut targets = Vec::with_capacity(input.targets.len());
+    for target in input.targets {
+        ensure!(
+            target.slot_ids.len() > 0,
+            "target has no resolved output slots"
+        );
+        let mut slots = Vec::with_capacity(target.slot_ids.len());
+        for (sample_index, (slot_id, artifact_id)) in target.slot_ids.into_iter().enumerate() {
+            let publication_name = format!(
+                "{}-{:03}.{}",
+                input.output_authority.0.filename_prefix,
+                global_slot_index + 1,
+                input.output_authority.0.extension
+            );
+            let attempts = (1..=target.max_attempts)
+                .map(|attempt_number| {
+                    let identity = digest_fields(&[
+                        &input.job_id.to_string(),
+                        &slot_id.to_string(),
+                        &attempt_number.to_string(),
+                    ]);
+                    AttemptPlanV1 {
+                        attempt_number,
+                        provider_request_identity: format!("request:{identity}"),
+                        provider_idempotency_identity: format!("idempotency:{identity}"),
+                        resource_maximum: target.attempt_resource_maximum.clone(),
+                        maximum_usd_micros: target.attempt_maximum_usd_micros,
+                    }
+                })
+                .collect();
+            slots.push(OutputSlotPlanV1 {
+                slot_id,
+                slot_index: global_slot_index,
+                sample_index: u32::try_from(sample_index)?,
+                managed_artifact_id: artifact_id,
+                publication_name,
+                attempts,
+            });
+            global_slot_index = global_slot_index
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("slot index overflow"))?;
+        }
+        targets.push(TargetPlanV1 {
+            target_id: target.authority.target_id,
+            target_config_generation: target.authority.target_config_generation,
+            normalized_config_digest: target.authority.normalized_config_digest,
+            capability_provenance: target.authority.capability_provenance,
+            destination: target.authority.destination,
+            reference_artifacts: target.reference_artifacts,
+            requested: target.requested,
+            resolved: target.resolved,
+            typed_parameters: target.typed_parameters,
+            sample_count: u32::try_from(slots.len())?,
+            max_attempts: target.max_attempts,
+            slots,
+        });
+    }
+    let mut plan = ImageGenerationPlanV1 {
+        schema_version: 1,
+        kind: "imageGenerationPlan".into(),
+        job_id: input.job_id,
+        owner_session_id: input.owner_session_id,
+        owner_principal_digest: input.owner_principal_digest,
+        project_identity_digest: input.project_identity_digest,
+        config_generation: input.config_generation,
+        enqueue_started_monotonic_ms: input.enqueue_started_monotonic_ms,
+        operation_deadline_monotonic_ms: input.operation_deadline_monotonic_ms,
+        required_grants: input.required_grants,
+        central_resources: input.central_resources,
+        spend: input.spend,
+        output_authority: input.output_authority.0,
+        targets,
+    };
+    plan.required_grants.sort();
+    plan.central_resources.sort();
+    plan.validate()?;
+    Ok(plan)
+}
+
 impl RuntimeTargetAuthorityV1 {
     pub fn from_registry_snapshot(
         snapshot: &ImageHealthSnapshot,
@@ -448,10 +595,11 @@ impl ImageGenerationPlanV1 {
                         && self.output_authority.extension == "jpeg"),
                 "resolved format disagrees with publication extension"
             );
-            total_slots = total_slots
-                .checked_add(target.slots.len())
-                .ok_or_else(|| anyhow::anyhow!("slot count overflow"))?;
-            for slot in &target.slots {
+            for (local_index, slot) in target.slots.iter().enumerate() {
+                ensure!(
+                    slot.slot_index as usize == total_slots + local_index,
+                    "global slot order is not canonical"
+                );
                 ensure!(
                     slot_ids.insert(slot.slot_id) && artifact_ids.insert(slot.managed_artifact_id),
                     "slot/artifact identities must be globally unique"
@@ -496,6 +644,9 @@ impl ImageGenerationPlanV1 {
                     };
                 }
             }
+            total_slots = total_slots
+                .checked_add(target.slots.len())
+                .ok_or_else(|| anyhow::anyhow!("slot count overflow"))?;
         }
         ensure!(
             total_slots <= MAX_IMAGE_GENERATION_SLOTS,
@@ -649,7 +800,7 @@ impl TargetPlanV1 {
                 "slot identity is incomplete"
             );
             ensure!(
-                slot.slot_index as usize == index && slot.sample_index as usize == index,
+                slot.sample_index as usize == index,
                 "slot order is not canonical"
             );
             ensure!(

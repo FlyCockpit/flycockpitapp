@@ -839,24 +839,28 @@ impl MediaStorageRecovery {
                     );
                     let reference = cockpit_db::Db::acquire_media_reference_conn(
                         conn,
-                        Uuid::now_v7(),
-                        attachment_id,
-                        record.attachment_version,
-                        session_id,
-                        &project_digest,
-                        MediaReferenceConsumerKind::Message,
-                        &db_consumer_id,
-                        now_unix_ms,
+                        cockpit_db::media_attachments::AcquireMediaReferenceInput {
+                            reference_id: Uuid::now_v7(),
+                            attachment_id,
+                            expected_version: record.attachment_version,
+                            session_id,
+                            project_digest: &project_digest,
+                            consumer_kind: MediaReferenceConsumerKind::Message,
+                            consumer_id: &db_consumer_id,
+                            now_unix_ms,
+                        },
                     )?;
                     let authority = cockpit_db::Db::acquire_media_component_lease_conn(
                         conn,
-                        Uuid::now_v7(),
-                        attachment_id,
-                        record.attachment_version,
-                        record.availability_generation,
-                        record.captured_capability_generation,
-                        MediaComponentLeaseKind::Model,
-                        now_unix_ms,
+                        cockpit_db::media_attachments::AcquireMediaComponentLeaseInput {
+                            lease_id: Uuid::now_v7(),
+                            attachment_id,
+                            expected_version: record.attachment_version,
+                            expected_availability_generation: record.availability_generation,
+                            expected_capability_generation: record.captured_capability_generation,
+                            kind: MediaComponentLeaseKind::Model,
+                            now_unix_ms,
+                        },
                     )?;
                     total_bytes = total_bytes
                         .checked_add(authority.component.byte_length)
@@ -1306,13 +1310,15 @@ impl MediaStorageRecovery {
             .transaction(move |conn| {
                 cockpit_db::Db::acquire_media_component_lease_conn(
                     conn,
-                    lease_id,
-                    attachment_id,
-                    attachment_version,
-                    availability_generation,
-                    capability_generation,
-                    kind,
-                    now_unix_ms,
+                    cockpit_db::media_attachments::AcquireMediaComponentLeaseInput {
+                        lease_id,
+                        attachment_id,
+                        expected_version: attachment_version,
+                        expected_availability_generation: availability_generation,
+                        expected_capability_generation: capability_generation,
+                        kind,
+                        now_unix_ms,
+                    },
                 )
             })
             .await?;

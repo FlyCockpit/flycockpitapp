@@ -1253,6 +1253,40 @@ pub enum SecurityRecoverySnapshotResult {
     Current(SecurityRecoverySnapshot),
 }
 
+struct MediaUploadStatusRow {
+    state: String,
+    generation: String,
+    kind: String,
+    chunks: u32,
+    bytes: String,
+    expires: i64,
+    transition: String,
+    draft: String,
+    attachment: Option<String>,
+    attachment_version: Option<String>,
+}
+
+pub struct AcquireMediaReferenceInput<'a> {
+    pub reference_id: Uuid,
+    pub attachment_id: Uuid,
+    pub expected_version: u64,
+    pub session_id: Uuid,
+    pub project_digest: &'a str,
+    pub consumer_kind: MediaReferenceConsumerKind,
+    pub consumer_id: &'a str,
+    pub now_unix_ms: i64,
+}
+
+pub struct AcquireMediaComponentLeaseInput {
+    pub lease_id: Uuid,
+    pub attachment_id: Uuid,
+    pub expected_version: u64,
+    pub expected_availability_generation: u64,
+    pub expected_capability_generation: u64,
+    pub kind: MediaComponentLeaseKind,
+    pub now_unix_ms: i64,
+}
+
 impl super::Db {
     pub fn media_upload_status_for_owner_conn(
         conn: &Connection,
@@ -1268,8 +1302,8 @@ impl super::Db {
             "invalid upload status request"
         );
         validate_digest(&request.canonical_project_digest, "project digest")?;
-        let row:Option<(String,String,String,u32,String,i64,String,String,Option<String>,Option<String>)>=conn.query_row("SELECT state,upload_generation,media_kind,acknowledged_chunks,acknowledged_bytes,expires_at_unix_ms,last_transition_json,client_draft_id,attachment_id,attachment_version FROM media_uploads WHERE upload_id=?1 AND session_id=?2 AND canonical_project_digest=?3 AND client_draft_id=?4",params![request.upload_id.to_string(),request.session_id.to_string(),request.canonical_project_digest,request.client_draft_id.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?))).optional()?;
-        let Some((
+        let row=conn.query_row("SELECT state,upload_generation,media_kind,acknowledged_chunks,acknowledged_bytes,expires_at_unix_ms,last_transition_json,client_draft_id,attachment_id,attachment_version FROM media_uploads WHERE upload_id=?1 AND session_id=?2 AND canonical_project_digest=?3 AND client_draft_id=?4",params![request.upload_id.to_string(),request.session_id.to_string(),request.canonical_project_digest,request.client_draft_id.to_string()],|r|Ok(MediaUploadStatusRow{state:r.get(0)?,generation:r.get(1)?,kind:r.get(2)?,chunks:r.get(3)?,bytes:r.get(4)?,expires:r.get(5)?,transition:r.get(6)?,draft:r.get(7)?,attachment:r.get(8)?,attachment_version:r.get(9)?})).optional()?;
+        let Some(MediaUploadStatusRow {
             state,
             generation,
             kind,
@@ -1280,7 +1314,7 @@ impl super::Db {
             draft,
             attachment,
             attachment_version,
-        )) = row
+        }) = row
         else {
             return Ok(None);
         };
@@ -1887,15 +1921,18 @@ impl super::Db {
     /// second generation increment.
     pub fn acquire_media_reference_conn(
         conn: &Connection,
-        reference_id: Uuid,
-        attachment_id: Uuid,
-        expected_version: u64,
-        session_id: Uuid,
-        project_digest: &str,
-        consumer_kind: MediaReferenceConsumerKind,
-        consumer_id: &str,
-        now_unix_ms: i64,
+        input: AcquireMediaReferenceInput<'_>,
     ) -> Result<AcquiredMediaReference> {
+        let AcquireMediaReferenceInput {
+            reference_id,
+            attachment_id,
+            expected_version,
+            session_id,
+            project_digest,
+            consumer_kind,
+            consumer_id,
+            now_unix_ms,
+        } = input;
         let attachment =
             Self::media_attachment_for_owner_conn(conn, attachment_id, session_id, project_digest)?
                 .context("media attachment unavailable")?;
@@ -2187,14 +2224,17 @@ impl super::Db {
     /// remains live; paths are intentionally not exposed here.
     pub fn acquire_media_component_lease_conn(
         conn: &Connection,
-        lease_id: Uuid,
-        attachment_id: Uuid,
-        expected_version: u64,
-        expected_availability_generation: u64,
-        expected_capability_generation: u64,
-        kind: MediaComponentLeaseKind,
-        now_unix_ms: i64,
+        input: AcquireMediaComponentLeaseInput,
     ) -> Result<AcquiredMediaComponentLease> {
+        let AcquireMediaComponentLeaseInput {
+            lease_id,
+            attachment_id,
+            expected_version,
+            expected_availability_generation,
+            expected_capability_generation,
+            kind,
+            now_unix_ms,
+        } = input;
         ensure!(is_strict_uuid_v7(lease_id), "lease id must be UUIDv7");
         let attachment =
             media_attachment_by_id(conn, attachment_id)?.context("media attachment unavailable")?;
@@ -2865,36 +2905,15 @@ mod tests {
             }
             let first = super::super::Db::acquire_media_reference_conn(
                 conn,
-                id(13),
-                attachment_id,
-                1,
-                session_id,
-                &project_digest,
-                MediaReferenceConsumerKind::Message,
-                "message-a",
-                10,
+                AcquireMediaReferenceInput { reference_id:id(13), attachment_id, expected_version:1, session_id, project_digest:&project_digest, consumer_kind:MediaReferenceConsumerKind::Message, consumer_id:"message-a", now_unix_ms:10 },
             )?;
             let retry = super::super::Db::acquire_media_reference_conn(
                 conn,
-                id(14),
-                attachment_id,
-                1,
-                session_id,
-                &project_digest,
-                MediaReferenceConsumerKind::Message,
-                "message-a",
-                11,
+                AcquireMediaReferenceInput { reference_id:id(14), attachment_id, expected_version:1, session_id, project_digest:&project_digest, consumer_kind:MediaReferenceConsumerKind::Message, consumer_id:"message-a", now_unix_ms:11 },
             )?;
             let second = super::super::Db::acquire_media_reference_conn(
                 conn,
-                id(15),
-                attachment_id,
-                1,
-                session_id,
-                &project_digest,
-                MediaReferenceConsumerKind::Message,
-                "message-b",
-                12,
+                AcquireMediaReferenceInput { reference_id:id(15), attachment_id, expected_version:1, session_id, project_digest:&project_digest, consumer_kind:MediaReferenceConsumerKind::Message, consumer_id:"message-b", now_unix_ms:12 },
             )?;
             assert!(first.inserted);
             assert!(!retry.inserted);
@@ -2919,9 +2938,9 @@ mod tests {
             let record = MediaAttachmentRecord { attachment_id, session_id, canonical_project_digest:"11".repeat(32), media_kind:MediaKind::Image, source_kind:MediaSourceKind::RetainedHttps, canonical_container:"png".into(), canonical_mime:"image/png".into(), availability:MediaAvailability::Ready, attachment_version:1, availability_generation:5, reference_generation:1, captured_capability_generation:9, source_identity_digest:"22".repeat(32), source_byte_length:3, source_sha256:"33".repeat(32), selected_video_stream:None, selected_audio_stream:None, created_at_unix_ms:1, updated_at_unix_ms:1, draft_expires_at_unix_ms:None, first_referenced_at_unix_ms:None };
             super::super::Db::insert_media_attachment_conn(conn,&record)?;
             conn.execute("INSERT INTO media_attachment_components(component_id,attachment_id,attachment_version,component_kind,storage_id,lifecycle_state,component_generation,stable_identity_digest,byte_length,sha256,reservation_id,created_at_unix_ms,updated_at_unix_ms) VALUES(?1,?2,'1','browser_thumbnail',?3,'ready','1',?4,'3',?5,'reservation',1,1)",params![component_id.to_string(),attachment_id.to_string(),storage_id.to_string(),"44".repeat(32),"55".repeat(32)])?;
-            assert!(super::super::Db::acquire_media_component_lease_conn(conn,Uuid::now_v7(),attachment_id,1,5,8,MediaComponentLeaseKind::Preview,2).is_err());
+            assert!(super::super::Db::acquire_media_component_lease_conn(conn,AcquireMediaComponentLeaseInput { lease_id:Uuid::now_v7(),attachment_id,expected_version:1,expected_availability_generation:5,expected_capability_generation:8,kind:MediaComponentLeaseKind::Preview,now_unix_ms:2 }).is_err());
             let lease_id=Uuid::now_v7();
-            let lease=super::super::Db::acquire_media_component_lease_conn(conn,lease_id,attachment_id,1,5,9,MediaComponentLeaseKind::Preview,2)?;
+            let lease=super::super::Db::acquire_media_component_lease_conn(conn,AcquireMediaComponentLeaseInput { lease_id,attachment_id,expected_version:1,expected_availability_generation:5,expected_capability_generation:9,kind:MediaComponentLeaseKind::Preview,now_unix_ms:2 })?;
             assert_eq!(lease.component.component_id,component_id);
             let live:i64=conn.query_row("SELECT COUNT(*) FROM media_attachment_component_leases WHERE attachment_id=?1 AND released_at_unix_ms IS NULL",[attachment_id.to_string()],|row|row.get(0))?;
             assert_eq!(live,1);
@@ -3059,7 +3078,7 @@ mod tests {
     async fn discard_snapshot_precedence_in_use_overflow_and_apply_are_stable() {
         let db = super::super::Db::open_in_memory_async().await.unwrap();
         let session = Uuid::now_v7();
-        let make = |id| MediaAttachmentRecord {
+        let make = move |id| MediaAttachmentRecord {
             attachment_id: id,
             session_id: session,
             canonical_project_digest: "11".repeat(32),
@@ -3086,7 +3105,7 @@ mod tests {
         let in_use = Uuid::now_v7();
         let overflow = Uuid::now_v7();
         let reference_id = Uuid::now_v7();
-        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at)VALUES(?1,'p','/redacted',1,1)",[session.to_string()])?;for id in [applied,in_use,overflow]{super::super::Db::insert_media_attachment_conn(conn,&make(id))?;}super::super::Db::acquire_media_reference_conn(conn,reference_id,in_use,1,session,&"11".repeat(32),MediaReferenceConsumerKind::Message,"message",2)?;conn.execute("UPDATE media_attachments SET availability_generation=?1 WHERE attachment_id=?2",params![u64::MAX.to_string(),overflow.to_string()])?;Ok(())}).await.unwrap();
+        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at)VALUES(?1,'p','/redacted',1,1)",[session.to_string()])?;for id in [applied,in_use,overflow]{super::super::Db::insert_media_attachment_conn(conn,&make(id))?;}let project_digest="11".repeat(32);super::super::Db::acquire_media_reference_conn(conn,AcquireMediaReferenceInput { reference_id,attachment_id:in_use,expected_version:1,session_id:session,project_digest:&project_digest,consumer_kind:MediaReferenceConsumerKind::Message,consumer_id:"message",now_unix_ms:2 })?;conn.execute("UPDATE media_attachments SET availability_generation=?1 WHERE attachment_id=?2",params![u64::MAX.to_string(),overflow.to_string()])?;Ok(())}).await.unwrap();
         let request = |id, availability, reference| DiscardUnreferencedMediaAttachmentV1 {
             schema_version: 1,
             kind: "discardUnreferencedMediaAttachment".into(),

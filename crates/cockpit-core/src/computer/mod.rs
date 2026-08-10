@@ -11,6 +11,7 @@
 
 #![allow(dead_code)]
 
+pub mod frame;
 pub mod host_identity;
 pub mod platform;
 pub mod target;
@@ -59,7 +60,7 @@ pub struct LogicalSize {
     pub height: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct ScaleFactor(pub f64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,7 +191,7 @@ pub struct CaptureFrame {
     pub native_zoom: Option<ScaleFactor>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct PixelRect {
     pub x: u32,
     pub y: u32,
@@ -2199,46 +2200,68 @@ pub struct OpenAiComputerCallOutput {
     pub call_id: String,
     pub completed: Vec<ComputerActionOutcome>,
     pub failure: Option<ComputerFailure>,
-    pub screenshot_png: Option<Vec<u8>>,
+    /// Sanitized projection of the screenshot frame, if one was captured.
+    ///
+    /// This is the durable projection accepted by every durable sink. It
+    /// contains dimensions, byte count, checksum, and IDs — never the pixel
+    /// bytes, base64, or data URL. The old `screenshot_png: Option<Vec<u8>>`
+    /// field is replaced by this safe type.
+    pub screenshot: Option<frame::SanitizedComputerFrame>,
 }
 
 impl OpenAiComputerCallOutput {
-    pub fn wire_item(&self) -> serde_json::Value {
-        let mut output = serde_json::Map::new();
-        output.insert(
-            "type".to_string(),
-            serde_json::Value::String("computer_call_output".to_string()),
-        );
-        output.insert(
-            "call_id".to_string(),
-            serde_json::Value::String(self.call_id.clone()),
-        );
-        output.insert(
-            "completed".to_string(),
-            serde_json::json!(self.completed.len()),
-        );
-        if let Some(failure) = &self.failure {
-            output.insert(
-                "failure".to_string(),
-                serde_json::json!({
-                    "index": failure.index,
-                    "error": failure.error.to_string(),
-                }),
-            );
-        } else if let Some(png) = &self.screenshot_png {
-            use base64::Engine as _;
-            output.insert(
-                "output".to_string(),
-                serde_json::json!({
-                    "type": "computer_screenshot",
-                    "image_url": format!(
-                        "data:image/png;base64,{}",
-                        base64::engine::general_purpose::STANDARD.encode(png)
-                    ),
-                }),
-            );
-        }
-        serde_json::Value::Object(output)
+    /// Returns true if a screenshot was captured.
+    pub fn has_screenshot(&self) -> bool {
+        self.screenshot.is_some()
+    }
+
+    /// The sanitized screenshot projection, if present.
+    pub fn sanitized_screenshot(&self) -> Option<&frame::SanitizedComputerFrame> {
+        self.screenshot.as_ref()
+    }
+}
+
+/// The result of executing an OpenAI computer call, including the live frame
+/// that owns the screenshot bytes.
+///
+/// The live frame is separated from the serializable call output so that no
+/// serializable object can accidentally carry pixel bytes. The caller builds a
+/// transient provider request from the live frame via
+/// [`frame::openai_transient_computer_output`] and records only the sanitized
+/// projection from the call output.
+pub struct OpenAiComputerCallResult {
+    /// The serializable call output with the sanitized screenshot projection.
+    pub output: OpenAiComputerCallOutput,
+    /// The live frame owning the screenshot bytes, if one was captured.
+    /// This is `None` on failure or when no screenshot was taken.
+    pub live_frame: Option<frame::LiveComputerFrame>,
+}
+
+impl OpenAiComputerCallResult {
+    /// Build a transient OpenAI `computer_call_output` wire payload from the
+    /// live frame, if present.
+    ///
+    /// Returns `None` if there is no live frame (e.g. on failure). The
+    /// returned [`frame::TransientProviderRequest`] carries the wire payload
+    /// (with base64 image data) and the sanitized projection. The caller sends
+    /// the wire payload to the provider and records only the projection.
+    pub fn transient_wire(&self) -> Option<frame::TransientProviderRequest> {
+        let frame = self.live_frame.as_ref()?;
+        Some(frame::openai_transient_computer_output(
+            frame,
+            &self.output.call_id,
+            self.output.completed.len(),
+            self.output.failure.as_ref(),
+        ))
+    }
+}
+
+impl std::fmt::Debug for OpenAiComputerCallResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenAiComputerCallResult")
+            .field("output", &self.output)
+            .field("has_live_frame", &self.live_frame.is_some())
+            .finish()
     }
 }
 
@@ -2246,7 +2269,7 @@ pub async fn execute_openai_computer_call<B: ComputerBackend>(
     backend: &mut B,
     call_id: impl Into<String>,
     actions: &[OpenAiComputerAction],
-) -> OpenAiComputerCallOutput {
+) -> OpenAiComputerCallResult {
     let call_id = call_id.into();
     let mut completed = Vec::new();
     for (index, action) in actions.iter().enumerate() {
@@ -2254,30 +2277,59 @@ pub async fn execute_openai_computer_call<B: ComputerBackend>(
         completed.extend(report.completed);
         if let Some(mut failure) = report.failure {
             failure.index = index;
-            return OpenAiComputerCallOutput {
-                call_id,
-                completed,
-                failure: Some(failure),
-                screenshot_png: None,
+            return OpenAiComputerCallResult {
+                output: OpenAiComputerCallOutput {
+                    call_id,
+                    completed,
+                    failure: Some(failure),
+                    screenshot: None,
+                },
+                live_frame: None,
             };
         }
     }
-    let screenshot = match backend.execute_one(&ComputerAction::CaptureFull).await {
-        Ok(ComputerActionOutcome::Captured(frame)) => Some(frame.png),
-        Ok(_) | Err(_) => None,
+    let capture = backend.execute_one(&ComputerAction::CaptureFull).await;
+    let (screenshot, live_frame) = match capture {
+        Ok(ComputerActionOutcome::Captured(capture_frame)) => {
+            let dims = frame::FrameDimensions::from_capture(&capture_frame);
+            let reservation: Box<dyn frame::MediaReservationHandle> =
+                Box::new(frame::InMemoryReservationHandle::new(std::sync::Arc::new(
+                    std::sync::atomic::AtomicBool::new(false),
+                )));
+            match frame::LiveComputerFrame::try_new(
+                capture_frame.png,
+                frame::ScreenshotMediaType::Png,
+                dims,
+                frame::ObservationId(call_id.clone()),
+                frame::ActionId(call_id.clone()),
+                frame::CaptureEpoch(0),
+                reservation,
+                None,
+            ) {
+                Ok(live) => {
+                    let sanitized = live.sanitized();
+                    (Some(sanitized), Some(live))
+                }
+                Err(_) => (None, None),
+            }
+        }
+        _ => (None, None),
     };
-    OpenAiComputerCallOutput {
-        call_id,
-        completed,
-        failure: None,
-        screenshot_png: screenshot,
+    OpenAiComputerCallResult {
+        output: OpenAiComputerCallOutput {
+            call_id,
+            completed,
+            failure: None,
+            screenshot,
+        },
+        live_frame,
     }
 }
 
 pub async fn execute_openai_computer_call_json<B: ComputerBackend>(
     backend: &mut B,
     call: &serde_json::Value,
-) -> Result<OpenAiComputerCallOutput, OpenAiComputerWireError> {
+) -> Result<OpenAiComputerCallResult, OpenAiComputerWireError> {
     let (call_id, actions) = parse_openai_computer_call(call)?;
     Ok(execute_openai_computer_call(backend, call_id, &actions).await)
 }
@@ -2646,12 +2698,22 @@ mod tests {
             },
             OpenAiComputerAction::TypeText("hello".to_string()),
         ];
-        let output = execute_openai_computer_call(&mut backend, "call-1", &actions).await;
+        let result = execute_openai_computer_call(&mut backend, "call-1", &actions).await;
 
-        assert_eq!(output.call_id, "call-1");
-        assert_eq!(output.failure, None);
-        assert_eq!(output.completed.len(), 3);
-        assert!(output.screenshot_png.is_some());
+        assert_eq!(result.output.call_id, "call-1");
+        assert_eq!(result.output.failure, None);
+        assert_eq!(result.output.completed.len(), 3);
+        // The screenshot is a sanitized projection, not raw bytes.
+        assert!(result.output.has_screenshot());
+        // The old `screenshot_png: Option<Vec<u8>>` field is removed; the
+        // sanitized projection contains byte_count, not raw bytes.
+        assert!(result.live_frame.is_some());
+        // The sanitized projection contains no pixel data.
+        let sanitized = result.output.sanitized_screenshot().unwrap();
+        assert!(sanitized.byte_count > 0);
+        let proj_json = serde_json::to_string(sanitized).unwrap();
+        assert!(!proj_json.contains("base64"));
+        assert!(!proj_json.contains("data:image"));
         assert_eq!(
             backend.recorded[..3],
             actions
@@ -2660,17 +2722,26 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(matches!(backend.recorded[3], ComputerAction::CaptureFull));
+        // The transient wire payload is built from the live frame via a scoped
+        // borrow, not from a serializable field on the output.
+        let transient = result.transient_wire().unwrap();
+        let wire = transient.wire_payload();
         assert_eq!(
-            output.wire_item()["type"],
+            wire["type"],
             serde_json::Value::String("computer_call_output".to_string())
         );
-        assert_eq!(output.wire_item()["call_id"], "call-1");
-        assert_eq!(output.wire_item()["output"]["type"], "computer_screenshot");
+        assert_eq!(wire["call_id"], "call-1");
+        assert_eq!(wire["output"]["type"], "computer_screenshot");
         assert!(
-            output.wire_item()["output"]["image_url"]
+            wire["output"]["image_url"]
                 .as_str()
                 .unwrap()
                 .starts_with("data:image/png;base64,")
+        );
+        // The transient request's projection matches the output's projection.
+        assert_eq!(
+            transient.projection().checksum,
+            result.output.sanitized_screenshot().unwrap().checksum
         );
     }
 
@@ -2686,12 +2757,22 @@ mod tests {
             ],
         });
         let mut backend = FakeBackend::new();
-        let output = execute_openai_computer_call_json(&mut backend, &call)
+        let result = execute_openai_computer_call_json(&mut backend, &call)
             .await
             .unwrap();
 
-        assert_eq!(output.call_id, "call-json");
-        assert_eq!(output.failure, None);
+        assert_eq!(result.output.call_id, "call-json");
+        assert_eq!(result.output.failure, None);
+        // The screenshot is a sanitized projection, not raw bytes.
+        assert!(result.output.has_screenshot());
+        // The old `screenshot_png: Option<Vec<u8>>` field is removed; the
+        // sanitized projection contains byte_count, not raw bytes.
+        assert!(result.live_frame.is_some());
+        // The sanitized projection contains no pixel data.
+        let proj_json =
+            serde_json::to_string(result.output.sanitized_screenshot().unwrap()).unwrap();
+        assert!(!proj_json.contains("base64"));
+        assert!(!proj_json.contains("data:image"));
         assert_eq!(backend.recorded.len(), 5);
         assert!(matches!(
             backend.recorded[0],
@@ -2735,12 +2816,17 @@ mod tests {
             OpenAiComputerAction::TypeText("stop here".to_string()),
             OpenAiComputerAction::TypeText("must not execute".to_string()),
         ];
-        let output = execute_openai_computer_call(&mut backend, "call-2", &actions).await;
+        let result = execute_openai_computer_call(&mut backend, "call-2", &actions).await;
 
-        assert_eq!(output.call_id, "call-2");
-        assert_eq!(output.completed.len(), 1);
-        assert_eq!(output.failure.as_ref().unwrap().index, 1);
-        assert_eq!(output.screenshot_png, None);
+        assert_eq!(result.output.call_id, "call-2");
+        assert_eq!(result.output.completed.len(), 1);
+        assert_eq!(result.output.failure.as_ref().unwrap().index, 1);
+        // On failure, no screenshot is captured and no live frame exists.
+        assert!(!result.output.has_screenshot());
+        // The old `screenshot_png: Option<Vec<u8>>` field is removed; no
+        // screenshot is captured on failure.
+        assert!(result.live_frame.is_none());
+        assert!(result.transient_wire().is_none());
         assert_eq!(
             backend.recorded,
             actions[..=1]

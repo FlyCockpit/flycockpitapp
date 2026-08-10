@@ -2573,6 +2573,12 @@ mod tests {
         sealed.targets[0].slots[0].attempts[0].resource_maximum[0].reservation_identity =
             resource_identity;
         sealed.spend.reservation_id = format!("spend:{suffix}");
+        let provider_request_identity = format!("request:{suffix}");
+        let provider_idempotency_identity = format!("idem:{suffix}");
+        sealed.targets[0].slots[0].attempts[0].provider_request_identity =
+            provider_request_identity.clone();
+        sealed.targets[0].slots[0].attempts[0].provider_idempotency_identity =
+            provider_idempotency_identity.clone();
         let canonical = sealed.canonical_bytes().unwrap();
         let plan_digest = sealed.digest().unwrap();
         let policy = MediaResourcePolicy::default();
@@ -2642,7 +2648,7 @@ mod tests {
                 project_key: format!("fixture-project-{suffix}"),
             },
             vec![AttemptMaximum {
-                attempt_id: "idem:1".into(),
+                attempt_id: provider_idempotency_identity.clone(),
                 usd_micros: Some(10),
             }],
             1,
@@ -2671,8 +2677,8 @@ mod tests {
                     managed_artifact_id: slot.managed_artifact_id,
                     attempts: vec![CreateImageGenerationAttempt {
                         attempt_number: 1,
-                        provider_request_identity: "request:1".into(),
-                        provider_idempotency_identity: "idem:1".into(),
+                        provider_request_identity,
+                        provider_idempotency_identity,
                     }],
                 }],
             )?;

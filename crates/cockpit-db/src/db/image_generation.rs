@@ -106,7 +106,7 @@ pub const fn artifact_transition_allowed(
             )
             | (S::CleanupPending, S::Deleting | S::SecurityBlocked)
             | (S::Deleting, S::Tombstoned | S::SecurityBlocked)
-            | (S::SecurityBlocked, S::CleanupPending)
+            | (S::SecurityBlocked, S::CleanupPending | S::Retained)
     )
 }
 
@@ -1983,6 +1983,9 @@ impl Db {
                 ) | (
                     ImageGenerationArtifactState::SecurityBlocked,
                     ImageGenerationArtifactState::CleanupPending
+                ) | (
+                    ImageGenerationArtifactState::SecurityBlocked,
+                    ImageGenerationArtifactState::Retained
                 )
             ),
             "artifact transition requires a specialized authority CAS"

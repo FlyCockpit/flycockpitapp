@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::{Result, ensure};
+use anyhow::{Context as _, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
@@ -243,6 +243,7 @@ pub struct RecordedImageArtifactSecurityRecovery {
     artifact_id: Uuid,
     artifact_generation: u64,
     component_set_digest: String,
+    publication_operation_id: Option<Uuid>,
 }
 
 impl ImageGenerationOwnerContextAuthority {
@@ -295,6 +296,7 @@ impl ImageGenerationOwnerContextAuthority {
             artifact_id: input.artifact_id,
             artifact_generation: input.artifact_generation,
             component_set_digest: input.component_set_digest.clone(),
+            publication_operation_id: input.publication_operation_id,
         })
     }
 
@@ -397,6 +399,78 @@ impl ImageGenerationOwnerContextAuthority {
             recorded.operation_id, recorded.component_set_digest
         )));
         ensure!(tx.execute("UPDATE image_generation_artifact_security_recovery_audits SET state='applied',outcome_digest=?1,decided_at_unix_ms=?2 WHERE recovery_operation_id=?3 AND principal_digest=?4 AND state='recorded'",params![outcome,now,recorded.operation_id.to_string(),self.principal_digest])?==1,"security recovery audit compare-and-set lost");
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn complete_verified_late_publication(
+        &self,
+        conn: &Connection,
+        recorded: RecordedImageArtifactSecurityRecovery,
+        output: &HeldImageGenerationOutputDirectory,
+        recovery: &HeldDirectoryRecovery,
+    ) -> Result<()> {
+        let operation_id = recorded.operation_id;
+        let result =
+            self.complete_verified_late_publication_inner(conn, &recorded, output, recovery);
+        if let Err(error) = result {
+            let _ = self.close_security_recovery_audit(
+                conn,
+                operation_id,
+                "proof_failed",
+                format!("publication_proof_failed:{operation_id}").as_bytes(),
+            );
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn complete_verified_late_publication_inner(
+        &self,
+        conn: &Connection,
+        recorded: &RecordedImageArtifactSecurityRecovery,
+        output: &HeldImageGenerationOutputDirectory,
+        recovery: &HeldDirectoryRecovery,
+    ) -> Result<()> {
+        ensure!(
+            recorded.disposition
+                == ImageArtifactSecurityRecoveryDisposition::CompleteVerifiedLatePublication,
+            "security recovery disposition differs"
+        );
+        let publication_operation_id = recorded
+            .publication_operation_id
+            .context("security recovery publication identity is absent")?;
+        let effect = output.reconcile_publication(recovery)?;
+        let HeldDirectoryEffectOutcome::AppliedDurable(effect) = effect else {
+            anyhow::bail!("late publication held outcome is not durably applied")
+        };
+        let destination = effect
+            .destination_name()
+            .context("late publication destination evidence is absent")?;
+        let authority = &output.authority.0;
+        let evidence=cockpit_db::db::image_generation::ImageGenerationLatePublicationEvidenceV1::OutputDurable{schema_version:1,identity_digest:effect.artifact().identity_digest().to_owned(),security_digest:effect.artifact().security_digest().to_owned(),byte_length:effect.artifact().byte_length().to_string(),sha256:effect.artifact().sha256().to_owned(),parent_sync_digest:authority.parent_identity_digest.clone()}.canonical_json()?;
+        let row=conn.query_row("SELECT p.version,p.destination_name,p.output_authority_digest,p.output_authority_generation,p.expected_slot_version,a.state FROM image_generation_late_publication_leases p JOIN image_generation_artifacts a ON a.artifact_id=p.artifact_id WHERE p.publication_operation_id=?1 AND p.artifact_id=?2 AND p.artifact_generation=?3 AND p.state='security_blocked'",params![publication_operation_id.to_string(),recorded.artifact_id.to_string(),i64::try_from(recorded.artifact_generation)?],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,i64>(3)?,row.get::<_,i64>(4)?,row.get::<_,String>(5)?))).optional()?.context("security-blocked publication is unavailable")?;
+        ensure!(
+            row.1 == destination
+                && row.2 == authority.canonical_destination_digest
+                && row.3 == i64::try_from(authority.authority_generation)?
+                && matches!(row.5.as_str(), "late_quarantined" | "security_blocked"),
+            "late publication authority differs"
+        );
+        let tx = conn.unchecked_transaction()?;
+        let now: i64 = tx.query_row(
+            "SELECT CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)",
+            [],
+            |row| row.get(0),
+        )?;
+        tx.execute("INSERT INTO image_generation_user_published_outputs(publication_operation_id,artifact_id,artifact_generation,output_authority_digest,output_authority_generation,destination_name,output_evidence_json,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![publication_operation_id.to_string(),recorded.artifact_id.to_string(),i64::try_from(recorded.artifact_generation)?,row.2,row.3,row.1,evidence,now])?;
+        ensure!(tx.execute("UPDATE image_generation_late_publication_leases SET state='published',version=version+1,output_evidence_json=?1,decided_at_unix_ms=?2 WHERE publication_operation_id=?3 AND state='security_blocked' AND version=?4",params![evidence,now,publication_operation_id.to_string(),row.0])?==1,"security publication lease compare-and-set lost");
+        let outcome = crate::intel::hex_lower(&Sha256::digest(format!(
+            "published:{publication_operation_id}:{evidence}"
+        )));
+        ensure!(tx.execute("UPDATE image_generation_artifact_security_recovery_audits SET state='applied',outcome_digest=?1,decided_at_unix_ms=?2 WHERE recovery_operation_id=?3 AND principal_digest=?4 AND state='recorded'",params![outcome,now,recorded.operation_id.to_string(),self.principal_digest])?==1,"security recovery audit compare-and-set lost");
+        ensure!(tx.execute("UPDATE image_generation_artifacts SET state='retained',generation=generation+1,updated_at_unix_ms=?1 WHERE artifact_id=?2 AND state IN ('late_quarantined','security_blocked') AND generation=?3",params![now,recorded.artifact_id.to_string(),i64::try_from(recorded.artifact_generation)?])?==1,"security publication artifact compare-and-set lost");
+        ensure!(tx.execute("UPDATE image_generation_slots SET state='published',version=version+1,published_disposition='late_authorized',published_disposition_generation=version+1 WHERE job_id=(SELECT job_id FROM image_generation_artifacts WHERE artifact_id=?1) AND slot_id=(SELECT slot_id FROM image_generation_artifacts WHERE artifact_id=?1) AND state='late_quarantined' AND version=?2 AND result_after_cancel=1",params![recorded.artifact_id.to_string(),row.4])?==1,"security publication slot compare-and-set lost");
         tx.commit()?;
         Ok(())
     }

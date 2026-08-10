@@ -3446,7 +3446,7 @@ INSERT INTO image_generation_artifact_transitions VALUES
 ('late_quarantined','retained'),('late_quarantined','cleanup_pending'),('late_quarantined','security_blocked'),
 ('cleanup_pending','deleting'),('cleanup_pending','security_blocked'),
 ('deleting','tombstoned'),('deleting','security_blocked'),
-('security_blocked','cleanup_pending');
+('security_blocked','cleanup_pending'),('security_blocked','retained');
 CREATE TABLE image_generation_component_transitions(from_state TEXT NOT NULL,to_state TEXT NOT NULL,PRIMARY KEY(from_state,to_state));
 INSERT INTO image_generation_component_transitions VALUES
 ('planned','writing'),('planned','cleanup_pending'),('planned','security_blocked'),
@@ -3514,6 +3514,9 @@ BEGIN SELECT RAISE(ABORT,'late artifact retention lacks exact published disposit
 CREATE TRIGGER image_generation_artifact_security_recovery_guard BEFORE UPDATE OF state ON image_generation_artifacts
 WHEN OLD.state='security_blocked' AND NEW.state='cleanup_pending' AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_cleanup_intents i WHERE i.artifact_id=NEW.artifact_id AND i.reason='owner_recovery' AND i.expected_artifact_generation=NEW.generation)
 BEGIN SELECT RAISE(ABORT,'security-blocked artifact lacks Owner recovery intent'); END;
+CREATE TRIGGER image_generation_artifact_security_publication_guard BEFORE UPDATE OF state ON image_generation_artifacts
+WHEN OLD.state='security_blocked' AND NEW.state='retained' AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_security_recovery_audits r JOIN image_generation_late_publication_leases p ON p.publication_operation_id=r.publication_operation_id WHERE r.artifact_id=NEW.artifact_id AND r.artifact_generation=OLD.generation AND r.disposition='complete_verified_late_publication' AND r.state='applied' AND p.state='published')
+BEGIN SELECT RAISE(ABORT,'security-blocked artifact lacks verified Owner publication'); END;
 CREATE TRIGGER image_generation_component_security_recovery_guard BEFORE UPDATE OF state ON image_generation_artifact_components
 WHEN OLD.state='security_blocked' AND NEW.state='cleanup_pending' AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_cleanup_intents i WHERE i.artifact_id=NEW.artifact_id AND i.reason='owner_recovery')
 BEGIN SELECT RAISE(ABORT,'security-blocked component lacks Owner recovery intent'); END;

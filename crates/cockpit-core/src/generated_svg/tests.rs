@@ -13,7 +13,7 @@ fn bad(svg: &str) -> SvgSanitizeCode {
 #[test]
 fn generated_svg_allowlist() {
     let artifact = ok(
-        r##"<title xml:space="preserve">safe</title><desc>description</desc><defs><linearGradient id="paint"><stop offset="0" stop-color="red"/><stop offset="100%" stop-color="#ABC"/></linearGradient><clipPath id="clip"><rect width="1" height="1"/></clipPath><mask id="mask"><path d="M 0 0 L 1 1 Z"/></mask></defs><g fill="url(#paint)" clip-path="url(#clip)" mask="url(#mask)" transform="translate(1,2)"><rect id="shape" x="0" y="0" width="10" height="10" rx="1" fill-opacity="0.5"/></g>"##,
+        r##"<title>safe</title><desc>description</desc><defs><linearGradient id="paint"><stop offset="0" stop-color="red"/><stop offset="100%" stop-color="#ABC"/></linearGradient><clipPath id="clip"><rect width="1" height="1"/></clipPath><mask id="mask"><path d="M 0 0 L 1 1 Z"/></mask></defs><g fill="url(#paint)" clip-path="url(#clip)" mask="url(#mask)" transform="translate(1,2)"><rect id="shape" x="0" y="0" width="10" height="10" rx="1" fill-opacity="0.5"/></g>"##,
     );
     let text = std::str::from_utf8(artifact.as_bytes()).unwrap();
     assert!(text.contains("svg_000001"));
@@ -152,6 +152,32 @@ fn generated_svg_structural_verify() {
             .unwrap_err()
             .code(),
         SvgSanitizeCode::DefenseMismatch
+    );
+}
+
+#[test]
+fn generated_svg_defense_disagreement_is_never_projected_away() {
+    let raw = format!(r##"<svg xmlns="{SVG_NS}"><title xml:space="preserve">x</title></svg>"##);
+    assert_eq!(
+        sanitize_generated_svg(raw.as_bytes()).unwrap_err().code(),
+        SvgSanitizeCode::DefenseMismatch
+    );
+}
+
+#[test]
+fn generated_svg_transform_argument_roles_and_radial_radius_are_exact() {
+    assert!(!ok(r#"<g transform="translate(1000000 -1000000) rotate(360000 1000000 -1000000) scale(1000000)"/>"#).as_bytes().is_empty());
+    assert!(
+        sanitize_generated_svg(
+            format!(r#"<svg xmlns="{SVG_NS}"><g transform="rotate(360001)"/></svg>"#).as_bytes()
+        )
+        .is_err()
+    );
+    assert!(sanitize_generated_svg(format!(r#"<svg xmlns="{SVG_NS}"><defs><radialGradient id="g" r="0"><stop/></radialGradient></defs></svg>"#).as_bytes()).is_err());
+    assert!(
+        !ok(r#"<defs><radialGradient id="g" r="0.000001" fr="0"><stop/></radialGradient></defs>"#)
+            .as_bytes()
+            .is_empty()
     );
 }
 

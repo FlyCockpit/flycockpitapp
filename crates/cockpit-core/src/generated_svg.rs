@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::io::{self, Write};
 
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
@@ -262,22 +263,11 @@ pub fn sanitize_generated_svg(raw: &[u8]) -> Result<SanitizedSvgArtifact> {
             "document",
         ));
     }
-    // svg-hush 0.9.6 drops every namespaced attribute and documents
-    // `xml:space` as unsupported. Project only its two closed canonical
-    // spellings out of the defense input; the authoritative tree and the
-    // independent final verification still retain and validate them.
-    let defense_input = defense_projection(&canonical)?;
-    let mut hush = Vec::with_capacity(defense_input.len().min(MAX_CANONICAL_BYTES));
+    let mut hush = BoundedBytes::new(MAX_CANONICAL_BYTES);
     svg_hush::Filter::new()
-        .filter(defense_input.as_slice(), &mut hush)
+        .filter(canonical.as_slice(), &mut hush)
         .map_err(|_| SvgSanitizeError::new(SvgSanitizeCode::DefenseMismatch, "svg-hush"))?;
-    if hush.len() > MAX_CANONICAL_BYTES {
-        return Err(SvgSanitizeError::new(
-            SvgSanitizeCode::CanonicalBytes,
-            "svg-hush",
-        ));
-    }
-    verify_defense_output(&defense_input, &hush)?;
+    verify_defense_output(&canonical, hush.as_slice())?;
     let verified = canonicalize(
         parse_validate(&canonical, true, false)
             .map_err(|_| SvgSanitizeError::new(SvgSanitizeCode::StructuralVerify, "canonical"))?,
@@ -291,13 +281,44 @@ pub fn sanitize_generated_svg(raw: &[u8]) -> Result<SanitizedSvgArtifact> {
     Ok(SanitizedSvgArtifact(canonical))
 }
 
-fn defense_projection(canonical: &[u8]) -> Result<Vec<u8>> {
-    let canonical = std::str::from_utf8(canonical)
-        .map_err(|_| SvgSanitizeError::new(SvgSanitizeCode::StructuralVerify, "canonical"))?;
-    Ok(canonical
-        .replace(" xml:space=\"default\"", "")
-        .replace(" xml:space=\"preserve\"", "")
-        .into_bytes())
+struct BoundedBytes {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedBytes {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Write for BoundedBytes {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .is_none_or(|len| len > self.limit)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "generated SVG defense output exceeds limit",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn verify_defense_output(canonical: &[u8], hush: &[u8]) -> Result<()> {
@@ -1138,7 +1159,15 @@ fn validate_attr(
         return percent_or(v, 1, 1_000_000_000, 1, 1_000_000_000_000, true);
     }
     if matches!(a, "r" | "fr") && k == ElementKind::RadialGradient {
-        return percent_or(v, 0, 1_000_000_000, 0, 1_000_000_000_000, false);
+        let positive = a == "r";
+        return percent_or(
+            v,
+            if positive { 1 } else { 0 },
+            1_000_000_000,
+            if positive { 1 } else { 0 },
+            1_000_000_000_000,
+            positive,
+        );
     }
     let coordinate = matches!(
         a,
@@ -1400,7 +1429,16 @@ fn canonical_transform(v: &str) -> Result<String> {
         }
         let vals = args
             .into_iter()
-            .map(|x| number_range(x, -360_000_000_000, 360_000_000_000, false, "transform"))
+            .enumerate()
+            .map(|(index, value)| {
+                let angle = matches!(name, "skewX" | "skewY") || (name == "rotate" && index == 0);
+                let bound = if angle {
+                    360_000_000_000
+                } else {
+                    1_000_000_000_000
+                };
+                number_range(value, -bound, bound, false, "transform")
+            })
             .collect::<Result<Vec<_>>>()?;
         out.push(format!("{name}({})", vals.join(" ")));
         rest = rest[close + 1..].trim_start_matches(|character: char| {

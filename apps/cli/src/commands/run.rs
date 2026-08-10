@@ -589,6 +589,7 @@ fn load_and_validate_images(paths: &[PathBuf]) -> Result<Vec<Vec<u8>>> {
             let bytes = std::fs::read(path)
                 .with_context(|| format!("reading attachment {}", path.display()))?;
             crate::daemon::server::validate_png_attachment_blocking(bytes)
+                .map(|validated| validated.bytes)
                 .map_err(|error| anyhow::anyhow!(error.message))
         })
         .collect::<Result<_>>()?;

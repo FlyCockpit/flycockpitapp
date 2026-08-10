@@ -11,14 +11,82 @@ use crate::daemon::{EventSender, SharedRedactionTable};
 pub type TerminalResult = std::result::Result<Response, ErrorPayload>;
 pub type TerminalHostHandle = Arc<dyn TerminalHost>;
 
+/// Server-derived identity for terminal authority decisions. This type is
+/// deliberately not part of `cockpit-proto`: clients can present only the
+/// opaque binding capability issued after daemon authorization.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AuthenticatedTerminalContext {
+    pub principal_id: String,
+    pub client_instance_id: Uuid,
+    pub connection_epoch: u64,
+}
+
 pub trait TerminalHost: std::fmt::Debug + Send + Sync {
-    fn open(&self, cwd: Option<String>, cols: u16, rows: u16) -> TerminalResult;
-    fn attach(&self, terminal_id: Uuid, cols: u16, rows: u16) -> TerminalResult;
-    fn release_viewer(&self, terminal_id: Uuid);
-    fn input(&self, terminal_id: Uuid, bytes: Vec<u8>) -> TerminalResult;
-    fn resize(&self, terminal_id: Uuid, cols: u16, rows: u16) -> TerminalResult;
-    fn close(&self, terminal_id: Uuid) -> TerminalResult;
-    fn paste_image(&self, terminal_id: Uuid, bytes: &[u8]) -> TerminalResult;
+    fn open(
+        &self,
+        context: AuthenticatedTerminalContext,
+        session_id: Uuid,
+        cwd: Option<String>,
+        cols: u16,
+        rows: u16,
+    ) -> TerminalResult;
+    fn attach(
+        &self,
+        context: AuthenticatedTerminalContext,
+        session_id: Uuid,
+        terminal_id: Uuid,
+        cols: u16,
+        rows: u16,
+    ) -> TerminalResult;
+    fn release_viewer(
+        &self,
+        terminal_id: Uuid,
+        binding: crate::daemon::proto::terminal::TerminalBinding,
+    );
+    fn input(
+        &self,
+        terminal_id: Uuid,
+        binding: crate::daemon::proto::terminal::TerminalBinding,
+        bytes: Vec<u8>,
+    ) -> TerminalResult;
+    fn resize(
+        &self,
+        terminal_id: Uuid,
+        binding: crate::daemon::proto::terminal::TerminalBinding,
+        cols: u16,
+        rows: u16,
+    ) -> TerminalResult;
+    fn close(
+        &self,
+        terminal_id: Uuid,
+        binding: crate::daemon::proto::terminal::TerminalBinding,
+    ) -> TerminalResult;
+    fn ingress_begin(
+        &self,
+        terminal_id: Uuid,
+        binding: crate::daemon::proto::terminal::TerminalBinding,
+        metadata: crate::daemon::proto::terminal::TerminalIngressMetadata,
+    ) -> TerminalResult;
+    fn ingress_chunk(
+        &self,
+        terminal_id: Uuid,
+        binding: crate::daemon::proto::terminal::TerminalBinding,
+        operation_id: Uuid,
+        offset: u64,
+        bytes: Vec<u8>,
+    ) -> TerminalResult;
+    fn ingress_finish(
+        &self,
+        terminal_id: Uuid,
+        binding: crate::daemon::proto::terminal::TerminalBinding,
+        operation_id: Uuid,
+    ) -> TerminalResult;
+    fn ingress_status(
+        &self,
+        terminal_id: Uuid,
+        binding: crate::daemon::proto::terminal::TerminalBinding,
+        operation_id: Uuid,
+    ) -> TerminalResult;
     fn contains(&self, terminal_id: Uuid) -> bool;
     fn sweep_idle(&self, now: Instant) -> Vec<Uuid>;
 }
@@ -72,29 +140,94 @@ fn unsupported_host_factory() -> TerminalHostFactory {
 struct UnsupportedTerminalHost;
 
 impl TerminalHost for UnsupportedTerminalHost {
-    fn open(&self, _cwd: Option<String>, _cols: u16, _rows: u16) -> TerminalResult {
+    fn open(
+        &self,
+        _context: AuthenticatedTerminalContext,
+        _session_id: Uuid,
+        _cwd: Option<String>,
+        _cols: u16,
+        _rows: u16,
+    ) -> TerminalResult {
         Err(unsupported_terminal_host())
     }
 
-    fn attach(&self, _terminal_id: Uuid, _cols: u16, _rows: u16) -> TerminalResult {
+    fn attach(
+        &self,
+        _context: AuthenticatedTerminalContext,
+        _session_id: Uuid,
+        _terminal_id: Uuid,
+        _cols: u16,
+        _rows: u16,
+    ) -> TerminalResult {
         Err(unsupported_terminal_host())
     }
 
-    fn release_viewer(&self, _terminal_id: Uuid) {}
+    fn release_viewer(
+        &self,
+        _terminal_id: Uuid,
+        _binding: crate::daemon::proto::terminal::TerminalBinding,
+    ) {
+    }
 
-    fn input(&self, _terminal_id: Uuid, _bytes: Vec<u8>) -> TerminalResult {
+    fn input(
+        &self,
+        _terminal_id: Uuid,
+        _binding: crate::daemon::proto::terminal::TerminalBinding,
+        _bytes: Vec<u8>,
+    ) -> TerminalResult {
         Err(unsupported_terminal_host())
     }
 
-    fn resize(&self, _terminal_id: Uuid, _cols: u16, _rows: u16) -> TerminalResult {
+    fn resize(
+        &self,
+        _terminal_id: Uuid,
+        _binding: crate::daemon::proto::terminal::TerminalBinding,
+        _cols: u16,
+        _rows: u16,
+    ) -> TerminalResult {
         Err(unsupported_terminal_host())
     }
 
-    fn close(&self, _terminal_id: Uuid) -> TerminalResult {
+    fn close(
+        &self,
+        _terminal_id: Uuid,
+        _binding: crate::daemon::proto::terminal::TerminalBinding,
+    ) -> TerminalResult {
         Err(unsupported_terminal_host())
     }
 
-    fn paste_image(&self, _terminal_id: Uuid, _bytes: &[u8]) -> TerminalResult {
+    fn ingress_begin(
+        &self,
+        _terminal_id: Uuid,
+        _binding: crate::daemon::proto::terminal::TerminalBinding,
+        _metadata: crate::daemon::proto::terminal::TerminalIngressMetadata,
+    ) -> TerminalResult {
+        Err(unsupported_terminal_host())
+    }
+    fn ingress_chunk(
+        &self,
+        _terminal_id: Uuid,
+        _binding: crate::daemon::proto::terminal::TerminalBinding,
+        _operation_id: Uuid,
+        _offset: u64,
+        _bytes: Vec<u8>,
+    ) -> TerminalResult {
+        Err(unsupported_terminal_host())
+    }
+    fn ingress_finish(
+        &self,
+        _terminal_id: Uuid,
+        _binding: crate::daemon::proto::terminal::TerminalBinding,
+        _operation_id: Uuid,
+    ) -> TerminalResult {
+        Err(unsupported_terminal_host())
+    }
+    fn ingress_status(
+        &self,
+        _terminal_id: Uuid,
+        _binding: crate::daemon::proto::terminal::TerminalBinding,
+        _operation_id: Uuid,
+    ) -> TerminalResult {
         Err(unsupported_terminal_host())
     }
 
@@ -154,7 +287,14 @@ impl TestTerminalHost {
 
 #[cfg(test)]
 impl TerminalHost for TestTerminalHost {
-    fn open(&self, cwd: Option<String>, _cols: u16, _rows: u16) -> TerminalResult {
+    fn open(
+        &self,
+        _context: AuthenticatedTerminalContext,
+        _session_id: Uuid,
+        cwd: Option<String>,
+        _cols: u16,
+        _rows: u16,
+    ) -> TerminalResult {
         // Same cwd validation as the real host's `resolve_cwd`, without
         // consulting the home directory for the `None` default.
         if let Some(cwd) = cwd
@@ -171,31 +311,68 @@ impl TerminalHost for TestTerminalHost {
             terminal_id,
             viewer_count: 1,
             recording: false,
+            binding: crate::daemon::proto::terminal::TerminalBinding {
+                binding_id: Uuid::nil(),
+                binding_epoch: 1,
+            },
+            terminal_generation: 1,
         })
     }
 
-    fn attach(&self, terminal_id: Uuid, _cols: u16, _rows: u16) -> TerminalResult {
+    fn attach(
+        &self,
+        _context: AuthenticatedTerminalContext,
+        _session_id: Uuid,
+        terminal_id: Uuid,
+        _cols: u16,
+        _rows: u16,
+    ) -> TerminalResult {
         self.require_open(terminal_id)?;
         Ok(Response::TerminalOpened {
             terminal_id,
             viewer_count: 1,
             recording: false,
+            binding: crate::daemon::proto::terminal::TerminalBinding {
+                binding_id: Uuid::nil(),
+                binding_epoch: 1,
+            },
+            terminal_generation: 1,
         })
     }
 
-    fn release_viewer(&self, _terminal_id: Uuid) {}
+    fn release_viewer(
+        &self,
+        _terminal_id: Uuid,
+        _binding: crate::daemon::proto::terminal::TerminalBinding,
+    ) {
+    }
 
-    fn input(&self, terminal_id: Uuid, _bytes: Vec<u8>) -> TerminalResult {
+    fn input(
+        &self,
+        terminal_id: Uuid,
+        _binding: crate::daemon::proto::terminal::TerminalBinding,
+        _bytes: Vec<u8>,
+    ) -> TerminalResult {
         self.require_open(terminal_id)?;
         Ok(Response::Ack)
     }
 
-    fn resize(&self, terminal_id: Uuid, _cols: u16, _rows: u16) -> TerminalResult {
+    fn resize(
+        &self,
+        terminal_id: Uuid,
+        _binding: crate::daemon::proto::terminal::TerminalBinding,
+        _cols: u16,
+        _rows: u16,
+    ) -> TerminalResult {
         self.require_open(terminal_id)?;
         Ok(Response::Ack)
     }
 
-    fn close(&self, terminal_id: Uuid) -> TerminalResult {
+    fn close(
+        &self,
+        terminal_id: Uuid,
+        _binding: crate::daemon::proto::terminal::TerminalBinding,
+    ) -> TerminalResult {
         if self.open_terminals.lock().unwrap().remove(&terminal_id) {
             Ok(Response::Ack)
         } else {
@@ -203,12 +380,66 @@ impl TerminalHost for TestTerminalHost {
         }
     }
 
-    fn paste_image(&self, terminal_id: Uuid, _bytes: &[u8]) -> TerminalResult {
+    fn ingress_begin(
+        &self,
+        terminal_id: Uuid,
+        _binding: crate::daemon::proto::terminal::TerminalBinding,
+        metadata: crate::daemon::proto::terminal::TerminalIngressMetadata,
+    ) -> TerminalResult {
         self.require_open(terminal_id)?;
-        Ok(Response::TerminalPasteImage {
-            terminal_id,
-            path: String::new(),
+        Ok(Response::TerminalIngress {
+            receipt: crate::daemon::proto::terminal::TerminalIngressReceipt {
+                operation_id: metadata.operation_id,
+                state: crate::daemon::proto::terminal::TerminalIngressState::Prepared,
+                next_offset: 0,
+                input_sequence: None,
+                expires_at_unix_ms: None,
+            },
         })
+    }
+    fn ingress_chunk(
+        &self,
+        terminal_id: Uuid,
+        _binding: crate::daemon::proto::terminal::TerminalBinding,
+        operation_id: Uuid,
+        offset: u64,
+        bytes: Vec<u8>,
+    ) -> TerminalResult {
+        self.require_open(terminal_id)?;
+        Ok(Response::TerminalIngress {
+            receipt: crate::daemon::proto::terminal::TerminalIngressReceipt {
+                operation_id,
+                state: crate::daemon::proto::terminal::TerminalIngressState::Prepared,
+                next_offset: offset + bytes.len() as u64,
+                input_sequence: None,
+                expires_at_unix_ms: None,
+            },
+        })
+    }
+    fn ingress_finish(
+        &self,
+        terminal_id: Uuid,
+        _binding: crate::daemon::proto::terminal::TerminalBinding,
+        operation_id: Uuid,
+    ) -> TerminalResult {
+        self.require_open(terminal_id)?;
+        Ok(Response::TerminalIngress {
+            receipt: crate::daemon::proto::terminal::TerminalIngressReceipt {
+                operation_id,
+                state: crate::daemon::proto::terminal::TerminalIngressState::Committed,
+                next_offset: 0,
+                input_sequence: Some(1),
+                expires_at_unix_ms: None,
+            },
+        })
+    }
+    fn ingress_status(
+        &self,
+        terminal_id: Uuid,
+        binding: crate::daemon::proto::terminal::TerminalBinding,
+        operation_id: Uuid,
+    ) -> TerminalResult {
+        self.ingress_finish(terminal_id, binding, operation_id)
     }
 
     fn contains(&self, terminal_id: Uuid) -> bool {

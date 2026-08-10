@@ -771,11 +771,15 @@ async fn channel_task(
     outbound: mpsc::Sender<OutboundFrame>,
 ) -> Result<()> {
     let (daemon_side, relay_side) = tokio::io::duplex(CHANNEL_DUPLEX_BYTES);
-    let daemon_task = tokio::spawn(crate::daemon::server::handle_relay_channel_as(
-        daemon_side,
-        ctx.clone(),
-        ClientPrincipal::from_relay(principal),
-    ));
+    let client_instance_id = relay_channel_client_instance_id(&channel_id);
+    let daemon_task = tokio::spawn(
+        crate::daemon::server::handle_relay_channel_as_with_instance(
+            daemon_side,
+            ctx.clone(),
+            ClientPrincipal::from_relay(principal),
+            client_instance_id,
+        ),
+    );
     let (read_half, mut write_half) = tokio::io::split(relay_side);
     let writer = tokio::spawn(async move {
         while let Some(payload) = input_rx.recv().await {
@@ -806,6 +810,14 @@ async fn channel_task(
     daemon_task.abort();
     let _ = relay_url;
     Ok(())
+}
+
+fn relay_channel_client_instance_id(channel_id: &str) -> uuid::Uuid {
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(channel_id.as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    uuid::Uuid::from_bytes(bytes)
 }
 
 async fn publish_status(

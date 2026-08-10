@@ -60,3 +60,115 @@ pub fn hold_config_mutation_lock(
 ) -> anyhow::Result<HeldConfigMutationLock> {
     files::ConfigMutationLock::acquire(target).map(HeldConfigMutationLock)
 }
+
+/// Reuse the audited component-relative/no-follow private-file primitive for
+/// short-lived terminal ingress. Callers must still enforce their own root,
+/// filename, media, and lifecycle policy.
+pub fn write_terminal_ingress_private_file(
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> anyhow::Result<TerminalIngressFileIdentity> {
+    files::prepare_atomic_write(path, bytes)?.commit_noreplace()?;
+    let (_, _, identity) = files::read_file_nofollow_with_identity(path)?
+        .ok_or_else(|| anyhow::anyhow!("published terminal ingress file disappeared"))?;
+    Ok(identity)
+}
+
+/// Create/open every terminal-ingress directory component without following
+/// symlinks or reparse points and enforce the platform private-directory mode.
+pub fn ensure_terminal_ingress_private_dir(path: &std::path::Path) -> anyhow::Result<()> {
+    files::ensure_parent_dir_private(&path.join("ingress-leaf"))
+}
+
+/// Read a terminal-ingress file through the same retained-parent no-follow
+/// implementation used by config journals.
+pub fn read_terminal_ingress_file_nofollow(
+    path: &std::path::Path,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    files::read_file_nofollow(path)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalIngressFileIdentity {
+    pub volume: u64,
+    pub file: u64,
+    pub links: u32,
+}
+
+#[derive(Debug)]
+pub struct VerifiedTerminalIngressFile {
+    file: std::fs::File,
+    pub bytes: Vec<u8>,
+    pub identity: TerminalIngressFileIdentity,
+}
+
+impl Drop for VerifiedTerminalIngressFile {
+    fn drop(&mut self) {
+        // The held exact object is scrubbed even if a same-user process renamed
+        // it after verification. Do not perform a later pathname unlink: POSIX
+        // has no conditional unlink-by-identity primitive, so check-then-unlink
+        // could delete a same-user replacement. Generation teardown owns the
+        // remaining private namespace; this handle cleanup targets only the
+        // proven object.
+        let _ = self.file.set_len(0);
+    }
+}
+
+pub fn read_terminal_ingress_file_verified(
+    path: &std::path::Path,
+) -> anyhow::Result<Option<(Vec<u8>, TerminalIngressFileIdentity)>> {
+    Ok(
+        files::read_file_nofollow_with_identity(path)?
+            .map(|(_, bytes, identity)| (bytes, identity)),
+    )
+}
+
+pub fn hold_terminal_ingress_file_verified(
+    path: &std::path::Path,
+) -> anyhow::Result<Option<VerifiedTerminalIngressFile>> {
+    Ok(
+        files::read_file_nofollow_with_identity(path)?.map(|(file, bytes, identity)| {
+            VerifiedTerminalIngressFile {
+                file,
+                bytes,
+                identity,
+            }
+        }),
+    )
+}
+
+/// Remove the exact no-follow terminal-ingress entry through the audited
+/// retained-parent platform primitive.
+pub fn remove_terminal_ingress_file_nofollow(path: &std::path::Path) -> anyhow::Result<()> {
+    files::remove_file_nofollow(path)
+}
+
+#[cfg(all(test, unix))]
+mod terminal_ingress_cleanup_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn held_cleanup_scrubs_exact_inode_without_deleting_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let published = temp.path().join("published.png");
+        let renamed = temp.path().join("renamed.png");
+        std::fs::write(&published, b"verified-image").unwrap();
+        std::fs::set_permissions(&published, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let held = hold_terminal_ingress_file_verified(&published)
+            .unwrap()
+            .unwrap();
+        std::fs::rename(&published, &renamed).unwrap();
+        std::fs::write(&published, b"replacement-must-survive").unwrap();
+        std::fs::set_permissions(&published, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        drop(held);
+
+        assert_eq!(
+            std::fs::read(&published).unwrap(),
+            b"replacement-must-survive"
+        );
+        assert!(std::fs::read(&renamed).unwrap().is_empty());
+    }
+}

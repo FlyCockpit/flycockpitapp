@@ -556,8 +556,251 @@ pub(crate) fn read_file_nofollow(path: &Path) -> Result<Option<Vec<u8>>> {
     }
 }
 
+pub(crate) fn read_file_nofollow_with_identity(
+    path: &Path,
+) -> Result<Option<(std::fs::File, Vec<u8>, super::TerminalIngressFileIdentity)>> {
+    let (parent, file_name) = match open_parent_directory_nofollow(path) {
+        Ok(parts) => parts,
+        Err(error) if root_cause_is_not_found(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    #[cfg(unix)]
+    let file = open_file_at_nofollow(
+        &parent,
+        &file_name,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    )?;
+    #[cfg(windows)]
+    let file = {
+        use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_READ_ATTRIBUTES, FILE_READ_DATA, SYNCHRONIZE,
+        };
+        open_windows_relative_nofollow(
+            &parent,
+            &file_name,
+            false,
+            FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_OPEN,
+        )?
+    };
+    #[cfg(all(not(unix), not(windows)))]
+    let file = std::fs::File::open(path)?;
+    let before = file.metadata()?;
+    if !before.is_file() {
+        anyhow::bail!("terminal ingress entry is not a regular file");
+    }
+    #[cfg(unix)]
+    let identity = {
+        use std::os::unix::fs::MetadataExt as _;
+        if before.uid() != unsafe { libc::geteuid() }
+            || before.mode() & 0o777 != 0o600
+            || before.nlink() != 1
+        {
+            anyhow::bail!("terminal ingress file ownership, mode, or link count changed");
+        }
+        super::TerminalIngressFileIdentity {
+            volume: before.dev(),
+            file: before.ino(),
+            links: before.nlink().try_into().unwrap_or(u32::MAX),
+        }
+    };
+    #[cfg(windows)]
+    let identity = {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        verify_windows_protected_dacl(&file)?;
+        super::TerminalIngressFileIdentity {
+            volume: u64::from(info.dwVolumeSerialNumber),
+            file: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+            links: info.nNumberOfLinks,
+        }
+    };
+    #[cfg(windows)]
+    if identity.links != 1 {
+        anyhow::bail!("terminal ingress file link count changed");
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    let identity = super::TerminalIngressFileIdentity {
+        volume: 0,
+        file: 0,
+        links: 1,
+    };
+    let mut file = file;
+    let bytes = read_all(&mut file, path)?;
+    Ok(Some((file, bytes, identity)))
+}
+
+#[cfg(windows)]
+fn verify_windows_protected_dacl(file: &std::fs::File) -> Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+        GetKernelObjectSecurity, GetLengthSid, GetSecurityDescriptorControl,
+        GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, IsWellKnownSid,
+        OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED, WinBuiltinAdministratorsSid,
+        WinLocalSystemSid,
+    };
+    let expected_owner = current_windows_user_sid()?;
+    let security_information = DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION;
+    let mut needed = 0u32;
+    unsafe {
+        GetKernelObjectSecurity(
+            file.as_raw_handle(),
+            security_information,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        );
+    }
+    if needed == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut descriptor = vec![0u8; needed as usize];
+    if unsafe {
+        GetKernelObjectSecurity(
+            file.as_raw_handle(),
+            security_information,
+            descriptor.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut control = 0u16;
+    let mut revision = 0u32;
+    if unsafe {
+        GetSecurityDescriptorControl(descriptor.as_mut_ptr().cast(), &mut control, &mut revision)
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if control & SE_DACL_PROTECTED == 0 {
+        anyhow::bail!("terminal ingress DACL is not protected");
+    }
+    let mut owner = std::ptr::null_mut();
+    let mut owner_defaulted = 0;
+    if unsafe {
+        GetSecurityDescriptorOwner(
+            descriptor.as_mut_ptr().cast(),
+            &mut owner,
+            &mut owner_defaulted,
+        )
+    } == 0
+        || owner.is_null()
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if unsafe { EqualSid(owner, expected_owner.as_ptr().cast()) } == 0 {
+        anyhow::bail!("terminal ingress object owner is not the daemon user");
+    }
+    let mut dacl_present = 0;
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut dacl_defaulted = 0;
+    if unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor.as_mut_ptr().cast(),
+            &mut dacl_present,
+            &mut dacl,
+            &mut dacl_defaulted,
+        )
+    } == 0
+        || dacl_present == 0
+        || dacl.is_null()
+    {
+        anyhow::bail!("terminal ingress file has no protected DACL");
+    }
+    let ace_count = unsafe { (*dacl).AceCount };
+    for index in 0..u32::from(ace_count) {
+        let mut raw_ace = std::ptr::null_mut();
+        if unsafe { GetAce(dacl, index, &mut raw_ace) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let header = raw_ace.cast::<windows_sys::Win32::Security::ACE_HEADER>();
+        let ace_type = unsafe { (*header).AceType };
+        // ACCESS_ALLOWED_ACE_TYPE is zero. Fail closed on object/callback
+        // allow ACE shapes because their SID offsets differ.
+        if ace_type == 0 {
+            let allowed = raw_ace.cast::<ACCESS_ALLOWED_ACE>();
+            let sid = unsafe { std::ptr::addr_of_mut!((*allowed).SidStart).cast() };
+            let approved = unsafe {
+                EqualSid(sid, expected_owner.as_ptr().cast()) != 0
+                    || IsWellKnownSid(sid, WinLocalSystemSid) != 0
+                    || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
+            };
+            if !approved {
+                anyhow::bail!("terminal ingress DACL grants an unapproved SID");
+            }
+        } else if matches!(ace_type, 5 | 9 | 11) {
+            anyhow::bail!("terminal ingress DACL contains an unsupported allow ACE");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn current_windows_user_sid() -> Result<Vec<u8>> {
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+    use windows_sys::Wdk::Storage::FileSystem::{NtOpenProcessToken, NtQueryInformationToken};
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Security::{GetLengthSid, TOKEN_QUERY, TOKEN_USER, TokenUser};
+
+    let mut token: HANDLE = std::ptr::null_mut();
+    let status = unsafe { NtOpenProcessToken((-1isize) as HANDLE, TOKEN_QUERY, &mut token) };
+    if status < 0 || token.is_null() {
+        anyhow::bail!("opening current process token failed with NTSTATUS {status:#x}");
+    }
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+    let mut needed = 0u32;
+    unsafe {
+        NtQueryInformationToken(
+            token.as_raw_handle(),
+            TokenUser,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        );
+    }
+    if needed < std::mem::size_of::<TOKEN_USER>() as u32 {
+        anyhow::bail!("current process token returned no user SID");
+    }
+    let mut info = vec![0u8; needed as usize];
+    let status = unsafe {
+        NtQueryInformationToken(
+            token.as_raw_handle(),
+            TokenUser,
+            info.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    };
+    if status < 0 {
+        anyhow::bail!("querying current process user SID failed with NTSTATUS {status:#x}");
+    }
+    let sid = unsafe { (*(info.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+    if sid.is_null() {
+        anyhow::bail!("current process token has a null user SID");
+    }
+    let sid_len = unsafe { GetLengthSid(sid) };
+    if sid_len == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut owned = vec![0u8; sid_len as usize];
+    unsafe { std::ptr::copy_nonoverlapping(sid.cast::<u8>(), owned.as_mut_ptr(), owned.len()) };
+    Ok(owned)
+}
+
 #[cfg(any(unix, windows))]
-fn read_all(mut file: std::fs::File, path: &Path) -> Result<Vec<u8>> {
+fn read_all(mut file: impl std::io::Read, path: &Path) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut file, &mut bytes)
         .with_context(|| format!("reading {}", path.display()))?;
@@ -743,7 +986,7 @@ impl PreparedAtomicWrite {
                 .tmp_file
                 .as_ref()
                 .expect("prepared atomic write always retains its temporary file");
-            rename_open_file_on_windows(tmp_file, &self.parent_dir, &self.destination_name)
+            rename_open_file_on_windows(tmp_file, &self.parent_dir, &self.destination_name, true)
                 .with_context(|| format!("replacing {}", self.parent.display()))?;
             self.tmp_file = None;
             let _ = self.parent_dir.sync_all();
@@ -760,6 +1003,58 @@ impl PreparedAtomicWrite {
             self.tmp_path = None;
             let _ = std::fs::File::open(&self.parent).and_then(|dir| dir.sync_all());
             Ok(())
+        }
+    }
+
+    pub(crate) fn commit_noreplace(mut self) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            use std::os::unix::ffi::OsStrExt as _;
+            let tmp_name = self
+                .tmp_name
+                .as_ref()
+                .expect("prepared atomic write has a temporary name");
+            let source = std::ffi::CString::new(tmp_name.as_bytes())?;
+            let destination = std::ffi::CString::new(self.destination_name.as_bytes())?;
+            // SAFETY: names are NUL-free and both operations are relative to
+            // the same retained directory descriptor. linkat is an atomic
+            // no-replace publication; unlink removes only the staging name.
+            let linked = unsafe {
+                libc::linkat(
+                    self.parent_dir.as_raw_fd(),
+                    source.as_ptr(),
+                    self.parent_dir.as_raw_fd(),
+                    destination.as_ptr(),
+                    0,
+                )
+            };
+            if linked != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("publishing private file without replacement");
+            }
+            unlink_file_at(&self.parent_dir, tmp_name)?;
+            self.tmp_name = None;
+            self.parent_dir.sync_all()?;
+            Ok(())
+        }
+        #[cfg(windows)]
+        {
+            let tmp_file = self
+                .tmp_file
+                .as_ref()
+                .expect("prepared atomic write retains its temporary file");
+            rename_open_file_on_windows(tmp_file, &self.parent_dir, &self.destination_name, false)?;
+            self.tmp_file = None;
+            self.parent_dir.sync_all()?;
+            Ok(())
+        }
+        #[cfg(all(not(unix), not(windows)))]
+        {
+            if self.path.exists() {
+                anyhow::bail!("destination already exists");
+            }
+            self.commit()
         }
     }
 }
@@ -947,7 +1242,7 @@ fn open_windows_directory_nofollow_with_final_access(
 ) -> Result<std::fs::File> {
     use windows_sys::Wdk::Storage::FileSystem::{FILE_CREATE, FILE_OPEN};
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_READ_ATTRIBUTES, FILE_TRAVERSE, SYNCHRONIZE,
+        FILE_READ_ATTRIBUTES, FILE_TRAVERSE, SYNCHRONIZE, WRITE_DAC,
     };
 
     let (anchor, names) = windows_absolute_path_parts(path)?;
@@ -976,10 +1271,14 @@ fn open_windows_directory_nofollow_with_final_access(
                     &directory,
                     &name,
                     true,
-                    desired_access,
+                    desired_access | WRITE_DAC,
                     FILE_CREATE,
                 ) {
-                    Ok(directory) => directory,
+                    Ok(directory) => {
+                        protect_windows_dacl(&directory)?;
+                        verify_windows_protected_dacl(&directory)?;
+                        directory
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                         open_windows_relative_nofollow(
                             &directory,
@@ -1221,6 +1520,7 @@ fn rename_open_file_on_windows(
     file: &std::fs::File,
     parent: &std::fs::File,
     destination: &std::ffi::OsStr,
+    replace_existing: bool,
 ) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt as _;
     use std::os::windows::io::AsRawHandle as _;
@@ -1269,7 +1569,7 @@ fn rename_open_file_on_windows(
     // header plus the UTF-16 destination bytes and terminator. The parent and
     // source handles remain live for the subsequent rename call.
     unsafe {
-        (*info).Anonymous.ReplaceIfExists = true;
+        (*info).Anonymous.ReplaceIfExists = replace_existing;
         (*info).RootDirectory = parent.as_raw_handle();
         (*info).FileNameLength = name_bytes;
         std::ptr::copy_nonoverlapping(
@@ -1399,18 +1699,72 @@ fn open_windows_private_atomic_temp(
     use windows_sys::Wdk::Storage::FileSystem::FILE_CREATE;
     use windows_sys::Win32::Storage::FileSystem::{
         DELETE, FILE_READ_ATTRIBUTES, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, SYNCHRONIZE,
+        WRITE_DAC,
     };
 
     let file = open_windows_relative_nofollow(
         parent,
         name,
         false,
-        DELETE | FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        DELETE
+            | FILE_WRITE_DATA
+            | FILE_WRITE_ATTRIBUTES
+            | FILE_READ_ATTRIBUTES
+            | SYNCHRONIZE
+            | WRITE_DAC,
         FILE_CREATE,
     )
     .with_context(|| format!("creating temporary file {}", display_path.display()))?;
     reject_windows_reparse_handle(&file, display_path)?;
+    protect_windows_dacl(&file)?;
     Ok(file)
+}
+
+#[cfg(windows)]
+fn protect_windows_dacl(file: &std::fs::File) -> Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GetKernelObjectSecurity, PROTECTED_DACL_SECURITY_INFORMATION,
+        SetKernelObjectSecurity,
+    };
+    let mut needed = 0u32;
+    // First call obtains the exact self-relative descriptor size.
+    unsafe {
+        GetKernelObjectSecurity(
+            file.as_raw_handle(),
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        );
+    }
+    if needed == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut descriptor = vec![0u8; needed as usize];
+    if unsafe {
+        GetKernelObjectSecurity(
+            file.as_raw_handle(),
+            DACL_SECURITY_INFORMATION,
+            descriptor.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if unsafe {
+        SetKernelObjectSecurity(
+            file.as_raw_handle(),
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            descriptor.as_mut_ptr().cast(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
 }
 
 #[cfg(unix)]

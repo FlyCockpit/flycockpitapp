@@ -1380,6 +1380,14 @@ pub enum ErrorCode {
     /// Status/cancel for an unknown id could not install a tombstone because
     /// quota is full. Non-authoritative Busy; content-free.
     InvocationLookupBusy,
+    /// Content-free terminal binding/operation rejection.
+    InvalidIngress,
+    /// An operation id was reused with different immutable metadata.
+    IngressConflict,
+    /// The host cannot safely represent the private path for this shell.
+    IngressPathUnavailable,
+    /// The operation belongs to a terminal generation that no longer exists.
+    TerminalGenerationGone,
     /// Anything else.
     Internal,
     /// Error code from a future peer that this binary does not know yet.
@@ -1430,6 +1438,10 @@ impl<'de> Deserialize<'de> for ErrorCode {
             "invocation_not_found" => Self::InvocationNotFound,
             "invocation_capacity_exceeded" => Self::InvocationCapacityExceeded,
             "invocation_lookup_busy" => Self::InvocationLookupBusy,
+            "invalid_ingress" => Self::InvalidIngress,
+            "ingress_conflict" => Self::IngressConflict,
+            "ingress_path_unavailable" => Self::IngressPathUnavailable,
+            "terminal_generation_gone" => Self::TerminalGenerationGone,
             "internal" => Self::Internal,
             _ => Self::Other(raw),
         })
@@ -1467,6 +1479,10 @@ impl std::fmt::Display for ErrorCode {
             Self::InvocationNotFound => "invocation_not_found",
             Self::InvocationCapacityExceeded => "invocation_capacity_exceeded",
             Self::InvocationLookupBusy => "invocation_lookup_busy",
+            Self::InvalidIngress => "invalid_ingress",
+            Self::IngressConflict => "ingress_conflict",
+            Self::IngressPathUnavailable => "ingress_path_unavailable",
+            Self::TerminalGenerationGone => "terminal_generation_gone",
             Self::Internal => "internal",
             Self::Other(raw) => raw,
         };
@@ -2887,6 +2903,10 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
             "invocation_not_found",
             "invocation_capacity_exceeded",
             "invocation_lookup_busy",
+            "invalid_ingress",
+            "ingress_conflict",
+            "ingress_path_unavailable",
+            "terminal_generation_gone",
         ] {
             assert!(
                 errors.values().any(|value| value
@@ -3213,6 +3233,30 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
                 Some(sentinel_uuid()),
                 ErrorCode::InvocationLookupBusy,
                 "invocation lookup busy",
+            ),
+            (
+                "invalid_ingress_paired",
+                Some(sentinel_uuid()),
+                ErrorCode::InvalidIngress,
+                "invalid terminal ingress",
+            ),
+            (
+                "ingress_conflict_paired",
+                Some(sentinel_uuid()),
+                ErrorCode::IngressConflict,
+                "terminal ingress metadata conflict",
+            ),
+            (
+                "ingress_path_unavailable_paired",
+                Some(sentinel_uuid()),
+                ErrorCode::IngressPathUnavailable,
+                "terminal ingress path unavailable",
+            ),
+            (
+                "terminal_generation_gone_paired",
+                Some(sentinel_uuid()),
+                ErrorCode::TerminalGenerationGone,
+                "terminal generation is gone",
             ),
             (
                 "invalid_response_metrics_tokenizer_paired",

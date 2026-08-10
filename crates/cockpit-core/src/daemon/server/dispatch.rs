@@ -80,6 +80,25 @@ fn connector_disclosure_to_proto(
     }
 }
 
+fn invalid_terminal_ingress() -> ErrorPayload {
+    ErrorPayload {
+        code: ErrorCode::InvalidIngress,
+        message: "invalid terminal ingress".to_string(),
+    }
+}
+
+fn require_terminal_binding(
+    state: &MutableClientState,
+    terminal_id: Uuid,
+    binding: proto::terminal::TerminalBinding,
+) -> std::result::Result<(), ErrorPayload> {
+    if state.terminal_views.get(&terminal_id) == Some(&binding) {
+        Ok(())
+    } else {
+        Err(invalid_terminal_ingress())
+    }
+}
+
 #[cfg(test)]
 pub(super) async fn handle_request(
     request: Request,
@@ -2812,14 +2831,25 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         }
 
         Request::OpenTerminal { cwd, cols, rows } => {
-            let response = state.terminal_host.open(cwd, cols, rows)?;
-            if let Response::TerminalOpened { terminal_id, .. } = response {
-                state.terminal_views.insert(terminal_id);
-                Ok(Response::TerminalOpened {
-                    terminal_id,
-                    viewer_count: 1,
-                    recording: false,
-                })
+            let session_id = state
+                .attached
+                .as_ref()
+                .map_or(Uuid::nil(), |attached| attached.handle.session_id);
+            let response = state.terminal_host.open(
+                state.terminal_context.clone(),
+                session_id,
+                cwd,
+                cols,
+                rows,
+            )?;
+            if let Response::TerminalOpened {
+                terminal_id,
+                binding,
+                ..
+            } = &response
+            {
+                state.terminal_views.insert(*terminal_id, *binding);
+                Ok(response)
             } else {
                 Ok(response)
             }
@@ -2830,12 +2860,28 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             cols,
             rows,
         } => {
-            let response = state.terminal_host.attach(terminal_id, cols, rows)?;
-            state.terminal_views.insert(terminal_id);
+            let session_id = state
+                .attached
+                .as_ref()
+                .map_or(Uuid::nil(), |attached| attached.handle.session_id);
+            let response = state.terminal_host.attach(
+                state.terminal_context.clone(),
+                session_id,
+                terminal_id,
+                cols,
+                rows,
+            )?;
+            if let Response::TerminalOpened { binding, .. } = &response {
+                state.terminal_views.insert(terminal_id, *binding);
+            }
             Ok(response)
         }
 
         Request::TerminalInput { terminal_id, bytes } => {
+            let binding = *state
+                .terminal_views
+                .get(&terminal_id)
+                .ok_or_else(invalid_terminal_ingress)?;
             if let Some(operation) = remote_operation {
                 let request = Request::TerminalInput {
                     terminal_id,
@@ -2847,11 +2893,11 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 {
                     return Ok(response);
                 }
-                let response = state.terminal_host.input(terminal_id, bytes)?;
+                let response = state.terminal_host.input(terminal_id, binding, bytes)?;
                 return commit_remote_nonrepeatable(operation, ctx, "terminal_input", response)
                     .await;
             }
-            state.terminal_host.input(terminal_id, bytes)
+            state.terminal_host.input(terminal_id, binding, bytes)
         }
 
         Request::TerminalResize {
@@ -2859,6 +2905,10 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             cols,
             rows,
         } => {
+            let binding = *state
+                .terminal_views
+                .get(&terminal_id)
+                .ok_or_else(invalid_terminal_ingress)?;
             if let Some(operation) = remote_operation {
                 let request = Request::TerminalResize {
                     terminal_id,
@@ -2871,16 +2921,68 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 {
                     return Ok(response);
                 }
-                let response = state.terminal_host.resize(terminal_id, cols, rows)?;
+                let response = state.terminal_host.resize(terminal_id, binding, cols, rows)?;
                 return commit_remote_nonrepeatable(operation, ctx, "terminal_resize", response)
                     .await;
             }
-            state.terminal_host.resize(terminal_id, cols, rows)
+            state.terminal_host.resize(terminal_id, binding, cols, rows)
         }
 
         Request::CloseTerminal { terminal_id } => {
-            state.terminal_views.remove(&terminal_id);
-            state.terminal_host.close(terminal_id)
+            let binding = state
+                .terminal_views
+                .remove(&terminal_id)
+                .ok_or_else(invalid_terminal_ingress)?;
+            state.terminal_host.close(terminal_id, binding)
+        }
+
+        Request::TerminalIngressBegin {
+            terminal_id,
+            binding,
+            metadata,
+        } => {
+            require_terminal_binding(state, terminal_id, binding)?;
+            state
+                .terminal_host
+                .ingress_begin(terminal_id, binding, metadata)
+        }
+        Request::TerminalIngressChunk {
+            terminal_id,
+            binding,
+            operation_id,
+            offset,
+            data_base64,
+        } => {
+            require_terminal_binding(state, terminal_id, binding)?;
+            if data_base64.len() > 66_000 {
+                return Err(invalid_terminal_ingress());
+            }
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data_base64)
+                .map_err(|_| invalid_terminal_ingress())?;
+            state
+                .terminal_host
+                .ingress_chunk(terminal_id, binding, operation_id, offset, bytes)
+        }
+        Request::TerminalIngressFinish {
+            terminal_id,
+            binding,
+            operation_id,
+        } => {
+            require_terminal_binding(state, terminal_id, binding)?;
+            state
+                .terminal_host
+                .ingress_finish(terminal_id, binding, operation_id)
+        }
+        Request::TerminalIngressStatus {
+            terminal_id,
+            binding,
+            operation_id,
+        } => {
+            require_terminal_binding(state, terminal_id, binding)?;
+            state
+                .terminal_host
+                .ingress_status(terminal_id, binding, operation_id)
         }
 
         Request::LspControl {

@@ -524,6 +524,32 @@ pub enum Request {
         terminal_id: Uuid,
     },
 
+    TerminalIngressBegin {
+        terminal_id: Uuid,
+        binding: crate::terminal::TerminalBinding,
+        metadata: crate::terminal::TerminalIngressMetadata,
+    },
+
+    TerminalIngressChunk {
+        terminal_id: Uuid,
+        binding: crate::terminal::TerminalBinding,
+        operation_id: Uuid,
+        offset: u64,
+        data_base64: String,
+    },
+
+    TerminalIngressFinish {
+        terminal_id: Uuid,
+        binding: crate::terminal::TerminalBinding,
+        operation_id: Uuid,
+    },
+
+    TerminalIngressStatus {
+        terminal_id: Uuid,
+        binding: crate::terminal::TerminalBinding,
+        operation_id: Uuid,
+    },
+
     /// Control a daemon-owned LSP server. The TUI may request these from
     /// `/settings`, but the daemon remains the only process that checks,
     /// installs, uninstalls, restarts, or kills language servers.
@@ -1270,6 +1296,10 @@ macro_rules! request_variants {
             (Request::TerminalInput { .. }, "terminal_input");
             (Request::TerminalResize { .. }, "terminal_resize");
             (Request::CloseTerminal { .. }, "close_terminal");
+            (Request::TerminalIngressBegin { .. }, "terminal_ingress_begin");
+            (Request::TerminalIngressChunk { .. }, "terminal_ingress_chunk");
+            (Request::TerminalIngressFinish { .. }, "terminal_ingress_finish");
+            (Request::TerminalIngressStatus { .. }, "terminal_ingress_status");
             (Request::LspControl { .. }, "lsp_control");
             (Request::ResolveInterrupt { .. }, "resolve_interrupt");
             (Request::ListSessions { .. }, "list_sessions");
@@ -1432,6 +1462,10 @@ macro_rules! command {
             (Request::TerminalInput { terminal_id, bytes }, "terminal_input", terminal, none, false, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "terminal_id:Uuid|bytes:Vec<u8>", [terminal_id: Uuid => terminal, bytes: Vec<u8> => param]);
             (Request::TerminalResize { terminal_id, cols, rows }, "terminal_resize", terminal, none, false, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "terminal_id:Uuid|cols:u16|rows:u16", [terminal_id: Uuid => terminal, cols: u16 => param, rows: u16 => param]);
             (Request::CloseTerminal { terminal_id }, "close_terminal", terminal, none, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "terminal_id:Uuid", [terminal_id: Uuid => terminal]);
+            (Request::TerminalIngressBegin { terminal_id, binding, metadata }, "terminal_ingress_begin", terminal, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "terminal_id:Uuid|binding:crate::terminal::TerminalBinding|metadata:crate::terminal::TerminalIngressMetadata", [terminal_id: Uuid => terminal, binding: crate::terminal::TerminalBinding => param, metadata: crate::terminal::TerminalIngressMetadata => param]);
+            (Request::TerminalIngressChunk { terminal_id, binding, operation_id, offset, data_base64 }, "terminal_ingress_chunk", terminal, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "terminal_id:Uuid|binding:crate::terminal::TerminalBinding|operation_id:Uuid|offset:u64|data_base64:String", [terminal_id: Uuid => terminal, binding: crate::terminal::TerminalBinding => param, operation_id: Uuid => param, offset: u64 => param, data_base64: String => param]);
+            (Request::TerminalIngressFinish { terminal_id, binding, operation_id }, "terminal_ingress_finish", terminal, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "terminal_id:Uuid|binding:crate::terminal::TerminalBinding|operation_id:Uuid", [terminal_id: Uuid => terminal, binding: crate::terminal::TerminalBinding => param, operation_id: Uuid => param]);
+            (Request::TerminalIngressStatus { terminal_id, binding, operation_id }, "terminal_ingress_status", terminal, none, false, read_only, none, concurrent, none, "terminal_id:Uuid|binding:crate::terminal::TerminalBinding|operation_id:Uuid", [terminal_id: Uuid => terminal, binding: crate::terminal::TerminalBinding => param, operation_id: Uuid => param]);
             (Request::LspControl { project_root, server_id, action }, "lsp_control", custom(authorize_lsp_control), attached, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "project_root:String|server_id:String|action:LspControlAction", [project_root: String => project_root, server_id: String => param, action: LspControlAction => param]);
             (Request::ResolveInterrupt { interrupt_id, response }, "resolve_interrupt", session_writer, attached, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "interrupt_id:Uuid|response:ResolveResponse", [interrupt_id: Uuid => interrupt, response: ResolveResponse => param]);
             (Request::ListSessions { project_id, parent_session_id }, "list_sessions", public_read, none, false, read_only, none, concurrent, none, "project_id:Option<String>|parent_session_id:Option<Uuid>", [project_id: Option<String> => project, parent_session_id: Option<Uuid> => param]);
@@ -1528,7 +1562,6 @@ pub enum LspControlAction {
 #[serde(rename_all = "snake_case")]
 pub enum AttachmentPurpose {
     UserMessageImage,
-    TerminalPasteImage { terminal_id: Uuid },
 }
 
 /// Cross-transport retry semantics assigned to every known request tag.

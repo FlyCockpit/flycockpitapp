@@ -265,12 +265,6 @@ pub(super) fn begin_attachment_upload_with_limits(
         proto::AttachmentPurpose::UserMessageImage => {
             Some(require_attached(state)?.handle.session_id)
         }
-        proto::AttachmentPurpose::TerminalPasteImage { terminal_id } => {
-            if !state.terminal_host.contains(terminal_id) {
-                return Err(bad_request(format!("unknown terminal {terminal_id}")));
-            }
-            None
-        }
     };
     if mime != proto::IMAGE_ATTACHMENT_MIME_PNG {
         return Err(bad_request(format!("unsupported attachment MIME `{mime}`")));
@@ -535,9 +529,6 @@ pub(super) async fn finish_attachment_upload(
             );
             Ok(Response::AttachmentUploaded { image_ref })
         }
-        proto::AttachmentPurpose::TerminalPasteImage { terminal_id } => {
-            state.terminal_host.paste_image(terminal_id, &bytes)
-        }
     }
 }
 
@@ -734,21 +725,6 @@ pub(super) async fn finish_attachment_upload_admitted(
             );
             abandon.reservation_id = None;
             Ok(Response::AttachmentUploaded { image_ref })
-        }
-        proto::AttachmentPurpose::TerminalPasteImage { terminal_id } => {
-            let response = state.terminal_host.paste_image(terminal_id, &bytes);
-            let checksum = format!("terminal-paste-buffer-destroyed:{upload_id}");
-            ctx.media_ledger
-                .destroy_local_artifacts(
-                    &completed.reservation_id,
-                    completed.version,
-                    &checksum,
-                    wall_ms,
-                )
-                .await
-                .map_err(internal)?;
-            abandon.reservation_id = None;
-            response
         }
     }
 }

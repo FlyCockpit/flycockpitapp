@@ -375,11 +375,43 @@ impl CanonicalFcorValueV1 for crate::AttachmentPurpose {
         let mut nested = CanonicalParamsV1::new();
         match self {
             Self::UserMessageImage => nested.push_u16(1),
-            Self::TerminalPasteImage { terminal_id } => {
-                nested.push_u16(2);
-                nested.push_uuid(*terminal_id);
-            }
         }
+        out.0.extend(nested.0);
+        Ok(())
+    }
+}
+
+impl CanonicalFcorValueV1 for crate::terminal::TerminalBinding {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        let mut nested = CanonicalParamsV1::new();
+        nested.push_uuid(self.binding_id);
+        nested.push_u64(self.binding_epoch);
+        out.0.extend(nested.0);
+        Ok(())
+    }
+}
+
+impl CanonicalFcorValueV1 for crate::terminal::TerminalImageType {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        let mut nested = CanonicalParamsV1::new();
+        nested.push_u16(match self {
+            Self::Png => 1,
+            Self::Jpeg => 2,
+            Self::Gif => 3,
+            Self::Webp => 4,
+        });
+        out.0.extend(nested.0);
+        Ok(())
+    }
+}
+
+impl CanonicalFcorValueV1 for crate::terminal::TerminalIngressMetadata {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        let mut nested = CanonicalParamsV1::new();
+        nested.push_uuid(self.operation_id);
+        nested.push_u64(self.size);
+        self.media_type.encode_fcor_value_v1(&mut nested)?;
+        nested.push_string(&self.sha256)?;
         out.0.extend(nested.0);
         Ok(())
     }
@@ -1027,12 +1059,6 @@ mod tests {
                 prompt_cache_retention: None,
             },
             "0000000170000000016d000000",
-        );
-        exact(
-            &crate::AttachmentPurpose::TerminalPasteImage {
-                terminal_id: Uuid::from_bytes([2; 16]),
-            },
-            "000202020202020202020202020202020202",
         );
         exact(
             &cockpit_db::wire::ResolveResponse::Single {

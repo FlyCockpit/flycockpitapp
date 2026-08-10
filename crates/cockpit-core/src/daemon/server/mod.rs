@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -183,6 +184,8 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             terminal_id: _,
             viewer_count: _,
             recording: _,
+            binding: _,
+            terminal_generation: _,
         }
         | proto::Response::FsWrite { hash: _ }
         | proto::Response::UsageCounts {
@@ -209,10 +212,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             enabled: _,
             default_depth: _,
         } => {}
-        proto::Response::TerminalPasteImage {
-            terminal_id: _,
-            path,
-        } => scrub_string(path, redact),
+        proto::Response::TerminalIngress { receipt: _ } => {}
         proto::Response::RemoveQueuedUserMessageResult {
             applied: _,
             reason: _,
@@ -2624,13 +2624,14 @@ fn validate_peer_uid(peer_uid: libc::uid_t, daemon_uid: libc::uid_t) -> Result<(
 
 struct MutableClientState {
     principal: ClientPrincipal,
+    terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext,
     attached: Option<AttachedSession>,
     pending_replay: Vec<proto::Event>,
     pending_uploads: HashMap<Uuid, PendingAttachmentUpload>,
     ready_attachments: HashMap<Uuid, ReadyAttachment>,
     upload_accounting: Arc<StdMutex<UploadAccounting>>,
     upload_limits: AttachmentUploadLimits,
-    terminal_views: HashSet<Uuid>,
+    terminal_views: HashMap<Uuid, proto::terminal::TerminalBinding>,
     terminal_host: crate::daemon::terminal::TerminalHostHandle,
 }
 
@@ -2704,16 +2705,24 @@ impl MutableClientState {
         upload_accounting: Arc<StdMutex<UploadAccounting>>,
         principal: ClientPrincipal,
         terminal_host: crate::daemon::terminal::TerminalHostHandle,
+        client_instance_id: Uuid,
+        connection_epoch: u64,
     ) -> Self {
+        let principal_id = principal.tag().unwrap_or_else(|| "local-owner".to_string());
         Self {
             principal,
+            terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
+                principal_id,
+                client_instance_id,
+                connection_epoch,
+            },
             attached: None,
             pending_replay: Vec::new(),
             pending_uploads: HashMap::new(),
             ready_attachments: HashMap::new(),
             upload_accounting,
             upload_limits: AttachmentUploadLimits,
-            terminal_views: HashSet::new(),
+            terminal_views: HashMap::new(),
             terminal_host,
         }
     }
@@ -2724,6 +2733,8 @@ impl MutableClientState {
             Arc::new(StdMutex::new(UploadAccounting::default())),
             ClientPrincipal::owner(),
             test_terminal_host(),
+            Uuid::new_v4(),
+            next_terminal_connection_epoch(),
         )
     }
 
@@ -2758,13 +2769,18 @@ impl Drop for MutableClientState {
             &self.upload_accounting,
             self.pending_uploads.keys().copied(),
         );
-        for terminal_id in self.terminal_views.drain() {
-            self.terminal_host.release_viewer(terminal_id);
+        for (terminal_id, binding) in self.terminal_views.drain() {
+            self.terminal_host.release_viewer(terminal_id, binding);
         }
     }
 }
 
 const MIN_ATTACHMENT_UPLOAD_BYTES: usize = 64 * 1024;
+static NEXT_TERMINAL_CONNECTION_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+fn next_terminal_connection_epoch() -> u64 {
+    NEXT_TERMINAL_CONNECTION_EPOCH.fetch_add(1, Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct AttachmentUploadLimits;
@@ -2923,6 +2939,8 @@ async fn run_in_process_client(
         ctx.upload_accounting.clone(),
         ClientPrincipal::owner(),
         ctx.terminal_host.clone(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
     );
     let mut shared = state.shared_snapshot();
     let mut global_rx = ctx.subscribe_global();
@@ -3158,20 +3176,33 @@ pub(crate) async fn handle_relay_channel_as<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    handle_client_transport_as(stream, ctx, principal).await
+    handle_client_transport_as(stream, ctx, principal, Uuid::new_v4()).await
+}
+
+pub(crate) async fn handle_relay_channel_as_with_instance<S>(
+    stream: S,
+    ctx: Arc<DaemonContext>,
+    principal: ClientPrincipal,
+    client_instance_id: Uuid,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    handle_client_transport_as(stream, ctx, principal, client_instance_id).await
 }
 
 async fn handle_client_transport<S>(stream: S, ctx: Arc<DaemonContext>) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    handle_client_transport_as(stream, ctx, ClientPrincipal::owner()).await
+    handle_client_transport_as(stream, ctx, ClientPrincipal::owner(), Uuid::new_v4()).await
 }
 
 async fn handle_client_transport_as<S>(
     stream: S,
     ctx: Arc<DaemonContext>,
     principal: ClientPrincipal,
+    client_instance_id: Uuid,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -3235,6 +3266,8 @@ where
     let executor_task = tokio::spawn(run_client_executor(
         ctx,
         principal,
+        client_instance_id,
+        next_terminal_connection_epoch(),
         executor_rx,
         event_cmd_tx,
         writer_tx,
@@ -3500,6 +3533,8 @@ async fn run_client_event_forwarder(
 async fn run_client_executor(
     ctx: Arc<DaemonContext>,
     principal: ClientPrincipal,
+    client_instance_id: Uuid,
+    connection_epoch: u64,
     mut executor_rx: mpsc::Receiver<ClientExecutorInput>,
     event_cmd_tx: mpsc::Sender<ClientEventCommand>,
     writer_tx: mpsc::Sender<ClientWriterMessage>,
@@ -3508,6 +3543,8 @@ async fn run_client_executor(
         ctx.upload_accounting.clone(),
         principal,
         ctx.terminal_host.clone(),
+        client_instance_id,
+        connection_epoch,
     );
     let mut shared = state.shared_snapshot();
     let mut concurrent = ConcurrentRequestRuntime::new();

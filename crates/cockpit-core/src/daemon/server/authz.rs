@@ -729,17 +729,8 @@ pub(super) async fn authorize_begin_attachment_upload(
         );
     };
 
-    if matches!(purpose, proto::AttachmentPurpose::TerminalPasteImage { .. }) {
-        if principal.has_terminal() {
-            Ok(())
-        } else {
-            Err(authorization_error(
-                "remote principal cannot paste into terminals",
-            ))
-        }
-    } else {
-        require_remote_session_writer(principal, state, ctx).await
-    }
+    let _ = purpose;
+    require_remote_session_writer(principal, state, ctx).await
 }
 
 pub(super) async fn authorize_attachment_upload_step(
@@ -755,22 +746,8 @@ pub(super) async fn authorize_attachment_upload_step(
         _ => unreachable!("authorize_attachment_upload_step called for non-upload-step request"),
     };
 
-    if state.pending_uploads.get(upload_id).is_some_and(|upload| {
-        matches!(
-            upload.purpose,
-            proto::AttachmentPurpose::TerminalPasteImage { .. }
-        )
-    }) {
-        if principal.has_terminal() {
-            Ok(())
-        } else {
-            Err(authorization_error(
-                "remote principal cannot paste into terminals",
-            ))
-        }
-    } else {
-        require_remote_session_writer(principal, state, ctx).await
-    }
+    let _ = upload_id;
+    require_remote_session_writer(principal, state, ctx).await
 }
 
 pub(super) async fn authorize_steer_delegation(
@@ -872,18 +849,8 @@ pub(super) async fn authorize_shared_custom(
                 Err(e) => Err(internal(e)),
             }
         }
-        Request::BeginAttachmentUpload { purpose, .. } => {
-            if matches!(purpose, proto::AttachmentPurpose::TerminalPasteImage { .. }) {
-                if principal.has_terminal() {
-                    Ok(())
-                } else {
-                    Err(authorization_error(
-                        "remote principal cannot paste into terminals",
-                    ))
-                }
-            } else {
-                require_remote_shared_session_writer(principal, shared, ctx).await
-            }
+        Request::BeginAttachmentUpload { .. } => {
+            require_remote_shared_session_writer(principal, shared, ctx).await
         }
         Request::UploadAttachmentChunk { .. }
         | Request::FinishAttachmentUpload { .. }

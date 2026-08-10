@@ -133,7 +133,8 @@ impl ReservationState {
                     | S::AccountingCorrupt
             ) | (
                 S::DispatchingExternal,
-                S::ExternalPending
+                S::ExecutingLocal
+                    | S::ExternalPending
                     | S::CancellationRequested
                     | S::Settling
                     | S::OverageQuarantined
@@ -1782,6 +1783,62 @@ pub(crate) fn finish_external_handoff_conn(
     Ok(ReservationReceipt {
         reservation_id: id.to_owned(),
         state: next_state,
+        version: next_version,
+        queue_sequence: sequence,
+        deadline_monotonic_ms: deadline,
+    })
+}
+
+pub(crate) fn definitive_rejection_retry_conn(
+    conn: &rusqlite::Connection,
+    id: &str,
+    expected_version: u64,
+    journal_operation_id: &str,
+    prior_plans: &[MediaReservationPlan],
+    next_plans: &[MediaReservationPlan],
+    wall_ms: u64,
+) -> Result<ReservationReceipt> {
+    let (sequence, deadline, project, session): (u64, u64, String, String) = conn.query_row(
+        "SELECT queue_sequence,deadline_monotonic_ms,project_id,owner_session_key FROM media_reservations WHERE reservation_id=?1 AND state='dispatching_external' AND version=?2 AND external_operation_id=?3",
+        params![id, sqlite_i64(expected_version)?, journal_operation_id],
+        |row| Ok((row_u64(row,0)?,row_u64(row,1)?,row.get(2)?,row.get(3)?)),
+    )?;
+    let journal_state: String = conn.query_row(
+        "SELECT state FROM external_journal_operations WHERE operation_id=?1",
+        [journal_operation_id],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        journal_state == "rejected",
+        "retry requires authoritative rejection"
+    );
+    ensure!(
+        !prior_plans.is_empty() && !next_plans.is_empty(),
+        "retry media plans are required"
+    );
+    let next_version = expected_version
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("accounting_overflow"))?;
+    for plan in prior_plans {
+        release_dimension_balance(
+            conn,
+            id,
+            next_version,
+            &dimension_name(plan.dimension),
+            wall_ms,
+        )?;
+    }
+    let owner = MediaOwner {
+        project_id: project,
+        session_id: session,
+    };
+    for plan in next_plans {
+        acquire_plan(conn, id, &owner, plan, next_version, wall_ms)?;
+    }
+    ensure!(conn.execute("UPDATE media_reservations SET state='executing_local',version=?1,external_operation_id=NULL WHERE reservation_id=?2 AND state='dispatching_external' AND version=?3 AND external_operation_id=?4",params![sqlite_i64(next_version)?,id,sqlite_i64(expected_version)?,journal_operation_id])?==1,"stale_version");
+    Ok(ReservationReceipt {
+        reservation_id: id.to_owned(),
+        state: ReservationState::ExecutingLocal,
         version: next_version,
         queue_sequence: sequence,
         deadline_monotonic_ms: deadline,

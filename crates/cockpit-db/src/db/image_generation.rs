@@ -1090,6 +1090,16 @@ pub struct ImageGenerationProviderHandoffEvidence<'a> {
     pub outcome: ImageSpendDispatchEvidence,
     pub bytes: &'a [u8],
 }
+
+pub enum ImageGenerationHandoffFinishDisposition {
+    Settled,
+    Replay,
+    RetryQueued {
+        next_attempt_number: u32,
+        canonical_media_plan: Vec<u8>,
+        media_plan_digest: String,
+    },
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredImageGenerationProviderHandoffEvidence {
     pub external_operation_id: Uuid,
@@ -1443,17 +1453,8 @@ impl Db {
         dispatching: DispatchingImageGenerationAttempt,
         evidence: ImageGenerationProviderHandoffEvidence<'_>,
         at_unix_ms: i64,
-    ) -> Result<()> {
+    ) -> Result<ImageGenerationHandoffFinishDisposition> {
         atomic_conn(conn, "image_generation_finish_handoff", || {
-            let outcome = finish_reserved_image_spend_dispatch_conn(
-                conn,
-                &dispatching.spend_reservation_id,
-                &dispatching.spend_attempt_id,
-                dispatching.operation.operation_id,
-                dispatching.operation.version,
-                evidence.outcome,
-                at_unix_ms,
-            )?;
             ensure!(
                 !evidence.bytes.is_empty() && evidence.bytes.len() <= 65_536,
                 "image generation handoff evidence is outside its bound"
@@ -1464,9 +1465,34 @@ impl Db {
                 ImageSpendDispatchEvidence::DefinitivelyRejected => "definitively_rejected",
                 ImageSpendDispatchEvidence::SubmissionUnknown => "submission_unknown",
             };
+            if let Some((stored_outcome,stored_digest))=conn.query_row("SELECT outcome,evidence_digest FROM image_generation_handoff_evidence WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND external_operation_id=?4",params![dispatching.job_id.to_string(),dispatching.slot_id.to_string(),i64::from(dispatching.attempt_number),dispatching.operation.operation_id.to_string()],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?))).optional()? {
+                ensure!(stored_outcome==outcome_name&&stored_digest==evidence_digest,"image generation handoff replay differs");
+                return Ok(ImageGenerationHandoffFinishDisposition::Replay);
+            }
+            let outcome = finish_reserved_image_spend_dispatch_conn(
+                conn,
+                &dispatching.spend_reservation_id,
+                &dispatching.spend_attempt_id,
+                dispatching.operation.operation_id,
+                dispatching.operation.version,
+                evidence.outcome,
+                at_unix_ms,
+            )?;
             ensure!(conn.execute("INSERT INTO image_generation_handoff_evidence(job_id,slot_id,attempt_number,external_operation_id,outcome,evidence,evidence_digest,recorded_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![dispatching.job_id.to_string(),dispatching.slot_id.to_string(),i64::from(dispatching.attempt_number),dispatching.operation.operation_id.to_string(),outcome_name,evidence.bytes,evidence_digest,at_unix_ms])?==1,"image generation handoff evidence was not recorded");
+            let next_attempt_number = dispatching
+                .attempt_number
+                .checked_add(1)
+                .context("image generation attempt number overflow")?;
+            let retry = if evidence.outcome == ImageSpendDispatchEvidence::DefinitivelyRejected {
+                conn.query_row("SELECT a.attempt_number,m.canonical_media_plan,m.media_plan_digest FROM image_generation_attempts a JOIN image_generation_attempt_media_snapshots m ON m.job_id=a.job_id AND m.slot_id=a.slot_id AND m.attempt_number=a.attempt_number JOIN image_generation_slots s ON s.job_id=a.job_id AND s.slot_id=a.slot_id WHERE a.job_id=?1 AND a.slot_id=?2 AND a.attempt_number=?3 AND a.state='planned' AND a.attempt_number<=s.max_attempt_count AND NOT EXISTS(SELECT 1 FROM image_generation_cancellation_facts c WHERE c.job_id=a.job_id)",params![dispatching.job_id.to_string(),dispatching.slot_id.to_string(),i64::from(next_attempt_number)],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,Vec<u8>>(1)?,row.get::<_,String>(2)?))).optional()?
+            } else {
+                None
+            };
             let (attempt, slot, job) = match evidence.outcome {
                 ImageSpendDispatchEvidence::Accepted => ("accepted", "running", "running"),
+                ImageSpendDispatchEvidence::DefinitivelyRejected if retry.is_some() => {
+                    ("rejected_not_accepted", "queued", "queued")
+                }
                 ImageSpendDispatchEvidence::DefinitivelyRejected => {
                     ("rejected_not_accepted", "failed", "failed")
                 }
@@ -1487,12 +1513,24 @@ impl Db {
             );
             ensure!(conn.execute("UPDATE image_generation_attempts SET state=?1,version=version+1,observed_journal_version=?2 WHERE job_id=?3 AND slot_id=?4 AND attempt_number=?5 AND state='dispatching' AND version=?6 AND external_operation_id=?7",params![attempt,outcome.record().version,dispatching.job_id.to_string(),dispatching.slot_id.to_string(),i64::from(dispatching.attempt_number),i64::try_from(dispatching.attempt_version)?,dispatching.operation.operation_id.to_string()])?==1,"image generation handoff attempt compare-and-set lost");
             ensure!(conn.execute("UPDATE image_generation_slots SET state=?1,version=version+1,failure_reason=CASE WHEN ?1='failed' THEN 'definitively_rejected' ELSE NULL END WHERE job_id=?2 AND slot_id=?3 AND state='dispatching'",params![slot,dispatching.job_id.to_string(),dispatching.slot_id.to_string()])?==1,"image generation handoff slot compare-and-set lost");
+            if let Some((next_attempt, _, _)) = &retry {
+                ensure!(conn.execute("INSERT INTO image_generation_attempt_activation_facts(job_id,slot_id,attempt_number,activation_reason,prior_attempt_number,activated_at_unix_ms) VALUES(?1,?2,?3,'authoritative_retry',?4,?5)",params![dispatching.job_id.to_string(),dispatching.slot_id.to_string(),next_attempt,i64::from(dispatching.attempt_number),at_unix_ms])?==1,"image generation retry activation was not recorded");
+            }
             if job == "failed" {
                 commit_terminal_job_projection_conn(conn, dispatching.job_id, at_unix_ms)?;
             } else {
                 ensure!(conn.execute("UPDATE image_generation_jobs SET state=?1,version=version+1,updated_at_unix_ms=?2 WHERE job_id=?3 AND state='dispatching'",params![job,at_unix_ms,dispatching.job_id.to_string()])?==1,"image generation handoff job compare-and-set lost");
             }
-            Ok(())
+            Ok(match retry {
+                Some((attempt, canonical_media_plan, media_plan_digest)) => {
+                    ImageGenerationHandoffFinishDisposition::RetryQueued {
+                        next_attempt_number: u32::try_from(attempt)?,
+                        canonical_media_plan,
+                        media_plan_digest,
+                    }
+                }
+                None => ImageGenerationHandoffFinishDisposition::Settled,
+            })
         })
     }
 

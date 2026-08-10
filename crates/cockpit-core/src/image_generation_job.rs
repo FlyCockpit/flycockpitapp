@@ -7,8 +7,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::{ensure, Context as _, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use anyhow::{Context as _, Result, ensure};
+use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
@@ -19,23 +19,24 @@ use cockpit_db::db::external_journal::{
     ExternalJournalDigest, ExternalJournalToken, PrepareExternalOperation, ProviderIdempotency,
 };
 use cockpit_db::db::image_generation::{
-    image_generation_component_set_binding, AdvanceImageGenerationLatePublication,
-    BlockVerifiedImageGenerationLatePublication, CreateImageGenerationArtifact,
-    CreateImageGenerationArtifactComponent, DispatchingImageGenerationAttempt,
-    ImageGenerationArtifactComponentKind, ImageGenerationArtifactComponentState,
-    ImageGenerationArtifactConsumerPurpose, ImageGenerationArtifactConsumerRoute,
-    ImageGenerationArtifactState, ImageGenerationDispatchCandidate,
+    AdvanceImageGenerationLatePublication, BlockVerifiedImageGenerationLatePublication,
+    CreateImageGenerationArtifact, CreateImageGenerationArtifactComponent,
+    DispatchingImageGenerationAttempt, ImageGenerationArtifactComponentKind,
+    ImageGenerationArtifactComponentState, ImageGenerationArtifactConsumerPurpose,
+    ImageGenerationArtifactConsumerRoute, ImageGenerationArtifactState,
+    ImageGenerationDispatchCandidate, ImageGenerationHandoffFinishDisposition,
     ImageGenerationLatePublicationEvidenceV1, ImageGenerationLatePublicationState,
     PreparedImageGenerationDispatch, ReserveImageGenerationLatePublication,
     TransitionImageGenerationArtifact, TransitionImageGenerationArtifactComponent,
+    image_generation_component_set_binding,
 };
 use cockpit_db::db::sealed_scope::SealedActionGrantRow;
 use cockpit_db::image_spend::{AttemptMaximum, ImageSpendDispatchEvidence, SpendReservation};
 use cockpit_db::media_attachments::AcquiredMediaComponentLease;
 
 use crate::media_reservation::{
-    finish_external_handoff_conn, handoff_external_conn, MediaExternalHandoffOutcome,
-    ReservationReceipt, ReservationState,
+    MediaExternalHandoffOutcome, ReservationReceipt, ReservationState,
+    definitive_rejection_retry_conn, finish_external_handoff_conn, handoff_external_conn,
 };
 
 pub use crate::private_fs::held_directory::{
@@ -44,11 +45,11 @@ pub use crate::private_fs::held_directory::{
 };
 pub use cockpit_db::image_generation_plan::{
     AttemptPlanV1, CapabilityProvenanceV1, GrantRequirementV1, ImageGenerationPlanV1,
-    OutputDirectoryAuthorityV1, OutputSlotPlanV1, ReferenceArtifactV1, RequestedOutputV1,
-    ResolvedOutputV1, ResourceReservationV1, SpendReservationPlanV1, TargetDestinationV1,
-    TargetPlanV1, TypedParameterV1, VectorSanitizerProvenanceV1,
     MAX_IMAGE_GENERATION_ATTEMPTS_PER_SLOT, MAX_IMAGE_GENERATION_DIMENSION,
-    MAX_IMAGE_GENERATION_SLOTS, MAX_IMAGE_GENERATION_TARGETS,
+    MAX_IMAGE_GENERATION_SLOTS, MAX_IMAGE_GENERATION_TARGETS, OutputDirectoryAuthorityV1,
+    OutputSlotPlanV1, ReferenceArtifactV1, RequestedOutputV1, ResolvedOutputV1,
+    ResourceReservationV1, SpendReservationPlanV1, TargetDestinationV1, TargetPlanV1,
+    TypedParameterV1, VectorSanitizerProvenanceV1,
 };
 
 const MAX_AUTHORITY_STRING_BYTES: usize = 1_024;
@@ -455,7 +456,9 @@ impl ImageGenerationDispatcher {
         dispatching: DispatchingImageGenerationAttempt,
         evidence: ImageSpendDispatchEvidence,
         evidence_bytes: Vec<u8>,
+        prior_handoff_plans: Vec<MediaReservationPlan>,
         at_unix_ms: i64,
+        media_wall_ms: u64,
     ) -> Result<()> {
         let operation_id = dispatching.operation().operation_id.to_string();
         let (reservation_id, reservation_version) = dispatching.media_reservation();
@@ -471,7 +474,7 @@ impl ImageGenerationDispatcher {
         };
         self.db
             .transaction(move |conn| {
-                cockpit_db::Db::finish_image_generation_handoff_conn(
+                let disposition = cockpit_db::Db::finish_image_generation_handoff_conn(
                     conn,
                     dispatching,
                     cockpit_db::db::image_generation::ImageGenerationProviderHandoffEvidence {
@@ -480,13 +483,35 @@ impl ImageGenerationDispatcher {
                     },
                     at_unix_ms,
                 )?;
-                finish_external_handoff_conn(
-                    conn,
-                    &reservation_id,
-                    reservation_version,
-                    &operation_id,
-                    media_outcome,
-                )?;
+                match disposition {
+                    ImageGenerationHandoffFinishDisposition::RetryQueued {
+                        canonical_media_plan,
+                        media_plan_digest,
+                        ..
+                    } => {
+                        let next =
+                            decode_media_plan_snapshot(&canonical_media_plan, &media_plan_digest)?;
+                        definitive_rejection_retry_conn(
+                            conn,
+                            &reservation_id,
+                            reservation_version,
+                            &operation_id,
+                            &prior_handoff_plans,
+                            &[next],
+                            media_wall_ms,
+                        )?;
+                    }
+                    ImageGenerationHandoffFinishDisposition::Settled => {
+                        finish_external_handoff_conn(
+                            conn,
+                            &reservation_id,
+                            reservation_version,
+                            &operation_id,
+                            media_outcome,
+                        )?;
+                    }
+                    ImageGenerationHandoffFinishDisposition::Replay => {}
+                }
                 Ok(())
             })
             .await
@@ -504,6 +529,7 @@ impl ImageGenerationDispatcher {
         now_monotonic_ms: u64,
         media_wall_ms: u64,
     ) -> Result<ImageGenerationHandoffResult> {
+        let prior_handoff_plans_for_finish = handoff_plans.clone();
         let dispatching = self
             .begin_external_handoff(
                 prepared,
@@ -536,7 +562,9 @@ impl ImageGenerationDispatcher {
             dispatching,
             result.spend_evidence(),
             evidence_bytes,
+            prior_handoff_plans_for_finish,
             at_unix_ms,
+            media_wall_ms,
         )
         .await?;
         Ok(result)
@@ -3136,18 +3164,20 @@ mod tests {
             )?;
             assert_eq!(replay.outcome, ImageSpendDispatchEvidence::Accepted);
             assert_eq!(replay.bytes, b"accepted");
-            assert!(conn
-                .execute(
+            assert!(
+                conn.execute(
                     "UPDATE image_generation_handoff_evidence SET evidence=X'00' WHERE job_id=?1",
                     [job_id.to_string()]
                 )
-                .is_err());
-            assert!(conn
-                .execute(
+                .is_err()
+            );
+            assert!(
+                conn.execute(
                     "DELETE FROM image_generation_handoff_evidence WHERE job_id=?1",
                     [job_id.to_string()]
                 )
-                .is_err());
+                .is_err()
+            );
             Ok(())
         })
         .await
@@ -4383,9 +4413,11 @@ mod tests {
         for count in [MAX_IMAGE_GENERATION_SLOTS - 1, MAX_IMAGE_GENERATION_SLOTS] {
             assert!(with_slots(count).validate().is_ok());
         }
-        assert!(with_slots(MAX_IMAGE_GENERATION_SLOTS + 1)
-            .validate()
-            .is_err());
+        assert!(
+            with_slots(MAX_IMAGE_GENERATION_SLOTS + 1)
+                .validate()
+                .is_err()
+        );
         for dimension in [
             MAX_IMAGE_GENERATION_DIMENSION - 1,
             MAX_IMAGE_GENERATION_DIMENSION,
@@ -4490,7 +4522,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn output_authority_is_held_private_and_nofollow() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::os::unix::fs::{PermissionsExt, symlink};
         let temporary = tempfile::TempDir::new().unwrap();
         let output = temporary.path().join("output");
         std::fs::create_dir(&output).unwrap();
@@ -4515,13 +4547,10 @@ mod tests {
         let widened = temporary.path().join("widened");
         std::fs::create_dir(&widened).unwrap();
         std::fs::set_permissions(&widened, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(open_image_generation_output_directory(
-            &widened,
-            1,
-            "generated".into(),
-            "png".into()
-        )
-        .is_err());
+        assert!(
+            open_image_generation_output_directory(&widened, 1, "generated".into(), "png".into())
+                .is_err()
+        );
         let link = temporary.path().join("link");
         symlink(&output, &link).unwrap();
         assert!(
@@ -4572,9 +4601,10 @@ mod tests {
             HeldDirectoryEffectOutcome::AppliedDurable(_)
         ));
         std::fs::write(root.join("mutated.bin"), b"changed").unwrap();
-        assert!(held
-            .open_verified_component("mutated.bin", &evidence)
-            .is_err());
+        assert!(
+            held.open_verified_component("mutated.bin", &evidence)
+                .is_err()
+        );
     }
 
     #[cfg(windows)]
@@ -4585,22 +4615,16 @@ mod tests {
         let output = temporary.path().join("output");
         std::fs::create_dir(&output).unwrap();
         crate::goal_scratch::set_private(&output).unwrap();
-        assert!(open_image_generation_output_directory(
-            &output,
-            1,
-            "generated".into(),
-            "png".into()
-        )
-        .is_ok());
+        assert!(
+            open_image_generation_output_directory(&output, 1, "generated".into(), "png".into())
+                .is_ok()
+        );
         let link = temporary.path().join("link");
         if symlink_dir(&output, &link).is_ok() {
-            assert!(open_image_generation_output_directory(
-                &link,
-                1,
-                "generated".into(),
-                "png".into()
-            )
-            .is_err());
+            assert!(
+                open_image_generation_output_directory(&link, 1, "generated".into(), "png".into())
+                    .is_err()
+            );
         }
     }
 }

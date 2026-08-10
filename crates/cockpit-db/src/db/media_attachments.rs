@@ -681,6 +681,8 @@ pub enum HttpsRetentionRejectionReasonV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HttpsRetentionResultV1 {
+    /// Immutable publication-commit snapshot. Decode may advance immediately;
+    /// `GetMediaAttachmentStatusV1` is authoritative for current availability.
     Retained {
         #[serde(with = "strict_uuid_v7")]
         attachment_id: Uuid,

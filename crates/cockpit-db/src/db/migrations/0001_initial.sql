@@ -497,6 +497,15 @@ CREATE TABLE media_retained_https_publication_intents (
     created_at_unix_ms INTEGER NOT NULL
 );
 
+CREATE TABLE media_retained_https_orphan_cleanup_evidence (
+    local_operation_id TEXT PRIMARY KEY,
+    storage_id         TEXT NOT NULL,
+    evidence_digest    TEXT NOT NULL,
+    outcome            TEXT NOT NULL CHECK(outcome IN ('verified_unlink','verified_absent_before_create')),
+    completed_at_unix_ms INTEGER NOT NULL,
+    CHECK (length(evidence_digest) = 64 AND evidence_digest NOT GLOB '*[^0-9a-f]*')
+);
+
 CREATE TABLE media_attachment_processing_jobs (
     job_id                           TEXT PRIMARY KEY,
     attachment_id                   TEXT NOT NULL UNIQUE,
@@ -504,6 +513,8 @@ CREATE TABLE media_attachment_processing_jobs (
     expected_availability_generation TEXT NOT NULL,
     source_evidence_digest          TEXT NOT NULL,
     state                            TEXT NOT NULL CHECK(state IN ('pending','claimed','completed')),
+    claimed_at_unix_ms               INTEGER,
+    claim_attempt                    INTEGER NOT NULL DEFAULT 0,
     created_at_unix_ms               INTEGER NOT NULL,
     completed_at_unix_ms             INTEGER,
     FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE

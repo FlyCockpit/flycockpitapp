@@ -39,7 +39,6 @@ impl Default for HttpsFetchLimits {
 pub(crate) struct VettedHttpsHop {
     url: Url,
     socket_addrs: Vec<SocketAddr>,
-    forward_explicit_authorization: bool,
     redirect_depth: u8,
 }
 
@@ -136,7 +135,7 @@ async fn fetch_retained_https_before_deadline<W: AsyncWrite + Unpin>(
 ) -> Result<RetainedHttpsFetchEvidence> {
     let initial_url = parse_fetch_url(raw_url)?;
     let answers = resolve_url(resolver, &initial_url).await?;
-    let mut hop = vetted_hop(initial_url, &answers, false, 0)?;
+    let mut hop = vetted_hop(initial_url, &answers, 0)?;
     let mut provenance = RedactedHttpsProvenance::initial(&hop)?;
 
     loop {
@@ -241,10 +240,6 @@ impl VettedHttpsHop {
         &self.socket_addrs
     }
 
-    pub(crate) fn forwards_explicit_authorization(&self) -> bool {
-        self.forward_explicit_authorization
-    }
-
     /// Build the only HTTP client permitted to execute this hop. Redirects are
     /// disabled because each Location must return through `redirected_https_hop`.
     /// Reqwest keeps the URL hostname for Host and TLS SNI while dialing only
@@ -266,7 +261,7 @@ impl VettedHttpsHop {
 
 pub(crate) fn initial_https_hop(url: &str, answers: &[IpAddr]) -> Result<VettedHttpsHop> {
     let url = parse_fetch_url(url)?;
-    vetted_hop(url, answers, false, 0)
+    vetted_hop(url, answers, 0)
 }
 
 pub(crate) fn redirected_https_hop(
@@ -283,13 +278,7 @@ pub(crate) fn redirected_https_hop(
         .join(location)
         .context("invalid HTTPS redirect location")?;
     validate_url(&url)?;
-    let same_origin = origin(&previous.url) == origin(&url);
-    vetted_hop(
-        url,
-        answers,
-        previous.forward_explicit_authorization && same_origin,
-        previous.redirect_depth + 1,
-    )
+    vetted_hop(url, answers, previous.redirect_depth + 1)
 }
 
 fn parse_fetch_url(value: &str) -> Result<Url> {
@@ -307,12 +296,7 @@ fn validate_url(url: &Url) -> Result<()> {
     Ok(())
 }
 
-fn vetted_hop(
-    url: Url,
-    answers: &[IpAddr],
-    forward_explicit_authorization: bool,
-    redirect_depth: u8,
-) -> Result<VettedHttpsHop> {
+fn vetted_hop(url: Url, answers: &[IpAddr], redirect_depth: u8) -> Result<VettedHttpsHop> {
     ensure!(!answers.is_empty(), "HTTPS host has no addresses");
     // Reject the complete answer set when even one answer is unsafe. Choosing
     // only a public member would leave DNS-order/retry behavior as an SSRF
@@ -332,7 +316,6 @@ fn vetted_hop(
     Ok(VettedHttpsHop {
         url,
         socket_addrs,
-        forward_explicit_authorization,
         redirect_depth,
     })
 }
@@ -391,13 +374,18 @@ fn is_public_v4(ip: Ipv4Addr) -> bool {
 
 fn is_public_v6(ip: Ipv6Addr) -> bool {
     let octets = ip.octets();
-    !(ip.is_unspecified()
-        || ip.is_loopback()
-        || (octets[0] & 0xfe) == 0xfc // unique-local fc00::/7
-        || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80) // link-local fe80::/10
-        || octets[0] == 0xff // multicast
-        || (octets[..4] == [0x20, 0x01, 0x0d, 0xb8]) // documentation
-        || ip.to_ipv4_mapped().is_some_and(|v4| !is_public_v4(v4)))
+    if let Some(v4) = ip.to_ipv4() {
+        return is_public_v4(v4);
+    }
+    // Ordinary 2000::/3 global unicast only. Translation, ULA, link/site-local,
+    // discard-only and multicast prefixes consequently never reach a socket.
+    if octets[0] & 0xe0 != 0x20 {
+        return false;
+    }
+    let segments = ip.segments();
+    !(segments[0] == 0x2001 && segments[1] < 0x0200 // IETF special assignments /23
+        || segments[0] == 0x2002 // 6to4 embeds an unchecked IPv4 destination
+        || (segments[0] == 0x3fff && segments[1] & 0xf000 == 0)) // documentation /20
 }
 
 pub(crate) fn checked_content_length(value: Option<u64>, limits: &HttpsFetchLimits) -> Result<()> {
@@ -467,16 +455,26 @@ mod tests {
     }
 
     #[test]
-    fn https_media_ingest_redirect_revalidates_scheme_and_origin_credentials() {
-        let mut first =
+    fn https_media_ingest_redirect_revalidates_scheme_without_credentials() {
+        let first =
             initial_https_hop("https://media.example.test/a", &[ip("93.184.216.34")]).unwrap();
-        first.forward_explicit_authorization = true;
         let same = redirected_https_hop(&first, "/b", &[ip("93.184.216.34")]).unwrap();
-        assert!(same.forwards_explicit_authorization());
         let other =
             redirected_https_hop(&same, "https://cdn.example.test/c", &[ip("93.184.216.35")])
                 .unwrap();
-        assert!(!other.forwards_explicit_authorization());
+        assert_eq!(other.url().host_str(), Some("cdn.example.test"));
+        let request = other
+            .bound_client(&HttpsFetchLimits::default())
+            .unwrap()
+            .get(other.url().clone())
+            .build()
+            .unwrap();
+        assert!(
+            !request
+                .headers()
+                .contains_key(reqwest::header::AUTHORIZATION)
+        );
+        assert!(!request.headers().contains_key(reqwest::header::COOKIE));
         assert!(
             redirected_https_hop(
                 &first,
@@ -522,12 +520,21 @@ mod tests {
             "fe80::1",
             "2001:db8::1",
             "::ffff:127.0.0.1",
+            "::127.0.0.1",
+            "64:ff9b::7f00:1",
+            "64:ff9b:1::7f00:1",
+            "fec0::1",
+            "2001::1",
+            "2001:2::1",
+            "2002:7f00:1::1",
+            "3fff::1",
         ] {
             assert!(
                 initial_https_hop("https://example.test/a", &[ip(address)]).is_err(),
                 "{address}"
             );
         }
+        initial_https_hop("https://example.test/a", &[ip("2606:4700:4700::1111")]).unwrap();
     }
 
     #[test]

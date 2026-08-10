@@ -141,10 +141,58 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    async fn finish_retained_https_orphan(
+        &self,
+        operation_id: Uuid,
+        storage_id: &str,
+        now_unix_ms: i64,
+    ) -> Result<()> {
+        let proof = if let Some(mut file) = open_optional_verified(&self.owned_root, storage_id)? {
+            let identity = stable_identity_digest(&file)?;
+            let (length, checksum) = read_full_digest(&mut file)?;
+            ensure!(
+                stable_identity_digest(&file)? == identity,
+                "storage_security_violation"
+            );
+            self.owned_root
+                .remove_file(storage_id)
+                .map_err(anyhow::Error::new)?;
+            self.owned_root.sync().map_err(anyhow::Error::new)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                ensure!(
+                    file.metadata()?.nlink() == 0,
+                    "retained HTTPS orphan was not deleted"
+                );
+            }
+            (
+                "verified_unlink",
+                digest_json(
+                    b"retained-https-orphan-unlink-v1",
+                    &(storage_id, identity, length, checksum),
+                )?,
+            )
+        } else {
+            self.owned_root.sync().map_err(anyhow::Error::new)?;
+            (
+                "verified_absent_before_create",
+                digest_json(b"retained-https-orphan-absent-v1", &storage_id)?,
+            )
+        };
+        let operation = operation_id.to_string();
+        let storage = storage_id.to_owned();
+        self.db.transaction(move|conn|{
+            conn.execute("INSERT OR IGNORE INTO media_retained_https_orphan_cleanup_evidence(local_operation_id,storage_id,evidence_digest,outcome,completed_at_unix_ms) VALUES(?1,?2,?3,?4,?5)",params![operation,storage,proof.1,proof.0,now_unix_ms])?;
+            conn.execute("DELETE FROM media_retained_https_publication_intents WHERE local_operation_id=?1 AND storage_id=?2",params![operation,storage])?;
+            Ok(())
+        }).await
+    }
     /// Claims and completes retained-HTTPS image work through the same strict
     /// classifier/canonical image normalizer used by upload Finalize.
     pub(crate) async fn process_retained_https_jobs(&self, now_unix_ms: i64) -> Result<usize> {
-        let jobs=self.db.read(|conn|{let mut statement=conn.prepare("SELECT j.job_id,j.attachment_id,j.expected_attachment_version,j.expected_availability_generation,j.source_evidence_digest,c.storage_id,c.stable_identity_digest,c.byte_length,c.sha256,c.reservation_id FROM media_attachment_processing_jobs j JOIN media_attachments a ON a.attachment_id=j.attachment_id JOIN media_attachment_components c ON c.attachment_id=a.attachment_id AND c.component_kind='quarantined_original' WHERE j.state='pending' AND a.source_kind='retained_https' AND a.media_kind='image' ORDER BY j.created_at_unix_ms,j.job_id")?;statement.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?)))?.collect::<std::result::Result<Vec<_>,_>>().map_err(Into::into)}).await?;
+        let reclaim_before = now_unix_ms.saturating_sub(300_000);
+        let jobs=self.db.read(move|conn|{let mut statement=conn.prepare("SELECT j.job_id,j.attachment_id,j.expected_attachment_version,j.expected_availability_generation,j.source_evidence_digest,c.storage_id,c.stable_identity_digest,c.byte_length,c.sha256,c.reservation_id,j.state FROM media_attachment_processing_jobs j JOIN media_attachments a ON a.attachment_id=j.attachment_id JOIN media_attachment_components c ON c.attachment_id=a.attachment_id AND c.component_kind='quarantined_original' WHERE (j.state='pending' OR (j.state='claimed' AND j.claimed_at_unix_ms<=?1)) AND a.source_kind='retained_https' AND a.media_kind='image' ORDER BY j.created_at_unix_ms,j.job_id")?;statement.query_map([reclaim_before],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?,r.get::<_,String>(10)?)))?.collect::<std::result::Result<Vec<_>,_>>().map_err(Into::into)}).await?;
         let mut completed = 0;
         for (
             job,
@@ -157,13 +205,14 @@ impl MediaStorageRecovery {
             length,
             checksum,
             reservation,
+            prior_state,
         ) in jobs
         {
             let job_id = Uuid::parse_str(&job)?;
             let attachment_id = Uuid::parse_str(&attachment)?;
             let expected_version = version.parse::<u64>()?;
             let expected_generation = generation.parse::<u64>()?;
-            let claimed=self.db.transaction(move|conn|{let changed=conn.execute("UPDATE media_attachment_processing_jobs SET state='claimed' WHERE job_id=?1 AND state='pending'",[job_id.to_string()])?;if changed==0{return Ok(false)}cockpit_db::Db::transition_media_attachment_conn(conn,attachment_id,expected_version,expected_generation,MediaAvailability::Probing,now_unix_ms)?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,'quarantined','probing',?3,?4)",params![attachment_id.to_string(),(expected_generation+1).to_string(),job_id.to_string(),now_unix_ms])?;Ok(true)}).await?;
+            let claimed=self.db.transaction(move|conn|{let changed=conn.execute("UPDATE media_attachment_processing_jobs SET state='claimed',claimed_at_unix_ms=?1,claim_attempt=claim_attempt+1 WHERE job_id=?2 AND (state='pending' OR (state='claimed' AND claimed_at_unix_ms<=?3))",params![now_unix_ms,job_id.to_string(),reclaim_before])?;if changed==0{return Ok(false)}if prior_state=="pending"{cockpit_db::Db::transition_media_attachment_conn(conn,attachment_id,expected_version,expected_generation,MediaAvailability::Probing,now_unix_ms)?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,'quarantined','probing',?3,?4)",params![attachment_id.to_string(),(expected_generation+1).to_string(),job_id.to_string(),now_unix_ms])?;}Ok(true)}).await?;
             if !claimed {
                 continue;
             }
@@ -316,8 +365,12 @@ impl MediaStorageRecovery {
         let fetch = match fetch {
             Ok(fetch) => fetch,
             Err(error) => {
-                let _ = self.owned_root.remove_file(&storage_name);
-                let _ = self.owned_root.sync();
+                self.finish_retained_https_orphan(
+                    request.local_operation_id,
+                    &storage_name,
+                    now_unix_ms,
+                )
+                .await?;
                 let text = error.to_string();
                 let reason = if text.contains("requires HTTPS")
                     || text.contains("userinfo")
@@ -355,7 +408,6 @@ impl MediaStorageRecovery {
                 return self.db.transaction(move |conn| {
                     conn.execute("INSERT INTO media_retained_https_operations(local_operation_id,authoritative_operation_id,session_id,canonical_project_digest,client_draft_id,request_binding_digest,operation_request_digest,semantic_command_digest,receipt_json,committed_at_unix_ms,is_alias) VALUES(?1,?1,?2,?3,?4,?5,?5,?6,?7,?8,0)",params![rejected_request.local_operation_id.to_string(),rejected_request.session_id.to_string(),rejected_request.canonical_project_digest,rejected_request.client_draft_id.to_string(),binding,semantic_digest,rejected_json,now_unix_ms])?;
                     conn.execute("INSERT INTO media_retained_https_audit(local_operation_id,outcome,committed_at_unix_ms) VALUES(?1,'rejected',?2)",params![rejected_request.local_operation_id.to_string(),now_unix_ms])?;
-                    conn.execute("DELETE FROM media_retained_https_publication_intents WHERE local_operation_id=?1",[rejected_request.local_operation_id.to_string()])?;
                     Ok(rejected)
                 }).await;
             }
@@ -483,7 +535,7 @@ impl MediaStorageRecovery {
         let receipt_json = serde_json::to_string(&receipt)?;
         let request_for_tx = request.clone();
         let result=self.db.transaction(move|conn|{
-            if let Some((authoritative,stored_semantic,json))=conn.query_row("SELECT authoritative_operation_id,semantic_command_digest,receipt_json FROM media_retained_https_operations WHERE session_id=?1 AND canonical_project_digest=?2 AND client_draft_id=?3 AND is_alias=0",params![request_for_tx.session_id.to_string(),request_for_tx.canonical_project_digest,request_for_tx.client_draft_id.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()? { ensure!(stored_semantic==semantic_digest,"idempotency_conflict"); conn.execute("INSERT INTO media_retained_https_operations(local_operation_id,authoritative_operation_id,session_id,canonical_project_digest,client_draft_id,request_binding_digest,operation_request_digest,semantic_command_digest,receipt_json,committed_at_unix_ms,is_alias) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1)",params![request_for_tx.local_operation_id.to_string(),authoritative,request_for_tx.session_id.to_string(),request_for_tx.canonical_project_digest,request_for_tx.client_draft_id.to_string(),binding,request_digest,semantic_digest,json,now_unix_ms])?; conn.execute("DELETE FROM media_retained_https_publication_intents WHERE local_operation_id=?1",[request_for_tx.local_operation_id.to_string()])?; return Ok(serde_json::from_str(&json)?); }
+            if let Some((authoritative,stored_semantic,json))=conn.query_row("SELECT authoritative_operation_id,semantic_command_digest,receipt_json FROM media_retained_https_operations WHERE session_id=?1 AND canonical_project_digest=?2 AND client_draft_id=?3 AND is_alias=0",params![request_for_tx.session_id.to_string(),request_for_tx.canonical_project_digest,request_for_tx.client_draft_id.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()? { ensure!(stored_semantic==semantic_digest,"idempotency_conflict"); conn.execute("INSERT INTO media_retained_https_operations(local_operation_id,authoritative_operation_id,session_id,canonical_project_digest,client_draft_id,request_binding_digest,operation_request_digest,semantic_command_digest,receipt_json,committed_at_unix_ms,is_alias) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1)",params![request_for_tx.local_operation_id.to_string(),authoritative,request_for_tx.session_id.to_string(),request_for_tx.canonical_project_digest,request_for_tx.client_draft_id.to_string(),binding,request_digest,semantic_digest,json,now_unix_ms])?; return Ok(serde_json::from_str(&json)?); }
             crate::media_reservation::reserve_conn(conn,crate::media_reservation::ReserveRequest{reservation_id:reservation_id.clone(),recovery_id:reservation_id.clone(),owner:crate::media_reservation::MediaOwner{project_id:request_for_tx.canonical_project_digest.clone(),session_id:request_for_tx.session_id.to_string()},operation:"retained_https_ingest".into(),purpose:"retained_media".into(),plans,wall_ms:u64::try_from(now_unix_ms)?},monotonic_now_ms)?;
             cockpit_db::Db::insert_media_attachment_conn(conn,&record)?; cockpit_db::Db::insert_media_attachment_component_conn(conn,&component)?;
             conn.execute("INSERT INTO media_retained_https_evidence(attachment_id,source_evidence_digest,redirect_classes_json,path_segment_count,safe_basename,fetched_at_unix_ms,reservation_id,reservation_digest) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![attachment_id.to_string(),source_evidence_digest,serde_json::to_string(&redirect_classes)?,path_segment_count,safe_basename,now_unix_ms,reservation_id,reservation_digest])?;
@@ -492,8 +544,14 @@ impl MediaStorageRecovery {
             conn.execute("INSERT INTO media_retained_https_audit(local_operation_id,outcome,committed_at_unix_ms) VALUES(?1,'retained',?2)",params![request_for_tx.local_operation_id.to_string(),now_unix_ms])?; conn.execute("DELETE FROM media_retained_https_publication_intents WHERE local_operation_id=?1",[request_for_tx.local_operation_id.to_string()])?; Ok(receipt)
         }).await;
         if result.as_ref().is_err() || result.as_ref().is_ok_and(|r| r.receipt_id != receipt_id) {
-            let _ = self.owned_root.remove_file(&storage_name);
-            let _ = self.owned_root.sync();
+            if result.is_ok() {
+                self.finish_retained_https_orphan(
+                    request.local_operation_id,
+                    &storage_name,
+                    now_unix_ms,
+                )
+                .await?;
+            }
         }
         result
     }
@@ -1255,21 +1313,12 @@ impl MediaStorageRecovery {
             statement.query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))?.collect::<std::result::Result<Vec<_>,_>>().map_err(Into::into)
         }).await?;
         for (operation_id, storage_id) in https_intents {
-            if let Some(file) = open_optional_verified(&self.owned_root, &storage_id)? {
-                self.owned_root
-                    .remove_file(&storage_id)
-                    .map_err(anyhow::Error::new)?;
-                self.owned_root.sync().map_err(anyhow::Error::new)?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::MetadataExt as _;
-                    ensure!(
-                        file.metadata()?.nlink() == 0,
-                        "retained HTTPS orphan was not deleted"
-                    );
-                }
-            }
-            self.db.transaction(move|conn|{conn.execute("DELETE FROM media_retained_https_publication_intents WHERE local_operation_id=?1",[operation_id])?;Ok(())}).await?;
+            self.finish_retained_https_orphan(
+                Uuid::parse_str(&operation_id)?,
+                &storage_id,
+                now_unix_ms,
+            )
+            .await?;
             repaired += 1;
         }
         let publication_intents=self.db.read(|conn|{let mut statement=conn.prepare("SELECT upload_id,temporary_storage_id,quarantine_storage_id,derivative_storage_ids_json FROM media_storage_publication_intents ORDER BY created_at_unix_ms,upload_id")?;let rows=statement.query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?)))?;rows.collect::<std::result::Result<Vec<_>,_>>().map_err(Into::into)}).await?;
@@ -5593,11 +5642,19 @@ mod tests {
             1
         );
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(recovery.process_retained_https_jobs(10).await.unwrap(), 1);
         let attachment_id = match &first.result {
             HttpsRetentionResultV1::Retained { attachment_id, .. } => *attachment_id,
             _ => unreachable!(),
         };
+        db.transaction(move|conn|{conn.execute("UPDATE media_attachment_processing_jobs SET state='claimed',claimed_at_unix_ms=1,claim_attempt=1 WHERE attachment_id=?1",[attachment_id.to_string()])?;cockpit_db::Db::transition_media_attachment_conn(conn,attachment_id,1,1,MediaAvailability::Probing,2)?;Ok(())}).await.unwrap();
+        drop(recovery);
+        let recovery = MediaStorageRecovery::open(db.clone(), &temp.path().join("media"))
+            .unwrap()
+            .with_https_fetcher(fetcher.clone());
+        assert_eq!(
+            recovery.process_retained_https_jobs(300_002).await.unwrap(),
+            1
+        );
         let ready = db.read(move|conn|Ok(conn.query_row("SELECT availability,(SELECT COUNT(*) FROM media_attachment_components c WHERE c.attachment_id=a.attachment_id AND c.component_kind IN ('image_model','browser_thumbnail')) FROM media_attachments a WHERE attachment_id=?1",[attachment_id.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?)))?)).await.unwrap();
         assert_eq!(ready, ("ready".into(), 2));
         assert_eq!(
@@ -5770,11 +5827,16 @@ mod tests {
                         [],
                         |r| r.get::<_, i64>(0),
                     )?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM media_retained_https_orphan_cleanup_evidence WHERE outcome='verified_unlink'",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )?,
                 ))
             })
             .await
             .unwrap();
-        assert_eq!(counts, (0, 0));
+        assert_eq!(counts, (0, 0, 1));
     }
 
     #[tokio::test]
@@ -5971,6 +6033,7 @@ mod tests {
         assert!(!temp.path().join("media").join(&quarantine).exists());
         assert!(!temp.path().join("media").join(&orphan).exists());
         assert!(!temp.path().join("media").join(&https_orphan).exists());
+        assert_eq!(db.read(|conn|Ok(conn.query_row("SELECT COUNT(*) FROM media_retained_https_orphan_cleanup_evidence WHERE outcome='verified_unlink'",[],|r|r.get::<_,i64>(0))?)).await.unwrap(),1);
         let insecure = Uuid::now_v7().to_string();
         std::fs::write(temp.path().join("media").join(&insecure), b"insecure").unwrap();
         std::fs::set_permissions(

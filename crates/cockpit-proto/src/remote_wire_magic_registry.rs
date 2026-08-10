@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct MagicOwner {
     pub magic: String,
     pub symbolic_type: String,

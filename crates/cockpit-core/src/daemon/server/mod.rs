@@ -2863,6 +2863,7 @@ where
 
 struct PendingAttachmentUpload {
     media_reservation: Option<crate::media_reservation::ReservationReceipt>,
+    media_resources_policy: Option<Box<crate::config::media_budget::MediaResourcePolicy>>,
     session_id: Option<Uuid>,
     byte_len: usize,
     sha256: String,

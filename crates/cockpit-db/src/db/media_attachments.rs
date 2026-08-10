@@ -524,7 +524,7 @@ pub enum MediaUploadStateDetailV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct MediaUploadStatusV1 {
     pub schema_version: u8,
     pub kind: String,

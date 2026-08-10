@@ -4290,7 +4290,10 @@ fn dispatch_matrix_class_for_command(
         | ("goal_status", "session_row_reader", false)
         | ("get_inventory_bundle", "session_row_reader", false)
         | ("daemon_status", "public_read", false)
-        | ("guidance_estimate", "project_read", false) => DispatchMatrixClass::Readonly,
+        | ("guidance_estimate", "project_read", false)
+        | ("get_media_attachment_status", "public_read", false)
+        | ("get_media_attachment_preview", "public_read", false)
+        | ("get_media_upload_status", "public_read", false) => DispatchMatrixClass::Readonly,
         ("attach_terminal", "terminal", false)
         | ("terminal_input", "terminal", false)
         | ("terminal_resize", "terminal", false)
@@ -5124,7 +5127,10 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "cancel_schedule"
         | "prune"
         | "compact"
-        | "pin" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
+        | "pin"
+        | "recover_security_blocked_media"
+        | "register_local_path_media"
+        | "retain_https_media" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
         other => panic!("unhandled authz allowed outcome for {other}"),
     }
 }
@@ -5245,6 +5251,8 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("mark_app_flag_seen"),
         authz_owner_only("set_workspace_trust"),
         authz_owner_only("recover_security_blocked_media"),
+        authz_owner_only("register_local_path_media"),
+        authz_owner_only("retain_https_media"),
         authz_project_read("guidance_estimate"),
         authz_owner_only("stop_daemon"),
         authz_owner_only("restart_if_idle"),
@@ -11412,6 +11420,246 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 content_hash: "h".into(),
             },
             kind: "upsert_assistant",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::RecoverSecurityBlockedMedia(
+                cockpit_db::media_attachments::RecoverSecurityBlockedMediaV1 {
+                    schema_version: 1,
+                    kind: "recoverSecurityBlockedMedia".into(),
+                    local_request_id: Uuid::now_v7(),
+                    owner_principal_digest: "11".repeat(32),
+                    attachment_id: Uuid::now_v7(),
+                    attachment_version: 1,
+                    expected_availability_generation: 1,
+                    affected_components: vec![],
+                    borrowed_source_evidence_digest: None,
+                    disposition:
+                        cockpit_db::media_attachments::MediaSecurityRecoveryDisposition::RetainBlocked,
+                },
+            ),
+            kind: "recover_security_blocked_media",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::RegisterLocalPathMedia(
+                cockpit_db::media_attachments::RegisterLocalPathMediaV1 {
+                    schema_version: 1,
+                    kind: "registerLocalPathMedia".into(),
+                    local_operation_id: Uuid::now_v7(),
+                    owner_principal_digest: "11".repeat(32),
+                    session_id: Uuid::now_v7(),
+                    canonical_project_digest: "22".repeat(32),
+                    client_draft_id: Uuid::now_v7(),
+                    requested_media_kind:
+                        cockpit_db::media_attachments::RequestedLocalPathMediaKind::Image,
+                    path: "/repo/file.png".into(),
+                },
+            ),
+            kind: "register_local_path_media",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::RetainHttpsMedia(
+                cockpit_db::media_attachments::RetainHttpsMediaV1 {
+                    schema_version: 1,
+                    kind: "retainHttpsMedia".into(),
+                    local_operation_id: Uuid::now_v7(),
+                    owner_principal_digest: "11".repeat(32),
+                    session_id: Uuid::now_v7(),
+                    canonical_project_digest: "22".repeat(32),
+                    client_draft_id: Uuid::now_v7(),
+                    requested_media_kind:
+                        cockpit_db::media_attachments::RequestedLocalPathMediaKind::Image,
+                    url: "https://example.com/image.png".into(),
+                },
+            ),
+            kind: "retain_https_media",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::GetMediaAttachmentStatus(
+                cockpit_db::media_attachments::GetMediaAttachmentStatusV1 {
+                    schema_version: 1,
+                    kind: "getMediaAttachmentStatus".into(),
+                    session_id: Uuid::now_v7(),
+                    canonical_project_digest: "22".repeat(32),
+                    attachment_id: Uuid::now_v7(),
+                },
+            ),
+            kind: "get_media_attachment_status",
+            session_id: None,
+            audit_path: None,
+            mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::GetMediaAttachmentPreview(
+                cockpit_db::media_attachments::GetMediaAttachmentPreviewV1 {
+                    schema_version: 1,
+                    kind: "getMediaAttachmentPreview".into(),
+                    session_id: Uuid::now_v7(),
+                    canonical_project_digest: "22".repeat(32),
+                    attachment_id: Uuid::now_v7(),
+                    attachment_version: 1,
+                    availability_generation: 1,
+                    preview_generation: 1,
+                    preview_checksum: "33".repeat(32),
+                },
+            ),
+            kind: "get_media_attachment_preview",
+            session_id: None,
+            audit_path: None,
+            mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::BeginMediaUpload(
+                cockpit_db::media_attachments::LocalMediaMutationV1 {
+                    schema_version: 1,
+                    kind: "localMediaMutation".into(),
+                    local_operation_id: Uuid::now_v7(),
+                    actor_principal_digest: "11".repeat(32),
+                    actor_role: cockpit_db::media_attachments::LocalMediaActorRoleV1::Owner,
+                    payload:
+                        cockpit_db::media_attachments::LocalMediaMutationPayloadV1::Begin {
+                            session_id: Uuid::now_v7(),
+                            canonical_project_digest: "22".repeat(32),
+                            client_draft_id: Uuid::now_v7(),
+                            media_kind:
+                                cockpit_db::media_attachments::RequestedLocalPathMediaKind::Image,
+                            declared_total_bytes: 1,
+                            reservation_digest: "33".repeat(32),
+                        },
+                },
+            ),
+            kind: "begin_media_upload",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::AppendMediaUploadChunk(
+                cockpit_db::media_attachments::AppendMediaUploadChunkV1 {
+                    mutation: cockpit_db::media_attachments::LocalMediaMutationV1 {
+                        schema_version: 1,
+                        kind: "localMediaMutation".into(),
+                        local_operation_id: Uuid::now_v7(),
+                        actor_principal_digest: "11".repeat(32),
+                        actor_role: cockpit_db::media_attachments::LocalMediaActorRoleV1::Owner,
+                        payload:
+                            cockpit_db::media_attachments::LocalMediaMutationPayloadV1::Append {
+                                session_id: Uuid::now_v7(),
+                                canonical_project_digest: "22".repeat(32),
+                                client_draft_id: Uuid::now_v7(),
+                                upload_id: Uuid::now_v7(),
+                                upload_generation: 1,
+                                chunk_index: 0,
+                                chunk_length: 1,
+                                chunk_sha256: "33".repeat(32),
+                            },
+                    },
+                    data_base64: "AA==".into(),
+                },
+            ),
+            kind: "append_media_upload_chunk",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::CancelMediaUpload(
+                cockpit_db::media_attachments::LocalMediaMutationV1 {
+                    schema_version: 1,
+                    kind: "localMediaMutation".into(),
+                    local_operation_id: Uuid::now_v7(),
+                    actor_principal_digest: "11".repeat(32),
+                    actor_role: cockpit_db::media_attachments::LocalMediaActorRoleV1::Owner,
+                    payload:
+                        cockpit_db::media_attachments::LocalMediaMutationPayloadV1::Cancel {
+                            session_id: Uuid::now_v7(),
+                            canonical_project_digest: "22".repeat(32),
+                            client_draft_id: Uuid::now_v7(),
+                            upload_id: Uuid::now_v7(),
+                            upload_generation: 1,
+                        },
+                },
+            ),
+            kind: "cancel_media_upload",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::DiscardUnreferencedMediaAttachment(
+                cockpit_db::media_attachments::LocalMediaMutationV1 {
+                    schema_version: 1,
+                    kind: "localMediaMutation".into(),
+                    local_operation_id: Uuid::now_v7(),
+                    actor_principal_digest: "11".repeat(32),
+                    actor_role: cockpit_db::media_attachments::LocalMediaActorRoleV1::Owner,
+                    payload:
+                        cockpit_db::media_attachments::LocalMediaMutationPayloadV1::Discard {
+                            session_id: Uuid::now_v7(),
+                            canonical_project_digest: "22".repeat(32),
+                            attachment_id: Uuid::now_v7(),
+                            attachment_version: 1,
+                            availability_generation: 1,
+                            reference_generation: 1,
+                            origin_upload: None,
+                        },
+                },
+            ),
+            kind: "discard_unreferenced_media_attachment",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::GetMediaUploadStatus(
+                cockpit_db::media_attachments::GetMediaUploadStatusV1 {
+                    schema_version: 1,
+                    kind: "getMediaUploadStatus".into(),
+                    session_id: Uuid::now_v7(),
+                    canonical_project_digest: "22".repeat(32),
+                    client_draft_id: Uuid::now_v7(),
+                    upload_id: Uuid::now_v7(),
+                    upload_generation: 1,
+                },
+            ),
+            kind: "get_media_upload_status",
+            session_id: None,
+            audit_path: None,
+            mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::FinalizeMediaUpload(
+                cockpit_db::media_attachments::LocalMediaMutationV1 {
+                    schema_version: 1,
+                    kind: "localMediaMutation".into(),
+                    local_operation_id: Uuid::now_v7(),
+                    actor_principal_digest: "11".repeat(32),
+                    actor_role: cockpit_db::media_attachments::LocalMediaActorRoleV1::Owner,
+                    payload:
+                        cockpit_db::media_attachments::LocalMediaMutationPayloadV1::Finalize {
+                            session_id: Uuid::now_v7(),
+                            canonical_project_digest: "22".repeat(32),
+                            client_draft_id: Uuid::now_v7(),
+                            upload_id: Uuid::now_v7(),
+                            upload_generation: 1,
+                            chunk_count: 1,
+                            total_bytes: 1,
+                            object_sha256: "33".repeat(32),
+                        },
+                },
+            ),
+            kind: "finalize_media_upload",
             session_id: None,
             audit_path: None,
             mutating: true,

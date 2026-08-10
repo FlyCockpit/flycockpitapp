@@ -258,6 +258,7 @@ pub(super) fn begin_attachment_upload_with_limits(
         upload_id,
         PendingAttachmentUpload {
             media_reservation: None,
+            media_resources_policy: None,
             session_id,
             byte_len,
             sha256,
@@ -413,6 +414,11 @@ pub(super) async fn begin_attachment_upload_admitted(
         .get_mut(&upload_id)
         .expect("upload inserted before durable admission")
         .media_reservation = Some(receipt);
+    state
+        .pending_uploads
+        .get_mut(&upload_id)
+        .expect("upload inserted before durable admission")
+        .media_resources_policy = Some(policy);
     Ok(response)
 }
 
@@ -659,20 +665,20 @@ pub(super) async fn finish_attachment_upload_admitted(
             let session_id = upload
                 .session_id
                 .ok_or_else(|| bad_request("user-message image upload is missing its session"))?;
-            let attached = require_attached(state)?;
-            let project_text = attached
-                .handle
-                .project_root
-                .to_str()
-                .ok_or_else(|| internal("project path is not UTF-8"))?;
+            let project_text = {
+                let attached = require_attached(state)?;
+                attached
+                    .handle
+                    .project_root
+                    .to_str()
+                    .ok_or_else(|| internal("project path is not UTF-8"))?
+                    .to_owned()
+            };
             let project_digest = crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes()));
-            let (_, extended) = ctx
-                .config_source
-                .load_effective_for_daemon(
-                    &attached.handle.project_root,
-                    &attached.handle.trust_policy,
-                )
-                .map_err(internal)?;
+            let policy = upload
+                .media_resources_policy
+                .take()
+                .ok_or_else(|| internal("attachment upload is missing its evaluated media policy"))?;
             let storage = ctx
                 .media_storage_recovery
                 .as_ref()
@@ -695,7 +701,7 @@ pub(super) async fn finish_attachment_upload_admitted(
                     session_id,
                     project_digest,
                     bytes,
-                    policy: &extended.media_resources,
+                    policy: &policy,
                     now_unix_ms: wall_ms.try_into().unwrap_or(i64::MAX),
                     now_monotonic_ms: ctx.media_ledger.clock_now_ms(),
                 })

@@ -7193,13 +7193,13 @@ mod tests {
         })
         .await
         .unwrap();
+        let finalize_err = recovery
+            .finalize_media_upload(finalize.clone(), 42)
+            .await
+            .unwrap_err();
         assert!(
-            recovery
-                .finalize_media_upload(finalize.clone(), 42)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("injected upload attachment failure")
+            format!("{finalize_err:#}").contains("injected upload attachment failure"),
+            "finalize error did not contain injected trigger message: {finalize_err:#}"
         );
         let failed_counts = db
             .read(move |conn| {
@@ -7256,13 +7256,13 @@ mod tests {
             })
             .await
             .unwrap();
+            let tranche_err = recovery
+                .finalize_media_upload(finalize.clone(), 43)
+                .await
+                .unwrap_err();
             assert!(
-                recovery
-                    .finalize_media_upload(finalize.clone(), 43)
-                    .await
-                    .unwrap_err()
-                    .to_string()
-                    .contains("injected finalize tranche failure")
+                format!("{tranche_err:#}").contains("injected finalize tranche failure"),
+                "finalize tranche error did not contain injected trigger message: {tranche_err:#}"
             );
             let graph_counts = db
                 .read(|conn| {
@@ -8091,7 +8091,7 @@ mod tests {
         let session = Uuid::now_v7();
         let attachment = Uuid::now_v7();
         let component = Uuid::now_v7();
-        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/redacted',1,1)",[session.to_string()])?;conn.execute("INSERT INTO media_reservations(reservation_id,policy_version,project_id,owner_session_key,operation,purpose,recovery_id,state,version,queue_sequence,deadline_monotonic_ms,created_wall_ms) VALUES('cleanup-reservation',1,'p',?1,'cleanup','retention','cleanup-recovery','settling',1,1,1,1)",[session.to_string()])?;cockpit_db::Db::insert_media_attachment_conn(conn,&MediaAttachmentRecord{attachment_id:attachment,session_id:session,canonical_project_digest:"11".repeat(32),media_kind:MediaKind::Image,source_kind:MediaSourceKind::RetainedHttps,canonical_container:"png".into(),canonical_mime:"image/png".into(),availability:MediaAvailability::OwnedCleanupPending,attachment_version:1,availability_generation:2,reference_generation:1,captured_capability_generation:1,source_identity_digest:"22".repeat(32),source_byte_length:length,source_sha256:checksum.clone(),selected_video_stream:None,selected_audio_stream:None,created_at_unix_ms:1,updated_at_unix_ms:1,draft_expires_at_unix_ms:None,first_referenced_at_unix_ms:Some(1)})?;cockpit_db::Db::insert_media_attachment_component_conn(conn,&MediaAttachmentComponent{component_id:component,attachment_id:attachment,attachment_version:1,component_kind:"image_model".into(),storage_id,lifecycle_state:"cleanup_pending".into(),component_generation:2,stable_identity_digest:identity,byte_length:length,sha256:checksum,reservation_id:"cleanup-reservation".into(),created_at_unix_ms:1,updated_at_unix_ms:1})?;conn.execute("INSERT INTO media_attachment_cleanup_intents(intent_id,attachment_id,attachment_version,expected_availability_generation,expected_reference_generation,component_set_digest,reason,created_at_unix_ms) VALUES(?1,?2,'1','2','1',?3,'session_retention',1)",params![Uuid::now_v7().to_string(),attachment.to_string(),"33".repeat(32)])?;Ok(())}).await.unwrap();
+        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/redacted',1,1)",[session.to_string()])?;conn.execute("INSERT INTO media_reservations(reservation_id,policy_version,project_id,owner_session_key,operation,purpose,recovery_id,state,version,queue_sequence,deadline_monotonic_ms,created_wall_ms) VALUES('cleanup-reservation',1,'p',?1,'cleanup','retention','cleanup-recovery','settling',1,1,1,1)",[session.to_string()])?;cockpit_db::Db::insert_media_attachment_conn(conn,&MediaAttachmentRecord{attachment_id:attachment,session_id:session,canonical_project_digest:"11".repeat(32),media_kind:MediaKind::Image,source_kind:MediaSourceKind::RetainedHttps,canonical_container:"png".into(),canonical_mime:"image/png".into(),availability:MediaAvailability::Quarantined,attachment_version:1,availability_generation:1,reference_generation:1,captured_capability_generation:1,source_identity_digest:"22".repeat(32),source_byte_length:length,source_sha256:checksum.clone(),selected_video_stream:None,selected_audio_stream:None,created_at_unix_ms:1,updated_at_unix_ms:1,draft_expires_at_unix_ms:None,first_referenced_at_unix_ms:Some(1)})?;cockpit_db::Db::transition_media_attachment_conn(conn,attachment,1,1,MediaAvailability::OwnedCleanupPending,1)?;cockpit_db::Db::insert_media_attachment_component_conn(conn,&MediaAttachmentComponent{component_id:component,attachment_id:attachment,attachment_version:1,component_kind:"image_model".into(),storage_id,lifecycle_state:"cleanup_pending".into(),component_generation:2,stable_identity_digest:identity,byte_length:length,sha256:checksum,reservation_id:"cleanup-reservation".into(),created_at_unix_ms:1,updated_at_unix_ms:1})?;conn.execute("INSERT INTO media_attachment_cleanup_intents(intent_id,attachment_id,attachment_version,expected_availability_generation,expected_reference_generation,component_set_digest,reason,created_at_unix_ms) VALUES(?1,?2,'1','2','1',?3,'session_retention',1)",params![Uuid::now_v7().to_string(),attachment.to_string(),"33".repeat(32)])?;Ok(())}).await.unwrap();
         let storage = MediaStorageRecovery::open(db.clone(), &root_path).unwrap();
         (temp, storage, db, attachment, component, storage_id)
     }
@@ -8144,7 +8144,11 @@ mod tests {
         let component_id = Uuid::now_v7();
         db.transaction(move |conn| {
             conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/redacted',1,1)",[session_id.to_string()])?;
-            cockpit_db::Db::insert_media_attachment_conn(conn,&MediaAttachmentRecord { attachment_id,session_id,canonical_project_digest:"11".repeat(32),media_kind:MediaKind::Image,source_kind:MediaSourceKind::RetainedHttps,canonical_container:"png".into(),canonical_mime:"image/png".into(),availability:MediaAvailability::Ready,attachment_version:1,availability_generation:5,reference_generation:1,captured_capability_generation:7,source_identity_digest:"22".repeat(32),source_byte_length:length,source_sha256:checksum.clone(),selected_video_stream:None,selected_audio_stream:None,created_at_unix_ms:1,updated_at_unix_ms:1,draft_expires_at_unix_ms:None,first_referenced_at_unix_ms:None})?;
+            cockpit_db::Db::insert_media_attachment_conn(conn,&MediaAttachmentRecord { attachment_id,session_id,canonical_project_digest:"11".repeat(32),media_kind:MediaKind::Image,source_kind:MediaSourceKind::RetainedHttps,canonical_container:"png".into(),canonical_mime:"image/png".into(),availability:MediaAvailability::Quarantined,attachment_version:1,availability_generation:1,reference_generation:1,captured_capability_generation:7,source_identity_digest:"22".repeat(32),source_byte_length:length,source_sha256:checksum.clone(),selected_video_stream:None,selected_audio_stream:None,created_at_unix_ms:1,updated_at_unix_ms:1,draft_expires_at_unix_ms:None,first_referenced_at_unix_ms:None})?;
+            cockpit_db::Db::transition_media_attachment_conn(conn,attachment_id,1,1,MediaAvailability::Probing,1)?;
+            cockpit_db::Db::transition_media_attachment_conn(conn,attachment_id,1,2,MediaAvailability::Decoding,1)?;
+            cockpit_db::Db::transition_media_attachment_conn(conn,attachment_id,1,3,MediaAvailability::Normalizing,1)?;
+            cockpit_db::Db::transition_media_attachment_conn(conn,attachment_id,1,4,MediaAvailability::Ready,1)?;
             cockpit_db::Db::insert_media_attachment_component_conn(conn,&MediaAttachmentComponent { component_id,attachment_id,attachment_version:1,component_kind:"browser_thumbnail".into(),storage_id,lifecycle_state:"ready".into(),component_generation:1,stable_identity_digest:identity,byte_length:length,sha256:checksum,reservation_id:"reservation".into(),created_at_unix_ms:1,updated_at_unix_ms:1 })?;
             Ok(())
         }).await.unwrap();

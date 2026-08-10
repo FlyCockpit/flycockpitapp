@@ -2684,6 +2684,27 @@ CREATE INDEX idx_remote_attachment_operations_retire
     ON remote_attachment_operations (retire_at_ms)
     WHERE retire_at_ms IS NOT NULL;
 
+CREATE TABLE remote_attachment_lifecycle (
+    logical_attachment_id TEXT PRIMARY KEY CHECK (
+        length(logical_attachment_id) = 36 AND logical_attachment_id = lower(logical_attachment_id)
+        AND substr(logical_attachment_id, 9, 1) = '-' AND substr(logical_attachment_id, 14, 1) = '-'
+        AND substr(logical_attachment_id, 19, 1) = '-' AND substr(logical_attachment_id, 24, 1) = '-'
+        AND substr(logical_attachment_id, 20, 1) GLOB '[89ab]'
+        AND length(replace(logical_attachment_id, '-', '')) = 32
+        AND replace(logical_attachment_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+        AND replace(logical_attachment_id, '-', '') <> '00000000000000000000000000000000'
+    ),
+    closed_at_ms INTEGER NOT NULL CHECK(closed_at_ms >= 0),
+    retain_until_ms INTEGER NOT NULL CHECK(retain_until_ms >= closed_at_ms),
+    CHECK(retain_until_ms - closed_at_ms = 2592000000)
+);
+
+CREATE TRIGGER remote_attachment_lifecycle_immutable
+BEFORE UPDATE ON remote_attachment_lifecycle
+BEGIN
+    SELECT RAISE(ABORT, 'remote attachment close authority is immutable');
+END;
+
 CREATE TRIGGER remote_attachment_operation_reservation_insert
 BEFORE INSERT ON remote_attachment_operations
 WHEN NEW.state <> 'reserved' OR NEW.safe_response IS NOT NULL OR NEW.event_high_water_mark IS NOT NULL

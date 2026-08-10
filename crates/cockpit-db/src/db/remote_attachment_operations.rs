@@ -16,6 +16,7 @@ pub const MAX_SAFE_RESPONSE_BYTES: usize = 512 * 1024;
 pub const MAX_OUTBOX_EVENTS_PER_ATTACHMENT: u64 = 200_000;
 pub const MAX_OUTBOX_PAYLOAD_BYTES_PER_ATTACHMENT: u64 = 2 * 1024 * 1024 * 1024;
 pub const MAX_OUTBOX_PAYLOAD_BYTES: usize = 512 * 1024;
+pub const REMOTE_ATTACHMENT_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 
 fn operation_reservation_at_capacity(row_count: u64, response_bytes: u64) -> bool {
     row_count >= MAX_OPERATION_ROWS_PER_ATTACHMENT
@@ -239,6 +240,105 @@ impl Db {
             )
             .optional()
             .context("querying remote operation status")
+        })
+        .await
+    }
+
+    /// Records the authoritative close instant once and schedules terminal
+    /// operation rows for the mandatory thirty-day retention window.
+    pub async fn close_remote_attachment_operation_ledger(
+        &self,
+        logical_attachment_id: &str,
+        closed_at_ms: i64,
+    ) -> Result<i64> {
+        validate_uuid("logical attachment id", logical_attachment_id)?;
+        ensure!(closed_at_ms >= 0, "close timestamp must be nonnegative");
+        let retain_until_ms = closed_at_ms
+            .checked_add(REMOTE_ATTACHMENT_RETENTION_MS)
+            .context("remote attachment retention deadline overflow")?;
+        let attachment = logical_attachment_id.to_owned();
+        self.transaction(move |conn| {
+            let existing: Option<(i64, i64)> = conn
+                .query_row(
+                    "SELECT closed_at_ms, retain_until_ms FROM remote_attachment_lifecycle
+                     WHERE logical_attachment_id=?1",
+                    [&attachment],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                ensure!(
+                    existing == (closed_at_ms, retain_until_ms),
+                    "remote attachment already closed at a different instant"
+                );
+                return Ok(retain_until_ms);
+            }
+            conn.execute(
+                "INSERT INTO remote_attachment_lifecycle
+                 (logical_attachment_id, closed_at_ms, retain_until_ms) VALUES (?1,?2,?3)",
+                params![attachment, closed_at_ms, retain_until_ms],
+            )?;
+            conn.execute(
+                "UPDATE remote_attachment_operations SET retire_at_ms=?2
+                 WHERE logical_attachment_id=?1 AND state IN ('committed','rejected','outcome_unknown')
+                   AND retire_at_ms IS NULL",
+                params![attachment, retain_until_ms],
+            )?;
+            Ok(retain_until_ms)
+        })
+        .await
+    }
+
+    /// Advances the client snapshot authority, compacts only covered immutable
+    /// events, and retires terminal operations only after the close deadline.
+    pub async fn compact_closed_remote_attachment_operation_ledger(
+        &self,
+        logical_attachment_id: &str,
+        compacted_through_event_seq: u64,
+        snapshot_high_water_mark: u64,
+        now_ms: i64,
+    ) -> Result<u64> {
+        validate_uuid("logical attachment id", logical_attachment_id)?;
+        ensure!(
+            snapshot_high_water_mark >= compacted_through_event_seq,
+            "snapshot high-water mark precedes compacted cursor"
+        );
+        let cursor = i64::try_from(compacted_through_event_seq)?;
+        let high_water = i64::try_from(snapshot_high_water_mark)?;
+        let attachment = logical_attachment_id.to_owned();
+        self.transaction(move |conn| {
+            let retain_until: i64 = conn.query_row(
+                "SELECT retain_until_ms FROM remote_attachment_lifecycle
+                 WHERE logical_attachment_id=?1",
+                [&attachment],
+                |row| row.get(0),
+            ).context("remote attachment must be authoritatively closed before compaction")?;
+            conn.execute(
+                "INSERT INTO remote_attachment_outbox_snapshots
+                 (logical_attachment_id, compacted_through_event_seq, snapshot_high_water_mark, updated_at_ms)
+                 VALUES (?1,?2,?3,?4)
+                 ON CONFLICT(logical_attachment_id) DO UPDATE SET
+                   compacted_through_event_seq=excluded.compacted_through_event_seq,
+                   snapshot_high_water_mark=excluded.snapshot_high_water_mark,
+                   updated_at_ms=excluded.updated_at_ms",
+                params![attachment, cursor, high_water, now_ms],
+            )?;
+            conn.execute(
+                "DELETE FROM remote_attachment_outbox
+                 WHERE logical_attachment_id=?1 AND event_seq<=?2",
+                params![attachment, cursor],
+            )?;
+            if now_ms < retain_until {
+                return Ok(0);
+            }
+            let deleted = conn.execute(
+                "DELETE FROM remote_attachment_operations
+                 WHERE logical_attachment_id=?1 AND retire_at_ms<=?2
+                   AND state IN ('committed','rejected','outcome_unknown')
+                   AND (event_high_water_mark IS NULL OR event_high_water_mark<=?3)",
+                params![attachment, now_ms, cursor],
+            )?;
+            Ok(deleted as u64)
         })
         .await
     }
@@ -605,6 +705,12 @@ fn reserve_conn(
             seq, state, response, high_water,
         )?));
     }
+    let closed: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM remote_attachment_lifecycle WHERE logical_attachment_id=?1)",
+        [&request.logical_attachment_id],
+        |row| row.get(0),
+    )?;
+    ensure!(!closed, "remote attachment operation ledger is closed");
 
     let (row_count, response_bytes): (i64, i64) = conn.query_row(
         "SELECT COUNT(*), COALESCE(SUM(length(safe_response)), 0)
@@ -1755,6 +1861,112 @@ mod tests {
             BeginNonrepeatableRemoteOperationOutcome::OutcomeUnknown(
                 br#"{"outcome":"unknown"}"#.to_vec()
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_attachment_retains_replay_for_thirty_days_then_snapshot_retires_it() {
+        let db = Db::open_in_memory().unwrap();
+        let operation = "01890f3e-4c00-7000-8000-000000000098";
+        db.reserve_remote_attachment_operation(reserve(operation, [8; 32]))
+            .await
+            .unwrap();
+        db.commit_remote_attachment_operation(CommitRemoteOperation {
+            logical_attachment_id: ATTACHMENT,
+            operation_id: operation,
+            safe_response: b"closed-safe-response",
+            outbox_delivery_id: "00000000-0000-4000-8000-000000000099",
+            outbox_kind: "closed_test",
+            outbox_payload: b"closed-event",
+            now_ms: 11,
+        })
+        .await
+        .unwrap();
+
+        let deadline = db
+            .close_remote_attachment_operation_ledger(ATTACHMENT, 100)
+            .await
+            .unwrap();
+        assert_eq!(deadline, 100 + REMOTE_ATTACHMENT_RETENTION_MS);
+        assert!(matches!(
+            db.reserve_remote_attachment_operation(reserve(operation, [8; 32]))
+                .await
+                .unwrap(),
+            ReserveRemoteOperationOutcome::Replay(_)
+        ));
+        assert!(
+            db.reserve_remote_attachment_operation(reserve(
+                "01890f3e-4c00-7000-8000-00000000009a",
+                [9; 32],
+            ))
+            .await
+            .is_err(),
+            "close authority rejects new operations"
+        );
+        assert_eq!(
+            db.compact_closed_remote_attachment_operation_ledger(ATTACHMENT, 1, 1, deadline - 1,)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(
+            db.remote_operation_status(ATTACHMENT, operation)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            db.compact_closed_remote_attachment_operation_ledger(ATTACHMENT, 1, 1, deadline)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            db.remote_operation_status(ATTACHMENT, operation)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn close_authority_is_immutable_and_snapshot_cursor_is_required_for_fk_cleanup() {
+        let db = Db::open_in_memory().unwrap();
+        let operation = "01890f3e-4c00-7000-8000-00000000009b";
+        db.reserve_remote_attachment_operation(reserve(operation, [10; 32]))
+            .await
+            .unwrap();
+        db.commit_remote_attachment_operation(CommitRemoteOperation {
+            logical_attachment_id: ATTACHMENT,
+            operation_id: operation,
+            safe_response: b"safe",
+            outbox_delivery_id: "00000000-0000-4000-8000-00000000009c",
+            outbox_kind: "retention_test",
+            outbox_payload: b"event",
+            now_ms: 11,
+        })
+        .await
+        .unwrap();
+        let deadline = db
+            .close_remote_attachment_operation_ledger(ATTACHMENT, 100)
+            .await
+            .unwrap();
+        assert!(
+            db.close_remote_attachment_operation_ledger(ATTACHMENT, 101)
+                .await
+                .is_err()
+        );
+        assert!(
+            db.compact_closed_remote_attachment_operation_ledger(ATTACHMENT, 0, 1, deadline)
+                .await
+                .is_err(),
+            "an uncovered event FK prevents premature retirement"
+        );
+        assert!(
+            db.remote_operation_status(ATTACHMENT, operation)
+                .await
+                .unwrap()
+                .is_some()
         );
     }
 }

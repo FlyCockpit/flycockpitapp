@@ -357,11 +357,164 @@ pub struct ConnectionProof {
 pub trait BoundConnector: Send + Sync {
     fn connect<'a>(
         &'a self,
-        authority: &'a str,
+        origin: &'a reqwest::Url,
         candidates: &'a [IpAddr],
         required_location: AddressClass,
         limits: ProbeLimits,
     ) -> Pin<Box<dyn Future<Output = Result<ConnectionProof, RuntimeError>> + Send + 'a>>;
+}
+
+pub struct ReqwestPinnedConnector {
+    dns: Arc<dyn DnsResolver>,
+}
+
+impl ReqwestPinnedConnector {
+    pub fn new(dns: Arc<dyn DnsResolver>) -> Self {
+        Self { dns }
+    }
+
+    async fn pinned_head(
+        &self,
+        url: &reqwest::Url,
+        ip: IpAddr,
+        limits: ProbeLimits,
+    ) -> Result<reqwest::Response, RuntimeError> {
+        let hostname = url.host_str().ok_or(RuntimeError::new(
+            RuntimeErrorCode::Dns,
+            "Correct the endpoint hostname.",
+        ))?;
+        let port = url.port_or_known_default().ok_or(RuntimeError::new(
+            RuntimeErrorCode::Dns,
+            "Correct the endpoint port.",
+        ))?;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .connect_timeout(limits.connect_timeout)
+            .resolve(hostname, std::net::SocketAddr::new(ip, port))
+            .build()
+            .map_err(|_| {
+                RuntimeError::new(
+                    RuntimeErrorCode::Tls,
+                    "Check the endpoint certificate and configured hostname.",
+                )
+            })?;
+        tokio::time::timeout(limits.header_timeout, client.head(url.clone()).send())
+            .await
+            .map_err(|_| {
+                RuntimeError::new(
+                    RuntimeErrorCode::HeaderTimeout,
+                    "The provider did not return response headers in time.",
+                )
+            })?
+            .map_err(|error| {
+                let code = if error.is_connect() && url.scheme() == "https" {
+                    RuntimeErrorCode::Tls
+                } else {
+                    RuntimeErrorCode::ConnectTimeout
+                };
+                RuntimeError::new(code, health_state_for_error(code).remediation())
+            })
+    }
+}
+
+impl BoundConnector for ReqwestPinnedConnector {
+    fn connect<'a>(
+        &'a self,
+        origin: &'a reqwest::Url,
+        candidates: &'a [IpAddr],
+        required_location: AddressClass,
+        limits: ProbeLimits,
+    ) -> Pin<Box<dyn Future<Output = Result<ConnectionProof, RuntimeError>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut url = origin.clone();
+            let mut candidates = candidates.to_vec();
+            let mut hops = Vec::new();
+            for redirect_count in 0..=limits.redirect_limit {
+                let ip = *candidates.first().ok_or(RuntimeError::new(
+                    RuntimeErrorCode::DnsDenied,
+                    ImageHealthState::DnsDenied.remediation(),
+                ))?;
+                let hostname = url.host_str().ok_or(RuntimeError::new(
+                    RuntimeErrorCode::Dns,
+                    "Correct the endpoint hostname.",
+                ))?;
+                let authority = origin_authority(&url, hostname);
+                let response = self.pinned_head(&url, ip, limits).await?;
+                let connected_ip =
+                    response
+                        .remote_addr()
+                        .map(|address| address.ip())
+                        .ok_or(RuntimeError::new(
+                            RuntimeErrorCode::DnsDenied,
+                            ImageHealthState::DnsDenied.remediation(),
+                        ))?;
+                if !candidates.contains(&connected_ip)
+                    || classify_address(connected_ip) != required_location
+                {
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::DnsDenied,
+                        ImageHealthState::DnsDenied.remediation(),
+                    ));
+                }
+                hops.push(ConnectionHop {
+                    authority: authority.clone(),
+                    hostname: hostname.to_owned(),
+                    connected_ip,
+                    location: required_location,
+                });
+                if !response.status().is_redirection() {
+                    let first = &hops[0];
+                    return Ok(ConnectionProof {
+                        authority: first.authority.clone(),
+                        connected_ip: first.connected_ip,
+                        location: required_location,
+                        established_at: 0,
+                        hops,
+                    });
+                }
+                if redirect_count == limits.redirect_limit {
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::RedirectLimit,
+                        "Use an endpoint with at most three redirects.",
+                    ));
+                }
+                let location = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or(RuntimeError::new(
+                        RuntimeErrorCode::MalformedResponse,
+                        "Correct the provider redirect response.",
+                    ))?;
+                url = url.join(location).map_err(|_| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::MalformedResponse,
+                        "Correct the provider redirect location.",
+                    )
+                })?;
+                let redirect_host = url.host_str().ok_or(RuntimeError::new(
+                    RuntimeErrorCode::Dns,
+                    "Correct the redirect hostname.",
+                ))?;
+                candidates = self.dns.resolve(redirect_host).await?;
+                if candidates.is_empty()
+                    || candidates
+                        .iter()
+                        .any(|ip| classify_address(*ip) != required_location)
+                {
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::DnsDenied,
+                        ImageHealthState::DnsDenied.remediation(),
+                    ));
+                }
+            }
+            Err(RuntimeError::new(
+                RuntimeErrorCode::RedirectLimit,
+                "Use an endpoint with at most three redirects.",
+            ))
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -954,7 +1107,7 @@ impl ImageRuntimeRegistry {
         let connect_deadline = header_deadline.min(tokio::time::Instant::now() + CONNECT_TIMEOUT);
         let connection = match tokio::time::timeout_at(
             connect_deadline,
-            self.connector.connect(&authority, &allowed, wanted, limits),
+            self.connector.connect(&url, &allowed, wanted, limits),
         )
         .await
         .map_err(|_| {
@@ -1000,10 +1153,7 @@ impl ImageRuntimeRegistry {
                 ImageHealthState::DnsDenied.remediation(),
             ));
         }
-        if let Err(error) = self
-            .validate_connection_hops(&connection, wanted, &allowed)
-            .await
-        {
+        if let Err(error) = Self::validate_connection_hops(&connection, wanted, &allowed) {
             self.commit_failure(
                 &endpoint,
                 &target_id,
@@ -1178,8 +1328,7 @@ impl ImageRuntimeRegistry {
             &immutable_identity,
         )
     }
-    async fn validate_connection_hops(
-        &self,
+    fn validate_connection_hops(
         proof: &ConnectionProof,
         wanted: AddressClass,
         initial_candidates: &[IpAddr],
@@ -1201,14 +1350,7 @@ impl ImageRuntimeRegistry {
             ));
         }
         for (index, hop) in proof.hops.iter().enumerate() {
-            let resolved = if index == 0 {
-                initial_candidates.to_vec()
-            } else {
-                self.dns
-                    .resolve(unbracketed_hostname(&hop.hostname))
-                    .await?
-            };
-            if !resolved.contains(&hop.connected_ip)
+            if (index == 0 && !initial_candidates.contains(&hop.connected_ip))
                 || classify_address(hop.connected_ip) != wanted
                 || hop.location != wanted
             {
@@ -1427,7 +1569,7 @@ impl ImageRuntimeRegistry {
         let allowed = ips;
         let proof = self
             .connector
-            .connect(&authority, &allowed, class, ProbeLimits::health())
+            .connect(&url, &allowed, class, ProbeLimits::health())
             .await?;
         if !allowed.contains(&proof.connected_ip)
             || proof.location != class
@@ -1439,7 +1581,7 @@ impl ImageRuntimeRegistry {
                 ImageHealthState::DnsDenied.remediation(),
             ));
         }
-        if let Err(error) = self.validate_connection_hops(&proof, class, &allowed).await {
+        if let Err(error) = Self::validate_connection_hops(&proof, class, &allowed) {
             self.invalidate_target_cache(&endpoint.id, target_id);
             return Err(error);
         }

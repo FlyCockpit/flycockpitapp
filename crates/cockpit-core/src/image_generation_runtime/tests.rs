@@ -30,20 +30,22 @@ struct Connector;
 impl BoundConnector for Connector {
     fn connect<'a>(
         &'a self,
-        authority: &'a str,
+        origin: &'a reqwest::Url,
         candidates: &'a [IpAddr],
         _required_location: AddressClass,
         _: ProbeLimits,
     ) -> Pin<Box<dyn Future<Output = Result<ConnectionProof, RuntimeError>> + Send + 'a>> {
         Box::pin(async move {
+            let hostname = origin.host_str().unwrap();
+            let authority = origin_authority(origin, hostname);
             Ok(ConnectionProof {
-                authority: authority.into(),
+                authority: authority.clone(),
                 connected_ip: candidates[0],
                 location: classify_address(candidates[0]),
                 established_at: 0,
                 hops: vec![ConnectionHop {
-                    authority: authority.into(),
-                    hostname: authority.split(':').next().unwrap().into(),
+                    authority,
+                    hostname: hostname.into(),
                     connected_ip: candidates[0],
                     location: classify_address(candidates[0]),
                 }],
@@ -55,7 +57,7 @@ struct ErrorConnector(RuntimeErrorCode);
 impl BoundConnector for ErrorConnector {
     fn connect<'a>(
         &'a self,
-        _: &'a str,
+        _: &'a reqwest::Url,
         _: &'a [IpAddr],
         _: AddressClass,
         _: ProbeLimits,
@@ -72,7 +74,7 @@ struct PendingConnector;
 impl BoundConnector for PendingConnector {
     fn connect<'a>(
         &'a self,
-        _: &'a str,
+        _: &'a reqwest::Url,
         _: &'a [IpAddr],
         _: AddressClass,
         _: ProbeLimits,
@@ -84,12 +86,13 @@ struct MismatchedConnector;
 impl BoundConnector for MismatchedConnector {
     fn connect<'a>(
         &'a self,
-        authority: &'a str,
+        origin: &'a reqwest::Url,
         _: &'a [IpAddr],
         _: AddressClass,
         _: ProbeLimits,
     ) -> Pin<Box<dyn Future<Output = Result<ConnectionProof, RuntimeError>> + Send + 'a>> {
         Box::pin(async move {
+            let authority = origin_authority(origin, origin.host_str().unwrap());
             Ok(ConnectionProof {
                 authority: format!("wrong.{authority}"),
                 connected_ip: "1.1.1.1".parse().unwrap(),
@@ -628,14 +631,8 @@ fn image_generation_credential_identity_is_typed_and_redacted() {
     assert!(!rendered.contains("5a"));
 }
 
-#[tokio::test]
-async fn image_generation_runtime_revalidates_every_redirect_hop() {
-    let clock = Arc::new(Clock(AtomicU64::new(0)));
-    let adapter = Arc::new(Adapter {
-        kind: ImageAdapterKind::OpenaiImages,
-        calls: AtomicUsize::new(0),
-    });
-    let registry = registry(clock, adapter);
+#[test]
+fn image_generation_runtime_revalidates_every_redirect_hop() {
     let proof = ConnectionProof {
         authority: "example.com:443".into(),
         connected_ip: "8.8.8.8".parse().unwrap(),
@@ -657,25 +654,21 @@ async fn image_generation_runtime_revalidates_every_redirect_hop() {
         ],
     };
     assert!(matches!(
-        registry
-            .validate_connection_hops(
-                &proof,
-                AddressClass::PublicRemote,
-                &["8.8.8.8".parse().unwrap()],
-            )
-            .await,
+        ImageRuntimeRegistry::validate_connection_hops(
+            &proof,
+            AddressClass::PublicRemote,
+            &["8.8.8.8".parse().unwrap()],
+        ),
         Err(error) if error.code == RuntimeErrorCode::DnsDenied
     ));
     let mut too_many = proof.clone();
     too_many.hops = vec![too_many.hops[0].clone(); REDIRECT_LIMIT + 2];
     assert!(matches!(
-        registry
-            .validate_connection_hops(
-                &too_many,
-                AddressClass::PublicRemote,
-                &["8.8.8.8".parse().unwrap()],
-            )
-            .await,
+        ImageRuntimeRegistry::validate_connection_hops(
+            &too_many,
+            AddressClass::PublicRemote,
+            &["8.8.8.8".parse().unwrap()],
+        ),
         Err(error) if error.code == RuntimeErrorCode::RedirectLimit
     ));
 }
@@ -766,4 +759,58 @@ async fn image_generation_runtime_rejects_mixed_dns_location_classes() {
             .await,
         Err(error) if error.code == RuntimeErrorCode::DnsDenied
     ));
+}
+
+#[tokio::test]
+async fn image_generation_pinned_connector_preserves_authority_and_revalidates_redirects() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for redirect in [true, false] {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = vec![0; 4096];
+            let read = socket.read(&mut bytes).await.unwrap();
+            requests.push(String::from_utf8_lossy(&bytes[..read]).into_owned());
+            let response = if redirect {
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://redirect.test:{port}/final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+            } else {
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+            };
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+        requests
+    });
+    let dns: Arc<dyn DnsResolver> = Arc::new(Dns(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+    let connector = ReqwestPinnedConnector::new(dns);
+    let origin = reqwest::Url::parse(&format!("http://origin.test:{port}/health")).unwrap();
+    let proof = connector
+        .connect(
+            &origin,
+            &[IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            AddressClass::Loopback,
+            ProbeLimits::health(),
+        )
+        .await
+        .unwrap();
+    let requests = server.await.unwrap();
+    assert!(
+        requests[0]
+            .to_ascii_lowercase()
+            .contains(&format!("host: origin.test:{port}"))
+    );
+    assert!(
+        requests[1]
+            .to_ascii_lowercase()
+            .contains(&format!("host: redirect.test:{port}"))
+    );
+    assert_eq!(proof.hops.len(), 2);
+    assert_eq!(proof.hops[0].connected_ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    assert_eq!(proof.hops[1].connected_ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
 }

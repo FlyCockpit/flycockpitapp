@@ -1949,6 +1949,73 @@ fn video_normalization_argv(
     Ok(argv)
 }
 
+fn gcd_u128(mut a: u128, mut b: u128) -> u128 {
+    while b != 0 {
+        let remainder = a % b;
+        a = b;
+        b = remainder;
+    }
+    a
+}
+
+fn select_video_rate(timestamps: &[(u64, u64)]) -> Result<(u32, u32, u32, u32)> {
+    ensure!(!timestamps.is_empty(), "invalid_media");
+    for &(_, den) in timestamps {
+        ensure!(den > 0, "invalid_media");
+    }
+    if timestamps.len() == 1 {
+        return Ok((1, 1, 10, 1));
+    }
+    let delta = |left: (u64, u64), right: (u64, u64)| -> Result<(u128, u128)> {
+        let lhs = u128::from(right.0)
+            .checked_mul(u128::from(left.1))
+            .context("invalid_media")?;
+        let rhs = u128::from(left.0)
+            .checked_mul(u128::from(right.1))
+            .context("invalid_media")?;
+        ensure!(lhs > rhs, "invalid_media");
+        let num = lhs - rhs;
+        let den = u128::from(left.1)
+            .checked_mul(u128::from(right.1))
+            .context("invalid_media")?;
+        let gcd = gcd_u128(num, den);
+        Ok((num / gcd, den / gcd))
+    };
+    let deltas = timestamps
+        .windows(2)
+        .map(|pair| delta(pair[0], pair[1]))
+        .collect::<Result<Vec<_>>>()?;
+    let cfr = deltas.iter().all(|value| *value == deltas[0]);
+    let (mut num, mut den) = if cfr {
+        (deltas[0].1, deltas[0].0)
+    } else {
+        let total = delta(timestamps[0], *timestamps.last().unwrap())?;
+        (
+            u128::try_from(timestamps.len() - 1)?
+                .checked_mul(total.1)
+                .context("invalid_media")?,
+            total.0,
+        )
+    };
+    let gcd = gcd_u128(num, den);
+    num /= gcd;
+    den /= gcd;
+    if num > 24 * den {
+        num = 24;
+        den = 1;
+    }
+    let num = u32::try_from(num).context("invalid_media")?;
+    let den = u32::try_from(den).context("invalid_media")?;
+    let ceil = |a: u64, b: u64| {
+        a.checked_add(b - 1)
+            .context("invalid_media")
+            .map(|value| value / b)
+    };
+    let gop = u32::try_from(ceil(10 * u64::from(num), u64::from(den))?.clamp(1, 240))?;
+    let min_keyint = u32::try_from(ceil(u64::from(num), u64::from(den))?.clamp(1, u64::from(gop)))?;
+    Ok((num, den, gop, min_keyint))
+}
+
 struct NormalizedImageDerivatives {
     model_png: Vec<u8>,
     thumbnail_png: Vec<u8>,
@@ -2979,6 +3046,19 @@ mod tests {
                 .iter()
                 .any(|arg| matches!(arg.as_str(), "sh" | "-c" | "cmd.exe"))
         );
+    }
+
+    #[test]
+    fn video_frame_rate_uses_exact_timestamp_rationals() {
+        assert_eq!(select_video_rate(&[(0, 1)]).unwrap(), (1, 1, 10, 1));
+        let rate = select_video_rate(&[(0, 1), (1001, 24000), (2002, 24000)]).unwrap();
+        assert_eq!((rate.0, rate.1), (24000, 1001));
+        let rate = select_video_rate(&[(0, 1), (1001, 30000), (2002, 30000)]).unwrap();
+        assert_eq!((rate.0, rate.1), (24, 1));
+        let rate = select_video_rate(&[(0, 1), (1, 10), (1, 2)]).unwrap();
+        assert_eq!((rate.0, rate.1), (4, 1));
+        assert!(select_video_rate(&[(0, 1), (0, 1)]).is_err());
+        assert!(select_video_rate(&[(0, 1), (1, 0)]).is_err());
     }
 
     #[test]

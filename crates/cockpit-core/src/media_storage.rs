@@ -1557,7 +1557,7 @@ fn probe_upload_container(
     file: &mut File,
     declared: MediaKind,
 ) -> Result<(&'static str, &'static str)> {
-    let mut header = [0u8; 32];
+    let mut header = [0u8; 4096];
     file.seek(SeekFrom::Start(0))?;
     let read = file.read(&mut header)?;
     file.seek(SeekFrom::Start(0))?;
@@ -1570,12 +1570,53 @@ fn probe_upload_container(
         Some((MediaKind::Image, "gif", "image/gif"))
     } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
         Some((MediaKind::Image, "webp", "image/webp"))
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
+        Some((MediaKind::Audio, "wav", "audio/wav"))
+    } else if bytes.starts_with(b"fLaC") {
+        Some((MediaKind::Audio, "flac", "audio/flac"))
+    } else if bytes.starts_with(b"OggS") {
+        Some((MediaKind::Audio, "ogg", "audio/ogg"))
+    } else if valid_mpeg_audio_prefix(bytes) {
+        Some((MediaKind::Audio, "mp3", "audio/mpeg"))
     } else {
         None
     };
     let (kind, container, mime) = classified.context("ambiguous_or_unsupported_container")?;
     ensure!(kind == declared, "ambiguous_or_unsupported_container");
     Ok((container, mime))
+}
+
+fn valid_mpeg_audio_prefix(bytes: &[u8]) -> bool {
+    let mut offset = 0usize;
+    if bytes.starts_with(b"ID3") {
+        if bytes.len() < 10
+            || bytes[3] == 0xff
+            || bytes[4] == 0xff
+            || bytes[6..10].iter().any(|byte| byte & 0x80 != 0)
+        {
+            return false;
+        }
+        let size = ((bytes[6] as usize) << 21)
+            | ((bytes[7] as usize) << 14)
+            | ((bytes[8] as usize) << 7)
+            | (bytes[9] as usize);
+        offset = match 10usize
+            .checked_add(size)
+            .and_then(|value| value.checked_add(if bytes[5] & 0x10 != 0 { 10 } else { 0 }))
+        {
+            Some(value) => value,
+            None => return false,
+        };
+    }
+    let Some(frame) = bytes.get(offset..offset.saturating_add(4)) else {
+        return false;
+    };
+    frame[0] == 0xff
+        && frame[1] & 0xe0 == 0xe0
+        && frame[1] & 0x18 != 0x08
+        && frame[1] & 0x06 != 0
+        && frame[2] & 0xf0 != 0xf0
+        && frame[2] & 0x0c != 0x0c
 }
 
 struct NormalizedImageDerivatives {
@@ -2413,6 +2454,30 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    #[test]
+    fn av_byte_classification_rejects_spoofed_mp3_and_normalizes_audio_signatures() {
+        assert!(valid_mpeg_audio_prefix(&[0xff, 0xfb, 0x90, 0x64]));
+        let mut id3 = vec![
+            b'I', b'D', b'3', 4, 0, 0, 0, 0, 0, 1, 0, 0xff, 0xfb, 0x90, 0x64,
+        ];
+        assert!(valid_mpeg_audio_prefix(&id3));
+        id3[6] = 0x80;
+        assert!(!valid_mpeg_audio_prefix(&id3));
+        for (bytes, kind, container) in [
+            (b"RIFF\x04\0\0\0WAVE".as_slice(), MediaKind::Audio, "wav"),
+            (b"fLaC\0\0\0\0".as_slice(), MediaKind::Audio, "flac"),
+            (b"OggS\0\0\0\0".as_slice(), MediaKind::Audio, "ogg"),
+        ] {
+            let temp = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(temp.path(), bytes).unwrap();
+            let mut file = File::open(temp.path()).unwrap();
+            assert_eq!(
+                probe_upload_container(&mut file, kind).unwrap().0,
+                container
+            );
+        }
+    }
 
     #[test]
     fn upload_container_probe_is_byte_authoritative_and_kind_exact() {

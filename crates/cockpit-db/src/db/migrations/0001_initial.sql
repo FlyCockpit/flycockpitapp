@@ -3123,7 +3123,8 @@ CREATE TABLE image_generation_plans (
     max_attempt_count INTEGER NOT NULL CHECK(max_attempt_count > 0),
     enqueue_started_monotonic_ms INTEGER NOT NULL CHECK(enqueue_started_monotonic_ms >= 0),
     operation_deadline_monotonic_ms INTEGER NOT NULL,
-    CHECK(operation_deadline_monotonic_ms > enqueue_started_monotonic_ms)
+    CHECK(operation_deadline_monotonic_ms > enqueue_started_monotonic_ms),
+    UNIQUE(job_id,plan_digest)
 );
 
 CREATE TABLE image_generation_jobs (
@@ -3198,6 +3199,19 @@ CREATE TABLE image_generation_scheduler_claims (
  PRIMARY KEY(job_id,slot_id),
  FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT
 );
+CREATE TABLE image_generation_attempt_media_snapshots (
+ job_id TEXT NOT NULL,
+ slot_id TEXT NOT NULL,
+ attempt_number INTEGER NOT NULL,
+ plan_digest TEXT NOT NULL CHECK(length(plan_digest)=64),
+ canonical_media_plan BLOB NOT NULL CHECK(length(canonical_media_plan)>0 AND length(canonical_media_plan)<=65536),
+ media_plan_digest TEXT NOT NULL CHECK(length(media_plan_digest)=64),
+ PRIMARY KEY(job_id,slot_id,attempt_number),
+ FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT,
+ FOREIGN KEY(job_id,plan_digest) REFERENCES image_generation_plans(job_id,plan_digest) ON DELETE RESTRICT
+);
+CREATE TRIGGER image_generation_attempt_media_snapshot_immutable BEFORE UPDATE ON image_generation_attempt_media_snapshots BEGIN SELECT RAISE(ABORT,'image generation media snapshot is immutable'); END;
+CREATE TRIGGER image_generation_attempt_media_snapshot_no_delete BEFORE DELETE ON image_generation_attempt_media_snapshots BEGIN SELECT RAISE(ABORT,'image generation media snapshot is immutable'); END;
 CREATE TRIGGER image_generation_scheduler_claim_immutable BEFORE UPDATE ON image_generation_scheduler_claims
 WHEN NEW.job_id!=OLD.job_id OR NEW.slot_id!=OLD.slot_id OR NEW.attempt_number!=OLD.attempt_number OR NEW.claim_generation!=OLD.claim_generation+1 OR NEW.claimed_at_unix_ms<OLD.claimed_at_unix_ms OR NEW.expires_at_unix_ms<=NEW.claimed_at_unix_ms OR NEW.expires_at_unix_ms>NEW.claimed_at_unix_ms+60000
 BEGIN SELECT RAISE(ABORT,'image generation scheduler claim is not monotonic'); END;

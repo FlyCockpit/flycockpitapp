@@ -760,6 +760,11 @@ pub struct ImageGenerationQueueAuthority {
     job_version: u64,
 }
 
+pub struct ImageGenerationMediaPlanSnapshot<'a> {
+    pub canonical_bytes: &'a [u8],
+    pub digest: &'a str,
+}
+
 pub struct PreparedImageGenerationDispatch {
     job_id: Uuid,
     slot_id: Uuid,
@@ -897,9 +902,36 @@ impl Db {
     pub fn queue_image_generation_job_conn(
         conn: &Connection,
         authority: ImageGenerationQueueAuthority,
+        media: &ImageGenerationMediaPlanSnapshot<'_>,
         at_unix_ms: i64,
     ) -> Result<()> {
         atomic_conn(conn, "image_generation_queue", || {
+            ensure!(
+                !media.canonical_bytes.is_empty()
+                    && media.canonical_bytes.len() <= 65_536
+                    && media.digest.len() == 64,
+                "image generation media snapshot is invalid"
+            );
+            let actual = hex_lower(&Sha256::digest(media.canonical_bytes));
+            ensure!(
+                actual == media.digest,
+                "image generation media snapshot digest differs"
+            );
+            let plan_digest: String = conn.query_row(
+                "SELECT plan_digest FROM image_generation_plans WHERE job_id=?1",
+                [authority.job_id.to_string()],
+                |row| row.get(0),
+            )?;
+            let snapshots=conn.execute("INSERT INTO image_generation_attempt_media_snapshots(job_id,slot_id,attempt_number,plan_digest,canonical_media_plan,media_plan_digest) SELECT job_id,slot_id,attempt_number,?1,?2,?3 FROM image_generation_attempts WHERE job_id=?4",params![plan_digest,media.canonical_bytes,media.digest,authority.job_id.to_string()])?;
+            let attempts: i64 = conn.query_row(
+                "SELECT count(*) FROM image_generation_attempts WHERE job_id=?1",
+                [authority.job_id.to_string()],
+                |row| row.get(0),
+            )?;
+            ensure!(
+                i64::try_from(snapshots)? == attempts && attempts > 0,
+                "image generation media snapshot graph differs"
+            );
             ensure!(conn.execute("UPDATE image_generation_jobs SET state='validating',version=version+1,updated_at_unix_ms=?1 WHERE job_id=?2 AND state='created' AND version=?3",params![at_unix_ms,authority.job_id.to_string(),i64::try_from(authority.job_version)?])?==1,"image generation queue authority is stale");
             ensure!(conn.execute("UPDATE image_generation_jobs SET state='queued',version=version+1,updated_at_unix_ms=?1 WHERE job_id=?2 AND state='validating' AND version=?3",params![at_unix_ms,authority.job_id.to_string(),i64::try_from(authority.job_version+1)?])?==1,"image generation queue validation lost compare-and-set");
             let changed=conn.execute("UPDATE image_generation_slots SET state='queued',version=version+1 WHERE job_id=?1 AND state='planned' AND version=1",[authority.job_id.to_string()])?;

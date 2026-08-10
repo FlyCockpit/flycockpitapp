@@ -48,6 +48,37 @@ pub use cockpit_db::image_generation_plan::{
 
 const MAX_AUTHORITY_STRING_BYTES: usize = 1_024;
 const MAX_PROVIDER_HANDOFF_EVIDENCE_BYTES: usize = 64 * 1024;
+const MAX_IMAGE_MEDIA_PLAN_SNAPSHOT_BYTES: usize = 64 * 1024;
+
+pub fn canonical_media_plan_snapshot(plan: &MediaReservationPlan) -> Result<(Vec<u8>, String)> {
+    let bytes = serde_json::to_vec(plan)?;
+    ensure!(
+        !bytes.is_empty() && bytes.len() <= MAX_IMAGE_MEDIA_PLAN_SNAPSHOT_BYTES,
+        "image generation media plan snapshot is outside its bound"
+    );
+    let digest = crate::intel::hex_lower(&Sha256::digest(&bytes));
+    Ok((bytes, digest))
+}
+
+pub fn decode_media_plan_snapshot(
+    bytes: &[u8],
+    expected_digest: &str,
+) -> Result<MediaReservationPlan> {
+    ensure!(
+        !bytes.is_empty() && bytes.len() <= MAX_IMAGE_MEDIA_PLAN_SNAPSHOT_BYTES,
+        "image generation media plan snapshot is outside its bound"
+    );
+    ensure!(
+        crate::intel::hex_lower(&Sha256::digest(bytes)) == expected_digest,
+        "image generation media plan snapshot digest differs"
+    );
+    let plan: MediaReservationPlan = serde_json::from_slice(bytes)?;
+    ensure!(
+        serde_json::to_vec(&plan)? == bytes,
+        "image generation media plan snapshot is not canonical"
+    );
+    Ok(plan)
+}
 
 mod image_generation_adapter_sealed {
     pub trait Sealed {}

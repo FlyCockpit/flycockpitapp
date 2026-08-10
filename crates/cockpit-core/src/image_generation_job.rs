@@ -103,6 +103,19 @@ pub struct ImageGenerationOwnerContextAuthority {
 }
 
 impl ImageGenerationOwnerContextAuthority {
+    fn revalidate_live_session(&self, conn: &Connection) -> Result<()> {
+        let session = cockpit_db::Db::get_session_conn(conn, self.session_id)?
+            .context("image generation owner session is unavailable")?;
+        ensure!(
+            session.ended_at.is_none()
+                && session.project_id == self.project_id
+                && crate::intel::hex_lower(&Sha256::digest(session.project_root.as_bytes()))
+                    == self.project_identity_digest,
+            "image generation owner session is unavailable"
+        );
+        Ok(())
+    }
+
     pub fn from_attached_session(
         conn: &Connection,
         session_id: Uuid,
@@ -280,6 +293,21 @@ pub struct RecordedImageArtifactSecurityRecovery {
     output_identity_digest: Option<String>,
 }
 
+#[derive(Debug)]
+pub enum VerifiedExternalCopyRemovalOutcome {
+    RemovedDurably,
+    RecoveryRequired(HeldDirectoryRecovery),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageArtifactSecurityRecoveryReplay {
+    Recorded,
+    Applied { outcome_digest: String },
+    Denied { outcome_digest: String },
+    ProofFailed { outcome_digest: String },
+    Stale { outcome_digest: String },
+}
+
 fn component_recovery_identity_digest(
     components: &[RecoverImageArtifactComponentIdentity],
 ) -> Result<String> {
@@ -332,6 +360,40 @@ fn security_recovery_request_digest(input: &RecordImageArtifactSecurityRecovery)
 }
 
 impl ImageGenerationOwnerContextAuthority {
+    pub fn replay_image_artifact_security_recovery_outcome(
+        &self,
+        conn: &Connection,
+        operation_id: Uuid,
+    ) -> Result<ImageArtifactSecurityRecoveryReplay> {
+        let (state, outcome) = conn
+            .query_row(
+                "SELECT state,outcome_digest FROM image_generation_artifact_security_recovery_audits WHERE recovery_operation_id=?1 AND principal_digest=?2",
+                params![operation_id.to_string(), self.principal_digest],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?
+            .context("security recovery audit is unavailable")?;
+        Ok(match state.as_str() {
+            "recorded" => {
+                ensure!(outcome.is_none(), "recorded recovery has terminal evidence");
+                ImageArtifactSecurityRecoveryReplay::Recorded
+            }
+            "applied" => ImageArtifactSecurityRecoveryReplay::Applied {
+                outcome_digest: outcome.context("applied recovery evidence is absent")?,
+            },
+            "denied" => ImageArtifactSecurityRecoveryReplay::Denied {
+                outcome_digest: outcome.context("denied recovery evidence is absent")?,
+            },
+            "proof_failed" => ImageArtifactSecurityRecoveryReplay::ProofFailed {
+                outcome_digest: outcome.context("failed recovery evidence is absent")?,
+            },
+            "stale" => ImageArtifactSecurityRecoveryReplay::Stale {
+                outcome_digest: outcome.context("stale recovery evidence is absent")?,
+            },
+            _ => anyhow::bail!("security recovery outcome is invalid"),
+        })
+    }
+
     pub fn record_image_artifact_security_recovery(
         &self,
         conn: &Connection,
@@ -565,6 +627,7 @@ impl ImageGenerationOwnerContextAuthority {
         conn: &Connection,
         recorded: RecordedImageArtifactSecurityRecovery,
     ) -> Result<()> {
+        self.revalidate_live_session(conn)?;
         ensure!(
             recorded.disposition == ImageArtifactSecurityRecoveryDisposition::RetainBlocked,
             "security recovery disposition differs"
@@ -615,6 +678,7 @@ impl ImageGenerationOwnerContextAuthority {
         cleanup_operation_id: Uuid,
         components: &[VerifiedManagedComponentForRecovery],
     ) -> Result<()> {
+        self.revalidate_live_session(conn)?;
         ensure!(
             recorded.disposition == ImageArtifactSecurityRecoveryDisposition::ResumeVerifiedCleanup,
             "security recovery disposition differs"
@@ -702,7 +766,8 @@ impl ImageGenerationOwnerContextAuthority {
         recorded: RecordedImageArtifactSecurityRecovery,
         output: &HeldImageGenerationOutputDirectory,
         recovery: &HeldDirectoryRecovery,
-    ) -> Result<()> {
+    ) -> Result<VerifiedExternalCopyRemovalOutcome> {
+        self.revalidate_live_session(conn)?;
         ensure!(
             recorded.disposition
                 == ImageArtifactSecurityRecoveryDisposition::RemoveVerifiedExternalCopy,
@@ -731,10 +796,17 @@ impl ImageGenerationOwnerContextAuthority {
             ensure!(pre_effect.query_row("SELECT EXISTS(SELECT 1 FROM image_generation_late_publication_leases WHERE publication_operation_id=?1 AND artifact_id=?2 AND artifact_generation=?3 AND state='delete_authorized' AND version=?4)",params![operation.to_string(),recorded.artifact_id.to_string(),i64::try_from(recorded.artifact_generation)?,i64::try_from(authorized_version)?],|row|row.get::<_,bool>(0))?,"external publication deletion authority is unavailable");
         }
         pre_effect.commit()?;
-        let HeldDirectoryEffectOutcome::AppliedDurable(deleted) =
-            output.delete_recovered_publication(recovery)?
-        else {
-            anyhow::bail!("external publication deletion is not durable")
+        let deleted = match output.delete_recovered_publication(recovery)? {
+            HeldDirectoryEffectOutcome::AppliedDurable(deleted) => deleted,
+            HeldDirectoryEffectOutcome::AppliedUnknown(recovery)
+            | HeldDirectoryEffectOutcome::SecurityAmbiguous(recovery) => {
+                return Ok(VerifiedExternalCopyRemovalOutcome::RecoveryRequired(
+                    recovery,
+                ));
+            }
+            HeldDirectoryEffectOutcome::ProvenNotApplied(_) => {
+                anyhow::bail!("external publication deletion was not applied")
+            }
         };
         let authority = &output.authority.0;
         let evidence = ImageGenerationLatePublicationEvidenceV1::TemporaryDeleted {
@@ -759,7 +831,7 @@ impl ImageGenerationOwnerContextAuthority {
             crate::intel::hex_lower(&Sha256::digest(format!("removed:{operation}:{evidence}")));
         ensure!(tx.execute("UPDATE image_generation_artifact_security_recovery_audits SET state='applied',outcome_digest=?1,decided_at_unix_ms=?2 WHERE recovery_operation_id=?3 AND principal_digest=?4 AND disposition='remove_verified_external_copy' AND state='recorded'",params![outcome,now,recorded.operation_id.to_string(),self.principal_digest])?==1,"security recovery audit compare-and-set lost");
         tx.commit()?;
-        Ok(())
+        Ok(VerifiedExternalCopyRemovalOutcome::RemovedDurably)
     }
 
     fn complete_verified_late_publication_inner(
@@ -769,6 +841,7 @@ impl ImageGenerationOwnerContextAuthority {
         output: &HeldImageGenerationOutputDirectory,
         recovery: &HeldDirectoryRecovery,
     ) -> Result<()> {
+        self.revalidate_live_session(conn)?;
         ensure!(
             recorded.disposition
                 == ImageArtifactSecurityRecoveryDisposition::CompleteVerifiedLatePublication,
@@ -1267,6 +1340,7 @@ pub fn adopt_verified_copy_authorized_publication(
     output: &HeldImageGenerationOutputDirectory,
     input: &AdoptVerifiedCopyAuthorizedPublication<'_>,
 ) -> Result<()> {
+    owner.revalidate_live_session(conn)?;
     let HeldDirectoryEffectOutcome::AppliedDurable(effect) =
         output.reconcile_publication(input.recovery)?
     else {

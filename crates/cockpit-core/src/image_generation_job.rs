@@ -20,10 +20,10 @@ use cockpit_db::db::image_generation::{
     CreateImageGenerationArtifactComponent, DispatchingImageGenerationAttempt,
     ImageGenerationArtifactComponentKind, ImageGenerationArtifactComponentState,
     ImageGenerationArtifactConsumerPurpose, ImageGenerationArtifactConsumerRoute,
-    ImageGenerationArtifactState, ImageGenerationLatePublicationEvidenceV1,
-    ImageGenerationLatePublicationState, PreparedImageGenerationDispatch,
-    TransitionImageGenerationArtifact, TransitionImageGenerationArtifactComponent,
-    image_generation_component_set_binding,
+    ImageGenerationArtifactState, ImageGenerationDispatchCandidate,
+    ImageGenerationLatePublicationEvidenceV1, ImageGenerationLatePublicationState,
+    PreparedImageGenerationDispatch, TransitionImageGenerationArtifact,
+    TransitionImageGenerationArtifactComponent, image_generation_component_set_binding,
 };
 use cockpit_db::db::sealed_scope::SealedActionGrantRow;
 use cockpit_db::image_spend::{AttemptMaximum, ImageSpendDispatchEvidence, SpendReservation};
@@ -182,9 +182,52 @@ pub struct ImageGenerationDispatcher {
     db: cockpit_db::Db,
 }
 
+pub struct DecodedImageGenerationDispatchCandidate {
+    pub candidate: ImageGenerationDispatchCandidate,
+    pub plan: ImageGenerationPlanV1,
+    pub media_plan: MediaReservationPlan,
+}
+
 impl ImageGenerationDispatcher {
     pub fn new(db: cockpit_db::Db) -> Self {
         Self { db }
+    }
+
+    pub async fn scan_dispatch_candidates(
+        &self,
+        now_monotonic_ms: u64,
+        limit: u32,
+    ) -> Result<Vec<DecodedImageGenerationDispatchCandidate>> {
+        self.db
+            .read(move |conn| {
+                cockpit_db::Db::scan_image_generation_dispatch_candidates_conn(
+                    conn,
+                    now_monotonic_ms,
+                    limit,
+                )?
+                .into_iter()
+                .map(|candidate| {
+                    let plan = ImageGenerationPlanV1::from_canonical(
+                        &candidate.canonical_plan,
+                        &candidate.plan_digest,
+                    )?;
+                    ensure!(
+                        plan.job_id == candidate.job_id,
+                        "scheduler candidate plan identity differs"
+                    );
+                    let media_plan = decode_media_plan_snapshot(
+                        &candidate.canonical_media_plan,
+                        &candidate.media_plan_digest,
+                    )?;
+                    Ok(DecodedImageGenerationDispatchCandidate {
+                        candidate,
+                        plan,
+                        media_plan,
+                    })
+                })
+                .collect()
+            })
+            .await
     }
 
     pub async fn begin_external_handoff(

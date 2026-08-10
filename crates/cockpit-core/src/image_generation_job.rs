@@ -20,17 +20,17 @@ use cockpit_db::db::external_journal::{
     ExternalJournalDigest, ExternalJournalToken, PrepareExternalOperation, ProviderIdempotency,
 };
 use cockpit_db::db::image_generation::{
-    image_generation_component_set_binding, AcquireImageGenerationArtifactLease,
-    AcquiredImageGenerationArtifactLease, AdvanceImageGenerationLatePublication,
-    BlockVerifiedImageGenerationLatePublication, CreateImageGenerationArtifact,
-    CreateImageGenerationArtifactComponent, DispatchingImageGenerationAttempt,
-    ImageGenerationArtifactComponentKind, ImageGenerationArtifactComponentState,
-    ImageGenerationArtifactConsumerPurpose, ImageGenerationArtifactConsumerRoute,
-    ImageGenerationArtifactState, ImageGenerationDispatchCandidate,
-    ImageGenerationHandoffFinishDisposition,
+    AcquireImageGenerationArtifactLease, AcquiredImageGenerationArtifactLease,
+    AdvanceImageGenerationLatePublication, BlockVerifiedImageGenerationLatePublication,
+    CreateImageGenerationArtifact, CreateImageGenerationArtifactComponent,
+    DispatchingImageGenerationAttempt, ImageGenerationArtifactComponentKind,
+    ImageGenerationArtifactComponentState, ImageGenerationArtifactConsumerPurpose,
+    ImageGenerationArtifactConsumerRoute, ImageGenerationArtifactState,
+    ImageGenerationDispatchCandidate, ImageGenerationHandoffFinishDisposition,
     ImageGenerationLatePublicationEvidenceV1, ImageGenerationLatePublicationState,
     PreparedImageGenerationDispatch, ReserveImageGenerationLatePublication,
     TransitionImageGenerationArtifact, TransitionImageGenerationArtifactComponent,
+    image_generation_component_set_binding,
 };
 use cockpit_db::db::sealed_scope::SealedActionGrantRow;
 use cockpit_db::image_spend::{AttemptMaximum, ImageSpendDispatchEvidence, SpendReservation};
@@ -3028,13 +3028,31 @@ mod tests {
         db: cockpit_db::Db,
         suffix: &str,
     ) -> RealLedgerSchedulerFixture {
-        setup_real_ledger_scheduler_job_with_output(db, suffix, None).await
+        setup_real_ledger_scheduler_job_with_attempts(db, suffix, 1).await
+    }
+
+    async fn setup_real_ledger_scheduler_job_with_attempts(
+        db: cockpit_db::Db,
+        suffix: &str,
+        max_attempts: u32,
+    ) -> RealLedgerSchedulerFixture {
+        setup_real_ledger_scheduler_job_with_output_and_attempts(db, suffix, None, max_attempts)
+            .await
     }
 
     async fn setup_real_ledger_scheduler_job_with_output(
         db: cockpit_db::Db,
         suffix: &str,
         output: Option<VerifiedOutputDirectoryAuthority>,
+    ) -> RealLedgerSchedulerFixture {
+        setup_real_ledger_scheduler_job_with_output_and_attempts(db, suffix, output, 1).await
+    }
+
+    async fn setup_real_ledger_scheduler_job_with_output_and_attempts(
+        db: cockpit_db::Db,
+        suffix: &str,
+        output: Option<VerifiedOutputDirectoryAuthority>,
+        max_attempts: u32,
     ) -> RealLedgerSchedulerFixture {
         use crate::media_reservation::{
             MediaOwner, MediaReservationLedger, ReservationState, ReserveRequest,
@@ -3078,10 +3096,18 @@ mod tests {
         sealed.spend.reservation_id = format!("spend:{suffix}");
         let provider_request_identity = format!("request:{suffix}");
         let provider_idempotency_identity = format!("idem:{suffix}");
-        sealed.targets[0].slots[0].attempts[0].provider_request_identity =
-            provider_request_identity.clone();
-        sealed.targets[0].slots[0].attempts[0].provider_idempotency_identity =
-            provider_idempotency_identity.clone();
+        let template = sealed.targets[0].slots[0].attempts[0].clone();
+        sealed.targets[0].max_attempts = max_attempts;
+        sealed.targets[0].slots[0].attempts = (1..=max_attempts)
+            .map(|number| {
+                let mut attempt = template.clone();
+                attempt.attempt_number = number;
+                attempt.provider_request_identity = format!("{provider_request_identity}:{number}");
+                attempt.provider_idempotency_identity =
+                    format!("{provider_idempotency_identity}:{number}");
+                attempt
+            })
+            .collect();
         let policy = MediaResourcePolicy::default();
         let evaluated = |dimension, requested| {
             policy
@@ -3105,8 +3131,10 @@ mod tests {
             sealed.central_resources[0].reservation_identity.clone(),
         )
         .unwrap();
-        sealed.targets[0].slots[0].attempts[0].resource_maximum =
-            vec![sealed.central_resources[0].clone()];
+        for attempt in &mut sealed.targets[0].slots[0].attempts {
+            attempt.resource_maximum = vec![sealed.central_resources[0].clone()];
+        }
+        sealed.spend.maximum_usd_micros = Some(u64::from(max_attempts) * 10);
         let canonical = sealed.canonical_bytes().unwrap();
         let plan_digest = sealed.digest().unwrap();
         let ledger = MediaReservationLedger::new(db.clone(), Arc::new(SchedulerClock));
@@ -3163,10 +3191,12 @@ mod tests {
                 session_id: sealed.owner_session_id.to_string(),
                 project_key: project_id,
             },
-            vec![AttemptMaximum {
-                attempt_id: provider_idempotency_identity.clone(),
-                usd_micros: Some(10),
-            }],
+            (1..=max_attempts)
+                .map(|number| AttemptMaximum {
+                    attempt_id: format!("{provider_idempotency_identity}:{number}"),
+                    usd_micros: Some(10),
+                })
+                .collect(),
             1,
             1,
         )
@@ -3193,27 +3223,31 @@ mod tests {
                     slot_index: 0,
                     sample_index: 0,
                     managed_artifact_id: slot.managed_artifact_id,
-                    attempts: vec![CreateImageGenerationAttempt {
-                        attempt_number: 1,
-                        provider_request_identity,
-                        provider_idempotency_identity,
-                    }],
+                    attempts: slot
+                        .attempts
+                        .iter()
+                        .map(|attempt| CreateImageGenerationAttempt {
+                            attempt_number: attempt.attempt_number,
+                            provider_request_identity: attempt.provider_request_identity.clone(),
+                            provider_idempotency_identity: attempt
+                                .provider_idempotency_identity
+                                .clone(),
+                        })
+                        .collect(),
                 }],
             )?;
             let authority =
                 cockpit_db::Db::image_generation_queue_authority_conn(conn, sealed.job_id)?;
             let (bytes, digest) = canonical_media_plan_snapshot(&handoff)?;
-            cockpit_db::Db::queue_image_generation_job_conn(
-                conn,
-                authority,
-                &[ImageGenerationMediaPlanSnapshot {
+            let snapshots = (1..=max_attempts)
+                .map(|attempt_number| ImageGenerationMediaPlanSnapshot {
                     slot_id: slot.slot_id,
-                    attempt_number: 1,
+                    attempt_number,
                     canonical_bytes: &bytes,
                     digest: &digest,
-                }],
-                1,
-            )
+                })
+                .collect::<Vec<_>>();
+            cockpit_db::Db::queue_image_generation_job_conn(conn, authority, &snapshots, 1)
         })
         .await
         .unwrap();
@@ -3282,6 +3316,216 @@ mod tests {
     #[tokio::test]
     async fn scheduler_dispatches_one_real_ledger_job_once() {
         run_real_ledger_scheduler_fixture("once").await;
+    }
+
+    #[tokio::test]
+    async fn authoritative_rejection_advances_exact_attempt_and_exhaustion_is_terminal() {
+        let fixture = setup_real_ledger_scheduler_job_with_attempts(
+            cockpit_db::Db::open_in_memory().unwrap(),
+            "retry-three",
+            3,
+        )
+        .await;
+        let dispatcher = ImageGenerationDispatcher::new(fixture.db.clone());
+        let adapter = DeterministicImageGenerationAdapter::new(vec![
+            ImageGenerationHandoffResult::DefinitivelyRejected {
+                evidence: b"reject-1".to_vec(),
+            },
+            ImageGenerationHandoffResult::DefinitivelyRejected {
+                evidence: b"reject-2".to_vec(),
+            },
+            ImageGenerationHandoffResult::Accepted {
+                evidence: b"accept-3".to_vec(),
+            },
+        ]);
+        for at in 2..=4 {
+            let pass = dispatcher
+                .run_scheduler_pass(&adapter, deadline_boot(), 100, at, at as u64, 8)
+                .await
+                .unwrap();
+            assert_eq!(pass.dispatched, 1, "{pass:#?}");
+        }
+        assert_eq!(
+            adapter
+                .requests()
+                .iter()
+                .map(|request| request.attempt_number)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        fixture.db.read(move|conn|{
+            let states=conn.prepare("SELECT attempt_number,state FROM image_generation_attempts WHERE job_id=?1 ORDER BY attempt_number")?.query_map([fixture.job_id.to_string()],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            assert_eq!(states,vec![(1,"rejected_not_accepted".into()),(2,"rejected_not_accepted".into()),(3,"accepted".into())]);
+            let activations:i64=conn.query_row("SELECT count(*) FROM image_generation_attempt_activation_facts WHERE job_id=?1",[fixture.job_id.to_string()],|row|row.get(0))?; assert_eq!(activations,3);
+            let media:String=conn.query_row("SELECT state FROM media_reservations WHERE reservation_id=?1",[fixture.media_reservation_id],|row|row.get(0))?; assert_eq!(media,"external_pending");
+            Ok(())
+        }).await.unwrap();
+
+        let exhausted = setup_real_ledger_scheduler_job_with_attempts(
+            cockpit_db::Db::open_in_memory().unwrap(),
+            "retry-one",
+            1,
+        )
+        .await;
+        let adapter = DeterministicImageGenerationAdapter::new(vec![
+            ImageGenerationHandoffResult::DefinitivelyRejected {
+                evidence: b"final-reject".to_vec(),
+            },
+        ]);
+        ImageGenerationDispatcher::new(exhausted.db.clone())
+            .run_scheduler_pass(&adapter, deadline_boot(), 100, 2, 2, 8)
+            .await
+            .unwrap();
+        exhausted
+            .db
+            .read(move |conn| {
+                let event = cockpit_db::Db::replay_image_generation_terminal_event_conn(
+                    conn,
+                    exhausted.job_id,
+                )?
+                .context("exhausted retry terminal event missing")?;
+                assert_eq!(
+                    event.terminal_state,
+                    cockpit_db::db::image_generation::ImageGenerationJobState::Failed
+                );
+                assert_eq!(event.failed_count, 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ambiguous_handoff_never_activates_or_redispatches_retry() {
+        let fixture = setup_real_ledger_scheduler_job_with_attempts(
+            cockpit_db::Db::open_in_memory().unwrap(),
+            "retry-unknown",
+            3,
+        )
+        .await;
+        let dispatcher = ImageGenerationDispatcher::new(fixture.db.clone());
+        let adapter = DeterministicImageGenerationAdapter::new(vec![
+            ImageGenerationHandoffResult::SubmissionUnknown {
+                evidence: b"unknown".to_vec(),
+            },
+        ]);
+        assert_eq!(
+            dispatcher
+                .run_scheduler_pass(&adapter, deadline_boot(), 100, 2, 2, 8)
+                .await
+                .unwrap()
+                .dispatched,
+            1
+        );
+        assert_eq!(
+            dispatcher
+                .run_scheduler_pass(&adapter, deadline_boot(), 100, 3, 3, 8)
+                .await
+                .unwrap()
+                .dispatched,
+            0
+        );
+        assert_eq!(adapter.requests().len(), 1);
+        fixture.db.read(move|conn|{let activations:i64=conn.query_row("SELECT count(*) FROM image_generation_attempt_activation_facts WHERE job_id=?1",[fixture.job_id.to_string()],|row|row.get(0))?;assert_eq!(activations,1);Ok(())}).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authoritative_retry_survives_file_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("retry.db");
+        let fixture = setup_real_ledger_scheduler_job_with_attempts(
+            cockpit_db::Db::open(&path).unwrap(),
+            "retry-reopen",
+            2,
+        )
+        .await;
+        let first = DeterministicImageGenerationAdapter::new(vec![
+            ImageGenerationHandoffResult::DefinitivelyRejected {
+                evidence: b"reopen-reject".to_vec(),
+            },
+        ]);
+        ImageGenerationDispatcher::new(fixture.db)
+            .run_scheduler_pass(&first, deadline_boot(), 100, 2, 2, 8)
+            .await
+            .unwrap();
+        let reopened = cockpit_db::Db::open(&path).unwrap();
+        let second = DeterministicImageGenerationAdapter::new(vec![
+            ImageGenerationHandoffResult::Accepted {
+                evidence: b"reopen-accept".to_vec(),
+            },
+        ]);
+        assert_eq!(
+            ImageGenerationDispatcher::new(reopened)
+                .run_scheduler_pass(&second, deadline_boot(), 100, 3, 3, 8)
+                .await
+                .unwrap()
+                .dispatched,
+            1
+        );
+        assert_eq!(second.requests()[0].attempt_number, 2);
+    }
+
+    #[tokio::test]
+    async fn retry_finish_fault_cuts_roll_back_every_projection() {
+        for (name, trigger, max_attempts) in [
+            (
+                "evidence",
+                "CREATE TEMP TRIGGER retry_cut BEFORE INSERT ON image_generation_handoff_evidence BEGIN SELECT RAISE(ABORT,'cut'); END",
+                2,
+            ),
+            (
+                "activation",
+                "CREATE TEMP TRIGGER retry_cut BEFORE INSERT ON image_generation_attempt_activation_facts WHEN NEW.activation_reason='authoritative_retry' BEGIN SELECT RAISE(ABORT,'cut'); END",
+                2,
+            ),
+            (
+                "media",
+                "CREATE TEMP TRIGGER retry_cut BEFORE UPDATE ON media_reservations WHEN NEW.state='executing_local' BEGIN SELECT RAISE(ABORT,'cut'); END",
+                2,
+            ),
+            (
+                "slot",
+                "CREATE TEMP TRIGGER retry_cut BEFORE UPDATE ON image_generation_slots WHEN NEW.state IN ('queued','failed') BEGIN SELECT RAISE(ABORT,'cut'); END",
+                2,
+            ),
+            (
+                "job",
+                "CREATE TEMP TRIGGER retry_cut BEFORE UPDATE ON image_generation_jobs WHEN NEW.state IN ('queued','failed') BEGIN SELECT RAISE(ABORT,'cut'); END",
+                2,
+            ),
+            (
+                "event",
+                "CREATE TEMP TRIGGER retry_cut BEFORE INSERT ON image_generation_terminal_events BEGIN SELECT RAISE(ABORT,'cut'); END",
+                1,
+            ),
+        ] {
+            let fixture = setup_real_ledger_scheduler_job_with_attempts(
+                cockpit_db::Db::open_in_memory().unwrap(),
+                &format!("retry-cut-{name}"),
+                max_attempts,
+            )
+            .await;
+            fixture
+                .db
+                .write(move |conn| {
+                    conn.execute_batch(trigger)?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            let adapter = DeterministicImageGenerationAdapter::new(vec![
+                ImageGenerationHandoffResult::DefinitivelyRejected {
+                    evidence: format!("reject-{name}").into_bytes(),
+                },
+            ]);
+            let pass = ImageGenerationDispatcher::new(fixture.db.clone())
+                .run_scheduler_pass(&adapter, deadline_boot(), 100, 2, 2, 8)
+                .await
+                .unwrap();
+            assert_eq!(pass.dispatched, 0, "{name}: {pass:#?}");
+            assert_eq!(adapter.requests().len(), 1, name);
+            fixture.db.read(move|conn|{let row:(String,String,i64,i64)=conn.query_row("SELECT a.state,o.state,(SELECT count(*) FROM image_generation_handoff_evidence e WHERE e.job_id=a.job_id),(SELECT count(*) FROM image_generation_attempt_activation_facts f WHERE f.job_id=a.job_id AND f.activation_reason='authoritative_retry') FROM image_generation_attempts a JOIN external_journal_operations o ON o.operation_id=a.external_operation_id WHERE a.job_id=?1 AND a.attempt_number=1",[fixture.job_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;assert_eq!(row,("dispatching".into(),"dispatching".into(),0,0),"{name}");Ok(())}).await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -4705,13 +4949,10 @@ mod tests {
                 Ok(())
             }
         }
-        assert!(write_verified_artifact_component(
-            &held,
-            &full,
-            evidence.sha256(),
-            &mut Disconnected,
-        )
-        .is_err());
+        assert!(
+            write_verified_artifact_component(&held, &full, evidence.sha256(), &mut Disconnected,)
+                .is_err()
+        );
         let mut reopened = held
             .open_verified_component("component.bin", &evidence)
             .unwrap();

@@ -900,115 +900,178 @@ impl<'de> Deserialize<'de> for MediaAttachmentStatusV1 {
     where
         D: serde::Deserializer<'de>,
     {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Wire {
-            schema_version: u8,
-            kind: String,
-            #[serde(with = "strict_uuid_v7")]
-            attachment_id: Uuid,
-            attachment_version: u64,
-            media_kind: RequestedLocalPathMediaKind,
-            availability_generation: u64,
-            reference_generation: u64,
-            can_discard: bool,
-            preview_available: bool,
-            #[serde(default)]
-            draft_expires_at_unix_ms: Option<i64>,
-            #[serde(flatten)]
-            detail: MediaAttachmentStatusDetailV1,
-        }
-        struct UniqueObject(serde_json::Map<String, serde_json::Value>);
-        impl<'de> Deserialize<'de> for UniqueObject {
-            fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = MediaAttachmentStatusV1;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a closed media attachment status object")
+            }
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
             where
-                D: serde::Deserializer<'de>,
+                A: serde::de::MapAccess<'de>,
             {
-                struct Visitor;
-                impl<'de> serde::de::Visitor<'de> for Visitor {
-                    type Value = UniqueObject;
-                    fn expecting(
-                        &self,
-                        formatter: &mut std::fmt::Formatter<'_>,
-                    ) -> std::fmt::Result {
-                        formatter.write_str("a media attachment status object with unique keys")
-                    }
-                    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
-                    where
-                        A: serde::de::MapAccess<'de>,
-                    {
-                        let mut object = serde_json::Map::new();
-                        while let Some((key, value)) =
-                            map.next_entry::<String, serde_json::Value>()?
-                        {
-                            if object.insert(key.clone(), value).is_some() {
-                                return Err(serde::de::Error::custom(format!(
-                                    "duplicate field `{key}`"
-                                )));
-                            }
+                #[derive(Deserialize)]
+                struct Strict(#[serde(with = "strict_uuid_v7")] Uuid);
+                macro_rules! take {
+                    ($slot:ident,$value:expr,$name:literal) => {{
+                        if $slot.is_some() {
+                            return Err(serde::de::Error::duplicate_field($name));
                         }
-                        Ok(UniqueObject(object))
+                        $slot = Some($value);
+                    }};
+                }
+                let (mut schema, mut kind, mut attachment, mut version, mut media_kind) =
+                    (None, None, None, None, None);
+                let (
+                    mut availability_generation,
+                    mut reference_generation,
+                    mut can_discard,
+                    mut preview_available,
+                ) = (None, None, None, None);
+                let (mut expires, mut state, mut ready_checksum, mut preview, mut reason) =
+                    (None, None, None, None, None);
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "schemaVersion" => take!(schema, map.next_value()?, "schemaVersion"),
+                        "kind" => take!(kind, map.next_value()?, "kind"),
+                        "attachmentId" => {
+                            take!(attachment, map.next_value::<Strict>()?.0, "attachmentId")
+                        }
+                        "attachmentVersion" => {
+                            take!(version, map.next_value()?, "attachmentVersion")
+                        }
+                        "mediaKind" => take!(media_kind, map.next_value()?, "mediaKind"),
+                        "availabilityGeneration" => take!(
+                            availability_generation,
+                            map.next_value()?,
+                            "availabilityGeneration"
+                        ),
+                        "referenceGeneration" => take!(
+                            reference_generation,
+                            map.next_value()?,
+                            "referenceGeneration"
+                        ),
+                        "canDiscard" => take!(can_discard, map.next_value()?, "canDiscard"),
+                        "previewAvailable" => {
+                            take!(preview_available, map.next_value()?, "previewAvailable")
+                        }
+                        "draftExpiresAtUnixMs" => take!(
+                            expires,
+                            map.next_value::<Option<i64>>()?,
+                            "draftExpiresAtUnixMs"
+                        ),
+                        "availabilityState" => {
+                            take!(state, map.next_value::<String>()?, "availabilityState")
+                        }
+                        "readyChecksum" => {
+                            take!(ready_checksum, map.next_value()?, "readyChecksum")
+                        }
+                        "preview" => take!(
+                            preview,
+                            map.next_value::<Option<MediaAttachmentPreviewSummaryV1>>()?,
+                            "preview"
+                        ),
+                        "reason" => take!(
+                            reason,
+                            map.next_value::<MediaAttachmentReasonV1>()?,
+                            "reason"
+                        ),
+                        _ => return Err(serde::de::Error::unknown_field(&key, &[])),
                     }
                 }
-                deserializer.deserialize_map(Visitor)
+                let state =
+                    state.ok_or_else(|| serde::de::Error::missing_field("availabilityState"))?;
+                let detail = match state.as_str() {
+                    "ready" => {
+                        if reason.is_some() {
+                            return Err(serde::de::Error::custom("reason forbidden for ready"));
+                        }
+                        MediaAttachmentStatusDetailV1::Ready {
+                            ready_checksum: ready_checksum
+                                .ok_or_else(|| serde::de::Error::missing_field("readyChecksum"))?,
+                            preview: preview.unwrap_or(None),
+                        }
+                    }
+                    "model_derivative_unavailable"
+                    | "failed"
+                    | "source_changed"
+                    | "security_blocked"
+                    | "owned_cleanup_pending"
+                    | "borrowed_cleanup_pending"
+                    | "retained_copy_deleted"
+                    | "borrowed_derivatives_deleted" => {
+                        if ready_checksum.is_some() || preview.is_some() {
+                            return Err(serde::de::Error::custom(
+                                "ready fields forbidden for this availabilityState",
+                            ));
+                        }
+                        let reason =
+                            reason.ok_or_else(|| serde::de::Error::missing_field("reason"))?;
+                        match state.as_str() {
+                            "model_derivative_unavailable" => {
+                                MediaAttachmentStatusDetailV1::ModelDerivativeUnavailable { reason }
+                            }
+                            "failed" => MediaAttachmentStatusDetailV1::Failed { reason },
+                            "source_changed" => {
+                                MediaAttachmentStatusDetailV1::SourceChanged { reason }
+                            }
+                            "security_blocked" => {
+                                MediaAttachmentStatusDetailV1::SecurityBlocked { reason }
+                            }
+                            "owned_cleanup_pending" => {
+                                MediaAttachmentStatusDetailV1::OwnedCleanupPending { reason }
+                            }
+                            "borrowed_cleanup_pending" => {
+                                MediaAttachmentStatusDetailV1::BorrowedCleanupPending { reason }
+                            }
+                            "retained_copy_deleted" => {
+                                MediaAttachmentStatusDetailV1::RetainedCopyDeleted { reason }
+                            }
+                            _ => {
+                                MediaAttachmentStatusDetailV1::BorrowedDerivativesDeleted { reason }
+                            }
+                        }
+                    }
+                    unit => {
+                        if ready_checksum.is_some() || preview.is_some() || reason.is_some() {
+                            return Err(serde::de::Error::custom(
+                                "variant fields forbidden for this availabilityState",
+                            ));
+                        }
+                        match unit {
+                            "quarantined" => MediaAttachmentStatusDetailV1::Quarantined,
+                            "registered" => MediaAttachmentStatusDetailV1::Registered,
+                            "probing" => MediaAttachmentStatusDetailV1::Probing,
+                            "decoding" => MediaAttachmentStatusDetailV1::Decoding,
+                            "normalizing" => MediaAttachmentStatusDetailV1::Normalizing,
+                            _ => return Err(serde::de::Error::custom("unknown availabilityState")),
+                        }
+                    }
+                };
+                Ok(MediaAttachmentStatusV1 {
+                    schema_version: schema
+                        .ok_or_else(|| serde::de::Error::missing_field("schemaVersion"))?,
+                    kind: kind.ok_or_else(|| serde::de::Error::missing_field("kind"))?,
+                    attachment_id: attachment
+                        .ok_or_else(|| serde::de::Error::missing_field("attachmentId"))?,
+                    attachment_version: version
+                        .ok_or_else(|| serde::de::Error::missing_field("attachmentVersion"))?,
+                    media_kind: media_kind
+                        .ok_or_else(|| serde::de::Error::missing_field("mediaKind"))?,
+                    availability_generation: availability_generation
+                        .ok_or_else(|| serde::de::Error::missing_field("availabilityGeneration"))?,
+                    reference_generation: reference_generation
+                        .ok_or_else(|| serde::de::Error::missing_field("referenceGeneration"))?,
+                    can_discard: can_discard
+                        .ok_or_else(|| serde::de::Error::missing_field("canDiscard"))?,
+                    preview_available: preview_available
+                        .ok_or_else(|| serde::de::Error::missing_field("previewAvailable"))?,
+                    draft_expires_at_unix_ms: expires.unwrap_or(None),
+                    detail,
+                })
             }
         }
-        let UniqueObject(object) = UniqueObject::deserialize(deserializer)?;
-        let state = object
-            .get("availabilityState")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| serde::de::Error::custom("missing availabilityState"))?;
-        let mut allowed = std::collections::BTreeSet::from([
-            "schemaVersion",
-            "kind",
-            "attachmentId",
-            "attachmentVersion",
-            "mediaKind",
-            "availabilityGeneration",
-            "referenceGeneration",
-            "canDiscard",
-            "previewAvailable",
-            "draftExpiresAtUnixMs",
-            "availabilityState",
-        ]);
-        match state {
-            "ready" => {
-                allowed.extend(["readyChecksum", "preview"]);
-            }
-            "model_derivative_unavailable"
-            | "failed"
-            | "source_changed"
-            | "security_blocked"
-            | "owned_cleanup_pending"
-            | "borrowed_cleanup_pending"
-            | "retained_copy_deleted"
-            | "borrowed_derivatives_deleted" => {
-                allowed.insert("reason");
-            }
-            "quarantined" | "registered" | "probing" | "decoding" | "normalizing" => {}
-            _ => return Err(serde::de::Error::custom("unknown availabilityState")),
-        }
-        if let Some(field) = object
-            .keys()
-            .find(|field| !allowed.contains(field.as_str()))
-        {
-            return Err(serde::de::Error::custom(format!("unknown field `{field}`")));
-        }
-        let wire: Wire = serde_json::from_value(serde_json::Value::Object(object))
-            .map_err(serde::de::Error::custom)?;
-        Ok(Self {
-            schema_version: wire.schema_version,
-            kind: wire.kind,
-            attachment_id: wire.attachment_id,
-            attachment_version: wire.attachment_version,
-            media_kind: wire.media_kind,
-            availability_generation: wire.availability_generation,
-            reference_generation: wire.reference_generation,
-            can_discard: wire.can_discard,
-            preview_available: wire.preview_available,
-            draft_expires_at_unix_ms: wire.draft_expires_at_unix_ms,
-            detail: wire.detail,
-        })
+        deserializer.deserialize_map(Visitor)
     }
 }
 
@@ -2852,6 +2915,30 @@ mod tests {
             1,
         );
         assert!(serde_json::from_str::<MediaAttachmentStatusV1>(&duplicate_variant).is_err());
+        let nested = MediaAttachmentStatusV1 {
+            detail: MediaAttachmentStatusDetailV1::Ready {
+                ready_checksum: "33".repeat(32),
+                preview: Some(MediaAttachmentPreviewSummaryV1 {
+                    generation: 1,
+                    checksum: "55".repeat(32),
+                    width: 2,
+                    height: 2,
+                    byte_length: 8,
+                }),
+            },
+            ..status.clone()
+        };
+        let nested_text = serde_json::to_string(&nested).unwrap();
+        let nested_checksum = format!("\"checksum\":\"{}\"", "55".repeat(32));
+        let duplicate_nested = nested_text.replacen(
+            &nested_checksum,
+            &format!("{nested_checksum},\"checksum\":\"{}\"", "66".repeat(32)),
+            1,
+        );
+        assert!(serde_json::from_str::<MediaAttachmentStatusV1>(&duplicate_nested).is_err());
+        let unknown_nested =
+            nested_text.replacen("\"width\":2", "\"width\":2,\"path\":\"/secret\"", 1);
+        assert!(serde_json::from_str::<MediaAttachmentStatusV1>(&unknown_nested).is_err());
         let request = serde_json::json!({"schemaVersion":1,"kind":"getMediaAttachmentStatus","sessionId":Uuid::now_v7().to_string(),"canonicalProjectDigest":"11".repeat(32),"attachmentId":attachment_id.to_string(),"extra":true});
         assert!(serde_json::from_value::<GetMediaAttachmentStatusV1>(request).is_err());
     }

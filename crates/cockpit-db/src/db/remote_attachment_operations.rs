@@ -130,25 +130,6 @@ pub enum BeginIdempotentAdapterRemoteOperationOutcome {
     AttachmentLedgerCapacity,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StagedFilesystemEvidence {
-    pub artifact_id: String,
-    pub state: String,
-    pub dispatch_generation: u64,
-    pub precondition_digest: [u8; 32],
-    pub result_digest: [u8; 32],
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PrepareStagedFilesystemOperationOutcome {
-    Prepared(StagedFilesystemEvidence),
-    Reconcile(StagedFilesystemEvidence),
-    Replay(Vec<u8>),
-    OperationConflict,
-    OperationActorConflict,
-    AttachmentLedgerCapacity,
-}
-
 pub struct TransactionalRemoteMutation<T> {
     pub value: T,
     pub safe_response: Vec<u8>,
@@ -169,124 +150,6 @@ pub struct RemoteOutboxDeliveryLease {
 }
 
 impl Db {
-    pub async fn prepare_staged_filesystem_remote_operation(
-        &self,
-        request: ReserveRemoteOperation<'_>,
-        adapter_kind: &str,
-        precondition_digest: Option<[u8; 32]>,
-        result_digest: [u8; 32],
-    ) -> Result<PrepareStagedFilesystemOperationOutcome> {
-        ensure!(
-            request.operation_class == RemoteOperationClass::IdempotentAdapterMutation,
-            "staged filesystem operation requires adapter class"
-        );
-        ensure!(
-            matches!(adapter_kind, "fs_write" | "fs_create_dir" | "fs_rename"),
-            "unsupported staged filesystem adapter"
-        );
-        let owned = OwnedReserveRemoteOperation {
-            logical_attachment_id: request.logical_attachment_id.to_owned(),
-            operation_id: request.operation_id.to_owned(),
-            authenticated_device_id: request.authenticated_device_id.to_owned(),
-            authenticated_device_generation: request.authenticated_device_generation,
-            operation_class: request.operation_class,
-            request_hash: request.request_hash,
-            now_ms: request.now_ms,
-        };
-        let kind = adapter_kind.to_owned();
-        self.transaction(move |conn| match reserve_conn(conn, &owned)? {
-            ReserveRemoteOperationOutcome::Reserved(reservation) => {
-                let precondition_digest = precondition_digest
-                    .context("new staged filesystem operation lacks a source precondition")?;
-                let artifact_id = Uuid::now_v7().to_string();
-                conn.execute(
-                    "INSERT INTO remote_staged_filesystem_operations
-                     (logical_attachment_id,operation_id,adapter_kind,artifact_id,
-                      precondition_digest,result_digest,state,created_at_ms,updated_at_ms)
-                     VALUES (?1,?2,?3,?4,?5,?6,'prepared',?7,?7)",
-                    params![owned.logical_attachment_id,owned.operation_id,kind,artifact_id,
-                        precondition_digest.as_slice(),result_digest.as_slice(),owned.now_ms],
-                )?;
-                conn.execute(
-                    "UPDATE remote_attachment_operations SET state='dispatched',dispatch_generation=1
-                     WHERE logical_attachment_id=?1 AND operation_id=?2 AND state='reserved'",
-                    params![owned.logical_attachment_id,owned.operation_id],
-                )?;
-                Ok(PrepareStagedFilesystemOperationOutcome::Prepared(StagedFilesystemEvidence {
-                    artifact_id, state: "prepared".into(), dispatch_generation: 1,
-                    precondition_digest, result_digest,
-                }))
-            }
-            ReserveRemoteOperationOutcome::Replay(replay) if replay.state == "committed" =>
-                Ok(PrepareStagedFilesystemOperationOutcome::Replay(
-                    replay.safe_response.context("committed operation missing safe response")?)),
-            ReserveRemoteOperationOutcome::Replay(replay) if replay.state == "dispatched" => {
-                let evidence: (String,String,Vec<u8>,Vec<u8>) = conn.query_row(
-                    "SELECT artifact_id,state,precondition_digest,result_digest
-                     FROM remote_staged_filesystem_operations
-                     WHERE logical_attachment_id=?1 AND operation_id=?2 AND adapter_kind=?3",
-                    params![owned.logical_attachment_id,owned.operation_id,kind],
-                    |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
-                ).context("dispatched staged operation lacks prepared evidence")?;
-                if evidence.3.as_slice() != result_digest {
-                    return Ok(PrepareStagedFilesystemOperationOutcome::OperationConflict);
-                }
-                let stored_precondition: [u8;32] = evidence.2.try_into()
-                    .map_err(|_| anyhow::anyhow!("invalid staged precondition digest"))?;
-                let stored_result: [u8;32] = evidence.3.try_into()
-                    .map_err(|_| anyhow::anyhow!("invalid staged result digest"))?;
-                let generation: i64 = conn.query_row(
-                    "UPDATE remote_attachment_operations SET dispatch_generation=dispatch_generation+1,updated_at_ms=?3
-                     WHERE logical_attachment_id=?1 AND operation_id=?2 RETURNING dispatch_generation",
-                    params![owned.logical_attachment_id,owned.operation_id,owned.now_ms], |row| row.get(0))?;
-                Ok(PrepareStagedFilesystemOperationOutcome::Reconcile(StagedFilesystemEvidence {
-                    artifact_id:evidence.0,state:evidence.1,dispatch_generation:generation.try_into()?,
-                    precondition_digest:stored_precondition,result_digest:stored_result,
-                }))
-            }
-            ReserveRemoteOperationOutcome::Replay(_) => bail!("invalid staged filesystem replay state"),
-            ReserveRemoteOperationOutcome::OperationConflict => Ok(PrepareStagedFilesystemOperationOutcome::OperationConflict),
-            ReserveRemoteOperationOutcome::OperationActorConflict => Ok(PrepareStagedFilesystemOperationOutcome::OperationActorConflict),
-            ReserveRemoteOperationOutcome::AttachmentLedgerCapacity => Ok(PrepareStagedFilesystemOperationOutcome::AttachmentLedgerCapacity),
-        }).await
-    }
-
-    pub async fn advance_staged_filesystem_remote_operation(
-        &self,
-        logical_attachment_id: &str,
-        operation_id: &str,
-        artifact_id: &str,
-        from_state: &str,
-        to_state: &str,
-        now_ms: i64,
-    ) -> Result<bool> {
-        validate_uuid("logical attachment id", logical_attachment_id)?;
-        validate_operation_id(operation_id)?;
-        validate_uuid("staged artifact id", artifact_id)?;
-        ensure!(
-            matches!(
-                (from_state, to_state),
-                ("prepared", "artifact_synced")
-                    | ("prepared", "applied")
-                    | ("artifact_synced", "applied")
-                    | ("applied", "ledger_committed")
-            ),
-            "invalid staged filesystem transition"
-        );
-        let attachment = logical_attachment_id.to_owned();
-        let operation = operation_id.to_owned();
-        let artifact = artifact_id.to_owned();
-        let from = from_state.to_owned();
-        let to = to_state.to_owned();
-        self.transaction(move |conn| {
-            Ok(conn.execute(
-                "UPDATE remote_staged_filesystem_operations SET state=?5,updated_at_ms=?6
-             WHERE logical_attachment_id=?1 AND operation_id=?2 AND artifact_id=?3 AND state=?4",
-                params![attachment, operation, artifact, from, to, now_ms],
-            )? == 1)
-        })
-        .await
-    }
     /// Reserves an adapter effect before dispatch. A process restart may claim
     /// the same immutable request again with a higher dispatch generation;
     /// the adapter's durable evidence decides whether to finish or reconcile.
@@ -1123,16 +986,6 @@ fn commit_conn(
             request.safe_response,
             next_event_seq,
             request.now_ms,
-        ],
-    )?;
-    conn.execute(
-        "UPDATE remote_staged_filesystem_operations
-         SET state='ledger_committed',updated_at_ms=?3
-         WHERE logical_attachment_id=?1 AND operation_id=?2 AND state='applied'",
-        params![
-            request.logical_attachment_id,
-            request.operation_id,
-            request.now_ms
         ],
     )?;
     Ok(CommitRemoteOperationOutcome::Committed {
@@ -2211,45 +2064,6 @@ mod tests {
                 .unwrap(),
             BeginIdempotentAdapterRemoteOperationOutcome::Replay(b"adapter-safe".to_vec())
         );
-    }
-
-    #[tokio::test]
-    async fn staged_prepare_is_atomic_and_recovery_requires_the_same_evidence() {
-        let db = Db::open_in_memory().unwrap();
-        let operation = "01890f3e-4c00-7000-8000-0000000000a3";
-        let request = || ReserveRemoteOperation {
-            operation_class: RemoteOperationClass::IdempotentAdapterMutation,
-            ..reserve(operation, [13; 32])
-        };
-        let PrepareStagedFilesystemOperationOutcome::Prepared(prepared) = db
-            .prepare_staged_filesystem_remote_operation(
-                request(),
-                "fs_rename",
-                Some([14; 32]),
-                [13; 32],
-            )
-            .await
-            .unwrap()
-        else {
-            panic!("prepared")
-        };
-        assert_eq!(prepared.state, "prepared");
-        assert_eq!(
-            db.prepare_staged_filesystem_remote_operation(request(), "fs_rename", None, [99; 32],)
-                .await
-                .unwrap(),
-            PrepareStagedFilesystemOperationOutcome::OperationConflict,
-        );
-        let PrepareStagedFilesystemOperationOutcome::Reconcile(recovery) = db
-            .prepare_staged_filesystem_remote_operation(request(), "fs_rename", None, [13; 32])
-            .await
-            .unwrap()
-        else {
-            panic!("reconcile")
-        };
-        assert_eq!(recovery.artifact_id, prepared.artifact_id);
-        assert_eq!(recovery.precondition_digest, [14; 32]);
-        assert_eq!(recovery.dispatch_generation, 2);
     }
 
     #[tokio::test]

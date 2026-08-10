@@ -830,6 +830,18 @@ pub struct CommitAcceptedImageResponseFailure<'a> {
     pub safe_reason: &'a str,
     pub at_unix_ms: i64,
 }
+pub struct ReserveAcceptedResponsePublication<'a> {
+    pub publication_operation_id: Uuid,
+    pub job_id: Uuid,
+    pub slot_id: Uuid,
+    pub attempt_number: u32,
+    pub artifact_id: Uuid,
+    pub component_id: Uuid,
+    pub temporary_name: &'a str,
+    pub destination_name: &'a str,
+    pub response_digest: &'a str,
+    pub at_unix_ms: i64,
+}
 pub struct CommitImageGenerationValidation {
     pub job_id: Uuid,
     pub slot_id: Uuid,
@@ -1925,6 +1937,47 @@ impl Db {
             commit_terminal_job_projection_conn(conn, input.job_id, input.at_unix_ms)?;
             Ok(())
         })
+    }
+
+    pub fn reserve_accepted_response_publication_conn(
+        conn: &Connection,
+        input: &ReserveAcceptedResponsePublication<'_>,
+    ) -> Result<()> {
+        ensure_digest(input.response_digest, "response publication digest")?;
+        ensure!(
+            !input.temporary_name.is_empty() && !input.destination_name.is_empty(),
+            "response publication names are empty"
+        );
+        conn.execute("INSERT INTO image_generation_response_publication_intents(publication_operation_id,job_id,slot_id,attempt_number,artifact_id,component_id,temporary_name,destination_name,response_digest,state,version,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'pending',1,?10)",params![input.publication_operation_id.to_string(),input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),input.artifact_id.to_string(),input.component_id.to_string(),input.temporary_name,input.destination_name,input.response_digest,input.at_unix_ms])?;
+        Ok(())
+    }
+
+    pub fn finish_accepted_response_publication_conn(
+        conn: &Connection,
+        operation_id: Uuid,
+        held_evidence_json: &str,
+        at_unix_ms: i64,
+    ) -> Result<()> {
+        ensure!(
+            !held_evidence_json.is_empty(),
+            "response publication evidence is empty"
+        );
+        ensure!(conn.execute("UPDATE image_generation_response_publication_intents SET state='applied',version=version+1,held_evidence_json=?1,decided_at_unix_ms=?2 WHERE publication_operation_id=?3 AND state='pending' AND version=1",params![held_evidence_json,at_unix_ms,operation_id.to_string()])?==1,"response publication intent compare-and-set lost");
+        Ok(())
+    }
+
+    pub fn block_accepted_response_publication_conn(
+        conn: &Connection,
+        operation_id: Uuid,
+        failure_evidence_digest: &str,
+        at_unix_ms: i64,
+    ) -> Result<()> {
+        ensure_digest(
+            failure_evidence_digest,
+            "response publication failure evidence",
+        )?;
+        ensure!(conn.execute("UPDATE image_generation_response_publication_intents SET state='security_blocked',version=version+1,failure_evidence_digest=?1,decided_at_unix_ms=?2 WHERE publication_operation_id=?3 AND state='pending' AND version=1",params![failure_evidence_digest,at_unix_ms,operation_id.to_string()])?==1,"response publication intent compare-and-set lost");
+        Ok(())
     }
 
     pub fn commit_image_generation_validation_conn(

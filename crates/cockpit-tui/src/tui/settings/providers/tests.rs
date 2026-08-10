@@ -4108,8 +4108,8 @@ fn provider_header_editor_rejects_invalid_or_duplicate_on_entry_save_reopen() {
     }];
     let mut editor = HeaderEditor::new_for_provider("p", original.clone(), false);
     <HeaderEditor as RowListEditor>::start_add(&mut editor);
-    editor.name_buf = TextField::new("x-test".into());
-    editor.value_buf = TextField::new("secret-value".into());
+    editor.name_buf = TextField::new("x-test");
+    editor.value_buf = TextField::new("secret-value");
     let error = <HeaderEditor as RowListEditor>::commit_edit_fields(&mut editor).unwrap_err();
     assert_eq!(
         error,
@@ -4118,7 +4118,7 @@ fn provider_header_editor_rejects_invalid_or_duplicate_on_entry_save_reopen() {
     assert_eq!(editor.rows(), original.as_slice());
     assert!(!error.contains("secret-value"));
 
-    editor.name_buf = TextField::new("HTTP-Referer".into());
+    editor.name_buf = TextField::new("HTTP-Referer");
     editor.value_buf = TextField::new(String::new());
     <HeaderEditor as RowListEditor>::commit_edit_fields(&mut editor).unwrap();
     assert!(

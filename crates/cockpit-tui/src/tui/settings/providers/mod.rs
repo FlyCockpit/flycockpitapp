@@ -69,8 +69,6 @@ use cockpit_core::providers::models_fetch::FetchOutcome;
 use cockpit_core::providers::{self as templates, ProviderTemplate};
 use cockpit_core::wizard::{WizardAnswer, WizardRun};
 
-#[cfg(test)]
-pub(super) use row_editor::RowListEditor;
 pub(super) use row_editor::{
     HeaderEditor, HeaderMode, HeaderResult, ModelEditor, ModelField, ModelMode, ModelResult,
 };

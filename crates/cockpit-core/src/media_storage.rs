@@ -133,6 +133,8 @@ pub(crate) struct MediaStorageRecovery {
     borrowed_sources:
         std::sync::Arc<std::sync::Mutex<std::collections::HashMap<Uuid, BorrowedSourceHandle>>>,
     av_runner: std::sync::Arc<dyn AvRuntimeRunner>,
+    #[cfg(test)]
+    av_runtime_override: Option<ApprovedAvRuntime>,
 }
 
 impl MediaStorageRecovery {
@@ -723,10 +725,7 @@ impl MediaStorageRecovery {
                 held.seek(SeekFrom::Start(0))?;
                 let mut bytes = Vec::new();
                 held.read_to_end(&mut bytes)?;
-                let health = crate::external_runtime::global_health_store()
-                    .current()
-                    .context("model_runtime_unavailable")?;
-                let runtime = approved_av_runtime(&health)?;
+                let runtime = self.resolve_av_runtime()?;
                 let (document, probe_digest) =
                     run_bounded_ffprobe(&runtime, self.av_runner.as_ref(), bytes.clone()).await?;
                 let streams = document
@@ -1542,6 +1541,8 @@ impl MediaStorageRecovery {
             owned_root: std::sync::Arc::new(root),
             borrowed_sources: Default::default(),
             av_runner: std::sync::Arc::new(SystemAvRuntimeRunner),
+            #[cfg(test)]
+            av_runtime_override: None,
         })
     }
 
@@ -1557,12 +1558,31 @@ impl MediaStorageRecovery {
             owned_root: std::sync::Arc::new(root),
             borrowed_sources: Default::default(),
             av_runner: std::sync::Arc::new(SystemAvRuntimeRunner),
+            #[cfg(test)]
+            av_runtime_override: None,
         })
     }
 
     #[cfg(test)]
     fn with_av_runner(mut self, runner: std::sync::Arc<dyn AvRuntimeRunner>) -> Self {
         self.av_runner = runner;
+        self
+    }
+
+    fn resolve_av_runtime(&self) -> Result<ApprovedAvRuntime> {
+        #[cfg(test)]
+        if let Some(runtime) = &self.av_runtime_override {
+            return Ok(runtime.clone());
+        }
+        let health = crate::external_runtime::global_health_store()
+            .current()
+            .context("model_runtime_unavailable")?;
+        approved_av_runtime(&health)
+    }
+
+    #[cfg(test)]
+    fn with_av_runtime(mut self, runtime: ApprovedAvRuntime) -> Self {
+        self.av_runtime_override = Some(runtime);
         self
     }
 
@@ -2578,6 +2598,7 @@ async fn verify_required_video_encoders(
     Ok(())
 }
 
+#[derive(Clone)]
 struct ApprovedAvRuntime {
     ffmpeg: std::path::PathBuf,
     ffprobe: std::path::PathBuf,

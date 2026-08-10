@@ -3079,7 +3079,7 @@ mod tests {
             .unwrap();
         assert_eq!(first.dispatched, 1, "{first:#?}");
         assert_eq!(adapter.requests().len(), 1);
-        db.blocking_for_sync_cli(move |conn| {
+        db.write(move |conn| {
             let replay = cockpit_db::Db::replay_image_generation_handoff_evidence_conn(
                 conn, job_id, slot_id, 1,
             )?;
@@ -3101,6 +3101,7 @@ mod tests {
             );
             Ok(())
         })
+        .await
         .unwrap();
         let second = dispatcher
             .run_scheduler_pass(&adapter, Uuid::now_v7(), 100, 3, 3, 8)
@@ -3137,7 +3138,7 @@ mod tests {
             .unwrap();
         let reopened = cockpit_db::Db::open(&path).unwrap();
         reopened
-            .blocking_for_sync_cli(move |conn| {
+            .read(move |conn| {
                 let replay = cockpit_db::Db::replay_image_generation_handoff_evidence_conn(
                     conn, job, slot, 1,
                 )?;
@@ -3148,6 +3149,7 @@ mod tests {
                 assert_eq!(replay.bytes, b"ambiguous");
                 Ok(())
             })
+            .await
             .unwrap();
     }
 
@@ -3160,7 +3162,7 @@ mod tests {
         .await;
         let job = fixture.job_id;
         let slot = fixture.slot_id;
-        fixture.db.blocking_for_sync_cli(|conn|{conn.execute_batch("CREATE TEMP TRIGGER cut_handoff_evidence AFTER INSERT ON image_generation_handoff_evidence BEGIN SELECT RAISE(ABORT,'cut'); END")?;Ok(())}).unwrap();
+        fixture.db.write(|conn|{conn.execute_batch("CREATE TEMP TRIGGER cut_handoff_evidence AFTER INSERT ON image_generation_handoff_evidence BEGIN SELECT RAISE(ABORT,'cut'); END")?;Ok(())}).await.unwrap();
         let adapter = DeterministicImageGenerationAdapter::new(vec![
             ImageGenerationHandoffResult::Accepted {
                 evidence: b"accepted-cut".to_vec(),
@@ -3172,7 +3174,7 @@ mod tests {
             .unwrap();
         assert_eq!(pass.dispatched, 0);
         assert_eq!(adapter.requests().len(), 1);
-        fixture.db.blocking_for_sync_cli(move|conn|{let row:(String,String,i64)=conn.query_row("SELECT a.state,o.state,(SELECT count(*) FROM image_generation_handoff_evidence e WHERE e.job_id=a.job_id AND e.slot_id=a.slot_id) FROM image_generation_attempts a JOIN external_journal_operations o ON o.operation_id=a.external_operation_id WHERE a.job_id=?1 AND a.slot_id=?2",rusqlite::params![job.to_string(),slot.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;assert_eq!(row,("dispatching".into(),"dispatching".into(),0));Ok(())}).unwrap();
+        fixture.db.read(move|conn|{let row:(String,String,i64)=conn.query_row("SELECT a.state,o.state,(SELECT count(*) FROM image_generation_handoff_evidence e WHERE e.job_id=a.job_id AND e.slot_id=a.slot_id) FROM image_generation_attempts a JOIN external_journal_operations o ON o.operation_id=a.external_operation_id WHERE a.job_id=?1 AND a.slot_id=?2",rusqlite::params![job.to_string(),slot.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;assert_eq!(row,("dispatching".into(),"dispatching".into(),0));Ok(())}).await.unwrap();
     }
 
     struct LatePublicationRecoveryFixture {

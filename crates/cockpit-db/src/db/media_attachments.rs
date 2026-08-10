@@ -2886,22 +2886,20 @@ mod tests {
                 first_referenced_at_unix_ms: None,
             };
             super::super::Db::insert_media_attachment_conn(conn, &record)?;
-            let mut generation = 1;
-            for state in [
+            for (generation, state) in [1_u64, 2, 3, 4].into_iter().zip([
                 MediaAvailability::Probing,
                 MediaAvailability::Decoding,
                 MediaAvailability::Normalizing,
                 MediaAvailability::Ready,
-            ] {
+            ]) {
                 super::super::Db::transition_media_attachment_conn(
                     conn,
                     attachment_id,
                     1,
                     generation,
                     state,
-                    generation as i64 + 1,
+                    i64::try_from(generation)? + 1,
                 )?;
-                generation += 1;
             }
             let first = super::super::Db::acquire_media_reference_conn(
                 conn,

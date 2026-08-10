@@ -98,17 +98,6 @@ pub enum OpenStrictness {
     ContainedOnly,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HeldEntryIdentity {
-    pub filesystem_id: u64,
-    pub object_id: u128,
-    pub kind: u8,
-    pub len: u64,
-    pub mode: u32,
-    pub owner_id: u64,
-    pub link_count: u64,
-}
-
 fn io(context: &str, error: std::io::Error) -> ExternalJournalError {
     ExternalJournalError::Spool(format!("{context}: {error}"))
 }
@@ -197,38 +186,6 @@ mod imp {
         path: PathBuf,
     }
 
-    #[derive(Debug)]
-    pub struct HeldEntry {
-        file: File,
-    }
-
-    fn identity(metadata: &std::fs::Metadata) -> HeldEntryIdentity {
-        HeldEntryIdentity {
-            filesystem_id: metadata.dev(),
-            object_id: metadata.ino() as u128,
-            kind: if metadata.is_file() {
-                1
-            } else if metadata.is_dir() {
-                2
-            } else {
-                3
-            },
-            len: metadata.len(),
-            mode: metadata.mode(),
-            owner_id: ((metadata.uid() as u64) << 32) | metadata.gid() as u64,
-            link_count: metadata.nlink(),
-        }
-    }
-
-    impl HeldEntry {
-        pub fn identity(&self) -> Result<HeldEntryIdentity, ExternalJournalError> {
-            self.file
-                .metadata()
-                .map(|value| identity(&value))
-                .map_err(|error| io("stat held entry", error))
-        }
-    }
-
     fn cstring(name: &str) -> Result<CString, ExternalJournalError> {
         CString::new(name).map_err(|_| {
             ExternalJournalError::Containment(format!("spool name contains NUL: {name:?}"))
@@ -299,54 +256,6 @@ mod imp {
     }
 
     impl DirGuard {
-        pub fn identity(&self) -> Result<HeldEntryIdentity, ExternalJournalError> {
-            self.dir
-                .metadata()
-                .map(|value| identity(&value))
-                .map_err(|error| io("stat held directory", error))
-        }
-
-        pub fn open_entry_held(&self, name: &str) -> Result<HeldEntry, ExternalJournalError> {
-            check_component(name)?;
-            let name = cstring(name)?;
-            let fd = unsafe {
-                libc::openat(
-                    self.dir.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-            if fd < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    return Err(ExternalJournalError::CapsuleMissing(
-                        name.to_string_lossy().into_owned(),
-                    ));
-                }
-                return Err(io("opening held guarded entry", error));
-            }
-            let file = unsafe { File::from_raw_fd(fd) };
-            let metadata = file
-                .metadata()
-                .map_err(|error| io("stat held guarded entry", error))?;
-            if !metadata.is_file() && !metadata.is_dir() {
-                return Err(ExternalJournalError::Containment(format!(
-                    "guarded entry is neither regular file nor directory"
-                )));
-            }
-            Ok(HeldEntry { file })
-        }
-
-        pub fn entry_identity(
-            &self,
-            name: &str,
-        ) -> Result<Option<HeldEntryIdentity>, ExternalJournalError> {
-            match self.open_entry_held(name) {
-                Ok(entry) => entry.identity().map(Some),
-                Err(ExternalJournalError::CapsuleMissing(_)) => Ok(None),
-                Err(error) => Err(error),
-            }
-        }
         /// Open the spool root: canonicalize the existing part once, then
         /// walk any remaining components no-follow.
         pub fn open_root(path: &Path, create: bool) -> Result<Self, ExternalJournalError> {
@@ -670,55 +579,6 @@ mod imp {
         path: PathBuf,
     }
 
-    #[derive(Debug)]
-    pub struct HeldEntry {
-        file: File,
-    }
-
-    impl HeldEntry {
-        pub fn identity(&self) -> Result<HeldEntryIdentity, ExternalJournalError> {
-            let metadata = self
-                .file
-                .metadata()
-                .map_err(|error| io("stat held entry", error))?;
-            #[cfg(windows)]
-            let (filesystem_id, object_id, link_count) = {
-                use std::os::windows::io::AsRawHandle as _;
-                use windows::Win32::Foundation::HANDLE;
-                use windows::Win32::Storage::FileSystem::{
-                    BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-                };
-                let mut info = BY_HANDLE_FILE_INFORMATION::default();
-                unsafe { GetFileInformationByHandle(HANDLE(self.file.as_raw_handle()), &mut info) }
-                    .map_err(|error| {
-                        ExternalJournalError::Containment(format!("inspect held entry: {error}"))
-                    })?;
-                (
-                    info.dwVolumeSerialNumber as u64,
-                    ((info.nFileIndexHigh as u128) << 32) | info.nFileIndexLow as u128,
-                    info.nNumberOfLinks as u64,
-                )
-            };
-            #[cfg(not(windows))]
-            let (filesystem_id, object_id, link_count) = (0, 0, 1);
-            Ok(HeldEntryIdentity {
-                filesystem_id,
-                object_id,
-                kind: if metadata.is_file() {
-                    1
-                } else if metadata.is_dir() {
-                    2
-                } else {
-                    3
-                },
-                len: metadata.len(),
-                mode: 0,
-                owner_id: 0,
-                link_count,
-            })
-        }
-    }
-
     #[cfg(windows)]
     fn reject_reparse(path: &Path) -> Result<(), ExternalJournalError> {
         use std::os::windows::fs::MetadataExt as _;
@@ -797,39 +657,6 @@ mod imp {
     }
 
     impl DirGuard {
-        pub fn identity(&self) -> Result<HeldEntryIdentity, ExternalJournalError> {
-            reject_reparse(&self.path)?;
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .open(&self.path)
-                .map_err(|error| io("opening held guarded directory", error))?;
-            HeldEntry { file }.identity()
-        }
-
-        pub fn open_entry_held(&self, name: &str) -> Result<HeldEntry, ExternalJournalError> {
-            check_component(name)?;
-            let path = self.path.join(name);
-            reject_reparse(&path)?;
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .open(&path)
-                .map_err(|error| io("opening held guarded entry", error))?;
-            Ok(HeldEntry { file })
-        }
-
-        pub fn entry_identity(
-            &self,
-            name: &str,
-        ) -> Result<Option<HeldEntryIdentity>, ExternalJournalError> {
-            let path = self.path.join(name);
-            if !path
-                .try_exists()
-                .map_err(|error| io("checking guarded entry", error))?
-            {
-                return Ok(None);
-            }
-            self.open_entry_held(name)?.identity().map(Some)
-        }
         pub fn open_root(path: &Path, create: bool) -> Result<Self, ExternalJournalError> {
             let (base, pending) = resolve_existing_base(path)?;
             if !create && !pending.is_empty() {
@@ -1002,7 +829,7 @@ mod imp {
     }
 }
 
-pub use imp::{DirGuard, HeldEntry};
+pub use imp::DirGuard;
 
 impl DirGuard {
     /// Enumerate candidate file names. The names are untrusted: every caller
@@ -1195,34 +1022,5 @@ mod tests {
         from.rename_into_noreplace("tree", &to, "moved").unwrap();
         assert!(!from.path().join("tree").exists());
         assert!(to.path().join("moved").is_dir());
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn held_entry_identity_detects_identical_byte_inode_swap_and_filesystem_binding() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = DirGuard::open_root(&tmp.path().join("root"), true).unwrap();
-        let mut file = root.create_file_exclusive("entry").unwrap();
-        use std::io::Write as _;
-        file.write_all(b"identical").unwrap();
-        file.sync_all().unwrap();
-        drop(file);
-        let held = root.open_entry_held("entry").unwrap();
-        let before = held.identity().unwrap();
-        std::fs::remove_file(root.path().join("entry")).unwrap();
-        let mut replacement = root.create_file_exclusive("entry").unwrap();
-        replacement.write_all(b"identical").unwrap();
-        replacement.sync_all().unwrap();
-        let planted = root.entry_identity("entry").unwrap().unwrap();
-        assert_ne!(
-            before.object_id, planted.object_id,
-            "byte equality is not identity"
-        );
-        assert_eq!(before.filesystem_id, root.identity().unwrap().filesystem_id);
-        assert_eq!(
-            held.identity().unwrap(),
-            before,
-            "held handle retains the prepared object"
-        );
     }
 }

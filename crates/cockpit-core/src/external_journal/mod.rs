@@ -51,8 +51,7 @@ use cockpit_db::external_journal::{
 };
 
 pub use fsguard::{
-    DirGuard, HeldEntry, HeldEntryIdentity, OpenStrictness, SPOOL_DIR_MODE, SPOOL_FILE_MODE,
-    SPOOL_PERMISSION_POLICY, SpoolPermissionPolicy,
+    OpenStrictness, SPOOL_DIR_MODE, SPOOL_FILE_MODE, SPOOL_PERMISSION_POLICY, SpoolPermissionPolicy,
 };
 
 use capsule::{CapsuleSlot, authentic_slots};

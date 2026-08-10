@@ -327,6 +327,16 @@ CREATE TABLE media_component_lease_reconciliation_evidence (
     released_at_unix_ms INTEGER NOT NULL
 );
 
+CREATE TABLE media_component_security_evidence (
+    lease_id TEXT PRIMARY KEY REFERENCES media_attachment_component_leases(lease_id) ON DELETE CASCADE,
+    attachment_id TEXT NOT NULL,
+    component_id TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK(reason = 'storage_security_violation'),
+    recorded_at_unix_ms INTEGER NOT NULL,
+    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE,
+    FOREIGN KEY (component_id) REFERENCES media_attachment_components(component_id) ON DELETE CASCADE
+);
+
 CREATE TABLE media_attachment_cleanup_intents (
     intent_id                         TEXT PRIMARY KEY,
     attachment_id                    TEXT NOT NULL UNIQUE,

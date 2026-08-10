@@ -58,31 +58,45 @@ impl HeldMediaComponentLease {
         &self.authority
     }
 
+    async fn block_after_failed_proof(&self, now_unix_ms: i64) -> Result<()> {
+        block_component_lease_after_failed_proof(&self.db, self.authority.clone(), now_unix_ms)
+            .await
+    }
+
     /// Complete-read verification is deliberately coupled to durable release.
-    /// A failed proof leaves the lease live, preventing cleanup until startup
-    /// reconciliation moves the attachment to `security_blocked`.
+    /// Failure atomically blocks the aggregate/component and records evidence.
     pub(crate) async fn read_verified(mut self, now_unix_ms: i64) -> Result<Vec<u8>> {
-        let before = stable_identity_digest(&self.file)?;
-        ensure!(
-            before == self.authority.component.stable_identity_digest,
-            "storage_security_violation"
-        );
-        self.file.seek(SeekFrom::Start(0))?;
-        let mut bytes = Vec::new();
-        self.file
-            .by_ref()
-            .take(self.authority.component.byte_length.saturating_add(1))
-            .read_to_end(&mut bytes)?;
-        ensure!(
-            bytes.len() as u64 == self.authority.component.byte_length
-                && crate::intel::hex_lower(&Sha256::digest(&bytes))
-                    == self.authority.component.sha256,
-            "storage_security_violation"
-        );
-        ensure!(
-            stable_identity_digest(&self.file)? == before,
-            "storage_security_violation"
-        );
+        let proof = (|| -> Result<Vec<u8>> {
+            let before = stable_identity_digest(&self.file)?;
+            ensure!(
+                before == self.authority.component.stable_identity_digest,
+                "storage_security_violation"
+            );
+            self.file.seek(SeekFrom::Start(0))?;
+            let mut bytes = Vec::new();
+            self.file
+                .by_ref()
+                .take(self.authority.component.byte_length.saturating_add(1))
+                .read_to_end(&mut bytes)?;
+            ensure!(
+                bytes.len() as u64 == self.authority.component.byte_length
+                    && crate::intel::hex_lower(&Sha256::digest(&bytes))
+                        == self.authority.component.sha256,
+                "storage_security_violation"
+            );
+            ensure!(
+                stable_identity_digest(&self.file)? == before,
+                "storage_security_violation"
+            );
+            Ok(bytes)
+        })();
+        let bytes = match proof {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.block_after_failed_proof(now_unix_ms).await?;
+                return Err(error);
+            }
+        };
         let lease_id = self.authority.lease_id;
         self.db
             .transaction(move |conn| {
@@ -91,6 +105,25 @@ impl HeldMediaComponentLease {
             .await?;
         Ok(bytes)
     }
+}
+
+async fn block_component_lease_after_failed_proof(
+    db: &cockpit_db::Db,
+    authority: AcquiredMediaComponentLease,
+    now_unix_ms: i64,
+) -> Result<()> {
+    db.transaction(move |conn| {
+        let next_attachment = authority.availability_generation.checked_add(1).context("availability generation overflow")?;
+        let next_component = authority.component.component_generation.checked_add(1).context("component generation overflow")?;
+        let changed = conn.execute("UPDATE media_attachments SET availability='security_blocked',availability_generation=?1,updated_at_unix_ms=?2 WHERE attachment_id=?3 AND attachment_version=?4 AND availability='ready' AND availability_generation=?5",params![next_attachment.to_string(),now_unix_ms,authority.attachment_id.to_string(),authority.attachment_version.to_string(),authority.availability_generation.to_string()])?;
+        ensure!(changed == 1,"media security transition lost compare-and-swap");
+        let changed = conn.execute("UPDATE media_attachment_components SET lifecycle_state='security_blocked',component_generation=?1,updated_at_unix_ms=?2 WHERE component_id=?3 AND component_generation=?4 AND lifecycle_state='ready'",params![next_component.to_string(),now_unix_ms,authority.component.component_id.to_string(),authority.component.component_generation.to_string()])?;
+        ensure!(changed == 1,"media component security transition lost compare-and-swap");
+        conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,'ready','security_blocked',?3,?4)",params![authority.attachment_id.to_string(),next_attachment.to_string(),authority.lease_id.to_string(),now_unix_ms])?;
+        conn.execute("INSERT INTO media_component_security_evidence(lease_id,attachment_id,component_id,reason,recorded_at_unix_ms) VALUES(?1,?2,?3,'storage_security_violation',?4)",params![authority.lease_id.to_string(),authority.attachment_id.to_string(),authority.component.component_id.to_string(),now_unix_ms])?;
+        cockpit_db::Db::release_media_component_lease_conn(conn,authority.lease_id,now_unix_ms)?;
+        Ok(())
+    }).await
 }
 
 #[derive(Clone)]
@@ -144,11 +177,10 @@ impl MediaStorageRecovery {
         kind: MediaComponentLeaseKind,
         now_unix_ms: i64,
     ) -> Result<HeldMediaComponentLease> {
-        let root = self.owned_root.clone();
-        let (authority, file) = self
+        let authority = self
             .db
             .transaction(move |conn| {
-                let authority = cockpit_db::Db::acquire_media_component_lease_conn(
+                cockpit_db::Db::acquire_media_component_lease_conn(
                     conn,
                     lease_id,
                     attachment_id,
@@ -157,22 +189,34 @@ impl MediaStorageRecovery {
                     capability_generation,
                     kind,
                     now_unix_ms,
-                )?;
-                let name = authority.component.storage_id.to_string();
-                let mut file = root.open_file_verified(&name).map_err(anyhow::Error::new)?;
-                let before = stable_identity_digest(&file)?;
-                let (length, checksum) = read_full_digest(&mut file)?;
-                ensure!(
-                    before == authority.component.stable_identity_digest
-                        && length == authority.component.byte_length
-                        && checksum == authority.component.sha256
-                        && stable_identity_digest(&file)? == before,
-                    "storage_security_violation"
-                );
-                file.seek(SeekFrom::Start(0))?;
-                Ok((authority, file))
+                )
             })
             .await?;
+        let opened = (|| -> Result<File> {
+            let name = authority.component.storage_id.to_string();
+            let mut file = self
+                .owned_root
+                .open_file_verified(&name)
+                .map_err(anyhow::Error::new)?;
+            let before = stable_identity_digest(&file)?;
+            let (length, checksum) = read_full_digest(&mut file)?;
+            ensure!(
+                before == authority.component.stable_identity_digest
+                    && length == authority.component.byte_length
+                    && checksum == authority.component.sha256
+                    && stable_identity_digest(&file)? == before,
+                "storage_security_violation"
+            );
+            file.seek(SeekFrom::Start(0))?;
+            Ok(file)
+        })();
+        let file = match opened {
+            Ok(file) => file,
+            Err(error) => {
+                block_component_lease_after_failed_proof(&self.db, authority, now_unix_ms).await?;
+                return Err(error);
+            }
+        };
         Ok(HeldMediaComponentLease {
             db: self.db.clone(),
             authority,
@@ -3273,6 +3317,27 @@ mod tests {
         );
         let evidence:i64=db.read(move|conn|Ok(conn.query_row("SELECT COUNT(*) FROM media_component_lease_reconciliation_evidence WHERE lease_id=?1 AND reason='daemon_restart'",[abandoned_id.to_string()],|row|row.get(0))?)).await.unwrap();
         assert_eq!(evidence, 1);
+        std::fs::write(root_path.join(storage_id.to_string()), b"evil preview").unwrap();
+        let failed_lease = Uuid::now_v7();
+        assert!(
+            reopened
+                .acquire_component_lease(
+                    failed_lease,
+                    attachment_id,
+                    1,
+                    5,
+                    7,
+                    MediaComponentLeaseKind::Preview,
+                    7
+                )
+                .await
+                .is_err()
+        );
+        let blocked:(String,String,String,i64)=db.read(move|conn|Ok(conn.query_row("SELECT a.availability,a.availability_generation,c.component_generation,(SELECT COUNT(*) FROM media_component_security_evidence e WHERE e.lease_id=?1 AND e.reason='storage_security_violation') FROM media_attachments a JOIN media_attachment_components c ON c.attachment_id=a.attachment_id WHERE a.attachment_id=?2",params![failed_lease.to_string(),attachment_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?)).await.unwrap();
+        assert_eq!(
+            blocked,
+            ("security_blocked".into(), "6".into(), "2".into(), 1)
+        );
     }
 
     async fn fixture() -> Fixture {

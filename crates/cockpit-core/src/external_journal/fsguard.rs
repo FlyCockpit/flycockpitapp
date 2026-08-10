@@ -186,6 +186,43 @@ mod imp {
         path: PathBuf,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct HeldEntryIdentity {
+        pub filesystem_id: u64,
+        pub object_id: u128,
+        pub kind: u8,
+        pub len: u64,
+        pub mode: u32,
+        pub owner_id: u64,
+        pub link_count: u64,
+    }
+
+    fn identity(metadata: &std::fs::Metadata) -> Result<HeldEntryIdentity, ExternalJournalError> {
+        let kind = if metadata.is_file() {
+            1
+        } else if metadata.is_dir() {
+            2
+        } else {
+            return Err(ExternalJournalError::Containment(
+                "held entry must be a regular file or directory".into(),
+            ));
+        };
+        if metadata.nlink() == 0 {
+            return Err(ExternalJournalError::Containment(
+                "held entry has no filesystem links".into(),
+            ));
+        }
+        Ok(HeldEntryIdentity {
+            filesystem_id: metadata.dev(),
+            object_id: u128::from(metadata.ino()),
+            kind,
+            len: metadata.len(),
+            mode: metadata.mode(),
+            owner_id: u64::from(metadata.uid()),
+            link_count: metadata.nlink(),
+        })
+    }
+
     fn cstring(name: &str) -> Result<CString, ExternalJournalError> {
         CString::new(name).map_err(|_| {
             ExternalJournalError::Containment(format!("spool name contains NUL: {name:?}"))
@@ -266,28 +303,33 @@ mod imp {
                     path.display()
                 )));
             }
-            let base_c =
-                std::ffi::CString::new(base.as_os_str().as_encoded_bytes()).map_err(|_| {
-                    ExternalJournalError::Containment("spool root contains NUL".to_string())
-                })?;
-            // The base is fully resolved, so no component of it is a symlink.
-            // `O_NOFOLLOW` is still set: it costs nothing and closes the narrow
-            // window in which the final component is swapped for a symlink
-            // between `canonicalize` and this open.
-            // SAFETY: `base_c` is a live NUL-terminated C string; the returned
-            // descriptor is transferred exactly once to `File`.
+            // Hold `/` first and walk every canonical component with openat
+            // and O_NOFOLLOW. Opening the canonical absolute path in one call
+            // would still follow an ancestor swapped after canonicalization.
             let fd = unsafe {
                 libc::open(
-                    base_c.as_ptr(),
+                    b"/\0".as_ptr().cast(),
                     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 )
             };
             if fd < 0 {
                 return Err(io("opening spool root", std::io::Error::last_os_error()));
             }
-            // SAFETY: `fd` was just returned by `open` and is uniquely owned.
             let mut dir = unsafe { File::from_raw_fd(fd) };
-            let mut walked = base;
+            let mut walked = PathBuf::from("/");
+            for component in base.components() {
+                let std::path::Component::Normal(name) = component else {
+                    continue;
+                };
+                let name = name.to_str().ok_or_else(|| {
+                    ExternalJournalError::Containment(
+                        "spool root component is not valid UTF-8".into(),
+                    )
+                })?;
+                let (next, _) = open_dir_at(Some(&dir), &cstring(name)?, false)?;
+                dir = next;
+                walked.push(name);
+            }
             for name in pending {
                 let (next, created) = open_dir_at(Some(&dir), &cstring(&name)?, create)?;
                 dir = next;
@@ -316,6 +358,99 @@ mod imp {
 
         pub fn path(&self) -> &Path {
             &self.path
+        }
+
+        pub fn held_identity(&self) -> Result<HeldEntryIdentity, ExternalJournalError> {
+            identity(
+                &self
+                    .dir
+                    .metadata()
+                    .map_err(|error| io("stat held directory", error))?,
+            )
+        }
+
+        pub fn open_entry_identity(
+            &self,
+            name: &str,
+        ) -> Result<HeldEntryIdentity, ExternalJournalError> {
+            check_component(name)?;
+            let name = cstring(name)?;
+            let fd = unsafe {
+                libc::openat(
+                    self.dir.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(io("opening held entry", std::io::Error::last_os_error()));
+            }
+            let file = unsafe { File::from_raw_fd(fd) };
+            identity(
+                &file
+                    .metadata()
+                    .map_err(|error| io("stat held entry", error))?,
+            )
+        }
+
+        pub fn require_same_filesystem(
+            &self,
+            other: &DirGuard,
+        ) -> Result<(), ExternalJournalError> {
+            if self.held_identity()?.filesystem_id != other.held_identity()?.filesystem_id {
+                return Err(ExternalJournalError::Containment(
+                    "atomic rename requires source and target on one filesystem".into(),
+                ));
+            }
+            Ok(())
+        }
+
+        pub fn rename_entry_noreplace_atomic(
+            &self,
+            name: &str,
+            target: &DirGuard,
+            target_name: &str,
+        ) -> Result<(), ExternalJournalError> {
+            self.require_same_filesystem(target)?;
+            check_component(name)?;
+            check_component(target_name)?;
+            let from = cstring(name)?;
+            let to = cstring(target_name)?;
+            #[cfg(target_os = "linux")]
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    self.dir.as_raw_fd(),
+                    from.as_ptr(),
+                    target.dir.as_raw_fd(),
+                    to.as_ptr(),
+                    1_u32,
+                ) as libc::c_int
+            };
+            #[cfg(target_os = "macos")]
+            let result = unsafe {
+                libc::renameatx_np(
+                    self.dir.as_raw_fd(),
+                    from.as_ptr(),
+                    target.dir.as_raw_fd(),
+                    to.as_ptr(),
+                    libc::RENAME_EXCL,
+                )
+            };
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            return Err(ExternalJournalError::Containment(
+                "held atomic no-replace rename is unsupported on this platform".into(),
+            ));
+            if result == 0 {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                return Err(ExternalJournalError::QuarantineNameTaken(
+                    target_name.to_owned(),
+                ));
+            }
+            Err(io("held atomic no-replace rename", error))
         }
 
         /// Verify the held directory still carries exactly `0700`.
@@ -604,7 +739,7 @@ mod imp {
             use std::os::windows::io::AsRawHandle as _;
             use windows::Win32::Foundation::HANDLE;
             use windows::Win32::Storage::FileSystem::{
-                BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+                GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
             };
 
             // `std::os::windows::fs::MetadataExt::number_of_links` is still
@@ -768,6 +903,8 @@ mod imp {
 }
 
 pub use imp::DirGuard;
+#[cfg(unix)]
+pub use imp::HeldEntryIdentity;
 
 impl DirGuard {
     /// Enumerate candidate file names. The names are untrusted: every caller
@@ -844,11 +981,9 @@ mod tests {
                 guard.open_file_checked("probe.v1", OpenStrictness::Private),
                 Err(ExternalJournalError::InsecurePermissions(_))
             ));
-            assert!(
-                guard
-                    .open_file_checked("probe.v1", OpenStrictness::ContainedOnly)
-                    .is_ok()
-            );
+            assert!(guard
+                .open_file_checked("probe.v1", OpenStrictness::ContainedOnly)
+                .is_ok());
         }
     }
 
@@ -941,5 +1076,36 @@ mod tests {
         from.rename_into_noreplace("a.v1", &to, "a.v1.1").unwrap();
         assert!(std::fs::symlink_metadata(from.path().join("a.v1")).is_err());
         assert!(std::fs::symlink_metadata(to.path().join("a.v1.1")).is_ok());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn held_entry_identity_and_atomic_noreplace_rename_are_descriptor_relative() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = DirGuard::open_root(&tmp.path().join("root"), true).unwrap();
+        let from = root.open_child_dir("from", true).unwrap();
+        let to = root.open_child_dir("to", true).unwrap();
+        std::fs::write(from.path().join("entry"), b"payload").unwrap();
+        let before = from.open_entry_identity("entry").unwrap();
+        assert_eq!(before.kind, 1);
+        assert_eq!(
+            before.filesystem_id,
+            from.held_identity().unwrap().filesystem_id
+        );
+        std::fs::write(to.path().join("occupied"), b"other").unwrap();
+        assert!(matches!(
+            from.rename_entry_noreplace_atomic("entry", &to, "occupied"),
+            Err(ExternalJournalError::QuarantineNameTaken(_))
+        ));
+        from.rename_entry_noreplace_atomic("entry", &to, "moved")
+            .unwrap();
+        assert_eq!(to.open_entry_identity("moved").unwrap(), before);
+        assert!(from.open_entry_identity("entry").is_err());
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("moved", to.path().join("alias")).unwrap();
+            assert!(to.open_entry_identity("alias").is_err());
+        }
     }
 }

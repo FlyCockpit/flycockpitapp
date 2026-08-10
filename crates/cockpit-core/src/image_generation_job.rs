@@ -338,12 +338,13 @@ impl ImageGenerationOwnerContextAuthority {
         principal: &ClientPrincipal,
         input: &RecordImageArtifactSecurityRecovery,
     ) -> Result<RecordedImageArtifactSecurityRecovery> {
-        let _local_owner = DaemonLocalOwnerRecoveryAuthority::from_local_direct(principal)?;
         ensure!(
             conn.is_autocommit(),
             "security recovery must begin outside a transaction"
         );
         let request_digest = security_recovery_request_digest(input)?;
+        let presented_principal_digest =
+            crate::intel::hex_lower(&Sha256::digest(serde_json::to_vec(principal)?));
         let now: i64 = conn.query_row(
             "SELECT CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)",
             [],
@@ -351,13 +352,13 @@ impl ImageGenerationOwnerContextAuthority {
         )?;
         let inserted = conn.execute(
             "INSERT OR IGNORE INTO image_generation_artifact_security_recovery_attempts(recovery_operation_id,principal_digest,request_digest,state,created_at_unix_ms) VALUES(?1,?2,?3,'received',?4)",
-            params![input.operation_id.to_string(), self.principal_digest, request_digest, now],
+            params![input.operation_id.to_string(), presented_principal_digest, request_digest, now],
         )?;
         if inserted == 0 {
             let replay = conn
                 .query_row(
                     "SELECT request_digest,state FROM image_generation_artifact_security_recovery_attempts WHERE recovery_operation_id=?1 AND principal_digest=?2",
-                    params![input.operation_id.to_string(), self.principal_digest],
+                    params![input.operation_id.to_string(), presented_principal_digest],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                 )
                 .optional()?
@@ -367,6 +368,11 @@ impl ImageGenerationOwnerContextAuthority {
                 "security recovery replay differs"
             );
             return self.replay_recorded_security_recovery(conn, input);
+        }
+        if let Err(error) = DaemonLocalOwnerRecoveryAuthority::from_local_direct(principal) {
+            let digest = crate::intel::hex_lower(&Sha256::digest(error.to_string()));
+            conn.execute("UPDATE image_generation_artifact_security_recovery_attempts SET state='denied',outcome_digest=?1,decided_at_unix_ms=?2 WHERE recovery_operation_id=?3 AND principal_digest=?4 AND state='received'",params![digest,now,input.operation_id.to_string(),presented_principal_digest])?;
+            return Err(error);
         }
         match self.record_image_artifact_security_recovery_inner(conn, input) {
             Ok(recorded) => {
@@ -614,7 +620,7 @@ impl ImageGenerationOwnerContextAuthority {
             "security recovery disposition differs"
         );
         let tx = conn.unchecked_transaction()?;
-        let expected:i64=tx.query_row("SELECT expected_component_count FROM image_generation_artifacts WHERE artifact_id=?1 AND generation=?2 AND state='security_blocked' AND component_set_digest=?3 AND active_lease_count=0 AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_references r WHERE r.artifact_id=image_generation_artifacts.artifact_id AND r.released_at_unix_ms IS NULL) AND NOT EXISTS(SELECT 1 FROM image_generation_late_publication_leases p WHERE p.artifact_id=image_generation_artifacts.artifact_id AND p.state IN ('reserved','copy_authorized','copy_committed','security_blocked'))",params![recorded.artifact_id.to_string(),i64::try_from(recorded.artifact_generation)?,recorded.component_set_digest],|row|row.get(0))?;
+        let expected:i64=tx.query_row("SELECT expected_component_count FROM image_generation_artifacts WHERE artifact_id=?1 AND generation=?2 AND state='security_blocked' AND component_set_digest=?3 AND active_lease_count=0 AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_references r WHERE r.artifact_id=image_generation_artifacts.artifact_id AND r.released_at_unix_ms IS NULL) AND NOT EXISTS(SELECT 1 FROM image_generation_late_publication_leases p WHERE p.artifact_id=image_generation_artifacts.artifact_id AND p.state IN ('reserved','copy_authorized','copy_committed','security_blocked','delete_authorized'))",params![recorded.artifact_id.to_string(),i64::try_from(recorded.artifact_generation)?,recorded.component_set_digest],|row|row.get(0))?;
         ensure!(
             usize::try_from(expected)? == components.len(),
             "security recovery component set differs"
@@ -716,6 +722,15 @@ impl ImageGenerationOwnerContextAuthority {
                     .context("security recovery output identity is absent")?,
             "security recovery output identity differs"
         );
+        let authorized_version = version
+            .checked_add(1)
+            .context("external publication recovery version overflow")?;
+        let pre_effect = conn.unchecked_transaction()?;
+        let changed = pre_effect.execute("UPDATE image_generation_late_publication_leases SET state='delete_authorized',version=version+1 WHERE publication_operation_id=?1 AND artifact_id=?2 AND artifact_generation=?3 AND state='security_blocked' AND version=?4 AND output_evidence_json IS NOT NULL AND EXISTS(SELECT 1 FROM image_generation_artifact_security_recovery_audits r WHERE r.recovery_operation_id=?5 AND r.publication_operation_id=image_generation_late_publication_leases.publication_operation_id AND r.publication_lease_version=image_generation_late_publication_leases.version AND r.output_identity_digest=?6 AND r.disposition='remove_verified_external_copy' AND r.state='recorded')",params![operation.to_string(),recorded.artifact_id.to_string(),i64::try_from(recorded.artifact_generation)?,i64::try_from(version)?,recorded.operation_id.to_string(),recorded.output_identity_digest])?;
+        if changed == 0 {
+            ensure!(pre_effect.query_row("SELECT EXISTS(SELECT 1 FROM image_generation_late_publication_leases WHERE publication_operation_id=?1 AND artifact_id=?2 AND artifact_generation=?3 AND state='delete_authorized' AND version=?4)",params![operation.to_string(),recorded.artifact_id.to_string(),i64::try_from(recorded.artifact_generation)?,i64::try_from(authorized_version)?],|row|row.get::<_,bool>(0))?,"external publication deletion authority is unavailable");
+        }
+        pre_effect.commit()?;
         let HeldDirectoryEffectOutcome::AppliedDurable(deleted) =
             output.delete_recovered_publication(recovery)?
         else {
@@ -739,7 +754,7 @@ impl ImageGenerationOwnerContextAuthority {
             [],
             |row| row.get(0),
         )?;
-        ensure!(tx.execute("UPDATE image_generation_late_publication_leases SET state='aborted',version=version+1,recovery_evidence_json=?1,decided_at_unix_ms=?2 WHERE publication_operation_id=?3 AND artifact_id=?4 AND artifact_generation=?5 AND state='security_blocked' AND version=?6 AND output_evidence_json IS NOT NULL",params![evidence,now,operation.to_string(),recorded.artifact_id.to_string(),i64::try_from(recorded.artifact_generation)?,i64::try_from(version)?])?==1,"external publication recovery compare-and-set lost");
+        ensure!(tx.execute("UPDATE image_generation_late_publication_leases SET state='aborted',version=version+1,recovery_evidence_json=?1,decided_at_unix_ms=?2 WHERE publication_operation_id=?3 AND artifact_id=?4 AND artifact_generation=?5 AND state='delete_authorized' AND version=?6 AND output_evidence_json IS NOT NULL",params![evidence,now,operation.to_string(),recorded.artifact_id.to_string(),i64::try_from(recorded.artifact_generation)?,i64::try_from(authorized_version)?])?==1,"external publication recovery compare-and-set lost");
         let outcome =
             crate::intel::hex_lower(&Sha256::digest(format!("removed:{operation}:{evidence}")));
         ensure!(tx.execute("UPDATE image_generation_artifact_security_recovery_audits SET state='applied',outcome_digest=?1,decided_at_unix_ms=?2 WHERE recovery_operation_id=?3 AND principal_digest=?4 AND disposition='remove_verified_external_copy' AND state='recorded'",params![outcome,now,recorded.operation_id.to_string(),self.principal_digest])?==1,"security recovery audit compare-and-set lost");

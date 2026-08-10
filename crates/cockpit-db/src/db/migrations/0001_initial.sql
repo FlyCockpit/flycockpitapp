@@ -3378,7 +3378,7 @@ CREATE TABLE image_generation_late_publication_leases (
  deadline_unix_ms INTEGER NOT NULL,
  worker_boot_id TEXT,
  claim_generation INTEGER CHECK(claim_generation IS NULL OR claim_generation>=1),
- state TEXT NOT NULL CHECK(state IN ('reserved','copy_authorized','copy_committed','published','aborted','expired','security_blocked')),
+ state TEXT NOT NULL CHECK(state IN ('reserved','copy_authorized','copy_committed','published','aborted','expired','security_blocked','delete_authorized')),
  version INTEGER NOT NULL CHECK(version>=1),
  temporary_evidence_json TEXT,
  output_evidence_json TEXT,
@@ -3412,7 +3412,7 @@ CREATE TABLE image_generation_late_publication_authorization_facts (
 );
 CREATE UNIQUE INDEX image_generation_one_live_late_publication
 ON image_generation_late_publication_leases(artifact_id)
-WHERE state IN ('reserved','copy_authorized','copy_committed');
+WHERE state IN ('reserved','copy_authorized','copy_committed','security_blocked','delete_authorized');
 CREATE TABLE image_generation_user_published_outputs (
  publication_operation_id TEXT PRIMARY KEY REFERENCES image_generation_late_publication_leases(publication_operation_id) ON DELETE RESTRICT,
  artifact_id TEXT NOT NULL REFERENCES image_generation_artifacts(artifact_id) ON DELETE RESTRICT,
@@ -3484,7 +3484,7 @@ CREATE TABLE image_generation_late_publication_transitions(from_state TEXT NOT N
 INSERT INTO image_generation_late_publication_transitions VALUES
 ('reserved','copy_authorized'),('reserved','aborted'),('reserved','expired'),('reserved','security_blocked'),
 ('copy_authorized','copy_committed'),('copy_authorized','aborted'),('copy_authorized','security_blocked'),
-('copy_committed','published'),('copy_committed','security_blocked'),('security_blocked','published'),('security_blocked','aborted');
+('copy_committed','published'),('copy_committed','security_blocked'),('security_blocked','published'),('security_blocked','delete_authorized'),('delete_authorized','aborted'),('delete_authorized','security_blocked');
 
 CREATE TRIGGER image_generation_artifact_transition_guard BEFORE UPDATE OF state,generation ON image_generation_artifacts
 WHEN NEW.generation!=OLD.generation+1 OR NOT EXISTS(SELECT 1 FROM image_generation_artifact_transitions WHERE from_state=OLD.state AND to_state=NEW.state)

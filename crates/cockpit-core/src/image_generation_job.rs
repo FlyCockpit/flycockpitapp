@@ -2653,7 +2653,7 @@ pub async fn reconcile_unknown_accepted_image_response<F: AcceptedImageResponseF
     Ok(outcome)
 }
 
-pub struct CoordinateAcceptedImageResponse<'a> {
+pub struct CoordinateAcceptedImageResponse {
     pub job_id: Uuid,
     pub slot_id: Uuid,
     pub attempt_number: u32,
@@ -2662,14 +2662,16 @@ pub struct CoordinateAcceptedImageResponse<'a> {
     pub expected_attempt_version: u64,
     pub external_operation_id: Uuid,
     pub expected_journal_version: u64,
-    pub bytes: &'a [u8],
+    pub component_id: Uuid,
+    pub release_operation_id: Uuid,
+    pub bytes: Vec<u8>,
     pub now_unix_ms: i64,
 }
 
 pub fn retain_accepted_image_response_conn(
     conn: &Connection,
     root: &HeldImageGenerationArtifactRoot,
-    input: &CoordinateAcceptedImageResponse<'_>,
+    input: &CoordinateAcceptedImageResponse,
 ) -> Result<AcceptedImageResponseProgress> {
     let (canonical, digest, artifact_id): (Vec<u8>, String, String) = conn.query_row(
         "SELECT p.canonical_plan,p.plan_digest,s.managed_artifact_id FROM image_generation_plans p JOIN image_generation_slots s ON s.job_id=p.job_id WHERE p.job_id=?1 AND s.slot_id=?2",
@@ -2719,7 +2721,7 @@ pub fn retain_accepted_image_response_conn(
             "accepted response is unavailable"
         );
     }
-    let response_digest = crate::intel::hex_lower(&Sha256::digest(input.bytes));
+    let response_digest = crate::intel::hex_lower(&Sha256::digest(&input.bytes));
     cockpit_db::Db::adopt_image_generation_response_conn(
         conn,
         &cockpit_db::db::image_generation::AdoptImageGenerationResponse {
@@ -2747,13 +2749,13 @@ pub fn retain_accepted_image_response_conn(
             artifact_id: Uuid::parse_str(&artifact_id)?,
             job_id: input.job_id,
             slot_id: input.slot_id,
-            component_id: Uuid::now_v7(),
+            component_id: input.component_id,
             format,
             expected_width: target.resolved.width,
             expected_height: target.resolved.height,
-            bytes: input.bytes,
+            bytes: &input.bytes,
             resource_reservation_id: plan.central_resources[0].reservation_identity.clone(),
-            release_operation_id: Uuid::now_v7(),
+            release_operation_id: input.release_operation_id,
             late_quarantined: after_cancel,
             now_unix_ms: input.now_unix_ms,
         },
@@ -2774,6 +2776,122 @@ pub fn retain_accepted_image_response_conn(
             AcceptedImageResponseProgress::Retained
         },
     )
+}
+
+pub async fn coordinate_persisted_accepted_image_response(
+    db: cockpit_db::Db,
+    root: std::sync::Arc<HeldImageGenerationArtifactRoot>,
+    input: CoordinateAcceptedImageResponse,
+) -> Result<AcceptedImageResponseProgress> {
+    let operation_id = Uuid::now_v7();
+    let component_id = input.component_id;
+    let query_job = input.job_id;
+    let query_slot = input.slot_id;
+    let query_attempt = input.attempt_number;
+    let decided_at = input.now_unix_ms;
+    let (artifact_id,response_digest):(String,String)=db.read(move|conn|conn.query_row("SELECT s.managed_artifact_id,f.response_digest FROM image_generation_slots s JOIN image_generation_response_fetches f ON f.job_id=s.job_id AND f.slot_id=s.slot_id WHERE s.job_id=?1 AND s.slot_id=?2 AND f.attempt_number=?3",params![query_job.to_string(),query_slot.to_string(),i64::from(query_attempt)],|row|Ok((row.get(0)?,row.get(1)?))).map_err(Into::into)).await?;
+    let artifact_id = Uuid::parse_str(&artifact_id)?;
+    ensure!(
+        crate::intel::hex_lower(&Sha256::digest(&input.bytes)) == response_digest,
+        "accepted response bytes differ from durable fetch"
+    );
+    let temporary_name = format!(".{artifact_id}-{component_id}.partial");
+    let destination_name = format!("{artifact_id}-{component_id}.artifact");
+    let reserve_job = input.job_id;
+    let reserve_slot = input.slot_id;
+    let reserve_attempt = input.attempt_number;
+    let reserve_digest = response_digest.clone();
+    db.write(move |conn| {
+        cockpit_db::Db::reserve_accepted_response_publication_conn(
+            conn,
+            &cockpit_db::db::image_generation::ReserveAcceptedResponsePublication {
+                publication_operation_id: operation_id,
+                job_id: reserve_job,
+                slot_id: reserve_slot,
+                attempt_number: reserve_attempt,
+                artifact_id,
+                component_id,
+                temporary_name: &temporary_name,
+                destination_name: &destination_name,
+                response_digest: &reserve_digest,
+                at_unix_ms: decided_at,
+            },
+        )
+    })
+    .await?;
+    let result = db
+        .transaction(move |conn| retain_accepted_image_response_conn(conn, &root, &input))
+        .await;
+    match result {
+        Ok(progress) => {
+            db.write(move|conn|{let evidence:String=conn.query_row("SELECT c.stable_identity_json FROM image_generation_response_publication_intents i JOIN image_generation_artifact_components c ON c.artifact_id=i.artifact_id AND c.component_id=i.component_id WHERE i.publication_operation_id=?1",[operation_id.to_string()],|row|row.get(0))?;cockpit_db::Db::finish_accepted_response_publication_conn(conn,operation_id,&evidence,decided_at)}).await?;
+            Ok(progress)
+        }
+        Err(error) => {
+            let failure = crate::intel::hex_lower(&Sha256::digest(format!("{error:#}").as_bytes()));
+            db.write(move |conn| {
+                cockpit_db::Db::block_accepted_response_publication_conn(
+                    conn,
+                    operation_id,
+                    &failure,
+                    decided_at,
+                )
+            })
+            .await?;
+            Err(error)
+        }
+    }
+}
+
+pub async fn reconcile_pending_accepted_response_publications(
+    db: cockpit_db::Db,
+    root: std::sync::Arc<HeldImageGenerationArtifactRoot>,
+    now_unix_ms: i64,
+) -> Result<u64> {
+    let pending=db.read(|conn|{let mut statement=conn.prepare("SELECT i.publication_operation_id,i.destination_name,c.stable_identity_json FROM image_generation_response_publication_intents i LEFT JOIN image_generation_artifact_components c ON c.artifact_id=i.artifact_id AND c.component_id=i.component_id WHERE i.state='pending'")?;Ok(statement.query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?)}).await?;
+    let mut reconciled = 0_u64;
+    for (operation, name, evidence) in pending {
+        let operation = Uuid::parse_str(&operation)?;
+        let outcome = evidence
+            .as_deref()
+            .map(decode_held_artifact_evidence)
+            .transpose()
+            .and_then(|evidence| {
+                evidence
+                    .map(|evidence| root.open_verified_component(&name, &evidence))
+                    .transpose()
+            });
+        match outcome {
+            Ok(Some(_)) => {
+                let evidence = evidence.context("pending publication evidence absent")?;
+                db.write(move |conn| {
+                    cockpit_db::Db::finish_accepted_response_publication_conn(
+                        conn,
+                        operation,
+                        &evidence,
+                        now_unix_ms,
+                    )
+                })
+                .await?;
+                reconciled += 1
+            }
+            _ => {
+                let failure = crate::intel::hex_lower(&Sha256::digest(
+                    b"accepted_response_publication_reconcile_failed",
+                ));
+                db.write(move |conn| {
+                    cockpit_db::Db::block_accepted_response_publication_conn(
+                        conn,
+                        operation,
+                        &failure,
+                        now_unix_ms,
+                    )
+                })
+                .await?;
+            }
+        }
+    }
+    Ok(reconciled)
 }
 
 pub struct RetainGeneratedImageArtifact<'a> {

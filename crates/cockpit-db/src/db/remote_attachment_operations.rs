@@ -241,6 +241,25 @@ pub struct RemoteOutboxDeliveryLease {
     pub lease_expires_at_ms: i64,
 }
 
+struct RemoteOutboxDeliveryCandidateRow {
+    logical_attachment_id: String,
+    event_seq: i64,
+    delivery_id: String,
+    kind: String,
+    canonical_payload: Vec<u8>,
+    prior_attempts: Option<i64>,
+}
+
+struct RemoteRenameEvidenceRow {
+    artifact_id: String,
+    dispatch_generation: i64,
+    state: String,
+    source_identity: Vec<u8>,
+    source_parent_identity: Vec<u8>,
+    target_parent_identity: Vec<u8>,
+    observed_target_identity: Option<Vec<u8>>,
+}
+
 impl Db {
     pub async fn remote_rename_artifact_cleanup_intents(
         &self,
@@ -817,7 +836,7 @@ impl Db {
         let outbox_kind = outbox_kind.to_owned();
         let attachment_filter = logical_attachment_id.map(str::to_owned);
         self.transaction(move |conn| {
-            let candidate: Option<(String, i64, String, String, Vec<u8>, Option<i64>)> = conn
+            let candidate: Option<RemoteOutboxDeliveryCandidateRow> = conn
                 .query_row(
                     "SELECT o.logical_attachment_id, o.event_seq, o.delivery_id, o.kind,
                             o.canonical_payload, d.attempts
@@ -830,13 +849,20 @@ impl Db {
                         AND (d.state IS NULL OR (d.state='leased' AND d.lease_expires_at_ms<=?2))
                       ORDER BY o.created_at_ms, o.logical_attachment_id, o.event_seq LIMIT 1",
                     params![consumer_kind, now_ms, outbox_kind, after_event_seq.unwrap_or(0) as i64, attachment_filter],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+                    |row| Ok(RemoteOutboxDeliveryCandidateRow {
+                        logical_attachment_id: row.get(0)?,
+                        event_seq: row.get(1)?,
+                        delivery_id: row.get(2)?,
+                        kind: row.get(3)?,
+                        canonical_payload: row.get(4)?,
+                        prior_attempts: row.get(5)?,
+                    }),
                 )
                 .optional()?;
-            let Some((attachment, event_seq, delivery_id, kind, payload, prior_attempts)) = candidate else {
+            let Some(candidate) = candidate else {
                 return Ok(None);
             };
-            let attempts = prior_attempts.unwrap_or(0).checked_add(1).context("delivery attempts overflow")?;
+            let attempts = candidate.prior_attempts.unwrap_or(0).checked_add(1).context("delivery attempts overflow")?;
             ensure!(attempts <= 1_000_000, "delivery attempts exhausted");
             let lease_id = Uuid::now_v7().to_string();
             let expires = now_ms.checked_add(lease_duration_ms).context("delivery lease expiry overflow")?;
@@ -849,11 +875,11 @@ impl Db {
                    state='leased', lease_id=excluded.lease_id,
                    lease_expires_at_ms=excluded.lease_expires_at_ms,
                    attempts=excluded.attempts, updated_at_ms=excluded.updated_at_ms, acked_at_ms=NULL",
-                params![attachment, delivery_id, consumer_kind, lease_id, expires, attempts, now_ms],
+                params![candidate.logical_attachment_id, candidate.delivery_id, consumer_kind, lease_id, expires, attempts, now_ms],
             )?;
             Ok(Some(RemoteOutboxDeliveryLease {
-                logical_attachment_id: attachment, event_seq: event_seq.try_into()?, delivery_id,
-                kind, canonical_payload: payload, lease_id,
+                logical_attachment_id: candidate.logical_attachment_id, event_seq: candidate.event_seq.try_into()?, delivery_id: candidate.delivery_id,
+                kind: candidate.kind, canonical_payload: candidate.canonical_payload, lease_id,
                 attempts: attempts.try_into()?, lease_expires_at_ms: expires,
             }))
         }).await
@@ -1248,23 +1274,24 @@ fn load_remote_rename_evidence(
     attachment: &str,
     operation: &str,
 ) -> Result<RemoteRenameEvidence> {
-    let (artifact_id, generation, state, source, source_parent, target_parent, observed): (
-        String,
-        i64,
-        String,
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-        Option<Vec<u8>>,
-    ) = conn.query_row("SELECT artifact_id,dispatch_generation,state,source_identity,source_parent_identity,target_parent_identity,observed_target_identity FROM remote_rename_journal WHERE logical_attachment_id=?1 AND operation_id=?2",params![attachment,operation],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?))).context("loading remote rename evidence")?;
+    let row = conn.query_row("SELECT artifact_id,dispatch_generation,state,source_identity,source_parent_identity,target_parent_identity,observed_target_identity FROM remote_rename_journal WHERE logical_attachment_id=?1 AND operation_id=?2",params![attachment,operation],|row|Ok(RemoteRenameEvidenceRow {
+        artifact_id: row.get(0)?,
+        dispatch_generation: row.get(1)?,
+        state: row.get(2)?,
+        source_identity: row.get(3)?,
+        source_parent_identity: row.get(4)?,
+        target_parent_identity: row.get(5)?,
+        observed_target_identity: row.get(6)?,
+    })).context("loading remote rename evidence")?;
     Ok(RemoteRenameEvidence {
-        artifact_id,
-        dispatch_generation: generation.try_into()?,
-        state,
-        source_identity: RemoteFilesystemIdentityV1::decode(&source)?,
-        source_parent_identity: RemoteFilesystemIdentityV1::decode(&source_parent)?,
-        target_parent_identity: RemoteFilesystemIdentityV1::decode(&target_parent)?,
-        observed_target_identity: observed
+        artifact_id: row.artifact_id,
+        dispatch_generation: row.dispatch_generation.try_into()?,
+        state: row.state,
+        source_identity: RemoteFilesystemIdentityV1::decode(&row.source_identity)?,
+        source_parent_identity: RemoteFilesystemIdentityV1::decode(&row.source_parent_identity)?,
+        target_parent_identity: RemoteFilesystemIdentityV1::decode(&row.target_parent_identity)?,
+        observed_target_identity: row
+            .observed_target_identity
             .map(|value| RemoteFilesystemIdentityV1::decode(&value))
             .transpose()?,
     })

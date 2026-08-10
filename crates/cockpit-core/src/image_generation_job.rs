@@ -1462,6 +1462,32 @@ impl ImageGenerationOwnerContextAuthority {
             parent_sync_digest: authority.parent_identity_digest.clone(),
         }
         .canonical_json()?;
+        self.commit_verified_external_copy_removal(conn, &recorded, &evidence)?;
+        Ok(VerifiedExternalCopyRemovalOutcome::RemovedDurably)
+    }
+
+    fn commit_verified_external_copy_removal(
+        &self,
+        conn: &Connection,
+        recorded: &RecordedImageArtifactSecurityRecovery,
+        evidence: &str,
+    ) -> Result<()> {
+        ensure!(
+            matches!(
+                ImageGenerationLatePublicationEvidenceV1::from_canonical_json(evidence)?,
+                ImageGenerationLatePublicationEvidenceV1::TemporaryDeleted { .. }
+                    | ImageGenerationLatePublicationEvidenceV1::ExactAbsence { .. }
+            ),
+            "external publication removal evidence kind differs"
+        );
+        let operation = recorded
+            .publication_operation_id
+            .context("security recovery publication identity is absent")?;
+        let authorized_version = recorded
+            .publication_lease_version
+            .context("security recovery publication version is absent")?
+            .checked_add(1)
+            .context("external publication recovery version overflow")?;
         let tx = conn.unchecked_transaction()?;
         let now: i64 = tx.query_row(
             "SELECT CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)",
@@ -1473,7 +1499,7 @@ impl ImageGenerationOwnerContextAuthority {
             crate::intel::hex_lower(&Sha256::digest(format!("removed:{operation}:{evidence}")));
         ensure!(tx.execute("UPDATE image_generation_artifact_security_recovery_audits SET state='applied',outcome_digest=?1,decided_at_unix_ms=?2 WHERE recovery_operation_id=?3 AND principal_digest=?4 AND disposition='remove_verified_external_copy' AND state='recorded'",params![outcome,now,recorded.operation_id.to_string(),self.principal_digest])?==1,"security recovery audit compare-and-set lost");
         tx.commit()?;
-        Ok(VerifiedExternalCopyRemovalOutcome::RemovedDurably)
+        Ok(())
     }
 
     pub fn reconcile_verified_external_copy_removal(
@@ -1483,7 +1509,53 @@ impl ImageGenerationOwnerContextAuthority {
         output: &HeldImageGenerationOutputDirectory,
         recovery: &HeldDirectoryRecovery,
     ) -> Result<VerifiedExternalCopyRemovalOutcome> {
-        self.remove_verified_external_copy(conn, recorded, output, recovery)
+        self.revalidate_live_session(conn)?;
+        ensure!(
+            recorded.disposition
+                == ImageArtifactSecurityRecoveryDisposition::RemoveVerifiedExternalCopy,
+            "security recovery disposition differs"
+        );
+        ensure!(
+            recovery.destination_name().is_none()
+                && recovery.artifact().identity_digest()
+                    == recorded
+                        .output_identity_digest
+                        .as_deref()
+                        .context("security recovery output identity is absent")?,
+            "restart deletion recovery identity differs"
+        );
+        let reconciled = match output.reconcile_publication(recovery)? {
+            HeldDirectoryEffectOutcome::AppliedDurable(evidence) => evidence,
+            HeldDirectoryEffectOutcome::AppliedUnknown(recovery)
+            | HeldDirectoryEffectOutcome::SecurityAmbiguous(recovery) => {
+                return Ok(VerifiedExternalCopyRemovalOutcome::RecoveryRequired(
+                    recovery,
+                ));
+            }
+            HeldDirectoryEffectOutcome::ProvenNotApplied(_) => {
+                anyhow::bail!("external publication deletion is proven not applied")
+            }
+        };
+        ensure!(
+            reconciled.destination_name().is_none(),
+            "restart deletion reconciliation unexpectedly retained a destination"
+        );
+        let operation = recorded
+            .publication_operation_id
+            .context("security recovery publication identity is absent")?;
+        let authority = &output.authority.0;
+        let evidence = ImageGenerationLatePublicationEvidenceV1::ExactAbsence {
+            schema_version: 1,
+            absence_digest: crate::intel::hex_lower(&Sha256::digest(format!(
+                "absent:{}:{}",
+                operation,
+                reconciled.artifact().identity_digest()
+            ))),
+            parent_identity_digest: authority.parent_identity_digest.clone(),
+        }
+        .canonical_json()?;
+        self.commit_verified_external_copy_removal(conn, &recorded, &evidence)?;
+        Ok(VerifiedExternalCopyRemovalOutcome::RemovedDurably)
     }
 
     fn complete_verified_late_publication_inner(
@@ -3572,6 +3644,7 @@ mod tests {
                     )?,
                     ImageGenerationLatePublicationReplay::Terminal {
                         state: ImageGenerationLatePublicationState::Aborted,
+                        evidence: ImageGenerationLatePublicationEvidenceV1::ExactAbsence { .. },
                         ..
                     }
                 ));

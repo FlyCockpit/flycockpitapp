@@ -11,6 +11,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
+pub const MAX_IMAGE_GENERATION_TARGETS: usize = 16;
+pub const MAX_IMAGE_GENERATION_SLOTS: usize = 256;
+pub const MAX_IMAGE_GENERATION_ATTEMPTS_PER_SLOT: u32 = 8;
+pub const MAX_IMAGE_GENERATION_DIMENSION: u32 = 16_384;
+const MAX_PLAN_STRING_BYTES: usize = 1_024;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ImageGenerationPlanV1 {
@@ -198,7 +204,7 @@ impl ImageGenerationPlanV1 {
         );
         for grant in &self.required_grants {
             ensure!(
-                !grant.grant_kind.is_empty() && grant.generation > 0,
+                valid_string(&grant.grant_kind) && grant.generation > 0,
                 "grant authority is incomplete"
             );
             validate_digest(&grant.authority_digest)?;
@@ -208,7 +214,10 @@ impl ImageGenerationPlanV1 {
             "resources must be nonempty, unique, and sorted"
         );
         validate_resources(&self.central_resources)?;
-        ensure!(!self.targets.is_empty(), "plan must contain targets");
+        ensure!(
+            !self.targets.is_empty() && self.targets.len() <= MAX_IMAGE_GENERATION_TARGETS,
+            "plan target count is out of bounds"
+        );
         ensure!(
             self.targets
                 .windows(2)
@@ -216,8 +225,8 @@ impl ImageGenerationPlanV1 {
             "targets must be unique and sorted"
         );
         ensure!(
-            !self.output_authority.filename_prefix.is_empty()
-                && !self.output_authority.extension.is_empty(),
+            valid_path_component(&self.output_authority.filename_prefix)
+                && valid_path_component(&self.output_authority.extension),
             "output authority is incomplete"
         );
         validate_digest(&self.output_authority.canonical_destination_digest)?;
@@ -228,9 +237,19 @@ impl ImageGenerationPlanV1 {
             "spend authority is incomplete"
         );
         let mut total_maximum = Some(0_u64);
+        let mut slot_ids = std::collections::BTreeSet::new();
+        let mut artifact_ids = std::collections::BTreeSet::new();
+        let mut total_slots = 0_usize;
         for target in &self.targets {
             target.validate()?;
+            total_slots = total_slots
+                .checked_add(target.slots.len())
+                .ok_or_else(|| anyhow::anyhow!("slot count overflow"))?;
             for slot in &target.slots {
+                ensure!(
+                    slot_ids.insert(slot.slot_id) && artifact_ids.insert(slot.managed_artifact_id),
+                    "slot/artifact identities must be globally unique"
+                );
                 for attempt in &slot.attempts {
                     total_maximum = match (total_maximum, attempt.maximum_usd_micros) {
                         (Some(total), Some(value)) => Some(
@@ -243,6 +262,10 @@ impl ImageGenerationPlanV1 {
                 }
             }
         }
+        ensure!(
+            total_slots <= MAX_IMAGE_GENERATION_SLOTS,
+            "plan slot count is out of bounds"
+        );
         ensure!(
             self.spend.maximum_usd_micros == total_maximum,
             "spend maximum must cover the complete attempt graph"
@@ -258,7 +281,7 @@ impl ImageGenerationPlanV1 {
 impl TargetPlanV1 {
     fn validate(&self) -> Result<()> {
         ensure!(
-            !self.target_id.is_empty() && self.target_config_generation > 0,
+            valid_string(&self.target_id) && self.target_config_generation > 0,
             "target identity is incomplete"
         );
         validate_digest(&self.normalized_config_digest)?;
@@ -272,7 +295,7 @@ impl TargetPlanV1 {
         validate_digest(&self.destination.endpoint_identity_digest)?;
         validate_digest(&self.destination.credential_identity_digest)?;
         ensure!(
-            !self.destination.adapter_kind.is_empty()
+            valid_string(&self.destination.adapter_kind)
                 && self.destination.destination_generation > 0,
             "destination authority is incomplete"
         );
@@ -280,7 +303,11 @@ impl TargetPlanV1 {
             self.requested.width > 0
                 && self.requested.height > 0
                 && self.resolved.width > 0
-                && self.resolved.height > 0,
+                && self.resolved.height > 0
+                && self.requested.width <= MAX_IMAGE_GENERATION_DIMENSION
+                && self.requested.height <= MAX_IMAGE_GENERATION_DIMENSION
+                && self.resolved.width <= MAX_IMAGE_GENERATION_DIMENSION
+                && self.resolved.height <= MAX_IMAGE_GENERATION_DIMENSION,
             "dimensions must be positive"
         );
         ensure!(
@@ -290,7 +317,9 @@ impl TargetPlanV1 {
             "format resolution is incomplete"
         );
         ensure!(
-            self.sample_count > 0 && self.max_attempts > 0,
+            self.sample_count > 0
+                && self.max_attempts > 0
+                && self.max_attempts <= MAX_IMAGE_GENERATION_ATTEMPTS_PER_SLOT,
             "sample and attempt counts must be positive"
         );
         ensure!(
@@ -308,7 +337,7 @@ impl TargetPlanV1 {
                     && reference.attachment_version > 0
                     && reference.component_generation > 0
                     && reference.byte_length > 0
-                    && !reference.media_kind.is_empty(),
+                    && valid_string(&reference.media_kind),
                 "reference authority is incomplete"
             );
             validate_digest(&reference.identity_digest)?;
@@ -318,7 +347,7 @@ impl TargetPlanV1 {
             ensure!(
                 slot.slot_id.get_version_num() == 7
                     && slot.managed_artifact_id.get_version_num() == 7
-                    && !slot.publication_name.is_empty(),
+                    && valid_path_component(&slot.publication_name),
                 "slot identity is incomplete"
             );
             ensure!(
@@ -335,8 +364,8 @@ impl TargetPlanV1 {
                     "attempt numbers must be contiguous from one"
                 );
                 ensure!(
-                    !attempt.provider_request_identity.is_empty()
-                        && !attempt.provider_idempotency_identity.is_empty(),
+                    valid_string(&attempt.provider_request_identity)
+                        && valid_string(&attempt.provider_idempotency_identity),
                     "attempt provider identity is incomplete"
                 );
                 ensure!(
@@ -365,12 +394,22 @@ fn validate_digest(value: &str) -> Result<()> {
     Ok(())
 }
 
+fn valid_string(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_PLAN_STRING_BYTES
+        && !value.chars().any(char::is_control)
+}
+
+fn valid_path_component(value: &str) -> bool {
+    valid_string(value) && value != "." && value != ".." && !value.contains(['/', '\\'])
+}
+
 fn validate_resources(resources: &[ResourceReservationV1]) -> Result<()> {
     for resource in resources {
         ensure!(
-            !resource.resource_kind.is_empty()
+            valid_string(&resource.resource_kind)
                 && resource.units > 0
-                && !resource.reservation_identity.is_empty(),
+                && valid_string(&resource.reservation_identity),
             "resource reservation is incomplete"
         );
     }

@@ -98,7 +98,7 @@ pub trait ImageGenerationAdapter: image_generation_adapter_sealed::Sealed + Send
     async fn handoff(
         &self,
         request: &ImageGenerationHandoffRequest,
-    ) -> Result<ImageGenerationHandoffResult>;
+    ) -> ImageGenerationHandoffResult;
 }
 
 #[cfg(test)]
@@ -130,7 +130,7 @@ impl ImageGenerationAdapter for DeterministicImageGenerationAdapter {
     async fn handoff(
         &self,
         request: &ImageGenerationHandoffRequest,
-    ) -> Result<ImageGenerationHandoffResult> {
+    ) -> ImageGenerationHandoffResult {
         self.requests
             .lock()
             .expect("fake lock poisoned")
@@ -139,7 +139,7 @@ impl ImageGenerationAdapter for DeterministicImageGenerationAdapter {
             .lock()
             .expect("fake lock poisoned")
             .pop_front()
-            .context("deterministic image adapter has no configured outcome")
+            .expect("deterministic image adapter has no configured outcome")
     }
 }
 
@@ -259,7 +259,7 @@ impl ImageGenerationDispatcher {
             provider_request_identity: provider_request_identity.to_owned(),
             provider_idempotency_identity: provider_idempotency_identity.to_owned(),
         };
-        let result = adapter.handoff(&request).await?;
+        let result = adapter.handoff(&request).await;
         result.validate()?;
         self.finish_external_handoff(dispatching, result.spend_evidence(), at_unix_ms)
             .await?;

@@ -1356,3 +1356,337 @@ fn stop_gate_state_capped_forces_end() {
     };
     assert!(state.capped());
 }
+
+// ---------------------------------------------------------------------------
+// README hooks-contract documentation test
+// ---------------------------------------------------------------------------
+
+use crate::config::extended::hooks::{HookApplicability, HookGate, HookMatcherPolicy};
+
+/// A structured, machine-checkable projection of the native command-hook
+/// contract that the public `apps/cli/README.md` `## Hooks` subsection must
+/// describe.
+///
+/// Normative values are derived from the typed config/runtime constants rather
+/// than hand-maintained test literals, so a drift between the prose contract
+/// and the implementation fails the test.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HookDocumentationContract {
+    /// Canonical event keys in canonical order, derived from `HookEvent::ALL`.
+    pub events: Vec<HookEventDoc>,
+    /// Config layer origin kinds, in least-to-most-specific load order.
+    pub origin_layers: Vec<&'static str>,
+    /// Environment variable that points at one concrete `config.json`.
+    pub cockpit_config_env: &'static str,
+    /// Per-handler config filename.
+    pub config_file: &'static str,
+    /// Reserved `COCKPIT_HOOK_*` / Cockpit env keys overwritten after configured env.
+    pub reserved_env_keys: Vec<&'static str>,
+    /// Envelope `toolInput`/`toolResult` value cap in bytes.
+    pub envelope_value_max_bytes: usize,
+    /// Independent stdout/stderr cap in bytes.
+    pub output_cap_bytes: usize,
+    /// Deny/block reason max length in chars.
+    pub reason_max_chars: usize,
+    /// Stop-gate continuations per (session, frame-or-job).
+    pub stop_hook_max_continuations: u8,
+    /// `timeoutSecs` valid range, inclusive.
+    pub timeout_secs_range: (u16, u16),
+    /// Closed `hook_run` audit status vocabulary.
+    pub audit_statuses: Vec<&'static str>,
+    /// `hook_run` audit fields that are deliberately absent (privacy exclusions).
+    pub audit_excluded_fields: Vec<&'static str>,
+    /// `hook_run` byte caps: (event, correlation, reason).
+    pub audit_byte_caps: (usize, usize, usize),
+    /// Pre-tool decision vocabulary that blocks control flow.
+    pub pre_tool_blocking_decision: &'static str,
+    /// Pre-tool decision vocabulary that allows.
+    pub pre_tool_allow_decision: &'static str,
+    /// Stop-gate decision vocabulary that requests another model round.
+    pub stop_block_decision: &'static str,
+    /// Stop-gate field that ends the turn.
+    pub stop_continue_false: &'static str,
+    /// Stop-gate additional-context field path.
+    pub stop_additional_context_field: &'static str,
+    /// Fail-open conditions recorded as `failed` runs.
+    pub fail_open_conditions: Vec<&'static str>,
+    /// Deliberately unsupported formats/sources.
+    pub unsupported_formats: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HookEventDoc {
+    pub key: &'static str,
+    pub gate: &'static str,
+    pub applicability: &'static str,
+    pub matcher_kind: &'static str,
+    pub matcher_values: Vec<&'static str>,
+    pub default_timeout_secs: u16,
+    pub affects_control_flow: bool,
+}
+
+impl HookDocumentationContract {
+    /// Build the contract from the typed config/runtime constants.
+    pub(crate) fn from_typed_constants() -> Self {
+        let events: Vec<HookEventDoc> = HookEvent::ALL
+            .iter()
+            .map(|event| {
+                let policy = event.policy();
+                let (matcher_kind, matcher_values) = match policy.matcher {
+                    HookMatcherPolicy::Closed(values) => {
+                        ("closed", values.iter().copied().collect::<Vec<_>>())
+                    }
+                    HookMatcherPolicy::CanonicalToolName => ("canonicalToolName", Vec::new()),
+                    HookMatcherPolicy::ChildAgentType => ("childAgentType", Vec::new()),
+                    HookMatcherPolicy::ErrorClass => ("errorClass", Vec::new()),
+                };
+                let gate = match policy.gate {
+                    HookGate::Observe => "observe",
+                    HookGate::Tool => "tool",
+                    HookGate::Stop => "stop",
+                };
+                let applicability = match policy.applicability {
+                    HookApplicability::RootAndChild => "rootAndChild",
+                    HookApplicability::RootOnly => "rootOnly",
+                    HookApplicability::OrdinaryToolOnly => "ordinaryToolOnly",
+                    HookApplicability::RealOrdinaryExecutionOnly => "realOrdinaryExecutionOnly",
+                    HookApplicability::AnyDeniedToolApproval => "anyDeniedToolApproval",
+                    HookApplicability::NormalRootDoneOnly => "normalRootDoneOnly",
+                    HookApplicability::InferenceErrorOnly => "inferenceErrorOnly",
+                    HookApplicability::ChildOnly => "childOnly",
+                    HookApplicability::SuccessfulCompactionOnly => "successfulCompactionOnly",
+                    HookApplicability::EverySession => "everySession",
+                };
+                let affects_control_flow = matches!(policy.gate, HookGate::Tool | HookGate::Stop);
+                HookEventDoc {
+                    key: event.key(),
+                    gate,
+                    applicability,
+                    matcher_kind,
+                    matcher_values,
+                    default_timeout_secs: policy.default_timeout_secs,
+                    affects_control_flow,
+                }
+            })
+            .collect();
+
+        Self {
+            events,
+            origin_layers: vec!["global", "user", "machine", "project", "explicit"],
+            cockpit_config_env: crate::config::dirs::COCKPIT_CONFIG_ENV,
+            config_file: crate::config::dirs::CONFIG_FILE,
+            reserved_env_keys: RESERVED_ENV_KEYS.to_vec(),
+            envelope_value_max_bytes: ENVELOPE_VALUE_MAX_BYTES,
+            output_cap_bytes: OUTPUT_CAP_BYTES,
+            reason_max_chars: REASON_MAX_CHARS,
+            stop_hook_max_continuations: STOP_HOOK_MAX_CONTINUATIONS,
+            timeout_secs_range: (1, 600),
+            audit_statuses: vec!["success", "denied", "blocked", "failed"],
+            audit_excluded_fields: vec![
+                "payload",
+                "output",
+                "argv",
+                "cwd",
+                "environment",
+                "stdout",
+                "stderr",
+                "http",
+                "unknown",
+            ],
+            audit_byte_caps: (128, 256, 1024),
+            pre_tool_blocking_decision: "deny",
+            pre_tool_allow_decision: "allow",
+            stop_block_decision: "block",
+            stop_continue_false: "continue",
+            stop_additional_context_field: "hookSpecificOutput.additionalContext",
+            fail_open_conditions: vec![
+                "crash",
+                "timeout",
+                "spawn-failure",
+                "malformed-output",
+                "oversized-output",
+                "nonzero-exit",
+                "missing-command",
+            ],
+            unsupported_formats: vec![
+                "toml",
+                "shell-string",
+                "http-endpoint",
+                "network-hook",
+                "regex-matcher",
+                "glob-matcher",
+                "vendor-alias",
+                "plugin-source",
+                "agent-frontmatter",
+            ],
+        }
+    }
+}
+
+/// Read the `<!-- hooks-contract:start -->` / `<!-- hooks-contract:end -->`
+/// block from `apps/cli/README.md`.
+fn read_hooks_contract_block() -> String {
+    let readme = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../apps/cli/README.md");
+    let contents = std::fs::read_to_string(&readme)
+        .unwrap_or_else(|error| panic!("could not read {}: {error}", readme.display()));
+    let start_marker = "<!-- hooks-contract:start -->";
+    let end_marker = "<!-- hooks-contract:end -->";
+    let start = contents
+        .find(start_marker)
+        .unwrap_or_else(|| panic!("missing `{start_marker}` marker in {}", readme.display()));
+    let after_start = start + start_marker.len();
+    let end = contents[after_start..].find(end_marker).unwrap_or_else(|| {
+        panic!(
+            "missing `{end_marker}` marker after `{start_marker}` in {}",
+            readme.display()
+        )
+    }) + after_start;
+    contents[after_start..end].to_string()
+}
+
+/// Assert the contract block mentions every normative value. Each check
+/// fails with a precise message so a missing/extra/wrong value is obvious.
+fn assert_contract_block_matches(block: &str, contract: &HookDocumentationContract) {
+    let lower = block.to_ascii_lowercase();
+    let assert_contains = |needle: &str, what: &str| {
+        assert!(
+            lower.contains(&needle.to_ascii_lowercase()),
+            "hooks-contract block is missing {what} (`{needle}`)"
+        );
+    };
+    let assert_not_contains = |needle: &str, what: &str| {
+        assert!(
+            !lower.contains(&needle.to_ascii_lowercase()),
+            "hooks-contract block must not present {what} as supported (`{needle}`)"
+        );
+    };
+
+    // Config schema + every event/gate/matcher/default-timeout.
+    for event in &contract.events {
+        assert_contains(event.key, &format!("event key `{}`", event.key));
+        assert_contains(
+            event.gate,
+            &format!("gate `{}` for event `{}`", event.gate, event.key),
+        );
+        assert_contains(
+            event.applicability,
+            &format!(
+                "applicability `{}` for event `{}`",
+                event.applicability, event.key
+            ),
+        );
+        assert_contains(
+            event.matcher_kind,
+            &format!(
+                "matcher kind `{}` for event `{}`",
+                event.matcher_kind, event.key
+            ),
+        );
+        let timeout_str = format!("{}s", event.default_timeout_secs);
+        assert_contains(
+            &timeout_str,
+            &format!(
+                "default timeout {} for event `{}`",
+                event.default_timeout_secs, event.key
+            ),
+        );
+        if event.affects_control_flow {
+            assert_contains(
+                "control flow",
+                &format!("control-flow note for gating event `{}`", event.key),
+            );
+        }
+    }
+
+    // Source ordering + trust + COCKPIT_CONFIG + config file.
+    for layer in &contract.origin_layers {
+        assert_contains(layer, &format!("origin layer `{}`", layer));
+    }
+    assert_contains(contract.cockpit_config_env, "COCKPIT_CONFIG env var");
+    assert_contains(contract.config_file, "config.json filename");
+
+    // Reserved env keys.
+    for key in &contract.reserved_env_keys {
+        assert_contains(key, &format!("reserved env key `{}`", key));
+    }
+
+    // Byte/time caps.
+    let envelope_cap = format!("{} KiB", contract.envelope_value_max_bytes / 1024);
+    assert_contains(&envelope_cap, "envelope value cap");
+    let output_cap = format!("{} KiB", contract.output_cap_bytes / 1024);
+    assert_contains(&output_cap, "output cap");
+    assert_contains(
+        &format!("{}", contract.reason_max_chars),
+        "reason max chars",
+    );
+    assert_contains(
+        &format!("{}", contract.stop_hook_max_continuations),
+        "stop continuation cap",
+    );
+    let (lo, hi) = contract.timeout_secs_range;
+    assert_contains(&format!("{}..={}", lo, hi), "timeoutSecs range");
+
+    // Audit statuses + privacy exclusions + byte caps.
+    for status in &contract.audit_statuses {
+        assert_contains(status, &format!("audit status `{}`", status));
+    }
+    for field in &contract.audit_excluded_fields {
+        assert_contains(field, &format!("audit excluded field `{}`", field));
+    }
+    let (ev, corr, reason) = contract.audit_byte_caps;
+    assert_contains(&format!("{}", ev), "audit event byte cap");
+    assert_contains(&format!("{}", corr), "audit correlation byte cap");
+    assert_contains(&format!("{}", reason), "audit reason byte cap");
+
+    // Decision vocabularies.
+    assert_contains(
+        &format!("\"{}\"", contract.pre_tool_blocking_decision),
+        "pre-tool blocking decision",
+    );
+    assert_contains(
+        &format!("\"{}\"", contract.pre_tool_allow_decision),
+        "pre-tool allow decision",
+    );
+    assert_contains(
+        &format!("\"{}\"", contract.stop_block_decision),
+        "stop block decision",
+    );
+    assert_contains(contract.stop_continue_false, "stop continue:false field");
+    assert_contains(
+        contract.stop_additional_context_field,
+        "stop additionalContext field",
+    );
+
+    // Fail-open conditions.
+    for cond in &contract.fail_open_conditions {
+        assert_contains(cond, &format!("fail-open condition `{}`", cond));
+    }
+
+    // Unsupported formats must NOT be presented as supported.
+    for fmt in &contract.unsupported_formats {
+        assert_not_contains(
+            &format!("supported: {}", fmt),
+            &format!("unsupported format `{}`", fmt),
+        );
+    }
+    // The block must explicitly reject each unsupported format.
+    for fmt in &contract.unsupported_formats {
+        assert!(
+            lower.contains(&fmt.to_ascii_lowercase()),
+            "hooks-contract block must explicitly reject unsupported format `{fmt}`"
+        );
+    }
+}
+
+/// `hooks_documentation_matches_typed_contract` verifies that the public
+/// `apps/cli/README.md` `## Hooks` contract block matches the typed
+/// config/runtime constants. It fails on a missing marker, any
+/// missing/extra/wrong normative value, or an unsupported format presented
+/// as supported.
+#[test]
+fn hooks_documentation_matches_typed_contract() {
+    let block = read_hooks_contract_block();
+    assert!(!block.trim().is_empty(), "hooks-contract block is empty");
+    let contract = HookDocumentationContract::from_typed_constants();
+    assert_contract_block_matches(&block, &contract);
+}

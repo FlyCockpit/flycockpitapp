@@ -377,6 +377,40 @@ fn generated_svg_structural_verify() {
 }
 
 #[test]
+fn generated_svg_independent_verifier_rejects_adversarial_canonical_mutations() {
+    let mutations = [
+        format!(
+            r#"<svg xmlns="{SVG_NS}"><defs><clipPath clipPathUnits="objectBoundingBox" id="svg_000001"><rect height="1" width="1" x="2"/></clipPath></defs></svg>"#
+        ),
+        format!(r#"<svg xmlns="{SVG_NS}"><polygon points="0 0 bad 1 1 2 2"/></svg>"#),
+        format!(r#"<svg xmlns="{SVG_NS}"><path stroke-dasharray="1 bad 2"/></svg>"#),
+        format!(r#"<svg xmlns="{SVG_NS}" viewBox="0 0 bad 10 10"/>"#),
+        format!(r#"<svg xmlns="{SVG_NS}"><path d="M 0 0 A -1 1 0 0 0 1 1"/></svg>"#),
+        format!(r#"<svg xmlns="{SVG_NS}"><rect id="svg_000000"/></svg>"#),
+        format!(r#"<svg xmlns="{SVG_NS}"><rect id="svg_000002"/><rect id="svg_000001"/></svg>"#),
+    ];
+    for mutation in mutations {
+        assert!(
+            super::verify::verify_canonical_svg(mutation.as_bytes()).is_err(),
+            "{mutation}"
+        );
+    }
+
+    for accepted in [
+        format!(
+            r#"<svg xmlns="{SVG_NS}"><defs><clipPath clipPathUnits="objectBoundingBox" id="svg_000001"><rect height="1" width="1" x="0"/></clipPath></defs></svg>"#
+        ),
+        format!(r#"<svg xmlns="{SVG_NS}"><path d="M 0 0 A 0 1 0 0 0 1 1"/></svg>"#),
+        format!(r#"<svg xmlns="{SVG_NS}"><rect id="svg_000001"/><rect id="svg_000002"/></svg>"#),
+    ] {
+        assert!(
+            super::verify::verify_canonical_svg(accepted.as_bytes()).is_ok(),
+            "{accepted}"
+        );
+    }
+}
+
+#[test]
 fn generated_svg_defense_disagreement_is_never_projected_away() {
     let raw = format!(r##"<svg xmlns="{SVG_NS}"><title xml:space="preserve">x</title></svg>"##);
     assert_eq!(

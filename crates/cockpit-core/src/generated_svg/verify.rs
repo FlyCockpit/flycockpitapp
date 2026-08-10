@@ -78,6 +78,7 @@ struct Frame {
     desc: bool,
     stops: usize,
     definition: Option<usize>,
+    object_bbox: bool,
     radial_r: Option<(i64, bool)>,
     radial_fr: Option<(i64, bool)>,
     text_bytes: usize,
@@ -237,6 +238,23 @@ fn verify_start(
     let mut saw_xmlns = false;
     let mut radial_r = None;
     let mut radial_fr = None;
+    let inherited_object_bbox = stack.last().is_some_and(|frame| frame.object_bbox);
+    let mut object_bbox = inherited_object_bbox;
+    for attribute in event.attributes().with_checks(true) {
+        let attribute = attribute.map_err(|_| error("attribute"))?;
+        let name = std::str::from_utf8(attribute.key.as_ref()).map_err(|_| error("attribute"))?;
+        let value = attribute
+            .decode_and_unescape_value(reader.decoder())
+            .map_err(|_| error("attribute"))?;
+        object_bbox |= match (kind, name) {
+            (Kind::ClipPath, "clipPathUnits") => value == "objectBoundingBox",
+            (Kind::Mask, "maskUnits" | "maskContentUnits") => value == "objectBoundingBox",
+            (Kind::LinearGradient | Kind::RadialGradient, "gradientUnits") => {
+                value == "objectBoundingBox"
+            }
+            _ => false,
+        };
+    }
     for attribute in event.attributes().with_checks(true) {
         let attribute = attribute.map_err(|_| error("attribute"))?;
         attributes += 1;
@@ -286,10 +304,18 @@ fn verify_start(
         if !attribute_allowed(kind, name) || !canonical_value(kind, name, &value, limits)? {
             return fail(SvgSanitizeCode::StructuralVerify, "attribute-value");
         }
+        if object_bbox
+            && bbox_numeric_attribute(name)
+            && !value.ends_with('%')
+            && !canonical_range(&value, 0, 1_000_000)
+        {
+            return fail(SvgSanitizeCode::StructuralVerify, "objectBoundingBox");
+        }
         if name == "id" {
             has_id = true;
             limits.ids += 1;
-            if limits.ids > MAX_IDS || !canonical_id(&value) {
+            let expected = format!("svg_{:06}", limits.ids);
+            if limits.ids > MAX_IDS || value.as_ref() != expected {
                 return fail(SvgSanitizeCode::StructuralVerify, "id");
             }
         } else if let Some((target, reference_kind)) = canonical_reference(name, &value) {
@@ -335,6 +361,7 @@ fn verify_start(
         desc: false,
         stops: 0,
         definition,
+        object_bbox,
         radial_r,
         radial_fr,
         text_bytes: 0,
@@ -515,10 +542,13 @@ fn canonical_value(kind: Kind, name: &str, value: &str, limits: &mut Limits) -> 
         return Ok(canonical_transform_shape(value));
     }
     if name == "points" {
-        let values = value
+        let Some(values) = value
             .split(' ')
-            .filter_map(canonical_scaled)
-            .collect::<Vec<_>>();
+            .map(canonical_scaled)
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(false);
+        };
         return Ok(values.len() >= (if kind == Kind::Polygon { 6 } else { 4 })
             && values.len() <= 131_072
             && values.len() % 2 == 0
@@ -530,10 +560,13 @@ fn canonical_value(kind: Kind, name: &str, value: &str, limits: &mut Limits) -> 
         if value == "none" {
             return Ok(true);
         }
-        let values = value
+        let Some(values) = value
             .split(' ')
-            .filter_map(canonical_scaled)
-            .collect::<Vec<_>>();
+            .map(canonical_scaled)
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(false);
+        };
         return Ok((1..=64).contains(&values.len())
             && values.iter().all(|value| *value >= 0)
             && values.iter().any(|value| *value > 0));
@@ -595,10 +628,13 @@ fn canonical_value(kind: Kind, name: &str, value: &str, limits: &mut Limits) -> 
         return Ok(matches!(value, "visible" | "hidden" | "collapse"));
     }
     if name == "viewBox" {
-        let values = value
+        let Some(values) = value
             .split(' ')
-            .filter_map(canonical_scaled)
-            .collect::<Vec<_>>();
+            .map(canonical_scaled)
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(false);
+        };
         return Ok(values.len() == 4
             && values[2] > 0
             && values[3] > 0
@@ -719,6 +755,29 @@ fn canonical_reference<'a>(name: &str, value: &'a str) -> Option<(&'a str, u8)> 
     let id = value.strip_prefix("url(#")?.strip_suffix(')')?;
     canonical_id(id).then_some((id, kind))
 }
+fn bbox_numeric_attribute(name: &str) -> bool {
+    matches!(
+        name,
+        "x" | "y"
+            | "cx"
+            | "cy"
+            | "x1"
+            | "y1"
+            | "x2"
+            | "y2"
+            | "fx"
+            | "fy"
+            | "width"
+            | "height"
+            | "rx"
+            | "ry"
+            | "r"
+            | "fr"
+            | "pathLength"
+            | "stroke-width"
+            | "stroke-dashoffset"
+    )
+}
 fn canonical_transform_shape(value: &str) -> bool {
     if value.is_empty() {
         return true;
@@ -824,12 +883,16 @@ fn canonical_path_shape(value: &str) -> bool {
                         return false;
                     }
                 } else if !canonical_scaled(token).is_some_and(|number| {
-                    number.abs()
-                        <= if command == "A" && offset == 2 {
-                            360_000_000_000
-                        } else {
-                            1_000_000_000_000
-                        }
+                    if command == "A" && matches!(offset, 0 | 1) {
+                        (0..=1_000_000_000_000).contains(&number)
+                    } else {
+                        number.abs()
+                            <= if command == "A" && offset == 2 {
+                                360_000_000_000
+                            } else {
+                                1_000_000_000_000
+                            }
+                    }
                 }) {
                     return false;
                 }

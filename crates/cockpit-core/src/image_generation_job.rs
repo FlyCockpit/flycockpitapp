@@ -5246,6 +5246,160 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_and_reconciliation_orderings_preserve_authoritative_resource_semantics() {
+        for cancel_first in [true, false] {
+            for outcome_name in ["accepted", "nonacceptance", "failure"] {
+                let suffix = format!("race-{cancel_first}-{outcome_name}");
+                let fixture = setup_real_ledger_scheduler_job(
+                    cockpit_db::Db::open_in_memory().unwrap(),
+                    &suffix,
+                )
+                .await;
+                let job_id = fixture.job_id;
+                let slot_id = fixture.slot_id;
+                let media_id = fixture.media_reservation_id.clone();
+                let spend_id = fixture.spend_reservation_id.clone();
+                let handoff = DeterministicImageGenerationAdapter::new(vec![
+                    ImageGenerationHandoffResult::SubmissionUnknown {
+                        evidence: format!("unknown-{suffix}").into_bytes(),
+                    },
+                ]);
+                let dispatcher = ImageGenerationDispatcher::new(fixture.db.clone());
+                dispatcher
+                    .run_scheduler_pass(&handoff, deadline_boot(), 100, 2, 2, 8)
+                    .await
+                    .unwrap();
+                if cancel_first {
+                    fixture
+                        .db
+                        .transaction(move |conn| {
+                            cockpit_db::Db::request_image_generation_cancellation_conn(
+                                conn,
+                                &RequestImageGenerationCancellation {
+                                    job_id,
+                                    cancellation_version: 1,
+                                    request_operation_id: "cancel:before-reconcile",
+                                    requested_at_unix_ms: 3,
+                                },
+                            )?;
+                            Ok(())
+                        })
+                        .await
+                        .unwrap();
+                }
+                let outcome = match outcome_name {
+                    "accepted" => ImageGenerationReconcileResult::AuthoritativeAccepted {
+                        evidence: b"race-accepted".to_vec(),
+                    },
+                    "nonacceptance" => ImageGenerationReconcileResult::AuthoritativeNonacceptance {
+                        evidence: b"race-nonacceptance".to_vec(),
+                    },
+                    "failure" => ImageGenerationReconcileResult::AuthoritativeFailure {
+                        evidence: b"race-failure".to_vec(),
+                    },
+                    _ => unreachable!(),
+                };
+                let recovery =
+                    DeterministicImageGenerationAdapter::with_recovery(vec![outcome], Vec::new());
+                assert_eq!(
+                    dispatcher
+                        .run_reconciliation_pass(&recovery, Uuid::now_v7(), 10, 8)
+                        .await
+                        .unwrap(),
+                    1,
+                    "{suffix}"
+                );
+                let late_cancel_applied = if cancel_first {
+                    true
+                } else {
+                    fixture
+                        .db
+                        .transaction(move |conn| {
+                            cockpit_db::Db::request_image_generation_cancellation_conn(
+                                conn,
+                                &RequestImageGenerationCancellation {
+                                    job_id,
+                                    cancellation_version: 1,
+                                    request_operation_id: "cancel:after-reconcile",
+                                    requested_at_unix_ms: 11,
+                                },
+                            )
+                        })
+                        .await
+                        .is_ok()
+                };
+                let row = fixture.db.read(move|conn|conn.query_row("SELECT a.state,s.state,j.state,m.state,b.state,(SELECT COUNT(*) FROM image_generation_reconciliation_evidence e WHERE e.job_id=a.job_id),(SELECT COUNT(*) FROM image_generation_reconciliation_claim_completions c WHERE c.job_id=a.job_id) FROM image_generation_attempts a JOIN image_generation_slots s USING(job_id,slot_id) JOIN image_generation_jobs j USING(job_id) JOIN media_reservations m ON m.reservation_id=?3 JOIN image_spend_reservations b ON b.reservation_id=?4 WHERE a.job_id=?1 AND a.slot_id=?2 AND a.attempt_number=1",rusqlite::params![job_id.to_string(),slot_id.to_string(),media_id,spend_id],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,i64>(5)?,row.get::<_,i64>(6)?)))).await.unwrap();
+                let expected = match (cancel_first, outcome_name) {
+                    (true, "accepted") => (
+                        "accepted",
+                        "cancellation_requested",
+                        "cancellation_requested",
+                        "external_pending",
+                        "reserved",
+                        true,
+                    ),
+                    (false, "accepted") => (
+                        "cancellation_requested",
+                        "cancellation_requested",
+                        "cancellation_requested",
+                        "external_pending",
+                        "reserved",
+                        true,
+                    ),
+                    (true, "nonacceptance") => (
+                        "cancelled",
+                        "cancelled",
+                        "cancelled",
+                        "settling",
+                        "released",
+                        true,
+                    ),
+                    (false, "nonacceptance") => (
+                        "rejected_not_accepted",
+                        "failed",
+                        "failed",
+                        "settling",
+                        "released",
+                        false,
+                    ),
+                    (true, "failure") => (
+                        "failed_after_acceptance",
+                        "failed",
+                        "failed",
+                        "external_pending",
+                        "reserved",
+                        true,
+                    ),
+                    (false, "failure") => (
+                        "failed_after_acceptance",
+                        "failed",
+                        "failed",
+                        "external_pending",
+                        "reserved",
+                        false,
+                    ),
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    (
+                        row.0.as_str(),
+                        row.1.as_str(),
+                        row.2.as_str(),
+                        row.3.as_str(),
+                        row.4.as_str()
+                    ),
+                    (expected.0, expected.1, expected.2, expected.3, expected.4),
+                    "{suffix}"
+                );
+                assert_eq!(late_cancel_applied, expected.5, "{suffix}");
+                assert_eq!((row.5, row.6), (1, 1), "{suffix}");
+                assert_eq!(handoff.requests().len(), 1, "{suffix}");
+                assert_eq!(recovery.reconciliation_requests().len(), 1, "{suffix}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn handoff_evidence_finish_failure_rolls_back_every_projection() {
         let fixture = setup_real_ledger_scheduler_job(
             cockpit_db::Db::open_in_memory().unwrap(),

@@ -1794,6 +1794,59 @@ mod tests {
     }
 
     #[test]
+    fn mixed_multi_slot_terminal_matrix_has_one_deterministic_projection() {
+        use ImageGenerationJobState as J;
+        use ImageGenerationSlotState as S;
+        let cases = [
+            (
+                vec![
+                    (S::Published, false),
+                    (S::Failed, false),
+                    (S::Cancelled, false),
+                ],
+                Some(J::PartiallyFailed),
+            ),
+            (
+                vec![
+                    (S::Published, false),
+                    (S::Discarded, true),
+                    (S::Cancelled, false),
+                ],
+                Some(J::CompletedAfterCancel),
+            ),
+            (
+                vec![
+                    (S::LateQuarantined, true),
+                    (S::Discarded, true),
+                    (S::Cancelled, false),
+                ],
+                Some(J::Cancelled),
+            ),
+            (
+                vec![
+                    (S::Published, false),
+                    (S::Planned, false),
+                    (S::Dispatching, false),
+                ],
+                None,
+            ),
+            (
+                vec![
+                    (S::SubmissionUnknown, false),
+                    (S::CancellationRequested, false),
+                    (S::Downloading, false),
+                ],
+                None,
+            ),
+        ];
+        for (slots, expected) in cases {
+            assert_eq!(reduce_terminal_job(&slots), expected, "{slots:?}");
+            let reversed = slots.iter().copied().rev().collect::<Vec<_>>();
+            assert_eq!(reduce_terminal_job(&reversed), expected, "{reversed:?}");
+        }
+    }
+
+    #[test]
     fn terminal_reducer_rejects_every_invalid_cancellation_vector() {
         use ImageGenerationSlotState as S;
         for state in [

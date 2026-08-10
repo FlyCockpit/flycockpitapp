@@ -2884,4 +2884,80 @@ mod tests {
         assert_eq!(&bytes[..6], b"FCDR\x01\x02");
         assert_eq!(&bytes[183..], [2, 2]);
     }
+
+    #[tokio::test]
+    async fn discard_snapshot_precedence_in_use_overflow_and_apply_are_stable() {
+        let db = super::super::Db::open_in_memory_async().await.unwrap();
+        let session = Uuid::now_v7();
+        let make = |id| MediaAttachmentRecord {
+            attachment_id: id,
+            session_id: session,
+            canonical_project_digest: "11".repeat(32),
+            media_kind: MediaKind::Image,
+            source_kind: MediaSourceKind::LocalPath,
+            canonical_container: "png".into(),
+            canonical_mime: "image/png".into(),
+            availability: MediaAvailability::Registered,
+            attachment_version: 1,
+            availability_generation: 1,
+            reference_generation: 1,
+            captured_capability_generation: 1,
+            source_identity_digest: "22".repeat(32),
+            source_byte_length: 1,
+            source_sha256: "33".repeat(32),
+            selected_video_stream: None,
+            selected_audio_stream: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+            draft_expires_at_unix_ms: None,
+            first_referenced_at_unix_ms: None,
+        };
+        let applied = Uuid::now_v7();
+        let in_use = Uuid::now_v7();
+        let overflow = Uuid::now_v7();
+        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at)VALUES(?1,'p','/redacted',1,1)",[session.to_string()])?;for id in [applied,in_use,overflow]{super::super::Db::insert_media_attachment_conn(conn,&make(id))?;}super::super::Db::acquire_media_reference_conn(conn,Uuid::now_v7(),in_use,1,session,&"11".repeat(32),MediaReferenceConsumerKind::Message,"message",2)?;conn.execute("UPDATE media_attachments SET availability_generation=?1 WHERE attachment_id=?2",params![u64::MAX.to_string(),overflow.to_string()])?;Ok(())}).await.unwrap();
+        let request = |id, availability, reference| DiscardUnreferencedMediaAttachmentV1 {
+            schema_version: 1,
+            kind: "discardUnreferencedMediaAttachment".into(),
+            attachment_id: id,
+            attachment_version: 1,
+            availability_generation: availability,
+            reference_generation: reference,
+            origin_upload: None,
+        };
+        let decisions = db
+            .transaction(move |conn| {
+                Ok((
+                    super::super::Db::discard_unreferenced_media_attachment_conn(
+                        conn,
+                        &request(in_use, 1, 2),
+                        3,
+                    )?,
+                    super::super::Db::discard_unreferenced_media_attachment_conn(
+                        conn,
+                        &request(overflow, u64::MAX, 1),
+                        3,
+                    )?,
+                    super::super::Db::discard_unreferenced_media_attachment_conn(
+                        conn,
+                        &request(applied, 1, 1),
+                        3,
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            decisions.0.reason,
+            MediaDiscardReasonV1::MediaAttachmentInUse
+        );
+        assert_eq!(
+            decisions.1.reason,
+            MediaDiscardReasonV1::AvailabilityGenerationOverflow
+        );
+        assert_eq!(decisions.2.reason, MediaDiscardReasonV1::DiscardStarted);
+        assert_eq!(decisions.2.availability_generation_after, 2);
+        let counts=db.read(move|conn|Ok((conn.query_row("SELECT COUNT(*) FROM media_attachment_cleanup_intents WHERE attachment_id=?1",[applied.to_string()],|row|row.get::<_,i64>(0))?,conn.query_row("SELECT COUNT(*) FROM media_attachment_cleanup_intents WHERE attachment_id IN (?1,?2)",params![in_use.to_string(),overflow.to_string()],|row|row.get::<_,i64>(0))?))).await.unwrap();
+        assert_eq!(counts, (1, 0));
+    }
 }

@@ -192,13 +192,6 @@ pub fn tag_protocol_id_bytes<K: kind::ProtocolIdKind>(
     })
 }
 
-impl<K: kind::ProtocolIdKind> RemoteProtocolId<K> {
-    /// Canonical raw identifier bytes for binary protocol codecs.
-    pub fn as_bytes(&self) -> &[u8; REMOTE_PROTOCOL_ID_BYTES] {
-        &self.bytes
-    }
-}
-
 /// JSON form of every kind-branded id is the 22-character unpadded base64url
 /// spelling — the single identifier codec, with no per-kind mapping row.
 impl<K: kind::ProtocolIdKind> serde::Serialize for RemoteProtocolId<K> {

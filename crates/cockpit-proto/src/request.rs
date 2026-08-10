@@ -1688,7 +1688,11 @@ macro_rules! encode_fcor_role {
         $name.encode_fcor_value_v1(&mut $out)?;
     };
     ($out:ident, $name:ident, legacy_message) => {
-        anyhow::bail!("legacy_send_user_message_not_remote_operation");
+        // Rejection is performed before entering the exhaustive generated
+        // encoder. Keeping this role as an omission preserves the one typed
+        // command-table source without placing a diverging expression ahead
+        // of the remaining field encoders in this arm.
+        let _ = $name;
     };
     ($out:ident, $name:ident, $resource:ident) => {
         let _ = $name;
@@ -1729,6 +1733,9 @@ impl Request {
     /// v2 message envelope is intentionally a separate protocol and the
     /// retired legacy message variant has no remote-operation encoding.
     pub fn canonical_remote_operation_params_v1(&self) -> anyhow::Result<Vec<u8>> {
+        if matches!(self, Self::SendUserMessage { .. }) {
+            anyhow::bail!("legacy_send_user_message_not_remote_operation");
+        }
         crate::command!(command_encode_fcor_params, self)
     }
 }

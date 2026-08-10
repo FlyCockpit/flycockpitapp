@@ -220,6 +220,7 @@ impl ImageGenerationDispatcher {
 
     pub async fn scan_dispatch_candidates(
         &self,
+        worker_boot_id: Uuid,
         now_monotonic_ms: u64,
         limit: u32,
     ) -> Result<Vec<DecodedImageGenerationDispatchCandidate>> {
@@ -227,7 +228,10 @@ impl ImageGenerationDispatcher {
             .read(move |conn| {
                 cockpit_db::Db::scan_image_generation_dispatch_candidates_conn(
                     conn,
-                    now_monotonic_ms,
+                    cockpit_db::db::image_generation::DeadlineObservationV1::new(
+                        worker_boot_id,
+                        now_monotonic_ms,
+                    )?,
                     limit,
                 )?
                 .into_iter()
@@ -273,7 +277,7 @@ impl ImageGenerationDispatcher {
             ensure!(spend_exists,"scheduler spend reservation is unavailable");
             let token=ExternalJournalToken::parse(&crate::intel::hex_lower(&Sha256::digest(attempt.provider_idempotency_identity.as_bytes())))?;
             let journal=PrepareExternalOperation{operation_kind:ExternalJournalToken::parse("image_generation")?,owner_session_id:ExternalJournalToken::for_session(candidate.plan.owner_session_id),idempotency_key:token.clone(),payload_digest:ExternalJournalDigest::of(&c.canonical_plan),payload_len:c.canonical_plan.len(),provider_idempotency:Some(ProviderIdempotency{key:token,contract:ExternalJournalToken::parse("image_generation_v1")?})};
-            let prepared=cockpit_db::Db::prepare_image_generation_dispatch_conn(conn,&cockpit_db::db::image_generation::PrepareImageGenerationDispatch{job_id:c.job_id,slot_id:c.slot_id,attempt_number:c.attempt_number,expected_job_version:c.job_version,expected_slot_version:c.slot_version,expected_attempt_version:c.attempt_version,spend_reservation_id:&candidate.plan.spend.reservation_id,spend_attempt_id:&attempt.provider_idempotency_identity,media_reservation_id:&media_id,expected_media_reservation_version:media_version,journal:&journal,at_unix_ms,now_monotonic_ms,worker_boot_id,claim_generation})?;
+            let prepared=cockpit_db::Db::prepare_image_generation_dispatch_conn(conn,&cockpit_db::db::image_generation::PrepareImageGenerationDispatch{job_id:c.job_id,slot_id:c.slot_id,attempt_number:c.attempt_number,expected_job_version:c.job_version,expected_slot_version:c.slot_version,expected_attempt_version:c.attempt_version,spend_reservation_id:&candidate.plan.spend.reservation_id,spend_attempt_id:&attempt.provider_idempotency_identity,media_reservation_id:&media_id,expected_media_reservation_version:media_version,journal:&journal,at_unix_ms,deadline_observation:cockpit_db::db::image_generation::DeadlineObservationV1::new(worker_boot_id,now_monotonic_ms)?,worker_boot_id,claim_generation})?;
             Ok((prepared,vec![candidate.media_plan]))
         }).await
     }
@@ -317,7 +321,7 @@ impl ImageGenerationDispatcher {
         H: FnMut(&DecodedImageGenerationDispatchCandidate) -> Result<()>,
     {
         let candidates = self
-            .scan_dispatch_candidates(now_monotonic_ms, limit)
+            .scan_dispatch_candidates(worker_boot_id, now_monotonic_ms, limit)
             .await?;
         let mut pass = ImageGenerationSchedulerPass {
             scanned: u32::try_from(candidates.len())?,
@@ -367,6 +371,7 @@ impl ImageGenerationDispatcher {
                     adapter,
                     prepared,
                     plans,
+                    worker_boot_id,
                     at_unix_ms,
                     now_monotonic_ms,
                     media_wall_ms,
@@ -386,6 +391,7 @@ impl ImageGenerationDispatcher {
         &self,
         prepared: PreparedImageGenerationDispatch,
         handoff_plans: Vec<MediaReservationPlan>,
+        worker_boot_id: Uuid,
         at_unix_ms: i64,
         now_monotonic_ms: u64,
         media_wall_ms: u64,
@@ -396,7 +402,10 @@ impl ImageGenerationDispatcher {
                     conn,
                     prepared,
                     at_unix_ms,
-                    now_monotonic_ms,
+                    cockpit_db::db::image_generation::DeadlineObservationV1::new(
+                        worker_boot_id,
+                        now_monotonic_ms,
+                    )?,
                 )?;
                 let operation_id = dispatching.operation().operation_id.to_string();
                 let (reservation_id, dispatching_version) = dispatching.media_reservation();
@@ -466,6 +475,7 @@ impl ImageGenerationDispatcher {
         adapter: &A,
         prepared: PreparedImageGenerationDispatch,
         handoff_plans: Vec<MediaReservationPlan>,
+        worker_boot_id: Uuid,
         at_unix_ms: i64,
         now_monotonic_ms: u64,
         media_wall_ms: u64,
@@ -474,6 +484,7 @@ impl ImageGenerationDispatcher {
             .begin_external_handoff(
                 prepared,
                 handoff_plans,
+                worker_boot_id,
                 at_unix_ms,
                 now_monotonic_ms,
                 media_wall_ms,
@@ -549,6 +560,7 @@ pub struct ImageGenerationTargetResolutionAuthorityV1 {
 pub struct ImageGenerationResolutionAuthorityV1 {
     job_id: Uuid,
     owner: ImageGenerationOwnerContextAuthority,
+    deadline_boot_id: Uuid,
     enqueue_started_monotonic_ms: u64,
     operation_deadline_monotonic_ms: u64,
     required_grants: Vec<GrantRequirementV1>,
@@ -1656,6 +1668,7 @@ pub struct ImageGenerationResolutionProofs<'a> {
     pub spend_attempts: &'a [AttemptMaximum],
     pub reference_leases: &'a [AcquiredMediaComponentLease],
     pub output: &'a HeldImageGenerationOutputDirectory,
+    pub deadline_boot_id: Uuid,
     pub enqueue_started_monotonic_ms: u64,
     pub operation_deadline_monotonic_ms: u64,
     pub now_unix_ms: i64,
@@ -1672,7 +1685,8 @@ impl ImageGenerationResolutionAuthorityV1 {
             "image generation request has no outputs"
         );
         ensure!(
-            proofs.operation_deadline_monotonic_ms > proofs.enqueue_started_monotonic_ms,
+            !proofs.deadline_boot_id.is_nil()
+                && proofs.operation_deadline_monotonic_ms > proofs.enqueue_started_monotonic_ms,
             "image generation deadline is invalid"
         );
         ensure!(
@@ -1821,6 +1835,7 @@ impl ImageGenerationResolutionAuthorityV1 {
         Ok(Self {
             job_id: Uuid::now_v7(),
             owner,
+            deadline_boot_id: proofs.deadline_boot_id,
             enqueue_started_monotonic_ms: proofs.enqueue_started_monotonic_ms,
             operation_deadline_monotonic_ms: proofs.operation_deadline_monotonic_ms,
             required_grants: grants,
@@ -1945,6 +1960,7 @@ pub fn resolve_image_generation(
         owner_principal_digest: authority.owner.principal_digest,
         project_identity_digest: authority.owner.project_identity_digest,
         config_generation: authority.owner.config_generation,
+        deadline_boot_id: authority.deadline_boot_id,
         enqueue_started_monotonic_ms: authority.enqueue_started_monotonic_ms,
         operation_deadline_monotonic_ms: authority.operation_deadline_monotonic_ms,
         required_grants: authority.required_grants,
@@ -2448,6 +2464,7 @@ pub(crate) struct ImageGenerationPreflightInputV1 {
     pub owner_principal_digest: String,
     pub project_identity_digest: String,
     pub config_generation: u64,
+    pub deadline_boot_id: Uuid,
     pub enqueue_started_monotonic_ms: u64,
     pub operation_deadline_monotonic_ms: u64,
     pub required_grants: Vec<GrantRequirementV1>,
@@ -2545,6 +2562,7 @@ pub(crate) fn plan_image_generation(
         owner_principal_digest: input.owner_principal_digest,
         project_identity_digest: input.project_identity_digest,
         config_generation: input.config_generation,
+        deadline_boot_id: input.deadline_boot_id,
         enqueue_started_monotonic_ms: input.enqueue_started_monotonic_ms,
         operation_deadline_monotonic_ms: input.operation_deadline_monotonic_ms,
         required_grants: input.required_grants,
@@ -3074,7 +3092,7 @@ mod tests {
             },
         ]);
         let first = dispatcher
-            .run_scheduler_pass(&adapter, Uuid::now_v7(), 100, 2, 2, 8)
+            .run_scheduler_pass(&adapter, deadline_boot(), 100, 2, 2, 8)
             .await
             .unwrap();
         assert_eq!(first.dispatched, 1, "{first:#?}");
@@ -3104,7 +3122,7 @@ mod tests {
         .await
         .unwrap();
         let second = dispatcher
-            .run_scheduler_pass(&adapter, Uuid::now_v7(), 100, 3, 3, 8)
+            .run_scheduler_pass(&adapter, deadline_boot(), 100, 3, 3, 8)
             .await
             .unwrap();
         assert_eq!(second.dispatched, 0, "{second:#?}");
@@ -3133,7 +3151,7 @@ mod tests {
             },
         ]);
         ImageGenerationDispatcher::new(fixture.db)
-            .run_scheduler_pass(&adapter, Uuid::now_v7(), 100, 2, 2, 8)
+            .run_scheduler_pass(&adapter, deadline_boot(), 100, 2, 2, 8)
             .await
             .unwrap();
         let reopened = cockpit_db::Db::open(&path).unwrap();
@@ -3169,7 +3187,7 @@ mod tests {
             },
         ]);
         let pass = ImageGenerationDispatcher::new(fixture.db.clone())
-            .run_scheduler_pass(&adapter, Uuid::now_v7(), 100, 2, 2, 8)
+            .run_scheduler_pass(&adapter, deadline_boot(), 100, 2, 2, 8)
             .await
             .unwrap();
         assert_eq!(pass.dispatched, 0);
@@ -3235,7 +3253,7 @@ mod tests {
             },
         ]);
         let pass = dispatcher
-            .run_scheduler_pass(&adapter, Uuid::now_v7(), 100, 2, 2, 8)
+            .run_scheduler_pass(&adapter, deadline_boot(), 100, 2, 2, 8)
             .await
             .unwrap();
         assert_eq!(pass.dispatched, 1, "{pass:#?}");
@@ -3700,7 +3718,7 @@ mod tests {
             },
         ]);
         let pass = dispatcher
-            .run_scheduler_pass(&adapter, Uuid::now_v7(), 100, 2, 2, 8)
+            .run_scheduler_pass(&adapter, deadline_boot(), 100, 2, 2, 8)
             .await
             .unwrap();
         assert_eq!(pass.dispatched, 1, "{pass:#?}");
@@ -3708,7 +3726,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].job_id, second.job_id);
         let replay = dispatcher
-            .run_scheduler_pass(&adapter, Uuid::now_v7(), 100, 3, 3, 8)
+            .run_scheduler_pass(&adapter, deadline_boot(), 100, 3, 3, 8)
             .await
             .unwrap();
         assert_eq!(replay.dispatched, 0, "{replay:#?}");
@@ -3833,6 +3851,9 @@ mod tests {
     fn digest(byte: char) -> String {
         std::iter::repeat_n(byte, 64).collect()
     }
+    fn deadline_boot() -> Uuid {
+        Uuid::from_u128(0xbbbbbbbb_bbbb_4bbb_8bbb_bbbbbbbbbbbb)
+    }
     fn plan() -> ImageGenerationPlanV1 {
         let resources = vec![ResourceReservationV1 {
             resource_kind: "gpu".into(),
@@ -3847,6 +3868,7 @@ mod tests {
             owner_principal_digest: digest('1'),
             project_identity_digest: digest('2'),
             config_generation: 7,
+            deadline_boot_id: deadline_boot(),
             enqueue_started_monotonic_ms: 100,
             operation_deadline_monotonic_ms: 400,
             required_grants: vec![GrantRequirementV1 {
@@ -3948,6 +3970,7 @@ mod tests {
                     project_identity_digest: sealed.project_identity_digest,
                     config_generation: sealed.config_generation,
                 },
+                deadline_boot_id: sealed.deadline_boot_id,
                 enqueue_started_monotonic_ms: sealed.enqueue_started_monotonic_ms,
                 operation_deadline_monotonic_ms: sealed.operation_deadline_monotonic_ms,
                 required_grants: sealed.required_grants,
@@ -4146,7 +4169,7 @@ mod tests {
         let baseline = original.digest().unwrap();
         assert_eq!(
             baseline,
-            "d58c8a7a1a22f1709bbafeef63e935f19d89fd1bea0ffccf4da50cb8713710ce"
+            "c1cb4d4362e0375e71f7f52550d97a83ca0f9936a6f4abd565f493e9530094df"
         );
         assert_eq!(
             verify_canonical_image_generation_plan(&bytes, &baseline).unwrap(),
@@ -4163,6 +4186,7 @@ mod tests {
             Box::new(|p| p.owner_principal_digest = digest('b')),
             Box::new(|p| p.project_identity_digest = digest('c')),
             Box::new(|p| p.config_generation += 1),
+            Box::new(|p| p.deadline_boot_id = id(99)),
             Box::new(|p| p.enqueue_started_monotonic_ms += 1),
             Box::new(|p| p.operation_deadline_monotonic_ms += 1),
             Box::new(|p| p.required_grants[0].generation += 1),

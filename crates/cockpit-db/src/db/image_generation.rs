@@ -404,6 +404,7 @@ pub struct CreateImageGenerationJob<'a> {
     canonical_plan: &'a [u8],
     slot_count: u32,
     max_attempt_count: u32,
+    deadline_boot_id: Uuid,
     enqueue_started_monotonic_ms: u64,
     operation_deadline_monotonic_ms: u64,
     created_at_unix_ms: i64,
@@ -464,6 +465,7 @@ impl<'a> CreateImageGenerationJob<'a> {
                 canonical_plan,
                 slot_count: u32::try_from(sealed_slots.len())?,
                 max_attempt_count,
+                deadline_boot_id: plan.deadline_boot_id,
                 enqueue_started_monotonic_ms: plan.enqueue_started_monotonic_ms,
                 operation_deadline_monotonic_ms: plan.operation_deadline_monotonic_ms,
                 created_at_unix_ms,
@@ -491,6 +493,7 @@ impl<'a> CreateImageGenerationJob<'a> {
                         "ownerPrincipalDigest",
                         "projectIdentityDigest",
                         "configGeneration",
+                        "deadlineBootId",
                         "enqueueStartedMonotonicMs",
                         "operationDeadlineMonotonicMs",
                         "requiredGrants",
@@ -602,6 +605,11 @@ impl<'a> CreateImageGenerationJob<'a> {
                 slot_count,
                 max_attempt_count: max_attempt_count
                     .ok_or_else(|| anyhow::anyhow!("sealed attempts missing"))?,
+                deadline_boot_id: Uuid::parse_str(
+                    plan.get("deadlineBootId")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| anyhow::anyhow!("deadline boot id missing"))?,
+                )?,
                 enqueue_started_monotonic_ms: plan
                     .get("enqueueStartedMonotonicMs")
                     .and_then(serde_json::Value::as_u64)
@@ -705,9 +713,35 @@ pub struct PrepareImageGenerationDispatch<'a> {
     pub expected_media_reservation_version: u64,
     pub journal: &'a PrepareExternalOperation,
     pub at_unix_ms: i64,
-    pub now_monotonic_ms: u64,
+    pub deadline_observation: DeadlineObservationV1,
     pub worker_boot_id: Uuid,
     pub claim_generation: u64,
+}
+
+/// A daemon-owned observation of the monotonic clock. A value from another
+/// boot can never be compared with the plan's captured monotonic deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeadlineObservationV1 {
+    daemon_boot_id: Uuid,
+    now_monotonic_ms: u64,
+}
+
+impl DeadlineObservationV1 {
+    pub fn new(daemon_boot_id: Uuid, now_monotonic_ms: u64) -> Result<Self> {
+        ensure!(
+            !daemon_boot_id.is_nil(),
+            "deadline observation boot id is nil"
+        );
+        Ok(Self {
+            daemon_boot_id,
+            now_monotonic_ms,
+        })
+    }
+
+    fn is_before(self, deadline_boot_id: Uuid, deadline_monotonic_ms: i64) -> Result<bool> {
+        Ok(self.daemon_boot_id == deadline_boot_id
+            && i64::try_from(self.now_monotonic_ms)? < deadline_monotonic_ms)
+    }
 }
 
 pub struct ClaimImageGenerationDispatch {
@@ -749,16 +783,17 @@ struct ImageGenerationDispatchCandidateRow {
 impl Db {
     pub fn scan_image_generation_dispatch_candidates_conn(
         conn: &Connection,
-        now_monotonic_ms: u64,
+        deadline_observation: DeadlineObservationV1,
         limit: u32,
     ) -> Result<Vec<ImageGenerationDispatchCandidate>> {
         ensure!((1..=64).contains(&limit), "invalid scheduler scan limit");
         let database_now = database_now_unix_ms(conn)?;
-        let mut statement=conn.prepare("SELECT j.job_id,s.slot_id,a.attempt_number,j.version,s.version,a.version,p.canonical_plan,p.plan_digest,m.canonical_media_plan,m.media_plan_digest,COALESCE((SELECT MAX(claim_generation)+1 FROM image_generation_scheduler_claims old WHERE old.job_id=s.job_id AND old.slot_id=s.slot_id),1) FROM image_generation_jobs j JOIN image_generation_slots s ON s.job_id=j.job_id JOIN image_generation_attempts a ON a.job_id=s.job_id AND a.slot_id=s.slot_id JOIN image_generation_plans p ON p.job_id=j.job_id JOIN image_generation_attempt_media_snapshots m ON m.job_id=a.job_id AND m.slot_id=a.slot_id AND m.attempt_number=a.attempt_number WHERE j.state='queued' AND s.state='queued' AND a.state='planned' AND p.operation_deadline_monotonic_ms>?2 AND NOT EXISTS(SELECT 1 FROM image_generation_scheduler_claims c WHERE c.job_id=s.job_id AND c.slot_id=s.slot_id AND c.expires_at_unix_ms>?1) AND NOT EXISTS(SELECT 1 FROM image_generation_cancellation_facts x WHERE x.job_id=j.job_id) ORDER BY j.created_at_unix_ms,j.job_id,s.slot_index,a.attempt_number LIMIT ?3")?;
+        let mut statement=conn.prepare("SELECT j.job_id,s.slot_id,a.attempt_number,j.version,s.version,a.version,p.canonical_plan,p.plan_digest,m.canonical_media_plan,m.media_plan_digest,COALESCE((SELECT MAX(claim_generation)+1 FROM image_generation_scheduler_claims old WHERE old.job_id=s.job_id AND old.slot_id=s.slot_id),1) FROM image_generation_jobs j JOIN image_generation_slots s ON s.job_id=j.job_id JOIN image_generation_attempts a ON a.job_id=s.job_id AND a.slot_id=s.slot_id JOIN image_generation_plans p ON p.job_id=j.job_id JOIN image_generation_attempt_media_snapshots m ON m.job_id=a.job_id AND m.slot_id=a.slot_id AND m.attempt_number=a.attempt_number WHERE j.state='queued' AND s.state='queued' AND a.state='planned' AND p.deadline_boot_id=?2 AND p.operation_deadline_monotonic_ms>?3 AND NOT EXISTS(SELECT 1 FROM image_generation_scheduler_claims c WHERE c.job_id=s.job_id AND c.slot_id=s.slot_id AND c.expires_at_unix_ms>?1) AND NOT EXISTS(SELECT 1 FROM image_generation_cancellation_facts x WHERE x.job_id=j.job_id) ORDER BY j.created_at_unix_ms,j.job_id,s.slot_index,a.attempt_number LIMIT ?4")?;
         let rows = statement.query_map(
             params![
                 database_now,
-                i64::try_from(now_monotonic_ms)?,
+                deadline_observation.daemon_boot_id.to_string(),
+                i64::try_from(deadline_observation.now_monotonic_ms)?,
                 i64::from(limit)
             ],
             |row| {
@@ -1070,9 +1105,9 @@ impl Db {
             ensure!(conn.query_row("SELECT EXISTS(SELECT 1 FROM image_generation_scheduler_claims WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND worker_boot_id=?4 AND claim_generation=?5 AND expires_at_unix_ms>?6)",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),input.worker_boot_id.to_string(),i64::try_from(input.claim_generation)?,database_now],|row|row.get::<_,bool>(0))?,"image generation scheduler claim is absent or stale");
             let projection = conn
                 .query_row(
-                    "SELECT j.state,s.state,a.state,p.plan_digest,p.operation_deadline_monotonic_ms,a.provider_idempotency_identity FROM image_generation_jobs j JOIN image_generation_slots s ON s.job_id=j.job_id JOIN image_generation_attempts a ON a.job_id=s.job_id AND a.slot_id=s.slot_id JOIN image_generation_plans p ON p.job_id=j.job_id WHERE j.job_id=?1 AND s.slot_id=?2 AND a.attempt_number=?3 AND j.version=?4 AND s.version=?5 AND a.version=?6 AND NOT EXISTS(SELECT 1 FROM image_generation_cancellation_facts c WHERE c.job_id=j.job_id)",
+                    "SELECT j.state,s.state,a.state,p.plan_digest,p.deadline_boot_id,p.operation_deadline_monotonic_ms,a.provider_idempotency_identity FROM image_generation_jobs j JOIN image_generation_slots s ON s.job_id=j.job_id JOIN image_generation_attempts a ON a.job_id=s.job_id AND a.slot_id=s.slot_id JOIN image_generation_plans p ON p.job_id=j.job_id WHERE j.job_id=?1 AND s.slot_id=?2 AND a.attempt_number=?3 AND j.version=?4 AND s.version=?5 AND a.version=?6 AND NOT EXISTS(SELECT 1 FROM image_generation_cancellation_facts c WHERE c.job_id=j.job_id)",
                     params![input.job_id.to_string(), input.slot_id.to_string(), i64::from(input.attempt_number), i64::try_from(input.expected_job_version)?, i64::try_from(input.expected_slot_version)?, i64::try_from(input.expected_attempt_version)?],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, i64>(4)?, row.get::<_, String>(5)?)),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, i64>(5)?, row.get::<_, String>(6)?)),
                 )
                 .optional()?
                 .context("image generation dispatch authority is unavailable")?;
@@ -1081,11 +1116,13 @@ impl Db {
                 "image generation dispatch is not queued"
             );
             ensure!(
-                i64::try_from(input.now_monotonic_ms)? < projection.4,
+                input
+                    .deadline_observation
+                    .is_before(Uuid::parse_str(&projection.4)?, projection.5)?,
                 "image generation operation deadline expired"
             );
             ensure!(
-                projection.5 == input.spend_attempt_id,
+                projection.6 == input.spend_attempt_id,
                 "image generation spend attempt identity differs"
             );
             let provider_request_identity: String = conn.query_row(
@@ -1142,12 +1179,12 @@ impl Db {
         conn: &Connection,
         prepared: PreparedImageGenerationDispatch,
         at_unix_ms: i64,
-        now_monotonic_ms: u64,
+        deadline_observation: DeadlineObservationV1,
     ) -> Result<DispatchingImageGenerationAttempt> {
         atomic_conn(conn, "image_generation_begin_handoff", || {
-            let deadline: i64 = conn.query_row("SELECT p.operation_deadline_monotonic_ms FROM image_generation_plans p JOIN image_generation_jobs j ON j.job_id=p.job_id JOIN image_generation_slots s ON s.job_id=j.job_id WHERE j.job_id=?1 AND j.state='dispatching' AND j.version=?2 AND s.slot_id=?3 AND s.state='dispatching' AND s.version=?4 AND NOT EXISTS(SELECT 1 FROM image_generation_cancellation_facts c WHERE c.job_id=j.job_id)",params![prepared.job_id.to_string(),i64::try_from(prepared.job_version)?,prepared.slot_id.to_string(),i64::try_from(prepared.slot_version)?],|row|row.get(0)).context("image generation handoff authority is unavailable")?;
+            let (deadline_boot_id,deadline):(String,i64) = conn.query_row("SELECT p.deadline_boot_id,p.operation_deadline_monotonic_ms FROM image_generation_plans p JOIN image_generation_jobs j ON j.job_id=p.job_id JOIN image_generation_slots s ON s.job_id=j.job_id WHERE j.job_id=?1 AND j.state='dispatching' AND j.version=?2 AND s.slot_id=?3 AND s.state='dispatching' AND s.version=?4 AND NOT EXISTS(SELECT 1 FROM image_generation_cancellation_facts c WHERE c.job_id=j.job_id)",params![prepared.job_id.to_string(),i64::try_from(prepared.job_version)?,prepared.slot_id.to_string(),i64::try_from(prepared.slot_version)?],|row|Ok((row.get(0)?,row.get(1)?))).context("image generation handoff authority is unavailable")?;
             ensure!(
-                i64::try_from(now_monotonic_ms)? < deadline,
+                deadline_observation.is_before(Uuid::parse_str(&deadline_boot_id)?, deadline)?,
                 "image generation operation deadline expired"
             );
             let operation = match transition_external_operation_conn(
@@ -1418,8 +1455,8 @@ impl Db {
         let slot_count = i64::from(input.slot_count);
         let max_attempt_count = i64::from(input.max_attempt_count);
         conn.execute(
-            "INSERT INTO image_generation_plans(job_id,schema_version,plan_digest,canonical_plan,slot_count,max_attempt_count,enqueue_started_monotonic_ms,operation_deadline_monotonic_ms) VALUES(?1,1,?2,?3,?4,?5,?6,?7)",
-            params![input.job_id.to_string(), input.plan_digest, input.canonical_plan, slot_count, max_attempt_count, enqueue, deadline],
+            "INSERT INTO image_generation_plans(job_id,schema_version,plan_digest,canonical_plan,slot_count,max_attempt_count,deadline_boot_id,enqueue_started_monotonic_ms,operation_deadline_monotonic_ms) VALUES(?1,1,?2,?3,?4,?5,?6,?7,?8)",
+            params![input.job_id.to_string(), input.plan_digest, input.canonical_plan, slot_count, max_attempt_count, input.deadline_boot_id.to_string(), enqueue, deadline],
         )?;
         conn.execute(
             "INSERT INTO image_generation_jobs(job_id,state,version,created_at_unix_ms,updated_at_unix_ms) VALUES(?1,'created',1,?2,?2)",
@@ -3365,6 +3402,7 @@ mod tests {
             owner_principal_digest: "1".repeat(64),
             project_identity_digest: "2".repeat(64),
             config_generation: 1,
+            deadline_boot_id: Uuid::from_u128(0xaaaaaaaa_aaaa_4aaa_8aaa_aaaaaaaaaaaa),
             enqueue_started_monotonic_ms: enqueue_ms,
             operation_deadline_monotonic_ms: deadline_ms,
             required_grants: vec![GrantRequirementV1 {
@@ -3669,6 +3707,37 @@ mod tests {
     }
 
     #[test]
+    fn deadline_observation_has_exact_boot_and_boundary_semantics() {
+        let boot = Uuid::now_v7();
+        let other_boot = Uuid::now_v7();
+        assert!(
+            DeadlineObservationV1::new(boot, 99)
+                .unwrap()
+                .is_before(boot, 100)
+                .unwrap()
+        );
+        assert!(
+            !DeadlineObservationV1::new(boot, 100)
+                .unwrap()
+                .is_before(boot, 100)
+                .unwrap()
+        );
+        assert!(
+            !DeadlineObservationV1::new(boot, 101)
+                .unwrap()
+                .is_before(boot, 100)
+                .unwrap()
+        );
+        assert!(
+            !DeadlineObservationV1::new(other_boot, 0)
+                .unwrap()
+                .is_before(boot, 100)
+                .unwrap()
+        );
+        assert!(DeadlineObservationV1::new(Uuid::nil(), 0).is_err());
+    }
+
+    #[test]
     fn media_dispatch_snapshot_is_immutable_and_survives_reopen() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("image.db");
@@ -3693,11 +3762,59 @@ mod tests {
         let reopened = Db::open(&path).unwrap();
         reopened
             .blocking_for_sync_cli(|conn| {
-                let rows = Db::scan_image_generation_dispatch_candidates_conn(conn, 0, 1)?;
+                let rows = Db::scan_image_generation_dispatch_candidates_conn(
+                    conn,
+                    DeadlineObservationV1::new(
+                        Uuid::from_u128(0xaaaaaaaa_aaaa_4aaa_8aaa_aaaaaaaaaaaa),
+                        0,
+                    )?,
+                    1,
+                )?;
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0].job_id, job_id);
                 assert_eq!(rows[0].canonical_media_plan, media);
                 assert_eq!(rows[0].media_plan_digest, media_digest);
+                let boot = Uuid::from_u128(0xaaaaaaaa_aaaa_4aaa_8aaa_aaaaaaaaaaaa);
+                assert_eq!(
+                    Db::scan_image_generation_dispatch_candidates_conn(
+                        conn,
+                        DeadlineObservationV1::new(boot, 99)?,
+                        1,
+                    )?
+                    .len(),
+                    1
+                );
+                assert!(Db::scan_image_generation_dispatch_candidates_conn(
+                    conn,
+                    DeadlineObservationV1::new(boot, 100)?,
+                    1,
+                )?
+                .is_empty());
+                assert!(Db::scan_image_generation_dispatch_candidates_conn(
+                    conn,
+                    DeadlineObservationV1::new(boot, 101)?,
+                    1,
+                )?
+                .is_empty());
+                assert!(Db::scan_image_generation_dispatch_candidates_conn(
+                    conn,
+                    DeadlineObservationV1::new(Uuid::now_v7(), 0)?,
+                    1,
+                )?
+                .is_empty());
+                conn.execute(
+                    "UPDATE image_generation_jobs SET created_at_unix_ms=-9000000000000,updated_at_unix_ms=9000000000000 WHERE job_id=?1",
+                    [job_id.to_string()],
+                )?;
+                assert_eq!(
+                    Db::scan_image_generation_dispatch_candidates_conn(
+                        conn,
+                        DeadlineObservationV1::new(boot, 99)?,
+                        1,
+                    )?
+                    .len(),
+                    1
+                );
                 Ok(())
             })
             .unwrap();

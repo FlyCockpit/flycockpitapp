@@ -3121,6 +3121,7 @@ CREATE TABLE image_generation_plans (
     canonical_plan BLOB NOT NULL,
     slot_count INTEGER NOT NULL CHECK(slot_count > 0),
     max_attempt_count INTEGER NOT NULL CHECK(max_attempt_count > 0),
+    deadline_boot_id TEXT NOT NULL CHECK(length(deadline_boot_id) = 36 AND deadline_boot_id <> '00000000-0000-0000-0000-000000000000'),
     enqueue_started_monotonic_ms INTEGER NOT NULL CHECK(enqueue_started_monotonic_ms >= 0),
     operation_deadline_monotonic_ms INTEGER NOT NULL,
     CHECK(operation_deadline_monotonic_ms > enqueue_started_monotonic_ms),

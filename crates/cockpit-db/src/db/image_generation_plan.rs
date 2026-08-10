@@ -14,7 +14,7 @@ pub const MAX_PLAN_STRING_BYTES: usize = 1_024;
 pub const MAX_PLAN_LIST_ITEMS: usize = 64;
 
 macro_rules! dto {($name:ident{$($field:ident:$ty:ty),*$(,)?})=>{#[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]#[serde(rename_all="camelCase",deny_unknown_fields)]pub struct $name{$(pub $field:$ty),*}}}
-dto!(ImageGenerationPlanV1{schema_version:u8,kind:String,job_id:Uuid,owner_session_id:Uuid,owner_principal_digest:String,project_identity_digest:String,config_generation:u64,enqueue_started_monotonic_ms:u64,operation_deadline_monotonic_ms:u64,required_grants:Vec<GrantRequirementV1>,central_resources:Vec<ResourceReservationV1>,spend:SpendReservationPlanV1,output_authority:OutputDirectoryAuthorityV1,targets:Vec<TargetPlanV1>});
+dto!(ImageGenerationPlanV1{schema_version:u8,kind:String,job_id:Uuid,owner_session_id:Uuid,owner_principal_digest:String,project_identity_digest:String,config_generation:u64,deadline_boot_id:Uuid,enqueue_started_monotonic_ms:u64,operation_deadline_monotonic_ms:u64,required_grants:Vec<GrantRequirementV1>,central_resources:Vec<ResourceReservationV1>,spend:SpendReservationPlanV1,output_authority:OutputDirectoryAuthorityV1,targets:Vec<TargetPlanV1>});
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GrantRequirementV1 {
@@ -125,6 +125,7 @@ impl ImageGenerationPlanV1 {
         digest(&self.project_identity_digest)?;
         ensure!(
             self.config_generation > 0
+                && !self.deadline_boot_id.is_nil()
                 && self.operation_deadline_monotonic_ms > self.enqueue_started_monotonic_ms,
             "invalid generation/deadline"
         );

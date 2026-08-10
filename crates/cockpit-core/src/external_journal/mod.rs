@@ -401,6 +401,12 @@ impl ExternalJournal {
     /// Open the owner-private namespace used by remote operation recovery.
     /// Callers receive a held no-follow directory authority, never its path.
     pub(crate) fn remote_operation_artifact_dir(&self) -> Result<DirGuard, ExternalJournalError> {
+        if !cfg!(any(target_os = "linux", target_os = "macos")) {
+            return Err(ExternalJournalError::Containment(
+                "remote operation artifacts require Unix held-handle and owner-mode enforcement"
+                    .into(),
+            ));
+        }
         let root = DirGuard::open_root(self.spool.root_path(), false)?;
         root.verify_private()?;
         let operations = root.open_child_dir("remote-operations", true)?;

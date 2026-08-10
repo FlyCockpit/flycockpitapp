@@ -98,6 +98,7 @@ fn keys_v1() -> SpoolKeyRing {
     SpoolKeyRing::for_test(&[(1, [0x11u8; 32])], 1).expect("key ring")
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn remote_operation_artifact_authority_is_private_held_and_nofollow() {
     let env = Env::new();

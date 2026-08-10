@@ -447,6 +447,79 @@ impl Db {
             .await
     }
 
+    /// Atomically persist an adapter's authoritative desired/domain state and
+    /// its replay receipt. The live adapter effect occurs after this commit
+    /// and may be reconciled from the durable domain state after a crash.
+    pub async fn execute_idempotent_adapter_remote_operation<T, F>(
+        &self,
+        request: ReserveRemoteOperation<'_>,
+        mutation: F,
+    ) -> Result<TransactionalRemoteOperationOutcome<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> Result<TransactionalRemoteMutation<T>> + Send + 'static,
+    {
+        ensure!(
+            request.operation_class == RemoteOperationClass::IdempotentAdapterMutation,
+            "adapter executor requires idempotent_adapter_mutation class"
+        );
+        let owned = OwnedReserveRemoteOperation {
+            logical_attachment_id: request.logical_attachment_id.to_owned(),
+            operation_id: request.operation_id.to_owned(),
+            authenticated_device_id: request.authenticated_device_id.to_owned(),
+            authenticated_device_generation: request.authenticated_device_generation,
+            operation_class: request.operation_class,
+            request_hash: request.request_hash,
+            now_ms: request.now_ms,
+        };
+        self.transaction(move |conn| match reserve_conn(conn, &owned)? {
+            ReserveRemoteOperationOutcome::Reserved(_) => {
+                let result = mutation(conn)?;
+                let delivery_id = Uuid::now_v7().to_string();
+                match commit_conn(
+                    conn,
+                    &OwnedCommitRemoteOperation {
+                        logical_attachment_id: owned.logical_attachment_id.clone(),
+                        operation_id: owned.operation_id.clone(),
+                        safe_response: result.safe_response,
+                        outbox_delivery_id: delivery_id,
+                        outbox_kind: result.outbox_kind,
+                        outbox_payload: result.outbox_payload,
+                        now_ms: owned.now_ms,
+                    },
+                )? {
+                    CommitRemoteOperationOutcome::Committed { .. } => {
+                        Ok(TransactionalRemoteOperationOutcome::Applied(result.value))
+                    }
+                    CommitRemoteOperationOutcome::AttachmentLedgerCapacity => {
+                        bail!("adapter operation ledger capacity")
+                    }
+                    CommitRemoteOperationOutcome::AttachmentOutboxCapacity => {
+                        bail!("adapter operation outbox capacity")
+                    }
+                }
+            }
+            ReserveRemoteOperationOutcome::Replay(replay) if replay.state == "committed" => {
+                Ok(TransactionalRemoteOperationOutcome::Replay(
+                    replay
+                        .safe_response
+                        .context("committed adapter operation missing safe response")?,
+                ))
+            }
+            ReserveRemoteOperationOutcome::Replay(_) => bail!("adapter operation is indeterminate"),
+            ReserveRemoteOperationOutcome::OperationConflict => {
+                Ok(TransactionalRemoteOperationOutcome::OperationConflict)
+            }
+            ReserveRemoteOperationOutcome::OperationActorConflict => {
+                Ok(TransactionalRemoteOperationOutcome::OperationActorConflict)
+            }
+            ReserveRemoteOperationOutcome::AttachmentLedgerCapacity => {
+                Ok(TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity)
+            }
+        })
+        .await
+    }
+
     /// Atomically commits a bounded safe outcome and its authoritative outbox
     /// event. Capacity checks and writes share one `BEGIN IMMEDIATE` boundary.
     pub async fn commit_remote_attachment_operation(

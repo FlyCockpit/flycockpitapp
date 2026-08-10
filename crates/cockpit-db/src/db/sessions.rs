@@ -1829,6 +1829,18 @@ impl Db {
         .await
     }
 
+    pub fn set_session_agent_conn(
+        conn: &rusqlite::Connection,
+        session_id: Uuid,
+        active_agent: &str,
+    ) -> Result<()> {
+        conn.execute(
+            "UPDATE sessions SET active_agent = ?1 WHERE session_id = ?2",
+            params![active_agent, session_id.to_string()],
+        )?;
+        Ok(())
+    }
+
     pub async fn set_session_llm_mode(&self, session_id: Uuid, mode: Option<&str>) -> Result<()> {
         let mode = mode.map(str::to_owned);
         self.write(move |conn| {

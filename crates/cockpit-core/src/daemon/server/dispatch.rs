@@ -2878,6 +2878,52 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         Request::SetAgent { name } => {
             let att = require_attached(state)?;
             validate_set_agent(ctx, att, &name)?;
+            if let Some(operation) = remote_operation {
+                let session_id = att.handle.session_id;
+                let request = Request::SetAgent { name: name.clone() };
+                let params = request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&request, &params)?;
+                let request_hash =
+                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let attachment = operation.logical_attachment_id.to_string();
+                let operation_id = operation.operation_id.to_string();
+                let device = operation.authenticated_device_id.to_string();
+                let desired = name.clone();
+                let outcome = ctx.db.execute_idempotent_adapter_remote_operation(
+                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                        logical_attachment_id: &attachment, operation_id: &operation_id,
+                        authenticated_device_id: &device,
+                        authenticated_device_generation: operation.authenticated_device_generation,
+                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::IdempotentAdapterMutation,
+                        request_hash, now_ms: chrono::Utc::now().timestamp_millis(),
+                    },
+                    move |conn| {
+                        crate::db::Db::set_session_agent_conn(conn, session_id, &desired)?;
+                        let response = Response::Ack;
+                        let bytes = serde_json::to_vec(&response)?;
+                        Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
+                            value: response, safe_response: bytes.clone(),
+                            outbox_kind: "set_agent".into(), outbox_payload: bytes,
+                        })
+                    },
+                ).await.map_err(internal)?;
+                let response = match outcome {
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => response,
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal)?,
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                };
+                // Idempotent live convergence. If the process dies here, the
+                // durable session row is authoritative on resume/recovery.
+                att.handle
+                    .send_work(SessionWork::SetAgent { name })
+                    .await
+                    .map_err(internal)?;
+                return Ok(response);
+            }
             att.handle
                 .send_work(SessionWork::SetAgent { name })
                 .await

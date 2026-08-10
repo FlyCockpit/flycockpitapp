@@ -294,13 +294,6 @@ fn verify_start(
             if limits.ids > MAX_IDS || !canonical_id(&value) {
                 return fail(SvgSanitizeCode::StructuralVerify, "id");
             }
-            let reference_kind = kind.reference_kind().unwrap_or(0);
-            if ids
-                .insert(value.into_owned(), (reference_kind, limits.elements - 1))
-                .is_some()
-            {
-                return fail(SvgSanitizeCode::StructuralVerify, "duplicate-id");
-            }
         } else if let Some((target, reference_kind)) = canonical_reference(name, &value) {
             limits.references += 1;
             if limits.references > MAX_REFERENCES {
@@ -320,6 +313,15 @@ fn verify_start(
                 radial_r = Some((number, percent));
             } else {
                 radial_fr = Some((number, percent));
+            }
+        }
+        if name == "id" {
+            let reference_kind = kind.reference_kind().unwrap_or(0);
+            if ids
+                .insert(value.into_owned(), (reference_kind, limits.elements - 1))
+                .is_some()
+            {
+                return fail(SvgSanitizeCode::StructuralVerify, "duplicate-id");
             }
         }
     }

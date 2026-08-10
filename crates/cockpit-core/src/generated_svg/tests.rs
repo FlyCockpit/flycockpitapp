@@ -469,6 +469,230 @@ fn generated_svg_incremental_writers_and_decoders_stop_at_exact_ceiling() {
 }
 
 #[test]
+fn generated_svg_raw_depth_element_id_reference_and_text_ceilings_are_exact() {
+    let document_at_depth = |depth: usize| {
+        format!(
+            "<svg>{}{}</svg>",
+            "<g>".repeat(depth - 1),
+            "</g>".repeat(depth - 1)
+        )
+    };
+    assert!(parse_validate(document_at_depth(MAX_DEPTH).as_bytes(), false, false).is_ok());
+    assert_eq!(
+        parse_validate(document_at_depth(MAX_DEPTH + 1).as_bytes(), false, false)
+            .unwrap_err()
+            .code(),
+        SvgSanitizeCode::Depth
+    );
+
+    let sibling_document =
+        |elements: usize| format!("<svg>{}</svg>", "<path/>".repeat(elements - 1));
+    assert!(parse_validate(sibling_document(MAX_ELEMENTS).as_bytes(), false, false).is_ok());
+    assert_eq!(
+        parse_validate(sibling_document(MAX_ELEMENTS + 1).as_bytes(), false, false)
+            .unwrap_err()
+            .code(),
+        SvgSanitizeCode::ElementCount
+    );
+
+    let id_document = |ids: usize| {
+        let mut raw = String::from("<svg>");
+        for id in 0..ids {
+            raw.push_str(&format!("<path id=\"i{id}\"/>"));
+        }
+        raw.push_str("</svg>");
+        raw
+    };
+    assert!(parse_validate(id_document(MAX_IDS).as_bytes(), false, false).is_ok());
+    assert_eq!(
+        parse_validate(id_document(MAX_IDS + 1).as_bytes(), false, false)
+            .unwrap_err()
+            .code(),
+        SvgSanitizeCode::IdCount
+    );
+
+    let reference_document = |references: usize| {
+        let mut raw = String::from(
+            "<svg><defs><linearGradient id=\"p\"><stop/></linearGradient><clipPath id=\"c\"/><mask id=\"m\"/></defs>",
+        );
+        let full = references / 4;
+        for _ in 0..full {
+            raw.push_str("<path fill=\"url(#p)\" stroke=\"url(#p)\" clip-path=\"url(#c)\" mask=\"url(#m)\"/>");
+        }
+        for attribute in ["fill", "stroke", "clip-path", "mask"]
+            .into_iter()
+            .take(references % 4)
+        {
+            let target = if matches!(attribute, "fill" | "stroke") {
+                "p"
+            } else if attribute == "clip-path" {
+                "c"
+            } else {
+                "m"
+            };
+            raw.push_str(&format!("<path {attribute}=\"url(#{target})\"/>"));
+        }
+        raw.push_str("</svg>");
+        raw
+    };
+    assert!(parse_validate(reference_document(MAX_REFERENCES).as_bytes(), false, false).is_ok());
+    assert_eq!(
+        parse_validate(
+            reference_document(MAX_REFERENCES + 1).as_bytes(),
+            false,
+            false
+        )
+        .unwrap_err()
+        .code(),
+        SvgSanitizeCode::ReferenceCount
+    );
+
+    let text_document = |scalars: usize| {
+        let mut raw = String::from("<svg>");
+        let mut remaining = scalars;
+        while remaining > 0 {
+            let count = remaining.min(1024);
+            raw.push_str("<g><title>");
+            raw.push_str(&"x".repeat(count));
+            raw.push_str("</title></g>");
+            remaining -= count;
+        }
+        raw.push_str("</svg>");
+        raw
+    };
+    assert!(parse_validate(text_document(MAX_TEXT_SCALARS).as_bytes(), false, false).is_ok());
+    assert_eq!(
+        parse_validate(text_document(MAX_TEXT_SCALARS + 1).as_bytes(), false, false)
+            .unwrap_err()
+            .code(),
+        SvgSanitizeCode::TextScalars
+    );
+    let unicode_text_document = |scalars: usize| {
+        let mut raw = String::from("<svg>");
+        let mut remaining = scalars;
+        while remaining > 0 {
+            let count = remaining.min(1024);
+            raw.push_str("<g><title>");
+            raw.push_str(&"😀".repeat(count));
+            raw.push_str("</title></g>");
+            remaining -= count;
+        }
+        raw.push_str("</svg>");
+        raw
+    };
+    assert!(
+        parse_validate(
+            unicode_text_document(MAX_TEXT_SCALARS).as_bytes(),
+            false,
+            false
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        parse_validate(
+            unicode_text_document(MAX_TEXT_SCALARS + 1).as_bytes(),
+            false,
+            false
+        )
+        .unwrap_err()
+        .code(),
+        SvgSanitizeCode::TextBytes
+    );
+}
+
+#[test]
+fn generated_svg_raw_attribute_and_path_aggregate_ceilings_are_exact() {
+    let attributes_document = |root_attributes: &str, groups: usize| {
+        format!("<svg {root_attributes}>{}</svg>","<g transform=\"\" fill=\"none\" fill-opacity=\"1\" stroke=\"none\" stroke-width=\"0\" stroke-linecap=\"butt\" stroke-linejoin=\"miter\" stroke-miterlimit=\"1\" stroke-dasharray=\"none\" stroke-dashoffset=\"0\" stroke-opacity=\"1\" opacity=\"1\" color=\"black\" display=\"inline\" visibility=\"visible\"/>".repeat(groups))
+    };
+    // 13,333 * 15 ordinary attributes plus five root attributes, including xmlns.
+    let equal = attributes_document(
+        &format!(
+            "xmlns=\"{SVG_NS}\" width=\"1\" height=\"1\" viewBox=\"0 0 1 1\" preserveAspectRatio=\"none\""
+        ),
+        13_333,
+    );
+    assert!(parse_validate(equal.as_bytes(), false, false).is_ok());
+    let above = attributes_document(
+        &format!(
+            "xmlns=\"{SVG_NS}\" id=\"root\" width=\"1\" height=\"1\" viewBox=\"0 0 1 1\" preserveAspectRatio=\"none\""
+        ),
+        13_333,
+    );
+    assert_eq!(
+        parse_validate(above.as_bytes(), false, false)
+            .unwrap_err()
+            .code(),
+        SvgSanitizeCode::TotalAttributeCount
+    );
+
+    let path_document = |extra: bool| {
+        let mut raw = String::from("<svg>");
+        for _ in 0..8 {
+            let mut path = String::from("M 0 0 L 0 0");
+            path.push_str(&" ".repeat(MAX_PATH_ATTRIBUTE_BYTES - path.len()));
+            raw.push_str("<path d=\"");
+            raw.push_str(&path);
+            raw.push_str("\"/>");
+        }
+        if extra {
+            raw.push_str("<path d=\" \"/>");
+        }
+        raw.push_str("</svg>");
+        raw
+    };
+    assert!(parse_validate(path_document(false).as_bytes(), false, false).is_ok());
+    assert_eq!(
+        parse_validate(path_document(true).as_bytes(), false, false)
+            .unwrap_err()
+            .code(),
+        SvgSanitizeCode::PathBytes
+    );
+}
+
+#[test]
+fn generated_svg_path_command_ceiling_is_exact_across_attributes() {
+    let document = |commands: usize| {
+        let mut raw = String::from("<svg>");
+        let mut remaining = commands;
+        while remaining > 0 {
+            let chunk = remaining.min(150_000);
+            raw.push_str("<path d=\"M 0 0");
+            raw.push_str(&" L 0 0".repeat(chunk - 1));
+            raw.push_str("\"/>");
+            remaining -= chunk;
+        }
+        raw.push_str("</svg>");
+        raw
+    };
+    assert!(parse_validate(document(MAX_PATH_COMMANDS).as_bytes(), false, false).is_ok());
+    assert_eq!(
+        parse_validate(document(MAX_PATH_COMMANDS + 1).as_bytes(), false, false)
+            .unwrap_err()
+            .code(),
+        SvgSanitizeCode::PathCommands
+    );
+}
+
+#[test]
+fn generated_svg_raw_byte_ceiling_is_checked_before_parse() {
+    for length in [MAX_RAW_BYTES - 1, MAX_RAW_BYTES] {
+        let mut raw = Vec::with_capacity(length);
+        raw.extend_from_slice(b"<svg/>");
+        raw.resize(length, b' ');
+        if let Err(error) = sanitize_generated_svg(&raw) {
+            assert_ne!(error.code(), SvgSanitizeCode::RawBytes);
+        }
+    }
+    assert_eq!(
+        sanitize_generated_svg(&vec![b' '; MAX_RAW_BYTES + 1])
+            .unwrap_err()
+            .code(),
+        SvgSanitizeCode::RawBytes
+    );
+}
+
+#[test]
 fn generated_svg_namespace_and_active_content_matrix_is_closed() {
     for raw in [
         format!(r#"<svg xmlns="{SVG_NS}"><g xmlns="{SVG_NS}"/></svg>"#),

@@ -3213,21 +3213,39 @@ where
     if !send_writer_envelope(&writer_tx, hello).await {
         return Ok(());
     }
-    let reader_task = tokio::spawn(run_client_reader(
-        reader,
-        executor_tx.clone(),
-        writer_tx.clone(),
-        Some(ctx.caffeinate_state_event()),
-    ));
-    let writer_task = tokio::spawn(run_client_writer(writer, writer_rx));
-    let event_task = tokio::spawn(run_client_event_forwarder(
-        ctx.clone(),
-        principal.clone(),
-        ctx.subscribe_global(),
-        event_cmd_rx,
-        executor_tx.clone(),
-        writer_tx.clone(),
-    ));
+    let reader_ctx = ctx.clone();
+    let reader_executor_tx = executor_tx.clone();
+    let reader_writer_tx = writer_tx.clone();
+    let reader_task = tokio::spawn(async move {
+        run_client_reader(
+            reader,
+            reader_executor_tx,
+            reader_writer_tx,
+            Some(reader_ctx.caffeinate_state_event()),
+        )
+        .await;
+        Ok::<(), anyhow::Error>(())
+    });
+    let writer_task = tokio::spawn(async move {
+        run_client_writer(writer, writer_rx).await;
+        Ok::<(), anyhow::Error>(())
+    });
+    let event_ctx = ctx.clone();
+    let event_principal = principal.clone();
+    let event_executor_tx = executor_tx.clone();
+    let event_writer_tx = writer_tx.clone();
+    let event_task = tokio::spawn(async move {
+        run_client_event_forwarder(
+            event_ctx.clone(),
+            event_principal,
+            event_ctx.subscribe_global(),
+            event_cmd_rx,
+            event_executor_tx,
+            event_writer_tx,
+        )
+        .await;
+        Ok::<(), anyhow::Error>(())
+    });
     let executor_task = tokio::spawn(run_client_executor(
         ctx,
         principal,
@@ -3242,10 +3260,10 @@ where
     tokio::pin!(executor_task);
 
     let completed = tokio::select! {
-        result = &mut reader_task => result.context("client reader task failed"),
-        result = &mut writer_task => result.context("client writer task failed"),
-        result = &mut event_task => result.context("client event task failed"),
-        result = &mut executor_task => result.context("client executor task failed"),
+        result = &mut reader_task => flatten_client_task(result, "client reader task"),
+        result = &mut writer_task => flatten_client_task(result, "client writer task"),
+        result = &mut event_task => flatten_client_task(result, "client event task"),
+        result = &mut executor_task => flatten_client_task(result, "client executor task"),
     };
 
     reader_task.abort();
@@ -3254,6 +3272,15 @@ where
     executor_task.abort();
     completed?;
     Ok(())
+}
+
+fn flatten_client_task(
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+    label: &str,
+) -> Result<()> {
+    result
+        .with_context(|| format!("{label} join failed"))?
+        .with_context(|| format!("{label} failed"))
 }
 
 enum ClientExecutorInput {
@@ -3500,7 +3527,7 @@ async fn run_client_executor(
     mut executor_rx: mpsc::Receiver<ClientExecutorInput>,
     event_cmd_tx: mpsc::Sender<ClientEventCommand>,
     writer_tx: mpsc::Sender<ClientWriterMessage>,
-) {
+) -> Result<()> {
     let mut state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         principal,
@@ -3521,7 +3548,7 @@ async fn run_client_executor(
                     if let Err(error) = attachments::drain_client_attachment_ownership(&mut state, &ctx, "disconnect").await {
                         tracing::warn!(message=%error.message,"attachment ownership drain failed during disconnect; durable charges remain for retry recovery");
                     }
-                    return;
+                    return Ok(());
                 };
                 match input {
                     ClientExecutorInput::Frame(frame) => {
@@ -3534,9 +3561,9 @@ async fn run_client_executor(
                             &writer_tx,
                             &mut concurrent,
                         )
-                        .await
+                        .await?
                         {
-                            return;
+                            return Ok(());
                         }
                     }
                     ClientExecutorInput::SessionEventsClosed => {
@@ -3557,7 +3584,7 @@ async fn handle_client_frame(
     event_cmd_tx: &mpsc::Sender<ClientEventCommand>,
     writer_tx: &mpsc::Sender<ClientWriterMessage>,
     concurrent: &mut ConcurrentRequestRuntime,
-) -> bool {
+) -> Result<bool> {
     match frame {
         RecvFrame::Envelope(env) => handle_envelope(
             *env,
@@ -3569,7 +3596,7 @@ async fn handle_client_frame(
             concurrent,
         )
         .await
-        .is_ok(),
+        .map(|()| true),
         RecvFrame::VersionMismatch { v, kind, id } => {
             if kind == "req"
                 && let Some(id) = id
@@ -3590,7 +3617,7 @@ async fn handle_client_frame(
                     "closing client after protocol version mismatch"
                 );
             }
-            false
+            Ok(false)
         }
         RecvFrame::Unknown { v, kind, tag, id } => {
             if kind == "req"
@@ -3610,7 +3637,7 @@ async fn handle_client_frame(
                     "dropping unknown protocol frame"
                 );
             }
-            true
+            Ok(true)
         }
     }
 }

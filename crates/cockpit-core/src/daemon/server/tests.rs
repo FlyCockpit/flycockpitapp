@@ -16328,6 +16328,16 @@ async fn server_answers_too_new_request_with_protocol_version_error() {
     server.await.unwrap().unwrap();
 }
 
+#[tokio::test]
+async fn client_transport_task_flattener_preserves_inner_error_and_task_context() {
+    let task = tokio::spawn(async { Err::<(), _>(anyhow::anyhow!("forced child failure")) });
+    let error = super::flatten_client_task(task.await, "client fixture task").unwrap_err();
+    assert_eq!(
+        format!("{error:#}"),
+        "client fixture task failed: forced child failure"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn server_responses_use_negotiated_client_protocol_version() {

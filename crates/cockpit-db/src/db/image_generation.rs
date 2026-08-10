@@ -872,6 +872,7 @@ impl Db {
         Ok(())
     }
 
+    #[cfg(test)]
     fn cas_image_generation_job_state_conn(
         conn: &Connection,
         job_id: Uuid,
@@ -902,6 +903,7 @@ impl Db {
         })
     }
 
+    #[cfg(test)]
     fn cas_image_generation_slot_state_conn(
         conn: &Connection,
         job_id: Uuid,
@@ -1438,6 +1440,109 @@ fn reject_duplicate_json_keys(bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::image_generation_plan::*;
+
+    fn canonical_test_plan(
+        job_id: Uuid,
+        slot_id: Uuid,
+        artifact_id: Uuid,
+        attempts: u32,
+        enqueue_ms: u64,
+        deadline_ms: u64,
+    ) -> (Vec<u8>, String) {
+        let reservation = ResourceReservationV1 {
+            resource_kind: "image_samples".into(),
+            units: u64::from(attempts),
+            reservation_identity: "resource:fixture".into(),
+        };
+        let attempt_graph = (1..=attempts)
+            .map(|attempt_number| AttemptPlanV1 {
+                attempt_number,
+                provider_request_identity: format!("request:{attempt_number}"),
+                provider_idempotency_identity: format!("idem:{attempt_number}"),
+                resource_maximum: vec![ResourceReservationV1 {
+                    units: 1,
+                    ..reservation.clone()
+                }],
+                maximum_usd_micros: Some(1),
+            })
+            .collect();
+        let plan = ImageGenerationPlanV1 {
+            schema_version: 1,
+            kind: "imageGenerationPlan".into(),
+            job_id,
+            owner_session_id: Uuid::new_v4(),
+            owner_principal_digest: "1".repeat(64),
+            project_identity_digest: "2".repeat(64),
+            config_generation: 1,
+            enqueue_started_monotonic_ms: enqueue_ms,
+            operation_deadline_monotonic_ms: deadline_ms,
+            required_grants: vec![GrantRequirementV1 {
+                grant_kind: "image.generate".into(),
+                authority_digest: "3".repeat(64),
+                generation: 1,
+            }],
+            central_resources: vec![reservation],
+            spend: SpendReservationPlanV1 {
+                required: true,
+                policy_version: 1,
+                reservation_id: "spend:fixture".into(),
+                maximum_usd_micros: Some(u64::from(attempts)),
+                plan_digest: "4".repeat(64),
+            },
+            output_authority: OutputDirectoryAuthorityV1 {
+                canonical_destination_digest: "5".repeat(64),
+                parent_identity_digest: "6".repeat(64),
+                authority_generation: 1,
+                filename_prefix: "generated".into(),
+                extension: "png".into(),
+            },
+            targets: vec![TargetPlanV1 {
+                target_id: "fixture".into(),
+                target_config_generation: 1,
+                normalized_config_digest: "7".repeat(64),
+                capability_provenance: CapabilityProvenanceV1 {
+                    capability_generation: 1,
+                    capability_digest: "8".repeat(64),
+                    health_observed_at_monotonic_ms: 0,
+                    health_expires_at_monotonic_ms: deadline_ms,
+                },
+                destination: TargetDestinationV1 {
+                    adapter_kind: "fixture".into(),
+                    endpoint_identity_digest: "9".repeat(64),
+                    credential_identity_digest: "a".repeat(64),
+                    destination_generation: 1,
+                },
+                reference_artifacts: vec![],
+                requested: RequestedOutputV1 {
+                    width: 1,
+                    height: 1,
+                    format: "png".into(),
+                },
+                resolved: ResolvedOutputV1 {
+                    width: 1,
+                    height: 1,
+                    format: "png".into(),
+                    mime: "image/png".into(),
+                    vector_sanitization_required: false,
+                },
+                typed_parameters: Default::default(),
+                sample_count: 1,
+                max_attempts: attempts,
+                slots: vec![OutputSlotPlanV1 {
+                    slot_id,
+                    slot_index: 0,
+                    sample_index: 0,
+                    managed_artifact_id: artifact_id,
+                    publication_name: "generated.png".into(),
+                    attempts: attempt_graph,
+                }],
+            }],
+        };
+        let bytes = plan.canonical_bytes().unwrap();
+        let digest = plan.digest().unwrap();
+        (bytes, digest)
+    }
 
     struct RaceFixture {
         job_id: Uuid,
@@ -1450,12 +1555,8 @@ mod tests {
         let slot_id = Uuid::now_v7();
         let operation_id = Uuid::now_v7();
         let artifact_id = Uuid::now_v7();
-        let plan = format!(
-            r#"{{"schemaVersion":1,"jobId":"{job_id}","enqueueStartedMonotonicMs":1,"operationDeadlineMonotonicMs":100,"targets":[{{"maxAttempts":1,"slots":[{{"slotId":"{slot_id}","slotIndex":0,"sampleIndex":0,"managedArtifactId":"{artifact_id}","attempts":[{{"attemptNumber":1,"providerRequestIdentity":"request:1","providerIdempotencyIdentity":"idem:1"}}]}}]}}]}}"#
-        );
-        let digest = hex_lower(&Sha256::digest(plan.as_bytes()));
-        let verified =
-            CreateImageGenerationJob::from_verified_canonical_plan(plan.as_bytes(), &digest, 1)?;
+        let (plan, digest) = canonical_test_plan(job_id, slot_id, artifact_id, 1, 1, 100);
+        let verified = CreateImageGenerationJob::from_verified_canonical_plan(&plan, &digest, 1)?;
         Db::create_image_generation_graph_conn(
             conn,
             &verified,
@@ -1665,18 +1766,11 @@ mod tests {
         let job_id = Uuid::now_v7();
         let slot_id = Uuid::now_v7();
         let artifact_id = Uuid::now_v7();
-        let canonical = format!(
-            r#"{{"jobId":"{job_id}","enqueueStartedMonotonicMs":1,"operationDeadlineMonotonicMs":2,"targets":[{{"maxAttempts":1,"slots":[{{"slotId":"{slot_id}","slotIndex":0,"sampleIndex":0,"managedArtifactId":"{artifact_id}","attempts":[{{"attemptNumber":1,"providerRequestIdentity":"request:1","providerIdempotencyIdentity":"idem:1"}}]}}]}}]}}"#
-        );
-        let digest = hex_lower(&Sha256::digest(canonical.as_bytes()));
+        let (canonical, digest) = canonical_test_plan(job_id, slot_id, artifact_id, 1, 1, 2);
         assert!(
-            CreateImageGenerationJob::from_verified_canonical_plan(
-                canonical.as_bytes(),
-                &digest,
-                1
-            )
-            .is_ok()
+            CreateImageGenerationJob::from_verified_canonical_plan(&canonical, &digest, 1).is_ok()
         );
+        let canonical = String::from_utf8(canonical).unwrap();
         let spaced = canonical.replacen("{", "{ ", 1);
         let spaced_digest = hex_lower(&Sha256::digest(spaced.as_bytes()));
         assert!(
@@ -1724,11 +1818,8 @@ mod tests {
         let slot_id = Uuid::now_v7();
         db.blocking_for_sync_cli(move |conn| {
             let artifact_id=Uuid::now_v7();
-            let canonical_plan = format!(
-                r#"{{"schemaVersion":1,"jobId":"{job_id}","enqueueStartedMonotonicMs":10,"operationDeadlineMonotonicMs":20,"targets":[{{"maxAttempts":1,"slots":[{{"slotId":"{slot_id}","slotIndex":0,"sampleIndex":0,"managedArtifactId":"{artifact_id}","attempts":[{{"attemptNumber":1,"providerRequestIdentity":"request:1","providerIdempotencyIdentity":"idem:1"}}]}}]}}]}}"#
-            );
-            let plan_digest = hex_lower(&Sha256::digest(canonical_plan.as_bytes()));
-            let verified=CreateImageGenerationJob::from_verified_canonical_plan(canonical_plan.as_bytes(),&plan_digest,30)?;
+            let (canonical_plan, plan_digest) = canonical_test_plan(job_id, slot_id, artifact_id, 1, 10, 20);
+            let verified=CreateImageGenerationJob::from_verified_canonical_plan(&canonical_plan,&plan_digest,30)?;
             Db::create_image_generation_job_conn(
                 conn,
                 &verified,
@@ -1757,9 +1848,8 @@ mod tests {
         let slot_id = Uuid::now_v7();
         db.blocking_for_sync_cli(move|conn|{
             let artifact_id=Uuid::now_v7();
-            let canonical_plan=format!(r#"{{"schemaVersion":1,"jobId":"{job_id}","enqueueStartedMonotonicMs":1,"operationDeadlineMonotonicMs":10,"targets":[{{"maxAttempts":2,"slots":[{{"slotId":"{slot_id}","slotIndex":0,"sampleIndex":0,"managedArtifactId":"{artifact_id}","attempts":[{{"attemptNumber":1,"providerRequestIdentity":"request:1","providerIdempotencyIdentity":"idem:1"}},{{"attemptNumber":2,"providerRequestIdentity":"request:2","providerIdempotencyIdentity":"idem:2"}}]}}]}}]}}"#);
-            let digest=hex_lower(&Sha256::digest(canonical_plan.as_bytes()));
-            let verified=CreateImageGenerationJob::from_verified_canonical_plan(canonical_plan.as_bytes(),&digest,1)?;
+            let (canonical_plan, digest)=canonical_test_plan(job_id, slot_id, artifact_id, 2, 1, 10);
+            let verified=CreateImageGenerationJob::from_verified_canonical_plan(&canonical_plan,&digest,1)?;
             Db::create_image_generation_graph_conn(conn,&verified,&[CreateImageGenerationSlot{slot_id,slot_index:0,sample_index:0,managed_artifact_id:artifact_id,attempts:vec![CreateImageGenerationAttempt{attempt_number:1,provider_request_identity:"request:1".into(),provider_idempotency_identity:"idem:1".into()},CreateImageGenerationAttempt{attempt_number:2,provider_request_identity:"request:2".into(),provider_idempotency_identity:"idem:2".into()}]}])?;
             assert!(matches!(Db::cas_image_generation_job_state_conn(conn,job_id,ImageGenerationJobState::Created,1,ImageGenerationJobState::Validating,2)?,ImageGenerationCasOutcome::Applied{..}));
             assert!(matches!(Db::cas_image_generation_job_state_conn(conn,job_id,ImageGenerationJobState::Validating,2,ImageGenerationJobState::Queued,3)?,ImageGenerationCasOutcome::Applied{..}));

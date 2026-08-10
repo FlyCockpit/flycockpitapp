@@ -47,6 +47,47 @@ struct HeldHandleRecoveryProof {
     _handles: Vec<File>,
 }
 
+pub(crate) struct AcquireMessageImagesInput<'a> {
+    pub attachment_ids: Vec<Uuid>,
+    pub session_id: Uuid,
+    pub project_digest: String,
+    pub consumer_id: String,
+    pub ledger: &'a crate::media_reservation::MediaReservationLedger,
+    pub max_total_bytes: u64,
+    pub now_unix_ms: i64,
+}
+
+pub(crate) struct IngestMessageImageInput<'a> {
+    pub actor_principal_digest: String,
+    pub session_id: Uuid,
+    pub project_digest: String,
+    pub bytes: Vec<u8>,
+    pub policy: &'a cockpit_config::config::media_budget::MediaResourcePolicy,
+    pub now_unix_ms: i64,
+    pub now_monotonic_ms: u64,
+}
+
+pub(crate) struct AcquireComponentLeaseInput {
+    pub lease_id: Uuid,
+    pub attachment_id: Uuid,
+    pub attachment_version: u64,
+    pub availability_generation: u64,
+    pub capability_generation: u64,
+    pub kind: MediaComponentLeaseKind,
+    pub now_unix_ms: i64,
+}
+
+struct UploadReconcileInput {
+    upload_id: String,
+    generation: u64,
+    reservation_id: String,
+    state: &'static str,
+    reason: &'static str,
+    evidence: Option<String>,
+    transition: cockpit_db::media_attachments::MediaUploadLastTransitionV1,
+    now_unix_ms: i64,
+}
+
 /// A DB-authorized component lease and the exact no-follow handle proven by
 /// that acquisition transaction. Consumers never receive a storage name.
 pub(crate) struct HeldMediaComponentLease {
@@ -676,15 +717,16 @@ impl MediaStorageRecovery {
             conn.execute("INSERT INTO media_retained_https_operations(local_operation_id,authoritative_operation_id,session_id,canonical_project_digest,client_draft_id,request_binding_digest,operation_request_digest,semantic_command_digest,receipt_json,committed_at_unix_ms,is_alias) VALUES(?1,?1,?2,?3,?4,?5,?6,?7,?8,?9,0)",params![request_for_tx.local_operation_id.to_string(),request_for_tx.session_id.to_string(),request_for_tx.canonical_project_digest,request_for_tx.client_draft_id.to_string(),binding,request_digest,semantic_digest,receipt_json,now_unix_ms])?;
             conn.execute("INSERT INTO media_retained_https_audit(local_operation_id,outcome,committed_at_unix_ms) VALUES(?1,'retained',?2)",params![request_for_tx.local_operation_id.to_string(),now_unix_ms])?; conn.execute("DELETE FROM media_retained_https_publication_intents WHERE local_operation_id=?1",[request_for_tx.local_operation_id.to_string()])?; Ok(receipt)
         }).await;
-        if result.as_ref().is_err() || result.as_ref().is_ok_and(|r| r.receipt_id != receipt_id) {
-            if result.is_ok() {
-                self.finish_retained_https_orphan(
-                    request.local_operation_id,
-                    &storage_name,
-                    now_unix_ms,
-                )
-                .await?;
-            }
+        if result
+            .as_ref()
+            .is_ok_and(|retained| retained.receipt_id != receipt_id)
+        {
+            self.finish_retained_https_orphan(
+                request.local_operation_id,
+                &storage_name,
+                now_unix_ms,
+            )
+            .await?;
         }
         result
     }
@@ -809,17 +851,20 @@ impl MediaStorageRecovery {
     }
     pub(crate) async fn acquire_message_images_bound(
         &self,
-        attachment_ids: Vec<Uuid>,
-        session_id: Uuid,
-        project_digest: String,
-        consumer_id: String,
-        ledger: &crate::media_reservation::MediaReservationLedger,
-        max_total_bytes: u64,
-        now_unix_ms: i64,
+        input: AcquireMessageImagesInput<'_>,
     ) -> Result<Vec<Vec<u8>>> {
         use cockpit_db::media_attachments::{
             AcquiredMediaReference, MediaComponentLeaseKind, MediaKind, MediaReferenceConsumerKind,
         };
+        let AcquireMessageImagesInput {
+            attachment_ids,
+            session_id,
+            project_digest,
+            consumer_id,
+            ledger,
+            max_total_bytes,
+            now_unix_ms,
+        } = input;
         ensure!(!attachment_ids.is_empty(), "media_attachment_unavailable");
         let db_consumer_id = consumer_id.clone();
         let acquired = self
@@ -994,19 +1039,22 @@ impl MediaStorageRecovery {
     }
     pub(crate) async fn ingest_message_image(
         &self,
-        actor_principal_digest: String,
-        session_id: Uuid,
-        project_digest: String,
-        bytes: Vec<u8>,
-        policy: &cockpit_config::config::media_budget::MediaResourcePolicy,
-        now_unix_ms: i64,
-        now_monotonic_ms: u64,
+        input: IngestMessageImageInput<'_>,
     ) -> Result<Uuid> {
         use base64::Engine as _;
         use cockpit_db::media_attachments::{
             AppendMediaUploadChunkV1, LocalMediaActorRoleV1, LocalMediaMutationPayloadV1,
             LocalMediaMutationV1,
         };
+        let IngestMessageImageInput {
+            actor_principal_digest,
+            session_id,
+            project_digest,
+            bytes,
+            policy,
+            now_unix_ms,
+            now_monotonic_ms,
+        } = input;
         ensure!(
             !bytes.is_empty() && bytes.len() <= u32::MAX as usize,
             "media_attachment_unavailable"
@@ -1299,14 +1347,17 @@ impl MediaStorageRecovery {
 
     pub(crate) async fn acquire_component_lease(
         &self,
-        lease_id: Uuid,
-        attachment_id: Uuid,
-        attachment_version: u64,
-        availability_generation: u64,
-        capability_generation: u64,
-        kind: MediaComponentLeaseKind,
-        now_unix_ms: i64,
+        input: AcquireComponentLeaseInput,
     ) -> Result<HeldMediaComponentLease> {
+        let AcquireComponentLeaseInput {
+            lease_id,
+            attachment_id,
+            attachment_version,
+            availability_generation,
+            capability_generation,
+            kind,
+            now_unix_ms,
+        } = input;
         let authority = self
             .db
             .transaction(move |conn| {
@@ -1497,16 +1548,16 @@ impl MediaStorageRecovery {
                         action: MediaUploadSystemActionV1::StartupReconcile,
                         outcome: RemoteMediaOperationOutcomeV1::Applied,
                     };
-                    self.commit_upload_reconcile(
+                    self.commit_upload_reconcile(UploadReconcileInput {
                         upload_id,
                         generation,
                         reservation_id,
-                        "failed",
-                        "storage_failure",
-                        None,
+                        state: "failed",
+                        reason: "storage_failure",
+                        evidence: None,
                         transition,
                         now_unix_ms,
-                    )
+                    })
                     .await?;
                     repaired += 1;
                     continue;
@@ -1518,16 +1569,16 @@ impl MediaStorageRecovery {
                     action: MediaUploadSystemActionV1::StartupReconcile,
                     outcome: RemoteMediaOperationOutcomeV1::Applied,
                 };
-                self.commit_upload_reconcile(
+                self.commit_upload_reconcile(UploadReconcileInput {
                     upload_id,
                     generation,
                     reservation_id,
-                    "failed",
-                    "storage_failure",
-                    None,
+                    state: "failed",
+                    reason: "storage_failure",
+                    evidence: None,
                     transition,
                     now_unix_ms,
-                )
+                })
                 .await?;
                 repaired += 1;
                 continue;
@@ -1569,33 +1620,33 @@ impl MediaStorageRecovery {
                     "expired upload temporary was not deleted"
                 );
             }
-            self.commit_upload_reconcile(
+            self.commit_upload_reconcile(UploadReconcileInput {
                 upload_id,
                 generation,
                 reservation_id,
-                "expired",
-                "draft_expired",
-                Some(evidence),
+                state: "expired",
+                reason: "draft_expired",
+                evidence: Some(evidence),
                 transition,
                 now_unix_ms,
-            )
+            })
             .await?;
             repaired += 1;
         }
         Ok(repaired)
     }
 
-    async fn commit_upload_reconcile(
-        &self,
-        upload_id: String,
-        generation: u64,
-        reservation_id: String,
-        state: &'static str,
-        reason: &'static str,
-        evidence: Option<String>,
-        transition: cockpit_db::media_attachments::MediaUploadLastTransitionV1,
-        now_unix_ms: i64,
-    ) -> Result<()> {
+    async fn commit_upload_reconcile(&self, input: UploadReconcileInput) -> Result<()> {
+        let UploadReconcileInput {
+            upload_id,
+            generation,
+            reservation_id,
+            state,
+            reason,
+            evidence,
+            transition,
+            now_unix_ms,
+        } = input;
         self.db.transaction(move |conn| {
             let next = generation.checked_add(1).context("upload generation overflow")?;
             let changed = conn.execute(
@@ -1621,12 +1672,7 @@ impl MediaStorageRecovery {
         let mut av_terminal = None;
         let mut av_normalization_evidence = None;
         let av_derivatives = if media_kind != MediaKind::Image {
-            let prepared: Result<(
-                Vec<(&'static str, Uuid, Vec<u8>, Option<(u32, u32)>)>,
-                Option<SelectedMediaStream>,
-                Option<SelectedMediaStream>,
-                AvNormalizationEvidence,
-            )> = async {
+            let prepared: Result<SuccessfulAvNormalization> = async {
                 held.seek(SeekFrom::Start(0))?;
                 let mut bytes = Vec::new();
                 held.read_to_end(&mut bytes)?;
@@ -1763,18 +1809,23 @@ impl MediaStorageRecovery {
                         audio.is_some(),
                     )?;
                     let derivative_checksum = crate::intel::hex_lower(&Sha256::digest(&mp4));
-                    Ok((
-                        vec![("video_model", Uuid::now_v7(), mp4, Some((width, height)))],
-                        selected_video,
-                        selected_audio,
-                        AvNormalizationEvidence {
+                    Ok(SuccessfulAvNormalization {
+                        derivatives: vec![(
+                            "video_model",
+                            Uuid::now_v7(),
+                            mp4,
+                            Some((width, height)),
+                        )],
+                        video: selected_video,
+                        audio: selected_audio,
+                        evidence: AvNormalizationEvidence {
                             runtime_fingerprint: runtime.fingerprint,
                             probe_digest,
                             decode_digest,
                             plan_digest,
                             derivative_checksum,
                         },
-                    ))
+                    })
                 } else {
                     let audio = audio.context("invalid_media")?;
                     let probe = document
@@ -1802,27 +1853,27 @@ impl MediaStorageRecovery {
                         .await?;
                     let wav = canonicalize_pcm_wav(&output.stdout)?;
                     let derivative_checksum = crate::intel::hex_lower(&Sha256::digest(&wav));
-                    Ok((
-                        vec![("audio_model", Uuid::now_v7(), wav, None)],
-                        None,
-                        selected_audio,
-                        AvNormalizationEvidence {
+                    Ok(SuccessfulAvNormalization {
+                        derivatives: vec![("audio_model", Uuid::now_v7(), wav, None)],
+                        video: None,
+                        audio: selected_audio,
+                        evidence: AvNormalizationEvidence {
                             runtime_fingerprint: runtime.fingerprint,
                             probe_digest,
                             decode_digest,
                             plan_digest,
                             derivative_checksum,
                         },
-                    ))
+                    })
                 }
             }
             .await;
             match prepared {
-                Ok((derivatives, video, audio, evidence)) => {
-                    selected_video_stream = video;
-                    selected_audio_stream = audio;
-                    av_normalization_evidence = Some(evidence);
-                    Some(derivatives)
+                Ok(prepared) => {
+                    selected_video_stream = prepared.video;
+                    selected_audio_stream = prepared.audio;
+                    av_normalization_evidence = Some(prepared.evidence);
+                    Some(prepared.derivatives)
                 }
                 Err(error) => {
                     av_terminal = Some(if error.to_string().contains("model_runtime") {
@@ -2002,7 +2053,7 @@ impl MediaStorageRecovery {
                     ),
                 ]
             })
-            .map_or_else(|| av_derivatives.unwrap_or_default(), |value| value);
+            .unwrap_or_else(|| av_derivatives.unwrap_or_default());
         let intent_upload = upload.to_string();
         let intent_temporary = snapshot.0.clone();
         let intent_target = target.clone();
@@ -3073,7 +3124,10 @@ fn classify_iso_bmff(bytes: &[u8], has_video: bool, audio_streams: usize) -> Res
     ensure!(bytes.len() >= 16, "ambiguous_or_unsupported_container");
     let size = u32::from_be_bytes(bytes[..4].try_into()?) as usize;
     ensure!(
-        size >= 16 && size <= bytes.len() && &bytes[4..8] == b"ftyp" && (size - 16) % 4 == 0,
+        size >= 16
+            && size <= bytes.len()
+            && &bytes[4..8] == b"ftyp"
+            && (size - 16).is_multiple_of(4),
         "ambiguous_or_unsupported_container"
     );
     let major: [u8; 4] = bytes[8..12].try_into()?;
@@ -3216,6 +3270,13 @@ struct PreparedAvNormalization {
     derivatives: Vec<AvDerivativePlan>,
     terminal_availability: Option<MediaAvailability>,
     evidence: Option<AvNormalizationEvidence>,
+}
+
+struct SuccessfulAvNormalization {
+    derivatives: Vec<AvDerivativePlan>,
+    video: Option<SelectedMediaStream>,
+    audio: Option<SelectedMediaStream>,
+    evidence: AvNormalizationEvidence,
 }
 
 fn av_plan_digest(runtime_fingerprint: &str, argv: &[String]) -> String {
@@ -3806,8 +3867,8 @@ fn video_normalization_argv(
     ensure!(
         width >= 2
             && height >= 2
-            && width % 2 == 0
-            && height % 2 == 0
+            && width.is_multiple_of(2)
+            && height.is_multiple_of(2)
             && fps_num > 0
             && fps_den > 0
             && gop > 0
@@ -7606,15 +7667,15 @@ mod tests {
             std::sync::Arc::new(FixedMediaClock),
         );
         let result = storage
-            .acquire_message_images_bound(
-                fixtures.iter().map(|value| value.0).collect(),
-                session,
-                project,
-                "submission".into(),
-                &ledger,
-                1024,
-                5,
-            )
+            .acquire_message_images_bound(AcquireMessageImagesInput {
+                attachment_ids: fixtures.iter().map(|value| value.0).collect(),
+                session_id: session,
+                project_digest: project,
+                consumer_id: "submission".into(),
+                ledger: &ledger,
+                max_total_bytes: 1024,
+                now_unix_ms: 5,
+            })
             .await;
         assert!(result.is_err());
         let counts=db.read(|conn|Ok((conn.query_row("SELECT COUNT(*) FROM media_attachment_component_leases WHERE released_at_unix_ms IS NULL",[],|row|row.get::<_,i64>(0))?,conn.query_row("SELECT COUNT(*) FROM media_attachment_references WHERE released_at_unix_ms IS NULL",[],|row|row.get::<_,i64>(0))?,conn.query_row("SELECT COUNT(*) FROM media_downstream_ownership WHERE released_wall_ms IS NULL",[],|row|row.get::<_,i64>(0))?))).await.unwrap();
@@ -8089,15 +8150,15 @@ mod tests {
         }).await.unwrap();
         let storage = MediaStorageRecovery::open(db.clone(), &root_path).unwrap();
         let lease = storage
-            .acquire_component_lease(
-                Uuid::now_v7(),
+            .acquire_component_lease(AcquireComponentLeaseInput {
+                lease_id: Uuid::now_v7(),
                 attachment_id,
-                1,
-                5,
-                7,
-                MediaComponentLeaseKind::Preview,
-                2,
-            )
+                attachment_version: 1,
+                availability_generation: 5,
+                capability_generation: 7,
+                kind: MediaComponentLeaseKind::Preview,
+                now_unix_ms: 2,
+            })
             .await
             .unwrap();
         assert_eq!(lease.authority().component.component_id, component_id);
@@ -8106,15 +8167,15 @@ mod tests {
         assert_eq!(live, 0);
         let abandoned_id = Uuid::now_v7();
         let abandoned = storage
-            .acquire_component_lease(
-                abandoned_id,
+            .acquire_component_lease(AcquireComponentLeaseInput {
+                lease_id: abandoned_id,
                 attachment_id,
-                1,
-                5,
-                7,
-                MediaComponentLeaseKind::Preview,
-                4,
-            )
+                attachment_version: 1,
+                availability_generation: 5,
+                capability_generation: 7,
+                kind: MediaComponentLeaseKind::Preview,
+                now_unix_ms: 4,
+            })
             .await
             .unwrap();
         drop(abandoned);
@@ -8139,15 +8200,15 @@ mod tests {
         let failed_lease = Uuid::now_v7();
         assert!(
             reopened
-                .acquire_component_lease(
-                    failed_lease,
+                .acquire_component_lease(AcquireComponentLeaseInput {
+                    lease_id: failed_lease,
                     attachment_id,
-                    1,
-                    5,
-                    7,
-                    MediaComponentLeaseKind::Preview,
-                    7
-                )
+                    attachment_version: 1,
+                    availability_generation: 5,
+                    capability_generation: 7,
+                    kind: MediaComponentLeaseKind::Preview,
+                    now_unix_ms: 7
+                })
                 .await
                 .is_err()
         );

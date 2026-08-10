@@ -688,15 +688,17 @@ pub(super) async fn finish_attachment_upload_admitted(
                 .map_err(internal)?;
             abandon.reservation_id = None;
             let attachment_id = storage
-                .ingest_message_image(
-                    super::run_invocation::principal_digest(&state.principal),
+                .ingest_message_image(crate::media_storage::IngestMessageImageInput {
+                    actor_principal_digest: super::run_invocation::principal_digest(
+                        &state.principal,
+                    ),
                     session_id,
                     project_digest,
                     bytes,
-                    &extended.media_resources,
-                    wall_ms.try_into().unwrap_or(i64::MAX),
-                    ctx.media_ledger.clock_now_ms(),
-                )
+                    policy: &extended.media_resources,
+                    now_unix_ms: wall_ms.try_into().unwrap_or(i64::MAX),
+                    now_monotonic_ms: ctx.media_ledger.clock_now_ms(),
+                })
                 .await
                 .map_err(internal)?;
             let image_ref = proto::ImageAttachmentRef { id: attachment_id };
@@ -781,15 +783,15 @@ pub(super) async fn claim_message_image_refs_admitted(
         .ok_or_else(|| bad_request("media attachment unavailable"))?;
     let now = chrono::Utc::now().timestamp_millis();
     let images = storage
-        .acquire_message_images_bound(
-            refs.iter().map(|image_ref| image_ref.id).collect(),
+        .acquire_message_images_bound(crate::media_storage::AcquireMessageImagesInput {
+            attachment_ids: refs.iter().map(|image_ref| image_ref.id).collect(),
             session_id,
             project_digest,
-            client_submission_id.to_string(),
-            &ctx.media_ledger,
-            proto::MAX_TOTAL_IMAGE_BYTES as u64,
-            now,
-        )
+            consumer_id: client_submission_id.to_string(),
+            ledger: &ctx.media_ledger,
+            max_total_bytes: proto::MAX_TOTAL_IMAGE_BYTES as u64,
+            now_unix_ms: now,
+        })
         .await
         .map_err(|_| bad_request("media attachment unavailable"))?;
     Ok(images)

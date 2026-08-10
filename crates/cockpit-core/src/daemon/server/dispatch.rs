@@ -2459,15 +2459,15 @@ pub(super) async fn handle_serialized_request(
                 .ok_or_else(unavailable)?;
             let now = chrono::Utc::now().timestamp_millis();
             let lease = storage
-                .acquire_component_lease(
-                    Uuid::now_v7(),
-                    request.attachment_id,
-                    request.attachment_version,
-                    request.availability_generation,
-                    capability,
-                    MediaComponentLeaseKind::Preview,
-                    now,
-                )
+                .acquire_component_lease(crate::media_storage::AcquireComponentLeaseInput {
+                    lease_id: Uuid::now_v7(),
+                    attachment_id: request.attachment_id,
+                    attachment_version: request.attachment_version,
+                    availability_generation: request.availability_generation,
+                    capability_generation: capability,
+                    kind: MediaComponentLeaseKind::Preview,
+                    now_unix_ms: now,
+                })
                 .await
                 .map_err(|_| unavailable())?;
             let body = lease.read_verified(now).await.map_err(|_| unavailable())?;

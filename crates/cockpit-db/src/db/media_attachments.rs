@@ -2774,6 +2774,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn component_lease_authority_columns_live_only_on_lease_table_and_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("media-lease.db");
+        let session_id = Uuid::now_v7();
+        let attachment_id = Uuid::now_v7();
+        let component_id = Uuid::now_v7();
+        let lease_id = Uuid::now_v7();
+        {
+            let db = super::super::Db::open(&path).unwrap();
+            db.blocking_for_sync_cli(move|conn|{
+                let columns=|table:&str|->Result<Vec<String>>{let mut statement=conn.prepare(&format!("PRAGMA table_info({table})"))?;Ok(statement.query_map([],|row|row.get(1))?.collect::<rusqlite::Result<Vec<_>>>()?)};
+                let attachment_columns=columns("media_attachments")?;let lease_columns=columns("media_attachment_component_leases")?;
+                for column in ["owner_session_id","lease_purpose","lease_expires_at_unix_ms"]{ensure!(!attachment_columns.iter().any(|value|value==column),"{column} leaked onto attachment schema");ensure!(lease_columns.iter().any(|value|value==column),"{column} missing from lease schema");}
+                ensure!(attachment_columns.iter().filter(|value|value.as_str()=="canonical_project_digest").count()==1,"attachment project digest duplicated");
+                conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/project',1,1)",[session_id.to_string()])?;
+                super::super::Db::insert_media_attachment_conn(conn,&MediaAttachmentRecord{attachment_id,session_id,canonical_project_digest:"11".repeat(32),media_kind:MediaKind::Image,source_kind:MediaSourceKind::RetainedHttps,canonical_container:"png".into(),canonical_mime:"image/png".into(),availability:MediaAvailability::Ready,attachment_version:1,availability_generation:1,reference_generation:1,captured_capability_generation:9,source_identity_digest:"22".repeat(32),source_byte_length:3,source_sha256:"33".repeat(32),selected_video_stream:None,selected_audio_stream:None,created_at_unix_ms:1,updated_at_unix_ms:1,draft_expires_at_unix_ms:None,first_referenced_at_unix_ms:Some(1)})?;
+                super::super::Db::insert_media_attachment_component_conn(conn,&MediaAttachmentComponent{component_id,attachment_id,attachment_version:1,component_kind:"image_model".into(),storage_id:Uuid::now_v7(),lifecycle_state:"ready".into(),component_generation:1,stable_identity_digest:"44".repeat(32),byte_length:3,sha256:"55".repeat(32),reservation_id:"reservation".into(),created_at_unix_ms:1,updated_at_unix_ms:1})?;
+                let lease=super::super::Db::acquire_media_component_lease_conn(conn,AcquireMediaComponentLeaseInput{lease_id,attachment_id,expected_version:1,expected_availability_generation:1,expected_capability_generation:9,kind:MediaComponentLeaseKind::Model,now_unix_ms:2})?;
+                assert_eq!((lease.owner_session_id,lease.canonical_project_digest.as_str(),lease.lease_purpose.as_str(),lease.lease_expires_at_unix_ms),(session_id,"11".repeat(32).as_str(),"model_input",900_002));Ok(())
+            }).unwrap();
+        }
+        let reopened = super::super::Db::open(&path).unwrap();
+        reopened.blocking_for_sync_cli(move|conn|{let row:(String,String,String,i64)=conn.query_row("SELECT owner_session_id,canonical_project_digest,lease_purpose,lease_expires_at_unix_ms FROM media_attachment_component_leases WHERE lease_id=?1",[lease_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;assert_eq!(row,(session_id.to_string(),"11".repeat(32),"model_input".into(),900_002));Ok(())}).unwrap();
+    }
+
+    #[test]
     fn https_media_ingest_request_and_redacted_receipt_are_closed() {
         let operation_id = Uuid::now_v7();
         // Session authority predates typed media and production currently

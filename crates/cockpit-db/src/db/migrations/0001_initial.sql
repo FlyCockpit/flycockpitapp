@@ -3259,6 +3259,19 @@ WHEN OLD.state='planned' AND NEW.state='preparing' AND NEW.attempt_number>1 AND 
  SELECT 1 FROM image_generation_attempts prior WHERE prior.job_id=NEW.job_id AND prior.slot_id=NEW.slot_id
  AND prior.attempt_number=NEW.attempt_number-1 AND prior.state IN ('failed_not_submitted','rejected_not_accepted'))
 BEGIN SELECT RAISE(ABORT,'image generation retry lacks authoritative nonacceptance'); END;
+CREATE TRIGGER image_generation_attempt_plan_bound_guard BEFORE INSERT ON image_generation_attempts
+WHEN NEW.attempt_number > (SELECT max_attempt_count FROM image_generation_plans WHERE job_id=NEW.job_id)
+BEGIN SELECT RAISE(ABORT,'image generation attempt exceeds sealed plan'); END;
+CREATE TRIGGER image_generation_slot_plan_bound_guard BEFORE INSERT ON image_generation_slots
+WHEN NEW.slot_index >= (SELECT slot_count FROM image_generation_plans WHERE job_id=NEW.job_id)
+BEGIN SELECT RAISE(ABORT,'image generation slot exceeds sealed plan'); END;
+CREATE TRIGGER image_generation_response_adopted_guard AFTER UPDATE OF state ON image_generation_attempts
+WHEN NEW.state='response_adopted' AND (
+ NEW.applied_cancellation_version IS NOT NULL OR NEW.response_digest IS NULL OR NOT EXISTS(
+  SELECT 1 FROM external_journal_operations j WHERE j.operation_id=NEW.external_operation_id
+  AND j.state='succeeded' AND j.version=NEW.observed_journal_version)
+ OR EXISTS(SELECT 1 FROM image_generation_cancellation_facts c WHERE c.job_id=NEW.job_id))
+BEGIN SELECT RAISE(ABORT,'response-adopted attempt lacks exact uncancelled journal evidence'); END;
 CREATE TRIGGER image_generation_failed_not_submitted_guard BEFORE UPDATE OF state ON image_generation_attempts
 WHEN OLD.state='dispatching' AND NEW.state='failed_not_submitted' AND NEW.nonacceptance_evidence_digest IS NULL
 BEGIN SELECT RAISE(ABORT,'dispatch failure lacks zero-handoff evidence'); END;

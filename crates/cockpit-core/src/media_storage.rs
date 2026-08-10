@@ -5742,11 +5742,48 @@ mod tests {
             HttpsRetentionResultV1::Retained { attachment_id, .. } => *attachment_id,
             _ => unreachable!(),
         };
-        db.transaction(move|conn|{conn.execute("UPDATE media_attachment_processing_jobs SET state='claimed',claimed_at_unix_ms=1,claim_attempt=1 WHERE attachment_id=?1",[attachment_id.to_string()])?;cockpit_db::Db::transition_media_attachment_conn(conn,attachment_id,1,1,MediaAvailability::Probing,2)?;Ok(())}).await.unwrap();
+        let job_id = db
+            .read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT job_id FROM media_attachment_processing_jobs WHERE attachment_id=?1",
+                    [attachment_id.to_string()],
+                    |r| r.get::<_, String>(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        let orphan_ids = vec![Uuid::now_v7().to_string(), Uuid::now_v7().to_string()];
+        for id in &orphan_ids {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(temp.path().join("media").join(id))
+                .unwrap();
+            file.write_all(b"crashed derivative").unwrap();
+            file.sync_all().unwrap();
+        }
+        let orphan_json = serde_json::to_string(&orphan_ids).unwrap();
+        let intent_job = job_id.clone();
+        db.transaction(move|conn|{conn.execute("INSERT INTO media_attachment_processing_publication_intents(job_id,output_ids_json,created_at_unix_ms) VALUES(?1,?2,20)",params![intent_job,orphan_json])?;Ok(())}).await.unwrap();
         drop(recovery);
         let recovery = MediaStorageRecovery::open(db.clone(), &temp.path().join("media"))
             .unwrap()
             .with_https_fetcher(fetcher.clone());
+        assert_eq!(recovery.reconcile_media_uploads(21).await.unwrap(), 1);
+        for id in &orphan_ids {
+            assert!(!temp.path().join("media").join(id).exists());
+        }
+        assert_eq!(
+            db.read(move |conn| Ok(conn.query_row(
+                "SELECT COUNT(*) FROM media_attachment_processing_cleanup_evidence WHERE job_id=?1",
+                [job_id],
+                |r| r.get::<_, i64>(0)
+            )?))
+            .await
+            .unwrap(),
+            1
+        );
+        db.transaction(move|conn|{conn.execute("UPDATE media_attachment_processing_jobs SET state='claimed',claimed_at_unix_ms=1,claim_attempt=1 WHERE attachment_id=?1",[attachment_id.to_string()])?;cockpit_db::Db::transition_media_attachment_conn(conn,attachment_id,1,1,MediaAvailability::Probing,2)?;Ok(())}).await.unwrap();
         assert_eq!(
             recovery.process_retained_https_jobs(300_002).await.unwrap(),
             1

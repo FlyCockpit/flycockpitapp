@@ -2717,10 +2717,9 @@ CREATE TABLE remote_rename_journal (
       AND replace(artifact_id,'-','') NOT GLOB '*[^0-9a-f]*'
       AND replace(artifact_id,'-','')<>'00000000000000000000000000000000'
     ),
-    source_identity BLOB NOT NULL CHECK(length(source_identity) BETWEEN 1 AND 256),
-    source_parent_identity BLOB NOT NULL CHECK(length(source_parent_identity) BETWEEN 1 AND 256),
-    target_parent_identity BLOB NOT NULL CHECK(length(target_parent_identity) BETWEEN 1 AND 256),
-    target_identity BLOB CHECK(target_identity IS NULL OR length(target_identity) BETWEEN 1 AND 256),
+    source_identity BLOB NOT NULL CHECK(length(source_identity) = 57 AND substr(source_identity,1,4)=X'52464931' AND substr(source_identity,29,1) IN (X'01',X'02') AND substr(source_identity,50,8)<>zeroblob(8)),
+    source_parent_identity BLOB NOT NULL CHECK(length(source_parent_identity) = 57 AND substr(source_parent_identity,1,4)=X'52464931' AND substr(source_parent_identity,29,1) IN (X'01',X'02') AND substr(source_parent_identity,50,8)<>zeroblob(8)),
+    target_parent_identity BLOB NOT NULL CHECK(length(target_parent_identity) = 57 AND substr(target_parent_identity,1,4)=X'52464931' AND substr(target_parent_identity,29,1) IN (X'01',X'02') AND substr(target_parent_identity,50,8)<>zeroblob(8)),
     dispatch_generation INTEGER NOT NULL CHECK(dispatch_generation > 0),
     state TEXT NOT NULL CHECK(state IN ('prepared','artifact_synced','renamed','source_parent_synced','target_parent_synced','applied','ledger_committed')),
     created_at_ms INTEGER NOT NULL,
@@ -2738,7 +2737,6 @@ WHEN NEW.logical_attachment_id IS NOT OLD.logical_attachment_id
   OR NEW.source_identity IS NOT OLD.source_identity
   OR NEW.source_parent_identity IS NOT OLD.source_parent_identity
   OR NEW.target_parent_identity IS NOT OLD.target_parent_identity
-  OR NEW.target_identity IS NOT OLD.target_identity
   OR NEW.dispatch_generation < OLD.dispatch_generation
   OR NEW.updated_at_ms < OLD.updated_at_ms
   OR CASE OLD.state

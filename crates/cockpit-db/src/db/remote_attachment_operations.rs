@@ -4,8 +4,8 @@
 //! safe response bytes. Canonical request bytes, credentials, grants, and
 //! transport metadata have no representation here.
 
-use anyhow::{Context, Result, bail, ensure};
-use rusqlite::{Connection, OptionalExtension, params};
+use anyhow::{bail, ensure, Context, Result};
+use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
 use crate::db::Db;
@@ -135,10 +135,9 @@ pub struct RemoteRenameEvidence {
     pub artifact_id: String,
     pub dispatch_generation: u64,
     pub state: String,
-    pub source_identity: Vec<u8>,
-    pub source_parent_identity: Vec<u8>,
-    pub target_parent_identity: Vec<u8>,
-    pub target_identity: Option<Vec<u8>>,
+    pub source_identity: RemoteFilesystemIdentityV1,
+    pub source_parent_identity: RemoteFilesystemIdentityV1,
+    pub target_parent_identity: RemoteFilesystemIdentityV1,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,6 +148,67 @@ pub enum PrepareRemoteRenameOutcome {
     OperationConflict,
     OperationActorConflict,
     AttachmentLedgerCapacity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteFilesystemIdentityV1 {
+    pub filesystem_id: u64,
+    pub object_id: u128,
+    pub kind: u8,
+    pub len: u64,
+    pub mode: u32,
+    pub owner_id: u64,
+    pub link_count: u64,
+}
+
+impl RemoteFilesystemIdentityV1 {
+    pub const ENCODED_LEN: usize = 57;
+    pub fn encode(self) -> Result<[u8; Self::ENCODED_LEN]> {
+        ensure!(
+            matches!(self.kind, 1 | 2),
+            "invalid remote filesystem identity kind"
+        );
+        ensure!(
+            self.link_count > 0,
+            "remote filesystem identity has no links"
+        );
+        let mut out = [0; Self::ENCODED_LEN];
+        out[..4].copy_from_slice(b"RFI1");
+        out[4..12].copy_from_slice(&self.filesystem_id.to_be_bytes());
+        out[12..28].copy_from_slice(&self.object_id.to_be_bytes());
+        out[28] = self.kind;
+        out[29..37].copy_from_slice(&self.len.to_be_bytes());
+        out[37..41].copy_from_slice(&self.mode.to_be_bytes());
+        out[41..49].copy_from_slice(&self.owner_id.to_be_bytes());
+        out[49..57].copy_from_slice(&self.link_count.to_be_bytes());
+        Ok(out)
+    }
+    pub fn decode(value: &[u8]) -> Result<Self> {
+        ensure!(
+            value.len() == Self::ENCODED_LEN && &value[..4] == b"RFI1",
+            "invalid remote filesystem identity codec"
+        );
+        let array =
+            |range: std::ops::Range<usize>| -> Result<[u8; 8]> { Ok(value[range].try_into()?) };
+        let decoded = Self {
+            filesystem_id: u64::from_be_bytes(array(4..12)?),
+            object_id: u128::from_be_bytes(value[12..28].try_into()?),
+            kind: value[28],
+            len: u64::from_be_bytes(array(29..37)?),
+            mode: u32::from_be_bytes(value[37..41].try_into()?),
+            owner_id: u64::from_be_bytes(array(41..49)?),
+            link_count: u64::from_be_bytes(array(49..57)?),
+        };
+        ensure!(
+            matches!(decoded.kind, 1 | 2),
+            "invalid remote filesystem identity kind"
+        );
+        ensure!(
+            decoded.link_count > 0,
+            "remote filesystem identity has no links"
+        );
+        Ok(decoded)
+    }
 }
 
 pub struct TransactionalRemoteMutation<T> {
@@ -175,35 +235,13 @@ impl Db {
     pub async fn prepare_remote_rename_operation(
         &self,
         request: ReserveRemoteOperation<'_>,
-        source_identity: Option<&[u8]>,
-        source_parent_identity: Option<&[u8]>,
-        target_parent_identity: Option<&[u8]>,
-        target_identity: Option<&[u8]>,
+        source_identity: Option<RemoteFilesystemIdentityV1>,
+        source_parent_identity: Option<RemoteFilesystemIdentityV1>,
+        target_parent_identity: Option<RemoteFilesystemIdentityV1>,
     ) -> Result<PrepareRemoteRenameOutcome> {
         ensure!(
             request.operation_class == RemoteOperationClass::IdempotentAdapterMutation,
             "remote rename requires adapter class"
-        );
-        for value in [
-            source_identity,
-            source_parent_identity,
-            target_parent_identity,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            ensure!(
-                !value.is_empty() && value.len() <= 256,
-                "rename identity must be bounded"
-            );
-        }
-        ensure!(
-            target_identity.is_none_or(|value| !value.is_empty() && value.len() <= 256),
-            "target identity must be bounded"
-        );
-        ensure!(
-            target_identity.is_none(),
-            "remote rename is no-replace; target must be absent"
         );
         let owned = OwnedReserveRemoteOperation {
             logical_attachment_id: request.logical_attachment_id.into(),
@@ -214,17 +252,22 @@ impl Db {
             request_hash: request.request_hash,
             now_ms: request.now_ms,
         };
-        let source = source_identity.map(<[u8]>::to_vec);
-        let source_parent = source_parent_identity.map(<[u8]>::to_vec);
-        let target_parent = target_parent_identity.map(<[u8]>::to_vec);
-        let target = target_identity.map(<[u8]>::to_vec);
+        let source = source_identity
+            .map(RemoteFilesystemIdentityV1::encode)
+            .transpose()?;
+        let source_parent = source_parent_identity
+            .map(RemoteFilesystemIdentityV1::encode)
+            .transpose()?;
+        let target_parent = target_parent_identity
+            .map(RemoteFilesystemIdentityV1::encode)
+            .transpose()?;
         self.transaction(move |conn| match reserve_conn(conn,&owned)? {
             ReserveRemoteOperationOutcome::Reserved(_) => {
                 let source=source.context("new rename lacks source identity")?;
                 let source_parent=source_parent.context("new rename lacks source parent identity")?;
                 let target_parent=target_parent.context("new rename lacks target parent identity")?;
                 let artifact=Uuid::now_v7().to_string();
-                conn.execute("INSERT INTO remote_rename_journal(logical_attachment_id,operation_id,artifact_id,source_identity,source_parent_identity,target_parent_identity,target_identity,dispatch_generation,state,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,1,'prepared',?8,?8)",params![owned.logical_attachment_id,owned.operation_id,artifact,source,source_parent,target_parent,target,owned.now_ms])?;
+                conn.execute("INSERT INTO remote_rename_journal(logical_attachment_id,operation_id,artifact_id,source_identity,source_parent_identity,target_parent_identity,dispatch_generation,state,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,1,'prepared',?7,?7)",params![owned.logical_attachment_id,owned.operation_id,artifact,source,source_parent,target_parent,owned.now_ms])?;
                 conn.execute("UPDATE remote_attachment_operations SET state='dispatched',dispatch_generation=1 WHERE logical_attachment_id=?1 AND operation_id=?2 AND state='reserved'",params![owned.logical_attachment_id,owned.operation_id])?;
                 Ok(PrepareRemoteRenameOutcome::Prepared(load_remote_rename_evidence(conn,&owned.logical_attachment_id,&owned.operation_id)?))
             }
@@ -895,6 +938,47 @@ impl Db {
         self.transaction(move |conn| commit_conn(conn, &owned))
             .await
     }
+
+    /// Commits a staged rename only after its exact dispatch generation has
+    /// crossed every filesystem durability barrier. The journal transition,
+    /// safe response, and outbox append share one transaction.
+    pub async fn commit_remote_rename_operation(
+        &self,
+        request: CommitRemoteOperation<'_>,
+        expected_dispatch_generation: u64,
+    ) -> Result<CommitRemoteOperationOutcome> {
+        ensure!(
+            expected_dispatch_generation > 0,
+            "rename generation must be positive"
+        );
+        let generation = i64::try_from(expected_dispatch_generation)?;
+        let owned = OwnedCommitRemoteOperation {
+            logical_attachment_id: request.logical_attachment_id.to_owned(),
+            operation_id: request.operation_id.to_owned(),
+            safe_response: request.safe_response.to_vec(),
+            outbox_delivery_id: request.outbox_delivery_id.to_owned(),
+            outbox_kind: request.outbox_kind.to_owned(),
+            outbox_payload: request.outbox_payload.to_vec(),
+            now_ms: request.now_ms,
+        };
+        self.transaction(move |conn| {
+            let outcome = commit_conn_with_policy(conn, &owned, true)?;
+            if !matches!(outcome, CommitRemoteOperationOutcome::Committed { .. }) {
+                return Ok(outcome);
+            }
+            let changed = conn.execute(
+                "UPDATE remote_rename_journal SET state='ledger_committed',updated_at_ms=?4
+                 WHERE logical_attachment_id=?1 AND operation_id=?2 AND state='applied'
+                   AND dispatch_generation=?3
+                   AND dispatch_generation=(SELECT dispatch_generation FROM remote_attachment_operations
+                     WHERE logical_attachment_id=?1 AND operation_id=?2)",
+                params![owned.logical_attachment_id, owned.operation_id, generation, owned.now_ms],
+            )?;
+            ensure!(changed == 1, "rename commit requires one applied row at the expected generation");
+            Ok(outcome)
+        })
+        .await
+    }
 }
 
 struct OwnedCommitRemoteOperation {
@@ -1015,7 +1099,22 @@ fn load_remote_rename_evidence(
     attachment: &str,
     operation: &str,
 ) -> Result<RemoteRenameEvidence> {
-    conn.query_row("SELECT artifact_id,dispatch_generation,state,source_identity,source_parent_identity,target_parent_identity,target_identity FROM remote_rename_journal WHERE logical_attachment_id=?1 AND operation_id=?2",params![attachment,operation],|row|Ok(RemoteRenameEvidence{artifact_id:row.get(0)?,dispatch_generation:row.get::<_,i64>(1)?.try_into().map_err(|error|rusqlite::Error::FromSqlConversionFailure(1,rusqlite::types::Type::Integer,Box::new(error)))?,state:row.get(2)?,source_identity:row.get(3)?,source_parent_identity:row.get(4)?,target_parent_identity:row.get(5)?,target_identity:row.get(6)?})).context("loading remote rename evidence")
+    let (artifact_id, generation, state, source, source_parent, target_parent): (
+        String,
+        i64,
+        String,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+    ) = conn.query_row("SELECT artifact_id,dispatch_generation,state,source_identity,source_parent_identity,target_parent_identity FROM remote_rename_journal WHERE logical_attachment_id=?1 AND operation_id=?2",params![attachment,operation],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))).context("loading remote rename evidence")?;
+    Ok(RemoteRenameEvidence {
+        artifact_id,
+        dispatch_generation: generation.try_into()?,
+        state,
+        source_identity: RemoteFilesystemIdentityV1::decode(&source)?,
+        source_parent_identity: RemoteFilesystemIdentityV1::decode(&source_parent)?,
+        target_parent_identity: RemoteFilesystemIdentityV1::decode(&target_parent)?,
+    })
 }
 
 fn validate_snapshot_high_water(
@@ -1044,9 +1143,28 @@ fn commit_conn(
     conn: &Connection,
     request: &OwnedCommitRemoteOperation,
 ) -> Result<CommitRemoteOperationOutcome> {
+    commit_conn_with_policy(conn, request, false)
+}
+
+fn commit_conn_with_policy(
+    conn: &Connection,
+    request: &OwnedCommitRemoteOperation,
+    allow_remote_rename: bool,
+) -> Result<CommitRemoteOperationOutcome> {
     validate_uuid("logical attachment id", &request.logical_attachment_id)?;
     validate_operation_id(&request.operation_id)?;
     validate_uuid("outbox delivery id", &request.outbox_delivery_id)?;
+    if !allow_remote_rename {
+        let has_rename: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM remote_rename_journal WHERE logical_attachment_id=?1 AND operation_id=?2)",
+            params![request.logical_attachment_id, request.operation_id],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            !has_rename,
+            "remote rename requires generation-bound commit"
+        );
+    }
     if request.safe_response.len() > MAX_SAFE_RESPONSE_BYTES {
         bail!("safe response exceeds 512 KiB");
     }
@@ -1116,17 +1234,6 @@ fn commit_conn(
             request.safe_response,
             next_event_seq,
             request.now_ms,
-        ],
-    )?;
-    conn.execute(
-        "UPDATE remote_rename_journal SET state='ledger_committed',updated_at_ms=?3
-         WHERE logical_attachment_id=?1 AND operation_id=?2 AND state='applied'
-           AND dispatch_generation=(SELECT dispatch_generation FROM remote_attachment_operations
-             WHERE logical_attachment_id=?1 AND operation_id=?2)",
-        params![
-            request.logical_attachment_id,
-            request.operation_id,
-            request.now_ms
         ],
     )?;
     Ok(CommitRemoteOperationOutcome::Committed {
@@ -1228,8 +1335,8 @@ mod tests {
         let mut failed = request();
         failed.operation_id = failed_operation;
         failed.request_hash = [7; 32];
-        assert!(
-            db.execute_transactional_remote_operation::<(), _>(failed, |conn| {
+        assert!(db
+            .execute_transactional_remote_operation::<(), _>(failed, |conn| {
                 conn.execute(
                     "INSERT INTO app_flags(key,seen_at) VALUES ('rollback-test',1)",
                     [],
@@ -1237,8 +1344,7 @@ mod tests {
                 anyhow::bail!("injected crash")
             })
             .await
-            .is_err()
-        );
+            .is_err());
         assert_eq!(
             db.read(|conn| Db::app_flag_version_conn(conn, "rollback-test"))
                 .await
@@ -1265,15 +1371,14 @@ mod tests {
         let mut wrong_class = request();
         wrong_class.operation_id = "01890f3e-4c00-7000-8000-000000000097";
         wrong_class.operation_class = RemoteOperationClass::IdempotentAdapterMutation;
-        assert!(
-            db.execute_transactional_remote_operation::<(), _>(wrong_class, |_| {
+        assert!(db
+            .execute_transactional_remote_operation::<(), _>(wrong_class, |_| {
                 panic!("wrong-class operation must not execute domain closure")
             })
             .await
             .unwrap_err()
             .to_string()
-            .contains("requires transactional_mutation class")
-        );
+            .contains("requires transactional_mutation class"));
     }
 
     #[tokio::test]
@@ -1312,13 +1417,11 @@ mod tests {
         // Simulate process loss after commit and before the in-memory WakeGoal.
         drop(db);
         let reopened = Db::open(&path).unwrap();
-        assert!(
-            reopened
-                .current_session_goal(session_id, false)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(reopened
+            .current_session_goal(session_id, false)
+            .await
+            .unwrap()
+            .is_none());
         let replay = reopened
             .execute_transactional_remote_operation(request(), |_| {
                 panic!("reopen replay must not repeat goal transition")
@@ -1343,6 +1446,18 @@ mod tests {
             operation_class: RemoteOperationClass::TransactionalMutation,
             request_hash: hash,
             now_ms: 10,
+        }
+    }
+
+    fn filesystem_identity(seed: u64, kind: u8) -> RemoteFilesystemIdentityV1 {
+        RemoteFilesystemIdentityV1 {
+            filesystem_id: 7,
+            object_id: u128::from(seed),
+            kind,
+            len: seed,
+            mode: 0o700,
+            owner_id: 42,
+            link_count: 1,
         }
     }
 
@@ -1446,27 +1561,24 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let mut invalid = reserve("01890f3e-4c00-7000-8000-000000000009", [1; 32]);
         invalid.authenticated_device_generation = 0;
-        assert!(
-            db.reserve_remote_attachment_operation(invalid)
-                .await
-                .is_err()
-        );
+        assert!(db
+            .reserve_remote_attachment_operation(invalid)
+            .await
+            .is_err());
         let invalid = ReserveRemoteOperation {
             operation_id: "00000000000040008000000000000009",
             ..reserve("01890f3e-4c00-7000-8000-000000000009", [1; 32])
         };
-        assert!(
-            db.reserve_remote_attachment_operation(invalid)
-                .await
-                .is_err()
-        );
+        assert!(db
+            .reserve_remote_attachment_operation(invalid)
+            .await
+            .is_err());
         let mut overflow = reserve("01890f3e-4c00-7000-8000-000000000009", [1; 32]);
         overflow.authenticated_device_generation = u64::MAX;
-        assert!(
-            db.reserve_remote_attachment_operation(overflow)
-                .await
-                .is_err()
-        );
+        assert!(db
+            .reserve_remote_attachment_operation(overflow)
+            .await
+            .is_err());
     }
 
     #[test]
@@ -1520,26 +1632,23 @@ mod tests {
             .unwrap();
         conn.execute("INSERT INTO ops VALUES ('a', NULL)", [])
             .unwrap();
-        assert!(
-            conn.execute("INSERT INTO ops VALUES ('a', NULL)", [])
-                .is_err()
-        );
+        assert!(conn
+            .execute("INSERT INTO ops VALUES ('a', NULL)", [])
+            .is_err());
         conn.execute("UPDATE ops SET response = zeroblob(4) WHERE rowid = 1", [])
             .unwrap();
         conn.execute("UPDATE ops SET response = zeroblob(4) WHERE rowid = 2", [])
             .unwrap();
-        assert!(
-            conn.execute("UPDATE ops SET response = zeroblob(5) WHERE rowid = 2", [])
-                .is_err()
-        );
+        assert!(conn
+            .execute("UPDATE ops SET response = zeroblob(5) WHERE rowid = 2", [])
+            .is_err());
         conn.execute("INSERT INTO events VALUES ('a', zeroblob(4))", [])
             .unwrap();
         conn.execute("INSERT INTO events VALUES ('a', zeroblob(4))", [])
             .unwrap();
-        assert!(
-            conn.execute("INSERT INTO events VALUES ('a', zeroblob(1))", [])
-                .is_err()
-        );
+        assert!(conn
+            .execute("INSERT INTO events VALUES ('a', zeroblob(1))", [])
+            .is_err());
     }
 
     #[tokio::test]
@@ -1550,8 +1659,8 @@ mod tests {
             .await
             .unwrap();
         let oversized = vec![0_u8; MAX_SAFE_RESPONSE_BYTES + 1];
-        assert!(
-            db.commit_remote_attachment_operation(CommitRemoteOperation {
+        assert!(db
+            .commit_remote_attachment_operation(CommitRemoteOperation {
                 logical_attachment_id: ATTACHMENT,
                 operation_id: operation,
                 safe_response: &oversized,
@@ -1561,10 +1670,9 @@ mod tests {
                 now_ms: 2,
             })
             .await
-            .is_err()
-        );
-        assert!(
-            db.commit_remote_attachment_operation(CommitRemoteOperation {
+            .is_err());
+        assert!(db
+            .commit_remote_attachment_operation(CommitRemoteOperation {
                 logical_attachment_id: ATTACHMENT,
                 operation_id: operation,
                 safe_response: b"safe",
@@ -1574,8 +1682,7 @@ mod tests {
                 now_ms: 2,
             })
             .await
-            .is_err()
-        );
+            .is_err());
     }
 
     #[tokio::test]
@@ -1617,8 +1724,8 @@ mod tests {
             let db = Db::open_in_memory().unwrap();
             let attachment = attachment.to_owned();
             let device = device.to_owned();
-            assert!(
-                db.write(move |conn| {
+            assert!(db
+                .write(move |conn| {
                     conn.execute(
                         "INSERT INTO remote_attachment_operations
                          (logical_attachment_id, operation_id, authenticated_device_id,
@@ -1631,8 +1738,7 @@ mod tests {
                     Ok(())
                 })
                 .await
-                .is_err()
-            );
+                .is_err());
         }
     }
 
@@ -1793,22 +1899,20 @@ mod tests {
                 );
                 assert!(conn.execute(&sql, params![attachment, operation]).is_err());
             }
-            assert!(
-                conn.execute(
+            assert!(conn
+                .execute(
                     "UPDATE remote_attachment_outbox SET kind = 'changed'
                  WHERE logical_attachment_id = ?1 AND event_seq = 1",
                     [&attachment],
                 )
-                .is_err()
-            );
-            assert!(
-                conn.execute(
+                .is_err());
+            assert!(conn
+                .execute(
                     "DELETE FROM remote_attachment_outbox
                  WHERE logical_attachment_id = ?1 AND event_seq = 1",
                     [&attachment],
                 )
-                .is_err()
-            );
+                .is_err());
             Ok(())
         })
         .await
@@ -1970,12 +2074,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(first.attempts, 1);
-        assert!(
-            db.claim_remote_outbox_delivery("worker", "wake_goal", None, None, 119, 100)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(db
+            .claim_remote_outbox_delivery("worker", "wake_goal", None, None, 119, 100)
+            .await
+            .unwrap()
+            .is_none());
         let second = db
             .claim_remote_outbox_delivery("worker", "wake_goal", None, None, 120, 100)
             .await
@@ -1984,22 +2087,19 @@ mod tests {
         assert_eq!(second.delivery_id, first.delivery_id);
         assert_eq!(second.attempts, 2);
         assert_ne!(second.lease_id, first.lease_id);
-        assert!(
-            !db.ack_remote_outbox_delivery(ATTACHMENT, delivery, "worker", &first.lease_id, 121)
-                .await
-                .unwrap()
-        );
-        assert!(
-            db.ack_remote_outbox_delivery(ATTACHMENT, delivery, "worker", &second.lease_id, 121)
-                .await
-                .unwrap()
-        );
-        assert!(
-            db.claim_remote_outbox_delivery("worker", "wake_goal", None, None, 500, 100)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(!db
+            .ack_remote_outbox_delivery(ATTACHMENT, delivery, "worker", &first.lease_id, 121)
+            .await
+            .unwrap());
+        assert!(db
+            .ack_remote_outbox_delivery(ATTACHMENT, delivery, "worker", &second.lease_id, 121)
+            .await
+            .unwrap());
+        assert!(db
+            .claim_remote_outbox_delivery("worker", "wake_goal", None, None, 500, 100)
+            .await
+            .unwrap()
+            .is_none());
         let transport = db
             .claim_remote_outbox_delivery("transport", "wake_goal", None, None, 500, 100)
             .await
@@ -2033,12 +2133,11 @@ mod tests {
             )?;
             Ok(())
         }).await.unwrap();
-        assert!(
-            db.claim_remote_outbox_delivery("transport", "wake_goal", None, None, 700, 100)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(db
+            .claim_remote_outbox_delivery("transport", "wake_goal", None, None, 700, 100)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -2083,12 +2182,11 @@ mod tests {
         }
         {
             let db = Db::open(&path).unwrap();
-            assert!(
-                db.claim_remote_outbox_delivery("worker", "restart_effect", None, None, 109, 100)
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(db
+                .claim_remote_outbox_delivery("worker", "restart_effect", None, None, 109, 100)
+                .await
+                .unwrap()
+                .is_none());
             let lease = db
                 .claim_remote_outbox_delivery("worker", "restart_effect", None, None, 110, 100)
                 .await
@@ -2096,9 +2194,10 @@ mod tests {
                 .unwrap();
             assert_eq!(lease.delivery_id, delivery);
             assert_eq!(lease.attempts, 2);
-            assert!(db.ack_remote_outbox_delivery(
-                attachment, delivery, "worker", &lease.lease_id, 111,
-            ).await.unwrap());
+            assert!(db
+                .ack_remote_outbox_delivery(attachment, delivery, "worker", &lease.lease_id, 111,)
+                .await
+                .unwrap());
             let attachment_owned = attachment.to_owned();
             assert!(
                 db.write(move |conn| {
@@ -2142,16 +2241,15 @@ mod tests {
                 .unwrap(),
             BeginNonrepeatableRemoteOperationOutcome::OutcomeUnknown(_)
         ));
-        assert!(
-            db.mark_nonrepeatable_remote_operation_outcome_unknown(
+        assert!(db
+            .mark_nonrepeatable_remote_operation_outcome_unknown(
                 request().logical_attachment_id,
                 request().operation_id,
                 br#"{"outcome":"unknown"}"#,
                 2,
             )
             .await
-            .unwrap()
-        );
+            .unwrap());
         assert_eq!(
             db.begin_nonrepeatable_remote_operation(request())
                 .await
@@ -2222,10 +2320,9 @@ mod tests {
             let PrepareRemoteRenameOutcome::Prepared(evidence) = db
                 .prepare_remote_rename_operation(
                     request(),
-                    Some(b"source"),
-                    Some(b"source-parent"),
-                    Some(b"target-parent"),
-                    None,
+                    Some(filesystem_identity(1, 1)),
+                    Some(filesystem_identity(2, 2)),
+                    Some(filesystem_identity(3, 2)),
                 )
                 .await
                 .unwrap()
@@ -2233,8 +2330,8 @@ mod tests {
                 panic!("prepared")
             };
             artifact = evidence.artifact_id;
-            assert!(
-                db.advance_remote_rename_operation(
+            assert!(db
+                .advance_remote_rename_operation(
                     ATTACHMENT,
                     operation,
                     1,
@@ -2243,12 +2340,11 @@ mod tests {
                     11
                 )
                 .await
-                .unwrap()
-            );
+                .unwrap());
         }
         let db = Db::open(&path).unwrap();
         let PrepareRemoteRenameOutcome::Reconcile(evidence) = db
-            .prepare_remote_rename_operation(request(), None, None, None, None)
+            .prepare_remote_rename_operation(request(), None, None, None)
             .await
             .unwrap()
         else {
@@ -2270,8 +2366,8 @@ mod tests {
             .unwrap(),
             "late generation cannot advance a barrier"
         );
-        assert!(
-            db.advance_remote_rename_operation(
+        assert!(db
+            .advance_remote_rename_operation(
                 ATTACHMENT,
                 operation,
                 2,
@@ -2280,8 +2376,86 @@ mod tests {
                 12
             )
             .await
-            .unwrap()
+            .unwrap());
+        let commit = || CommitRemoteOperation {
+            logical_attachment_id: ATTACHMENT,
+            operation_id: operation,
+            safe_response: b"rename-ack",
+            outbox_delivery_id: "00000000-0000-4000-8000-0000000000a5",
+            outbox_kind: "filesystem_changed",
+            outbox_payload: b"rename",
+            now_ms: 20,
+        };
+        assert!(db
+            .commit_remote_rename_operation(commit(), 2)
+            .await
+            .is_err());
+        assert!(db
+            .commit_remote_attachment_operation(commit())
+            .await
+            .is_err());
+        let (state, outbox): (String, i64) = db
+            .transaction(move |conn| {
+                Ok((
+                    conn.query_row(
+                        "SELECT state FROM remote_attachment_operations WHERE logical_attachment_id=?1 AND operation_id=?2",
+                        params![ATTACHMENT, operation],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM remote_attachment_outbox WHERE logical_attachment_id=?1",
+                        [ATTACHMENT],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(state, "dispatched");
+        assert_eq!(outbox, 0);
+        for (from, to) in [
+            ("renamed", "source_parent_synced"),
+            ("source_parent_synced", "target_parent_synced"),
+            ("target_parent_synced", "applied"),
+        ] {
+            assert!(db
+                .advance_remote_rename_operation(ATTACHMENT, operation, 2, from, to, 21)
+                .await
+                .unwrap());
+        }
+        assert!(db
+            .commit_remote_rename_operation(commit(), 1)
+            .await
+            .is_err());
+        assert!(matches!(
+            db.commit_remote_rename_operation(commit(), 2)
+                .await
+                .unwrap(),
+            CommitRemoteOperationOutcome::Committed { .. }
+        ));
+        assert_eq!(
+            db.prepare_remote_rename_operation(request(), None, None, None)
+                .await
+                .unwrap(),
+            PrepareRemoteRenameOutcome::Replay(b"rename-ack".to_vec())
         );
+    }
+
+    #[test]
+    fn remote_filesystem_identity_codec_is_versioned_and_strict() {
+        let identity = filesystem_identity(9, 1);
+        let encoded = identity.encode().unwrap();
+        assert_eq!(
+            RemoteFilesystemIdentityV1::decode(&encoded).unwrap(),
+            identity
+        );
+        let mut bad_magic = encoded;
+        bad_magic[3] = b'2';
+        assert!(RemoteFilesystemIdentityV1::decode(&bad_magic).is_err());
+        let mut bad_kind = encoded;
+        bad_kind[28] = 3;
+        assert!(RemoteFilesystemIdentityV1::decode(&bad_kind).is_err());
+        assert!(RemoteFilesystemIdentityV1::decode(&encoded[..56]).is_err());
     }
 
     #[tokio::test]
@@ -2329,24 +2503,22 @@ mod tests {
                 .unwrap(),
             0
         );
-        assert!(
-            db.remote_operation_status(ATTACHMENT, operation)
-                .await
-                .unwrap()
-                .is_some()
-        );
+        assert!(db
+            .remote_operation_status(ATTACHMENT, operation)
+            .await
+            .unwrap()
+            .is_some());
         assert_eq!(
             db.compact_closed_remote_attachment_operation_ledger(ATTACHMENT, 1, 1, deadline)
                 .await
                 .unwrap(),
             1
         );
-        assert!(
-            db.remote_operation_status(ATTACHMENT, operation)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(db
+            .remote_operation_status(ATTACHMENT, operation)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -2371,23 +2543,21 @@ mod tests {
             .close_remote_attachment_operation_ledger(ATTACHMENT, 100)
             .await
             .unwrap();
-        assert!(
-            db.close_remote_attachment_operation_ledger(ATTACHMENT, 101)
-                .await
-                .is_err()
-        );
+        assert!(db
+            .close_remote_attachment_operation_ledger(ATTACHMENT, 101)
+            .await
+            .is_err());
         assert!(
             db.compact_closed_remote_attachment_operation_ledger(ATTACHMENT, 0, 1, deadline)
                 .await
                 .is_err(),
             "an uncovered event FK prevents premature retirement"
         );
-        assert!(
-            db.remote_operation_status(ATTACHMENT, operation)
-                .await
-                .unwrap()
-                .is_some()
-        );
+        assert!(db
+            .remote_operation_status(ATTACHMENT, operation)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]

@@ -2921,7 +2921,9 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 {
                     return Ok(response);
                 }
-                let response = state.terminal_host.resize(terminal_id, binding, cols, rows)?;
+                let response = state
+                    .terminal_host
+                    .resize(terminal_id, binding, cols, rows)?;
                 return commit_remote_nonrepeatable(operation, ctx, "terminal_resize", response)
                     .await;
             }

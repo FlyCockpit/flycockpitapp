@@ -1055,6 +1055,8 @@ async fn authorized_fcor_resources_normalize_attach_and_nested_schedule_roots() 
         ctx.upload_accounting.clone(),
         remote_principal(),
         ctx.terminal_host.clone(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
     );
     assert!(
         authorize_request_context(&scheduled, &denied, &ctx)
@@ -1205,6 +1207,8 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
         ctx.upload_accounting.clone(),
         remote(Some(actor.clone())),
         ctx.terminal_host.clone(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
     );
     let mut shared = state.shared_snapshot();
     let mut concurrent = ConcurrentRequestRuntime::with_permits_for_test(0);
@@ -1239,6 +1243,8 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
         ctx.upload_accounting.clone(),
         remote(None),
         ctx.terminal_host.clone(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
     );
     let mut shared = state.shared_snapshot();
     let mut concurrent = ConcurrentRequestRuntime::new();
@@ -2195,6 +2201,8 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
         ctx.upload_accounting.clone(),
         principal,
         ctx.terminal_host.clone(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
     );
     let mut shared = state.shared_snapshot();
     let operation = proto::RemoteOperationIdentityV1::new(
@@ -2880,6 +2888,8 @@ async fn remote_scheduler_mutation_is_local_only_before_ledger_or_domain_write()
         ctx.upload_accounting.clone(),
         principal,
         ctx.terminal_host.clone(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
     );
     let mut shared = state.shared_snapshot();
     let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
@@ -2965,6 +2975,8 @@ async fn remote_cancel_invocation_applies_replays_and_conflicts_once() {
         ctx.upload_accounting.clone(),
         principal,
         ctx.terminal_host.clone(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
     );
     let mut shared = state.shared_snapshot();
     let operation = proto::RemoteOperationIdentityV1::new(
@@ -3142,11 +3154,15 @@ async fn remote_outbox_replay_is_actor_bound_ordered_and_token_correlated() {
         ctx.upload_accounting.clone(),
         principal_for("33333333-3333-4333-8333-333333333340"),
         ctx.terminal_host.clone(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
     );
     let mut second = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         principal_for("33333333-3333-4333-8333-333333333341"),
         ctx.terminal_host.clone(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
     );
     let mut first_shared = first.shared_snapshot();
     let mut second_shared = second.shared_snapshot();

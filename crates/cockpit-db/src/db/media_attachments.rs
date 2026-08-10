@@ -642,6 +642,88 @@ pub struct RegisterLocalPathMediaV1 {
     pub path: String,
 }
 
+/// Owner-authorized daemon request to retain a remote HTTPS object. The URL
+/// exists only at this ingress boundary; no receipt or attachment row stores
+/// it verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetainHttpsMediaV1 {
+    pub schema_version: u8,
+    pub kind: String,
+    #[serde(with = "strict_uuid_v7")]
+    pub local_operation_id: Uuid,
+    pub owner_principal_digest: String,
+    #[serde(with = "strict_uuid_v7")]
+    pub session_id: Uuid,
+    pub canonical_project_digest: String,
+    #[serde(with = "strict_uuid_v7")]
+    pub client_draft_id: Uuid,
+    pub requested_media_kind: RequestedLocalPathMediaKind,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpsRedirectLocationClassV1 {
+    SameOrigin,
+    CrossOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpsRetentionRejectionReasonV1 {
+    SourceUnavailable,
+    ResourceLimit,
+    InvalidHttpsSource,
+    StorageFailure,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HttpsRetentionResultV1 {
+    Retained {
+        #[serde(with = "strict_uuid_v7")]
+        attachment_id: Uuid,
+        attachment_version: u64,
+        availability_state: String,
+        availability_generation: u64,
+        reference_generation: u64,
+        reservation_id: String,
+        reservation_digest: String,
+        source_evidence_digest: String,
+    },
+    Rejected {
+        reason: HttpsRetentionRejectionReasonV1,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetainedHttpsMediaReceiptV1 {
+    pub schema_version: u8,
+    pub kind: String,
+    #[serde(with = "strict_uuid_v7")]
+    pub receipt_id: Uuid,
+    #[serde(with = "strict_uuid_v7")]
+    pub local_operation_id: Uuid,
+    pub owner_principal_digest: String,
+    #[serde(with = "strict_uuid_v7")]
+    pub session_id: Uuid,
+    pub canonical_project_digest: String,
+    #[serde(with = "strict_uuid_v7")]
+    pub client_draft_id: Uuid,
+    pub operation_request_digest: String,
+    pub semantic_command_digest: String,
+    pub origin_scheme: String,
+    pub redirect_location_classes: Vec<HttpsRedirectLocationClassV1>,
+    pub path_segment_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safe_basename: Option<String>,
+    pub fetched_at_unix_ms: i64,
+    pub result: HttpsRetentionResultV1,
+    pub committed_at_unix_ms: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalPathRegistrationRejectionReason {
@@ -2430,6 +2512,67 @@ text_enum!(MediaAvailability, {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn https_media_ingest_request_and_redacted_receipt_are_closed() {
+        let operation_id = Uuid::now_v7();
+        let session_id = Uuid::now_v7();
+        let draft_id = Uuid::now_v7();
+        let request_json = serde_json::json!({
+            "schemaVersion": 1,
+            "kind": "retainHttpsMedia",
+            "localOperationId": operation_id,
+            "ownerPrincipalDigest": "11".repeat(32),
+            "sessionId": session_id,
+            "canonicalProjectDigest": "22".repeat(32),
+            "clientDraftId": draft_id,
+            "requestedMediaKind": "image",
+            "url": "https://media.example.test/private/signed.png?token=secret"
+        });
+        let request: RetainHttpsMediaV1 = serde_json::from_value(request_json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&request).unwrap(), request_json);
+
+        let receipt = RetainedHttpsMediaReceiptV1 {
+            schema_version: 1,
+            kind: "retainedHttpsMediaReceipt".into(),
+            receipt_id: Uuid::now_v7(),
+            local_operation_id: operation_id,
+            owner_principal_digest: "11".repeat(32),
+            session_id,
+            canonical_project_digest: "22".repeat(32),
+            client_draft_id: draft_id,
+            operation_request_digest: "33".repeat(32),
+            semantic_command_digest: "44".repeat(32),
+            origin_scheme: "https".into(),
+            redirect_location_classes: vec![HttpsRedirectLocationClassV1::CrossOrigin],
+            path_segment_count: 2,
+            safe_basename: Some("signed.png".into()),
+            fetched_at_unix_ms: 1,
+            result: HttpsRetentionResultV1::Rejected {
+                reason: HttpsRetentionRejectionReasonV1::SourceUnavailable,
+            },
+            committed_at_unix_ms: 2,
+        };
+        let encoded = serde_json::to_string(&receipt).unwrap();
+        assert!(!encoded.contains("media.example"));
+        assert!(!encoded.contains("private/"));
+        assert!(!encoded.contains("token"));
+        assert!(!encoded.contains("secret"));
+        assert_eq!(
+            serde_json::from_str::<RetainedHttpsMediaReceiptV1>(&encoded).unwrap(),
+            receipt
+        );
+
+        let mut unknown = request_json.clone();
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("extra".into(), true.into());
+        assert!(serde_json::from_value::<RetainHttpsMediaV1>(unknown).is_err());
+        let mut malformed = request_json;
+        malformed["clientDraftId"] = serde_json::json!(draft_id.to_string().to_uppercase());
+        assert!(serde_json::from_value::<RetainHttpsMediaV1>(malformed).is_err());
+    }
 
     fn id(value: u128) -> Uuid {
         Uuid::from_u128(value)

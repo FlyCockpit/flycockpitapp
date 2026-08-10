@@ -64,18 +64,6 @@ pub enum ImageSpendDispatchEvidence {
     SubmissionUnknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreDispatchCancellationEvidence(ExternalJournalToken);
-
-impl PreDispatchCancellationEvidence {
-    pub fn parse(identity: &str) -> Result<Self> {
-        Ok(Self(ExternalJournalToken::parse(identity)?))
-    }
-    fn identity(&self) -> &str {
-        self.0.as_str()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,6 +293,165 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn calendar_and_rolling_epochs_advance_from_reservation_clock() {
+        for (project, settings, rollover_ms) in [
+            ("calendar", finite(100), 2_700_000_000),
+            (
+                "rolling",
+                ImageSpendSettings {
+                    project_epoch: Some(ProjectEpochPolicy::Rolling {
+                        duration_seconds: 86_400,
+                        anchor: SavedInstant {
+                            unix_ms: 0,
+                            monotonic_sequence: 1,
+                        },
+                    }),
+                    ..finite(100)
+                },
+                86_400_000,
+            ),
+        ] {
+            let db = Db::open_in_memory().unwrap();
+            db.save_image_spend_policy(project.into(), settings, None, 0)
+                .await
+                .unwrap();
+            let mut scope = keys("first");
+            scope.project_key = project.into();
+            db.reserve_image_spend(
+                "first".into(),
+                scope,
+                vec![AttemptMaximum {
+                    attempt_id: "a".into(),
+                    usd_micros: Some(1),
+                }],
+                1,
+                0,
+            )
+            .await
+            .unwrap();
+            let mut scope = keys("second");
+            scope.project_key = project.into();
+            db.reserve_image_spend(
+                "second".into(),
+                scope,
+                vec![AttemptMaximum {
+                    attempt_id: "b".into(),
+                    usd_micros: Some(1),
+                }],
+                1,
+                rollover_ms,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                db.image_spend_diagnostic("second".into())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .epoch_sequence,
+                2
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_epoch_rollover_cas_advances_once() {
+        let db = Db::open_in_memory().unwrap();
+        db.save_image_spend_policy("project".into(), finite(100), None, 0)
+            .await
+            .unwrap();
+        let first = db.reserve_image_spend(
+            "race-a".into(),
+            keys("race-a"),
+            vec![AttemptMaximum {
+                attempt_id: "a".into(),
+                usd_micros: Some(1),
+            }],
+            1,
+            2_700_000_000,
+        );
+        let second = db.reserve_image_spend(
+            "race-b".into(),
+            keys("race-b"),
+            vec![AttemptMaximum {
+                attempt_id: "b".into(),
+                usd_micros: Some(1),
+            }],
+            1,
+            2_700_000_000,
+        );
+        let (first, second) = tokio::join!(first, second);
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(
+            db.image_spend_diagnostic("race-a".into())
+                .await
+                .unwrap()
+                .unwrap()
+                .epoch_sequence,
+            2
+        );
+        assert_eq!(
+            db.image_spend_diagnostic("race-b".into())
+                .await
+                .unwrap()
+                .unwrap()
+                .epoch_sequence,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn journal_fault_rolls_back_epoch_head_advance() {
+        let db = Db::open_in_memory().unwrap();
+        db.save_image_spend_policy("project".into(), finite(10), None, 0)
+            .await
+            .unwrap();
+        let failed = db
+            .reserve_and_prepare_image_spend(ReserveAndPrepareImageSpend {
+                reservation_id: "future".into(),
+                keys: keys("future"),
+                attempts: vec![AttemptMaximum {
+                    attempt_id: "a".into(),
+                    usd_micros: Some(1),
+                }],
+                expected_policy_version: 1,
+                attempt_id: "a".into(),
+                journal: PrepareExternalOperation {
+                    operation_kind: ExternalJournalToken::parse("image_generation").unwrap(),
+                    owner_session_id: ExternalJournalToken::parse("wrong").unwrap(),
+                    idempotency_key: ExternalJournalToken::parse("future-key").unwrap(),
+                    payload_digest: ExternalJournalDigest::of(b"p"),
+                    payload_len: 1,
+                    provider_idempotency: None,
+                },
+                created_at_ms: 2_700_000_000,
+            })
+            .await;
+        assert!(failed.is_err());
+        db.reserve_image_spend(
+            "present".into(),
+            keys("present"),
+            vec![AttemptMaximum {
+                attempt_id: "b".into(),
+                usd_micros: Some(1),
+            }],
+            1,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.image_spend_diagnostic("present".into())
+                .await
+                .unwrap()
+                .unwrap()
+                .epoch_sequence,
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn unknown_requires_all_unlimited_and_late_cost_charges_once() {
         let db = Db::open_in_memory().unwrap();
         db.save_image_spend_policy("project".into(), finite(10), None, 0)
@@ -348,13 +495,9 @@ mod tests {
             .unwrap();
         assert!(reservation.cost_unknown);
         assert!(
-            db.cancel_image_spend_before_dispatch(
-                "unknown".into(),
-                PreDispatchCancellationEvidence::parse("proof").unwrap(),
-                2,
-            )
-            .await
-            .unwrap()
+            db.cancel_image_spend_before_dispatch("unknown".into(), 2)
+                .await
+                .unwrap()
         );
         assert!(
             db.reconcile_image_spend(
@@ -519,13 +662,9 @@ mod tests {
         )
         .await
         .unwrap();
-        db.cancel_image_spend_before_dispatch(
-            "released".into(),
-            PreDispatchCancellationEvidence::parse("not-accepted").unwrap(),
-            5,
-        )
-        .await
-        .unwrap();
+        db.cancel_image_spend_before_dispatch("released".into(), 5)
+            .await
+            .unwrap();
         db.reconcile_image_spend(
             "released".into(),
             "c".into(),
@@ -607,13 +746,9 @@ mod tests {
             )
             .await
             .unwrap();
-            db.cancel_image_spend_before_dispatch(
-                "cancelled".into(),
-                PreDispatchCancellationEvidence::parse("cancel").unwrap(),
-                1,
-            )
-            .await
-            .unwrap();
+            db.cancel_image_spend_before_dispatch("cancelled".into(), 1)
+                .await
+                .unwrap();
         }
         let reopened = Db::open(&path).unwrap();
         let policy = reopened
@@ -1201,7 +1336,7 @@ impl Db {
     ) -> Result<ExternalTransitionOutcome> {
         self.transaction(move |conn| {
             let bound: Option<i64> = conn.query_row(
-                "SELECT 1 FROM image_spend_attempt_dispatches WHERE reservation_id=?1 AND attempt_id=?2 AND external_operation_id=?3",
+                "SELECT 1 FROM image_spend_attempt_dispatches d JOIN image_spend_reservations r USING(reservation_id) WHERE d.reservation_id=?1 AND d.attempt_id=?2 AND d.external_operation_id=?3 AND r.state='reserved'",
                 params![reservation_id, attempt_id, operation_id.to_string()], |row| row.get(0),
             ).optional()?;
             if bound.is_none() { bail!("external operation is not bound to the image spend attempt"); }
@@ -1285,7 +1420,6 @@ impl Db {
     pub async fn cancel_image_spend_before_dispatch(
         &self,
         reservation_id: String,
-        evidence: PreDispatchCancellationEvidence,
         at_ms: i64,
     ) -> Result<bool> {
         self.transaction(move |conn| {
@@ -1296,7 +1430,13 @@ impl Db {
             if possibly_accepted != 0 {
                 bail!("provider acceptance is possible; retain the image spend reservation");
             }
-            let changed=conn.execute("UPDATE image_spend_reservations SET state='released',release_proof_identity=?2,released_at_ms=?3 WHERE reservation_id=?1 AND state='reserved'",params![reservation_id,evidence.identity(),at_ms])?;
+            let rejected_or_unprepared: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM image_spend_attempts a LEFT JOIN image_spend_attempt_dispatches d USING(reservation_id,attempt_id) LEFT JOIN external_journal_operations o ON o.operation_id=d.external_operation_id WHERE a.reservation_id=?1 AND (d.external_operation_id IS NULL OR o.state IN ('prepared','rejected'))",
+                [&reservation_id], |row| row.get(0),
+            )?;
+            let attempts: i64 = conn.query_row("SELECT COUNT(*) FROM image_spend_attempts WHERE reservation_id=?1",[&reservation_id],|row|row.get(0))?;
+            if attempts == 0 || rejected_or_unprepared != attempts { bail!("authoritative pre-provider evidence is incomplete"); }
+            let changed=conn.execute("UPDATE image_spend_reservations SET state='released',release_proof_identity='journal:no-provider-dispatch',released_at_ms=?2 WHERE reservation_id=?1 AND state='reserved'",params![reservation_id,at_ms])?;
             if changed != 0 { conn.execute("UPDATE image_spend_scope_usage SET reserved_usd_micros=charged_usd_micros WHERE reservation_id=?1",[reservation_id])?; }
             Ok(changed != 0)
         }).await

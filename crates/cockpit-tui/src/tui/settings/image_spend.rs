@@ -38,6 +38,7 @@ pub(super) fn page(project_key: String) -> PageBox {
         project_key,
         cursor: 0,
         editing_time_zone: false,
+        time_zone_before_edit: None,
         draft: ImageSpendSettings::default(),
         saved: ImageSpendSettings::default(),
         version: None,
@@ -51,6 +52,7 @@ pub(super) struct ImageSpendPage {
     project_key: String,
     cursor: usize,
     editing_time_zone: bool,
+    time_zone_before_edit: Option<String>,
     draft: ImageSpendSettings,
     saved: ImageSpendSettings,
     version: Option<u64>,
@@ -67,9 +69,14 @@ impl ImageSpendPage {
             return;
         };
         match code {
-            KeyCode::Enter => self.editing_time_zone = false,
+            KeyCode::Enter => {
+                self.time_zone_before_edit = None;
+                self.editing_time_zone = false;
+            }
             KeyCode::Esc => {
-                time_zone.clear();
+                if let Some(previous) = self.time_zone_before_edit.take() {
+                    *time_zone = previous;
+                }
                 self.editing_time_zone = false;
             }
             KeyCode::Backspace => {
@@ -273,6 +280,12 @@ impl SettingsPage for ImageSpendPage {
                         Some(ProjectEpochPolicy::CalendarMonth { .. })
                     ) =>
             {
+                self.time_zone_before_edit = match &self.draft.project_epoch {
+                    Some(ProjectEpochPolicy::CalendarMonth { time_zone }) => {
+                        Some(time_zone.clone())
+                    }
+                    _ => None,
+                };
                 self.editing_time_zone = true;
                 Nav::Stay
             }
@@ -350,6 +363,7 @@ mod tests {
             project_key: "project".into(),
             cursor: 0,
             editing_time_zone: false,
+            time_zone_before_edit: None,
             draft: ImageSpendSettings::default(),
             saved: ImageSpendSettings::default(),
             version: None,
@@ -421,5 +435,20 @@ mod tests {
             page.draft.project_epoch,
             Some(ProjectEpochPolicy::CalendarMonth { ref time_zone }) if time_zone == "Pacific/Auckland"
         ));
+    }
+
+    #[test]
+    fn escape_restores_timezone_value_from_before_edit() {
+        let mut page = fixture();
+        page.draft.project_epoch = Some(ProjectEpochPolicy::CalendarMonth {
+            time_zone: "America/Chicago".into(),
+        });
+        page.time_zone_before_edit = Some("America/Chicago".into());
+        page.editing_time_zone = true;
+        page.edit_time_zone(KeyCode::Backspace);
+        page.edit_time_zone(KeyCode::Esc);
+        assert!(
+            matches!(page.draft.project_epoch, Some(ProjectEpochPolicy::CalendarMonth { ref time_zone }) if time_zone == "America/Chicago")
+        );
     }
 }

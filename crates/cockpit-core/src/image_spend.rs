@@ -21,7 +21,17 @@ pub struct PaidImagePlan {
     pub scopes: SpendScopeKeys,
     pub attempts: Vec<AttemptMaximum>,
     pub policy_version: u64,
-    pub created_at_ms: i64,
+}
+
+pub trait ImageSpendClock: Send + Sync {
+    fn now_ms(&self) -> i64;
+}
+
+pub struct SystemImageSpendClock;
+impl ImageSpendClock for SystemImageSpendClock {
+    fn now_ms(&self) -> i64 {
+        chrono::Utc::now().timestamp_millis()
+    }
 }
 
 pub trait PaidImageProvider: Send + Sync {
@@ -37,19 +47,19 @@ pub struct PaidImageDispatch {
     pub session_id: String,
     pub idempotency_key: String,
     pub request_projection: Vec<u8>,
-    pub at_ms: i64,
 }
 
 pub async fn reserve_paid_image_plan(
     db: &Db,
     plan: PaidImagePlan,
+    clock: &dyn ImageSpendClock,
 ) -> anyhow::Result<SpendReservation> {
     db.reserve_image_spend(
         plan.reservation_id,
         plan.scopes,
         plan.attempts,
         plan.policy_version,
-        plan.created_at_ms,
+        clock.now_ms(),
     )
     .await
 }
@@ -57,6 +67,7 @@ pub async fn reserve_paid_image_plan(
 pub async fn preflight_and_dispatch_paid_image(
     db: &Db,
     provider: &dyn PaidImageProvider,
+    clock: &dyn ImageSpendClock,
     request: PaidImageDispatch,
 ) -> anyhow::Result<ImageSpendDispatchEvidence> {
     let PaidImageDispatch {
@@ -65,8 +76,8 @@ pub async fn preflight_and_dispatch_paid_image(
         session_id,
         idempotency_key,
         request_projection,
-        at_ms,
     } = request;
+    let at_ms = clock.now_ms();
     let reservation_id = plan.reservation_id.clone();
     let journal = PrepareExternalOperation {
         operation_kind: ExternalJournalToken::parse("image_generation")?,
@@ -84,7 +95,7 @@ pub async fn preflight_and_dispatch_paid_image(
             expected_policy_version: plan.policy_version,
             attempt_id: attempt_id.clone(),
             journal,
-            created_at_ms: plan.created_at_ms,
+            created_at_ms: at_ms,
         })
         .await?;
     dispatch_prepared_attempt(db, provider, reservation_id, attempt_id, prepared, at_ms).await
@@ -130,6 +141,13 @@ mod tests {
 
     use super::*;
 
+    struct Clock(i64);
+    impl ImageSpendClock for Clock {
+        fn now_ms(&self) -> i64 {
+            self.0
+        }
+    }
+
     struct FakeProvider(AtomicUsize);
     impl PaidImageProvider for FakeProvider {
         fn handoff<'a>(
@@ -160,6 +178,7 @@ mod tests {
         let result = preflight_and_dispatch_paid_image(
             &db,
             &provider,
+            &Clock(0),
             PaidImageDispatch {
                 plan: PaidImagePlan {
                     reservation_id: "reservation".into(),
@@ -173,13 +192,11 @@ mod tests {
                         usd_micros: Some(1),
                     }],
                     policy_version: 1,
-                    created_at_ms: 0,
                 },
                 attempt_id: "attempt".into(),
                 session_id: "session".into(),
                 idempotency_key: "idempotency".into(),
                 request_projection: b"redacted projection".to_vec(),
-                at_ms: 0,
             },
         )
         .await;
@@ -209,6 +226,7 @@ mod tests {
         let result = preflight_and_dispatch_paid_image(
             &db,
             &FailingProvider,
+            &Clock(0),
             PaidImageDispatch {
                 plan: PaidImagePlan {
                     reservation_id: "failed".into(),
@@ -222,13 +240,11 @@ mod tests {
                         usd_micros: Some(1),
                     }],
                     policy_version: 1,
-                    created_at_ms: 0,
                 },
                 attempt_id: "attempt".into(),
                 session_id: "session".into(),
                 idempotency_key: "failure-key".into(),
                 request_projection: b"projection".to_vec(),
-                at_ms: 1,
             },
         )
         .await;

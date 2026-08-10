@@ -1803,6 +1803,113 @@ pub struct ReclaimImageGenerationLatePublication<'a> {
     pub reconciled_cleanup_evidence_json: &'a str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ImageGenerationLatePublicationEvidenceV1 {
+    TemporaryPrepared {
+        schema_version: u32,
+        identity_digest: String,
+        security_digest: String,
+        byte_length: String,
+        sha256: String,
+    },
+    OutputDurable {
+        schema_version: u32,
+        identity_digest: String,
+        security_digest: String,
+        byte_length: String,
+        sha256: String,
+        parent_sync_digest: String,
+    },
+    TemporaryDeleted {
+        schema_version: u32,
+        identity_digest: String,
+        deletion_digest: String,
+        parent_sync_digest: String,
+    },
+    ExactAbsence {
+        schema_version: u32,
+        absence_digest: String,
+        parent_identity_digest: String,
+    },
+    SecurityAmbiguous {
+        schema_version: u32,
+        recovery_digest: String,
+    },
+}
+
+impl ImageGenerationLatePublicationEvidenceV1 {
+    pub fn canonical_json(&self) -> Result<String> {
+        self.validate()?;
+        Ok(serde_json::to_string(self)?)
+    }
+
+    fn validate(&self) -> Result<()> {
+        let (version, digests, length) = match self {
+            Self::TemporaryPrepared {
+                schema_version,
+                identity_digest,
+                security_digest,
+                byte_length,
+                sha256,
+            } => (
+                *schema_version,
+                vec![identity_digest, security_digest, sha256],
+                Some(byte_length),
+            ),
+            Self::OutputDurable {
+                schema_version,
+                identity_digest,
+                security_digest,
+                byte_length,
+                sha256,
+                parent_sync_digest,
+            } => (
+                *schema_version,
+                vec![identity_digest, security_digest, sha256, parent_sync_digest],
+                Some(byte_length),
+            ),
+            Self::TemporaryDeleted {
+                schema_version,
+                identity_digest,
+                deletion_digest,
+                parent_sync_digest,
+            } => (
+                *schema_version,
+                vec![identity_digest, deletion_digest, parent_sync_digest],
+                None,
+            ),
+            Self::ExactAbsence {
+                schema_version,
+                absence_digest,
+                parent_identity_digest,
+            } => (
+                *schema_version,
+                vec![absence_digest, parent_identity_digest],
+                None,
+            ),
+            Self::SecurityAmbiguous {
+                schema_version,
+                recovery_digest,
+            } => (*schema_version, vec![recovery_digest], None),
+        };
+        ensure!(version == 1, "late publication evidence schema differs");
+        for digest in digests {
+            ensure_digest(digest, "late publication evidence digest")?;
+        }
+        if let Some(length) = length {
+            let parsed = length
+                .parse::<u64>()
+                .context("late publication evidence length is invalid")?;
+            ensure!(
+                length == &parsed.to_string(),
+                "late publication evidence length is not canonical"
+            );
+        }
+        Ok(())
+    }
+}
+
 impl Db {
     /// Creates the complete expected component graph in the same transaction.
     /// No component or temporary may be introduced outside this sealed graph.
@@ -2087,7 +2194,15 @@ impl Db {
         conn: &Connection,
         input: &ReclaimImageGenerationLatePublication<'_>,
     ) -> Result<()> {
-        validate_late_evidence(input.reconciled_cleanup_evidence_json)?;
+        let evidence = validate_late_evidence(input.reconciled_cleanup_evidence_json)?;
+        ensure!(
+            matches!(
+                evidence,
+                ImageGenerationLatePublicationEvidenceV1::TemporaryDeleted { .. }
+                    | ImageGenerationLatePublicationEvidenceV1::ExactAbsence { .. }
+            ),
+            "replacement claim lacks exact cleanup evidence"
+        );
         ensure!(
             input.claim_generation > input.previous_claim_generation,
             "replacement claim is not fenced"
@@ -2162,8 +2277,7 @@ fn advance_image_generation_late_publication_at_conn(
         !input.evidence_json.is_empty() && input.evidence_json.len() <= 64 * 1024,
         "late publication evidence length is invalid"
     );
-    let _: serde_json::Value = serde_json::from_str(input.evidence_json)
-        .context("late publication evidence is invalid JSON")?;
+    let evidence = validate_late_evidence(input.evidence_json)?;
     ensure!(
         matches!(
             (input.from, input.to),
@@ -2176,6 +2290,19 @@ fn advance_image_generation_late_publication_at_conn(
             )
         ),
         "late publication advance requires a specialized edge"
+    );
+    ensure!(
+        matches!(
+            (input.to, evidence),
+            (
+                ImageGenerationLatePublicationState::CopyAuthorized,
+                ImageGenerationLatePublicationEvidenceV1::TemporaryPrepared { .. }
+            ) | (
+                ImageGenerationLatePublicationState::CopyCommitted,
+                ImageGenerationLatePublicationEvidenceV1::OutputDurable { .. }
+            )
+        ),
+        "late publication evidence kind differs from transition"
     );
     let evidence_column = match input.to {
         ImageGenerationLatePublicationState::CopyAuthorized => "temporary_evidence_json",
@@ -2226,7 +2353,7 @@ fn resolve_image_generation_late_publication_at_conn(
     input: &ResolveImageGenerationLatePublication<'_>,
     database_now_unix_ms: i64,
 ) -> Result<()> {
-    validate_late_evidence(input.recovery_evidence_json)?;
+    let evidence = validate_late_evidence(input.recovery_evidence_json)?;
     ensure!(
         matches!(
             (input.from, input.to),
@@ -2247,6 +2374,21 @@ fn resolve_image_generation_late_publication_at_conn(
             )
         ),
         "late publication resolution edge is not specialized"
+    );
+    ensure!(
+        matches!(
+            (input.to, evidence),
+            (
+                ImageGenerationLatePublicationState::Expired
+                    | ImageGenerationLatePublicationState::Aborted,
+                ImageGenerationLatePublicationEvidenceV1::TemporaryDeleted { .. }
+                    | ImageGenerationLatePublicationEvidenceV1::ExactAbsence { .. }
+            ) | (
+                ImageGenerationLatePublicationState::SecurityBlocked,
+                ImageGenerationLatePublicationEvidenceV1::SecurityAmbiguous { .. }
+            )
+        ),
+        "late publication recovery evidence kind differs"
     );
     let deadline_clause = if input.to == ImageGenerationLatePublicationState::Expired {
         "AND ?6>=deadline_unix_ms"
@@ -2296,14 +2438,19 @@ fn resolve_image_generation_late_publication_at_conn(
     Ok(())
 }
 
-fn validate_late_evidence(evidence: &str) -> Result<()> {
+fn validate_late_evidence(evidence: &str) -> Result<ImageGenerationLatePublicationEvidenceV1> {
     ensure!(
         !evidence.is_empty() && evidence.len() <= 64 * 1024,
         "late publication evidence length is invalid"
     );
-    let _: serde_json::Value =
+    let parsed: ImageGenerationLatePublicationEvidenceV1 =
         serde_json::from_str(evidence).context("late publication evidence is invalid JSON")?;
-    Ok(())
+    parsed.validate()?;
+    ensure!(
+        serde_json::to_string(&parsed)? == evidence,
+        "late publication evidence is not canonical"
+    );
+    Ok(parsed)
 }
 
 impl Db {
@@ -3708,8 +3855,10 @@ mod tests {
             assert!(claim_image_generation_late_publication_at_conn(conn,&ClaimImageGenerationLatePublication{publication_operation_id:operation,expected_version:1,worker_boot_id:Uuid::now_v7(),claim_generation:1},base+300_000).is_err());
             let worker=Uuid::now_v7();
             claim_image_generation_late_publication_at_conn(conn,&ClaimImageGenerationLatePublication{publication_operation_id:operation,expected_version:1,worker_boot_id:worker,claim_generation:1},base+299_999)?;
-            advance_image_generation_late_publication_at_conn(conn,&AdvanceImageGenerationLatePublication{publication_operation_id:operation,expected_version:2,worker_boot_id:worker,claim_generation:1,from:ImageGenerationLatePublicationState::Reserved,to:ImageGenerationLatePublicationState::CopyAuthorized,evidence_json:"{\"temporary\":\"held\"}"},base+299_999)?;
-            advance_image_generation_late_publication_at_conn(conn,&AdvanceImageGenerationLatePublication{publication_operation_id:operation,expected_version:3,worker_boot_id:worker,claim_generation:1,from:ImageGenerationLatePublicationState::CopyAuthorized,to:ImageGenerationLatePublicationState::CopyCommitted,evidence_json:"{\"output\":\"durable\"}"},base+400_000)?;
+            let prepared=ImageGenerationLatePublicationEvidenceV1::TemporaryPrepared{schema_version:1,identity_digest:"1".repeat(64),security_digest:"2".repeat(64),byte_length:"9".into(),sha256:"a".repeat(64)}.canonical_json()?;
+            let durable=ImageGenerationLatePublicationEvidenceV1::OutputDurable{schema_version:1,identity_digest:"3".repeat(64),security_digest:"4".repeat(64),byte_length:"9".into(),sha256:"a".repeat(64),parent_sync_digest:"5".repeat(64)}.canonical_json()?;
+            advance_image_generation_late_publication_at_conn(conn,&AdvanceImageGenerationLatePublication{publication_operation_id:operation,expected_version:2,worker_boot_id:worker,claim_generation:1,from:ImageGenerationLatePublicationState::Reserved,to:ImageGenerationLatePublicationState::CopyAuthorized,evidence_json:&prepared},base+299_999)?;
+            advance_image_generation_late_publication_at_conn(conn,&AdvanceImageGenerationLatePublication{publication_operation_id:operation,expected_version:3,worker_boot_id:worker,claim_generation:1,from:ImageGenerationLatePublicationState::CopyAuthorized,to:ImageGenerationLatePublicationState::CopyCommitted,evidence_json:&durable},base+400_000)?;
             finalize_image_generation_late_publication_at_conn(conn,operation,4,base+400_001)?;
             let states:(String,String,String)=conn.query_row("SELECT p.state,a.state,s.published_disposition FROM image_generation_late_publication_leases p JOIN image_generation_artifacts a ON a.artifact_id=p.artifact_id JOIN image_generation_slots s ON s.job_id=p.job_id AND s.slot_id=p.slot_id WHERE p.publication_operation_id=?1",[operation.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
             assert_eq!(states,("published".into(),"retained".into(),"late_authorized".into()));

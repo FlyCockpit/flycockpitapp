@@ -159,6 +159,96 @@ impl MediaStorageRecovery {
         }).await
     }
 
+    /// Resume every durable cleanup intent component-by-component. Capacity is
+    /// intentionally not released here unless the central reservation ledger
+    /// can consume the committed deletion evidence in the same transaction.
+    pub(crate) async fn reconcile_media_cleanup_intents(&self, now_unix_ms: i64) -> Result<usize> {
+        let rows=self.db.read(|conn|{let mut statement=conn.prepare("SELECT c.component_id,c.attachment_id,c.storage_id,c.stable_identity_digest,c.byte_length,c.sha256 FROM media_attachment_components c JOIN media_attachment_cleanup_intents i ON i.attachment_id=c.attachment_id WHERE i.completed_at_unix_ms IS NULL AND c.lifecycle_state='cleanup_pending' ORDER BY c.attachment_id,c.component_id")?;statement.query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?)))?.collect::<std::result::Result<Vec<_>,_>>().map_err(Into::into)}).await?;
+        let mut completed = 0usize;
+        for (component_id, attachment_id, storage_id, identity, length, checksum) in rows {
+            let length = length.parse::<u64>()?;
+            let mut intent_hasher = Sha256::new();
+            intent_hasher.update(b"media-component-delete-intent-v1\0");
+            for value in [
+                &component_id,
+                &attachment_id,
+                &storage_id,
+                &identity,
+                &length.to_string(),
+                &checksum,
+            ] {
+                intent_hasher.update(value.as_bytes());
+                intent_hasher.update([0]);
+            }
+            let intent_digest = crate::intel::hex_lower(&intent_hasher.finalize());
+            let existing_intent=self.db.read({let component_id=component_id.clone();move|conn|conn.query_row("SELECT intent_digest FROM media_component_deletion_intents WHERE component_id=?1",[component_id],|row|row.get::<_,String>(0)).optional().map_err(Into::into)}).await?;
+            ensure!(
+                existing_intent
+                    .as_ref()
+                    .is_none_or(|stored| stored == &intent_digest),
+                "storage_security_violation"
+            );
+            let opened = self.owned_root.open_file_verified(&storage_id);
+            let deletion_kind = match opened {
+                Ok(mut file) => {
+                    let before = stable_identity_digest(&file)?;
+                    let (actual_length, actual_checksum) = read_full_digest(&mut file)?;
+                    ensure!(
+                        before == identity
+                            && actual_length == length
+                            && actual_checksum == checksum
+                            && stable_identity_digest(&file)? == before,
+                        "storage_security_violation"
+                    );
+                    if existing_intent.is_none() {
+                        let component = component_id.clone();
+                        let attachment = attachment_id.clone();
+                        let storage = storage_id.clone();
+                        let identity = identity.clone();
+                        let checksum = checksum.clone();
+                        let digest = intent_digest.clone();
+                        self.db.transaction(move|conn|{conn.execute("INSERT INTO media_component_deletion_intents(component_id,attachment_id,storage_id,stable_identity_digest,byte_length,sha256,intent_digest,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![component,attachment,storage,identity,length.to_string(),checksum,digest,now_unix_ms])?;Ok(())}).await?;
+                    }
+                    self.owned_root
+                        .remove_file(&storage_id)
+                        .map_err(anyhow::Error::new)?;
+                    self.owned_root.sync().map_err(anyhow::Error::new)?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt as _;
+                        ensure!(file.metadata()?.nlink() == 0, "storage_security_violation");
+                    }
+                    "verified_unlink"
+                }
+                Err(ExternalJournalError::CapsuleMissing(_))
+                    if existing_intent.as_deref() == Some(intent_digest.as_str()) =>
+                {
+                    "interrupted_unlink_reconciled"
+                }
+                Err(error) => {
+                    return Err(anyhow::Error::new(error)
+                        .context("storage_security_violation during media cleanup"));
+                }
+            };
+            let mut evidence_hasher = Sha256::new();
+            evidence_hasher.update(b"media-component-deletion-evidence-v1\0");
+            evidence_hasher.update(intent_digest.as_bytes());
+            evidence_hasher.update([0]);
+            evidence_hasher.update(deletion_kind.as_bytes());
+            let evidence = crate::intel::hex_lower(&evidence_hasher.finalize());
+            let component = component_id.clone();
+            let attachment = attachment_id.clone();
+            let intent = intent_digest.clone();
+            self.db.transaction(move|conn|{conn.execute("INSERT INTO media_component_deletion_evidence(component_id,attachment_id,intent_digest,deletion_evidence_digest,deletion_kind,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(component_id) DO NOTHING",params![component,attachment,intent,evidence,deletion_kind,now_unix_ms])?;ensure!(conn.execute("UPDATE media_attachment_components SET lifecycle_state='deleted',deletion_evidence_digest=?1,updated_at_unix_ms=?2 WHERE component_id=?3 AND lifecycle_state='cleanup_pending'",params![evidence,now_unix_ms,component_id])?==1,"cleanup component tombstone lost compare-and-swap");Ok(())}).await?;
+            completed += 1;
+        }
+        let attachments=self.db.read(|conn|{let mut statement=conn.prepare("SELECT a.attachment_id,a.source_kind,a.availability_generation FROM media_attachments a JOIN media_attachment_cleanup_intents i ON i.attachment_id=a.attachment_id WHERE i.completed_at_unix_ms IS NULL AND a.availability IN ('owned_cleanup_pending','borrowed_cleanup_pending') AND NOT EXISTS(SELECT 1 FROM media_attachment_components c WHERE c.attachment_id=a.attachment_id AND c.lifecycle_state<>'deleted') ORDER BY a.attachment_id")?;statement.query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>().map_err(Into::into)}).await?;
+        for (attachment, source, generation) in attachments {
+            self.db.transaction(move|conn|{let next=generation.parse::<u64>()?.checked_add(1).context("availability generation overflow")?.to_string();let terminal=if source=="local_path"{"borrowed_derivatives_deleted"}else{"retained_copy_deleted"};ensure!(conn.execute("UPDATE media_attachments SET availability=?1,availability_generation=?2,updated_at_unix_ms=?3,draft_expires_at_unix_ms=NULL WHERE attachment_id=?4 AND availability_generation=?5",params![terminal,next,now_unix_ms,attachment,generation])?==1,"cleanup terminal lost compare-and-swap");conn.execute("UPDATE media_attachment_cleanup_intents SET completed_at_unix_ms=?1 WHERE attachment_id=?2 AND completed_at_unix_ms IS NULL",params![now_unix_ms,attachment])?;Ok(())}).await?;
+        }
+        Ok(completed)
+    }
+
     /// Process-local handles cannot survive daemon restart. Boot records that
     /// fact before releasing every leftover durable lease, and must call this
     /// before exposing any media request handler.

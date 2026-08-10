@@ -352,6 +352,31 @@ CREATE TABLE media_attachment_cleanup_intents (
         REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE
 );
 
+CREATE TABLE media_component_deletion_intents (
+    component_id TEXT PRIMARY KEY REFERENCES media_attachment_components(component_id) ON DELETE CASCADE,
+    attachment_id TEXT NOT NULL,
+    storage_id TEXT NOT NULL,
+    stable_identity_digest TEXT NOT NULL,
+    byte_length TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    intent_digest TEXT NOT NULL,
+    created_at_unix_ms INTEGER NOT NULL,
+    CHECK(length(intent_digest)=64 AND intent_digest NOT GLOB '*[^0-9a-f]*')
+);
+
+-- Deliberately has no attachment/component FK: deletion proof must survive a
+-- borrowed attachment's subsequent metadata deletion.
+CREATE TABLE media_component_deletion_evidence (
+    component_id TEXT PRIMARY KEY,
+    attachment_id TEXT NOT NULL,
+    intent_digest TEXT NOT NULL,
+    deletion_evidence_digest TEXT NOT NULL,
+    deletion_kind TEXT NOT NULL CHECK(deletion_kind IN ('verified_unlink','interrupted_unlink_reconciled')),
+    committed_at_unix_ms INTEGER NOT NULL,
+    CHECK(length(intent_digest)=64 AND intent_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK(length(deletion_evidence_digest)=64 AND deletion_evidence_digest NOT GLOB '*[^0-9a-f]*')
+);
+
 CREATE TABLE media_security_recovery_operations (
     local_request_id       TEXT PRIMARY KEY,
     owner_principal_digest TEXT NOT NULL,

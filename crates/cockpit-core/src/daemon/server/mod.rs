@@ -2107,6 +2107,14 @@ pub(crate) async fn boot_with_db(
             .reconcile_media_uploads(chrono::Utc::now().timestamp_millis())
             .await
             .context("reconciling authenticated media uploads")?;
+        storage
+            .begin_due_retention(chrono::Utc::now().timestamp_millis())
+            .await
+            .context("starting due media retention")?;
+        storage
+            .reconcile_media_cleanup_intents(chrono::Utc::now().timestamp_millis())
+            .await
+            .context("reconciling media cleanup intents")?;
     }
     timer.phase("media_upload_reconcile");
     // Installation identity + secure-key actor: under single-instance lock

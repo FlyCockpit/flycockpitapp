@@ -227,8 +227,13 @@ impl MediaStorageRecovery {
             }).await?;
             return Err(anyhow::anyhow!(error.to_string()).context("media_attachment_unavailable"));
         }
-        let mut images = Vec::with_capacity(acquired.len());
-        for (_, authority) in acquired {
+        let inserted_references = acquired
+            .iter()
+            .filter_map(|(reference, _)| reference.inserted.then_some(reference.clone()))
+            .collect::<Vec<_>>();
+        let mut pending = std::collections::VecDeque::from(acquired);
+        let mut images = Vec::with_capacity(pending.len());
+        while let Some((_, authority)) = pending.pop_front() {
             let opened = (|| -> Result<File> {
                 let mut file = self
                     .owned_root
@@ -251,20 +256,67 @@ impl MediaStorageRecovery {
                 Err(error) => {
                     block_component_lease_after_failed_proof(&self.db, authority, now_unix_ms)
                         .await?;
+                    self.compensate_failed_message_claim(
+                        ledger,
+                        &consumer_id,
+                        &inserted_references,
+                        pending
+                            .iter()
+                            .map(|(_, authority)| authority.lease_id)
+                            .collect(),
+                        now_unix_ms,
+                    )
+                    .await?;
                     return Err(error);
                 }
             };
-            images.push(
-                HeldMediaComponentLease {
-                    db: self.db.clone(),
-                    authority,
-                    file,
+            let read = HeldMediaComponentLease {
+                db: self.db.clone(),
+                authority,
+                file,
+            }
+            .read_verified(now_unix_ms)
+            .await;
+            match read {
+                Ok(bytes) => images.push(bytes),
+                Err(error) => {
+                    self.compensate_failed_message_claim(
+                        ledger,
+                        &consumer_id,
+                        &inserted_references,
+                        pending
+                            .iter()
+                            .map(|(_, authority)| authority.lease_id)
+                            .collect(),
+                        now_unix_ms,
+                    )
+                    .await?;
+                    return Err(error);
                 }
-                .read_verified(now_unix_ms)
-                .await?,
-            );
+            }
         }
         Ok(images)
+    }
+
+    async fn compensate_failed_message_claim(
+        &self,
+        ledger: &crate::media_reservation::MediaReservationLedger,
+        consumer_id: &str,
+        references: &[cockpit_db::media_attachments::AcquiredMediaReference],
+        unread_leases: Vec<Uuid>,
+        now_unix_ms: i64,
+    ) -> Result<()> {
+        ledger.return_downstream_ownership(consumer_id).await?;
+        let references = references.to_vec();
+        self.db.transaction(move |conn| {
+            for lease in unread_leases {
+                conn.execute("UPDATE media_attachment_component_leases SET released_at_unix_ms=?1 WHERE lease_id=?2 AND released_at_unix_ms IS NULL",params![now_unix_ms,lease.to_string()])?;
+            }
+            for reference in references {
+                cockpit_db::Db::release_media_reference_conn(conn,reference.reference_id,reference.reference_generation,now_unix_ms)?;
+            }
+            Ok(())
+        }).await
     }
     pub(crate) async fn ingest_message_image(
         &self,

@@ -3107,3 +3107,118 @@ CREATE TABLE image_spend_epoch_heads (
     resolved_at_ms INTEGER NOT NULL,
     PRIMARY KEY(project_key,epoch_policy_version)
 );
+
+-- Provider-neutral image generation. Plans are immutable canonical bytes;
+-- mutable projections cite monotonically increasing row and journal versions.
+CREATE TABLE image_generation_plans (
+    job_id TEXT PRIMARY KEY,
+    schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+    plan_digest TEXT NOT NULL UNIQUE CHECK(length(plan_digest) = 64),
+    canonical_plan BLOB NOT NULL,
+    slot_count INTEGER NOT NULL CHECK(slot_count > 0),
+    max_attempt_count INTEGER NOT NULL CHECK(max_attempt_count > 0),
+    enqueue_started_monotonic_ms INTEGER NOT NULL CHECK(enqueue_started_monotonic_ms >= 0),
+    operation_deadline_monotonic_ms INTEGER NOT NULL,
+    CHECK(operation_deadline_monotonic_ms > enqueue_started_monotonic_ms)
+);
+
+CREATE TABLE image_generation_jobs (
+    job_id TEXT PRIMARY KEY REFERENCES image_generation_plans(job_id) ON DELETE RESTRICT,
+    state TEXT NOT NULL CHECK(state IN ('created','validating','awaiting_authorization','queued','dispatching','submission_unknown','running','cancellation_requested','downloading','validating_output','publishing','completed','completed_after_cancel','partially_failed','failed','cancelled')),
+    version INTEGER NOT NULL CHECK(version >= 1),
+    terminal_event_version INTEGER,
+    created_at_unix_ms INTEGER NOT NULL,
+    updated_at_unix_ms INTEGER NOT NULL,
+    CHECK(terminal_event_version IS NULL OR terminal_event_version >= 1)
+);
+
+CREATE TABLE image_generation_slots (
+    job_id TEXT NOT NULL REFERENCES image_generation_jobs(job_id) ON DELETE RESTRICT,
+    slot_id TEXT NOT NULL,
+    slot_index INTEGER NOT NULL CHECK(slot_index >= 0),
+    sample_index INTEGER NOT NULL CHECK(sample_index >= 0),
+    managed_artifact_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('planned','queued','dispatching','submission_unknown','running','cancellation_requested','downloading','validating','ready_to_publish','published','late_quarantined','failed','cancelled','discarded')),
+    version INTEGER NOT NULL CHECK(version >= 1),
+    applied_cancellation_version INTEGER,
+    result_after_cancel INTEGER NOT NULL DEFAULT 0 CHECK(result_after_cancel IN (0,1)),
+    failure_reason TEXT,
+    PRIMARY KEY(job_id,slot_id),
+    UNIQUE(job_id,slot_index),
+    UNIQUE(managed_artifact_id),
+    CHECK(
+      (state IN ('planned','queued','ready_to_publish') AND applied_cancellation_version IS NULL AND result_after_cancel=0) OR
+      (state IN ('dispatching','submission_unknown','running','downloading') AND result_after_cancel=0) OR
+      (state='cancellation_requested' AND applied_cancellation_version IS NOT NULL AND result_after_cancel=0) OR
+      (state='validating' AND ((applied_cancellation_version IS NULL AND result_after_cancel=0) OR (applied_cancellation_version IS NOT NULL AND result_after_cancel=1))) OR
+      (state='published' AND ((applied_cancellation_version IS NULL AND result_after_cancel=0) OR (applied_cancellation_version IS NOT NULL AND result_after_cancel=1))) OR
+      (state IN ('late_quarantined','discarded') AND applied_cancellation_version IS NOT NULL AND result_after_cancel=1) OR
+      (state='cancelled' AND applied_cancellation_version IS NOT NULL AND result_after_cancel=0) OR
+      (state='failed' AND ((applied_cancellation_version IS NULL AND result_after_cancel=0) OR applied_cancellation_version IS NOT NULL))
+    )
+);
+
+CREATE TABLE image_generation_attempts (
+    job_id TEXT NOT NULL,
+    slot_id TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL CHECK(attempt_number >= 1),
+    state TEXT NOT NULL CHECK(state IN ('planned','preparing','prepared','dispatching','accepted','submission_unknown','reconciling','running','downloading','cancellation_requested','response_adopted','failed_not_submitted','rejected_not_accepted','cancelled','succeeded','completed_after_cancel','failed_after_acceptance')),
+    version INTEGER NOT NULL CHECK(version >= 1),
+    external_operation_id TEXT UNIQUE,
+    observed_journal_version INTEGER,
+    applied_cancellation_version INTEGER,
+    response_digest TEXT CHECK(response_digest IS NULL OR length(response_digest)=64),
+    PRIMARY KEY(job_id,slot_id,attempt_number),
+    FOREIGN KEY(job_id,slot_id) REFERENCES image_generation_slots(job_id,slot_id) ON DELETE RESTRICT,
+    FOREIGN KEY(external_operation_id) REFERENCES external_journal_operations(operation_id) ON DELETE RESTRICT,
+    CHECK((external_operation_id IS NULL AND observed_journal_version IS NULL) OR (external_operation_id IS NOT NULL AND observed_journal_version >= 1))
+);
+
+CREATE TABLE image_generation_cancellation_facts (
+    job_id TEXT PRIMARY KEY REFERENCES image_generation_jobs(job_id) ON DELETE RESTRICT,
+    cancellation_version INTEGER NOT NULL CHECK(cancellation_version >= 1),
+    requested_at_unix_ms INTEGER NOT NULL,
+    request_operation_id TEXT NOT NULL UNIQUE,
+    UNIQUE(job_id,cancellation_version)
+);
+
+CREATE TABLE image_generation_cancelled_result_facts (
+    job_id TEXT NOT NULL,
+    slot_id TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL,
+    cancellation_version INTEGER NOT NULL,
+    response_digest TEXT NOT NULL CHECK(length(response_digest)=64),
+    journal_terminal_version INTEGER NOT NULL CHECK(journal_terminal_version >= 1),
+    ordering TEXT NOT NULL CHECK(ordering IN ('response_after_cancellation','response_adopted_before_cancellation')),
+    PRIMARY KEY(job_id,slot_id,attempt_number),
+    FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT,
+    FOREIGN KEY(job_id,cancellation_version) REFERENCES image_generation_cancellation_facts(job_id,cancellation_version) ON DELETE RESTRICT
+);
+
+CREATE TABLE image_generation_publication_right_facts (
+    job_id TEXT NOT NULL,
+    slot_id TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL,
+    slot_version INTEGER NOT NULL CHECK(slot_version >= 1),
+    artifact_generation INTEGER NOT NULL CHECK(artifact_generation >= 1),
+    committed_at_unix_ms INTEGER NOT NULL,
+    PRIMARY KEY(job_id,slot_id),
+    FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT
+);
+
+CREATE TRIGGER image_generation_plans_immutable
+BEFORE UPDATE ON image_generation_plans BEGIN
+  SELECT RAISE(ABORT, 'image generation plans are immutable');
+END;
+CREATE TRIGGER image_generation_cancellations_immutable
+BEFORE UPDATE ON image_generation_cancellation_facts BEGIN
+  SELECT RAISE(ABORT, 'image generation cancellation facts are immutable');
+END;
+CREATE TRIGGER image_generation_cancelled_results_immutable
+BEFORE UPDATE ON image_generation_cancelled_result_facts BEGIN
+  SELECT RAISE(ABORT, 'image generation cancelled-result facts are immutable');
+END;
+CREATE TRIGGER image_generation_publication_rights_immutable
+BEFORE UPDATE ON image_generation_publication_right_facts BEGIN
+  SELECT RAISE(ABORT, 'image generation publication-right facts are immutable');
+END;

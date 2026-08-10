@@ -30,15 +30,15 @@ const MAX_AUTHORITY_STRING_BYTES: usize = 1_024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeTargetAuthorityV1 {
-    pub target_id: String,
-    pub target_config_generation: u64,
-    pub normalized_config_digest: String,
-    pub capability_provenance: CapabilityProvenanceV1,
-    pub destination: TargetDestinationV1,
-    pub supported_formats: BTreeMap<String, String>,
-    pub maximum_width: u32,
-    pub maximum_height: u32,
-    pub allowed_parameters: Vec<String>,
+    target_id: String,
+    target_config_generation: u64,
+    normalized_config_digest: String,
+    capability_provenance: CapabilityProvenanceV1,
+    destination: TargetDestinationV1,
+    supported_formats: BTreeMap<String, String>,
+    maximum_width: u32,
+    maximum_height: u32,
+    allowed_parameters: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,28 +53,28 @@ pub struct ImageGenerationRequestV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageGenerationTargetResolutionAuthorityV1 {
-    pub runtime: RuntimeTargetAuthorityV1,
-    pub references: Vec<ReferenceArtifactV1>,
-    pub slot_artifact_ids: Vec<(Uuid, Uuid)>,
-    pub max_attempts: u32,
-    pub attempt_resources: Vec<ResourceReservationV1>,
-    pub attempt_maximum_usd_micros: Option<u64>,
+    runtime: RuntimeTargetAuthorityV1,
+    references: Vec<ReferenceArtifactV1>,
+    slot_artifact_ids: Vec<(Uuid, Uuid)>,
+    max_attempts: u32,
+    attempt_resources: Vec<ResourceReservationV1>,
+    attempt_maximum_usd_micros: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageGenerationResolutionAuthorityV1 {
-    pub job_id: Uuid,
-    pub owner_session_id: Uuid,
-    pub owner_principal_digest: String,
-    pub project_identity_digest: String,
-    pub config_generation: u64,
-    pub enqueue_started_monotonic_ms: u64,
-    pub operation_deadline_monotonic_ms: u64,
-    pub required_grants: Vec<GrantRequirementV1>,
-    pub central_resources: Vec<ResourceReservationV1>,
-    pub spend: SpendReservationPlanV1,
-    pub output_authority: VerifiedOutputDirectoryAuthority,
-    pub targets: Vec<ImageGenerationTargetResolutionAuthorityV1>,
+    job_id: Uuid,
+    owner_session_id: Uuid,
+    owner_principal_digest: String,
+    project_identity_digest: String,
+    config_generation: u64,
+    enqueue_started_monotonic_ms: u64,
+    operation_deadline_monotonic_ms: u64,
+    required_grants: Vec<GrantRequirementV1>,
+    central_resources: Vec<ResourceReservationV1>,
+    spend: SpendReservationPlanV1,
+    output_authority: VerifiedOutputDirectoryAuthority,
+    targets: Vec<ImageGenerationTargetResolutionAuthorityV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,10 +118,21 @@ pub fn resolve_image_generation(
             continue;
         };
         let compatible = target.runtime.supported_formats.get(&request.format);
-        let parameters_valid = request
-            .parameters
-            .keys()
-            .all(|key| target.runtime.allowed_parameters.binary_search(key).is_ok());
+        let parameters_valid = request.parameters.iter().all(|(key, value)| {
+            match (
+                target
+                    .runtime
+                    .allowed_parameters
+                    .get(key)
+                    .map(String::as_str),
+                value,
+            ) {
+                (Some("boolean"), TypedParameterV1::Boolean(_))
+                | (Some("integer"), TypedParameterV1::Integer(_)) => true,
+                (Some("text"), TypedParameterV1::Text(text)) => valid_string(text),
+                _ => false,
+            }
+        });
         if compatible.is_none()
             || request.width > target.runtime.maximum_width
             || request.height > target.runtime.maximum_height
@@ -389,6 +400,31 @@ impl RuntimeTargetAuthorityV1 {
             .credential_identity_digest
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("runtime credential identity is missing"))?;
+        ensure!(
+            capability.constraints.keys().all(|key| matches!(
+                key.as_str(),
+                "formats" | "max_width" | "max_height" | "parameters"
+            )),
+            "capability contains an unknown constraint"
+        );
+        let formats = capability
+            .constraints
+            .get("formats")
+            .ok_or_else(|| anyhow::anyhow!("capability formats are missing"))?
+            .split(',')
+            .map(|format| {
+                let mime = match format {
+                    "png" => "image/png",
+                    "jpeg" | "jpg" => "image/jpeg",
+                    "webp" => "image/webp",
+                    "svg" => "image/svg+xml",
+                    _ => anyhow::bail!("unknown capability format"),
+                };
+                Ok((format.to_owned(), mime.to_owned()))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        ensure!(!formats.is_empty(), "capability formats are empty");
+        let canonical_constraints = serde_json::to_string(&capability.constraints)?;
         Ok(Self {
             target_id: snapshot.target_id.clone(),
             target_config_generation: snapshot.config_generation,
@@ -398,6 +434,7 @@ impl RuntimeTargetAuthorityV1 {
                 capability_digest: digest_fields(&[
                     &capability.target_id,
                     &capability.model_or_workflow_digest,
+                    &canonical_constraints,
                 ]),
                 health_observed_at_monotonic_ms: snapshot.retrieved_at,
                 health_expires_at_monotonic_ms: snapshot.expires_at.min(capability.expires_at),
@@ -417,22 +454,7 @@ impl RuntimeTargetAuthorityV1 {
                 credential_identity_digest: credential.plan_identity_hex(),
                 destination_generation: snapshot.config_generation,
             },
-            supported_formats: capability
-                .constraints
-                .get("formats")
-                .into_iter()
-                .flat_map(|value| value.split(','))
-                .filter_map(|format| {
-                    let mime = match format {
-                        "png" => "image/png",
-                        "jpeg" | "jpg" => "image/jpeg",
-                        "webp" => "image/webp",
-                        "svg" => "image/svg+xml",
-                        _ => return None,
-                    };
-                    Some((format.to_owned(), mime.to_owned()))
-                })
-                .collect(),
+            supported_formats: formats,
             maximum_width: capability
                 .constraints
                 .get("max_width")
@@ -446,8 +468,19 @@ impl RuntimeTargetAuthorityV1 {
             allowed_parameters: capability
                 .constraints
                 .get("parameters")
-                .map(|value| value.split(',').map(str::to_owned).collect())
-                .unwrap_or_default(),
+                .into_iter()
+                .flat_map(|value| value.split(','))
+                .map(|entry| {
+                    let (name, kind) = entry
+                        .split_once(':')
+                        .ok_or_else(|| anyhow::anyhow!("invalid parameter capability"))?;
+                    ensure!(
+                        valid_string(name) && matches!(kind, "boolean" | "integer" | "text"),
+                        "unknown parameter capability"
+                    );
+                    Ok((name.to_owned(), kind.to_owned()))
+                })
+                .collect::<Result<_>>()?,
         })
     }
 }
@@ -734,7 +767,7 @@ mod tests {
                         supported_formats: BTreeMap::from([("png".into(), "image/png".into())]),
                         maximum_width: 512,
                         maximum_height: 512,
-                        allowed_parameters: vec!["quality".into()],
+                        allowed_parameters: BTreeMap::from([("quality".into(), "integer".into())]),
                     },
                     references: target.reference_artifacts.clone(),
                     slot_artifact_ids: vec![(

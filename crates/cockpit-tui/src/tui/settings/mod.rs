@@ -8,7 +8,7 @@
 //!   - `Dialog::CreateConfig`    no config yet — pick a location to scaffold
 //!   - `Dialog::Settings`        navigate the settings tree
 //!
-//! The Settings page tree (root has 14 nodes; see `root_nodes()`):
+//! The Settings page tree (root has 15 nodes; see `root_nodes()`):
 //!
 //! ```text
 //! Root
@@ -42,6 +42,7 @@ mod dependencies_page;
 mod descriptor;
 mod grab;
 mod harnesses_page;
+mod image_spend;
 mod lsp_page;
 mod mcp_page;
 mod multimodal_capability_editor;
@@ -432,6 +433,7 @@ pub(crate) enum TestPageRef<'a> {
     Harnesses(&'a HarnessesPage),
     Providers(&'a ProvidersPage),
     Category(&'a CategoryPage),
+    ImageSpend(&'a image_spend::ImageSpendPage),
     Instructions(&'a InstructionsPage),
     RedactPatterns(&'a RedactPatternsPage),
     StringList(&'a StringListPage),
@@ -448,6 +450,7 @@ enum TestPageMut<'a> {
     Harnesses(&'a mut HarnessesPage),
     Providers(&'a mut ProvidersPage),
     Category(&'a mut CategoryPage),
+    ImageSpend(&'a mut image_spend::ImageSpendPage),
     Instructions(&'a mut InstructionsPage),
     RedactPatterns(&'a mut RedactPatternsPage),
     StringList(&'a mut StringListPage),
@@ -467,6 +470,7 @@ impl std::fmt::Debug for TestPageRef<'_> {
             Self::Harnesses(_) => f.write_str("Harnesses"),
             Self::Providers(_) => f.write_str("Providers"),
             Self::Category(_) => f.write_str("Category"),
+            Self::ImageSpend(_) => f.write_str("ImageSpend"),
             Self::Instructions(_) => f.write_str("Instructions"),
             Self::RedactPatterns(_) => f.write_str("RedactPatterns"),
             Self::StringList(_) => f.write_str("StringList"),
@@ -487,6 +491,7 @@ impl std::fmt::Debug for TestPageMut<'_> {
             Self::Harnesses(_) => f.write_str("Harnesses"),
             Self::Providers(_) => f.write_str("Providers"),
             Self::Category(_) => f.write_str("Category"),
+            Self::ImageSpend(_) => f.write_str("ImageSpend"),
             Self::Instructions(_) => f.write_str("Instructions"),
             Self::RedactPatterns(_) => f.write_str("RedactPatterns"),
             Self::StringList(_) => f.write_str("StringList"),
@@ -1719,6 +1724,9 @@ impl SettingsDialog {
         if let Some(p) = self.page.downcast_ref::<CategoryPage>() {
             return TestPageRef::Category(p);
         }
+        if let Some(p) = self.page.downcast_ref::<image_spend::ImageSpendPage>() {
+            return TestPageRef::ImageSpend(p);
+        }
         if let Some(p) = self.page.downcast_ref::<InstructionsPage>() {
             return TestPageRef::Instructions(p);
         }
@@ -1762,6 +1770,13 @@ impl SettingsDialog {
         }
         if self.page.as_any().is::<CategoryPage>() {
             return TestPageMut::Category(self.page.downcast_mut::<CategoryPage>().unwrap());
+        }
+        if self.page.as_any().is::<image_spend::ImageSpendPage>() {
+            return TestPageMut::ImageSpend(
+                self.page
+                    .downcast_mut::<image_spend::ImageSpendPage>()
+                    .unwrap(),
+            );
         }
         if self.page.as_any().is::<InstructionsPage>() {
             return TestPageMut::Instructions(
@@ -1984,6 +1999,9 @@ impl SettingsDialog {
     }
 
     fn tick(&mut self) {
+        if let Some(page) = self.page.downcast_mut::<image_spend::ImageSpendPage>() {
+            page.poll();
+        }
         if let Some(page) = self
             .page
             .downcast_mut::<dependencies_page::DependenciesPage>()
@@ -2516,6 +2534,13 @@ impl SettingsPage for RootPage {
                         cx.reload_extended();
                         Some(category_page(CategoryPage::new(Category::Behavior)))
                     }
+                    "Image spend budgets" => Some(image_spend::page(
+                        cx.active_project_root
+                            .as_ref()
+                            .unwrap_or(&cx.extended_path)
+                            .to_string_lossy()
+                            .into_owned(),
+                    )),
                     "Privacy & Safety" => {
                         cx.reload_extended();
                         Some(category_page(CategoryPage::new(Category::Privacy)))
@@ -2657,7 +2682,7 @@ pub(super) const DEFAULT_MODEL_TITLE: &str = "Default model for new sessions";
 /// `Default model for new sessions` leads, then the locked scheme in order;
 /// MCP/LSP are kept as extra nodes so integration settings stay reachable
 /// from the menu.
-fn root_nodes() -> [NavNode; 14] {
+fn root_nodes() -> [NavNode; 15] {
     [
         NavNode {
             id: pointer_actions::RootNodeId::DefaultModel,
@@ -2688,6 +2713,11 @@ fn root_nodes() -> [NavNode; 14] {
             id: pointer_actions::RootNodeId::Behavior,
             title: "Behavior",
             description: "Session & agent behavior: default agent, llm mode, approval mode, plan isolation, prediction, shell compression, the utility model, instructions files, and (Advanced) tuning + plan-execution knobs.",
+        },
+        NavNode {
+            id: pointer_actions::RootNodeId::ImageSpend,
+            title: "Image spend budgets",
+            description: "Explicit request, session, and project image-generation budgets and project window. Suggestions do not authorize dispatch until reviewed and saved.",
         },
         NavNode {
             id: pointer_actions::RootNodeId::Privacy,

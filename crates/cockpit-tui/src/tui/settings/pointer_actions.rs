@@ -30,6 +30,7 @@ pub(super) enum RootNodeId {
     Interface,
     Behavior,
     Privacy,
+    ImageSpend,
     Translation,
     Tools,
     Harnesses,
@@ -39,7 +40,7 @@ pub(super) enum RootNodeId {
     Lsp,
 }
 impl RootNodeId {
-    pub(super) const ALL: [Self; 14] = [
+    pub(super) const ALL: [Self; 15] = [
         Self::DefaultModel,
         Self::Providers,
         Self::Dependencies,
@@ -47,6 +48,7 @@ impl RootNodeId {
         Self::Interface,
         Self::Behavior,
         Self::Privacy,
+        Self::ImageSpend,
         Self::Translation,
         Self::Tools,
         Self::Harnesses,
@@ -64,6 +66,7 @@ impl RootNodeId {
             Self::Interface => "Interface",
             Self::Behavior => "Behavior",
             Self::Privacy => "Privacy & Safety",
+            Self::ImageSpend => "Image spend budgets",
             Self::Translation => "Translation",
             Self::Tools => "Tools",
             Self::Harnesses => "Harnesses",

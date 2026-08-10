@@ -13,6 +13,7 @@ workspace = true
 anyhow = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
+jiff = { workspace = true }
 libc = { workspace = true }
 rand = { workspace = true }
 rusqlite = { workspace = true }

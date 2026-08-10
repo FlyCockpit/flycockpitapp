@@ -207,6 +207,114 @@ const fn route_authority_pair_valid(
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageArtifactSecurityRecoveryDisposition {
+    RetainBlocked,
+    ResumeVerifiedCleanup,
+    CompleteVerifiedLatePublication,
+}
+impl ImageArtifactSecurityRecoveryDisposition {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RetainBlocked => "retain_blocked",
+            Self::ResumeVerifiedCleanup => "resume_verified_cleanup",
+            Self::CompleteVerifiedLatePublication => "complete_verified_late_publication",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordImageArtifactSecurityRecovery {
+    pub operation_id: Uuid,
+    pub artifact_id: Uuid,
+    pub artifact_generation: u64,
+    pub job_id: Uuid,
+    pub slot_id: Uuid,
+    pub slot_generation: u64,
+    pub component_set_digest: String,
+    pub publication_operation_id: Option<Uuid>,
+    pub disposition: ImageArtifactSecurityRecoveryDisposition,
+}
+
+#[derive(Debug)]
+pub struct RecordedImageArtifactSecurityRecovery {
+    operation_id: Uuid,
+    disposition: ImageArtifactSecurityRecoveryDisposition,
+}
+
+impl ImageGenerationOwnerContextAuthority {
+    pub fn record_image_artifact_security_recovery(
+        &self,
+        conn: &Connection,
+        input: &RecordImageArtifactSecurityRecovery,
+    ) -> Result<RecordedImageArtifactSecurityRecovery> {
+        ensure!(
+            conn.is_autocommit(),
+            "security recovery must begin outside a transaction"
+        );
+        let row=conn.query_row("SELECT a.state,a.component_set_digest,p.canonical_plan,p.plan_digest,COALESCE(lp.state,'') FROM image_generation_artifacts a JOIN image_generation_slots s ON s.job_id=a.job_id AND s.slot_id=a.slot_id JOIN image_generation_plans p ON p.job_id=a.job_id LEFT JOIN image_generation_late_publication_leases lp ON lp.publication_operation_id=?1 WHERE a.artifact_id=?2 AND a.generation=?3 AND a.job_id=?4 AND a.slot_id=?5 AND s.version=?6",params![input.publication_operation_id.map(|id|id.to_string()),input.artifact_id.to_string(),i64::try_from(input.artifact_generation)?,input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.slot_generation)?],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Vec<u8>>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?))).optional()?.ok_or_else(||anyhow::anyhow!("image artifact recovery is unavailable"))?;
+        let plan = ImageGenerationPlanV1::from_canonical(&row.2, &row.3)?;
+        ensure!(
+            plan.owner_session_id == self.session_id
+                && plan.owner_principal_digest == self.principal_digest
+                && plan.project_identity_digest == self.project_identity_digest
+                && plan.config_generation == self.config_generation
+                && row.1 == input.component_set_digest,
+            "image artifact recovery is unavailable"
+        );
+        ensure!(
+            row.0 == "security_blocked" || row.4 == "security_blocked",
+            "image artifact recovery is unavailable"
+        );
+        ensure!(
+            matches!(
+                (input.disposition, input.publication_operation_id),
+                (
+                    ImageArtifactSecurityRecoveryDisposition::CompleteVerifiedLatePublication,
+                    Some(_)
+                ) | (
+                    ImageArtifactSecurityRecoveryDisposition::RetainBlocked
+                        | ImageArtifactSecurityRecoveryDisposition::ResumeVerifiedCleanup,
+                    None
+                )
+            ),
+            "image artifact recovery disposition is unavailable"
+        );
+        let now: i64 = conn.query_row(
+            "SELECT CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)",
+            [],
+            |row| row.get(0),
+        )?;
+        conn.execute("INSERT INTO image_generation_artifact_security_recovery_audits(recovery_operation_id,artifact_id,artifact_generation,job_id,slot_id,slot_generation,principal_digest,component_set_digest,publication_operation_id,disposition,state,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'recorded',?11)",params![input.operation_id.to_string(),input.artifact_id.to_string(),i64::try_from(input.artifact_generation)?,input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.slot_generation)?,self.principal_digest,input.component_set_digest,input.publication_operation_id.map(|id|id.to_string()),input.disposition.as_str(),now])?;
+        Ok(RecordedImageArtifactSecurityRecovery {
+            operation_id: input.operation_id,
+            disposition: input.disposition,
+        })
+    }
+
+    pub fn retain_image_artifact_security_block(
+        &self,
+        conn: &Connection,
+        recorded: RecordedImageArtifactSecurityRecovery,
+    ) -> Result<()> {
+        ensure!(
+            recorded.disposition == ImageArtifactSecurityRecoveryDisposition::RetainBlocked,
+            "security recovery disposition differs"
+        );
+        let now: i64 = conn.query_row(
+            "SELECT CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)",
+            [],
+            |row| row.get(0),
+        )?;
+        let outcome = crate::intel::hex_lower(&Sha256::digest(format!(
+            "retain:{}:{}",
+            recorded.operation_id, self.principal_digest
+        )));
+        ensure!(conn.execute("UPDATE image_generation_artifact_security_recovery_audits SET state='applied',outcome_digest=?1,decided_at_unix_ms=?2 WHERE recovery_operation_id=?3 AND principal_digest=?4 AND state='recorded'",params![outcome,now,recorded.operation_id.to_string(),self.principal_digest])?==1,"security recovery audit is unavailable");
+        Ok(())
+    }
+}
+
 pub struct ImageGenerationResolutionProofs<'a> {
     pub runtime_snapshots: &'a [ImageHealthSnapshot],
     pub grants: &'a [SealedActionGrantRow],
@@ -552,28 +660,44 @@ pub struct HeldImageGenerationArtifactRoot {
 }
 
 impl HeldImageGenerationArtifactRoot {
-    pub fn create_component_temporary(&self,name:&str)->Result<HeldTemporaryArtifact>{
+    pub fn create_component_temporary(&self, name: &str) -> Result<HeldTemporaryArtifact> {
         self.guard.create_file_exclusive(name)
     }
-    pub fn seal_component(&self,temporary:HeldTemporaryArtifact)->Result<HeldSealedArtifact>{
+    pub fn seal_component(&self, temporary: HeldTemporaryArtifact) -> Result<HeldSealedArtifact> {
         self.guard.seal(temporary)
     }
-    pub fn retain_component_noreplace(&self,temporary:HeldSealedArtifact,name:&str)->Result<HeldDirectoryEffectOutcome>{
-        self.guard.rename_noreplace(temporary,name)
+    pub fn retain_component_noreplace(
+        &self,
+        temporary: HeldSealedArtifact,
+        name: &str,
+    ) -> Result<HeldDirectoryEffectOutcome> {
+        self.guard.rename_noreplace(temporary, name)
     }
-    pub fn open_verified_component(&self,name:&str,evidence:&HeldArtifactEvidence)->Result<HeldSealedArtifact>{
-        self.guard.open_verified(name,evidence)
+    pub fn open_verified_component(
+        &self,
+        name: &str,
+        evidence: &HeldArtifactEvidence,
+    ) -> Result<HeldSealedArtifact> {
+        self.guard.open_verified(name, evidence)
     }
-    pub fn remove_verified_component(&self,component:HeldSealedArtifact)->Result<HeldDirectoryEffectOutcome>{
+    pub fn remove_verified_component(
+        &self,
+        component: HeldSealedArtifact,
+    ) -> Result<HeldDirectoryEffectOutcome> {
         self.guard.unlink(component)
     }
-    pub fn reconcile_component(&self,recovery:&HeldDirectoryRecovery)->Result<HeldDirectoryEffectOutcome>{
+    pub fn reconcile_component(
+        &self,
+        recovery: &HeldDirectoryRecovery,
+    ) -> Result<HeldDirectoryEffectOutcome> {
         self.guard.reconcile(recovery)
     }
 }
 
-pub fn open_image_generation_artifact_root(path:&Path)->Result<HeldImageGenerationArtifactRoot>{
-    Ok(HeldImageGenerationArtifactRoot{guard:crate::private_fs::held_directory::HeldDirectoryAuthority::open_existing(path)?})
+pub fn open_image_generation_artifact_root(path: &Path) -> Result<HeldImageGenerationArtifactRoot> {
+    Ok(HeldImageGenerationArtifactRoot {
+        guard: crate::private_fs::held_directory::HeldDirectoryAuthority::open_existing(path)?,
+    })
 }
 impl HeldImageGenerationOutputDirectory {
     pub fn authority(&self) -> &VerifiedOutputDirectoryAuthority {

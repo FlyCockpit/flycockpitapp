@@ -2538,6 +2538,8 @@ mod tests {
 
     struct RealLedgerSchedulerFixture {
         db: cockpit_db::Db,
+        job_id: Uuid,
+        slot_id: Uuid,
     }
 
     async fn setup_real_ledger_scheduler_job(
@@ -2557,7 +2559,18 @@ mod tests {
         use cockpit_db::image_spend::{
             AttemptMaximum, BudgetPolicy, ImageSpendSettings, ProjectEpochPolicy, SpendScopeKeys,
         };
-        let sealed = plan();
+        let mut sealed = plan();
+        let suffix_id = suffix
+            .bytes()
+            .fold(0_u128, |sum, byte| sum.wrapping_add(u128::from(byte)));
+        sealed.job_id = id(1_000 + suffix_id * 3);
+        sealed.targets[0].slots[0].slot_id = id(1_001 + suffix_id * 3);
+        sealed.targets[0].slots[0].managed_artifact_id = id(1_002 + suffix_id * 3);
+        let resource_identity = format!("gpu:{suffix}");
+        sealed.central_resources[0].reservation_identity = resource_identity.clone();
+        sealed.targets[0].slots[0].attempts[0].resource_maximum[0].reservation_identity =
+            resource_identity;
+        sealed.spend.reservation_id = format!("spend:{suffix}");
         let canonical = sealed.canonical_bytes().unwrap();
         let plan_digest = sealed.digest().unwrap();
         let policy = MediaResourcePolicy::default();
@@ -2635,6 +2648,8 @@ mod tests {
         )
         .await
         .unwrap();
+        let fixture_job_id = sealed.job_id;
+        let fixture_slot_id = sealed.targets[0].slots[0].slot_id;
         db.transaction(move |conn| {
             let verified = CreateImageGenerationJob::from_verified_canonical_plan(
                 &canonical,
@@ -2672,7 +2687,11 @@ mod tests {
         })
         .await
         .unwrap();
-        RealLedgerSchedulerFixture { db }
+        RealLedgerSchedulerFixture {
+            db,
+            job_id: fixture_job_id,
+            slot_id: fixture_slot_id,
+        }
     }
 
     async fn run_real_ledger_scheduler_fixture(suffix: &str) {
@@ -2703,6 +2722,48 @@ mod tests {
     #[tokio::test]
     async fn scheduler_dispatches_one_real_ledger_job_once() {
         run_real_ledger_scheduler_fixture("once").await;
+    }
+
+    #[tokio::test]
+    async fn scheduler_skips_stolen_first_claim_without_head_of_line_blocking() {
+        let db = cockpit_db::Db::open_in_memory().unwrap();
+        let first = setup_real_ledger_scheduler_job(db.clone(), "stolen-first").await;
+        let second = setup_real_ledger_scheduler_job(db.clone(), "dispatch-second").await;
+        let stolen_boot = Uuid::now_v7();
+        db.transaction(move |conn| {
+            cockpit_db::Db::claim_image_generation_dispatch_conn(
+                conn,
+                &cockpit_db::db::image_generation::ClaimImageGenerationDispatch {
+                    job_id: first.job_id,
+                    slot_id: first.slot_id,
+                    attempt_number: 1,
+                    worker_boot_id: stolen_boot,
+                    claim_generation: 1,
+                },
+            )
+        })
+        .await
+        .unwrap();
+        let dispatcher = ImageGenerationDispatcher::new(db);
+        let adapter = DeterministicImageGenerationAdapter::new(vec![
+            ImageGenerationHandoffResult::Accepted {
+                evidence: b"accepted-second".to_vec(),
+            },
+        ]);
+        let pass = dispatcher
+            .run_scheduler_pass(&adapter, Uuid::now_v7(), 100, 2, 2, 8)
+            .await
+            .unwrap();
+        assert_eq!(pass.dispatched, 1);
+        let requests = adapter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].job_id, second.job_id);
+        let replay = dispatcher
+            .run_scheduler_pass(&adapter, Uuid::now_v7(), 100, 3, 3, 8)
+            .await
+            .unwrap();
+        assert_eq!(replay.dispatched, 0);
+        assert_eq!(adapter.requests().len(), 1);
     }
 
     #[test]

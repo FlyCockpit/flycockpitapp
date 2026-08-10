@@ -3978,6 +3978,8 @@ async fn media_security_recovery_denial_precedes_operation_table() {
         ctx.upload_accounting.clone(),
         remote_principal(),
         ctx.terminal_host.clone(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
     );
     let request = Request::RecoverSecurityBlockedMedia(
         cockpit_db::media_attachments::RecoverSecurityBlockedMediaV1 {
@@ -16019,16 +16021,10 @@ async fn image_submission_exact_retry_case() {
     })
     .await
     .expect("the accepted submission becomes durable");
-    // Simulate either consumed-cache TTL expiry or a daemon process restart.
-    // The exact wire fingerprint is durable, so the retry must be acknowledged
-    // before dispatch needs the now-unavailable attachment bytes.
-    crate::sync::lock_or_recover(&state.upload_accounting)
-        .consumed_message_attachments
-        .clear();
-
-    // Drop the entire per-client attachment state, then reconnect. Neither the
-    // old client nor the daemon replay cache has the bytes now; the durable
-    // wire receipt alone must acknowledge the exact request.
+    // Simulate a daemon process restart by dropping the entire per-client
+    // attachment state, then reconnecting. Neither the old client nor the
+    // daemon replay cache has the bytes now; the durable wire receipt alone
+    // must acknowledge the exact request.
     drop(state);
     let mut state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),

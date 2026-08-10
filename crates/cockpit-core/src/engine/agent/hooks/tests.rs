@@ -1433,9 +1433,7 @@ impl HookDocumentationContract {
             .map(|event| {
                 let policy = event.policy();
                 let (matcher_kind, matcher_values) = match policy.matcher {
-                    HookMatcherPolicy::Closed(values) => {
-                        ("closed", values.iter().copied().collect::<Vec<_>>())
-                    }
+                    HookMatcherPolicy::Closed(values) => ("closed", values.to_vec()),
                     HookMatcherPolicy::CanonicalToolName => ("canonicalToolName", Vec::new()),
                     HookMatcherPolicy::ChildAgentType => ("childAgentType", Vec::new()),
                     HookMatcherPolicy::ErrorClass => ("errorClass", Vec::new()),

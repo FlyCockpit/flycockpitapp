@@ -1667,6 +1667,67 @@ pub struct CommitImageGenerationComponentDeletion {
     pub committed_at_unix_ms: i64,
 }
 
+state_enum!(ImageGenerationArtifactPublishedDisposition {
+    Ordinary => "ordinary", LateAuthorized => "late_authorized"
+});
+
+state_enum!(ImageGenerationArtifactConsumerPurpose {
+    ServeArtifact => "serve_artifact", ServeThumbnail => "serve_thumbnail",
+    ToolInput => "tool_input", ModelInput => "model_input",
+    InternalVerification => "internal_verification", InternalCleanup => "internal_cleanup"
+});
+
+state_enum!(ImageGenerationArtifactConsumerRoute {
+    ArtifactFull => "artifact_full", ArtifactRange => "artifact_range",
+    Thumbnail => "thumbnail", Tool => "tool", ModelPayload => "model_payload",
+    Verification => "verification", Cleanup => "cleanup"
+});
+
+state_enum!(ImageGenerationArtifactReadKind { Full => "full", Range => "range" });
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcquireImageGenerationArtifactLease<'a> {
+    pub lease_id: Uuid,
+    pub artifact_id: Uuid,
+    pub expected_artifact_generation: u64,
+    pub job_id: Uuid,
+    pub expected_job_generation: u64,
+    pub slot_id: Uuid,
+    pub expected_slot_generation: u64,
+    pub disposition: ImageGenerationArtifactPublishedDisposition,
+    pub expected_disposition_generation: u64,
+    pub component_id: Uuid,
+    pub expected_component_kind: ImageGenerationArtifactComponentKind,
+    pub expected_component_generation: u64,
+    pub expected_component_checksum: &'a str,
+    pub purpose: ImageGenerationArtifactConsumerPurpose,
+    pub route: ImageGenerationArtifactConsumerRoute,
+    pub read_kind: ImageGenerationArtifactReadKind,
+    pub range_start: u64,
+    pub requested_length: u64,
+    pub component_set_digest: &'a str,
+    pub authorization_digest: &'a str,
+    pub daemon_boot_id: Uuid,
+    pub committed_at_monotonic: u64,
+}
+
+#[derive(Debug)]
+struct LeaseComponentProjection {
+    artifact_state: String,
+    artifact_generation: i64,
+    component_set_digest: String,
+    active_lease_count: i64,
+    job_generation: i64,
+    slot_state: String,
+    slot_generation: i64,
+    result_after_cancel: bool,
+    component_kind: String,
+    component_state: String,
+    component_generation: i64,
+    component_checksum: String,
+    component_byte_length_decimal: String,
+}
+
 impl Db {
     /// Creates the complete expected component graph in the same transaction.
     /// No component or temporary may be introduced outside this sealed graph.
@@ -1784,6 +1845,129 @@ impl Db {
         Ok(())
     }
 
+    pub fn acquire_image_generation_artifact_lease_conn(
+        conn: &Connection,
+        input: &AcquireImageGenerationArtifactLease<'_>,
+    ) -> Result<()> {
+        ensure_digest(input.expected_component_checksum, "component checksum")?;
+        ensure_digest(input.component_set_digest, "component set digest")?;
+        ensure_digest(input.authorization_digest, "authorization digest")?;
+        ensure!(
+            input.requested_length > 0,
+            "lease read length must be positive"
+        );
+        ensure!(
+            lease_route_valid(input.purpose, input.route, input.read_kind),
+            "lease purpose, route, and read kind disagree"
+        );
+        let deadline = input
+            .committed_at_monotonic
+            .checked_add(60_000)
+            .context("lease deadline overflow")?;
+        let tx = conn.unchecked_transaction()?;
+        let projection=tx.query_row(
+            "SELECT a.state,a.generation,a.component_set_digest,a.active_lease_count,j.version,s.state,s.version,s.result_after_cancel,c.component_kind,c.state,c.generation,c.sha256,c.byte_length_decimal FROM image_generation_artifacts a JOIN image_generation_jobs j ON j.job_id=a.job_id JOIN image_generation_slots s ON s.job_id=a.job_id AND s.slot_id=a.slot_id JOIN image_generation_artifact_components c ON c.artifact_id=a.artifact_id WHERE a.artifact_id=?1 AND a.job_id=?2 AND a.slot_id=?3 AND c.component_id=?4",
+            params![input.artifact_id.to_string(),input.job_id.to_string(),input.slot_id.to_string(),input.component_id.to_string()],
+            |row| Ok(LeaseComponentProjection{artifact_state:row.get(0)?,artifact_generation:row.get(1)?,component_set_digest:row.get(2)?,active_lease_count:row.get(3)?,job_generation:row.get(4)?,slot_state:row.get(5)?,slot_generation:row.get(6)?,result_after_cancel:row.get(7)?,component_kind:row.get(8)?,component_state:row.get(9)?,component_generation:row.get(10)?,component_checksum:row.get(11)?,component_byte_length_decimal:row.get(12)?}),
+        ).optional()?.context("artifact lease target is unavailable")?;
+        ensure!(
+            projection.artifact_state == "retained"
+                && projection.artifact_generation
+                    == i64::try_from(input.expected_artifact_generation)?,
+            "artifact generation is not retained"
+        );
+        ensure!(
+            projection.job_generation == i64::try_from(input.expected_job_generation)?
+                && projection.slot_state == "published"
+                && projection.slot_generation == i64::try_from(input.expected_slot_generation)?,
+            "owning job or published slot generation differs"
+        );
+        ensure!(
+            projection.component_set_digest == input.component_set_digest,
+            "component set differs"
+        );
+        ensure!(
+            projection.component_kind == input.expected_component_kind.as_str()
+                && projection.component_state == "ready"
+                && projection.component_generation
+                    == i64::try_from(input.expected_component_generation)?
+                && projection.component_checksum == input.expected_component_checksum,
+            "component lease binding differs"
+        );
+        ensure!(
+            matches!(
+                (input.disposition, projection.result_after_cancel),
+                (ImageGenerationArtifactPublishedDisposition::Ordinary, false)
+                    | (
+                        ImageGenerationArtifactPublishedDisposition::LateAuthorized,
+                        true
+                    )
+            ),
+            "published disposition differs"
+        );
+        ensure!(
+            input.expected_disposition_generation == input.expected_slot_generation,
+            "published disposition generation differs"
+        );
+        let component_length = projection
+            .component_byte_length_decimal
+            .parse::<u64>()
+            .context("stored component length is invalid")?;
+        match input.read_kind {
+            ImageGenerationArtifactReadKind::Full => ensure!(
+                input.range_start == 0 && input.requested_length == component_length,
+                "full lease must bind exact component length"
+            ),
+            ImageGenerationArtifactReadKind::Range => ensure!(
+                input
+                    .range_start
+                    .checked_add(input.requested_length)
+                    .is_some_and(|end| end <= component_length),
+                "range lease exceeds component"
+            ),
+        }
+        let authorized:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM image_generation_artifact_authorization_facts f WHERE f.authorization_digest=?1 AND f.artifact_id=?2 AND f.artifact_generation=?3 AND f.job_id=?4 AND f.job_generation=?5 AND f.slot_id=?6 AND f.slot_generation=?7 AND f.consumer_purpose=?8 AND f.consumer_route=?9 AND f.revoked_at_unix_ms IS NULL)",params![input.authorization_digest,input.artifact_id.to_string(),i64::try_from(input.expected_artifact_generation)?,input.job_id.to_string(),i64::try_from(input.expected_job_generation)?,input.slot_id.to_string(),i64::try_from(input.expected_slot_generation)?,input.purpose.as_str(),input.route.as_str()],|row|row.get(0))?;
+        ensure!(
+            authorized,
+            "artifact route authorization is absent or stale"
+        );
+        let incremented=tx.execute("UPDATE image_generation_artifacts SET active_lease_count=active_lease_count+1 WHERE artifact_id=?1 AND state='retained' AND generation=?2 AND active_lease_count=?3 AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_cleanup_intents i WHERE i.artifact_id=?1)",params![input.artifact_id.to_string(),i64::try_from(input.expected_artifact_generation)?,projection.active_lease_count])?;
+        ensure!(
+            incremented == 1,
+            "artifact lease count compare-and-set lost"
+        );
+        tx.execute("INSERT INTO image_generation_artifact_leases(lease_id,artifact_id,artifact_generation,owning_job_id,owning_job_generation,owning_slot_id,owning_slot_generation,published_disposition,published_disposition_generation,component_id,component_kind,component_generation,component_checksum,consumer_purpose,consumer_route,read_kind,range_start_decimal,requested_length_decimal,component_set_digest,authorization_digest,daemon_boot_id,committed_at_monotonic,deadline_monotonic) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",params![input.lease_id.to_string(),input.artifact_id.to_string(),i64::try_from(input.expected_artifact_generation)?,input.job_id.to_string(),i64::try_from(input.expected_job_generation)?,input.slot_id.to_string(),i64::try_from(input.expected_slot_generation)?,input.disposition.as_str(),i64::try_from(input.expected_disposition_generation)?,input.component_id.to_string(),input.expected_component_kind.as_str(),i64::try_from(input.expected_component_generation)?,input.expected_component_checksum,input.purpose.as_str(),input.route.as_str(),input.read_kind.as_str(),input.range_start.to_string(),input.requested_length.to_string(),input.component_set_digest,input.authorization_digest,input.daemon_boot_id.to_string(),i64::try_from(input.committed_at_monotonic)?,i64::try_from(deadline)?])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn release_image_generation_artifact_lease_conn(
+        conn: &Connection,
+        lease_id: Uuid,
+        released_at_monotonic: u64,
+    ) -> Result<bool> {
+        release_image_generation_artifact_lease_inner(conn, lease_id, released_at_monotonic, false)
+    }
+
+    pub fn expire_image_generation_artifact_lease_conn(
+        conn: &Connection,
+        lease_id: Uuid,
+        now_monotonic: u64,
+    ) -> Result<bool> {
+        release_image_generation_artifact_lease_inner(conn, lease_id, now_monotonic, true)
+    }
+
+    pub fn repair_image_generation_artifact_leases_for_boot_conn(
+        conn: &Connection,
+        current_boot_id: Uuid,
+    ) -> Result<u64> {
+        let tx = conn.unchecked_transaction()?;
+        let released=tx.execute("UPDATE image_generation_artifact_leases SET released_at=0 WHERE released_at IS NULL AND daemon_boot_id!=?1",[current_boot_id.to_string()])?;
+        tx.execute("UPDATE image_generation_artifacts SET active_lease_count=(SELECT count(*) FROM image_generation_artifact_leases l WHERE l.artifact_id=image_generation_artifacts.artifact_id AND l.released_at IS NULL)",[])?;
+        tx.commit()?;
+        Ok(u64::try_from(released)?)
+    }
+
     pub fn begin_image_generation_artifact_cleanup_conn(
         conn: &Connection,
         input: &BeginImageGenerationArtifactCleanup,
@@ -1874,6 +2058,58 @@ impl Db {
         tx.commit()?;
         Ok(())
     }
+}
+
+const fn lease_route_valid(
+    purpose: ImageGenerationArtifactConsumerPurpose,
+    route: ImageGenerationArtifactConsumerRoute,
+    read_kind: ImageGenerationArtifactReadKind,
+) -> bool {
+    use ImageGenerationArtifactConsumerPurpose as P;
+    use ImageGenerationArtifactConsumerRoute as R;
+    use ImageGenerationArtifactReadKind as K;
+    matches!(
+        (purpose, route, read_kind),
+        (P::ServeArtifact, R::ArtifactFull, K::Full)
+            | (P::ServeArtifact, R::ArtifactRange, K::Range)
+            | (P::ServeThumbnail, R::Thumbnail, K::Full)
+            | (P::ToolInput, R::Tool, K::Full)
+            | (P::ModelInput, R::ModelPayload, K::Full)
+            | (P::InternalVerification, R::Verification, K::Full)
+            | (P::InternalCleanup, R::Cleanup, K::Full)
+    )
+}
+
+fn release_image_generation_artifact_lease_inner(
+    conn: &Connection,
+    lease_id: Uuid,
+    released_at_monotonic: u64,
+    require_expired: bool,
+) -> Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    let row = tx
+        .query_row(
+            "SELECT artifact_id,deadline_monotonic,released_at FROM image_generation_artifact_leases WHERE lease_id=?1",
+            [lease_id.to_string()],
+            |row| Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,Option<i64>>(2)?)),
+        )
+        .optional()?;
+    let Some((artifact_id, deadline, released)) = row else {
+        return Ok(false);
+    };
+    if released.is_some() {
+        return Ok(false);
+    }
+    let released_at = i64::try_from(released_at_monotonic)?;
+    if require_expired && released_at < deadline {
+        return Ok(false);
+    }
+    let changed=tx.execute("UPDATE image_generation_artifact_leases SET released_at=?1 WHERE lease_id=?2 AND released_at IS NULL",params![released_at,lease_id.to_string()])?;
+    ensure!(changed == 1, "artifact lease release compare-and-set lost");
+    let decremented=tx.execute("UPDATE image_generation_artifacts SET active_lease_count=active_lease_count-1 WHERE artifact_id=?1 AND active_lease_count>0",[artifact_id])?;
+    ensure!(decremented == 1, "artifact lease count is inconsistent");
+    tx.commit()?;
+    Ok(true)
 }
 
 fn ensure_digest(value: &str, label: &str) -> Result<()> {
@@ -2728,9 +2964,10 @@ mod tests {
                 let expected = states
                     .iter()
                     .flat_map(|from| {
-                        states.iter().filter_map(|to| {
-                            allowed(from, to).then(|| ((*from).to_owned(), (*to).to_owned()))
-                        })
+                        states
+                            .iter()
+                            .filter(|to| allowed(from, to))
+                            .map(|to| ((*from).to_owned(), (*to).to_owned()))
                     })
                     .collect::<std::collections::BTreeSet<_>>();
                 ensure!(
@@ -3022,6 +3259,67 @@ mod tests {
             let releases:i64=conn.query_row("SELECT count(*) FROM image_generation_component_release_facts WHERE artifact_id=?1",[artifact_id.to_string()],|row|row.get(0))?;
             assert_eq!(releases,1);
             assert!(Db::commit_image_generation_component_deletion_conn(conn,&CommitImageGenerationComponentDeletion{artifact_id,component_id,expected_generation:5,release_operation_id,deletion_evidence_digest:"d".repeat(64),committed_at_unix_ms:6}).is_err());
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
+    fn artifact_lease_route_matrix_is_closed() {
+        use ImageGenerationArtifactConsumerPurpose as P;
+        use ImageGenerationArtifactConsumerRoute as R;
+        use ImageGenerationArtifactReadKind as K;
+        let allowed = [
+            (P::ServeArtifact, R::ArtifactFull, K::Full),
+            (P::ServeArtifact, R::ArtifactRange, K::Range),
+            (P::ServeThumbnail, R::Thumbnail, K::Full),
+            (P::ToolInput, R::Tool, K::Full),
+            (P::ModelInput, R::ModelPayload, K::Full),
+            (P::InternalVerification, R::Verification, K::Full),
+            (P::InternalCleanup, R::Cleanup, K::Full),
+        ];
+        for &purpose in P::ALL {
+            for &route in R::ALL {
+                for &kind in K::ALL {
+                    assert_eq!(
+                        lease_route_valid(purpose, route, kind),
+                        allowed.contains(&(purpose, route, kind)),
+                        "{purpose:?}/{route:?}/{kind:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn artifact_lease_acquire_release_expiry_and_boot_repair_are_exact() {
+        let db = Db::open_in_memory().unwrap();
+        db.blocking_for_sync_cli(|conn| {
+            let fixture=race_fixture(conn,true)?;
+            Db::commit_image_generation_publication_conn(conn,&CommitImageGenerationPublication{job_id:fixture.job_id,slot_id:fixture.slot_id,attempt_number:1,expected_attempt_version:7,expected_slot_version:7,artifact_generation:1,now_unix_ms:1})?;
+            let artifact_id=Uuid::parse_str(&conn.query_row::<String,_,_>("SELECT managed_artifact_id FROM image_generation_slots WHERE job_id=?1 AND slot_id=?2",params![fixture.job_id.to_string(),fixture.slot_id.to_string()],|row|row.get(0))?)?;
+            let component_id=Uuid::now_v7(); let release_operation_id=Uuid::now_v7();
+            let component=CreateImageGenerationArtifactComponent{component_id,kind:ImageGenerationArtifactComponentKind::Primary,relative_storage_key:format!("{artifact_id}/primary"),byte_length:9,sha256:"a".repeat(64),resource_reservation_id:"resource".into(),release_operation_id};
+            let component_set_digest=component_set_binding(std::slice::from_ref(&component))?.1;
+            Db::create_image_generation_artifact_conn(conn,&CreateImageGenerationArtifact{artifact_id,job_id:fixture.job_id,slot_id:fixture.slot_id,component_set_digest:component_set_digest.clone(),components:vec![component],now_unix_ms:1})?;
+            Db::transition_image_generation_artifact_conn(conn,&TransitionImageGenerationArtifact{artifact_id,expected_generation:1,from:ImageGenerationArtifactState::Allocating,to:ImageGenerationArtifactState::Writing,now_unix_ms:2,terminal_reason:None})?;
+            Db::transition_image_generation_artifact_component_conn(conn,&TransitionImageGenerationArtifactComponent{artifact_id,component_id,expected_generation:1,from:ImageGenerationArtifactComponentState::Planned,to:ImageGenerationArtifactComponentState::Writing,stable_identity_json:None,deletion_evidence_digest:None})?;
+            Db::transition_image_generation_artifact_component_conn(conn,&TransitionImageGenerationArtifactComponent{artifact_id,component_id,expected_generation:2,from:ImageGenerationArtifactComponentState::Writing,to:ImageGenerationArtifactComponentState::Ready,stable_identity_json:Some("{\"held\":true}".into()),deletion_evidence_digest:None})?;
+            Db::transition_image_generation_artifact_conn(conn,&TransitionImageGenerationArtifact{artifact_id,expected_generation:2,from:ImageGenerationArtifactState::Writing,to:ImageGenerationArtifactState::Retained,now_unix_ms:3,terminal_reason:None})?;
+            let authorization_digest="b".repeat(64);
+            conn.execute("INSERT INTO image_generation_artifact_authorization_facts(authorization_digest,artifact_id,artifact_generation,job_id,job_generation,slot_id,slot_generation,consumer_purpose,consumer_route,principal_digest,created_at_unix_ms) VALUES(?1,?2,3,?3,4,?4,8,'serve_artifact','artifact_full',?5,3)",params![authorization_digest,artifact_id.to_string(),fixture.job_id.to_string(),fixture.slot_id.to_string(),"c".repeat(64)])?;
+            let boot=Uuid::now_v7(); let lease=Uuid::now_v7();
+            let checksum="a".repeat(64);
+            let acquire=AcquireImageGenerationArtifactLease{lease_id:lease,artifact_id,expected_artifact_generation:3,job_id:fixture.job_id,expected_job_generation:4,slot_id:fixture.slot_id,expected_slot_generation:8,disposition:ImageGenerationArtifactPublishedDisposition::Ordinary,expected_disposition_generation:8,component_id,expected_component_kind:ImageGenerationArtifactComponentKind::Primary,expected_component_generation:3,expected_component_checksum:&checksum,purpose:ImageGenerationArtifactConsumerPurpose::ServeArtifact,route:ImageGenerationArtifactConsumerRoute::ArtifactFull,read_kind:ImageGenerationArtifactReadKind::Full,range_start:0,requested_length:9,component_set_digest:&component_set_digest,authorization_digest:&authorization_digest,daemon_boot_id:boot,committed_at_monotonic:100};
+            Db::acquire_image_generation_artifact_lease_conn(conn,&acquire)?;
+            assert!(!Db::expire_image_generation_artifact_lease_conn(conn,lease,60_099)?);
+            assert!(conn.execute("UPDATE image_generation_artifact_leases SET deadline_monotonic=999999 WHERE lease_id=?1",[lease.to_string()]).is_err());
+            assert!(Db::expire_image_generation_artifact_lease_conn(conn,lease,60_100)?);
+            assert!(!Db::release_image_generation_artifact_lease_conn(conn,lease,60_101)?);
+            let active:i64=conn.query_row("SELECT active_lease_count FROM image_generation_artifacts WHERE artifact_id=?1",[artifact_id.to_string()],|row|row.get(0))?; assert_eq!(active,0);
+            let lease2=Uuid::now_v7(); let mut acquire2=acquire.clone(); acquire2.lease_id=lease2; acquire2.committed_at_monotonic=200;
+            Db::acquire_image_generation_artifact_lease_conn(conn,&acquire2)?;
+            assert_eq!(Db::repair_image_generation_artifact_leases_for_boot_conn(conn,Uuid::now_v7())?,1);
+            let active:i64=conn.query_row("SELECT active_lease_count FROM image_generation_artifacts WHERE artifact_id=?1",[artifact_id.to_string()],|row|row.get(0))?; assert_eq!(active,0);
             Ok(())
         }).unwrap();
     }

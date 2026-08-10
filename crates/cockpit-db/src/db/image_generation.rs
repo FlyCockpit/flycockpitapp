@@ -1626,11 +1626,52 @@ pub struct TransitionImageGenerationArtifactComponent {
     pub deletion_evidence_digest: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageGenerationArtifactCleanupReason {
+    RetentionExpired,
+    DiscardLateResult,
+    InvalidOutput,
+    RestartRecovery,
+    OwnerRecovery,
+}
+
+impl ImageGenerationArtifactCleanupReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::RetentionExpired => "retention_expired",
+            Self::DiscardLateResult => "discard_late_result",
+            Self::InvalidOutput => "invalid_output",
+            Self::RestartRecovery => "restart_recovery",
+            Self::OwnerRecovery => "owner_recovery",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BeginImageGenerationArtifactCleanup {
+    pub cleanup_operation_id: Uuid,
+    pub artifact_id: Uuid,
+    pub expected_generation: u64,
+    pub expected_state: ImageGenerationArtifactState,
+    pub reason: ImageGenerationArtifactCleanupReason,
+    pub now_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitImageGenerationComponentDeletion {
+    pub artifact_id: Uuid,
+    pub component_id: Uuid,
+    pub expected_generation: u64,
+    pub release_operation_id: Uuid,
+    pub deletion_evidence_digest: String,
+    pub committed_at_unix_ms: i64,
+}
+
 impl Db {
     /// Creates the complete expected component graph in the same transaction.
     /// No component or temporary may be introduced outside this sealed graph.
     pub fn create_image_generation_artifact_conn(
-        conn: &mut Connection,
+        conn: &Connection,
         input: &CreateImageGenerationArtifact,
     ) -> Result<()> {
         ensure!(
@@ -1663,7 +1704,7 @@ impl Db {
                 "component reservation is empty"
             );
         }
-        let tx = conn.transaction()?;
+        let tx = conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO image_generation_artifacts(artifact_id,job_id,slot_id,state,generation,expected_component_count,component_set_digest,created_at_unix_ms,updated_at_unix_ms) VALUES(?1,?2,?3,'allocating',1,?4,?5,?6,?6)",
             params![input.artifact_id.to_string(),input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.components.len())?,input.component_set_digest,input.now_unix_ms],
@@ -1713,6 +1754,92 @@ impl Db {
             changed == 1,
             "image artifact component compare-and-set lost"
         );
+        Ok(())
+    }
+
+    pub fn begin_image_generation_artifact_cleanup_conn(
+        conn: &Connection,
+        input: &BeginImageGenerationArtifactCleanup,
+    ) -> Result<()> {
+        ensure!(
+            matches!(
+                input.expected_state,
+                ImageGenerationArtifactState::Allocating
+                    | ImageGenerationArtifactState::Writing
+                    | ImageGenerationArtifactState::Retained
+                    | ImageGenerationArtifactState::LateQuarantined
+                    | ImageGenerationArtifactState::SecurityBlocked
+            ),
+            "artifact state cannot begin cleanup"
+        );
+        let tx = conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE image_generation_artifacts SET state='cleanup_pending',generation=generation+1,updated_at_unix_ms=?1 WHERE artifact_id=?2 AND state=?3 AND generation=?4 AND active_lease_count=0 AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_references r WHERE r.artifact_id=image_generation_artifacts.artifact_id AND r.released_at_unix_ms IS NULL) AND NOT EXISTS(SELECT 1 FROM image_generation_late_publication_leases p WHERE p.artifact_id=image_generation_artifacts.artifact_id AND p.state IN ('reserved','copy_authorized','copy_committed')) AND (immediate_cleanup=1 OR (eligibility_at_unix_ms IS NOT NULL AND eligibility_at_unix_ms<=?1) OR ?5 IN ('invalid_output','restart_recovery','owner_recovery'))",
+            params![input.now_unix_ms,input.artifact_id.to_string(),input.expected_state.as_str(),i64::try_from(input.expected_generation)?,input.reason.as_str()],
+        )?;
+        ensure!(
+            changed == 1,
+            "artifact cleanup compare-and-set lost or is ineligible"
+        );
+        let cleanup_generation = input
+            .expected_generation
+            .checked_add(1)
+            .context("artifact generation overflow")?;
+        tx.execute(
+            "INSERT INTO image_generation_artifact_cleanup_intents(cleanup_operation_id,artifact_id,expected_artifact_generation,reason,state,version,created_at_unix_ms) VALUES(?1,?2,?3,?4,'pending',1,?5)",
+            params![input.cleanup_operation_id.to_string(),input.artifact_id.to_string(),i64::try_from(cleanup_generation)?,input.reason.as_str(),input.now_unix_ms],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Commits held-file deletion evidence, the exactly-once central resource
+    /// release fact, and the component tombstone as one indivisible projection.
+    pub fn commit_image_generation_component_deletion_conn(
+        conn: &Connection,
+        input: &CommitImageGenerationComponentDeletion,
+    ) -> Result<()> {
+        ensure_digest(&input.deletion_evidence_digest, "deletion evidence digest")?;
+        let tx = conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE image_generation_artifact_components SET deletion_evidence_digest=?1 WHERE artifact_id=?2 AND component_id=?3 AND state='deleting' AND generation=?4 AND release_operation_id=?5 AND deletion_evidence_digest IS NULL",
+            params![input.deletion_evidence_digest,input.artifact_id.to_string(),input.component_id.to_string(),i64::try_from(input.expected_generation)?,input.release_operation_id.to_string()],
+        )?;
+        ensure!(
+            changed == 1,
+            "component deletion evidence compare-and-set lost"
+        );
+        tx.execute(
+            "INSERT INTO image_generation_component_release_facts(artifact_id,component_id,release_operation_id,deletion_evidence_digest,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5)",
+            params![input.artifact_id.to_string(),input.component_id.to_string(),input.release_operation_id.to_string(),input.deletion_evidence_digest,input.committed_at_unix_ms],
+        )?;
+        let tombstoned = tx.execute(
+            "UPDATE image_generation_artifact_components SET state='tombstoned',generation=generation+1 WHERE artifact_id=?1 AND component_id=?2 AND state='deleting' AND generation=?3",
+            params![input.artifact_id.to_string(),input.component_id.to_string(),i64::try_from(input.expected_generation)?],
+        )?;
+        ensure!(tombstoned == 1, "component tombstone compare-and-set lost");
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn finish_image_generation_artifact_cleanup_conn(
+        conn: &Connection,
+        artifact_id: Uuid,
+        expected_generation: u64,
+        cleanup_operation_id: Uuid,
+        now_unix_ms: i64,
+        terminal_reason: &str,
+    ) -> Result<()> {
+        ensure!(
+            !terminal_reason.is_empty(),
+            "artifact terminal reason is empty"
+        );
+        let tx = conn.unchecked_transaction()?;
+        let artifact=tx.execute("UPDATE image_generation_artifacts SET state='tombstoned',generation=generation+1,terminal_reason=?1,updated_at_unix_ms=?2 WHERE artifact_id=?3 AND state='deleting' AND generation=?4",params![terminal_reason,now_unix_ms,artifact_id.to_string(),i64::try_from(expected_generation)?])?;
+        ensure!(artifact == 1, "artifact tombstone compare-and-set lost");
+        let cleanup=tx.execute("UPDATE image_generation_artifact_cleanup_intents SET state='completed',version=version+1,completed_at_unix_ms=?1 WHERE cleanup_operation_id=?2 AND artifact_id=?3 AND state='deleting'",params![now_unix_ms,cleanup_operation_id.to_string(),artifact_id.to_string()])?;
+        ensure!(cleanup == 1, "cleanup completion compare-and-set lost");
+        tx.commit()?;
         Ok(())
     }
 }
@@ -2805,6 +2932,37 @@ mod tests {
             assert!(Db::create_image_generation_artifact_conn(conn,&forged).is_err());
             let count:i64=conn.query_row("SELECT count(*) FROM image_generation_artifacts",[],|row|row.get(0))?;
             assert_eq!(count,1);
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
+    fn artifact_cleanup_never_releases_before_exact_deletion_evidence() {
+        let db = Db::open_in_memory().unwrap();
+        db.blocking_for_sync_cli(|conn| {
+            let fixture=race_fixture(conn,false)?;
+            let artifact_id=Uuid::parse_str(&conn.query_row::<String,_,_>("SELECT managed_artifact_id FROM image_generation_slots WHERE job_id=?1 AND slot_id=?2",params![fixture.job_id.to_string(),fixture.slot_id.to_string()],|row|row.get(0))?)?;
+            let component_id=Uuid::now_v7();
+            let release_operation_id=Uuid::now_v7();
+            Db::create_image_generation_artifact_conn(conn,&CreateImageGenerationArtifact{artifact_id,job_id:fixture.job_id,slot_id:fixture.slot_id,component_set_digest:"b".repeat(64),components:vec![CreateImageGenerationArtifactComponent{component_id,kind:ImageGenerationArtifactComponentKind::Primary,relative_storage_key:format!("{artifact_id}/primary"),byte_length:9,sha256:"a".repeat(64),resource_reservation_id:"resource_1".into(),release_operation_id}],now_unix_ms:1})?;
+            Db::transition_image_generation_artifact_conn(conn,&TransitionImageGenerationArtifact{artifact_id,expected_generation:1,from:ImageGenerationArtifactState::Allocating,to:ImageGenerationArtifactState::Writing,now_unix_ms:2,terminal_reason:None})?;
+            Db::transition_image_generation_artifact_component_conn(conn,&TransitionImageGenerationArtifactComponent{artifact_id,component_id,expected_generation:1,from:ImageGenerationArtifactComponentState::Planned,to:ImageGenerationArtifactComponentState::Writing,stable_identity_json:None,deletion_evidence_digest:None})?;
+            Db::transition_image_generation_artifact_component_conn(conn,&TransitionImageGenerationArtifactComponent{artifact_id,component_id,expected_generation:2,from:ImageGenerationArtifactComponentState::Writing,to:ImageGenerationArtifactComponentState::Ready,stable_identity_json:Some("{\"held\":true}".into()),deletion_evidence_digest:None})?;
+            Db::transition_image_generation_artifact_conn(conn,&TransitionImageGenerationArtifact{artifact_id,expected_generation:2,from:ImageGenerationArtifactState::Writing,to:ImageGenerationArtifactState::Retained,now_unix_ms:3,terminal_reason:None})?;
+            let cleanup_operation_id=Uuid::now_v7();
+            Db::begin_image_generation_artifact_cleanup_conn(conn,&BeginImageGenerationArtifactCleanup{cleanup_operation_id,artifact_id,expected_generation:3,expected_state:ImageGenerationArtifactState::Retained,reason:ImageGenerationArtifactCleanupReason::InvalidOutput,now_unix_ms:4})?;
+            conn.execute("UPDATE image_generation_artifact_cleanup_intents SET state='deleting',version=2 WHERE cleanup_operation_id=?1",[cleanup_operation_id.to_string()])?;
+            Db::transition_image_generation_artifact_conn(conn,&TransitionImageGenerationArtifact{artifact_id,expected_generation:4,from:ImageGenerationArtifactState::CleanupPending,to:ImageGenerationArtifactState::Deleting,now_unix_ms:5,terminal_reason:None})?;
+            Db::transition_image_generation_artifact_component_conn(conn,&TransitionImageGenerationArtifactComponent{artifact_id,component_id,expected_generation:3,from:ImageGenerationArtifactComponentState::Ready,to:ImageGenerationArtifactComponentState::CleanupPending,stable_identity_json:None,deletion_evidence_digest:None})?;
+            Db::transition_image_generation_artifact_component_conn(conn,&TransitionImageGenerationArtifactComponent{artifact_id,component_id,expected_generation:4,from:ImageGenerationArtifactComponentState::CleanupPending,to:ImageGenerationArtifactComponentState::Deleting,stable_identity_json:None,deletion_evidence_digest:None})?;
+            assert!(conn.execute("INSERT INTO image_generation_component_release_facts(artifact_id,component_id,release_operation_id,deletion_evidence_digest,committed_at_unix_ms) VALUES(?1,?2,?3,?4,6)",params![artifact_id.to_string(),component_id.to_string(),release_operation_id.to_string(),"c".repeat(64)]).is_err());
+            Db::commit_image_generation_component_deletion_conn(conn,&CommitImageGenerationComponentDeletion{artifact_id,component_id,expected_generation:5,release_operation_id,deletion_evidence_digest:"d".repeat(64),committed_at_unix_ms:6})?;
+            Db::finish_image_generation_artifact_cleanup_conn(conn,artifact_id,5,cleanup_operation_id,7,"invalid_output")?;
+            let state:String=conn.query_row("SELECT state FROM image_generation_artifacts WHERE artifact_id=?1",[artifact_id.to_string()],|row|row.get(0))?;
+            assert_eq!(state,"tombstoned");
+            let releases:i64=conn.query_row("SELECT count(*) FROM image_generation_component_release_facts WHERE artifact_id=?1",[artifact_id.to_string()],|row|row.get(0))?;
+            assert_eq!(releases,1);
+            assert!(Db::commit_image_generation_component_deletion_conn(conn,&CommitImageGenerationComponentDeletion{artifact_id,component_id,expected_generation:5,release_operation_id,deletion_evidence_digest:"d".repeat(64),committed_at_unix_ms:6}).is_err());
             Ok(())
         }).unwrap();
     }

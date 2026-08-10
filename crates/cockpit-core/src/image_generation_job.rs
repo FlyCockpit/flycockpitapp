@@ -3675,6 +3675,16 @@ mod tests {
             AttemptMaximum, BudgetPolicy, ImageSpendSettings, ProjectEpochPolicy, SpendScopeKeys,
         };
         let mut sealed = plan();
+        if suffix.starts_with("svg-response") {
+            sealed.targets[0].requested.format = "svg".into();
+            sealed.targets[0].resolved.format = "svg".into();
+            sealed.targets[0].resolved.mime = "image/svg+xml".into();
+            sealed.targets[0].resolved.vector_sanitization_required = true;
+            sealed.targets[0].resolved.vector_sanitizer =
+                Some(crate::generated_svg::sanitizer_provenance());
+            sealed.output_authority.extension = "svg".into();
+            sealed.targets[0].slots[0].publication_name = "generated-000000.svg".into();
+        }
         let project_id = format!("fixture-project-{suffix}");
         let project_root = format!("/fixture-project-{suffix}");
         let session = db
@@ -4564,6 +4574,57 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(progress, AcceptedImageResponseProgress::LateQuarantined);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn accepted_svg_is_sanitized_and_retained_through_intent() {
+        use std::os::unix::fs::PermissionsExt;
+        let (fixture, request) = setup_accepted_response_fixture("svg-response-success").await;
+        let bytes=br#"<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512"><path d="M0 0h1v1z"/></svg>"#.to_vec();
+        let fetcher = ScriptedAcceptedResponseFetcher::new(
+            vec![AcceptedImageResponseFetchOutcome::Fetched {
+                bytes: bytes.clone(),
+                evidence: b"svg-fetch-proof".to_vec(),
+            }],
+            vec![],
+        );
+        fetch_accepted_image_response(
+            fixture.db.clone(),
+            &fetcher,
+            fixture.job_id,
+            fixture.slot_id,
+            1,
+            10,
+        )
+        .await
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let managed = temp.path().join("managed");
+        std::fs::create_dir(&managed).unwrap();
+        std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let root = std::sync::Arc::new(open_image_generation_artifact_root(&managed).unwrap());
+        let progress = coordinate_persisted_accepted_image_response(
+            fixture.db.clone(),
+            root,
+            CoordinateAcceptedImageResponse {
+                job_id: fixture.job_id,
+                slot_id: fixture.slot_id,
+                attempt_number: 1,
+                expected_job_version: 5,
+                expected_slot_version: 4,
+                expected_attempt_version: 5,
+                external_operation_id: request.external_operation_id,
+                expected_journal_version: 3,
+                component_id: Uuid::now_v7(),
+                release_operation_id: Uuid::now_v7(),
+                bytes,
+                now_unix_ms: 11,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(progress, AcceptedImageResponseProgress::Retained);
     }
 
     #[tokio::test]

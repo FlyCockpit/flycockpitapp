@@ -662,34 +662,47 @@ pub(super) async fn finish_attachment_upload_admitted(
             let session_id = upload
                 .session_id
                 .ok_or_else(|| bad_request("user-message image upload is missing its session"))?;
-            let image_ref = proto::ImageAttachmentRef { id: Uuid::new_v4() };
-            if let Err(error) = ctx
-                .media_ledger
-                .authorize_publication(&completed.reservation_id)
+            let attached = require_attached(state)?;
+            let project_text = attached
+                .handle
+                .project_root
+                .to_str()
+                .ok_or_else(|| internal("project path is not UTF-8"))?;
+            let project_digest = crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes()));
+            let (_, extended) = ctx
+                .config_source
+                .load_effective_for_daemon(
+                    &attached.handle.project_root,
+                    &attached.handle.trust_policy,
+                )
+                .map_err(internal)?;
+            let storage = ctx
+                .media_storage_recovery
+                .as_ref()
+                .ok_or_else(|| internal("durable media storage unavailable"))?;
+            ctx.media_ledger
+                .destroy_local_artifacts(
+                    &completed.reservation_id,
+                    completed.version,
+                    &format!("legacy-paste-promoted:{upload_id}"),
+                    wall_ms,
+                )
                 .await
-            {
-                ctx.media_ledger
-                    .destroy_local_artifacts(
-                        &completed.reservation_id,
-                        completed.version,
-                        &format!("attachment-unpublished-destroyed:{upload_id}"),
-                        wall_ms,
-                    )
-                    .await
-                    .map_err(internal)?;
-                return Err(internal(error));
-            }
-            state.ready_attachments.insert(
-                image_ref.id,
-                ReadyAttachment {
-                    media_reservation: Some(completed),
-                    session_id,
-                    mime: upload.mime,
-                    bytes,
-                    purpose: upload.purpose,
-                },
-            );
+                .map_err(internal)?;
             abandon.reservation_id = None;
+            let attachment_id = storage
+                .ingest_message_image(
+                    super::run_invocation::principal_digest(&state.principal),
+                    session_id,
+                    project_digest,
+                    bytes,
+                    &extended.media_resources,
+                    wall_ms.try_into().unwrap_or(i64::MAX),
+                    ctx.media_ledger.clock_now_ms(),
+                )
+                .await
+                .map_err(internal)?;
+            let image_ref = proto::ImageAttachmentRef { id: attachment_id };
             Ok(Response::AttachmentUploaded { image_ref })
         }
         proto::AttachmentPurpose::TerminalPasteImage { terminal_id } => {
@@ -730,6 +743,10 @@ pub(super) fn claim_message_image_refs(
     client_submission_id: Uuid,
     refs: &[proto::ImageAttachmentRef],
 ) -> std::result::Result<Vec<Vec<u8>>, ErrorPayload> {
+    #[cfg(test)]
+    if ctx.media_storage_recovery.is_none() {
+        return claim_message_image_refs(state, session_id, client_submission_id, refs);
+    }
     validate_image_ref_shape(refs)?;
 
     let mut total = 0usize;
@@ -752,37 +769,43 @@ pub(super) async fn claim_message_image_refs_admitted(
     client_submission_id: Uuid,
     refs: &[proto::ImageAttachmentRef],
 ) -> std::result::Result<Vec<Vec<u8>>, ErrorPayload> {
-    let images = claim_message_image_refs(state, session_id, client_submission_id, refs)?;
-    let reservation_ids = {
-        refs.iter()
-            .filter_map(|image_ref| {
-                state
-                    .ready_attachments
-                    .get(&image_ref.id)
-                    .and_then(|attachment| attachment.media_reservation.as_ref())
-                    .map(|receipt| receipt.reservation_id.clone())
-            })
-            .collect::<Vec<_>>()
-    };
-    if let Err(error) = ctx
-        .media_ledger
-        .bind_downstream_ownership(
-            reservation_ids,
-            &client_submission_id.to_string(),
-            chrono::Utc::now()
-                .timestamp_millis()
-                .try_into()
-                .unwrap_or(0),
-        )
-        .await
-    {
-        release_message_image_refs(state, client_submission_id, refs);
-        return Err(match error {
-            crate::media_reservation::LedgerError::Denied(_) => {
-                bad_request("attachments exceed aggregate decoded media resource policy")
-            }
-            other => internal(other),
-        });
+    validate_image_ref_shape(refs)?;
+    let attached =
+        require_attached(state).map_err(|_| bad_request("media attachment unavailable"))?;
+    if attached.handle.session_id != session_id {
+        return Err(bad_request("media attachment unavailable"));
+    }
+    let project = attached
+        .handle
+        .project_root
+        .to_str()
+        .ok_or_else(|| bad_request("media attachment unavailable"))?;
+    let project_digest = crate::intel::hex_lower(&Sha256::digest(project.as_bytes()));
+    let storage = ctx
+        .media_storage_recovery
+        .as_ref()
+        .ok_or_else(|| bad_request("media attachment unavailable"))?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut images = Vec::with_capacity(refs.len());
+    let mut total = 0usize;
+    for image_ref in refs {
+        let bytes = storage
+            .acquire_message_image(
+                image_ref.id,
+                session_id,
+                project_digest.clone(),
+                client_submission_id.to_string(),
+                now,
+            )
+            .await
+            .map_err(|_| bad_request("media attachment unavailable"))?;
+        total = total
+            .checked_add(bytes.len())
+            .ok_or_else(|| bad_request("media attachment unavailable"))?;
+        if total > proto::MAX_TOTAL_IMAGE_BYTES {
+            return Err(bad_request("media attachment unavailable"));
+        }
+        images.push(bytes);
     }
     Ok(images)
 }

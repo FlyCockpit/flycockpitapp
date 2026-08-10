@@ -138,6 +138,100 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    pub(crate) async fn ingest_message_image(
+        &self,
+        actor_principal_digest: String,
+        session_id: Uuid,
+        project_digest: String,
+        bytes: Vec<u8>,
+        policy: &cockpit_config::config::media_budget::MediaResourcePolicy,
+        now_unix_ms: i64,
+        now_monotonic_ms: u64,
+    ) -> Result<Uuid> {
+        use base64::Engine as _;
+        use cockpit_db::media_attachments::{
+            AppendMediaUploadChunkV1, LocalMediaActorRoleV1, LocalMediaMutationPayloadV1,
+            LocalMediaMutationV1,
+        };
+        ensure!(
+            !bytes.is_empty() && bytes.len() <= u32::MAX as usize,
+            "media_attachment_unavailable"
+        );
+        let draft = Uuid::now_v7();
+        let length = bytes.len() as u64;
+        let checksum = crate::intel::hex_lower(&Sha256::digest(&bytes));
+        let begin = LocalMediaMutationV1 {
+            schema_version: 1,
+            kind: "localMediaMutation".into(),
+            local_operation_id: Uuid::now_v7(),
+            actor_principal_digest: actor_principal_digest.clone(),
+            actor_role: LocalMediaActorRoleV1::Owner,
+            payload: LocalMediaMutationPayloadV1::Begin {
+                session_id,
+                canonical_project_digest: project_digest.clone(),
+                client_draft_id: draft,
+                media_kind: RequestedLocalPathMediaKind::Image,
+                declared_total_bytes: length,
+                reservation_digest: digest_json(
+                    b"media-upload-reservation-v1",
+                    &local_path_plans(policy, length)?,
+                )?,
+            },
+        };
+        let upload = self
+            .begin_media_upload(begin, policy, now_unix_ms, now_monotonic_ms)
+            .await?
+            .subject_id;
+        self.append_media_upload_chunk(
+            AppendMediaUploadChunkV1 {
+                mutation: LocalMediaMutationV1 {
+                    schema_version: 1,
+                    kind: "localMediaMutation".into(),
+                    local_operation_id: Uuid::now_v7(),
+                    actor_principal_digest: actor_principal_digest.clone(),
+                    actor_role: LocalMediaActorRoleV1::Owner,
+                    payload: LocalMediaMutationPayloadV1::Append {
+                        session_id,
+                        canonical_project_digest: project_digest.clone(),
+                        client_draft_id: draft,
+                        upload_id: upload,
+                        upload_generation: 1,
+                        chunk_index: 0,
+                        chunk_length: bytes.len() as u32,
+                        chunk_sha256: checksum.clone(),
+                    },
+                },
+                data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+            },
+            now_unix_ms,
+        )
+        .await?;
+        self.finalize_media_upload(
+            LocalMediaMutationV1 {
+                schema_version: 1,
+                kind: "localMediaMutation".into(),
+                local_operation_id: Uuid::now_v7(),
+                actor_principal_digest,
+                actor_role: LocalMediaActorRoleV1::Owner,
+                payload: LocalMediaMutationPayloadV1::Finalize {
+                    session_id,
+                    canonical_project_digest: project_digest,
+                    client_draft_id: draft,
+                    upload_id: upload,
+                    upload_generation: 2,
+                    chunk_count: 1,
+                    total_bytes: length,
+                    object_sha256: checksum,
+                },
+            },
+            now_unix_ms,
+        )
+        .await?;
+        self.db.read(move |conn| {
+            let id: String = conn.query_row("SELECT attachment_id FROM media_uploads WHERE upload_id=?1 AND state='materialized'", [upload.to_string()], |row| row.get(0))?;
+            Uuid::parse_str(&id).context("invalid materialized attachment id")
+        }).await
+    }
     pub(crate) async fn acquire_message_image(
         &self,
         attachment_id: Uuid,

@@ -918,10 +918,42 @@ impl<'de> Deserialize<'de> for MediaAttachmentStatusV1 {
             #[serde(flatten)]
             detail: MediaAttachmentStatusDetailV1,
         }
-        let value = serde_json::Value::deserialize(deserializer)?;
-        let object = value
-            .as_object()
-            .ok_or_else(|| serde::de::Error::custom("media attachment status must be an object"))?;
+        struct UniqueObject(serde_json::Map<String, serde_json::Value>);
+        impl<'de> Deserialize<'de> for UniqueObject {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct Visitor;
+                impl<'de> serde::de::Visitor<'de> for Visitor {
+                    type Value = UniqueObject;
+                    fn expecting(
+                        &self,
+                        formatter: &mut std::fmt::Formatter<'_>,
+                    ) -> std::fmt::Result {
+                        formatter.write_str("a media attachment status object with unique keys")
+                    }
+                    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+                    where
+                        A: serde::de::MapAccess<'de>,
+                    {
+                        let mut object = serde_json::Map::new();
+                        while let Some((key, value)) =
+                            map.next_entry::<String, serde_json::Value>()?
+                        {
+                            if object.insert(key.clone(), value).is_some() {
+                                return Err(serde::de::Error::custom(format!(
+                                    "duplicate field `{key}`"
+                                )));
+                            }
+                        }
+                        Ok(UniqueObject(object))
+                    }
+                }
+                deserializer.deserialize_map(Visitor)
+            }
+        }
+        let UniqueObject(object) = UniqueObject::deserialize(deserializer)?;
         let state = object
             .get("availabilityState")
             .and_then(serde_json::Value::as_str)
@@ -962,7 +994,8 @@ impl<'de> Deserialize<'de> for MediaAttachmentStatusV1 {
         {
             return Err(serde::de::Error::custom(format!("unknown field `{field}`")));
         }
-        let wire: Wire = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        let wire: Wire = serde_json::from_value(serde_json::Value::Object(object))
+            .map_err(serde::de::Error::custom)?;
         Ok(Self {
             schema_version: wire.schema_version,
             kind: wire.kind,
@@ -2792,6 +2825,33 @@ mod tests {
             .unwrap()
             .insert("reason".into(), serde_json::json!("storage_failure"));
         assert!(serde_json::from_value::<MediaAttachmentStatusV1>(wrong_variant_field).is_err());
+        let duplicate_base = text.replacen(
+            "\"kind\":\"mediaAttachmentStatus\"",
+            "\"kind\":\"mediaAttachmentStatus\",\"kind\":\"mediaAttachmentStatus\"",
+            1,
+        );
+        assert!(serde_json::from_str::<MediaAttachmentStatusV1>(&duplicate_base).is_err());
+        let duplicate_state = text.replacen(
+            "\"availabilityState\":\"registered\"",
+            "\"availabilityState\":\"registered\",\"availabilityState\":\"ready\"",
+            1,
+        );
+        assert!(serde_json::from_str::<MediaAttachmentStatusV1>(&duplicate_state).is_err());
+        let ready = MediaAttachmentStatusV1 {
+            detail: MediaAttachmentStatusDetailV1::Ready {
+                ready_checksum: "33".repeat(32),
+                preview: None,
+            },
+            ..status.clone()
+        };
+        let ready_text = serde_json::to_string(&ready).unwrap();
+        let checksum_field = format!("\"readyChecksum\":\"{}\"", "33".repeat(32));
+        let duplicate_variant = ready_text.replacen(
+            &checksum_field,
+            &format!("{checksum_field},\"readyChecksum\":\"{}\"", "44".repeat(32)),
+            1,
+        );
+        assert!(serde_json::from_str::<MediaAttachmentStatusV1>(&duplicate_variant).is_err());
         let request = serde_json::json!({"schemaVersion":1,"kind":"getMediaAttachmentStatus","sessionId":Uuid::now_v7().to_string(),"canonicalProjectDigest":"11".repeat(32),"attachmentId":attachment_id.to_string(),"extra":true});
         assert!(serde_json::from_value::<GetMediaAttachmentStatusV1>(request).is_err());
     }

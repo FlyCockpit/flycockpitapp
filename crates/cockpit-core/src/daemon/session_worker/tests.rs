@@ -109,7 +109,9 @@ async fn remote_queue_receipt_and_terminal_disposition_commit_and_replay_togethe
             .unwrap()
             .is_some()
     );
-    let replay = db
+    let replay: crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome<
+        RemoteQueueMutationReceiptV1,
+    > = db
         .execute_transactional_remote_operation(operation(), |_| {
             panic!("replay must not rewrite terminal receipt")
         })

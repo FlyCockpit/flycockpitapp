@@ -1466,7 +1466,7 @@ mod tests {
         let mut changed = request();
         changed.request_hash = [8; 32];
         assert!(matches!(
-            db.execute_transactional_remote_operation(changed, |_| panic!(
+            db.execute_transactional_remote_operation::<(), _>(changed, |_| panic!(
                 "conflict must not execute domain closure"
             ))
             .await

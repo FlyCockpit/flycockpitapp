@@ -103,39 +103,6 @@
     "kind": "err",
     "v": 9
   },
-  "model_generation_stale_paired": {
-    "error": {
-      "code": "model_generation_stale",
-      "message": "captured model generation is no longer active"
-    },
-    "id": "11111111-1111-4111-8111-111111111111",
-    "kind": "err",
-    "v": 6
-  },
-  "invalid_ingress_paired": {
-    "error": { "code": "invalid_ingress", "message": "invalid terminal ingress" },
-    "id": "11111111-1111-4111-8111-111111111111",
-    "kind": "err",
-    "v": 6
-  },
-  "ingress_conflict_paired": {
-    "error": { "code": "ingress_conflict", "message": "terminal ingress metadata conflict" },
-    "id": "11111111-1111-4111-8111-111111111111",
-    "kind": "err",
-    "v": 6
-  },
-  "ingress_path_unavailable_paired": {
-    "error": { "code": "ingress_path_unavailable", "message": "terminal ingress path unavailable" },
-    "id": "11111111-1111-4111-8111-111111111111",
-    "kind": "err",
-    "v": 6
-  },
-  "terminal_generation_gone_paired": {
-    "error": { "code": "terminal_generation_gone", "message": "terminal generation is gone" },
-    "id": "11111111-1111-4111-8111-111111111111",
-    "kind": "err",
-    "v": 6
-  },
   "protocol_version_paired": {
     "error": {
       "code": "protocol_version",

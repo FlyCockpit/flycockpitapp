@@ -15,6 +15,7 @@ pub enum ClientPrincipal {
 pub struct RemotePrincipal {
     pub user_id: String,
     pub grants: Vec<PrincipalGrant>,
+    pub actor_binding: Option<crate::daemon::relay_envelope::ClientActorBindingV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +49,7 @@ impl ClientPrincipal {
     pub fn from_relay(principal: RelayPrincipal) -> Self {
         Self::Remote(RemotePrincipal {
             user_id: principal.user_id,
+            actor_binding: principal.actor_binding,
             grants: principal
                 .grants
                 .into_iter()
@@ -169,7 +171,7 @@ fn canonical_if_exists(path: &str) -> PathBuf {
 }
 
 macro_rules! command_request_kind_match {
-    (($request:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+    (($request:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
         match $request {
             $($pattern => $kind,)+
         }
@@ -202,7 +204,7 @@ macro_rules! command_request_ordering_value {
 }
 
 macro_rules! command_request_ordering_match {
-    (($request:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+    (($request:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
         match $request {
             $($pattern => command_request_ordering_value!($ordering),)+
         }
@@ -220,13 +222,13 @@ mod tests {
     use crate::daemon::relay_envelope::{RelayGrant, RelayGrantScope, RelayPrincipal};
 
     macro_rules! request_ordering_rows_from_command_table {
-        (($($context:ident),*) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+        (($($context:ident),*) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
             &[$(($kind, command_request_ordering_value!($ordering))),+]
         }};
     }
 
     macro_rules! request_ordering_row_count_from_command_table {
-        (($($context:ident),*) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+        (($($context:ident),*) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
             0usize $(+ {
                 let _ = stringify!($pattern);
                 1usize
@@ -235,7 +237,7 @@ mod tests {
     }
 
     macro_rules! request_ordering_no_wildcard_check {
-        (($request:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+        (($request:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
             let classify_without_wildcard: fn(&Request) -> RequestOrdering = |$request| {
                 match $request {
                     $($pattern => command_request_ordering_value!($ordering),)+
@@ -253,6 +255,7 @@ mod tests {
                 scope,
                 project_root,
             }],
+            actor_binding: None,
         })
     }
 

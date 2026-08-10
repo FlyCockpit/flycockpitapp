@@ -1,6 +1,274 @@
 use super::sessions::*;
 use super::*;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct AuthorizedFcorResource {
+    pub(super) kind: proto::remote_operation_fcor::RemoteOperationResourceKind,
+    pub(super) value: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AuthorizedRequestContext {
+    pub(super) fcor_resources: Vec<AuthorizedFcorResource>,
+}
+
+impl AuthorizedRequestContext {
+    /// Build the canonical operation bytes from resources resolved at the
+    /// authorization boundary. Callers must supply the request-specific
+    /// canonical parameter encoding; schema text or transport JSON are not
+    /// valid substitutes.
+    pub(super) fn encode_fcor(
+        &self,
+        request: &Request,
+        canonical_params: &[u8],
+    ) -> std::result::Result<Vec<u8>, ErrorPayload> {
+        let resources: Vec<_> = self
+            .fcor_resources
+            .iter()
+            .map(
+                |resource| proto::remote_operation_fcor::RemoteOperationResource {
+                    kind: resource.kind,
+                    value: resource.value.as_slice(),
+                },
+            )
+            .collect();
+        proto::remote_operation_fcor::encode_fcor_v1(
+            request.wire_tag(),
+            &resources,
+            canonical_params,
+        )
+        .map_err(|error| ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: format!("request cannot be canonically encoded: {error}"),
+        })
+    }
+}
+
+fn canonical_project_root_bytes(
+    path: &std::path::Path,
+) -> std::result::Result<Vec<u8>, ErrorPayload> {
+    let text = path.to_str().ok_or_else(|| ErrorPayload {
+        code: ErrorCode::BadRequest,
+        message: "canonical project root is not valid UTF-8".into(),
+    })?;
+    Ok(text.as_bytes().to_vec())
+}
+
+fn push_fcor_resource(
+    resources: &mut Vec<AuthorizedFcorResource>,
+    kind: proto::remote_operation_fcor::RemoteOperationResourceKind,
+    value: Vec<u8>,
+) {
+    resources.push(AuthorizedFcorResource { kind, value });
+}
+
+trait SessionFcorResource {
+    fn push_to(&self, resources: &mut Vec<AuthorizedFcorResource>);
+}
+impl SessionFcorResource for Uuid {
+    fn push_to(&self, resources: &mut Vec<AuthorizedFcorResource>) {
+        push_fcor_resource(
+            resources,
+            proto::remote_operation_fcor::RemoteOperationResourceKind::SessionUuid,
+            self.as_bytes().to_vec(),
+        );
+    }
+}
+impl SessionFcorResource for Option<Uuid> {
+    fn push_to(&self, resources: &mut Vec<AuthorizedFcorResource>) {
+        if let Some(value) = self {
+            value.push_to(resources);
+        }
+    }
+}
+
+trait OptionalFcorText {
+    fn optional_text(&self) -> Option<&str>;
+}
+impl OptionalFcorText for String {
+    fn optional_text(&self) -> Option<&str> {
+        Some(self)
+    }
+}
+impl OptionalFcorText for Option<String> {
+    fn optional_text(&self) -> Option<&str> {
+        self.as_deref()
+    }
+}
+
+macro_rules! resolve_fcor_role {
+    ($resources:ident, $cwd:ident, $name:ident => param) => {
+        let _ = $name;
+    };
+    ($resources:ident, $cwd:ident, $name:ident => scheduled) => {{
+        use proto::remote_operation_fcor::RemoteOperationResourceKind as Kind;
+        push_fcor_resource(
+            &mut $resources,
+            Kind::SchedulerId,
+            $name.id.as_bytes().to_vec(),
+        );
+        if let proto::ScheduledJobPayload::RunPrompt { project_root, .. } = &$name.payload {
+            let canonical = crate::daemon::fs_api::canonical_project_root(project_root)?;
+            push_fcor_resource(
+                &mut $resources,
+                Kind::ProjectRoot,
+                canonical_project_root_bytes(&canonical)?,
+            );
+        }
+    }};
+    ($resources:ident, $cwd:ident, $name:ident => session) => {
+        $name.push_to(&mut $resources);
+    };
+    ($resources:ident, $cwd:ident, $name:ident => project_root_effective) => {{
+        let raw = $name
+            .as_deref()
+            .unwrap_or_else(|| $cwd.to_str().unwrap_or(""));
+        let canonical = crate::daemon::fs_api::canonical_project_root(raw)?;
+        push_fcor_resource(
+            &mut $resources,
+            proto::remote_operation_fcor::RemoteOperationResourceKind::ProjectRoot,
+            canonical_project_root_bytes(&canonical)?,
+        );
+    }};
+    ($resources:ident, $cwd:ident, $name:ident => project_root) => {{
+        let canonical = crate::daemon::fs_api::canonical_project_root($name)?;
+        push_fcor_resource(
+            &mut $resources,
+            proto::remote_operation_fcor::RemoteOperationResourceKind::ProjectRoot,
+            canonical_project_root_bytes(&canonical)?,
+        );
+    }};
+    ($resources:ident, $cwd:ident, $name:ident => project) => {
+        if let Some(value) = $name {
+            push_fcor_resource(
+                &mut $resources,
+                proto::remote_operation_fcor::RemoteOperationResourceKind::ProjectId,
+                value.as_bytes().to_vec(),
+            );
+        }
+    };
+    ($resources:ident, $cwd:ident, $name:ident => file_existing($root:ident)) => {{
+        let canonical = crate::daemon::fs_api::resolve_authorized_canonical_path(
+            $root,
+            $name,
+            crate::daemon::fs_api::AuthorizedCanonicalPathMode::Existing,
+        )?;
+        push_fcor_resource(
+            &mut $resources,
+            proto::remote_operation_fcor::RemoteOperationResourceKind::FilePath,
+            canonical_project_root_bytes(&canonical)?,
+        );
+    }};
+    ($resources:ident, $cwd:ident, $name:ident => file_write_target($root:ident)) => {{
+        let canonical = crate::daemon::fs_api::resolve_authorized_canonical_path(
+            $root,
+            $name,
+            crate::daemon::fs_api::AuthorizedCanonicalPathMode::WriteTarget,
+        )?;
+        push_fcor_resource(
+            &mut $resources,
+            proto::remote_operation_fcor::RemoteOperationResourceKind::FilePath,
+            canonical_project_root_bytes(&canonical)?,
+        );
+    }};
+    ($resources:ident, $cwd:ident, $name:ident => rename_source($root:ident)) => {{
+        let canonical = crate::daemon::fs_api::resolve_authorized_canonical_path(
+            $root,
+            $name,
+            crate::daemon::fs_api::AuthorizedCanonicalPathMode::RenameSource,
+        )?;
+        push_fcor_resource(
+            &mut $resources,
+            proto::remote_operation_fcor::RemoteOperationResourceKind::FilePath,
+            canonical_project_root_bytes(&canonical)?,
+        );
+    }};
+    ($resources:ident, $cwd:ident, $name:ident => terminal) => {
+        push_fcor_resource(
+            &mut $resources,
+            proto::remote_operation_fcor::RemoteOperationResourceKind::TerminalUuid,
+            $name.as_bytes().to_vec(),
+        );
+    };
+    ($resources:ident, $cwd:ident, $name:ident => upload) => {
+        push_fcor_resource(
+            &mut $resources,
+            proto::remote_operation_fcor::RemoteOperationResourceKind::UploadUuid,
+            $name.as_bytes().to_vec(),
+        );
+    };
+    ($resources:ident, $cwd:ident, $name:ident => interrupt) => {
+        push_fcor_resource(
+            &mut $resources,
+            proto::remote_operation_fcor::RemoteOperationResourceKind::InterruptUuid,
+            $name.as_bytes().to_vec(),
+        );
+    };
+    ($resources:ident, $cwd:ident, $name:ident => queue) => {
+        push_fcor_resource(
+            &mut $resources,
+            proto::remote_operation_fcor::RemoteOperationResourceKind::QueueUuid,
+            $name.as_bytes().to_vec(),
+        );
+    };
+    ($resources:ident, $cwd:ident, $name:ident => legacy_message) => {
+        let _ = $name;
+    };
+    ($resources:ident, $cwd:ident, $name:ident => provider_model_right($left:ident)) => {
+        let _ = ($name, $left);
+    };
+    ($resources:ident, $cwd:ident, $name:ident => provider_model_left($model:ident)) => {{
+        if let (Some(provider), Some(model)) = ($name.optional_text(), $model.optional_text()) {
+            let value =
+                proto::remote_operation_fcor::encode_provider_model_resource_v1(provider, model)
+                    .map_err(|error| ErrorPayload {
+                        code: ErrorCode::BadRequest,
+                        message: error.to_string(),
+                    })?;
+            push_fcor_resource(
+                &mut $resources,
+                proto::remote_operation_fcor::RemoteOperationResourceKind::ProviderModel,
+                value,
+            );
+        }
+    }};
+}
+
+macro_rules! command_resolve_fcor_resources {
+    (($request:ident, $cwd:ident) [$(($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+        match $request { $($pattern => {
+            let mut resources = Vec::new();
+            let _: &mut Vec<AuthorizedFcorResource> = &mut resources;
+            let _ = $cwd;
+            $(resolve_fcor_role!(resources, $cwd, $fcor_field => $fcor_role $(($($fcor_role_arg),*))?);)*
+            Ok(resources)
+        },)+ }
+    }};
+}
+
+/// Resolve path-bearing FCOR resources only after request authorization.
+/// Raw client path text never leaves this boundary.
+fn resolve_authorized_fcor_resources(
+    request: &Request,
+    daemon_cwd: &std::path::Path,
+) -> std::result::Result<Vec<AuthorizedFcorResource>, ErrorPayload> {
+    proto::command!(command_resolve_fcor_resources, request, daemon_cwd)
+}
+
+pub(super) async fn authorize_request_context(
+    request: &Request,
+    state: &MutableClientState,
+    ctx: &DaemonContext,
+) -> std::result::Result<AuthorizedRequestContext, ErrorPayload> {
+    authorize_request(request, state, ctx).await?;
+    #[cfg(test)]
+    ctx.fcor_resolver_calls
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(AuthorizedRequestContext {
+        fcor_resources: resolve_authorized_fcor_resources(request, &ctx.canonical_cwd)?,
+    })
+}
+
 pub(super) fn session_access_for_row(
     principal: &ClientPrincipal,
     row: &crate::db::sessions::SessionRow,
@@ -191,7 +459,7 @@ macro_rules! command_session_id_value {
 }
 
 macro_rules! command_request_session_id_match {
-    (($request:ident, $state:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+    (($request:ident, $state:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
         match $request {
             $($pattern => command_session_id_value!($state, $session $(($session_arg))?),)+
         }
@@ -216,7 +484,7 @@ macro_rules! command_audit_path_value {
 }
 
 macro_rules! command_request_audit_path_match {
-    (($request:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+    (($request:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
         match $request {
             $($pattern => command_audit_path_value!($audit_path $(($($audit_arg),+))?),)+
         }
@@ -229,7 +497,7 @@ pub(super) fn request_audit_path(request: &Request) -> Option<String> {
 }
 
 macro_rules! command_is_remote_mutating_match {
-    (($request:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+    (($request:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
         match $request {
             $($pattern => $mutating,)+
         }
@@ -461,17 +729,8 @@ pub(super) async fn authorize_begin_attachment_upload(
         );
     };
 
-    if matches!(purpose, proto::AttachmentPurpose::TerminalPasteImage { .. }) {
-        if principal.has_terminal() {
-            Ok(())
-        } else {
-            Err(authorization_error(
-                "remote principal cannot paste into terminals",
-            ))
-        }
-    } else {
-        require_remote_session_writer(principal, state, ctx).await
-    }
+    let _ = purpose;
+    require_remote_session_writer(principal, state, ctx).await
 }
 
 pub(super) async fn authorize_attachment_upload_step(
@@ -487,22 +746,8 @@ pub(super) async fn authorize_attachment_upload_step(
         _ => unreachable!("authorize_attachment_upload_step called for non-upload-step request"),
     };
 
-    if state.pending_uploads.get(upload_id).is_some_and(|upload| {
-        matches!(
-            upload.purpose,
-            proto::AttachmentPurpose::TerminalPasteImage { .. }
-        )
-    }) {
-        if principal.has_terminal() {
-            Ok(())
-        } else {
-            Err(authorization_error(
-                "remote principal cannot paste into terminals",
-            ))
-        }
-    } else {
-        require_remote_session_writer(principal, state, ctx).await
-    }
+    let _ = upload_id;
+    require_remote_session_writer(principal, state, ctx).await
 }
 
 pub(super) async fn authorize_steer_delegation(
@@ -604,18 +849,8 @@ pub(super) async fn authorize_shared_custom(
                 Err(e) => Err(internal(e)),
             }
         }
-        Request::BeginAttachmentUpload { purpose, .. } => {
-            if matches!(purpose, proto::AttachmentPurpose::TerminalPasteImage { .. }) {
-                if principal.has_terminal() {
-                    Ok(())
-                } else {
-                    Err(authorization_error(
-                        "remote principal cannot paste into terminals",
-                    ))
-                }
-            } else {
-                require_remote_shared_session_writer(principal, shared, ctx).await
-            }
+        Request::BeginAttachmentUpload { .. } => {
+            require_remote_shared_session_writer(principal, shared, ctx).await
         }
         Request::UploadAttachmentChunk { .. }
         | Request::FinishAttachmentUpload { .. }
@@ -743,7 +978,7 @@ macro_rules! command_authorize_value {
 }
 
 macro_rules! command_authorize_request_match {
-    (($request:ident, $state:ident, $ctx:ident, $principal:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+    (($request:ident, $state:ident, $ctx:ident, $principal:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
         match $request {
             $($pattern => command_authorize_value!($principal, $state, $ctx, $request, $authz $(($authz_arg))?),)+
         }
@@ -821,7 +1056,7 @@ macro_rules! command_authorize_shared_value {
 }
 
 macro_rules! command_authorize_shared_request_match {
-    (($request:ident, $shared:ident, $ctx:ident, $principal:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+    (($request:ident, $shared:ident, $ctx:ident, $principal:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
         match $request {
             $($pattern => command_authorize_shared_value!($principal, $shared, $ctx, $request, $authz $(($authz_arg))?),)+
         }

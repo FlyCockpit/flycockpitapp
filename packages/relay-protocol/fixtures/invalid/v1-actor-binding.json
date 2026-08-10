@@ -1,0 +1,16 @@
+{
+  "channelId": "ch-invalid-v1-actor",
+  "from": "client",
+  "payload": {},
+  "principal": {
+    "actorBinding": {
+      "deviceGeneration": "1",
+      "deviceId": "00000000-0000-4000-8000-000000000001",
+      "logicalAttachmentId": "00000000-0000-4000-8000-000000000002",
+      "schemaVersion": 1
+    },
+    "grants": [],
+    "userId": "user-1"
+  },
+  "v": 1
+}

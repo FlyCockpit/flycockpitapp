@@ -146,16 +146,31 @@ it("pairs a daemon and client, stamps principals, and routes daemon replies by c
     instanceId: "instance-1",
     userId: "user-1",
     grants: [{ scope: "terminal", projectRoot: null }],
+    actorBinding: {
+      schemaVersion: 1,
+      deviceId: "00000000-0000-4000-8000-000000000001",
+      deviceGeneration: "9007199254740993",
+      logicalAttachmentId: "00000000-0000-4000-8000-000000000002",
+    },
   });
   const clientFrame = loadFixture<ClientRelayFrame>("client-relay-frame.json");
   const daemonFrame = loadFixture<DaemonClientRelayFrame>("daemon-client-relay-frame.json");
 
   client.send(JSON.stringify(clientFrame));
   await expect(nextMessage(daemon)).resolves.toMatchObject({
-    v: 1,
+    v: 2,
     channelId: clientFrame.channelId,
     from: "client",
-    principal: { userId: "user-1", grants: [{ scope: "terminal", projectRoot: null }] },
+    principal: {
+      userId: "user-1",
+      grants: [{ scope: "terminal", projectRoot: null }],
+      actorBinding: {
+        schemaVersion: 1,
+        deviceId: "00000000-0000-4000-8000-000000000001",
+        deviceGeneration: "9007199254740993",
+        logicalAttachmentId: "00000000-0000-4000-8000-000000000002",
+      },
+    },
     payload: clientFrame.payload,
   });
 
@@ -164,6 +179,44 @@ it("pairs a daemon and client, stamps principals, and routes daemon replies by c
     v: 1,
     channelId: clientFrame.channelId,
     payload: daemonFrame.payload,
+  });
+});
+
+it("rejects channel collisions, permits same-owner reuse, and releases ownership on disconnect", async () => {
+  relay = await startRelayUnderTest();
+  const daemon = await openDaemon(relay);
+  const owner = await openClient(relay, {
+    tokenType: "client",
+    instanceId: "instance-1",
+    userId: "owner",
+  });
+  const frame = loadFixture<ClientRelayFrame>("client-relay-frame.json");
+  owner.send(JSON.stringify(frame));
+  await nextMessage(daemon);
+  owner.send(JSON.stringify(frame));
+  await nextMessage(daemon);
+
+  const contender = await openClient(relay, {
+    tokenType: "client",
+    instanceId: "instance-1",
+    userId: "contender",
+  });
+  const contenderClose = closed(contender);
+  contender.send(JSON.stringify(frame));
+  await expect(contenderClose).resolves.toMatchObject({ code: 4400 });
+
+  const ownerClose = closed(owner);
+  owner.close();
+  await ownerClose;
+  const successor = await openClient(relay, {
+    tokenType: "client",
+    instanceId: "instance-1",
+    userId: "successor",
+  });
+  successor.send(JSON.stringify(frame));
+  await expect(nextMessage(daemon)).resolves.toMatchObject({
+    channelId: frame.channelId,
+    principal: { userId: "successor" },
   });
 });
 

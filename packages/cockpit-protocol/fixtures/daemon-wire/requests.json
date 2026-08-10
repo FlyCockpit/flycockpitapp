@@ -1,43 +1,4 @@
 {
-  "get_app_flag": {
-    "id": "11111111-1111-4111-8111-111111111111",
-    "kind": "req",
-    "params": { "key": "daemon_autostart_notice" },
-    "request": "get_app_flag",
-    "v": 9
-  },
-  "get_startup_disclosures": {
-    "id": "11111111-1111-4111-8111-111111111111",
-    "kind": "req",
-    "params": { "project_root": "/tmp/project" },
-    "request": "get_startup_disclosures",
-    "v": 9
-  },
-  "mark_app_flag_seen": {
-    "id": "11111111-1111-4111-8111-111111111111",
-    "kind": "req",
-    "params": { "expected_version": 7, "key": "daemon_autostart_notice" },
-    "request": "mark_app_flag_seen",
-    "v": 9
-  },
-  "resolve_assistant_session": {
-    "id": "11111111-1111-4111-8111-111111111111",
-    "kind": "req",
-    "params": {
-      "assistant_id": "helper-bot",
-      "mode": "most_recent_or_create",
-      "project_root": "/tmp/project"
-    },
-    "request": "resolve_assistant_session",
-    "v": 9
-  },
-  "set_workspace_trust": {
-    "id": "11111111-1111-4111-8111-111111111111",
-    "kind": "req",
-    "params": { "expected_config_generation": 7, "mode": "trust", "project_root": "/tmp/project" },
-    "request": "set_workspace_trust",
-    "v": 9
-  },
   "archive_session": {
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "req",
@@ -202,6 +163,15 @@
     "request": "fs_write",
     "v": 9
   },
+  "get_app_flag": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "req",
+    "params": {
+      "key": "daemon_autostart_notice"
+    },
+    "request": "get_app_flag",
+    "v": 9
+  },
   "get_inventory_bundle": {
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "req",
@@ -220,6 +190,15 @@
       "client_submission_id": "11111111-1111-4111-8111-111111111111"
     },
     "request": "get_run_invocation_status",
+    "v": 9
+  },
+  "get_startup_disclosures": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "req",
+    "params": {
+      "project_root": "/tmp/project"
+    },
+    "request": "get_startup_disclosures",
     "v": 9
   },
   "git_diff_file": {
@@ -264,6 +243,16 @@
       "project_id": "project_id-fixture"
     },
     "request": "list_sessions",
+    "v": 9
+  },
+  "mark_app_flag_seen": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "req",
+    "params": {
+      "expected_version": 7,
+      "key": "daemon_autostart_notice"
+    },
+    "request": "mark_app_flag_seen",
     "v": 9
   },
   "read_bulk_transfer_chunk": {
@@ -319,6 +308,17 @@
       "title": "title-fixture"
     },
     "request": "rename_session",
+    "v": 9
+  },
+  "resolve_assistant_session": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "req",
+    "params": {
+      "assistant_id": "helper-bot",
+      "mode": "most_recent_or_create",
+      "project_root": "/tmp/project"
+    },
+    "request": "resolve_assistant_session",
     "v": 9
   },
   "resolve_interrupt": {
@@ -451,6 +451,17 @@
       "provider": "openai"
     },
     "request": "set_model_favorite",
+    "v": 9
+  },
+  "set_workspace_trust": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "req",
+    "params": {
+      "expected_config_generation": 7,
+      "mode": "trust",
+      "project_root": "/tmp/project"
+    },
+    "request": "set_workspace_trust",
     "v": 9
   },
   "share_session": {

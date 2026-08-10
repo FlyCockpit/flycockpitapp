@@ -25,8 +25,11 @@
 //! refuse envelopes whose `v` is outside the supported range.
 
 pub mod remote_identity_protocol;
+pub mod remote_operation_fcor;
 pub mod remote_protocol_id;
+pub mod remote_signaling_attempt_store;
 pub mod remote_transport;
+pub mod remote_version;
 pub mod remote_wire_magic_registry;
 pub mod send_user_message_v2;
 pub mod terminal;
@@ -43,6 +46,18 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 use tokio_util::codec::{Framed, FramedRead, FramedWrite, LinesCodec, LinesCodecError};
 use uuid::Uuid;
+
+/// Source-preserving image spend settings shared by daemon clients.
+pub type ImageSpendPolicyView = cockpit_config::config::image_spend::ImageSpendSettings;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageSpendPreflightView {
+    pub policy: ImageSpendPolicyView,
+    pub blocked: Option<cockpit_config::config::image_spend::BudgetBlockReason>,
+    pub policy_version: Option<u64>,
+    pub epoch_policy_version: Option<u64>,
+    pub epoch_sequence: Option<u64>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -428,13 +443,69 @@ pub enum ToolFailKind {
     Execution,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AccountInfo {
     pub user_id: String,
     pub email: String,
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+impl AccountInfo {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.user_id.is_empty(),
+            "account user id must not be empty"
+        );
+        anyhow::ensure!(!self.email.is_empty(), "account email must not be empty");
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for AccountInfo {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            user_id: String,
+            email: String,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let value = Self {
+            user_id: wire.user_id,
+            email: wire.email,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
+}
+
+pub fn normalize_server_url(raw: &str) -> anyhow::Result<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    anyhow::ensure!(!trimmed.is_empty(), "server URL cannot be empty");
+    let url = url::Url::parse(trimmed)
+        .map_err(|_| anyhow::anyhow!("server URL must be an absolute URL"))?;
+    anyhow::ensure!(
+        url.username().is_empty() && url.password().is_none(),
+        "server URL must not include credentials"
+    );
+    anyhow::ensure!(
+        url.query().is_none() && url.fragment().is_none(),
+        "server URL must not include a query string or fragment"
+    );
+    anyhow::ensure!(
+        matches!(url.path(), "" | "/"),
+        "server URL must be an origin, not a path"
+    );
+    let loopback = matches!(
+        url.host_str(),
+        Some("localhost" | "127.0.0.1" | "::1" | "[::1]")
+    );
+    anyhow::ensure!(
+        url.scheme() == "https" || (url.scheme() == "http" && loopback),
+        "server URL must use HTTPS except for localhost development"
+    );
+    Ok(url.origin().ascii_serialization())
+}
+
+#[derive(Clone, Serialize, PartialEq, Eq)]
 pub struct StoredFlycockpitCredential {
     pub server_url: String,
     pub instance_id: String,
@@ -446,7 +517,56 @@ pub struct StoredFlycockpitCredential {
     pub relay_choice: Option<RelayChoice>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+impl<'de> Deserialize<'de> for StoredFlycockpitCredential {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            server_url: String,
+            instance_id: String,
+            instance_token: String,
+            account: AccountInfo,
+            #[serde(default)]
+            display_name: Option<String>,
+            #[serde(default)]
+            relay_choice: Option<RelayChoice>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let value = Self {
+            server_url: wire.server_url,
+            instance_id: wire.instance_id,
+            instance_token: wire.instance_token,
+            account: wire.account,
+            display_name: wire.display_name,
+            relay_choice: wire.relay_choice,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
+}
+
+impl StoredFlycockpitCredential {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            normalize_server_url(&self.server_url)? == self.server_url,
+            "server URL must be normalized"
+        );
+        anyhow::ensure!(
+            !self.instance_id.is_empty(),
+            "instance id must not be empty"
+        );
+        anyhow::ensure!(
+            !self.instance_token.is_empty(),
+            "instance token must not be empty"
+        );
+        self.account.validate()?;
+        if let Some(relay) = &self.relay_choice {
+            relay.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RelayChoice {
     pub relay_id: String,
@@ -459,9 +579,47 @@ pub struct RelayChoice {
 }
 
 impl RelayChoice {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.relay_id.is_empty(), "relay id must not be empty");
+        anyhow::ensure!(
+            !self.ws_url.is_empty(),
+            "relay websocket URL must not be empty"
+        );
+        if let Some(region) = &self.region {
+            anyhow::ensure!(!region.is_empty(), "relay region must not be empty");
+        }
+        Ok(())
+    }
+
     pub fn is_fresh_at(&self, now_ms: i64) -> bool {
         const TTL_MS: i64 = 30 * 60 * 1000;
         now_ms.saturating_sub(self.chosen_at) < TTL_MS
+    }
+}
+
+impl<'de> Deserialize<'de> for RelayChoice {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Wire {
+            relay_id: String,
+            #[serde(default)]
+            region: Option<String>,
+            ws_url: String,
+            #[serde(default)]
+            rtt_ms: Option<u64>,
+            chosen_at: i64,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let value = Self {
+            relay_id: wire.relay_id,
+            region: wire.region,
+            ws_url: wire.ws_url,
+            rtt_ms: wire.rtt_ms,
+            chosen_at: wire.chosen_at,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
     }
 }
 
@@ -641,7 +799,26 @@ impl Envelope {
     pub fn request_at(v: u32, id: Uuid, request: Request) -> Self {
         Self {
             v,
-            body: Body::Request { id, request },
+            body: Body::Request {
+                id,
+                operation: None,
+                request,
+            },
+        }
+    }
+
+    pub fn remote_request(
+        id: Uuid,
+        operation: RemoteOperationIdentityV1,
+        request: Request,
+    ) -> Self {
+        Self {
+            v: PROTOCOL_VERSION,
+            body: Body::Request {
+                id,
+                operation: Some(operation),
+                request,
+            },
         }
     }
 
@@ -688,6 +865,8 @@ pub enum Body {
     #[serde(rename = "req")]
     Request {
         id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation: Option<RemoteOperationIdentityV1>,
         #[serde(flatten)]
         request: Request,
     },
@@ -710,16 +889,199 @@ pub enum Body {
         id: Option<Uuid>,
         error: ErrorPayload,
     },
+    #[serde(rename = "replay_req")]
+    RemoteReplayRequest(RemoteReplayRequestV2),
+    #[serde(rename = "replay_res")]
+    RemoteReplayResponse(RemoteReplayResponseV2),
+    #[serde(rename = "replay_ack")]
+    RemoteReplayAck(RemoteReplayAckV2),
+    #[serde(rename = "replay_ack_res")]
+    RemoteReplayAckResponse(RemoteReplayAckResponseV2),
     #[serde(other)]
     Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteReplayRequestV2 {
+    pub id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_event_seq: Option<crate::remote_protocol_id::CanonicalU64DecimalStringV1>,
+    pub limit: RemoteReplayLimit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteReplayResponseV2 {
+    pub id: Uuid,
+    pub events: Vec<RemoteOutboxDeliveryV1>,
+    pub high_water_mark: crate::remote_protocol_id::CanonicalU64DecimalStringV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteReplayAckV2 {
+    pub id: Uuid,
+    pub delivery_id: CanonicalRfcUuidV1,
+    pub lease_token: CanonicalRfcUuidV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteReplayAckResponseV2 {
+    pub id: Uuid,
+    pub acked: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteOutboxDeliveryV1 {
+    pub event_seq: crate::remote_protocol_id::CanonicalU64DecimalStringV1,
+    pub delivery_id: CanonicalRfcUuidV1,
+    pub kind: String,
+    pub canonical_payload: Vec<u8>,
+    pub lease_token: CanonicalRfcUuidV1,
+    pub lease_expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanonicalRfcUuidV1(Uuid);
+
+impl CanonicalRfcUuidV1 {
+    pub fn new(value: Uuid) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !value.is_nil() && value.get_variant() == uuid::Variant::RFC4122,
+            "UUID must be nonnil RFC variant"
+        );
+        Ok(Self(value))
+    }
+    pub fn get(self) -> Uuid {
+        self.0
+    }
+}
+
+impl Serialize for CanonicalRfcUuidV1 {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0.hyphenated().to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for CanonicalRfcUuidV1 {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        let value = Uuid::parse_str(&text).map_err(serde::de::Error::custom)?;
+        if value.hyphenated().to_string() != text {
+            return Err(serde::de::Error::custom(
+                "UUID must use canonical lowercase hyphenated spelling",
+            ));
+        }
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct RemoteReplayLimit(u16);
+
+impl RemoteReplayLimit {
+    pub fn new(value: u16) -> anyhow::Result<Self> {
+        anyhow::ensure!((1..=256).contains(&value), "replay limit must be 1..=256");
+        Ok(Self(value))
+    }
+    pub fn get(self) -> u16 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for RemoteReplayLimit {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        Self::new(u16::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteOperationIdentityV1 {
+    pub schema_version: u8,
+    pub logical_attachment_id: Uuid,
+    pub operation_id: Uuid,
+}
+
+impl RemoteOperationIdentityV1 {
+    pub fn new(logical_attachment_id: Uuid, operation_id: Uuid) -> Result<Self> {
+        anyhow::ensure!(
+            !logical_attachment_id.is_nil()
+                && logical_attachment_id.get_variant() == uuid::Variant::RFC4122,
+            "logical attachment id must be a nonnil RFC UUID"
+        );
+        anyhow::ensure!(
+            !operation_id.is_nil() && operation_id.get_variant() == uuid::Variant::RFC4122,
+            "operation id must be a nonnil RFC UUID"
+        );
+        anyhow::ensure!(
+            operation_id.get_version_num() == 7,
+            "operation id must be UUIDv7"
+        );
+        Ok(Self {
+            schema_version: 1,
+            logical_attachment_id,
+            operation_id,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for RemoteOperationIdentityV1 {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Wire {
+            schema_version: u8,
+            logical_attachment_id: String,
+            operation_id: String,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        if wire.schema_version != 1 {
+            return Err(serde::de::Error::custom(
+                "remote operation identity schemaVersion must be 1",
+            ));
+        }
+        let parse_canonical = |text: String| {
+            let value = Uuid::parse_str(&text).map_err(serde::de::Error::custom)?;
+            if value.hyphenated().to_string() != text {
+                return Err(serde::de::Error::custom(
+                    "UUID must use canonical lowercase hyphenated spelling",
+                ));
+            }
+            Ok(value)
+        };
+        Self::new(
+            parse_canonical(wire.logical_attachment_id)?,
+            parse_canonical(wire.operation_id)?,
+        )
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 // ---- Requests --------------------------------------------------------------
 
 mod request;
 pub use request::{
-    ActiveModelSwitchTrigger, AttachmentPurpose, LspControlAction, Request, RunInvocationOptions,
-    UsageKind,
+    ActiveModelSwitchTrigger, AttachmentPurpose, LspControlAction, RemoteAdapterEvidenceV1,
+    RemoteAdapterRecoveryContractV1, RemoteAdapterRecoveryStrategy, RemoteOperationClass, Request,
+    RunInvocationOptions, UnknownRemoteOperationClass, UsageKind,
+    canonical_remote_operation_fcor_schema_for_tag, remote_adapter_recovery_contract_for_tag,
+    remote_adapter_recovery_strategy_for_tag, remote_operation_class_for_tag,
+    remote_operation_fcor_schema_for_tag,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -873,9 +1235,10 @@ impl DelegationSteerResult {
 
 mod response;
 pub use response::{
-    ActiveModelState, BtwForkInfo, ClientSubmissionReceiptStatus, Response,
-    RunInvocationCancelOutcome, RunInvocationCancelResultV1, RunInvocationLifecycleState,
-    RunInvocationStatusV1, RunInvocationTerminalReason,
+    ActiveModelState, BtwForkInfo, ClientSubmissionReceiptStatus, RemoteGoalOutcomeV1,
+    RemoteOperationStateV1, RemoteOperationStatusV1, Response, RunInvocationCancelOutcome,
+    RunInvocationCancelResultV1, RunInvocationLifecycleState, RunInvocationStatusV1,
+    RunInvocationTerminalReason,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1017,6 +1380,14 @@ pub enum ErrorCode {
     /// Status/cancel for an unknown id could not install a tombstone because
     /// quota is full. Non-authoritative Busy; content-free.
     InvocationLookupBusy,
+    /// Content-free terminal binding/operation rejection.
+    InvalidIngress,
+    /// An operation id was reused with different immutable metadata.
+    IngressConflict,
+    /// The host cannot safely represent the private path for this shell.
+    IngressPathUnavailable,
+    /// The operation belongs to a terminal generation that no longer exists.
+    TerminalGenerationGone,
     /// Anything else.
     Internal,
     /// Error code from a future peer that this binary does not know yet.
@@ -1067,6 +1438,10 @@ impl<'de> Deserialize<'de> for ErrorCode {
             "invocation_not_found" => Self::InvocationNotFound,
             "invocation_capacity_exceeded" => Self::InvocationCapacityExceeded,
             "invocation_lookup_busy" => Self::InvocationLookupBusy,
+            "invalid_ingress" => Self::InvalidIngress,
+            "ingress_conflict" => Self::IngressConflict,
+            "ingress_path_unavailable" => Self::IngressPathUnavailable,
+            "terminal_generation_gone" => Self::TerminalGenerationGone,
             "internal" => Self::Internal,
             _ => Self::Other(raw),
         })
@@ -1104,6 +1479,10 @@ impl std::fmt::Display for ErrorCode {
             Self::InvocationNotFound => "invocation_not_found",
             Self::InvocationCapacityExceeded => "invocation_capacity_exceeded",
             Self::InvocationLookupBusy => "invocation_lookup_busy",
+            Self::InvalidIngress => "invalid_ingress",
+            Self::IngressConflict => "ingress_conflict",
+            Self::IngressPathUnavailable => "ingress_path_unavailable",
+            Self::TerminalGenerationGone => "terminal_generation_gone",
             Self::Internal => "internal",
             Self::Other(raw) => raw,
         };
@@ -1996,6 +2375,10 @@ fn envelope_contains_unknown(env: &Envelope) -> bool {
         Body::Response { response, .. } => matches!(**response, Response::Unknown),
         Body::Event { event } => matches!(event, Event::Unknown),
         Body::Error { error, .. } => matches!(error.code, ErrorCode::Other(_)),
+        Body::RemoteReplayRequest(_)
+        | Body::RemoteReplayResponse(_)
+        | Body::RemoteReplayAck(_)
+        | Body::RemoteReplayAckResponse(_) => false,
         Body::Unknown => true,
     }
 }
@@ -2520,6 +2903,10 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
             "invocation_not_found",
             "invocation_capacity_exceeded",
             "invocation_lookup_busy",
+            "invalid_ingress",
+            "ingress_conflict",
+            "ingress_path_unavailable",
+            "terminal_generation_gone",
         ] {
             assert!(
                 errors.values().any(|value| value
@@ -2846,6 +3233,30 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
                 Some(sentinel_uuid()),
                 ErrorCode::InvocationLookupBusy,
                 "invocation lookup busy",
+            ),
+            (
+                "invalid_ingress_paired",
+                Some(sentinel_uuid()),
+                ErrorCode::InvalidIngress,
+                "invalid terminal ingress",
+            ),
+            (
+                "ingress_conflict_paired",
+                Some(sentinel_uuid()),
+                ErrorCode::IngressConflict,
+                "terminal ingress metadata conflict",
+            ),
+            (
+                "ingress_path_unavailable_paired",
+                Some(sentinel_uuid()),
+                ErrorCode::IngressPathUnavailable,
+                "terminal ingress path unavailable",
+            ),
+            (
+                "terminal_generation_gone_paired",
+                Some(sentinel_uuid()),
+                ErrorCode::TerminalGenerationGone,
+                "terminal generation is gone",
             ),
             (
                 "invalid_response_metrics_tokenizer_paired",
@@ -3427,6 +3838,22 @@ mod errorcode_forward_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_operation_identity_requires_strict_uuid_v7_wire_form() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../packages/cockpit-protocol/fixtures/remote-operation-identity-v1.json"
+        ))
+        .unwrap();
+        assert!(
+            serde_json::from_value::<RemoteOperationIdentityV1>(fixture["valid"].clone()).is_ok()
+        );
+        for malformed in fixture["invalid"].as_array().unwrap() {
+            assert!(
+                serde_json::from_value::<RemoteOperationIdentityV1>(malformed.clone()).is_err()
+            );
+        }
+    }
     use serde_json::json;
     use tokio::io::duplex;
 
@@ -4296,6 +4723,7 @@ mod tests {
             Body::Request {
                 id: got_id,
                 request: Request::DaemonStatus,
+                ..
             } => assert_eq!(got_id, id),
             other => panic!("unexpected: {other:?}"),
         }

@@ -27,6 +27,9 @@ describe("terminal frame codec", () => {
         terminalId: "pty-1",
         viewerCount: 1,
         recording: false,
+        bindingId: "550e8400-e29b-41d4-a716-446655440000",
+        bindingEpoch: 1,
+        terminalGeneration: 1,
       }),
     ).toMatchObject({ type: "terminal.opened", terminalId: "pty-1" });
 
@@ -34,23 +37,79 @@ describe("terminal frame codec", () => {
       terminalClientPayloadSchema.parse({ type: "terminal.resize", v: 1, cols: 1, rows: 24 }),
     ).toThrow();
   });
+
+  it("terminal_ingress_no_reusable_authority_or_sensitive_control_plane", () => {
+    const identity = {
+      operationId: "550e8400-e29b-41d4-a716-446655440000",
+      bindingId: "550e8400-e29b-41d4-a716-446655440001",
+      bindingEpoch: 1,
+    };
+    expect(() =>
+      terminalClientPayloadSchema.parse({
+        type: "terminal.ingress_begin",
+        v: 1,
+        ...identity,
+        mediaType: "image/png",
+        size: 8,
+        sha256: "0".repeat(64),
+        name: "browser-name.png",
+      }),
+    ).toThrow();
+    expect(() =>
+      terminalDaemonPayloadSchema.parse({
+        type: "terminal.ingress_state",
+        v: 1,
+        operationId: identity.operationId,
+        state: "committed",
+        nextOffset: 8,
+        inputSequence: 1,
+        path: "/private/secret.png",
+      }),
+    ).toThrow();
+    expect(
+      terminalClientPayloadSchema.parse({ type: "terminal.ingress_abort", v: 1, ...identity }),
+    ).toMatchObject({ type: "terminal.ingress_abort", operationId: identity.operationId });
+    expect(
+      terminalDaemonPayloadSchema.parse({
+        type: "terminal.ingress_state",
+        v: 1,
+        operationId: identity.operationId,
+        state: "no_operation",
+        nextOffset: 0,
+      }),
+    ).toMatchObject({ state: "no_operation" });
+  });
 });
 
 describe("terminal paste router", () => {
-  it("prefers images over text when files are present", () => {
+  it("plans one structural image without a text route", () => {
     const plan = planTerminalPaste({
-      text: "ignored",
       files: [{ name: "screen.png", type: "image/png", size: 123 }],
     });
 
     expect(plan).toMatchObject({
-      kind: "images",
-      images: [{ kind: "image", name: "screen.png" }],
+      kind: "image",
+      image: { kind: "image", name: "screen.png" },
     });
   });
 
-  it("routes plain text when no file is present", () => {
-    expect(planTerminalPaste({ text: "hello" })).toEqual({ kind: "text", text: "hello" });
+  it("returns empty when no file is present", () => {
+    expect(planTerminalPaste({})).toEqual({ kind: "empty" });
+  });
+
+  it("rejects a multi-file gesture as a whole", () => {
+    expect(
+      planTerminalPaste({
+        files: [
+          { name: "one.png", type: "image/png", size: 1 },
+          { name: "two.png", type: "image/png", size: 1 },
+        ],
+      }),
+    ).toEqual({
+      kind: "error",
+      code: "too_many_files",
+      maxBytes: TERMINAL_IMAGE_MAX_BYTES,
+    });
   });
 
   it("rejects oversized images before upload", () => {
@@ -63,6 +122,21 @@ describe("terminal paste router", () => {
       code: "image_too_large",
       maxBytes: TERMINAL_IMAGE_MAX_BYTES,
     });
+  });
+
+  it("accepts only the exact terminal image contract and inclusive size bounds", () => {
+    for (const type of ["image/png", "image/jpeg", "image/gif", "image/webp"]) {
+      expect(planTerminalPaste({ files: [{ type, size: 1 }] }).kind).toBe("image");
+      expect(planTerminalPaste({ files: [{ type, size: TERMINAL_IMAGE_MAX_BYTES }] }).kind).toBe(
+        "image",
+      );
+    }
+    for (const file of [
+      { type: "image/svg+xml", size: 1 },
+      { type: "image/png", size: 0 },
+    ]) {
+      expect(planTerminalPaste({ files: [file] }).kind).toBe("error");
+    }
   });
 });
 

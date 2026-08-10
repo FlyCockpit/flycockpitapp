@@ -20,18 +20,12 @@
 //! permissive umask cannot widen a capsule), and verification of mode, file
 //! type, and link count on every reopen.
 //!
-//! Windows enforcement is **weaker, and this module does not pretend
-//! otherwise**. Real Windows DACL and handle-containment work is deferred to a
-//! dedicated `windows-file-security` prompt; this module must not grow blind
-//! Win32 FFI in the meantime.
-//! [`SPOOL_PERMISSION_POLICY`] reports `windows_dacl_enforced:
-//! false`. What Windows does get: relative opens beneath the resolved root,
+//! Windows applies and verifies the repository's audited protected
+//! current-user-and-SYSTEM-only DACL on every guarded directory and file. It also uses
+//! relative opens beneath the resolved root,
 //! rejection of any entry carrying `FILE_ATTRIBUTE_REPARSE_POINT`, a
 //! regular-file check, and a hard-link (`number_of_links`) check. What it does
-//! not get: an explicit owner-only DACL with inheritance disabled. Nothing in
-//! this repository sets a Windows security descriptor today, so claiming one
-//! would be a lie in a security-critical path; the spool therefore inherits
-//! the ACL of the per-user application data directory. `DirGuard::sync` is
+//! `DirGuard::sync` is
 //! also a documented no-op on Windows because there is no directory fsync,
 //! which means a Windows crash can lose a *newly created* directory entry —
 //! recovery treats a missing capsule as a missing durable medium rather than
@@ -65,10 +59,8 @@ pub struct SpoolPermissionPolicy {
     pub unix_file_mode: u32,
     /// Whether Unix modes are enforced on this build.
     pub unix_mode_enforced: bool,
-    /// Whether an explicit owner-only DACL is written on Windows.
-    ///
-    /// `false`. No code in this repository sets a Windows security descriptor;
-    /// the spool inherits the per-user application data directory ACL.
+    /// Whether an explicit protected current-user-and-SYSTEM-only DACL is written and
+    /// verified on Windows.
     pub windows_dacl_enforced: bool,
     /// Whether reparse points are rejected for every spool entry.
     pub reparse_rejected: bool,
@@ -81,7 +73,7 @@ pub const SPOOL_PERMISSION_POLICY: SpoolPermissionPolicy = SpoolPermissionPolicy
     unix_dir_mode: SPOOL_DIR_MODE,
     unix_file_mode: SPOOL_FILE_MODE,
     unix_mode_enforced: cfg!(unix),
-    windows_dacl_enforced: false,
+    windows_dacl_enforced: cfg!(windows),
     reparse_rejected: true,
     directory_fsync_available: cfg!(unix),
 };
@@ -108,6 +100,7 @@ fn io(context: &str, error: std::io::Error) -> ExternalJournalError {
 /// Canonicalizing the existing part once is what makes a symlinked ancestor
 /// (`/var` -> `/private/var` on macOS) work while keeping every component
 /// below the resolved root no-follow.
+#[cfg(not(unix))]
 fn resolve_existing_base(path: &Path) -> Result<(PathBuf, Vec<String>), ExternalJournalError> {
     if !path.is_absolute() {
         return Err(ExternalJournalError::Containment(format!(
@@ -186,6 +179,52 @@ mod imp {
         path: PathBuf,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct HeldEntryIdentity {
+        pub filesystem_id: u64,
+        pub object_id: u128,
+        pub kind: u8,
+        pub len: u64,
+        pub mode: u32,
+        pub owner_id: u64,
+        pub link_count: u64,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum HeldRenameEffect {
+        Applied(HeldEntryIdentity),
+        AppliedIdentityMismatch {
+            expected: HeldEntryIdentity,
+            observed: HeldEntryIdentity,
+        },
+    }
+
+    fn identity(metadata: &std::fs::Metadata) -> Result<HeldEntryIdentity, ExternalJournalError> {
+        let kind = if metadata.is_file() {
+            1
+        } else if metadata.is_dir() {
+            2
+        } else {
+            return Err(ExternalJournalError::Containment(
+                "held entry must be a regular file or directory".into(),
+            ));
+        };
+        if metadata.nlink() == 0 {
+            return Err(ExternalJournalError::Containment(
+                "held entry has no filesystem links".into(),
+            ));
+        }
+        Ok(HeldEntryIdentity {
+            filesystem_id: metadata.dev(),
+            object_id: u128::from(metadata.ino()),
+            kind,
+            len: metadata.len(),
+            mode: metadata.mode(),
+            owner_id: u64::from(metadata.uid()),
+            link_count: metadata.nlink(),
+        })
+    }
+
     fn cstring(name: &str) -> Result<CString, ExternalJournalError> {
         CString::new(name).map_err(|_| {
             ExternalJournalError::Containment(format!("spool name contains NUL: {name:?}"))
@@ -256,42 +295,51 @@ mod imp {
     }
 
     impl DirGuard {
-        /// Open the spool root: canonicalize the existing part once, then
-        /// walk any remaining components no-follow.
+        /// Open an absolute configured root from held `/`, never canonicalizing
+        /// or following a component supplied by the path.
         pub fn open_root(path: &Path, create: bool) -> Result<Self, ExternalJournalError> {
-            let (base, pending) = resolve_existing_base(path)?;
-            if !create && !pending.is_empty() {
-                return Err(ExternalJournalError::Spool(format!(
-                    "spool root {} does not exist",
+            Self::open_root_with_walk_hook(path, create, || {})
+        }
+
+        pub(crate) fn open_root_with_walk_hook(
+            path: &Path,
+            create: bool,
+            before_walk: impl FnOnce(),
+        ) -> Result<Self, ExternalJournalError> {
+            if !path.is_absolute()
+                || path
+                    .components()
+                    .any(|part| matches!(part, Component::ParentDir))
+            {
+                return Err(ExternalJournalError::Containment(format!(
+                    "held root must be absolute without `..`: {}",
                     path.display()
                 )));
             }
-            let base_c =
-                std::ffi::CString::new(base.as_os_str().as_encoded_bytes()).map_err(|_| {
-                    ExternalJournalError::Containment("spool root contains NUL".to_string())
-                })?;
-            // The base is fully resolved, so no component of it is a symlink.
-            // `O_NOFOLLOW` is still set: it costs nothing and closes the narrow
-            // window in which the final component is swapped for a symlink
-            // between `canonicalize` and this open.
-            // SAFETY: `base_c` is a live NUL-terminated C string; the returned
-            // descriptor is transferred exactly once to `File`.
             let fd = unsafe {
                 libc::open(
-                    base_c.as_ptr(),
+                    c"/".as_ptr(),
                     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 )
             };
             if fd < 0 {
                 return Err(io("opening spool root", std::io::Error::last_os_error()));
             }
-            // SAFETY: `fd` was just returned by `open` and is uniquely owned.
             let mut dir = unsafe { File::from_raw_fd(fd) };
-            let mut walked = base;
-            for name in pending {
-                let (next, created) = open_dir_at(Some(&dir), &cstring(&name)?, create)?;
+            let mut walked = PathBuf::from("/");
+            before_walk();
+            for component in path.components() {
+                let Component::Normal(name) = component else {
+                    continue;
+                };
+                let name = name.to_str().ok_or_else(|| {
+                    ExternalJournalError::Containment(
+                        "held root component is not valid UTF-8".into(),
+                    )
+                })?;
+                let (next, created) = open_dir_at(Some(&dir), &cstring(name)?, create)?;
                 dir = next;
-                walked.push(&name);
+                walked.push(name);
                 if created {
                     enforce_dir_mode(&dir, &walked)?;
                 }
@@ -316,6 +364,155 @@ mod imp {
 
         pub fn path(&self) -> &Path {
             &self.path
+        }
+
+        pub fn held_identity(&self) -> Result<HeldEntryIdentity, ExternalJournalError> {
+            identity(
+                &self
+                    .dir
+                    .metadata()
+                    .map_err(|error| io("stat held directory", error))?,
+            )
+        }
+
+        pub fn open_entry_identity(
+            &self,
+            name: &str,
+        ) -> Result<HeldEntryIdentity, ExternalJournalError> {
+            check_component(name)?;
+            let name = cstring(name)?;
+            let fd = unsafe {
+                libc::openat(
+                    self.dir.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(io("opening held entry", std::io::Error::last_os_error()));
+            }
+            let file = unsafe { File::from_raw_fd(fd) };
+            identity(
+                &file
+                    .metadata()
+                    .map_err(|error| io("stat held entry", error))?,
+            )
+        }
+
+        pub fn require_entry_absent(&self, name: &str) -> Result<(), ExternalJournalError> {
+            check_component(name)?;
+            let name = cstring(name)?;
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            let result = unsafe {
+                libc::fstatat(
+                    self.dir.as_raw_fd(),
+                    name.as_ptr(),
+                    stat.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if result == 0 {
+                return Err(ExternalJournalError::QuarantineNameTaken(
+                    name.to_string_lossy().into_owned(),
+                ));
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(());
+            }
+            Err(io("checking held target absence", error))
+        }
+
+        pub fn require_same_filesystem(
+            &self,
+            other: &DirGuard,
+        ) -> Result<(), ExternalJournalError> {
+            if self.held_identity()?.filesystem_id != other.held_identity()?.filesystem_id {
+                return Err(ExternalJournalError::Containment(
+                    "atomic rename requires source and target on one filesystem".into(),
+                ));
+            }
+            Ok(())
+        }
+
+        pub fn rename_entry_noreplace_atomic(
+            &self,
+            name: &str,
+            target: &DirGuard,
+            target_name: &str,
+            expected_source: HeldEntryIdentity,
+        ) -> Result<HeldRenameEffect, ExternalJournalError> {
+            self.rename_entry_noreplace_atomic_with_hook(
+                name,
+                target,
+                target_name,
+                expected_source,
+                || {},
+            )
+        }
+
+        pub(crate) fn rename_entry_noreplace_atomic_with_hook(
+            &self,
+            name: &str,
+            target: &DirGuard,
+            target_name: &str,
+            expected_source: HeldEntryIdentity,
+            before_syscall: impl FnOnce(),
+        ) -> Result<HeldRenameEffect, ExternalJournalError> {
+            self.require_same_filesystem(target)?;
+            check_component(name)?;
+            check_component(target_name)?;
+            let from = cstring(name)?;
+            let to = cstring(target_name)?;
+            let observed_source = self.open_entry_identity(name)?;
+            if observed_source != expected_source {
+                return Err(ExternalJournalError::Containment(
+                    "rename source identity changed before dispatch".into(),
+                ));
+            }
+            before_syscall();
+            #[cfg(target_os = "linux")]
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    self.dir.as_raw_fd(),
+                    from.as_ptr(),
+                    target.dir.as_raw_fd(),
+                    to.as_ptr(),
+                    1_u32,
+                ) as libc::c_int
+            };
+            #[cfg(target_os = "macos")]
+            let result = unsafe {
+                libc::renameatx_np(
+                    self.dir.as_raw_fd(),
+                    from.as_ptr(),
+                    target.dir.as_raw_fd(),
+                    to.as_ptr(),
+                    libc::RENAME_EXCL,
+                )
+            };
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            let result: libc::c_int = return Err(ExternalJournalError::Containment(
+                "held atomic no-replace rename is unsupported on this platform".into(),
+            ));
+            if result == 0 {
+                let observed_target = target.open_entry_identity(target_name)?;
+                if observed_target != expected_source {
+                    return Ok(HeldRenameEffect::AppliedIdentityMismatch {
+                        expected: expected_source,
+                        observed: observed_target,
+                    });
+                }
+                return Ok(HeldRenameEffect::Applied(observed_target));
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                return Err(ExternalJournalError::QuarantineNameTaken(
+                    target_name.to_owned(),
+                ));
+            }
+            Err(io("held atomic no-replace rename", error))
         }
 
         /// Verify the held directory still carries exactly `0700`.
@@ -639,13 +836,25 @@ mod imp {
             let mut resolved = base;
             for name in pending {
                 resolved.push(&name);
-                std::fs::create_dir(&resolved).or_else(|error| match error.kind() {
-                    std::io::ErrorKind::AlreadyExists => Ok(()),
-                    _ => Err(io("creating spool directory", error)),
-                })?;
+                let created = match std::fs::create_dir(&resolved) {
+                    Ok(()) => true,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+                    Err(error) => return Err(io("creating spool directory", error)),
+                };
+                #[cfg(not(windows))]
+                let _ = created;
                 reject_reparse(&resolved)?;
+                #[cfg(windows)]
+                if created {
+                    crate::goal_scratch::set_private(&resolved).map_err(|error| {
+                        ExternalJournalError::InsecurePermissions(error.to_string())
+                    })?;
+                }
             }
             reject_reparse(&resolved)?;
+            #[cfg(windows)]
+            crate::goal_scratch::verify_private_dacl(&resolved)
+                .map_err(|error| ExternalJournalError::InsecurePermissions(error.to_string()))?;
             if !resolved.is_dir() {
                 return Err(ExternalJournalError::Containment(format!(
                     "spool root {} is not a directory",
@@ -663,10 +872,16 @@ mod imp {
             check_component(name)?;
             let path = self.path.join(name);
             if create {
-                std::fs::create_dir(&path).or_else(|error| match error.kind() {
-                    std::io::ErrorKind::AlreadyExists => Ok(()),
-                    _ => Err(io("creating spool directory", error)),
-                })?;
+                match std::fs::create_dir(&path) {
+                    Ok(()) => {
+                        #[cfg(windows)]
+                        crate::goal_scratch::set_private(&path).map_err(|error| {
+                            ExternalJournalError::InsecurePermissions(error.to_string())
+                        })?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(io("creating spool directory", error)),
+                }
             }
             reject_reparse(&path)?;
             if !path.is_dir() {
@@ -675,7 +890,9 @@ mod imp {
                     path.display()
                 )));
             }
-            Ok(Self { path })
+            let guard = Self { path };
+            guard.verify_private()?;
+            Ok(guard)
         }
 
         pub fn path(&self) -> &Path {
@@ -683,7 +900,11 @@ mod imp {
         }
 
         pub fn verify_private(&self) -> Result<(), ExternalJournalError> {
-            reject_reparse(&self.path)
+            reject_reparse(&self.path)?;
+            #[cfg(windows)]
+            crate::goal_scratch::verify_private_dacl(&self.path)
+                .map_err(|error| ExternalJournalError::InsecurePermissions(error.to_string()))?;
+            Ok(())
         }
 
         pub fn create_file_exclusive(&self, name: &str) -> Result<File, ExternalJournalError> {
@@ -697,6 +918,9 @@ mod imp {
                 .map_err(|error| io("creating capsule file", error))?;
             reject_reparse(&path)?;
             verify_open_file(&file, name)?;
+            #[cfg(windows)]
+            crate::goal_scratch::set_private(&path)
+                .map_err(|error| ExternalJournalError::InsecurePermissions(error.to_string()))?;
             Ok(file)
         }
 
@@ -724,6 +948,9 @@ mod imp {
                     }
                 })?;
             verify_open_file(&file, name)?;
+            #[cfg(windows)]
+            crate::goal_scratch::verify_private_dacl(&path)
+                .map_err(|error| ExternalJournalError::InsecurePermissions(error.to_string()))?;
             Ok(file)
         }
 
@@ -768,6 +995,8 @@ mod imp {
 }
 
 pub use imp::DirGuard;
+#[cfg(unix)]
+pub use imp::{HeldEntryIdentity, HeldRenameEffect};
 
 impl DirGuard {
     /// Enumerate candidate file names. The names are untrusted: every caller
@@ -814,7 +1043,7 @@ mod tests {
         // Honest by construction: nothing in this repository writes a Windows
         // security descriptor, so the policy must not claim one. Compile-time
         // so the claim cannot drift ahead of the implementation.
-        const { assert!(!SPOOL_PERMISSION_POLICY.windows_dacl_enforced) };
+        const { assert!(SPOOL_PERMISSION_POLICY.windows_dacl_enforced == cfg!(windows)) };
         const { assert!(SPOOL_PERMISSION_POLICY.reparse_rejected) };
 
         #[cfg(unix)]
@@ -852,6 +1081,29 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_private_dacl_reopen_rejects_broad_directory_and_file_acl() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root_path = tmp.path().join("dacl-root");
+        let root = DirGuard::open_root(&root_path, true).unwrap();
+        let file = root.create_file_exclusive("component.v1").unwrap();
+        drop(file);
+        root.verify_private().unwrap();
+        root.open_file_verified("component.v1").unwrap();
+
+        crate::goal_scratch::apply_test_windows_dacl(&root_path, "D:P(A;;FA;;;WD)").unwrap();
+        assert!(root.verify_private().is_err());
+        crate::goal_scratch::set_private(&root_path).unwrap();
+
+        let file_path = root_path.join("component.v1");
+        crate::goal_scratch::apply_test_windows_dacl(&file_path, "D:P(A;;FA;;;BU)").unwrap();
+        assert!(root.open_file_verified("component.v1").is_err());
+        crate::goal_scratch::set_private(&file_path).unwrap();
+        crate::goal_scratch::apply_test_windows_dacl(&file_path, "D:P(A;;FA;;;AU)").unwrap();
+        assert!(root.open_file_verified("component.v1").is_err());
+    }
+
     /// A symlinked ancestor must not break the spool: macOS resolves `/var` to
     /// `/private/var`, so `$TMPDIR` — and any data directory beneath it — is
     /// reached through a symlink on a stock machine.
@@ -866,11 +1118,12 @@ mod tests {
         #[cfg(not(unix))]
         std::fs::create_dir(&link).unwrap();
 
-        let guard = DirGuard::open_root(&link.join("spool"), true).unwrap();
-        // The handle resolves to the real directory, and the spool really was
-        // created there rather than beside the link.
+        #[cfg(unix)]
+        assert!(DirGuard::open_root(&link.join("spool"), true).is_err());
+        let configured = if cfg!(unix) { &real } else { &link };
+        let guard = DirGuard::open_root(&configured.join("spool"), true).unwrap();
         assert!(guard.path().is_absolute());
-        assert!(real.join("spool").is_dir() || link.join("spool").is_dir());
+        assert!(configured.join("spool").is_dir());
         guard.verify_private().unwrap();
     }
 
@@ -941,5 +1194,102 @@ mod tests {
         from.rename_into_noreplace("a.v1", &to, "a.v1.1").unwrap();
         assert!(std::fs::symlink_metadata(from.path().join("a.v1")).is_err());
         assert!(std::fs::symlink_metadata(to.path().join("a.v1.1")).is_ok());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn held_entry_identity_and_atomic_noreplace_rename_are_descriptor_relative() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = DirGuard::open_root(&tmp.path().join("root"), true).unwrap();
+        let from = root.open_child_dir("from", true).unwrap();
+        let to = root.open_child_dir("to", true).unwrap();
+        std::fs::write(from.path().join("entry"), b"payload").unwrap();
+        let before = from.open_entry_identity("entry").unwrap();
+        assert_eq!(before.kind, 1);
+        assert_eq!(
+            before.filesystem_id,
+            from.held_identity().unwrap().filesystem_id
+        );
+        std::fs::write(to.path().join("occupied"), b"other").unwrap();
+        assert!(matches!(
+            from.rename_entry_noreplace_atomic("entry", &to, "occupied", before),
+            Err(ExternalJournalError::QuarantineNameTaken(_))
+        ));
+        from.rename_entry_noreplace_atomic("entry", &to, "moved", before)
+            .unwrap();
+        assert_eq!(to.open_entry_identity("moved").unwrap(), before);
+        assert!(from.open_entry_identity("entry").is_err());
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("moved", to.path().join("alias")).unwrap();
+            assert!(to.open_entry_identity("alias").is_err());
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn held_atomic_rename_rejects_source_identity_swap() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = DirGuard::open_root(&tmp.path().join("root"), true).unwrap();
+        let from = root.open_child_dir("from", true).unwrap();
+        let to = root.open_child_dir("to", true).unwrap();
+        std::fs::write(from.path().join("entry"), b"first").unwrap();
+        let expected = from.open_entry_identity("entry").unwrap();
+        std::fs::rename(from.path().join("entry"), from.path().join("old")).unwrap();
+        std::fs::write(from.path().join("entry"), b"first").unwrap();
+        assert!(matches!(
+            from.rename_entry_noreplace_atomic("entry", &to, "moved", expected),
+            Err(ExternalJournalError::Containment(_))
+        ));
+        assert!(!to.path().join("moved").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn held_root_walk_has_no_pre_authority_canonical_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let moved = tmp.path().join("moved");
+        let result = DirGuard::open_root_with_walk_hook(&root, false, || {
+            std::fs::rename(&root, &moved).unwrap();
+            std::fs::create_dir(&root).unwrap();
+        })
+        .unwrap();
+        assert_eq!(
+            result.held_identity().unwrap(),
+            DirGuard::open_root(&root, false)
+                .unwrap()
+                .held_identity()
+                .unwrap()
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn rename_name_swap_is_reported_as_applied_identity_mismatch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = DirGuard::open_root(&tmp.path().join("root"), true).unwrap();
+        let from = root.open_child_dir("from", true).unwrap();
+        let to = root.open_child_dir("to", true).unwrap();
+        std::fs::write(from.path().join("entry"), b"expected").unwrap();
+        let expected = from.open_entry_identity("entry").unwrap();
+        let effect = from
+            .rename_entry_noreplace_atomic_with_hook("entry", &to, "moved", expected, || {
+                std::fs::rename(from.path().join("entry"), from.path().join("expected-held"))
+                    .unwrap();
+                std::fs::write(from.path().join("entry"), b"replacement").unwrap();
+            })
+            .unwrap();
+        assert!(matches!(
+            effect,
+            HeldRenameEffect::AppliedIdentityMismatch { expected: value, observed }
+                if value == expected && observed != expected
+        ));
+        assert_eq!(
+            std::fs::read(to.path().join("moved")).unwrap(),
+            b"replacement"
+        );
     }
 }

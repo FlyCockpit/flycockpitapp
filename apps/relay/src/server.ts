@@ -6,6 +6,7 @@ import {
   clientRelayFrameSchema,
   type DaemonRelayFrame,
   daemonRelayFrameSchema,
+  RELAY_ENVELOPE_VERSION,
   type RelayControlMessage,
   type RelayGrant,
   type RelayTokenPayload,
@@ -39,6 +40,7 @@ type ClientConnection = {
   instanceId: string;
   userId: string;
   grants: RelayGrant[];
+  actorBinding: RelayTokenPayload["actorBinding"];
   channels: Set<string>;
   isAlive: boolean;
   rate: RateState;
@@ -264,6 +266,7 @@ export function createRelayServer(config: RelayServerConfig): RelayServerHandle 
       instanceId: payload.instanceId,
       userId: payload.userId,
       grants: payload.grants,
+      actorBinding: payload.actorBinding,
       channels: new Set(),
       isAlive: true,
       rate: { windowStartedAt: Date.now(), count: 0 },
@@ -382,19 +385,30 @@ export function createRelayServer(config: RelayServerConfig): RelayServerHandle 
       connection.ws.close(CLOSE_BAD_FRAME);
       return;
     }
+    const ownerKey = channelKey(connection.instanceId, frame.channelId);
+    const existingOwner = channelOwners.get(ownerKey);
+    if (existingOwner && existingOwner.connectionId !== connection.connectionId) {
+      sendJson(connection.ws, { v: 1, type: "system", code: "channel_owned" });
+      connection.ws.close(CLOSE_BAD_FRAME);
+      return;
+    }
     if (!connection.channels.has(frame.channelId)) {
       if (connection.channels.size >= config.maxChannelsPerClient) {
         sendJson(connection.ws, { v: 1, type: "system", code: "channel_limit" });
         return;
       }
       connection.channels.add(frame.channelId);
-      channelOwners.set(channelKey(connection.instanceId, frame.channelId), connection);
+      channelOwners.set(ownerKey, connection);
     }
     sendJson(daemon.ws, {
-      v: 1,
+      v: RELAY_ENVELOPE_VERSION,
       channelId: frame.channelId,
       from: "client",
-      principal: { userId: connection.userId, grants: connection.grants },
+      principal: {
+        userId: connection.userId,
+        grants: connection.grants,
+        actorBinding: connection.actorBinding,
+      },
       payload: frame.payload,
     });
   }

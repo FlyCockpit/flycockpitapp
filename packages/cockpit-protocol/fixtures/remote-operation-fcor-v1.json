@@ -1,0 +1,145 @@
+{
+  "requestKind": "daemon_status",
+  "resources": [{ "kind": "daemon_global", "valueHex": "" }],
+  "paramsHex": "",
+  "canonicalHex": "46434f52010d6461656d6f6e5f73746174757300010b0000000000000000",
+  "sha256Hex": "7ea781718e707de7107ecaf18e3d4de8e76a749ccbc116360023022cbf60f954",
+  "richPositive": {
+    "requestKind": "fs_read",
+    "resources": [
+      { "kind": "project_root", "valueHex": "2f746d702f78" },
+      { "kind": "file_path", "valueHex": "612e747874" }
+    ],
+    "paramsHex": "01",
+    "canonicalHex": "46434f52010766735f72656164000203000000062f746d702f780400000005612e7478740000000101",
+    "sha256Hex": "67c61e0070db03a09e2fe4d1bb8e2166299bb5972da93afe0a07d41ff587ff87"
+  },
+  "sizeCases": [
+    {
+      "name": "kind 255",
+      "kindLength": 255,
+      "resourceLengths": [],
+      "paramsLength": 0,
+      "valid": true
+    },
+    {
+      "name": "kind 256",
+      "kindLength": 256,
+      "resourceLengths": [],
+      "paramsLength": 0,
+      "valid": false
+    },
+    {
+      "name": "resource u32",
+      "kindLength": 1,
+      "resourceLengths": [4294967295],
+      "paramsLength": 0,
+      "valid": false
+    },
+    {
+      "name": "resource over u32",
+      "kindLength": 1,
+      "resourceLengths": [4294967296],
+      "paramsLength": 0,
+      "valid": false
+    },
+    {
+      "name": "params u32",
+      "kindLength": 1,
+      "resourceLengths": [],
+      "paramsLength": 4294967295,
+      "valid": false
+    },
+    {
+      "name": "params over u32",
+      "kindLength": 1,
+      "resourceLengths": [],
+      "paramsLength": 4294967296,
+      "valid": false
+    },
+    {
+      "name": "total exact maximum",
+      "kindLength": 1,
+      "resourceLengths": [],
+      "paramsLength": 4294967282,
+      "valid": true
+    },
+    {
+      "name": "total maximum plus one",
+      "kindLength": 1,
+      "resourceLengths": [],
+      "paramsLength": 4294967283,
+      "valid": false
+    }
+  ],
+  "shapeCases": [
+    { "name": "daemon global empty", "kind": "daemon_global", "valueLength": 0, "valid": true },
+    { "name": "daemon global nonempty", "kind": "daemon_global", "valueLength": 1, "valid": false },
+    { "name": "UUID 15", "kind": "session_uuid", "valueLength": 15, "valid": false },
+    { "name": "UUID 16", "kind": "session_uuid", "valueLength": 16, "valid": true },
+    { "name": "UUID 17", "kind": "session_uuid", "valueLength": 17, "valid": false }
+  ],
+  "canonicalParams": {
+    "primitiveHex": "ff011234010203040102030405060708fffffffffffffffe000102030405060708090a0b0c0d0e0f",
+    "sortedStringMapHex": "000000020000000161000000017800000001620000000179",
+    "u64MaxHex": "ffffffffffffffff",
+    "i64MinHex": "8000000000000000",
+    "i64MaxHex": "7fffffffffffffff",
+    "optionNoneHex": "00",
+    "optionSomeU16Hex": "011234",
+    "emptyBytesHex": "00000000",
+    "composedStringHex": "00000002c3a9",
+    "encodedLengthSortedMapHex": "00000002000000016200000001780000000261610000000179"
+  },
+  "primitiveBoundaryCases": [
+    { "codec": "u8", "value": "0", "valid": true, "hex": "00" },
+    { "codec": "u8", "value": "255", "valid": true, "hex": "ff" },
+    { "codec": "u8", "value": "256", "valid": false },
+    { "codec": "u16", "value": "0", "valid": true, "hex": "0000" },
+    { "codec": "u16", "value": "65535", "valid": true, "hex": "ffff" },
+    { "codec": "u16", "value": "65536", "valid": false },
+    { "codec": "u32", "value": "0", "valid": true, "hex": "00000000" },
+    { "codec": "u32", "value": "4294967295", "valid": true, "hex": "ffffffff" },
+    { "codec": "u32", "value": "4294967296", "valid": false },
+    { "codec": "u64", "value": "0", "valid": true, "hex": "0000000000000000" },
+    { "codec": "u64", "value": "18446744073709551615", "valid": true, "hex": "ffffffffffffffff" },
+    { "codec": "u64", "value": "18446744073709551616", "valid": false }
+  ],
+  "collectionCases": {
+    "boolFalseHex": "00",
+    "boolTrueHex": "01",
+    "nonemptyBytesHex": "0000000200ff",
+    "nonemptyStringHex": "0000000161",
+    "emptyMapHex": "00000000",
+    "singleMapHex": "0000000100000001610000000178",
+    "emptyListHex": "00000000",
+    "u16ListHex": "0000000200010102"
+  },
+  "invalidCanonicalCases": [
+    { "name": "decomposed string", "kind": "string", "value": "é", "errorClass": "non_nfc" },
+    { "name": "NUL string", "kind": "string", "value": "nul\u0000value", "errorClass": "nul" },
+    {
+      "name": "lone UTF-16 surrogate",
+      "kind": "utf16_string",
+      "codeUnits": [55296],
+      "errorClass": "invalid_unicode_scalar"
+    },
+    {
+      "name": "duplicate normalized map keys",
+      "kind": "string_map",
+      "entries": [["é", "x"], ["é", "y"]],
+      "errorClass": "duplicate_nfc_key"
+    }
+  ],
+  "malformed": [
+    { "name": "magic", "replaceByte": [0, 0] },
+    { "name": "version", "replaceByte": [4, 2] },
+    { "name": "zero kind length", "replaceByte": [5, 0] },
+    { "name": "non-lowercase ASCII kind", "replaceByte": [6, 68] },
+    { "name": "resource count mismatch", "replaceByte": [20, 2] },
+    { "name": "unknown resource kind", "replaceByte": [21, 12] },
+    { "name": "truncated resource header", "truncateBy": 7 },
+    { "name": "truncated params length", "truncateBy": 1 },
+    { "name": "trailing bytes", "appendHex": "00" }
+  ]
+}

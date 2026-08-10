@@ -1,6 +1,18 @@
 import { z } from "zod";
 
-export const RELAY_ENVELOPE_VERSION = 1 as const;
+export const RELAY_ENVELOPE_VERSION = 2 as const;
+export const RELAY_MIN_SUPPORTED_ENVELOPE_VERSION = 1 as const;
+export const relayEnvelopeVersionSchema = z.union([z.literal(1), z.literal(2)]);
+const canonicalUuidSchema = z
+  .string()
+  .uuid()
+  .refine((value) => value === value.toLowerCase(), "UUID must be lowercase")
+  .refine((value) => value !== "00000000-0000-0000-0000-000000000000", "UUID must be nonnil")
+  .refine((value) => /^[0-9a-f-]{19}[89ab][0-9a-f-]{16}$/.test(value), "UUID must use RFC variant");
+const canonicalU64Schema = z
+  .string()
+  .regex(/^(0|[1-9][0-9]*)$/)
+  .refine((value) => BigInt(value) <= 18_446_744_073_709_551_615n, "u64 overflow");
 
 export const relayGrantScopeSchema = z.enum([
   "terminal",
@@ -18,10 +30,24 @@ export const relayGrantSchema = z
   .strict();
 export type RelayGrant = z.infer<typeof relayGrantSchema>;
 
+export const clientActorBindingSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    deviceId: canonicalUuidSchema,
+    deviceGeneration: canonicalU64Schema.refine(
+      (value) => value !== "0",
+      "generation must be positive",
+    ),
+    logicalAttachmentId: canonicalUuidSchema,
+  })
+  .strict();
+export type ClientActorBinding = z.infer<typeof clientActorBindingSchema>;
+
 export const relayPrincipalSchema = z
   .object({
     userId: z.string().min(1),
     grants: z.array(relayGrantSchema),
+    actorBinding: clientActorBindingSchema.optional(),
   })
   .strict();
 export type RelayPrincipal = z.infer<typeof relayPrincipalSchema>;
@@ -58,7 +84,7 @@ export type AttentionNotificationPayload = z.infer<typeof attentionNotificationP
 
 export const userPresenceRelayFrameSchema = z
   .object({
-    v: z.literal(RELAY_ENVELOPE_VERSION),
+    v: relayEnvelopeVersionSchema,
     type: z.literal("presence"),
     clientId: relayClientIdSchema,
     visible: z.boolean(),
@@ -72,7 +98,7 @@ export type UserRelayFrame = z.infer<typeof userRelayFrameSchema>;
 
 export const userNotificationRelayFrameSchema = z
   .object({
-    v: z.literal(RELAY_ENVELOPE_VERSION),
+    v: relayEnvelopeVersionSchema,
     type: z.literal("notification"),
     notification: z
       .object({
@@ -92,7 +118,7 @@ export type UserNotificationRelayFrame = z.infer<typeof userNotificationRelayFra
 
 export const clientRelayFrameSchema = z
   .object({
-    v: z.literal(RELAY_ENVELOPE_VERSION),
+    v: relayEnvelopeVersionSchema,
     channelId: channelIdSchema,
     payload: z.unknown(),
   })
@@ -101,18 +127,27 @@ export type ClientRelayFrame = z.infer<typeof clientRelayFrameSchema>;
 
 export const stampedClientRelayFrameSchema = z
   .object({
-    v: z.literal(RELAY_ENVELOPE_VERSION),
+    v: relayEnvelopeVersionSchema,
     channelId: channelIdSchema,
     from: z.literal("client"),
     principal: relayPrincipalSchema,
     payload: z.unknown(),
   })
-  .strict();
+  .strict()
+  .superRefine((frame, ctx) => {
+    if (frame.v === 1 && frame.principal.actorBinding) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["principal", "actorBinding"],
+        message: "relay envelope v1 must be actorless",
+      });
+    }
+  });
 export type StampedClientRelayFrame = z.infer<typeof stampedClientRelayFrameSchema>;
 
 export const daemonClientRelayFrameSchema = z
   .object({
-    v: z.literal(RELAY_ENVELOPE_VERSION),
+    v: relayEnvelopeVersionSchema,
     channelId: channelIdSchema,
     payload: z.unknown(),
   })
@@ -121,7 +156,7 @@ export type DaemonClientRelayFrame = z.infer<typeof daemonClientRelayFrameSchema
 
 export const daemonControlRelayFrameSchema = z
   .object({
-    v: z.literal(RELAY_ENVELOPE_VERSION),
+    v: relayEnvelopeVersionSchema,
     to: z.literal("control"),
     event: z.string().trim().min(1).max(128).optional(),
     payload: z.unknown(),
@@ -137,7 +172,7 @@ export type DaemonRelayFrame = z.infer<typeof daemonRelayFrameSchema>;
 
 export const systemRelayFrameSchema = z
   .object({
-    v: z.literal(RELAY_ENVELOPE_VERSION),
+    v: relayEnvelopeVersionSchema,
     type: z.literal("system"),
     code: z.enum([
       "bad_frame",

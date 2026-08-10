@@ -134,6 +134,476 @@ CREATE TABLE sessions (
     FOREIGN KEY (btw_parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
 
+-- ---- typed media attachments ----------------------------------------------
+-- Full-range monotonic values are canonical decimal text because SQLite's
+-- INTEGER is signed i64. Application codecs reject zero, leading zeroes and
+-- values outside u64 before any mutation.
+CREATE TABLE media_attachments (
+    attachment_id                  TEXT PRIMARY KEY,
+    session_id                     TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    canonical_project_digest       TEXT NOT NULL,
+    media_kind                     TEXT NOT NULL CHECK (media_kind IN ('image', 'audio', 'video')),
+    source_kind                    TEXT NOT NULL CHECK (source_kind IN ('local_path', 'retained_https', 'authenticated_session_upload')),
+    canonical_container            TEXT NOT NULL,
+    canonical_mime                 TEXT NOT NULL,
+    availability                   TEXT NOT NULL CHECK (availability IN (
+        'registered', 'quarantined', 'probing', 'decoding', 'normalizing',
+        'ready', 'model_derivative_unavailable', 'source_changed', 'failed',
+        'security_blocked', 'owned_cleanup_pending', 'retained_copy_deleted',
+        'borrowed_cleanup_pending', 'borrowed_derivatives_deleted', 'metadata_deleted'
+    )),
+    attachment_version             TEXT NOT NULL,
+    availability_generation        TEXT NOT NULL,
+    reference_generation           TEXT NOT NULL,
+    captured_capability_generation TEXT NOT NULL,
+    source_identity_digest         TEXT NOT NULL,
+    source_byte_length             TEXT NOT NULL,
+    source_sha256                  TEXT NOT NULL,
+    selected_video_stream_json     TEXT,
+    selected_audio_stream_json     TEXT,
+    created_at_unix_ms             INTEGER NOT NULL,
+    updated_at_unix_ms             INTEGER NOT NULL,
+    draft_expires_at_unix_ms       INTEGER,
+    first_referenced_at_unix_ms    INTEGER,
+    UNIQUE (attachment_id, attachment_version),
+    CHECK (length(canonical_project_digest) = 64 AND canonical_project_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(source_identity_digest) = 64 AND source_identity_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(source_sha256) = 64 AND source_sha256 NOT GLOB '*[^0-9a-f]*'),
+    CHECK ((source_kind = 'authenticated_session_upload') OR draft_expires_at_unix_ms IS NULL)
+);
+
+CREATE INDEX idx_media_attachments_session
+    ON media_attachments(session_id, created_at_unix_ms, attachment_id);
+CREATE INDEX idx_media_attachments_cleanup
+    ON media_attachments(availability, draft_expires_at_unix_ms);
+
+CREATE TABLE media_attachment_failure_reasons (
+    attachment_id TEXT PRIMARY KEY REFERENCES media_attachments(attachment_id) ON DELETE CASCADE,
+    reason TEXT NOT NULL CHECK (reason IN (
+        'ambiguous_or_unsupported_container', 'unsupported_codec',
+        'unsupported_color_profile', 'invalid_media', 'resource_limit',
+        'decode_failed', 'normalization_failed', 'storage_failure'
+    )),
+    recorded_at_unix_ms INTEGER NOT NULL
+);
+
+CREATE TRIGGER media_attachment_identity_immutable
+BEFORE UPDATE ON media_attachments
+WHEN NEW.attachment_id <> OLD.attachment_id
+  OR NEW.session_id <> OLD.session_id
+  OR NEW.canonical_project_digest <> OLD.canonical_project_digest
+  OR NEW.media_kind <> OLD.media_kind
+  OR NEW.source_kind <> OLD.source_kind
+  OR NEW.attachment_version <> OLD.attachment_version
+  OR NEW.captured_capability_generation <> OLD.captured_capability_generation
+  OR NEW.source_identity_digest <> OLD.source_identity_digest
+  OR NEW.source_byte_length <> OLD.source_byte_length
+  OR NEW.source_sha256 <> OLD.source_sha256
+BEGIN
+    SELECT RAISE(ABORT, 'media attachment identity is immutable');
+END;
+
+CREATE TABLE media_attachment_components (
+    component_id          TEXT PRIMARY KEY,
+    attachment_id         TEXT NOT NULL,
+    attachment_version    TEXT NOT NULL,
+    component_kind        TEXT NOT NULL CHECK (component_kind IN ('quarantined_original', 'image_model', 'browser_thumbnail', 'audio_model', 'video_model', 'upload_temporary')),
+    storage_id            TEXT NOT NULL UNIQUE,
+    lifecycle_state       TEXT NOT NULL CHECK (lifecycle_state IN ('temporary', 'ready', 'cleanup_pending', 'deleted', 'security_blocked')),
+    component_generation  TEXT NOT NULL,
+    stable_identity_digest TEXT NOT NULL,
+    byte_length           TEXT NOT NULL,
+    sha256                TEXT NOT NULL,
+    reservation_id        TEXT NOT NULL,
+    deletion_evidence_digest TEXT,
+    created_at_unix_ms    INTEGER NOT NULL,
+    updated_at_unix_ms    INTEGER NOT NULL,
+    CHECK (length(stable_identity_digest) = 64 AND stable_identity_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
+    CHECK (deletion_evidence_digest IS NULL OR (length(deletion_evidence_digest) = 64 AND deletion_evidence_digest NOT GLOB '*[^0-9a-f]*')),
+    FOREIGN KEY (attachment_id, attachment_version)
+        REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_media_attachment_components_attachment
+    ON media_attachment_components(attachment_id, component_id);
+
+CREATE TABLE media_image_component_dimensions (
+    component_id TEXT PRIMARY KEY REFERENCES media_attachment_components(component_id) ON DELETE CASCADE,
+    width INTEGER NOT NULL CHECK(width > 0 AND width <= 8192),
+    height INTEGER NOT NULL CHECK(height > 0 AND height <= 8192)
+);
+
+CREATE TABLE media_attachment_transition_evidence (
+    attachment_id TEXT NOT NULL REFERENCES media_attachments(attachment_id) ON DELETE CASCADE,
+    availability_generation TEXT NOT NULL,
+    from_state TEXT NOT NULL,
+    to_state TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    committed_at_unix_ms INTEGER NOT NULL,
+    PRIMARY KEY(attachment_id, availability_generation)
+);
+
+CREATE TABLE media_av_normalization_evidence (
+    attachment_id TEXT PRIMARY KEY REFERENCES media_attachments(attachment_id) ON DELETE CASCADE,
+    runtime_fingerprint TEXT NOT NULL,
+    probe_digest TEXT NOT NULL,
+    decode_digest TEXT NOT NULL,
+    plan_digest TEXT NOT NULL,
+    derivative_version TEXT GENERATED ALWAYS AS (plan_digest) STORED,
+    derivative_checksum TEXT NOT NULL,
+    CHECK (length(runtime_fingerprint) = 64 AND runtime_fingerprint NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(probe_digest) = 64 AND probe_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(decode_digest) = 64 AND decode_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(plan_digest) = 64 AND plan_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(derivative_version) = 64 AND derivative_version NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(derivative_checksum) = 64 AND derivative_checksum NOT GLOB '*[^0-9a-f]*')
+);
+
+CREATE TABLE media_storage_publication_intents (
+    upload_id TEXT PRIMARY KEY REFERENCES media_uploads(upload_id) ON DELETE CASCADE,
+    temporary_storage_id TEXT NOT NULL,
+    quarantine_storage_id TEXT NOT NULL,
+    derivative_storage_ids_json TEXT NOT NULL,
+    created_at_unix_ms INTEGER NOT NULL
+);
+
+CREATE TRIGGER media_attachment_component_compatibility_insert
+BEFORE INSERT ON media_attachment_components
+WHEN NOT EXISTS (
+    SELECT 1 FROM media_attachments a
+    WHERE a.attachment_id = NEW.attachment_id
+      AND a.attachment_version = NEW.attachment_version
+      AND (
+        (NEW.component_kind = 'quarantined_original' AND a.source_kind <> 'local_path') OR
+        (NEW.component_kind = 'upload_temporary' AND a.source_kind = 'authenticated_session_upload') OR
+        (NEW.component_kind IN ('image_model', 'browser_thumbnail') AND a.media_kind = 'image') OR
+        (NEW.component_kind = 'audio_model' AND a.media_kind = 'audio') OR
+        (NEW.component_kind = 'video_model' AND a.media_kind = 'video')
+      )
+      AND (NEW.lifecycle_state <> 'temporary' OR NEW.component_kind IN ('quarantined_original', 'upload_temporary'))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'media component incompatible with attachment');
+END;
+
+CREATE TRIGGER media_attachment_component_compatibility_update
+BEFORE UPDATE OF attachment_id, attachment_version, component_kind, lifecycle_state
+ON media_attachment_components
+WHEN NOT EXISTS (
+    SELECT 1 FROM media_attachments a
+    WHERE a.attachment_id = NEW.attachment_id
+      AND a.attachment_version = NEW.attachment_version
+      AND (
+        (NEW.component_kind = 'quarantined_original' AND a.source_kind <> 'local_path') OR
+        (NEW.component_kind = 'upload_temporary' AND a.source_kind = 'authenticated_session_upload') OR
+        (NEW.component_kind IN ('image_model', 'browser_thumbnail') AND a.media_kind = 'image') OR
+        (NEW.component_kind = 'audio_model' AND a.media_kind = 'audio') OR
+        (NEW.component_kind = 'video_model' AND a.media_kind = 'video')
+      )
+      AND (NEW.lifecycle_state <> 'temporary' OR NEW.component_kind IN ('quarantined_original', 'upload_temporary'))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'media component incompatible with attachment');
+END;
+
+CREATE TABLE media_attachment_references (
+    reference_id          TEXT PRIMARY KEY,
+    attachment_id         TEXT NOT NULL,
+    attachment_version    TEXT NOT NULL,
+    consumer_kind         TEXT NOT NULL CHECK (consumer_kind IN ('message', 'tool', 'job')),
+    consumer_id           TEXT NOT NULL,
+    acquired_generation   TEXT NOT NULL,
+    acquired_at_unix_ms   INTEGER NOT NULL,
+    released_at_unix_ms   INTEGER,
+    UNIQUE (attachment_id, attachment_version, consumer_kind, consumer_id),
+    FOREIGN KEY (attachment_id, attachment_version)
+        REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_media_attachment_references_live
+    ON media_attachment_references(attachment_id, released_at_unix_ms);
+
+-- Short-lived held-handle leases serialize every consumer with cleanup.  The
+-- capability generation is captured at acquisition so a daemon authority
+-- rotation invalidates new work without weakening an already-held read.
+CREATE TABLE media_attachment_component_leases (
+    lease_id                       TEXT PRIMARY KEY,
+    attachment_id                  TEXT NOT NULL,
+    attachment_version             TEXT NOT NULL,
+    component_id                   TEXT NOT NULL REFERENCES media_attachment_components(component_id) ON DELETE CASCADE,
+    lease_kind                     TEXT NOT NULL CHECK (lease_kind IN ('preview', 'model')),
+    expected_availability_generation TEXT NOT NULL,
+    captured_capability_generation TEXT NOT NULL,
+    acquired_at_unix_ms            INTEGER NOT NULL,
+    released_at_unix_ms            INTEGER,
+    FOREIGN KEY (attachment_id, attachment_version)
+        REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX idx_media_attachment_component_leases_live_id
+    ON media_attachment_component_leases(lease_id)
+    WHERE released_at_unix_ms IS NULL;
+CREATE INDEX idx_media_attachment_component_leases_live_attachment
+    ON media_attachment_component_leases(attachment_id, attachment_version, released_at_unix_ms);
+
+CREATE TABLE media_component_lease_reconciliation_evidence (
+    lease_id TEXT PRIMARY KEY REFERENCES media_attachment_component_leases(lease_id) ON DELETE CASCADE,
+    reason TEXT NOT NULL CHECK(reason = 'daemon_restart'),
+    released_at_unix_ms INTEGER NOT NULL
+);
+
+CREATE TABLE media_component_security_evidence (
+    lease_id TEXT PRIMARY KEY REFERENCES media_attachment_component_leases(lease_id) ON DELETE CASCADE,
+    attachment_id TEXT NOT NULL,
+    component_id TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK(reason = 'storage_security_violation'),
+    recorded_at_unix_ms INTEGER NOT NULL,
+    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE,
+    FOREIGN KEY (component_id) REFERENCES media_attachment_components(component_id) ON DELETE CASCADE
+);
+
+CREATE TABLE media_attachment_cleanup_intents (
+    intent_id                         TEXT PRIMARY KEY,
+    attachment_id                    TEXT NOT NULL UNIQUE,
+    attachment_version               TEXT NOT NULL,
+    expected_availability_generation TEXT NOT NULL,
+    expected_reference_generation    TEXT NOT NULL,
+    component_set_digest             TEXT NOT NULL,
+    reason                           TEXT NOT NULL CHECK (reason IN ('discard', 'draft_expired', 'session_retention', 'session_deleted', 'security_recovery')),
+    created_at_unix_ms               INTEGER NOT NULL,
+    completed_at_unix_ms             INTEGER,
+    CHECK (length(component_set_digest) = 64 AND component_set_digest NOT GLOB '*[^0-9a-f]*'),
+    FOREIGN KEY (attachment_id, attachment_version)
+        REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE
+);
+
+CREATE TABLE media_component_deletion_intents (
+    component_id TEXT PRIMARY KEY REFERENCES media_attachment_components(component_id) ON DELETE CASCADE,
+    attachment_id TEXT NOT NULL,
+    storage_id TEXT NOT NULL,
+    stable_identity_digest TEXT NOT NULL,
+    byte_length TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    intent_digest TEXT NOT NULL,
+    created_at_unix_ms INTEGER NOT NULL,
+    CHECK(length(intent_digest)=64 AND intent_digest NOT GLOB '*[^0-9a-f]*')
+);
+
+-- Deliberately has no attachment/component FK: deletion proof must survive a
+-- borrowed attachment's subsequent metadata deletion.
+CREATE TABLE media_component_deletion_evidence (
+    component_id TEXT PRIMARY KEY,
+    attachment_id TEXT NOT NULL,
+    intent_digest TEXT NOT NULL,
+    deletion_evidence_digest TEXT NOT NULL,
+    deletion_kind TEXT NOT NULL CHECK(deletion_kind IN ('verified_unlink','interrupted_unlink_reconciled')),
+    committed_at_unix_ms INTEGER NOT NULL,
+    CHECK(length(intent_digest)=64 AND intent_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK(length(deletion_evidence_digest)=64 AND deletion_evidence_digest NOT GLOB '*[^0-9a-f]*')
+);
+
+CREATE TABLE media_cleanup_security_evidence (
+    component_id TEXT PRIMARY KEY,
+    attachment_id TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK(reason='storage_security_violation'),
+    recorded_at_unix_ms INTEGER NOT NULL
+);
+
+CREATE TABLE media_security_recovery_operations (
+    local_request_id       TEXT PRIMARY KEY,
+    owner_principal_digest TEXT NOT NULL,
+    attachment_id          TEXT NOT NULL,
+    attachment_version     TEXT NOT NULL,
+    request_digest         TEXT NOT NULL,
+    affected_set_digest    TEXT NOT NULL,
+    receipt_json           TEXT NOT NULL,
+    committed_at_unix_ms   INTEGER NOT NULL,
+    CHECK (length(owner_principal_digest) = 64 AND owner_principal_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(request_digest) = 64 AND request_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(affected_set_digest) = 64 AND affected_set_digest NOT GLOB '*[^0-9a-f]*'),
+    FOREIGN KEY (attachment_id, attachment_version)
+        REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE
+);
+
+CREATE TABLE media_local_path_registration_operations (
+    local_operation_id       TEXT PRIMARY KEY,
+    authoritative_operation_id TEXT NOT NULL,
+    session_id               TEXT NOT NULL,
+    canonical_project_digest TEXT NOT NULL,
+    client_draft_id          TEXT NOT NULL,
+    request_binding_digest   TEXT NOT NULL,
+    operation_request_digest TEXT NOT NULL,
+    semantic_command_digest  TEXT NOT NULL,
+    receipt_json             TEXT NOT NULL,
+    committed_at_unix_ms     INTEGER NOT NULL,
+    is_alias                 INTEGER NOT NULL CHECK (is_alias IN (0,1))
+);
+CREATE UNIQUE INDEX uq_media_local_path_registration_domain
+ON media_local_path_registration_operations(session_id, canonical_project_digest, client_draft_id)
+WHERE is_alias = 0;
+
+CREATE TABLE media_local_path_registration_evidence (
+    attachment_id             TEXT PRIMARY KEY,
+    canonical_path_digest     TEXT NOT NULL,
+    path_authority_digest     TEXT NOT NULL,
+    source_evidence_digest    TEXT NOT NULL,
+    source_mtime_unix_ns      TEXT NOT NULL,
+    reservation_id           TEXT NOT NULL,
+    reservation_digest       TEXT NOT NULL,
+    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE
+);
+
+CREATE TABLE media_local_path_registration_audit (
+    local_operation_id TEXT PRIMARY KEY,
+    outcome            TEXT NOT NULL,
+    committed_at_unix_ms INTEGER NOT NULL
+);
+
+CREATE TABLE media_retained_https_operations (
+    local_operation_id         TEXT PRIMARY KEY,
+    authoritative_operation_id TEXT NOT NULL,
+    session_id                 TEXT NOT NULL,
+    canonical_project_digest   TEXT NOT NULL,
+    client_draft_id            TEXT NOT NULL,
+    request_binding_digest     TEXT NOT NULL,
+    operation_request_digest   TEXT NOT NULL,
+    semantic_command_digest    TEXT NOT NULL,
+    receipt_json               TEXT NOT NULL,
+    committed_at_unix_ms       INTEGER NOT NULL,
+    is_alias                   INTEGER NOT NULL CHECK (is_alias IN (0,1)),
+    CHECK (length(canonical_project_digest) = 64 AND canonical_project_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(request_binding_digest) = 64 AND request_binding_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(operation_request_digest) = 64 AND operation_request_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(semantic_command_digest) = 64 AND semantic_command_digest NOT GLOB '*[^0-9a-f]*')
+);
+CREATE UNIQUE INDEX uq_media_retained_https_domain
+ON media_retained_https_operations(session_id, canonical_project_digest, client_draft_id)
+WHERE is_alias = 0;
+
+CREATE TABLE media_retained_https_evidence (
+    attachment_id             TEXT PRIMARY KEY,
+    source_evidence_digest    TEXT NOT NULL,
+    redirect_classes_json     TEXT NOT NULL,
+    path_segment_count        INTEGER NOT NULL CHECK(path_segment_count >= 0),
+    safe_basename             TEXT,
+    fetched_at_unix_ms        INTEGER NOT NULL,
+    reservation_id           TEXT NOT NULL,
+    reservation_digest       TEXT NOT NULL,
+    CHECK (length(source_evidence_digest) = 64 AND source_evidence_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(reservation_digest) = 64 AND reservation_digest NOT GLOB '*[^0-9a-f]*'),
+    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE
+);
+
+CREATE TABLE media_retained_https_audit (
+    local_operation_id   TEXT PRIMARY KEY,
+    outcome              TEXT NOT NULL CHECK(outcome IN ('retained','rejected')),
+    committed_at_unix_ms INTEGER NOT NULL
+);
+
+CREATE TABLE media_retained_https_publication_intents (
+    local_operation_id TEXT PRIMARY KEY,
+    storage_id         TEXT NOT NULL UNIQUE,
+    created_at_unix_ms INTEGER NOT NULL
+);
+
+CREATE TABLE media_retained_https_orphan_cleanup_evidence (
+    local_operation_id TEXT PRIMARY KEY,
+    storage_id         TEXT NOT NULL,
+    evidence_digest    TEXT NOT NULL,
+    outcome            TEXT NOT NULL CHECK(outcome IN ('verified_unlink','verified_absent_before_create')),
+    completed_at_unix_ms INTEGER NOT NULL,
+    CHECK (length(evidence_digest) = 64 AND evidence_digest NOT GLOB '*[^0-9a-f]*')
+);
+
+CREATE TABLE media_attachment_processing_jobs (
+    job_id                           TEXT PRIMARY KEY,
+    attachment_id                   TEXT NOT NULL UNIQUE,
+    expected_attachment_version     TEXT NOT NULL,
+    expected_availability_generation TEXT NOT NULL,
+    source_evidence_digest          TEXT NOT NULL,
+    state                            TEXT NOT NULL CHECK(state IN ('pending','claimed','completed')),
+    claimed_at_unix_ms               INTEGER,
+    claim_attempt                    INTEGER NOT NULL DEFAULT 0,
+    created_at_unix_ms               INTEGER NOT NULL,
+    completed_at_unix_ms             INTEGER,
+    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE
+);
+CREATE TABLE media_attachment_processing_security_evidence (
+    job_id             TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE,
+    attachment_id      TEXT NOT NULL,
+    component_id       TEXT NOT NULL,
+    reason             TEXT NOT NULL CHECK(reason = 'storage_security_violation'),
+    recorded_at_unix_ms INTEGER NOT NULL,
+    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE,
+    FOREIGN KEY (component_id) REFERENCES media_attachment_components(component_id) ON DELETE CASCADE
+);
+CREATE TABLE media_attachment_processing_publication_intents (
+    job_id          TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE,
+    output_ids_json TEXT NOT NULL,
+    created_at_unix_ms INTEGER NOT NULL
+);
+CREATE TABLE media_attachment_processing_cleanup_evidence (
+    job_id          TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE,
+    evidence_digest TEXT NOT NULL,
+    completed_at_unix_ms INTEGER NOT NULL,
+    CHECK (length(evidence_digest)=64 AND evidence_digest NOT GLOB '*[^0-9a-f]*')
+);
+CREATE TABLE media_attachment_processing_failure_evidence (
+    job_id TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE,
+    attachment_id TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK(reason IN ('processing_failed','model_runtime_unavailable')),
+    recorded_at_unix_ms INTEGER NOT NULL,
+    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE
+);
+CREATE TABLE media_attachment_processing_output_security_evidence (
+    job_id TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE,
+    attachment_id TEXT NOT NULL,
+    output_ids_json TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK(reason='storage_security_violation'),
+    recorded_at_unix_ms INTEGER NOT NULL,
+    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE
+);
+
+CREATE TABLE media_uploads (
+    upload_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, canonical_project_digest TEXT NOT NULL,
+    client_draft_id TEXT NOT NULL, media_kind TEXT NOT NULL CHECK(media_kind IN ('image','audio','video')),
+    state TEXT NOT NULL CHECK(state IN ('open','finalizing','materialized','cancelled','expired','failed')),
+    upload_generation TEXT NOT NULL, declared_total_bytes TEXT NOT NULL, acknowledged_chunks INTEGER NOT NULL,
+    acknowledged_bytes TEXT NOT NULL, next_chunk_index INTEGER, expires_at_unix_ms INTEGER NOT NULL,
+    reservation_id TEXT NOT NULL UNIQUE, reservation_digest TEXT NOT NULL, temporary_storage_id TEXT NOT NULL UNIQUE,
+    attachment_id TEXT, attachment_version TEXT, terminal_reason TEXT, cleanup_evidence_digest TEXT, last_transition_json TEXT NOT NULL,
+    creation_sequence INTEGER NOT NULL UNIQUE, created_at_unix_ms INTEGER NOT NULL, updated_at_unix_ms INTEGER NOT NULL,
+    UNIQUE(session_id,canonical_project_digest,client_draft_id),
+    CHECK(length(canonical_project_digest)=64 AND canonical_project_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK(length(reservation_digest)=64 AND reservation_digest NOT GLOB '*[^0-9a-f]*')
+);
+CREATE TABLE media_upload_chunks (
+    upload_id TEXT NOT NULL, chunk_index INTEGER NOT NULL, byte_length INTEGER NOT NULL,
+    sha256 TEXT NOT NULL, storage_offset TEXT NOT NULL, acknowledged_at_unix_ms INTEGER NOT NULL,
+    PRIMARY KEY(upload_id,chunk_index), FOREIGN KEY(upload_id) REFERENCES media_uploads(upload_id) ON DELETE CASCADE,
+    CHECK(byte_length>0 AND byte_length<=262144), CHECK(length(sha256)=64 AND sha256 NOT GLOB '*[^0-9a-f]*')
+);
+CREATE TRIGGER media_upload_publication_intent_complete
+AFTER UPDATE OF state ON media_uploads
+WHEN NEW.state='materialized'
+BEGIN
+    DELETE FROM media_storage_publication_intents WHERE upload_id=NEW.upload_id;
+END;
+CREATE TABLE media_attachment_upload_origins(
+    attachment_id TEXT PRIMARY KEY,client_draft_id TEXT NOT NULL,upload_id TEXT NOT NULL UNIQUE,upload_generation TEXT NOT NULL,
+    FOREIGN KEY(attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE
+);
+CREATE TABLE local_media_operations (
+    local_operation_id TEXT PRIMARY KEY, authoritative_operation_id TEXT NOT NULL, action TEXT NOT NULL,
+    domain_key TEXT NOT NULL, operation_request_digest TEXT NOT NULL, semantic_command_digest TEXT NOT NULL,
+    receipt_json TEXT NOT NULL, is_alias INTEGER NOT NULL CHECK(is_alias IN(0,1)), committed_at_unix_ms INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX uq_local_media_operation_domain ON local_media_operations(action,domain_key) WHERE is_alias=0;
+CREATE TABLE local_media_operation_audit(local_operation_id TEXT PRIMARY KEY,outcome TEXT NOT NULL,committed_at_unix_ms INTEGER NOT NULL);
+CREATE TABLE media_creation_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),next_value INTEGER NOT NULL);
+INSERT INTO media_creation_sequence(singleton,next_value) VALUES(1,1);
+
 CREATE INDEX idx_sessions_project_started ON sessions (project_id, started_at DESC);
 CREATE INDEX idx_sessions_last_active     ON sessions (last_active_at DESC);
 CREATE INDEX idx_sessions_open            ON sessions (ended_at) WHERE ended_at IS NULL;
@@ -2622,4 +3092,375 @@ BEFORE UPDATE ON sealed_action_grants
 WHEN NEW.use_epoch < OLD.use_epoch
 BEGIN
     SELECT RAISE(ABORT, 'sealed action grant use epoch is monotonic');
+END;
+
+-- ---- remote attachment operation ledger ----------------------------------
+-- Canonical request bytes and transport metadata are deliberately absent.
+-- The daemon retains only their SHA-256 digest and a bounded safe response.
+CREATE TABLE remote_attachment_operations (
+    logical_attachment_id          TEXT    NOT NULL CHECK (
+        length(logical_attachment_id) = 36 AND logical_attachment_id = lower(logical_attachment_id)
+        AND substr(logical_attachment_id, 9, 1) = '-' AND substr(logical_attachment_id, 14, 1) = '-'
+        AND substr(logical_attachment_id, 19, 1) = '-' AND substr(logical_attachment_id, 24, 1) = '-'
+        AND substr(logical_attachment_id, 20, 1) GLOB '[89ab]'
+        AND length(replace(logical_attachment_id, '-', '')) = 32
+        AND replace(logical_attachment_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+        AND replace(logical_attachment_id, '-', '') <> '00000000000000000000000000000000'
+    ),
+    operation_id                   TEXT    NOT NULL CHECK (
+        length(operation_id) = 36 AND operation_id = lower(operation_id)
+        AND substr(operation_id, 9, 1) = '-' AND substr(operation_id, 14, 1) = '-'
+        AND substr(operation_id, 15, 1) = '7'
+        AND substr(operation_id, 19, 1) = '-' AND substr(operation_id, 20, 1) GLOB '[89ab]'
+        AND substr(operation_id, 24, 1) = '-'
+        AND length(replace(operation_id, '-', '')) = 32
+        AND replace(operation_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+        AND replace(operation_id, '-', '') <> '00000000000000000000000000000000'
+    ),
+    authenticated_device_id        TEXT    NOT NULL CHECK (
+        length(authenticated_device_id) = 36 AND authenticated_device_id = lower(authenticated_device_id)
+        AND substr(authenticated_device_id, 9, 1) = '-' AND substr(authenticated_device_id, 14, 1) = '-'
+        AND substr(authenticated_device_id, 19, 1) = '-' AND substr(authenticated_device_id, 24, 1) = '-'
+        AND substr(authenticated_device_id, 20, 1) GLOB '[89ab]'
+        AND length(replace(authenticated_device_id, '-', '')) = 32
+        AND replace(authenticated_device_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+        AND replace(authenticated_device_id, '-', '') <> '00000000000000000000000000000000'
+    ),
+    authenticated_device_generation INTEGER NOT NULL CHECK (authenticated_device_generation > 0),
+    operation_seq                  INTEGER NOT NULL CHECK (operation_seq > 0),
+    operation_class                TEXT    NOT NULL CHECK (operation_class IN (
+        'transactional_mutation', 'idempotent_adapter_mutation', 'nonrepeatable_mutation'
+    )),
+    operation_kind                 TEXT    NOT NULL DEFAULT 'generic' CHECK (operation_kind IN ('generic','staged_rename')),
+    state                          TEXT    NOT NULL CHECK (state IN (
+        'reserved', 'dispatched', 'committed', 'rejected', 'outcome_unknown'
+    )),
+    dispatch_generation            INTEGER NOT NULL DEFAULT 0 CHECK (dispatch_generation >= 0),
+    request_hash                   BLOB    NOT NULL CHECK (length(request_hash) = 32),
+    safe_response                  BLOB CHECK (safe_response IS NULL OR length(safe_response) <= 524288),
+    event_high_water_mark          INTEGER CHECK (event_high_water_mark IS NULL OR event_high_water_mark >= 0),
+    created_at_ms                  INTEGER NOT NULL,
+    updated_at_ms                  INTEGER NOT NULL,
+    retire_at_ms                   INTEGER,
+    CHECK (
+        (state IN ('reserved', 'dispatched') AND safe_response IS NULL AND event_high_water_mark IS NULL)
+        OR (state IN ('committed', 'rejected') AND safe_response IS NOT NULL AND event_high_water_mark IS NOT NULL)
+        OR (state = 'outcome_unknown' AND safe_response IS NOT NULL)
+    ),
+    PRIMARY KEY (logical_attachment_id, operation_id),
+    UNIQUE (logical_attachment_id, operation_seq)
+);
+
+CREATE INDEX idx_remote_attachment_operations_retire
+    ON remote_attachment_operations (retire_at_ms)
+    WHERE retire_at_ms IS NOT NULL;
+
+CREATE TABLE remote_attachment_lifecycle (
+    logical_attachment_id TEXT PRIMARY KEY CHECK (
+        length(logical_attachment_id) = 36 AND logical_attachment_id = lower(logical_attachment_id)
+        AND substr(logical_attachment_id, 9, 1) = '-' AND substr(logical_attachment_id, 14, 1) = '-'
+        AND substr(logical_attachment_id, 19, 1) = '-' AND substr(logical_attachment_id, 24, 1) = '-'
+        AND substr(logical_attachment_id, 20, 1) GLOB '[89ab]'
+        AND length(replace(logical_attachment_id, '-', '')) = 32
+        AND replace(logical_attachment_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+        AND replace(logical_attachment_id, '-', '') <> '00000000000000000000000000000000'
+    ),
+    closed_at_ms INTEGER NOT NULL CHECK(closed_at_ms >= 0),
+    retain_until_ms INTEGER NOT NULL CHECK(retain_until_ms >= closed_at_ms),
+    CHECK(retain_until_ms - closed_at_ms = 2592000000)
+);
+
+CREATE TRIGGER remote_attachment_lifecycle_immutable
+BEFORE UPDATE ON remote_attachment_lifecycle
+BEGIN
+    SELECT RAISE(ABORT, 'remote attachment close authority is immutable');
+END;
+
+CREATE TABLE remote_rename_journal (
+    logical_attachment_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL UNIQUE CHECK (
+      length(artifact_id)=36 AND artifact_id=lower(artifact_id)
+      AND substr(artifact_id,9,1)='-' AND substr(artifact_id,14,1)='-'
+      AND substr(artifact_id,19,1)='-' AND substr(artifact_id,24,1)='-'
+      AND substr(artifact_id,20,1) GLOB '[89ab]'
+      AND length(replace(artifact_id,'-',''))=32
+      AND replace(artifact_id,'-','') NOT GLOB '*[^0-9a-f]*'
+      AND replace(artifact_id,'-','')<>'00000000000000000000000000000000'
+    ),
+    source_identity BLOB NOT NULL CHECK(length(source_identity) = 57 AND substr(source_identity,1,4)=X'52464931' AND ((substr(source_identity,29,1)=X'01' AND substr(hex(source_identity),79,1)='8') OR (substr(source_identity,29,1)=X'02' AND substr(hex(source_identity),79,1)='4')) AND substr(source_identity,50,8)<>zeroblob(8)),
+    source_parent_identity BLOB NOT NULL CHECK(length(source_parent_identity) = 57 AND substr(source_parent_identity,1,4)=X'52464931' AND substr(source_parent_identity,29,1)=X'02' AND substr(hex(source_parent_identity),79,1)='4' AND substr(source_parent_identity,50,8)<>zeroblob(8)),
+    target_parent_identity BLOB NOT NULL CHECK(length(target_parent_identity) = 57 AND substr(target_parent_identity,1,4)=X'52464931' AND substr(target_parent_identity,29,1)=X'02' AND substr(hex(target_parent_identity),79,1)='4' AND substr(target_parent_identity,50,8)<>zeroblob(8)),
+    observed_target_identity BLOB CHECK(observed_target_identity IS NULL OR (length(observed_target_identity)=57 AND substr(observed_target_identity,1,4)=X'52464931')),
+    dispatch_generation INTEGER NOT NULL CHECK(dispatch_generation > 0),
+    state TEXT NOT NULL CHECK(state IN ('prepared','artifact_synced','renamed','source_parent_synced','target_parent_synced','applied','applied_mismatch','effect_unknown','ledger_committed')),
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    CHECK((state='applied_mismatch') = (observed_target_identity IS NOT NULL)),
+    PRIMARY KEY(logical_attachment_id,operation_id),
+    FOREIGN KEY(logical_attachment_id,operation_id)
+      REFERENCES remote_attachment_operations(logical_attachment_id,operation_id) ON DELETE CASCADE
+);
+
+CREATE TRIGGER remote_rename_journal_insert_authority
+BEFORE INSERT ON remote_rename_journal
+WHEN NOT EXISTS (
+  SELECT 1 FROM remote_attachment_operations
+  WHERE logical_attachment_id=NEW.logical_attachment_id
+    AND operation_id=NEW.operation_id
+    AND operation_kind='staged_rename'
+    AND operation_class='idempotent_adapter_mutation'
+    AND state='dispatched'
+    AND dispatch_generation=NEW.dispatch_generation
+)
+BEGIN
+    SELECT RAISE(ABORT, 'remote rename journal requires staged rename authority');
+END;
+
+CREATE TRIGGER remote_rename_journal_guard
+BEFORE UPDATE ON remote_rename_journal
+WHEN NEW.logical_attachment_id IS NOT OLD.logical_attachment_id
+  OR NEW.operation_id IS NOT OLD.operation_id
+  OR NEW.artifact_id IS NOT OLD.artifact_id
+  OR NEW.source_identity IS NOT OLD.source_identity
+  OR NEW.source_parent_identity IS NOT OLD.source_parent_identity
+  OR NEW.target_parent_identity IS NOT OLD.target_parent_identity
+  OR (OLD.observed_target_identity IS NOT NULL AND NEW.observed_target_identity IS NOT OLD.observed_target_identity)
+  OR NEW.dispatch_generation < OLD.dispatch_generation
+  OR NEW.updated_at_ms < OLD.updated_at_ms
+  OR CASE OLD.state
+       WHEN 'prepared' THEN NEW.state NOT IN ('prepared','artifact_synced','effect_unknown')
+       WHEN 'artifact_synced' THEN NEW.state NOT IN ('artifact_synced','renamed','applied_mismatch','effect_unknown')
+       WHEN 'renamed' THEN NEW.state NOT IN ('renamed','source_parent_synced','effect_unknown')
+       WHEN 'source_parent_synced' THEN NEW.state NOT IN ('source_parent_synced','target_parent_synced','effect_unknown')
+       WHEN 'target_parent_synced' THEN NEW.state NOT IN ('target_parent_synced','applied','effect_unknown')
+       WHEN 'applied' THEN NEW.state NOT IN ('applied','ledger_committed')
+       WHEN 'applied_mismatch' THEN NEW.state <> OLD.state
+       WHEN 'effect_unknown' THEN NEW.state <> OLD.state
+       ELSE NEW.state <> OLD.state
+     END
+BEGIN
+    SELECT RAISE(ABORT, 'remote rename journal is immutable, monotonic, and generation bound');
+END;
+
+CREATE TABLE remote_rename_artifact_cleanup_intents (
+    logical_attachment_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    PRIMARY KEY(logical_attachment_id,operation_id),
+    FOREIGN KEY(logical_attachment_id,operation_id)
+      REFERENCES remote_rename_journal(logical_attachment_id,operation_id) ON DELETE CASCADE
+);
+
+CREATE TRIGGER remote_rename_artifact_cleanup_intents_immutable
+BEFORE UPDATE ON remote_rename_artifact_cleanup_intents
+BEGIN
+    SELECT RAISE(ABORT, 'remote rename artifact cleanup intent is immutable');
+END;
+
+CREATE TRIGGER remote_rename_journal_cleanup_obligation
+BEFORE DELETE ON remote_rename_journal
+WHEN EXISTS (
+    SELECT 1 FROM remote_rename_artifact_cleanup_intents
+    WHERE logical_attachment_id=OLD.logical_attachment_id
+      AND operation_id=OLD.operation_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'remote rename artifact cleanup remains outstanding');
+END;
+
+CREATE TRIGGER remote_attachment_operation_reservation_insert
+BEFORE INSERT ON remote_attachment_operations
+WHEN NEW.state <> 'reserved' OR NEW.safe_response IS NOT NULL OR NEW.event_high_water_mark IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'remote operation insert must be a bounded reservation');
+END;
+
+CREATE TRIGGER remote_attachment_operation_capacity_insert
+BEFORE INSERT ON remote_attachment_operations
+WHEN (SELECT COUNT(*) FROM remote_attachment_operations
+      WHERE logical_attachment_id = NEW.logical_attachment_id) >= 100000
+BEGIN
+    SELECT RAISE(ABORT, 'attachment_ledger_capacity');
+END;
+
+CREATE TRIGGER remote_attachment_operation_response_capacity
+BEFORE UPDATE OF safe_response ON remote_attachment_operations
+WHEN (SELECT COALESCE(SUM(length(safe_response)), 0)
+      FROM remote_attachment_operations
+      WHERE logical_attachment_id = NEW.logical_attachment_id)
+     - COALESCE(length(OLD.safe_response), 0)
+     + COALESCE(length(NEW.safe_response), 0) > 536870912
+BEGIN
+    SELECT RAISE(ABORT, 'attachment_ledger_capacity');
+END;
+
+-- Operation identity, actor binding, request digest, class, and sequence are
+-- immutable after reservation. Reuse with changed bytes or actor generation
+-- is resolved as a typed conflict by the reservation API, never by UPDATE.
+CREATE TRIGGER remote_attachment_operation_binding_immutable
+BEFORE UPDATE ON remote_attachment_operations
+WHEN NEW.logical_attachment_id IS NOT OLD.logical_attachment_id
+  OR NEW.operation_id IS NOT OLD.operation_id
+  OR NEW.authenticated_device_id IS NOT OLD.authenticated_device_id
+  OR NEW.authenticated_device_generation IS NOT OLD.authenticated_device_generation
+  OR NEW.operation_seq IS NOT OLD.operation_seq
+  OR NEW.operation_class IS NOT OLD.operation_class
+  OR (NEW.operation_kind IS NOT OLD.operation_kind AND NOT (
+      OLD.operation_kind='generic' AND NEW.operation_kind='staged_rename' AND OLD.state='reserved'
+  ))
+  OR NEW.request_hash IS NOT OLD.request_hash
+  OR NEW.created_at_ms IS NOT OLD.created_at_ms
+BEGIN
+    SELECT RAISE(ABORT, 'remote attachment operation binding is immutable');
+END;
+
+CREATE TRIGGER remote_attachment_operation_transition_guard
+BEFORE UPDATE ON remote_attachment_operations
+WHEN (OLD.state NOT IN ('reserved', 'dispatched') AND NEW.state <> OLD.state)
+  OR (OLD.state = 'reserved' AND NEW.state NOT IN ('reserved', 'dispatched', 'committed', 'rejected', 'outcome_unknown'))
+  OR (OLD.state = 'dispatched' AND NEW.state NOT IN ('dispatched', 'committed', 'rejected', 'outcome_unknown'))
+  OR NEW.dispatch_generation < OLD.dispatch_generation
+  OR NEW.updated_at_ms < OLD.updated_at_ms
+  OR (OLD.safe_response IS NOT NULL AND NEW.safe_response IS NOT OLD.safe_response)
+  OR (OLD.event_high_water_mark IS NOT NULL
+      AND (NEW.event_high_water_mark IS NULL OR NEW.event_high_water_mark < OLD.event_high_water_mark))
+  OR (OLD.retire_at_ms IS NOT NULL
+      AND (NEW.retire_at_ms IS NULL OR NEW.retire_at_ms <> OLD.retire_at_ms))
+  OR (NEW.state IN ('committed', 'rejected') AND NOT EXISTS (
+      SELECT 1 FROM remote_attachment_outbox
+      WHERE logical_attachment_id = OLD.logical_attachment_id
+        AND operation_seq = OLD.operation_seq
+        AND event_seq = NEW.event_high_water_mark
+  ))
+BEGIN
+    SELECT RAISE(ABORT, 'illegal remote attachment operation transition');
+END;
+
+CREATE TABLE remote_attachment_outbox (
+    logical_attachment_id TEXT    NOT NULL,
+    event_seq              INTEGER NOT NULL CHECK (event_seq > 0),
+    delivery_id            TEXT    NOT NULL CHECK (
+        length(delivery_id) = 36 AND delivery_id = lower(delivery_id)
+        AND substr(delivery_id, 9, 1) = '-' AND substr(delivery_id, 14, 1) = '-'
+        AND substr(delivery_id, 19, 1) = '-' AND substr(delivery_id, 20, 1) GLOB '[89ab]'
+        AND substr(delivery_id, 24, 1) = '-'
+        AND length(replace(delivery_id, '-', '')) = 32
+        AND replace(delivery_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+        AND replace(delivery_id, '-', '') <> '00000000000000000000000000000000'
+    ),
+    operation_seq          INTEGER CHECK (operation_seq IS NULL OR operation_seq > 0),
+    kind                   TEXT    NOT NULL CHECK (length(kind) BETWEEN 1 AND 255),
+    canonical_payload      BLOB    NOT NULL CHECK (length(canonical_payload) <= 524288),
+    created_at_ms          INTEGER NOT NULL,
+    PRIMARY KEY (logical_attachment_id, event_seq),
+    UNIQUE (logical_attachment_id, delivery_id),
+    FOREIGN KEY (logical_attachment_id, operation_seq)
+        REFERENCES remote_attachment_operations(logical_attachment_id, operation_seq)
+        ON DELETE RESTRICT
+);
+
+CREATE INDEX idx_remote_attachment_outbox_operation
+    ON remote_attachment_outbox (logical_attachment_id, operation_seq)
+    WHERE operation_seq IS NOT NULL;
+
+-- Delivery attempts are consumer-local and never authorize replay compaction.
+-- The immutable event row remains the sole application replay authority.
+CREATE TABLE remote_attachment_outbox_deliveries (
+    logical_attachment_id TEXT NOT NULL,
+    delivery_id TEXT NOT NULL,
+    consumer_kind TEXT NOT NULL CHECK (length(consumer_kind) BETWEEN 1 AND 64),
+    state TEXT NOT NULL CHECK (state IN ('leased', 'acked')),
+    lease_id TEXT CHECK (lease_id IS NULL OR (
+        length(lease_id) = 36 AND lease_id = lower(lease_id)
+        AND substr(lease_id, 9, 1) = '-' AND substr(lease_id, 14, 1) = '-'
+        AND substr(lease_id, 19, 1) = '-' AND substr(lease_id, 20, 1) GLOB '[89ab]'
+        AND substr(lease_id, 24, 1) = '-'
+        AND length(replace(lease_id, '-', '')) = 32
+        AND replace(lease_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+        AND replace(lease_id, '-', '') <> '00000000000000000000000000000000'
+    )),
+    lease_expires_at_ms INTEGER,
+    attempts INTEGER NOT NULL CHECK (attempts BETWEEN 1 AND 1000000),
+    first_claimed_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    acked_at_ms INTEGER,
+    PRIMARY KEY (logical_attachment_id, delivery_id, consumer_kind),
+    FOREIGN KEY (logical_attachment_id, delivery_id)
+        REFERENCES remote_attachment_outbox(logical_attachment_id, delivery_id)
+        ON DELETE CASCADE,
+    CHECK ((state = 'leased' AND lease_id IS NOT NULL AND lease_expires_at_ms IS NOT NULL AND acked_at_ms IS NULL)
+        OR (state = 'acked' AND lease_id IS NULL AND lease_expires_at_ms IS NULL AND acked_at_ms IS NOT NULL)),
+    CHECK (updated_at_ms >= first_claimed_at_ms),
+    CHECK (acked_at_ms IS NULL OR acked_at_ms >= first_claimed_at_ms)
+);
+
+CREATE INDEX idx_remote_attachment_outbox_deliveries_claim
+    ON remote_attachment_outbox_deliveries (consumer_kind, state, lease_expires_at_ms);
+
+CREATE TRIGGER remote_attachment_outbox_delivery_monotonic
+BEFORE UPDATE ON remote_attachment_outbox_deliveries
+WHEN NEW.logical_attachment_id <> OLD.logical_attachment_id
+  OR NEW.delivery_id <> OLD.delivery_id
+  OR NEW.consumer_kind <> OLD.consumer_kind
+  OR NEW.first_claimed_at_ms <> OLD.first_claimed_at_ms
+  OR NEW.attempts < OLD.attempts
+  OR NEW.updated_at_ms < OLD.updated_at_ms
+  OR OLD.state = 'acked'
+BEGIN
+    SELECT RAISE(ABORT, 'illegal remote outbox delivery transition');
+END;
+
+CREATE TRIGGER remote_attachment_outbox_capacity_insert
+BEFORE INSERT ON remote_attachment_outbox
+WHEN (SELECT COUNT(*) FROM remote_attachment_outbox
+      WHERE logical_attachment_id = NEW.logical_attachment_id) >= 200000
+  OR (SELECT COALESCE(SUM(length(canonical_payload)), 0)
+      FROM remote_attachment_outbox
+      WHERE logical_attachment_id = NEW.logical_attachment_id)
+     + length(NEW.canonical_payload) > 2147483648
+BEGIN
+    SELECT RAISE(ABORT, 'attachment_outbox_capacity');
+END;
+
+CREATE TRIGGER remote_attachment_outbox_immutable
+BEFORE UPDATE ON remote_attachment_outbox
+BEGIN
+    SELECT RAISE(ABORT, 'remote attachment outbox is append-only');
+END;
+
+CREATE TRIGGER remote_attachment_outbox_delete_forbidden
+BEFORE DELETE ON remote_attachment_outbox
+WHEN NOT EXISTS (
+    SELECT 1 FROM remote_attachment_outbox_snapshots
+    WHERE logical_attachment_id = OLD.logical_attachment_id
+      AND compacted_through_event_seq >= OLD.event_seq
+)
+BEGIN
+    SELECT RAISE(ABORT, 'remote attachment outbox deletion lacks snapshot authority');
+END;
+
+CREATE TABLE remote_attachment_outbox_snapshots (
+    logical_attachment_id       TEXT PRIMARY KEY CHECK (
+        length(logical_attachment_id) = 36 AND logical_attachment_id = lower(logical_attachment_id)
+        AND substr(logical_attachment_id, 9, 1) = '-' AND substr(logical_attachment_id, 14, 1) = '-'
+        AND substr(logical_attachment_id, 19, 1) = '-' AND substr(logical_attachment_id, 24, 1) = '-'
+        AND substr(logical_attachment_id, 20, 1) GLOB '[89ab]'
+        AND length(replace(logical_attachment_id, '-', '')) = 32
+        AND replace(logical_attachment_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+        AND replace(logical_attachment_id, '-', '') <> '00000000000000000000000000000000'
+    ),
+    compacted_through_event_seq INTEGER NOT NULL CHECK (compacted_through_event_seq >= 0),
+    snapshot_high_water_mark    INTEGER NOT NULL CHECK (snapshot_high_water_mark >= compacted_through_event_seq),
+    updated_at_ms               INTEGER NOT NULL
+);
+
+CREATE TRIGGER remote_attachment_snapshot_monotonic
+BEFORE UPDATE ON remote_attachment_outbox_snapshots
+WHEN NEW.compacted_through_event_seq < OLD.compacted_through_event_seq
+  OR NEW.snapshot_high_water_mark < OLD.snapshot_high_water_mark
+  OR NEW.updated_at_ms < OLD.updated_at_ms
+BEGIN
+    SELECT RAISE(ABORT, 'remote attachment snapshot cursor is monotonic');
 END;

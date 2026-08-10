@@ -266,6 +266,320 @@ cockpit packages prune --dry-run
 
 Cockpit uses its own config layout and does not parse `opencode.json` or `.opencode/`.
 
+### Hooks
+
+Cockpit ships a native command-hook system: local commands you configure in
+layered `config.json` that fire on fixed agent-lifecycle boundaries. This is a
+Cockpit-native contract. It is **not** compatible with Claude Code, Cursor,
+Grok, OpenCode, or any other vendor's hook format, and Cockpit does not run
+HTTP/network hooks, shell-string commands, TOML hooks, plugin sources, or
+agent-frontmatter hooks. Do not copy vendor examples — they will not load.
+
+A hook is executable code. Review every handler before trusting a workspace,
+the same way you review `.cockpit/config.json` providers and approvals.
+
+<!-- hooks-contract:start -->
+#### Configuration schema
+
+Hooks live under a top-level `hooks` object in any layered `config.json`. Each
+event key maps to an array of handler objects:
+
+```json
+{
+  "hooks": {
+    "preToolUse": [
+      {
+        "matcher": ["bash", "write"],
+        "command": ["./scripts/audit-tool.sh", "--json"],
+        "timeoutSecs": 10,
+        "env": { "AUDIT_MODE": "strict" }
+      }
+    ],
+    "stop": [
+      {
+        "command": ["./scripts/notify-done.sh"],
+        "env": { "NOTIFY_CHANNEL": "builds" }
+      }
+    ]
+  }
+}
+```
+
+Each handler object fields:
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `command` | string[] (argv) | yes | Non-empty argv array with no empty items. The executable is resolved source-relative (see below); no empty items. |
+| `matcher` | string[] | no | Omit to match all; otherwise a non-empty array constrained by the event's matcher policy (see the event table). |
+| `timeoutSecs` | integer | no | Defaults to the event's default timeout. Must be in 1..=600. |
+| `env` | object (string→string) | no | Extra environment for the child. Keys must not be empty. Reserved `COCKPIT_*` keys are overwritten after this map. |
+
+Unknown fields are rejected. The `hooks` value must be an object whose values
+are arrays.
+
+#### Canonical events
+
+Cockpit recognizes exactly these event keys (in canonical order):
+
+| Event | Gate | Applicability | Matcher | Default timeout | Affects control flow |
+| --- | --- | --- | --- | --- | --- |
+| `sessionStart` | observe | rootAndChild | closed: `fresh`, `resume` | 5s | no |
+| `userPromptSubmit` | observe | rootOnly | closed: `user`, `queued` | 5s | no |
+| `preToolUse` | tool | ordinaryToolOnly | canonicalToolName | 5s | yes |
+| `postToolUse` | observe | realOrdinaryExecutionOnly | canonicalToolName | 5s | no |
+| `postToolUseFailure` | observe | realOrdinaryExecutionOnly | canonicalToolName | 5s | no |
+| `permissionDenied` | observe | anyDeniedToolApproval | canonicalToolName | 5s | no |
+| `stop` | stop | normalRootDoneOnly | closed: `end_turn` | 60s | yes |
+| `stopFailure` | observe | inferenceErrorOnly | errorClass | 5s | no |
+| `subagentStart` | observe | childOnly | childAgentType | 5s | no |
+| `subagentStop` | stop | childOnly | childAgentType | 60s | yes |
+| `preCompact` | observe | successfulCompactionOnly | closed: `manual`, `auto` | 5s | no |
+| `postCompact` | observe | successfulCompactionOnly | closed: `manual`, `auto` | 5s | no |
+| `sessionEnd` | observe | everySession | closed: `completed`, `interrupted`, `cancelled`, `shutdown`, `error` | 5s | no |
+
+Gate kinds:
+
+- **observe** — the hook runs for its side effects and its decision JSON is
+  not parsed for control flow. It can never block.
+- **tool** — only `preToolUse`. The hook's JSON `decision` can deny the tool
+  call (see Decision vocabularies).
+- **stop** — `stop` and `subagentStop`. The hook's JSON can request another
+  model round (`block`) or end the turn (`continue: false`).
+
+Matcher policies:
+
+- **closed** — only the listed string values are valid; anything else is
+  rejected at config load.
+- **canonicalToolName** — a canonical tool name (ASCII alphanumeric plus
+  `_`, `-`, `.`, `:`, `/`). Used by the tool-applicable events.
+- **childAgentType** — a canonical child-agent type identifier.
+- **errorClass** — a canonical inference error class identifier.
+
+A normal root-turn `stop` and a child-only `subagentStop` are distinct events:
+`stop` fires for the root turn's normal completion; `subagentStop` fires only
+for child subagent frames. `sessionEnd` is observe-only and fires once per
+session regardless of how it ended.
+
+#### Source ordering, argv, and trust
+
+Hook handlers are discovered from the same layered `config.json` sources as the
+rest of Cockpit, loaded from least to most specific:
+
+1. `global` — `~/.config/cockpit/config.json`
+2. `user` — `~/.cockpit/config.json`
+3. `machine` — a machine-local per-cwd directory under the Cockpit data dir
+4. `project` — `.cockpit/config.json` in the current project or an ancestor
+5. `explicit` — the single file pointed at by `COCKPIT_CONFIG` (bypasses
+   layered discovery for runtime loading)
+
+When `COCKPIT_CONFIG` is set, only that one file supplies hooks; layered
+discovery is skipped for `config.json` loading. `mcp.json` and other sibling
+files are unaffected by `COCKPIT_CONFIG`.
+
+Duplicate handlers (same event, matcher, and command) across layers are
+de-duplicated; the first occurrence wins. The handler `origin` is recorded as
+`<layer>:<16-hex-digest>:<index>` where `layer` is one of `global`, `user`,
+`machine`, `project`, or `explicit`, the digest is an 8-byte SHA-256 of the
+canonical config path, and the index is the handler's position within its
+source's event list.
+
+**Project handlers run only after the existing workspace trust decision permits
+project config.** `trust` allows `.cockpit/config.json` (including its hooks);
+`ignore-config` opens the workspace without project config; `untrusted` refuses
+and exits. Global, user, and machine-local behavior follows normal config
+discovery and is not gated by workspace trust. A hook is executable code —
+review it before trusting a workspace, exactly as you review project providers
+and approvals.
+
+**Command argv is source-relative.** A bare executable (a single path
+component, no separator) is resolved at run time using Cockpit's parent-process
+executable lookup. Any other relative path is resolved against the directory of
+the `config.json` that declared it, then normalized (no `..` escapes the source
+directory). An absolute path is used verbatim. The first `command` item must
+not look like a URL (`://` is rejected); only local command hooks are
+supported.
+
+#### Environment
+
+The hook child receives a **clean environment**: only the handler's configured
+`env` map plus a small set of reserved Cockpit keys. Cockpit never passes its
+ambient daemon environment to a hook. On Windows only, `SystemRoot` and
+`WINDIR` (copied from the parent `SystemRoot`) are added so the child can boot;
+`ComSpec`, `PATHEXT`, and every other host variable stay absent. On Unix, no
+ambient variable is added.
+
+Reserved keys are overwritten **after** the configured `env` map, so a handler
+cannot spoof them:
+
+- `COCKPIT_HOOK_EVENT` — the event key (e.g. `preToolUse`)
+- `COCKPIT_HOOK_NAME` — the handler origin (`<layer>:<digest>:<index>`)
+- `COCKPIT_SESSION_ID` — the session UUID
+- `COCKPIT_WORKSPACE_ROOT` — the workspace root path
+- `COCKPIT_TOOL_NAME` — the tool name (tool-applicable events only)
+- `COCKPIT_TOOL_CALL_ID` — the tool call id (tool-applicable events only)
+
+You are responsible for the command code and any values you put in `env`.
+Cockpit does not promise to keep configured env values secret.
+
+#### Event envelope
+
+Each hook receives a Cockpit-native JSON envelope on stdin (camelCase). It
+contains `hookEventName`, `sessionId`, `workspaceRoot`, `timestamp`, and
+event-specific fields: `toolName`, `toolCallId`, `toolInput`,
+`toolInputTruncated`, `toolResult`, `toolResultTruncated`, `toolError`,
+`subagentId`, `subagentType`, `source`, and `reason`. Only fields relevant to
+the event are present.
+
+Envelope bounds: `toolInput` and `toolResult` values are serialized to a
+maximum of 128 KiB each; excess is replaced with a UTF-8-safe prefix and the
+corresponding `toolInputTruncated` / `toolResultTruncated` boolean is set. The
+hook's stdout and stderr are each independently capped at 64 KiB.
+
+Cockpit does not persist raw hook input or output. It does not pass the ambient
+daemon environment. The envelope is the bounded event payload; configured `env`
+values are the only other input to the child.
+
+#### Decision vocabularies
+
+A hook communicates by printing a single JSON object to stdout.
+
+**`preToolUse` (tool gate):**
+
+- `{"decision":"allow"}` — allow the tool call (also the default for empty
+  stdout and exit code 0).
+- `{"decision":"deny","reason":"..."}` — block the tool call. The reason is
+  shown to the model as a rejected-tool diagnostic and is the **only** way a
+  hook blocks a tool. `reason` is clipped to 1024 chars; a missing/blank reason
+  defaults to `blocked by preToolUse hook`.
+- `{"decision":"block",...}` — invalid for `preToolUse`; treated as a failed
+  run (fail-open).
+- Any other/unknown decision, non-object JSON, or malformed output is a failed
+  run, not a deny.
+
+**`stop` / `subagentStop` (stop gate):**
+
+- `{"decision":"block","reason":"..."}` — request another model round. An
+  optional `hookSpecificOutput.additionalContext` string is fed back to the
+  model as extra context for that round.
+- `{"continue":false,"stopReason":"..."}` — end the turn. `continue:false`
+  wins over any `decision` field.
+- `{"decision":"allow"}` — allow the stop (the turn ends normally).
+- `{"decision":"deny",...}` — invalid for a stop gate; treated as a failed
+  run (fail-open).
+- An unknown decision is observe-only (fail-open).
+
+**Observe-only events** (`sessionStart`, `userPromptSubmit`, `postToolUse`,
+`postToolUseFailure`, `permissionDenied`, `stopFailure`, `subagentStart`,
+`preCompact`, `postCompact`, `sessionEnd`) never block and their decision JSON
+is not parsed for control flow. Non-object or malformed stdout is recorded as a
+failed run; otherwise the run is a success.
+
+#### Fail-open behavior
+
+Only an explicit, parseable `preToolUse` `{"decision":"deny",...}` blocks a
+tool. Every other failure mode is **fail-open**: the run is recorded as
+`failed` in the audit ledger and the agent continues. Fail-open conditions are:
+
+- crash (process exited with a signal / non-zero status other than a parseable
+  deny)
+- timeout (the command did not finish within `timeoutSecs`)
+- spawn-failure (the executable could not be launched)
+- malformed-output (stdout was not valid JSON or not a JSON object)
+- oversized-output (stdout/stderr exceeded the 64 KiB cap)
+- nonzero-exit (a non-zero exit code with no parseable deny)
+- missing-command (the executable was not found on PATH)
+
+Exit status alone never denies. Post and observe-only hooks never block; they
+run sequentially even if an earlier observer fails.
+
+#### Stop continuation cap
+
+Each interactive, inline, detached, and nested child frame/job has its own
+stop-continuation counter. A `stop`/`subagentStop` `block` requests another
+model round and increments the counter for the affected frame/job. After **8**
+continuations per `(session, frame-or-job)`, Cockpit forces the turn to end
+without reconsulting stop hooks. Feedback from a stop hook stays in the
+affected frame/job; a child force-stop returns only its ordinary parent
+envelope/report.
+
+#### Audit and privacy
+
+Every hook run is recorded as a durable, redacted `hook_run` outcome with a
+closed status vocabulary:
+
+- `success` — the hook allowed (or an observer ran successfully, including a
+  stop `continue:false` that ended the turn)
+- `denied` — a `preToolUse` hook explicitly denied
+- `blocked` — a stop-gate hook requested another model round
+- `failed` — a fail-open failure
+
+The `hook_run` audit row carries only bounded, redacted metadata: `event`,
+`hook` (the origin), `origin`, `status`, `durationMs`, `reason`, `turnId`,
+`toolName`, `toolCallId`, and `subagentId`. It deliberately has **no** payload,
+output, argv, cwd, environment, stdout, stderr, http, or unknown fields —
+import deserialization rejects every field outside this projection. Byte caps:
+`event` and `toolName` ≤ 128 bytes; `turnId`, `toolCallId`, and `subagentId`
+≤ 256 bytes; `reason` ≤ 1024 bytes. The `event` must be an ASCII identifier;
+`hook`/`origin` must be a valid `<layer>:<digest>:<index>` with a layer in
+`global`, `user`, `machine`, `project`, or `explicit`.
+
+#### Unsupported formats
+
+The following are deliberately **not** supported and will not load or run. No
+source implies they work:
+
+- **toml** — only `config.json` (JSON) hooks are parsed.
+- **shell-string** — `command` must be an argv array; a single shell string is
+  rejected.
+- **http-endpoint** / **network-hook** — only local command hooks run; a
+  `command[0]` containing `://` is rejected. There are no HTTP/webhook hooks.
+- **regex-matcher** / **glob-matcher** — matchers are closed string sets or
+  canonical identifiers, never regex or glob patterns.
+- **vendor-alias** — Claude Code, Cursor, Grok, OpenCode, and other vendor
+  hook formats are not aliased or translated.
+- **plugin-source** — hooks come only from layered `config.json`; there is no
+  plugin marketplace or plugin-source loader.
+- **agent-frontmatter** — hooks are not declared in agent definition
+  frontmatter; only `config.json` `hooks` objects are read.
+
+#### Examples
+
+A harmless pre-tool deny that blocks `bash` calls in a destructive path:
+
+```json
+{
+  "hooks": {
+    "preToolUse": [
+      {
+        "matcher": ["bash"],
+        "command": ["./scripts/guard-rm.sh"]
+      }
+    ]
+  }
+}
+```
+
+`guard-rm.sh` inspects `$COCKPIT_TOOL_NAME` and the stdin envelope, and prints
+`{"decision":"deny","reason":"refusing rm -rf /"}` to block. A crash, timeout,
+or empty stdout from this script fail-opens (the bash call proceeds).
+
+A project-relative stop hook (resolved against the `.cockpit/` directory that
+declared it):
+
+```json
+{
+  "hooks": {
+    "stop": [
+      { "command": ["./scripts/notify-done.sh"] }
+    ]
+  }
+}
+```
+
+No example calls a network service, and no example places a secret value in
+config.
+<!-- hooks-contract:end -->
+
 Config is layered from:
 
 - `~/.config/cockpit/`

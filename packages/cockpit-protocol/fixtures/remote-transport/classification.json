@@ -52,8 +52,8 @@
   ],
   "counts": {
     "event": 76,
-    "request": 116,
-    "response": 74
+    "request": 126,
+    "response": 81
   },
   "messages": {
     "event": [
@@ -864,6 +864,30 @@
         "tag": "close_terminal"
       },
       {
+        "class": "terminal_io",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "terminal_ingress_begin"
+      },
+      {
+        "class": "terminal_io",
+        "inlinePayloadBound": "stream_chunked",
+        "lane": "interactive",
+        "tag": "terminal_ingress_chunk"
+      },
+      {
+        "class": "terminal_io",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "terminal_ingress_finish"
+      },
+      {
+        "class": "terminal_io",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "terminal_ingress_status"
+      },
+      {
         "class": "bounded_request_response",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
@@ -1210,6 +1234,42 @@
         "inlinePayloadBound": "bounded",
         "lane": "control",
         "tag": "restart_if_idle"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "operation_status"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "set_workspace_trust"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "get_startup_disclosures"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "get_app_flag"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "mark_app_flag_seen"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "resolve_assistant_session"
       }
     ],
     "response": [
@@ -1265,7 +1325,7 @@
         "class": "terminal_io",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
-        "tag": "terminal_paste_image"
+        "tag": "terminal_ingress"
       },
       {
         "class": "bounded_request_response",
@@ -1656,6 +1716,48 @@
         "inlinePayloadBound": "bounded",
         "lane": "control",
         "tag": "run_invocation_cancel_result"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "remote_operation_status"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "workspace_trust_set"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "startup_disclosures"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "app_flag"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "app_flag_seen"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "assistant_session_resolved"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "remote_goal_outcome"
       }
     ]
   },

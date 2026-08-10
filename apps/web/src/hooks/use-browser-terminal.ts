@@ -8,17 +8,10 @@ import { ClipboardAddon } from "@xterm/addon-clipboard";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
-import {
-  type ClipboardEvent,
-  type DragEvent,
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { type DragEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { TerminalClient, type TerminalClientStatus } from "@/lib/terminal/terminal-client";
 import { useLiveTerminalStore } from "@/stores/live-terminal";
+import { installTerminalPasteInterceptor } from "./browser-terminal-paste";
 
 type TokenInfo = {
   token: string;
@@ -41,7 +34,6 @@ export type BrowserTerminalState = {
   recording: boolean;
   pendingClipboardText: string | null;
   uploadProgress: { sentBytes: number; totalBytes: number } | null;
-  handlePaste: (event: ClipboardEvent) => void;
   handleDrop: (event: DragEvent) => void;
   confirmClipboardWrite: () => Promise<void>;
   sendInput: (data: string) => void;
@@ -71,6 +63,28 @@ export function useBrowserTerminal(options: BrowserTerminalOptions): BrowserTerm
     elementRef.current = node;
   }, []);
 
+  const pasteFiles = useCallback(
+    async (files: readonly File[]) => {
+      const plan = planTerminalPaste({ files });
+      if (plan.kind === "error") {
+        options.onError(plan.code);
+        return;
+      }
+      if (plan.kind !== "image") return;
+      const file = plan.image.file as File;
+      try {
+        await clientRef.current?.uploadImage(file, (sentBytes, totalBytes) => {
+          setUploadProgress({ sentBytes, totalBytes });
+        });
+      } catch (error) {
+        options.onError(sanitizedIngressCode(error));
+      } finally {
+        setUploadProgress(null);
+      }
+    },
+    [options.onError],
+  );
+
   useEffect(() => {
     const element = elementRef.current;
     if (!element) return;
@@ -92,6 +106,15 @@ export function useBrowserTerminal(options: BrowserTerminalOptions): BrowserTerm
       // Canvas rendering remains available when WebGL is unsupported or blocked.
     }
     terminal.open(element);
+    const textarea = terminal.textarea;
+    if (!textarea) {
+      terminal.dispose();
+      options.onError("host_error");
+      return;
+    }
+    const removePasteInterceptor = installTerminalPasteInterceptor(textarea, (files) => {
+      void pasteFiles(files);
+    });
     fit.fit();
     terminal.focus();
 
@@ -160,6 +183,7 @@ export function useBrowserTerminal(options: BrowserTerminalOptions): BrowserTerm
     client.connect();
 
     return () => {
+      removePasteInterceptor();
       resizeObserver.disconnect();
       for (const dispose of disposers) dispose();
       client.close();
@@ -179,56 +203,19 @@ export function useBrowserTerminal(options: BrowserTerminalOptions): BrowserTerm
     options.onError,
     options.tokenInfo.relayUrl,
     options.tokenInfo.token,
+    pasteFiles,
     reattach.status,
     reattach.status === "reattachable" ? reattach.terminalId : undefined,
     registerLiveTerminal,
     unregisterLiveTerminal,
   ]);
 
-  const pasteFiles = useCallback(
-    async (files: File[]) => {
-      const plan = planTerminalPaste({ files });
-      if (plan.kind === "error") {
-        options.onError(plan.code);
-        return;
-      }
-      if (plan.kind !== "images") return;
-      for (const image of plan.images) {
-        const file = image.file as File;
-        await clientRef.current?.uploadImage(file, (sentBytes, totalBytes) => {
-          setUploadProgress({ sentBytes, totalBytes });
-        });
-      }
-      setUploadProgress(null);
-    },
-    [options],
-  );
-
-  const handlePaste = useCallback(
-    (event: ClipboardEvent) => {
-      const files = Array.from(event.clipboardData.files);
-      const plan = planTerminalPaste({ text: event.clipboardData.getData("text"), files });
-      if (plan.kind === "empty") return;
-      event.preventDefault();
-      if (plan.kind === "text") {
-        clientRef.current?.input(plan.text);
-        return;
-      }
-      if (plan.kind === "error") {
-        options.onError(plan.code);
-        return;
-      }
-      void pasteFiles(files);
-    },
-    [options, pasteFiles],
-  );
-
   const handleDrop = useCallback(
     (event: DragEvent) => {
       const files = Array.from(event.dataTransfer.files);
       if (files.length === 0) return;
       event.preventDefault();
-      void pasteFiles(files);
+      void Promise.all(files.map((file) => pasteFiles([file])));
     },
     [pasteFiles],
   );
@@ -255,12 +242,32 @@ export function useBrowserTerminal(options: BrowserTerminalOptions): BrowserTerm
     recording,
     pendingClipboardText,
     uploadProgress,
-    handlePaste,
     handleDrop,
     confirmClipboardWrite,
     sendInput,
     disconnect,
   };
+}
+
+function sanitizedIngressCode(error: unknown) {
+  if (!(error instanceof Error)) return "UploadFailed";
+  const allowed = new Set([
+    "Busy",
+    "TooManyFiles",
+    "TooLarge",
+    "UnsupportedType",
+    "HashFailed",
+    "Conflict",
+    "UploadFailed",
+    "MaterializationFailed",
+    "Expired",
+    "DeadlineExceeded",
+    "CommitUnknown",
+    "CleanupPending",
+    "Cancelled",
+    "TerminalUnavailable",
+  ]);
+  return allowed.has(error.message) ? error.message : "UploadFailed";
 }
 
 function buildTerminalTheme() {

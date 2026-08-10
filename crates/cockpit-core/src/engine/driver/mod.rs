@@ -2654,6 +2654,7 @@ impl Driver {
             signature: None,
             additional_params: None,
         };
+        let config_snapshot = ctx.config.snapshot();
         let env = crate::engine::agent::tool_dispatch::DispatchEnv {
             agent: &agent,
             session: &self.session,
@@ -2667,6 +2668,7 @@ impl Driver {
             ),
             loop_guard_threshold: self.loop_guard_threshold,
             cwd: &self.cwd,
+            hooks: config_snapshot.hooks(),
         };
         crate::engine::interrupt::with_pre_resolved_interrupt_question(
             interrupt_id,

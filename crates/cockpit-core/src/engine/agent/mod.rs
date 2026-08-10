@@ -18,9 +18,8 @@
 use std::sync::Arc;
 use tokio::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
-use futures::FutureExt;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -41,6 +40,7 @@ use crate::session::{Session, ToolCallRow};
 mod backup;
 mod events;
 mod gate;
+pub(crate) mod hooks;
 mod loop_guard;
 mod outcome;
 mod recheck;

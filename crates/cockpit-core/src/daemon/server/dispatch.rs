@@ -1,9 +1,41 @@
 use super::attachments::*;
 use super::authz::*;
+use super::run_invocation::{principal_digest, wall_ms_now};
 use super::sessions::*;
 use super::*;
 
 static WORKSPACE_TRUST_RPC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[derive(Debug)]
+struct AppFlagVersionConflict;
+
+impl std::fmt::Display for AppFlagVersionConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("app flag version conflict")
+    }
+}
+
+impl std::error::Error for AppFlagVersionConflict {}
+
+#[derive(Debug)]
+struct PinMutationRejected(String);
+
+impl std::fmt::Display for PinMutationRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PinMutationRejected {}
+
+#[derive(Debug)]
+struct GoalMutationRejected(String);
+impl std::fmt::Display for GoalMutationRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for GoalMutationRejected {}
 
 fn app_flag_db_key(key: proto::AppFlagKey) -> &'static str {
     match key {
@@ -45,6 +77,25 @@ fn connector_disclosure_to_proto(
         relay_id: value.relay_id,
         relay_region: value.relay_region,
         last_error: value.last_error,
+    }
+}
+
+fn invalid_terminal_ingress() -> ErrorPayload {
+    ErrorPayload {
+        code: ErrorCode::InvalidIngress,
+        message: "invalid terminal ingress".to_string(),
+    }
+}
+
+fn require_terminal_binding(
+    state: &MutableClientState,
+    terminal_id: Uuid,
+    binding: proto::terminal::TerminalBinding,
+) -> std::result::Result<(), ErrorPayload> {
+    if state.terminal_views.get(&terminal_id) == Some(&binding) {
+        Ok(())
+    } else {
+        Err(invalid_terminal_ingress())
     }
 }
 
@@ -234,6 +285,691 @@ pub(super) async fn handle_serialized_request(
     ctx: &Arc<DaemonContext>,
     effects: &mut ClientRequestEffects,
 ) -> std::result::Result<Response, ErrorPayload> {
+    Box::pin(handle_serialized_request_with_remote_operation(
+        request, state, shared, ctx, effects, None,
+    ))
+    .await
+}
+
+async fn begin_remote_nonrepeatable(
+    request: &Request,
+    authorized: &AuthorizedRequestContext,
+    operation: &super::RemoteOperationContext,
+    ctx: &DaemonContext,
+) -> std::result::Result<Option<Response>, ErrorPayload> {
+    let params = request
+        .canonical_remote_operation_params_v1()
+        .map_err(internal)?;
+    let canonical = authorized.encode_fcor(request, &params)?;
+    let request_hash = proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+    let attachment = operation.logical_attachment_id.to_string();
+    let operation_id = operation.operation_id.to_string();
+    let device = operation.authenticated_device_id.to_string();
+    match ctx.db.begin_nonrepeatable_remote_operation(
+        crate::db::remote_attachment_operations::ReserveRemoteOperation {
+            logical_attachment_id: &attachment, operation_id: &operation_id,
+            authenticated_device_id: &device,
+            authenticated_device_generation: operation.authenticated_device_generation,
+            operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::NonrepeatableMutation,
+            request_hash, now_ms: chrono::Utc::now().timestamp_millis(),
+        },
+    ).await.map_err(internal)? {
+        crate::db::remote_attachment_operations::BeginNonrepeatableRemoteOperationOutcome::Dispatch { .. } => Ok(None),
+        crate::db::remote_attachment_operations::BeginNonrepeatableRemoteOperationOutcome::Replay(bytes) =>
+            serde_json::from_slice(&bytes).map(Some).map_err(internal),
+        crate::db::remote_attachment_operations::BeginNonrepeatableRemoteOperationOutcome::OutcomeUnknown(_) =>
+            Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation outcome is unknown; it will not be retried".into() }),
+        crate::db::remote_attachment_operations::BeginNonrepeatableRemoteOperationOutcome::OperationConflict
+        | crate::db::remote_attachment_operations::BeginNonrepeatableRemoteOperationOutcome::OperationActorConflict =>
+            Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+        crate::db::remote_attachment_operations::BeginNonrepeatableRemoteOperationOutcome::AttachmentLedgerCapacity =>
+            Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+    }
+}
+
+async fn commit_remote_nonrepeatable(
+    operation: &super::RemoteOperationContext,
+    ctx: &DaemonContext,
+    kind: &str,
+    response: Response,
+) -> std::result::Result<Response, ErrorPayload> {
+    let attachment = operation.logical_attachment_id.to_string();
+    let operation_id = operation.operation_id.to_string();
+    let bytes = serde_json::to_vec(&response).map_err(internal)?;
+    let delivery = Uuid::now_v7().to_string();
+    match ctx
+        .db
+        .commit_remote_attachment_operation(
+            crate::db::remote_attachment_operations::CommitRemoteOperation {
+                logical_attachment_id: &attachment,
+                operation_id: &operation_id,
+                safe_response: &bytes,
+                outbox_delivery_id: &delivery,
+                outbox_kind: kind,
+                outbox_payload: &bytes,
+                now_ms: chrono::Utc::now().timestamp_millis(),
+            },
+        )
+        .await
+        .map_err(internal)?
+    {
+        crate::db::remote_attachment_operations::CommitRemoteOperationOutcome::Committed {
+            ..
+        } => Ok(response),
+        _ => {
+            ctx.db
+                .mark_nonrepeatable_remote_operation_outcome_unknown(
+                    &attachment,
+                    &operation_id,
+                    br#"{"outcome":"unknown"}"#,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                .map_err(internal)?;
+            Err(ErrorPayload {
+                code: ErrorCode::Conflict,
+                message: "remote operation outcome is unknown; it will not be retried".into(),
+            })
+        }
+    }
+}
+
+async fn begin_remote_idempotent_adapter(
+    request: &Request,
+    authorized: &AuthorizedRequestContext,
+    operation: &super::RemoteOperationContext,
+    ctx: &DaemonContext,
+) -> std::result::Result<Option<Response>, ErrorPayload> {
+    let params = request
+        .canonical_remote_operation_params_v1()
+        .map_err(internal)?;
+    let canonical = authorized.encode_fcor(request, &params)?;
+    let request_hash = proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+    let attachment = operation.logical_attachment_id.to_string();
+    let operation_id = operation.operation_id.to_string();
+    let device = operation.authenticated_device_id.to_string();
+    match ctx.db.begin_idempotent_adapter_remote_operation(
+        crate::db::remote_attachment_operations::ReserveRemoteOperation {
+            logical_attachment_id: &attachment,
+            operation_id: &operation_id,
+            authenticated_device_id: &device,
+            authenticated_device_generation: operation.authenticated_device_generation,
+            operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::IdempotentAdapterMutation,
+            request_hash,
+            now_ms: chrono::Utc::now().timestamp_millis(),
+        },
+    ).await.map_err(internal)? {
+        crate::db::remote_attachment_operations::BeginIdempotentAdapterRemoteOperationOutcome::Dispatch { .. } => Ok(None),
+        crate::db::remote_attachment_operations::BeginIdempotentAdapterRemoteOperationOutcome::Replay(bytes) =>
+            serde_json::from_slice(&bytes).map(Some).map_err(internal),
+        crate::db::remote_attachment_operations::BeginIdempotentAdapterRemoteOperationOutcome::OperationConflict
+        | crate::db::remote_attachment_operations::BeginIdempotentAdapterRemoteOperationOutcome::OperationActorConflict =>
+            Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+        crate::db::remote_attachment_operations::BeginIdempotentAdapterRemoteOperationOutcome::AttachmentLedgerCapacity =>
+            Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+    }
+}
+
+async fn commit_remote_idempotent_adapter(
+    operation: &super::RemoteOperationContext,
+    ctx: &DaemonContext,
+    kind: &str,
+    response: Response,
+) -> std::result::Result<Response, ErrorPayload> {
+    let attachment = operation.logical_attachment_id.to_string();
+    let operation_id = operation.operation_id.to_string();
+    let bytes = serde_json::to_vec(&response).map_err(internal)?;
+    let delivery = Uuid::now_v7().to_string();
+    match ctx
+        .db
+        .commit_remote_attachment_operation(
+            crate::db::remote_attachment_operations::CommitRemoteOperation {
+                logical_attachment_id: &attachment,
+                operation_id: &operation_id,
+                safe_response: &bytes,
+                outbox_delivery_id: &delivery,
+                outbox_kind: kind,
+                outbox_payload: &bytes,
+                now_ms: chrono::Utc::now().timestamp_millis(),
+            },
+        )
+        .await
+        .map_err(internal)?
+    {
+        crate::db::remote_attachment_operations::CommitRemoteOperationOutcome::Committed {
+            ..
+        } => Ok(response),
+        _ => Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message: "remote adapter result could not be committed; reconciliation is required"
+                .into(),
+        }),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn db_filesystem_identity(
+    value: crate::external_journal::HeldEntryIdentity,
+) -> crate::db::remote_attachment_operations::RemoteFilesystemIdentityV1 {
+    crate::db::remote_attachment_operations::RemoteFilesystemIdentityV1 {
+        filesystem_id: value.filesystem_id,
+        object_id: value.object_id,
+        kind: value.kind,
+        len: value.len,
+        mode: value.mode,
+        owner_id: value.owner_id,
+        link_count: value.link_count,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn cleanup_remote_rename_artifacts(
+    _ctx: &DaemonContext,
+    journal: &crate::external_journal::ExternalJournal,
+    _attachment: &str,
+    _operation_id: &str,
+) {
+    let _ = journal.drain_remote_rename_artifact_cleanup().await;
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn close_remote_rename_effect_unknown(
+    ctx: &DaemonContext,
+    journal: &crate::external_journal::ExternalJournal,
+    attachment: &str,
+    operation_id: &str,
+    dispatch_generation: u64,
+    message: &'static str,
+) -> std::result::Result<Response, ErrorPayload> {
+    ctx.db
+        .record_remote_rename_effect_unknown(
+            attachment,
+            operation_id,
+            dispatch_generation,
+            b"{\"outcome\":\"unknown\"}",
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await
+        .map_err(internal)?;
+    cleanup_remote_rename_artifacts(ctx, journal, attachment, operation_id).await;
+    Err(ErrorPayload {
+        code: ErrorCode::Conflict,
+        message: message.into(),
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) async fn execute_remote_staged_rename(
+    request: &Request,
+    authorized: &AuthorizedRequestContext,
+    operation: &super::RemoteOperationContext,
+    ctx: &DaemonContext,
+) -> std::result::Result<Response, ErrorPayload> {
+    execute_remote_staged_rename_with_hook(request, authorized, operation, ctx, |_| Ok(())).await
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) async fn execute_remote_staged_rename_with_hook(
+    request: &Request,
+    authorized: &AuthorizedRequestContext,
+    operation: &super::RemoteOperationContext,
+    ctx: &DaemonContext,
+    mut after_barrier: impl FnMut(&'static str) -> std::result::Result<(), ErrorPayload>,
+) -> std::result::Result<Response, ErrorPayload> {
+    use crate::db::remote_attachment_operations::{
+        CommitRemoteOperation, CommitRemoteOperationOutcome, PrepareRemoteRenameOutcome,
+        RemoteOperationClass, ReserveRemoteOperation,
+    };
+    use crate::external_journal::{DirGuard, HeldRenameEffect, RemoteRenameArtifactV1};
+
+    let journal = ctx.external_journal.as_ref().ok_or_else(|| ErrorPayload {
+        code: ErrorCode::Unavailable,
+        message: "remote staged rename recovery authority is unavailable".into(),
+    })?;
+    journal
+        .ensure_dispatch_allowed()
+        .await
+        .map_err(|error| ErrorPayload {
+            code: ErrorCode::Unavailable,
+            message: format!("remote staged rename recovery authority blocked dispatch: {error}"),
+        })?;
+    let paths: Vec<std::path::PathBuf> = authorized
+        .fcor_resources
+        .iter()
+        .filter(|resource| {
+            resource.kind == proto::remote_operation_fcor::RemoteOperationResourceKind::FilePath
+        })
+        .map(|resource| {
+            std::str::from_utf8(&resource.value)
+                .map(std::path::PathBuf::from)
+                .map_err(internal)
+        })
+        .collect::<std::result::Result<_, _>>()?;
+    let [source_path, target_path] = paths.as_slice() else {
+        return Err(internal(anyhow::anyhow!(
+            "rename requires exact source and target resources"
+        )));
+    };
+    let source_parent_path = source_path
+        .parent()
+        .ok_or_else(|| internal(anyhow::anyhow!("rename source has no parent")))?;
+    let target_parent_path = target_path
+        .parent()
+        .ok_or_else(|| internal(anyhow::anyhow!("rename target has no parent")))?;
+    let source_name = source_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| internal(anyhow::anyhow!("rename source name is invalid")))?
+        .to_owned();
+    let target_name = target_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| internal(anyhow::anyhow!("rename target name is invalid")))?
+        .to_owned();
+    let source_parent = DirGuard::open_root(source_parent_path, false).map_err(internal)?;
+    let target_parent = DirGuard::open_root(target_parent_path, false).map_err(internal)?;
+    source_parent
+        .require_same_filesystem(&target_parent)
+        .map_err(internal)?;
+
+    let params = request
+        .canonical_remote_operation_params_v1()
+        .map_err(internal)?;
+    let canonical = authorized.encode_fcor(request, &params)?;
+    let request_hash = proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+    let attachment = operation.logical_attachment_id.to_string();
+    let operation_id = operation.operation_id.to_string();
+    let device = operation.authenticated_device_id.to_string();
+    let source_observed = source_parent.open_entry_identity(&source_name).ok();
+    if source_observed.is_some() {
+        target_parent
+            .require_entry_absent(&target_name)
+            .map_err(|_| ErrorPayload {
+                code: ErrorCode::Conflict,
+                message: "remote rename target already exists".into(),
+            })?;
+    }
+    let source_parent_identity =
+        db_filesystem_identity(source_parent.held_identity().map_err(internal)?);
+    let target_parent_identity =
+        db_filesystem_identity(target_parent.held_identity().map_err(internal)?);
+    let outcome = ctx
+        .db
+        .prepare_remote_rename_operation(
+            ReserveRemoteOperation {
+                logical_attachment_id: &attachment,
+                operation_id: &operation_id,
+                authenticated_device_id: &device,
+                authenticated_device_generation: operation.authenticated_device_generation,
+                operation_class: RemoteOperationClass::IdempotentAdapterMutation,
+                request_hash,
+                now_ms: chrono::Utc::now().timestamp_millis(),
+            },
+            source_observed.map(db_filesystem_identity),
+            Some(source_parent_identity),
+            Some(target_parent_identity),
+        )
+        .await
+        .map_err(internal)?;
+    let evidence = match outcome {
+        PrepareRemoteRenameOutcome::Prepared(value)
+        | PrepareRemoteRenameOutcome::Reconcile(value) => value,
+        PrepareRemoteRenameOutcome::Replay(bytes) => {
+            cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id).await;
+            return serde_json::from_slice(&bytes).map_err(internal);
+        }
+        PrepareRemoteRenameOutcome::OutcomeUnknown(_) => {
+            cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id).await;
+            return Err(ErrorPayload {
+                code: ErrorCode::Conflict,
+                message: "remote rename outcome is unknown and will not be redispatched".into(),
+            });
+        }
+        PrepareRemoteRenameOutcome::OperationConflict
+        | PrepareRemoteRenameOutcome::OperationActorConflict => {
+            return Err(ErrorPayload {
+                code: ErrorCode::Conflict,
+                message: "remote operation conflict".into(),
+            });
+        }
+        PrepareRemoteRenameOutcome::AttachmentLedgerCapacity => {
+            return Err(ErrorPayload {
+                code: ErrorCode::Conflict,
+                message: "remote operation capacity reached".into(),
+            });
+        }
+    };
+    if evidence.state != "applied"
+        && (evidence.source_parent_identity != source_parent_identity
+            || evidence.target_parent_identity != target_parent_identity)
+    {
+        ctx.db
+            .record_remote_rename_effect_unknown(
+                &attachment,
+                &operation_id,
+                evidence.dispatch_generation,
+                b"{\"outcome\":\"unknown\"}",
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(internal)?;
+        cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id).await;
+        return Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message: "rename authority changed during recovery".into(),
+        });
+    }
+    let artifact_id = Uuid::parse_str(&evidence.artifact_id).map_err(internal)?;
+    let artifact = RemoteRenameArtifactV1 {
+        logical_attachment_id: operation.logical_attachment_id,
+        operation_id: operation.operation_id,
+        dispatch_generation: evidence.dispatch_generation,
+        source_identity: evidence.source_identity,
+        source_parent_identity: evidence.source_parent_identity,
+        target_parent_identity: evidence.target_parent_identity,
+        source_name: source_name.clone(),
+        target_name: target_name.clone(),
+    };
+    match journal.read_remote_rename_artifact(artifact_id, evidence.dispatch_generation) {
+        Ok(stored) if stored == artifact => {}
+        Ok(_) => {
+            ctx.db
+                .record_remote_rename_effect_unknown(
+                    &attachment,
+                    &operation_id,
+                    evidence.dispatch_generation,
+                    b"{\"outcome\":\"unknown\"}",
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                .map_err(internal)?;
+            cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id).await;
+            return Err(ErrorPayload {
+                code: ErrorCode::Conflict,
+                message: "rename artifact binding mismatch; outcome is unknown".into(),
+            });
+        }
+        Err(crate::external_journal::ExternalJournalError::CapsuleMissing(_)) => {
+            if let Err(error) = journal.write_remote_rename_artifact(artifact_id, &artifact) {
+                ctx.db
+                    .record_remote_rename_effect_unknown(
+                        &attachment,
+                        &operation_id,
+                        evidence.dispatch_generation,
+                        b"{\"outcome\":\"unknown\"}",
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await
+                    .map_err(internal)?;
+                cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id).await;
+                return Err(internal(error));
+            }
+        }
+        Err(error) => {
+            ctx.db
+                .record_remote_rename_effect_unknown(
+                    &attachment,
+                    &operation_id,
+                    evidence.dispatch_generation,
+                    b"{\"outcome\":\"unknown\"}",
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                .map_err(internal)?;
+            cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id).await;
+            return Err(internal(error));
+        }
+    }
+    after_barrier("artifact_durable")?;
+    if evidence.state == "prepared" {
+        if source_observed.map(db_filesystem_identity) != Some(evidence.source_identity) {
+            ctx.db
+                .record_remote_rename_effect_unknown(
+                    &attachment,
+                    &operation_id,
+                    evidence.dispatch_generation,
+                    b"{\"outcome\":\"unknown\"}",
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                .map_err(internal)?;
+            cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id).await;
+            return Err(ErrorPayload {
+                code: ErrorCode::Conflict,
+                message: "rename source changed after reservation; outcome is closed as unknown"
+                    .into(),
+            });
+        }
+        if target_parent.require_entry_absent(&target_name).is_err() {
+            return close_remote_rename_effect_unknown(
+                ctx,
+                journal,
+                &attachment,
+                &operation_id,
+                evidence.dispatch_generation,
+                "rename target appeared after artifact durability; outcome is closed as unknown",
+            )
+            .await;
+        }
+        if !ctx
+            .db
+            .advance_remote_rename_operation(
+                &attachment,
+                &operation_id,
+                evidence.dispatch_generation,
+                "prepared",
+                "artifact_synced",
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(internal)?
+        {
+            return Err(internal(anyhow::anyhow!(
+                "rename artifact barrier generation lost"
+            )));
+        }
+        after_barrier("artifact_journal_synced")?;
+    }
+    let mut state = if evidence.state == "prepared" {
+        "artifact_synced"
+    } else {
+        evidence.state.as_str()
+    };
+    if state == "artifact_synced" {
+        match (
+            source_parent.open_entry_identity(&source_name),
+            target_parent.open_entry_identity(&target_name),
+        ) {
+            (Ok(source), Err(_)) if db_filesystem_identity(source) == evidence.source_identity => {
+                if target_parent.require_entry_absent(&target_name).is_err() {
+                    return close_remote_rename_effect_unknown(
+                        ctx,
+                        journal,
+                        &attachment,
+                        &operation_id,
+                        evidence.dispatch_generation,
+                        "rename target appeared before dispatch; outcome is closed as unknown",
+                    )
+                    .await;
+                }
+                let rename_effect = match source_parent.rename_entry_noreplace_atomic(
+                    &source_name,
+                    &target_parent,
+                    &target_name,
+                    source,
+                ) {
+                    Ok(effect) => effect,
+                    Err(crate::external_journal::ExternalJournalError::QuarantineNameTaken(_)) => {
+                        ctx.db
+                            .record_remote_rename_effect_unknown(
+                                &attachment,
+                                &operation_id,
+                                evidence.dispatch_generation,
+                                b"{\"outcome\":\"unknown\"}",
+                                chrono::Utc::now().timestamp_millis(),
+                            )
+                            .await
+                            .map_err(internal)?;
+                        cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id)
+                            .await;
+                        return Err(ErrorPayload { code: ErrorCode::Conflict, message: "rename target appeared during dispatch; outcome is closed as unknown".into() });
+                    }
+                    Err(error) => return Err(internal(error)),
+                };
+                match rename_effect {
+                    HeldRenameEffect::Applied(_) => {}
+                    HeldRenameEffect::AppliedIdentityMismatch { observed, .. } => {
+                        ctx.db
+                            .record_remote_rename_applied_mismatch(
+                                &attachment,
+                                &operation_id,
+                                evidence.dispatch_generation,
+                                db_filesystem_identity(observed),
+                                b"{\"outcome\":\"unknown\"}",
+                                chrono::Utc::now().timestamp_millis(),
+                            )
+                            .await
+                            .map_err(internal)?;
+                        cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id)
+                            .await;
+                        return Err(ErrorPayload {
+                            code: ErrorCode::Conflict,
+                            message:
+                                "rename applied an unexpected source identity; outcome is unknown"
+                                    .into(),
+                        });
+                    }
+                }
+                after_barrier("rename_effect")?;
+            }
+            (Err(_), Ok(target)) if db_filesystem_identity(target) == evidence.source_identity => {}
+            _ => {
+                ctx.db
+                    .record_remote_rename_effect_unknown(
+                        &attachment,
+                        &operation_id,
+                        evidence.dispatch_generation,
+                        b"{\"outcome\":\"unknown\"}",
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await
+                    .map_err(internal)?;
+                cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id).await;
+                return Err(ErrorPayload {
+                    code: ErrorCode::Conflict,
+                    message: "rename filesystem evidence is ambiguous; outcome is unknown".into(),
+                });
+            }
+        }
+        ctx.db
+            .advance_remote_rename_operation(
+                &attachment,
+                &operation_id,
+                evidence.dispatch_generation,
+                "artifact_synced",
+                "renamed",
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(internal)?;
+        state = "renamed";
+    }
+    if state == "renamed" {
+        source_parent.sync().map_err(internal)?;
+        after_barrier("source_parent_fsync")?;
+        ctx.db
+            .advance_remote_rename_operation(
+                &attachment,
+                &operation_id,
+                evidence.dispatch_generation,
+                "renamed",
+                "source_parent_synced",
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(internal)?;
+        state = "source_parent_synced";
+    }
+    if state == "source_parent_synced" {
+        target_parent.sync().map_err(internal)?;
+        after_barrier("target_parent_fsync")?;
+        ctx.db
+            .advance_remote_rename_operation(
+                &attachment,
+                &operation_id,
+                evidence.dispatch_generation,
+                "source_parent_synced",
+                "target_parent_synced",
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(internal)?;
+        state = "target_parent_synced";
+    }
+    if state == "target_parent_synced" {
+        ctx.db
+            .advance_remote_rename_operation(
+                &attachment,
+                &operation_id,
+                evidence.dispatch_generation,
+                "target_parent_synced",
+                "applied",
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(internal)?;
+        after_barrier("applied_journal")?;
+    }
+    let response = Response::Ack;
+    let bytes = serde_json::to_vec(&response).map_err(internal)?;
+    let delivery = Uuid::now_v7().to_string();
+    match ctx
+        .db
+        .commit_remote_rename_operation(
+            CommitRemoteOperation {
+                logical_attachment_id: &attachment,
+                operation_id: &operation_id,
+                safe_response: &bytes,
+                outbox_delivery_id: &delivery,
+                outbox_kind: "fs_rename",
+                outbox_payload: &bytes,
+                now_ms: chrono::Utc::now().timestamp_millis(),
+            },
+            evidence.dispatch_generation,
+        )
+        .await
+        .map_err(internal)?
+    {
+        CommitRemoteOperationOutcome::Committed { .. } => {
+            after_barrier("ledger_committed")?;
+            cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id).await;
+            Ok(response)
+        }
+        _ => Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message: "remote rename result could not be committed".into(),
+        }),
+    }
+}
+
+pub(super) async fn handle_serialized_request_with_remote_operation(
+    request: Request,
+    state: &mut MutableClientState,
+    shared: &Arc<SharedClientState>,
+    ctx: &Arc<DaemonContext>,
+    effects: &mut ClientRequestEffects,
+    remote_operation: Option<&super::RemoteOperationContext>,
+) -> std::result::Result<Response, ErrorPayload> {
+    if let Some(operation) = remote_operation {
+        tracing::debug!(
+            request_id = %operation.request_id,
+            operation_id = %operation.operation_id,
+            logical_attachment_id = %operation.logical_attachment_id,
+            authenticated_device_id = %operation.authenticated_device_id,
+            authenticated_device_generation = operation.authenticated_device_generation,
+            "dispatching admitted remote operation"
+        );
+    }
     validate_request_semantics(&request)?;
     debug_assert_eq!(shared.principal, state.principal);
     let pruned = prune_expired_attachments(state);
@@ -268,28 +1004,30 @@ pub(super) async fn handle_serialized_request(
     let audit_session_id = request_session_id(&request, state);
     let audit_path = request_audit_path(&request);
     let audit_remote = !state.principal.is_owner() && is_remote_mutating_request(&request);
-    if let Err(error) = authorize_request(&request, state, ctx).await {
-        if audit_remote {
-            audit_remote_request(
-                ctx,
-                &state.principal,
-                request_kind,
-                audit_session_id,
-                audit_path.as_deref(),
-                "denied",
-            )
-            .await;
-        }
-        // `SetDefaultModel` is terminal-by-event: a bare authorization error
-        // would leave a remote/shared client waiting for a correlated result
-        // that never arrives. Emit the typed rejection instead — no scope
-        // label, no path, no configuration content, and no mutation.
-        if let Request::SetDefaultModel {
-            default_update_id, ..
-        } = &request
-            && let Some(att) = state.attached.as_ref()
-        {
-            att.handle.broadcast_default_model_update_result(
+    let authorized_request = match authorize_request_context(&request, state, ctx).await {
+        Ok(authorized) => authorized,
+        Err(error) => {
+            if audit_remote {
+                audit_remote_request(
+                    ctx,
+                    &state.principal,
+                    request_kind,
+                    audit_session_id,
+                    audit_path.as_deref(),
+                    "denied",
+                )
+                .await;
+            }
+            // `SetDefaultModel` is terminal-by-event: a bare authorization error
+            // would leave a remote/shared client waiting for a correlated result
+            // that never arrives. Emit the typed rejection instead — no scope
+            // label, no path, no configuration content, and no mutation.
+            if let Request::SetDefaultModel {
+                default_update_id, ..
+            } = &request
+                && let Some(att) = state.attached.as_ref()
+            {
+                att.handle.broadcast_default_model_update_result(
                 *default_update_id,
                 proto::DefaultModelStandaloneOutcome::Rejected {
                     user_message: "Changing the default model for new sessions requires the                                    local owner of this workspace."
@@ -297,9 +1035,10 @@ pub(super) async fn handle_serialized_request(
                     diagnostic_code: "effective_default_local_owner_only".to_string(),
                 },
             );
+            }
+            return Err(error);
         }
-        return Err(error);
-    }
+    };
     if audit_remote {
         audit_remote_request(
             ctx,
@@ -429,7 +1168,108 @@ pub(super) async fn handle_serialized_request(
 
         Request::CancelRunInvocation {
             client_submission_id,
-        } => run_invocation::handle_cancel_run_invocation(state, ctx, client_submission_id).await,
+        } => {
+            if let Some(operation) = remote_operation {
+                let canonical_request = Request::CancelRunInvocation {
+                    client_submission_id,
+                };
+                let params = canonical_request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&canonical_request, &params)?;
+                let request_hash =
+                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let logical_attachment_id = operation.logical_attachment_id.to_string();
+                let operation_id = operation.operation_id.to_string();
+                let device_id = operation.authenticated_device_id.to_string();
+                let digest = principal_digest(&state.principal);
+                let is_owner = state.principal.is_owner();
+                let now = wall_ms_now();
+                let outcome = ctx.db.execute_transactional_remote_operation(
+                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                        logical_attachment_id: &logical_attachment_id, operation_id: &operation_id,
+                        authenticated_device_id: &device_id, authenticated_device_generation: operation.authenticated_device_generation,
+                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
+                        request_hash, now_ms: now,
+                    },
+                    move |conn| {
+                        let lookup = crate::db::Db::lookup_or_tombstone_run_invocation_conn(
+                            conn, client_submission_id, &digest, now, is_owner,
+                        )?;
+                        let row = match lookup {
+                            crate::db::run_invocations::LookupRunInvocationOutcome::Found(row) => *row,
+                            crate::db::run_invocations::LookupRunInvocationOutcome::LookupBusy => anyhow::bail!("invocation lookup busy"),
+                            crate::db::run_invocations::LookupRunInvocationOutcome::NotFoundInstalledTombstone
+                            | crate::db::run_invocations::LookupRunInvocationOutcome::NotFoundExistingTombstone => {
+                                let receipt = proto::RunInvocationCancelResultV1 {
+                                    schema_version: proto::RunInvocationCancelResultV1::SCHEMA_VERSION,
+                                    client_submission_id,
+                                    outcome: proto::RunInvocationCancelOutcome::NotFound,
+                                    state: proto::RunInvocationLifecycleState::NotFound,
+                                    state_version: 0,
+                                };
+                                let bytes = serde_json::to_vec(&receipt)?;
+                                return Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
+                                    value: (receipt, None), safe_response: bytes.clone(),
+                                    outbox_kind: "cancel_run_invocation".into(), outbox_payload: bytes,
+                                });
+                            }
+                        };
+                        let updated = if row.cancel_result.is_some() {
+                            row
+                        } else {
+                            let (state_name, result) = if row.terminal_at_wall_ms.is_some() {
+                                (row.state.as_str(), "already_terminal")
+                            } else {
+                                ("cancellation_requested", "cancellation_requested")
+                            };
+                            crate::db::Db::update_run_invocation_state_conn(
+                                conn, client_submission_id, row.state_version, state_name,
+                                row.remaining_ms, Some(true), Some(result), now,
+                            )?.ok_or_else(|| anyhow::anyhow!("invocation not found"))?
+                        };
+                        let result = match updated.cancel_result.as_deref() {
+                            Some("cancellation_requested") => proto::RunInvocationCancelOutcome::CancellationRequested,
+                            Some("already_cancelled") => proto::RunInvocationCancelOutcome::AlreadyCancelled,
+                            Some("already_terminal") => proto::RunInvocationCancelOutcome::AlreadyTerminal,
+                            _ => anyhow::bail!("invalid cancellation result"),
+                        };
+                        let receipt = proto::RunInvocationCancelResultV1 {
+                            schema_version: proto::RunInvocationCancelResultV1::SCHEMA_VERSION,
+                            client_submission_id, outcome: result,
+                            state: run_invocation::parse_lifecycle_state(&updated.state)
+                                .map_err(|error| anyhow::anyhow!(error.message))?,
+                            state_version: updated.state_version,
+                        };
+                        let bytes = serde_json::to_vec(&receipt)?;
+                        Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
+                            value: (receipt, Some(updated.session_id)), safe_response: bytes.clone(),
+                            outbox_kind: "cancel_run_invocation".into(), outbox_payload: bytes,
+                        })
+                    },
+                ).await.map_err(internal)?;
+                let (result, session_id, applied) = match outcome {
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied((result, session_id)) => (result, session_id, true),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => {
+                        let result: proto::RunInvocationCancelResultV1 = serde_json::from_slice(&bytes).map_err(internal)?;
+                        (result, None, false)
+                    }
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                };
+                if applied
+                    && result.outcome == proto::RunInvocationCancelOutcome::CancellationRequested
+                    && let Some(session_id) = session_id
+                    && let Some(handle) = ctx.registry.live_handle(session_id)
+                {
+                    let _ = handle.send_work(SessionWork::Cancel).await;
+                }
+                Ok(Response::RunInvocationCancelResult { result })
+            } else {
+                run_invocation::handle_cancel_run_invocation(state, ctx, client_submission_id).await
+            }
+        }
 
         Request::SteerDelegation {
             session_id,
@@ -437,14 +1277,35 @@ pub(super) async fn handle_serialized_request(
             label,
             message,
         } => {
+            if let Some(operation) = remote_operation {
+                let request = Request::SteerDelegation {
+                    session_id,
+                    task_call_id: task_call_id.clone(),
+                    label: label.clone(),
+                    message: message.clone(),
+                };
+                if let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+                {
+                    return Ok(response);
+                }
+            }
             let Some(handle) = ctx.registry.live_handle(session_id) else {
-                return Ok(Response::DelegationSteer {
+                let response = Response::DelegationSteer {
                     result: proto::DelegationSteerResult::not_steerable(
                         task_call_id,
                         Some(label),
                         "session is not live".to_string(),
                     ),
-                });
+                };
+                return match remote_operation {
+                    Some(operation) => {
+                        commit_remote_nonrepeatable(operation, ctx, "steer_delegation", response)
+                            .await
+                    }
+                    None => Ok(response),
+                };
             };
             let (respond_to, response_rx) = tokio::sync::oneshot::channel();
             handle
@@ -458,7 +1319,13 @@ pub(super) async fn handle_serialized_request(
                 .await
                 .map_err(internal)?;
             let result = response_rx.await.map_err(internal)?;
-            Ok(Response::DelegationSteer { result })
+            let response = Response::DelegationSteer { result };
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "steer_delegation", response).await
+                }
+                None => Ok(response),
+            }
         }
 
         Request::BeginAttachmentUpload {
@@ -466,13 +1333,16 @@ pub(super) async fn handle_serialized_request(
             byte_len,
             sha256,
             purpose,
-        } => begin_attachment_upload_admitted(ctx, state, mime, byte_len, sha256, purpose).await,
+        } => {
+            begin_attachment_upload_admitted(ctx, state, mime, byte_len as usize, sha256, purpose)
+                .await
+        }
 
         Request::UploadAttachmentChunk {
             upload_id,
             offset,
             data_base64,
-        } => upload_attachment_chunk(state, upload_id, offset, data_base64),
+        } => upload_attachment_chunk(state, upload_id, offset as usize, data_base64),
 
         Request::FinishAttachmentUpload { upload_id } => {
             finish_attachment_upload_admitted(ctx, state, upload_id).await
@@ -500,10 +1370,28 @@ pub(super) async fn handle_serialized_request(
 
         Request::RemoveQueuedUserMessage { queue_item_id } => {
             let att = require_attached(state)?;
+            let remote_queue_operation = if let Some(operation) = remote_operation {
+                let request = Request::RemoveQueuedUserMessage { queue_item_id };
+                let params = request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&request, &params)?;
+                Some(crate::daemon::session_worker::RemoteQueueOperation {
+                    logical_attachment_id: operation.logical_attachment_id.to_string(),
+                    operation_id: operation.operation_id.to_string(),
+                    authenticated_device_id: operation.authenticated_device_id.to_string(),
+                    authenticated_device_generation: operation.authenticated_device_generation,
+                    request_hash: proto::remote_operation_fcor::hash_fcor_v1(&canonical)
+                        .map_err(internal)?,
+                })
+            } else {
+                None
+            };
             let (respond_to, response_rx) = tokio::sync::oneshot::channel();
             att.handle
                 .send_work(SessionWork::RemoveQueuedUserMessage {
                     queue_item_id,
+                    remote_operation: remote_queue_operation,
                     respond_to,
                 })
                 .await
@@ -518,10 +1406,37 @@ pub(super) async fn handle_serialized_request(
         }
         Request::RemoveNewestQueuedUserMessage { target_id } => {
             let att = require_attached(state)?;
+            let remote_queue_operation = if let Some(operation) = remote_operation {
+                if target_id.is_none() {
+                    return Err(ErrorPayload {
+                        code: ErrorCode::BadRequest,
+                        message: "remote editable queue removal requires an explicit target_id"
+                            .into(),
+                    });
+                }
+                let request = Request::RemoveNewestQueuedUserMessage {
+                    target_id: target_id.clone(),
+                };
+                let params = request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&request, &params)?;
+                Some(crate::daemon::session_worker::RemoteQueueOperation {
+                    logical_attachment_id: operation.logical_attachment_id.to_string(),
+                    operation_id: operation.operation_id.to_string(),
+                    authenticated_device_id: operation.authenticated_device_id.to_string(),
+                    authenticated_device_generation: operation.authenticated_device_generation,
+                    request_hash: proto::remote_operation_fcor::hash_fcor_v1(&canonical)
+                        .map_err(internal)?,
+                })
+            } else {
+                None
+            };
             let (respond_to, response_rx) = tokio::sync::oneshot::channel();
             att.handle
                 .send_work(SessionWork::RemoveNewestQueuedUserMessage {
                     target_id,
+                    remote_operation: remote_queue_operation,
                     respond_to,
                 })
                 .await
@@ -536,10 +1451,30 @@ pub(super) async fn handle_serialized_request(
         }
         Request::RemoveEditableQueuedUserMessages { target_id } => {
             let att = require_attached(state)?;
+            let remote_queue_operation = if let Some(operation) = remote_operation {
+                let request = Request::RemoveEditableQueuedUserMessages {
+                    target_id: target_id.clone(),
+                };
+                let params = request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&request, &params)?;
+                Some(crate::daemon::session_worker::RemoteQueueOperation {
+                    logical_attachment_id: operation.logical_attachment_id.to_string(),
+                    operation_id: operation.operation_id.to_string(),
+                    authenticated_device_id: operation.authenticated_device_id.to_string(),
+                    authenticated_device_generation: operation.authenticated_device_generation,
+                    request_hash: proto::remote_operation_fcor::hash_fcor_v1(&canonical)
+                        .map_err(internal)?,
+                })
+            } else {
+                None
+            };
             let (respond_to, response_rx) = tokio::sync::oneshot::channel();
             att.handle
                 .send_work(SessionWork::RemoveEditableQueuedUserMessages {
                     target_id,
+                    remote_operation: remote_queue_operation,
                     respond_to,
                 })
                 .await
@@ -554,6 +1489,52 @@ pub(super) async fn handle_serialized_request(
         }
 
         Request::ResumePausedWork { session_id } => {
+            if let Some(operation) = remote_operation {
+                let request = Request::ResumePausedWork { session_id };
+                let canonical_params = request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&request, &canonical_params)?;
+                let request_hash =
+                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let logical_attachment_id = operation.logical_attachment_id.to_string();
+                let operation_id = operation.operation_id.to_string();
+                let device_id = operation.authenticated_device_id.to_string();
+                let outcome = ctx.db.execute_transactional_remote_operation(
+                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                        logical_attachment_id: &logical_attachment_id,
+                        operation_id: &operation_id,
+                        authenticated_device_id: &device_id,
+                        authenticated_device_generation: operation.authenticated_device_generation,
+                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
+                        request_hash,
+                        now_ms: chrono::Utc::now().timestamp_millis(),
+                    },
+                    move |conn| {
+                        let changed = crate::db::Db::resolve_paused_session_work_conn(
+                            conn, session_id, crate::db::paused_work::PausedWorkStatus::Resumed,
+                            chrono::Utc::now().timestamp(),
+                        )?;
+                        let response = Response::Ack;
+                        let safe_response = serde_json::to_vec(&response)?;
+                        Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
+                            value: (response, changed), safe_response: safe_response.clone(),
+                            outbox_kind: "resume_paused_work".into(), outbox_payload: safe_response,
+                        })
+                    },
+                ).await.map_err(internal)?;
+                return match outcome {
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied((response, changed)) => {
+                        if changed && let Some(att) = state.attached.as_ref().filter(|att| att.handle.session_id == session_id) {
+                            att.handle.broadcast_notice("paused work resumed; pending approvals will use the normal prompt flow".to_string());
+                        }
+                        Ok(response)
+                    }
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                };
+            }
             let changed = ctx
                 .db
                 .mark_paused_session_work_resumed(session_id)
@@ -572,6 +1553,55 @@ pub(super) async fn handle_serialized_request(
         }
 
         Request::CancelPausedWork { session_id } => {
+            if let Some(operation) = remote_operation {
+                let request = Request::CancelPausedWork { session_id };
+                let canonical_params = request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&request, &canonical_params)?;
+                let request_hash =
+                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let logical_attachment_id = operation.logical_attachment_id.to_string();
+                let operation_id = operation.operation_id.to_string();
+                let device_id = operation.authenticated_device_id.to_string();
+                let outcome = ctx.db.execute_transactional_remote_operation(
+                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                        logical_attachment_id: &logical_attachment_id, operation_id: &operation_id,
+                        authenticated_device_id: &device_id, authenticated_device_generation: operation.authenticated_device_generation,
+                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
+                        request_hash, now_ms: chrono::Utc::now().timestamp_millis(),
+                    },
+                    move |conn| {
+                        let changed = crate::db::Db::resolve_paused_session_work_conn(
+                            conn, session_id, crate::db::paused_work::PausedWorkStatus::Cancelled,
+                            chrono::Utc::now().timestamp(),
+                        )?;
+                        let response = Response::Ack;
+                        let bytes = serde_json::to_vec(&response)?;
+                        let effect = serde_json::to_vec(&crate::daemon::remote_outbox_worker::RemoteSessionEffectV1 { schema_version: 1, session_id })?;
+                        Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
+                            value: (response, changed), safe_response: bytes.clone(),
+                            outbox_kind: "cancel_paused_work".into(), outbox_payload: effect,
+                        })
+                    },
+                ).await.map_err(internal)?;
+                return match outcome {
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied((response, changed)) => {
+                        if changed {
+                            if let Err(error) = ctx.registry.locks().suspend_session(session_id).await {
+                                tracing::warn!(%error, %session_id, "releasing cancelled paused work locks failed");
+                            }
+                            if let Some(att) = state.attached.as_ref().filter(|att| att.handle.session_id == session_id) {
+                                att.handle.broadcast_notice("paused work cancelled; the session is waiting for new input".to_string());
+                            }
+                        }
+                        Ok(response)
+                    }
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                };
+            }
             let changed = ctx
                 .db
                 .cancel_paused_session_work(session_id)
@@ -600,13 +1630,28 @@ pub(super) async fn handle_serialized_request(
                     message: "repair_resume session_id does not match the attached session".into(),
                 });
             }
+            if let Some(operation) = remote_operation {
+                let request = Request::RepairResume { session_id };
+                if let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+                {
+                    return Ok(response);
+                }
+            }
             let (respond_to, response_rx) = tokio::sync::oneshot::channel();
             att.handle
                 .send_work(SessionWork::RepairResume { respond_to })
                 .await
                 .map_err(internal)?;
             match response_rx.await.map_err(internal)? {
-                Ok(()) => Ok(Response::Ack),
+                Ok(()) => match remote_operation {
+                    Some(operation) => {
+                        commit_remote_nonrepeatable(operation, ctx, "repair_resume", Response::Ack)
+                            .await
+                    }
+                    None => Ok(Response::Ack),
+                },
                 Err(message) => Err(ErrorPayload {
                     code: ErrorCode::BadRequest,
                     message,
@@ -664,6 +1709,69 @@ pub(super) async fn handle_serialized_request(
                     message: "goal budget must be positive".to_string(),
                 });
             }
+            let policy_json = serde_json::to_string(&policy).map_err(internal)?;
+            if let Some(operation) = remote_operation {
+                let request = Request::CreateGoal {
+                    session_id,
+                    objective: objective.clone(),
+                    token_budget,
+                };
+                let params = request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&request, &params)?;
+                let request_hash =
+                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let logical_attachment_id = operation.logical_attachment_id.to_string();
+                let operation_id = operation.operation_id.to_string();
+                let device_id = operation.authenticated_device_id.to_string();
+                let project_id = session.project_id.clone();
+                let goal_id = Uuid::new_v4();
+                let now = chrono::Utc::now().timestamp();
+                let outcome = ctx.db.execute_transactional_remote_operation(
+                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                        logical_attachment_id: &logical_attachment_id, operation_id: &operation_id,
+                        authenticated_device_id: &device_id, authenticated_device_generation: operation.authenticated_device_generation,
+                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
+                        request_hash, now_ms: chrono::Utc::now().timestamp_millis(),
+                    },
+                    move |conn| {
+                        let goal = crate::db::Db::create_session_goal_with_policy_conn(conn, session_id, goal_id, now, &project_id, &objective, None, budget, &policy_json)
+                            .map_err(|error| GoalMutationRejected(error.to_string()))?;
+                        let receipt = proto::RemoteGoalOutcomeV1 { schema_version: 1, session_id, goal_id: goal.id, attempt_generation: goal.attempt_generation, disposition: goal.disposition };
+                        let safe_response = serde_json::to_vec(&receipt)?;
+                        Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation { value: receipt, safe_response: safe_response.clone(), outbox_kind: "create_goal".into(), outbox_payload: safe_response })
+                    },
+                ).await.map_err(|error| {
+                    if let Some(rejected) = error.downcast_ref::<GoalMutationRejected>() { bad_request(rejected.to_string()) } else { internal(error) }
+                })?;
+                let receipt = match outcome {
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(receipt) => receipt,
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal)?,
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                };
+                if receipt.schema_version != 1
+                    || receipt.session_id != session_id
+                    || receipt.disposition != proto::GoalDisposition::Running
+                {
+                    return Err(internal(anyhow::anyhow!(
+                        "invalid remote create-goal receipt"
+                    )));
+                }
+                if let Some(attached) = state
+                    .attached
+                    .as_ref()
+                    .filter(|attached| attached.handle.session().id == session_id)
+                {
+                    attached
+                        .handle
+                        .send_work(SessionWork::WakeGoal)
+                        .await
+                        .map_err(internal)?;
+                }
+                return Ok(Response::RemoteGoalOutcome { outcome: receipt });
+            }
             ctx.db
                 .create_session_goal_with_policy(
                     session_id,
@@ -671,7 +1779,7 @@ pub(super) async fn handle_serialized_request(
                     &objective,
                     None,
                     Some(budget),
-                    &serde_json::to_string(&policy).map_err(internal)?,
+                    &policy_json,
                 )
                 .await
                 .map_err(|error| ErrorPayload {
@@ -740,6 +1848,62 @@ pub(super) async fn handle_serialized_request(
                     });
                 }
             }
+            if let Some(operation) = remote_operation {
+                let request = Request::SetGoalStatus { session_id, status };
+                let params = request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&request, &params)?;
+                let request_hash =
+                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let logical_attachment_id = operation.logical_attachment_id.to_string();
+                let operation_id = operation.operation_id.to_string();
+                let device_id = operation.authenticated_device_id.to_string();
+                let outcome = ctx.db.execute_transactional_remote_operation(
+                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                        logical_attachment_id: &logical_attachment_id, operation_id: &operation_id,
+                        authenticated_device_id: &device_id, authenticated_device_generation: operation.authenticated_device_generation,
+                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
+                        request_hash, now_ms: chrono::Utc::now().timestamp_millis(),
+                    },
+                    move |conn| {
+                        let goal = crate::db::Db::set_session_goal_status_conn(conn, session_id, status)
+                            .map_err(|error| GoalMutationRejected(error.to_string()))?;
+                        let receipt = proto::RemoteGoalOutcomeV1 { schema_version: 1, session_id, goal_id: goal.id, attempt_generation: goal.attempt_generation, disposition: goal.disposition };
+                        let safe_response = serde_json::to_vec(&receipt)?;
+                        Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation { value: receipt, safe_response: safe_response.clone(), outbox_kind: "set_goal_status".into(), outbox_payload: safe_response })
+                    },
+                ).await.map_err(|error| {
+                    if let Some(rejected) = error.downcast_ref::<GoalMutationRejected>() { bad_request(rejected.to_string()) } else { internal(error) }
+                })?;
+                let receipt = match outcome {
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(receipt) => receipt,
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal)?,
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                };
+                if receipt.schema_version != 1
+                    || receipt.session_id != session_id
+                    || receipt.disposition != status
+                {
+                    return Err(internal(anyhow::anyhow!(
+                        "invalid remote goal replay receipt"
+                    )));
+                }
+                if status == proto::GoalDisposition::Running
+                    && let Some(attached) = state
+                        .attached
+                        .as_ref()
+                        .filter(|attached| attached.handle.session().id == session_id)
+                {
+                    attached
+                        .handle
+                        .send_work(SessionWork::WakeGoal)
+                        .await
+                        .map_err(internal)?;
+                }
+                return Ok(Response::RemoteGoalOutcome { outcome: receipt });
+            }
             let goal = ctx
                 .db
                 .set_session_goal_status(session_id, status)
@@ -766,6 +1930,71 @@ pub(super) async fn handle_serialized_request(
         }
 
         Request::ClearGoal { session_id } => {
+            if let Some(operation) = remote_operation {
+                let request = Request::ClearGoal { session_id };
+                let canonical_params = request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&request, &canonical_params)?;
+                let request_hash =
+                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let logical_attachment_id = operation.logical_attachment_id.to_string();
+                let operation_id = operation.operation_id.to_string();
+                let device_id = operation.authenticated_device_id.to_string();
+                let outcome = ctx
+                    .db
+                    .execute_transactional_remote_operation(
+                        crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                            logical_attachment_id: &logical_attachment_id,
+                            operation_id: &operation_id,
+                            authenticated_device_id: &device_id,
+                            authenticated_device_generation: operation
+                                .authenticated_device_generation,
+                            operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
+                            request_hash,
+                            now_ms: chrono::Utc::now().timestamp_millis(),
+                        },
+                        move |conn| {
+                            let cleared = crate::db::Db::clear_session_goal_conn(conn, session_id)?;
+                            let response = Response::GoalCleared { cleared };
+                            let safe_response = serde_json::to_vec(&response)?;
+                            let effect = serde_json::to_vec(&crate::daemon::remote_outbox_worker::RemoteSessionEffectV1 { schema_version: 1, session_id })?;
+                            Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
+                                value: response,
+                                safe_response: safe_response.clone(),
+                                outbox_kind: "clear_goal".into(),
+                                outbox_payload: effect,
+                            })
+                        },
+                    )
+                    .await
+                    .map_err(internal)?;
+                return match outcome {
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => {
+                        // WakeGoal is a level-triggered reconciliation nudge: the driver
+                        // reloads the authoritative goal row and is safe to wake more than
+                        // once. Deliver it for Applied and Replay so a response retry closes
+                        // a crash/send-failure window after the durable commit.
+                        if matches!(response, Response::GoalCleared { cleared: true })
+                            && let Some(attached) = state.attached.as_ref().filter(|attached| attached.handle.session().id == session_id)
+                        {
+                            attached.handle.send_work(SessionWork::WakeGoal).await.map_err(internal)?;
+                        }
+                        Ok(response)
+                    }
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => {
+                        let response: Response = serde_json::from_slice(&bytes).map_err(internal)?;
+                        if matches!(response, Response::GoalCleared { cleared: true })
+                            && let Some(attached) = state.attached.as_ref().filter(|attached| attached.handle.session().id == session_id)
+                        {
+                            attached.handle.send_work(SessionWork::WakeGoal).await.map_err(internal)?;
+                        }
+                        Ok(response)
+                    }
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                };
+            }
             let cleared = ctx
                 .db
                 .clear_session_goal(session_id)
@@ -786,24 +2015,145 @@ pub(super) async fn handle_serialized_request(
             Ok(Response::GoalCleared { cleared })
         }
 
-        Request::PinMessage { session_id, seq } => ctx
-            .db
-            .pin_message(session_id, seq)
-            .await
-            .map(|changed| Response::PinChanged { changed })
-            .map_err(|error| bad_request(error.to_string())),
-        Request::UnpinMessage { session_id, seq } => ctx
-            .db
-            .unpin_message(session_id, seq)
-            .await
-            .map(|changed| Response::PinChanged { changed })
-            .map_err(|error| bad_request(error.to_string())),
-        Request::TogglePinnedMessage { session_id, seq } => ctx
-            .db
-            .toggle_pin(session_id, seq)
-            .await
-            .map(|pinned| Response::PinToggled { pinned })
-            .map_err(|error| bad_request(error.to_string())),
+        Request::PinMessage { session_id, seq } => {
+            if let Some(operation) = remote_operation {
+                let request = Request::PinMessage { session_id, seq };
+                let canonical_params = request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&request, &canonical_params)?;
+                let request_hash =
+                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let logical_attachment_id = operation.logical_attachment_id.to_string();
+                let operation_id = operation.operation_id.to_string();
+                let device_id = operation.authenticated_device_id.to_string();
+                let outcome = ctx.db.execute_transactional_remote_operation(
+                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                        logical_attachment_id: &logical_attachment_id,
+                        operation_id: &operation_id,
+                        authenticated_device_id: &device_id,
+                        authenticated_device_generation: operation.authenticated_device_generation,
+                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
+                        request_hash,
+                        now_ms: chrono::Utc::now().timestamp_millis(),
+                    },
+                    move |conn| {
+                        let changed = crate::db::Db::pin_message_conn(conn, session_id, seq, chrono::Utc::now().timestamp_millis())
+                            .map_err(|error| PinMutationRejected(error.to_string()))?;
+                        let response = Response::PinChanged { changed };
+                        let safe_response = serde_json::to_vec(&response)?;
+                        Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation { value: response, safe_response: safe_response.clone(), outbox_kind: "pin_message".into(), outbox_payload: safe_response })
+                    },
+                ).await.map_err(|error| {
+                    if let Some(rejected) = error.downcast_ref::<PinMutationRejected>() {
+                        bad_request(rejected.to_string())
+                    } else {
+                        internal(error)
+                    }
+                })?;
+                return match outcome {
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => Ok(response),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                };
+            }
+            ctx.db
+                .pin_message(session_id, seq)
+                .await
+                .map(|changed| Response::PinChanged { changed })
+                .map_err(|error| bad_request(error.to_string()))
+        }
+        Request::UnpinMessage { session_id, seq } => {
+            if let Some(operation) = remote_operation {
+                let request = Request::UnpinMessage { session_id, seq };
+                let canonical_params = request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&request, &canonical_params)?;
+                let request_hash =
+                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let logical_attachment_id = operation.logical_attachment_id.to_string();
+                let operation_id = operation.operation_id.to_string();
+                let device_id = operation.authenticated_device_id.to_string();
+                let outcome = ctx.db.execute_transactional_remote_operation(
+                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                        logical_attachment_id: &logical_attachment_id,
+                        operation_id: &operation_id,
+                        authenticated_device_id: &device_id,
+                        authenticated_device_generation: operation.authenticated_device_generation,
+                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
+                        request_hash,
+                        now_ms: chrono::Utc::now().timestamp_millis(),
+                    },
+                    move |conn| {
+                        let changed = crate::db::Db::unpin_message_conn(conn, session_id, seq)?;
+                        let response = Response::PinChanged { changed };
+                        let safe_response = serde_json::to_vec(&response)?;
+                        Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
+                            value: response, safe_response: safe_response.clone(),
+                            outbox_kind: "unpin_message".into(), outbox_payload: safe_response,
+                        })
+                    },
+                ).await.map_err(internal)?;
+                return match outcome {
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => Ok(response),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                };
+            }
+            ctx.db
+                .unpin_message(session_id, seq)
+                .await
+                .map(|changed| Response::PinChanged { changed })
+                .map_err(|error| bad_request(error.to_string()))
+        }
+        Request::TogglePinnedMessage { session_id, seq } => {
+            if let Some(operation) = remote_operation {
+                let request = Request::TogglePinnedMessage { session_id, seq };
+                let canonical_params = request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&request, &canonical_params)?;
+                let request_hash =
+                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let logical_attachment_id = operation.logical_attachment_id.to_string();
+                let operation_id = operation.operation_id.to_string();
+                let device_id = operation.authenticated_device_id.to_string();
+                let outcome = ctx.db.execute_transactional_remote_operation(
+                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                        logical_attachment_id: &logical_attachment_id,
+                        operation_id: &operation_id,
+                        authenticated_device_id: &device_id,
+                        authenticated_device_generation: operation.authenticated_device_generation,
+                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
+                        request_hash,
+                        now_ms: chrono::Utc::now().timestamp_millis(),
+                    },
+                    move |conn| {
+                        let pinned = crate::db::Db::toggle_pin_conn(conn, session_id, seq, chrono::Utc::now().timestamp_millis())
+                            .map_err(|error| PinMutationRejected(error.to_string()))?;
+                        let response = Response::PinToggled { pinned };
+                        let safe_response = serde_json::to_vec(&response)?;
+                        Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation { value: response, safe_response: safe_response.clone(), outbox_kind: "toggle_pinned_message".into(), outbox_payload: safe_response })
+                    },
+                ).await.map_err(|error| {
+                    if let Some(rejected) = error.downcast_ref::<PinMutationRejected>() { bad_request(rejected.to_string()) } else { internal(error) }
+                })?;
+                return match outcome {
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => Ok(response),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                };
+            }
+            ctx.db
+                .toggle_pin(session_id, seq)
+                .await
+                .map(|pinned| Response::PinToggled { pinned })
+                .map_err(|error| bad_request(error.to_string()))
+        }
         Request::CountPinnedMessages { session_id } => ctx
             .db
             .count_pins(session_id)
@@ -991,6 +2341,55 @@ pub(super) async fn handle_serialized_request(
             expected_version,
         } => {
             let db_key = app_flag_db_key(key);
+            if let Some(operation) = remote_operation {
+                let canonical_params = Request::MarkAppFlagSeen {
+                    key,
+                    expected_version,
+                }
+                .canonical_remote_operation_params_v1()
+                .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(
+                    &Request::MarkAppFlagSeen {
+                        key,
+                        expected_version,
+                    },
+                    &canonical_params,
+                )?;
+                let request_hash =
+                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let logical_attachment_id = operation.logical_attachment_id.to_string();
+                let operation_id = operation.operation_id.to_string();
+                let device_id = operation.authenticated_device_id.to_string();
+                let outcome = ctx.db.execute_transactional_remote_operation(
+                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                        logical_attachment_id: &logical_attachment_id,
+                        operation_id: &operation_id,
+                        authenticated_device_id: &device_id,
+                        authenticated_device_generation: operation.authenticated_device_generation,
+                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
+                        request_hash,
+                        now_ms: chrono::Utc::now().timestamp_millis(),
+                    },
+                    move |conn| {
+                        let Some((version, changed)) = crate::db::Db::mark_app_flag_seen_versioned_conn(conn, db_key, expected_version)? else { return Err(AppFlagVersionConflict.into()) };
+                        let response = Response::AppFlagSeen { key, version, changed };
+                        let safe_response = serde_json::to_vec(&response)?;
+                        Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation { value: response, safe_response: safe_response.clone(), outbox_kind: "mark_app_flag_seen".into(), outbox_payload: safe_response })
+                    },
+                ).await.map_err(|error| {
+                    if error.downcast_ref::<AppFlagVersionConflict>().is_some() {
+                        ErrorPayload { code: ErrorCode::Conflict, message: error.to_string() }
+                    } else {
+                        internal(error)
+                    }
+                })?;
+                return match outcome {
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => Ok(response),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                };
+            }
             let outcome = ctx
                 .db
                 .write(move |conn| {
@@ -1150,6 +2549,52 @@ pub(super) async fn handle_serialized_request(
             )
             .await
         }
+        Request::OperationStatus { operation_id } => {
+            let ClientPrincipal::Remote(remote) = &shared.principal else {
+                return Err(ErrorPayload {
+                    code: ErrorCode::Authorization,
+                    message: "operation status requires an authenticated remote actor".into(),
+                });
+            };
+            let Some(actor) = remote.actor_binding.as_ref() else {
+                return Err(ErrorPayload {
+                    code: ErrorCode::Authorization,
+                    message: "legacy actorless transport cannot query operation status".into(),
+                });
+            };
+            let row = ctx
+                .db
+                .remote_operation_status(
+                    &actor.logical_attachment_id.to_string(),
+                    &operation_id.to_string(),
+                )
+                .await
+                .map_err(internal)?;
+            let status = if let Some(row) = row {
+                let state = match row.state.as_str() {
+                    "reserved" => proto::RemoteOperationStateV1::Reserved,
+                    "committed" => proto::RemoteOperationStateV1::Committed,
+                    "rejected" => proto::RemoteOperationStateV1::Rejected,
+                    "outcome_unknown" => proto::RemoteOperationStateV1::OutcomeUnknown,
+                    _ => return Err(internal(anyhow::anyhow!("invalid remote operation state"))),
+                };
+                Some(proto::RemoteOperationStatusV1 {
+                    schema_version: 1,
+                    operation_id,
+                    state,
+                    operation_seq: proto::remote_protocol_id::CanonicalU64DecimalStringV1::from_u64(
+                        row.operation_seq,
+                    ),
+                    safe_response: row.safe_response,
+                    event_high_water_mark: row
+                        .event_high_water_mark
+                        .map(proto::remote_protocol_id::CanonicalU64DecimalStringV1::from_u64),
+                })
+            } else {
+                None
+            };
+            Ok(Response::RemoteOperationStatus { status })
+        }
 
         Request::ImportSessionArchive { transfer, as_new } => {
             import_session_archive(ctx, &transfer, as_new).await
@@ -1171,6 +2616,75 @@ pub(super) async fn handle_serialized_request(
 
         Request::CancelTurn => {
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation {
+                let request = Request::CancelTurn;
+                let params = request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&request, &params)?;
+                let request_hash =
+                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let logical_attachment_id = operation.logical_attachment_id.to_string();
+                let operation_id = operation.operation_id.to_string();
+                let device_id = operation.authenticated_device_id.to_string();
+                let now = chrono::Utc::now().timestamp_millis();
+                let begin = ctx.db.begin_nonrepeatable_remote_operation(
+                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                        logical_attachment_id: &logical_attachment_id, operation_id: &operation_id,
+                        authenticated_device_id: &device_id,
+                        authenticated_device_generation: operation.authenticated_device_generation,
+                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::NonrepeatableMutation,
+                        request_hash, now_ms: now,
+                    },
+                ).await.map_err(internal)?;
+                match begin {
+                    crate::db::remote_attachment_operations::BeginNonrepeatableRemoteOperationOutcome::Replay(bytes) =>
+                        return serde_json::from_slice(&bytes).map_err(internal),
+                    crate::db::remote_attachment_operations::BeginNonrepeatableRemoteOperationOutcome::OutcomeUnknown(_) =>
+                        return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation outcome is unknown; it will not be retried".into() }),
+                    crate::db::remote_attachment_operations::BeginNonrepeatableRemoteOperationOutcome::OperationConflict
+                    | crate::db::remote_attachment_operations::BeginNonrepeatableRemoteOperationOutcome::OperationActorConflict =>
+                        return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::BeginNonrepeatableRemoteOperationOutcome::AttachmentLedgerCapacity =>
+                        return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                    crate::db::remote_attachment_operations::BeginNonrepeatableRemoteOperationOutcome::Dispatch { .. } => {}
+                }
+                if let Err(error) = att.handle.send_work(SessionWork::Cancel).await {
+                    let unknown = serde_json::to_vec(&serde_json::json!({"outcome":"unknown"}))
+                        .map_err(internal)?;
+                    ctx.db
+                        .mark_nonrepeatable_remote_operation_outcome_unknown(
+                            &logical_attachment_id,
+                            &operation_id,
+                            &unknown,
+                            chrono::Utc::now().timestamp_millis(),
+                        )
+                        .await
+                        .map_err(internal)?;
+                    return Err(internal(error));
+                }
+                let response = Response::Ack;
+                let bytes = serde_json::to_vec(&response).map_err(internal)?;
+                let delivery_id = Uuid::now_v7().to_string();
+                match ctx.db.commit_remote_attachment_operation(
+                    crate::db::remote_attachment_operations::CommitRemoteOperation {
+                        logical_attachment_id: &logical_attachment_id, operation_id: &operation_id,
+                        safe_response: &bytes, outbox_delivery_id: &delivery_id,
+                        outbox_kind: "cancel_turn", outbox_payload: &bytes,
+                        now_ms: chrono::Utc::now().timestamp_millis(),
+                    },
+                ).await.map_err(internal)? {
+                    crate::db::remote_attachment_operations::CommitRemoteOperationOutcome::Committed { .. } => return Ok(response),
+                    _ => {
+                        let unknown = br#"{"outcome":"unknown"}"#;
+                        ctx.db.mark_nonrepeatable_remote_operation_outcome_unknown(
+                            &logical_attachment_id, &operation_id, unknown,
+                            chrono::Utc::now().timestamp_millis(),
+                        ).await.map_err(internal)?;
+                        return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached after dispatch; outcome is unknown".into() });
+                    }
+                }
+            }
             att.handle
                 .send_work(SessionWork::Cancel)
                 .await
@@ -1219,11 +2733,53 @@ pub(super) async fn handle_serialized_request(
             content,
             base_hash,
         } => {
+            if let Some(operation) = remote_operation {
+                let request = Request::FsWrite {
+                    project_root: project_root.clone(),
+                    path: path.clone(),
+                    content: content.clone(),
+                    base_hash: base_hash.clone(),
+                };
+                if let Some(response) =
+                    begin_remote_idempotent_adapter(&request, &authorized_request, operation, ctx)
+                        .await?
+                {
+                    return Ok(response);
+                }
+                let response = crate::daemon::fs_api::fs_write_staged_remote(
+                    ctx.clone(),
+                    project_root,
+                    path,
+                    content,
+                    base_hash,
+                    operation.operation_id.to_string(),
+                )
+                .await?;
+                return commit_remote_idempotent_adapter(operation, ctx, "fs_write", response)
+                    .await;
+            }
             crate::daemon::fs_api::fs_write(ctx.clone(), project_root, path, content, base_hash)
                 .await
         }
 
         Request::FsCreateDir { project_root, path } => {
+            if let Some(operation) = remote_operation {
+                let request = Request::FsCreateDir {
+                    project_root: project_root.clone(),
+                    path: path.clone(),
+                };
+                if let Some(response) =
+                    begin_remote_idempotent_adapter(&request, &authorized_request, operation, ctx)
+                        .await?
+                {
+                    return Ok(response);
+                }
+                let response =
+                    crate::daemon::fs_api::fs_create_dir_reconciled_remote(project_root, path)
+                        .await?;
+                return commit_remote_idempotent_adapter(operation, ctx, "fs_create_dir", response)
+                    .await;
+            }
             crate::daemon::fs_api::fs_create_dir(project_root, path).await
         }
 
@@ -1231,7 +2787,36 @@ pub(super) async fn handle_serialized_request(
             project_root,
             from_path,
             to_path,
-        } => crate::daemon::fs_api::fs_rename(ctx.clone(), project_root, from_path, to_path).await,
+        } => {
+            if let Some(operation) = remote_operation {
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                if ctx.external_journal.is_some() {
+                    let request = Request::FsRename {
+                        project_root,
+                        from_path,
+                        to_path,
+                    };
+                    return execute_remote_staged_rename(
+                        &request,
+                        &authorized_request,
+                        operation,
+                        ctx,
+                    )
+                    .await;
+                }
+                return Err(ErrorPayload {
+                    code: ErrorCode::Unavailable,
+                    message: if cfg!(any(target_os = "linux", target_os = "macos")) {
+                        "remote staged rename is unavailable until held-handle recovery is initialized"
+                            .into()
+                    } else {
+                        "remote staged rename is unavailable on this platform; held-handle security is deferred"
+                            .into()
+                    },
+                });
+            }
+            crate::daemon::fs_api::fs_rename(ctx.clone(), project_root, from_path, to_path).await
+        }
 
         Request::FsDelete { project_root, path } => {
             crate::daemon::fs_api::fs_delete(ctx.clone(), project_root, path).await
@@ -1246,14 +2831,25 @@ pub(super) async fn handle_serialized_request(
         }
 
         Request::OpenTerminal { cwd, cols, rows } => {
-            let response = state.terminal_host.open(cwd, cols, rows)?;
-            if let Response::TerminalOpened { terminal_id, .. } = response {
-                state.terminal_views.insert(terminal_id);
-                Ok(Response::TerminalOpened {
-                    terminal_id,
-                    viewer_count: 1,
-                    recording: false,
-                })
+            let session_id = state
+                .attached
+                .as_ref()
+                .map_or(Uuid::nil(), |attached| attached.handle.session_id);
+            let response = state.terminal_host.open(
+                state.terminal_context.clone(),
+                session_id,
+                cwd,
+                cols,
+                rows,
+            )?;
+            if let Response::TerminalOpened {
+                terminal_id,
+                binding,
+                ..
+            } = &response
+            {
+                state.terminal_views.insert(*terminal_id, *binding);
+                Ok(response)
             } else {
                 Ok(response)
             }
@@ -1264,24 +2860,131 @@ pub(super) async fn handle_serialized_request(
             cols,
             rows,
         } => {
-            let response = state.terminal_host.attach(terminal_id, cols, rows)?;
-            state.terminal_views.insert(terminal_id);
+            let session_id = state
+                .attached
+                .as_ref()
+                .map_or(Uuid::nil(), |attached| attached.handle.session_id);
+            let response = state.terminal_host.attach(
+                state.terminal_context.clone(),
+                session_id,
+                terminal_id,
+                cols,
+                rows,
+            )?;
+            if let Response::TerminalOpened { binding, .. } = &response {
+                state.terminal_views.insert(terminal_id, *binding);
+            }
             Ok(response)
         }
 
         Request::TerminalInput { terminal_id, bytes } => {
-            state.terminal_host.input(terminal_id, bytes)
+            let binding = *state
+                .terminal_views
+                .get(&terminal_id)
+                .ok_or_else(invalid_terminal_ingress)?;
+            if let Some(operation) = remote_operation {
+                let request = Request::TerminalInput {
+                    terminal_id,
+                    bytes: bytes.clone(),
+                };
+                if let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+                {
+                    return Ok(response);
+                }
+                let response = state.terminal_host.input(terminal_id, binding, bytes)?;
+                return commit_remote_nonrepeatable(operation, ctx, "terminal_input", response)
+                    .await;
+            }
+            state.terminal_host.input(terminal_id, binding, bytes)
         }
 
         Request::TerminalResize {
             terminal_id,
             cols,
             rows,
-        } => state.terminal_host.resize(terminal_id, cols, rows),
+        } => {
+            let binding = *state
+                .terminal_views
+                .get(&terminal_id)
+                .ok_or_else(invalid_terminal_ingress)?;
+            if let Some(operation) = remote_operation {
+                let request = Request::TerminalResize {
+                    terminal_id,
+                    cols,
+                    rows,
+                };
+                if let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+                {
+                    return Ok(response);
+                }
+                let response = state
+                    .terminal_host
+                    .resize(terminal_id, binding, cols, rows)?;
+                return commit_remote_nonrepeatable(operation, ctx, "terminal_resize", response)
+                    .await;
+            }
+            state.terminal_host.resize(terminal_id, binding, cols, rows)
+        }
 
         Request::CloseTerminal { terminal_id } => {
-            state.terminal_views.remove(&terminal_id);
-            state.terminal_host.close(terminal_id)
+            let binding = state
+                .terminal_views
+                .remove(&terminal_id)
+                .ok_or_else(invalid_terminal_ingress)?;
+            state.terminal_host.close(terminal_id, binding)
+        }
+
+        Request::TerminalIngressBegin {
+            terminal_id,
+            binding,
+            metadata,
+        } => {
+            require_terminal_binding(state, terminal_id, binding)?;
+            state
+                .terminal_host
+                .ingress_begin(terminal_id, binding, metadata)
+        }
+        Request::TerminalIngressChunk {
+            terminal_id,
+            binding,
+            operation_id,
+            offset,
+            data_base64,
+        } => {
+            require_terminal_binding(state, terminal_id, binding)?;
+            if data_base64.len() > 66_000 {
+                return Err(invalid_terminal_ingress());
+            }
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data_base64)
+                .map_err(|_| invalid_terminal_ingress())?;
+            state
+                .terminal_host
+                .ingress_chunk(terminal_id, binding, operation_id, offset, bytes)
+        }
+        Request::TerminalIngressFinish {
+            terminal_id,
+            binding,
+            operation_id,
+        } => {
+            require_terminal_binding(state, terminal_id, binding)?;
+            state
+                .terminal_host
+                .ingress_finish(terminal_id, binding, operation_id)
+        }
+        Request::TerminalIngressStatus {
+            terminal_id,
+            binding,
+            operation_id,
+        } => {
+            require_terminal_binding(state, terminal_id, binding)?;
+            state
+                .terminal_host
+                .ingress_status(terminal_id, binding, operation_id)
         }
 
         Request::LspControl {
@@ -1468,9 +3171,84 @@ pub(super) async fn handle_serialized_request(
         Request::ArchiveSession {
             session_id,
             cascade,
-        } => archive_session(ctx, session_id, cascade).await,
+        } => {
+            if let Some(operation) = remote_operation {
+                let request = Request::ArchiveSession {
+                    session_id,
+                    cascade,
+                };
+                let params = request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&request, &params)?;
+                let request_hash =
+                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let logical_attachment_id = operation.logical_attachment_id.to_string();
+                let operation_id = operation.operation_id.to_string();
+                let device_id = operation.authenticated_device_id.to_string();
+                let outcome = ctx.db.execute_transactional_remote_operation(
+                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                        logical_attachment_id: &logical_attachment_id, operation_id: &operation_id,
+                        authenticated_device_id: &device_id, authenticated_device_generation: operation.authenticated_device_generation,
+                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
+                        request_hash, now_ms: chrono::Utc::now().timestamp_millis(),
+                    },
+                    move |conn| {
+                        crate::db::Db::archive_session_conn(conn, session_id, cascade, chrono::Utc::now().timestamp())?;
+                        let response = Response::Ack;
+                        let bytes = serde_json::to_vec(&response)?;
+                        Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
+                            value: response, safe_response: bytes.clone(), outbox_kind: "archive_session".into(), outbox_payload: bytes,
+                        })
+                    },
+                ).await.map_err(internal)?;
+                return match outcome {
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => Ok(response),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                };
+            }
+            archive_session(ctx, session_id, cascade).await
+        }
 
-        Request::UnarchiveSession { session_id } => unarchive_session(ctx, session_id).await,
+        Request::UnarchiveSession { session_id } => {
+            if let Some(operation) = remote_operation {
+                let request = Request::UnarchiveSession { session_id };
+                let params = request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&request, &params)?;
+                let request_hash =
+                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let logical_attachment_id = operation.logical_attachment_id.to_string();
+                let operation_id = operation.operation_id.to_string();
+                let device_id = operation.authenticated_device_id.to_string();
+                let outcome = ctx.db.execute_transactional_remote_operation(
+                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                        logical_attachment_id: &logical_attachment_id, operation_id: &operation_id,
+                        authenticated_device_id: &device_id, authenticated_device_generation: operation.authenticated_device_generation,
+                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
+                        request_hash, now_ms: chrono::Utc::now().timestamp_millis(),
+                    },
+                    move |conn| {
+                        crate::db::Db::unarchive_session_conn(conn, session_id)?;
+                        let response = Response::Ack;
+                        let bytes = serde_json::to_vec(&response)?;
+                        Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
+                            value: response, safe_response: bytes.clone(), outbox_kind: "unarchive_session".into(), outbox_payload: bytes,
+                        })
+                    },
+                ).await.map_err(internal)?;
+                return match outcome {
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => Ok(response),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                };
+            }
+            unarchive_session(ctx, session_id).await
+        }
 
         Request::ForkSession {
             parent_session_id,
@@ -1497,6 +3275,54 @@ pub(super) async fn handle_serialized_request(
         Request::EndBtwFork { parent_session_id } => end_btw_fork(ctx, parent_session_id).await,
 
         Request::RenameSession { session_id, title } => {
+            if let Some(operation) = remote_operation {
+                let request = Request::RenameSession {
+                    session_id,
+                    title: title.clone(),
+                };
+                let canonical_params = request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&request, &canonical_params)?;
+                let request_hash =
+                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let logical_attachment_id = operation.logical_attachment_id.to_string();
+                let operation_id = operation.operation_id.to_string();
+                let device_id = operation.authenticated_device_id.to_string();
+                let outcome = ctx
+                    .db
+                    .execute_transactional_remote_operation(
+                        crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                            logical_attachment_id: &logical_attachment_id,
+                            operation_id: &operation_id,
+                            authenticated_device_id: &device_id,
+                            authenticated_device_generation: operation
+                                .authenticated_device_generation,
+                            operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
+                            request_hash,
+                            now_ms: chrono::Utc::now().timestamp_millis(),
+                        },
+                        move |conn| {
+                            crate::db::Db::rename_session_conn(conn, session_id, &title)?;
+                            let response = Response::Ack;
+                            let safe_response = serde_json::to_vec(&response)?;
+                            Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
+                                value: response,
+                                safe_response: safe_response.clone(),
+                                outbox_kind: "rename_session".into(),
+                                outbox_payload: safe_response,
+                            })
+                        },
+                    )
+                    .await
+                    .map_err(internal)?;
+                return match outcome {
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => Ok(response),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                };
+            }
             rename_session(ctx, session_id, &title).await
         }
 
@@ -1509,6 +3335,75 @@ pub(super) async fn handle_serialized_request(
         }
 
         Request::RecordSessionNote { session_id, text } => {
+            if let Some(operation) = remote_operation {
+                let request = Request::RecordSessionNote {
+                    session_id,
+                    text: text.clone(),
+                };
+                let canonical_params = request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&request, &canonical_params)?;
+                let request_hash =
+                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let agent = ctx
+                    .db
+                    .get_session(session_id)
+                    .await
+                    .map_err(internal)?
+                    .ok_or_else(|| ErrorPayload {
+                        code: ErrorCode::UnknownSession,
+                        message: format!("unknown session {session_id}"),
+                    })?
+                    .active_agent;
+                let data_json = serde_json::to_string(&serde_json::json!({ "text": text }))
+                    .map_err(internal)?;
+                let logical_attachment_id = operation.logical_attachment_id.to_string();
+                let operation_id = operation.operation_id.to_string();
+                let device_id = operation.authenticated_device_id.to_string();
+                let outcome = ctx
+                    .db
+                    .execute_transactional_remote_operation(
+                        crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                            logical_attachment_id: &logical_attachment_id,
+                            operation_id: &operation_id,
+                            authenticated_device_id: &device_id,
+                            authenticated_device_generation: operation
+                                .authenticated_device_generation,
+                            operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
+                            request_hash,
+                            now_ms: chrono::Utc::now().timestamp_millis(),
+                        },
+                        move |conn| {
+                            let seq = crate::db::Db::insert_session_event_json_conn(
+                                conn,
+                                session_id,
+                                crate::db::session_log::SessionEventKind::UserNote,
+                                Some(&agent),
+                                None,
+                                crate::db::session_log::SessionEventContext::default(),
+                                chrono::Utc::now().timestamp_millis(),
+                                &data_json,
+                            )?;
+                            let response = Response::NoteRecorded { seq };
+                            let safe_response = serde_json::to_vec(&response)?;
+                            Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
+                                value: response,
+                                safe_response: safe_response.clone(),
+                                outbox_kind: "record_session_note".into(),
+                                outbox_payload: safe_response,
+                            })
+                        },
+                    )
+                    .await
+                    .map_err(internal)?;
+                return match outcome {
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => Ok(response),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                };
+            }
             record_session_note(ctx, session_id, &text).await
         }
 
@@ -1732,6 +3627,52 @@ pub(super) async fn handle_serialized_request(
         Request::SetAgent { name } => {
             let att = require_attached(state)?;
             validate_set_agent(ctx, att, &name)?;
+            if let Some(operation) = remote_operation {
+                let session_id = att.handle.session_id;
+                let request = Request::SetAgent { name: name.clone() };
+                let params = request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&request, &params)?;
+                let request_hash =
+                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let attachment = operation.logical_attachment_id.to_string();
+                let operation_id = operation.operation_id.to_string();
+                let device = operation.authenticated_device_id.to_string();
+                let desired = name.clone();
+                let outcome = ctx.db.execute_idempotent_adapter_remote_operation(
+                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                        logical_attachment_id: &attachment, operation_id: &operation_id,
+                        authenticated_device_id: &device,
+                        authenticated_device_generation: operation.authenticated_device_generation,
+                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::IdempotentAdapterMutation,
+                        request_hash, now_ms: chrono::Utc::now().timestamp_millis(),
+                    },
+                    move |conn| {
+                        crate::db::Db::set_session_agent_conn(conn, session_id, &desired)?;
+                        let response = Response::Ack;
+                        let bytes = serde_json::to_vec(&response)?;
+                        Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
+                            value: response, safe_response: bytes.clone(),
+                            outbox_kind: "set_agent".into(), outbox_payload: bytes,
+                        })
+                    },
+                ).await.map_err(internal)?;
+                let response = match outcome {
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => response,
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal)?,
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                };
+                // Idempotent live convergence. If the process dies here, the
+                // durable session row is authoritative on resume/recovery.
+                att.handle
+                    .send_work(SessionWork::SetAgent { name })
+                    .await
+                    .map_err(internal)?;
+                return Ok(response);
+            }
             att.handle
                 .send_work(SessionWork::SetAgent { name })
                 .await
@@ -1741,15 +3682,75 @@ pub(super) async fn handle_serialized_request(
 
         Request::SetLlmMode { mode } => {
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation
+                && let Some(response) = begin_remote_nonrepeatable(
+                    &Request::SetLlmMode { mode },
+                    &authorized_request,
+                    operation,
+                    ctx,
+                )
+                .await?
+            {
+                return Ok(response);
+            }
             att.handle
                 .send_work(SessionWork::SetLlmMode { mode })
                 .await
                 .map_err(internal)?;
-            Ok(Response::Ack)
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "set_llm_mode", Response::Ack).await
+                }
+                None => Ok(Response::Ack),
+            }
         }
 
         Request::SetSessionLlmMode { mode } => {
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation {
+                let session_id = att.handle.session_id;
+                let request = Request::SetSessionLlmMode { mode };
+                let params = request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&request, &params)?;
+                let request_hash =
+                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let attachment = operation.logical_attachment_id.to_string();
+                let operation_id = operation.operation_id.to_string();
+                let device = operation.authenticated_device_id.to_string();
+                let mode_label = mode.as_str().to_string();
+                let outcome = ctx.db.execute_idempotent_adapter_remote_operation(
+                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                        logical_attachment_id: &attachment, operation_id: &operation_id,
+                        authenticated_device_id: &device,
+                        authenticated_device_generation: operation.authenticated_device_generation,
+                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::IdempotentAdapterMutation,
+                        request_hash, now_ms: chrono::Utc::now().timestamp_millis(),
+                    },
+                    move |conn| {
+                        crate::db::Db::set_session_llm_mode_conn(conn, session_id, &mode_label)?;
+                        let response = Response::Ack;
+                        let bytes = serde_json::to_vec(&response)?;
+                        Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
+                            value: response, safe_response: bytes.clone(),
+                            outbox_kind: "set_session_llm_mode".into(), outbox_payload: bytes,
+                        })
+                    },
+                ).await.map_err(internal)?;
+                let response = match outcome {
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => response,
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal)?,
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict
+                    | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                };
+                att.handle
+                    .send_work(SessionWork::SetSessionLlmMode { mode })
+                    .await
+                    .map_err(internal)?;
+                return Ok(response);
+            }
             att.handle
                 .send_work(SessionWork::SetSessionLlmMode { mode })
                 .await
@@ -1764,6 +3765,20 @@ pub(super) async fn handle_serialized_request(
             monty_nudge,
         } => {
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation {
+                let request = Request::SetToolSurfaceOverride {
+                    override_json: override_json.clone(),
+                    persist_session,
+                    prune_after_switch,
+                    monty_nudge: monty_nudge.clone(),
+                };
+                if let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+                {
+                    return Ok(response);
+                }
+            }
             serde_json::from_str::<crate::agents::ToolSurfaceSelection>(&override_json)
                 .map_err(|error| bad_request(format!("invalid tool surface override: {error}")))?;
             att.handle
@@ -1775,7 +3790,18 @@ pub(super) async fn handle_serialized_request(
                 })
                 .await
                 .map_err(internal)?;
-            Ok(Response::Ack)
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(
+                        operation,
+                        ctx,
+                        "set_tool_surface_override",
+                        Response::Ack,
+                    )
+                    .await
+                }
+                None => Ok(Response::Ack),
+            }
         }
 
         Request::SetGoalSettingsOverride {
@@ -1783,6 +3809,18 @@ pub(super) async fn handle_serialized_request(
             persist_session,
         } => {
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation {
+                let request = Request::SetGoalSettingsOverride {
+                    override_json: override_json.clone(),
+                    persist_session,
+                };
+                if let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+                {
+                    return Ok(response);
+                }
+            }
             if let Some(raw) = override_json.as_deref() {
                 crate::agents::parse_goal_settings_override_json(raw).map_err(|error| {
                     bad_request(format!("invalid goal settings override: {error}"))
@@ -1795,13 +3833,41 @@ pub(super) async fn handle_serialized_request(
                 })
                 .await
                 .map_err(internal)?;
-            Ok(Response::Ack)
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(
+                        operation,
+                        ctx,
+                        "set_goal_settings_override",
+                        Response::Ack,
+                    )
+                    .await
+                }
+                None => Ok(Response::Ack),
+            }
         }
 
         Request::SetApprovalMode { mode } => {
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation
+                && let Some(response) = begin_remote_nonrepeatable(
+                    &Request::SetApprovalMode { mode },
+                    &authorized_request,
+                    operation,
+                    ctx,
+                )
+                .await?
+            {
+                return Ok(response);
+            }
             let mode = att.handle.set_approval_mode(mode);
-            Ok(Response::ApprovalModeState { mode })
+            let response = Response::ApprovalModeState { mode };
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "set_approval_mode", response).await
+                }
+                None => Ok(response),
+            }
         }
 
         Request::SetDelegationRecursion {
@@ -1809,6 +3875,20 @@ pub(super) async fn handle_serialized_request(
             default_depth,
         } => {
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation
+                && let Some(response) = begin_remote_nonrepeatable(
+                    &Request::SetDelegationRecursion {
+                        enabled,
+                        default_depth,
+                    },
+                    &authorized_request,
+                    operation,
+                    ctx,
+                )
+                .await?
+            {
+                return Ok(response);
+            }
             att.handle
                 .send_work(SessionWork::SetDelegationRecursion {
                     enabled,
@@ -1816,10 +3896,22 @@ pub(super) async fn handle_serialized_request(
                 })
                 .await
                 .map_err(internal)?;
-            Ok(Response::DelegationRecursionState {
+            let response = Response::DelegationRecursionState {
                 enabled,
                 default_depth,
-            })
+            };
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(
+                        operation,
+                        ctx,
+                        "set_delegation_recursion",
+                        response,
+                    )
+                    .await
+                }
+                None => Ok(response),
+            }
         }
 
         Request::SetCaffeinate { mode } => set_caffeinate(state, ctx, mode),
@@ -1842,22 +3934,58 @@ pub(super) async fn handle_serialized_request(
             // broadcasts a `SandboxState` event so every attached client
             // stays in sync.
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation {
+                let request = Request::SetSandbox {
+                    mode,
+                    container_network_enabled,
+                };
+                if let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+                {
+                    return Ok(response);
+                }
+            }
             let new = att
                 .handle
                 .set_sandbox(mode, container_network_enabled)
                 .map_err(bad_request)?;
-            Ok(Response::SandboxState {
+            let response = Response::SandboxState {
                 mode: new,
                 enabled: new.enabled(),
                 container_network_enabled: att.handle.container_network_enabled(),
                 container_availability: crate::container::availability_snapshot(),
-            })
+            };
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "set_sandbox", response).await
+                }
+                None => Ok(response),
+            }
         }
 
         Request::SetSandboxEscalation { enabled } => {
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation
+                && let Some(response) = begin_remote_nonrepeatable(
+                    &Request::SetSandboxEscalation { enabled },
+                    &authorized_request,
+                    operation,
+                    ctx,
+                )
+                .await?
+            {
+                return Ok(response);
+            }
             let enabled = att.handle.set_sandbox_escalation(enabled);
-            Ok(Response::SandboxEscalationState { enabled })
+            let response = Response::SandboxEscalationState { enabled };
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "set_sandbox_escalation", response)
+                        .await
+                }
+                None => Ok(response),
+            }
         }
 
         Request::SetPreflight { enabled } => {
@@ -1866,6 +3994,17 @@ pub(super) async fn handle_serialized_request(
             // the resulting state (→ toast + mirror). Session-only — no
             // config-file write.
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation
+                && let Some(response) = begin_remote_nonrepeatable(
+                    &Request::SetPreflight { enabled },
+                    &authorized_request,
+                    operation,
+                    ctx,
+                )
+                .await?
+            {
+                return Ok(response);
+            }
             let (respond_to, response_rx) = tokio::sync::oneshot::channel();
             att.handle
                 .send_work(SessionWork::SetPreflight {
@@ -1874,16 +4013,33 @@ pub(super) async fn handle_serialized_request(
                 })
                 .await
                 .map_err(internal)?;
-            Ok(Response::PreflightState {
+            let response = Response::PreflightState {
                 enabled: response_rx
                     .await
                     .map_err(internal)?
                     .map_err(|error| internal(anyhow::anyhow!(error)))?,
-            })
+            };
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "set_preflight", response).await
+                }
+                None => Ok(response),
+            }
         }
 
         Request::SetLongcache { enabled } => {
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation
+                && let Some(response) = begin_remote_nonrepeatable(
+                    &Request::SetLongcache { enabled },
+                    &authorized_request,
+                    operation,
+                    ctx,
+                )
+                .await?
+            {
+                return Ok(response);
+            }
             let (respond_to, response_rx) = tokio::sync::oneshot::channel();
             att.handle
                 .send_work(SessionWork::SetLongcache {
@@ -1892,12 +4048,18 @@ pub(super) async fn handle_serialized_request(
                 })
                 .await
                 .map_err(internal)?;
-            Ok(Response::LongcacheState {
+            let response = Response::LongcacheState {
                 enabled: response_rx
                     .await
                     .map_err(internal)?
                     .map_err(|error| internal(anyhow::anyhow!(error)))?,
-            })
+            };
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "set_longcache", response).await
+                }
+                None => Ok(response),
+            }
         }
 
         Request::SetRedaction {
@@ -1911,6 +4073,19 @@ pub(super) async fn handle_serialized_request(
             // broadcasts the resulting state (→ toast). Session-only — no
             // config-file write. `scrub()` stays non-bypassable.
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation {
+                let request = Request::SetRedaction {
+                    scan_environment,
+                    scan_dotenv,
+                    scan_ssh_keys,
+                };
+                if let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+                {
+                    return Ok(response);
+                }
+            }
             let (respond_to, response_rx) = tokio::sync::oneshot::channel();
             att.handle
                 .send_work(SessionWork::SetRedaction {
@@ -1925,11 +4100,17 @@ pub(super) async fn handle_serialized_request(
                 .await
                 .map_err(internal)?
                 .map_err(|error| internal(anyhow::anyhow!(error)))?;
-            Ok(Response::RedactionState {
+            let response = Response::RedactionState {
                 scan_environment,
                 scan_dotenv,
                 scan_ssh_keys,
-            })
+            };
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "set_redaction", response).await
+                }
+                None => Ok(response),
+            }
         }
 
         Request::SetTandemModels { models } => {
@@ -1939,38 +4120,97 @@ pub(super) async fn handle_serialized_request(
             // state (+ token-burn warning) via `Event::TandemState`.
             // Session-only — no config-file write.
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation {
+                let request = Request::SetTandemModels {
+                    models: models.clone(),
+                };
+                if let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+                {
+                    return Ok(response);
+                }
+            }
             att.handle
                 .send_work(SessionWork::SetTandemModels { models })
                 .await
                 .map_err(internal)?;
-            Ok(Response::Ack)
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "set_tandem_models", Response::Ack)
+                        .await
+                }
+                None => Ok(Response::Ack),
+            }
         }
 
         Request::Prune => {
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&Request::Prune, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
             att.handle
                 .send_work(SessionWork::Prune)
                 .await
                 .map_err(internal)?;
-            Ok(Response::Ack)
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "prune", Response::Ack).await
+                }
+                None => Ok(Response::Ack),
+            }
         }
 
         Request::Compact => {
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation
+                && let Some(response) = begin_remote_nonrepeatable(
+                    &Request::Compact,
+                    &authorized_request,
+                    operation,
+                    ctx,
+                )
+                .await?
+            {
+                return Ok(response);
+            }
             att.handle
                 .send_work(SessionWork::Compact)
                 .await
                 .map_err(internal)?;
-            Ok(Response::Ack)
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "compact", Response::Ack).await
+                }
+                None => Ok(Response::Ack),
+            }
         }
 
         Request::Pin { text } => {
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation {
+                let request = Request::Pin { text: text.clone() };
+                if let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+                {
+                    return Ok(response);
+                }
+            }
             att.handle
                 .send_work(SessionWork::Pin { text })
                 .await
                 .map_err(internal)?;
-            Ok(Response::Ack)
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "pin", Response::Ack).await
+                }
+                None => Ok(Response::Ack),
+            }
         }
 
         Request::StoreFlycockpitCredential { credential } => {
@@ -2019,12 +4259,37 @@ pub(super) async fn handle_serialized_request(
 
         Request::RefreshEnv { vars } => {
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation {
+                let request = Request::RefreshEnv { vars: vars.clone() };
+                if let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+                {
+                    return Ok(response);
+                }
+            }
             att.handle.set_env_overlay(vars);
-            Ok(Response::Ack)
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "refresh_env", Response::Ack).await
+                }
+                None => Ok(Response::Ack),
+            }
         }
 
         Request::RefreshConfig => {
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation
+                && let Some(response) = begin_remote_nonrepeatable(
+                    &Request::RefreshConfig,
+                    &authorized_request,
+                    operation,
+                    ctx,
+                )
+                .await?
+            {
+                return Ok(response);
+            }
             let refreshed = crate::daemon::config_refresh::refresh_session_config_explicit(
                 &ctx.db,
                 ctx.config_source(),
@@ -2032,10 +4297,16 @@ pub(super) async fn handle_serialized_request(
             )
             .await
             .map_err(explicit_config_refresh_error)?;
-            Ok(Response::ConfigRefreshed {
+            let response = Response::ConfigRefreshed {
                 applied_generation: refreshed.applied_generation,
                 changed: refreshed.changed,
-            })
+            };
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "refresh_config", response).await
+                }
+                None => Ok(response),
+            }
         }
 
         Request::RecordUsage {
@@ -2176,6 +4447,693 @@ pub(super) async fn handle_serialized_request(
                 reason: None,
             })
         }
+        Request::RecoverSecurityBlockedMedia(request) => {
+            use sha2::{Digest as _, Sha256};
+            let expected_owner = super::run_invocation::principal_digest(&state.principal);
+            if request.owner_principal_digest != expected_owner {
+                return Err(authorization_error(
+                    "media recovery owner binding is invalid",
+                ));
+            }
+            let recovery = ctx
+                .media_storage_recovery
+                .as_ref()
+                .ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::Internal,
+                    message: "media storage authority is unavailable".into(),
+                })?;
+            let att = require_attached(state).map_err(|_| ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: "media_attachment_unavailable".into(),
+            })?;
+            let project_text = att
+                .handle
+                .project_root
+                .to_str()
+                .ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::BadRequest,
+                    message: "media_attachment_unavailable".into(),
+                })?;
+            let project_digest = crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes()));
+            let receipt = recovery
+                .recover(
+                    request,
+                    att.handle.session_id,
+                    project_digest,
+                    None,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                .map_err(|error| {
+                    if error
+                        .to_string()
+                        .contains("security-blocked media attachment unavailable")
+                    {
+                        ErrorPayload {
+                            code: ErrorCode::BadRequest,
+                            message: "media_attachment_unavailable".into(),
+                        }
+                    } else {
+                        internal(error)
+                    }
+                })?;
+            Ok(Response::MediaOwnerRecovery(receipt))
+        }
+        Request::RegisterLocalPathMedia(request) => {
+            use sha2::{Digest as _, Sha256};
+            let unavailable = || ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: "media_attachment_unavailable".into(),
+            };
+            let attached = require_attached(state).map_err(|_| unavailable())?;
+            let owner = super::run_invocation::principal_digest(&state.principal);
+            let project_text = attached
+                .handle
+                .project_root
+                .to_str()
+                .ok_or_else(unavailable)?;
+            let project_digest = crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes()));
+            if request.owner_principal_digest != owner
+                || request.session_id != attached.handle.session_id
+                || request.canonical_project_digest != project_digest
+            {
+                return Err(unavailable());
+            }
+            let recovery = ctx
+                .media_storage_recovery
+                .as_ref()
+                .ok_or_else(|| ErrorPayload {
+                    code: ErrorCode::Internal,
+                    message: "media storage authority is unavailable".into(),
+                })?;
+            let (_, extended) = ctx
+                .config_source
+                .load_effective_for_daemon(
+                    &attached.handle.project_root,
+                    &attached.handle.trust_policy,
+                )
+                .map_err(internal)?;
+            let receipt = recovery
+                .register_local_path(
+                    request,
+                    &attached.handle.project_root,
+                    &extended.media_resources,
+                    ctx.media_ledger.clock_now_ms(),
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                .map_err(|error| {
+                    let text = error.to_string();
+                    if text.contains("media_attachment_unavailable") {
+                        unavailable()
+                    } else if text.contains("idempotency_conflict") {
+                        ErrorPayload {
+                            code: ErrorCode::Conflict,
+                            message: "idempotency_conflict".into(),
+                        }
+                    } else {
+                        internal(error)
+                    }
+                })?;
+            Ok(Response::LocalPathMediaRegistration(receipt))
+        }
+        Request::RetainHttpsMedia(request) => {
+            use sha2::{Digest as _, Sha256};
+            let unavailable = || ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: "media_attachment_unavailable".into(),
+            };
+            let attached = require_attached(state).map_err(|_| unavailable())?;
+            let owner = super::run_invocation::principal_digest(&state.principal);
+            let project_text = attached
+                .handle
+                .project_root
+                .to_str()
+                .ok_or_else(unavailable)?;
+            let project_digest = crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes()));
+            if request.schema_version != 1
+                || request.kind != "retainHttpsMedia"
+                || request.owner_principal_digest != owner
+                || request.session_id != attached.handle.session_id
+                || request.canonical_project_digest != project_digest
+            {
+                return Err(unavailable());
+            }
+            let recovery = ctx
+                .media_storage_recovery
+                .as_ref()
+                .ok_or_else(unavailable)?;
+            let (_, extended) = ctx
+                .config_source
+                .load_effective_for_daemon(
+                    &attached.handle.project_root,
+                    &attached.handle.trust_policy,
+                )
+                .map_err(internal)?;
+            let receipt = recovery
+                .retain_https_media(
+                    request,
+                    &extended.media_resources,
+                    ctx.media_ledger.clock_now_ms(),
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                .map_err(|error| {
+                    if error.to_string().contains("idempotency_conflict") {
+                        ErrorPayload {
+                            code: ErrorCode::Conflict,
+                            message: "idempotency_conflict".into(),
+                        }
+                    } else {
+                        internal(error)
+                    }
+                })?;
+            recovery
+                .process_retained_https_jobs(chrono::Utc::now().timestamp_millis())
+                .await
+                .map_err(internal)?;
+            Ok(Response::RetainedHttpsMedia(receipt))
+        }
+        Request::GetMediaAttachmentStatus(request) => {
+            use sha2::{Digest as _, Sha256};
+            let unavailable = || ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: "media_attachment_unavailable".into(),
+            };
+            authorize_session_row_reader(&state.principal, ctx, request.session_id)
+                .await
+                .map_err(|_| unavailable())?;
+            let attached = require_attached(state).map_err(|_| unavailable())?;
+            let project_text = attached
+                .handle
+                .project_root
+                .to_str()
+                .ok_or_else(unavailable)?;
+            let project_digest = crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes()));
+            if request.session_id != attached.handle.session_id
+                || request.canonical_project_digest != project_digest
+            {
+                return Err(unavailable());
+            }
+            let status = ctx
+                .db
+                .read(move |conn| {
+                    cockpit_db::Db::media_attachment_status_for_owner_conn(conn, &request)
+                })
+                .await
+                .map_err(internal)?
+                .ok_or_else(unavailable)?;
+            Ok(Response::MediaAttachmentStatus(status))
+        }
+        Request::GetMediaAttachmentPreview(request) => {
+            use cockpit_db::media_attachments::{
+                GetMediaAttachmentStatusV1, MediaAttachmentPreviewV1,
+                MediaAttachmentStatusDetailV1, MediaComponentLeaseKind,
+            };
+            use sha2::{Digest as _, Sha256};
+            let unavailable = || ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: "media_attachment_unavailable".into(),
+            };
+            if request.schema_version != 1
+                || request.kind != "getMediaAttachmentPreview"
+                || request.attachment_version == 0
+                || request.availability_generation == 0
+                || request.preview_generation == 0
+            {
+                return Err(unavailable());
+            }
+            authorize_session_row_reader(&state.principal, ctx, request.session_id)
+                .await
+                .map_err(|_| unavailable())?;
+            let attached = require_attached(state).map_err(|_| unavailable())?;
+            let project_text = attached
+                .handle
+                .project_root
+                .to_str()
+                .ok_or_else(unavailable)?;
+            let project_digest = crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes()));
+            if request.session_id != attached.handle.session_id
+                || request.canonical_project_digest != project_digest
+                || request.preview_checksum.len() != 64
+                || request
+                    .preview_checksum
+                    .bytes()
+                    .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+            {
+                return Err(unavailable());
+            }
+            let status_request = GetMediaAttachmentStatusV1 {
+                schema_version: 1,
+                kind: "getMediaAttachmentStatus".into(),
+                session_id: request.session_id,
+                canonical_project_digest: request.canonical_project_digest.clone(),
+                attachment_id: request.attachment_id,
+            };
+            let (status, capability) = ctx
+                .db
+                .read(move |conn| {
+                    let status = cockpit_db::Db::media_attachment_status_for_owner_conn(
+                        conn,
+                        &status_request,
+                    )?
+                    .context("media_attachment_unavailable")?;
+                    let record = cockpit_db::Db::media_attachment_for_owner_conn(
+                        conn,
+                        status_request.attachment_id,
+                        status_request.session_id,
+                        &status_request.canonical_project_digest,
+                    )?
+                    .context("media_attachment_unavailable")?;
+                    Ok((status, record.captured_capability_generation))
+                })
+                .await
+                .map_err(|_| unavailable())?;
+            let MediaAttachmentStatusDetailV1::Ready {
+                preview: Some(preview),
+                ..
+            } = status.detail
+            else {
+                return Err(unavailable());
+            };
+            if status.attachment_version != request.attachment_version
+                || status.availability_generation != request.availability_generation
+                || preview.generation != request.preview_generation
+                || preview.checksum != request.preview_checksum
+                || preview.byte_length > 524_288
+            {
+                return Err(unavailable());
+            }
+            let storage = ctx
+                .media_storage_recovery
+                .as_ref()
+                .ok_or_else(unavailable)?;
+            let now = chrono::Utc::now().timestamp_millis();
+            let lease = storage
+                .acquire_component_lease(crate::media_storage::AcquireComponentLeaseInput {
+                    lease_id: Uuid::now_v7(),
+                    attachment_id: request.attachment_id,
+                    attachment_version: request.attachment_version,
+                    availability_generation: request.availability_generation,
+                    capability_generation: capability,
+                    kind: MediaComponentLeaseKind::Preview,
+                    now_unix_ms: now,
+                })
+                .await
+                .map_err(|_| unavailable())?;
+            let body = lease.read_verified(now).await.map_err(|_| unavailable())?;
+            if body.len() as u64 != preview.byte_length || !body.starts_with(b"\x89PNG\r\n\x1a\n") {
+                return Err(unavailable());
+            }
+            Ok(Response::MediaAttachmentPreview(MediaAttachmentPreviewV1 {
+                schema_version: 1,
+                kind: "mediaAttachmentPreview".into(),
+                content_type: "image/png".into(),
+                cache_control: "no-store, private".into(),
+                x_content_type_options: "nosniff".into(),
+                content_length: body.len() as u64,
+                body,
+            }))
+        }
+        Request::BeginMediaUpload(request) => {
+            use cockpit_db::media_attachments::{
+                LocalMediaActorRoleV1, LocalMediaMutationPayloadV1,
+            };
+            use sha2::{Digest as _, Sha256};
+            let unavailable = || ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: "media_attachment_unavailable".into(),
+            };
+            let LocalMediaMutationPayloadV1::Begin {
+                session_id,
+                canonical_project_digest,
+                ..
+            } = &request.payload
+            else {
+                return Err(bad_request("media upload action mismatch"));
+            };
+            let access = ctx
+                .db
+                .get_session(*session_id)
+                .await
+                .map_err(internal)?
+                .map(|row| session_access_for_row(&state.principal, &row))
+                .ok_or_else(unavailable)?;
+            let expected_role = match access {
+                SessionAccess::Owner => LocalMediaActorRoleV1::Owner,
+                SessionAccess::Writer => LocalMediaActorRoleV1::Writer,
+                _ => return Err(unavailable()),
+            };
+            let attached = require_attached(state).map_err(|_| unavailable())?;
+            let project_text = attached
+                .handle
+                .project_root
+                .to_str()
+                .ok_or_else(unavailable)?;
+            let project_digest = crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes()));
+            if *session_id != attached.handle.session_id
+                || *canonical_project_digest != project_digest
+                || request.actor_role != expected_role
+                || request.actor_principal_digest
+                    != super::run_invocation::principal_digest(&state.principal)
+            {
+                return Err(unavailable());
+            }
+            let (_, extended) = ctx
+                .config_source
+                .load_effective_for_daemon(
+                    &attached.handle.project_root,
+                    &attached.handle.trust_policy,
+                )
+                .map_err(internal)?;
+            let recovery = ctx
+                .media_storage_recovery
+                .as_ref()
+                .ok_or_else(|| internal("media storage authority is unavailable"))?;
+            let receipt = recovery
+                .begin_media_upload(
+                    request,
+                    &extended.media_resources,
+                    ctx.media_ledger.clock_now_ms(),
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                .map_err(|error| {
+                    let text = error.to_string();
+                    if text.contains("conflict") {
+                        ErrorPayload {
+                            code: ErrorCode::Conflict,
+                            message: text,
+                        }
+                    } else {
+                        internal(error)
+                    }
+                })?;
+            Ok(Response::LocalMediaMutation(receipt))
+        }
+        Request::AppendMediaUploadChunk(request) => {
+            use cockpit_db::media_attachments::{
+                LocalMediaActorRoleV1, LocalMediaMutationPayloadV1,
+            };
+            use sha2::{Digest as _, Sha256};
+            let unavailable = || ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: "media_attachment_unavailable".into(),
+            };
+            let LocalMediaMutationPayloadV1::Append {
+                session_id,
+                canonical_project_digest,
+                ..
+            } = &request.mutation.payload
+            else {
+                return Err(bad_request("media upload action mismatch"));
+            };
+            let access = ctx
+                .db
+                .get_session(*session_id)
+                .await
+                .map_err(internal)?
+                .map(|row| session_access_for_row(&state.principal, &row))
+                .ok_or_else(unavailable)?;
+            let role = match access {
+                SessionAccess::Owner => LocalMediaActorRoleV1::Owner,
+                SessionAccess::Writer => LocalMediaActorRoleV1::Writer,
+                _ => return Err(unavailable()),
+            };
+            let attached = require_attached(state).map_err(|_| unavailable())?;
+            let text = attached
+                .handle
+                .project_root
+                .to_str()
+                .ok_or_else(unavailable)?;
+            let digest = crate::intel::hex_lower(&Sha256::digest(text.as_bytes()));
+            if *session_id != attached.handle.session_id
+                || *canonical_project_digest != digest
+                || request.mutation.actor_role != role
+                || request.mutation.actor_principal_digest
+                    != super::run_invocation::principal_digest(&state.principal)
+            {
+                return Err(unavailable());
+            }
+            let recovery = ctx
+                .media_storage_recovery
+                .as_ref()
+                .ok_or_else(|| internal("media storage authority is unavailable"))?;
+            let receipt = recovery
+                .append_media_upload_chunk(request, chrono::Utc::now().timestamp_millis())
+                .await
+                .map_err(|error| {
+                    let text = error.to_string();
+                    if text.contains("conflict") {
+                        ErrorPayload {
+                            code: ErrorCode::Conflict,
+                            message: text,
+                        }
+                    } else {
+                        internal(error)
+                    }
+                })?;
+            Ok(Response::LocalMediaMutation(receipt))
+        }
+        Request::CancelMediaUpload(request) => {
+            use cockpit_db::media_attachments::{
+                LocalMediaActorRoleV1, LocalMediaMutationPayloadV1,
+            };
+            use sha2::{Digest as _, Sha256};
+            let unavailable = || ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: "media_attachment_unavailable".into(),
+            };
+            let LocalMediaMutationPayloadV1::Cancel {
+                session_id,
+                canonical_project_digest,
+                ..
+            } = &request.payload
+            else {
+                return Err(bad_request("media upload action mismatch"));
+            };
+            let access = ctx
+                .db
+                .get_session(*session_id)
+                .await
+                .map_err(internal)?
+                .map(|row| session_access_for_row(&state.principal, &row))
+                .ok_or_else(unavailable)?;
+            let role = match access {
+                SessionAccess::Owner => LocalMediaActorRoleV1::Owner,
+                SessionAccess::Writer => LocalMediaActorRoleV1::Writer,
+                _ => return Err(unavailable()),
+            };
+            let attached = require_attached(state).map_err(|_| unavailable())?;
+            let text = attached
+                .handle
+                .project_root
+                .to_str()
+                .ok_or_else(unavailable)?;
+            let digest = crate::intel::hex_lower(&Sha256::digest(text.as_bytes()));
+            if *session_id != attached.handle.session_id
+                || *canonical_project_digest != digest
+                || request.actor_role != role
+                || request.actor_principal_digest
+                    != super::run_invocation::principal_digest(&state.principal)
+            {
+                return Err(unavailable());
+            }
+            let recovery = ctx
+                .media_storage_recovery
+                .as_ref()
+                .ok_or_else(|| internal("media storage authority is unavailable"))?;
+            let receipt = recovery
+                .cancel_media_upload(request, chrono::Utc::now().timestamp_millis())
+                .await
+                .map_err(|error| {
+                    let text = error.to_string();
+                    if text.contains("conflict") {
+                        ErrorPayload {
+                            code: ErrorCode::Conflict,
+                            message: text,
+                        }
+                    } else {
+                        internal(error)
+                    }
+                })?;
+            Ok(Response::LocalMediaMutation(receipt))
+        }
+        Request::DiscardUnreferencedMediaAttachment(request) => {
+            use cockpit_db::media_attachments::{
+                LocalMediaActorRoleV1, LocalMediaMutationPayloadV1,
+            };
+            use sha2::{Digest as _, Sha256};
+            let unavailable = || ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: "media_attachment_unavailable".into(),
+            };
+            let LocalMediaMutationPayloadV1::Discard {
+                session_id,
+                canonical_project_digest,
+                ..
+            } = &request.payload
+            else {
+                return Err(bad_request("media discard action mismatch"));
+            };
+            let access = ctx
+                .db
+                .get_session(*session_id)
+                .await
+                .map_err(internal)?
+                .map(|row| session_access_for_row(&state.principal, &row))
+                .ok_or_else(unavailable)?;
+            let role = match access {
+                SessionAccess::Owner => LocalMediaActorRoleV1::Owner,
+                SessionAccess::Writer => LocalMediaActorRoleV1::Writer,
+                _ => return Err(unavailable()),
+            };
+            let attached = require_attached(state).map_err(|_| unavailable())?;
+            let project = attached
+                .handle
+                .project_root
+                .to_str()
+                .ok_or_else(unavailable)?;
+            let digest = crate::intel::hex_lower(&Sha256::digest(project.as_bytes()));
+            if *session_id != attached.handle.session_id
+                || *canonical_project_digest != digest
+                || request.actor_role != role
+                || request.actor_principal_digest
+                    != super::run_invocation::principal_digest(&state.principal)
+            {
+                return Err(unavailable());
+            }
+            let storage = ctx
+                .media_storage_recovery
+                .as_ref()
+                .ok_or_else(|| internal("media storage authority is unavailable"))?;
+            let receipt = storage
+                .discard_media_attachment(request, chrono::Utc::now().timestamp_millis())
+                .await
+                .map_err(|error| {
+                    let text = error.to_string();
+                    if text.contains("conflict") {
+                        ErrorPayload {
+                            code: ErrorCode::Conflict,
+                            message: text,
+                        }
+                    } else if text.contains("media_attachment_unavailable") {
+                        unavailable()
+                    } else {
+                        internal(error)
+                    }
+                })?;
+            if receipt.outcome
+                == cockpit_db::media_attachments::LocalMediaMutationOutcomeV1::Applied
+            {
+                storage
+                    .reconcile_media_cleanup_intents(chrono::Utc::now().timestamp_millis())
+                    .await
+                    .map_err(internal)?;
+            }
+            Ok(Response::LocalMediaMutation(receipt))
+        }
+        Request::GetMediaUploadStatus(request) => {
+            use sha2::{Digest as _, Sha256};
+            let unavailable = || ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: "media_attachment_unavailable".into(),
+            };
+            authorize_session_row_reader(&state.principal, ctx, request.session_id)
+                .await
+                .map_err(|_| unavailable())?;
+            let attached = require_attached(state).map_err(|_| unavailable())?;
+            let text = attached
+                .handle
+                .project_root
+                .to_str()
+                .ok_or_else(unavailable)?;
+            let digest = crate::intel::hex_lower(&Sha256::digest(text.as_bytes()));
+            if request.session_id != attached.handle.session_id
+                || request.canonical_project_digest != digest
+            {
+                return Err(unavailable());
+            }
+            let status = ctx
+                .db
+                .read(move |conn| {
+                    cockpit_db::Db::media_upload_status_for_owner_conn(conn, &request)
+                })
+                .await
+                .map_err(|error| {
+                    if error.to_string().contains("media_attachment_unavailable") {
+                        unavailable()
+                    } else {
+                        internal(error)
+                    }
+                })?
+                .ok_or_else(unavailable)?;
+            Ok(Response::MediaUploadStatus(status))
+        }
+        Request::FinalizeMediaUpload(request) => {
+            use cockpit_db::media_attachments::{
+                LocalMediaActorRoleV1, LocalMediaMutationPayloadV1,
+            };
+            use sha2::{Digest as _, Sha256};
+            let unavailable = || ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: "media_attachment_unavailable".into(),
+            };
+            let LocalMediaMutationPayloadV1::Finalize {
+                session_id,
+                canonical_project_digest,
+                ..
+            } = &request.payload
+            else {
+                return Err(bad_request("media upload action mismatch"));
+            };
+            let access = ctx
+                .db
+                .get_session(*session_id)
+                .await
+                .map_err(internal)?
+                .map(|row| session_access_for_row(&state.principal, &row))
+                .ok_or_else(unavailable)?;
+            let role = match access {
+                SessionAccess::Owner => LocalMediaActorRoleV1::Owner,
+                SessionAccess::Writer => LocalMediaActorRoleV1::Writer,
+                _ => return Err(unavailable()),
+            };
+            let attached = require_attached(state).map_err(|_| unavailable())?;
+            let text = attached
+                .handle
+                .project_root
+                .to_str()
+                .ok_or_else(unavailable)?;
+            let digest = crate::intel::hex_lower(&Sha256::digest(text.as_bytes()));
+            if *session_id != attached.handle.session_id
+                || *canonical_project_digest != digest
+                || request.actor_role != role
+                || request.actor_principal_digest
+                    != super::run_invocation::principal_digest(&state.principal)
+            {
+                return Err(unavailable());
+            }
+            let recovery = ctx
+                .media_storage_recovery
+                .as_ref()
+                .ok_or_else(|| internal("media storage authority is unavailable"))?;
+            let receipt = recovery
+                .finalize_media_upload(request, chrono::Utc::now().timestamp_millis())
+                .await
+                .map_err(|error| {
+                    let text = error.to_string();
+                    if text.contains("conflict") {
+                        ErrorPayload {
+                            code: ErrorCode::Conflict,
+                            message: text,
+                        }
+                    } else {
+                        internal(error)
+                    }
+                })?;
+            Ok(Response::LocalMediaMutation(receipt))
+        }
         Request::Unknown => Err(proto::unsupported_request_error(
             proto::PROTOCOL_VERSION,
             None,
@@ -2183,11 +5141,22 @@ pub(super) async fn handle_serialized_request(
     }
 }
 
-pub(super) async fn handle_concurrent_request(
+pub(super) async fn handle_concurrent_request_with_remote_operation(
     request: Request,
     shared: Arc<SharedClientState>,
     ctx: Arc<DaemonContext>,
+    remote_operation: Option<super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
+    if let Some(operation) = remote_operation {
+        tracing::debug!(
+            request_id = %operation.request_id,
+            operation_id = %operation.operation_id,
+            logical_attachment_id = %operation.logical_attachment_id,
+            authenticated_device_id = %operation.authenticated_device_id,
+            authenticated_device_generation = operation.authenticated_device_generation,
+            "dispatching admitted concurrent remote operation"
+        );
+    }
     validate_request_semantics(&request)?;
     let request_kind = principal::request_kind(&request);
     let audit_path = request_audit_path(&request);

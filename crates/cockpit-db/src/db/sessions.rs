@@ -785,6 +785,21 @@ fn btw_info_for_row_conn(conn: &Connection, row: &SessionRow) -> Result<BtwForkI
 /// without recreating session content. It is written in the caller's
 /// transaction, so a session can never be removed without one.
 pub fn delete_session_conn(conn: &Connection, session_id: Uuid) -> Result<()> {
+    // Media metadata may cascade only after owned bytes have independently
+    // reached a deletion-evidenced terminal. Starting cleanup is owned by the
+    // media storage orchestrator; this DB boundary is the final fail-closed
+    // guard for every current and future session-deletion caller.
+    let unsafe_media: i64 = conn
+        .query_row(
+            "WITH RECURSIVE subtree(session_id) AS (SELECT ?1 UNION ALL SELECT s.session_id FROM sessions s JOIN subtree p ON s.parent_session_id=p.session_id) SELECT COUNT(*) FROM media_attachments a JOIN subtree t ON t.session_id=a.session_id WHERE a.availability NOT IN ('retained_copy_deleted','borrowed_derivatives_deleted','metadata_deleted') OR EXISTS(SELECT 1 FROM media_attachment_components c WHERE c.attachment_id=a.attachment_id AND c.lifecycle_state<>'deleted')",
+            [session_id.to_string()],
+            |row| row.get(0),
+        )
+        .context("checking session media deletion barrier")?;
+    anyhow::ensure!(
+        unsafe_media == 0,
+        "session media cleanup must complete before session deletion"
+    );
     // The delete cascades to descendant forks and `/btw` rows, so every member
     // of the cascade set needs a tombstone — not just the requested root. A
     // descendant deleted without one loses the owner-visible marker for its
@@ -1361,17 +1376,19 @@ impl Db {
 
     /// Set or replace the session's title. `user_renamed` flips to true
     /// to lock out the auto-titling pass (GOALS §17d).
+    pub fn rename_session_conn(conn: &Connection, session_id: Uuid, title: &str) -> Result<()> {
+        conn.execute(
+            "UPDATE sessions SET title = ?1, user_renamed = 1 WHERE session_id = ?2",
+            params![title, session_id.to_string()],
+        )
+        .context("renaming session")?;
+        Ok(())
+    }
+
     pub async fn rename_session(&self, session_id: Uuid, title: &str) -> Result<()> {
         let title = title.to_owned();
-        self.write(move |conn| {
-            conn.execute(
-                "UPDATE sessions SET title = ?1, user_renamed = 1 WHERE session_id = ?2",
-                params![title, session_id.to_string()],
-            )
-            .context("renaming session")?;
-            Ok(())
-        })
-        .await
+        self.write(move |conn| Self::rename_session_conn(conn, session_id, &title))
+            .await
     }
 
     /// Set the title from the auto-titling pass. Refuses to overwrite a
@@ -1688,36 +1705,47 @@ impl Db {
             let tx = conn
                 .unchecked_transaction()
                 .context("begin archive_session tx")?;
-            let targets = if cascade {
-                collect_subtree(&tx, session_id)?
-            } else {
-                vec![session_id]
-            };
-            for id in targets {
-                tx.execute(
-                    "UPDATE sessions SET archived_at = ?1 WHERE session_id = ?2",
-                    params![now, id.to_string()],
-                )
-                .context("archiving session")?;
-            }
-            tx.commit().context("commit archive_session tx")?;
-            Ok(())
+            Self::archive_session_conn(&tx, session_id, cascade, now)?;
+            tx.commit().context("commit archive_session tx")
         })
         .await
+    }
+
+    pub fn archive_session_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        cascade: bool,
+        now: i64,
+    ) -> Result<()> {
+        let targets = if cascade {
+            collect_subtree(conn, session_id)?
+        } else {
+            vec![session_id]
+        };
+        for id in targets {
+            conn.execute(
+                "UPDATE sessions SET archived_at = ?1 WHERE session_id = ?2",
+                params![now, id.to_string()],
+            )
+            .context("archiving session")?;
+        }
+        Ok(())
     }
 
     /// Clear a session's archive flag (recover). Single row only — the
     /// browser unarchives one session at a time from the archived view.
     pub async fn unarchive_session(&self, session_id: Uuid) -> Result<()> {
-        self.write(move |conn| {
-            conn.execute(
-                "UPDATE sessions SET archived_at = NULL WHERE session_id = ?1",
-                [session_id.to_string()],
-            )
-            .context("unarchiving session")?;
-            Ok(())
-        })
-        .await
+        self.write(move |conn| Self::unarchive_session_conn(conn, session_id))
+            .await
+    }
+
+    pub fn unarchive_session_conn(conn: &Connection, session_id: Uuid) -> Result<()> {
+        conn.execute(
+            "UPDATE sessions SET archived_at = NULL WHERE session_id = ?1",
+            [session_id.to_string()],
+        )
+        .context("unarchiving session")?;
+        Ok(())
     }
 
     /// Count the descendant forks of a session (depth-unbounded, not
@@ -1814,6 +1842,30 @@ impl Db {
             Ok(())
         })
         .await
+    }
+
+    pub fn set_session_agent_conn(
+        conn: &rusqlite::Connection,
+        session_id: Uuid,
+        active_agent: &str,
+    ) -> Result<()> {
+        conn.execute(
+            "UPDATE sessions SET active_agent = ?1 WHERE session_id = ?2",
+            params![active_agent, session_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_session_llm_mode_conn(
+        conn: &rusqlite::Connection,
+        session_id: Uuid,
+        mode: &str,
+    ) -> Result<()> {
+        conn.execute(
+            "UPDATE sessions SET session_llm_mode = ?1 WHERE session_id = ?2",
+            params![mode, session_id.to_string()],
+        )?;
+        Ok(())
     }
 
     pub async fn set_session_llm_mode(&self, session_id: Uuid, mode: Option<&str>) -> Result<()> {

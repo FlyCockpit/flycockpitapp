@@ -278,6 +278,11 @@ pub struct SessionConfigSnapshot {
     pub generation: u64,
     pub providers: crate::config::providers::ProvidersConfig,
     pub extended: crate::config::extended::ExtendedConfig,
+    /// Turn-pinned hook registry resolved under the same workspace-trust scope
+    /// and generation as providers/extended config. A config reload affects
+    /// later turns only; no hook set changes between `preToolUse` and its
+    /// matching post event.
+    pub hooks: crate::config::extended::hooks::HookRegistry,
 }
 
 impl SessionConfigSnapshot {
@@ -290,7 +295,28 @@ impl SessionConfigSnapshot {
             generation,
             providers,
             extended,
+            hooks: crate::config::extended::hooks::HookRegistry::default(),
         }
+    }
+
+    /// Construct a snapshot with an explicit hook registry.
+    pub fn with_hooks(
+        generation: u64,
+        providers: crate::config::providers::ProvidersConfig,
+        extended: crate::config::extended::ExtendedConfig,
+        hooks: crate::config::extended::hooks::HookRegistry,
+    ) -> Self {
+        Self {
+            generation,
+            providers,
+            extended,
+            hooks,
+        }
+    }
+
+    /// The turn-pinned hook registry.
+    pub fn hooks(&self) -> &crate::config::extended::hooks::HookRegistry {
+        &self.hooks
     }
 
     pub fn to_proto(&self, session_id: Uuid) -> proto::ConfigSnapshot {
@@ -381,14 +407,17 @@ impl SessionConfigHandle {
             }),
             mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         };
-        let (providers, extended) =
+        let (providers, extended, hooks) =
             crate::config::trust::with_workspace_trust_policy(policy, || {
                 (
                     crate::config::providers::ConfigDoc::load_effective(cwd),
                     crate::config::extended::load_for_cwd(cwd),
+                    crate::config::extended::hooks::resolve_hooks_for_cwd(cwd),
                 )
             });
-        Self::detached(SessionConfigSnapshot::new(0, providers, extended))
+        Self::detached(SessionConfigSnapshot::with_hooks(
+            0, providers, extended, hooks,
+        ))
     }
 
     fn read_shared(&self) -> SessionConfigSnapshot {
@@ -499,6 +528,7 @@ pub(super) fn replace_config_snapshot(
     snapshot.generation = snapshot.generation.saturating_add(1);
     snapshot.providers = replacement.providers;
     snapshot.extended = replacement.extended;
+    snapshot.hooks = replacement.hooks;
     ReplaceConfigSnapshotResult {
         generation: snapshot.generation,
         changed: true,
@@ -535,6 +565,7 @@ fn config_snapshots_equal(
 ) -> bool {
     serialize_equal(&current.providers, &replacement.providers)
         && serialize_equal(&current.extended, &replacement.extended)
+        && current.hooks == replacement.hooks
 }
 
 fn serialize_equal<T: serde::Serialize>(left: &T, right: &T) -> bool {
@@ -1332,6 +1363,44 @@ pub enum UserMessageProbeResult {
     Conflict,
 }
 
+#[derive(Debug, Clone)]
+pub struct RemoteQueueOperation {
+    pub logical_attachment_id: String,
+    pub operation_id: String,
+    pub authenticated_device_id: String,
+    pub authenticated_device_generation: u64,
+    pub request_hash: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteQueueMutationReceiptV1 {
+    pub schema_version: u8,
+    pub applied: bool,
+    pub reason: proto::RemoveQueuedUserMessageReason,
+    pub removed_count: u32,
+}
+
+impl RemoteQueueMutationReceiptV1 {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.schema_version == 1, "unsupported queue receipt schema");
+        anyhow::ensure!(
+            self.removed_count <= 10_000,
+            "queue receipt removed_count exceeds bound"
+        );
+        let removed = matches!(self.reason, proto::RemoveQueuedUserMessageReason::Removed);
+        anyhow::ensure!(
+            self.applied == removed,
+            "queue receipt applied/reason mismatch"
+        );
+        anyhow::ensure!(
+            removed == (self.removed_count > 0),
+            "queue receipt count mismatch"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub enum SessionWork {
     WakeGoal,
@@ -1363,18 +1432,21 @@ pub enum SessionWork {
     },
     RemoveQueuedUserMessage {
         queue_item_id: Uuid,
+        remote_operation: Option<RemoteQueueOperation>,
         respond_to: oneshot::Sender<
             std::result::Result<proto::RemoveQueuedUserMessageResult, proto::ErrorPayload>,
         >,
     },
     RemoveNewestQueuedUserMessage {
         target_id: Option<String>,
+        remote_operation: Option<RemoteQueueOperation>,
         respond_to: oneshot::Sender<
             std::result::Result<proto::RemoveQueuedUserMessageResult, proto::ErrorPayload>,
         >,
     },
     RemoveEditableQueuedUserMessages {
         target_id: Option<String>,
+        remote_operation: Option<RemoteQueueOperation>,
         respond_to: oneshot::Sender<
             std::result::Result<proto::RemoveQueuedUserMessagesResult, proto::ErrorPayload>,
         >,

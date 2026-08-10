@@ -285,17 +285,22 @@ fn settings_pointer_links_and_capture_transitions_are_safe() {
         ),
         crate::tui::links::LinkGestureOutcome::Consumed
     );
-    assert_eq!(
-        gesture.handle(
-            MouseEventKind::Up(MouseButton::Left),
-            2,
-            3,
-            Some("https://example.test"),
-            1,
-            now + Duration::from_millis(500)
-        ),
-        crate::tui::links::LinkGestureOutcome::Activate("https://example.test".into())
+    // Release now schedules activation (delayed through the multi-click
+    // window) rather than activating synchronously.
+    let outcome = gesture.handle(
+        MouseEventKind::Up(MouseButton::Left),
+        2,
+        3,
+        Some("https://example.test"),
+        1,
+        now + Duration::from_millis(500),
     );
+    let pa = match outcome {
+        crate::tui::links::LinkGestureOutcome::ScheduleActivation(pa) => pa,
+        other => panic!("expected ScheduleActivation, got {other:?}"),
+    };
+    assert_eq!(pa.url, "https://example.test");
+    // A second release without a new press is unhandled.
     assert_eq!(
         gesture.handle(
             MouseEventKind::Up(MouseButton::Left),

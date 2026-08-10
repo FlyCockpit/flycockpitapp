@@ -13,6 +13,20 @@ pub enum Response {
     /// `CancelTurn`, `ResolveInterrupt`, …).
     Ack,
 
+    MediaOwnerRecovery(cockpit_db::media_attachments::LocalMediaOwnerReceiptV1),
+
+    LocalPathMediaRegistration(cockpit_db::media_attachments::LocalPathRegistrationReceiptV1),
+
+    RetainedHttpsMedia(cockpit_db::media_attachments::RetainedHttpsMediaReceiptV1),
+
+    MediaAttachmentStatus(cockpit_db::media_attachments::MediaAttachmentStatusV1),
+
+    MediaAttachmentPreview(cockpit_db::media_attachments::MediaAttachmentPreviewV1),
+
+    LocalMediaMutation(cockpit_db::media_attachments::LocalMediaMutationReceiptV1),
+
+    MediaUploadStatus(cockpit_db::media_attachments::MediaUploadStatusV1),
+
     /// Terminal proof that an explicit config refresh was adopted.
     ConfigRefreshed {
         applied_generation: u64,
@@ -52,9 +66,8 @@ pub enum Response {
         image_ref: ImageAttachmentRef,
     },
 
-    TerminalPasteImage {
-        terminal_id: Uuid,
-        path: String,
+    TerminalIngress {
+        receipt: crate::terminal::TerminalIngressReceipt,
     },
 
     /// Result of [`Request::RemoveQueuedUserMessage`].
@@ -168,6 +181,11 @@ pub enum Response {
 
     GoalUpdated {
         goal: GoalSummary,
+    },
+
+    /// Deterministic secret-free terminal projection for remote goal mutations.
+    RemoteGoalOutcome {
+        outcome: RemoteGoalOutcomeV1,
     },
 
     GoalCleared {
@@ -381,6 +399,8 @@ pub enum Response {
         terminal_id: Uuid,
         viewer_count: usize,
         recording: bool,
+        binding: crate::terminal::TerminalBinding,
+        terminal_generation: u64,
     },
 
     LspControlResult {
@@ -504,6 +524,9 @@ pub enum Response {
     RunInvocationStatus {
         status: RunInvocationStatusV1,
     },
+    RemoteOperationStatus {
+        status: Option<RemoteOperationStatusV1>,
+    },
 
     /// Idempotent cancel result ([`Request::CancelRunInvocation`]).
     RunInvocationCancelResult {
@@ -532,6 +555,7 @@ pub enum ClientSubmissionReceiptStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunInvocationLifecycleState {
+    NotFound,
     Accepted,
     Queued,
     Dispatching,
@@ -550,6 +574,7 @@ pub enum RunInvocationLifecycleState {
 impl RunInvocationLifecycleState {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::NotFound => "not_found",
             Self::Accepted => "accepted",
             Self::Queued => "queued",
             Self::Dispatching => "dispatching",
@@ -662,6 +687,8 @@ pub enum RunInvocationCancelOutcome {
     CancellationRequested,
     AlreadyCancelled,
     AlreadyTerminal,
+    /// The authoritative lookup installed or observed a durable tombstone.
+    NotFound,
 }
 
 impl RunInvocationCancelOutcome {
@@ -670,8 +697,38 @@ impl RunInvocationCancelOutcome {
             Self::CancellationRequested => "cancellation_requested",
             Self::AlreadyCancelled => "already_cancelled",
             Self::AlreadyTerminal => "already_terminal",
+            Self::NotFound => "not_found",
         }
     }
+}
+
+/// Versioned, content-free response for a remote goal mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteGoalOutcomeV1 {
+    pub schema_version: u8,
+    pub session_id: Uuid,
+    pub goal_id: Uuid,
+    pub attempt_generation: i64,
+    pub disposition: GoalDisposition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteOperationStatusV1 {
+    pub schema_version: u8,
+    pub operation_id: Uuid,
+    pub state: RemoteOperationStateV1,
+    pub operation_seq: crate::remote_protocol_id::CanonicalU64DecimalStringV1,
+    pub safe_response: Option<Vec<u8>>,
+    pub event_high_water_mark: Option<crate::remote_protocol_id::CanonicalU64DecimalStringV1>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteOperationStateV1 {
+    Reserved,
+    Committed,
+    Rejected,
+    OutcomeUnknown,
 }
 
 /// Versioned, content-free cancel response for a run invocation.
@@ -692,6 +749,13 @@ macro_rules! response_variants {
     ($with_variants:ident $(, $context:ident)*) => {
         $with_variants! { ($($context),*) [
             (Response::Ack, "ack");
+            (Response::MediaOwnerRecovery(..), "media_owner_recovery");
+            (Response::LocalPathMediaRegistration(..), "local_path_media_registration");
+            (Response::RetainedHttpsMedia(..), "retained_https_media");
+            (Response::MediaAttachmentStatus(..), "media_attachment_status");
+            (Response::MediaAttachmentPreview(..), "media_attachment_preview");
+            (Response::LocalMediaMutation(..), "local_media_mutation");
+            (Response::MediaUploadStatus(..), "media_upload_status");
             (Response::ConfigRefreshed { .. }, "config_refreshed");
             (Response::RestartDecision { .. }, "restart_decision");
             (Response::UserMessageQueued { .. }, "user_message_queued");
@@ -699,7 +763,7 @@ macro_rules! response_variants {
             (Response::AttachmentUploadStarted { .. }, "attachment_upload_started");
             (Response::AttachmentChunkAccepted { .. }, "attachment_chunk_accepted");
             (Response::AttachmentUploaded { .. }, "attachment_uploaded");
-            (Response::TerminalPasteImage { .. }, "terminal_paste_image");
+            (Response::TerminalIngress { .. }, "terminal_ingress");
             (Response::RemoveQueuedUserMessageResult { .. }, "remove_queued_user_message_result");
             (Response::RemoveQueuedUserMessagesResult { .. }, "remove_queued_user_messages_result");
             (Response::Attached { .. }, "attached");
@@ -712,6 +776,7 @@ macro_rules! response_variants {
             (Response::NoteRecorded { .. }, "note_recorded");
             (Response::GoalStatus { .. }, "goal_status");
             (Response::GoalUpdated { .. }, "goal_updated");
+            (Response::RemoteGoalOutcome { .. }, "remote_goal_outcome");
             (Response::GoalCleared { .. }, "goal_cleared");
             (Response::PinChanged { .. }, "pin_changed");
             (Response::PinToggled { .. }, "pin_toggled");
@@ -769,6 +834,7 @@ macro_rules! response_variants {
             (Response::CaffeinateState { .. }, "caffeinate_state");
             (Response::PausedWork { .. }, "paused_work");
             (Response::RunInvocationStatus { .. }, "run_invocation_status");
+            (Response::RemoteOperationStatus { .. }, "remote_operation_status");
             (Response::RunInvocationCancelResult { .. }, "run_invocation_cancel_result");
             (Response::Unknown, "__unknown");
         ] }

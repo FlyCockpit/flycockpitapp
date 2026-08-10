@@ -661,13 +661,10 @@ impl Db {
     /// Store the full assembled (post-redaction) request body for one
     /// inference call with its lifecycle `status`. `call_id` must match the
     /// `inference_calls` row's `call_id` so the export can join usage onto the
-    /// payload. Uses `INSERT OR REPLACE` so the dispatch-time write
-    /// (status `pending`) and the terminal update (status
-    /// `completed`/`errored`/`timed_out`/`cancelled`) for the same `call_id`
-    /// land on one row — the terminal write supersedes the pending one
-    /// (implementation note). The
-    /// dispatch `ts_ms` is preserved across the update via `COALESCE` so the
-    /// recorded timestamp is when the request went out, not when it settled.
+    /// payload. The conflict update enforces monotonic precedence: pending
+    /// can advance to any terminal status, completed wins over other terminal
+    /// observations, and no terminal row can regress to pending. The original
+    /// dispatch timestamp is retained on conflict.
     pub async fn insert_inference_request(
         &self,
         call_id: &str,
@@ -697,9 +694,21 @@ impl Db {
                 "INSERT INTO inference_requests
                    (call_id, session_id, ts_ms, payload_json, status, goal_id, goal_attempt_generation)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(call_id) DO UPDATE SET
-                   payload_json = excluded.payload_json,
-                   status       = excluded.status",
+             ON CONFLICT(call_id) DO UPDATE SET
+               payload_json = CASE
+                 WHEN inference_requests.status = 'completed'
+                   OR excluded.status = 'pending' THEN inference_requests.payload_json
+                 WHEN inference_requests.status = 'pending'
+                   OR excluded.status = 'completed' THEN excluded.payload_json
+                 ELSE inference_requests.payload_json
+               END,
+               status = CASE
+                 WHEN inference_requests.status = 'completed'
+                   OR excluded.status = 'pending' THEN inference_requests.status
+                 WHEN inference_requests.status = 'pending'
+                   OR excluded.status = 'completed' THEN excluded.status
+                 ELSE inference_requests.status
+               END",
                 params![
                     call_id,
                     session_id.to_string(),
@@ -908,63 +917,67 @@ impl Db {
         if receipts.is_empty() {
             return Ok(());
         }
-        self.write(move |conn| {
-            let tx = conn
-                .unchecked_transaction()
-                .context("begin terminal client submission receipt tx")?;
-            for receipt in receipts {
-                let id = receipt.client_submission_id.to_string();
-                let disposition = receipt.disposition.as_str();
-                let inserted = tx
-                    .execute(
-                        "INSERT OR IGNORE INTO client_submission_terminal_receipts
+        self.transaction(move |conn| {
+            Self::insert_client_submission_terminal_receipts_conn(conn, session_id, &receipts)
+        })
+        .await
+    }
+
+    pub fn insert_client_submission_terminal_receipts_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        receipts: &[ClientSubmissionTerminalReceipt],
+    ) -> Result<()> {
+        for receipt in receipts {
+            let id = receipt.client_submission_id.to_string();
+            let disposition = receipt.disposition.as_str();
+            let inserted = conn
+                .execute(
+                    "INSERT OR IGNORE INTO client_submission_terminal_receipts
                          (session_id, client_submission_id, fingerprint, wire_fingerprint,
                           origin_principal, disposition, created_at_ms)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                        params![
-                            session_id.to_string(),
-                            id,
-                            receipt.fingerprint,
-                            receipt.wire_fingerprint,
-                            receipt.origin_principal,
-                            disposition,
-                            now_ms(),
-                        ],
-                    )
-                    .context("inserting terminal client submission receipt")?;
-                if inserted == 0 {
-                    let existing = tx
-                        .query_row(
-                            "SELECT fingerprint, wire_fingerprint, origin_principal, disposition
+                    params![
+                        session_id.to_string(),
+                        id,
+                        &receipt.fingerprint,
+                        &receipt.wire_fingerprint,
+                        receipt.origin_principal.as_deref(),
+                        disposition,
+                        now_ms(),
+                    ],
+                )
+                .context("inserting terminal client submission receipt")?;
+            if inserted == 0 {
+                let existing = conn
+                    .query_row(
+                        "SELECT fingerprint, wire_fingerprint, origin_principal, disposition
                                FROM client_submission_terminal_receipts
                               WHERE session_id = ?1 AND client_submission_id = ?2",
-                            params![session_id.to_string(), id],
-                            |row| {
-                                Ok((
-                                    row.get::<_, String>(0)?,
-                                    row.get::<_, String>(1)?,
-                                    row.get::<_, Option<String>>(2)?,
-                                    row.get::<_, String>(3)?,
-                                ))
-                            },
-                        )
-                        .context("reading existing terminal client submission receipt")?;
-                    if existing.0 != receipt.fingerprint
-                        || existing.1 != receipt.wire_fingerprint
-                        || existing.2 != receipt.origin_principal
-                        || existing.3 != disposition
-                    {
-                        bail!(
-                            "client submission {} already has a different terminal receipt",
-                            receipt.client_submission_id
-                        );
-                    }
+                        params![session_id.to_string(), id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                                row.get::<_, String>(3)?,
+                            ))
+                        },
+                    )
+                    .context("reading existing terminal client submission receipt")?;
+                if existing.0 != receipt.fingerprint
+                    || existing.1 != receipt.wire_fingerprint
+                    || existing.2.as_ref() != receipt.origin_principal.as_ref()
+                    || existing.3 != disposition
+                {
+                    bail!(
+                        "client submission {} already has a different terminal receipt",
+                        receipt.client_submission_id
+                    );
                 }
             }
-            tx.commit()
-                .context("commit terminal client submission receipt tx")
-        })
-        .await
+        }
+        Ok(())
     }
 
     pub async fn client_submission_terminal_receipt(
@@ -2250,6 +2263,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn inference_status_precedence() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
+        let call_id = Uuid::new_v4().to_string();
+        let terminal = json!({ "phase": "terminal" });
+        db.insert_inference_request(
+            &call_id,
+            session.session_id,
+            &terminal,
+            InferenceRequestStatus::Completed,
+        )
+        .await
+        .unwrap();
+
+        let late_pending = json!({ "phase": "late-pending" });
+        db.insert_inference_request(
+            &call_id,
+            session.session_id,
+            &late_pending,
+            InferenceRequestStatus::Pending,
+        )
+        .await
+        .unwrap();
+        db.insert_inference_request(
+            &call_id,
+            session.session_id,
+            &json!({ "phase": "duplicate-terminal" }),
+            InferenceRequestStatus::Errored,
+        )
+        .await
+        .unwrap();
+
+        let (payload, status) = db.get_inference_request(&call_id).await.unwrap().unwrap();
+        assert_eq!(status, "completed");
+        assert_eq!(payload, terminal);
+
+        let failover_call_id = Uuid::new_v4().to_string();
+        db.insert_inference_request(
+            &failover_call_id,
+            session.session_id,
+            &json!({ "attempt": "primary" }),
+            InferenceRequestStatus::Errored,
+        )
+        .await
+        .unwrap();
+        let backup = json!({ "attempt": "backup" });
+        db.insert_inference_request(
+            &failover_call_id,
+            session.session_id,
+            &backup,
+            InferenceRequestStatus::Completed,
+        )
+        .await
+        .unwrap();
+        let (payload, status) = db
+            .get_inference_request(&failover_call_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, "completed");
+        assert_eq!(payload, backup);
     }
 
     #[tokio::test]

@@ -470,7 +470,7 @@ mod tests;
 use self::helpers::queue_target_to_proto;
 
 pub use handle::{
-    InteractiveClientGuard, ReplaceConfigSnapshotResult, SessionConfigHandle,
+    InteractiveClientGuard, RemoteQueueOperation, ReplaceConfigSnapshotResult, SessionConfigHandle,
     SessionConfigSnapshot, SessionWork, SessionWorkerHandle, TurnOutcome, UserMessageProbeResult,
     spawn,
 };

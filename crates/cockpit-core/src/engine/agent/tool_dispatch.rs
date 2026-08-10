@@ -21,6 +21,10 @@ pub(crate) struct DispatchEnv<'a> {
     pub(crate) hint_corrections: bool,
     pub(crate) loop_guard_threshold: u32,
     pub(crate) cwd: &'a std::path::Path,
+    /// Turn-pinned hook registry. Resolved once from the config snapshot and
+    /// immutable for the turn. A config reload affects later turns only; no
+    /// hook set changes between `preToolUse` and its matching post event.
+    pub(crate) hooks: &'a crate::config::extended::hooks::HookRegistry,
 }
 /// The authorization portion of ordinary dispatch, reused by Monty's builtin
 /// adapter. Monty is a transport, not a second tool-execution authority: a
@@ -499,6 +503,11 @@ pub(crate) async fn execute_ordinary_call(
     }
     let gate_blocked = gate_block.is_some();
     let repeated_recoverable_tool_call_reject = repeated_recoverable_tool_call.is_some();
+    // Track whether a real tool execution actually occurred. Existing
+    // gate/sandbox/approval refusals, schema-validation failures, loop-guard
+    // rejections, and placeholder blocks are NOT executions and fire no post
+    // hook. Only the `dispatch_one_timed` path is a real execution.
+    let mut tool_was_dispatched = false;
     let (result, duration_ms) = if let Some(err) = placeholder_block {
         (Err(err), 0)
     } else if let Some(msg) = repeated_recoverable_tool_call.clone() {
@@ -569,6 +578,33 @@ pub(crate) async fn execute_ordinary_call(
             },
             gate: gate_memo,
         };
+        // Pre-tool hook gate: runs after name/argument/path repair and after
+        // existing loop/safety/review/btw decisions permit dispatch, but
+        // before `dispatch_one_timed`. A hook can deny only by printing valid
+        // JSON `{"decision":"deny","reason":"..."}` to stdout. The first
+        // explicit deny short-circuits later pre hooks and the tool is not
+        // executed. Pre-hook failures are fail-open.
+        let pre_hook_decision = super::hooks::run_pre_tool_hooks(
+            env.hooks,
+            resolved_name,
+            &args,
+            &tc.id,
+            env.session.id,
+            env.cwd,
+            &env.session.db,
+        )
+        .await;
+        if let super::hooks::PreHookOutcome::Deny { reason } = &pre_hook_decision {
+            // The deny is already recorded by `run_pre_tool_hooks` via
+            // `record_hook_run`. Return the deterministic model-visible
+            // rejected-tool diagnostic; the tool is never executed and no
+            // post hook fires.
+            return Err(invalid_input(reason.clone()));
+        }
+        // A real tool execution is about to occur: the pre-hook gate allowed
+        // it and `dispatch_one_timed` will run. Post hooks fire only after a
+        // real execution (success or failure).
+        tool_was_dispatched = true;
         crate::engine::interrupt::with_interrupt_park_payload(payload, async {
             dispatch_one_timed(
                 env.active_tools,
@@ -605,6 +641,32 @@ pub(crate) async fn execute_ordinary_call(
     // result-assembly site reads it. Non-tip tools record nothing.
     if result.is_ok() && crate::tools::shell_compress::tip_adopted_by(resolved_name).is_some() {
         env.session.record_tip_tool_used(resolved_name);
+    }
+
+    // Post-tool hooks: run once after a successful real tool execution
+    // (`postToolUse`) or after a real tool execution that returns an error
+    // (`postToolUseFailure`). Existing gate/sandbox/approval refusals are not
+    // executions and fire no post hook. Rejected/parked calls produce no post
+    // event (the pre-hook deny and park paths already returned above; schema
+    // failures and gate rejections set `tool_was_dispatched = false`).
+    if tool_was_dispatched {
+        let post_event = if result.is_ok() {
+            crate::config::extended::hooks::HookEvent::PostToolUse
+        } else {
+            crate::config::extended::hooks::HookEvent::PostToolUseFailure
+        };
+        super::hooks::run_post_tool_hooks(
+            env.hooks,
+            post_event,
+            resolved_name,
+            &args,
+            &tc.id,
+            &result,
+            env.session.id,
+            env.cwd,
+            &env.session.db,
+        )
+        .await;
     }
 
     // Canonical-form history rewrite. Two layers can feed the model's
@@ -2013,6 +2075,7 @@ mod tests {
             tx: &tx,
             hint_corrections: false,
             loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
             cwd: tmp.path(),
         };
         let call = tool_call("echo", serde_json::json!({ "text": "should not run" }));
@@ -2050,6 +2113,7 @@ mod tests {
             tx: &tx,
             hint_corrections: false,
             loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
             cwd: tmp.path(),
         };
         let call = tool_call("number", serde_json::json!({ "count": "[redacted]" }));
@@ -2108,6 +2172,7 @@ mod tests {
             tx: &tx,
             hint_corrections: false,
             loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
             cwd: tmp.path(),
         };
         let call = tool_call("bash", serde_json::json!({ "command": "cat [redacted]" }));
@@ -2177,6 +2242,7 @@ mod tests {
             tx: &tx,
             hint_corrections: false,
             loop_guard_threshold: 1,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
             cwd: tmp.path(),
         };
         let call = tool_call("echo", serde_json::json!({ "text": "[redacted]" }));
@@ -2226,6 +2292,7 @@ mod tests {
             tx: &tx,
             hint_corrections: false,
             loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
             cwd: tmp.path(),
         };
         let call = tool_call("echo", serde_json::json!({ "text": "[redacted]" }));
@@ -2272,6 +2339,7 @@ mod tests {
             tx: &tx,
             hint_corrections: false,
             loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
             cwd: tmp.path(),
         };
         let call = tool_call("echo", serde_json::json!({ "text": "hello" }));
@@ -2322,6 +2390,7 @@ mod tests {
             tx: &tx,
             hint_corrections: false,
             loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
             cwd: tmp.path(),
         };
         let call = tool_call("dynamic_tool", serde_json::json!({ "text": "blocked" }));
@@ -2375,6 +2444,7 @@ mod tests {
             tx: &tx,
             hint_corrections: false,
             loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
             cwd: tmp.path(),
         };
         let call = tool_call("readonly_echo", serde_json::json!({ "text": "allowed" }));
@@ -2421,6 +2491,7 @@ mod tests {
             tx: &tx,
             hint_corrections: false,
             loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
             cwd: tmp.path(),
         };
         let call = tool_call("graph", serde_json::json!({ "kind": "recent", "limit": 1 }));
@@ -2460,6 +2531,7 @@ mod tests {
             tx: &tx,
             hint_corrections: false,
             loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
             cwd: tmp.path(),
         };
         let call = tool_call("dynamic_tool", serde_json::json!({ "text": "blocked" }));
@@ -2504,6 +2576,7 @@ mod tests {
             tx: &tx,
             hint_corrections: false,
             loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
             cwd: tmp.path(),
         };
         let call = tool_call(
@@ -2556,6 +2629,7 @@ mod tests {
             tx: &tx,
             hint_corrections: false,
             loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
             cwd: tmp.path(),
         };
         let call = tool_call("interrupt_wait", serde_json::json!({}));
@@ -2650,6 +2724,7 @@ mod tests {
             tx: &tx,
             hint_corrections: false,
             loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
             cwd: tmp.path(),
         };
         let call = tool_call(
@@ -2740,6 +2815,7 @@ mod tests {
             tx: &tx,
             hint_corrections: false,
             loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
             cwd: tmp.path(),
         };
         let call = tool_call("bash", serde_json::json!({ "command": "echo inner" }));
@@ -2791,6 +2867,7 @@ mod tests {
             tx: &tx,
             hint_corrections: false,
             loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
             cwd: tmp.path(),
         };
         let call = tool_call("missing", serde_json::json!({}));
@@ -2849,6 +2926,7 @@ mod tests {
             tx: &tx,
             hint_corrections: false,
             loop_guard_threshold: 1,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
             cwd: tmp.path(),
         };
         let call = tool_call("echo", serde_json::json!({ "text": "again" }));
@@ -2914,6 +2992,7 @@ mod tests {
             tx: &tx,
             hint_corrections: false,
             loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
             cwd: tmp.path(),
         };
         let call = tool_call(
@@ -2996,6 +3075,7 @@ mod tests {
             tx: &tx,
             hint_corrections: false,
             loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
             cwd: tmp.path(),
         };
         let call = tool_call("bash", serde_json::json!({ "command": "gh pr create" }));
@@ -3040,6 +3120,7 @@ mod tests {
             tx: &tx,
             hint_corrections: false,
             loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
             cwd: tmp.path(),
         };
         let call = tool_call(
@@ -3084,6 +3165,7 @@ mod tests {
             tx: &tx,
             hint_corrections: true,
             loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
             cwd: tmp.path(),
         };
         let call = tool_call("echo", serde_json::json!({ "message": "hello" }));
@@ -3138,6 +3220,7 @@ mod tests {
             tx: &tx,
             hint_corrections: false,
             loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
             cwd: tmp.path(),
         };
         let call = tool_call("fail", serde_json::json!({}));
@@ -3184,6 +3267,7 @@ mod tests {
             tx: &tx,
             hint_corrections: false,
             loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
             cwd: tmp.path(),
         };
         let call = tool_call("big", serde_json::json!({}));
@@ -3231,6 +3315,7 @@ mod tests {
             tx: &tx,
             hint_corrections: false,
             loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
             cwd: tmp.path(),
         };
         let call = tool_call("big", serde_json::json!({}));
@@ -3272,6 +3357,7 @@ mod tests {
             tx: &tx,
             hint_corrections: false,
             loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
             cwd: tmp.path(),
         };
         let call = tool_call("bash", serde_json::json!({ "command": "synthetic" }));
@@ -3320,6 +3406,7 @@ mod tests {
             tx: &tx,
             hint_corrections: false,
             loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
             cwd: tmp.path(),
         };
         let call = tool_call(tool_name, serde_json::json!({}));
@@ -3379,6 +3466,7 @@ mod tests {
             tx: &tx,
             hint_corrections: false,
             loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
             cwd: tmp.path(),
         };
         let call = tool_call("big_partial", serde_json::json!({}));
@@ -3425,6 +3513,7 @@ mod tests {
             tx: &tx,
             hint_corrections: false,
             loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
             cwd: tmp.path(),
         };
         let call = tool_call("big", serde_json::json!({}));

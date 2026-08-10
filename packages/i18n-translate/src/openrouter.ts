@@ -6,27 +6,40 @@ import type { TranslateInput, TranslateResult, TranslationProvider } from "./typ
 const DEFAULT_MODEL = "anthropic/claude-haiku-4-5";
 const MAX_OUTPUT_TOKENS = 8192;
 
+export interface OpenRouterAttributionOptions {
+  httpReferer?: string | null;
+  title?: string | null;
+}
+
+export function openRouterAttributionHeaders(
+  options: OpenRouterAttributionOptions = {},
+): Record<string, string> {
+  const headers: Record<string, string> = {};
+  const title = options.title === undefined ? "FlyCockpit Translation" : options.title;
+  if (title) headers["X-OpenRouter-Title"] = title;
+
+  let referer: string | null | undefined;
+  if (options.httpReferer !== undefined) {
+    referer = options.httpReferer;
+  } else if (env.PUBLIC_APP_URL !== undefined) {
+    referer = env.PUBLIC_APP_URL;
+  } else if (Object.hasOwn(process.env, "BETTER_AUTH_URL")) {
+    referer = process.env.BETTER_AUTH_URL;
+  } else {
+    referer = "https://flycockpit.dev";
+  }
+  if (referer) headers["HTTP-Referer"] = referer;
+  return headers;
+}
+
 export class OpenRouterProvider implements TranslationProvider {
   private readonly client: OpenAI;
 
-  constructor(apiKey: string) {
-    const defaultHeaders: Record<string, string> = {
-      "X-Title": "Flycockpit Translation",
-    };
-    // OpenRouter uses HTTP-Referer purely to attribute traffic on its
-    // leaderboard — it is optional metadata, not functional. PUBLIC_APP_URL is
-    // the stable public origin; fall back to the raw BETTER_AUTH_URL from
-    // process.env (set in the server process, absent in the worker — the
-    // header is simply omitted there). Both are read off process.env directly
-    // so this provider stays in the worker-safe env graph and never forces a
-    // worker deployment to set BETTER_AUTH_URL.
-    const referer = env.PUBLIC_APP_URL ?? process.env.BETTER_AUTH_URL;
-    if (referer) defaultHeaders["HTTP-Referer"] = referer;
-
+  constructor(apiKey: string, attribution: OpenRouterAttributionOptions = {}) {
     this.client = new OpenAI({
       apiKey,
       baseURL: "https://openrouter.ai/api/v1",
-      defaultHeaders,
+      defaultHeaders: openRouterAttributionHeaders(attribution),
     });
   }
 

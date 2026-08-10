@@ -125,17 +125,26 @@ impl Db {
     ) -> Result<bool> {
         let now = Utc::now().timestamp();
         self.write(move |conn| {
-            let changed = conn
-                .execute(
-                    "UPDATE paused_session_work
-                        SET status = ?2, updated_at = ?3, resolved_at = ?3
-                      WHERE session_id = ?1 AND status = 'paused'",
-                    params![session_id.to_string(), status.as_str(), now],
-                )
-                .context("resolving paused session work")?;
-            Ok(changed > 0)
+            Self::resolve_paused_session_work_conn(conn, session_id, status, now)
         })
         .await
+    }
+
+    pub fn resolve_paused_session_work_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        status: PausedWorkStatus,
+        now: i64,
+    ) -> Result<bool> {
+        let changed = conn
+            .execute(
+                "UPDATE paused_session_work
+                        SET status = ?2, updated_at = ?3, resolved_at = ?3
+                      WHERE session_id = ?1 AND status = 'paused'",
+                params![session_id.to_string(), status.as_str(), now],
+            )
+            .context("resolving paused session work")?;
+        Ok(changed > 0)
     }
 
     #[allow(dead_code)]

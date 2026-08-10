@@ -69,7 +69,7 @@ async fn upload_one_image(
         client,
         Request::BeginAttachmentUpload {
             mime: proto::IMAGE_ATTACHMENT_MIME_PNG.to_string(),
-            byte_len: png.len(),
+            byte_len: png.len() as u64,
             sha256,
             purpose: proto::AttachmentPurpose::UserMessageImage,
         },
@@ -116,7 +116,7 @@ async fn upload_one_image_chunks(
             client,
             Request::UploadAttachmentChunk {
                 upload_id,
-                offset,
+                offset: offset as u64,
                 data_base64,
             },
         )

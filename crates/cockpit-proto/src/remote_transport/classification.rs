@@ -508,6 +508,26 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
+        "terminal_ingress_begin",
+        RemoteMessageClass::TerminalIo,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "terminal_ingress_chunk",
+        RemoteMessageClass::TerminalIo,
+        RemoteInlinePayloadBound::StreamChunked,
+    ),
+    row(
+        "terminal_ingress_finish",
+        RemoteMessageClass::TerminalIo,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "terminal_ingress_status",
+        RemoteMessageClass::TerminalIo,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
         "lsp_control",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
@@ -797,6 +817,91 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteMessageClass::Liveness,
         RemoteInlinePayloadBound::Bounded,
     ),
+    row(
+        "operation_status",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "set_workspace_trust",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "get_startup_disclosures",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "get_app_flag",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "mark_app_flag_seen",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "resolve_assistant_session",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "recover_security_blocked_media",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "register_local_path_media",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "retain_https_media",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "get_media_attachment_status",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "get_media_attachment_preview",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "begin_media_upload",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "append_media_upload_chunk",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::TruncatedByCap,
+    ),
+    row(
+        "cancel_media_upload",
+        RemoteMessageClass::Cancel,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "discard_unreferenced_media_attachment",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "get_media_upload_status",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "finalize_media_upload",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
 ];
 
 /// Every `Response` variant.
@@ -842,7 +947,7 @@ pub const RESPONSE_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
-        "terminal_paste_image",
+        "terminal_ingress",
         RemoteMessageClass::TerminalIo,
         RemoteInlinePayloadBound::Bounded,
     ),
@@ -1169,6 +1274,76 @@ pub const RESPONSE_CLASSIFICATION: &[RemoteMessageClassification] = &[
     row(
         "run_invocation_cancel_result",
         RemoteMessageClass::Cancel,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "remote_operation_status",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "workspace_trust_set",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "startup_disclosures",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "app_flag",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "app_flag_seen",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "assistant_session_resolved",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "remote_goal_outcome",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "local_media_mutation",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "local_path_media_registration",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "media_owner_recovery",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "retained_https_media",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "media_attachment_status",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "media_attachment_preview",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "media_upload_status",
+        RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
 ];
@@ -1580,6 +1755,7 @@ pub const OVERSIZED_MESSAGE_INVENTORY: &[(RemoteMessageKind, &str)] = &[
     (RemoteMessageKind::Request, "set_goal_settings_override"),
     (RemoteMessageKind::Request, "pin"),
     (RemoteMessageKind::Request, "refresh_env"),
+    (RemoteMessageKind::Request, "append_media_upload_chunk"),
     (RemoteMessageKind::Response, "user_message_queued"),
     (
         RemoteMessageKind::Response,
@@ -1774,8 +1950,8 @@ mod tests {
         }
 
         // Exact table sizes, so a silent shrink is caught.
-        assert_eq!(REQUEST_CLASSIFICATION.len(), 116);
-        assert_eq!(RESPONSE_CLASSIFICATION.len(), 74);
+        assert_eq!(REQUEST_CLASSIFICATION.len(), 137);
+        assert_eq!(RESPONSE_CLASSIFICATION.len(), 88);
         assert_eq!(EVENT_CLASSIFICATION.len(), 76);
     }
 
@@ -1831,7 +2007,7 @@ mod tests {
         // The committed >512 KiB inventory is non-trivial and every member has
         // an explicit disposition other than `Bounded`.
         assert!(!OVERSIZED_MESSAGE_INVENTORY.is_empty());
-        assert_eq!(OVERSIZED_MESSAGE_INVENTORY.len(), 66);
+        assert_eq!(OVERSIZED_MESSAGE_INVENTORY.len(), 67);
 
         for (kind, tag) in OVERSIZED_MESSAGE_INVENTORY {
             let row = classify(*kind, tag).unwrap_or_else(|_| {
@@ -1917,6 +2093,10 @@ mod tests {
             "terminal_input",
             "terminal_resize",
             "close_terminal",
+            "terminal_ingress_begin",
+            "terminal_ingress_chunk",
+            "terminal_ingress_finish",
+            "terminal_ingress_status",
         ];
         for tag in terminal_requests {
             let row = classify_request_tag(tag).unwrap();

@@ -23,24 +23,10 @@ pub(super) fn prune_expired_attachments(state: &mut MutableClientState) -> Prune
         .filter_map(|upload| upload.media_reservation)
         .collect();
     release_uploads(&state.upload_accounting, expired);
-    let expired_ready: Vec<_> = state
-        .ready_attachments
-        .iter()
-        .filter_map(|(id, attachment)| {
-            (now.duration_since(attachment.created_at) > ttl).then_some(*id)
-        })
-        .collect();
-    let destroyed: Vec<_> = expired_ready
-        .into_iter()
-        .filter_map(|id| state.ready_attachments.remove(&id))
-        .filter_map(|attachment| attachment.media_reservation)
-        .collect();
-    // This cache is not authoritative ownership: the session actor already
-    // received an image clone. Cache TTL must not release that actor-owned
-    // durable reservation.
-    crate::sync::lock_or_recover(&state.upload_accounting)
-        .consumed_message_attachments
-        .retain(|_, consumed| now.duration_since(consumed.consumed_at) <= ttl);
+    // Published attachments are not pending uploads and never inherit the
+    // legacy 600-second transport TTL. Durable draft/session retention owns
+    // their cleanup after publication.
+    let destroyed = Vec::new();
     PrunedMediaReservations {
         cancelled,
         destroyed,
@@ -50,7 +36,7 @@ pub(super) fn prune_expired_attachments(state: &mut MutableClientState) -> Prune
 pub(super) async fn drain_client_attachment_ownership(
     state: &mut MutableClientState,
     ctx: &DaemonContext,
-    reason: &str,
+    _reason: &str,
 ) -> std::result::Result<(), ErrorPayload> {
     let pending: Vec<_> = state
         .pending_uploads
@@ -62,25 +48,10 @@ pub(super) async fn drain_client_attachment_ownership(
                 .map(|receipt| (*id, receipt))
         })
         .collect();
-    let ready: Vec<_> = state
-        .ready_attachments
-        .iter()
-        .filter_map(|(id, attachment)| {
-            attachment
-                .media_reservation
-                .clone()
-                .map(|receipt| (*id, receipt))
-        })
-        .collect();
     let untracked_pending: Vec<_> = state
         .pending_uploads
         .iter()
         .filter_map(|(id, upload)| upload.media_reservation.is_none().then_some(*id))
-        .collect();
-    let untracked_ready: Vec<_> = state
-        .ready_attachments
-        .iter()
-        .filter_map(|(id, attachment)| attachment.media_reservation.is_none().then_some(*id))
         .collect();
     let wall_ms = chrono::Utc::now()
         .timestamp_millis()
@@ -94,25 +65,13 @@ pub(super) async fn drain_client_attachment_ownership(
         state.pending_uploads.remove(&id);
         release_uploads(&state.upload_accounting, [id]);
     }
-    for (id, receipt) in ready {
-        ctx.media_ledger
-            .destroy_local_artifacts(
-                &receipt.reservation_id,
-                receipt.version,
-                &format!("attachment-{reason}-destroyed:{}", receipt.reservation_id),
-                wall_ms,
-            )
-            .await
-            .map_err(internal)?;
-        state.ready_attachments.remove(&id);
-    }
     for id in untracked_pending {
         state.pending_uploads.remove(&id);
         release_uploads(&state.upload_accounting, [id]);
     }
-    for id in untracked_ready {
-        state.ready_attachments.remove(&id);
-    }
+    // Published media is session-owned. Disconnect releases only this
+    // client's ephemeral view when `state` drops; retention/explicit discard
+    // remains the sole authority for bytes, reservations, and durable rows.
     Ok(())
 }
 
@@ -265,12 +224,6 @@ pub(super) fn begin_attachment_upload_with_limits(
         proto::AttachmentPurpose::UserMessageImage => {
             Some(require_attached(state)?.handle.session_id)
         }
-        proto::AttachmentPurpose::TerminalPasteImage { terminal_id } => {
-            if !state.terminal_host.contains(terminal_id) {
-                return Err(bad_request(format!("unknown terminal {terminal_id}")));
-            }
-            None
-        }
     };
     if mime != proto::IMAGE_ATTACHMENT_MIME_PNG {
         return Err(bad_request(format!("unsupported attachment MIME `{mime}`")));
@@ -299,8 +252,8 @@ pub(super) fn begin_attachment_upload_with_limits(
         upload_id,
         PendingAttachmentUpload {
             media_reservation: None,
+            media_resources_policy: None,
             session_id,
-            mime,
             byte_len,
             sha256,
             purpose,
@@ -455,6 +408,11 @@ pub(super) async fn begin_attachment_upload_admitted(
         .get_mut(&upload_id)
         .expect("upload inserted before durable admission")
         .media_reservation = Some(receipt);
+    state
+        .pending_uploads
+        .get_mut(&upload_id)
+        .expect("upload inserted before durable admission")
+        .media_resources_policy = Some(policy);
     Ok(response)
 }
 
@@ -525,18 +483,12 @@ pub(super) async fn finish_attachment_upload(
             state.ready_attachments.insert(
                 image_ref.id,
                 ReadyAttachment {
-                    media_reservation: upload.media_reservation,
                     session_id,
-                    mime: upload.mime,
                     bytes,
                     purpose: upload.purpose,
-                    created_at: Instant::now(),
                 },
             );
             Ok(Response::AttachmentUploaded { image_ref })
-        }
-        proto::AttachmentPurpose::TerminalPasteImage { terminal_id } => {
-            state.terminal_host.paste_image(terminal_id, &bytes)
         }
     }
 }
@@ -704,51 +656,49 @@ pub(super) async fn finish_attachment_upload_admitted(
             let session_id = upload
                 .session_id
                 .ok_or_else(|| bad_request("user-message image upload is missing its session"))?;
-            let image_ref = proto::ImageAttachmentRef { id: Uuid::new_v4() };
-            if let Err(error) = ctx
-                .media_ledger
-                .authorize_publication(&completed.reservation_id)
-                .await
-            {
-                ctx.media_ledger
-                    .destroy_local_artifacts(
-                        &completed.reservation_id,
-                        completed.version,
-                        &format!("attachment-unpublished-destroyed:{upload_id}"),
-                        wall_ms,
-                    )
-                    .await
-                    .map_err(internal)?;
-                return Err(internal(error));
-            }
-            state.ready_attachments.insert(
-                image_ref.id,
-                ReadyAttachment {
-                    media_reservation: Some(completed),
-                    session_id,
-                    mime: upload.mime,
-                    bytes,
-                    purpose: upload.purpose,
-                    created_at: Instant::now(),
-                },
-            );
-            abandon.reservation_id = None;
-            Ok(Response::AttachmentUploaded { image_ref })
-        }
-        proto::AttachmentPurpose::TerminalPasteImage { terminal_id } => {
-            let response = state.terminal_host.paste_image(terminal_id, &bytes);
-            let checksum = format!("terminal-paste-buffer-destroyed:{upload_id}");
+            let project_text = {
+                let attached = require_attached(state)?;
+                attached
+                    .handle
+                    .project_root
+                    .to_str()
+                    .ok_or_else(|| internal("project path is not UTF-8"))?
+                    .to_owned()
+            };
+            let project_digest = crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes()));
+            let policy = upload.media_resources_policy.take().ok_or_else(|| {
+                internal("attachment upload is missing its evaluated media policy")
+            })?;
+            let storage = ctx
+                .media_storage_recovery
+                .as_ref()
+                .ok_or_else(|| internal("durable media storage unavailable"))?;
             ctx.media_ledger
                 .destroy_local_artifacts(
                     &completed.reservation_id,
                     completed.version,
-                    &checksum,
+                    &format!("legacy-paste-promoted:{upload_id}"),
                     wall_ms,
                 )
                 .await
                 .map_err(internal)?;
             abandon.reservation_id = None;
-            response
+            let attachment_id = storage
+                .ingest_message_image(crate::media_storage::IngestMessageImageInput {
+                    actor_principal_digest: super::run_invocation::principal_digest(
+                        &state.principal,
+                    ),
+                    session_id,
+                    project_digest,
+                    bytes,
+                    policy: &policy,
+                    now_unix_ms: wall_ms.try_into().unwrap_or(i64::MAX),
+                    now_monotonic_ms: ctx.media_ledger.clock_now_ms(),
+                })
+                .await
+                .map_err(internal)?;
+            let image_ref = proto::ImageAttachmentRef { id: attachment_id };
+            Ok(Response::AttachmentUploaded { image_ref })
         }
     }
 }
@@ -759,65 +709,15 @@ pub(super) fn consume_image_refs(
     session_id: Uuid,
     refs: &[proto::ImageAttachmentRef],
 ) -> std::result::Result<Vec<Vec<u8>>, ErrorPayload> {
-    if refs.len() > proto::MAX_IMAGES_PER_USER_MESSAGE {
-        return Err(bad_request(format!(
-            "too many images: {} exceeds {} image limit",
-            refs.len(),
-            proto::MAX_IMAGES_PER_USER_MESSAGE
-        )));
-    }
-    let mut seen = HashSet::new();
-    for image_ref in refs {
-        if !seen.insert(image_ref.id) {
-            return Err(bad_request("duplicate image ref in user message"));
-        }
-    }
-    let mut total = 0usize;
-    for image_ref in refs {
-        let Some(attachment) = state.ready_attachments.get(&image_ref.id) else {
-            return Err(bad_request(
-                "unknown, expired, or already consumed image ref",
-            ));
-        };
-        if attachment.session_id != session_id {
-            return Err(bad_request("image ref belongs to a different session"));
-        }
-        if attachment.mime != proto::IMAGE_ATTACHMENT_MIME_PNG {
-            return Err(bad_request("image ref has unsupported MIME"));
-        }
-        if attachment.purpose != proto::AttachmentPurpose::UserMessageImage {
-            return Err(bad_request("image ref has unsupported purpose"));
-        }
-        total += attachment.bytes.len();
-        if total > proto::MAX_TOTAL_IMAGE_BYTES {
-            return Err(bad_request(format!(
-                "total image data is too large: {} bytes exceeds {} byte limit",
-                total,
-                proto::MAX_TOTAL_IMAGE_BYTES
-            )));
-        }
-    }
-    let images = refs
-        .iter()
-        .map(|image_ref| {
-            state
-                .ready_attachments
-                .remove(&image_ref.id)
-                .expect("image ref was validated before removal")
-                .bytes
-        })
-        .collect();
-    Ok(images)
+    claim_message_image_refs(state, session_id, Uuid::nil(), refs)
 }
 
-/// Atomically bind a message's single-use image refs to its client UUID and
-/// return their bytes.
+/// Acquire reusable immutable attachment bytes for one submission.
 ///
-/// Moving ready refs into the consumed map before the first await prevents a
-/// competing UUID from racing worker acceptance or reusing a ref after an
-/// ambiguous/lost worker response. The bytes remain TTL-scoped and resolvable
-/// only by this exact UUID, so the worker can still perform its authoritative
-/// durable/in-memory fingerprint check on every retry.
+/// Attachment ownership remains with the session. Submission UUID
+/// idempotency belongs to the worker receipt, while the durable media layer
+/// records a distinct reference per committed consumer.
+#[cfg(test)]
 pub(super) fn claim_message_image_refs(
     state: &mut MutableClientState,
     session_id: Uuid,
@@ -826,46 +726,16 @@ pub(super) fn claim_message_image_refs(
 ) -> std::result::Result<Vec<Vec<u8>>, ErrorPayload> {
     validate_image_ref_shape(refs)?;
 
-    let origin_principal = state.principal.tag();
-    let mut accounting = crate::sync::lock_or_recover(&state.upload_accounting);
     let mut total = 0usize;
     let mut images = Vec::with_capacity(refs.len());
     for image_ref in refs {
-        let attachment = if let Some(attachment) = state.ready_attachments.get(&image_ref.id) {
-            attachment
-        } else if let Some(consumed) = accounting.consumed_message_attachments.get(&image_ref.id) {
-            if consumed.client_submission_id != client_submission_id
-                || consumed.origin_principal != origin_principal
-            {
-                return Err(bad_request(
-                    "unknown, expired, or already consumed image ref",
-                ));
-            }
-            &consumed.attachment
-        } else {
-            return Err(bad_request(
-                "unknown, expired, or already consumed image ref",
-            ));
+        let Some(attachment) = state.ready_attachments.get(&image_ref.id) else {
+            return Err(bad_request("media attachment unavailable"));
         };
         validate_message_attachment(attachment, session_id, &mut total)?;
         images.push(attachment.bytes.clone());
     }
-
-    // Validation above is all-or-nothing. Move only after every ref and the
-    // aggregate size have passed, with no await between validation and bind.
-    for image_ref in refs {
-        if let Some(attachment) = state.ready_attachments.remove(&image_ref.id) {
-            accounting.consumed_message_attachments.insert(
-                image_ref.id,
-                ConsumedMessageAttachment {
-                    client_submission_id,
-                    origin_principal: origin_principal.clone(),
-                    consumed_at: Instant::now(),
-                    attachment,
-                },
-            );
-        }
-    }
+    let _ = client_submission_id;
     Ok(images)
 }
 
@@ -876,69 +746,46 @@ pub(super) async fn claim_message_image_refs_admitted(
     client_submission_id: Uuid,
     refs: &[proto::ImageAttachmentRef],
 ) -> std::result::Result<Vec<Vec<u8>>, ErrorPayload> {
-    let images = claim_message_image_refs(state, session_id, client_submission_id, refs)?;
-    let reservation_ids = {
-        let accounting = crate::sync::lock_or_recover(&state.upload_accounting);
-        refs.iter()
-            .filter_map(|image_ref| {
-                accounting
-                    .consumed_message_attachments
-                    .get(&image_ref.id)
-                    .and_then(|consumed| consumed.attachment.media_reservation.as_ref())
-                    .map(|receipt| receipt.reservation_id.clone())
-            })
-            .collect::<Vec<_>>()
-    };
-    if let Err(error) = ctx
-        .media_ledger
-        .bind_downstream_ownership(
-            reservation_ids,
-            &client_submission_id.to_string(),
-            chrono::Utc::now()
-                .timestamp_millis()
-                .try_into()
-                .unwrap_or(0),
-        )
-        .await
-    {
-        release_message_image_refs(state, client_submission_id, refs);
-        return Err(match error {
-            crate::media_reservation::LedgerError::Denied(_) => {
-                bad_request("attachments exceed aggregate decoded media resource policy")
-            }
-            other => internal(other),
-        });
+    validate_image_ref_shape(refs)?;
+    let attached =
+        require_attached(state).map_err(|_| bad_request("media attachment unavailable"))?;
+    if attached.handle.session_id != session_id {
+        return Err(bad_request("media attachment unavailable"));
     }
+    let project = attached
+        .handle
+        .project_root
+        .to_str()
+        .ok_or_else(|| bad_request("media attachment unavailable"))?;
+    let project_digest = crate::intel::hex_lower(&Sha256::digest(project.as_bytes()));
+    let storage = ctx
+        .media_storage_recovery
+        .as_ref()
+        .ok_or_else(|| bad_request("media attachment unavailable"))?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let images = storage
+        .acquire_message_images_bound(crate::media_storage::AcquireMessageImagesInput {
+            attachment_ids: refs.iter().map(|image_ref| image_ref.id).collect(),
+            session_id,
+            project_digest,
+            consumer_id: client_submission_id.to_string(),
+            ledger: &ctx.media_ledger,
+            max_total_bytes: proto::MAX_TOTAL_IMAGE_BYTES as u64,
+            now_unix_ms: now,
+        })
+        .await
+        .map_err(|_| bad_request("media attachment unavailable"))?;
     Ok(images)
 }
 
-/// Roll back only this submission's freshly claimed refs when the session
-/// actor proves the model fence stale before queue insertion.
+/// Reusable attachments do not transfer ownership during acquisition, so a
+/// rejected submission has no in-memory attachment mutation to roll back.
 pub(super) fn release_message_image_refs(
     state: &mut MutableClientState,
     client_submission_id: Uuid,
     refs: &[proto::ImageAttachmentRef],
 ) {
-    let origin_principal = state.principal.tag();
-    let mut accounting = crate::sync::lock_or_recover(&state.upload_accounting);
-    for image_ref in refs {
-        let matches = accounting
-            .consumed_message_attachments
-            .get(&image_ref.id)
-            .is_some_and(|consumed| {
-                consumed.client_submission_id == client_submission_id
-                    && consumed.origin_principal == origin_principal
-            });
-        if matches
-            && let Some(consumed) = accounting
-                .consumed_message_attachments
-                .remove(&image_ref.id)
-        {
-            state
-                .ready_attachments
-                .insert(image_ref.id, consumed.attachment);
-        }
-    }
+    let _ = (state, client_submission_id, refs);
 }
 
 fn validate_image_ref_shape(
@@ -960,6 +807,7 @@ fn validate_image_ref_shape(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_message_attachment(
     attachment: &ReadyAttachment,
     session_id: Uuid,
@@ -967,9 +815,6 @@ fn validate_message_attachment(
 ) -> std::result::Result<(), ErrorPayload> {
     if attachment.session_id != session_id {
         return Err(bad_request("image ref belongs to a different session"));
-    }
-    if attachment.mime != proto::IMAGE_ATTACHMENT_MIME_PNG {
-        return Err(bad_request("image ref has unsupported MIME"));
     }
     if attachment.purpose != proto::AttachmentPurpose::UserMessageImage {
         return Err(bad_request("image ref has unsupported purpose"));

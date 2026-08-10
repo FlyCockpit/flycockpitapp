@@ -1,0 +1,198 @@
+{
+  "version": 1,
+  "protocolVersion": 9,
+  "registry": {
+    "v1TupleId": 1,
+    "v1Signaling": 1,
+    "v1Authorization": 1,
+    "v1Transport": 1,
+    "v1Application": 9,
+    "v1SecurityRank": 100,
+    "v1FeatureCount": 0
+  },
+  "selectionCases": [
+    {
+      "name": "all_agree_v1",
+      "client": [1],
+      "daemon": [1],
+      "serverAllowed": [1],
+      "revoked": [],
+      "expectedSelected": 1
+    },
+    {
+      "name": "server_disallows",
+      "client": [1],
+      "daemon": [1],
+      "serverAllowed": [255],
+      "revoked": [],
+      "expectedSelected": null
+    },
+    {
+      "name": "client_lacks",
+      "client": [254],
+      "daemon": [1],
+      "serverAllowed": [1],
+      "revoked": [],
+      "expectedSelected": null
+    },
+    {
+      "name": "daemon_lacks",
+      "client": [1],
+      "daemon": [254],
+      "serverAllowed": [1],
+      "revoked": [],
+      "expectedSelected": null
+    },
+    {
+      "name": "v1_revoked",
+      "client": [1],
+      "daemon": [1],
+      "serverAllowed": [1],
+      "revoked": [1],
+      "expectedSelected": null
+    },
+    {
+      "name": "all_unknown",
+      "client": [254],
+      "daemon": [254],
+      "serverAllowed": [255],
+      "revoked": [],
+      "expectedSelected": null
+    }
+  ],
+  "upgradeCases": [
+    {
+      "name": "server_policy_p_nonempty",
+      "client": [1],
+      "daemon": [1],
+      "serverAllowed": [255],
+      "revoked": [],
+      "expectedUpgradeSide": "server_policy",
+      "expectedRecommended": 1,
+      "expectedClientSupported": [1],
+      "expectedDaemonSupported": [1],
+      "expectedServerAllowed": []
+    },
+    {
+      "name": "server_policy_s_empty_p_empty",
+      "client": [254],
+      "daemon": [254],
+      "serverAllowed": [255],
+      "revoked": [],
+      "expectedUpgradeSide": "server_policy",
+      "expectedRecommended": null,
+      "expectedClientSupported": [],
+      "expectedDaemonSupported": [],
+      "expectedServerAllowed": []
+    },
+    {
+      "name": "client_needs_upgrade",
+      "client": [254],
+      "daemon": [1],
+      "serverAllowed": [1],
+      "revoked": [],
+      "expectedUpgradeSide": "client",
+      "expectedRecommended": 1,
+      "expectedClientSupported": [],
+      "expectedDaemonSupported": [1],
+      "expectedServerAllowed": [1]
+    },
+    {
+      "name": "daemon_needs_upgrade",
+      "client": [1],
+      "daemon": [254],
+      "serverAllowed": [1],
+      "revoked": [],
+      "expectedUpgradeSide": "daemon",
+      "expectedRecommended": 1,
+      "expectedClientSupported": [1],
+      "expectedDaemonSupported": [],
+      "expectedServerAllowed": [1]
+    },
+    {
+      "name": "both_need_upgrade",
+      "client": [254],
+      "daemon": [253],
+      "serverAllowed": [1],
+      "revoked": [],
+      "expectedUpgradeSide": "multiple",
+      "expectedRecommended": 1,
+      "expectedClientSupported": [],
+      "expectedDaemonSupported": [],
+      "expectedServerAllowed": [1]
+    },
+    {
+      "name": "v1_revoked",
+      "client": [1],
+      "daemon": [1],
+      "serverAllowed": [1],
+      "revoked": [1],
+      "expectedUpgradeSide": "server_policy",
+      "expectedRecommended": null,
+      "expectedClientSupported": [],
+      "expectedDaemonSupported": [],
+      "expectedServerAllowed": []
+    }
+  ],
+  "transcriptVectors": [
+    {
+      "name": "webrtc",
+      "transcriptHex": "4643524e01010102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f80010001010001010001000100",
+      "expectedDigestHex": "cdda5789b36289675bd53188eac36461a262bc02a19dc5c14925ade5cc4114d7",
+      "expectedLen": 146
+    },
+    {
+      "name": "websocket_data",
+      "transcriptHex": "4643524e01020102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f80010001010001010001000100",
+      "expectedDigestHex": "f91fb969535e656b99ae10999989998269051ecb7bd1c7796a764fd539dca38e",
+      "expectedLen": 146
+    }
+  ],
+  "malformedVectors": [
+    {
+      "name": "truncated",
+      "transcriptHex": "4643524e01010102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f800100010100010100010001",
+      "rejection": "length"
+    },
+    {
+      "name": "trailing_byte",
+      "transcriptHex": "4643524e01010102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f8001000101000101000100010000",
+      "rejection": "length"
+    },
+    {
+      "name": "bad_magic",
+      "transcriptHex": "5843524e01010102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f80010001010001010001000100",
+      "rejection": "preamble"
+    },
+    {
+      "name": "bad_version",
+      "transcriptHex": "4643524e02010102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f80010001010001010001000100",
+      "rejection": "preamble"
+    },
+    {
+      "name": "reserved_transport_zero",
+      "transcriptHex": "4643524e01000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f80010001010001010001000100",
+      "rejection": "discriminant"
+    },
+    {
+      "name": "reserved_transport_three",
+      "transcriptHex": "4643524e01030102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f80010001010001010001000100",
+      "rejection": "discriminant"
+    },
+    {
+      "name": "client_count_oversize",
+      "transcriptHex": "4643524e01010102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f80110001010001010001000100",
+      "rejection": "length"
+    },
+    {
+      "name": "feature_count_oversize",
+      "transcriptHex": "4643524e01010102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f80010001010001010001000121",
+      "rejection": "length"
+    },
+    {
+      "name": "zero_selected_id",
+      "transcriptHex": "4643524e01010102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f80010001010001010001000000",
+      "rejection": "invalid"
+    }
+  ]
+}

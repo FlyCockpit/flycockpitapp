@@ -213,6 +213,7 @@ pub(in crate::tui::settings) trait RowListEditor {
 /// like `↓`/`↑`. With the popup open, `Tab`/`Shift+Tab` switch between
 /// the name and value fields, `enter` saves, and `esc` cancels.
 pub(in crate::tui::settings) struct HeaderEditor {
+    provider_id: String,
     pub(in crate::tui::settings) rows: Vec<HeaderSpec>,
     pub(in crate::tui::settings) cursor: usize,
     pub(in crate::tui::settings) mode: HeaderMode,
@@ -323,21 +324,31 @@ impl RowListEditor for HeaderEditor {
     fn commit_edit_fields(&mut self) -> Result<(), String> {
         let name = self.name_buf.text().trim().to_string();
         let value = self.value_buf.text().to_string();
+        let mut candidate = self.rows.clone();
         match self.edit_target {
             Some(index) => {
-                if let Some(row) = self.rows.get_mut(index) {
-                    row.name = name;
-                    row.value = value;
-                    self.cursor = index;
-                }
+                let Some(row) = candidate.get_mut(index) else {
+                    return Err(
+                        cockpit_config::config::providers::ProviderHeaderConfigError::new(
+                            &self.provider_id,
+                        )
+                        .to_string(),
+                    );
+                };
+                row.name = name;
+                row.value = value;
             }
             None => {
-                if !name.is_empty() {
-                    self.rows.push(HeaderSpec { name, value });
-                    self.cursor = self.rows.len() - 1;
+                if name.is_empty() {
+                    return Ok(());
                 }
+                candidate.push(HeaderSpec { name, value });
             }
         }
+        cockpit_config::config::providers::validate_provider_headers(&self.provider_id, &candidate)
+            .map_err(|error| error.to_string())?;
+        self.rows = candidate;
+        self.cursor = self.edit_target.unwrap_or(self.rows.len() - 1);
         Ok(())
     }
 
@@ -389,7 +400,16 @@ impl RowListEditor for HeaderEditor {
 
 impl HeaderEditor {
     pub(in crate::tui::settings) fn new(rows: Vec<HeaderSpec>, show_continue: bool) -> Self {
+        Self::new_for_provider("provider", rows, show_continue)
+    }
+
+    pub(in crate::tui::settings) fn new_for_provider(
+        provider_id: &str,
+        rows: Vec<HeaderSpec>,
+        show_continue: bool,
+    ) -> Self {
         Self {
+            provider_id: provider_id.to_string(),
             rows,
             cursor: 0,
             mode: HeaderMode::Browse,
@@ -404,6 +424,10 @@ impl HeaderEditor {
 
     pub(in crate::tui::settings) fn add_row_idx(&self) -> usize {
         <Self as RowListEditor>::add_row_idx(self)
+    }
+
+    pub(in crate::tui::settings) fn set_provider_id(&mut self, provider_id: &str) {
+        self.provider_id = provider_id.to_string();
     }
 
     pub(in crate::tui::settings) fn continue_idx(&self) -> Option<usize> {

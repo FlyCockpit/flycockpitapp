@@ -1,7 +1,7 @@
 //! Interactive image-generation spend policy settings page.
 
 use std::any::Any;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 use cockpit_config::config::image_spend::{
     BudgetPolicy, CurrentImageSpendPolicy, ImageSpendSettings, ImageSpendSuggestions,
@@ -16,6 +16,39 @@ use ratatui::widgets::{Paragraph, Wrap};
 use super::{Nav, PageBox, SettingsCx, SettingsPage, SettingsPointerSurfaceKind};
 
 type LoadResult = Result<Option<CurrentImageSpendPolicy>, String>;
+
+#[derive(Default)]
+struct WorkerCompletion {
+    complete: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl WorkerCompletion {
+    fn finish(&self) {
+        *self.complete.lock().unwrap() = true;
+        self.changed.notify_all();
+    }
+
+    fn is_finished(&self) -> bool {
+        *self.complete.lock().unwrap()
+    }
+
+    #[cfg(test)]
+    fn wait(&self) {
+        let mut complete = self.complete.lock().unwrap();
+        while !*complete {
+            complete = self.changed.wait(complete).unwrap();
+        }
+    }
+}
+
+struct WorkerCompletionGuard(Arc<WorkerCompletion>);
+
+impl Drop for WorkerCompletionGuard {
+    fn drop(&mut self) {
+        self.0.finish();
+    }
+}
 
 trait ImageSpendPersistence: Send + Sync {
     fn load(&self, project_key: String) -> LoadResult;
@@ -73,9 +106,12 @@ fn page_with_persistence(
     persistence: Arc<dyn ImageSpendPersistence>,
 ) -> PageBox {
     let (tx, rx) = mpsc::sync_channel(1);
+    let load_completion = Arc::new(WorkerCompletion::default());
     let key = project_key.clone();
     let loader = persistence.clone();
+    let worker_completion = load_completion.clone();
     std::thread::spawn(move || {
+        let _completion = WorkerCompletionGuard(worker_completion);
         let _ = tx.send(loader.load(key));
     });
     Box::new(ImageSpendPage {
@@ -91,6 +127,8 @@ fn page_with_persistence(
         status: "Loading saved policy…".into(),
         load: Mutex::new(Some(rx)),
         save: Mutex::new(None),
+        load_completion,
+        save_completion: Mutex::new(None),
         persistence,
     })
 }
@@ -108,6 +146,8 @@ pub(super) struct ImageSpendPage {
     status: String,
     load: Mutex<Option<mpsc::Receiver<LoadResult>>>,
     save: Mutex<Option<mpsc::Receiver<Result<CurrentImageSpendPolicy, String>>>>,
+    load_completion: Arc<WorkerCompletion>,
+    save_completion: Mutex<Option<Arc<WorkerCompletion>>>,
     persistence: Arc<dyn ImageSpendPersistence>,
 }
 
@@ -180,6 +220,9 @@ impl ImageSpendPage {
             let load = self.load.lock().unwrap();
             load.as_ref().and_then(|rx| match rx.try_recv() {
                 Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Empty) if self.load_completion.is_finished() => {
+                    Some(Err("policy load worker stopped without a result".into()))
+                }
                 Err(mpsc::TryRecvError::Empty) => None,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     Some(Err("policy load worker stopped without a result".into()))
@@ -201,8 +244,17 @@ impl ImageSpendPage {
         }
         let save_result = {
             let save = self.save.lock().unwrap();
+            let save_finished = self
+                .save_completion
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|completion| completion.is_finished());
             save.as_ref().and_then(|rx| match rx.try_recv() {
                 Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Empty) if save_finished => {
+                    Some(Err("policy save worker stopped without a result".into()))
+                }
                 Err(mpsc::TryRecvError::Empty) => None,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     Some(Err("policy save worker stopped without a result".into()))
@@ -243,10 +295,14 @@ impl ImageSpendPage {
         let draft = self.draft.clone();
         let version = self.version;
         let persistence = self.persistence.clone();
+        let completion = Arc::new(WorkerCompletion::default());
+        let worker_completion = completion.clone();
         std::thread::spawn(move || {
+            let _completion = WorkerCompletionGuard(worker_completion);
             let _ = tx.send(persistence.save(project_key, draft, version));
         });
         *self.save.lock().unwrap() = Some(rx);
+        *self.save_completion.lock().unwrap() = Some(completion);
         self.status = "Saving reviewed policy…".into();
     }
 
@@ -491,15 +547,17 @@ mod tests {
         }
     }
 
-    fn poll_until_idle(page: &mut ImageSpendPage) {
-        for _ in 0..100_000 {
-            page.poll();
-            if page.load.lock().unwrap().is_none() && page.save.lock().unwrap().is_none() {
-                return;
-            }
-            std::thread::yield_now();
+    fn poll_after_worker_completion(page: &mut ImageSpendPage) {
+        if page.load.lock().unwrap().is_some() {
+            page.load_completion.wait();
         }
-        panic!("image spend persistence worker did not finish");
+        let save_completion = page.save_completion.lock().unwrap().clone();
+        if let Some(completion) = save_completion {
+            completion.wait();
+        }
+        page.poll();
+        assert!(page.load.lock().unwrap().is_none());
+        assert!(page.save.lock().unwrap().is_none());
     }
 
     fn persisted_page(path: PathBuf) -> PageBox {
@@ -526,6 +584,8 @@ mod tests {
             status: String::new(),
             load: Mutex::new(None),
             save: Mutex::new(None),
+            load_completion: Arc::new(WorkerCompletion::default()),
+            save_completion: Mutex::new(None),
             persistence: Arc::new(DefaultImageSpendPersistence),
         }
     }
@@ -631,7 +691,7 @@ mod tests {
         let path = dir.path().join("image-spend.db");
         let mut boxed = persisted_page(path.clone());
         let page = boxed.as_any_mut().downcast_mut::<ImageSpendPage>().unwrap();
-        poll_until_idle(page);
+        poll_after_worker_completion(page);
 
         page.draft.request = BudgetPolicy::Unlimited;
         page.draft.session = BudgetPolicy::Finite { usd_micros: 7 };
@@ -651,7 +711,7 @@ mod tests {
         }
         page.edit_micros(KeyCode::Enter);
         page.save();
-        poll_until_idle(page);
+        poll_after_worker_completion(page);
         assert_eq!(page.version, Some(1));
 
         drop(boxed);
@@ -660,7 +720,7 @@ mod tests {
             .as_any_mut()
             .downcast_mut::<ImageSpendPage>()
             .unwrap();
-        poll_until_idle(reopened);
+        poll_after_worker_completion(reopened);
         assert_eq!(reopened.draft.request, BudgetPolicy::Unlimited);
         assert_eq!(
             reopened.draft.session,

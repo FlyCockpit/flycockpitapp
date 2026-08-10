@@ -76,6 +76,7 @@ jobs:
       tag-flag: --tag=${{ needs.validate.outputs.tag }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      CARGO_TARGET_DIR: target
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
@@ -84,12 +85,10 @@ jobs:
           fetch-depth: 0
 
       - name: Create local release tag
-        working-directory: apps/cli
         run: git tag --force "${{ needs.validate.outputs.tag }}" "${{ github.sha }}"
 
       - name: Install dist
         shell: bash
-        working-directory: apps/cli
         run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh
 
       - name: Cache dist
@@ -100,18 +99,18 @@ jobs:
 
       - id: plan
         name: Plan dist release
-        working-directory: apps/cli
         run: |
-          dist host --steps=create --tag=${{ needs.validate.outputs.tag }} --allow-dirty --output-format=json > plan-dist-manifest.json
+          mkdir -p target/distrib
+          dist host --steps=create --tag=${{ needs.validate.outputs.tag }} --allow-dirty --output-format=json > target/distrib/plan-dist-manifest.json
           echo "dist ran successfully"
-          cat plan-dist-manifest.json
-          echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
+          cat target/distrib/plan-dist-manifest.json
+          echo "manifest=$(jq -c "." target/distrib/plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
 
       - name: Upload dist-manifest.json
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
         with:
           name: artifacts-plan-dist-manifest
-          path: apps/cli/plan-dist-manifest.json
+          path: target/distrib/plan-dist-manifest.json
 
   build-cli-local-artifacts:
     name: build-cli-local-artifacts (${{ join(matrix.targets, ', ') }})
@@ -124,6 +123,7 @@ jobs:
     container: ${{ matrix.container && matrix.container.image || null }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      CARGO_TARGET_DIR: target
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
     steps:
       - name: Enable Windows long paths
@@ -136,7 +136,6 @@ jobs:
           fetch-depth: 0
 
       - name: Create local release tag
-        working-directory: apps/cli
         run: git tag --force "${{ needs.plan-cli-release.outputs.tag }}" "${{ github.sha }}"
 
       - name: Install Rust non-interactively if not already installed
@@ -154,35 +153,31 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v4
         with:
           pattern: artifacts-*
-          path: apps/cli/target/distrib/
+          path: target/distrib/
           merge-multiple: true
 
       - name: Install dependencies
-        working-directory: apps/cli
         run: |
           ${{ matrix.packages_install }}
 
       - name: Generate completions and man pages
-        working-directory: apps/cli
         shell: bash
-        run: ./scripts/generate-release-assets.sh
+        run: ./apps/cli/scripts/generate-release-assets.sh
 
       - name: Build artifacts
-        working-directory: apps/cli
         run: |
-          dist build ${{ needs.plan-cli-release.outputs.tag-flag }} --allow-dirty --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
+          dist build ${{ needs.plan-cli-release.outputs.tag-flag }} --allow-dirty --print=linkage --output-format=json ${{ matrix.dist_args }} > target/distrib/dist-manifest.json
           echo "dist ran successfully"
 
       - id: cargo-dist
         name: Post-build
         shell: bash
-        working-directory: apps/cli
         run: |
           echo "paths<<EOF" >> "$GITHUB_OUTPUT"
-          dist print-upload-files-from-manifest --manifest dist-manifest.json >> "$GITHUB_OUTPUT"
+          dist print-upload-files-from-manifest --manifest target/distrib/dist-manifest.json >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
-          cp dist-manifest.json "$BUILD_MANIFEST_NAME"
+          cp target/distrib/dist-manifest.json "$BUILD_MANIFEST_NAME"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
@@ -190,7 +185,7 @@ jobs:
           name: artifacts-build-local-${{ join(matrix.targets, '_') }}
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
-            apps/cli/${{ env.BUILD_MANIFEST_NAME }}
+            ${{ env.BUILD_MANIFEST_NAME }}
 
   build-cli-global-artifacts:
     name: build-cli-global-artifacts
@@ -200,6 +195,7 @@ jobs:
     runs-on: blacksmith-8vcpu-ubuntu-2204
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      CARGO_TARGET_DIR: target
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -209,7 +205,6 @@ jobs:
           fetch-depth: 0
 
       - name: Create local release tag
-        working-directory: apps/cli
         run: git tag --force "${{ needs.plan-cli-release.outputs.tag }}" "${{ github.sha }}"
 
       - name: Install cached dist
@@ -224,27 +219,25 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v4
         with:
           pattern: artifacts-*
-          path: apps/cli/target/distrib/
+          path: target/distrib/
           merge-multiple: true
 
       - name: Generate completions and man pages
-        working-directory: apps/cli
         shell: bash
-        run: ./scripts/generate-release-assets.sh
+        run: ./apps/cli/scripts/generate-release-assets.sh
 
       - id: cargo-dist
         shell: bash
-        working-directory: apps/cli
         run: |
-          dist build ${{ needs.plan-cli-release.outputs.tag-flag }} --allow-dirty --output-format=json "--artifacts=global" > dist-manifest.json
+          dist build ${{ needs.plan-cli-release.outputs.tag-flag }} --allow-dirty --output-format=json "--artifacts=global" > target/distrib/dist-manifest.json
           echo "dist ran successfully"
 
-          ./scripts/patch-dist-assets.py
+          ./apps/cli/scripts/patch-dist-assets.py
           echo "paths<<EOF" >> "$GITHUB_OUTPUT"
-          jq --raw-output ".upload_files[]" dist-manifest.json >> "$GITHUB_OUTPUT"
+          jq --raw-output ".upload_files[]" target/distrib/dist-manifest.json >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
-          cp dist-manifest.json "$BUILD_MANIFEST_NAME"
+          cp target/distrib/dist-manifest.json "$BUILD_MANIFEST_NAME"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
@@ -252,7 +245,7 @@ jobs:
           name: artifacts-build-global
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
-            apps/cli/${{ env.BUILD_MANIFEST_NAME }}
+            ${{ env.BUILD_MANIFEST_NAME }}
 
   publish-cli-release:
     name: Publish CLI GitHub Release
@@ -263,6 +256,7 @@ jobs:
     if: ${{ always() && needs.plan-cli-release.result == 'success' && (needs.build-cli-global-artifacts.result == 'skipped' || needs.build-cli-global-artifacts.result == 'success') && (needs.build-cli-local-artifacts.result == 'skipped' || needs.build-cli-local-artifacts.result == 'success') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      CARGO_TARGET_DIR: target
     runs-on: blacksmith-4vcpu-ubuntu-2204
     outputs:
       val: ${{ steps.host.outputs.manifest }}
@@ -274,7 +268,6 @@ jobs:
           fetch-depth: 0
 
       - name: Create local release tag
-        working-directory: apps/cli
         run: git tag --force "${{ needs.plan-cli-release.outputs.tag }}" "${{ github.sha }}"
 
       - name: Install cached dist
@@ -289,33 +282,32 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v4
         with:
           pattern: artifacts-*
-          path: apps/cli/target/distrib/
+          path: target/distrib/
           merge-multiple: true
 
       - id: host
         shell: bash
-        working-directory: apps/cli
         run: |
-          dist host ${{ needs.plan-cli-release.outputs.tag-flag }} --allow-dirty --steps=upload --steps=release --output-format=json > dist-manifest.json
+          dist host ${{ needs.plan-cli-release.outputs.tag-flag }} --allow-dirty --steps=upload --steps=release --output-format=json > target/distrib/dist-manifest.json
           echo "artifacts uploaded and released successfully"
-          cat dist-manifest.json
-          echo "manifest=$(jq -c "." dist-manifest.json)" >> "$GITHUB_OUTPUT"
+          cat target/distrib/dist-manifest.json
+          echo "manifest=$(jq -c "." target/distrib/dist-manifest.json)" >> "$GITHUB_OUTPUT"
 
       - name: Upload dist-manifest.json
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
         with:
           name: artifacts-dist-manifest
-          path: apps/cli/dist-manifest.json
+          path: target/distrib/dist-manifest.json
 
       - name: Download GitHub Artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v4
         with:
           pattern: artifacts-*
-          path: apps/cli/artifacts
+          path: artifacts
           merge-multiple: true
 
       - name: Cleanup
-        run: rm -f apps/cli/artifacts/*-dist-manifest.json
+        run: rm -f artifacts/*-dist-manifest.json
 
       - name: Create or update GitHub Release
         env:
@@ -330,10 +322,10 @@ jobs:
           echo "$ANNOUNCEMENT_BODY" > "$RUNNER_TEMP/notes.txt"
           tag="${{ needs.plan-cli-release.outputs.tag }}"
 
-          mapfile -t release_files < <(find apps/cli/artifacts -type f ! -name '*-dist-manifest.json' | sort)
+          mapfile -t release_files < <(find artifacts -type f ! -name '*-dist-manifest.json' | sort)
           if [ "${#release_files[@]}" -eq 0 ]; then
-            echo "::error::No release files found in apps/cli/artifacts."
-            find apps/cli/artifacts -maxdepth 3 -print | sort
+            echo "::error::No release files found in artifacts."
+            find artifacts -maxdepth 3 -print | sort
             exit 1
           fi
 

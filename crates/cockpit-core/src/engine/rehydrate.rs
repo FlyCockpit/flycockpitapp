@@ -1929,7 +1929,7 @@ fn detect_responses_identity_gaps(history: &[Message]) -> Result<()> {
 /// result is its own user message — the live wire shape), and no orphan
 /// `tool_result` (one with no preceding tool_use of the same id) may
 /// appear. A failure is a hard error.
-fn validate_pairing(history: &[Message]) -> Result<()> {
+pub(crate) fn validate_pairing(history: &[Message]) -> Result<()> {
     // Forward pass: each assistant turn's call ids must be covered by the
     // immediately-following run of tool-result user messages.
     let mut i = 0;

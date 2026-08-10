@@ -322,8 +322,40 @@ pub(super) async fn persist_staged_terminal_removal(
                 .to_string(),
         });
     }
-    let snapshot = queue.commit_staged_removal(staged).await;
+    let snapshot = commit_staged_removal_after_receipts(session, queue, staged, &receipts).await;
     Ok((removed, snapshot, receipts))
+}
+
+async fn commit_staged_removal_after_receipts(
+    session: &Session,
+    queue: &crate::engine::message::UserSubmissionQueue,
+    staged: crate::engine::message::StagedQueueRemoval,
+    receipts: &[crate::engine::message::ClientSubmissionReceipt],
+) -> Vec<crate::engine::message::QueuedUserMessage> {
+    let snapshot = queue.commit_staged_removal(staged).await;
+    struct TerminalCleanupClock;
+    impl crate::media_reservation::MonotonicClock for TerminalCleanupClock {
+        fn now_ms(&self) -> u64 {
+            0
+        }
+    }
+    let ledger = crate::media_reservation::MediaReservationLedger::new(
+        session.db.clone(),
+        std::sync::Arc::new(TerminalCleanupClock),
+    );
+    let wall_ms = chrono::Utc::now()
+        .timestamp_millis()
+        .try_into()
+        .unwrap_or(0);
+    for receipt in receipts {
+        if let Err(error) = ledger
+            .complete_downstream_invocation(&receipt.id.to_string(), wall_ms)
+            .await
+        {
+            tracing::warn!(%error,invocation=%receipt.id,"terminal queue removal left downstream media ownership retryable");
+        }
+    }
+    snapshot
 }
 
 fn queue_removal_in_progress_error() -> proto::ErrorPayload {
@@ -331,6 +363,122 @@ fn queue_removal_in_progress_error() -> proto::ErrorPayload {
         code: proto::ErrorCode::Internal,
         message: "a previous failed queue removal remains held; retry that same removal or cancel the queued work"
             .to_string(),
+    }
+}
+
+pub(super) fn remote_queue_mutation_response(
+    receipt: RemoteQueueMutationReceiptV1,
+) -> proto::RemoveQueuedUserMessageResult {
+    proto::RemoveQueuedUserMessageResult {
+        applied: receipt.applied,
+        reason: receipt.reason,
+        removed_item: None,
+        // QueueUpdated owns the mutable full queue view. Keeping it out of
+        // this response makes Applied and Replay byte-identical and secret-free.
+        queue: Vec::new(),
+    }
+}
+
+struct RemoteQueueMutationCommit<'a> {
+    session: &'a Session,
+    queue: &'a crate::engine::message::UserSubmissionQueue,
+    staged: Option<crate::engine::message::StagedQueueRemoval>,
+    result: crate::engine::message::RemoveQueuedMessageResult,
+    operation: RemoteQueueOperation,
+    outbox_kind: &'static str,
+    event_tx: &'a EventSender,
+    redaction: &'a SharedRedactionTable,
+}
+
+async fn commit_remote_queue_mutation(
+    input: RemoteQueueMutationCommit<'_>,
+) -> std::result::Result<RemoteQueueMutationReceiptV1, proto::ErrorPayload> {
+    let RemoteQueueMutationCommit {
+        session,
+        queue,
+        staged,
+        result,
+        operation,
+        outbox_kind,
+        event_tx,
+        redaction,
+    } = input;
+    let disposition = crate::db::session_log::ClientSubmissionTerminalDisposition::Removed;
+    let receipts = if let Some(staged) = staged.as_ref() {
+        queue.accepted_receipts(staged.ids()).await
+    } else {
+        Vec::new()
+    };
+    if let Some(staged) = staged.as_ref()
+        && receipts.is_empty()
+    {
+        queue.mark_staged_removal_failed(staged).await;
+        return Err(proto::ErrorPayload {
+            code: proto::ErrorCode::Internal,
+            message: "queued message lacks its durable acceptance receipt; removal remains held"
+                .into(),
+        });
+    }
+    let terminal_receipts = receipts
+        .iter()
+        .map(
+            |receipt| crate::db::session_log::ClientSubmissionTerminalReceipt {
+                client_submission_id: receipt.id,
+                fingerprint: receipt.fingerprint.clone(),
+                wire_fingerprint: receipt.wire_fingerprint.clone(),
+                origin_principal: receipt.origin_principal.clone(),
+                disposition,
+            },
+        )
+        .collect::<Vec<_>>();
+    let reason = remove_reason_to_proto(result);
+    let removed_count = u32::try_from(staged.as_ref().map_or(0, |value| value.ids().len()))
+        .map_err(|_| proto::ErrorPayload {
+            code: proto::ErrorCode::Internal,
+            message: "queue removal count exceeds protocol bound".into(),
+        })?;
+    let receipt = RemoteQueueMutationReceiptV1 {
+        schema_version: 1,
+        applied: matches!(reason, proto::RemoveQueuedUserMessageReason::Removed),
+        reason,
+        removed_count,
+    };
+    let session_id = session.id;
+    let outcome = session.db.execute_transactional_remote_operation(
+        crate::db::remote_attachment_operations::ReserveRemoteOperation {
+            logical_attachment_id: &operation.logical_attachment_id, operation_id: &operation.operation_id,
+            authenticated_device_id: &operation.authenticated_device_id, authenticated_device_generation: operation.authenticated_device_generation,
+            operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
+            request_hash: operation.request_hash, now_ms: chrono::Utc::now().timestamp_millis(),
+        },
+        move |conn| {
+            crate::db::Db::insert_client_submission_terminal_receipts_conn(conn, session_id, &terminal_receipts)?;
+            receipt.validate()?;
+            let safe_response = serde_json::to_vec(&receipt)?;
+            Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation { value: receipt, safe_response: safe_response.clone(), outbox_kind: outbox_kind.into(), outbox_payload: safe_response })
+        },
+    ).await;
+    match outcome {
+        Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(receipt)) => {
+            if let Some(staged) = staged { let _ = commit_staged_removal_after_receipts(session, queue, staged, &receipts).await; }
+            send_terminal_receipts_event(event_tx, redaction, session_id, &receipts, disposition);
+            Ok(receipt)
+        }
+        Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes)) => {
+            let receipt: RemoteQueueMutationReceiptV1 = serde_json::from_slice(&bytes).map_err(|error| proto::ErrorPayload { code: proto::ErrorCode::Internal, message: error.to_string() })?;
+            receipt.validate().map_err(|error| proto::ErrorPayload { code: proto::ErrorCode::Internal, message: error.to_string() })?;
+            if let Some(staged) = staged { let _ = commit_staged_removal_after_receipts(session, queue, staged, &receipts).await; }
+            send_terminal_receipts_event(event_tx, redaction, session_id, &receipts, disposition);
+            Ok(receipt)
+        }
+        Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict) => {
+            if let Some(staged) = staged.as_ref() { queue.abort_staged_removal(staged).await; }
+            Err(proto::ErrorPayload { code: proto::ErrorCode::Conflict, message: "remote operation conflict".into() })
+        }
+        Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity) | Err(_) => {
+            if let Some(staged) = staged.as_ref() { queue.mark_staged_removal_failed(staged).await; }
+            Err(proto::ErrorPayload { code: proto::ErrorCode::Internal, message: "remote queue operation could not be committed".into() })
+        }
     }
 }
 
@@ -1225,6 +1373,21 @@ pub(super) async fn run_worker(
                 .await;
             }
             WorkerInput::Work(work) => match work {
+                SessionWork::WakeGoal => {
+                    if !send_driver_control_or_fail(
+                        &driver_control_tx,
+                        crate::engine::driver::DriverControl::WakeGoal,
+                        &event_tx,
+                        &turn_completions,
+                        &redaction,
+                        session_id,
+                        &mut driver_failed,
+                    )
+                    .await
+                    {
+                        break WorkerStop::DriverFailed;
+                    }
+                }
                 SessionWork::ProbeUserMessage {
                     client_submission_id,
                     wire_fingerprint,
@@ -1400,7 +1563,7 @@ pub(super) async fn run_worker(
                         }));
                         break WorkerStop::DriverFailed;
                     }
-                    let max_rounds = {
+                    let max_primary_rounds = {
                         let snapshot = config_snapshot
                             .read()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1408,7 +1571,9 @@ pub(super) async fn run_worker(
                     };
                     if !send_driver_control_or_fail(
                         &driver_control_tx,
-                        crate::engine::driver::DriverControl::SetMaxPrimaryRounds { max_rounds },
+                        crate::engine::driver::DriverControl::SetMaxPrimaryRounds {
+                            max_primary_rounds,
+                        },
                         &event_tx,
                         &turn_completions,
                         &redaction,
@@ -1568,6 +1733,7 @@ pub(super) async fn run_worker(
                 }
                 SessionWork::RemoveQueuedUserMessage {
                     queue_item_id,
+                    remote_operation,
                     respond_to,
                 } => {
                     let (result, staged, mut snapshot) =
@@ -1578,6 +1744,101 @@ pub(super) async fn run_worker(
                                 continue;
                             }
                         };
+                    if let Some(operation) = remote_operation {
+                        let disposition =
+                            crate::db::session_log::ClientSubmissionTerminalDisposition::Removed;
+                        let receipts = if let Some(staged) = staged.as_ref() {
+                            driver_input_queue.accepted_receipts(staged.ids()).await
+                        } else {
+                            Vec::new()
+                        };
+                        if let Some(staged) = staged.as_ref()
+                            && receipts.is_empty()
+                        {
+                            driver_input_queue.mark_staged_removal_failed(staged).await;
+                            let _ = respond_to.send(Err(proto::ErrorPayload {
+                                code: proto::ErrorCode::Internal,
+                                message: "queued message lacks its durable acceptance receipt; removal remains held".into(),
+                            }));
+                            continue;
+                        }
+                        let terminal_receipts = receipts
+                            .iter()
+                            .map(|receipt| {
+                                crate::db::session_log::ClientSubmissionTerminalReceipt {
+                                    client_submission_id: receipt.id,
+                                    fingerprint: receipt.fingerprint.clone(),
+                                    wire_fingerprint: receipt.wire_fingerprint.clone(),
+                                    origin_principal: receipt.origin_principal.clone(),
+                                    disposition,
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        let reason = remove_reason_to_proto(result);
+                        let receipt = RemoteQueueMutationReceiptV1 {
+                            schema_version: 1,
+                            applied: matches!(
+                                reason,
+                                proto::RemoveQueuedUserMessageReason::Removed
+                            ),
+                            reason,
+                            removed_count: u32::from(staged.is_some()),
+                        };
+                        let outcome = session.db.execute_transactional_remote_operation(
+                            crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                                logical_attachment_id: &operation.logical_attachment_id,
+                                operation_id: &operation.operation_id,
+                                authenticated_device_id: &operation.authenticated_device_id,
+                                authenticated_device_generation: operation.authenticated_device_generation,
+                                operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
+                                request_hash: operation.request_hash,
+                                now_ms: chrono::Utc::now().timestamp_millis(),
+                            },
+                            move |conn| {
+                                crate::db::Db::insert_client_submission_terminal_receipts_conn(conn, session_id, &terminal_receipts)?;
+                                receipt.validate()?;
+                                let safe_response = serde_json::to_vec(&receipt)?;
+                                Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
+                                    value: receipt,
+                                    safe_response: safe_response.clone(),
+                                    outbox_kind: "remove_queued_user_message".into(),
+                                    outbox_payload: safe_response,
+                                })
+                            },
+                        ).await;
+                        let receipt = match outcome {
+                            Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(receipt)) => {
+                                if let Some(staged) = staged {
+                                    let _ = commit_staged_removal_after_receipts(&session, &driver_input_queue, staged, &receipts).await;
+                                    send_terminal_receipts_event(&event_tx, &redaction, session_id, &receipts, disposition);
+                                }
+                                receipt
+                            }
+                            Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes)) => match serde_json::from_slice::<RemoteQueueMutationReceiptV1>(&bytes) {
+                                Ok(receipt) => {
+                                    if let Err(error) = receipt.validate() {
+                                        let _ = respond_to.send(Err(proto::ErrorPayload { code: proto::ErrorCode::Internal, message: error.to_string() }));
+                                        continue;
+                                    }
+                                    if let Some(staged) = staged {
+                                        let _ = commit_staged_removal_after_receipts(&session, &driver_input_queue, staged, &receipts).await;
+                                    }
+                                    receipt
+                                }
+                                Err(error) => { let _ = respond_to.send(Err(proto::ErrorPayload { code: proto::ErrorCode::Internal, message: error.to_string() })); continue; }
+                            },
+                            Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict) => {
+                                if let Some(staged) = staged.as_ref() { driver_input_queue.abort_staged_removal(staged).await; }
+                                let _ = respond_to.send(Err(proto::ErrorPayload { code: proto::ErrorCode::Conflict, message: "remote operation conflict".into() })); continue;
+                            }
+                            Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity) | Err(_) => {
+                                if let Some(staged) = staged.as_ref() { driver_input_queue.mark_staged_removal_failed(staged).await; }
+                                let _ = respond_to.send(Err(proto::ErrorPayload { code: proto::ErrorCode::Internal, message: "remote queue operation could not be committed".into() })); continue;
+                            }
+                        };
+                        let _ = respond_to.send(Ok(remote_queue_mutation_response(receipt)));
+                        continue;
+                    }
                     if let Some(staged) = staged {
                         let disposition =
                             crate::db::session_log::ClientSubmissionTerminalDisposition::Removed;
@@ -1615,6 +1876,7 @@ pub(super) async fn run_worker(
                 }
                 SessionWork::RemoveNewestQueuedUserMessage {
                     target_id,
+                    remote_operation,
                     respond_to,
                 } => {
                     let target_id = target_id.unwrap_or_else(|| {
@@ -1632,6 +1894,29 @@ pub(super) async fn run_worker(
                                 continue;
                             }
                         };
+                    if let Some(operation) = remote_operation {
+                        match commit_remote_queue_mutation(RemoteQueueMutationCommit {
+                            session: &session,
+                            queue: &driver_input_queue,
+                            staged,
+                            result,
+                            operation,
+                            outbox_kind: "remove_newest_queued_user_message",
+                            event_tx: &event_tx,
+                            redaction: &redaction,
+                        })
+                        .await
+                        {
+                            Ok(receipt) => {
+                                let _ =
+                                    respond_to.send(Ok(remote_queue_mutation_response(receipt)));
+                            }
+                            Err(error) => {
+                                let _ = respond_to.send(Err(error));
+                            }
+                        }
+                        continue;
+                    }
                     let mut removed_item = None;
                     if let Some(staged) = staged {
                         let disposition =
@@ -1671,6 +1956,7 @@ pub(super) async fn run_worker(
                 }
                 SessionWork::RemoveEditableQueuedUserMessages {
                     target_id,
+                    remote_operation,
                     respond_to,
                 } => {
                     let target_id = target_id.unwrap_or_else(|| {
@@ -1690,6 +1976,34 @@ pub(super) async fn run_worker(
                             continue;
                         }
                     };
+                    if let Some(operation) = remote_operation {
+                        match commit_remote_queue_mutation(RemoteQueueMutationCommit {
+                            session: &session,
+                            queue: &driver_input_queue,
+                            staged,
+                            result,
+                            operation,
+                            outbox_kind: "remove_editable_queued_user_messages",
+                            event_tx: &event_tx,
+                            redaction: &redaction,
+                        })
+                        .await
+                        {
+                            Ok(receipt) => {
+                                let _ =
+                                    respond_to.send(Ok(proto::RemoveQueuedUserMessagesResult {
+                                        applied: receipt.applied,
+                                        reason: receipt.reason,
+                                        removed_items: Vec::new(),
+                                        queue: Vec::new(),
+                                    }));
+                            }
+                            Err(error) => {
+                                let _ = respond_to.send(Err(error));
+                            }
+                        }
+                        continue;
+                    }
                     let mut removed_items = Vec::new();
                     if let Some(staged) = staged {
                         let disposition =
@@ -2165,7 +2479,7 @@ pub(super) async fn run_worker(
                 } => {
                     let result = replace_config_snapshot(&config_snapshot, *snapshot);
                     let changed = result.changed;
-                    let generation = send_config_snapshot_event_if_changed(
+                    send_config_snapshot_event_if_changed(
                         &event_tx,
                         &redaction,
                         &config_snapshot,
@@ -2186,7 +2500,7 @@ pub(super) async fn run_worker(
                     {
                         break WorkerStop::DriverFailed;
                     }
-                    let _ = respond_to.send(generation);
+                    let _ = respond_to.send(result);
                 }
                 SessionWork::SetAgent { name } => {
                     // Persist the active-agent choice so a resume restarts on it,

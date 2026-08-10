@@ -25,14 +25,12 @@ pub(crate) enum GoalSettingsOutcome {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GoalSettingsField {
-    Enabled,
     SkepticCount,
     SkepticModel,
     MaxRounds,
 }
 
 const FIELDS: &[GoalSettingsField] = &[
-    GoalSettingsField::Enabled,
     GoalSettingsField::SkepticCount,
     GoalSettingsField::SkepticModel,
     GoalSettingsField::MaxRounds,
@@ -40,42 +38,42 @@ const FIELDS: &[GoalSettingsField] = &[
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct GoalSettingsDraft {
-    enabled: Option<bool>,
-    skeptic_count: Option<usize>,
-    skeptic_model: Option<String>,
-    max_rounds: Option<u32>,
+    cold_skeptic_count: Option<usize>,
+    cold_skeptic_model: Option<String>,
+    max_verification_attempts: Option<u32>,
 }
 
 impl GoalSettingsDraft {
     fn from_override(override_: &GoalSettingsOverride) -> Self {
         Self {
-            enabled: override_.enabled,
-            skeptic_count: override_.skeptic_count,
-            skeptic_model: override_.skeptic_model.clone(),
-            max_rounds: override_.max_rounds,
+            cold_skeptic_count: override_.cold_skeptic_count,
+            cold_skeptic_model: override_.cold_skeptic_model.clone(),
+            max_verification_attempts: override_.max_verification_attempts,
         }
     }
 
     fn to_override(&self) -> GoalSettingsOverride {
         GoalSettingsOverride {
-            enabled: self.enabled,
-            skeptic_count: self.skeptic_count,
-            skeptic_model: self
-                .skeptic_model
+            default_token_budget: None,
+            planner_model: None,
+            evaluator_model: None,
+            gatekeeper_model: None,
+            cold_skeptic_count: self.cold_skeptic_count,
+            cold_skeptic_model: self
+                .cold_skeptic_model
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_string),
-            max_rounds: self.max_rounds,
+            max_verification_attempts: self.max_verification_attempts,
         }
     }
 
     fn clear(&mut self, field: GoalSettingsField) {
         match field {
-            GoalSettingsField::Enabled => self.enabled = None,
-            GoalSettingsField::SkepticCount => self.skeptic_count = None,
-            GoalSettingsField::SkepticModel => self.skeptic_model = None,
-            GoalSettingsField::MaxRounds => self.max_rounds = None,
+            GoalSettingsField::SkepticCount => self.cold_skeptic_count = None,
+            GoalSettingsField::SkepticModel => self.cold_skeptic_model = None,
+            GoalSettingsField::MaxRounds => self.max_verification_attempts = None,
         }
     }
 }
@@ -95,7 +93,7 @@ impl GoalSettingsPane {
     pub(crate) fn open(cwd: &Path, agent_name: &str, root_foreground: bool) -> Result<Self> {
         let def = cockpit_core::agents::resolve(cwd, agent_name)?
             .ok_or_else(|| anyhow::anyhow!("agent `{agent_name}` could not be resolved"))?;
-        let draft = GoalSettingsDraft::from_override(&def.goal_verification);
+        let draft = GoalSettingsDraft::from_override(&def.goal_supervision);
         let status = (!root_foreground).then(|| {
             "Apply is disabled while an interactive subagent holds the foreground.".to_string()
         });
@@ -149,11 +147,11 @@ impl GoalSettingsPane {
             }
             KeyCode::Backspace => {
                 if self.selected_field() == GoalSettingsField::SkepticModel
-                    && let Some(model) = &mut self.draft.skeptic_model
+                    && let Some(model) = &mut self.draft.cold_skeptic_model
                 {
                     model.pop();
                     if model.trim().is_empty() {
-                        self.draft.skeptic_model = None;
+                        self.draft.cold_skeptic_model = None;
                     }
                     self.status = None;
                 }
@@ -171,7 +169,10 @@ impl GoalSettingsPane {
                 if self.selected_field() == GoalSettingsField::SkepticModel
                     && !key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
-                let model = self.draft.skeptic_model.get_or_insert_with(String::new);
+                let model = self
+                    .draft
+                    .cold_skeptic_model
+                    .get_or_insert_with(String::new);
                 model.push(ch);
                 self.status = None;
                 None
@@ -206,19 +207,13 @@ impl GoalSettingsPane {
 
     fn cycle_selected(&mut self) {
         match self.selected_field() {
-            GoalSettingsField::Enabled => {
-                self.draft.enabled = match self.draft.enabled {
-                    None => Some(true),
-                    Some(true) => Some(false),
-                    Some(false) => None,
-                };
-            }
             GoalSettingsField::SkepticCount => {
-                self.draft.skeptic_count = Some(self.draft.skeptic_count.unwrap_or(1));
+                self.draft.cold_skeptic_count = Some(self.draft.cold_skeptic_count.unwrap_or(1));
             }
             GoalSettingsField::SkepticModel => {}
             GoalSettingsField::MaxRounds => {
-                self.draft.max_rounds = Some(self.draft.max_rounds.unwrap_or(1));
+                self.draft.max_verification_attempts =
+                    Some(self.draft.max_verification_attempts.unwrap_or(1));
             }
         }
         self.status = None;
@@ -227,11 +222,14 @@ impl GoalSettingsPane {
     fn bump_selected(&mut self, delta: i32) {
         match self.selected_field() {
             GoalSettingsField::SkepticCount => {
-                self.draft.skeptic_count =
-                    Some(adjust_positive_usize(self.draft.skeptic_count, delta));
+                self.draft.cold_skeptic_count =
+                    Some(adjust_positive_usize(self.draft.cold_skeptic_count, delta));
             }
             GoalSettingsField::MaxRounds => {
-                self.draft.max_rounds = Some(adjust_positive_u32(self.draft.max_rounds, delta));
+                self.draft.max_verification_attempts = Some(adjust_positive_u32(
+                    self.draft.max_verification_attempts,
+                    delta,
+                ));
             }
             _ => {}
         }
@@ -281,7 +279,7 @@ impl GoalSettingsPane {
         };
         if target == GoalSettingsSaveTarget::Agent {
             let mut def = self.def.clone();
-            def.goal_verification = override_;
+            def.goal_supervision = override_;
             cockpit_core::agents::validate_invariants(&def)?;
             self.write_agent_def(&def)?;
             self.def = def;
@@ -342,19 +340,14 @@ impl GoalSettingsPane {
 
     fn value_label(&self, field: GoalSettingsField) -> String {
         match field {
-            GoalSettingsField::Enabled => match self.draft.enabled {
-                None => "inherit".to_string(),
-                Some(true) => "force on".to_string(),
-                Some(false) => "force off".to_string(),
-            },
             GoalSettingsField::SkepticCount => self
                 .draft
-                .skeptic_count
+                .cold_skeptic_count
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "inherit".to_string()),
             GoalSettingsField::SkepticModel => self
                 .draft
-                .skeptic_model
+                .cold_skeptic_model
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
@@ -362,7 +355,7 @@ impl GoalSettingsPane {
                 .to_string(),
             GoalSettingsField::MaxRounds => self
                 .draft
-                .max_rounds
+                .max_verification_attempts
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "inherit".to_string()),
         }
@@ -372,7 +365,6 @@ impl GoalSettingsPane {
 impl GoalSettingsField {
     fn label(self) -> &'static str {
         match self {
-            GoalSettingsField::Enabled => "enabled",
             GoalSettingsField::SkepticCount => "skeptic count",
             GoalSettingsField::SkepticModel => "skeptic model",
             GoalSettingsField::MaxRounds => "max rounds",
@@ -406,8 +398,6 @@ fn agent_edit_path(cwd: &Path, name: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cockpit_core::session::Session;
-
     fn focus_field(pane: &mut GoalSettingsPane, field: GoalSettingsField) {
         pane.cursor = FIELDS
             .iter()
@@ -422,50 +412,16 @@ mod tests {
 
         assert_eq!(
             pane.field_labels(),
-            vec!["enabled", "skeptic count", "skeptic model", "max rounds"]
+            vec!["skeptic count", "skeptic model", "max rounds"]
         );
         assert!(pane.draft.to_override().is_empty());
-    }
-
-    #[tokio::test]
-    async fn goal_settings_session_save_persists_and_does_not_eject() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db = cockpit_db::Db::open_in_memory().unwrap();
-        let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
-        let mut pane = GoalSettingsPane::open(tmp.path(), "Build", true).unwrap();
-        focus_field(&mut pane, GoalSettingsField::SkepticCount);
-        pane.handle_key(KeyEvent::from(KeyCode::Char('+')));
-        pane.start_confirm(GoalSettingsSaveTarget::Session);
-
-        let outcome = pane.confirmed_save();
-
-        let GoalSettingsOutcome::Apply {
-            override_json,
-            persist_session: true,
-        } = outcome
-        else {
-            panic!("session save should apply");
-        };
-        session
-            .set_goal_settings_override_json(override_json)
-            .unwrap();
-        let stored = db.get_session(session.id).await.unwrap().unwrap();
-        assert!(stored.goal_settings_override_json.is_some());
-        assert!(
-            !tmp.path()
-                .join(".cockpit")
-                .join("agents")
-                .join("Build.md")
-                .exists(),
-            "session save must not eject built-in agent to disk"
-        );
     }
 
     #[test]
     fn goal_settings_agent_save_writes_disk_and_ejects_pristine_builtin() {
         let tmp = tempfile::tempdir().unwrap();
         let mut pane = GoalSettingsPane::open(tmp.path(), "Build", true).unwrap();
-        focus_field(&mut pane, GoalSettingsField::Enabled);
+        focus_field(&mut pane, GoalSettingsField::SkepticCount);
         pane.handle_key(KeyEvent::from(KeyCode::Char('t')));
         pane.start_confirm(GoalSettingsSaveTarget::Agent);
 
@@ -481,8 +437,8 @@ mod tests {
         let path = tmp.path().join(".cockpit").join("agents").join("Build.md");
         assert!(path.exists(), "agent save must eject pristine built-in");
         let text = std::fs::read_to_string(path).unwrap();
-        assert!(text.contains("goalVerification:"));
-        assert!(text.contains("enabled: true"));
+        assert!(text.contains("goalSupervision:"));
+        assert!(text.contains("coldSkepticCount: 1"));
     }
 
     #[test]

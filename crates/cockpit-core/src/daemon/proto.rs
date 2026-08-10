@@ -423,8 +423,8 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
                 reason,
             }]
         }
-        TurnEvent::GoalVerificationProgress { done, total } => {
-            vec![Event::GoalVerificationProgress {
+        TurnEvent::GoalSupervisionProgress { done, total } => {
+            vec![Event::GoalSupervisionProgress {
                 session_id,
                 done,
                 total,

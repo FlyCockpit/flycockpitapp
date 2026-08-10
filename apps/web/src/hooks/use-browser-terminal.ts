@@ -215,7 +215,7 @@ export function useBrowserTerminal(options: BrowserTerminalOptions): BrowserTerm
       const files = Array.from(event.dataTransfer.files);
       if (files.length === 0) return;
       event.preventDefault();
-      void pasteFiles(files);
+      void Promise.all(files.map((file) => pasteFiles([file])));
     },
     [pasteFiles],
   );

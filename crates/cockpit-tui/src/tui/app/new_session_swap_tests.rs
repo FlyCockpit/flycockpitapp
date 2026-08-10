@@ -19,11 +19,7 @@ fn new_session_swap_reads_no_config_from_disk() {
     // (`tui-config-single-source`): the swapped-in session's attach delivers a
     // fresh `ConfigSnapshot`, so the swap itself never touches disk.
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new_with_db(
-        Some(tmp.path()),
-        false,
-        cockpit_db::Db::open_in_memory().unwrap(),
-    );
+    let mut app = App::new(Some(tmp.path()), false);
     cockpit_config::extended::reset_load_for_cwd_call_count();
     cockpit_config::providers::reset_load_effective_call_count();
 
@@ -40,11 +36,7 @@ fn new_session_swap_reads_no_config_from_disk() {
 #[test]
 fn new_session_swap_makes_no_daemon_probe_or_connect() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new_with_db(
-        Some(tmp.path()),
-        false,
-        cockpit_db::Db::open_in_memory().unwrap(),
-    );
+    let mut app = App::new(Some(tmp.path()), false);
     cockpit_core::daemon::reset_blocking_probe_call_count();
     cockpit_core::daemon::client::reset_connect_call_count();
 
@@ -61,12 +53,7 @@ fn new_session_swap_makes_no_daemon_probe_or_connect() {
 #[test]
 fn new_session_swap_opens_no_database() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new_with_db(
-        Some(tmp.path()),
-        false,
-        cockpit_db::Db::open_in_memory().unwrap(),
-    );
-    cockpit_db::reset_open_default_call_count();
+    let mut app = App::new(Some(tmp.path()), false);
 
     app.pending_new_session = true;
     let serviced = app
@@ -74,16 +61,11 @@ fn new_session_swap_opens_no_database() {
         .expect("/new should be serviced");
 
     assert!(serviced);
-    assert_eq!(cockpit_db::open_default_call_count(), 0);
 }
 
 fn app_with_only_session_switch_pending(started_at: Instant) -> App {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new_with_db(
-        Some(tmp.path()),
-        false,
-        cockpit_db::Db::open_in_memory().unwrap(),
-    );
+    let mut app = App::new(Some(tmp.path()), false);
     app.busy = false;
     app.pending = None;
     app.toast = None;
@@ -170,6 +152,7 @@ fn complete_submission(index: usize) -> UserSubmission {
         expected_model_state_generation: None,
         expected_model: None,
         kind: cockpit_core::engine::message::UserSubmissionKind::Compact,
+        origin: Default::default(),
         text: format!("wire-{index}"),
         display_text: Some(format!("display-{index}")),
         tag_expansions: vec![cockpit_core::daemon::proto::TagExpansionMeta {
@@ -239,11 +222,7 @@ async fn swap_above_threshold_shows_spinner() {
 #[tokio::test]
 async fn new_session_swap_failure_preserves_old_state_and_exact_staged_submission() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new_with_db(
-        Some(tmp.path()),
-        false,
-        cockpit_db::Db::open_in_memory().unwrap(),
-    );
+    let mut app = App::new(Some(tmp.path()), false);
     let (runner, mut input_rx, mut control_rx) = runner_with_input(1);
     let old_session_id = runner.session_id();
     app.agent_runner = Some(Ok(runner));
@@ -346,11 +325,7 @@ async fn new_session_swap_failure_preserves_old_state_and_exact_staged_submissio
 #[tokio::test]
 async fn new_session_swap_draws_before_swap_completes() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new_with_db(
-        Some(tmp.path()),
-        false,
-        cockpit_db::Db::open_in_memory().unwrap(),
-    );
+    let mut app = App::new(Some(tmp.path()), false);
     app.history.push(HistoryEntry::Plain {
         line: "old transcript remains visible".to_string(),
     });
@@ -372,11 +347,7 @@ async fn new_session_swap_draws_before_swap_completes() {
 #[tokio::test]
 async fn new_session_swap_success_commits_reset_and_keeps_new_optimistic_message() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new_with_db(
-        Some(tmp.path()),
-        false,
-        cockpit_db::Db::open_in_memory().unwrap(),
-    );
+    let mut app = App::new(Some(tmp.path()), false);
     let (runner, mut input_rx, _control_rx) = runner_with_input(1);
     app.agent_runner = Some(Ok(runner));
     app.history.push(HistoryEntry::Plain {
@@ -437,11 +408,7 @@ async fn new_session_swap_success_commits_reset_and_keeps_new_optimistic_message
 #[tokio::test]
 async fn new_session_swap_replays_each_identical_optimistic_row_by_submission_identity() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new_with_db(
-        Some(tmp.path()),
-        false,
-        cockpit_db::Db::open_in_memory().unwrap(),
-    );
+    let mut app = App::new(Some(tmp.path()), false);
     let (runner, mut input_rx, _control_rx) = runner_with_input(2);
     app.agent_runner = Some(Ok(runner));
     app.history.push(HistoryEntry::Plain {
@@ -565,11 +532,7 @@ async fn new_session_swap_replays_each_identical_optimistic_row_by_submission_id
 #[tokio::test]
 async fn new_session_normal_fresh_a_then_busy_b_preserves_distinct_optimistic_surfaces() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new_with_db(
-        Some(tmp.path()),
-        false,
-        cockpit_db::Db::open_in_memory().unwrap(),
-    );
+    let mut app = App::new(Some(tmp.path()), false);
     super::seed_ready_model_for_tests(&mut app);
     let (runner, mut input_rx, _control_rx) = runner_with_input(2);
     app.agent_runner = Some(Ok(runner));
@@ -676,11 +639,7 @@ async fn new_session_normal_fresh_a_then_busy_b_preserves_distinct_optimistic_su
 #[tokio::test]
 async fn new_session_swap_transfers_sixty_four_complete_submissions_in_order() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new_with_db(
-        Some(tmp.path()),
-        false,
-        cockpit_db::Db::open_in_memory().unwrap(),
-    );
+    let mut app = App::new(Some(tmp.path()), false);
     let (runner, mut input_rx, _control_rx) = runner_with_input(1);
     app.agent_runner = Some(Ok(runner));
     let expected = (0..64)
@@ -721,11 +680,7 @@ async fn new_session_swap_transfers_sixty_four_complete_submissions_in_order() {
 #[tokio::test]
 async fn new_session_swap_keeps_in_flight_switch_non_replaceable() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new_with_db(
-        Some(tmp.path()),
-        false,
-        cockpit_db::Db::open_in_memory().unwrap(),
-    );
+    let mut app = App::new(Some(tmp.path()), false);
     let first = uuid::Uuid::new_v4();
     let (finish_first_tx, finish_first_rx) = oneshot::channel();
 

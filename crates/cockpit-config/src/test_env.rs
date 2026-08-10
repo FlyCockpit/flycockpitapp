@@ -4,6 +4,7 @@ pub(crate) fn lock() -> TestEnvGuard {
     TestEnvGuard::blocking_lock()
 }
 
+#[cfg(test)]
 pub(crate) async fn lock_async() -> TestEnvGuard {
     TestEnvGuard::lock().await
 }

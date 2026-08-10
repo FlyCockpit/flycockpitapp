@@ -707,7 +707,9 @@ async fn run_socket(
                         }
                     }
                     IncomingRelayFrame::Client(frame) => {
-                        if frame.v != crate::daemon::relay_envelope::RELAY_ENVELOPE_VERSION {
+                        if !crate::daemon::relay_envelope::is_relay_envelope_version_supported(
+                            frame.v,
+                        ) {
                             continue;
                         }
                         let principal = frame.principal.clone();

@@ -5,6 +5,9 @@ import eventsFixture from "../fixtures/daemon-wire/events.json" with { type: "js
 import interruptsFixture from "../fixtures/daemon-wire/interrupts.json" with { type: "json" };
 import requestsFixture from "../fixtures/daemon-wire/requests.json" with { type: "json" };
 import responsesFixture from "../fixtures/daemon-wire/responses.json" with { type: "json" };
+import remoteOperationIdentityFixture from "../fixtures/remote-operation-identity-v1.json" with {
+  type: "json",
+};
 import {
   activeModelStateSchema,
   clientEnvelopeSchema,
@@ -13,11 +16,14 @@ import {
   errorEnvelopeSchema,
   eventEnvelopeSchema,
   grantKindSchema,
+  historyEntrySchema,
   interruptQuestionSchema,
   knownEventEnvelopeSchema,
   modelSelectionOutcomeSchema,
   modelSelectionResultDataSchema,
   PROTOCOL_VERSION,
+  pausedWorkSummarySchema,
+  remoteOperationIdentityV1Schema,
   resolveResponseSchema,
   responseEnvelopeSchema,
   sandboxEscalationSchema,
@@ -34,6 +40,14 @@ const goldenFiles = [
 const interruptRaisedDataSchema = z.object({ question: interruptQuestionSchema });
 
 describe("cockpit-proto daemon wire schemas", () => {
+  it("enforces canonical UUIDv7 remote operation identities", () => {
+    const valid = remoteOperationIdentityFixture.valid;
+    expect(remoteOperationIdentityV1Schema.safeParse(valid).success).toBe(true);
+    for (const malformed of remoteOperationIdentityFixture.invalid) {
+      expect(remoteOperationIdentityV1Schema.safeParse(malformed).success).toBe(false);
+    }
+  });
+
   it("parses every golden request envelope", () => {
     for (const [name, frame] of Object.entries(requestsFixture)) {
       const parsed = clientEnvelopeSchema.safeParse(frame);
@@ -415,5 +429,173 @@ describe("cockpit-proto daemon wire schemas", () => {
     expect(serverMessageSchema.safeParse({ type: "response", id: "req-1", ok: true }).success).toBe(
       false,
     );
+  });
+
+  it("config_refreshed_typescript_mirror_is_v9", () => {
+    expect(PROTOCOL_VERSION).toBe(9);
+    expect(responseEnvelopeSchema.parse(responsesFixture.config_refreshed)).toEqual(
+      responsesFixture.config_refreshed,
+    );
+    expect(
+      responseEnvelopeSchema.safeParse({
+        ...responsesFixture.config_refreshed,
+        data: { ...responsesFixture.config_refreshed.data, extra: true },
+      }).success,
+    ).toBe(false);
+  });
+
+  it("bounds mirrored Rust u64 and i64 JSON numbers to exact JavaScript integers", () => {
+    const markSeen = requestsFixture.mark_app_flag_seen;
+    expect(
+      clientEnvelopeSchema.safeParse({
+        ...markSeen,
+        params: { ...markSeen.params, expected_version: Number.MAX_SAFE_INTEGER },
+      }).success,
+    ).toBe(true);
+    for (const expected_version of [-1, Number.MAX_SAFE_INTEGER + 1, 1e100]) {
+      expect(
+        clientEnvelopeSchema.safeParse({
+          ...markSeen,
+          params: { ...markSeen.params, expected_version },
+        }).success,
+      ).toBe(false);
+    }
+
+    for (const request of [
+      requestsFixture.attach,
+      requestsFixture.read_history_page,
+      requestsFixture.read_session_messages,
+      requestsFixture.read_subagent_history_page,
+    ]) {
+      const cursor = request.request === "attach" ? "since_seq" : "before_seq";
+      for (const value of [Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER]) {
+        expect(
+          clientEnvelopeSchema.safeParse({
+            ...request,
+            params: { ...request.params, [cursor]: value },
+          }).success,
+        ).toBe(true);
+      }
+      for (const value of [Number.MIN_SAFE_INTEGER - 1, Number.MAX_SAFE_INTEGER + 1]) {
+        expect(
+          clientEnvelopeSchema.safeParse({
+            ...request,
+            params: { ...request.params, [cursor]: value },
+          }).success,
+        ).toBe(false);
+      }
+    }
+
+    const disclosures = responsesFixture.startup_disclosures;
+    for (const cursor_seq of [Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER]) {
+      expect(
+        responseEnvelopeSchema.safeParse({
+          ...disclosures,
+          data: {
+            ...disclosures.data,
+            org_sync: { ...disclosures.data.org_sync, cursor_seq },
+          },
+        }).success,
+      ).toBe(true);
+    }
+    for (const cursor_seq of [Number.MIN_SAFE_INTEGER - 1, Number.MAX_SAFE_INTEGER + 1, 1e100]) {
+      expect(
+        responseEnvelopeSchema.safeParse({
+          ...disclosures,
+          data: {
+            ...disclosures.data,
+            org_sync: { ...disclosures.data.org_sync, cursor_seq },
+          },
+        }).success,
+      ).toBe(false);
+    }
+
+    expect(
+      responseEnvelopeSchema.safeParse({
+        ...responsesFixture.workspace_trust_set,
+        data: { config_generation: 1e100 },
+      }).success,
+    ).toBe(false);
+    expect(
+      responseEnvelopeSchema.safeParse({
+        ...responsesFixture.config_refreshed,
+        data: { ...responsesFixture.config_refreshed.data, applied_generation: 1e100 },
+      }).success,
+    ).toBe(false);
+
+    for (const field of [
+      "config_generation",
+      "inventory_generation",
+      "session_generation",
+    ] as const) {
+      expect(
+        responseEnvelopeSchema.safeParse({
+          ...responsesFixture.inventory_bundle,
+          data: {
+            ...responsesFixture.inventory_bundle.data,
+            [field]: Number.MAX_SAFE_INTEGER,
+          },
+        }).success,
+      ).toBe(true);
+      expect(
+        responseEnvelopeSchema.safeParse({
+          ...responsesFixture.inventory_bundle,
+          data: {
+            ...responsesFixture.inventory_bundle.data,
+            [field]: Number.MAX_SAFE_INTEGER + 1,
+          },
+        }).success,
+      ).toBe(false);
+    }
+
+    const toolCall = {
+      role: "tool_call",
+      agent: "Build",
+      call_id: "call-1",
+      parent_child_index: Number.MIN_SAFE_INTEGER,
+      tool: "read",
+      original_input: {},
+      wire_input: {},
+      output: "ok",
+      hard_fail: false,
+      truncated: false,
+    };
+    expect(historyEntrySchema.safeParse(toolCall).success).toBe(true);
+    expect(
+      historyEntrySchema.safeParse({
+        ...toolCall,
+        parent_child_index: Number.MIN_SAFE_INTEGER - 1,
+      }).success,
+    ).toBe(false);
+
+    const compactBoundary = {
+      role: "compact_boundary",
+      predecessor_short_id: "abc123",
+      seed_tool_count: 1,
+      seed_tool_tokens: Number.MAX_SAFE_INTEGER,
+      tokens_before: Number.MAX_SAFE_INTEGER,
+      tokens_after: Number.MAX_SAFE_INTEGER,
+    };
+    expect(historyEntrySchema.safeParse(compactBoundary).success).toBe(true);
+    expect(
+      historyEntrySchema.safeParse({
+        ...compactBoundary,
+        seed_tool_tokens: Number.MAX_SAFE_INTEGER + 1,
+      }).success,
+    ).toBe(false);
+
+    const pausedWork = responsesFixture.attached.data.paused_work[0];
+    expect(
+      pausedWorkSummarySchema.safeParse({
+        ...pausedWork,
+        pending_tool_count: Number.MIN_SAFE_INTEGER,
+      }).success,
+    ).toBe(true);
+    expect(
+      pausedWorkSummarySchema.safeParse({
+        ...pausedWork,
+        pending_tool_count: Number.MIN_SAFE_INTEGER - 1,
+      }).success,
+    ).toBe(false);
   });
 });

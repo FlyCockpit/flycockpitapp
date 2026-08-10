@@ -108,6 +108,7 @@ fn io(context: &str, error: std::io::Error) -> ExternalJournalError {
 /// Canonicalizing the existing part once is what makes a symlinked ancestor
 /// (`/var` -> `/private/var` on macOS) work while keeping every component
 /// below the resolved root no-follow.
+#[cfg(not(unix))]
 fn resolve_existing_base(path: &Path) -> Result<(PathBuf, Vec<String>), ExternalJournalError> {
     if !path.is_absolute() {
         return Err(ExternalJournalError::Containment(format!(
@@ -186,6 +187,52 @@ mod imp {
         path: PathBuf,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct HeldEntryIdentity {
+        pub filesystem_id: u64,
+        pub object_id: u128,
+        pub kind: u8,
+        pub len: u64,
+        pub mode: u32,
+        pub owner_id: u64,
+        pub link_count: u64,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum HeldRenameEffect {
+        Applied(HeldEntryIdentity),
+        AppliedIdentityMismatch {
+            expected: HeldEntryIdentity,
+            observed: HeldEntryIdentity,
+        },
+    }
+
+    fn identity(metadata: &std::fs::Metadata) -> Result<HeldEntryIdentity, ExternalJournalError> {
+        let kind = if metadata.is_file() {
+            1
+        } else if metadata.is_dir() {
+            2
+        } else {
+            return Err(ExternalJournalError::Containment(
+                "held entry must be a regular file or directory".into(),
+            ));
+        };
+        if metadata.nlink() == 0 {
+            return Err(ExternalJournalError::Containment(
+                "held entry has no filesystem links".into(),
+            ));
+        }
+        Ok(HeldEntryIdentity {
+            filesystem_id: metadata.dev(),
+            object_id: u128::from(metadata.ino()),
+            kind,
+            len: metadata.len(),
+            mode: metadata.mode(),
+            owner_id: u64::from(metadata.uid()),
+            link_count: metadata.nlink(),
+        })
+    }
+
     fn cstring(name: &str) -> Result<CString, ExternalJournalError> {
         CString::new(name).map_err(|_| {
             ExternalJournalError::Containment(format!("spool name contains NUL: {name:?}"))
@@ -256,42 +303,51 @@ mod imp {
     }
 
     impl DirGuard {
-        /// Open the spool root: canonicalize the existing part once, then
-        /// walk any remaining components no-follow.
+        /// Open an absolute configured root from held `/`, never canonicalizing
+        /// or following a component supplied by the path.
         pub fn open_root(path: &Path, create: bool) -> Result<Self, ExternalJournalError> {
-            let (base, pending) = resolve_existing_base(path)?;
-            if !create && !pending.is_empty() {
-                return Err(ExternalJournalError::Spool(format!(
-                    "spool root {} does not exist",
+            Self::open_root_with_walk_hook(path, create, || {})
+        }
+
+        pub(crate) fn open_root_with_walk_hook(
+            path: &Path,
+            create: bool,
+            before_walk: impl FnOnce(),
+        ) -> Result<Self, ExternalJournalError> {
+            if !path.is_absolute()
+                || path
+                    .components()
+                    .any(|part| matches!(part, Component::ParentDir))
+            {
+                return Err(ExternalJournalError::Containment(format!(
+                    "held root must be absolute without `..`: {}",
                     path.display()
                 )));
             }
-            let base_c =
-                std::ffi::CString::new(base.as_os_str().as_encoded_bytes()).map_err(|_| {
-                    ExternalJournalError::Containment("spool root contains NUL".to_string())
-                })?;
-            // The base is fully resolved, so no component of it is a symlink.
-            // `O_NOFOLLOW` is still set: it costs nothing and closes the narrow
-            // window in which the final component is swapped for a symlink
-            // between `canonicalize` and this open.
-            // SAFETY: `base_c` is a live NUL-terminated C string; the returned
-            // descriptor is transferred exactly once to `File`.
             let fd = unsafe {
                 libc::open(
-                    base_c.as_ptr(),
+                    c"/".as_ptr(),
                     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 )
             };
             if fd < 0 {
                 return Err(io("opening spool root", std::io::Error::last_os_error()));
             }
-            // SAFETY: `fd` was just returned by `open` and is uniquely owned.
             let mut dir = unsafe { File::from_raw_fd(fd) };
-            let mut walked = base;
-            for name in pending {
-                let (next, created) = open_dir_at(Some(&dir), &cstring(&name)?, create)?;
+            let mut walked = PathBuf::from("/");
+            before_walk();
+            for component in path.components() {
+                let Component::Normal(name) = component else {
+                    continue;
+                };
+                let name = name.to_str().ok_or_else(|| {
+                    ExternalJournalError::Containment(
+                        "held root component is not valid UTF-8".into(),
+                    )
+                })?;
+                let (next, created) = open_dir_at(Some(&dir), &cstring(name)?, create)?;
                 dir = next;
-                walked.push(&name);
+                walked.push(name);
                 if created {
                     enforce_dir_mode(&dir, &walked)?;
                 }
@@ -316,6 +372,155 @@ mod imp {
 
         pub fn path(&self) -> &Path {
             &self.path
+        }
+
+        pub fn held_identity(&self) -> Result<HeldEntryIdentity, ExternalJournalError> {
+            identity(
+                &self
+                    .dir
+                    .metadata()
+                    .map_err(|error| io("stat held directory", error))?,
+            )
+        }
+
+        pub fn open_entry_identity(
+            &self,
+            name: &str,
+        ) -> Result<HeldEntryIdentity, ExternalJournalError> {
+            check_component(name)?;
+            let name = cstring(name)?;
+            let fd = unsafe {
+                libc::openat(
+                    self.dir.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(io("opening held entry", std::io::Error::last_os_error()));
+            }
+            let file = unsafe { File::from_raw_fd(fd) };
+            identity(
+                &file
+                    .metadata()
+                    .map_err(|error| io("stat held entry", error))?,
+            )
+        }
+
+        pub fn require_entry_absent(&self, name: &str) -> Result<(), ExternalJournalError> {
+            check_component(name)?;
+            let name = cstring(name)?;
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            let result = unsafe {
+                libc::fstatat(
+                    self.dir.as_raw_fd(),
+                    name.as_ptr(),
+                    stat.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if result == 0 {
+                return Err(ExternalJournalError::QuarantineNameTaken(
+                    name.to_string_lossy().into_owned(),
+                ));
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(());
+            }
+            Err(io("checking held target absence", error))
+        }
+
+        pub fn require_same_filesystem(
+            &self,
+            other: &DirGuard,
+        ) -> Result<(), ExternalJournalError> {
+            if self.held_identity()?.filesystem_id != other.held_identity()?.filesystem_id {
+                return Err(ExternalJournalError::Containment(
+                    "atomic rename requires source and target on one filesystem".into(),
+                ));
+            }
+            Ok(())
+        }
+
+        pub fn rename_entry_noreplace_atomic(
+            &self,
+            name: &str,
+            target: &DirGuard,
+            target_name: &str,
+            expected_source: HeldEntryIdentity,
+        ) -> Result<HeldRenameEffect, ExternalJournalError> {
+            self.rename_entry_noreplace_atomic_with_hook(
+                name,
+                target,
+                target_name,
+                expected_source,
+                || {},
+            )
+        }
+
+        pub(crate) fn rename_entry_noreplace_atomic_with_hook(
+            &self,
+            name: &str,
+            target: &DirGuard,
+            target_name: &str,
+            expected_source: HeldEntryIdentity,
+            before_syscall: impl FnOnce(),
+        ) -> Result<HeldRenameEffect, ExternalJournalError> {
+            self.require_same_filesystem(target)?;
+            check_component(name)?;
+            check_component(target_name)?;
+            let from = cstring(name)?;
+            let to = cstring(target_name)?;
+            let observed_source = self.open_entry_identity(name)?;
+            if observed_source != expected_source {
+                return Err(ExternalJournalError::Containment(
+                    "rename source identity changed before dispatch".into(),
+                ));
+            }
+            before_syscall();
+            #[cfg(target_os = "linux")]
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    self.dir.as_raw_fd(),
+                    from.as_ptr(),
+                    target.dir.as_raw_fd(),
+                    to.as_ptr(),
+                    1_u32,
+                ) as libc::c_int
+            };
+            #[cfg(target_os = "macos")]
+            let result = unsafe {
+                libc::renameatx_np(
+                    self.dir.as_raw_fd(),
+                    from.as_ptr(),
+                    target.dir.as_raw_fd(),
+                    to.as_ptr(),
+                    libc::RENAME_EXCL,
+                )
+            };
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            let result: libc::c_int = return Err(ExternalJournalError::Containment(
+                "held atomic no-replace rename is unsupported on this platform".into(),
+            ));
+            if result == 0 {
+                let observed_target = target.open_entry_identity(target_name)?;
+                if observed_target != expected_source {
+                    return Ok(HeldRenameEffect::AppliedIdentityMismatch {
+                        expected: expected_source,
+                        observed: observed_target,
+                    });
+                }
+                return Ok(HeldRenameEffect::Applied(observed_target));
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                return Err(ExternalJournalError::QuarantineNameTaken(
+                    target_name.to_owned(),
+                ));
+            }
+            Err(io("held atomic no-replace rename", error))
         }
 
         /// Verify the held directory still carries exactly `0700`.
@@ -768,6 +973,8 @@ mod imp {
 }
 
 pub use imp::DirGuard;
+#[cfg(unix)]
+pub use imp::{HeldEntryIdentity, HeldRenameEffect};
 
 impl DirGuard {
     /// Enumerate candidate file names. The names are untrusted: every caller
@@ -852,9 +1059,8 @@ mod tests {
         }
     }
 
-    /// A symlinked ancestor must not break the spool: macOS resolves `/var` to
-    /// `/private/var`, so `$TMPDIR` — and any data directory beneath it — is
-    /// reached through a symlink on a stock machine.
+    /// Configured roots are normalized before entering this primitive. The
+    /// held walk itself never follows an ancestor alias.
     #[test]
     fn external_journal_spool_security_tolerates_symlinked_ancestors() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -866,11 +1072,12 @@ mod tests {
         #[cfg(not(unix))]
         std::fs::create_dir(&link).unwrap();
 
-        let guard = DirGuard::open_root(&link.join("spool"), true).unwrap();
-        // The handle resolves to the real directory, and the spool really was
-        // created there rather than beside the link.
+        #[cfg(unix)]
+        assert!(DirGuard::open_root(&link.join("spool"), true).is_err());
+        let configured = if cfg!(unix) { &real } else { &link };
+        let guard = DirGuard::open_root(&configured.join("spool"), true).unwrap();
         assert!(guard.path().is_absolute());
-        assert!(real.join("spool").is_dir() || link.join("spool").is_dir());
+        assert!(configured.join("spool").is_dir());
         guard.verify_private().unwrap();
     }
 
@@ -941,5 +1148,102 @@ mod tests {
         from.rename_into_noreplace("a.v1", &to, "a.v1.1").unwrap();
         assert!(std::fs::symlink_metadata(from.path().join("a.v1")).is_err());
         assert!(std::fs::symlink_metadata(to.path().join("a.v1.1")).is_ok());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn held_entry_identity_and_atomic_noreplace_rename_are_descriptor_relative() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = DirGuard::open_root(&tmp.path().join("root"), true).unwrap();
+        let from = root.open_child_dir("from", true).unwrap();
+        let to = root.open_child_dir("to", true).unwrap();
+        std::fs::write(from.path().join("entry"), b"payload").unwrap();
+        let before = from.open_entry_identity("entry").unwrap();
+        assert_eq!(before.kind, 1);
+        assert_eq!(
+            before.filesystem_id,
+            from.held_identity().unwrap().filesystem_id
+        );
+        std::fs::write(to.path().join("occupied"), b"other").unwrap();
+        assert!(matches!(
+            from.rename_entry_noreplace_atomic("entry", &to, "occupied", before),
+            Err(ExternalJournalError::QuarantineNameTaken(_))
+        ));
+        from.rename_entry_noreplace_atomic("entry", &to, "moved", before)
+            .unwrap();
+        assert_eq!(to.open_entry_identity("moved").unwrap(), before);
+        assert!(from.open_entry_identity("entry").is_err());
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("moved", to.path().join("alias")).unwrap();
+            assert!(to.open_entry_identity("alias").is_err());
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn held_atomic_rename_rejects_source_identity_swap() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = DirGuard::open_root(&tmp.path().join("root"), true).unwrap();
+        let from = root.open_child_dir("from", true).unwrap();
+        let to = root.open_child_dir("to", true).unwrap();
+        std::fs::write(from.path().join("entry"), b"first").unwrap();
+        let expected = from.open_entry_identity("entry").unwrap();
+        std::fs::rename(from.path().join("entry"), from.path().join("old")).unwrap();
+        std::fs::write(from.path().join("entry"), b"first").unwrap();
+        assert!(matches!(
+            from.rename_entry_noreplace_atomic("entry", &to, "moved", expected),
+            Err(ExternalJournalError::Containment(_))
+        ));
+        assert!(!to.path().join("moved").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn held_root_walk_has_no_pre_authority_canonical_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let moved = tmp.path().join("moved");
+        let result = DirGuard::open_root_with_walk_hook(&root, false, || {
+            std::fs::rename(&root, &moved).unwrap();
+            std::fs::create_dir(&root).unwrap();
+        })
+        .unwrap();
+        assert_eq!(
+            result.held_identity().unwrap(),
+            DirGuard::open_root(&root, false)
+                .unwrap()
+                .held_identity()
+                .unwrap()
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn rename_name_swap_is_reported_as_applied_identity_mismatch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = DirGuard::open_root(&tmp.path().join("root"), true).unwrap();
+        let from = root.open_child_dir("from", true).unwrap();
+        let to = root.open_child_dir("to", true).unwrap();
+        std::fs::write(from.path().join("entry"), b"expected").unwrap();
+        let expected = from.open_entry_identity("entry").unwrap();
+        let effect = from
+            .rename_entry_noreplace_atomic_with_hook("entry", &to, "moved", expected, || {
+                std::fs::rename(from.path().join("entry"), from.path().join("expected-held"))
+                    .unwrap();
+                std::fs::write(from.path().join("entry"), b"replacement").unwrap();
+            })
+            .unwrap();
+        assert!(matches!(
+            effect,
+            HeldRenameEffect::AppliedIdentityMismatch { expected: value, observed }
+                if value == expected && observed != expected
+        ));
+        assert_eq!(
+            std::fs::read(to.path().join("moved")).unwrap(),
+            b"replacement"
+        );
     }
 }

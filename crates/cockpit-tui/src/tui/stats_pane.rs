@@ -1,7 +1,7 @@
 //! `/stats` pane (GOALS §15 / §15e).
 //!
 //! A full-body interactive view over the part-1 roll-up layer
-//! ([`cockpit_db::stats::rollup`]). It renders the three §15a sections —
+//! returned by the daemon stats RPC. It renders the three §15a sections —
 //! token spend per model, tool-call recovery per model, and the
 //! language breakdown — with interactive scope (current project / all)
 //! and range (7d / all) toggles plus an expandable recovery drilldown.
@@ -25,8 +25,8 @@ use crate::tui::pane::{Pane, ScrollList};
 use crate::tui::pane_shared::{resolve_project_id, short_id};
 use crate::tui::progress::render_bar;
 use crate::tui::theme::MUTED_COLOR_INDEX;
-use cockpit_db::stats::{
-    LanguageSection, PriceTable, RecoverySection, StatsRange, StatsRollup, StatsScope, TokenSpend,
+use cockpit_core::daemon::proto::{
+    LanguageSection, RecoverySection, StatsRange, StatsRollup, StatsScope, TokenSpend,
 };
 
 /// Width (in cells) of the language bar gauge. Hand-rolled `█`/`░`
@@ -436,23 +436,26 @@ fn init_expanded(rollup: &StatsPaneState) -> Vec<bool> {
     }
 }
 
-pub(crate) async fn fetch_stats_rollup(
-    db: Option<cockpit_db::Db>,
+pub(crate) fn fetch_stats_rollup(
+    socket: Option<&std::path::Path>,
     key: StatsPaneFetchKey,
 ) -> StatsPaneFetchResult {
-    let result = async {
-        let Some(db) = db else {
-            return Err("could not open the session database".to_string());
-        };
-        let prices = PriceTable::load_default();
-        let scope = key.scope();
-        let range = key.range();
-        let now = chrono::Utc::now().timestamp();
-        db.read(move |conn| cockpit_db::stats::rollup(conn, &scope, range, &prices, false, now))
-            .await
-            .map_err(|e| e.to_string())
+    let request = cockpit_core::daemon::proto::Request::StatsRollup {
+        project_id: match key.scope() {
+            StatsScope::Project(id) => Some(id),
+            StatsScope::All => None,
+        },
+        range: key.range(),
+        by_role: false,
+    };
+    let result = match socket {
+        Some(socket) => crate::tui::agent_runner::daemon_request_at_blocking(socket, request),
+        None => Err("Unavailable — reconnect to the daemon, then Retry".to_string()),
     }
-    .await;
+    .and_then(|response| match response {
+        cockpit_core::daemon::proto::Response::StatsRollup { rollup } => Ok(rollup),
+        other => Err(format!("unexpected stats response: {other:?}")),
+    });
     StatsPaneFetchResult { key, result }
 }
 
@@ -818,7 +821,7 @@ fn fmt_cost(c: Option<f64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cockpit_db::stats::{
+    use cockpit_core::daemon::proto::{
         HardFailShapeRow, LanguageRow, NonFileRow, RecoveryModeRow, RecoveryRow, RecoveryStageRow,
         RecoveryToolRow,
     };
@@ -1107,7 +1110,7 @@ mod tests {
     #[test]
     fn cursor_follow_accounts_for_expanded_variable_height_rows() {
         let mut rollup = empty_rollup();
-        rollup.tokens.by_model = vec![cockpit_db::stats::TokenRow {
+        rollup.tokens.by_model = vec![cockpit_core::daemon::proto::TokenRow {
             model: "tok".into(),
             provider: "p".into(),
             input_tokens: 1,

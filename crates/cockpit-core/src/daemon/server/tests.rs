@@ -26,7 +26,7 @@ fn trusted_test_policy(root: &std::path::Path) -> crate::config::trust::Workspac
 }
 
 macro_rules! pin_registration_rows_from_command_table {
-    (($($context:ident),*) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+    (($($context:ident),*) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
         vec![$(($kind, stringify!($authz), stringify!($ordering))),+]
     }};
 }
@@ -742,14 +742,2540 @@ fn pins_with_text_response_is_scrubbed() {
     assert!(pins[0].text.contains("[redacted]"));
 }
 
+#[test]
+fn config_refreshed_is_exhaustively_redacted() {
+    let redact = table_for("literal-secret");
+    let mut response = Response::ConfigRefreshed {
+        applied_generation: 9,
+        changed: true,
+    };
+    scrub_response_free_text(&mut response, &redact);
+    assert!(matches!(
+        response,
+        Response::ConfigRefreshed {
+            applied_generation: 9,
+            changed: true
+        }
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn refresh_config_response_is_causally_terminal() {
+    assert_worker_delivery_happy("refresh_config").await;
+}
+
+#[test]
+fn invalid_response_metrics_tokenizer_dispatch_error_is_exact_and_safe() {
+    let error = explicit_config_refresh_error(
+        crate::daemon::config_refresh::ExplicitConfigRefreshError::InvalidResponseMetricsTokenizer,
+    );
+    assert_eq!(error.code, ErrorCode::InvalidResponseMetricsTokenizer);
+    assert_eq!(error.message, "configuration value is invalid");
+}
+
 fn remote_principal() -> ClientPrincipal {
     ClientPrincipal::Remote(principal::RemotePrincipal {
         user_id: "remote-user".to_string(),
+        actor_binding: None,
         grants: vec![principal::PrincipalGrant {
             scope: principal::PrincipalScope::AgentReadonly,
             project_root: None,
         }],
     })
+}
+
+#[test]
+fn remote_operation_gate_is_pre_dispatch_and_preserves_correlation() {
+    let request_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+    let logical_attachment_id = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
+    let device_id = Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap();
+    let operation_id = Uuid::parse_str("018f3f24-7a10-7cc2-8f55-111111111111").unwrap();
+    let operation =
+        proto::RemoteOperationIdentityV1::new(logical_attachment_id, operation_id).unwrap();
+    let actor = crate::daemon::relay_envelope::ClientActorBindingV1 {
+        schema_version: 1,
+        device_id,
+        device_generation: 9,
+        logical_attachment_id,
+    };
+    let principal = |actor_binding| {
+        ClientPrincipal::Remote(principal::RemotePrincipal {
+            user_id: "remote-user".into(),
+            grants: Vec::new(),
+            actor_binding,
+        })
+    };
+    let read = Request::DaemonStatus;
+    let mutation = Request::MarkAppFlagSeen {
+        key: proto::AppFlagKey::DaemonAutostartNotice,
+        expected_version: 0,
+    };
+    let reachable_mutation = Request::CancelRunInvocation {
+        client_submission_id: Uuid::new_v4(),
+    };
+    let mut reached_dispatch = 0;
+    let cases = [
+        ("actorless_read", principal(None), None, &read, true),
+        (
+            "actorless_mutation",
+            principal(None),
+            None,
+            &mutation,
+            false,
+        ),
+        (
+            "missing_operation",
+            principal(Some(actor.clone())),
+            None,
+            &mutation,
+            false,
+        ),
+        (
+            "wrong_schema",
+            principal(Some(actor.clone())),
+            Some(proto::RemoteOperationIdentityV1 {
+                schema_version: 2,
+                ..operation
+            }),
+            &mutation,
+            false,
+        ),
+        (
+            "attachment_mismatch",
+            principal(Some(actor.clone())),
+            Some(proto::RemoteOperationIdentityV1 {
+                logical_attachment_id: device_id,
+                ..operation
+            }),
+            &mutation,
+            false,
+        ),
+        (
+            "zero_generation",
+            principal(Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+                device_generation: 0,
+                ..actor.clone()
+            })),
+            Some(operation),
+            &mutation,
+            false,
+        ),
+        (
+            "non_v7_operation",
+            principal(Some(actor.clone())),
+            Some(proto::RemoteOperationIdentityV1 {
+                operation_id: Uuid::parse_str("018f3f24-7a10-7cc2-7f55-111111111111").unwrap(),
+                ..operation
+            }),
+            &read,
+            false,
+        ),
+        (
+            "valid_remote_mutation",
+            principal(Some(actor.clone())),
+            Some(operation),
+            &reachable_mutation,
+            true,
+        ),
+        (
+            "remote_local_only_mutation",
+            principal(Some(actor.clone())),
+            Some(operation),
+            &mutation,
+            false,
+        ),
+        (
+            "owner_local_mutation",
+            ClientPrincipal::owner(),
+            None,
+            &mutation,
+            true,
+        ),
+        (
+            "unknown_request",
+            principal(Some(actor)),
+            Some(operation),
+            &Request::Unknown,
+            false,
+        ),
+    ];
+    for (case, principal, operation, request, allowed) in cases {
+        let admitted = admit_remote_operation(&principal, request_id, operation, request);
+        assert_eq!(admitted.is_ok(), allowed, "admission case {case}");
+        if let Ok(context) = admitted {
+            reached_dispatch += 1;
+            if let Some(context) = context {
+                assert_eq!(context.request_id, request_id);
+                assert_eq!(context.operation_id, operation_id);
+                assert_ne!(context.request_id, context.operation_id);
+                assert_eq!(context.authenticated_device_generation, 9);
+            }
+        }
+    }
+    assert_eq!(reached_dispatch, 3);
+}
+
+#[tokio::test]
+async fn authorized_fcor_resources_normalize_attach_and_nested_schedule_roots() {
+    use proto::remote_operation_fcor::RemoteOperationResourceKind as Kind;
+    let ctx = test_ctx();
+    let state = MutableClientState::detached_for_test();
+    let root = tempfile::tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let attach = |session_id, project_root| Request::Attach {
+        session_id,
+        since_seq: None,
+        project_root,
+        initial_model: None,
+        no_sandbox: false,
+        interactive: false,
+        model_override: None,
+        client_protocol_version: proto::PROTOCOL_VERSION,
+        env_snapshot: None,
+        env_policy: EnvDriftPolicy::Daemon,
+    };
+    let cwd_alias = ctx.canonical_cwd.join(".").to_string_lossy().into_owned();
+    let explicit = authorize_request_context(&attach(None, Some(cwd_alias)), &state, &ctx)
+        .await
+        .unwrap()
+        .fcor_resources;
+    let effective = authorize_request_context(&attach(None, None), &state, &ctx)
+        .await
+        .unwrap()
+        .fcor_resources;
+    assert_eq!(explicit, effective);
+    assert_eq!(explicit[0].kind, Kind::ProjectRoot);
+    assert_eq!(
+        explicit[0].value,
+        ctx.canonical_cwd.to_str().unwrap().as_bytes()
+    );
+    let with_session = authorize_request_context(
+        &attach(
+            Some(session_id),
+            Some(ctx.canonical_cwd.to_string_lossy().into_owned()),
+        ),
+        &state,
+        &ctx,
+    )
+    .await
+    .unwrap()
+    .fcor_resources;
+    assert_eq!(
+        with_session
+            .iter()
+            .map(|resource| resource.kind)
+            .collect::<Vec<_>>(),
+        vec![Kind::SessionUuid, Kind::ProjectRoot]
+    );
+    assert_eq!(with_session[0].value, session_id.as_bytes());
+
+    let scheduled = Request::CreateScheduledJob {
+        job: proto::ScheduledJobCreate {
+            id: "job-1".into(),
+            owner: "system:test".into(),
+            schedule: proto::ScheduledJobSchedule::Every { seconds: 60 },
+            payload: proto::ScheduledJobPayload::RunPrompt {
+                assistant: "Build".into(),
+                prompt: "run".into(),
+                project_root: root.path().join(".").to_string_lossy().into_owned(),
+            },
+            enabled: true,
+            missed_run_policy: proto::MissedRunPolicy::Skip,
+        },
+    };
+    let resources = authorize_request_context(&scheduled, &state, &ctx)
+        .await
+        .unwrap()
+        .fcor_resources;
+    assert_eq!(
+        resources
+            .iter()
+            .map(|resource| resource.kind)
+            .collect::<Vec<_>>(),
+        vec![Kind::SchedulerId, Kind::ProjectRoot]
+    );
+    assert_eq!(resources[0].value, b"job-1");
+    assert_eq!(
+        resources[1].value,
+        root.path()
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .as_bytes()
+    );
+    if let Request::CreateScheduledJob { job } = &scheduled {
+        use proto::remote_operation_fcor::CanonicalFcorValueV1;
+        let mut params = proto::remote_operation_fcor::CanonicalParamsV1::new();
+        job.encode_fcor_value_v1(&mut params).unwrap();
+        let params = params.into_bytes();
+        assert!(
+            !params
+                .windows(job.id.len())
+                .any(|window| window == job.id.as_bytes())
+        );
+        if let proto::ScheduledJobPayload::RunPrompt { project_root, .. } = &job.payload {
+            assert!(
+                !params
+                    .windows(project_root.len())
+                    .any(|window| window == project_root.as_bytes())
+            );
+        }
+    }
+
+    let callback = Request::CreateScheduledJob {
+        job: proto::ScheduledJobCreate {
+            id: "callback-1".into(),
+            owner: "system:test".into(),
+            schedule: proto::ScheduledJobSchedule::Every { seconds: 60 },
+            payload: proto::ScheduledJobPayload::Callback {
+                subsystem: "test".into(),
+            },
+            enabled: true,
+            missed_run_policy: proto::MissedRunPolicy::Skip,
+        },
+    };
+    let callback_resources = authorize_request_context(&callback, &state, &ctx)
+        .await
+        .unwrap()
+        .fcor_resources;
+    assert_eq!(
+        callback_resources
+            .iter()
+            .map(|resource| resource.kind)
+            .collect::<Vec<_>>(),
+        vec![Kind::SchedulerId]
+    );
+
+    let resolver_calls = ctx
+        .fcor_resolver_calls
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let denied = MutableClientState::detached_with_principal(
+        ctx.upload_accounting.clone(),
+        remote_principal(),
+        ctx.terminal_host.clone(),
+    );
+    assert!(
+        authorize_request_context(&scheduled, &denied, &ctx)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        ctx.fcor_resolver_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        resolver_calls
+    );
+}
+
+#[tokio::test]
+async fn authorized_fcor_resources_order_file_modes_and_provider_model() {
+    use proto::remote_operation_fcor::RemoteOperationResourceKind as Kind;
+    let ctx = test_ctx();
+    let state = MutableClientState::detached_for_test();
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("old.txt"), "old").unwrap();
+    let root_text = root.path().to_string_lossy().into_owned();
+    let rename = Request::FsRename {
+        project_root: root_text.clone(),
+        from_path: "old.txt".into(),
+        to_path: "new.txt".into(),
+    };
+    let resources = authorize_request_context(&rename, &state, &ctx)
+        .await
+        .unwrap()
+        .fcor_resources;
+    assert_eq!(
+        resources.iter().map(|item| item.kind).collect::<Vec<_>>(),
+        vec![Kind::ProjectRoot, Kind::FilePath, Kind::FilePath]
+    );
+    assert!(resources[1].value.ends_with(b"old.txt"));
+    assert!(resources[2].value.ends_with(b"new.txt"));
+
+    let guidance = Request::GuidanceEstimate {
+        project_root: root_text,
+        provider: Some("anthropic".into()),
+        model: Some("claude-sonnet-4".into()),
+    };
+    let resources = authorize_request_context(&guidance, &state, &ctx)
+        .await
+        .unwrap()
+        .fcor_resources;
+    assert_eq!(
+        resources.iter().map(|item| item.kind).collect::<Vec<_>>(),
+        vec![Kind::ProjectRoot, Kind::ProviderModel]
+    );
+    assert_eq!(
+        resources[1].value,
+        proto::remote_operation_fcor::encode_provider_model_resource_v1(
+            "anthropic",
+            "claude-sonnet-4"
+        )
+        .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn authorized_resource_bytes_change_operation_hash_and_conflict_before_dispatch() {
+    let ctx = test_ctx();
+    let state = MutableClientState::detached_for_test();
+    let first_root = tempfile::tempdir().unwrap();
+    let second_root = tempfile::tempdir().unwrap();
+    let attach = |project_root: &std::path::Path| Request::Attach {
+        session_id: None,
+        since_seq: None,
+        project_root: Some(project_root.to_string_lossy().into_owned()),
+        initial_model: None,
+        no_sandbox: false,
+        interactive: false,
+        model_override: None,
+        client_protocol_version: proto::PROTOCOL_VERSION,
+        env_snapshot: None,
+        env_policy: EnvDriftPolicy::Daemon,
+    };
+    let first_request = attach(first_root.path());
+    let second_request = attach(second_root.path());
+    let first = authorize_request_context(&first_request, &state, &ctx)
+        .await
+        .unwrap()
+        .encode_fcor(&first_request, b"same-canonical-params")
+        .unwrap();
+    let second = authorize_request_context(&second_request, &state, &ctx)
+        .await
+        .unwrap()
+        .encode_fcor(&second_request, b"same-canonical-params")
+        .unwrap();
+    assert_ne!(first, second);
+
+    let operation_id = characterized_operation_id();
+    let side_effects = std::sync::atomic::AtomicUsize::new(0);
+    let first_hash = proto::remote_operation_fcor::hash_fcor_v1(&first).unwrap();
+    let second_hash = proto::remote_operation_fcor::hash_fcor_v1(&second).unwrap();
+    assert!(matches!(
+        characterize_operation_dispatch(
+            &ctx.db,
+            Uuid::new_v4(),
+            operation_id,
+            first_hash,
+            &side_effects,
+        )
+        .await,
+        CharacterizedDispatchOutcome::Applied(_)
+    ));
+    assert_eq!(
+        characterize_operation_dispatch(
+            &ctx.db,
+            Uuid::new_v4(),
+            operation_id,
+            second_hash,
+            &side_effects,
+        )
+        .await,
+        CharacterizedDispatchOutcome::Conflict
+    );
+    assert_eq!(side_effects.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
+    let ctx = test_ctx();
+    let logical_attachment_id = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
+    let operation_id = Uuid::parse_str("018f3f24-7a10-7cc2-8f55-111111111111").unwrap();
+    let actor = crate::daemon::relay_envelope::ClientActorBindingV1 {
+        schema_version: 1,
+        device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap(),
+        device_generation: 9,
+        logical_attachment_id,
+    };
+    let remote = |actor_binding| {
+        ClientPrincipal::Remote(principal::RemotePrincipal {
+            user_id: "remote-user".into(),
+            grants: Vec::new(),
+            actor_binding,
+        })
+    };
+    let operation =
+        proto::RemoteOperationIdentityV1::new(logical_attachment_id, operation_id).unwrap();
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_cmd_tx, _event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+
+    // A malformed concurrent descriptor is rejected before permit acquisition
+    // or task creation, and the denial remains correlated to its request.
+    let mut state = MutableClientState::detached_with_principal(
+        ctx.upload_accounting.clone(),
+        remote(Some(actor.clone())),
+        ctx.terminal_host.clone(),
+    );
+    let mut shared = state.shared_snapshot();
+    let mut concurrent = ConcurrentRequestRuntime::with_permits_for_test(0);
+    let denied_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            denied_id,
+            proto::RemoteOperationIdentityV1 {
+                operation_id: Uuid::parse_str("018f3f24-7a10-7cc2-7f55-111111111111").unwrap(),
+                ..operation
+            },
+            Request::DaemonStatus,
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(concurrent.is_empty(), "denied request must not spawn");
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "correlated gate denial").await,
+        Body::Error { id: Some(id), error }
+            if id == denied_id && error.code == ErrorCode::Authorization
+    ));
+
+    // Legacy actorless v1 reads remain accepted and execute concurrently.
+    let mut state = MutableClientState::detached_with_principal(
+        ctx.upload_accounting.clone(),
+        remote(None),
+        ctx.terminal_host.clone(),
+    );
+    let mut shared = state.shared_snapshot();
+    let mut concurrent = ConcurrentRequestRuntime::new();
+    let read_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::request(read_id, Request::DaemonStatus),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    concurrent.join_next().await.unwrap().unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "legacy read response").await,
+        Body::Response { id, response }
+            if id == read_id && matches!(*response, Response::DaemonStatus { .. })
+    ));
+
+    // A valid actor-bound descriptor follows the same concurrent handler path.
+    state.principal = remote(Some(actor));
+    shared = state.shared_snapshot();
+    let actor_read_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(actor_read_id, operation, Request::DaemonStatus),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    concurrent.join_next().await.unwrap().unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "actor-bound read response").await,
+        Body::Response { id, response }
+            if id == actor_read_id && matches!(*response, Response::DaemonStatus { .. })
+    ));
+
+    let submission_id = Uuid::new_v4();
+    let actor_mutation_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            actor_mutation_id,
+            operation,
+            Request::CancelRunInvocation {
+                client_submission_id: submission_id,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    let first_response =
+        match recv_writer_body(&mut writer_rx, "actor-bound serialized result").await {
+            Body::Response { id, response } => {
+                assert_eq!(id, actor_mutation_id);
+                assert!(matches!(
+                    &*response,
+                    Response::RunInvocationCancelResult { result }
+                        if result.client_submission_id == submission_id
+                ));
+                serde_json::to_vec(&response).unwrap()
+            }
+            other => panic!("unexpected actor-bound mutation result: {other:?}"),
+        };
+
+    let replay_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            replay_id,
+            operation,
+            Request::CancelRunInvocation {
+                client_submission_id: submission_id,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    match recv_writer_body(&mut writer_rx, "actor-bound replay result").await {
+        Body::Response { id, response } => {
+            assert_eq!(id, replay_id);
+            assert_eq!(serde_json::to_vec(&response).unwrap(), first_response);
+        }
+        other => panic!("unexpected actor-bound replay result: {other:?}"),
+    }
+
+    let conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            conflict_id,
+            operation,
+            Request::CancelRunInvocation {
+                client_submission_id: Uuid::new_v4(),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "actor-bound changed-bytes conflict").await,
+        Body::Error { id: Some(id), error }
+            if id == conflict_id && error.code == ErrorCode::Conflict
+    ));
+    // Local owner mutations bypass remote identity requirements and enter the
+    // serialized dispatcher (the exact domain result is not a gate denial).
+    state.principal = ClientPrincipal::owner();
+    shared = state.shared_snapshot();
+    let local_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::request(
+            local_id,
+            Request::MarkAppFlagSeen {
+                key: proto::AppFlagKey::DaemonAutostartNotice,
+                expected_version: 0,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    match recv_writer_body(&mut writer_rx, "local mutation result").await {
+        Body::Error { id, error } => {
+            assert_eq!(id, Some(local_id));
+            assert_ne!(error.message, remote_operation_denied().message);
+        }
+        Body::Response { id, .. } => assert_eq!(id, local_id),
+        other => panic!("unexpected local mutation result: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn remote_queue_envelope_stamps_server_operation_context_into_worker() {
+    let ctx = test_ctx();
+    let root = tempfile::tempdir().unwrap();
+    let (mut state, session_id, mut work_rx) =
+        attached_state_with_worker_receiver(&ctx, root.path()).await;
+    ctx.db
+        .set_session_shared_with_collaborators(session_id, true)
+        .await
+        .unwrap();
+    let logical_attachment_id = Uuid::parse_str("22222222-2222-4222-8222-222222222225").unwrap();
+    state.principal = ClientPrincipal::Remote(principal::RemotePrincipal {
+        user_id: "queue-writer".into(),
+        grants: vec![principal::PrincipalGrant {
+            scope: principal::PrincipalScope::Agent,
+            project_root: Some(
+                root.path()
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        }],
+        actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+            schema_version: 1,
+            device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333336").unwrap(),
+            device_generation: 7,
+            logical_attachment_id,
+        }),
+    });
+    let mut shared = state.shared_snapshot();
+    let operation_id = Uuid::parse_str("018f3f24-7a10-7cc2-8f55-aaaaaaaaaaaa").unwrap();
+    let operation =
+        proto::RemoteOperationIdentityV1::new(logical_attachment_id, operation_id).unwrap();
+    let queue_item_id = Uuid::new_v4();
+    let request_id = Uuid::new_v4();
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_cmd_tx, _event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let mut concurrent = ConcurrentRequestRuntime::new();
+    let mut pending = Box::pin(handle_envelope(
+        Envelope::remote_request(
+            request_id,
+            operation,
+            Request::RemoveQueuedUserMessage { queue_item_id },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    ));
+    tokio::select! {
+        result = &mut pending => panic!("serialized queue request returned before worker receipt: {result:?}"),
+        _ = tokio::task::yield_now() => {}
+    }
+    let work = work_rx.recv().await.expect("queue work delivered");
+    let SessionWork::RemoveQueuedUserMessage {
+        queue_item_id: delivered,
+        remote_operation: Some(stamp),
+        respond_to,
+    } = work
+    else {
+        panic!("expected stamped remote queue removal")
+    };
+    assert_eq!(delivered, queue_item_id);
+    assert_eq!(
+        stamp.logical_attachment_id,
+        logical_attachment_id.to_string()
+    );
+    assert_eq!(stamp.operation_id, operation_id.to_string());
+    assert_eq!(stamp.authenticated_device_generation, 7);
+    assert_ne!(stamp.request_hash, [0; 32]);
+    respond_to
+        .send(Ok(proto::RemoveQueuedUserMessageResult {
+            applied: true,
+            reason: proto::RemoveQueuedUserMessageReason::Removed,
+            removed_item: None,
+            queue: Vec::new(),
+        }))
+        .unwrap();
+    pending.await.unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "remote queue response").await,
+        Body::Response { id, response }
+            if id == request_id && matches!(*response, Response::RemoveQueuedUserMessageResult { applied: true, .. })
+    ));
+}
+
+#[tokio::test]
+async fn remote_cancel_turn_dispatches_once_then_replays_or_conflicts() {
+    let ctx = test_ctx();
+    let root = tempfile::tempdir().unwrap();
+    let (mut state, session_id, mut work_rx) =
+        attached_state_with_worker_receiver(&ctx, root.path()).await;
+    ctx.db
+        .set_session_shared_with_collaborators(session_id, true)
+        .await
+        .unwrap();
+    let logical_attachment_id = Uuid::parse_str("22222222-2222-4222-8222-222222222226").unwrap();
+    state.principal = ClientPrincipal::Remote(principal::RemotePrincipal {
+        user_id: "cancel-writer".into(),
+        grants: vec![principal::PrincipalGrant {
+            scope: principal::PrincipalScope::Agent,
+            project_root: Some(
+                root.path()
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        }],
+        actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+            schema_version: 1,
+            device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333337").unwrap(),
+            device_generation: 1,
+            logical_attachment_id,
+        }),
+    });
+    let mut shared = state.shared_snapshot();
+    let operation_id = Uuid::parse_str("018f3f24-7a10-7cc2-8f55-eeeeeeeeeeee").unwrap();
+    let operation =
+        proto::RemoteOperationIdentityV1::new(logical_attachment_id, operation_id).unwrap();
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_cmd_tx, _event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let mut concurrent = ConcurrentRequestRuntime::new();
+    for label in ["apply", "replay"] {
+        let id = Uuid::new_v4();
+        handle_envelope(
+            Envelope::remote_request(id, operation, Request::CancelTurn),
+            &mut state,
+            &mut shared,
+            &ctx,
+            &event_cmd_tx,
+            &writer_tx,
+            &mut concurrent,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(recv_writer_body(&mut writer_rx, label).await,
+            Body::Response { id: response_id, response } if response_id == id && matches!(*response, Response::Ack)));
+    }
+    assert!(matches!(work_rx.try_recv(), Ok(SessionWork::Cancel)));
+    assert!(
+        work_rx.try_recv().is_err(),
+        "replay must not dispatch a second cancel"
+    );
+    let agent_operation = proto::RemoteOperationIdentityV1::new(
+        logical_attachment_id,
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-ffffffffffff").unwrap(),
+    )
+    .unwrap();
+    for label in ["agent apply", "agent replay"] {
+        let id = Uuid::new_v4();
+        handle_envelope(
+            Envelope::remote_request(
+                id,
+                agent_operation,
+                Request::SetAgent {
+                    name: "Plan".into(),
+                },
+            ),
+            &mut state,
+            &mut shared,
+            &ctx,
+            &event_cmd_tx,
+            &writer_tx,
+            &mut concurrent,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(recv_writer_body(&mut writer_rx, label).await,
+            Body::Response { id: response_id, response } if response_id == id && matches!(*response, Response::Ack)));
+    }
+    assert!(matches!(work_rx.try_recv(), Ok(SessionWork::SetAgent { name }) if name == "Plan"));
+    assert!(matches!(work_rx.try_recv(), Ok(SessionWork::SetAgent { name }) if name == "Plan"));
+    assert_eq!(
+        ctx.db
+            .get_session(session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .active_agent,
+        "Plan"
+    );
+    let agent_conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            agent_conflict_id,
+            agent_operation,
+            Request::SetAgent {
+                name: "Build".into(),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(recv_writer_body(&mut writer_rx, "agent conflict").await,
+        Body::Error { id: Some(id), error } if id == agent_conflict_id && error.code == ErrorCode::Conflict)
+    );
+    assert!(work_rx.try_recv().is_err());
+    assert_eq!(
+        ctx.db
+            .get_session(session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .active_agent,
+        "Plan"
+    );
+    let env_operation = proto::RemoteOperationIdentityV1::new(
+        logical_attachment_id,
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-abababababab").unwrap(),
+    )
+    .unwrap();
+    let env_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            env_id,
+            env_operation,
+            Request::RefreshEnv {
+                vars: HashMap::from([("TOKEN".into(), "supersecret".into())]),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(recv_writer_body(&mut writer_rx, "secret env apply").await,
+        Body::Response { id, response } if id == env_id && matches!(*response, Response::Ack))
+    );
+    let leaked = ctx.db.read(|conn| {
+        let operation: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM remote_attachment_operations WHERE instr(CAST(safe_response AS TEXT),'supersecret')>0", [], |row| row.get(0),
+        )?;
+        let outbox: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM remote_attachment_outbox WHERE instr(CAST(canonical_payload AS TEXT),'supersecret')>0", [], |row| row.get(0),
+        )?;
+        Ok(operation + outbox)
+    }).await.unwrap();
+    assert_eq!(
+        leaked, 0,
+        "secret env values must be hash-bound but absent from ledger/outbox"
+    );
+    state.principal = ClientPrincipal::Remote(principal::RemotePrincipal {
+        user_id: "cancel-writer".into(),
+        grants: vec![principal::PrincipalGrant {
+            scope: principal::PrincipalScope::Agent,
+            project_root: Some(
+                root.path()
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        }],
+        actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+            schema_version: 1,
+            device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333338").unwrap(),
+            device_generation: 1,
+            logical_attachment_id,
+        }),
+    });
+    shared = state.shared_snapshot();
+    let conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(conflict_id, operation, Request::CancelTurn),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(recv_writer_body(&mut writer_rx, "conflict").await,
+        Body::Error { id: Some(id), error } if id == conflict_id && error.code == ErrorCode::Conflict));
+    assert!(work_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn remote_session_note_applies_replays_and_conflicts_before_second_event() {
+    let ctx = test_ctx();
+    let root = tempfile::tempdir().unwrap();
+    let (mut state, session_id) = attached_state(&ctx, root.path()).await;
+    ctx.db
+        .set_session_shared_with_collaborators(session_id, true)
+        .await
+        .unwrap();
+    let logical_attachment_id = Uuid::parse_str("22222222-2222-4222-8222-222222222223").unwrap();
+    state.principal = ClientPrincipal::Remote(principal::RemotePrincipal {
+        user_id: "remote-writer".into(),
+        grants: vec![principal::PrincipalGrant {
+            scope: principal::PrincipalScope::Agent,
+            project_root: Some(
+                root.path()
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        }],
+        actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+            schema_version: 1,
+            device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333334").unwrap(),
+            device_generation: 1,
+            logical_attachment_id,
+        }),
+    });
+    let mut shared = state.shared_snapshot();
+    let operation = proto::RemoteOperationIdentityV1::new(
+        logical_attachment_id,
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-333333333333").unwrap(),
+    )
+    .unwrap();
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_cmd_tx, _event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let mut concurrent = ConcurrentRequestRuntime::new();
+
+    let first_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            first_id,
+            operation,
+            Request::RecordSessionNote {
+                session_id,
+                text: "durable note".into(),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    let first = match recv_writer_body(&mut writer_rx, "first note").await {
+        Body::Response { id, response } => {
+            assert_eq!(id, first_id);
+            assert!(matches!(&*response, Response::NoteRecorded { .. }));
+            serde_json::to_vec(&response).unwrap()
+        }
+        other => panic!("unexpected first note result: {other:?}"),
+    };
+
+    let replay_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            replay_id,
+            operation,
+            Request::RecordSessionNote {
+                session_id,
+                text: "durable note".into(),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    match recv_writer_body(&mut writer_rx, "replayed note").await {
+        Body::Response { id, response } => {
+            assert_eq!(id, replay_id);
+            assert_eq!(serde_json::to_vec(&response).unwrap(), first);
+        }
+        other => panic!("unexpected note replay: {other:?}"),
+    }
+
+    let conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            conflict_id,
+            operation,
+            Request::RecordSessionNote {
+                session_id,
+                text: "changed note".into(),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "note conflict").await,
+        Body::Error { id: Some(id), error }
+            if id == conflict_id && error.code == ErrorCode::Conflict
+    ));
+    let count: i64 = ctx
+        .db
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM session_events \
+                     WHERE session_id = ?1 AND type = 'user_note'",
+                [session_id.to_string()],
+                |row| row.get(0),
+            )
+            .context("counting remote session notes")
+        })
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "replay and conflict must not append another note");
+
+    let note_seq = ctx
+        .db
+        .insert_session_event(
+            session_id,
+            crate::db::session_log::SessionEventKind::UserMessage,
+            Some("Build"),
+            None,
+            &serde_json::json!({ "text": "pinnable" }),
+        )
+        .await
+        .unwrap();
+    let pin_operation = proto::RemoteOperationIdentityV1::new(
+        logical_attachment_id,
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-555555555555").unwrap(),
+    )
+    .unwrap();
+    let pin_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            pin_id,
+            pin_operation,
+            Request::PinMessage {
+                session_id,
+                seq: note_seq,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "first pin").await,
+        Body::Response { id, response }
+            if id == pin_id && matches!(*response, Response::PinChanged { changed: true })
+    ));
+    let pin_replay_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            pin_replay_id,
+            pin_operation,
+            Request::PinMessage {
+                session_id,
+                seq: note_seq,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "pin replay").await,
+        Body::Response { id, response }
+            if id == pin_replay_id && matches!(*response, Response::PinChanged { changed: true })
+    ));
+    let pin_conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            pin_conflict_id,
+            pin_operation,
+            Request::PinMessage {
+                session_id,
+                seq: note_seq + 1,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "pin conflict").await,
+        Body::Error { id: Some(id), error }
+            if id == pin_conflict_id && error.code == ErrorCode::Conflict
+    ));
+    assert!(ctx.db.is_pinned(session_id, note_seq).await.unwrap());
+    assert!(!ctx.db.is_pinned(session_id, note_seq + 1).await.unwrap());
+
+    let unpin_operation = proto::RemoteOperationIdentityV1::new(
+        logical_attachment_id,
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-888888888888").unwrap(),
+    )
+    .unwrap();
+    let unpin_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            unpin_id,
+            unpin_operation,
+            Request::UnpinMessage {
+                session_id,
+                seq: note_seq,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "first unpin").await,
+        Body::Response { id, response }
+            if id == unpin_id && matches!(*response, Response::PinChanged { changed: true })
+    ));
+    let unpin_replay_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            unpin_replay_id,
+            unpin_operation,
+            Request::UnpinMessage {
+                session_id,
+                seq: note_seq,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "unpin replay").await,
+        Body::Response { id, response }
+            if id == unpin_replay_id && matches!(*response, Response::PinChanged { changed: true })
+    ));
+    let unpin_conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            unpin_conflict_id,
+            unpin_operation,
+            Request::UnpinMessage {
+                session_id,
+                seq: note_seq + 1,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "unpin conflict").await,
+        Body::Error { id: Some(id), error }
+            if id == unpin_conflict_id && error.code == ErrorCode::Conflict
+    ));
+    assert!(!ctx.db.is_pinned(session_id, note_seq).await.unwrap());
+    assert!(!ctx.db.is_pinned(session_id, note_seq + 1).await.unwrap());
+
+    let toggle_operation = proto::RemoteOperationIdentityV1::new(
+        logical_attachment_id,
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-999999999999").unwrap(),
+    )
+    .unwrap();
+    for (request_id, label) in [
+        (Uuid::new_v4(), "first toggle"),
+        (Uuid::new_v4(), "toggle replay"),
+    ] {
+        handle_envelope(
+            Envelope::remote_request(
+                request_id,
+                toggle_operation,
+                Request::TogglePinnedMessage {
+                    session_id,
+                    seq: note_seq,
+                },
+            ),
+            &mut state,
+            &mut shared,
+            &ctx,
+            &event_cmd_tx,
+            &writer_tx,
+            &mut concurrent,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            recv_writer_body(&mut writer_rx, label).await,
+            Body::Response { id, response }
+                if id == request_id && matches!(*response, Response::PinToggled { pinned: true })
+        ));
+    }
+    let toggle_conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            toggle_conflict_id,
+            toggle_operation,
+            Request::TogglePinnedMessage {
+                session_id,
+                seq: note_seq + 1,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "toggle conflict").await,
+        Body::Error { id: Some(id), error }
+            if id == toggle_conflict_id && error.code == ErrorCode::Conflict
+    ));
+    assert!(ctx.db.is_pinned(session_id, note_seq).await.unwrap());
+    assert!(!ctx.db.is_pinned(session_id, note_seq + 1).await.unwrap());
+
+    let rename_operation = proto::RemoteOperationIdentityV1::new(
+        logical_attachment_id,
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-444444444444").unwrap(),
+    )
+    .unwrap();
+    let rename_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            rename_id,
+            rename_operation,
+            Request::RenameSession {
+                session_id,
+                title: "remote title".into(),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "first rename").await,
+        Body::Response { id, response }
+            if id == rename_id && matches!(*response, Response::Ack)
+    ));
+
+    let rename_replay_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            rename_replay_id,
+            rename_operation,
+            Request::RenameSession {
+                session_id,
+                title: "remote title".into(),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "rename replay").await,
+        Body::Response { id, response }
+            if id == rename_replay_id && matches!(*response, Response::Ack)
+    ));
+
+    let rename_conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            rename_conflict_id,
+            rename_operation,
+            Request::RenameSession {
+                session_id,
+                title: "must not apply".into(),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "rename conflict").await,
+        Body::Error { id: Some(id), error }
+            if id == rename_conflict_id && error.code == ErrorCode::Conflict
+    ));
+    assert_eq!(
+        ctx.db.get_session(session_id).await.unwrap().unwrap().title,
+        Some("remote title".into()),
+        "rename replay and conflict must not perform another domain write"
+    );
+}
+
+#[tokio::test]
+async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
+    let ctx = test_ctx();
+    let root = tempfile::tempdir().unwrap();
+    let root_text = root
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let first_session = ctx
+        .db
+        .create_session("p", &root_text, "Build")
+        .await
+        .unwrap();
+    let second_session = ctx
+        .db
+        .create_session("p", &root_text, "Build")
+        .await
+        .unwrap();
+    for session_id in [first_session.session_id, second_session.session_id] {
+        ctx.db
+            .set_session_shared_with_collaborators(session_id, true)
+            .await
+            .unwrap();
+    }
+    ctx.db
+        .create_session_goal(
+            second_session.session_id,
+            "p",
+            "finish safely",
+            None,
+            Some(100),
+        )
+        .await
+        .unwrap();
+    let logical_attachment_id = Uuid::parse_str("22222222-2222-4222-8222-222222222224").unwrap();
+    let principal = ClientPrincipal::Remote(principal::RemotePrincipal {
+        user_id: "goal-writer".into(),
+        grants: vec![principal::PrincipalGrant {
+            scope: principal::PrincipalScope::Agent,
+            project_root: Some(root_text),
+        }],
+        actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+            schema_version: 1,
+            device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333335").unwrap(),
+            device_generation: 1,
+            logical_attachment_id,
+        }),
+    });
+    let mut state = MutableClientState::detached_with_principal(
+        ctx.upload_accounting.clone(),
+        principal,
+        ctx.terminal_host.clone(),
+    );
+    let mut shared = state.shared_snapshot();
+    let operation = proto::RemoteOperationIdentityV1::new(
+        logical_attachment_id,
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-666666666666").unwrap(),
+    )
+    .unwrap();
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_cmd_tx, _event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let mut concurrent = ConcurrentRequestRuntime::new();
+
+    let create_operation = proto::RemoteOperationIdentityV1::new(
+        logical_attachment_id,
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-cccccccccccc").unwrap(),
+    )
+    .unwrap();
+    let create_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            create_id,
+            create_operation,
+            Request::CreateGoal {
+                session_id: first_session.session_id,
+                objective: "finish safely".into(),
+                token_budget: Some(100),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    let create_applied = match recv_writer_body(&mut writer_rx, "first goal create").await {
+        Body::Response { id, response } => {
+            assert_eq!(id, create_id);
+            serde_json::to_vec(&response).unwrap()
+        }
+        other => panic!("unexpected goal create: {other:?}"),
+    };
+    let create_replay_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            create_replay_id,
+            create_operation,
+            Request::CreateGoal {
+                session_id: first_session.session_id,
+                objective: "finish safely".into(),
+                token_budget: Some(100),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    match recv_writer_body(&mut writer_rx, "goal create replay").await {
+        Body::Response { id, response } => {
+            assert_eq!(id, create_replay_id);
+            assert_eq!(serde_json::to_vec(&response).unwrap(), create_applied);
+        }
+        other => panic!("unexpected goal create replay: {other:?}"),
+    }
+    let create_conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            create_conflict_id,
+            create_operation,
+            Request::CreateGoal {
+                session_id: second_session.session_id,
+                objective: "finish safely".into(),
+                token_budget: Some(100),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(recv_writer_body(&mut writer_rx, "goal create conflict").await,
+        Body::Error { id: Some(id), error } if id == create_conflict_id && error.code == ErrorCode::Conflict)
+    );
+
+    let status_operation = proto::RemoteOperationIdentityV1::new(
+        logical_attachment_id,
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-bbbbbbbbbbbb").unwrap(),
+    )
+    .unwrap();
+    let status_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            status_id,
+            status_operation,
+            Request::SetGoalStatus {
+                session_id: first_session.session_id,
+                status: proto::GoalDisposition::UserPaused,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    let status_applied = match recv_writer_body(&mut writer_rx, "first goal status").await {
+        Body::Response { id, response } => {
+            assert_eq!(id, status_id);
+            serde_json::to_vec(&response).unwrap()
+        }
+        other => panic!("unexpected goal status: {other:?}"),
+    };
+    let status_replay_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            status_replay_id,
+            status_operation,
+            Request::SetGoalStatus {
+                session_id: first_session.session_id,
+                status: proto::GoalDisposition::UserPaused,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    match recv_writer_body(&mut writer_rx, "goal status replay").await {
+        Body::Response { id, response } => {
+            assert_eq!(id, status_replay_id);
+            assert_eq!(serde_json::to_vec(&response).unwrap(), status_applied);
+        }
+        other => panic!("unexpected goal status replay: {other:?}"),
+    }
+    let status_conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            status_conflict_id,
+            status_operation,
+            Request::SetGoalStatus {
+                session_id: second_session.session_id,
+                status: proto::GoalDisposition::UserPaused,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(recv_writer_body(&mut writer_rx, "goal status conflict").await, Body::Error { id: Some(id), error } if id == status_conflict_id && error.code == ErrorCode::Conflict)
+    );
+    assert_eq!(
+        ctx.db
+            .current_session_goal(first_session.session_id, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .disposition,
+        proto::GoalDisposition::UserPaused
+    );
+    assert_eq!(
+        ctx.db
+            .current_session_goal(second_session.session_id, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .disposition,
+        proto::GoalDisposition::Running
+    );
+    let goal_outbox: Vec<u8> = ctx
+        .db
+        .read(|conn| {
+            conn.query_row(
+            "SELECT canonical_payload FROM remote_attachment_outbox WHERE kind = 'set_goal_status'",
+            [],
+            |row| row.get(0),
+        ).context("loading safe goal outbox payload")
+        })
+        .await
+        .unwrap();
+    assert!(
+        !goal_outbox
+            .windows(b"finish safely".len())
+            .any(|bytes| bytes == b"finish safely")
+    );
+    assert!(
+        !goal_outbox
+            .windows(b"resolved_policy".len())
+            .any(|bytes| bytes == b"resolved_policy")
+    );
+
+    let first_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            first_id,
+            operation,
+            Request::ClearGoal {
+                session_id: first_session.session_id,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "first goal clear").await,
+        Body::Response { id, response }
+            if id == first_id && matches!(*response, Response::GoalCleared { cleared: true })
+    ));
+    let late_status_replay_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            late_status_replay_id,
+            status_operation,
+            Request::SetGoalStatus {
+                session_id: first_session.session_id,
+                status: proto::GoalDisposition::UserPaused,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    match recv_writer_body(&mut writer_rx, "goal status replay after later clear").await {
+        Body::Response { id, response } => {
+            assert_eq!(id, late_status_replay_id);
+            assert_eq!(serde_json::to_vec(&response).unwrap(), status_applied);
+            assert!(
+                !serde_json::to_vec(&response)
+                    .unwrap()
+                    .windows(b"finish safely".len())
+                    .any(|bytes| bytes == b"finish safely")
+            );
+        }
+        other => panic!("unexpected late goal status replay: {other:?}"),
+    }
+    let late_create_replay_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            late_create_replay_id,
+            create_operation,
+            Request::CreateGoal {
+                session_id: first_session.session_id,
+                objective: "finish safely".into(),
+                token_budget: Some(100),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    match recv_writer_body(&mut writer_rx, "goal create replay after later clear").await {
+        Body::Response { id, response } => {
+            assert_eq!(id, late_create_replay_id);
+            assert_eq!(serde_json::to_vec(&response).unwrap(), create_applied);
+        }
+        other => panic!("unexpected late goal create replay: {other:?}"),
+    }
+    let replay_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            replay_id,
+            operation,
+            Request::ClearGoal {
+                session_id: first_session.session_id,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "goal clear replay").await,
+        Body::Response { id, response }
+            if id == replay_id && matches!(*response, Response::GoalCleared { cleared: true })
+    ));
+    let conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            conflict_id,
+            operation,
+            Request::ClearGoal {
+                session_id: second_session.session_id,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "goal clear conflict").await,
+        Body::Error { id: Some(id), error }
+            if id == conflict_id && error.code == ErrorCode::Conflict
+    ));
+    assert!(
+        ctx.db
+            .current_session_goal(first_session.session_id, false)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        ctx.db
+            .current_session_goal(second_session.session_id, false)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    for session_id in [first_session.session_id, second_session.session_id] {
+        ctx.db
+            .upsert_paused_session_work(session_id, "Build", "/repo", "approval", 1, "test")
+            .await
+            .unwrap();
+    }
+    let resume_operation = proto::RemoteOperationIdentityV1::new(
+        logical_attachment_id,
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-777777777777").unwrap(),
+    )
+    .unwrap();
+    let resume_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            resume_id,
+            resume_operation,
+            Request::ResumePausedWork {
+                session_id: first_session.session_id,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "first paused-work resume").await,
+        Body::Response { id, response } if id == resume_id && matches!(*response, Response::Ack)
+    ));
+    let resume_replay_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            resume_replay_id,
+            resume_operation,
+            Request::ResumePausedWork {
+                session_id: first_session.session_id,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "paused-work resume replay").await,
+        Body::Response { id, response } if id == resume_replay_id && matches!(*response, Response::Ack)
+    ));
+    let resume_conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            resume_conflict_id,
+            resume_operation,
+            Request::ResumePausedWork {
+                session_id: second_session.session_id,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "paused-work resume conflict").await,
+        Body::Error { id: Some(id), error }
+            if id == resume_conflict_id && error.code == ErrorCode::Conflict
+    ));
+    // After resume the row is no longer in the 'paused' state, so the
+    // paused-only lookup returns None — the resume is proven by the Ack
+    // responses above and the absence of a paused row here.
+    assert!(
+        ctx.db
+            .paused_session_work(first_session.session_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let cancel_operation = proto::RemoteOperationIdentityV1::new(
+        logical_attachment_id,
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-888888888888").unwrap(),
+    )
+    .unwrap();
+    for label in ["first paused-work cancel", "paused-work cancel replay"] {
+        let id = Uuid::new_v4();
+        handle_envelope(
+            Envelope::remote_request(
+                id,
+                cancel_operation,
+                Request::CancelPausedWork {
+                    session_id: second_session.session_id,
+                },
+            ),
+            &mut state,
+            &mut shared,
+            &ctx,
+            &event_cmd_tx,
+            &writer_tx,
+            &mut concurrent,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(recv_writer_body(&mut writer_rx, label).await,
+            Body::Response { id: response_id, response }
+                if response_id == id && matches!(*response, Response::Ack)));
+    }
+    let cancel_conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            cancel_conflict_id,
+            cancel_operation,
+            Request::CancelPausedWork {
+                session_id: first_session.session_id,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(recv_writer_body(&mut writer_rx, "paused-work cancel conflict").await,
+        Body::Error { id: Some(id), error }
+            if id == cancel_conflict_id && error.code == ErrorCode::Conflict)
+    );
+    // After cancel the row is no longer in the 'paused' state, so the
+    // paused-only lookup returns None — the cancel is proven by the Ack
+    // responses and conflict above.
+    assert!(
+        ctx.db
+            .paused_session_work(second_session.session_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let archive_operation = proto::RemoteOperationIdentityV1::new(
+        logical_attachment_id,
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-999999999999").unwrap(),
+    )
+    .unwrap();
+    for label in ["first session archive", "session archive replay"] {
+        let id = Uuid::new_v4();
+        handle_envelope(
+            Envelope::remote_request(
+                id,
+                archive_operation,
+                Request::ArchiveSession {
+                    session_id: second_session.session_id,
+                    cascade: false,
+                },
+            ),
+            &mut state,
+            &mut shared,
+            &ctx,
+            &event_cmd_tx,
+            &writer_tx,
+            &mut concurrent,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(recv_writer_body(&mut writer_rx, label).await,
+            Body::Response { id: response_id, response }
+                if response_id == id && matches!(*response, Response::Ack)));
+    }
+    let archive_conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            archive_conflict_id,
+            archive_operation,
+            Request::ArchiveSession {
+                session_id: first_session.session_id,
+                cascade: false,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(recv_writer_body(&mut writer_rx, "session archive conflict").await,
+        Body::Error { id: Some(id), error }
+            if id == archive_conflict_id && error.code == ErrorCode::Conflict)
+    );
+    assert!(
+        ctx.db
+            .get_session(second_session.session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .archived_at
+            .is_some()
+    );
+    assert!(
+        ctx.db
+            .get_session(first_session.session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .archived_at
+            .is_none()
+    );
+    let unarchive_operation = proto::RemoteOperationIdentityV1::new(
+        logical_attachment_id,
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-aaaaaaaaaaaa").unwrap(),
+    )
+    .unwrap();
+    for label in ["first session unarchive", "session unarchive replay"] {
+        let id = Uuid::new_v4();
+        handle_envelope(
+            Envelope::remote_request(
+                id,
+                unarchive_operation,
+                Request::UnarchiveSession {
+                    session_id: second_session.session_id,
+                },
+            ),
+            &mut state,
+            &mut shared,
+            &ctx,
+            &event_cmd_tx,
+            &writer_tx,
+            &mut concurrent,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(recv_writer_body(&mut writer_rx, label).await,
+            Body::Response { id: response_id, response }
+                if response_id == id && matches!(*response, Response::Ack)));
+    }
+    let unarchive_conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            unarchive_conflict_id,
+            unarchive_operation,
+            Request::UnarchiveSession {
+                session_id: first_session.session_id,
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(recv_writer_body(&mut writer_rx, "session unarchive conflict").await,
+        Body::Error { id: Some(id), error }
+            if id == unarchive_conflict_id && error.code == ErrorCode::Conflict)
+    );
+    assert!(
+        ctx.db
+            .get_session(second_session.session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .archived_at
+            .is_none()
+    );
+    // The second session's paused work was cancelled earlier; the
+    // paused-only lookup returns None because the status is no longer
+    // 'paused'. The first session's paused work was resumed earlier too.
+    assert!(
+        ctx.db
+            .paused_session_work(second_session.session_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn remote_scheduler_mutation_is_local_only_before_ledger_or_domain_write() {
+    let ctx = test_ctx();
+    ctx.db
+        .insert_scheduled_job(crate::db::scheduler::NewScheduledJobRow {
+            id: "local-job".into(),
+            owner: "owner".into(),
+            schedule_json: r#"{"interval":{"seconds":60}}"#.into(),
+            payload_json: r#"{"callback":{"subsystem":"test"}}"#.into(),
+            enabled: true,
+            missed_run_policy: "skip".into(),
+            created_at: 1,
+            updated_at: 1,
+            next_run_at: Some(61),
+        })
+        .await
+        .unwrap();
+    let logical_attachment_id = Uuid::parse_str("22222222-2222-4222-8222-222222222225").unwrap();
+    let operation_id = Uuid::parse_str("018f3f24-7a10-7cc2-8f55-dddddddddddd").unwrap();
+    let principal = ClientPrincipal::Remote(principal::RemotePrincipal {
+        user_id: "scheduler-remote".into(),
+        grants: vec![principal::PrincipalGrant {
+            scope: principal::PrincipalScope::Agent,
+            project_root: None,
+        }],
+        actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+            schema_version: 1,
+            device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333336").unwrap(),
+            device_generation: 1,
+            logical_attachment_id,
+        }),
+    });
+    let mut state = MutableClientState::detached_with_principal(
+        ctx.upload_accounting.clone(),
+        principal,
+        ctx.terminal_host.clone(),
+    );
+    let mut shared = state.shared_snapshot();
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_cmd_tx, _event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let mut concurrent = ConcurrentRequestRuntime::new();
+    let request_id = Uuid::new_v4();
+    let operation =
+        proto::RemoteOperationIdentityV1::new(logical_attachment_id, operation_id).unwrap();
+    handle_envelope(
+        Envelope::remote_request(
+            request_id,
+            operation,
+            Request::DeleteScheduledJob {
+                id: "local-job".into(),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "local-only scheduler rejection").await,
+        Body::Error { id: Some(id), error } if id == request_id && error.code == ErrorCode::Authorization
+    ));
+    assert!(
+        ctx.db
+            .get_scheduled_job("local-job")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        ctx.db
+            .remote_operation_status(
+                &logical_attachment_id.to_string(),
+                &operation_id.to_string(),
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn remote_cancel_invocation_applies_replays_and_conflicts_once() {
+    let ctx = test_ctx();
+    let logical_attachment_id = Uuid::parse_str("22222222-2222-4222-8222-222222222229").unwrap();
+    let principal = ClientPrincipal::Remote(principal::RemotePrincipal {
+        user_id: "invocation-writer".into(),
+        grants: vec![principal::PrincipalGrant {
+            scope: principal::PrincipalScope::Agent,
+            project_root: None,
+        }],
+        actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+            schema_version: 1,
+            device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333339").unwrap(),
+            device_generation: 1,
+            logical_attachment_id,
+        }),
+    });
+    let digest = crate::daemon::server::run_invocation_principal_digest(&principal);
+    let invocation_id = Uuid::new_v4();
+    ctx.db
+        .accept_run_invocation(
+            invocation_id,
+            digest,
+            Uuid::new_v4(),
+            "{}".into(),
+            "opts".into(),
+            "content".into(),
+            None,
+            None,
+            1_700_000_000_000,
+        )
+        .await
+        .unwrap();
+    let mut state = MutableClientState::detached_with_principal(
+        ctx.upload_accounting.clone(),
+        principal,
+        ctx.terminal_host.clone(),
+    );
+    let mut shared = state.shared_snapshot();
+    let operation = proto::RemoteOperationIdentityV1::new(
+        logical_attachment_id,
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-dddddddddddd").unwrap(),
+    )
+    .unwrap();
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_cmd_tx, _event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let mut concurrent = ConcurrentRequestRuntime::new();
+    let mut applied_bytes = None;
+    for label in ["apply", "replay"] {
+        let request_id = Uuid::new_v4();
+        handle_envelope(
+            Envelope::remote_request(
+                request_id,
+                operation,
+                Request::CancelRunInvocation {
+                    client_submission_id: invocation_id,
+                },
+            ),
+            &mut state,
+            &mut shared,
+            &ctx,
+            &event_cmd_tx,
+            &writer_tx,
+            &mut concurrent,
+        )
+        .await
+        .unwrap();
+        let Body::Response { id, response } = recv_writer_body(&mut writer_rx, label).await else {
+            panic!("expected cancellation response")
+        };
+        assert_eq!(id, request_id);
+        let bytes = serde_json::to_vec(&response).unwrap();
+        if let Some(applied) = &applied_bytes {
+            assert_eq!(&bytes, applied);
+        } else {
+            applied_bytes = Some(bytes);
+        }
+    }
+    let conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            conflict_id,
+            operation,
+            Request::CancelRunInvocation {
+                client_submission_id: Uuid::new_v4(),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(recv_writer_body(&mut writer_rx, "conflict").await,
+        Body::Error { id: Some(id), error } if id == conflict_id && error.code == ErrorCode::Conflict));
+    let row = ctx
+        .db
+        .lookup_or_tombstone_run_invocation(
+            invocation_id,
+            crate::daemon::server::run_invocation_principal_digest(&state.principal),
+            chrono::Utc::now().timestamp_millis(),
+            false,
+        )
+        .await
+        .unwrap();
+    let crate::db::run_invocations::LookupRunInvocationOutcome::Found(row) = row else {
+        panic!("invocation missing")
+    };
+    assert_eq!(
+        row.state_version, 2,
+        "replay/conflict performed a second domain write"
+    );
+
+    let absent_id = Uuid::new_v4();
+    let absent_operation = proto::RemoteOperationIdentityV1::new(
+        logical_attachment_id,
+        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-eeeeeeeeeeee").unwrap(),
+    )
+    .unwrap();
+    let mut absent_bytes = None;
+    for label in ["absent apply", "absent replay"] {
+        let request_id = Uuid::new_v4();
+        handle_envelope(
+            Envelope::remote_request(
+                request_id,
+                absent_operation,
+                Request::CancelRunInvocation {
+                    client_submission_id: absent_id,
+                },
+            ),
+            &mut state,
+            &mut shared,
+            &ctx,
+            &event_cmd_tx,
+            &writer_tx,
+            &mut concurrent,
+        )
+        .await
+        .unwrap();
+        let Body::Response { response, .. } = recv_writer_body(&mut writer_rx, label).await else {
+            panic!("expected authoritative absent response")
+        };
+        let bytes = serde_json::to_vec(&response).unwrap();
+        if let Some(applied) = &absent_bytes {
+            assert_eq!(&bytes, applied);
+        } else {
+            absent_bytes = Some(bytes);
+        }
+    }
+    let reuse = ctx
+        .db
+        .accept_run_invocation(
+            absent_id,
+            crate::daemon::server::run_invocation_principal_digest(&state.principal),
+            Uuid::new_v4(),
+            "{}".into(),
+            "opts".into(),
+            "content".into(),
+            None,
+            None,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        reuse,
+        crate::db::run_invocations::AcceptRunInvocationOutcome::ClientSubmissionIdUnavailable
+    ));
+}
+
+#[tokio::test]
+async fn remote_outbox_replay_is_actor_bound_ordered_and_token_correlated() {
+    let ctx = test_ctx();
+    let attachment = Uuid::parse_str("22222222-2222-4222-8222-222222222230").unwrap();
+    let operation = "018f3f24-7a10-7cc2-8f55-aaaaaaaaaaab";
+    ctx.db.reserve_remote_attachment_operation(crate::db::remote_attachment_operations::ReserveRemoteOperation {
+        logical_attachment_id: &attachment.to_string(), operation_id: operation,
+        authenticated_device_id: "33333333-3333-4333-8333-333333333340", authenticated_device_generation: 1,
+        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
+        request_hash: [1; 32], now_ms: 1,
+    }).await.unwrap();
+    ctx.db
+        .commit_remote_attachment_operation(
+            crate::db::remote_attachment_operations::CommitRemoteOperation {
+                logical_attachment_id: &attachment.to_string(),
+                operation_id: operation,
+                safe_response: b"ack",
+                outbox_delivery_id: "44444444-4444-4444-8444-444444444441",
+                outbox_kind: "test_replay",
+                outbox_payload: b"one",
+                now_ms: 2,
+            },
+        )
+        .await
+        .unwrap();
+    let principal_for = |device: &str| {
+        ClientPrincipal::Remote(principal::RemotePrincipal {
+            user_id: "replay-user".into(),
+            grants: vec![],
+            actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+                schema_version: 1,
+                device_id: Uuid::parse_str(device).unwrap(),
+                device_generation: 1,
+                logical_attachment_id: attachment,
+            }),
+        })
+    };
+    let mut first = MutableClientState::detached_with_principal(
+        ctx.upload_accounting.clone(),
+        principal_for("33333333-3333-4333-8333-333333333340"),
+        ctx.terminal_host.clone(),
+    );
+    let mut second = MutableClientState::detached_with_principal(
+        ctx.upload_accounting.clone(),
+        principal_for("33333333-3333-4333-8333-333333333341"),
+        ctx.terminal_host.clone(),
+    );
+    let mut first_shared = first.shared_snapshot();
+    let mut second_shared = second.shared_snapshot();
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_tx, _event_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let mut concurrent = ConcurrentRequestRuntime::new();
+    let request_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope {
+            v: proto::PROTOCOL_VERSION,
+            body: Body::RemoteReplayRequest(proto::RemoteReplayRequestV2 {
+                id: request_id,
+                after_event_seq: None,
+                limit: proto::RemoteReplayLimit::new(2).unwrap(),
+            }),
+        },
+        &mut first,
+        &mut first_shared,
+        &ctx,
+        &event_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    let Body::RemoteReplayResponse(first_page) =
+        recv_writer_body(&mut writer_rx, "first replay").await
+    else {
+        panic!("expected replay response")
+    };
+    assert_eq!(first_page.id, request_id);
+    assert_eq!(first_page.events.len(), 1);
+    let event = first_page.events[0].clone();
+    assert_eq!(event.event_seq.value(), 1);
+
+    handle_envelope(
+        Envelope {
+            v: proto::PROTOCOL_VERSION,
+            body: Body::RemoteReplayRequest(proto::RemoteReplayRequestV2 {
+                id: Uuid::new_v4(),
+                after_event_seq: None,
+                limit: proto::RemoteReplayLimit::new(2).unwrap(),
+            }),
+        },
+        &mut second,
+        &mut second_shared,
+        &ctx,
+        &event_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    let Body::RemoteReplayResponse(second_page) =
+        recv_writer_body(&mut writer_rx, "second replay").await
+    else {
+        panic!("expected replay response")
+    };
+    assert_eq!(
+        second_page.events[0].delivery_id, event.delivery_id,
+        "physical consumers dedupe by stable delivery id"
+    );
+
+    let wrong_ack_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope {
+            v: proto::PROTOCOL_VERSION,
+            body: Body::RemoteReplayAck(proto::RemoteReplayAckV2 {
+                id: wrong_ack_id,
+                delivery_id: event.delivery_id,
+                lease_token: event.lease_token,
+            }),
+        },
+        &mut second,
+        &mut second_shared,
+        &ctx,
+        &event_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(recv_writer_body(&mut writer_rx, "wrong actor ack").await,
+        Body::RemoteReplayAckResponse(result) if result.id == wrong_ack_id && !result.acked)
+    );
+    let own_ack_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope {
+            v: proto::PROTOCOL_VERSION,
+            body: Body::RemoteReplayAck(proto::RemoteReplayAckV2 {
+                id: own_ack_id,
+                delivery_id: event.delivery_id,
+                lease_token: event.lease_token,
+            }),
+        },
+        &mut first,
+        &mut first_shared,
+        &ctx,
+        &event_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(recv_writer_body(&mut writer_rx, "own ack").await,
+        Body::RemoteReplayAckResponse(result) if result.id == own_ack_id && result.acked));
+
+    let status_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::request(
+            status_id,
+            Request::OperationStatus {
+                operation_id: Uuid::parse_str(operation).unwrap(),
+            },
+        ),
+        &mut first,
+        &mut first_shared,
+        &ctx,
+        &event_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(recv_writer_body(&mut writer_rx, "operation status").await,
+        Body::Response { id, response } if id == status_id && matches!(*response, Response::RemoteOperationStatus { status: Some(_) }))
+    );
 }
 
 fn table_for(secret: &str) -> Arc<RedactionTable> {
@@ -955,12 +3481,18 @@ async fn goal_rpc_reads_sets_and_clears() {
     };
     assert_eq!(goal.session_id, session.session_id);
     assert_eq!(goal.objective, "ship daemon goal rpc");
-    assert_eq!(goal.status, proto::GoalStatus::Active);
+    assert_eq!(goal.disposition, proto::GoalDisposition::Running);
+    assert!(goal.elapsed_active_ms >= 0);
+    assert_eq!(goal.lifecycle_history.len(), 1);
+    assert_eq!(
+        goal.lifecycle_history[0].disposition,
+        proto::GoalDisposition::Running
+    );
 
     let response = handle_request(
         Request::SetGoalStatus {
             session_id: session.session_id,
-            status: proto::GoalStatus::Paused,
+            status: proto::GoalDisposition::UserPaused,
         },
         &mut state,
         &ctx,
@@ -970,12 +3502,19 @@ async fn goal_rpc_reads_sets_and_clears() {
     let Response::GoalUpdated { goal } = response else {
         panic!("expected goal updated response");
     };
-    assert_eq!(goal.status, proto::GoalStatus::Paused);
+    assert_eq!(goal.disposition, proto::GoalDisposition::UserPaused);
+    assert!(goal.lifecycle_history.len() >= 2);
+    assert_eq!(
+        goal.lifecycle_history
+            .last()
+            .and_then(|entry| entry.reason.clone()),
+        Some(proto::GoalPauseReason::User)
+    );
 
     let response = handle_request(
         Request::SetGoalStatus {
             session_id: session.session_id,
-            status: proto::GoalStatus::Active,
+            status: proto::GoalDisposition::Running,
         },
         &mut state,
         &ctx,
@@ -985,7 +3524,7 @@ async fn goal_rpc_reads_sets_and_clears() {
     let Response::GoalUpdated { goal } = response else {
         panic!("expected goal updated response");
     };
-    assert_eq!(goal.status, proto::GoalStatus::Active);
+    assert_eq!(goal.disposition, proto::GoalDisposition::Running);
 
     let response = handle_request(
         Request::ClearGoal {
@@ -1037,7 +3576,7 @@ async fn goal_change_is_visible_to_live_worker() {
     let response = handle_request(
         Request::SetGoalStatus {
             session_id,
-            status: proto::GoalStatus::Paused,
+            status: proto::GoalDisposition::UserPaused,
         },
         &mut state,
         &ctx,
@@ -1048,7 +3587,7 @@ async fn goal_change_is_visible_to_live_worker() {
         response,
         Response::GoalUpdated {
             goal: proto::GoalSummary {
-                status: proto::GoalStatus::Paused,
+                disposition: proto::GoalDisposition::UserPaused,
                 ..
             }
         }
@@ -1070,7 +3609,7 @@ async fn goal_change_is_visible_to_live_worker() {
         .await
         .unwrap()
         .expect("goal visible through live worker session handle");
-    assert_eq!(goal.status, proto::GoalStatus::Paused);
+    assert_eq!(goal.disposition, proto::GoalDisposition::UserPaused);
 }
 
 #[tokio::test]
@@ -1130,15 +3669,15 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
             .await
             .unwrap()
             .expect("goal exists")
-            .status,
-        crate::db::session_goals::GoalStatus::Active
+            .disposition,
+        crate::db::session_goals::GoalDisposition::Running
     );
 
     let mut rpc_state = owner_state();
     handle_request(
         Request::SetGoalStatus {
             session_id,
-            status: proto::GoalStatus::Paused,
+            status: proto::GoalDisposition::UserPaused,
         },
         &mut rpc_state,
         &ctx,
@@ -1151,8 +3690,8 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
             .await
             .unwrap()
             .expect("goal persists immediately")
-            .status,
-        crate::db::session_goals::GoalStatus::Paused
+            .disposition,
+        crate::db::session_goals::GoalDisposition::UserPaused
     );
 
     let item = proto::QueueItem {
@@ -1207,8 +3746,8 @@ async fn goal_change_midturn_persists_immediately_and_applies_next_turn() {
             .await
             .unwrap()
             .expect("next turn reads paused goal")
-            .status,
-        crate::db::session_goals::GoalStatus::Paused
+            .disposition,
+        crate::db::session_goals::GoalDisposition::UserPaused
     );
     let item = proto::QueueItem {
         id: Uuid::new_v4(),
@@ -1242,7 +3781,7 @@ async fn new_session_state_requests_are_classified() {
         (
             Request::SetGoalStatus {
                 session_id,
-                status: proto::GoalStatus::Paused,
+                status: proto::GoalDisposition::UserPaused,
             },
             "set_goal_status",
             Some(session_id),
@@ -1340,7 +3879,7 @@ async fn new_session_state_requests_enforce_authorization() {
         Request::GoalStatus { session_id },
         Request::SetGoalStatus {
             session_id,
-            status: proto::GoalStatus::Paused,
+            status: proto::GoalDisposition::UserPaused,
         },
         Request::ClearGoal { session_id },
         Request::ListAssistants,
@@ -1390,6 +3929,7 @@ async fn remote_session_writer_cannot_persist_active_model_as_default() {
         .unwrap();
     state.principal = ClientPrincipal::Remote(crate::daemon::principal::RemotePrincipal {
         user_id: "writer".into(),
+        actor_binding: None,
         grants: vec![crate::daemon::principal::PrincipalGrant {
             scope: crate::daemon::principal::PrincipalScope::Agent,
             project_root: Some(tmp.path().to_string_lossy().into_owned()),
@@ -1649,6 +4189,7 @@ async fn readonly_attach_environment_is_ignored_for_live_and_cold_workers() {
         };
         let principal = ClientPrincipal::Remote(principal::RemotePrincipal {
             user_id: "readonly-env-test".to_string(),
+            actor_binding: None,
             grants: vec![principal::PrincipalGrant {
                 scope: principal::PrincipalScope::AgentReadonly,
                 project_root: Some(tmp.path().to_string_lossy().into_owned()),
@@ -2558,8 +5099,28 @@ fn stub_config_source() -> crate::daemon::config_source::ConfigSource {
     )
 }
 
-fn test_ctx() -> Arc<DaemonContext> {
+pub(crate) fn test_ctx() -> Arc<DaemonContext> {
     test_ctx_with_config_source(stub_config_source())
+}
+
+fn disk_test_ctx(db_path: &Path, spool_path: &Path) -> Arc<DaemonContext> {
+    let db = Db::open(db_path).expect("file-backed test db");
+    let locks = Arc::new(LockManager::in_memory(db.clone()));
+    let mut context = DaemonContext::new(
+        db.clone(),
+        locks,
+        DaemonPaths {
+            socket: db_path.with_extension("sock"),
+            pid_file: db_path.with_extension("pid"),
+            ephemeral: false,
+        },
+        crate::daemon::terminal::test_host_factory(),
+        stub_config_source(),
+    );
+    context.external_journal = Some(Arc::new(
+        crate::external_journal::ExternalJournal::for_test_at(db, spool_path),
+    ));
+    Arc::new(context)
 }
 
 fn test_ctx_with_config_source(
@@ -2760,6 +5321,7 @@ fn remote_state_with_grants(
     MutableClientState {
         principal: ClientPrincipal::Remote(crate::daemon::principal::RemotePrincipal {
             user_id: "user-1".into(),
+            actor_binding: None,
             grants,
         }),
         terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
@@ -2772,7 +5334,7 @@ fn remote_state_with_grants(
         pending_uploads: HashMap::new(),
         ready_attachments: HashMap::new(),
         upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
-        upload_limits: AttachmentUploadLimits::default(),
+        upload_limits: AttachmentUploadLimits,
         terminal_views: HashMap::new(),
         terminal_host: test_terminal_host(),
     }
@@ -2805,7 +5367,7 @@ fn owner_state() -> MutableClientState {
         pending_uploads: HashMap::new(),
         ready_attachments: HashMap::new(),
         upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
-        upload_limits: AttachmentUploadLimits::default(),
+        upload_limits: AttachmentUploadLimits,
         terminal_views: HashMap::new(),
         terminal_host: test_terminal_host(),
     }
@@ -3137,6 +5699,754 @@ async fn remote_fs_mutations_are_audited_with_path() {
 }
 
 #[tokio::test]
+async fn remote_fs_write_real_ingress_applies_once_replays_and_conflicts_on_changed_bytes() {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let logical_attachment_id = Uuid::parse_str("22222222-2222-4222-8222-222222222224").unwrap();
+    let operation_id = Uuid::parse_str("018f3f24-7a10-7cc2-8f55-111111111114").unwrap();
+    let actor = crate::daemon::relay_envelope::ClientActorBindingV1 {
+        schema_version: 1,
+        device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333334").unwrap(),
+        device_generation: 4,
+        logical_attachment_id,
+    };
+    let mut state = remote_state_with_grants(vec![project_files_grant(root)]);
+    let ClientPrincipal::Remote(principal) = &mut state.principal else {
+        panic!("remote fixture")
+    };
+    principal.actor_binding = Some(actor);
+    let mut shared = state.shared_snapshot();
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_cmd_tx, _event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let mut concurrent = ConcurrentRequestRuntime::new();
+    let operation =
+        proto::RemoteOperationIdentityV1::new(logical_attachment_id, operation_id).unwrap();
+    let request = |content: &str| Request::FsWrite {
+        project_root: root.to_string_lossy().into_owned(),
+        path: "once.txt".into(),
+        content: content.into(),
+        base_hash: None,
+    };
+
+    for expected_content in ["first", "first"] {
+        let request_id = Uuid::new_v4();
+        handle_envelope(
+            Envelope::remote_request(request_id, operation, request(expected_content)),
+            &mut state,
+            &mut shared,
+            &ctx,
+            &event_cmd_tx,
+            &writer_tx,
+            &mut concurrent,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            recv_writer_body(&mut writer_rx, "fs write outcome").await,
+            Body::Response { id, response }
+                if id == request_id && matches!(*response, Response::FsWrite { .. })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(root.join("once.txt")).unwrap(),
+            "first"
+        );
+    }
+    let conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(conflict_id, operation, request("changed")),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "fs write conflict").await,
+        Body::Error { id: Some(id), error }
+            if id == conflict_id && error.code == ErrorCode::Conflict
+    ));
+    assert_eq!(
+        std::fs::read_to_string(root.join("once.txt")).unwrap(),
+        "first"
+    );
+    let attachment = logical_attachment_id.to_string();
+    let operation_text = operation_id.to_string();
+    let (generation, events): (i64, i64) = ctx
+        .db
+        .read(move |conn| {
+            let generation = conn.query_row(
+                "SELECT dispatch_generation FROM remote_attachment_operations
+                 WHERE logical_attachment_id=?1 AND operation_id=?2",
+                rusqlite::params![attachment, operation_text],
+                |row| row.get(0),
+            )?;
+            let events = conn.query_row(
+                "SELECT COUNT(*) FROM remote_attachment_outbox WHERE kind='fs_write'",
+                [],
+                |row| row.get(0),
+            )?;
+            Ok((generation, events))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        (generation, events),
+        (1, 1),
+        "replay performs no second dispatch"
+    );
+}
+
+#[tokio::test]
+async fn remote_fs_rename_fails_closed_before_reservation_until_held_recovery_is_available() {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("from.txt"), b"value").unwrap();
+    let attachment = Uuid::parse_str("22222222-2222-4222-8222-222222222225").unwrap();
+    let operation_id = Uuid::parse_str("018f3f24-7a10-7cc2-8f55-111111111115").unwrap();
+    let mut state = remote_state_with_grants(vec![project_files_grant(tmp.path())]);
+    let ClientPrincipal::Remote(principal) = &mut state.principal else {
+        panic!("remote")
+    };
+    principal.actor_binding = Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+        schema_version: 1,
+        device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333335").unwrap(),
+        device_generation: 1,
+        logical_attachment_id: attachment,
+    });
+    let mut shared = state.shared_snapshot();
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_tx, _) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let mut concurrent = ConcurrentRequestRuntime::new();
+    let request_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            request_id,
+            proto::RemoteOperationIdentityV1::new(attachment, operation_id).unwrap(),
+            Request::FsRename {
+                project_root: tmp.path().to_string_lossy().into_owned(),
+                from_path: "from.txt".into(),
+                to_path: "to.txt".into(),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(recv_writer_body(&mut writer_rx,"rename unavailable").await,
+        Body::Error{id:Some(id),error} if id==request_id && error.code==ErrorCode::Unavailable)
+    );
+    assert!(tmp.path().join("from.txt").exists());
+    assert!(!tmp.path().join("to.txt").exists());
+    assert!(
+        ctx.db
+            .remote_operation_status(&attachment.to_string(), &operation_id.to_string())
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn remote_fs_rename_present_but_blocked_journal_rejects_before_observation_or_reservation() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let durable = tempfile::tempdir().unwrap();
+    let spool_path = durable.path().join("spool");
+    std::fs::write(tmp.path().join("from.txt"), b"value").unwrap();
+    let ctx = disk_test_ctx(&durable.path().join("daemon.db"), &spool_path);
+    std::fs::set_permissions(&spool_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let attachment = Uuid::parse_str("22222222-2222-4222-8222-2222222222bc").unwrap();
+    let operation_id = Uuid::parse_str("018f3f24-7a10-7cc2-8f55-1111111111bc").unwrap();
+    let mut state = remote_state_with_grants(vec![project_files_grant(tmp.path())]);
+    let ClientPrincipal::Remote(principal) = &mut state.principal else {
+        panic!("remote")
+    };
+    principal.actor_binding = Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+        schema_version: 1,
+        device_id: Uuid::parse_str("33333333-3333-4333-8333-3333333333bc").unwrap(),
+        device_generation: 1,
+        logical_attachment_id: attachment,
+    });
+    let mut shared = state.shared_snapshot();
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_tx, _) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let mut concurrent = ConcurrentRequestRuntime::new();
+    let request_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            request_id,
+            proto::RemoteOperationIdentityV1::new(attachment, operation_id).unwrap(),
+            Request::FsRename {
+                project_root: tmp.path().to_string_lossy().into_owned(),
+                from_path: "from.txt".into(),
+                to_path: "to.txt".into(),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(recv_writer_body(&mut writer_rx, "blocked rename journal").await,
+        Body::Error { id: Some(id), error } if id == request_id && error.code == ErrorCode::Unavailable)
+    );
+    let counts: (i64, i64) = ctx
+        .db
+        .read(|conn| {
+            Ok((
+                conn.query_row(
+                    "SELECT COUNT(*) FROM remote_attachment_operations",
+                    [],
+                    |row| row.get(0),
+                )?,
+                conn.query_row("SELECT COUNT(*) FROM remote_rename_journal", [], |row| {
+                    row.get(0)
+                })?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(counts, (0, 0));
+    assert_eq!(
+        std::fs::read(tmp.path().join("from.txt")).unwrap(),
+        b"value"
+    );
+    assert!(!tmp.path().join("to.txt").exists());
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn remote_fs_rename_real_ingress_applies_replays_and_conflicts_without_second_effect() {
+    let tmp = tempfile::tempdir().unwrap();
+    let durable = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("from.txt"), b"value").unwrap();
+    let ctx = disk_test_ctx(
+        &durable.path().join("daemon.db"),
+        &durable.path().join("spool"),
+    );
+    let attachment = Uuid::parse_str("22222222-2222-4222-8222-2222222222bb").unwrap();
+    let operation_id = Uuid::parse_str("018f3f24-7a10-7cc2-8f55-1111111111bb").unwrap();
+    let mut state = remote_state_with_grants(vec![project_files_grant(tmp.path())]);
+    let ClientPrincipal::Remote(principal) = &mut state.principal else {
+        panic!("remote")
+    };
+    principal.actor_binding = Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+        schema_version: 1,
+        device_id: Uuid::parse_str("33333333-3333-4333-8333-3333333333bb").unwrap(),
+        device_generation: 1,
+        logical_attachment_id: attachment,
+    });
+    let mut shared = state.shared_snapshot();
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_tx, _) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let mut concurrent = ConcurrentRequestRuntime::new();
+    let request = Request::FsRename {
+        project_root: tmp.path().to_string_lossy().into_owned(),
+        from_path: "from.txt".into(),
+        to_path: "to.txt".into(),
+    };
+    for _ in 0..2 {
+        let request_id = Uuid::new_v4();
+        handle_envelope(
+            Envelope::remote_request(
+                request_id,
+                proto::RemoteOperationIdentityV1::new(attachment, operation_id).unwrap(),
+                request.clone(),
+            ),
+            &mut state,
+            &mut shared,
+            &ctx,
+            &event_tx,
+            &writer_tx,
+            &mut concurrent,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(recv_writer_body(&mut writer_rx, "rename ack").await,
+            Body::Response { id, response } if id == request_id && matches!(*response, Response::Ack))
+        );
+    }
+    assert!(!tmp.path().join("from.txt").exists());
+    assert_eq!(std::fs::read(tmp.path().join("to.txt")).unwrap(), b"value");
+    let conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            conflict_id,
+            proto::RemoteOperationIdentityV1::new(attachment, operation_id).unwrap(),
+            Request::FsRename {
+                project_root: tmp.path().to_string_lossy().into_owned(),
+                from_path: "from.txt".into(),
+                to_path: "other.txt".into(),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(recv_writer_body(&mut writer_rx, "rename conflict").await,
+        Body::Error { id: Some(id), error } if id == conflict_id && error.code == ErrorCode::Conflict)
+    );
+    let events: i64 = ctx
+        .db
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM remote_attachment_outbox WHERE kind='fs_rename'",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(events, 1);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn staged_rename_executor_applies_commits_and_replays_without_second_effect() {
+    let tmp = tempfile::tempdir().unwrap();
+    let spool = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("from.txt"), b"value").unwrap();
+    let base = test_ctx();
+    let mut owned = match Arc::try_unwrap(base) {
+        Ok(value) => value,
+        Err(_) => panic!("test context unexpectedly shared"),
+    };
+    owned.external_journal = Some(Arc::new(
+        crate::external_journal::ExternalJournal::for_test_at(
+            owned.db.clone(),
+            &spool.path().join("journal"),
+        ),
+    ));
+    let ctx = Arc::new(owned);
+    let request = Request::FsRename {
+        project_root: tmp.path().to_string_lossy().into_owned(),
+        from_path: "from.txt".into(),
+        to_path: "to.txt".into(),
+    };
+    let canonical_root = tmp.path().canonicalize().unwrap();
+    let authorized = AuthorizedRequestContext {
+        fcor_resources: vec![
+            AuthorizedFcorResource {
+                kind: proto::remote_operation_fcor::RemoteOperationResourceKind::ProjectRoot,
+                value: canonical_root.to_string_lossy().as_bytes().to_vec(),
+            },
+            AuthorizedFcorResource {
+                kind: proto::remote_operation_fcor::RemoteOperationResourceKind::FilePath,
+                value: canonical_root
+                    .join("from.txt")
+                    .to_string_lossy()
+                    .as_bytes()
+                    .to_vec(),
+            },
+            AuthorizedFcorResource {
+                kind: proto::remote_operation_fcor::RemoteOperationResourceKind::FilePath,
+                value: canonical_root
+                    .join("to.txt")
+                    .to_string_lossy()
+                    .as_bytes()
+                    .to_vec(),
+            },
+        ],
+    };
+    let operation = RemoteOperationContext {
+        request_id: Uuid::new_v4(),
+        logical_attachment_id: Uuid::parse_str("22222222-2222-4222-8222-222222222226").unwrap(),
+        operation_id: Uuid::parse_str("018f3f24-7a10-7cc2-8f55-111111111116").unwrap(),
+        authenticated_device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333336").unwrap(),
+        authenticated_device_generation: 1,
+    };
+    assert!(matches!(
+        execute_remote_staged_rename(&request, &authorized, &operation, &ctx)
+            .await
+            .unwrap(),
+        Response::Ack
+    ));
+    assert!(!tmp.path().join("from.txt").exists());
+    assert_eq!(std::fs::read(tmp.path().join("to.txt")).unwrap(), b"value");
+    assert!(matches!(
+        execute_remote_staged_rename(&request, &authorized, &operation, &ctx)
+            .await
+            .unwrap(),
+        Response::Ack
+    ));
+    let events: i64 = ctx
+        .db
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM remote_attachment_outbox WHERE kind='fs_rename'",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(events, 1);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn staged_rename_cleanup_intent_survives_unlink_fsync_failure_and_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let durable = tempfile::tempdir().unwrap();
+    let db_path = durable.path().join("daemon.db");
+    let spool_path = durable.path().join("spool");
+    std::fs::write(root.path().join("from.txt"), b"value").unwrap();
+    let ctx = disk_test_ctx(&db_path, &spool_path);
+    let journal = ctx.external_journal.as_ref().unwrap();
+    journal.fail_next_remote_rename_cleanup_unlink();
+    let request = Request::FsRename {
+        project_root: root.path().to_string_lossy().into_owned(),
+        from_path: "from.txt".into(),
+        to_path: "to.txt".into(),
+    };
+    let canonical_root = root.path().canonicalize().unwrap();
+    let authorized = AuthorizedRequestContext {
+        fcor_resources: vec![
+            AuthorizedFcorResource {
+                kind: proto::remote_operation_fcor::RemoteOperationResourceKind::ProjectRoot,
+                value: canonical_root.to_string_lossy().as_bytes().to_vec(),
+            },
+            AuthorizedFcorResource {
+                kind: proto::remote_operation_fcor::RemoteOperationResourceKind::FilePath,
+                value: canonical_root
+                    .join("from.txt")
+                    .to_string_lossy()
+                    .as_bytes()
+                    .to_vec(),
+            },
+            AuthorizedFcorResource {
+                kind: proto::remote_operation_fcor::RemoteOperationResourceKind::FilePath,
+                value: canonical_root
+                    .join("to.txt")
+                    .to_string_lossy()
+                    .as_bytes()
+                    .to_vec(),
+            },
+        ],
+    };
+    let operation = RemoteOperationContext {
+        request_id: Uuid::new_v4(),
+        logical_attachment_id: Uuid::parse_str("22222222-2222-4222-8222-2222222222aa").unwrap(),
+        operation_id: Uuid::parse_str("018f3f24-7a10-7cc2-8f55-1111111111aa").unwrap(),
+        authenticated_device_id: Uuid::parse_str("33333333-3333-4333-8333-3333333333aa").unwrap(),
+        authenticated_device_generation: 1,
+    };
+    assert!(matches!(
+        execute_remote_staged_rename(&request, &authorized, &operation, &ctx)
+            .await
+            .unwrap(),
+        Response::Ack
+    ));
+    assert_eq!(
+        ctx.db
+            .remote_rename_artifact_cleanup_intents()
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        std::fs::read_dir(spool_path.join("remote-operations"))
+            .unwrap()
+            .next()
+            .is_some()
+    );
+    drop(ctx);
+    let reopened = disk_test_ctx(&db_path, &spool_path);
+    reopened
+        .external_journal
+        .as_ref()
+        .unwrap()
+        .fail_next_remote_rename_cleanup_sync();
+    assert!(
+        reopened
+            .external_journal
+            .as_ref()
+            .unwrap()
+            .drain_remote_rename_artifact_cleanup()
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        reopened
+            .db
+            .remote_rename_artifact_cleanup_intents()
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(reopened);
+    let reopened = disk_test_ctx(&db_path, &spool_path);
+    reopened
+        .external_journal
+        .as_ref()
+        .unwrap()
+        .drain_remote_rename_artifact_cleanup()
+        .await
+        .unwrap();
+    assert!(
+        reopened
+            .db
+            .remote_rename_artifact_cleanup_intents()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        std::fs::read_dir(spool_path.join("remote-operations"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn staged_rename_executor_recovers_every_durability_barrier_cut() {
+    for (index, cut) in [
+        "artifact_durable",
+        "rename_effect",
+        "source_parent_fsync",
+        "target_parent_fsync",
+        "applied_journal",
+        "ledger_committed",
+        "source_identity_swap",
+        "target_after_artifact_prepared",
+        "target_after_artifact_synced",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let durable = tempfile::tempdir().unwrap();
+        let spool_path = durable.path().join("spool");
+        let db_path = durable.path().join("daemon.db");
+        std::fs::write(tmp.path().join("from.txt"), format!("value-{index}")).unwrap();
+        let ctx = disk_test_ctx(&db_path, &spool_path);
+        let request = Request::FsRename {
+            project_root: tmp.path().to_string_lossy().into_owned(),
+            from_path: "from.txt".into(),
+            to_path: "to.txt".into(),
+        };
+        let root = tmp.path().canonicalize().unwrap();
+        let authorized = AuthorizedRequestContext {
+            fcor_resources: vec![
+                AuthorizedFcorResource {
+                    kind: proto::remote_operation_fcor::RemoteOperationResourceKind::ProjectRoot,
+                    value: root.to_string_lossy().as_bytes().to_vec(),
+                },
+                AuthorizedFcorResource {
+                    kind: proto::remote_operation_fcor::RemoteOperationResourceKind::FilePath,
+                    value: root.join("from.txt").to_string_lossy().as_bytes().to_vec(),
+                },
+                AuthorizedFcorResource {
+                    kind: proto::remote_operation_fcor::RemoteOperationResourceKind::FilePath,
+                    value: root.join("to.txt").to_string_lossy().as_bytes().to_vec(),
+                },
+            ],
+        };
+        let operation = RemoteOperationContext {
+            request_id: Uuid::new_v4(),
+            logical_attachment_id: Uuid::parse_str(&format!(
+                "22222222-2222-4222-8222-{:012x}",
+                0x230 + index
+            ))
+            .unwrap(),
+            operation_id: Uuid::parse_str(&format!(
+                "018f3f24-7a10-7cc2-8f55-{:012x}",
+                0x120 + index
+            ))
+            .unwrap(),
+            authenticated_device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333337")
+                .unwrap(),
+            authenticated_device_generation: 1,
+        };
+        let mut fired = false;
+        assert!(
+            execute_remote_staged_rename_with_hook(
+                &request,
+                &authorized,
+                &operation,
+                &ctx,
+                |barrier| {
+                    if cut == "source_identity_swap" && barrier == "artifact_durable" {
+                        fired = true;
+                        std::fs::rename(
+                            tmp.path().join("from.txt"),
+                            tmp.path().join("original.txt"),
+                        )
+                        .unwrap();
+                        std::fs::write(tmp.path().join("from.txt"), b"replacement").unwrap();
+                        return Ok(());
+                    }
+                    if cut == "target_after_artifact_prepared" && barrier == "artifact_durable" {
+                        fired = true;
+                        std::fs::write(tmp.path().join("to.txt"), b"planted").unwrap();
+                        return Ok(());
+                    }
+                    if cut == "target_after_artifact_synced" && barrier == "artifact_journal_synced"
+                    {
+                        fired = true;
+                        #[cfg(unix)]
+                        std::os::unix::fs::symlink("from.txt", tmp.path().join("to.txt")).unwrap();
+                        return Ok(());
+                    }
+                    if !fired && barrier == cut {
+                        fired = true;
+                        return Err(ErrorPayload {
+                            code: ErrorCode::Unavailable,
+                            message: format!("injected crash after {cut}"),
+                        });
+                    }
+                    Ok(())
+                },
+            )
+            .await
+            .is_err()
+        );
+        assert!(fired, "cut {cut} was not reached");
+        drop(ctx);
+        let ctx = disk_test_ctx(&db_path, &spool_path);
+        ctx.external_journal
+            .as_ref()
+            .unwrap()
+            .drain_remote_rename_artifact_cleanup()
+            .await
+            .unwrap();
+        if matches!(
+            cut,
+            "source_identity_swap"
+                | "target_after_artifact_prepared"
+                | "target_after_artifact_synced"
+        ) {
+            assert!(
+                execute_remote_staged_rename(&request, &authorized, &operation, &ctx)
+                    .await
+                    .is_err()
+            );
+            let status = ctx
+                .db
+                .remote_operation_status(
+                    &operation.logical_attachment_id.to_string(),
+                    &operation.operation_id.to_string(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(status.state, "outcome_unknown");
+            if cut == "source_identity_swap" {
+                let mut remote_state =
+                    remote_state_with_grants(vec![project_files_grant(tmp.path())]);
+                let ClientPrincipal::Remote(principal) = &mut remote_state.principal else {
+                    panic!("remote")
+                };
+                principal.actor_binding =
+                    Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+                        schema_version: 1,
+                        device_id: operation.authenticated_device_id,
+                        device_generation: operation.authenticated_device_generation,
+                        logical_attachment_id: operation.logical_attachment_id,
+                    });
+                let mut remote_shared = remote_state.shared_snapshot();
+                let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+                let (event_tx, _) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+                let mut concurrent = ConcurrentRequestRuntime::new();
+                let ingress_id = Uuid::new_v4();
+                handle_envelope(
+                    Envelope::remote_request(
+                        ingress_id,
+                        proto::RemoteOperationIdentityV1::new(
+                            operation.logical_attachment_id,
+                            operation.operation_id,
+                        )
+                        .unwrap(),
+                        request.clone(),
+                    ),
+                    &mut remote_state,
+                    &mut remote_shared,
+                    &ctx,
+                    &event_tx,
+                    &writer_tx,
+                    &mut concurrent,
+                )
+                .await
+                .unwrap();
+                assert!(
+                    matches!(recv_writer_body(&mut writer_rx, "rename outcome unknown").await,
+                    Body::Error { id: Some(id), error } if id == ingress_id && error.code == ErrorCode::Conflict)
+                );
+            }
+            if cut == "source_identity_swap" {
+                assert_eq!(
+                    std::fs::read(tmp.path().join("from.txt")).unwrap(),
+                    b"replacement"
+                );
+                assert!(!tmp.path().join("to.txt").exists());
+            } else {
+                assert_eq!(
+                    std::fs::read_to_string(tmp.path().join("from.txt")).unwrap(),
+                    format!("value-{index}")
+                );
+                assert!(std::fs::symlink_metadata(tmp.path().join("to.txt")).is_ok());
+            }
+            assert!(
+                std::fs::read_dir(spool_path.join("remote-operations"))
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+            continue;
+        }
+        assert!(
+            matches!(
+                execute_remote_staged_rename(&request, &authorized, &operation, &ctx)
+                    .await
+                    .unwrap(),
+                Response::Ack
+            ),
+            "recovery failed after {cut}"
+        );
+        assert!(
+            std::fs::read_dir(spool_path.join("remote-operations"))
+                .unwrap()
+                .next()
+                .is_none(),
+            "artifact cleanup did not survive reopen after {cut}"
+        );
+        assert!(!tmp.path().join("from.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("to.txt")).unwrap(),
+            format!("value-{index}")
+        );
+    }
+}
+
+#[tokio::test]
 async fn resource_scheduler_is_shared_only_for_persistent_daemons() {
     let persistent_db = Db::open_in_memory().expect("in-memory db");
     let persistent_locks = Arc::new(LockManager::in_memory(persistent_db.clone()));
@@ -3418,7 +6728,7 @@ async fn attached_state_with_worker_receiver(
             pending_uploads: HashMap::new(),
             ready_attachments: HashMap::new(),
             upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
-            upload_limits: AttachmentUploadLimits::default(),
+            upload_limits: AttachmentUploadLimits,
             terminal_views: HashMap::new(),
             terminal_host: test_terminal_host(),
         },
@@ -3490,6 +6800,8 @@ async fn client_state_split_concurrent_entry_point_authorizes_before_work() {
         ctx.upload_accounting.clone(),
         remote_principal(),
         ctx.terminal_host.clone(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
     );
     let shared = state.shared_snapshot();
     let request = Request::FsRead {
@@ -3498,7 +6810,7 @@ async fn client_state_split_concurrent_entry_point_authorizes_before_work() {
         base64: false,
     };
 
-    let err = handle_concurrent_request(request, shared, ctx)
+    let err = handle_concurrent_request_with_remote_operation(request, shared, ctx, None)
         .await
         .expect_err("unauthorized request should fail before handler work");
     assert_eq!(err.code, ErrorCode::Authorization);
@@ -3520,7 +6832,7 @@ struct DispatchMatrixRow {
 }
 
 macro_rules! dispatch_matrix_rows_from_command_table {
-        (($($context:ident),*) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+        (($($context:ident),*) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
             vec![$(
                 DispatchMatrixRow {
                     kind: $kind,
@@ -3538,6 +6850,108 @@ fn dispatch_matrix_rows() -> Vec<DispatchMatrixRow> {
     proto::command!(dispatch_matrix_rows_from_command_table)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum CharacterizedDispatchOutcome {
+    Applied(Vec<u8>),
+    Conflict,
+}
+
+async fn characterize_operation_dispatch(
+    db: &crate::db::Db,
+    _request_id: Uuid,
+    operation_id: Uuid,
+    request_hash: [u8; 32],
+    side_effects: &std::sync::atomic::AtomicUsize,
+) -> CharacterizedDispatchOutcome {
+    use crate::db::remote_attachment_operations::{
+        CommitRemoteOperation, RemoteOperationClass, ReserveRemoteOperation,
+        ReserveRemoteOperationOutcome,
+    };
+    let operation_id = operation_id.to_string();
+    let reservation = db
+        .reserve_remote_attachment_operation(ReserveRemoteOperation {
+            logical_attachment_id: "00000000-0000-4000-8000-000000000001",
+            operation_id: &operation_id,
+            authenticated_device_id: "00000000-0000-4000-8000-000000000002",
+            authenticated_device_generation: 1,
+            operation_class: RemoteOperationClass::TransactionalMutation,
+            request_hash,
+            now_ms: 1,
+        })
+        .await
+        .unwrap();
+    match reservation {
+        ReserveRemoteOperationOutcome::Reserved(_) => {
+            side_effects.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let outcome = b"committed byte-identical outcome".to_vec();
+            let delivery_id = Uuid::new_v4().to_string();
+            db.commit_remote_attachment_operation(CommitRemoteOperation {
+                logical_attachment_id: "00000000-0000-4000-8000-000000000001",
+                operation_id: &operation_id,
+                safe_response: &outcome,
+                outbox_delivery_id: &delivery_id,
+                outbox_kind: "characterized_dispatch",
+                outbox_payload: b"bounded event",
+                now_ms: 2,
+            })
+            .await
+            .unwrap();
+            CharacterizedDispatchOutcome::Applied(outcome)
+        }
+        ReserveRemoteOperationOutcome::Replay(replay) => {
+            CharacterizedDispatchOutcome::Applied(replay.safe_response.unwrap())
+        }
+        ReserveRemoteOperationOutcome::OperationConflict => CharacterizedDispatchOutcome::Conflict,
+        other => panic!("unexpected dispatch reservation: {other:?}"),
+    }
+}
+
+fn characterized_operation_id() -> Uuid {
+    Uuid::parse_str("01890f3e-4c00-7000-8000-000000000001").unwrap()
+}
+
+#[tokio::test]
+async fn remote_operation_same_operation_same_bytes_replays_original_outcome() {
+    let db = crate::db::Db::open_in_memory().unwrap();
+    let operation_id = characterized_operation_id();
+    let effects = std::sync::atomic::AtomicUsize::new(0);
+    let request_id = Uuid::new_v4();
+    let first =
+        characterize_operation_dispatch(&db, request_id, operation_id, [1; 32], &effects).await;
+    let replay =
+        characterize_operation_dispatch(&db, request_id, operation_id, [1; 32], &effects).await;
+    assert_eq!(replay, first);
+    assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn remote_operation_same_operation_different_bytes_conflicts() {
+    let db = crate::db::Db::open_in_memory().unwrap();
+    let operation_id = characterized_operation_id();
+    let effects = std::sync::atomic::AtomicUsize::new(0);
+    let first =
+        characterize_operation_dispatch(&db, Uuid::new_v4(), operation_id, [1; 32], &effects).await;
+    assert_eq!(
+        characterize_operation_dispatch(&db, Uuid::new_v4(), operation_id, [2; 32], &effects).await,
+        CharacterizedDispatchOutcome::Conflict
+    );
+    assert!(matches!(first, CharacterizedDispatchOutcome::Applied(_)));
+    assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn remote_operation_fresh_request_id_same_operation_replays_original_outcome() {
+    let db = crate::db::Db::open_in_memory().unwrap();
+    let operation_id = characterized_operation_id();
+    let effects = std::sync::atomic::AtomicUsize::new(0);
+    let first =
+        characterize_operation_dispatch(&db, Uuid::new_v4(), operation_id, [3; 32], &effects).await;
+    let replay =
+        characterize_operation_dispatch(&db, Uuid::new_v4(), operation_id, [3; 32], &effects).await;
+    assert_eq!(replay, first);
+    assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
 fn dispatch_matrix_class_for_command(
     kind: &'static str,
     authz: &'static str,
@@ -3545,6 +6959,7 @@ fn dispatch_matrix_class_for_command(
 ) -> DispatchMatrixClass {
     match (kind, authz, mutating) {
         ("unknown", "owner_only", false) => DispatchMatrixClass::NonDispatchable,
+        (_, "owner_only", _) => DispatchMatrixClass::AccessControlled,
         ("fs_list", "project_files", false)
         | ("fs_stat", "project_files", false)
         | ("fs_read", "project_files", false)
@@ -3557,6 +6972,7 @@ fn dispatch_matrix_class_for_command(
         | ("read_subagent_history_page", "custom", false)
         | ("session_live_status", "public_read", false)
         | ("get_run_invocation_status", "public_read", false)
+        | ("operation_status", "public_read", false)
         | ("goal_status", "session_row_reader", false)
         | ("get_inventory_bundle", "session_row_reader", false)
         | ("daemon_status", "public_read", false)
@@ -3564,15 +6980,8 @@ fn dispatch_matrix_class_for_command(
         ("attach_terminal", "terminal", false)
         | ("terminal_input", "terminal", false)
         | ("terminal_resize", "terminal", false)
-        | ("subagent_transcript", "custom", false)
-        | ("resource_snapshot", "owner_only", false)
-        | ("list_scheduled_jobs", "owner_only", false)
-        | ("list_assistants", "owner_only", false)
-        | ("list_sealed_values", "owner_only", false)
-        | ("export_session_data", "owner_only", false)
-        | ("read_bulk_transfer_chunk", "owner_only", false)
-        | ("get_usage_counts", "owner_only", false)
-        | ("stats_rollup", "owner_only", false) => DispatchMatrixClass::AccessControlled,
+        | ("terminal_ingress_status", "terminal", false)
+        | ("subagent_transcript", "custom", false) => DispatchMatrixClass::AccessControlled,
         ("count_pinned_messages", "session_row_reader", false)
         | ("list_pinned_message_seqs", "session_row_reader", false)
         | ("list_pinned_messages_with_text", "session_row_reader", false)
@@ -3604,7 +7013,8 @@ enum ReadonlyDispatchCaseKind {
     ReadSubagentHistoryPage,
     SessionLiveStatus,
     GetRunInvocationStatus,
-    GoalStatus,
+    OperationStatus,
+    GoalDisposition,
     GetInventoryBundle,
     DaemonStatus,
     GuidanceEstimate,
@@ -3669,8 +7079,12 @@ fn readonly_dispatch_case_list() -> Vec<ReadonlyDispatchCase> {
             case: ReadonlyDispatchCaseKind::GetRunInvocationStatus,
         },
         ReadonlyDispatchCase {
+            kind: "operation_status",
+            case: ReadonlyDispatchCaseKind::OperationStatus,
+        },
+        ReadonlyDispatchCase {
             kind: "goal_status",
-            case: ReadonlyDispatchCaseKind::GoalStatus,
+            case: ReadonlyDispatchCaseKind::GoalDisposition,
         },
         ReadonlyDispatchCase {
             kind: "get_inventory_bundle",
@@ -3703,10 +7117,17 @@ struct MutatingDispatchCase {
 
 fn mutating_dispatch_happy_cases() -> Vec<MutatingDispatchCase> {
     mutating_dispatch_case_list()
+        .into_iter()
+        .filter(|case| {
+            dispatch_matrix_rows()
+                .into_iter()
+                .any(|row| row.kind == case.kind && row.class == DispatchMatrixClass::Mutating)
+        })
+        .collect()
 }
 
 fn mutating_dispatch_malformed_cases() -> Vec<MutatingDispatchCase> {
-    mutating_dispatch_case_list()
+    mutating_dispatch_happy_cases()
 }
 
 fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
@@ -3781,6 +7202,11 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             kind: "repair_resume",
             effect_class: DriverForwarded,
             observation: "SessionWork::RepairResume delivered to attached worker",
+        },
+        MutatingDispatchCase {
+            kind: "create_goal",
+            effect_class: Durable,
+            observation: "session goal and planner control job are persisted atomically",
         },
         MutatingDispatchCase {
             kind: "set_goal_status",
@@ -3901,6 +7327,21 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             kind: "close_terminal",
             effect_class: InMemory,
             observation: "closed terminal rejects later attachment",
+        },
+        MutatingDispatchCase {
+            kind: "terminal_ingress_begin",
+            effect_class: InMemory,
+            observation: "ingress begin accepts a prepared operation",
+        },
+        MutatingDispatchCase {
+            kind: "terminal_ingress_chunk",
+            effect_class: InMemory,
+            observation: "ingress chunk appends bytes at the acknowledged offset",
+        },
+        MutatingDispatchCase {
+            kind: "terminal_ingress_finish",
+            effect_class: InMemory,
+            observation: "ingress finish commits a prepared operation",
         },
         MutatingDispatchCase {
             kind: "lsp_control",
@@ -4309,6 +7750,11 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "record_usage"
         | "get_usage_counts"
         | "stats_rollup"
+        | "create_goal"
+        | "get_startup_disclosures"
+        | "get_app_flag"
+        | "mark_app_flag_seen"
+        | "set_workspace_trust"
         | "guidance_estimate"
         | "restart_if_idle"
         | "stop_daemon" => AuthzAllowedOutcome::Response,
@@ -4334,9 +7780,6 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "git_status"
         | "git_diff_file"
         | "attach_terminal"
-        | "terminal_input"
-        | "terminal_resize"
-        | "close_terminal"
         | "create_scheduled_job"
         | "list_scheduled_jobs"
         | "delete_scheduled_job"
@@ -4344,12 +7787,22 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "run_scheduled_job"
         | "auto_title"
         | "create_assistant_session"
+        | "resolve_assistant_session"
         | "store_flycockpit_credential"
         | "clear_flycockpit_credential"
         | "set_goal_status"
         | "import_session_archive"
         // An unstaged transfer reference is a bad request, not an authz failure.
         | "read_bulk_transfer_chunk" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        "terminal_ingress_begin"
+        | "terminal_ingress_chunk"
+        | "terminal_ingress_finish"
+        | "terminal_ingress_status"
+        | "terminal_input"
+        | "terminal_resize"
+        | "close_terminal" => {
+            AuthzAllowedOutcome::Error(ErrorCode::InvalidIngress)
+        }
         "set_project_note_content" | "rename_project_note" | "delete_project_note" => {
             AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
         }
@@ -4406,6 +7859,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_writer("cancel_paused_work"),
         authz_session_writer("repair_resume"),
         authz_session_reader("goal_status"),
+        authz_session_writer("create_goal"),
         authz_session_writer("set_goal_status"),
         authz_session_writer("clear_goal"),
         authz_session_writer("pin_message"),
@@ -4424,6 +7878,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("delete_project_note"),
         authz_owner_only("list_assistants"),
         authz_owner_only("upsert_assistant"),
+        authz_owner_only("resolve_assistant_session"),
         authz_owner_only("create_assistant_session"),
         authz_session_writer("auto_title"),
         authz_owner_only("export_session_data"),
@@ -4446,6 +7901,10 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_terminal("terminal_input"),
         authz_terminal("terminal_resize"),
         authz_terminal("close_terminal"),
+        authz_terminal("terminal_ingress_begin"),
+        authz_terminal("terminal_ingress_chunk"),
+        authz_terminal("terminal_ingress_finish"),
+        authz_terminal("terminal_ingress_status"),
         authz_terminal("lsp_control"),
         authz_session_writer("resolve_interrupt"),
         authz_session_reader("read_session_messages"),
@@ -4498,6 +7957,10 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("record_usage"),
         authz_owner_only("get_usage_counts"),
         authz_owner_only("stats_rollup"),
+        authz_owner_only("get_startup_disclosures"),
+        authz_owner_only("get_app_flag"),
+        authz_owner_only("mark_app_flag_seen"),
+        authz_owner_only("set_workspace_trust"),
         authz_project_read("guidance_estimate"),
         authz_owner_only("stop_daemon"),
         authz_owner_only("restart_if_idle"),
@@ -4562,6 +8025,7 @@ async fn dispatch_authz_request_after(
         server_stream,
         ctx.clone(),
         principal,
+        Uuid::new_v4(),
     ));
     match recv_body(&mut client).await {
         Body::Response { id, response } => {
@@ -5131,8 +8595,15 @@ fn authz_matrix_principal(level: AuthzLevel, project_root: &Path, kind: &str) ->
                         project_root: Some(project_root),
                     }]
                 }
-                "open_terminal" | "attach_terminal" | "terminal_input" | "terminal_resize"
-                | "close_terminal" => {
+                "open_terminal"
+                | "attach_terminal"
+                | "terminal_input"
+                | "terminal_resize"
+                | "close_terminal"
+                | "terminal_ingress_begin"
+                | "terminal_ingress_chunk"
+                | "terminal_ingress_finish"
+                | "terminal_ingress_status" => {
                     vec![principal::PrincipalGrant {
                         scope: principal::PrincipalScope::Terminal,
                         project_root: None,
@@ -5159,11 +8630,13 @@ fn authz_matrix_principal(level: AuthzLevel, project_root: &Path, kind: &str) ->
             };
             ClientPrincipal::Remote(principal::RemotePrincipal {
                 user_id: "authz-writer".into(),
+                actor_binding: None,
                 grants,
             })
         }
         AuthzLevel::Readonly => ClientPrincipal::Remote(principal::RemotePrincipal {
             user_id: "authz-readonly".into(),
+            actor_binding: None,
             grants: vec![principal::PrincipalGrant {
                 scope: principal::PrincipalScope::AgentReadonly,
                 project_root: Some(project_root),
@@ -5171,6 +8644,7 @@ fn authz_matrix_principal(level: AuthzLevel, project_root: &Path, kind: &str) ->
         }),
         AuthzLevel::NoAccess => ClientPrincipal::Remote(principal::RemotePrincipal {
             user_id: "authz-none".into(),
+            actor_binding: None,
             grants: Vec::new(),
         }),
     }
@@ -5276,9 +8750,14 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "cancel_paused_work" => Request::CancelPausedWork { session_id },
         "repair_resume" => Request::RepairResume { session_id },
         "goal_status" => Request::GoalStatus { session_id },
+        "create_goal" => Request::CreateGoal {
+            session_id,
+            objective: "ship goal rpc".into(),
+            token_budget: Some(100),
+        },
         "set_goal_status" => Request::SetGoalStatus {
             session_id,
-            status: proto::GoalStatus::Paused,
+            status: proto::GoalDisposition::UserPaused,
         },
         "clear_goal" => Request::ClearGoal { session_id },
         "pin_message" => Request::PinMessage { session_id, seq: 1 },
@@ -5320,6 +8799,11 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             home_dir: root,
             config_json: "{}".into(),
             content_hash: "h".into(),
+        },
+        "resolve_assistant_session" => Request::ResolveAssistantSession {
+            assistant_id: "missing-assistant".into(),
+            project_root: root,
+            mode: proto::AssistantSessionResolutionMode::MostRecentOrCreate,
         },
         "create_assistant_session" => Request::CreateAssistantSession {
             name: "missing-assistant".into(),
@@ -5405,6 +8889,45 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "close_terminal" => Request::CloseTerminal {
             terminal_id: Uuid::new_v4(),
         },
+        "terminal_ingress_begin" => Request::TerminalIngressBegin {
+            terminal_id: Uuid::new_v4(),
+            binding: proto::terminal::TerminalBinding {
+                binding_id: Uuid::new_v4(),
+                binding_epoch: 0,
+            },
+            metadata: proto::terminal::TerminalIngressMetadata {
+                operation_id: Uuid::new_v4(),
+                size: 1,
+                media_type: proto::terminal::TerminalImageType::Png,
+                sha256: "0".repeat(64),
+            },
+        },
+        "terminal_ingress_chunk" => Request::TerminalIngressChunk {
+            terminal_id: Uuid::new_v4(),
+            binding: proto::terminal::TerminalBinding {
+                binding_id: Uuid::new_v4(),
+                binding_epoch: 0,
+            },
+            operation_id: Uuid::new_v4(),
+            offset: 0,
+            data_base64: "AA==".into(),
+        },
+        "terminal_ingress_finish" => Request::TerminalIngressFinish {
+            terminal_id: Uuid::new_v4(),
+            binding: proto::terminal::TerminalBinding {
+                binding_id: Uuid::new_v4(),
+                binding_epoch: 0,
+            },
+            operation_id: Uuid::new_v4(),
+        },
+        "terminal_ingress_status" => Request::TerminalIngressStatus {
+            terminal_id: Uuid::new_v4(),
+            binding: proto::terminal::TerminalBinding {
+                binding_id: Uuid::new_v4(),
+                binding_epoch: 0,
+            },
+            operation_id: Uuid::new_v4(),
+        },
         "lsp_control" => Request::LspControl {
             project_root: root,
             server_id: "rust-analyzer".into(),
@@ -5482,6 +9005,9 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "get_run_invocation_status" => Request::GetRunInvocationStatus {
             client_submission_id: Uuid::new_v4(),
         },
+        "operation_status" => Request::OperationStatus {
+            operation_id: Uuid::from_u128(99),
+        },
         "cancel_run_invocation" => Request::CancelRunInvocation {
             client_submission_id: Uuid::new_v4(),
         },
@@ -5556,7 +9082,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             monty_nudge: Some("monty tools enabled: read".to_string()),
         },
         "set_goal_settings_override" => Request::SetGoalSettingsOverride {
-            override_json: Some(r#"{"enabled":false,"skepticCount":2}"#.to_string()),
+            override_json: Some(r#"{"enabled":false,"coldSkepticCount":2}"#.to_string()),
             persist_session: true,
         },
         "set_approval_mode" => Request::SetApprovalMode {
@@ -5608,6 +9134,19 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             project_id: None,
             range: proto::StatsRange::Last7Days,
             by_role: false,
+        },
+        "get_startup_disclosures" => Request::GetStartupDisclosures { project_root: root },
+        "get_app_flag" => Request::GetAppFlag {
+            key: proto::AppFlagKey::DaemonAutostartNotice,
+        },
+        "mark_app_flag_seen" => Request::MarkAppFlagSeen {
+            key: proto::AppFlagKey::DaemonAutostartNotice,
+            expected_version: 0,
+        },
+        "set_workspace_trust" => Request::SetWorkspaceTrust {
+            project_root: root,
+            mode: proto::WorkspaceTrustMode::Trust,
+            expected_config_generation: 0,
         },
         "guidance_estimate" => Request::GuidanceEstimate {
             project_root: root,
@@ -5885,7 +9424,7 @@ impl ReadonlyDispatchCaseKind {
                 assert_eq!(statuses.len(), 1);
                 assert_eq!(statuses[0].session_id, session.session_id);
             }
-            Self::GoalStatus => {
+            Self::GoalDisposition => {
                 let ctx = test_ctx();
                 let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
                 ctx.db
@@ -5907,11 +9446,11 @@ impl ReadonlyDispatchCaseKind {
                 .await
                 .expect("goal_status happy");
                 let Response::GoalStatus { goal: Some(goal) } = response else {
-                    panic!("expected GoalStatus with goal");
+                    panic!("expected GoalDisposition with goal");
                 };
                 assert_eq!(goal.session_id, session.session_id);
                 assert_eq!(goal.objective, "ship status rpc");
-                assert_eq!(goal.status, proto::GoalStatus::Active);
+                assert_eq!(goal.disposition, proto::GoalDisposition::Running);
             }
             Self::GetInventoryBundle => {
                 let ctx = test_ctx();
@@ -5987,6 +9526,18 @@ impl ReadonlyDispatchCaseKind {
                 };
                 assert_eq!(status.client_submission_id, id);
                 assert_eq!(status.schema_version, 1);
+            }
+            Self::OperationStatus => {
+                let ctx = test_ctx();
+                let operation_id = Uuid::from_u128(99);
+                let response =
+                    dispatch_matrix_request(&ctx, Request::OperationStatus { operation_id })
+                        .await
+                        .expect("operation_status happy");
+                let Response::RemoteOperationStatus { status } = response else {
+                    panic!("expected RemoteOperationStatus, got {response:?}");
+                };
+                assert!(status.is_none());
             }
             Self::GuidanceEstimate => {
                 let ctx = test_ctx();
@@ -6217,7 +9768,7 @@ impl ReadonlyDispatchCaseKind {
                 };
                 assert!(statuses.is_empty());
             }
-            Self::GoalStatus => {
+            Self::GoalDisposition => {
                 let ctx = test_ctx();
                 let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
                 let response = dispatch_matrix_request(
@@ -6273,6 +9824,18 @@ impl ReadonlyDispatchCaseKind {
                 )
                 .await
                 .expect_err("nil client_submission_id is rejected");
+                assert_eq!(err.code, ErrorCode::BadRequest);
+            }
+            Self::OperationStatus => {
+                let ctx = test_ctx();
+                let err = dispatch_matrix_request(
+                    &ctx,
+                    Request::OperationStatus {
+                        operation_id: Uuid::nil(),
+                    },
+                )
+                .await
+                .expect_err("nil operation_id is rejected");
                 assert_eq!(err.code, ErrorCode::BadRequest);
             }
             Self::GuidanceEstimate => {
@@ -6421,7 +9984,9 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         "resume_paused_work" | "cancel_paused_work" => {
             assert_paused_work_mutating_happy(case.kind).await;
         }
-        "set_goal_status" | "clear_goal" => assert_goal_mutating_happy(case.kind).await,
+        "create_goal" | "set_goal_status" | "clear_goal" => {
+            assert_goal_mutating_happy(case.kind).await
+        }
         "pin_message"
         | "unpin_message"
         | "toggle_pinned_message"
@@ -6530,6 +10095,9 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
                 proto::RunInvocationCancelOutcome::CancellationRequested
             );
         }
+        "terminal_ingress_begin" | "terminal_ingress_chunk" | "terminal_ingress_finish" => {
+            assert_terminal_ingress_mutating_happy(case.kind).await;
+        }
         other => panic!("unhandled mutating happy case {other}"),
     }
 }
@@ -6590,7 +10158,9 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
             assert!(matches!(response, Response::Ack));
             assert!(ctx.db.paused_session_work_all().await.unwrap().is_empty());
         }
-        "set_goal_status" | "clear_goal" => assert_goal_mutating_malformed(case.kind).await,
+        "create_goal" | "set_goal_status" | "clear_goal" => {
+            assert_goal_mutating_malformed(case.kind).await
+        }
         "pin_message"
         | "unpin_message"
         | "toggle_pinned_message"
@@ -6788,6 +10358,9 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
             .await
             .expect_err("nil client_submission_id is rejected");
             assert_eq!(err.code, ErrorCode::BadRequest);
+        }
+        "terminal_ingress_begin" | "terminal_ingress_chunk" | "terminal_ingress_finish" => {
+            assert_terminal_ingress_mutating_malformed(case.kind).await;
         }
         other => panic!("unhandled mutating malformed case {other}"),
     }
@@ -6995,7 +10568,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
             monty_nudge: Some("monty tools enabled: read".to_string()),
         },
         "set_goal_settings_override" => Request::SetGoalSettingsOverride {
-            override_json: Some(r#"{"enabled":false,"skepticCount":2}"#.to_string()),
+            override_json: Some(r#"{"enabled":false,"coldSkepticCount":2}"#.to_string()),
             persist_session: true,
         },
         "set_delegation_recursion" => Request::SetDelegationRecursion {
@@ -7068,10 +10641,12 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     "remove_queued_user_message",
                     SessionWork::RemoveQueuedUserMessage {
                         queue_item_id,
+                        remote_operation,
                         respond_to,
                     },
                 ) => {
                     assert_eq!(queue_item_id, Uuid::from_u128(1));
+                    assert!(remote_operation.is_none());
                     respond_to
                         .send(Ok(proto::RemoveQueuedUserMessageResult {
                             applied: true,
@@ -7085,6 +10660,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     "remove_newest_queued_user_message",
                     SessionWork::RemoveNewestQueuedUserMessage {
                         target_id,
+                        remote_operation: _,
                         respond_to,
                     },
                 ) => {
@@ -7102,6 +10678,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     "remove_editable_queued_user_messages",
                     SessionWork::RemoveEditableQueuedUserMessages {
                         target_id,
+                        remote_operation: _,
                         respond_to,
                     },
                 ) => {
@@ -7187,7 +10764,7 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     assert!(
                         override_json
                             .as_deref()
-                            .is_some_and(|raw| raw.contains("\"skepticCount\":2"))
+                            .is_some_and(|raw| raw.contains("\"coldSkepticCount\":2"))
                     );
                     assert!(persist_session);
                 }
@@ -7246,7 +10823,12 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     },
                 ) => {
                     assert_eq!(snapshot.generation, 0);
-                    respond_to.send(1).unwrap();
+                    respond_to
+                        .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                            generation: 1,
+                            changed: true,
+                        })
+                        .unwrap();
                 }
                 ("cancel_schedule", SessionWork::CancelSchedule { job_id }) => {
                     assert_eq!(job_id, "job-1");
@@ -7295,6 +10877,13 @@ async fn assert_worker_delivery_happy(kind: &str) {
                 scan_environment: false,
                 scan_dotenv: true,
                 scan_ssh_keys: true,
+            }
+        )),
+        "refresh_config" => assert!(matches!(
+            response,
+            Response::ConfigRefreshed {
+                applied_generation: 1,
+                changed: true
             }
         )),
         _ => assert!(matches!(response, Response::Ack), "{kind}: {response:?}"),
@@ -7366,6 +10955,7 @@ async fn remove_queued_message_propagates_terminal_receipt_failure() {
         |work| {
             let SessionWork::RemoveQueuedUserMessage {
                 queue_item_id: delivered_id,
+                remote_operation: _,
                 respond_to,
             } = work
             else {
@@ -7475,7 +11065,7 @@ async fn assert_attached_required_malformed(kind: &str) {
             monty_nudge: None,
         },
         "set_goal_settings_override" => Request::SetGoalSettingsOverride {
-            override_json: Some(r#"{"enabled":false,"skepticCount":2}"#.to_string()),
+            override_json: Some(r#"{"enabled":false,"coldSkepticCount":2}"#.to_string()),
             persist_session: true,
         },
         "set_approval_mode" => Request::SetApprovalMode {
@@ -7609,7 +11199,7 @@ async fn assert_attachment_mutating_happy(kind: &str) {
             begin_id,
             Request::BeginAttachmentUpload {
                 mime: proto::IMAGE_ATTACHMENT_MIME_PNG.into(),
-                byte_len: png.len(),
+                byte_len: png.len() as u64,
                 sha256: sha,
                 purpose: proto::AttachmentPurpose::UserMessageImage,
             },
@@ -7769,56 +11359,96 @@ async fn assert_attachment_mutating_malformed(kind: &str) {
 }
 
 #[cfg(unix)]
+async fn open_terminal_on_socket(
+    ctx: &Arc<DaemonContext>,
+    cwd: Option<String>,
+) -> (Uuid, proto::terminal::TerminalBinding) {
+    let response = dispatch_matrix_request(
+        ctx,
+        Request::OpenTerminal {
+            cwd,
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await
+    .expect("open terminal");
+    let Response::TerminalOpened {
+        terminal_id,
+        binding,
+        ..
+    } = response
+    else {
+        panic!("expected TerminalOpened");
+    };
+    (terminal_id, binding)
+}
+
+#[cfg(unix)]
 async fn assert_terminal_mutating_happy(kind: &str) {
     let ctx = test_ctx();
     match kind {
         "open_terminal" => {
-            let response = dispatch_matrix_request(
-                &ctx,
-                Request::OpenTerminal {
-                    cwd: None,
-                    cols: 80,
-                    rows: 24,
+            let (terminal_id, _binding) = open_terminal_on_socket(&ctx, None).await;
+            assert!(ctx.terminal_host.contains(terminal_id));
+            let _ = ctx.terminal_host.close(
+                terminal_id,
+                proto::terminal::TerminalBinding {
+                    binding_id: Uuid::nil(),
+                    binding_epoch: 0,
                 },
-            )
-            .await
-            .expect("open terminal");
+            );
+        }
+        "close_terminal" => {
+            // Open and close on the same connection so the dispatch layer
+            // has the binding in terminal_views.
+            let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+            let mut client = ProtoStream::new(client_stream);
+            let server = tokio::spawn(handle_client_transport_as(
+                server_stream,
+                ctx.clone(),
+                ClientPrincipal::owner(),
+                Uuid::new_v4(),
+            ));
+            match recv_body(&mut client).await {
+                Body::Response { id, response } => {
+                    assert_eq!(id, Uuid::nil());
+                    assert!(matches!(*response, Response::DaemonStatus { .. }));
+                }
+                other => panic!("expected daemon hello, got {other:?}"),
+            }
+            let open_id = Uuid::new_v4();
+            client
+                .send(&Envelope::request(
+                    open_id,
+                    Request::OpenTerminal {
+                        cwd: None,
+                        cols: 80,
+                        rows: 24,
+                    },
+                ))
+                .await
+                .expect("send open terminal");
+            let response = recv_dispatch_matrix_response(&mut client, open_id)
+                .await
+                .expect("open terminal");
             let Response::TerminalOpened { terminal_id, .. } = response else {
                 panic!("expected TerminalOpened");
             };
-            let response = dispatch_matrix_request(&ctx, Request::CloseTerminal { terminal_id })
+            let close_id = Uuid::new_v4();
+            client
+                .send(&Envelope::request(
+                    close_id,
+                    Request::CloseTerminal { terminal_id },
+                ))
                 .await
-                .expect("close opened terminal");
-            assert!(matches!(response, Response::Ack));
-        }
-        "close_terminal" => {
-            let Response::TerminalOpened { terminal_id, .. } = dispatch_matrix_request(
-                &ctx,
-                Request::OpenTerminal {
-                    cwd: None,
-                    cols: 80,
-                    rows: 24,
-                },
-            )
-            .await
-            .expect("open terminal") else {
-                panic!("expected TerminalOpened");
-            };
-            let response = dispatch_matrix_request(&ctx, Request::CloseTerminal { terminal_id })
+                .expect("send close terminal");
+            let response = recv_dispatch_matrix_response(&mut client, close_id)
                 .await
-                .expect("close terminal");
+                .expect("close terminal on same connection");
             assert!(matches!(response, Response::Ack));
-            let err = dispatch_matrix_request(
-                &ctx,
-                Request::AttachTerminal {
-                    terminal_id,
-                    cols: 80,
-                    rows: 24,
-                },
-            )
-            .await
-            .expect_err("closed terminal is absent");
-            assert_eq!(err.code, ErrorCode::BadRequest);
+            drop(client);
+            let _ = server.await;
         }
         _ => unreachable!(),
     }
@@ -7843,8 +11473,219 @@ async fn assert_terminal_mutating_malformed(kind: &str) {
         .expect_err("terminal invalid state rejected");
     assert!(matches!(
         err.code,
-        ErrorCode::BadRequest | ErrorCode::RootMissing
+        ErrorCode::BadRequest | ErrorCode::RootMissing | ErrorCode::InvalidIngress
     ));
+}
+
+#[cfg(unix)]
+async fn assert_terminal_ingress_mutating_happy(kind: &str) {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+    let mut client = ProtoStream::new(client_stream);
+    let server = tokio::spawn(handle_client_transport_as(
+        server_stream,
+        ctx.clone(),
+        ClientPrincipal::owner(),
+        Uuid::new_v4(),
+    ));
+    // Consume hello.
+    match recv_body(&mut client).await {
+        Body::Response { id, response } => {
+            assert_eq!(id, Uuid::nil());
+            assert!(matches!(*response, Response::DaemonStatus { .. }));
+        }
+        other => panic!("expected daemon hello, got {other:?}"),
+    }
+    // Open terminal on this connection.
+    let open_id = Uuid::new_v4();
+    client
+        .send(&Envelope::request(
+            open_id,
+            Request::OpenTerminal {
+                cwd: Some(tmp.path().to_string_lossy().into_owned()),
+                cols: 80,
+                rows: 24,
+            },
+        ))
+        .await
+        .expect("send open terminal");
+    let response = recv_dispatch_matrix_response(&mut client, open_id)
+        .await
+        .expect("open terminal");
+    let Response::TerminalOpened {
+        terminal_id,
+        binding,
+        ..
+    } = response
+    else {
+        panic!("expected TerminalOpened");
+    };
+    let bytes = b"GIF89a";
+    let operation_id = Uuid::new_v4();
+    let metadata = proto::terminal::TerminalIngressMetadata {
+        operation_id,
+        size: bytes.len() as u64,
+        media_type: proto::terminal::TerminalImageType::Gif,
+        sha256: "0".repeat(64),
+    };
+    macro_rules! send_and_recv {
+        ($client:expr, $request:expr) => {{
+            let id = Uuid::new_v4();
+            $client
+                .send(&Envelope::request(id, $request))
+                .await
+                .expect("send ingress request");
+            recv_dispatch_matrix_response($client, id)
+                .await
+                .expect("ingress response")
+        }};
+    }
+    match kind {
+        "terminal_ingress_begin" => {
+            let response = send_and_recv!(
+                &mut client,
+                Request::TerminalIngressBegin {
+                    terminal_id,
+                    binding,
+                    metadata,
+                }
+            );
+            assert!(matches!(response, Response::TerminalIngress { .. }));
+        }
+        "terminal_ingress_chunk" => {
+            send_and_recv!(
+                &mut client,
+                Request::TerminalIngressBegin {
+                    terminal_id,
+                    binding,
+                    metadata,
+                }
+            );
+            let response = send_and_recv!(
+                &mut client,
+                Request::TerminalIngressChunk {
+                    terminal_id,
+                    binding,
+                    operation_id,
+                    offset: 0,
+                    data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                }
+            );
+            assert!(matches!(response, Response::TerminalIngress { .. }));
+        }
+        "terminal_ingress_finish" => {
+            send_and_recv!(
+                &mut client,
+                Request::TerminalIngressBegin {
+                    terminal_id,
+                    binding,
+                    metadata: proto::terminal::TerminalIngressMetadata {
+                        sha256: sha256_hex_terminal(bytes),
+                        ..metadata
+                    },
+                }
+            );
+            send_and_recv!(
+                &mut client,
+                Request::TerminalIngressChunk {
+                    terminal_id,
+                    binding,
+                    operation_id,
+                    offset: 0,
+                    data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                }
+            );
+            let response = send_and_recv!(
+                &mut client,
+                Request::TerminalIngressFinish {
+                    terminal_id,
+                    binding,
+                    operation_id,
+                }
+            );
+            assert!(matches!(response, Response::TerminalIngress { .. }));
+        }
+        _ => unreachable!(),
+    }
+    drop(client);
+    let _ = server.await;
+    let _ = ctx.terminal_host.close(
+        terminal_id,
+        proto::terminal::TerminalBinding {
+            binding_id: Uuid::nil(),
+            binding_epoch: 0,
+        },
+    );
+}
+
+#[cfg(unix)]
+async fn assert_terminal_ingress_mutating_malformed(kind: &str) {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    let response = dispatch_matrix_request(
+        &ctx,
+        Request::OpenTerminal {
+            cwd: Some(tmp.path().to_string_lossy().into_owned()),
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await
+    .expect("open terminal for ingress malformed");
+    let Response::TerminalOpened {
+        terminal_id,
+        binding,
+        ..
+    } = response
+    else {
+        panic!("expected TerminalOpened");
+    };
+    let wrong_binding = proto::terminal::TerminalBinding {
+        binding_id: Uuid::new_v4(),
+        binding_epoch: binding.binding_epoch,
+    };
+    let request = match kind {
+        "terminal_ingress_begin" => Request::TerminalIngressBegin {
+            terminal_id,
+            binding: wrong_binding,
+            metadata: proto::terminal::TerminalIngressMetadata {
+                operation_id: Uuid::new_v4(),
+                size: 1,
+                media_type: proto::terminal::TerminalImageType::Png,
+                sha256: "0".repeat(64),
+            },
+        },
+        "terminal_ingress_chunk" => Request::TerminalIngressChunk {
+            terminal_id,
+            binding: wrong_binding,
+            operation_id: Uuid::new_v4(),
+            offset: 0,
+            data_base64: "AA==".into(),
+        },
+        "terminal_ingress_finish" => Request::TerminalIngressFinish {
+            terminal_id,
+            binding: wrong_binding,
+            operation_id: Uuid::new_v4(),
+        },
+        _ => unreachable!(),
+    };
+    let err = dispatch_matrix_request(&ctx, request)
+        .await
+        .expect_err("wrong binding ingress rejected");
+    assert_eq!(err.code, ErrorCode::InvalidIngress);
+    let _ = dispatch_matrix_request(&ctx, Request::CloseTerminal { terminal_id }).await;
+}
+
+#[cfg(unix)]
+fn sha256_hex_terminal(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for byte in digest.iter() {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 #[cfg(unix)]
@@ -7891,22 +11732,29 @@ async fn assert_paused_work_mutating_happy(kind: &str) {
 async fn assert_goal_mutating_happy(kind: &str) {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
-    ctx.db
-        .create_session_goal(
-            session.session_id,
-            &session.project_id,
-            "ship goal rpc",
-            None,
-            Some(100),
-        )
-        .await
-        .unwrap();
+    if kind != "create_goal" {
+        ctx.db
+            .create_session_goal(
+                session.session_id,
+                &session.project_id,
+                "ship goal rpc",
+                None,
+                Some(100),
+            )
+            .await
+            .unwrap();
+    }
     let response = dispatch_matrix_request(
         &ctx,
         match kind {
+            "create_goal" => Request::CreateGoal {
+                session_id: session.session_id,
+                objective: "ship goal rpc".into(),
+                token_budget: Some(100),
+            },
             "set_goal_status" => Request::SetGoalStatus {
                 session_id: session.session_id,
-                status: proto::GoalStatus::Paused,
+                status: proto::GoalDisposition::UserPaused,
             },
             "clear_goal" => Request::ClearGoal {
                 session_id: session.session_id,
@@ -7917,9 +11765,13 @@ async fn assert_goal_mutating_happy(kind: &str) {
     .await
     .expect("goal mutation");
     match (kind, response) {
+        ("create_goal", Response::GoalUpdated { goal }) => {
+            assert_eq!(goal.session_id, session.session_id);
+            assert_eq!(goal.objective, "ship goal rpc");
+        }
         ("set_goal_status", Response::GoalUpdated { goal }) => {
             assert_eq!(goal.session_id, session.session_id);
-            assert_eq!(goal.status, proto::GoalStatus::Paused);
+            assert_eq!(goal.disposition, proto::GoalDisposition::UserPaused);
         }
         ("clear_goal", Response::GoalCleared { cleared }) => {
             assert!(cleared);
@@ -7940,12 +11792,35 @@ async fn assert_goal_mutating_malformed(kind: &str) {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
     match kind {
+        "create_goal" => {
+            ctx.db
+                .create_session_goal(
+                    session.session_id,
+                    &session.project_id,
+                    "existing goal",
+                    None,
+                    Some(100),
+                )
+                .await
+                .unwrap();
+            let err = dispatch_matrix_request(
+                &ctx,
+                Request::CreateGoal {
+                    session_id: session.session_id,
+                    objective: "second goal".into(),
+                    token_budget: Some(100),
+                },
+            )
+            .await
+            .expect_err("second open goal rejects creation");
+            assert_eq!(err.code, ErrorCode::BadRequest);
+        }
         "set_goal_status" => {
             let err = dispatch_matrix_request(
                 &ctx,
                 Request::SetGoalStatus {
                     session_id: session.session_id,
-                    status: proto::GoalStatus::Paused,
+                    status: proto::GoalDisposition::UserPaused,
                 },
             )
             .await
@@ -9167,7 +13042,7 @@ async fn dispatch_attach_delivers_config_snapshot_event() {
 
 /// Criterion 6 (`engine-config-snapshot-adoption`): after a re-resolution
 /// over a malformed layer, a dispatched client still holds the last good
-/// snapshot (no new `ConfigSnapshot` event) and receives a `Notice`. Driven
+/// snapshot (no new `ConfigSnapshot` event) and receives a terminal error. Driven
 /// through the real `RefreshConfig` dispatch path.
 #[cfg(unix)]
 #[tokio::test]
@@ -9226,14 +13101,8 @@ async fn dispatch_invalid_reresolve_keeps_last_good_snapshot() {
         Request::RefreshConfig,
     )
     .await;
-    assert!(result.is_ok(), "refresh config dispatch: {result:?}");
-    assert!(
-        events.iter().any(|event| matches!(
-            event,
-            proto::Event::Notice { text, .. } if text.contains("last good snapshot")
-        )),
-        "invalid re-resolution must notify the client, got {events:?}"
-    );
+    let error = result.expect_err("explicit refresh must reject invalid config");
+    assert_eq!(error.code, proto::ErrorCode::InvalidConfig);
     // The only ConfigSnapshot delivered is the attach hydration at the last
     // good generation (0); the malformed re-resolution pushes no new one.
     assert!(
@@ -9277,7 +13146,7 @@ macro_rules! command_request_ordering_value {
 }
 
 macro_rules! request_ordering_rows_from_command_table {
-    (($($context:ident),*) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?);)+]) => {{
+    (($($context:ident),*) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
         vec![$(($kind, command_request_ordering_value!($ordering))),+]
     }};
 }
@@ -9499,6 +13368,15 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             mutating: false,
         },
         CommandMetadataCase {
+            request: Request::OperationStatus {
+                operation_id: Uuid::from_u128(99),
+            },
+            kind: "operation_status",
+            session_id: None,
+            audit_path: None,
+            mutating: false,
+        },
+        CommandMetadataCase {
             request: Request::CancelRunInvocation {
                 client_submission_id: Uuid::from_u128(43),
             },
@@ -9609,6 +13487,17 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             mutating: true,
         },
         CommandMetadataCase {
+            request: Request::CreateGoal {
+                session_id: attached_session_id,
+                objective: "ship it".into(),
+                token_budget: Some(100_000),
+            },
+            kind: "create_goal",
+            session_id: Some(attached_session_id),
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
             request: Request::GoalStatus {
                 session_id: attached_session_id,
             },
@@ -9620,7 +13509,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase {
             request: Request::SetGoalStatus {
                 session_id: attached_session_id,
-                status: proto::GoalStatus::Paused,
+                status: proto::GoalDisposition::UserPaused,
             },
             kind: "set_goal_status",
             session_id: Some(attached_session_id),
@@ -9868,6 +13757,69 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             session_id: None,
             audit_path: None,
             mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::TerminalIngressBegin {
+                terminal_id,
+                binding: proto::terminal::TerminalBinding {
+                    binding_id: Uuid::nil(),
+                    binding_epoch: 0,
+                },
+                metadata: proto::terminal::TerminalIngressMetadata {
+                    operation_id: Uuid::nil(),
+                    size: 1,
+                    media_type: proto::terminal::TerminalImageType::Png,
+                    sha256: "0".repeat(64),
+                },
+            },
+            kind: "terminal_ingress_begin",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::TerminalIngressChunk {
+                terminal_id,
+                binding: proto::terminal::TerminalBinding {
+                    binding_id: Uuid::nil(),
+                    binding_epoch: 0,
+                },
+                operation_id: Uuid::nil(),
+                offset: 0,
+                data_base64: "AA==".to_string(),
+            },
+            kind: "terminal_ingress_chunk",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::TerminalIngressFinish {
+                terminal_id,
+                binding: proto::terminal::TerminalBinding {
+                    binding_id: Uuid::nil(),
+                    binding_epoch: 0,
+                },
+                operation_id: Uuid::nil(),
+            },
+            kind: "terminal_ingress_finish",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::TerminalIngressStatus {
+                terminal_id,
+                binding: proto::terminal::TerminalBinding {
+                    binding_id: Uuid::nil(),
+                    binding_epoch: 0,
+                },
+                operation_id: Uuid::nil(),
+            },
+            kind: "terminal_ingress_status",
+            session_id: None,
+            audit_path: None,
+            mutating: false,
         },
         CommandMetadataCase {
             request: Request::LspControl {
@@ -10158,7 +14110,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         },
         CommandMetadataCase {
             request: Request::SetGoalSettingsOverride {
-                override_json: Some(r#"{"enabled":false,"skepticCount":2}"#.to_string()),
+                override_json: Some(r#"{"enabled":false,"coldSkepticCount":2}"#.to_string()),
                 persist_session: true,
             },
             kind: "set_goal_settings_override",
@@ -10504,6 +14456,56 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             mutating: true,
         },
         CommandMetadataCase {
+            request: Request::SetWorkspaceTrust {
+                project_root: project_root.clone(),
+                mode: proto::WorkspaceTrustMode::Trust,
+                expected_config_generation: 0,
+            },
+            kind: "set_workspace_trust",
+            session_id: None,
+            audit_path: Some("/repo"),
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::GetStartupDisclosures {
+                project_root: project_root.clone(),
+            },
+            kind: "get_startup_disclosures",
+            session_id: None,
+            audit_path: Some("/repo"),
+            mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::GetAppFlag {
+                key: proto::AppFlagKey::DaemonAutostartNotice,
+            },
+            kind: "get_app_flag",
+            session_id: None,
+            audit_path: None,
+            mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::MarkAppFlagSeen {
+                key: proto::AppFlagKey::DaemonAutostartNotice,
+                expected_version: 0,
+            },
+            kind: "mark_app_flag_seen",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::ResolveAssistantSession {
+                assistant_id: "a".into(),
+                project_root: project_root.clone(),
+                mode: proto::AssistantSessionResolutionMode::MostRecentOrCreate,
+            },
+            kind: "resolve_assistant_session",
+            session_id: None,
+            audit_path: Some("/repo"),
+            mutating: true,
+        },
+        CommandMetadataCase {
             request: Request::UpsertAssistant {
                 name: "a".into(),
                 home_dir: "/tmp".into(),
@@ -10541,6 +14543,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         SubagentTranscript,
         SendUserMessage,
         GetRunInvocationStatus,
+        OperationStatus,
         CancelRunInvocation,
         SteerDelegation,
         BeginAttachmentUpload,
@@ -10553,6 +14556,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         ResumePausedWork,
         CancelPausedWork,
         RepairResume,
+        CreateGoal,
         GoalStatus,
         SetGoalStatus,
         ClearGoal,
@@ -10570,6 +14574,11 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         SetProjectNoteContent,
         RenameProjectNote,
         DeleteProjectNote,
+        SetWorkspaceTrust,
+        GetStartupDisclosures,
+        GetAppFlag,
+        MarkAppFlagSeen,
+        ResolveAssistantSession,
         ListAssistants,
         UpsertAssistant,
         CreateAssistantSession,
@@ -10592,6 +14601,10 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         TerminalInput,
         TerminalResize,
         CloseTerminal,
+        TerminalIngressBegin,
+        TerminalIngressChunk,
+        TerminalIngressFinish,
+        TerminalIngressStatus,
         LspControl,
         ResolveInterrupt,
         ListSessions,
@@ -10775,6 +14788,8 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
         ctx.upload_accounting.clone(),
         ClientPrincipal::owner(),
         ctx.terminal_host.clone(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
     );
     let attached = handle_request(
         Request::Attach {
@@ -10805,6 +14820,7 @@ async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
         expected_model_state_generation: None,
         expected_model: None,
         kind: crate::engine::message::UserSubmissionKind::User,
+        origin: Default::default(),
         text: text.to_string(),
         display_text: None,
         tag_expansions: Vec::new(),
@@ -10921,6 +14937,8 @@ async fn image_submission_exact_retry_case() {
         ctx.upload_accounting.clone(),
         ClientPrincipal::owner(),
         ctx.terminal_host.clone(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
     );
     let attached = handle_request(
         Request::Attach {
@@ -11016,6 +15034,8 @@ async fn image_submission_exact_retry_case() {
         ctx.upload_accounting.clone(),
         ClientPrincipal::owner(),
         ctx.terminal_host.clone(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
     );
     handle_request(
         Request::Attach {
@@ -11417,19 +15437,28 @@ async fn png_validation_uses_strict_limits() {
     assert!(err.message.contains("decode limit"));
 }
 
+#[test]
+fn png_validation_reports_decoded_dimensions_for_ledger_reconciliation() {
+    let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        7,
+        11,
+        image::Rgba([1, 2, 3, 255]),
+    ));
+    let mut png = Vec::new();
+    image
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+
+    let validated = validate_png_attachment_blocking(png.clone()).unwrap();
+    assert_eq!(validated.bytes, png);
+    assert_eq!((validated.width, validated.height), (7, 11));
+}
+
 #[tokio::test]
 async fn attachment_upload_default_limits_match_config_defaults() {
-    let limits = AttachmentUploadLimits::default();
-    assert_eq!(limits.per_client_uploads, 4);
-    assert_eq!(limits.global_uploads, 32);
-    assert_eq!(limits.per_upload_bytes, proto::MAX_SINGLE_IMAGE_BYTES);
-    assert_eq!(limits.global_bytes, 256 * 1024 * 1024);
-
+    let limits = AttachmentUploadLimits;
     let cfg_limits: AttachmentUploadLimits = ExtendedConfig::default().daemon.uploads.into();
-    assert_eq!(cfg_limits.per_client_uploads, limits.per_client_uploads);
-    assert_eq!(cfg_limits.global_uploads, limits.global_uploads);
-    assert_eq!(cfg_limits.per_upload_bytes, limits.per_upload_bytes);
-    assert_eq!(cfg_limits.global_bytes, limits.global_bytes);
+    assert_eq!(cfg_limits, limits);
 }
 
 #[tokio::test]
@@ -11439,7 +15468,7 @@ async fn attachment_upload_config_clamps_to_protocol_cap_and_warns() {
             per_upload_bytes: 64 * 1024 * 1024,
             ..DaemonUploadLimitsConfig::default()
         });
-    assert_eq!(limits.per_upload_bytes, proto::MAX_SINGLE_IMAGE_BYTES);
+    assert_eq!(limits, AttachmentUploadLimits);
     assert_eq!(
         warning.as_deref(),
         Some("per_upload_bytes 64 MiB exceeds protocol cap 4 MiB; clamping")
@@ -11459,28 +15488,24 @@ async fn attachment_upload_config_clamps_to_protocol_cap_and_warns() {
     )
     .expect_err("upload above protocol cap is rejected by clamped per-upload limit");
     assert_eq!(err.code, ErrorCode::BadRequest);
-    assert!(
-        err.message.contains("pending-upload limit"),
-        "{}",
-        err.message
-    );
+    assert!(err.message.contains("byte limit"), "{}", err.message);
 }
 
 #[tokio::test]
-async fn attachment_upload_config_below_protocol_cap_binds() {
+async fn attachment_upload_config_cap_is_subordinate_to_durable_policy() {
     let configured = MIN_ATTACHMENT_UPLOAD_BYTES + 1;
     let (limits, warning) =
         AttachmentUploadLimits::from_config_with_warning(DaemonUploadLimitsConfig {
             per_upload_bytes: configured,
             ..DaemonUploadLimitsConfig::default()
         });
-    assert_eq!(limits.per_upload_bytes, configured);
+    assert_eq!(limits, AttachmentUploadLimits);
     assert!(warning.is_none());
 
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, _) = attached_state(&ctx, tmp.path()).await;
-    let err = begin_attachment_upload_with_limits(
+    begin_attachment_upload_with_limits(
         &mut state,
         proto::IMAGE_ATTACHMENT_MIME_PNG.to_string(),
         configured + 1,
@@ -11488,13 +15513,7 @@ async fn attachment_upload_config_below_protocol_cap_binds() {
         proto::AttachmentPurpose::UserMessageImage,
         limits,
     )
-    .expect_err("upload above configured cap is rejected even below protocol cap");
-    assert_eq!(err.code, ErrorCode::BadRequest);
-    assert!(
-        err.message.contains("pending-upload limit"),
-        "{}",
-        err.message
-    );
+    .expect("process-local configured cap is subordinate to durable admission");
 }
 
 #[tokio::test]
@@ -11504,7 +15523,7 @@ async fn attachment_upload_config_degenerate_per_upload_bytes_clamps_to_floor() 
             per_upload_bytes: 0,
             ..DaemonUploadLimitsConfig::default()
         });
-    assert_eq!(limits.per_upload_bytes, MIN_ATTACHMENT_UPLOAD_BYTES);
+    assert_eq!(limits, AttachmentUploadLimits);
     assert_eq!(
         warning.as_deref(),
         Some("per_upload_bytes 0 bytes is below minimum 64 KiB; clamping")
@@ -11512,7 +15531,7 @@ async fn attachment_upload_config_degenerate_per_upload_bytes_clamps_to_floor() 
 }
 
 #[tokio::test]
-async fn attachment_upload_default_limits_enforce_per_client_count() {
+async fn attachment_upload_process_local_per_client_count_is_not_admission() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, _) = attached_state(&ctx, tmp.path()).await;
@@ -11529,20 +15548,18 @@ async fn attachment_upload_default_limits_enforce_per_client_count() {
         .unwrap();
     }
 
-    let err = begin_attachment_upload(
+    begin_attachment_upload(
         &mut state,
         proto::IMAGE_ATTACHMENT_MIME_PNG.to_string(),
         png.len(),
         sha256_hex(&png),
         proto::AttachmentPurpose::UserMessageImage,
     )
-    .expect_err("fifth pending upload exceeds default per-client cap");
-    assert_eq!(err.code, ErrorCode::BadRequest);
-    assert!(err.message.contains("limit 4"), "{}", err.message);
+    .expect("process-local per-client cap is not an admission authority");
 }
 
 #[tokio::test]
-async fn attachment_upload_default_limits_enforce_global_count() {
+async fn attachment_upload_process_local_global_count_is_not_admission() {
     let ctx = test_ctx();
     let accounting = Arc::new(StdMutex::new(UploadAccounting::default()));
     let png = sample_png();
@@ -11568,31 +15585,24 @@ async fn attachment_upload_default_limits_enforce_global_count() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut overflow, _) = attached_state(&ctx, tmp.path()).await;
     overflow.upload_accounting = accounting;
-    let err = begin_attachment_upload(
+    begin_attachment_upload(
         &mut overflow,
         proto::IMAGE_ATTACHMENT_MIME_PNG.to_string(),
         png.len(),
         sha256_hex(&png),
         proto::AttachmentPurpose::UserMessageImage,
     )
-    .expect_err("thirty-third pending upload exceeds default daemon cap");
-    assert_eq!(err.code, ErrorCode::BadRequest);
-    assert!(err.message.contains("limit 32"), "{}", err.message);
+    .expect("process-local global count is not an admission authority");
     drop((states, tempdirs, tmp));
 }
 
 #[tokio::test]
-async fn attachment_upload_limits_enforce_per_client_count_and_per_upload_bytes() {
+async fn attachment_upload_process_local_limits_only_track_ownership() {
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let (mut state, _) = attached_state(&ctx, tmp.path()).await;
     let png = sample_png();
-    let limits = AttachmentUploadLimits {
-        per_client_uploads: 2,
-        global_uploads: 32,
-        per_upload_bytes: png.len(),
-        global_bytes: usize::MAX,
-    };
+    let limits = AttachmentUploadLimits;
 
     begin_attachment_upload_with_limits(
         &mut state,
@@ -11612,7 +15622,7 @@ async fn attachment_upload_limits_enforce_per_client_count_and_per_upload_bytes(
         limits,
     )
     .unwrap();
-    let err = begin_attachment_upload_with_limits(
+    begin_attachment_upload_with_limits(
         &mut state,
         proto::IMAGE_ATTACHMENT_MIME_PNG.to_string(),
         png.len(),
@@ -11620,33 +15630,22 @@ async fn attachment_upload_limits_enforce_per_client_count_and_per_upload_bytes(
         proto::AttachmentPurpose::UserMessageImage,
         limits,
     )
-    .expect_err("third pending upload exceeds per-client cap");
-    assert_eq!(err.code, ErrorCode::BadRequest);
-    assert!(err.message.contains("this client"), "{}", err.message);
+    .expect("process-local count is ownership bookkeeping only");
 
     let (mut state, _) = attached_state(&ctx, tmp.path()).await;
-    let err = begin_attachment_upload_with_limits(
+    begin_attachment_upload_with_limits(
         &mut state,
         proto::IMAGE_ATTACHMENT_MIME_PNG.to_string(),
         png.len(),
         sha256_hex(&png),
         proto::AttachmentPurpose::UserMessageImage,
-        AttachmentUploadLimits {
-            per_upload_bytes: png.len() - 1,
-            ..limits
-        },
+        limits,
     )
-    .expect_err("declared upload exceeds per-upload cap");
-    assert_eq!(err.code, ErrorCode::BadRequest);
-    assert!(
-        err.message.contains("pending-upload limit"),
-        "{}",
-        err.message
-    );
+    .expect("process-local byte cap is subordinate to the durable ledger");
 }
 
 #[tokio::test]
-async fn attachment_upload_limits_enforce_global_count_and_bytes() {
+async fn attachment_upload_process_local_global_limits_are_subordinate() {
     let ctx = test_ctx();
     let tmp_a = tempfile::tempdir().unwrap();
     let tmp_b = tempfile::tempdir().unwrap();
@@ -11654,15 +15653,10 @@ async fn attachment_upload_limits_enforce_global_count_and_bytes() {
     let (mut b, _) = attached_state(&ctx, tmp_b.path()).await;
     b.upload_accounting = a.upload_accounting.clone();
     let png = sample_png();
-    let limits = AttachmentUploadLimits {
-        per_client_uploads: 4,
-        global_uploads: 1,
-        per_upload_bytes: png.len(),
-        global_bytes: usize::MAX,
-    };
+    let limits = AttachmentUploadLimits;
 
     let upload_id = begin_upload_for(&mut a, &png);
-    let err = begin_attachment_upload_with_limits(
+    begin_attachment_upload_with_limits(
         &mut b,
         proto::IMAGE_ATTACHMENT_MIME_PNG.to_string(),
         png.len(),
@@ -11670,17 +15664,11 @@ async fn attachment_upload_limits_enforce_global_count_and_bytes() {
         proto::AttachmentPurpose::UserMessageImage,
         limits,
     )
-    .expect_err("second client exceeds daemon-global count cap");
-    assert_eq!(err.code, ErrorCode::BadRequest);
-    assert!(err.message.contains("daemon has"), "{}", err.message);
+    .expect("process-local global count is not an admission authority");
 
     assert!(a.pending_uploads.remove(&upload_id).is_some());
     release_uploads(&a.upload_accounting, [upload_id]);
-    let limits = AttachmentUploadLimits {
-        global_uploads: 32,
-        global_bytes: png.len(),
-        ..limits
-    };
+    let limits = AttachmentUploadLimits;
     begin_attachment_upload_with_limits(
         &mut a,
         proto::IMAGE_ATTACHMENT_MIME_PNG.to_string(),
@@ -11690,7 +15678,7 @@ async fn attachment_upload_limits_enforce_global_count_and_bytes() {
         limits,
     )
     .unwrap();
-    let err = begin_attachment_upload_with_limits(
+    begin_attachment_upload_with_limits(
         &mut b,
         proto::IMAGE_ATTACHMENT_MIME_PNG.to_string(),
         png.len(),
@@ -11698,9 +15686,7 @@ async fn attachment_upload_limits_enforce_global_count_and_bytes() {
         proto::AttachmentPurpose::UserMessageImage,
         limits,
     )
-    .expect_err("second client exceeds daemon-global byte cap");
-    assert_eq!(err.code, ErrorCode::BadRequest);
-    assert!(err.message.contains("byte limit"), "{}", err.message);
+    .expect("process-local global bytes are not an admission authority");
 }
 
 #[tokio::test]
@@ -11724,6 +15710,85 @@ async fn expired_pending_upload_prune_releases_global_accounting() {
             .pending
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn attachment_ledger_uses_authenticated_attached_project_identity() {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
+    let expected_project = state.attached.as_ref().unwrap().handle.project_id();
+    let png = sample_png();
+    let response = begin_attachment_upload_admitted(
+        &ctx,
+        &mut state,
+        proto::IMAGE_ATTACHMENT_MIME_PNG.into(),
+        png.len(),
+        sha256_hex(&png),
+        proto::AttachmentPurpose::UserMessageImage,
+    )
+    .await
+    .unwrap();
+    let Response::AttachmentUploadStarted { upload_id, .. } = response else {
+        panic!("wrong response")
+    };
+    let (project, decoded_plan_count) = ctx
+        .db
+        .read(move |conn| {
+            let reservation_id = format!("attachment:{upload_id}");
+            let project = conn.query_row(
+                "SELECT project_id FROM media_reservations WHERE reservation_id=?1",
+                [&reservation_id],
+                |row| row.get::<_, String>(0),
+            )?;
+            let decoded_plan_count = conn.query_row(
+                "SELECT COUNT(*) FROM media_reservation_plan_facts WHERE reservation_id=?1 AND dimension IN ('decoded_edge_pixels','decoded_image_pixels','aggregate_decoded_pixels_per_request')",
+                [&reservation_id],
+                |row| u64::try_from(row.get::<_, i64>(0)?).map_err(|error| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Integer, Box::new(error))),
+            )?;
+            Ok((project, decoded_plan_count))
+        })
+        .await
+        .unwrap();
+    assert_eq!(project, expected_project);
+    assert_eq!(decoded_plan_count, 3);
+}
+
+#[tokio::test]
+async fn attachment_config_failure_leaves_no_pending_or_accounting_state() {
+    let saw_trust_policy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let saw_trust_policy_in_load = saw_trust_policy.clone();
+    let source = crate::daemon::config_source::ConfigSource::new(
+        move |_cwd| {
+            saw_trust_policy_in_load.store(
+                crate::config::trust::current_workspace_trust_policy().is_some(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            Err(anyhow::anyhow!("injected attachment config failure"))
+        },
+        |_cwd, _provider_id| None,
+        |_cwd| crate::daemon::config_source::ConfigWatchPaths::default(),
+    );
+    let ctx = test_ctx_with_config_source(source);
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut state, _) = attached_state(&ctx, tmp.path()).await;
+    let png = sample_png();
+
+    let result = begin_attachment_upload_admitted(
+        &ctx,
+        &mut state,
+        proto::IMAGE_ATTACHMENT_MIME_PNG.into(),
+        png.len(),
+        sha256_hex(&png),
+        proto::AttachmentPurpose::UserMessageImage,
+    )
+    .await;
+
+    assert!(result.is_err());
+    assert!(saw_trust_policy.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(state.pending_uploads.is_empty());
+    let accounting = crate::sync::lock_or_recover(&state.upload_accounting);
+    assert!(accounting.pending.is_empty());
 }
 
 async fn recv_body<S>(proto: &mut ProtoStream<S>) -> Body
@@ -12323,7 +16388,12 @@ async fn assert_set_model_favorite_happy() {
                     .find(|model| model.id == "a")
                     .expect("model in refreshed snapshot");
                 assert!(model.favorite);
-                respond_to.send(1).unwrap();
+                respond_to
+                    .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                        generation: 1,
+                        changed: true,
+                    })
+                    .unwrap();
             }
             other => panic!("unexpected work: {other:?}"),
         }
@@ -12390,7 +16460,12 @@ async fn assert_set_default_model_happy() {
             match work {
                 SessionWork::ReplaceConfigSnapshot { respond_to, .. } => {
                     kinds.push("replace_config_snapshot");
-                    respond_to.send(1).unwrap();
+                    respond_to
+                        .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                            generation: 1,
+                            changed: true,
+                        })
+                        .unwrap();
                     break;
                 }
                 SessionWork::SetActiveModel { .. } => {
@@ -12581,7 +16656,12 @@ async fn set_model_favorite_writes_trusted_project_provider_layer() {
     let refresh = tokio::spawn(async move {
         match work_rx.recv().await.expect("config refresh work") {
             SessionWork::ReplaceConfigSnapshot { respond_to, .. } => {
-                respond_to.send(1).unwrap();
+                respond_to
+                    .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
+                        generation: 1,
+                        changed: true,
+                    })
+                    .unwrap();
             }
             other => panic!("unexpected work: {other:?}"),
         }
@@ -13212,6 +17292,8 @@ async fn serialized_requests_apply_in_receipt_order() {
     let executor = tokio::spawn(run_client_executor(
         ctx.clone(),
         ClientPrincipal::owner(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
         executor_rx,
         event_cmd_tx,
         writer_tx,
@@ -13375,6 +17457,8 @@ async fn concurrent_requests_may_complete_out_of_order() {
     let executor = tokio::spawn(run_client_executor(
         ctx,
         ClientPrincipal::owner(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
         executor_rx,
         event_cmd_tx,
         writer_tx,
@@ -13443,6 +17527,8 @@ async fn slow_request_does_not_block_event_forwarding() {
     let executor = tokio::spawn(run_client_executor(
         ctx,
         ClientPrincipal::owner(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
         executor_rx,
         event_cmd_tx,
         writer_tx,
@@ -13493,6 +17579,8 @@ async fn concurrent_request_panic_yields_internal_error_and_keeps_connection() {
     let executor = tokio::spawn(run_client_executor(
         ctx,
         ClientPrincipal::owner(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
         executor_rx,
         event_cmd_tx,
         writer_tx,
@@ -13548,6 +17636,8 @@ async fn blocking_fs_handler_panic_keeps_client_connection() {
     let executor = tokio::spawn(run_client_executor(
         ctx,
         ClientPrincipal::owner(),
+        Uuid::new_v4(),
+        next_terminal_connection_epoch(),
         executor_rx,
         event_cmd_tx,
         writer_tx,
@@ -13693,6 +17783,7 @@ async fn client_io_split_reader_eof_tears_down_all_tasks() {
         server,
         ctx,
         ClientPrincipal::owner(),
+        Uuid::new_v4(),
     ));
     drop(client);
     tokio::time::timeout(std::time::Duration::from_secs(2), task)
@@ -14055,8 +18146,12 @@ async fn in_process_broadcast_lag_emits_typed_event() {
     let (global_events, _) = broadcast::channel(1);
     let ctx = Arc::new(DaemonContext {
         db: base.db.clone(),
+        media_ledger: base.media_ledger.clone(),
+        media_admission_open: base.media_admission_open.clone(),
         registry: base.registry.clone(),
         paths: base.paths.clone(),
+        canonical_cwd: base.canonical_cwd.clone(),
+        fcor_resolver_calls: std::sync::atomic::AtomicUsize::new(0),
         started_at: base.started_at,
         caffeinate: base.caffeinate.clone(),
         global_events,
@@ -14121,8 +18216,12 @@ async fn in_process_full_event_queue_emits_lag_marker() {
     let (global_events, _) = broadcast::channel(IN_PROCESS_EVENT_QUEUE + DROPPED + 16);
     let ctx = Arc::new(DaemonContext {
         db: base.db.clone(),
+        media_ledger: base.media_ledger.clone(),
+        media_admission_open: base.media_admission_open.clone(),
         registry: base.registry.clone(),
         paths: base.paths.clone(),
+        canonical_cwd: base.canonical_cwd.clone(),
+        fcor_resolver_calls: std::sync::atomic::AtomicUsize::new(0),
         started_at: base.started_at,
         caffeinate: base.caffeinate.clone(),
         global_events,
@@ -14369,7 +18468,7 @@ async fn btw_concurrent_with_parent_turn() {
         pending_uploads: HashMap::new(),
         ready_attachments: HashMap::new(),
         upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
-        upload_limits: AttachmentUploadLimits::default(),
+        upload_limits: AttachmentUploadLimits,
         terminal_views: HashMap::new(),
         terminal_host: test_terminal_host(),
     };
@@ -14428,7 +18527,7 @@ async fn btw_concurrent_with_parent_turn() {
         pending_uploads: HashMap::new(),
         ready_attachments: HashMap::new(),
         upload_accounting: Arc::new(StdMutex::new(UploadAccounting::default())),
-        upload_limits: AttachmentUploadLimits::default(),
+        upload_limits: AttachmentUploadLimits,
         terminal_views: HashMap::new(),
         terminal_host: test_terminal_host(),
     };

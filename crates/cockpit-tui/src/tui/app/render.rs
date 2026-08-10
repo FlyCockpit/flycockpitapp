@@ -726,6 +726,21 @@ pub(crate) struct ChatRowMeta {
     pub fork_hit: Option<PinHit>,
     pub continuation: bool,
     pub selectable: bool,
+    /// Semantic copy provenance for each occupied terminal column. Wide
+    /// graphemes repeat the same fragment identity in every occupied cell.
+    pub copy_cells: Vec<Option<u32>>,
+    /// One shared fragment table per rendered message; cells retain compact
+    /// ids rather than cloning fragment payloads throughout the row cache.
+    pub copy_fragments: Rc<Vec<crate::tui::markdown::CopyFragment>>,
+    /// A rendered hard/block boundary precedes this row. Soft wrapping leaves
+    /// this false, so viewport materialization never invents line breaks.
+    pub copy_newlines_before: usize,
+    /// This selectable message row is visible plaintext outside the mapped
+    /// Markdown body (for example Markdown-disabled text or reasoning).
+    pub copy_fallback_if_unmapped: bool,
+    /// The row belongs to a Markdown body whose renderer emitted an
+    /// authoritative provenance map, even when the selected cells are chrome.
+    pub copy_provenance_present: bool,
 }
 
 impl ChatRowMeta {
@@ -746,6 +761,11 @@ impl ChatRowMeta {
             fork_hit: None,
             continuation: false,
             selectable: false,
+            copy_cells: Vec::new(),
+            copy_fragments: Rc::new(Vec::new()),
+            copy_newlines_before: 0,
+            copy_fallback_if_unmapped: false,
+            copy_provenance_present: false,
         }
     }
 
@@ -904,17 +924,9 @@ impl App {
         {
             return cached.clone();
         }
-        // The read-allowlist re-includes gitignored-but-allowlisted entries
-        // (implementation note); resolve the persisted
-        // per-layer list for the cwd, then union the daemon-pushed session set
-        // ("Approve for this session" approvals,
-        // implementation note) so session-only
-        // entries render exactly like persisted ones (dimmed, `gitignored`).
-        let mut allow = cockpit_config::extended::resolve_gitignore_allow(&self.launch.cwd);
-        allow.extend(self.gitignore_session_allow.clone());
-        let walked = cockpit_core::tags::suggestions(&self.launch.cwd, q, &self.usage_tags, &allow);
-        *self.at_cache.borrow_mut() = Some((q.to_string(), walked.clone()));
-        walked
+        // A cache miss is a deterministic loading state. Composer reduction
+        // schedules the filesystem walk; rendering never performs it.
+        Vec::new()
     }
 
     pub(super) fn suggestion_box_lines(&self) -> u16 {
@@ -922,6 +934,11 @@ impl App {
             let rows = self.at_suggestions().len().min(AUTOCOMPLETE_ROWS as usize);
             if rows > 0 {
                 return rows as u16 + 2;
+            }
+            if self.at_suggestions_loading
+                || self.at_suggestions_loaded_query.as_deref() == self.composer.at_query()
+            {
+                return 3;
             }
         }
         if self.slash_query().is_some() {
@@ -2326,9 +2343,11 @@ impl App {
         entry: &HistoryEntry,
         idx: usize,
         rendered: &Rendered,
+        _render_width: usize,
     ) -> Vec<ChatRowMeta> {
         let Rendered {
             lines,
+            copy_body_start,
             chip_row,
             continuations,
             tool_call_rows,
@@ -2344,6 +2363,7 @@ impl App {
         let base_copy = copy_target_for_entry(entry, idx);
         let base_kind = row_kind_for_entry(entry);
         let mut row_meta = Vec::with_capacity(lines.len());
+        let empty_fragments = Rc::new(Vec::new());
 
         for i in 0..lines.len() {
             let chip_target = if Some(i) == *chip_row {
@@ -2418,6 +2438,31 @@ impl App {
                 fork_hit,
                 continuation: false,
                 selectable: row_kind != ChatRowKind::Chip,
+                copy_cells: copy_body_start
+                    .as_ref()
+                    .and_then(|copy| copy.cells.get(i))
+                    .cloned()
+                    .unwrap_or_default(),
+                copy_fragments: copy_body_start.as_ref().map_or_else(
+                    || Rc::clone(&empty_fragments),
+                    |copy| Rc::clone(&copy.fragments),
+                ),
+                copy_newlines_before: copy_body_start
+                    .as_ref()
+                    .and_then(|copy| copy.newlines_before.get(i))
+                    .copied()
+                    .unwrap_or(0),
+                copy_fallback_if_unmapped: base_copy.is_some()
+                    && row_kind != ChatRowKind::Chip
+                    && (copy_body_start.as_ref().is_none_or(|copy| i < copy.start)
+                        || copy_body_start
+                            .as_ref()
+                            .and_then(|copy| copy.incomplete.get(i))
+                            .copied()
+                            .unwrap_or(false)),
+                copy_provenance_present: copy_body_start
+                    .as_ref()
+                    .is_some_and(|copy| i >= copy.start),
             });
         }
 
@@ -2507,8 +2552,12 @@ impl App {
                             preflight_dots_ms,
                             pin,
                         ));
-                        let entry_row_meta =
-                            Self::row_meta_for_rendered_entry(entry, idx, &rendered);
+                        let entry_row_meta = Self::row_meta_for_rendered_entry(
+                            entry,
+                            idx,
+                            &rendered,
+                            area.width as usize,
+                        );
                         let prewrapped = Rc::new(prewrap_entry_rows(
                             &rendered.lines,
                             &entry_row_meta,
@@ -3619,6 +3668,17 @@ impl App {
     ) {
         let suggestions = self.at_suggestions();
         if suggestions.is_empty() {
+            let text = if self.at_suggestions_loading {
+                "loading files…"
+            } else if self.at_suggestions_error.is_some() {
+                "file suggestions unavailable"
+            } else {
+                "no matching files"
+            };
+            frame.render_widget(
+                Paragraph::new(text).style(Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX))),
+                content_area,
+            );
             return;
         }
         let window = content_area.height.min(AUTOCOMPLETE_ROWS) as usize;
@@ -4260,6 +4320,14 @@ where
                 .cloned()
                 .unwrap_or_else(ChatRowMeta::padding);
             meta.continuation = meta.continuation || part_idx > 0;
+            if part_idx > 0 {
+                meta.copy_newlines_before = 0;
+            }
+            meta.copy_cells = meta
+                .copy_cells
+                .get(start_col..end_col.min(meta.copy_cells.len()))
+                .unwrap_or_default()
+                .to_vec();
             meta.pin_hit = meta
                 .pin_hit
                 .and_then(|hit| pin_hit_for_visual_row(hit, start_col, end_col));
@@ -4702,78 +4770,6 @@ fn content_bounds(row: &[String]) -> Option<(usize, usize)> {
 ///    with a space instead of a newline so a wrapped paragraph pastes as
 ///    one paragraph, not a stack of short visual lines. Hard line breaks
 ///    (paragraph boundaries) still produce newlines.
-pub(super) fn extract_selection_markdown_source(
-    history: &[HistoryEntry],
-    row_meta: &[ChatRowMeta],
-    area: Rect,
-    sel: Selection,
-) -> Option<String> {
-    let (start, end) = sel.ordered();
-    let mut target: Option<ChatCopyTarget> = None;
-    let mut selected_lines: Vec<usize> = Vec::new();
-    let mut active_target: Option<ChatCopyTarget> = None;
-    let mut source_line: Option<usize> = None;
-
-    for (row_idx, meta) in row_meta.iter().enumerate() {
-        if meta.copy_target != active_target {
-            active_target = meta.copy_target;
-            source_line = if meta.copy_target.is_some() && meta.selectable && !meta.continuation {
-                Some(0)
-            } else {
-                None
-            };
-        } else if meta.copy_target.is_some()
-            && meta.selectable
-            && !meta.continuation
-            && let Some(line) = source_line.as_mut()
-        {
-            *line += 1;
-        }
-
-        let abs_row = area.y.saturating_add(row_idx as u16);
-        if abs_row < start.1 || abs_row > end.1 {
-            continue;
-        }
-        if !meta.selectable {
-            return None;
-        }
-        let copy_target = meta.copy_target?;
-        if target.is_some_and(|existing| existing != copy_target) {
-            return None;
-        }
-        target = Some(copy_target);
-        selected_lines.push(source_line?);
-    }
-
-    let ChatCopyTarget::Message { history_index } = target?;
-    let source = match history.get(history_index)? {
-        HistoryEntry::User { text, .. } | HistoryEntry::Agent { text, .. } => text.as_str(),
-        _ => return None,
-    };
-    let ranges = source_line_ranges(source);
-    let first_line = *selected_lines.iter().min()?;
-    let last_line = *selected_lines.iter().max()?;
-    let start_byte = ranges.get(first_line)?.0;
-    let end_byte = ranges.get(last_line)?.1;
-    let selected = &source[start_byte..end_byte];
-    let selected = selected.strip_suffix('\n').unwrap_or(selected);
-    (!selected.is_empty()).then(|| selected.to_string())
-}
-
-fn source_line_ranges(source: &str) -> Vec<(usize, usize)> {
-    if source.is_empty() {
-        return vec![(0, 0)];
-    }
-    let mut ranges = Vec::new();
-    let mut start = 0usize;
-    for line in source.split_inclusive('\n') {
-        let end = start + line.len();
-        ranges.push((start, end));
-        start = end;
-    }
-    ranges
-}
-
 pub(super) fn extract_selection_plaintext(
     grid: &[Vec<String>],
     row_meta: &[ChatRowMeta],
@@ -4830,6 +4826,93 @@ pub(super) fn extract_selection_plaintext(
         out.push_str(&stripped);
     }
     out
+}
+
+/// Extract parser-owned semantic fragments under a cell selection. Fragment
+/// identity de-duplicates wide/combining graphemes even when the selection
+/// begins on a continuation cell. Rows without provenance (chrome) contribute
+/// nothing; callers may use visible plaintext only when the entire selection
+/// is outside a semantic Markdown message.
+pub(super) fn extract_selection_semantic(
+    row_meta: &[ChatRowMeta],
+    area: Rect,
+    sel: Selection,
+) -> Option<String> {
+    let (start, end) = sel.ordered();
+    let mut out = String::new();
+    let mut last_identity: Option<(Option<usize>, usize)> = None;
+    let mut last_message = None;
+    let mut emitted_row = false;
+    let mut saw_semantic_row = false;
+    for abs_row in start.1..=end.1 {
+        let row_index = abs_row.saturating_sub(area.y) as usize;
+        let Some(meta) = row_meta.get(row_index) else {
+            continue;
+        };
+        if meta.copy_target.is_some() {
+            if !meta.copy_provenance_present {
+                // Legacy/caller-supplied message rows have substantive
+                // visible plaintext but no authoritative semantic map.
+                return None;
+            }
+            saw_semantic_row = true;
+        } else if meta.selectable {
+            // A mixed selection must fall back as a whole; silently omitting
+            // tool/diff/plain rows would lose visible user-selected text.
+            return None;
+        }
+        let first_col = if abs_row == start.1 {
+            start.0.saturating_sub(area.x) as usize
+        } else {
+            0
+        };
+        let last_col = if abs_row == end.1 {
+            end.0.saturating_sub(area.x) as usize
+        } else {
+            meta.copy_cells.len().saturating_sub(1)
+        };
+        let mut row_emitted = false;
+        let mut row_table_cell = None;
+        for fragment_id in meta
+            .copy_cells
+            .get(first_col..=last_col.min(meta.copy_cells.len().saturating_sub(1)))
+            .unwrap_or_default()
+            .iter()
+            .flatten()
+        {
+            let fragment = meta.copy_fragments.get(*fragment_id as usize)?;
+            let identity = (meta.history_index, fragment.id);
+            if last_identity == Some(identity) {
+                continue;
+            }
+            if !row_emitted && emitted_row {
+                let cross_message = usize::from(last_message != meta.history_index);
+                for _ in 0..meta.copy_newlines_before.max(cross_message) {
+                    out.push('\n');
+                }
+            }
+            if row_emitted
+                && let (Some(previous), Some(current)) = (row_table_cell, fragment.table_cell)
+                && previous != current
+            {
+                out.push('\t');
+            }
+            out.push_str(&fragment.text);
+            last_identity = Some(identity);
+            row_emitted = true;
+            emitted_row = true;
+            last_message = meta.history_index;
+            row_table_cell = fragment.table_cell.or(row_table_cell);
+        }
+        if meta.copy_fallback_if_unmapped {
+            return None;
+        }
+    }
+    // An all-chrome selection inside a Markdown message is still a
+    // successfully mapped semantic selection: its clipboard value is empty.
+    // Returning `None` here would incorrectly authorize the caller's visible
+    // plaintext fallback and leak headings, fences, or table borders.
+    saw_semantic_row.then_some(out)
 }
 
 /// Rough row count for a history entry. Mirrors the breakdown in
@@ -5230,6 +5313,19 @@ mod slash_popup_full_list_tests {
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
 
+    async fn await_at_suggestions(app: &mut App) {
+        let kind = app.autocomplete_blocking_operation().action_kind();
+        while app.async_actions.has_pending_kind(&kind) {
+            let notify = app.async_actions.notifier();
+            let notified = notify.notified();
+            app.drain_async_actions();
+            if !app.async_actions.has_pending_kind(&kind) {
+                break;
+            }
+            notified.await;
+        }
+    }
+
     #[test]
     fn slash_suggestions_returns_full_match_list() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5312,8 +5408,8 @@ mod slash_popup_full_list_tests {
         );
     }
 
-    #[test]
-    fn at_popup_render_keeps_wheel_scrolled_offset_and_clamps() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn at_popup_render_keeps_wheel_scrolled_offset_and_clamps() {
         let tmp = tempfile::tempdir().unwrap();
         for name in [
             "alpha.rs",
@@ -5331,6 +5427,7 @@ mod slash_popup_full_list_tests {
         let mut app = App::new(Some(tmp.path()), false);
         app.composer.set("@".to_string());
         app.reset_at_window();
+        await_at_suggestions(&mut app).await;
         let total = app.at_suggestions().len();
         assert!(total > AUTOCOMPLETE_ROWS as usize);
 
@@ -5366,6 +5463,8 @@ mod slash_popup_full_list_tests {
         );
 
         app.composer.set("@alpha".to_string());
+        app.reset_at_window();
+        await_at_suggestions(&mut app).await;
         terminal
             .draw(|frame| {
                 app.render_suggestion_box(frame, Rect::new(0, 0, 100, height));
@@ -5409,10 +5508,10 @@ mod render_history_spacing_tests {
         App, ChatCopyTarget, ChatRowKind, ChatRowMeta, ControlChip, HISTORY_RENDER_CACHE_MAX_ROWS,
         HistoryRenderCacheEntry, PinHit, ScrollAnchor, Selection, TranscriptFind,
         affordance_target_for_row, append_pending_render_rows, chat_visible_top,
-        extract_selection_plaintext, find_lines_rebuild_count, fingerprint_call_count,
-        geometry_recompute_count, history_entry_render_fingerprint, materialized_row_count,
-        pending_wrap_row_count, pin_hit_for_visual_row, prewrap_call_count, prewrap_entry_rows,
-        prewrap_row_count, rendered_line_text, reset_find_lines_rebuild_count,
+        extract_selection_plaintext, extract_selection_semantic, find_lines_rebuild_count,
+        fingerprint_call_count, geometry_recompute_count, history_entry_render_fingerprint,
+        materialized_row_count, pending_wrap_row_count, pin_hit_for_visual_row, prewrap_call_count,
+        prewrap_entry_rows, prewrap_row_count, rendered_line_text, reset_find_lines_rebuild_count,
         reset_fingerprint_call_count, reset_geometry_recompute_count, reset_materialized_row_count,
         reset_pending_wrap_row_count, reset_prewrap_counters, wrap_line_to_visual_rows,
     };
@@ -5420,6 +5519,19 @@ mod render_history_spacing_tests {
         AffordanceTarget, HISTORY_PAGE_ENTRIES, HISTORY_WINDOW_TARGET_ENTRIES, HistoryEntryId,
         HistoryLog, PendingRenderCacheEntry, SandboxDownNotice, SideConversation,
     };
+
+    async fn await_at_suggestions(app: &mut App) {
+        let kind = app.autocomplete_blocking_operation().action_kind();
+        while app.async_actions.has_pending_kind(&kind) {
+            let notify = app.async_actions.notifier();
+            let notified = notify.notified();
+            app.drain_async_actions();
+            if !app.async_actions.has_pending_kind(&kind) {
+                break;
+            }
+            notified.await;
+        }
+    }
     use crate::tui::composer::VimMode;
     use crate::tui::history::{
         HistoryEntry, MarkdownOpts, PendingMsg, PendingRenderState, SubagentRoutingChips, ToolCall,
@@ -5439,7 +5551,6 @@ mod render_history_spacing_tests {
     use cockpit_config::extended::{DiffStyle, ThinkingDisplay, VimModeSetting};
     use cockpit_core::engine::message::{QueueItemStatus, QueueTarget, QueuedUserMessage};
     use cockpit_core::tokens::{count_call_count, reset_count_call_count};
-    use cockpit_db::{open_default_call_count, reset_open_default_call_count};
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -6034,8 +6145,8 @@ mod render_history_spacing_tests {
         app
     }
 
-    #[test]
-    fn banner_row_stable_across_transient_chrome() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn banner_row_stable_across_transient_chrome() {
         const WIDTH: u16 = 100;
         const HEIGHT: u16 = 40;
         let tmp = tempfile::tempdir().unwrap();
@@ -6073,6 +6184,7 @@ mod render_history_spacing_tests {
         let mut at_popup = empty_banner_app(tmp.path());
         at_popup.composer.set("@");
         at_popup.reset_at_window();
+        await_at_suggestions(&mut at_popup).await;
         assert_eq!(
             banner_top_row(
                 &render_app_buffer(&mut at_popup, WIDTH, HEIGHT),
@@ -6271,6 +6383,19 @@ mod render_history_spacing_tests {
         )
     }
 
+    fn extract_full_semantic_selection(app: &App, width: u16, height: u16) -> String {
+        extract_selection_semantic(
+            &app.chat_row_meta,
+            Rect::new(0, 0, width, height),
+            Selection {
+                anchor: (0, 0),
+                focus: (width.saturating_sub(1), height.saturating_sub(1)),
+                active: false,
+            },
+        )
+        .expect("rendered Markdown selection has semantic provenance")
+    }
+
     struct FullWrapReference {
         rows: Vec<Line<'static>>,
         row_meta: Vec<ChatRowMeta>,
@@ -6385,7 +6510,12 @@ mod render_history_spacing_tests {
                 preflight_dots_ms,
                 pin,
             );
-            row_meta.extend(App::row_meta_for_rendered_entry(entry, idx, &rendered));
+            row_meta.extend(App::row_meta_for_rendered_entry(
+                entry,
+                idx,
+                &rendered,
+                width as usize,
+            ));
             all.extend(rendered.lines);
             if gap_after_entry(&app.history, idx, entry) {
                 all.push(Line::default());
@@ -6994,9 +7124,7 @@ mod render_history_spacing_tests {
         app.pinned_seqs_cache.insert(42);
         app.history = vec![pinned_user("pin me", 42)].into();
 
-        reset_open_default_call_count();
         assert_eq!(render_calls_after(&mut app, 80, 8), 1);
-        assert_eq!(open_default_call_count(), 0);
         assert!(
             app.pin_control_rows
                 .iter()
@@ -7005,7 +7133,6 @@ mod render_history_spacing_tests {
             "render should expose the cached pin control hit region"
         );
         assert_eq!(render_calls_after(&mut app, 80, 8), 0);
-        assert_eq!(open_default_call_count(), 0);
     }
 
     #[test]
@@ -9309,6 +9436,154 @@ mod render_history_spacing_tests {
             },
         );
         assert_eq!(text, "abcdefgh ijklmnopqr");
+    }
+
+    #[test]
+    fn selection_source_map_survives_wrap_and_viewport_slice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.markdown_opts.agent = true;
+        app.history = vec![agent("alpha **wide界** omega repeated repeated tail")].into();
+
+        render_history(&mut app, 22, 8);
+        assert_eq!(
+            extract_full_semantic_selection(&app, 22, 8),
+            "alpha wide界 omega repeated repeated tail"
+        );
+
+        app.chat_scroll_offset = 1;
+        render_history(&mut app, 18, 4);
+        let visible = extract_full_semantic_selection(&app, 18, 4);
+        assert!(!visible.contains('*'));
+        assert!(visible.contains("wide界") || visible.contains("repeated"));
+    }
+
+    #[test]
+    fn selection_table_fragments_exclude_borders_and_padding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.markdown_opts.agent = true;
+        app.history = vec![agent(
+            "| A | long words here |\n|---|---|\n| x | y z |\n\n| C | D |\n|---|---|\n| q | r |",
+        )]
+        .into();
+
+        render_history(&mut app, 30, 16);
+        let copied = extract_full_semantic_selection(&app, 30, 16);
+        assert!(!copied.contains('│') && !copied.contains('─'));
+        assert!(copied.contains("A\tlong words here"), "{copied:?}");
+        assert!(copied.contains("C\tD"), "{copied:?}");
+    }
+
+    #[test]
+    fn selection_unmapped_chrome_never_guesses_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.markdown_opts.agent = true;
+        app.history = vec![agent("# **title**\n\n```rs\nlet x = 1;\n```")].into();
+
+        render_history(&mut app, 40, 12);
+        let copied = extract_full_semantic_selection(&app, 40, 12);
+        assert_eq!(copied, "title\n\nlet x = 1;");
+        assert!(!copied.contains('#') && !copied.contains('`') && !copied.contains('*'));
+
+        let heading_row = find_row(&app, "# title");
+        let chrome_only = extract_selection_semantic(
+            &app.chat_row_meta,
+            Rect::new(0, 0, 40, 12),
+            Selection {
+                anchor: (2, heading_row as u16),
+                focus: (2, heading_row as u16),
+                active: false,
+            },
+        );
+        assert_eq!(chrome_only.as_deref(), Some(""));
+
+        app.history = vec![agent("```diff\ndiff --git a/x b/x\n```\n\n1. 1999 follows")].into();
+        render_history(&mut app, 40, 12);
+        let code_row = find_row(&app, "diff --git");
+        let code = extract_selection_semantic(
+            &app.chat_row_meta,
+            Rect::new(0, 0, 40, 12),
+            Selection {
+                anchor: (0, code_row as u16),
+                focus: (39, code_row as u16),
+                active: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(code, "diff --git a/x b/x");
+        let list_row = find_row(&app, "1999 follows");
+        let item = extract_selection_semantic(
+            &app.chat_row_meta,
+            Rect::new(0, 0, 40, 12),
+            Selection {
+                anchor: (0, list_row as u16),
+                focus: (39, list_row as u16),
+                active: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(item, "1999 follows");
+
+        app.history = vec![agent(
+            "1. a deliberately long ordered item that wraps across several rows",
+        )]
+        .into();
+        render_history(&mut app, 22, 8);
+        assert_eq!(
+            extract_full_semantic_selection(&app, 22, 8),
+            "a deliberately long ordered item that wraps across several rows"
+        );
+
+        app.history = vec![agent("- run `cargo test` now")].into();
+        render_history(&mut app, 30, 5);
+        assert_eq!(
+            extract_full_semantic_selection(&app, 30, 5),
+            "run cargo test now"
+        );
+    }
+
+    #[test]
+    fn selection_tab_cells_copy_one_tab() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.markdown_opts.agent = true;
+        app.history = vec![agent("`a\t b`")].into();
+
+        render_history(&mut app, 24, 5);
+        assert_eq!(extract_full_semantic_selection(&app, 24, 5), "a\t b");
+        let tab_cells = app
+            .chat_row_meta
+            .iter()
+            .flat_map(|meta| meta.copy_cells.iter().flatten())
+            .fold(std::collections::HashMap::new(), |mut counts, id| {
+                *counts.entry(*id).or_insert(0usize) += 1;
+                counts
+            });
+        assert!(tab_cells.values().any(|count| *count > 1));
+    }
+
+    #[test]
+    fn selection_user_markdown_reserves_timestamp_before_mapping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(Some(tmp.path()), false);
+        app.launch.banner_enabled = false;
+        app.markdown_opts.user = true;
+        app.history = vec![user(
+            "**first row is deliberately near the timestamp edge** and tail",
+        )]
+        .into();
+
+        render_history(&mut app, 30, 8);
+        assert_eq!(
+            extract_full_semantic_selection(&app, 30, 8),
+            "first row is deliberately near the timestamp edge and tail"
+        );
     }
 
     #[test]

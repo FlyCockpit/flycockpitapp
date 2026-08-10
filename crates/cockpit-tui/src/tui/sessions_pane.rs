@@ -23,13 +23,8 @@
 //! - **Daemon-connected:** the pane is a socket client — fetch / archive /
 //!   delete are blocking daemon requests through
 //!   [`crate::tui::agent_runner`], and live status (tiers 1-2) is intact.
-//! - **Daemonless:** the list is read straight from the session DB
-//!   read-only ([`cockpit_db::Db::open_default`], same as `/stats`) via the
-//!   shared [`cockpit_db::Db::list_session_summaries`] the daemon also calls,
-//!   so ordering / scoping / fork-grouping match. Live status is absent
-//!   (every session falls to its DB-derived tier — never an error), and the
-//!   mutating actions (resume / archive / delete / unarchive) are disabled
-//!   with a non-error hint rather than spawning a daemon or writing the DB.
+//! - **Disconnected:** the pane renders typed Unavailable state with Retry;
+//!   it never opens local persistence or reconstructs daemon policy.
 //!
 //! The resume action is *not* performed here — `handle_key` returns a
 //! [`SessionsOutcome`] the `App` acts on, reusing the existing
@@ -49,12 +44,7 @@ use crate::tui::pane::{Pane, ScrollList};
 use crate::tui::pane_shared::{boxed_row, resolve_project_id, short_id};
 use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
 use cockpit_core::daemon::proto::{MessageRole, SessionMessage, SessionSummary};
-use cockpit_db::Db;
 
-/// Root-session row cap for the daemonless direct-DB list — matches the
-/// daemon `ListSessions` handler's `100` so both modes show the same set.
-const DAEMONLESS_LIST_LIMIT: u32 = 100;
-const PREVIEW_PAGE_LIMIT: u32 = 50;
 const DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Non-error status shown daemonless when the user tries an action that
@@ -369,10 +359,6 @@ pub struct SessionsPane {
     /// discoverable through the canonical daemon location.
     daemon_socket: Option<std::path::PathBuf>,
     use_emojis: bool,
-    /// Read-only session DB handle, opened only in the daemonless case so
-    /// the browser can list without a daemon. `None` when daemon-connected
-    /// (the RPC path is used) or when the DB couldn't be opened.
-    db: Option<Db>,
     /// Rendered body height + content rows at last draw (scroll clamp).
     last_body_height: usize,
     last_content_rows: usize,
@@ -440,17 +426,13 @@ impl SessionsPane {
     /// the root level. A load failure (daemon down) is non-fatal — the
     /// pane shows an inline message rather than refusing to open.
     ///
-    /// `daemon_connected` selects the data path: connected → the RPC list
-    /// (live status intact); daemonless → a read-only direct DB read
-    /// ([`Db::open_default`], same as `/stats`), with resume / archive /
-    /// delete disabled. A daemonless DB-open failure surfaces as an inline
-    /// error, not a crash, and the pane still opens (empty list).
+    /// `daemon_connected` selects the data path: connected uses the typed RPC
+    /// list; disconnected renders Unavailable and keeps Retry available.
     pub fn open(
         cwd: &std::path::Path,
         daemon_connected: bool,
         daemon_socket: Option<std::path::PathBuf>,
         use_emojis: bool,
-        shared_db: Option<Db>,
     ) -> Self {
         let project_id = resolve_project_id(cwd);
         let scope = if project_id.is_some() {
@@ -458,9 +440,6 @@ impl SessionsPane {
         } else {
             Scope::All
         };
-        // Daemonless browsing uses the App-owned handle; daemon-connected
-        // panes use RPCs and keep no direct DB handle.
-        let db = (!daemon_connected).then_some(shared_db).flatten();
         let mut pane = Self {
             project_id,
             scope,
@@ -473,7 +452,6 @@ impl SessionsPane {
             daemon_connected,
             daemon_socket,
             use_emojis,
-            db,
             last_body_height: 0,
             last_content_rows: 0,
             focus: Focus::List,
@@ -496,7 +474,12 @@ impl SessionsPane {
                 list: ScrollList::new(),
             }];
         } else {
-            pane.load_root();
+            pane.error = Some("Unavailable — reconnect to the daemon, then Retry".to_string());
+            pane.levels = vec![Level {
+                parent: None,
+                cards: Vec::new(),
+                list: ScrollList::new(),
+            }];
         }
         pane
     }
@@ -609,7 +592,7 @@ impl SessionsPane {
                 None => Err("daemon socket unavailable for sessions.list".to_string()),
             }
         } else {
-            self.list_sessions_daemonless(project_id.as_deref(), parent)
+            Err("Unavailable — reconnect to the daemon, then Retry".to_string())
         };
         match listed {
             Ok(mut sessions) => {
@@ -644,31 +627,6 @@ impl SessionsPane {
                 Vec::new()
             }
         }
-    }
-
-    /// Daemonless list path: read the level straight from the read-only DB
-    /// handle via the same `Db::list_session_summaries` the daemon uses, so
-    /// ordering / scoping / fork-grouping match. `Err` only when the DB
-    /// couldn't be opened (handle is `None`) or the query itself failed —
-    /// both surface as the pane's inline error, never a crash.
-    fn list_sessions_daemonless(
-        &self,
-        project_id: Option<&str>,
-        parent: Option<Uuid>,
-    ) -> Result<Vec<SessionSummary>, String> {
-        let Some(db) = self.db.as_ref() else {
-            return Err("could not open the session database".to_string());
-        };
-        let project_id = project_id.map(str::to_string);
-        db.blocking_read_for_sync_ui(move |conn| {
-            cockpit_db::Db::list_session_summaries_conn(
-                conn,
-                project_id.as_deref(),
-                parent,
-                DAEMONLESS_LIST_LIMIT,
-            )
-        })
-        .map_err(|e| e.to_string())
     }
 
     /// Reload the current level in place, preserving scope/breadcrumb and
@@ -830,28 +788,12 @@ impl SessionsPane {
                 before_seq,
             });
         }
-        let result = self.read_preview_daemonless(session_id, before_seq);
-        self.apply_preview_result(session_id, before_seq, result);
+        self.apply_preview_result(
+            session_id,
+            before_seq,
+            Err("Unavailable — reconnect to the daemon, then Retry".to_string()),
+        );
         None
-    }
-
-    fn read_preview_daemonless(
-        &self,
-        session_id: Uuid,
-        before_seq: Option<i64>,
-    ) -> Result<(Vec<SessionMessage>, bool), String> {
-        let Some(db) = self.db.as_ref() else {
-            return Err("could not open the session database".to_string());
-        };
-        db.blocking_read_for_sync_ui(move |conn| {
-            cockpit_db::Db::read_session_messages_conn(
-                conn,
-                session_id,
-                before_seq,
-                PREVIEW_PAGE_LIMIT,
-            )
-        })
-        .map_err(|error| error.to_string())
     }
 
     /// Handle a key. Returns `Some(outcome)` for close/resume; `None`
@@ -2707,41 +2649,6 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn daemonless_split_first_render_populates_preview() {
-        let db = Db::open_in_memory().unwrap();
-        let root = db.create_session("pid", "/proj", "builder").await.unwrap();
-        db.insert_session_event(
-            root.session_id,
-            cockpit_db::session_log::SessionEventKind::UserMessage,
-            Some("builder"),
-            None,
-            &serde_json::json!({"text": "preview on first render"}),
-        )
-        .await
-        .unwrap();
-        let mut loader = test_pane_mode(vec![], false);
-        loader.db = Some(db);
-        let cards = loader.fetch_level(Some("pid".into()), None);
-        let mut pane = test_pane_mode(cards, false);
-        pane.db = loader.db.take();
-        pane.preview = None;
-        pane.preview_enabled = false;
-        let backend = TestBackend::new(120, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-
-        terminal
-            .draw(|frame| pane.render(frame, Rect::new(0, 0, 120, 24)))
-            .unwrap();
-
-        let preview = pane.preview.as_ref().expect("preview populated");
-        assert_eq!(preview.session_id, root.session_id);
-        assert!(!preview.loading, "daemonless preview loads locally");
-        assert_eq!(preview.messages.len(), 1);
-        assert_eq!(preview.messages[0].text, "preview on first render");
-        assert!(pane.is_preview_enabled());
-    }
-
     #[test]
     fn breadcrumb_reflects_depth() {
         let mut parent = summary(Uuid::new_v4(), 1);
@@ -3103,7 +3010,6 @@ mod tests {
             daemon_socket: daemon_connected
                 .then(|| std::path::PathBuf::from("/tmp/cockpit-test.sock")),
             use_emojis: true,
-            db: None,
             last_body_height: 100,
             last_content_rows: 0,
             focus: Focus::List,
@@ -3174,36 +3080,16 @@ mod tests {
     }
 
     #[test]
-    fn daemonless_open_with_unopenable_db_lists_empty_no_crash() {
-        // Open daemonless against a pane whose DB handle is `None` (the
-        // DB-unopenable case): the list is empty and an inline error is
-        // set, never a crash. Drive the daemonless fetch directly.
+    fn disconnected_list_is_typed_unavailable() {
         let mut pane = test_pane_mode(vec![], false);
-        pane.db = None;
         let cards = pane.fetch_level(Some("pid".into()), None);
-        assert!(cards.is_empty(), "no cards when the DB can't be opened");
+        assert!(cards.is_empty());
         assert!(
             pane.error
                 .as_deref()
                 .unwrap_or_default()
-                .contains("database"),
-            "DB-unopenable surfaces a clear inline error"
+                .contains("Unavailable")
         );
-    }
-
-    #[tokio::test]
-    async fn daemonless_lists_from_the_db() {
-        // The factored `Db::list_session_summaries` populates the daemonless
-        // list: open an in-memory DB, seed a root session, and confirm the
-        // pane's daemonless fetch returns it tier-classified.
-        let db = Db::open_in_memory().unwrap();
-        let root = db.create_session("pid", "/proj", "builder").await.unwrap();
-        let mut pane = test_pane_mode(vec![], false);
-        pane.db = Some(db);
-        let cards = pane.fetch_level(Some("pid".into()), None);
-        assert_eq!(cards.len(), 1, "the seeded root session is listed");
-        assert_eq!(cards[0].0.session_id, root.session_id);
-        assert!(pane.error.is_none(), "a successful list clears the error");
     }
 
     #[test]
@@ -3214,7 +3100,6 @@ mod tests {
             true,
             Some(tmp.path().join("missing-daemon.sock")),
             false,
-            None,
         );
 
         assert_eq!(pane.loading, Some("Loading sessions..."));

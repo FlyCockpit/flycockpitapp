@@ -22,6 +22,7 @@ use crate::config::providers::ProvidersConfig;
 use crate::config::trust::WorkspaceTrustPolicy;
 
 type LoadFn = dyn Fn(&Path) -> Result<(ProvidersConfig, ExtendedConfig)> + Send + Sync;
+type DaemonLoadFn = dyn Fn(&Path) -> Result<DaemonConfigLoad> + Send + Sync;
 type WriteTargetFn = dyn Fn(&Path, &str) -> Option<PathBuf> + Send + Sync;
 type WatchPathsFn = dyn Fn(&Path) -> ConfigWatchPaths + Send + Sync;
 
@@ -34,6 +35,14 @@ type WatchPathsFn = dyn Fn(&Path) -> ConfigWatchPaths + Send + Sync;
 pub struct ConfigWatchPaths {
     pub config_files: Vec<PathBuf>,
     pub provider_dirs: Vec<PathBuf>,
+}
+
+pub struct DaemonConfigLoad {
+    pub providers: ProvidersConfig,
+    pub extended: ExtendedConfig,
+    pub response_metrics_tokenizer_validation:
+        std::result::Result<(), crate::config::extended::InvalidResponseMetricsTokenizer>,
+    pub participating_layers: Vec<PathBuf>,
 }
 
 impl ConfigWatchPaths {
@@ -69,6 +78,7 @@ impl ConfigWatchPaths {
 #[derive(Clone)]
 pub struct ConfigSource {
     load: Arc<LoadFn>,
+    daemon_load: Arc<DaemonLoadFn>,
     write_target: Arc<WriteTargetFn>,
     watch_paths: Arc<WatchPathsFn>,
 }
@@ -80,13 +90,44 @@ impl std::fmt::Debug for ConfigSource {
 }
 
 impl ConfigSource {
+    /// Construct an advisory injected source. This is suitable only when the
+    /// supplied typed config is already known valid. Raw-layer tests and any
+    /// future production source must use [`Self::new_with_daemon_load`].
     pub fn new(
         load: impl Fn(&Path) -> Result<(ProvidersConfig, ExtendedConfig)> + Send + Sync + 'static,
         write_target: impl Fn(&Path, &str) -> Option<PathBuf> + Send + Sync + 'static,
         watch_paths: impl Fn(&Path) -> ConfigWatchPaths + Send + Sync + 'static,
     ) -> Self {
+        let load = Arc::new(load) as Arc<LoadFn>;
+        let daemon_source = load.clone();
+        Self {
+            daemon_load: Arc::new(move |cwd| {
+                let (providers, extended) = daemon_source(cwd)?;
+                Ok(DaemonConfigLoad {
+                    providers,
+                    extended,
+                    response_metrics_tokenizer_validation: Ok(()),
+                    participating_layers: Vec::new(),
+                })
+            }),
+            load,
+            write_target: Arc::new(write_target),
+            watch_paths: Arc::new(watch_paths),
+        }
+    }
+
+    /// Construct an injected source with the same lossless daemon contract as
+    /// production. Tests that model raw participating layers use this rather
+    /// than allowing the advisory settings view to stand in for validation.
+    pub fn new_with_daemon_load(
+        load: impl Fn(&Path) -> Result<(ProvidersConfig, ExtendedConfig)> + Send + Sync + 'static,
+        daemon_load: impl Fn(&Path) -> Result<DaemonConfigLoad> + Send + Sync + 'static,
+        write_target: impl Fn(&Path, &str) -> Option<PathBuf> + Send + Sync + 'static,
+        watch_paths: impl Fn(&Path) -> ConfigWatchPaths + Send + Sync + 'static,
+    ) -> Self {
         Self {
             load: Arc::new(load),
+            daemon_load: Arc::new(daemon_load),
             write_target: Arc::new(write_target),
             watch_paths: Arc::new(watch_paths),
         }
@@ -98,36 +139,59 @@ impl ConfigSource {
     /// (GOALS §2a), and is the daemon's **only** route to
     /// `secret_ref::load_effective` / `extended::load_for_cwd`.
     pub fn production() -> Self {
-        Self::new(
-            |cwd| {
-                // Fail closed: a layer with an unmaskable pending default-model
-                // transaction must surface as a typed error, never as an
-                // ambiguous snapshot the daemon then serves to clients.
-                Ok((
-                    crate::secret_ref::try_load_effective(cwd)?,
-                    crate::config::extended::load_for_cwd(cwd),
-                ))
-            },
-            |cwd, provider_id| {
+        let load = Arc::new(|cwd: &Path| {
+            // Fail closed: a layer with an unmaskable pending default-model
+            // transaction must surface as a typed error, never as an
+            // ambiguous snapshot the daemon then serves to clients.
+            Ok((
+                crate::secret_ref::try_load_effective(cwd)?,
+                crate::config::extended::load_for_cwd(cwd),
+            ))
+        }) as Arc<LoadFn>;
+        let daemon_load = Arc::new(|cwd: &Path| {
+            crate::secret_ref::prepare_effective_layers(cwd);
+            let extended = crate::config::extended::load_for_cwd_for_daemon_contract(cwd)?;
+            Ok(DaemonConfigLoad {
+                providers: extended.providers,
+                extended: extended.config,
+                response_metrics_tokenizer_validation: extended
+                    .response_metrics_tokenizer_validation,
+                participating_layers: extended.participating_layers,
+            })
+        }) as Arc<DaemonLoadFn>;
+        Self {
+            load,
+            daemon_load,
+            write_target: Arc::new(|cwd, provider_id| {
                 crate::config::dirs::config_write_target_for_provider(cwd, provider_id)
-            },
-            |cwd| {
+            }),
+            watch_paths: Arc::new(|cwd| {
                 let config_files = crate::config::dirs::config_file_paths_for_load(cwd);
                 let provider_dirs = config_files
                     .iter()
                     .filter_map(|path| path.parent().map(|parent| parent.join("providers")))
                     .collect();
                 ConfigWatchPaths::new(config_files, provider_dirs)
-            },
-        )
+            }),
+        }
     }
 
     /// A source returning fixed in-memory configs regardless of project
     /// root, with no config write-target. Test contexts inject this so
     /// daemon tests never consult the machine's live config.
     pub fn fixed(providers: ProvidersConfig, extended: ExtendedConfig) -> Self {
-        Self::new(
+        let daemon_providers = providers.clone();
+        let daemon_extended = extended.clone();
+        Self::new_with_daemon_load(
             move |_cwd| Ok((providers.clone(), extended.clone())),
+            move |_cwd| {
+                Ok(DaemonConfigLoad {
+                    providers: daemon_providers.clone(),
+                    extended: daemon_extended.clone(),
+                    response_metrics_tokenizer_validation: Ok(()),
+                    participating_layers: Vec::new(),
+                })
+            },
             |_cwd, _provider_id| None,
             |_cwd| ConfigWatchPaths::default(),
         )
@@ -149,6 +213,19 @@ impl ConfigSource {
         policy: &WorkspaceTrustPolicy,
     ) -> Result<(ProvidersConfig, ExtendedConfig)> {
         crate::config::trust::with_workspace_trust_policy(policy.clone(), || self.load(cwd))
+    }
+
+    pub fn load_effective_for_daemon(
+        &self,
+        cwd: &Path,
+        policy: &WorkspaceTrustPolicy,
+    ) -> Result<(ProvidersConfig, ExtendedConfig)> {
+        crate::config::trust::with_workspace_trust_policy(policy.clone(), || {
+            let load = (self.daemon_load)(cwd)?;
+            load.response_metrics_tokenizer_validation
+                .map_err(anyhow::Error::new)?;
+            Ok((load.providers, load.extended))
+        })
     }
 
     /// Resolve the config-file write target for `provider_id` (the
@@ -198,6 +275,26 @@ mod tests {
         assert!(paths.config_files.contains(&layer.join("config.json")));
         assert!(paths.provider_dirs.contains(&layer.join("providers")));
         assert!(paths.watched_dirs().contains(&layer));
+    }
+
+    #[test]
+    fn injected_daemon_load_contract_cannot_be_bypassed_by_advisory_load() {
+        let source = ConfigSource::new_with_daemon_load(
+            |_cwd| Ok((ProvidersConfig::default(), ExtendedConfig::default())),
+            |_cwd| Err(anyhow::anyhow!("strict daemon validation failed")),
+            |_cwd, _provider_id| None,
+            |_cwd| ConfigWatchPaths::default(),
+        );
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(Path::new("/tmp")).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        assert!(source.load(Path::new("/tmp")).is_ok());
+        assert!(
+            source
+                .load_effective_for_daemon(Path::new("/tmp"), &policy)
+                .is_err()
+        );
     }
 
     #[test]

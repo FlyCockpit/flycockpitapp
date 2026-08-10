@@ -1113,7 +1113,6 @@ fn run_sessions(app: &mut App, _: &str) -> bool {
         app.daemon_connected,
         daemon_socket,
         app.config_snapshot.extended.tui.use_emojis,
-        app.shared_db(),
     ));
     if app.daemon_connected {
         app.start_sessions_list_action();
@@ -1445,116 +1444,68 @@ impl App {
     }
 
     pub(super) fn handle_curator_command(&mut self, args: &str) {
-        let Some(db) = self.shared_db() else {
-            self.push_plain("/curator: database unavailable".to_string());
+        let Some(socket) = self.startup_background.daemon_socket.clone() else {
+            self.push_plain(
+                "/curator: Unavailable — reconnect to the daemon, then Retry".to_string(),
+            );
             return;
         };
-        let args = args.to_string();
-        let cfg = self.config_snapshot.extended.skills.clone();
-        let cwd = self.launch.cwd.clone();
-        self.async_actions.start(
-            AsyncActionKind::Internal("curator.command"),
-            AsyncActionPolicy::AllowConcurrent,
-            async move {
-                let curator =
-                    cockpit_core::skills::curator::SkillCurator::new(db.clone(), cwd, cfg);
-                let message = async {
-                    let mut parts = args.split_whitespace();
-                    match parts.next().unwrap_or("status") {
-                        "status" => {
-                            let status = curator.status().await?;
-                            Ok(format!(
-                                "/curator: {} skills, {} snapshots",
-                                status.skills.len(),
-                                status.snapshots.len()
-                            ))
+        let mut parts = args.split_whitespace();
+        let action = match parts.next().unwrap_or("status") {
+            "status" => cockpit_core::daemon::proto::CuratorAction::Status,
+            "run" => {
+                let mut dry_run = false;
+                let mut consolidate = false;
+                for part in parts {
+                    match part {
+                        "--dry-run" => dry_run = true,
+                        "--consolidate" => consolidate = true,
+                        other => {
+                            self.push_plain(format!("/curator: unknown run option `{other}`"));
+                            return;
                         }
-                        "run" => {
-                            let mut options =
-                                cockpit_core::skills::curator::CuratorRunOptions::default();
-                            for part in parts {
-                                match part {
-                                    "--dry-run" => options.dry_run = true,
-                                    "--consolidate" => options.consolidate = true,
-                                    other => anyhow::bail!("unknown curator run option `{other}`"),
-                                }
-                            }
-                            let jobs = db
-                                .read(|conn| {
-                                    cockpit_db::scheduler::list_scheduled_jobs_conn(conn, None)
-                                })
-                                .await?;
-                            let cron_refs =
-                                cockpit_core::skills::curator::cron_referenced_skills_from_jobs(
-                                    jobs,
-                                )?;
-                            Ok(format!(
-                                "/curator: {}",
-                                curator
-                                    .run_with_cron_refs(options, cron_refs)
-                                    .await?
-                                    .summary()
-                            ))
-                        }
-                        "pin" => {
-                            let name = parts.next().context("usage: /curator pin <name>")?;
-                            curator.pin(name, true).await?;
-                            Ok(format!("/curator: pinned {name}"))
-                        }
-                        "unpin" => {
-                            let name = parts.next().context("usage: /curator unpin <name>")?;
-                            curator.pin(name, false).await?;
-                            Ok(format!("/curator: unpinned {name}"))
-                        }
-                        "restore" => {
-                            let name = parts.next().context("usage: /curator restore <name>")?;
-                            curator.restore(name).await?;
-                            Ok(format!("/curator: restored {name}"))
-                        }
-                        "rollback" => {
-                            let mut list = false;
-                            let mut id: Option<String> = None;
-                            while let Some(part) = parts.next() {
-                                match part {
-                                    "--list" => list = true,
-                                    "--id" => {
-                                        id = Some(
-                                            parts
-                                                .next()
-                                                .context("usage: /curator rollback --id <id>")?
-                                                .to_string(),
-                                        );
-                                    }
-                                    other => {
-                                        anyhow::bail!("unknown curator rollback option `{other}`")
-                                    }
-                                }
-                            }
-                            if list {
-                                let lines = curator
-                                    .snapshots()
-                                    .await?
-                                    .into_iter()
-                                    .map(|s| format!("{} {}", s.id, s.reason))
-                                    .collect::<Vec<_>>();
-                                return Ok(if lines.is_empty() {
-                                    "/curator: no snapshots".to_string()
-                                } else {
-                                    format!("/curator snapshots:\n{}", lines.join("\n"))
-                                });
-                            }
-                            let restored = curator.rollback(id.as_deref()).await?;
-                            Ok(format!("/curator: rolled back to {}", restored.id))
-                        }
-                        _ => Ok(
-                            "/curator: usage status | run [--dry-run] [--consolidate] | pin <name> | unpin <name> | restore <name> | rollback [--list|--id <id>]"
-                                .to_string(),
-                        ),
                     }
                 }
-                .await
-                .map_err(|e: anyhow::Error| e.to_string())?;
-                Ok(AsyncActionPayload::Text(message))
+                cockpit_core::daemon::proto::CuratorAction::Run {
+                    dry_run,
+                    consolidate,
+                }
+            }
+            "pin" | "unpin" | "restore" => {
+                let command = args.split_whitespace().next().unwrap();
+                let Some(name) = parts.next() else {
+                    self.push_plain(format!("/curator: usage {command} <name>"));
+                    return;
+                };
+                match command {
+                    "pin" => cockpit_core::daemon::proto::CuratorAction::Pin { name: name.into() },
+                    "unpin" => {
+                        cockpit_core::daemon::proto::CuratorAction::Unpin { name: name.into() }
+                    }
+                    _ => cockpit_core::daemon::proto::CuratorAction::Restore { name: name.into() },
+                }
+            }
+            other => {
+                self.push_plain(format!("/curator: unsupported action `{other}`"));
+                return;
+            }
+        };
+        let request = cockpit_core::daemon::proto::Request::Curator {
+            project_root: self.launch.cwd.to_string_lossy().into_owned(),
+            action,
+        };
+        let curator_key = AsyncActionKey::new("curator.command");
+        if self.async_actions.has_pending_key(&curator_key) {
+            return;
+        }
+        self.push_plain("/curator: pending".to_string());
+        let operation = self.curator_blocking_operation();
+        self.start_owned_blocking_action(
+            operation,
+            AsyncActionPolicy::Dedupe(curator_key),
+            move || {
+                let response = agent_runner::daemon_request_at_blocking(&socket, request)?;
+                Ok(AsyncActionPayload::Text(format!("/curator: {response:?}")))
             },
         );
     }
@@ -1567,11 +1518,14 @@ impl App {
         }
         match trimmed {
             "pause" => {
-                self.set_goal_status(cockpit_db::session_goals::GoalStatus::Paused, "/goal pause");
+                self.set_goal_status(
+                    cockpit_core::daemon::proto::GoalDisposition::UserPaused,
+                    "/goal pause",
+                );
             }
             "resume" => {
                 self.set_goal_status(
-                    cockpit_db::session_goals::GoalStatus::Active,
+                    cockpit_core::daemon::proto::GoalDisposition::Running,
                     "/goal resume",
                 );
             }
@@ -1584,10 +1538,49 @@ impl App {
             }
             _ => {
                 self.swap_primary_agent("Build");
-                let wire = build_goal_clarification_prompt(trimmed);
-                self.dispatch_goal_turn(trimmed, wire);
+                let (token_budget, objective) = match Self::parse_goal_create_args(trimmed) {
+                    Ok(parsed) => parsed,
+                    Err(message) => {
+                        self.push_plain(format!("/goal: {message}"));
+                        return;
+                    }
+                };
+                if objective.is_empty() {
+                    self.push_plain("/goal: objective must not be empty".to_string());
+                    return;
+                }
+                self.create_goal(objective, token_budget);
             }
         }
+    }
+
+    fn parse_goal_create_args(input: &str) -> Result<(Option<i64>, String), String> {
+        let mut words = input.split_whitespace();
+        let mut budget = None;
+        let mut objective = Vec::new();
+        while let Some(word) = words.next() {
+            if word == "--budget" {
+                if budget.is_some() {
+                    return Err("--budget may be specified only once".to_string());
+                }
+                let value = words
+                    .next()
+                    .ok_or_else(|| "--budget requires a positive integer".to_string())?;
+                if value.starts_with("--") {
+                    return Err("--budget requires a positive integer".to_string());
+                }
+                let parsed = value
+                    .parse::<i64>()
+                    .map_err(|_| "--budget requires a positive integer".to_string())?;
+                if parsed <= 0 {
+                    return Err("--budget requires a positive integer".to_string());
+                }
+                budget = Some(parsed);
+            } else {
+                objective.push(word);
+            }
+        }
+        Ok((budget, objective.join(" ")))
     }
 
     /// `/skill <skill-name> [task]` — the universal dispatcher
@@ -1800,45 +1793,31 @@ impl App {
             self.push_plain(format!("/assistant: {error}"));
             return;
         }
-        let Some(db) = self.shared_db() else {
-            self.push_plain("/assistant: database unavailable".to_string());
+        let Some(socket) = self.startup_background.daemon_socket.clone() else {
+            self.push_plain(
+                "/assistant: Unavailable — reconnect to the daemon, then Retry".to_string(),
+            );
             return;
         };
-        let session = match (|| {
-            let name_for_row = name.to_string();
-            let row = db
-                .blocking_write_for_sync_ui(move |conn| {
-                    cockpit_db::Db::get_assistant_conn(conn, &name_for_row)
-                })?
-                .ok_or_else(|| anyhow::anyhow!("assistant `{name}` not found"))?;
-            cockpit_core::assistants::load_from_row(&row)?;
-            let name_for_lookup = name.to_string();
-            if let Some(session) = db.blocking_write_for_sync_ui(move |conn| {
-                cockpit_db::Db::most_recent_session_for_assistant_conn(conn, &name_for_lookup)
-            })? {
-                return Ok(session);
-            }
-            let project_id = cockpit_core::session::project_id_for(&self.launch.cwd);
-            let project_root = self.launch.cwd.to_string_lossy().into_owned();
-            let name_for_create = name.to_string();
-            db.blocking_write_for_sync_ui(move |conn| {
-                let row = cockpit_db::Db::build_new_assistant_session_row_conn(
-                    conn,
-                    &project_id,
-                    &project_root,
-                    &name_for_create,
-                    &name_for_create,
-                )?;
-                cockpit_db::Db::insert_session_row_conn(conn, &row)
-            })
-        })() {
-            Ok(session) => session,
-            Err(error) => {
-                self.push_plain(format!("/assistant: {error}"));
-                return;
-            }
+        let request = cockpit_core::daemon::proto::Request::ResolveAssistantSession {
+            assistant_id: name.to_string(),
+            project_root: self.launch.cwd.to_string_lossy().into_owned(),
+            mode: cockpit_core::daemon::proto::AssistantSessionResolutionMode::MostRecentOrCreate,
         };
-        self.resume_session(session.session_id);
+        let source_session_id = self.launch.session_id;
+        self.async_actions.start_blocking(
+            AsyncActionKind::DaemonRpc("assistant.resolve"),
+            AsyncActionPolicy::AllowConcurrent,
+            move || match agent_runner::daemon_request_at_blocking(&socket, request)? {
+                cockpit_core::daemon::proto::Response::AssistantSessionResolved {
+                    session, ..
+                } => Ok(AsyncActionPayload::AssistantSessionResolved {
+                    session_id: session.session_id,
+                    source_session_id,
+                }),
+                other => Err(format!("unexpected assistant response: {other:?}")),
+            },
+        );
     }
 
     /// `/side [end]`: throwaway side conversation forked from here.
@@ -1967,7 +1946,30 @@ impl App {
     }
 
     pub(super) fn handle_doctor_command(&mut self) {
-        let input = cockpit_core::diagnostics::DiagnosticsInput {
+        let input = self.doctor_snapshot_input();
+        let clipboard_recovery = self.clipboard_recovery;
+        self.push_plain("/doctor: collecting diagnostics…".to_string());
+        let operation = self.doctor_blocking_operation();
+        self.start_owned_blocking_action(
+            operation,
+            AsyncActionPolicy::Replace(AsyncActionKey::new("doctor.snapshot")),
+            move || {
+                let snapshot = cockpit_core::diagnostics::tui_snapshot(input)
+                    .map_err(|error| format!("/doctor: {error}"))?;
+                let mut rendered = cockpit_core::diagnostics::render(&snapshot);
+                if let Ok(dir) = crate::clipboard::recovery::recovery_dir_path() {
+                    let (lines, _) =
+                        crate::clipboard::recovery::doctor_lines(clipboard_recovery, &dir);
+                    rendered.push('\n');
+                    rendered.push_str(&lines.join("\n"));
+                }
+                Ok(AsyncActionPayload::DoctorSnapshot(rendered))
+            },
+        );
+    }
+
+    pub(super) fn doctor_snapshot_input(&self) -> cockpit_core::diagnostics::DiagnosticsInput {
+        cockpit_core::diagnostics::DiagnosticsInput {
             cwd: self.launch.cwd.clone(),
             session_id: self.launch.session_id,
             session_short_id: self.launch.session_short_id.clone(),
@@ -1980,23 +1982,7 @@ impl App {
                 )
             }),
             sandbox_enabled: Some(!self.no_sandbox),
-        };
-        let mut rendered = match cockpit_core::diagnostics::tui_snapshot(input) {
-            Ok(snapshot) => cockpit_core::diagnostics::render(&snapshot),
-            Err(error) => format!("/doctor: {error}"),
-        };
-        // Clipboard recovery lives entirely in `crates/cockpit-tui`, which
-        // sits *above* `cockpit-core` in the crate graph — `diagnostics.rs`
-        // cannot depend on it — so its section is appended here instead of
-        // inside `cockpit_core::diagnostics::render`. Metadata only — see
-        // `crate::clipboard::recovery::doctor_lines`.
-        if let Ok(dir) = crate::clipboard::recovery::recovery_dir_path() {
-            let (lines, _) =
-                crate::clipboard::recovery::doctor_lines(self.clipboard_recovery, &dir);
-            rendered.push('\n');
-            rendered.push_str(&lines.join("\n"));
         }
-        self.push_plain(rendered);
     }
 
     /// `/preflight [on|off]`: flip request preflight for the running session
@@ -2282,38 +2268,16 @@ impl App {
             return;
         };
         if title.is_empty() {
-            let Some(db) = self.shared_db() else {
-                self.push_plain("/rename: database unavailable".to_string());
-                return;
-            };
             self.push_plain("/rename: generating".to_string());
-            self.async_actions.start(
+            let request = cockpit_core::daemon::proto::Request::AutoTitle { session_id };
+            self.async_actions.start_blocking(
                 AsyncActionKind::Internal("rename.auto"),
                 AsyncActionPolicy::AllowConcurrent,
-                async move {
-                    let session = cockpit_core::session::Session::resume(db, session_id)
-                        .map_err(|e| e.to_string())?
-                        .ok_or_else(|| format!("unknown session {session_id}"))?;
-                    let cwd = session.project_root.clone();
-                    let session = Arc::new(session);
-                    let (extended, providers) = cockpit_core::auto_title::load_configs_for(&cwd);
-                    let redactor =
-                        cockpit_core::redact::RedactionTable::build(&extended.redact, &cwd)
-                            .map_err(|e| e.to_string())?;
-                    let generated = cockpit_core::auto_title::generate_session_title_once(
-                        session,
-                        extended,
-                        providers,
-                        Arc::new(redactor),
-                        String::new(),
-                        cockpit_core::session::TitleAction::Explicit,
-                    )
-                    .await
-                    .map_err(|e| e.to_string())?;
-                    match generated {
-                        Some(title) => Ok(AsyncActionPayload::Text(title)),
-                        None => Err("utility model returned no usable title".to_string()),
+                move || match agent_runner::daemon_request_blocking(request)? {
+                    cockpit_core::daemon::proto::Response::AutoTitle { title, .. } => {
+                        Ok(AsyncActionPayload::Text(title))
                     }
+                    other => Err(format!("unexpected auto-title response: {other:?}")),
                 },
             );
             return;
@@ -3226,7 +3190,7 @@ mod tests {
         AgentRunner, AttachedRequest, ClientTasks, ControlRequest, UsageCounts,
     };
     use crate::tui::history::HistoryEntry;
-    use cockpit_core::daemon::proto::{GoalStatus, GoalSummary, Request, Response};
+    use cockpit_core::daemon::proto::{GoalDisposition, GoalSummary, Request, Response};
 
     fn app_with_attached_request_rx() -> (App, mpsc::Receiver<AttachedRequest>) {
         let tmp = tempfile::tempdir().unwrap();
@@ -3273,21 +3237,56 @@ mod tests {
         (app, attached_request_rx)
     }
 
-    fn goal_summary(status: GoalStatus) -> GoalSummary {
+    fn goal_summary(disposition: GoalDisposition) -> GoalSummary {
         GoalSummary {
             id: uuid::Uuid::new_v4(),
             session_id: uuid::Uuid::new_v4(),
             project_id: "project".to_string(),
             objective: "ship it".to_string(),
             context: None,
-            status,
-            token_budget: Some(100),
+            disposition,
+            phase: (disposition == GoalDisposition::Running)
+                .then_some(cockpit_core::daemon::proto::GoalPhase::Executing),
+            resume_phase: None,
+            pause_reason: (disposition == GoalDisposition::UserPaused)
+                .then_some(cockpit_core::daemon::proto::GoalPauseReason::User),
+            contract_available: true,
+            latest_gap_or_blocker: None,
+            verification_attempts: 2,
+            max_verification_attempts: 4,
+            attempt_generation: 1,
+            token_budget: 100,
             tokens_used: 4,
+            remaining_tokens: 96,
+            elapsed_active_ms: 1_250,
+            lifecycle_history: vec![cockpit_core::daemon::proto::GoalLifecycleHistoryEntry {
+                at: 0,
+                disposition,
+                phase: None,
+                reason: None,
+            }],
             blocked_attempts: 0,
             last_read_at: None,
             created_at: 0,
             updated_at: 0,
         }
+    }
+
+    #[test]
+    fn goal_budget_parser_rejects_missing_malformed_nonpositive_and_duplicate_values() {
+        for input in [
+            "--budget ship",
+            "--budget nope ship",
+            "--budget 0 ship",
+            "--budget -4 ship",
+            "--budget 4 --budget 5 ship",
+        ] {
+            assert!(App::parse_goal_create_args(input).is_err(), "{input}");
+        }
+        assert_eq!(
+            App::parse_goal_create_args("--budget 42 ship the feature").unwrap(),
+            (Some(42), "ship the feature".to_string())
+        );
     }
 
     async fn answer_goal_request(
@@ -3323,7 +3322,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn goal_commands_succeed_in_runtime_context() {
+    async fn goal_status_renders_lifecycle_snapshot() {
         let (mut app, mut rx) = app_with_attached_request_rx();
         let command = *slash_command_by_name("goal").expect("/goal command");
         let cases = [
@@ -3331,19 +3330,25 @@ mod tests {
             (
                 "/goal status",
                 Response::GoalStatus {
-                    goal: Some(goal_summary(GoalStatus::Active)),
+                    goal: Some(goal_summary(GoalDisposition::Running)),
+                },
+            ),
+            (
+                "/goal status",
+                Response::GoalStatus {
+                    goal: Some(goal_summary(GoalDisposition::UserPaused)),
                 },
             ),
             (
                 "/goal pause",
                 Response::GoalUpdated {
-                    goal: goal_summary(GoalStatus::Paused),
+                    goal: goal_summary(GoalDisposition::UserPaused),
                 },
             ),
             (
                 "/goal resume",
                 Response::GoalUpdated {
-                    goal: goal_summary(GoalStatus::Active),
+                    goal: goal_summary(GoalDisposition::Running),
                 },
             ),
             ("/goal clear", Response::GoalCleared { cleared: true }),
@@ -3356,6 +3361,11 @@ mod tests {
         let lines = history_lines(&app);
         assert!(lines.iter().any(|line| line.contains("no goal")));
         assert!(lines.iter().any(|line| line.contains("tokens 4/100")));
+        assert!(lines.iter().any(|line| line.contains("active 1250ms")));
+        assert!(lines.iter().any(|line| line.contains("1 transitions")));
+        assert!(lines.iter().any(|line| line.contains("pause none")));
+        assert!(lines.iter().any(|line| line.contains("pause user")));
+        assert!(lines.iter().any(|line| line.contains("verification 2/4")));
         assert!(lines.iter().any(|line| line.contains("goal is now paused")));
         assert!(lines.iter().any(|line| line.contains("goal is now active")));
         assert!(
@@ -3363,6 +3373,31 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("cleared current goal"))
         );
+    }
+
+    #[tokio::test]
+    async fn goal_controls_cover_every_open_disposition() {
+        let (mut app, mut rx) = app_with_attached_request_rx();
+        let command = *slash_command_by_name("goal").expect("/goal command");
+        for disposition in [
+            GoalDisposition::Running,
+            GoalDisposition::UserPaused,
+            GoalDisposition::BudgetLimited,
+            GoalDisposition::Blocked,
+            GoalDisposition::InfraPaused,
+            GoalDisposition::NoProgressPaused,
+        ] {
+            app.composer.set("/goal clear".to_string());
+            app.execute_slash(command);
+            let request = answer_goal_request(
+                &mut app,
+                &mut rx,
+                Ok(Response::GoalCleared { cleared: true }),
+            )
+            .await;
+            assert!(matches!(request, Request::ClearGoal { .. }));
+            assert!(disposition.is_open());
+        }
     }
 
     #[tokio::test]
@@ -3389,14 +3424,14 @@ mod tests {
             &mut app,
             &mut rx,
             Ok(Response::GoalUpdated {
-                goal: goal_summary(GoalStatus::Paused),
+                goal: goal_summary(GoalDisposition::UserPaused),
             }),
         )
         .await;
         assert!(matches!(
             request,
             Request::SetGoalStatus {
-                status: GoalStatus::Paused,
+                status: GoalDisposition::UserPaused,
                 ..
             }
         ));

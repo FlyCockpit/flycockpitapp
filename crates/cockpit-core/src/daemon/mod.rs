@@ -41,6 +41,7 @@ pub mod proto;
 pub mod registry;
 pub mod relay_envelope;
 pub mod remote_audit_upload;
+pub(crate) mod remote_outbox_worker;
 pub mod scheduler;
 pub mod server;
 pub mod session_worker;
@@ -1035,6 +1036,7 @@ pub(crate) async fn boot_in_process(
         let _org_sync_task = org_sync::spawn_background(ctx.clone());
         let _remote_audit_upload_task = remote_audit_upload::spawn_background(ctx.clone());
         let _connector_task = connector::spawn_background(ctx.clone());
+        let _remote_outbox_task = remote_outbox_worker::spawn_background(ctx.clone());
     }
     server::register_in_process_context(ctx.clone());
     Ok(ctx)
@@ -1213,6 +1215,7 @@ async fn run_foreground_inner_with_boot_db(
     let org_sync_task = org_sync::spawn_background(ctx.clone());
     let remote_audit_upload_task = remote_audit_upload::spawn_background(ctx.clone());
     let connector_task = connector::spawn_background(ctx.clone());
+    let remote_outbox_task = remote_outbox_worker::spawn_background(ctx.clone());
 
     timer.phase("signal_and_watchdog");
     timer.done();
@@ -1334,6 +1337,7 @@ async fn run_foreground_inner_with_boot_db(
     org_sync_task.abort();
     remote_audit_upload_task.abort();
     connector_task.abort();
+    remote_outbox_task.abort();
     result
 }
 

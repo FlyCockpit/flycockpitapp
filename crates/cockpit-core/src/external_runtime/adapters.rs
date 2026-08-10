@@ -17,8 +17,8 @@ use super::health::{ExternalRuntimeSnapshot, HealthEntry, HealthState};
 use super::platform::{common_platform_remedy, configured_command_remedy, package_remedy_table};
 use super::registry::{ExternalRuntimeRegistry, RegistryError};
 use super::schema::{
-    Applicability, DependencyImportance, ExternalRuntimeDescriptor, ExternalRuntimeId,
-    HostPlatform, ProbePolicy, RemedyKind, VersionParser,
+    Applicability, CompatibilityRule, DependencyImportance, ExternalRuntimeDescriptor,
+    ExternalRuntimeId, HostPlatform, ProbePolicy, RemedyKind, VersionParser,
 };
 use crate::capabilities::ExecutionTarget;
 
@@ -48,6 +48,10 @@ pub const ID_ACCEL_FD: &str = "accel.fd";
 pub const ID_ACCEL_GSED: &str = "accel.gsed";
 /// Host `jq` only for features the built-in Cockpit jq applet cannot serve.
 pub const ID_JQ_EXTERNAL: &str = "jq.external";
+/// FFmpeg decoder used for selected audio and video attachments.
+pub const ID_MEDIA_FFMPEG: &str = "media.ffmpeg";
+/// FFprobe metadata reader paired with FFmpeg.
+pub const ID_MEDIA_FFPROBE: &str = "media.ffprobe";
 
 /// Closed exact roster of known trusted-catalog integration adapters.
 ///
@@ -67,12 +71,65 @@ pub fn known_catalog_adapter_ids() -> &'static [&'static str] {
         ID_ACCEL_FD,
         ID_ACCEL_GSED,
         ID_JQ_EXTERNAL,
+        ID_MEDIA_FFMPEG,
+        ID_MEDIA_FFPROBE,
     ]
 }
 
 /// Known harness preset names that receive trusted-catalog recipes.
 pub fn known_harness_preset_names() -> &'static [&'static str] {
     &["claude", "codex", "gemini", "opencode"]
+}
+
+/// Fail-closed compatibility gate for selected audio/video media.
+///
+/// FFmpeg and FFprobe must both be available and report the same release major.
+/// Missing or unparsable version evidence is not treated as compatible.
+pub fn media_runtime_pair_is_compatible(snapshot: &ExternalRuntimeSnapshot) -> bool {
+    fn major(entry: Option<&HealthEntry>) -> Option<u64> {
+        let HealthState::Available {
+            version_evidence: Some(version),
+            ..
+        } = &entry?.state
+        else {
+            return None;
+        };
+        version
+            .split(|character: char| !character.is_ascii_digit())
+            .find(|part| !part.is_empty())?
+            .parse()
+            .ok()
+    }
+
+    match (
+        major(snapshot.get(ID_MEDIA_FFMPEG)),
+        major(snapshot.get(ID_MEDIA_FFPROBE)),
+    ) {
+        (Some(ffmpeg), Some(ffprobe)) => ffmpeg == ffprobe,
+        _ => false,
+    }
+}
+
+/// Select the resolved executable paths used by the media inspection/decoding
+/// path.
+///
+/// Callers must obtain the pair through this gate immediately before spawning
+/// either process. Returning paths independently would permit an incompatible
+/// FFmpeg/FFprobe pair to escape the health rule.
+pub fn select_media_runtime_pair(
+    snapshot: &ExternalRuntimeSnapshot,
+) -> Result<(&Path, &Path), &'static str> {
+    if !media_runtime_pair_is_compatible(snapshot) {
+        return Err("media inspection requires a healthy compatible FFmpeg/FFprobe pair");
+    }
+    let resolved = |id| match &snapshot.get(id)?.state {
+        HealthState::Available { resolved_path, .. } => resolved_path.as_deref(),
+        _ => None,
+    };
+    match (resolved(ID_MEDIA_FFMPEG), resolved(ID_MEDIA_FFPROBE)) {
+        (Some(ffmpeg), Some(ffprobe)) => Ok((ffmpeg, ffprobe)),
+        _ => Err("media inspection requires resolved FFmpeg and FFprobe paths"),
+    }
 }
 
 // ── ID builders for configured commands ─────────────────────────────────────
@@ -96,6 +153,20 @@ pub fn stdio_mcp_id(server_name: &str) -> ExternalRuntimeId {
 
 fn version_first_line_policy() -> ProbePolicy {
     ProbePolicy::trusted_catalog(["--version"], VersionParser::FirstSemverToken, None)
+}
+
+fn media_version_policy() -> ProbePolicy {
+    // Keep this contract identical to apps/worker/src/lib/media-runtime.ts:
+    // FFmpeg's supported version flag is singular, and health requires the
+    // tool-shaped release-major prefix rather than an arbitrary semver token.
+    ProbePolicy::trusted_catalog(
+        ["-version"],
+        VersionParser::RegexCapture {
+            pattern: r"(?i)\b(?:ffmpeg|ffprobe) version\s+(\d+)(?:\.|\s)".into(),
+            group: 1,
+        },
+        None,
+    )
 }
 
 fn catalog_owner(feature: &str) -> (String, String) {
@@ -175,6 +246,29 @@ fn trusted_descriptor(
     remedy_binary: &str,
     remedy_prose: &str,
 ) -> ExternalRuntimeDescriptor {
+    trusted_descriptor_with_policy(
+        id,
+        feature,
+        candidates,
+        importance,
+        applicability,
+        remedy_binary,
+        remedy_prose,
+        version_first_line_policy(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trusted_descriptor_with_policy(
+    id: &str,
+    feature: &str,
+    candidates: &[&str],
+    importance: DependencyImportance,
+    applicability: Applicability,
+    remedy_binary: &str,
+    remedy_prose: &str,
+    probe_policy: ProbePolicy,
+) -> ExternalRuntimeDescriptor {
     let (owner, feat) = catalog_owner(feature);
     ExternalRuntimeDescriptor::builder(id)
         .owner(owner, feat)
@@ -182,7 +276,7 @@ fn trusted_descriptor(
         .applicability(applicability)
         .importance(importance)
         .target(ExecutionTarget::Host)
-        .probe_policy(version_first_line_policy())
+        .probe_policy(probe_policy)
         .remedy(integration_remedy(remedy_binary, remedy_prose))
         .build()
         .expect("catalog descriptor is well-formed")
@@ -301,6 +395,32 @@ pub fn catalog_adapter_descriptors() -> Vec<ExternalRuntimeDescriptor> {
             "jq",
             "Install host jq only when a feature cannot use Cockpit's bundled `cockpit jq` applet.",
         ),
+        trusted_descriptor_with_policy(
+            ID_MEDIA_FFMPEG,
+            "media.decode",
+            &["ffmpeg"],
+            DependencyImportance::RequiredWhenFeatureSelected,
+            Applicability::WhenFeatureSelected,
+            "ffmpeg",
+            "Install FFmpeg from https://ffmpeg.org/download.html and verify it with `ffmpeg -version`. Cockpit never downloads or bundles it.",
+            media_version_policy(),
+        )
+        .with_compatibility(CompatibilityRule::CatalogRule {
+            rule_id: "ffmpeg-ffprobe-compatible-pair".into(),
+        }),
+        trusted_descriptor_with_policy(
+            ID_MEDIA_FFPROBE,
+            "media.decode",
+            &["ffprobe"],
+            DependencyImportance::RequiredWhenFeatureSelected,
+            Applicability::WhenFeatureSelected,
+            "ffprobe",
+            "Install FFprobe with FFmpeg from https://ffmpeg.org/download.html and verify it with `ffprobe -version`. Cockpit never downloads or bundles it.",
+            media_version_policy(),
+        )
+        .with_compatibility(CompatibilityRule::CatalogRule {
+            rule_id: "ffmpeg-ffprobe-compatible-pair".into(),
+        }),
     ]
 }
 
@@ -395,7 +515,7 @@ pub fn require_live_available_for_launch_with_cancel(
         return Err(LaunchGateError::Cancelled);
     }
     let store = global_health_store();
-    let (published, generation) = store.publish_live_entry(entry.clone(), platform);
+    let (published, generation) = store.publish_live_entry(entry.clone(), descriptor, platform);
     require_available_for_launch(&published, id, generation)?;
     Ok(entry)
 }
@@ -475,7 +595,7 @@ pub fn require_configured_command_available_for_launch_with_cancel(
         return Err(LaunchGateError::Cancelled);
     }
     let store = global_health_store();
-    let (published, generation) = store.publish_live_entry(entry.clone(), platform);
+    let (published, generation) = store.publish_live_entry(entry.clone(), desc, platform);
     require_available_for_launch(&published, id.as_str(), generation)?;
     Ok(entry)
 }
@@ -491,6 +611,18 @@ pub struct IntegrationHealthComposeInput {
     pub harnesses: Vec<ConfiguredCommandInput>,
     pub lsp_servers: Vec<ConfiguredCommandInput>,
     pub stdio_mcp: Vec<ConfiguredCommandInput>,
+    /// Per-invocation CLI override; `None` leaves the captured mode enabled.
+    pub sandbox_enabled: Option<bool>,
+    /// Layered sandbox mode captured by the config-owning caller.
+    pub sandbox_mode: crate::config::sandbox_mode::SandboxMode,
+    /// Layered computer-use policy captured by the config-owning caller.
+    pub computer_use_mode: Option<crate::config::extended::ComputerUseMode>,
+    /// Catalog-owned features selected by resolved configuration.
+    pub selected_features: BTreeSet<String>,
+    /// Invocation-frozen engine selection. `None` resolves the current mode
+    /// once at the caller boundary; bounded diagnostics set this before
+    /// spawning so roster construction and probing cannot diverge.
+    pub container_engine_mode: Option<super::safety_adapters::ContainerEngineMode>,
 }
 
 /// Compose catalog + configured integrations into the process-global health
@@ -519,7 +651,114 @@ pub fn compose_settings_doctor_health_with_executor(
     executor: &dyn super::probe::ProbeExecutor,
     path_env: Option<&str>,
 ) -> Result<Arc<ExternalRuntimeSnapshot>, RegistryError> {
-    let registry = super::registry::global_registry();
+    compose_settings_doctor_health_internal(
+        cwd,
+        input,
+        executor,
+        path_env,
+        CompositionScope::global(),
+        |_| {},
+    )
+}
+
+/// Invocation-owned composition used by bounded diagnostics. It reports
+/// progressive immutable snapshots and never publishes process-global state.
+pub(crate) fn compose_settings_doctor_health_for_invocation(
+    cwd: &Path,
+    input: &IntegrationHealthComposeInput,
+    cancel: &super::probe::CancelToken,
+    generation: u64,
+    observer: impl FnMut(&ExternalRuntimeSnapshot),
+) -> Result<Arc<ExternalRuntimeSnapshot>, RegistryError> {
+    compose_settings_doctor_health_internal(
+        cwd,
+        input,
+        &super::probe::SystemProbeExecutor,
+        None,
+        CompositionScope::invocation(cancel, generation),
+        observer,
+    )
+}
+
+/// Build the exact descriptor roster used by one private diagnostics
+/// invocation.  Deadline projection must retain this roster rather than
+/// consulting the process-global registry, whose configured rows may differ.
+pub(crate) fn invocation_descriptor_roster(
+    _cwd: &Path,
+    input: &IntegrationHealthComposeInput,
+) -> Result<Vec<ExternalRuntimeDescriptor>, RegistryError> {
+    let registry = ExternalRuntimeRegistry::new();
+    ensure_integration_adapters_registered(&registry)?;
+    let _ = super::safety_adapters::ensure_safety_adapters_registered(&registry);
+    let harness_ids = upsert_custom_harnesses(&registry, input.harnesses.clone())?;
+    let lsp_ids = upsert_lsp_servers(&registry, input.lsp_servers.clone())?;
+    let mcp_ids = upsert_stdio_mcp_servers(&registry, input.stdio_mcp.clone())?;
+    let keep = harness_ids
+        .iter()
+        .chain(lsp_ids.iter())
+        .chain(mcp_ids.iter())
+        .map(|id| id.as_str().to_owned())
+        .collect();
+    registry.retain_configured_ids(&keep);
+    let mut descriptors = registry.descriptors();
+    descriptors.extend(super::safety_adapters::container_engine_descriptors(
+        resolved_container_engine_mode(input),
+    )?);
+    descriptors.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(descriptors)
+}
+
+pub(crate) fn resolved_container_engine_mode(
+    input: &IntegrationHealthComposeInput,
+) -> super::safety_adapters::ContainerEngineMode {
+    if let Some(frozen) = input.container_engine_mode {
+        return frozen;
+    }
+    if input.sandbox_enabled.unwrap_or(true) && input.sandbox_mode.is_container() {
+        super::safety_adapters::current_container_engine_mode()
+    } else {
+        super::safety_adapters::ContainerEngineMode::Disabled
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CompositionScope<'a> {
+    cancel: Option<&'a super::probe::CancelToken>,
+    publish_global: bool,
+    generation: Option<u64>,
+}
+
+impl<'a> CompositionScope<'a> {
+    fn global() -> Self {
+        Self {
+            cancel: None,
+            publish_global: true,
+            generation: None,
+        }
+    }
+
+    fn invocation(cancel: &'a super::probe::CancelToken, generation: u64) -> Self {
+        Self {
+            cancel: Some(cancel),
+            publish_global: false,
+            generation: Some(generation),
+        }
+    }
+}
+
+fn compose_settings_doctor_health_internal(
+    cwd: &Path,
+    input: &IntegrationHealthComposeInput,
+    executor: &dyn super::probe::ProbeExecutor,
+    path_env: Option<&str>,
+    scope: CompositionScope<'_>,
+    mut observer: impl FnMut(&ExternalRuntimeSnapshot),
+) -> Result<Arc<ExternalRuntimeSnapshot>, RegistryError> {
+    let registry = if scope.publish_global {
+        super::registry::global_registry()
+    } else {
+        Arc::new(super::registry::ExternalRuntimeRegistry::new())
+    };
     ensure_integration_adapters_registered(&registry)?;
     let _ = super::safety_adapters::ensure_safety_adapters_registered(&registry);
     let harness_ids = upsert_custom_harnesses(&registry, input.harnesses.clone())?;
@@ -536,62 +775,119 @@ pub fn compose_settings_doctor_health_with_executor(
     }
     registry.retain_configured_ids(&keep);
 
-    let descriptors = registry.descriptors();
+    let base_descriptors = registry.descriptors();
     let mut features = BTreeSet::new();
-    for desc in &descriptors {
-        features.insert(desc.owner.feature.clone());
+    // Registration is inventory, not selection. Only configured entries in
+    // this composition make their owning feature applicable.
+    for id in &keep {
+        if let Some(desc) = base_descriptors.iter().find(|desc| desc.id.as_str() == id) {
+            features.insert(desc.owner.feature.clone());
+        }
+    }
+    features.extend(input.selected_features.iter().cloned());
+    if input.sandbox_enabled.unwrap_or(true)
+        && input.sandbox_mode.enabled()
+        && !input.sandbox_mode.is_container()
+    {
+        features.insert("shell-sandbox".to_string());
+    }
+    if input
+        .computer_use_mode
+        .is_some_and(|mode| !matches!(mode, crate::config::extended::ComputerUseMode::Disabled))
+    {
+        features.insert("computer-use".to_string());
     }
     let platform = super::platform::detect_host_platform();
-    // Container engines: only mark the feature selected and probe when mode is
-    // not Disabled (Settings may call set_container_engine_mode).
-    let engine_mode = super::safety_adapters::current_container_engine_mode();
+    // Container engine probes are applicable only when layered configuration
+    // selects a container sandbox; the runtime mode then narrows the engine.
+    let engine_mode = resolved_container_engine_mode(input);
     if !matches!(
         engine_mode,
         super::safety_adapters::ContainerEngineMode::Disabled
     ) {
         features.insert("container-sandbox".to_string());
     }
+    let mut descriptors = base_descriptors.clone();
+    descriptors.extend(super::safety_adapters::container_engine_descriptors(
+        engine_mode,
+    )?);
+    descriptors.sort_by(|left, right| left.id.cmp(&right.id));
     let ctx = super::probe::EvaluationContext::new(platform).with_features(features);
     let store = global_health_store();
-    let generation = store.begin_refresh();
-    let cancel = super::probe::CancelToken::new();
-    let mut snapshot = super::probe::refresh_snapshot(
+    let generation = if let Some(generation) = scope.generation {
+        generation
+    } else if scope.publish_global {
+        store.begin_refresh()
+    } else {
+        store
+            .current()
+            .map_or(1, |snapshot| snapshot.generation.saturating_add(1))
+    };
+    let local_cancel = super::probe::CancelToken::new();
+    let cancel = scope.cancel.unwrap_or(&local_cancel);
+    let mut snapshot = super::probe::refresh_snapshot_with_observer(
         generation,
-        &descriptors,
+        &base_descriptors,
         executor,
         path_env,
         cwd,
         &ctx,
         super::probe::ProbeDeadlines::default(),
-        &cancel,
+        cancel,
+        &mut observer,
+    );
+    snapshot.groups.insert(
+        "computer-use".to_owned(),
+        super::health::evaluate_requirement_group(
+            &super::safety_adapters::computer_use_requirement_group(),
+            &snapshot,
+        ),
     );
     // Merge Docker/Podman health from a private mode-aware refresh (never
     // registered into the global catalog).
     {
-        use super::safety_adapters::{
-            ContainerEngineMode, ID_DOCKER, ID_PODMAN, refresh_safety_snapshot,
-        };
+        use super::safety_adapters::{ContainerEngineMode, ID_DOCKER, ID_PODMAN};
         if !matches!(engine_mode, ContainerEngineMode::Disabled) {
+            let engine_ids: BTreeSet<String> = descriptors
+                .iter()
+                .filter(|descriptor| [ID_DOCKER, ID_PODMAN].contains(&descriptor.id.as_str()))
+                .map(|descriptor| descriptor.id.as_str().to_owned())
+                .collect();
             let engine_reg = super::registry::ExternalRuntimeRegistry::new();
-            let engine_snap = refresh_safety_snapshot(
+            let base_snapshot = snapshot.clone();
+            let engine_snap = super::safety_adapters::refresh_safety_snapshot_with_observer(
                 &engine_reg,
                 executor,
                 path_env,
                 cwd,
                 &ctx,
                 super::probe::ProbeDeadlines::default(),
-                &cancel,
+                cancel,
                 generation,
                 engine_mode,
+                |engine_progress| {
+                    let mut progress = base_snapshot.clone();
+                    progress.entries.extend(
+                        engine_progress
+                            .entries
+                            .iter()
+                            .filter(|(id, _)| engine_ids.contains(*id))
+                            .map(|(id, entry)| (id.clone(), entry.clone())),
+                    );
+                    observer(&progress);
+                },
             );
-            for id in [ID_DOCKER, ID_PODMAN] {
+            for id in &engine_ids {
                 if let Some(entry) = engine_snap.get(id) {
-                    snapshot.entries.insert(id.to_string(), entry.clone());
+                    snapshot.entries.insert(id.clone(), entry.clone());
                 }
             }
         }
     }
-    if !store.publish(snapshot.clone()) {
+    if !scope.publish_global {
+        return Ok(Arc::new(snapshot));
+    }
+    if !store.publish_complete_bundle(snapshot.clone(), descriptors) {
         // A newer full refresh or live handoff superseded this composition;
         // surface the current published snapshot when available.
         if let Some(current) = store.current() {
@@ -1059,6 +1355,81 @@ mod tests {
     }
 
     #[test]
+    fn media_probe_contract_matches_worker_argv_status_and_release_major() {
+        let descriptors: Vec<_> = catalog_adapter_descriptors()
+            .into_iter()
+            .filter(|desc| matches!(desc.id.as_str(), ID_MEDIA_FFMPEG | ID_MEDIA_FFPROBE))
+            .collect();
+        for desc in &descriptors {
+            let policy = desc.probe_policy.as_trusted_catalog().unwrap();
+            assert_eq!(policy.version_argv(), &["-version".to_string()]);
+        }
+
+        let executor = RecordingProbeExecutor::new()
+            .with_resolve("ffmpeg", "/tools/ffmpeg")
+            .with_resolve("ffprobe", "/tools/ffprobe");
+        executor.set_handler(|program, args| {
+            assert_eq!(args, &["-version".to_string()]);
+            let tool = program.file_name().unwrap().to_string_lossy();
+            crate::external_runtime::ProbeCommandResult {
+                exit_code: Some(0),
+                stdout: format!("{tool} version 7.1 Copyright FFmpeg\n").into_bytes(),
+                stderr: Vec::new(),
+                timed_out: false,
+                cancelled: false,
+                spawn_error: None,
+            }
+        });
+        let snapshot = refresh_snapshot(
+            1,
+            &descriptors,
+            &executor,
+            None,
+            Path::new("/"),
+            &ctx_features(HostPlatform::GenericLinux, &["media.decode"]),
+            ProbeDeadlines::default(),
+            &CancelToken::new(),
+        );
+        assert!(media_runtime_pair_is_compatible(&snapshot));
+        assert!(descriptors.iter().all(|desc| matches!(
+            snapshot.get(desc.id.as_str()).map(|entry| &entry.state),
+            Some(HealthState::Available { version_evidence: Some(major), .. }) if major == "7"
+        )));
+
+        let failed_executor = RecordingProbeExecutor::new().with_resolve("ffmpeg", "/tools/ffmpeg");
+        failed_executor.set_handler(|_, _| crate::external_runtime::ProbeCommandResult {
+            exit_code: Some(8),
+            stdout: b"ffmpeg version 7.1\n".to_vec(),
+            stderr: Vec::new(),
+            timed_out: false,
+            cancelled: false,
+            spawn_error: None,
+        });
+        let failed = evaluate_descriptor(
+            descriptors
+                .iter()
+                .find(|desc| desc.id.as_str() == ID_MEDIA_FFMPEG)
+                .unwrap(),
+            &failed_executor,
+            None,
+            Path::new("/"),
+            &ctx_features(HostPlatform::GenericLinux, &["media.decode"]),
+            ProbeDeadlines::default(),
+            &CancelToken::new(),
+        );
+        assert!(matches!(
+            failed.state,
+            HealthState::Failed {
+                cause: HealthCause::NonZeroExit { code: Some(8) }
+            }
+        ));
+
+        let worker_contract = include_str!("../../../../apps/worker/src/lib/media-runtime.ts");
+        assert!(worker_contract.contains(r#"execFileAsync(program, ["-version"]"#));
+        assert!(worker_contract.contains(r#"/\b(?:ffmpeg|ffprobe) version\s+(\d+)(?:\.|\s)/i"#));
+    }
+
+    #[test]
     fn external_dependency_adapter_inventory() {
         let expected: BTreeSet<&str> = known_catalog_adapter_ids().iter().copied().collect();
         let descriptors = catalog_adapter_descriptors();
@@ -1446,6 +1817,11 @@ mod tests {
             harnesses: vec![harness],
             lsp_servers: vec![lsp],
             stdio_mcp: vec![mcp],
+            sandbox_enabled: None,
+            sandbox_mode: crate::config::sandbox_mode::SandboxMode::default(),
+            computer_use_mode: None,
+            selected_features: BTreeSet::new(),
+            container_engine_mode: None,
         };
         // Isolate global store between tests that share the process registry.
         global_health_store().clear();
@@ -1619,7 +1995,12 @@ mod tests {
         for desc in &descriptors {
             let policy = desc.probe_policy.as_trusted_catalog().unwrap();
             // Only version probes (no functional side-effect probes today).
-            assert_eq!(policy.version_argv(), &["--version".to_string()]);
+            let expected = if matches!(desc.id.as_str(), ID_MEDIA_FFMPEG | ID_MEDIA_FFPROBE) {
+                "-version"
+            } else {
+                "--version"
+            };
+            assert_eq!(policy.version_argv(), &[expected.to_string()]);
             assert!(policy.functional_argv().is_none());
             discovery_probe_argv_is_safe(policy.version_argv()).unwrap();
         }
@@ -1647,5 +2028,150 @@ mod tests {
         // Forbidden argv detection works.
         assert!(discovery_probe_argv_is_safe(&["auth".into(), "login".into()]).is_err());
         assert!(discovery_probe_argv_is_safe(&["--version".into()]).is_ok());
+    }
+
+    #[test]
+    fn invocation_roster_retains_configured_rows_for_deadline_projection() {
+        let input = IntegrationHealthComposeInput {
+            harnesses: vec![ConfiguredCommandInput::new("private", "private-harness")],
+            lsp_servers: vec![ConfiguredCommandInput::new(
+                "private-lsp",
+                "language-server",
+            )],
+            stdio_mcp: vec![ConfiguredCommandInput::new("private-mcp", "mcp-server")],
+            sandbox_enabled: Some(false),
+            sandbox_mode: crate::config::sandbox_mode::SandboxMode::default(),
+            computer_use_mode: None,
+            selected_features: BTreeSet::new(),
+            container_engine_mode: None,
+        };
+        let descriptors = invocation_descriptor_roster(Path::new("/"), &input).unwrap();
+        for id in [
+            "harness.custom.private",
+            "lsp.private-lsp",
+            "mcp.stdio.private-mcp",
+        ] {
+            let descriptor = descriptors
+                .iter()
+                .find(|descriptor| descriptor.id.as_str() == id)
+                .unwrap_or_else(|| panic!("missing invocation-private descriptor {id}"));
+            let mut snapshot = ExternalRuntimeSnapshot::empty(7, HostPlatform::GenericLinux);
+            snapshot.entries.insert(
+                id.to_owned(),
+                HealthEntry {
+                    id: descriptor.id.clone(),
+                    state: HealthState::Pending,
+                    importance: descriptor.importance,
+                    target: descriptor.target,
+                    remedy: Some(descriptor.remedy.clone()),
+                    platform: HostPlatform::GenericLinux,
+                },
+            );
+            let frozen = super::super::projection::freeze_pending_as_timed_out(&snapshot);
+            let projection = super::super::projection::project_dependencies(
+                Some(&frozen),
+                std::slice::from_ref(descriptor),
+            );
+            assert_eq!(projection.rows[0].id, id);
+            assert_eq!(
+                projection.rows[0].state,
+                super::super::projection::DependencyViewState::TimedOut
+            );
+            assert_eq!(projection.rows[0].target, descriptor.target);
+            assert!(projection.rows[0].remedy.is_some());
+        }
+    }
+
+    #[test]
+    fn invocation_roster_contains_selected_engines_before_engine_probe_stage() {
+        let guard = cockpit_test_support::TestEnvGuard::blocking_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        // An explicit config under `.cockpit/` is intentionally trust-gated.
+        // This unit test is about diagnostics mode freezing, not workspace
+        // trust, so use the production-supported non-project override path.
+        let config_path = tmp.path().join("runtime-config.json");
+        std::fs::write(
+            &config_path,
+            r#"{"sandbox":{"defaultMode":"container_readonly"}}"#,
+        )
+        .unwrap();
+        guard.set_var(crate::config::dirs::COCKPIT_CONFIG_ENV, &config_path);
+        let previous = super::super::safety_adapters::current_container_engine_mode();
+        super::super::safety_adapters::set_container_engine_mode(
+            super::super::safety_adapters::ContainerEngineMode::Auto,
+        );
+        let mut input = IntegrationHealthComposeInput {
+            sandbox_enabled: Some(true),
+            sandbox_mode: crate::config::sandbox_mode::SandboxMode::ContainerReadonly,
+            ..Default::default()
+        };
+        let descriptors = invocation_descriptor_roster(tmp.path(), &input).unwrap();
+        input.container_engine_mode =
+            Some(super::super::safety_adapters::ContainerEngineMode::Auto);
+        std::fs::write(&config_path, r#"{"sandbox":{"defaultMode":"off"}}"#).unwrap();
+        assert_eq!(
+            resolved_container_engine_mode(&input),
+            super::super::safety_adapters::ContainerEngineMode::Auto,
+            "the worker must honor the invocation freeze after config changes"
+        );
+        super::super::safety_adapters::set_container_engine_mode(previous);
+        drop(guard);
+
+        let engines: Vec<_> = descriptors
+            .iter()
+            .filter(|descriptor| {
+                [
+                    super::super::safety_adapters::ID_DOCKER,
+                    super::super::safety_adapters::ID_PODMAN,
+                ]
+                .contains(&descriptor.id.as_str())
+            })
+            .collect();
+        assert_eq!(engines.len(), 2);
+        // Simulate a deadline before the engine stage has emitted progress:
+        // the invocation roster must still materialize both selected rows.
+        let mut pre_engine = ExternalRuntimeSnapshot::empty(9, HostPlatform::GenericLinux);
+        for descriptor in engines {
+            pre_engine.entries.insert(
+                descriptor.id.as_str().to_owned(),
+                HealthEntry {
+                    id: descriptor.id.clone(),
+                    state: HealthState::Pending,
+                    importance: descriptor.importance,
+                    target: descriptor.target,
+                    remedy: Some(descriptor.remedy.clone()),
+                    platform: HostPlatform::GenericLinux,
+                },
+            );
+        }
+        let frozen = super::super::projection::freeze_pending_as_timed_out(&pre_engine);
+        let projection =
+            super::super::projection::project_dependencies(Some(&frozen), &descriptors);
+        for id in [
+            super::super::safety_adapters::ID_DOCKER,
+            super::super::safety_adapters::ID_PODMAN,
+        ] {
+            let row = projection.rows.iter().find(|row| row.id == id).unwrap();
+            assert_eq!(
+                row.state,
+                super::super::projection::DependencyViewState::TimedOut
+            );
+        }
+
+        let disabled = invocation_descriptor_roster(
+            tmp.path(),
+            &IntegrationHealthComposeInput {
+                sandbox_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!disabled.iter().any(|descriptor| {
+            [
+                super::super::safety_adapters::ID_DOCKER,
+                super::super::safety_adapters::ID_PODMAN,
+            ]
+            .contains(&descriptor.id.as_str())
+        }));
     }
 }

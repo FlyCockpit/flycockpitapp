@@ -410,6 +410,34 @@ impl Model {
         .await
     }
 
+    /// Compact-utility dispatch: one transport attempt, no probe/backoff or
+    /// endpoint swap, and TTFT/idle deadlines are terminal even without a
+    /// configured backup. The compaction sampler exclusively owns retries.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn complete_captured_compact_utility(
+        &self,
+        system: &str,
+        history: &[Message],
+        prompt: Message,
+        tools: &[ToolDefinition],
+        params: ModelParams,
+        agent_name: &str,
+        cancel: &CancellationToken,
+    ) -> Result<(
+        (
+            Option<String>,
+            OneOrMany<AssistantContent>,
+            Option<TokenUsage>,
+        ),
+        serde_json::Value,
+        InferenceTiming,
+    )> {
+        self.complete_captured_with_pre_drain_mode(
+            system, history, prompt, tools, params, agent_name, None, cancel, None, None, true,
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn complete_captured_with_pre_drain(
         &self,
@@ -423,6 +451,45 @@ impl Model {
         cancel: &CancellationToken,
         endpoint_recovery: Option<EndpointRecoveryContext>,
         pre_drain: Option<PreDrainFuture>,
+    ) -> Result<(
+        (
+            Option<String>,
+            OneOrMany<AssistantContent>,
+            Option<TokenUsage>,
+        ),
+        serde_json::Value,
+        InferenceTiming,
+    )> {
+        self.complete_captured_with_pre_drain_mode(
+            system,
+            history,
+            prompt,
+            tools,
+            params,
+            agent_name,
+            event_tx,
+            cancel,
+            endpoint_recovery,
+            pre_drain,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_captured_with_pre_drain_mode(
+        &self,
+        system: &str,
+        history: &[Message],
+        prompt: Message,
+        tools: &[ToolDefinition],
+        params: ModelParams,
+        agent_name: &str,
+        event_tx: Option<&mpsc::Sender<TurnEvent>>,
+        cancel: &CancellationToken,
+        endpoint_recovery: Option<EndpointRecoveryContext>,
+        pre_drain: Option<PreDrainFuture>,
+        compact_utility: bool,
     ) -> Result<(
         (
             Option<String>,
@@ -450,6 +517,7 @@ impl Model {
             cancel,
             endpoint_recovery,
             pre_drain,
+            compact_utility,
         )
         .await
     }
@@ -480,6 +548,7 @@ impl Model {
         cancel: &CancellationToken,
         endpoint_recovery: Option<EndpointRecoveryContext>,
         pre_drain: Option<PreDrainFuture>,
+        compact_utility: bool,
     ) -> Result<(
         (
             Option<String>,
@@ -495,6 +564,7 @@ impl Model {
             history,
             prompt,
             mut captured,
+            single_handoff,
         } = prepared;
         let system = system.as_str();
 
@@ -508,7 +578,9 @@ impl Model {
         // fired (e.g. the user pressed ctrl+c between turns). Cheap and
         // keeps the cancel path from racing a fresh round-trip.
         if cancel.is_cancelled() {
-            return Err(anyhow::Error::new(InferenceCancelled));
+            return Err(anyhow::Error::new(InferenceCancelled {
+                phase: InferencePhase::Prep,
+            }));
         }
 
         // Inference-dispatch chokepoint (`daemon-graceful-drain-shutdown.md`):
@@ -545,7 +617,7 @@ impl Model {
         };
 
         let timeout = self.timeout().clone();
-        let hard_timeout_on_stall = self.hard_timeout_on_stall();
+        let hard_timeout_on_stall = compact_utility || self.hard_timeout_on_stall();
         // Furthest lifecycle phase reached across (possibly several) retry
         // attempts; seeded at `Prep` (we got past assembly). A typed failure
         // reports the furthest phase, so e.g. a network blip that reached
@@ -683,7 +755,18 @@ impl Model {
                             }
                         }
                     };
-                    let result = if tried_swap {
+                    let result = if single_handoff || compact_utility {
+                        retry::with_retry_max(
+                            agent_name,
+                            &reconnect_target,
+                            event_tx,
+                            cancel,
+                            probe.as_ref(),
+                            1,
+                            attempt,
+                        )
+                        .await
+                    } else if tried_swap {
                         retry::with_retry_max(
                             agent_name,
                             &reconnect_target,
@@ -753,7 +836,9 @@ impl Model {
                             let alternate_not_incompatible =
                                 endpoint_observation(provider_id, model_id, &base_url, alternate)
                                     != EndpointObservation::Incompatible;
-                            if !tried_swap
+                            if !single_handoff
+                                && !compact_utility
+                                && !tried_swap
                                 && no_output
                                 && is_endpoint_mismatch_error(&err)
                                 && !self.is_live_wire_api_explicit()
@@ -769,7 +854,9 @@ impl Model {
                                 endpoint = confirmed;
                                 continue;
                             }
-                            let approved = if !tried_swap
+                            let approved = if !single_handoff
+                                && !compact_utility
+                                && !tried_swap
                                 && no_output
                                 && is_endpoint_mismatch_error(&err)
                                 && !self.is_live_wire_api_explicit()
@@ -856,15 +943,28 @@ impl Model {
                     )
                     .await
                 };
-                retry::with_retry(
-                    agent_name,
-                    &reconnect_target,
-                    event_tx,
-                    cancel,
-                    probe.as_ref(),
-                    attempt,
-                )
-                .await
+                if single_handoff || compact_utility {
+                    retry::with_retry_max(
+                        agent_name,
+                        &reconnect_target,
+                        event_tx,
+                        cancel,
+                        probe.as_ref(),
+                        1,
+                        attempt,
+                    )
+                    .await
+                } else {
+                    retry::with_retry(
+                        agent_name,
+                        &reconnect_target,
+                        event_tx,
+                        cancel,
+                        probe.as_ref(),
+                        attempt,
+                    )
+                    .await
+                }
             }
             Model::Anthropic {
                 model,
@@ -902,15 +1002,28 @@ impl Model {
                     )
                     .await
                 };
-                retry::with_retry(
-                    agent_name,
-                    &reconnect_target,
-                    event_tx,
-                    cancel,
-                    probe.as_ref(),
-                    attempt,
-                )
-                .await
+                if single_handoff || compact_utility {
+                    retry::with_retry_max(
+                        agent_name,
+                        &reconnect_target,
+                        event_tx,
+                        cancel,
+                        probe.as_ref(),
+                        1,
+                        attempt,
+                    )
+                    .await
+                } else {
+                    retry::with_retry(
+                        agent_name,
+                        &reconnect_target,
+                        event_tx,
+                        cancel,
+                        probe.as_ref(),
+                        attempt,
+                    )
+                    .await
+                }
             }
         };
 
@@ -941,7 +1054,11 @@ impl Model {
                 // than logging a real failure — keep the dedicated
                 // sentinels the driver already special-cases.
                 if cancel.is_cancelled() || is_attempt_cancelled(&err) {
-                    return Err(anyhow::Error::new(InferenceCancelled));
+                    return Err(anyhow::Error::new(InferenceCancelled {
+                        phase: InferencePhase::from_rank(
+                            phase.load(std::sync::atomic::Ordering::SeqCst),
+                        ),
+                    }));
                 }
                 // Every other terminal failure (timeout / network /
                 // non-retryable HTTP) is mapped into the well-typed
@@ -1140,6 +1257,7 @@ impl Model {
             history,
             prompt,
             captured,
+            single_handoff: false,
         })
     }
 
@@ -1663,12 +1781,18 @@ where
     // during the initial round-trip aborts promptly. The request is now on
     // the wire: record `Dispatched` so a stall before the first token is
     // attributed to the dispatched (not prep) phase.
+    // Polling `request.stream()` can put bytes on the wire before it resolves,
+    // including when it resolves with an error. Advance first so every error
+    // or cancellation from that poll is conservatively post-handoff.
+    if cancel.is_cancelled() {
+        return Err(attempt_cancelled());
+    }
+    bump_phase(phase, InferencePhase::Dispatched);
     let mut stream = tokio::select! {
         biased;
         _ = cancel.cancelled() => return Err(attempt_cancelled()),
         built = request.stream() => built?,
     };
-    bump_phase(phase, InferencePhase::Dispatched);
     await_pre_drain_record(pre_drain).await?;
     // Drive the chunk loop with TTFT + idle timeouts. The post-loop reads
     // below pick up the aggregated `choice` / `message_id` / `response` rig

@@ -16,24 +16,28 @@
 //! Esc reverts both text and position; `d` deletes a row in browse mode.
 //! Each commit/delete persists `config.json`.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 use crate::tui::theme::MUTED_COLOR_INDEX;
 
 use super::grab;
+use super::pointer_actions::{ListAction, ListKind, ListRowId, SettingsPointerAction};
 use super::secret_display;
-use super::shell::{push_wrapped_text, selected_line_from_marker};
+use super::shell::{
+    SettingsPointerTarget, SettingsScrollRegionId, push_wrapped_text, selected_line_from_marker,
+};
 use super::ui_page::GrabState;
 use super::{Nav, RowDeleteConfirm, SettingsCx, SettingsPage, save_status};
 
 /// Which config list this editor is bound to. Each variant names its
 /// back-target category (so Esc/h lands on the page it was drilled from),
 /// its title, and a one-line intro.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum StringListKind {
     AgentDirs,
     ExtraDotenvPaths,
@@ -342,19 +346,11 @@ impl SettingsCx {
                 self.start_string_list_grab_on_new(p);
             }
             KeyCode::Char('d') | KeyCode::Delete if p.cursor < rows => {
-                let label = string_list_display_value(
-                    kind,
-                    p.cursor,
-                    &self.string_list_values(kind)[p.cursor],
-                );
-                if p.delete.arm_or_confirm(p.cursor) {
-                    self.string_list_remove(kind, p.cursor);
-                    let total = self.string_list_len(kind);
-                    p.cursor = p.cursor.min(total.saturating_sub(1));
-                    p.status = save_status(self.save_extended());
-                } else {
-                    p.status = Some(format!("press d/Delete again to delete `{label}`"));
-                }
+                p.delete.disarm();
+                self.string_list_remove(kind, p.cursor);
+                let total = self.string_list_len(kind);
+                p.cursor = p.cursor.min(total.saturating_sub(1));
+                p.status = save_status(self.save_extended());
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 p.delete.disarm();
@@ -451,8 +447,12 @@ impl SettingsCx {
             )),
             Line::default(),
         ];
+        let mut controls = vec![None; lines.len()];
+        let mut confirmation_lines = Vec::new();
         push_wrapped_text(&mut lines, area.width, p.kind.intro(), muted);
+        controls.resize(lines.len(), None);
         lines.push(Line::default());
+        controls.push(None);
 
         let values = self.string_list_values(p.kind);
         for (i, val) in values.iter().enumerate() {
@@ -464,6 +464,11 @@ impl SettingsCx {
                     p.grabbed.as_ref().unwrap().buf.cursor(),
                     p.kind.empty_hint(),
                 )));
+                // The row is already in edit/grab mode. Save and Cancel below
+                // own its terminal pointer actions; publishing another Edit
+                // identity here merely aliases Save and is especially
+                // misleading for a newly-added empty row.
+                controls.push(None);
                 continue;
             }
             let marker = if on_cursor {
@@ -480,6 +485,34 @@ impl SettingsCx {
                 Span::raw(marker),
                 Span::styled(string_list_display_value(p.kind, i, val), style),
             ]));
+            controls.push(Some((
+                SettingsPointerAction::List(ListAction::Edit(string_list_row_id(p.kind, i, val))),
+                true,
+                None,
+            )));
+            let pending = p.delete.is_pending_for(i);
+            let display = string_list_display_value(p.kind, i, val);
+            lines.push(Line::from(if pending {
+                format!("    Delete {display}? [Delete] [Cancel]")
+            } else {
+                format!("    [Delete {display}]")
+            }));
+            if pending {
+                controls.push(None);
+                confirmation_lines.push((
+                    lines.len() - 1,
+                    13 + display.as_str().width(),
+                    string_list_row_id(p.kind, i, val),
+                ));
+            } else {
+                controls.push(Some((
+                    SettingsPointerAction::List(ListAction::Delete(string_list_row_id(
+                        p.kind, i, val,
+                    ))),
+                    true,
+                    None,
+                )));
+            }
         }
 
         if p.grabbed.is_none() {
@@ -499,36 +532,198 @@ impl SettingsCx {
                 Span::raw(marker),
                 Span::styled("[+ add]".to_string(), style),
             ]));
+            controls.push(Some((
+                SettingsPointerAction::List(ListAction::Add),
+                true,
+                None,
+            )));
         }
 
         if p.grabbed.is_some() {
             lines.push(Line::default());
+            controls.push(None);
+            let can_up = p.cursor > 0;
+            let can_down = p.cursor + 1 < values.len();
+            lines.push(Line::from("[Move up]"));
+            controls.push(Some((
+                SettingsPointerAction::List(ListAction::MoveUp(string_list_row_id(
+                    p.kind,
+                    p.cursor,
+                    &values[p.cursor],
+                ))),
+                can_up,
+                (!can_up).then_some("already first"),
+            )));
+            lines.push(Line::from("[Move down]"));
+            controls.push(Some((
+                SettingsPointerAction::List(ListAction::MoveDown(string_list_row_id(
+                    p.kind,
+                    p.cursor,
+                    &values[p.cursor],
+                ))),
+                can_down,
+                (!can_down).then_some("already last"),
+            )));
+            lines.push(Line::from("[Save]"));
+            controls.push(Some((
+                SettingsPointerAction::List(ListAction::Save),
+                true,
+                None,
+            )));
+            lines.push(Line::from("[Cancel]"));
+            controls.push(Some((
+                SettingsPointerAction::List(ListAction::Cancel),
+                true,
+                None,
+            )));
             lines.push(grab::grab_hint_line(grab::GRAB_HINT));
+            controls.push(None);
         }
 
         if let Some(status) = &p.status {
             lines.push(Line::default());
+            controls.push(None);
             lines.push(Line::from(Span::styled(status.clone(), yellow)));
+            controls.push(None);
         }
 
         let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states.render_lines(
+        self.scroll_states.render_control_lines(
             frame,
             area,
             format!("string-list:{:?}", p.kind),
-            lines,
-            selected_line,
+            (lines, selected_line),
+            controls,
+            (&self.pointer_surface, SettingsScrollRegionId("string-list")).into(),
         );
+        let key = format!("string-list:{:?}", p.kind);
+        let offset = self.scroll_states.offset_for(&key);
+        for (line, delete_column, id) in confirmation_lines {
+            if let Some(row) = line
+                .checked_sub(offset)
+                .filter(|row| *row < usize::from(area.height))
+            {
+                for (column, action) in [
+                    (delete_column, ListAction::Delete(id.clone())),
+                    (delete_column + 9, ListAction::Cancel),
+                ] {
+                    self.pointer_surface.register(SettingsPointerTarget {
+                        rect: Rect::new(
+                            area.x.saturating_add(column as u16),
+                            area.y.saturating_add(row as u16),
+                            8,
+                            1,
+                        ),
+                        action: super::shell::SettingsPointerAction::Page(
+                            SettingsPointerAction::List(action),
+                        ),
+                        enabled: true,
+                        disabled_reason: None,
+                    });
+                }
+            }
+        }
     }
 }
 
 impl SettingsPage for StringListPage {
+    fn pointer_surface_kind(&self) -> super::SettingsPointerSurfaceKind {
+        super::SettingsPointerSurfaceKind::StringList
+    }
+
+    fn pointer_surface_token(&self) -> u64 {
+        500 + self.kind as u64 * 2 + u64::from(self.grabbed.is_some())
+    }
+
+    fn resolve_header_back(&self) -> super::SettingsLocalBack {
+        if self.grabbed.is_some() {
+            super::SettingsLocalBack::LocalBack
+        } else {
+            super::SettingsLocalBack::NoLocalBack
+        }
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         cx.handle_string_list_page_key(key, self)
     }
 
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         cx.render_string_list_page(frame, area, self);
+    }
+
+    fn handle_pointer_control(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: SettingsPointerAction,
+    ) -> Nav {
+        let SettingsPointerAction::List(action) = action else {
+            return Nav::Stay;
+        };
+        if self.grabbed.is_some() {
+            let key = match action {
+                ListAction::MoveUp(id) if self.current_row_id(cx).as_ref() == Some(&id) => {
+                    KeyCode::Up
+                }
+                ListAction::MoveDown(id) if self.current_row_id(cx).as_ref() == Some(&id) => {
+                    KeyCode::Down
+                }
+                ListAction::Save => KeyCode::Enter,
+                ListAction::Cancel => KeyCode::Esc,
+                _ => return Nav::Stay,
+            };
+            return cx.handle_string_list_page_key(KeyEvent::new(key, KeyModifiers::NONE), self);
+        }
+        let values = cx.string_list_values(self.kind);
+        let index =
+            match action {
+                ListAction::Add => values.len(),
+                ListAction::Edit(id) => values
+                    .iter()
+                    .enumerate()
+                    .position(|(index, value)| string_list_row_id(self.kind, index, value) == id)
+                    .unwrap_or(values.len().saturating_add(1)),
+                ListAction::Delete(id) => {
+                    let Some(index) = values.iter().enumerate().position(|(index, value)| {
+                        string_list_row_id(self.kind, index, value) == id
+                    }) else {
+                        return Nav::Stay;
+                    };
+                    self.cursor = index;
+                    if self.delete.arm_or_confirm(index) {
+                        cx.string_list_remove(self.kind, index);
+                        self.cursor = index.min(cx.string_list_len(self.kind).saturating_sub(1));
+                        self.status = save_status(cx.save_extended());
+                    } else {
+                        self.status = Some("confirm deletion or cancel".into());
+                    }
+                    return Nav::Stay;
+                }
+                ListAction::Cancel if self.delete.is_pending_for(self.cursor) => {
+                    self.delete.disarm();
+                    self.status = None;
+                    return Nav::Stay;
+                }
+                _ => return Nav::Stay,
+            };
+        if index > values.len() {
+            return Nav::Stay;
+        }
+        self.cursor = index;
+        cx.handle_string_list_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
+    }
+
+    fn handle_pointer_scroll(
+        &mut self,
+        cx: &mut SettingsCx,
+        region: SettingsScrollRegionId,
+        delta: isize,
+    ) -> Nav {
+        if region == SettingsScrollRegionId("string-list") && self.grabbed.is_none() {
+            let last = cx.string_list_values(self.kind).len();
+            self.delete.disarm();
+            self.cursor = self.cursor.saturating_add_signed(delta).min(last);
+        }
+        Nav::Stay
     }
 
     fn title(&self, cx: &SettingsCx) -> String {
@@ -556,5 +751,22 @@ impl SettingsPage for StringListPage {
     #[cfg(test)]
     fn test_name(&self) -> &'static str {
         "StringList"
+    }
+}
+
+fn string_list_row_id(kind: StringListKind, index: usize, value: &str) -> ListRowId {
+    ListRowId {
+        kind: ListKind::String(kind),
+        index,
+        value: value.into(),
+    }
+}
+
+impl StringListPage {
+    fn current_row_id(&self, cx: &SettingsCx) -> Option<ListRowId> {
+        let values = cx.string_list_values(self.kind);
+        values
+            .get(self.cursor)
+            .map(|value| string_list_row_id(self.kind, self.cursor, value))
     }
 }

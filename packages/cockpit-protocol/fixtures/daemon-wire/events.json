@@ -25,7 +25,7 @@
     },
     "event": "active_model_state",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "agent_idle": {
     "data": {
@@ -38,7 +38,7 @@
     },
     "event": "agent_idle",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "approval_mode_state": {
     "data": {
@@ -47,7 +47,7 @@
     },
     "event": "approval_mode_state",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "assistant_text": {
     "data": {
@@ -59,7 +59,7 @@
     },
     "event": "assistant_text",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "assistant_text_delta": {
     "data": {
@@ -69,7 +69,7 @@
     },
     "event": "assistant_text_delta",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "backup_used": {
     "data": {
@@ -81,7 +81,7 @@
     },
     "event": "backup_used",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "caffeinate_state": {
     "data": {
@@ -91,7 +91,7 @@
     },
     "event": "caffeinate_state",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "command_capability_unavailable": {
     "data": {
@@ -101,7 +101,7 @@
     },
     "event": "command_capability_unavailable",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "compact_ready": {
     "data": {
@@ -121,7 +121,7 @@
     },
     "event": "compact_ready",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "config_snapshot": {
     "data": {
@@ -190,6 +190,54 @@
             "max_cached_clients": 16
           },
           "maxPrimaryRounds": 0,
+          "mediaResources": {
+            "limits": {
+              "aggregate_decoded_pixels_per_request": 80000000,
+              "decoded_edge_pixels": 8192,
+              "decoded_image_pixels": 40000000,
+              "duration_seconds_per_object": 7200,
+              "encoded_bytes_per_object": 268435456,
+              "generated_outputs_per_request": 4,
+              "generation_targets_per_request": 4,
+              "local_cpu_jobs_global": 2,
+              "operation_deadline_seconds": 120,
+              "outbound_submissions_global": 4,
+              "queued_operations_global": 32,
+              "queued_operations_per_session": 8,
+              "redirects_per_request": 5,
+              "reference_images_per_request": 4,
+              "response_header_bytes_per_request": 65536,
+              "retained_bytes_per_session": 2147483648,
+              "sidecar_invocations_per_session": 16,
+              "transcription_invocations_per_session": 8
+            },
+            "profiles": {
+              "paste_image": {
+                "aggregate_encoded_bytes_per_request": 8388608,
+                "limits": {
+                  "aggregate_decoded_pixels_per_request": null,
+                  "decoded_edge_pixels": 8192,
+                  "decoded_image_pixels": null,
+                  "duration_seconds_per_object": null,
+                  "encoded_bytes_per_object": 4194304,
+                  "generated_outputs_per_request": null,
+                  "generation_targets_per_request": null,
+                  "local_cpu_jobs_global": null,
+                  "operation_deadline_seconds": null,
+                  "outbound_submissions_global": null,
+                  "queued_operations_global": null,
+                  "queued_operations_per_session": null,
+                  "redirects_per_request": null,
+                  "reference_images_per_request": 4,
+                  "response_header_bytes_per_request": null,
+                  "retained_bytes_per_session": null,
+                  "sidecar_invocations_per_session": null,
+                  "transcription_invocations_per_session": null
+                }
+              }
+            },
+            "version": 1
+          },
           "predictNextMessage": "short",
           "preflight": {
             "enabled": false
@@ -227,6 +275,7 @@
               }
             }
           },
+          "response_metrics_tokenizer": "cl100k_base",
           "retention": {
             "payload_window_days": 30,
             "session_window_days": 0,
@@ -346,7 +395,7 @@
     },
     "event": "config_snapshot",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "connector_status": {
     "data": {
@@ -359,7 +408,7 @@
     },
     "event": "connector_status",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "context_projection": {
     "data": {
@@ -369,7 +418,7 @@
     },
     "event": "context_projection",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "daemon_draining": {
     "data": {
@@ -377,7 +426,7 @@
     },
     "event": "daemon_draining",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "default_model_update_result": {
     "data": {
@@ -396,7 +445,7 @@
     },
     "event": "default_model_update_result",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "delegation_recursion_state": {
     "data": {
@@ -406,7 +455,7 @@
     },
     "event": "delegation_recursion_state",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "env_drift_warning": {
     "data": {
@@ -436,7 +485,7 @@
     },
     "event": "env_drift_warning",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "event_stream_lagged": {
     "data": {
@@ -445,7 +494,7 @@
     },
     "event": "event_stream_lagged",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "foreground_input_target": {
     "data": {
@@ -459,7 +508,7 @@
     },
     "event": "foreground_input_target",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "gitignore_allow": {
     "data": {
@@ -468,17 +517,17 @@
     },
     "event": "gitignore_allow",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
-  "goal_verification_progress": {
+  "goal_supervision_progress": {
     "data": {
       "done": 1,
       "session_id": "11111111-1111-4111-8111-111111111111",
       "total": 3
     },
-    "event": "goal_verification_progress",
+    "event": "goal_supervision_progress",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "history_replay": {
     "data": {
@@ -505,7 +554,7 @@
     },
     "event": "history_replay",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "inference_failed": {
     "data": {
@@ -522,7 +571,7 @@
     },
     "event": "inference_failed",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "inference_succeeded": {
     "data": {
@@ -532,7 +581,7 @@
     },
     "event": "inference_succeeded",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "inference_warning": {
     "data": {
@@ -545,7 +594,7 @@
     },
     "event": "inference_warning",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "interrupt_queue_changed": {
     "data": {
@@ -555,7 +604,7 @@
     },
     "event": "interrupt_queue_changed",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "interrupt_raised": {
     "data": {
@@ -661,7 +710,7 @@
     },
     "event": "interrupt_raised",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "interrupt_resolved": {
     "data": {
@@ -681,7 +730,7 @@
     },
     "event": "interrupt_resolved",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "llm_mode_changed": {
     "data": {
@@ -690,7 +739,7 @@
     },
     "event": "llm_mode_changed",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "longcache_state": {
     "data": {
@@ -700,7 +749,7 @@
     },
     "event": "longcache_state",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "lsp_notice": {
     "data": {
@@ -708,7 +757,7 @@
     },
     "event": "lsp_notice",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "model_selection_result": {
     "data": {
@@ -762,7 +811,7 @@
     },
     "event": "model_selection_result",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "nested_turn": {
     "data": {
@@ -780,7 +829,7 @@
     },
     "event": "nested_turn",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "notice": {
     "data": {
@@ -789,7 +838,7 @@
     },
     "event": "notice",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "osc52_protocol_violation": {
     "data": {
@@ -798,7 +847,7 @@
     },
     "event": "osc52_protocol_violation",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "paused_work_available": {
     "data": {
@@ -818,7 +867,7 @@
     },
     "event": "paused_work_available",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "preflight_started": {
     "data": {
@@ -827,7 +876,7 @@
     },
     "event": "preflight_started",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "preflight_state": {
     "data": {
@@ -836,7 +885,7 @@
     },
     "event": "preflight_state",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "primary_swapped": {
     "data": {
@@ -845,7 +894,7 @@
     },
     "event": "primary_swapped",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "pruned": {
     "data": {
@@ -859,7 +908,7 @@
     },
     "event": "pruned",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "queue_updated": {
     "data": {
@@ -881,7 +930,7 @@
     },
     "event": "queue_updated",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "queued_user_messages_folded": {
     "data": {
@@ -908,7 +957,7 @@
     },
     "event": "queued_user_messages_folded",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "reasoning_delta": {
     "data": {
@@ -918,7 +967,7 @@
     },
     "event": "reasoning_delta",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "reconnecting": {
     "data": {
@@ -931,7 +980,7 @@
     },
     "event": "reconnecting",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "redaction_state": {
     "data": {
@@ -942,7 +991,7 @@
     },
     "event": "redaction_state",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "resource_clear": {
     "data": {
@@ -958,7 +1007,7 @@
     },
     "event": "resource_clear",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "resource_start": {
     "data": {
@@ -975,7 +1024,7 @@
     },
     "event": "resource_start",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "resource_wait": {
     "data": {
@@ -992,7 +1041,7 @@
     },
     "event": "resource_wait",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "sandbox_escalation_state": {
     "data": {
@@ -1001,7 +1050,7 @@
     },
     "event": "sandbox_escalation_state",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "sandbox_state": {
     "data": {
@@ -1018,7 +1067,7 @@
     },
     "event": "sandbox_state",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "sandbox_unavailable": {
     "data": {
@@ -1028,7 +1077,7 @@
     },
     "event": "sandbox_unavailable",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "schedule_completed": {
     "data": {
@@ -1040,7 +1089,7 @@
     },
     "event": "schedule_completed",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "schedule_note": {
     "data": {
@@ -1050,7 +1099,7 @@
     },
     "event": "schedule_note",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "schedule_progress": {
     "data": {
@@ -1059,7 +1108,7 @@
     },
     "event": "schedule_progress",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "schedule_started": {
     "data": {
@@ -1070,7 +1119,7 @@
     },
     "event": "schedule_started",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "session_driver_failed": {
     "data": {
@@ -1079,7 +1128,7 @@
     },
     "event": "session_driver_failed",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "session_ended": {
     "data": {
@@ -1088,7 +1137,7 @@
     },
     "event": "session_ended",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "session_persist_failed": {
     "data": {
@@ -1098,7 +1147,7 @@
     },
     "event": "session_persist_failed",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "skill_auto_injected": {
     "data": {
@@ -1108,7 +1157,7 @@
     },
     "event": "skill_auto_injected",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "subagent_report": {
     "data": {
@@ -1125,7 +1174,7 @@
     },
     "event": "subagent_report",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "subagent_routing": {
     "data": {
@@ -1142,7 +1191,7 @@
     },
     "event": "subagent_routing",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "subagent_spawned": {
     "data": {
@@ -1161,7 +1210,7 @@
     },
     "event": "subagent_spawned",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "tandem_state": {
     "data": {
@@ -1171,7 +1220,7 @@
     },
     "event": "tandem_state",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "terminal_clipboard": {
     "data": {
@@ -1180,7 +1229,7 @@
     },
     "event": "terminal_clipboard",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "terminal_closed": {
     "data": {
@@ -1190,7 +1239,7 @@
     },
     "event": "terminal_closed",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "terminal_output": {
     "data": {
@@ -1199,7 +1248,7 @@
     },
     "event": "terminal_output",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "terminal_viewers": {
     "data": {
@@ -1208,7 +1257,7 @@
     },
     "event": "terminal_viewers",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "thinking_started": {
     "data": {
@@ -1218,7 +1267,7 @@
     },
     "event": "thinking_started",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "tool_end": {
     "data": {
@@ -1233,7 +1282,7 @@
     },
     "event": "tool_end",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "tool_error": {
     "data": {
@@ -1247,7 +1296,7 @@
     },
     "event": "tool_error",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "tool_progress": {
     "data": {
@@ -1259,7 +1308,7 @@
     },
     "event": "tool_progress",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "tool_start": {
     "data": {
@@ -1273,7 +1322,7 @@
     },
     "event": "tool_start",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "usage": {
     "data": {
@@ -1286,7 +1335,7 @@
     },
     "event": "usage",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "user_message_recorded": {
     "data": {
@@ -1297,7 +1346,7 @@
     },
     "event": "user_message_recorded",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "user_message_retracted": {
     "data": {
@@ -1306,7 +1355,7 @@
     },
     "event": "user_message_retracted",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "user_messages_terminated": {
     "data": {
@@ -1316,7 +1365,7 @@
     },
     "event": "user_messages_terminated",
     "kind": "evt",
-    "v": 6
+    "v": 9
   },
   "waiting_for_lock": {
     "data": {
@@ -1327,6 +1376,6 @@
     },
     "event": "waiting_for_lock",
     "kind": "evt",
-    "v": 6
+    "v": 9
   }
 }

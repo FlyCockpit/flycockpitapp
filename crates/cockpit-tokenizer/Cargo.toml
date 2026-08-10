@@ -1,0 +1,17 @@
+[package]
+name = "cockpit-tokenizer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+tiktoken-rs = "0.12"
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

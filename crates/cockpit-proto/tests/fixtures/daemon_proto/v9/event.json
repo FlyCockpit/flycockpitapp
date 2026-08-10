@@ -209,6 +209,7 @@
               }
             }
           },
+          "response_metrics_tokenizer": "cl100k_base",
           "retention": {
             "payload_window_days": 30,
             "session_window_days": 0,
@@ -265,6 +266,54 @@
             "thinking": "condensed",
             "use_emojis": false,
             "vim_mode": "hint"
+          },
+          "mediaResources": {
+            "version": 1,
+            "limits": {
+              "aggregate_decoded_pixels_per_request": 80000000,
+              "decoded_edge_pixels": 8192,
+              "decoded_image_pixels": 40000000,
+              "duration_seconds_per_object": 7200,
+              "encoded_bytes_per_object": 268435456,
+              "generated_outputs_per_request": 4,
+              "generation_targets_per_request": 4,
+              "local_cpu_jobs_global": 2,
+              "operation_deadline_seconds": 120,
+              "outbound_submissions_global": 4,
+              "queued_operations_global": 32,
+              "queued_operations_per_session": 8,
+              "redirects_per_request": 5,
+              "reference_images_per_request": 4,
+              "response_header_bytes_per_request": 65536,
+              "retained_bytes_per_session": 2147483648,
+              "sidecar_invocations_per_session": 16,
+              "transcription_invocations_per_session": 8
+            },
+            "profiles": {
+              "paste_image": {
+                "aggregate_encoded_bytes_per_request": 8388608,
+                "limits": {
+                  "aggregate_decoded_pixels_per_request": null,
+                  "decoded_edge_pixels": 8192,
+                  "decoded_image_pixels": null,
+                  "duration_seconds_per_object": null,
+                  "encoded_bytes_per_object": 4194304,
+                  "generated_outputs_per_request": null,
+                  "generation_targets_per_request": null,
+                  "local_cpu_jobs_global": null,
+                  "operation_deadline_seconds": null,
+                  "outbound_submissions_global": null,
+                  "queued_operations_global": null,
+                  "queued_operations_per_session": null,
+                  "redirects_per_request": null,
+                  "reference_images_per_request": 4,
+                  "response_header_bytes_per_request": null,
+                  "retained_bytes_per_session": null,
+                  "sidecar_invocations_per_session": null,
+                  "transcription_invocations_per_session": null
+                }
+              }
+            }
           }
         },
         "generation": 4,
@@ -432,13 +481,13 @@
     },
     "event": "gitignore_allow"
   },
-  "goal_verification_progress": {
+  "goal_supervision_progress": {
     "data": {
       "done": 1,
       "session_id": "11111111-1111-4111-8111-111111111111",
       "total": 3
     },
-    "event": "goal_verification_progress"
+    "event": "goal_supervision_progress"
   },
   "history_replay": {
     "data": {

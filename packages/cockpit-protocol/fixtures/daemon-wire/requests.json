@@ -7,7 +7,7 @@
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "request": "archive_session",
-    "v": 6
+    "v": 9
   },
   "attach": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -48,7 +48,7 @@
       "since_seq": 7
     },
     "request": "attach",
-    "v": 6
+    "v": 9
   },
   "cancel_paused_work": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -57,7 +57,7 @@
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "request": "cancel_paused_work",
-    "v": 6
+    "v": 9
   },
   "cancel_run_invocation": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -66,7 +66,7 @@
       "client_submission_id": "11111111-1111-4111-8111-111111111111"
     },
     "request": "cancel_run_invocation",
-    "v": 6
+    "v": 9
   },
   "delete_session": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -75,7 +75,7 @@
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "request": "delete_session",
-    "v": 6
+    "v": 9
   },
   "fork_session": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -86,7 +86,7 @@
       "parent_session_id": "11111111-1111-4111-8111-111111111111"
     },
     "request": "fork_session",
-    "v": 6
+    "v": 9
   },
   "fs_create_dir": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -96,7 +96,7 @@
       "project_root": "project_root-fixture"
     },
     "request": "fs_create_dir",
-    "v": 6
+    "v": 9
   },
   "fs_delete": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -106,7 +106,7 @@
       "project_root": "project_root-fixture"
     },
     "request": "fs_delete",
-    "v": 6
+    "v": 9
   },
   "fs_list": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -117,7 +117,7 @@
       "show_hidden": true
     },
     "request": "fs_list",
-    "v": 6
+    "v": 9
   },
   "fs_read": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -128,7 +128,7 @@
       "project_root": "project_root-fixture"
     },
     "request": "fs_read",
-    "v": 6
+    "v": 9
   },
   "fs_rename": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -139,7 +139,7 @@
       "to_path": "to_path-fixture"
     },
     "request": "fs_rename",
-    "v": 6
+    "v": 9
   },
   "fs_stat": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -149,7 +149,7 @@
       "project_root": "project_root-fixture"
     },
     "request": "fs_stat",
-    "v": 6
+    "v": 9
   },
   "fs_write": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -161,7 +161,16 @@
       "project_root": "project_root-fixture"
     },
     "request": "fs_write",
-    "v": 6
+    "v": 9
+  },
+  "get_app_flag": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "req",
+    "params": {
+      "key": "daemon_autostart_notice"
+    },
+    "request": "get_app_flag",
+    "v": 9
   },
   "get_inventory_bundle": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -172,7 +181,7 @@
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "request": "get_inventory_bundle",
-    "v": 6
+    "v": 9
   },
   "get_run_invocation_status": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -181,7 +190,16 @@
       "client_submission_id": "11111111-1111-4111-8111-111111111111"
     },
     "request": "get_run_invocation_status",
-    "v": 6
+    "v": 9
+  },
+  "get_startup_disclosures": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "req",
+    "params": {
+      "project_root": "/tmp/project"
+    },
+    "request": "get_startup_disclosures",
+    "v": 9
   },
   "git_diff_file": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -191,7 +209,7 @@
       "project_root": "project_root-fixture"
     },
     "request": "git_diff_file",
-    "v": 6
+    "v": 9
   },
   "git_status": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -200,7 +218,7 @@
       "project_root": "project_root-fixture"
     },
     "request": "git_status",
-    "v": 6
+    "v": 9
   },
   "import_session_archive": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -215,7 +233,7 @@
       }
     },
     "request": "import_session_archive",
-    "v": 6
+    "v": 9
   },
   "list_sessions": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -225,7 +243,17 @@
       "project_id": "project_id-fixture"
     },
     "request": "list_sessions",
-    "v": 6
+    "v": 9
+  },
+  "mark_app_flag_seen": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "req",
+    "params": {
+      "expected_version": 7,
+      "key": "daemon_autostart_notice"
+    },
+    "request": "mark_app_flag_seen",
+    "v": 9
   },
   "read_bulk_transfer_chunk": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -235,7 +263,7 @@
       "transfer_id": "AQIDBAUGBwgJCgsMDQ4PEA"
     },
     "request": "read_bulk_transfer_chunk",
-    "v": 6
+    "v": 9
   },
   "read_history_page": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -246,7 +274,7 @@
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "request": "read_history_page",
-    "v": 6
+    "v": 9
   },
   "read_session_messages": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -257,7 +285,7 @@
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "request": "read_session_messages",
-    "v": 6
+    "v": 9
   },
   "read_subagent_history_page": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -270,7 +298,7 @@
       "task_call_id": "task_call_id-fixture"
     },
     "request": "read_subagent_history_page",
-    "v": 6
+    "v": 9
   },
   "rename_session": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -280,7 +308,18 @@
       "title": "title-fixture"
     },
     "request": "rename_session",
-    "v": 6
+    "v": 9
+  },
+  "resolve_assistant_session": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "req",
+    "params": {
+      "assistant_id": "helper-bot",
+      "mode": "most_recent_or_create",
+      "project_root": "/tmp/project"
+    },
+    "request": "resolve_assistant_session",
+    "v": 9
   },
   "resolve_interrupt": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -308,13 +347,13 @@
       }
     },
     "request": "resolve_interrupt",
-    "v": 6
+    "v": 9
   },
   "restart_if_idle": {
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "req",
     "request": "restart_if_idle",
-    "v": 6
+    "v": 9
   },
   "resume_paused_work": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -323,7 +362,7 @@
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "request": "resume_paused_work",
-    "v": 6
+    "v": 9
   },
   "send_user_message": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -352,7 +391,7 @@
       "text": "text-fixture"
     },
     "request": "send_user_message",
-    "v": 6
+    "v": 9
   },
   "session_live_status": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -361,7 +400,7 @@
       "session_ids": ["11111111-1111-4111-8111-111111111111"]
     },
     "request": "session_live_status",
-    "v": 6
+    "v": 9
   },
   "set_active_model": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -377,7 +416,7 @@
       "trigger": "daemon"
     },
     "request": "set_active_model",
-    "v": 6
+    "v": 9
   },
   "set_agent": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -386,7 +425,7 @@
       "name": "name-fixture"
     },
     "request": "set_agent",
-    "v": 6
+    "v": 9
   },
   "set_default_model": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -401,7 +440,7 @@
       "thinking_mode": "high"
     },
     "request": "set_default_model",
-    "v": 6
+    "v": 9
   },
   "set_model_favorite": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -412,7 +451,18 @@
       "provider": "openai"
     },
     "request": "set_model_favorite",
-    "v": 6
+    "v": 9
+  },
+  "set_workspace_trust": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "kind": "req",
+    "params": {
+      "expected_config_generation": 7,
+      "mode": "trust",
+      "project_root": "/tmp/project"
+    },
+    "request": "set_workspace_trust",
+    "v": 9
   },
   "share_session": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -422,7 +472,7 @@
       "shared": true
     },
     "request": "share_session",
-    "v": 6
+    "v": 9
   },
   "stats_rollup": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -433,7 +483,7 @@
       "range": "all_time"
     },
     "request": "stats_rollup",
-    "v": 6
+    "v": 9
   },
   "unarchive_session": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -442,7 +492,7 @@
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "request": "unarchive_session",
-    "v": 6
+    "v": 9
   },
   "write_bulk_transfer_chunk": {
     "id": "11111111-1111-4111-8111-111111111111",
@@ -458,6 +508,6 @@
       }
     },
     "request": "write_bulk_transfer_chunk",
-    "v": 6
+    "v": 9
   }
 }

@@ -14,7 +14,7 @@
 //!     cycled enums (prompt input mode, argv overflow, JSON-output +
 //!     agent-file toggles).
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -28,8 +28,8 @@ use cockpit_config::extended::{
 
 use super::reset::{ResetButton, ResetOutcome};
 use super::shell::{
-    focused_field_style, marker, muted_style, push_text_field_at_cursor, selected_line_from_marker,
-    selected_style, warning_style,
+    SettingsScrollRegionId, focused_field_style, marker, muted_style, push_text_field_at_cursor,
+    selected_line_from_marker, selected_style, warning_style,
 };
 use super::{Nav, SettingsCx, SettingsPage, save_status};
 
@@ -107,6 +107,29 @@ const FIELDS: [Field; 17] = [
 ];
 
 impl Field {
+    fn pointer_id(self) -> super::pointer_actions::HarnessField {
+        use super::pointer_actions::HarnessField as P;
+        match self {
+            Self::Command => P::Command,
+            Self::Args => P::Args,
+            Self::PromptInput => P::PromptInput,
+            Self::ArgvOverflow => P::ArgvOverflow,
+            Self::ModelArgs => P::ModelArgs,
+            Self::DefaultModel => P::DefaultModel,
+            Self::Models => P::Models,
+            Self::ModelListArgs => P::ModelListArgs,
+            Self::SupportsJson => P::SupportsJson,
+            Self::JsonOutputArgs => P::JsonOutputArgs,
+            Self::SupportsAgentFile => P::SupportsAgentFile,
+            Self::AgentFileArgs => P::AgentFileArgs,
+            Self::AgentFileEnv => P::AgentFileEnv,
+            Self::AuthEnvVars => P::AuthEnvVars,
+            Self::AuthProbeArgs => P::AuthProbeArgs,
+            Self::Timeout => P::Timeout,
+            Self::AlwaysAllow => P::AlwaysAllow,
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Field::Command => "command",
@@ -502,6 +525,7 @@ impl SettingsCx {
         let muted = muted_style();
         let yellow = warning_style();
         let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut bindings = Vec::new();
         lines.push(Line::from(Span::styled(
             "External harnesses (harness_invoke)".to_string(),
             Style::default().add_modifier(Modifier::BOLD),
@@ -536,6 +560,12 @@ impl SettingsCx {
                 hc.prompt_input.as_str(),
                 hc.models.len()
             );
+            bindings.push((
+                lines.len(),
+                super::pointer_actions::HarnessesAction::Open(super::pointer_actions::HarnessId(
+                    (*name).clone(),
+                )),
+            ));
             lines.push(Line::from(vec![
                 Span::raw(marker),
                 Span::styled(format!("{name:<14}"), label_style),
@@ -548,15 +578,47 @@ impl SettingsCx {
         let seed_row = names.len() + 1;
         let reset_row = names.len() + 2;
         lines.push(Line::default());
+        bindings.push((lines.len(), super::pointer_actions::HarnessesAction::Add));
         lines.push(synthetic_row("[+ add harness]", s.cursor == add_row));
+        bindings.push((
+            lines.len(),
+            super::pointer_actions::HarnessesAction::SeedInstalledPresets,
+        ));
         lines.push(synthetic_row(
             "[seed installed presets]",
             s.cursor == seed_row,
+        ));
+        bindings.push((
+            lines.len(),
+            super::pointer_actions::HarnessesAction::ResetAndSeedPresets,
         ));
         lines.push(
             s.reset
                 .render_line(s.cursor == reset_row, "reset to verified presets"),
         );
+        if let Some(name) = names.get(s.cursor) {
+            lines.push(Line::default());
+            if s.delete_pending {
+                lines.push(Line::from(format!("Delete {name}?")));
+                bindings.push((
+                    lines.len(),
+                    super::pointer_actions::HarnessesAction::Delete(
+                        super::pointer_actions::HarnessId((*name).clone()),
+                    ),
+                ));
+                lines.push(Line::from("[Delete]"));
+                bindings.push((lines.len(), super::pointer_actions::HarnessesAction::Cancel));
+                lines.push(Line::from("[Cancel]"));
+            } else {
+                bindings.push((
+                    lines.len(),
+                    super::pointer_actions::HarnessesAction::Delete(
+                        super::pointer_actions::HarnessId((*name).clone()),
+                    ),
+                ));
+                lines.push(Line::from("[Delete]"));
+            }
+        }
 
         if let Some(buf) = &s.adding {
             lines.push(Line::default());
@@ -575,14 +637,25 @@ impl SettingsCx {
             lines.push(Line::from(Span::styled(status.clone(), yellow)));
         }
         let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states
-            .render_lines(frame, area, "harnesses:list", lines, selected_line);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "harnesses:list",
+            (lines, selected_line),
+            bindings,
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("harnesses:list"),
+            )
+                .into(),
+        );
     }
 
     fn render_harness_edit(&self, frame: &mut Frame, area: Rect, s: &EditState) {
         let muted = muted_style();
         let yellow = warning_style();
         let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut bindings = Vec::new();
         lines.push(Line::from(Span::styled(
             format!("Harness: {}", s.name),
             Style::default()
@@ -610,6 +683,10 @@ impl SettingsCx {
             } else {
                 value
             };
+            bindings.push((
+                lines.len(),
+                super::pointer_actions::HarnessesAction::EditField(field.pointer_id()),
+            ));
             lines.push(Line::from(vec![
                 Span::raw(marker),
                 Span::styled(format!("{:<18}", field.label()), label_style),
@@ -621,6 +698,7 @@ impl SettingsCx {
         if let Some(buf) = &s.editing {
             let field = FIELDS[s.cursor.min(FIELDS.len() - 1)];
             lines.push(Line::default());
+            let edit_line = lines.len();
             push_text_field_at_cursor(
                 &mut lines,
                 area.width,
@@ -630,14 +708,66 @@ impl SettingsCx {
                 true,
                 None,
             );
+            let field_x = field.label().chars().count().saturating_add(2) as u16;
+            self.pointer_surface
+                .register(super::shell::SettingsPointerTarget {
+                    rect: Rect::new(
+                        area.x.saturating_add(field_x),
+                        area.y.saturating_add(edit_line as u16),
+                        area.width.saturating_sub(field_x),
+                        1,
+                    ),
+                    action: super::shell::SettingsPointerAction::Page(
+                        super::pointer_actions::SettingsPointerAction::Harnesses(
+                            super::pointer_actions::HarnessesAction::EditField(field.pointer_id()),
+                        ),
+                    ),
+                    enabled: true,
+                    disabled_reason: None,
+                });
+            let action_line = lines.len();
+            lines.push(Line::from(vec![
+                Span::styled("[Save]", selected_style()),
+                Span::raw("  "),
+                Span::styled("[Cancel]", selected_style()),
+            ]));
+            for (action, x, width) in [
+                (super::pointer_actions::HarnessesAction::Save, 0, 6),
+                (super::pointer_actions::HarnessesAction::Cancel, 8, 8),
+            ] {
+                self.pointer_surface
+                    .register(super::shell::SettingsPointerTarget {
+                        rect: Rect::new(
+                            area.x + x,
+                            area.y.saturating_add(action_line as u16),
+                            width,
+                            1,
+                        ),
+                        action: super::shell::SettingsPointerAction::Page(
+                            super::pointer_actions::SettingsPointerAction::Harnesses(action),
+                        ),
+                        enabled: true,
+                        disabled_reason: None,
+                    });
+            }
         }
         if let Some(status) = &s.status {
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(status.clone(), yellow)));
         }
         let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states
-            .render_lines(frame, area, "harnesses:edit", lines, selected_line);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "harnesses:edit",
+            (lines, selected_line),
+            bindings,
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("harnesses:edit"),
+            )
+                .into(),
+        );
     }
 }
 
@@ -680,12 +810,179 @@ fn synthetic_row(label: &str, selected: bool) -> Line<'static> {
 }
 
 impl SettingsPage for HarnessesPage {
+    fn pointer_surface_kind(&self) -> super::SettingsPointerSurfaceKind {
+        super::SettingsPointerSurfaceKind::Harnesses
+    }
+
+    fn pointer_surface_token(&self) -> u64 {
+        match self {
+            HarnessesPage::List(state) if state.adding.is_some() => 202,
+            HarnessesPage::List(_) => 200,
+            HarnessesPage::Edit(state) if state.editing.is_some() => 203,
+            HarnessesPage::Edit(_) => 201,
+        }
+    }
+
+    fn resolve_header_back(&self) -> super::SettingsLocalBack {
+        match self {
+            HarnessesPage::List(state) if state.adding.is_some() => {
+                super::SettingsLocalBack::LocalBack
+            }
+            HarnessesPage::Edit(_) => super::SettingsLocalBack::LocalBack,
+            HarnessesPage::List(_) => super::SettingsLocalBack::NoLocalBack,
+        }
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         cx.handle_harnesses_page_key(key, self)
     }
 
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         cx.render_harnesses_page(frame, area, self);
+    }
+
+    fn handle_pointer_control(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: super::pointer_actions::SettingsPointerAction,
+    ) -> Nav {
+        let super::pointer_actions::SettingsPointerAction::Harnesses(action) = action else {
+            return Nav::Stay;
+        };
+        if let HarnessesPage::List(state) = self {
+            match &action {
+                super::pointer_actions::HarnessesAction::Delete(id) => {
+                    let Some(index) = cx.harness_names().iter().position(|name| name == &id.0)
+                    else {
+                        return Nav::Stay;
+                    };
+                    state.cursor = index;
+                    return cx.handle_harnesses_page_key(
+                        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+                        self,
+                    );
+                }
+                super::pointer_actions::HarnessesAction::Cancel if state.delete_pending => {
+                    state.delete_pending = false;
+                    state.status = Some("delete cancelled".into());
+                    return Nav::Stay;
+                }
+                _ => {}
+            }
+        }
+        if matches!(self, HarnessesPage::Edit(state) if state.editing.is_some()) {
+            return match action {
+                super::pointer_actions::HarnessesAction::EditField(_) => Nav::Stay,
+                super::pointer_actions::HarnessesAction::Save => cx.handle_harnesses_page_key(
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    self,
+                ),
+                super::pointer_actions::HarnessesAction::Cancel => cx.handle_harnesses_page_key(
+                    KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                    self,
+                ),
+                _ => Nav::Stay,
+            };
+        }
+        match (&mut *self, action) {
+            (HarnessesPage::List(state), super::pointer_actions::HarnessesAction::Open(id)) => {
+                let Some(index) = cx.harness_names().iter().position(|name| name == &id.0) else {
+                    return Nav::Stay;
+                };
+                state.cursor = index;
+            }
+            (HarnessesPage::List(state), super::pointer_actions::HarnessesAction::Add) => {
+                state.cursor = cx.harness_names().len()
+            }
+            (
+                HarnessesPage::List(state),
+                super::pointer_actions::HarnessesAction::SeedInstalledPresets,
+            ) => state.cursor = cx.harness_names().len() + 1,
+            (
+                HarnessesPage::List(state),
+                super::pointer_actions::HarnessesAction::ResetAndSeedPresets,
+            ) => state.cursor = cx.harness_names().len() + 2,
+            (
+                HarnessesPage::Edit(state),
+                super::pointer_actions::HarnessesAction::EditField(id),
+            ) => {
+                let Some(index) = FIELDS.iter().position(|field| field.pointer_id() == id) else {
+                    return Nav::Stay;
+                };
+                state.cursor = index;
+            }
+            _ => return Nav::Stay,
+        }
+        cx.handle_harnesses_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
+    }
+
+    fn handle_pointer_control_at(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: super::pointer_actions::SettingsPointerAction,
+        column: u16,
+        _row: u16,
+    ) -> Nav {
+        let super::pointer_actions::SettingsPointerAction::Harnesses(ref harness_action) = action
+        else {
+            return Nav::Stay;
+        };
+        if matches!(
+            harness_action,
+            super::pointer_actions::HarnessesAction::EditField(_)
+        ) && let HarnessesPage::Edit(state) = self
+            && let Some(buf) = state.editing.as_mut()
+        {
+            let field_x = cx
+                .pointer_surface
+                .targets
+                .borrow()
+                .iter()
+                .find(|target| {
+                    target.action == super::shell::SettingsPointerAction::Page(action.clone())
+                })
+                .map_or(column, |target| target.rect.x);
+            buf.set_cursor_display_col(usize::from(column.saturating_sub(field_x)));
+        }
+        self.handle_pointer_control(cx, action)
+    }
+
+    fn handle_pointer_scroll(
+        &mut self,
+        cx: &mut SettingsCx,
+        region: SettingsScrollRegionId,
+        delta: isize,
+    ) -> Nav {
+        match self {
+            HarnessesPage::List(state)
+                if region == SettingsScrollRegionId("harnesses:list") && state.adding.is_none() =>
+            {
+                state.delete_pending = false;
+                state.reset.disarm();
+                state.cursor = state
+                    .cursor
+                    .saturating_add_signed(delta)
+                    .min(cx.harness_names().len() + 2);
+            }
+            HarnessesPage::Edit(state)
+                if region == SettingsScrollRegionId("harnesses:edit")
+                    && state.editing.is_none() =>
+            {
+                state.cursor = state
+                    .cursor
+                    .saturating_add_signed(delta)
+                    .min(FIELDS.len().saturating_sub(1));
+            }
+            _ => {}
+        }
+        Nav::Stay
+    }
+
+    fn cancel_pointer_transients(&mut self) {
+        if let HarnessesPage::List(state) = self {
+            state.delete_pending = false;
+            state.reset.disarm();
+        }
     }
 
     fn title(&self, cx: &SettingsCx) -> String {

@@ -111,28 +111,6 @@ const MODEL_WIZARD_MODEL_FIELD_KEYS: &[&str] = &[
     "capability_overrides",
 ];
 
-const KNOWN_PROVIDER_TEMPLATE_IDS: &[&str] = &[
-    "openai-compatible",
-    "openai",
-    "codex-oauth",
-    "grok",
-    "grok-oauth",
-    "z-ai",
-    "nous-research",
-    "baseten",
-    "minimax",
-    "opencode-zen",
-    "copilot",
-    "openrouter",
-    "deepseek",
-    "anthropic",
-    "xiaomi-mimo",
-];
-
-fn known_provider_template_id(id: &str) -> bool {
-    KNOWN_PROVIDER_TEMPLATE_IDS.contains(&id)
-}
-
 fn builtin_thinking_params(provider: &str, mode: ThinkingMode) -> Option<Value> {
     match provider {
         "deepseek" => Some(match mode {
@@ -342,12 +320,8 @@ impl ActiveModelRef {
         if self.model.is_empty() {
             return Err("active model model must not be empty");
         }
-        if self
-            .reasoning_effort
-            .as_ref()
-            .is_some_and(|effort| effort.value.is_empty())
-        {
-            return Err("active model reasoning effort must not be empty");
+        if let Some(effort) = &self.reasoning_effort {
+            effort.validate()?;
         }
         Ok(())
     }
@@ -410,10 +384,31 @@ impl ModelAvailability {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ActiveReasoningEffort {
-    #[serde(deserialize_with = "deserialize_nonempty_string")]
     pub value: String,
+}
+
+impl ActiveReasoningEffort {
+    pub fn validate(&self) -> std::result::Result<(), &'static str> {
+        if self.value.is_empty() {
+            return Err("active reasoning effort must not be empty");
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for ActiveReasoningEffort {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            value: String,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let value = Self { value: wire.value };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -428,8 +423,8 @@ pub struct ProviderEntry {
     /// freely — e.g. `anthropic-work` for a second Anthropic connection), this
     /// records the underlying vendor and is what keys the known-frontier
     /// defaults ([`is_frontier_default_provider_template`]). Not user-editable.
-    /// Absent on pre-field configs; [`ProviderEntry::effective_template`] falls
-    /// back to the map key when it matches a known template id.
+    /// Absent entries are custom providers; the mutable config-map key never
+    /// establishes immutable vendor identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template: Option<String>,
 
@@ -921,6 +916,57 @@ pub enum CacheMode {
 pub struct HeaderSpec {
     pub name: String,
     pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderHeaderConfigError {
+    provider_id: String,
+}
+
+impl ProviderHeaderConfigError {
+    pub const CODE: &'static str = "provider_header_invalid";
+
+    pub fn new(provider_id: &str) -> Self {
+        Self {
+            provider_id: provider_id.to_string(),
+        }
+    }
+
+    pub fn code(&self) -> &'static str {
+        Self::CODE
+    }
+}
+
+impl std::fmt::Display for ProviderHeaderConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Provider '{}' has invalid or duplicate HTTP header configuration; edit provider headers before retrying.",
+            self.provider_id
+        )
+    }
+}
+
+impl std::error::Error for ProviderHeaderConfigError {}
+
+/// Validate literal header rows without resolving any secret-bearing values.
+/// Empty values are valid suppression markers; names and nonempty literal
+/// values use the exact parser used by request dispatch.
+pub fn validate_provider_headers(
+    provider_id: &str,
+    headers: &[HeaderSpec],
+) -> Result<(), ProviderHeaderConfigError> {
+    let mut names = std::collections::BTreeSet::new();
+    for header in headers {
+        let normalized = header.name.to_ascii_lowercase();
+        if !names.insert(normalized)
+            || reqwest::header::HeaderName::from_bytes(header.name.as_bytes()).is_err()
+            || reqwest::header::HeaderValue::from_str(&header.value).is_err()
+        {
+            return Err(ProviderHeaderConfigError::new(provider_id));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1844,17 +1890,10 @@ impl ProviderEntry {
 
     /// The provider's effective template identity, used to key the
     /// known-frontier defaults. Returns the persisted [`Self::template`] when
-    /// present; otherwise falls back to the config-map `key` when that key
-    /// itself names a known [`ProviderTemplate`](crate::providers) — which
-    /// recovers pre-`template`-field configs that were never renamed (e.g. a
-    /// stock `anthropic`). A renamed pre-field config, or a custom provider,
-    /// resolves to `None`.
-    pub fn effective_template<'a>(&'a self, key: &'a str) -> Option<&'a str> {
-        match self.template.as_deref() {
-            Some(t) => Some(t),
-            None if known_provider_template_id(key) => Some(key),
-            None => None,
-        }
+    /// present. The config-map `key` is deliberately ignored: it is mutable
+    /// and cannot prove registry provenance.
+    pub fn effective_template(&self, _key: &str) -> Option<&str> {
+        self.template.as_deref()
     }
 
     pub fn mark_model_fetch_success(&mut self, catalog: ProviderModelCatalog) {

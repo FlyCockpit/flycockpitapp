@@ -39,7 +39,7 @@ pub struct InferenceCallRow {
 impl Db {
     pub async fn insert_inference_call(&self, row: &InferenceCallRow) -> Result<()> {
         let row = row.clone();
-        self.write(move |conn| Self::insert_inference_call_conn(conn, &row))
+        self.transaction(move |conn| Self::insert_inference_call_conn(conn, &row))
             .await
     }
 
@@ -48,6 +48,25 @@ impl Db {
             "INSERT INTO inference_calls (call_id, session_id, project_id, project_root, model, provider, timestamp, input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens, cost_usd_micros, is_utility) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![row.call_id.to_string(), row.session_id.to_string(), row.project_id, row.project_root, row.model, row.provider, row.timestamp, row.input_tokens, row.output_tokens, row.cached_input_tokens, row.cache_creation_input_tokens, row.cost_usd_micros, row.is_utility],
         ).context("inserting inference_call")?;
+        // Account usage at the immutable append boundary, in the same DB
+        // transaction as the call row. Aggregate snapshots can later shrink
+        // under retention and grow past an old baseline before anyone polls;
+        // charging each uniquely keyed call exactly once avoids that ambiguity.
+        conn.execute(
+            "UPDATE session_goals
+                SET tokens_used = tokens_used + MAX(0, ?1 + ?2)
+              WHERE id = (SELECT goal_id FROM inference_requests WHERE call_id = ?3)
+                AND attempt_generation = (SELECT goal_attempt_generation FROM inference_requests WHERE call_id = ?3)
+                AND token_budget IS NOT NULL
+                AND ?4 = 0",
+            params![
+                row.input_tokens,
+                row.output_tokens,
+                row.call_id.to_string(),
+                row.is_utility,
+            ],
+        )
+        .context("accounting inference call against open session goal")?;
         Ok(())
     }
 
@@ -135,6 +154,7 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::session_goals::GoalDisposition;
 
     #[tokio::test]
     async fn insert_round_trip() {
@@ -219,5 +239,138 @@ mod tests {
         assert!(!flagged.contains(&unknown));
         // Empty input is a clean no-op.
         assert!(db.utility_call_ids(&[]).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn goal_accounting_requires_matching_dispatch_provenance() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "a").await.unwrap();
+        let goal = db
+            .create_session_goal(session.session_id, "p", "ship it", None, Some(1_000))
+            .await
+            .unwrap();
+        let inference = |call_id, input_tokens, output_tokens, is_utility| InferenceCallRow {
+            call_id,
+            session_id: session.session_id,
+            project_id: "p".into(),
+            project_root: "/x".into(),
+            model: "m".into(),
+            provider: "provider".into(),
+            timestamp: 1,
+            input_tokens,
+            output_tokens,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cost_usd_micros: None,
+            is_utility,
+        };
+
+        // An ordinary foreground call in the same Running session has no
+        // supervised dispatch provenance and must not consume the goal budget.
+        db.insert_inference_call(&inference(Uuid::new_v4(), 20, 10, false))
+            .await
+            .unwrap();
+        let running = db
+            .current_session_goal(session.session_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(running.tokens_used, 0);
+
+        let utility_call = Uuid::new_v4();
+        db.insert_inference_request_with_goal_provenance(
+            &utility_call.to_string(),
+            session.session_id,
+            &serde_json::json!({}),
+            crate::db::session_log::InferenceRequestStatus::Pending,
+            Some((goal.id, goal.attempt_generation)),
+        )
+        .await
+        .unwrap();
+        db.insert_inference_call(&inference(utility_call, 40, 30, true))
+            .await
+            .unwrap();
+
+        let matching_call = Uuid::new_v4();
+        db.insert_inference_request_with_goal_provenance(
+            &matching_call.to_string(),
+            session.session_id,
+            &serde_json::json!({}),
+            crate::db::session_log::InferenceRequestStatus::Pending,
+            Some((goal.id, goal.attempt_generation)),
+        )
+        .await
+        .unwrap();
+        db.insert_inference_call(&inference(matching_call, 20, 10, false))
+            .await
+            .unwrap();
+
+        db.set_session_goal_status(session.session_id, GoalDisposition::UserPaused)
+            .await
+            .unwrap();
+        let paused_call = Uuid::new_v4();
+        db.insert_inference_request_with_goal_provenance(
+            &paused_call.to_string(),
+            session.session_id,
+            &serde_json::json!({}),
+            crate::db::session_log::InferenceRequestStatus::Pending,
+            Some((goal.id, goal.attempt_generation)),
+        )
+        .await
+        .unwrap();
+        db.insert_inference_call(&inference(paused_call, 7, 4, false))
+            .await
+            .unwrap();
+        let paused = db
+            .current_session_goal(session.session_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            paused.tokens_used, 41,
+            "a matching call dispatched before pause remains append-once usage"
+        );
+
+        let resumed = db
+            .set_session_goal_status(session.session_id, GoalDisposition::Running)
+            .await
+            .unwrap();
+        assert_eq!(resumed.id, goal.id);
+        assert_eq!(resumed.tokens_used, 41);
+        assert!(resumed.attempt_generation > goal.attempt_generation);
+
+        let stale_call = Uuid::new_v4();
+        db.insert_inference_request_with_goal_provenance(
+            &stale_call.to_string(),
+            session.session_id,
+            &serde_json::json!({}),
+            crate::db::session_log::InferenceRequestStatus::Pending,
+            Some((goal.id, goal.attempt_generation)),
+        )
+        .await
+        .unwrap();
+        db.insert_inference_call(&inference(stale_call, 100, 100, false))
+            .await
+            .unwrap();
+
+        let resumed_call = Uuid::new_v4();
+        db.insert_inference_request_with_goal_provenance(
+            &resumed_call.to_string(),
+            session.session_id,
+            &serde_json::json!({}),
+            crate::db::session_log::InferenceRequestStatus::Pending,
+            Some((resumed.id, resumed.attempt_generation)),
+        )
+        .await
+        .unwrap();
+        db.insert_inference_call(&inference(resumed_call, 5, 6, false))
+            .await
+            .unwrap();
+        let charged_after_resume = db
+            .current_session_goal(session.session_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(charged_after_resume.tokens_used, 52);
     }
 }

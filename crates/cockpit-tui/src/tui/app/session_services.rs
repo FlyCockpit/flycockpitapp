@@ -342,8 +342,7 @@ impl App {
         for (id, sequence) in cancelled {
             self.submission_fences.remove(&id);
             self.deferred_fence_dispatches.remove(&id);
-            self.pending_paste_probes
-                .retain(|_, probe| probe.owner_fence != Some(id));
+            self.cancel_paste_probes_matching(|probe| probe.owner_fence == Some(id));
             self.retained_pre_dispatch_submissions
                 .retain(|retained| retained.pending.optimistic_submission_id != id);
             self.submission_order.cancel(sequence);
@@ -569,6 +568,12 @@ impl App {
         outcome: agent_runner::SessionSwitchOutcome,
         resume_chrome: bool,
     ) {
+        // Session navigation changes the owner view before any authoritative
+        // replacement state is installed. Blocking results from the previous
+        // view are cancelled and cannot mutate the new transcript or chrome.
+        self.async_actions.advance_view_generation();
+        self.at_suggestions_loading = false;
+        self.at_suggestions_error = None;
         self.drain_agent_events();
         self.cancel_older_history_page_request();
         let resume_history = matches!(outcome.target, agent_runner::SessionTarget::Resume { .. })

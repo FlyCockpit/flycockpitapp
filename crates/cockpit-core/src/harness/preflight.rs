@@ -21,7 +21,11 @@ use crate::harness::env::{harness_auth_env_present, harness_child_env};
 #[derive(Debug)]
 pub enum PreflightError {
     /// The command isn't on `PATH`.
-    NotOnPath { harness: String, command: String },
+    NotOnPath {
+        harness: String,
+        command: String,
+        dependency_line: Option<String>,
+    },
     /// The harness is on `PATH` but not authenticated.
     NotAuthenticated { harness: String, command: String },
 }
@@ -29,11 +33,18 @@ pub enum PreflightError {
 impl std::fmt::Display for PreflightError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PreflightError::NotOnPath { harness, command } => write!(
-                f,
-                "harness `{harness}` is not installed: `{command}` was not found on PATH. \
-                 Install it or fix the `command` in /settings.",
-            ),
+            PreflightError::NotOnPath {
+                harness,
+                command,
+                dependency_line,
+            } => match dependency_line {
+                Some(line) => f.write_str(line),
+                None => write!(
+                    f,
+                    "harness `{harness}` is not installed: `{command}` was not found on PATH. \
+                     Install it or fix the `command` in /settings.",
+                ),
+            },
             PreflightError::NotAuthenticated { harness, command } => write!(
                 f,
                 "harness `{harness}` is not authenticated: `{command}` has no credentials. \
@@ -67,6 +78,9 @@ pub async fn preflight_with_env(
             return Err(PreflightError::NotOnPath {
                 harness: harness_name.to_string(),
                 command: format!("{} ({err})", cfg.command),
+                dependency_line: crate::external_runtime::current_dependency_context_line(
+                    &adapter_id,
+                ),
             });
         }
     } else {
@@ -81,6 +95,9 @@ pub async fn preflight_with_env(
         .map_err(|err| PreflightError::NotOnPath {
             harness: harness_name.to_string(),
             command: format!("{} ({err})", cfg.command),
+            dependency_line: crate::external_runtime::current_dependency_context_line(&format!(
+                "harness.custom.{harness_name}"
+            )),
         })?;
     }
 

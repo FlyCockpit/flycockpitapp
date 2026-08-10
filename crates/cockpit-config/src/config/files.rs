@@ -558,7 +558,7 @@ pub(crate) fn read_file_nofollow(path: &Path) -> Result<Option<Vec<u8>>> {
 
 pub(crate) fn read_file_nofollow_with_identity(
     path: &Path,
-) -> Result<Option<(Vec<u8>, super::TerminalIngressFileIdentity)>> {
+) -> Result<Option<(std::fs::File, Vec<u8>, super::TerminalIngressFileIdentity)>> {
     let (parent, file_name) = match open_parent_directory_nofollow(path) {
         Ok(parts) => parts,
         Err(error) if root_cause_is_not_found(&error) => return Ok(None),
@@ -633,8 +633,9 @@ pub(crate) fn read_file_nofollow_with_identity(
         file: 0,
         links: 1,
     };
-    let bytes = read_all(file, path)?;
-    Ok(Some((bytes, identity)))
+    let mut file = file;
+    let bytes = read_all(&mut file, path)?;
+    Ok(Some((file, bytes, identity)))
 }
 
 #[cfg(windows)]
@@ -642,15 +643,18 @@ fn verify_windows_protected_dacl(file: &std::fs::File) -> Result<()> {
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
-        GetKernelObjectSecurity, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
-        GetSecurityDescriptorOwner, IsWellKnownSid, SE_DACL_PROTECTED, WinBuiltinAdministratorsSid,
+        GetKernelObjectSecurity, GetLengthSid, GetSecurityDescriptorControl,
+        GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, IsWellKnownSid,
+        OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED, WinBuiltinAdministratorsSid,
         WinLocalSystemSid,
     };
+    let expected_owner = current_windows_user_sid()?;
+    let security_information = DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION;
     let mut needed = 0u32;
     unsafe {
         GetKernelObjectSecurity(
             file.as_raw_handle(),
-            DACL_SECURITY_INFORMATION,
+            security_information,
             std::ptr::null_mut(),
             0,
             &mut needed,
@@ -663,7 +667,7 @@ fn verify_windows_protected_dacl(file: &std::fs::File) -> Result<()> {
     if unsafe {
         GetKernelObjectSecurity(
             file.as_raw_handle(),
-            DACL_SECURITY_INFORMATION,
+            security_information,
             descriptor.as_mut_ptr().cast(),
             needed,
             &mut needed,
@@ -696,6 +700,9 @@ fn verify_windows_protected_dacl(file: &std::fs::File) -> Result<()> {
     {
         return Err(std::io::Error::last_os_error().into());
     }
+    if unsafe { EqualSid(owner, expected_owner.as_ptr().cast()) } == 0 {
+        anyhow::bail!("terminal ingress object owner is not the daemon user");
+    }
     let mut dacl_present = 0;
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut dacl_defaulted = 0;
@@ -726,7 +733,7 @@ fn verify_windows_protected_dacl(file: &std::fs::File) -> Result<()> {
             let allowed = raw_ace.cast::<ACCESS_ALLOWED_ACE>();
             let sid = unsafe { std::ptr::addr_of_mut!((*allowed).SidStart).cast() };
             let approved = unsafe {
-                EqualSid(sid, owner) != 0
+                EqualSid(sid, expected_owner.as_ptr().cast()) != 0
                     || IsWellKnownSid(sid, WinLocalSystemSid) != 0
                     || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
             };
@@ -740,8 +747,60 @@ fn verify_windows_protected_dacl(file: &std::fs::File) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn current_windows_user_sid() -> Result<Vec<u8>> {
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+    use windows_sys::Wdk::Storage::FileSystem::{NtOpenProcessToken, NtQueryInformationToken};
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Security::{GetLengthSid, TOKEN_QUERY, TOKEN_USER, TokenUser};
+
+    let mut token: HANDLE = std::ptr::null_mut();
+    let status = unsafe { NtOpenProcessToken((-1isize) as HANDLE, TOKEN_QUERY, &mut token) };
+    if status < 0 || token.is_null() {
+        anyhow::bail!("opening current process token failed with NTSTATUS {status:#x}");
+    }
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+    let mut needed = 0u32;
+    unsafe {
+        NtQueryInformationToken(
+            token.as_raw_handle(),
+            TokenUser,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        );
+    }
+    if needed < std::mem::size_of::<TOKEN_USER>() as u32 {
+        anyhow::bail!("current process token returned no user SID");
+    }
+    let mut info = vec![0u8; needed as usize];
+    let status = unsafe {
+        NtQueryInformationToken(
+            token.as_raw_handle(),
+            TokenUser,
+            info.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    };
+    if status < 0 {
+        anyhow::bail!("querying current process user SID failed with NTSTATUS {status:#x}");
+    }
+    let sid = unsafe { (*(info.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+    if sid.is_null() {
+        anyhow::bail!("current process token has a null user SID");
+    }
+    let sid_len = unsafe { GetLengthSid(sid) };
+    if sid_len == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut owned = vec![0u8; sid_len as usize];
+    unsafe { std::ptr::copy_nonoverlapping(sid.cast::<u8>(), owned.as_mut_ptr(), owned.len()) };
+    Ok(owned)
+}
+
 #[cfg(any(unix, windows))]
-fn read_all(mut file: std::fs::File, path: &Path) -> Result<Vec<u8>> {
+fn read_all(mut file: impl std::io::Read, path: &Path) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut file, &mut bytes)
         .with_context(|| format!("reading {}", path.display()))?;

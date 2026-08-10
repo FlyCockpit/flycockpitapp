@@ -46,6 +46,21 @@ fn write_ready_model_config(root: &Path) {
     .unwrap();
 }
 
+async fn refresh_at_suggestions(app: &mut App) {
+    app.reset_at_window();
+    let kind = crate::tui::async_action::AsyncActionKind::Blocking(app.autocomplete_action_name());
+    while app.async_actions.has_pending_kind(&kind) {
+        let notify = app.async_actions.notifier();
+        let notified = notify.notified();
+        app.drain_async_actions();
+        if !app.async_actions.has_pending_kind(&kind) {
+            return;
+        }
+        notified.await;
+    }
+    app.drain_async_actions();
+}
+
 /// The daemon's `GitignoreAllow` push overwrites the tracked session set
 /// wholesale (full-list replace) and drops the `@`-suggestion memo so the
 /// next popup render re-walks with the new globs — purely client-side, no
@@ -85,8 +100,8 @@ fn apply_replaces_field_and_invalidates_at_cache() {
 /// with no session approval is re-included (dimmed, `gitignored`) once the
 /// session set carries its glob — exercised through the real `at_suggestions`
 /// render path, including the cache invalidation on the apply-handler.
-#[test]
-fn at_suggestions_unions_session_allow_with_persisted() {
+#[tokio::test]
+async fn at_suggestions_unions_session_allow_with_persisted() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
     // Build the cwd into a git worktree with a gitignored file.
@@ -99,6 +114,7 @@ fn at_suggestions_unions_session_allow_with_persisted() {
     // Activate the `@`-popup query (bare `@` → empty partial → whole tree).
     app.composer.insert_str("@");
     assert_eq!(app.composer.at_query(), Some(""));
+    refresh_at_suggestions(&mut app).await;
 
     // No session approval → the gitignored file is absent from the popup.
     let before = app.at_suggestions();
@@ -113,6 +129,7 @@ fn at_suggestions_unions_session_allow_with_persisted() {
     app.apply_event(TurnEvent::GitignoreAllow {
         allow: vec!["secret.txt".to_string()],
     });
+    refresh_at_suggestions(&mut app).await;
     let after = app.at_suggestions();
     let entry = after
         .iter()
@@ -145,11 +162,12 @@ fn at_popup_no_match_enter_dismisses_not_submits() {
     assert_eq!(app.at_scroll, 0);
 }
 
-#[test]
-fn at_popup_match_enter_still_accepts() {
+#[tokio::test]
+async fn at_popup_match_enter_still_accepts() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = at_popup_app(&tmp);
     app.composer.insert_str("@kept");
+    refresh_at_suggestions(&mut app).await;
 
     assert_eq!(app.at_suggestions().len(), 1);
     assert!(app.at_popup_active());

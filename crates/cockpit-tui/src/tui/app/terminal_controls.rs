@@ -134,9 +134,11 @@ impl App {
         if res.is_ok() {
             self.mouse_capture = want;
             if !want {
+                self.link_pointer_gesture.cancel();
                 self.hovered_affordance = None;
                 self.hovered_suggestion = None;
                 self.link_registry.clear_hover();
+                self.dialog.clear_settings_pointer_hover();
             }
         }
     }

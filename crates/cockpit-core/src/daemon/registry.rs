@@ -63,6 +63,7 @@ struct Inner {
     /// Durable write-scope authority. Late-installed like `scheduler`: the
     /// coordinator is built in `boot_with_db`, after this registry exists.
     write_scope: crate::write_scope::WriteScopeSource,
+    external_journal: Arc<Mutex<Option<Arc<crate::external_journal::ExternalJournal>>>>,
     workers: Mutex<WorkerState>,
     /// Live `JoinHandle` per worker, so a graceful drain can *await* the
     /// in-flight turn finishing (and `abort()` it past the deadline).
@@ -354,6 +355,7 @@ impl SessionRegistry {
                 locks,
                 lsp: Arc::new(crate::daemon::lsp::LspManager::new()),
                 write_scope: Arc::new(Mutex::new(None)),
+                external_journal: Arc::new(Mutex::new(None)),
                 resource_scheduler,
                 scheduler: Arc::new(Mutex::new(None)),
                 workers: Mutex::new(WorkerState {
@@ -397,6 +399,14 @@ impl SessionRegistry {
 
     fn write_scope_source(&self) -> crate::write_scope::WriteScopeSource {
         self.inner.write_scope.clone()
+    }
+
+    pub fn set_external_journal(&self, journal: Arc<crate::external_journal::ExternalJournal>) {
+        *crate::sync::lock_or_recover(&self.inner.external_journal) = Some(journal);
+    }
+
+    fn external_journal(&self) -> Option<Arc<crate::external_journal::ExternalJournal>> {
+        crate::sync::lock_or_recover(&self.inner.external_journal).clone()
     }
 
     pub fn scheduler(&self) -> Option<crate::daemon::scheduler::DaemonSchedulerHandle> {
@@ -446,6 +456,7 @@ impl SessionRegistry {
                 }
                 AttachClaim::Start(ticket) => {
                     let generation = ticket.generation();
+                    self.inner.db.restore_supervised_goals(id).await?;
                     let result = self
                         .start_resumed_worker(
                             id,
@@ -472,7 +483,7 @@ impl SessionRegistry {
         let (providers_cfg, extended_cfg) = self
             .inner
             .config_source
-            .load_with_trust(&project_root, &trust_policy)?;
+            .load_effective_for_daemon(&project_root, &trust_policy)?;
         if let (Some(initial), Some(pinned)) = (&initial_model, model_override) {
             anyhow::ensure!(
                 initial == pinned,
@@ -539,7 +550,7 @@ impl SessionRegistry {
         let (providers_cfg, extended_cfg) = self
             .inner
             .config_source
-            .load_with_trust(&project_root, &trust_policy)?;
+            .load_effective_for_daemon(&project_root, &trust_policy)?;
         let active = initial_model
             .or_else(|| providers_cfg.active_model.clone())
             .context("no model selected for the new assistant session")?;
@@ -587,7 +598,7 @@ impl SessionRegistry {
         let (providers_cfg, extended_cfg) = self
             .inner
             .config_source
-            .load_with_trust(&session.project_root, &trust_policy)?;
+            .load_effective_for_daemon(&session.project_root, &trust_policy)?;
         self.start_worker(
             session,
             &providers_cfg,
@@ -779,6 +790,7 @@ impl SessionRegistry {
         }
         let model_override = model_override.map(|_| model.clone());
 
+        session.set_external_journal(self.external_journal());
         let session = Arc::new(session);
         let cleanup_inner = Arc::downgrade(&self.inner);
         let cleanup =
@@ -1504,6 +1516,108 @@ mod tests {
 
         assert!(reg.lookup(handle.session_id).is_some());
         reg.forget(handle.session_id);
+    }
+
+    #[tokio::test]
+    async fn malformed_response_metrics_tokenizer_blocks_registry_attach_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home =
+            crate::config::dirs::test_support::IsolatedCockpitHome::new_async(tmp.path()).await;
+        let project = tmp.path().join("repo");
+        std::fs::create_dir_all(project.join(".cockpit")).unwrap();
+        std::fs::write(
+            project.join(".cockpit/config.json"),
+            r#"{"response_metrics_tokenizer":"invalid-registry-value"}"#,
+        )
+        .unwrap();
+        let reg = test_registry_with_config_source(
+            crate::daemon::config_source::ConfigSource::production(),
+        );
+        reg.inner
+            .db
+            .set_workspace_trust(
+                &project,
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .await
+            .unwrap();
+        let persisted = reg
+            .inner
+            .db
+            .create_session("provider", project.to_str().unwrap(), "Build")
+            .await
+            .unwrap();
+        let error = reg
+            .attach(
+                None,
+                Some(project.clone()),
+                None,
+                false,
+                None,
+                EnvSnapshot::new(
+                    crate::env_snapshot::EnvSnapshotSource::DaemonStart,
+                    Default::default(),
+                ),
+            )
+            .await
+            .err()
+            .expect("invalid tokenizer must block registry snapshot");
+        assert!(
+            error
+                .downcast_ref::<crate::config::extended::InvalidResponseMetricsTokenizer>()
+                .is_some()
+        );
+        let resume_error = reg
+            .attach(
+                Some(persisted.session_id),
+                Some(project.clone()),
+                None,
+                false,
+                None,
+                EnvSnapshot::new(
+                    crate::env_snapshot::EnvSnapshotSource::DaemonStart,
+                    Default::default(),
+                ),
+            )
+            .await
+            .err()
+            .expect("invalid tokenizer must block resumed snapshot");
+        assert!(
+            resume_error
+                .downcast_ref::<crate::config::extended::InvalidResponseMetricsTokenizer>()
+                .is_some()
+        );
+        let assistant_home = tmp.path().join("assistant");
+        std::fs::create_dir_all(&assistant_home).unwrap();
+        std::fs::write(
+            assistant_home.join("assistant.md"),
+            "---\ndescription: Test helper\nmode: primary\n---\n\nHelp with tests.\n",
+        )
+        .unwrap();
+        reg.inner
+            .db
+            .upsert_assistant("helper", assistant_home.to_str().unwrap(), "{}", "hash")
+            .await
+            .unwrap();
+        let create_error = reg
+            .create_assistant_session(
+                "helper",
+                project,
+                None,
+                false,
+                EnvSnapshot::new(
+                    crate::env_snapshot::EnvSnapshotSource::DaemonStart,
+                    Default::default(),
+                ),
+            )
+            .await
+            .err()
+            .expect("invalid tokenizer must block assistant snapshot creation");
+        assert!(
+            create_error
+                .downcast_ref::<crate::config::extended::InvalidResponseMetricsTokenizer>()
+                .is_some()
+        );
     }
 
     #[tokio::test]

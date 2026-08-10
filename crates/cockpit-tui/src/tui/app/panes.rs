@@ -145,17 +145,31 @@ impl App {
         terminal: &mut DefaultTerminal,
         terminal_input: &mut TerminalInput,
     ) -> Result<bool> {
-        let Some(path) = self.dialog.take_pending_agent_edit() else {
+        let Some(effect) = self.dialog.take_pending_agent_edit() else {
             return Ok(false);
         };
+        let operation_id = effect.operation_id;
+        let path = effect.path;
 
         let Some(editor) = std::env::var_os("EDITOR") else {
             // Env shifted between the page deciding to defer and now; the
             // page only defers when EDITOR was set, so this is defensive.
-            self.dialog
-                .finish_agent_edit(Some("$EDITOR is no longer set".to_string()));
+            self.dialog.finish_agent_edit(
+                operation_id,
+                crate::tui::settings::pointer_actions::ExternalEditOutcome::Failed,
+                Some("$EDITOR is no longer set".to_string()),
+            );
             return Ok(true);
         };
+
+        if let Err(error) = std::fs::write(&path, effect.text_before_launch) {
+            self.dialog.finish_agent_edit(
+                operation_id,
+                crate::tui::settings::pointer_actions::ExternalEditOutcome::Failed,
+                Some(format!("write failed before launching $EDITOR: {error}")),
+            );
+            return Ok(true);
+        }
 
         let (outcome, live_mouse) = Self::run_external_editor_command(
             terminal,
@@ -170,25 +184,47 @@ impl App {
         self.mouse_capture = live_mouse;
         let redraw = outcome.redraw;
 
-        let editor_error = match (&outcome.status, &outcome.restore) {
-            (Ok(s), Ok(())) if s.success() => None,
-            (Ok(s), Ok(())) => Some(format!("editor exited with {s} — file left unchanged")),
-            (Ok(s), Err(restore)) if s.success() => {
-                Some(format!("terminal restore: {restore} — file left unchanged"))
-            }
-            (Ok(s), Err(restore)) => Some(format!(
-                "editor exited with {s}; terminal restore: {restore} — file left unchanged"
-            )),
-            (Err(e), Ok(())) => Some(format!(
-                "invoking `{}`: {e} — file left unchanged",
-                editor.to_string_lossy()
-            )),
-            (Err(e), Err(restore)) => Some(format!(
-                "invoking `{}`: {e}; terminal restore: {restore} — file left unchanged",
-                editor.to_string_lossy()
-            )),
+        use crate::tui::settings::pointer_actions::ExternalEditOutcome;
+        let (completion, detail) = match (&outcome.status, &outcome.restore) {
+            (Ok(status), Ok(())) if status.success() => (ExternalEditOutcome::Saved, None),
+            (Ok(status), Err(restore)) if status.success() => (
+                ExternalEditOutcome::Saved,
+                Some(format!("terminal restore: {restore}")),
+            ),
+            (Ok(status), Ok(())) if status.code() == Some(130) => (
+                ExternalEditOutcome::Cancelled,
+                Some("external editor cancelled".into()),
+            ),
+            (Ok(status), Err(restore)) if status.code() == Some(130) => (
+                ExternalEditOutcome::Cancelled,
+                Some(format!(
+                    "external editor cancelled; terminal restore: {restore}"
+                )),
+            ),
+            (Ok(status), Ok(())) => (
+                ExternalEditOutcome::Failed,
+                Some(format!("editor exited with {status}")),
+            ),
+            (Ok(status), Err(restore)) => (
+                ExternalEditOutcome::Failed,
+                Some(format!(
+                    "editor exited with {status}; terminal restore: {restore}"
+                )),
+            ),
+            (Err(error), Ok(())) => (
+                ExternalEditOutcome::Failed,
+                Some(format!("invoking `{}`: {error}", editor.to_string_lossy())),
+            ),
+            (Err(error), Err(restore)) => (
+                ExternalEditOutcome::Failed,
+                Some(format!(
+                    "invoking `{}`: {error}; terminal restore: {restore}",
+                    editor.to_string_lossy()
+                )),
+            ),
         };
-        self.dialog.finish_agent_edit(editor_error);
+        self.dialog
+            .finish_agent_edit(operation_id, completion, detail);
         Ok(redraw)
     }
 
@@ -200,13 +236,16 @@ impl App {
         terminal: &mut DefaultTerminal,
         terminal_input: &mut TerminalInput,
     ) -> Result<bool> {
-        let Some(path) = self.dialog.take_pending_category_setting_edit() else {
+        let Some((operation_id, path)) = self.dialog.take_pending_category_setting_edit() else {
             return Ok(false);
         };
 
         let Some(editor) = std::env::var_os("EDITOR") else {
-            self.dialog
-                .finish_category_setting_edit(Some("$EDITOR is no longer set".to_string()));
+            self.dialog.finish_category_setting_edit(
+                operation_id,
+                crate::tui::settings::pointer_actions::ExternalEditOutcome::Failed,
+                Some("$EDITOR is no longer set".to_string()),
+            );
             return Ok(true);
         };
 
@@ -223,25 +262,52 @@ impl App {
         self.mouse_capture = live_mouse;
         let redraw = outcome.redraw;
 
-        let editor_error = match (&outcome.status, &outcome.restore) {
-            (Ok(s), Ok(())) if s.success() => None,
-            (Ok(s), Ok(())) => Some(format!("editor exited with {s} - value left unchanged")),
-            (Ok(s), Err(restore)) if s.success() => Some(format!(
-                "terminal restore: {restore} - value left unchanged"
-            )),
-            (Ok(s), Err(restore)) => Some(format!(
-                "editor exited with {s}; terminal restore: {restore} - value left unchanged"
-            )),
-            (Err(e), Ok(())) => Some(format!(
-                "invoking `{}`: {e} - value left unchanged",
-                editor.to_string_lossy()
-            )),
-            (Err(e), Err(restore)) => Some(format!(
-                "invoking `{}`: {e}; terminal restore: {restore} - value left unchanged",
-                editor.to_string_lossy()
-            )),
+        use crate::tui::settings::pointer_actions::ExternalEditOutcome;
+        let (completion, detail) = match (&outcome.status, &outcome.restore) {
+            (Ok(status), Ok(())) if status.success() => (ExternalEditOutcome::Saved, None),
+            (Ok(status), Err(restore)) if status.success() => (
+                ExternalEditOutcome::Saved,
+                Some(format!("terminal restore: {restore}")),
+            ),
+            (Ok(status), Ok(())) if status.code() == Some(130) => (
+                ExternalEditOutcome::Cancelled,
+                Some("external editor cancelled".into()),
+            ),
+            (Ok(status), Err(restore)) if status.code() == Some(130) => (
+                ExternalEditOutcome::Cancelled,
+                Some(format!(
+                    "external editor cancelled; terminal restore: {restore}"
+                )),
+            ),
+            (Ok(status), Ok(())) => (
+                ExternalEditOutcome::Failed,
+                Some(format!(
+                    "editor exited with {status} - value left unchanged"
+                )),
+            ),
+            (Ok(status), Err(restore)) => (
+                ExternalEditOutcome::Failed,
+                Some(format!(
+                    "editor exited with {status}; terminal restore: {restore} - value left unchanged"
+                )),
+            ),
+            (Err(error), Ok(())) => (
+                ExternalEditOutcome::Failed,
+                Some(format!(
+                    "invoking `{}`: {error} - value left unchanged",
+                    editor.to_string_lossy()
+                )),
+            ),
+            (Err(error), Err(restore)) => (
+                ExternalEditOutcome::Failed,
+                Some(format!(
+                    "invoking `{}`: {error}; terminal restore: {restore} - value left unchanged",
+                    editor.to_string_lossy()
+                )),
+            ),
         };
-        self.dialog.finish_category_setting_edit(editor_error);
+        self.dialog
+            .finish_category_setting_edit(operation_id, completion, detail);
         Ok(redraw)
     }
 

@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use cockpit_tokenizer::TiktokenEncoding;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -79,6 +80,14 @@ use harness::{parse_harness_config, resolve_harnesses_from_paths};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtendedConfig {
+    /// Encoding used exclusively for locally measured response metrics.
+    #[serde(default)]
+    pub response_metrics_tokenizer: TiktokenEncoding,
+
+    /// Saved image spend choices. Missing is intentionally unconfigured and
+    /// blocks paid dispatch; loaders must not inject display suggestions.
+    #[serde(default)]
+    pub image_spend: crate::config::image_spend::ImageSpendSettings,
     #[serde(default)]
     pub harnesses: HashMap<String, HarnessConfig>,
 
@@ -259,6 +268,10 @@ pub struct ExtendedConfig {
     #[serde(default)]
     pub daemon: DaemonConfig,
 
+    /// Authoritative evaluated-plan source for every media reservation.
+    #[serde(rename = "mediaResources", default)]
+    pub media_resources: Box<crate::config::media_budget::MediaResourcePolicy>,
+
     /// Session-payload retention knobs.
     #[serde(default)]
     pub retention: RetentionConfig,
@@ -281,11 +294,11 @@ pub struct ExtendedConfig {
     /// Goal-completion skeptic verification defaults. The driver applies this
     /// only to budgeted goals unless a later per-session override says more.
     #[serde(
-        rename = "goalVerification",
+        rename = "goalSupervision",
         default,
-        skip_serializing_if = "GoalVerificationConfig::is_default"
+        skip_serializing_if = "GoalSupervisionConfig::is_default"
     )]
-    pub goal_verification: GoalVerificationConfig,
+    pub goal_supervision: GoalSupervisionConfig,
 
     /// Language Server Protocol diagnostics and navigation settings.
     #[serde(default)]
@@ -1537,6 +1550,8 @@ impl ExtendedConfig {
 impl Default for ExtendedConfig {
     fn default() -> Self {
         Self {
+            response_metrics_tokenizer: TiktokenEncoding::default(),
+            image_spend: crate::config::image_spend::ImageSpendSettings::default(),
             harnesses: HashMap::new(),
             agent_guidance_files: default_agent_guidance_files(),
             concurrency: Concurrency::default(),
@@ -1573,11 +1588,12 @@ impl Default for ExtendedConfig {
             resource_scheduler: ResourceSchedulerConfig::default(),
             sandbox: SandboxConfig::default(),
             daemon: DaemonConfig::default(),
+            media_resources: Box::new(crate::config::media_budget::MediaResourcePolicy::default()),
             retention: RetentionConfig::default(),
             delegation: DelegationConfig::default(),
             deepthink: DeepthinkConfig::default(),
             review: ReviewConfig::default(),
-            goal_verification: GoalVerificationConfig::default(),
+            goal_supervision: GoalSupervisionConfig::default(),
             lsp: LspConfig::default(),
             data_syntax: DataSyntaxConfig::default(),
             loop_guard: LoopGuardConfig::default(),
@@ -1603,71 +1619,131 @@ impl Default for ExtendedConfig {
     }
 }
 
-pub const DEFAULT_GOAL_VERIFICATION_SKEPTIC_COUNT: usize = 3;
-pub const DEFAULT_GOAL_VERIFICATION_MAX_ROUNDS: u32 = 2;
+pub const DEFAULT_GOAL_SUPERVISION_TOKEN_BUDGET: i64 = 200_000;
+pub const DEFAULT_GOAL_SUPERVISION_COLD_SKEPTIC_COUNT: usize = 3;
+pub const DEFAULT_GOAL_SUPERVISION_MAX_VERIFICATION_ATTEMPTS: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GoalVerificationConfig {
-    /// Master switch for completion verification. Effective verification is
-    /// also gated on the goal having a token budget in this prompt's default
-    /// surface.
+pub struct GoalSupervisionConfig {
+    /// Global operator kill switch. This field is not overridable by an agent
+    /// or session policy.
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Number of parallel refute-framed skeptics per verification round.
     #[serde(
-        rename = "skepticCount",
-        default = "default_goal_verification_skeptic_count"
+        rename = "defaultTokenBudget",
+        default = "default_goal_supervision_token_budget"
     )]
-    pub skeptic_count: usize,
-    /// Optional model selector (`provider:model-id`) for skeptic agents.
-    /// Unset falls back to the session model.
+    pub default_token_budget: i64,
     #[serde(
-        rename = "skepticModel",
+        rename = "plannerModel",
         default,
         skip_serializing_if = "Option::is_none"
     )]
-    pub skeptic_model: Option<String>,
+    pub planner_model: Option<String>,
+    #[serde(
+        rename = "evaluatorModel",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub evaluator_model: Option<String>,
+    #[serde(
+        rename = "gatekeeperModel",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub gatekeeper_model: Option<String>,
+    /// Number of parallel refute-framed skeptics per verification round.
+    #[serde(
+        rename = "coldSkepticCount",
+        default = "default_goal_supervision_cold_skeptic_count"
+    )]
+    pub cold_skeptic_count: usize,
+    /// Optional model selector (`provider:model-id`) for skeptic agents.
+    /// Unset falls back to the session model.
+    #[serde(
+        rename = "coldSkepticModel",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cold_skeptic_model: Option<String>,
     /// Failed/inconclusive rounds before the driver stops and surfaces
     /// `verification_failed`.
-    #[serde(rename = "maxRounds", default = "default_goal_verification_max_rounds")]
-    pub max_rounds: u32,
+    #[serde(
+        rename = "maxVerificationAttempts",
+        default = "default_goal_supervision_max_verification_attempts"
+    )]
+    pub max_verification_attempts: u32,
 }
 
-impl GoalVerificationConfig {
+impl GoalSupervisionConfig {
     pub fn is_default(&self) -> bool {
         self == &Self::default()
     }
 
-    pub fn effective_skeptic_count(&self) -> usize {
-        self.skeptic_count.max(1)
+    pub fn effective_cold_skeptic_count(&self) -> usize {
+        self.cold_skeptic_count.max(1)
     }
 
-    pub fn effective_max_rounds(&self) -> u32 {
-        self.max_rounds.max(1)
+    pub fn effective_max_verification_attempts(&self) -> u32 {
+        self.max_verification_attempts.max(1)
     }
 
-    pub fn enabled_for_token_budget(&self, token_budget: Option<i64>) -> bool {
-        self.enabled && token_budget.is_some()
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.default_token_budget <= 0 {
+            anyhow::bail!("goalSupervision.defaultTokenBudget must be positive");
+        }
+        if !(1..=5).contains(&self.cold_skeptic_count) {
+            anyhow::bail!("goalSupervision.coldSkepticCount must be between 1 and 5");
+        }
+        if self.max_verification_attempts == 0 {
+            anyhow::bail!("goalSupervision.maxVerificationAttempts must be positive");
+        }
+        for selector in [
+            self.planner_model.as_deref(),
+            self.evaluator_model.as_deref(),
+            self.gatekeeper_model.as_deref(),
+            self.cold_skeptic_model.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let Some((provider, model)) = crate::config::provider::split_provider_model(selector)
+            else {
+                anyhow::bail!("goalSupervision model selectors must use provider/model form");
+            };
+            if provider.trim().is_empty() || model.trim().is_empty() {
+                anyhow::bail!("goalSupervision model selectors must use provider/model form");
+            }
+        }
+        Ok(())
     }
 }
 
-impl Default for GoalVerificationConfig {
+impl Default for GoalSupervisionConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            skeptic_count: DEFAULT_GOAL_VERIFICATION_SKEPTIC_COUNT,
-            skeptic_model: None,
-            max_rounds: DEFAULT_GOAL_VERIFICATION_MAX_ROUNDS,
+            default_token_budget: DEFAULT_GOAL_SUPERVISION_TOKEN_BUDGET,
+            planner_model: None,
+            evaluator_model: None,
+            gatekeeper_model: None,
+            cold_skeptic_count: DEFAULT_GOAL_SUPERVISION_COLD_SKEPTIC_COUNT,
+            cold_skeptic_model: None,
+            max_verification_attempts: DEFAULT_GOAL_SUPERVISION_MAX_VERIFICATION_ATTEMPTS,
         }
     }
 }
 
-fn default_goal_verification_skeptic_count() -> usize {
-    DEFAULT_GOAL_VERIFICATION_SKEPTIC_COUNT
+fn default_goal_supervision_cold_skeptic_count() -> usize {
+    DEFAULT_GOAL_SUPERVISION_COLD_SKEPTIC_COUNT
 }
 
-fn default_goal_verification_max_rounds() -> u32 {
-    DEFAULT_GOAL_VERIFICATION_MAX_ROUNDS
+fn default_goal_supervision_max_verification_attempts() -> u32 {
+    DEFAULT_GOAL_SUPERVISION_MAX_VERIFICATION_ATTEMPTS
+}
+
+fn default_goal_supervision_token_budget() -> i64 {
+    DEFAULT_GOAL_SUPERVISION_TOKEN_BUDGET
 }
 
 fn default_agent_guidance_files() -> Vec<String> {
@@ -1712,13 +1788,26 @@ pub fn config_layer_read_count() -> usize {
 /// on-disk config whose `scan_dirs` is absent/empty (clean break: scan
 /// nothing).
 pub fn load_for_cwd(cwd: &Path) -> ExtendedConfig {
+    load_for_cwd_with_computer_use_policy(cwd).0
+}
+
+/// Load the effective config and the most-restrictive computer-use policy
+/// from one captured set of layered documents.
+pub fn load_for_cwd_with_computer_use_policy(
+    cwd: &Path,
+) -> (ExtendedConfig, Option<ComputerUseMode>) {
     LOAD_FOR_CWD_CALLS.with(|calls| calls.set(calls.get() + 1));
     let paths = config_file_paths_for_load(cwd);
     let docs = load_existing_docs_from_paths(&paths);
+    let computer_use = resolve_computer_use_policy_from_docs(&docs);
+    (resolve_loaded_docs(&docs), computer_use)
+}
+
+fn resolve_loaded_docs(docs: &[ExtendedConfigDoc]) -> ExtendedConfig {
     if !docs.is_empty() {
-        let mut cfg = load_merged_from_docs(&docs);
-        cfg.gitignore_allow = resolve_gitignore_allow_from_docs(&docs);
-        let redact_unions = resolve_redact_list_unions_from_docs(&docs);
+        let mut cfg = load_merged_from_docs(docs);
+        cfg.gitignore_allow = resolve_gitignore_allow_from_docs(docs);
+        let redact_unions = resolve_redact_list_unions_from_docs(docs);
         cfg.redact.denylist = redact_unions.denylist;
         cfg.redact.allowlist = redact_unions.allowlist;
         cfg.redact.extra_dotenv_paths = redact_unions.extra_dotenv_paths;
@@ -1732,6 +1821,72 @@ pub fn load_for_cwd(cwd: &Path) -> ExtendedConfig {
         ..Default::default()
     }
 }
+
+/// Daemon-only effective loader. Existing settings/bootstrap callers remain
+/// advisory, while an explicitly present malformed response tokenizer in any
+/// participating (trust-filtered) readable layer rejects daemon adoption.
+pub struct DaemonExtendedConfigLoad {
+    pub providers: crate::config::providers::ProvidersConfig,
+    pub config: ExtendedConfig,
+    pub response_metrics_tokenizer_validation:
+        std::result::Result<(), InvalidResponseMetricsTokenizer>,
+    pub participating_layers: Vec<PathBuf>,
+}
+
+pub fn load_for_cwd_for_daemon_contract(cwd: &Path) -> Result<DaemonExtendedConfigLoad> {
+    LOAD_FOR_CWD_CALLS.with(|calls| calls.set(calls.get() + 1));
+    let paths = config_file_paths_for_load(cwd);
+    // Provider recovery/migration is a barrier. Only after it completes do we
+    // capture every readable participating config layer once; providers,
+    // extended settings, strict validation, and provenance are all projected
+    // from that one trust-filtered snapshot.
+    let (providers, captured) =
+        crate::config::providers::ConfigDoc::try_load_effective_with_layer_snapshot(&paths)?;
+    let docs: Vec<_> = captured
+        .into_iter()
+        .map(|(path, raw)| ExtendedConfigDoc { path, raw })
+        .collect();
+    let mut validation = Ok(());
+    for doc in &docs {
+        if let Some(value) = doc.raw_field("response_metrics_tokenizer")
+            && let Err(source) = serde_json::from_value::<TiktokenEncoding>(value.clone())
+            && validation.is_ok()
+        {
+            validation = Err(InvalidResponseMetricsTokenizer {
+                path: doc.path.clone(),
+                source,
+            });
+        }
+    }
+    let participating_layers = docs.iter().map(|doc| doc.path.clone()).collect();
+    let config = resolve_loaded_docs(&docs);
+    Ok(DaemonExtendedConfigLoad {
+        providers,
+        config,
+        response_metrics_tokenizer_validation: validation,
+        participating_layers,
+    })
+}
+
+#[derive(Debug)]
+pub struct InvalidResponseMetricsTokenizer {
+    path: PathBuf,
+    source: serde_json::Error,
+}
+
+impl InvalidResponseMetricsTokenizer {
+    pub fn diagnostic(&self) -> String {
+        format!("{}: {}", self.path.display(), self.source)
+    }
+}
+
+impl std::fmt::Display for InvalidResponseMetricsTokenizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("configuration value is invalid")
+    }
+}
+
+impl std::error::Error for InvalidResponseMetricsTokenizer {}
 
 fn read_extended_config_doc(path: &Path) -> Result<ExtendedConfigDoc> {
     CONFIG_LAYER_READS.with(|calls| calls.set(calls.get() + 1));
@@ -1807,6 +1962,24 @@ pub fn resolve_computer_use_policy_from_paths(paths: &[PathBuf]) -> Option<Compu
         }
     }
     ComputerUseMode::most_restrictive(tiers)
+}
+
+fn resolve_computer_use_policy_from_docs(docs: &[ExtendedConfigDoc]) -> Option<ComputerUseMode> {
+    ComputerUseMode::most_restrictive(docs.iter().filter_map(|doc| {
+        let value = doc.raw_field("computer_use")?;
+        match serde_json::from_value::<ComputerUseMode>(value.clone()) {
+            Ok(tier) => Some(tier),
+            Err(error) => {
+                tracing::warn!(
+                    path = %doc.path.display(),
+                    key = "computer_use",
+                    %error,
+                    "skipping malformed computer_use policy"
+                );
+                None
+            }
+        }
+    }))
 }
 
 /// Round-trip loader/saver for the cockpit-only keys in `config.json` that
@@ -1886,6 +2059,8 @@ impl ExtendedConfigDoc {
         }
 
         parse_field!("harnesses", harnesses);
+        parse_field!("response_metrics_tokenizer", response_metrics_tokenizer);
+        parse_field!("image_spend", image_spend);
         parse_field!("agent_guidance_files", agent_guidance_files);
         parse_field!("concurrency", concurrency);
         parse_field!("agent_dirs", agent_dirs);
@@ -1923,7 +2098,7 @@ impl ExtendedConfigDoc {
         parse_field!("delegation", delegation);
         parse_field!("deepthink", deepthink);
         parse_field!("review", review);
-        parse_field!("goalVerification", goal_verification);
+        parse_field!("goalSupervision", goal_supervision);
         parse_field!("lsp", lsp);
         parse_field!("data_syntax", data_syntax);
         parse_field!("loop_guard", loop_guard);
@@ -1999,6 +2174,17 @@ impl ExtendedConfigDoc {
         }
 
         remove_malformed!("redact", RedactConfig);
+        remove_malformed!("response_metrics_tokenizer", TiktokenEncoding);
+        if let Some(value) = obj.get("image_spend")
+            && serde_json::from_value::<crate::config::image_spend::ImageSpendSettings>(
+                value.clone(),
+            )
+            .is_err()
+        {
+            // Invalid policy is an explicit fail-closed layer, not absence
+            // that may reveal and authorize a lower layer's policy.
+            obj.insert("image_spend".into(), serde_json::json!({}));
+        }
         remove_malformed!("tui", TuiConfig);
         remove_malformed!("computer_use", Option<ComputerUseMode>);
         remove_malformed!("project_knowledge", bool);
@@ -2010,7 +2196,7 @@ impl ExtendedConfigDoc {
         remove_malformed!("approvalPolicy", ApprovalPolicyConfig);
         remove_malformed!("sandbox", SandboxConfig);
         remove_malformed!("review", ReviewConfig);
-        remove_malformed!("goalVerification", GoalVerificationConfig);
+        remove_malformed!("goalSupervision", GoalSupervisionConfig);
         raw
     }
 

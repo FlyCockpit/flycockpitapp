@@ -229,7 +229,7 @@ pub fn resolve_spawn_selector(
 
 /// Resolve a **host-config** spawn model selector.
 ///
-/// The host wrote this selector in a config file (`goalVerification.skepticModel`),
+/// The host wrote this selector in a config file (`goalSupervision.coldSkepticModel`),
 /// so custody is the target's own configured class — a self-hosted skeptic
 /// stays trusted instead of hard-failing against the model-directed filter.
 pub fn resolve_host_config_spawn_selector(
@@ -2199,7 +2199,7 @@ mod tests {
     /// Provenance decides custody, not the selector string. The identical
     /// `provider:model` value is refused when a model wrote it and accepted
     /// when the host wrote it in a config file — so a self-hosted
-    /// `goalVerification.skepticModel` stops hard-failing every round.
+    /// `goalSupervision.coldSkepticModel` stops hard-failing every round.
     #[test]
     fn spawn_selector_custody_follows_provenance() {
         let providers = trust_mode_providers();
@@ -2523,7 +2523,7 @@ mod tests {
         assert_eq!(model.model_id_ref(), "trusted-code");
         assert_eq!(custody.custody(), ModelCustody::Trusted);
 
-        // Host-config spawn path (`goalVerification.skepticModel`).
+        // Host-config spawn path (`goalSupervision.coldSkepticModel`).
         let (model, _) = resolve_host_config_spawn_selector(
             "minimax:trusted-code",
             "scout",

@@ -1127,6 +1127,7 @@ async fn failed_side_return_preserves_side_runner_ui_and_exact_queued_submission
         expected_model_state_generation: None,
         expected_model: None,
         kind: cockpit_core::engine::message::UserSubmissionKind::Compact,
+        origin: Default::default(),
         text: "exact wire text".to_string(),
         display_text: Some("visible side draft".to_string()),
         tag_expansions: vec![cockpit_core::daemon::proto::TagExpansionMeta {
@@ -1233,6 +1234,7 @@ fn complete_dispatch_submission(marker: &str) -> UserSubmission {
         expected_model_state_generation: None,
         expected_model: None,
         kind: cockpit_core::engine::message::UserSubmissionKind::Compact,
+        origin: Default::default(),
         text: format!("wire-{marker}"),
         display_text: Some(format!("visible-{marker}")),
         tag_expansions: vec![cockpit_core::daemon::proto::TagExpansionMeta {
@@ -1613,11 +1615,7 @@ fn normal_dispatch_closed_marks_user_failed_and_ends_span() {
 #[test]
 fn busy_submit_queue_full_retries_consumed_wire_payload_exactly() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new_with_db(
-        Some(tmp.path()),
-        false,
-        cockpit_db::Db::open_in_memory().unwrap(),
-    );
+    let mut app = App::new(Some(tmp.path()), false);
     super::seed_ready_model_for_tests(&mut app);
     let (tx, mut rx) = mpsc::channel(1);
     tx.try_send(UserSubmission::text("channel blocker".to_string()).into())
@@ -1722,28 +1720,19 @@ fn runner_failure_before_session_creation_binds_retry_to_first_runner() {
 #[test]
 fn slash_dispatch_failures_use_same_failed_user_reconciliation() {
     let tmp = tempfile::tempdir().unwrap();
-    for (label, dispatch) in [
-        (
-            "/init",
-            App::dispatch_init_turn as fn(&mut App, &str, String),
-        ),
-        (
-            "/goal",
-            App::dispatch_goal_turn as fn(&mut App, &str, String),
-        ),
-    ] {
-        let mut app = App::new(Some(tmp.path()), false);
-        app.agent_runner = Some(Err("model missing".to_string()));
-        dispatch(&mut app, "thing", "wire".to_string());
+    let mut app = App::new(Some(tmp.path()), false);
+    app.agent_runner = Some(Err("model missing".to_string()));
+    app.dispatch_init_turn("thing", "wire".to_string());
 
-        assert!(!app.busy, "{label} failed dispatch ends its span");
-        assert!(!app.current_session_persisted);
-        assert!(newest_user_failed(&app));
-        assert!(
-            error_lines(&app).iter().any(|line| line.starts_with(label)),
-            "{label} failure uses the shared error path"
-        );
-    }
+    assert!(!app.busy, "/init failed dispatch ends its span");
+    assert!(!app.current_session_persisted);
+    assert!(newest_user_failed(&app));
+    assert!(
+        error_lines(&app)
+            .iter()
+            .any(|line| line.starts_with("/init")),
+        "/init failure uses the shared error path"
+    );
 
     let mut app = App::new(Some(tmp.path()), false);
     app.agent_runner = Some(Err("model missing".to_string()));
@@ -2034,6 +2023,7 @@ async fn completed_switch_cannot_be_replaced_before_ui_adopts_it() {
         expected_model_state_generation: None,
         expected_model: None,
         kind: cockpit_core::engine::message::UserSubmissionKind::Compact,
+        origin: Default::default(),
         text: format!(
             "wire-before{}wire-after",
             cockpit_core::engine::message::IMAGE_PART_SENTINEL

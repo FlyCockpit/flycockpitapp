@@ -196,6 +196,10 @@ impl ScheduleContext {
 pub enum SpawnWorkerKind {
     Bee,
     Scout,
+    GoalPlanner,
+    GoalEvaluator,
+    GoalGatekeeper,
+    GoalColdSkeptic,
 }
 
 impl SpawnWorkerKind {
@@ -215,6 +219,13 @@ impl SpawnWorkerKind {
     /// tracked as follow-up work; it predates this write-scope subsystem.
     pub fn is_write_capable(self) -> bool {
         matches!(self, Self::Bee)
+    }
+
+    pub fn is_goal_control(self) -> bool {
+        matches!(
+            self,
+            Self::GoalPlanner | Self::GoalEvaluator | Self::GoalGatekeeper | Self::GoalColdSkeptic
+        )
     }
 }
 
@@ -236,7 +247,7 @@ pub enum SpawnModelOrigin {
     /// Routed under the forced redacted-untrusted custody filter.
     #[default]
     ModelDirected,
-    /// Written by the host in a config file (`goalVerification.skepticModel`
+    /// Written by the host in a config file (`goalSupervision.coldSkepticModel`
     /// and friends). The host named the target, so it keeps its own configured
     /// custody class — a self-hosted skeptic stays trusted.
     HostConfig,
@@ -247,6 +258,10 @@ pub struct SpawnSpec {
     /// Optional preassigned job id for callers that need to correlate queued
     /// work before a concurrency slot is available.
     pub job_id: Option<String>,
+    /// Immutable host-goal attribution for every inference dispatched by this
+    /// job. Stored on the job spec so concurrent workers cannot overwrite one
+    /// another through session-global state.
+    pub goal_provenance: Option<(uuid::Uuid, i64)>,
     /// Which worker factory to use. Both route through this same authority:
     /// write-capable `bee` for Swarm, `scout` for Multireview. `scout` holds no
     /// Cockpit write tools but can still write via `bash`; see
@@ -371,8 +386,7 @@ impl ScheduleAuthority {
         self.ctx.config = config;
     }
 
-    #[cfg(test)]
-    pub fn redaction_table(&self) -> Arc<RedactionTable> {
+    pub(crate) fn redaction_table(&self) -> Arc<RedactionTable> {
         self.ctx.redact.clone()
     }
 
@@ -1164,6 +1178,7 @@ mod tests {
     fn swarm_spec(depth: u32) -> SpawnSpec {
         SpawnSpec {
             job_id: None,
+            goal_provenance: None,
             worker: SpawnWorkerKind::Bee,
             prompt: "slice".into(),
             write_scope: "/tmp/out".into(),

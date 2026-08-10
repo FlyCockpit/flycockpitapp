@@ -11,6 +11,7 @@ mod adapters;
 mod health;
 mod platform;
 mod probe;
+mod projection;
 mod registry;
 mod safety_adapters;
 mod sanitize;
@@ -22,20 +23,24 @@ mod tests;
 pub use adapters::{
     ConfiguredCommandInput, GhAuthState, ID_ACCEL_FD, ID_ACCEL_GSED, ID_ACCEL_RG, ID_GH, ID_GIT,
     ID_HARNESS_CLAUDE, ID_HARNESS_CODEX, ID_HARNESS_GEMINI, ID_HARNESS_OPENCODE, ID_JQ_EXTERNAL,
-    ID_KCL, ID_LAZYGIT, IntegrationHealthComposeInput, LaunchGateError, accelerator_adapter_id,
-    assert_catalog_discovery_is_safe, catalog_adapter_descriptors,
-    cockpit_owned_jq_requires_host_jq, compose_settings_doctor_health,
+    ID_KCL, ID_LAZYGIT, ID_MEDIA_FFMPEG, ID_MEDIA_FFPROBE, IntegrationHealthComposeInput,
+    LaunchGateError, accelerator_adapter_id, assert_catalog_discovery_is_safe,
+    catalog_adapter_descriptors, cockpit_owned_jq_requires_host_jq, compose_settings_doctor_health,
     compose_settings_doctor_health_with_executor, custom_harness_id, discovery_performs_gh_auth,
     discovery_probe_argv_is_safe, discovery_side_effects_forbidden,
     ensure_integration_adapters_registered, external_jq_adapter_id, gh_binary_health_implies_auth,
     global_health_store, harness_compose_inputs, known_catalog_adapter_ids,
     known_harness_preset_names, lsp_command_input, lsp_server_id, mcp_stdio_input,
-    register_integration_adapters, require_available_for_launch,
+    media_runtime_pair_is_compatible, register_integration_adapters, require_available_for_launch,
     require_available_for_launch_uncancelled, require_configured_command_available_for_launch,
     require_configured_command_available_for_launch_with_cancel, require_live_available_for_launch,
-    require_live_available_for_launch_with_cancel, stdio_mcp_id, upsert_custom_harness,
-    upsert_custom_harnesses, upsert_lsp_server, upsert_lsp_servers, upsert_stdio_mcp,
-    upsert_stdio_mcp_servers,
+    require_live_available_for_launch_with_cancel, select_media_runtime_pair, stdio_mcp_id,
+    upsert_custom_harness, upsert_custom_harnesses, upsert_lsp_server, upsert_lsp_servers,
+    upsert_stdio_mcp, upsert_stdio_mcp_servers,
+};
+pub(crate) use adapters::{
+    compose_settings_doctor_health_for_invocation, invocation_descriptor_roster,
+    resolved_container_engine_mode,
 };
 pub use health::{
     ExternalRuntimeSnapshot, GroupHealth, HealthCause, HealthEntry, HealthSnapshotStore,
@@ -48,6 +53,12 @@ pub use platform::{
 pub use probe::{
     CancelToken, EvaluationContext, ProbeCommandResult, ProbeDeadlines, ProbeExecutor,
     RecordingProbeExecutor, RunRecord, SystemProbeExecutor, evaluate_descriptor, refresh_snapshot,
+};
+pub use projection::{
+    DEPENDENCY_HEADLESS_SCHEMA_VERSION, DependenciesPageState, DependencyProjection,
+    DependencyProjectionRow, DependencyStartupPolicy, DependencyViewState,
+    current_dependency_context_line, current_startup_dependency_policy,
+    freeze_pending_as_timed_out, project_dependencies, startup_dependency_policy,
 };
 pub use safety_adapters::{
     ContainerEngineMode, ContainerEngineSelection, ContainerRuntime as SafetyContainerRuntime,

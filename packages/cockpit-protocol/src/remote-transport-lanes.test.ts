@@ -15,7 +15,7 @@ import classificationFixture from "../fixtures/remote-transport/classification.j
 import constantsFixture from "../fixtures/remote-transport/constants.json" with { type: "json" };
 import fragmentsFixture from "../fixtures/remote-transport/fragments.json" with { type: "json" };
 import framesFixture from "../fixtures/remote-transport/frames.json" with { type: "json" };
-import { bulkTransferRefSchema, clientEnvelopeSchema } from ".";
+import { bulkTransferRefSchema, clientEnvelopeSchema, PROTOCOL_VERSION } from ".";
 import {
   BULK_ABORT_BYTES,
   BULK_BEGIN_BYTES_WITH_OPTIONS,
@@ -1450,7 +1450,7 @@ describe("daemon-wire bulk schemas reject what Rust rejects", () => {
 
   it("bounds chunk indexes at u32, as Rust's type does", () => {
     const base = {
-      v: 6,
+      v: PROTOCOL_VERSION,
       kind: "req",
       id: "11111111-1111-4111-8111-111111111111",
       request: "read_bulk_transfer_chunk",

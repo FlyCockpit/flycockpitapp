@@ -163,6 +163,14 @@ fn write_config(path: &std::path::Path) {
 }
 
 fn exact_queued_submission() -> super::QueuedModelSubmission {
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        1,
+        1,
+        image::Rgba([1, 2, 3, 255]),
+    ))
+    .write_to(&mut png, image::ImageFormat::Png)
+    .unwrap();
     let tag = cockpit_core::daemon::proto::TagExpansionMeta {
         tool: "read".to_string(),
         path: "src/model.rs".to_string(),
@@ -171,17 +179,17 @@ fn exact_queued_submission() -> super::QueuedModelSubmission {
     };
     super::QueuedModelSubmission {
         client_submission_id: uuid::Uuid::new_v4(),
-        fence_sequence: 0,
         composer_text: "review @src/model.rs with image".to_string(),
         display: "review @src/model.rs with image".to_string(),
         submission: cockpit_core::engine::message::UserSubmission {
             expected_model_state_generation: None,
             expected_model: None,
             kind: cockpit_core::engine::message::UserSubmissionKind::Compact,
+            origin: Default::default(),
             text: "review expanded source\n\n<image>".to_string(),
             display_text: Some("review @src/model.rs with image".to_string()),
             tag_expansions: vec![tag.clone()],
-            images: vec![vec![0x89, b'P', b'N', b'G']],
+            images: vec![png.into_inner()],
             forced_skill: Some("review".to_string()),
             origin_principal: Some("flycockpit:test-user".to_string()),
             job_id: Some("job-1".to_string()),
@@ -208,6 +216,67 @@ fn queued_submission_value(queued: &super::QueuedModelSubmission) -> serde_json:
         "submission": &queued.submission,
         "tag_expansions": &queued.tag_expansions,
     })
+}
+
+fn install_pending_model_submission(
+    app: &mut App,
+    session_id: uuid::Uuid,
+    selection_id: uuid::Uuid,
+    requested: cockpit_config::providers::ActiveModelRef,
+    minimum_generation: u64,
+    queued: super::QueuedModelSubmission,
+) {
+    let order_sequence = app
+        .submission_order
+        .enqueue(crate::tui::structured_paste::OrderedIntent::ModelSwitch(
+            selection_id,
+        ))
+        .unwrap();
+    let fence_sequence = app
+        .submission_order
+        .enqueue(crate::tui::structured_paste::OrderedIntent::Fence(
+            queued.client_submission_id,
+        ))
+        .unwrap();
+    app.submission_fences.insert(
+        queued.client_submission_id,
+        crate::tui::structured_paste::SubmissionFenceV1 {
+            client_submission_id: queued.client_submission_id,
+            fence_sequence,
+            host: crate::tui::structured_paste::HostIdentity {
+                client_instance_id: app.paste_client_instance_id,
+                connection_epoch: 0,
+                session_id,
+                terminal_generation: app.terminal_input_generation.unwrap_or_default(),
+            },
+            view_generation: app.config_snapshot.generation,
+            source_draft_generation: app.draft_generation,
+            created_at: app.monotonic_origin.elapsed(),
+            captured_composer: queued.composer_text.clone(),
+            accepted_tags: Vec::new(),
+            pending_git_blocks: Vec::new(),
+            model: crate::tui::structured_paste::CapturedModel {
+                provider_id: requested.provider.clone(),
+                model_id: requested.model.clone(),
+                active_model_state_generation: minimum_generation,
+                image_capability_generation: app.config_snapshot.generation,
+                supports_images: true,
+            },
+            assembled_wire_digest: None,
+            slots: Vec::new(),
+            lifecycle: crate::tui::structured_paste::FenceLifecycle::Ready,
+        },
+    );
+    app.pending_model_selection = Some(super::PendingModelSelection {
+        order_sequence,
+        session_id: Some(session_id),
+        selection_id,
+        requested,
+        trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
+        minimum_generation,
+        started_at: std::time::Instant::now(),
+        queued_submission: Some(queued),
+    });
 }
 
 #[test]
@@ -1253,20 +1322,21 @@ fn confirmed_model_release_queue_full_retains_and_retries_exact_draft() {
     app.agent_runner = Some(Ok(runner));
 
     let queued = exact_queued_submission();
-    let expected = serde_json::to_value(&queued.submission).unwrap();
     app.composer.set(queued.composer_text.clone());
     let requested = preference_bearing_selection("p", "a");
+    let mut expected_submission = queued.submission.clone();
+    expected_submission.expected_model_state_generation = Some(1);
+    expected_submission.expected_model = Some(requested.clone());
+    let expected = serde_json::to_value(expected_submission).unwrap();
     let selection_id = uuid::Uuid::new_v4();
-    app.pending_model_selection = Some(super::PendingModelSelection {
-        order_sequence: 0,
-        session_id: Some(session_id),
+    install_pending_model_submission(
+        &mut app,
+        session_id,
         selection_id,
-        requested: requested.clone(),
-        trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker,
-        minimum_generation: 0,
-        started_at: std::time::Instant::now(),
-        queued_submission: Some(queued),
-    });
+        requested.clone(),
+        0,
+        queued,
+    );
 
     app.apply_event(cockpit_core::engine::TurnEvent::ModelSelectionResult {
         selection_id,
@@ -1600,20 +1670,21 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
 
     let queued = exact_queued_submission();
     let expected_queued = queued_submission_value(&queued);
-    let expected_submission = serde_json::to_value(&queued.submission).unwrap();
     let pending_requested = preference_bearing_selection("pending-provider", "pending-model");
+    let mut expected_submission = queued.submission.clone();
+    expected_submission.expected_model_state_generation = Some(1);
+    expected_submission.expected_model = Some(pending_requested.clone());
+    let expected_submission = serde_json::to_value(expected_submission).unwrap();
     app.composer.set(queued.composer_text.clone());
     let old_selection_id = uuid::Uuid::new_v4();
-    app.pending_model_selection = Some(super::PendingModelSelection {
-        order_sequence: 0,
-        session_id: Some(old_session_id),
-        selection_id: old_selection_id,
-        requested: pending_requested.clone(),
-        trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
-        minimum_generation: 9,
-        started_at: std::time::Instant::now(),
-        queued_submission: Some(queued),
-    });
+    install_pending_model_submission(
+        &mut app,
+        old_session_id,
+        old_selection_id,
+        pending_requested.clone(),
+        9,
+        queued,
+    );
     app.pending_control_requests.insert(
         cockpit_core::engine::ControlRequestId(77),
         super::PendingControlRequest {
@@ -1624,6 +1695,10 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
         },
     );
 
+    let automatically_retried = matches!(
+        path,
+        ModelEpochPath::SameRunnerReconnect | ModelEpochPath::EventStreamLagResync
+    );
     match path {
         ModelEpochPath::AdoptReplacement | ModelEpochPath::AdoptSameSession => {
             app.adopt_runner(Ok(attached_runner.take().unwrap()));
@@ -1674,22 +1749,33 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
         Some(&attached_selection)
     );
     assert_eq!(app.launch.session_id, Some(new_session_id));
-    assert!(app.pending_model_selection.is_none());
-    assert!(app.pending_control_requests.is_empty());
-    let preserved_retry = app
-        .retry_model_selections
-        .get(&Some(old_session_id))
-        .expect("runner epoch change retains retry intent for its owning session");
-    assert_eq!(preserved_retry.requested, pending_requested);
+    assert_eq!(app.pending_model_selection.is_some(), automatically_retried);
     assert_eq!(
-        queued_submission_value(
-            preserved_retry
-                .queued_submission
-                .as_ref()
-                .expect("runner epoch change retains queued submission"),
-        ),
-        expected_queued
+        !app.pending_control_requests.is_empty(),
+        automatically_retried
     );
+    let preserved = if automatically_retried {
+        let pending = app
+            .pending_model_selection
+            .as_ref()
+            .expect("reconnect immediately retries the retained model intent");
+        assert_eq!(pending.requested, pending_requested);
+        pending
+            .queued_submission
+            .as_ref()
+            .expect("automatic retry retains queued submission")
+    } else {
+        let retry = app
+            .retry_model_selections
+            .get(&Some(old_session_id))
+            .expect("runner epoch change retains retry intent for its owning session");
+        assert_eq!(retry.requested, pending_requested);
+        retry
+            .queued_submission
+            .as_ref()
+            .expect("runner epoch change retains queued submission")
+    };
+    assert_eq!(queued_submission_value(preserved), expected_queued);
     if old_session_id != new_session_id {
         assert!(
             app.current_model_selection_retry().is_none(),
@@ -1712,17 +1798,18 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
         assert!(input_rx.try_recv().is_err());
         return;
     }
-    app.open_model_picker();
-    assert!(matches!(&app.overlay, Overlay::ModelPicker(picker)
-        if picker.draft_active_model() == Some(&pending_requested)));
-
     let requested = pending_requested;
-    assert!(app.request_model_selection(
-        "/quick",
-        requested.clone(),
-        false,
-        cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
-    ));
+    if !automatically_retried {
+        app.open_model_picker();
+        assert!(matches!(&app.overlay, Overlay::ModelPicker(picker)
+            if picker.draft_active_model() == Some(&requested)));
+        assert!(app.request_model_selection(
+            "/quick",
+            requested.clone(),
+            false,
+            cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
+        ));
+    }
     let selection_id = app
         .pending_model_selection
         .as_ref()
@@ -1827,16 +1914,14 @@ fn session_switch_drains_queued_old_epoch_events_before_authoritative_attach() {
     let queued = exact_queued_submission();
     let expected_submission = serde_json::to_value(&queued.submission).unwrap();
     let old_selection_id = uuid::Uuid::new_v4();
-    app.pending_model_selection = Some(super::PendingModelSelection {
-        order_sequence: 0,
-        session_id: Some(old_session_id),
-        selection_id: old_selection_id,
-        requested: requested.clone(),
-        trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
-        minimum_generation: 8,
-        started_at: std::time::Instant::now(),
-        queued_submission: Some(queued),
-    });
+    install_pending_model_submission(
+        &mut app,
+        old_session_id,
+        old_selection_id,
+        requested.clone(),
+        8,
+        queued,
+    );
     app.pending_control_requests.insert(
         cockpit_core::engine::ControlRequestId(88),
         super::PendingControlRequest {

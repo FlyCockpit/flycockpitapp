@@ -4,8 +4,10 @@ use ratatui::layout::{Margin, Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use std::cell::Cell;
+use unicode_width::UnicodeWidthStr;
 
 use crate::tui::composer::{Composer, VimMode};
+use crate::tui::markdown;
 
 pub enum VimEditorOutcome {
     Stay,
@@ -38,6 +40,32 @@ impl VimEditor {
         if !text.is_empty() {
             self.composer.insert_str(text);
         }
+    }
+
+    /// Place the caret from a currently rendered editor body cell. Rows are
+    /// relative to the visible (scrolled) body and columns are display cells;
+    /// the result always lands on a grapheme boundary.
+    pub fn set_cursor_from_visible_cell(&mut self, row: usize, col: usize) {
+        let line_index = self.scroll.get().saturating_add(row);
+        let mut line_start = 0usize;
+        let Some(line) = self.composer.text().split('\n').nth(line_index) else {
+            self.composer.set_cursor(self.composer.text().len());
+            return;
+        };
+        for preceding in self.composer.text().split('\n').take(line_index) {
+            line_start = line_start.saturating_add(preceding.len()).saturating_add(1);
+        }
+        let mut display = 0usize;
+        let mut byte = 0usize;
+        for grapheme in markdown::semantic_graphemes(line) {
+            let width = UnicodeWidthStr::width(grapheme.as_str());
+            if col < display.saturating_add(width) {
+                break;
+            }
+            display = display.saturating_add(width);
+            byte = byte.saturating_add(grapheme.len());
+        }
+        self.composer.set_cursor(line_start.saturating_add(byte));
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> VimEditorOutcome {

@@ -1,9 +1,14 @@
 import { Queue } from "bullmq";
-import { redisConnection } from "./connection.js";
+import { getRedisConnection } from "./connection.js";
 import { QUEUE_NAMES } from "./jobs.js";
 
 export { FlowProducer, Job, Queue, QueueEvents, Worker } from "bullmq";
-export { createRedisConnection, redisConnection } from "./connection.js";
+export {
+  closeRedisConnection,
+  createRedisConnection,
+  getRedisConnection,
+  resetRedisConnectionForTests,
+} from "./connection.js";
 export {
   type AnalyzeAssetJobData,
   analyzeAssetJobSchema,
@@ -35,15 +40,29 @@ const defaultJobOptions = {
   removeOnFail: { age: 86400, count: 5000 },
 };
 
+function lazyQueue(
+  name: string,
+  options: Omit<NonNullable<ConstructorParameters<typeof Queue>[1]>, "connection">,
+): Queue {
+  let queue: Queue | undefined;
+  const current = () =>
+    (queue ??= new Queue(name, { ...options, connection: getRedisConnection() }));
+  return new Proxy({} as Queue, {
+    get: (_target, property) => {
+      const value = Reflect.get(current(), property);
+      return typeof value === "function" ? value.bind(current()) : value;
+    },
+    set: (_target, property, value) => Reflect.set(current(), property, value),
+  });
+}
+
 /** Pre-configured echo queue. Add more queues here as needed. */
-export const echoQueue = new Queue(QUEUE_NAMES.echo, {
-  connection: redisConnection,
+export const echoQueue = lazyQueue(QUEUE_NAMES.echo, {
   defaultJobOptions,
 });
 
 /** Re-derives Asset metadata from S3 bytes after a presigned upload finalizes. */
-export const analyzeAssetQueue = new Queue(QUEUE_NAMES.analyzeAsset, {
-  connection: redisConnection,
+export const analyzeAssetQueue = lazyQueue(QUEUE_NAMES.analyzeAsset, {
   defaultJobOptions,
 });
 
@@ -53,8 +72,7 @@ export const analyzeAssetQueue = new Queue(QUEUE_NAMES.analyzeAsset, {
  * Single-attempt — a transient failure is logged and the next cron firing
  * picks it up; retrying immediately would burn API quota for no gain.
  */
-export const cleanupAssetsQueue = new Queue(QUEUE_NAMES.cleanupAssets, {
-  connection: redisConnection,
+export const cleanupAssetsQueue = lazyQueue(QUEUE_NAMES.cleanupAssets, {
   defaultJobOptions: {
     ...defaultJobOptions,
     attempts: 1,
@@ -71,8 +89,7 @@ export const cleanupAssetsQueue = new Queue(QUEUE_NAMES.cleanupAssets, {
  * burns minutes of CPU for the same outcome. Failures surface in the admin
  * UI via Video.failureReason; admins can re-upload or re-enqueue manually.
  */
-export const transcodeVideoQueue = new Queue(QUEUE_NAMES.transcodeVideo, {
-  connection: redisConnection,
+export const transcodeVideoQueue = lazyQueue(QUEUE_NAMES.transcodeVideo, {
   defaultJobOptions: {
     ...defaultJobOptions,
     attempts: 1,
@@ -85,8 +102,7 @@ export const transcodeVideoQueue = new Queue(QUEUE_NAMES.transcodeVideo, {
  * no video re-encode, no thumbnail generation — but still CPU-bound on AAC
  * encoding, so attempts stay at 1 for the same reason.
  */
-export const transcodeAudioTrackQueue = new Queue(QUEUE_NAMES.transcodeAudioTrack, {
-  connection: redisConnection,
+export const transcodeAudioTrackQueue = lazyQueue(QUEUE_NAMES.transcodeAudioTrack, {
   defaultJobOptions: {
     ...defaultJobOptions,
     attempts: 1,
@@ -98,8 +114,7 @@ export const transcodeAudioTrackQueue = new Queue(QUEUE_NAMES.transcodeAudioTrac
  * objects under the video prefixes. Single-attempt like cleanupAssets — the
  * next cron firing picks up any transient failure.
  */
-export const cleanupVideosQueue = new Queue(QUEUE_NAMES.cleanupVideos, {
-  connection: redisConnection,
+export const cleanupVideosQueue = lazyQueue(QUEUE_NAMES.cleanupVideos, {
   defaultJobOptions: {
     ...defaultJobOptions,
     attempts: 1,
@@ -112,8 +127,7 @@ export const cleanupVideosQueue = new Queue(QUEUE_NAMES.cleanupVideos, {
  * failure surfaces to the admin instead of silently re-running. Concurrency is
  * pinned to 1 in the worker so two seed runs never overlap.
  */
-export const seedQueue = new Queue(QUEUE_NAMES.seed, {
-  connection: redisConnection,
+export const seedQueue = lazyQueue(QUEUE_NAMES.seed, {
   defaultJobOptions: {
     ...defaultJobOptions,
     attempts: 1,
@@ -121,8 +135,7 @@ export const seedQueue = new Queue(QUEUE_NAMES.seed, {
 });
 
 /** Generates enterprise log export artifacts. Potentially large, so concurrency stays low. */
-export const enterpriseLogExportQueue = new Queue(QUEUE_NAMES.enterpriseLogExport, {
-  connection: redisConnection,
+export const enterpriseLogExportQueue = lazyQueue(QUEUE_NAMES.enterpriseLogExport, {
   defaultJobOptions: {
     ...defaultJobOptions,
     attempts: 1,

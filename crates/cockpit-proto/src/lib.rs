@@ -7,7 +7,7 @@
 //! Layout:
 //!
 //! ```text
-//! { "v": 6, "kind": "req"|"res"|"evt"|"err", ... }
+//! { "v": 9, "kind": "req"|"res"|"evt"|"err", ... }
 //! ```
 //!
 //! - **`req`** — client → daemon. Carries a uuid `id` the daemon
@@ -25,9 +25,13 @@
 //! refuse envelopes whose `v` is outside the supported range.
 
 pub mod remote_identity_protocol;
+pub mod remote_operation_fcor;
 pub mod remote_protocol_id;
+pub mod remote_signaling_attempt_store;
 pub mod remote_transport;
+pub mod remote_version;
 pub mod remote_wire_magic_registry;
+pub mod send_user_message_v2;
 pub mod terminal;
 
 use std::collections::{BTreeMap, HashMap};
@@ -42,6 +46,18 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 use tokio_util::codec::{Framed, FramedRead, FramedWrite, LinesCodec, LinesCodecError};
 use uuid::Uuid;
+
+/// Source-preserving image spend settings shared by daemon clients.
+pub type ImageSpendPolicyView = cockpit_config::config::image_spend::ImageSpendSettings;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageSpendPreflightView {
+    pub policy: ImageSpendPolicyView,
+    pub blocked: Option<cockpit_config::config::image_spend::BudgetBlockReason>,
+    pub policy_version: Option<u64>,
+    pub epoch_policy_version: Option<u64>,
+    pub epoch_sequence: Option<u64>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -427,13 +443,69 @@ pub enum ToolFailKind {
     Execution,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AccountInfo {
     pub user_id: String,
     pub email: String,
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+impl AccountInfo {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.user_id.is_empty(),
+            "account user id must not be empty"
+        );
+        anyhow::ensure!(!self.email.is_empty(), "account email must not be empty");
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for AccountInfo {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            user_id: String,
+            email: String,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let value = Self {
+            user_id: wire.user_id,
+            email: wire.email,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
+}
+
+pub fn normalize_server_url(raw: &str) -> anyhow::Result<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    anyhow::ensure!(!trimmed.is_empty(), "server URL cannot be empty");
+    let url = url::Url::parse(trimmed)
+        .map_err(|_| anyhow::anyhow!("server URL must be an absolute URL"))?;
+    anyhow::ensure!(
+        url.username().is_empty() && url.password().is_none(),
+        "server URL must not include credentials"
+    );
+    anyhow::ensure!(
+        url.query().is_none() && url.fragment().is_none(),
+        "server URL must not include a query string or fragment"
+    );
+    anyhow::ensure!(
+        matches!(url.path(), "" | "/"),
+        "server URL must be an origin, not a path"
+    );
+    let loopback = matches!(
+        url.host_str(),
+        Some("localhost" | "127.0.0.1" | "::1" | "[::1]")
+    );
+    anyhow::ensure!(
+        url.scheme() == "https" || (url.scheme() == "http" && loopback),
+        "server URL must use HTTPS except for localhost development"
+    );
+    Ok(url.origin().ascii_serialization())
+}
+
+#[derive(Clone, Serialize, PartialEq, Eq)]
 pub struct StoredFlycockpitCredential {
     pub server_url: String,
     pub instance_id: String,
@@ -445,7 +517,56 @@ pub struct StoredFlycockpitCredential {
     pub relay_choice: Option<RelayChoice>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+impl<'de> Deserialize<'de> for StoredFlycockpitCredential {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            server_url: String,
+            instance_id: String,
+            instance_token: String,
+            account: AccountInfo,
+            #[serde(default)]
+            display_name: Option<String>,
+            #[serde(default)]
+            relay_choice: Option<RelayChoice>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let value = Self {
+            server_url: wire.server_url,
+            instance_id: wire.instance_id,
+            instance_token: wire.instance_token,
+            account: wire.account,
+            display_name: wire.display_name,
+            relay_choice: wire.relay_choice,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
+}
+
+impl StoredFlycockpitCredential {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            normalize_server_url(&self.server_url)? == self.server_url,
+            "server URL must be normalized"
+        );
+        anyhow::ensure!(
+            !self.instance_id.is_empty(),
+            "instance id must not be empty"
+        );
+        anyhow::ensure!(
+            !self.instance_token.is_empty(),
+            "instance token must not be empty"
+        );
+        self.account.validate()?;
+        if let Some(relay) = &self.relay_choice {
+            relay.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RelayChoice {
     pub relay_id: String,
@@ -458,9 +579,47 @@ pub struct RelayChoice {
 }
 
 impl RelayChoice {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.relay_id.is_empty(), "relay id must not be empty");
+        anyhow::ensure!(
+            !self.ws_url.is_empty(),
+            "relay websocket URL must not be empty"
+        );
+        if let Some(region) = &self.region {
+            anyhow::ensure!(!region.is_empty(), "relay region must not be empty");
+        }
+        Ok(())
+    }
+
     pub fn is_fresh_at(&self, now_ms: i64) -> bool {
         const TTL_MS: i64 = 30 * 60 * 1000;
         now_ms.saturating_sub(self.chosen_at) < TTL_MS
+    }
+}
+
+impl<'de> Deserialize<'de> for RelayChoice {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Wire {
+            relay_id: String,
+            #[serde(default)]
+            region: Option<String>,
+            ws_url: String,
+            #[serde(default)]
+            rtt_ms: Option<u64>,
+            chosen_at: i64,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let value = Self {
+            relay_id: wire.relay_id,
+            region: wire.region,
+            ws_url: wire.ws_url,
+            rtt_ms: wire.rtt_ms,
+            chosen_at: wire.chosen_at,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
     }
 }
 
@@ -485,12 +644,12 @@ impl fmt::Debug for StoredFlycockpitCredential {
 /// such as removals, renames, and type changes bump
 /// [`MIN_SUPPORTED_PROTOCOL_VERSION`] and are the only class that narrows the
 /// compatibility window.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 9;
 
-/// Oldest wire schema version this binary accepts. Protocol v6 deliberately
-/// breaks the active-model state shape so clients cannot silently lose
-/// session-level reasoning, thinking, or cache preferences.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 6;
+/// Oldest wire schema version this binary accepts. The supervised-goal batch
+/// retires v8 because it replaces the goal status shape, renames its progress
+/// event, and adds a goal-creation request with no v8-compatible fallback.
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 9;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -640,7 +799,26 @@ impl Envelope {
     pub fn request_at(v: u32, id: Uuid, request: Request) -> Self {
         Self {
             v,
-            body: Body::Request { id, request },
+            body: Body::Request {
+                id,
+                operation: None,
+                request,
+            },
+        }
+    }
+
+    pub fn remote_request(
+        id: Uuid,
+        operation: RemoteOperationIdentityV1,
+        request: Request,
+    ) -> Self {
+        Self {
+            v: PROTOCOL_VERSION,
+            body: Body::Request {
+                id,
+                operation: Some(operation),
+                request,
+            },
         }
     }
 
@@ -687,6 +865,8 @@ pub enum Body {
     #[serde(rename = "req")]
     Request {
         id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation: Option<RemoteOperationIdentityV1>,
         #[serde(flatten)]
         request: Request,
     },
@@ -709,16 +889,199 @@ pub enum Body {
         id: Option<Uuid>,
         error: ErrorPayload,
     },
+    #[serde(rename = "replay_req")]
+    RemoteReplayRequest(RemoteReplayRequestV2),
+    #[serde(rename = "replay_res")]
+    RemoteReplayResponse(RemoteReplayResponseV2),
+    #[serde(rename = "replay_ack")]
+    RemoteReplayAck(RemoteReplayAckV2),
+    #[serde(rename = "replay_ack_res")]
+    RemoteReplayAckResponse(RemoteReplayAckResponseV2),
     #[serde(other)]
     Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteReplayRequestV2 {
+    pub id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_event_seq: Option<crate::remote_protocol_id::CanonicalU64DecimalStringV1>,
+    pub limit: RemoteReplayLimit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteReplayResponseV2 {
+    pub id: Uuid,
+    pub events: Vec<RemoteOutboxDeliveryV1>,
+    pub high_water_mark: crate::remote_protocol_id::CanonicalU64DecimalStringV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteReplayAckV2 {
+    pub id: Uuid,
+    pub delivery_id: CanonicalRfcUuidV1,
+    pub lease_token: CanonicalRfcUuidV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteReplayAckResponseV2 {
+    pub id: Uuid,
+    pub acked: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteOutboxDeliveryV1 {
+    pub event_seq: crate::remote_protocol_id::CanonicalU64DecimalStringV1,
+    pub delivery_id: CanonicalRfcUuidV1,
+    pub kind: String,
+    pub canonical_payload: Vec<u8>,
+    pub lease_token: CanonicalRfcUuidV1,
+    pub lease_expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanonicalRfcUuidV1(Uuid);
+
+impl CanonicalRfcUuidV1 {
+    pub fn new(value: Uuid) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !value.is_nil() && value.get_variant() == uuid::Variant::RFC4122,
+            "UUID must be nonnil RFC variant"
+        );
+        Ok(Self(value))
+    }
+    pub fn get(self) -> Uuid {
+        self.0
+    }
+}
+
+impl Serialize for CanonicalRfcUuidV1 {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0.hyphenated().to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for CanonicalRfcUuidV1 {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        let value = Uuid::parse_str(&text).map_err(serde::de::Error::custom)?;
+        if value.hyphenated().to_string() != text {
+            return Err(serde::de::Error::custom(
+                "UUID must use canonical lowercase hyphenated spelling",
+            ));
+        }
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct RemoteReplayLimit(u16);
+
+impl RemoteReplayLimit {
+    pub fn new(value: u16) -> anyhow::Result<Self> {
+        anyhow::ensure!((1..=256).contains(&value), "replay limit must be 1..=256");
+        Ok(Self(value))
+    }
+    pub fn get(self) -> u16 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for RemoteReplayLimit {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        Self::new(u16::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteOperationIdentityV1 {
+    pub schema_version: u8,
+    pub logical_attachment_id: Uuid,
+    pub operation_id: Uuid,
+}
+
+impl RemoteOperationIdentityV1 {
+    pub fn new(logical_attachment_id: Uuid, operation_id: Uuid) -> Result<Self> {
+        anyhow::ensure!(
+            !logical_attachment_id.is_nil()
+                && logical_attachment_id.get_variant() == uuid::Variant::RFC4122,
+            "logical attachment id must be a nonnil RFC UUID"
+        );
+        anyhow::ensure!(
+            !operation_id.is_nil() && operation_id.get_variant() == uuid::Variant::RFC4122,
+            "operation id must be a nonnil RFC UUID"
+        );
+        anyhow::ensure!(
+            operation_id.get_version_num() == 7,
+            "operation id must be UUIDv7"
+        );
+        Ok(Self {
+            schema_version: 1,
+            logical_attachment_id,
+            operation_id,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for RemoteOperationIdentityV1 {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Wire {
+            schema_version: u8,
+            logical_attachment_id: String,
+            operation_id: String,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        if wire.schema_version != 1 {
+            return Err(serde::de::Error::custom(
+                "remote operation identity schemaVersion must be 1",
+            ));
+        }
+        let parse_canonical = |text: String| {
+            let value = Uuid::parse_str(&text).map_err(serde::de::Error::custom)?;
+            if value.hyphenated().to_string() != text {
+                return Err(serde::de::Error::custom(
+                    "UUID must use canonical lowercase hyphenated spelling",
+                ));
+            }
+            Ok(value)
+        };
+        Self::new(
+            parse_canonical(wire.logical_attachment_id)?,
+            parse_canonical(wire.operation_id)?,
+        )
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 // ---- Requests --------------------------------------------------------------
 
 mod request;
 pub use request::{
-    ActiveModelSwitchTrigger, AttachmentPurpose, LspControlAction, Request, RunInvocationOptions,
-    UsageKind,
+    ActiveModelSwitchTrigger, AttachmentPurpose, LspControlAction, RemoteAdapterEvidenceV1,
+    RemoteAdapterRecoveryContractV1, RemoteAdapterRecoveryStrategy, RemoteOperationClass, Request,
+    RunInvocationOptions, UnknownRemoteOperationClass, UsageKind,
+    canonical_remote_operation_fcor_schema_for_tag, remote_adapter_recovery_contract_for_tag,
+    remote_adapter_recovery_strategy_for_tag, remote_operation_class_for_tag,
+    remote_operation_fcor_schema_for_tag,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -872,9 +1235,10 @@ impl DelegationSteerResult {
 
 mod response;
 pub use response::{
-    ActiveModelState, BtwForkInfo, ClientSubmissionReceiptStatus, Response,
-    RunInvocationCancelOutcome, RunInvocationCancelResultV1, RunInvocationLifecycleState,
-    RunInvocationStatusV1, RunInvocationTerminalReason,
+    ActiveModelState, BtwForkInfo, ClientSubmissionReceiptStatus, RemoteGoalOutcomeV1,
+    RemoteOperationStateV1, RemoteOperationStatusV1, Response, RunInvocationCancelOutcome,
+    RunInvocationCancelResultV1, RunInvocationLifecycleState, RunInvocationStatusV1,
+    RunInvocationTerminalReason,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -975,6 +1339,8 @@ pub enum ErrorCode {
     HashMismatch,
     /// Requested path is locked by another writer.
     LockConflict,
+    /// Optimistic generation/version did not match authoritative state.
+    Conflict,
     /// Workspace trust is unset or explicitly refuses access.
     WorkspaceTrust,
     /// A user message was deterministically rejected before entering the
@@ -995,6 +1361,8 @@ pub enum ErrorCode {
     /// Config is invalid; the daemon retained the last valid snapshot and
     /// cannot build a fresh inventory from the broken config.
     InvalidConfig,
+    /// The response-metrics tokenizer is explicitly present but invalid.
+    InvalidResponseMetricsTokenizer,
     /// A dependency required to serve inventory is temporarily unavailable.
     Unavailable,
     /// Same-principal start/replay used a client_submission_id with different
@@ -1055,6 +1423,7 @@ impl<'de> Deserialize<'de> for ErrorCode {
             "path_outside_root" => Self::PathOutsideRoot,
             "hash_mismatch" => Self::HashMismatch,
             "lock_conflict" => Self::LockConflict,
+            "conflict" => Self::Conflict,
             "workspace_trust" => Self::WorkspaceTrust,
             "user_message_not_accepted" => Self::UserMessageNotAccepted,
             "model_generation_stale" => Self::ModelGenerationStale,
@@ -1062,6 +1431,7 @@ impl<'de> Deserialize<'de> for ErrorCode {
             "unknown_agent" => Self::UnknownAgent,
             "inventory_too_large" => Self::InventoryTooLarge,
             "invalid_config" => Self::InvalidConfig,
+            "invalid_response_metrics_tokenizer" => Self::InvalidResponseMetricsTokenizer,
             "unavailable" => Self::Unavailable,
             "idempotency_conflict" => Self::IdempotencyConflict,
             "client_submission_id_unavailable" => Self::ClientSubmissionIdUnavailable,
@@ -1094,6 +1464,7 @@ impl std::fmt::Display for ErrorCode {
             Self::PathOutsideRoot => "path_outside_root",
             Self::HashMismatch => "hash_mismatch",
             Self::LockConflict => "lock_conflict",
+            Self::Conflict => "conflict",
             Self::WorkspaceTrust => "workspace_trust",
             Self::UserMessageNotAccepted => "user_message_not_accepted",
             Self::ModelGenerationStale => "model_generation_stale",
@@ -1101,6 +1472,7 @@ impl std::fmt::Display for ErrorCode {
             Self::UnknownAgent => "unknown_agent",
             Self::InventoryTooLarge => "inventory_too_large",
             Self::InvalidConfig => "invalid_config",
+            Self::InvalidResponseMetricsTokenizer => "invalid_response_metrics_tokenizer",
             Self::Unavailable => "unavailable",
             Self::IdempotencyConflict => "idempotency_conflict",
             Self::ClientSubmissionIdUnavailable => "client_submission_id_unavailable",
@@ -1303,8 +1675,14 @@ pub use cockpit_db::wire::{
     SessionMessage, SessionSummary, WriteContentPreview,
 };
 
-pub use cockpit_db::db::session_goals::GoalStatus;
-pub use cockpit_db::stats::StatsRollup;
+pub use cockpit_db::db::session_goals::{
+    GoalContract, GoalDisposition, GoalLifecycleHistoryEntry, GoalPauseReason, GoalPhase,
+};
+pub use cockpit_db::stats::{
+    HardFailShapeRow, LanguageRow, LanguageSection, NonFileRow, PriceTable, RecoveryModeRow,
+    RecoveryRow, RecoverySection, RecoveryStageRow, RecoveryToolRow, StatsRollup, StatsScope,
+    TokenRow, TokenSpend,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GoalSummary {
@@ -1314,10 +1692,28 @@ pub struct GoalSummary {
     pub objective: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
-    pub status: GoalStatus,
+    pub disposition: GoalDisposition,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_budget: Option<i64>,
+    pub phase: Option<GoalPhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_phase: Option<GoalPhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_reason: Option<GoalPauseReason>,
+    pub contract_available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_gap_or_blocker: Option<String>,
+    pub verification_attempts: i64,
+    /// Inclusive configured cap for started verification panels.
+    pub max_verification_attempts: u64,
+    pub attempt_generation: i64,
+    pub token_budget: i64,
     pub tokens_used: i64,
+    pub remaining_tokens: i64,
+    /// Wall-clock milliseconds spent in the running disposition.
+    pub elapsed_active_ms: i64,
+    /// Bounded, oldest-to-newest durable lifecycle audit trail.
+    #[serde(default)]
+    pub lifecycle_history: Vec<GoalLifecycleHistoryEntry>,
     pub blocked_attempts: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_read_at: Option<i64>,
@@ -1353,6 +1749,85 @@ pub struct ProjectNote {
     pub project_root: String,
     pub name: String,
     pub content: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceTrustMode {
+    Trust,
+    IgnoreConfig,
+    Untrusted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgSyncDisclosure {
+    pub org_id: String,
+    pub cursor_seq: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_synced_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectorDisclosure {
+    pub enabled: bool,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_region: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppFlagKey {
+    DaemonAutostartNotice,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssistantSessionResolutionMode {
+    MostRecentOrCreate,
+}
+
+#[cfg(test)]
+mod tui_ownership_rpc_contract_tests {
+    use super::*;
+
+    #[test]
+    fn missing_rpc_protocol_contract_rejects_open_ended_policy_values() {
+        assert!(serde_json::from_str::<AppFlagKey>(r#""arbitrary-string""#).is_err());
+        assert!(serde_json::from_str::<WorkspaceTrustMode>(r#""future-mode""#).is_err());
+        assert!(
+            serde_json::from_str::<AssistantSessionResolutionMode>(r#""create-always""#).is_err()
+        );
+    }
+
+    #[test]
+    fn missing_rpc_protocol_contract_has_exact_request_fields() {
+        let trust = serde_json::to_value(Request::SetWorkspaceTrust {
+            project_root: "/workspace".into(),
+            mode: WorkspaceTrustMode::IgnoreConfig,
+            expected_config_generation: 9,
+        })
+        .unwrap();
+        assert_eq!(trust["request"], "set_workspace_trust");
+        assert_eq!(trust["params"]["project_root"], "/workspace");
+        assert_eq!(trust["params"]["mode"], "ignore_config");
+        assert_eq!(trust["params"]["expected_config_generation"], 9);
+
+        let assistant = serde_json::to_value(Request::ResolveAssistantSession {
+            assistant_id: "helper".into(),
+            project_root: "/workspace".into(),
+            mode: AssistantSessionResolutionMode::MostRecentOrCreate,
+        })
+        .unwrap();
+        assert_eq!(assistant["params"]["assistant_id"], "helper");
+        assert_eq!(assistant["params"]["mode"], "most_recent_or_create");
+    }
 }
 
 /// Metadata for a session sealed value.  The literal is deliberately absent
@@ -1900,6 +2375,10 @@ fn envelope_contains_unknown(env: &Envelope) -> bool {
         Body::Response { response, .. } => matches!(**response, Response::Unknown),
         Body::Event { event } => matches!(event, Event::Unknown),
         Body::Error { error, .. } => matches!(error.code, ErrorCode::Other(_)),
+        Body::RemoteReplayRequest(_)
+        | Body::RemoteReplayResponse(_)
+        | Body::RemoteReplayAck(_)
+        | Body::RemoteReplayAckResponse(_) => false,
         Body::Unknown => true,
     }
 }
@@ -1930,7 +2409,7 @@ mod proto_fixture_tests {
     use super::*;
 
     const UNKNOWN_SENTINEL: &str = "__unknown";
-    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[6];
+    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[9];
     const DAEMON_PROTO_FIXTURE_FILES: &[&str] = &["event.json", "request.json", "response.json"];
 
     #[test]
@@ -2112,7 +2591,7 @@ mod proto_fixture_tests {
         }
     }
 
-    fn read_fixture(file_name: &str) -> Map<String, Value> {
+    pub(super) fn read_fixture(file_name: &str) -> Map<String, Value> {
         read_fixture_for(PROTOCOL_VERSION, file_name)
     }
 
@@ -2307,32 +2786,41 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "git_diff_file",
         "git_status",
         "get_inventory_bundle",
+        "get_app_flag",
+        "get_startup_disclosures",
         "list_sessions",
         "read_history_page",
         "read_session_messages",
         "read_subagent_history_page",
         "rename_session",
         "resolve_interrupt",
+        "resolve_assistant_session",
         "restart_if_idle",
         "resume_paused_work",
         "send_user_message",
         "session_live_status",
         "set_active_model",
+        "set_workspace_trust",
         "set_agent",
         "set_default_model",
         "set_model_favorite",
         "share_session",
+        "mark_app_flag_seen",
         "stats_rollup",
         "unarchive_session",
     ];
 
     const RESPONSE_ALLOWLIST: &[&str] = &[
         "ack",
+        "config_refreshed",
         "bulk_transfer_chunk",
         "bulk_transfer_chunk_accepted",
         // Migrated to a typed bulk transfer reference.
         "export_session_data",
         "attached",
+        "app_flag",
+        "app_flag_seen",
+        "assistant_session_resolved",
         "forked",
         "fs_list",
         "fs_read",
@@ -2348,8 +2836,10 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
         "session_messages",
         "sessions",
         "stats_rollup",
+        "startup_disclosures",
         "subagent_history_page",
         "user_message_queued",
+        "workspace_trust_set",
     ];
 
     #[test]
@@ -2767,6 +3257,12 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
                 Some(sentinel_uuid()),
                 ErrorCode::TerminalGenerationGone,
                 "terminal generation is gone",
+            ),
+            (
+                "invalid_response_metrics_tokenizer_paired",
+                Some(sentinel_uuid()),
+                ErrorCode::InvalidResponseMetricsTokenizer,
+                "configuration value is invalid",
             ),
             (
                 "model_generation_stale_paired",
@@ -3342,6 +3838,22 @@ mod errorcode_forward_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_operation_identity_requires_strict_uuid_v7_wire_form() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../packages/cockpit-protocol/fixtures/remote-operation-identity-v1.json"
+        ))
+        .unwrap();
+        assert!(
+            serde_json::from_value::<RemoteOperationIdentityV1>(fixture["valid"].clone()).is_ok()
+        );
+        for malformed in fixture["invalid"].as_array().unwrap() {
+            assert!(
+                serde_json::from_value::<RemoteOperationIdentityV1>(malformed.clone()).is_err()
+            );
+        }
+    }
     use serde_json::json;
     use tokio::io::duplex;
 
@@ -3350,6 +3862,48 @@ mod tests {
             daemon_version: "0.0.test-daemon".to_string(),
             protocol_version,
         }
+    }
+
+    #[test]
+    fn goal_lifecycle_proto_round_trips_elapsed_and_history() {
+        let summary = GoalSummary {
+            id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            project_id: "project".into(),
+            objective: "ship".into(),
+            context: None,
+            disposition: GoalDisposition::UserPaused,
+            phase: None,
+            resume_phase: Some(GoalPhase::Executing),
+            pause_reason: Some(GoalPauseReason::User),
+            contract_available: true,
+            latest_gap_or_blocker: None,
+            verification_attempts: 2,
+            max_verification_attempts: 4,
+            attempt_generation: 4,
+            token_budget: 100,
+            tokens_used: 25,
+            remaining_tokens: 75,
+            elapsed_active_ms: 12_345,
+            lifecycle_history: vec![GoalLifecycleHistoryEntry {
+                at: 7,
+                disposition: GoalDisposition::UserPaused,
+                phase: None,
+                reason: Some(GoalPauseReason::User),
+            }],
+            blocked_attempts: 0,
+            last_read_at: None,
+            created_at: 1,
+            updated_at: 7,
+        };
+        let encoded = serde_json::to_value(&summary).unwrap();
+        assert_eq!(encoded["elapsed_active_ms"], 12_345);
+        assert_eq!(encoded["max_verification_attempts"], 4);
+        assert_eq!(encoded["lifecycle_history"][0]["reason"]["kind"], "user");
+        assert_eq!(
+            serde_json::from_value::<GoalSummary>(encoded).unwrap(),
+            summary
+        );
     }
 
     #[test]
@@ -4169,6 +4723,7 @@ mod tests {
             Body::Request {
                 id: got_id,
                 request: Request::DaemonStatus,
+                ..
             } => assert_eq!(got_id, id),
             other => panic!("unexpected: {other:?}"),
         }
@@ -4570,6 +5125,46 @@ mod tests {
         assert!(!is_protocol_compatible(PROTOCOL_VERSION + 1));
         if MIN_SUPPORTED_PROTOCOL_VERSION > 0 {
             assert!(!is_protocol_compatible(MIN_SUPPORTED_PROTOCOL_VERSION - 1));
+        }
+    }
+
+    #[test]
+    fn config_refreshed_response_is_frozen_in_current_fixture() {
+        assert_eq!(PROTOCOL_VERSION, 9);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 9);
+        let fixture = proto_fixture_tests::read_fixture("response.json");
+        let response: Response = serde_json::from_value(
+            fixture
+                .get("config_refreshed")
+                .expect("v9 config_refreshed fixture")
+                .clone(),
+        )
+        .unwrap();
+        assert!(matches!(
+            response,
+            Response::ConfigRefreshed {
+                applied_generation: 3,
+                changed: true
+            }
+        ));
+    }
+
+    #[test]
+    fn goal_summary_cap_is_present_in_every_v9_response_fixture() {
+        assert_eq!(PROTOCOL_VERSION, 9);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 9);
+        let fixture = proto_fixture_tests::read_fixture("response.json");
+
+        for response_name in ["goal_status", "goal_updated"] {
+            let response = fixture
+                .get(response_name)
+                .unwrap_or_else(|| panic!("v9 {response_name} fixture"));
+            assert_eq!(
+                response["data"]["goal"]["max_verification_attempts"], 4,
+                "v9 {response_name} must freeze the inclusive verification cap"
+            );
+            serde_json::from_value::<Response>(response.clone())
+                .unwrap_or_else(|error| panic!("v9 {response_name} must deserialize: {error}"));
         }
     }
 }

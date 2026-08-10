@@ -57,6 +57,7 @@ fn default_retention_vacuum_interval_days() -> u32 {
 pub struct RetentionOutcome {
     pub sessions_expired: u64,
     pub payload_rows_deleted: u64,
+    pub goal_tombstones_purged: u64,
     pub vacuumed: bool,
 }
 
@@ -125,8 +126,16 @@ impl Db {
             let cutoff = now_secs - (cfg.payload_window_days as i64) * 86_400;
             outcome.payload_rows_deleted = self.prune_session_payloads(cutoff).await?;
         }
+        outcome.goal_tombstones_purged = self
+            .purge_cleared_goal_tombstones(now_secs)
+            .await?
+            .try_into()
+            .unwrap_or(u64::MAX);
 
-        let deleted = outcome.sessions_expired + outcome.payload_rows_deleted;
+        let deleted = outcome
+            .sessions_expired
+            .saturating_add(outcome.payload_rows_deleted)
+            .saturating_add(outcome.goal_tombstones_purged);
         if self.path.is_some()
             && self.should_vacuum(deleted, now_secs, cfg).await
             && self.vacuum_retention_database().await?

@@ -1,4 +1,8 @@
 {
+  "dependencies": {
+    "title": "Dependencies",
+    "refreshFailed": "Dependency refresh failed; showing the last complete snapshot."
+  },
   "navProfile": "Profile",
   "navSecurity": "Security",
   "title": "Settings",

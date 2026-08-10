@@ -132,7 +132,7 @@ impl SealedProjectKey {
     /// identity function the session layer uses. There is deliberately no
     /// second canonicalization rule for sealed values.
     pub fn canonical(project_root: &Path) -> Self {
-        Self(crate::session::project_id_for(&project_root.to_path_buf()))
+        Self(crate::session::project_id_for(project_root))
     }
 
     /// Adopt an already-canonical key (for example `Session::project_id`).

@@ -869,6 +869,8 @@ fn parse_version(parser: &VersionParser, combined: &str) -> Option<String> {
 
 fn compatibility_failure(rule: &CompatibilityRule, version: Option<&str>) -> Option<String> {
     match rule {
+        // Cross-runtime catalog rules are evaluated after the complete snapshot
+        // has been assembled. A single-row probe cannot safely decide them.
         CompatibilityRule::CatalogRule { .. } => None,
         CompatibilityRule::ExactVersion { version: expected } => {
             let Some(actual) = version else {
@@ -944,6 +946,34 @@ pub fn refresh_snapshot(
     deadlines: ProbeDeadlines,
     cancel: &CancelToken,
 ) -> super::health::ExternalRuntimeSnapshot {
+    refresh_snapshot_with_observer(
+        generation,
+        descriptors,
+        executor,
+        path_env,
+        cwd,
+        ctx,
+        deadlines,
+        cancel,
+        |_| {},
+    )
+}
+
+/// Refresh descriptors while exposing immutable invocation-local progress.
+/// The observer runs after each completed row and never receives a snapshot
+/// that can subsequently be mutated by the worker.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn refresh_snapshot_with_observer(
+    generation: u64,
+    descriptors: &[ExternalRuntimeDescriptor],
+    executor: &dyn ProbeExecutor,
+    path_env: Option<&str>,
+    cwd: &Path,
+    ctx: &EvaluationContext,
+    deadlines: ProbeDeadlines,
+    cancel: &CancelToken,
+    mut observer: impl FnMut(&super::health::ExternalRuntimeSnapshot),
+) -> super::health::ExternalRuntimeSnapshot {
     let platform = ctx.platform;
     let mut snapshot = super::health::ExternalRuntimeSnapshot::empty(generation, platform);
     for descriptor in descriptors {
@@ -969,7 +999,9 @@ pub fn refresh_snapshot(
         snapshot
             .entries
             .insert(descriptor.id.as_str().to_string(), entry);
+        observer(&snapshot);
     }
+    apply_catalog_compatibility_rules(descriptors, &mut snapshot);
     for descriptor in descriptors {
         if let Some(group) = &descriptor.group {
             let key = descriptor.id.as_str().to_string();
@@ -977,6 +1009,45 @@ pub fn refresh_snapshot(
         }
     }
     snapshot
+}
+
+fn apply_catalog_compatibility_rules(
+    descriptors: &[ExternalRuntimeDescriptor],
+    snapshot: &mut super::health::ExternalRuntimeSnapshot,
+) {
+    const MEDIA_PAIR_RULE: &str = "ffmpeg-ffprobe-compatible-pair";
+    let has_media_pair_rule = descriptors.iter().any(|descriptor| {
+        matches!(
+            descriptor.compatibility.as_ref(),
+            Some(CompatibilityRule::CatalogRule { rule_id }) if rule_id == MEDIA_PAIR_RULE
+        )
+    });
+    if !has_media_pair_rule || super::adapters::media_runtime_pair_is_compatible(snapshot) {
+        return;
+    }
+
+    for id in [
+        super::adapters::ID_MEDIA_FFMPEG,
+        super::adapters::ID_MEDIA_FFPROBE,
+    ] {
+        let Some(entry) = snapshot.entries.get_mut(id) else {
+            continue;
+        };
+        // Preserve the more precise Missing/Failed/Unknown state. An otherwise
+        // available row becomes incompatible because selection requires both
+        // sides of the catalog-owned pair to be healthy and version-compatible.
+        if matches!(entry.state, HealthState::Available { .. }) {
+            entry.state = HealthState::Incompatible {
+                detail: "FFmpeg and FFprobe must both report the same parseable release major"
+                    .into(),
+            };
+            if entry.remedy.is_none()
+                && let Some(descriptor) = descriptors.iter().find(|item| item.id == entry.id)
+            {
+                entry.remedy = Some(descriptor.remedy.clone());
+            }
+        }
+    }
 }
 
 /// Handler for [`RecordingProbeExecutor`] run invocations in tests.

@@ -44,10 +44,12 @@ pub mod execution_containments;
 pub mod external_journal;
 mod files;
 pub mod guidance;
+pub mod image_spend;
 pub mod inference_calls;
 pub mod installation_identity;
 pub mod lang;
 pub mod locks;
+pub mod message_attachments;
 pub mod needs_attention;
 pub mod org_sync;
 pub mod packages;
@@ -56,6 +58,7 @@ pub mod pins;
 pub mod principals;
 pub mod project_notes;
 pub mod prune_ledger;
+pub mod remote_attachment_operations;
 pub mod remote_audit_upload;
 pub mod retention;
 pub mod run_invocations;
@@ -737,10 +740,20 @@ struct Migration {
 
 /// All schema migrations in version order. Append the exact filename and SQL;
 /// never derive names from the numeric position.
-const MIGRATIONS: &[Migration] = &[Migration {
-    name: "0001_initial.sql",
-    sql: include_str!("migrations/0001_initial.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        name: "0001_initial.sql",
+        sql: include_str!("migrations/0001_initial.sql"),
+    },
+    Migration {
+        name: "0002_goal_inference_provenance.sql",
+        sql: include_str!("migrations/0002_goal_inference_provenance.sql"),
+    },
+    Migration {
+        name: "0003_media_resource_reservation_ledger.sql",
+        sql: include_str!("migrations/0003_media_resource_reservation_ledger.sql"),
+    },
+];
 
 /// Latest schema version understood by this build.
 ///
@@ -1230,6 +1243,36 @@ mod tests {
     }
 
     #[test]
+    fn media_ledger_is_an_append_only_upgrade_for_existing_v2_databases() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_with(&conn, &MIGRATIONS[..2]).unwrap();
+        let existing_checksums = conn
+            .prepare("SELECT sha256 FROM schema_version ORDER BY version")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+
+        migrate_with(&conn, MIGRATIONS).unwrap();
+
+        let upgraded_checksums = conn
+            .prepare("SELECT sha256 FROM schema_version ORDER BY version")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(&upgraded_checksums[..2], existing_checksums);
+        assert_eq!(upgraded_checksums.len(), 3);
+        assert_eq!(current_schema_version(&conn).unwrap(), 3);
+        conn.query_row("SELECT COUNT(*) FROM media_reservations", [], |_| Ok(()))
+            .unwrap();
+        conn.query_row("SELECT COUNT(*) FROM media_execution_ready", [], |_| Ok(()))
+            .unwrap();
+    }
+
+    #[test]
     fn newer_database_is_refused() {
         let conn = Connection::open_in_memory().unwrap();
         migrate_with(&conn, MIGRATIONS).unwrap();
@@ -1259,6 +1302,107 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert_eq!(names, vec!["0001_test.sql", "0002_test.sql"]);
+    }
+
+    #[tokio::test]
+    async fn goal_upgrade_preserves_v1_rows_and_validates_migration_ledger() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("v1-goal.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            migrate_with(&conn, &MIGRATIONS[..1]).unwrap();
+            conn.execute(
+                "INSERT INTO sessions (session_id, project_id, project_root, started_at, last_active_at)
+                 VALUES ('00000000-0000-0000-0000-000000000001', 'project-v1', '/tmp/v1', 10, 20)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_goals
+                   (id, session_id, project_id, objective, context, status, token_budget,
+                    tokens_used, blocked_attempts, completion_evidence, verification_rounds,
+                    last_read_at, created_at, updated_at)
+                 VALUES ('00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001', 'project-v1', 'preserve me', 'legacy context',
+                         'active', NULL, 37, 2, NULL, 1, 19, 10, 20)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        let session_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001")
+            .unwrap_or_else(|_| unreachable!());
+        let migrated: (String, String, String, String, String, i64, i64, i64) = db
+            .read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT objective, context, disposition, resume_phase, pause_reason, token_budget, tokens_used, blocked_attempts
+                       FROM session_goals WHERE id = '00000000-0000-0000-0000-000000000002'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            migrated,
+            (
+                "preserve me".into(),
+                "legacy context".into(),
+                "user_paused".into(),
+                "planning".into(),
+                "restart".into(),
+                200_000,
+                37,
+                2,
+            )
+        );
+        let (schema, mirror) = db
+            .read(|conn| Ok((current_schema_version(conn)?, sqlite_schema_version(conn)?)))
+            .await
+            .unwrap();
+        assert_eq!(schema, MIGRATIONS.len() as i64);
+        assert_eq!(mirror, MIGRATIONS.len() as i64);
+        db.read(foreign_key_check).await.unwrap();
+        // Re-opening against the same immutable ledger validates both stored
+        // checksums instead of silently accepting a rewritten v1 migration.
+        db.write(|conn| migrate_with(conn, MIGRATIONS))
+            .await
+            .unwrap();
+        let ledger_rows: i64 = db
+            .read(|conn| {
+                Ok(conn.query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(ledger_rows, MIGRATIONS.len() as i64);
+
+        let resumed = db
+            .set_session_goal_status(
+                session_id,
+                crate::db::session_goals::GoalDisposition::Running,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resumed.phase,
+            Some(crate::db::session_goals::GoalPhase::Planning)
+        );
+        assert!(resumed.contract.is_none());
+        let planner = db
+            .lease_goal_control_job(resumed.id, resumed.attempt_generation, 30, 60)
+            .await
+            .unwrap()
+            .expect("resuming a legacy goal must register a planner");
+        assert_eq!(
+            planner.role,
+            crate::db::session_goals::GoalControlRole::Planner
+        );
+        assert!(
+            db.begin_goal_root_turn(resumed.id, resumed.attempt_generation)
+                .await
+                .is_err(),
+            "a migrated goal cannot dispatch root work before planner acceptance"
+        );
     }
 
     #[tokio::test]
@@ -2145,7 +2289,12 @@ mod tests {
             // Run invocations retain durable receipts after session deletion
             // (cancelled_session_deleted terminalization; no FK cascade).
             // Tombstones are global UUID receipts with no session column FK.
-            if name == "run_invocations" || name == "run_invocation_tombstones" {
+            // Monetary reservations and debt are immutable billing receipts;
+            // deleting a session must not erase spend or unblock its scopes.
+            if name == "run_invocations"
+                || name == "run_invocation_tombstones"
+                || name == "image_spend_reservations"
+            {
                 continue;
             }
             if !has_cascade_path_to_sessions(conn, &name, &mut std::collections::HashSet::new())? {
@@ -2238,8 +2387,8 @@ mod tests {
                 ),
                 (
                     "session_goals",
-                    "status",
-                    crate::db::session_goals::GoalStatus::ALL
+                    "disposition",
+                    crate::db::session_goals::GoalDisposition::ALL
                         .iter()
                         .map(|value| value.as_str())
                         .collect(),

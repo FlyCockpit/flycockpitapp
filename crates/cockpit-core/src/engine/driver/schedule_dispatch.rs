@@ -38,7 +38,7 @@ impl Driver {
                     self.schedule.swarm_completed();
                 }
                 if self
-                    .handle_goal_verification_completion(&job_id, &result, failed, input_rx, tx)
+                    .handle_goal_supervision_completion(&job_id, &result, failed, input_rx, tx)
                     .await?
                 {
                     return Ok(());
@@ -94,6 +94,7 @@ impl Driver {
                         expected_model_state_generation: None,
                         expected_model: None,
                         kind: UserSubmissionKind::User,
+                        origin: crate::engine::message::SubmissionOrigin::ScheduledJob,
                         text: injected,
                         display_text: None,
                         tag_expansions: Vec::new(),

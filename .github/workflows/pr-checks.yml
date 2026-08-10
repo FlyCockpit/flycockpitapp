@@ -143,6 +143,16 @@ jobs:
     needs: setup
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
+    services:
+      redis:
+        image: redis:7.4.2-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 20
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
@@ -170,6 +180,13 @@ jobs:
 
       - name: Test
         run: pnpm test
+
+      - name: Remote signaling Redis integration
+        env:
+          TEST_REDIS_URL: redis://127.0.0.1:6379
+          REDIS_URL: redis://127.0.0.1:6379
+          DATABASE_URL: postgresql://test:test@127.0.0.1:5432/test
+        run: pnpm --filter @flycockpit/api exec vitest run --config vitest.redis.config.ts src/lib/remote-signaling-store.redis.test.ts
 
   # ── Policy checks (grep-based, enforce AGENTS.md rules) ───────────
 

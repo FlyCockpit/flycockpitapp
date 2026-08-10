@@ -460,6 +460,10 @@ pub struct DirHandle {
 }
 
 impl DirHandle {
+    pub fn sync(&self) -> io::Result<()> {
+        self.dir.sync_all()
+    }
+
     pub fn open_or_create(path: &Path) -> io::Result<Self> {
         let parent = path
             .parent()

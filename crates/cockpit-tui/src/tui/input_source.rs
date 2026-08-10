@@ -1,15 +1,17 @@
-#[cfg(test)]
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::future::{pending, poll_fn};
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{Event, EventStream};
 use futures::{Stream, StreamExt};
+use tokio::sync::mpsc;
 
 pub const MAX_DRAIN_PER_PASS: usize = 256;
 static NEXT_TERMINAL_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -23,14 +25,128 @@ pub struct ObservedTerminalEvent {
     pub event: io::Result<Event>,
     pub observed_at: Duration,
     pub terminal_generation: u64,
+    /// Authoritative adapter provenance for a paste event. Raw terminal
+    /// `EventStream` paste frames are bracketed PTY input; a native adapter
+    /// may construct the same envelope with `NativePaste` without injecting
+    /// duplicate key bytes.
+    pub paste_source: Option<crate::tui::structured_paste::PasteSource>,
+    pub paste_correlation_id: Option<uuid::Uuid>,
 }
 
 type MonotonicClock = Arc<dyn Fn() -> Duration + Send + Sync>;
 
+#[derive(Clone)]
+pub struct NativePasteAdapter {
+    tx: mpsc::UnboundedSender<ObservedTerminalEvent>,
+    clock: MonotonicClock,
+    terminal_generation: u64,
+}
+
+impl NativePasteAdapter {
+    pub fn enqueue(&self, text: String) -> bool {
+        self.tx
+            .send(ObservedTerminalEvent {
+                event: Ok(Event::Paste(text)),
+                observed_at: (self.clock)(),
+                terminal_generation: self.terminal_generation,
+                paste_source: Some(crate::tui::structured_paste::PasteSource::NativePaste),
+                paste_correlation_id: Some(uuid::Uuid::new_v4()),
+            })
+            .is_ok()
+    }
+
+    pub fn enqueue_with_correlation(
+        &self,
+        text: String,
+        correlation_id: uuid::Uuid,
+    ) -> Option<tokio::sync::oneshot::Receiver<crate::tui::structured_paste::DedupResult>> {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        if let Ok(mut acks) = native_paste_acks().lock() {
+            acks.entry(correlation_id).or_default().push(ack_tx);
+        }
+        let sent = self
+            .tx
+            .send(ObservedTerminalEvent {
+                event: Ok(Event::Paste(text)),
+                observed_at: (self.clock)(),
+                terminal_generation: self.terminal_generation,
+                paste_source: Some(crate::tui::structured_paste::PasteSource::NativePaste),
+                paste_correlation_id: Some(correlation_id),
+            })
+            .is_ok();
+        if sent {
+            Some(ack_rx)
+        } else {
+            acknowledge_native_paste(
+                correlation_id,
+                crate::tui::structured_paste::DedupResult::Busy,
+            );
+            None
+        }
+    }
+}
+
+static NATIVE_PASTE_ADAPTER: OnceLock<Mutex<Option<NativePasteAdapter>>> = OnceLock::new();
+type NativePasteAckSender = tokio::sync::oneshot::Sender<crate::tui::structured_paste::DedupResult>;
+static NATIVE_PASTE_ACKS: OnceLock<Mutex<HashMap<uuid::Uuid, Vec<NativePasteAckSender>>>> =
+    OnceLock::new();
+
+fn native_paste_acks() -> &'static Mutex<HashMap<uuid::Uuid, Vec<NativePasteAckSender>>> {
+    NATIVE_PASTE_ACKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn acknowledge_native_paste(
+    correlation_id: uuid::Uuid,
+    result: crate::tui::structured_paste::DedupResult,
+) {
+    if let Ok(mut acks) = native_paste_acks().lock()
+        && let Some(waiters) = acks.remove(&correlation_id)
+    {
+        for ack in waiters {
+            let _ = ack.send(result);
+        }
+    }
+}
+
+pub fn install_native_paste_adapter(adapter: NativePasteAdapter) {
+    if let Ok(mut slot) = NATIVE_PASTE_ADAPTER.get_or_init(|| Mutex::new(None)).lock() {
+        *slot = Some(adapter);
+    }
+}
+
+pub fn clear_native_paste_adapter() {
+    if let Some(slot) = NATIVE_PASTE_ADAPTER.get()
+        && let Ok(mut slot) = slot.lock()
+    {
+        *slot = None;
+    }
+    if let Ok(mut acks) = native_paste_acks().lock() {
+        for (_, waiters) in acks.drain() {
+            for ack in waiters {
+                let _ = ack.send(crate::tui::structured_paste::DedupResult::Busy);
+            }
+        }
+    }
+}
+
+/// Production native platform hooks call this entrypoint once per direct
+/// paste. It wakes the same `TerminalInput::next` select used by PTY input.
+pub fn enqueue_native_paste(text: String) -> bool {
+    NATIVE_PASTE_ADAPTER
+        .get()
+        .and_then(|slot| slot.lock().ok())
+        .and_then(|slot| slot.as_ref().cloned())
+        .is_some_and(|adapter| adapter.enqueue(text))
+}
+
 pub struct TerminalInput {
     stream: Option<TerminalInputStream>,
+    native_paste_tx: mpsc::UnboundedSender<ObservedTerminalEvent>,
+    native_paste_rx: mpsc::UnboundedReceiver<ObservedTerminalEvent>,
+    pending_observed: VecDeque<ObservedTerminalEvent>,
     clock: MonotonicClock,
     generation: u64,
+    native_adapter_installed: bool,
     #[cfg(test)]
     test_stream: bool,
 }
@@ -38,10 +154,17 @@ pub struct TerminalInput {
 impl TerminalInput {
     pub fn new() -> Self {
         let origin = Instant::now();
+        let clock: MonotonicClock = Arc::new(move || origin.elapsed());
+        let generation = next_generation();
+        let (native_paste_tx, native_paste_rx) = mpsc::unbounded_channel();
         Self {
             stream: Some(TerminalInputStream::new()),
-            clock: Arc::new(move || origin.elapsed()),
-            generation: next_generation(),
+            native_paste_tx,
+            native_paste_rx,
+            pending_observed: VecDeque::new(),
+            clock,
+            generation,
+            native_adapter_installed: false,
             #[cfg(test)]
             test_stream: false,
         }
@@ -54,21 +177,48 @@ impl TerminalInput {
 
     #[cfg(test)]
     pub(crate) fn new_for_test_with_clock(clock: MonotonicClock) -> Self {
+        let (native_paste_tx, native_paste_rx) = mpsc::unbounded_channel();
         Self {
             stream: Some(TerminalInputStream::TestLive(VecDeque::new())),
+            native_paste_tx,
+            native_paste_rx,
+            pending_observed: VecDeque::new(),
             clock,
             generation: next_generation(),
+            native_adapter_installed: false,
             test_stream: true,
         }
     }
 
     pub async fn next(&mut self) -> Option<ObservedTerminalEvent> {
+        while let Ok(event) = self.native_paste_rx.try_recv() {
+            self.pending_observed.push_back(event);
+        }
+        self.pending_observed
+            .make_contiguous()
+            .sort_by_key(|event| event.observed_at);
+        if let Some(event) = self.pending_observed.pop_front() {
+            return Some(event);
+        }
+        let clock = Arc::clone(&self.clock);
+        let generation = self.generation;
         match self.stream.as_mut() {
-            Some(stream) => stream.next().await.map(|event| ObservedTerminalEvent {
+            Some(stream) => tokio::select! {
+                biased;
+                native = self.native_paste_rx.recv() => native,
+                event = stream.next() => event.map(|event| ObservedTerminalEvent {
+                paste_correlation_id: event.as_ref().ok().and_then(|event| {
+                    matches!(event, Event::Paste(_)).then_some(uuid::Uuid::new_v4())
+                }),
+                paste_source: event.as_ref().ok().and_then(|event| {
+                    matches!(event, Event::Paste(_))
+                        .then_some(crate::tui::structured_paste::PasteSource::BracketedPty)
+                }),
                 event,
-                observed_at: (self.clock)(),
-                terminal_generation: self.generation,
-            }),
+                observed_at: clock(),
+                terminal_generation: generation,
+                }),
+            },
             None => pending().await,
         }
     }
@@ -77,30 +227,102 @@ impl TerminalInput {
     where
         F: FnMut(Option<ObservedTerminalEvent>) -> Result<bool>,
     {
+        let mut ready = Vec::new();
+        while let Some(event) = self.pending_observed.pop_front() {
+            ready.push((event.observed_at, 0_u8, Some(event)));
+        }
+        while let Ok(event) = self.native_paste_rx.try_recv() {
+            ready.push((event.observed_at, 0_u8, Some(event)));
+        }
         let Some(stream) = self.stream.as_mut() else {
+            ready.sort_by_key(|(observed_at, source_order, _)| (*observed_at, *source_order));
+            for (_, _, event) in ready {
+                if on_event(event)? {
+                    return Ok(true);
+                }
+            }
             return Ok(false);
         };
         let clock = Arc::clone(&self.clock);
         let generation = self.generation;
+        // Always sample at least one ready PTY event even when native events
+        // fill the output cap. The timestamp merge below emits only `cap`
+        // items and retains overflow for the next call.
+        let remaining = cap.max(1);
         stream
-            .drain_ready(cap, move |item| {
-                on_event(item.map(|event| ObservedTerminalEvent {
+            .drain_ready(remaining, |item| {
+                let observed_at = clock();
+                let event = item.map(|event| ObservedTerminalEvent {
+                    paste_source: event.as_ref().ok().and_then(|event| {
+                        matches!(event, Event::Paste(_))
+                            .then_some(crate::tui::structured_paste::PasteSource::BracketedPty)
+                    }),
+                    paste_correlation_id: event.as_ref().ok().and_then(|event| {
+                        matches!(event, Event::Paste(_)).then_some(uuid::Uuid::new_v4())
+                    }),
                     event,
-                    observed_at: clock(),
+                    observed_at,
                     terminal_generation: generation,
-                }))
+                });
+                ready.push((observed_at, 1_u8, event));
+                Ok(false)
             })
-            .await
+            .await?;
+        ready.sort_by_key(|(observed_at, source_order, _)| (*observed_at, *source_order));
+        let overflow = ready.split_off(cap.min(ready.len()));
+        for (_, _, event) in overflow {
+            if let Some(event) = event {
+                self.pending_observed.push_back(event);
+            }
+        }
+        for (_, _, event) in ready {
+            if on_event(event)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Native platform adapters call this exactly once per direct paste and
+    /// must not also enqueue key bytes for the same operation.
+    pub fn enqueue_native_paste(&mut self, text: String) {
+        let _ = self.native_paste_tx.send(ObservedTerminalEvent {
+            event: Ok(Event::Paste(text)),
+            observed_at: (self.clock)(),
+            terminal_generation: self.generation,
+            paste_source: Some(crate::tui::structured_paste::PasteSource::NativePaste),
+            paste_correlation_id: Some(uuid::Uuid::new_v4()),
+        });
+    }
+
+    pub fn native_paste_adapter(&self) -> NativePasteAdapter {
+        NativePasteAdapter {
+            tx: self.native_paste_tx.clone(),
+            clock: Arc::clone(&self.clock),
+            terminal_generation: self.generation,
+        }
+    }
+
+    pub fn install_native_paste_adapter(&mut self) {
+        install_native_paste_adapter(self.native_paste_adapter());
+        self.native_adapter_installed = true;
     }
 
     pub fn suspend(&mut self) {
         self.stream = None;
+        if self.native_adapter_installed {
+            clear_native_paste_adapter();
+        }
+        while self.native_paste_rx.try_recv().is_ok() {}
     }
 
     pub fn resume(&mut self) {
         if self.stream.is_none() {
             self.stream = Some(self.new_stream());
             self.generation = next_generation();
+            if self.native_adapter_installed {
+                install_native_paste_adapter(self.native_paste_adapter());
+            }
         }
     }
 
@@ -121,10 +343,15 @@ impl TerminalInput {
         clock: MonotonicClock,
         events: impl IntoIterator<Item = io::Result<Event>>,
     ) -> Self {
+        let (native_paste_tx, native_paste_rx) = mpsc::unbounded_channel();
         Self {
             stream: Some(TerminalInputStream::TestLive(events.into_iter().collect())),
+            native_paste_tx,
+            native_paste_rx,
             clock,
             generation: next_generation(),
+            native_adapter_installed: false,
+            pending_observed: VecDeque::new(),
             test_stream: true,
         }
     }

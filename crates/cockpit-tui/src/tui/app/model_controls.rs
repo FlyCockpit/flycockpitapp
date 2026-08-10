@@ -525,9 +525,34 @@ impl App {
                 deferred.parked_fence_sequence = None;
             }
         }
-        let queued_submission = self
-            .take_current_model_selection_retry()
-            .and_then(|retry| retry.queued_submission);
+        let retry = self.take_current_model_selection_retry();
+        let queued_submission = retry.and_then(|retry| retry.queued_submission);
+        if let Some(queued) = queued_submission.as_ref() {
+            let Ok(fence_sequence) =
+                self.submission_order
+                    .enqueue(crate::tui::structured_paste::OrderedIntent::Fence(
+                        queued.client_submission_id,
+                    ))
+            else {
+                self.submission_order.cancel(sequence);
+                self.set_model_selection_retry(super::ModelSelectionRetry {
+                    session_id: self.launch.session_id,
+                    requested: active.clone(),
+                    trigger,
+                    queued_submission,
+                });
+                self.show_model_selection_error(
+                    &active,
+                    trigger,
+                    "Model switching is unavailable because local ordering was exhausted"
+                        .to_string(),
+                );
+                return false;
+            };
+            if let Some(fence) = self.submission_fences.get_mut(&queued.client_submission_id) {
+                fence.fence_sequence = fence_sequence;
+            }
+        }
         self.pending_model_selection = Some(super::PendingModelSelection {
             order_sequence: sequence,
             session_id: self.launch.session_id,
@@ -821,7 +846,9 @@ impl App {
             _ => None,
         };
         match outcome {
-            ControlRequestOutcome::Applied => self.apply_control_success(pending.applied),
+            ControlRequestOutcome::Applied | ControlRequestOutcome::ConfigRefreshed { .. } => {
+                self.apply_control_success(pending.applied)
+            }
             ControlRequestOutcome::Rejected(error) => {
                 let message = format!("{}: daemon rejected request: {error}", pending.label);
                 if let Some(selection) = self.clear_pending_model_selection(selection_id) {
@@ -870,15 +897,29 @@ impl App {
         &mut self,
         mut pending: super::PendingModelSelection,
     ) -> super::PendingModelSelection {
-        self.retry_model_selections
-            .entry(pending.session_id)
-            .or_insert_with(|| super::ModelSelectionRetry {
-                session_id: pending.session_id,
-                requested: pending.requested.clone(),
-                trigger: pending.trigger,
-                queued_submission: pending.queued_submission.take(),
-            });
+        if let Some(queued) = pending.queued_submission.as_ref()
+            && let Some(fence) = self.submission_fences.get_mut(&queued.client_submission_id)
+        {
+            self.submission_order.cancel(fence.fence_sequence);
+            fence.fence_sequence = 0;
+        }
+        self.set_model_selection_retry(super::ModelSelectionRetry {
+            session_id: pending.session_id,
+            requested: pending.requested.clone(),
+            trigger: pending.trigger,
+            queued_submission: pending.queued_submission.take(),
+        });
         pending
+    }
+
+    fn set_model_selection_retry(&mut self, mut retry: super::ModelSelectionRetry) {
+        let session_id = retry.session_id;
+        self.retry_model_selections
+            .entry(session_id)
+            .or_insert_with(|| {
+                retry.session_id = session_id;
+                retry
+            });
     }
 
     pub(super) fn current_model_selection_retry(&self) -> Option<&super::ModelSelectionRetry> {
@@ -1008,6 +1049,7 @@ impl App {
                     expected_model_state_generation: None,
                     expected_model: None,
                     kind: cockpit_core::engine::message::UserSubmissionKind::User,
+                    origin: cockpit_core::engine::message::SubmissionOrigin::AutoContinue,
                     text: kickoff.clone(),
                     display_text: None,
                     tag_expansions: Vec::new(),

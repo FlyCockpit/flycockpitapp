@@ -13,12 +13,7 @@
 //! The user-facing contract for any token-budget enforcement remains
 //! "≈" — exactness is not promised across providers.
 
-use tiktoken_rs::{
-    cl100k_base_singleton, o200k_base_singleton, p50k_base_singleton, p50k_edit_singleton,
-    r50k_base_singleton,
-};
-
-pub use crate::db::tokenizer_calibration::TokenizerStrategy;
+pub use cockpit_tokenizer::TiktokenEncoding as TokenizerStrategy;
 
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
@@ -37,7 +32,7 @@ pub fn count_call_count() -> usize {
 
 /// Warm the default cl100k tokenizer singleton without counting user text.
 pub fn warm_cl100k() {
-    let _ = cl100k_base_singleton();
+    TokenizerStrategy::Cl100k.warm();
 }
 
 /// Count tokens in `text` using cl100k_base — the documented global
@@ -49,27 +44,25 @@ pub fn count(text: &str) -> usize {
 }
 
 /// Every strategy, in a fixed order — the calibration loop tries each.
-pub const STRATEGIES: [TokenizerStrategy; 5] = [
-    TokenizerStrategy::R50k,
-    TokenizerStrategy::P50k,
-    TokenizerStrategy::P50kEdit,
-    TokenizerStrategy::Cl100k,
-    TokenizerStrategy::O200k,
-];
+pub const STRATEGIES: [TokenizerStrategy; 5] = TokenizerStrategy::ALL;
+
+/// Tolerant conversion isolated immediately above the legacy DB boundary.
+pub fn calibration_strategy_from_persisted(name: &str) -> TokenizerStrategy {
+    match name {
+        "r50k_base" => TokenizerStrategy::R50k,
+        "p50k_base" => TokenizerStrategy::P50k,
+        "p50k_edit" => TokenizerStrategy::P50kEdit,
+        "o200k_base" => TokenizerStrategy::O200k,
+        _ => TokenizerStrategy::Cl100k,
+    }
+}
 
 /// Count tokens in `text` with a specific [`TokenizerStrategy`].
 pub fn count_with(text: &str, strategy: TokenizerStrategy) -> usize {
     if text.is_empty() {
         return 0;
     }
-    let bpe = match strategy {
-        TokenizerStrategy::R50k => r50k_base_singleton(),
-        TokenizerStrategy::P50k => p50k_base_singleton(),
-        TokenizerStrategy::P50kEdit => p50k_edit_singleton(),
-        TokenizerStrategy::Cl100k => cl100k_base_singleton(),
-        TokenizerStrategy::O200k => o200k_base_singleton(),
-    };
-    bpe.encode_with_special_tokens(text).len()
+    strategy.count(text)
 }
 
 /// Apply a calibrated `(strategy, scale)` to `text`: `count_with * scale`,
@@ -253,14 +246,20 @@ mod tests {
         assert_eq!(count(t), count_with(t, TokenizerStrategy::Cl100k));
     }
 
-    #[test]
-    fn strategy_name_round_trips() {
+    #[tokio::test]
+    async fn calibration_strategy_unknown_row_falls_back_above_db_boundary() {
         for s in STRATEGIES {
-            assert_eq!(TokenizerStrategy::from_name(s.as_str()), s);
+            assert_eq!(calibration_strategy_from_persisted(s.as_str()), s);
         }
-        // Unknown names fall back to the cl100k floor.
+        let db = crate::db::Db::open_in_memory().unwrap();
+        db.upsert_tokenizer_calibration("provider", "model", "bogus", 1.25, 1, 2, 10, 1)
+            .await
+            .unwrap();
+        let (raw, scale) = db.resolve_tokenizer("provider", "model").await;
+        assert_eq!(raw, "bogus", "DB boundary must preserve persisted text");
+        assert_eq!(scale, 1.25);
         assert_eq!(
-            TokenizerStrategy::from_name("bogus"),
+            calibration_strategy_from_persisted(&raw),
             TokenizerStrategy::Cl100k
         );
     }

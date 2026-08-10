@@ -121,6 +121,14 @@ impl App {
     /// [`Self::try_attach_for_display`] instead, which never latches an
     /// error.
     pub(super) fn ensure_agent_runner(&mut self) {
+        if !self.startup_disclosures_ready {
+            self.start_startup_disclosures_fetch();
+            self.show_toast(
+                "Startup disclosures Unavailable — waiting for the daemon; Retry",
+                ToastKind::Warning,
+            );
+            return;
+        }
         if matches!(self.agent_runner, Some(Ok(_))) {
             return;
         }
@@ -222,6 +230,17 @@ impl App {
         new_session_id: Option<uuid::Uuid>,
         state: Option<&cockpit_core::daemon::proto::ActiveModelState>,
     ) {
+        // A submission held by the pending model transaction is not an
+        // independently dispatchable paste fence. Keep it intact while the
+        // model control is converted into a session-scoped retry below; that
+        // path parks its order sequence and recreates it behind the retried
+        // model switch. Generic epoch cleanup would otherwise delete the
+        // fence first and leave the retained payload with nothing to release.
+        let model_held_fence = self
+            .pending_model_selection
+            .as_ref()
+            .and_then(|pending| pending.queued_submission.as_ref())
+            .map(|queued| queued.client_submission_id);
         let mut cancelled_sequences = Vec::new();
         let mut cancelled_fences = Vec::new();
         let reconciling_fences = self
@@ -240,6 +259,9 @@ impl App {
             .retain(|id, fence| match fence.lifecycle {
                 crate::tui::structured_paste::FenceLifecycle::AwaitingProbes
                 | crate::tui::structured_paste::FenceLifecycle::Ready => {
+                    if Some(*id) == model_held_fence {
+                        return true;
+                    }
                     cancelled_sequences.push(fence.fence_sequence);
                     cancelled_fences.push(*id);
                     false
@@ -257,8 +279,7 @@ impl App {
         }
         for id in cancelled_fences {
             self.deferred_fence_dispatches.remove(&id);
-            self.pending_paste_probes
-                .retain(|_, probe| probe.owner_fence != Some(id));
+            self.cancel_paste_probes_matching(|probe| probe.owner_fence == Some(id));
             self.retained_pre_dispatch_submissions
                 .retain(|retained| retained.pending.optimistic_submission_id != id);
         }
@@ -266,8 +287,7 @@ impl App {
         if cancelled_any_fence {
             self.show_toast("Paste unavailable", super::ToastKind::Error);
         }
-        self.pending_paste_probes
-            .retain(|_, probe| probe.owner_fence.is_some());
+        self.cancel_paste_probes_matching(|probe| probe.owner_fence.is_none());
         self.cancel_model_controls_for_epoch_change(new_session_id);
         self.start_config_snapshot_epoch();
         self.active_model_state_generation = 0;
@@ -360,6 +380,9 @@ impl App {
     /// `is_some()`), so the id shown in the welcome box is exactly the
     /// session persisted on first message.
     pub(super) fn try_attach_for_display(&mut self) {
+        if !self.startup_disclosures_ready {
+            return;
+        }
         let runner =
             agent_runner::try_spawn(&self.launch.cwd, self.no_sandbox, self.lifecycle_mode());
         if runner.is_ok() {

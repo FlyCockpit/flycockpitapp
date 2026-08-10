@@ -1,4 +1,5 @@
 use std::io::{self, IsTerminal, Write};
+use std::time::{Duration, Instant};
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -16,12 +17,21 @@ pub struct LinkRegistry {
     regions: Vec<LinkRegion>,
     hovered: Option<usize>,
     hovered_url: Option<String>,
+    generation: u64,
 }
 
 impl LinkRegistry {
     pub fn begin_frame(&mut self) {
         self.regions.clear();
         self.hovered = None;
+    }
+
+    pub fn invalidate_pointer_generation(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn register(&mut self, rect: Rect, url: impl Into<String>, label: impl Into<String>) {
@@ -74,6 +84,193 @@ impl LinkRegistry {
 
     pub fn regions(&self) -> &[LinkRegion] {
         &self.regions
+    }
+}
+
+const LINK_RELEASE_WINDOW: Duration = Duration::from_millis(500);
+
+#[derive(Debug, Clone)]
+struct PendingLinkPress {
+    url: String,
+    column: u16,
+    row: u16,
+    registry_generation: u64,
+    #[allow(dead_code)]
+    pressed_at: Instant,
+}
+
+/// A scheduled activation waiting for the multi-click window to expire.
+/// The host calls [`LinkPointerGesture::check_activation`] after the
+/// deadline to see if the token is still current.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingActivation {
+    pub url: String,
+    pub token: u64,
+    pub deadline: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkGestureOutcome {
+    Consumed,
+    /// Link activation scheduled — the host should start a timer and call
+    /// [`LinkPointerGesture::check_activation`] after the deadline. A
+    /// second click, movement, view change, or cancellation tombstones the
+    /// token before the timer fires.
+    ScheduleActivation(PendingActivation),
+    /// Link activation is now current — the host should open/copy the URL.
+    Activate(String),
+    /// A second click on the same semantic link canceled the pending
+    /// activation and the release is now a double-click. The host should
+    /// select the URL/word.
+    SelectUrl(String),
+    Unhandled,
+}
+
+/// Generation-scoped press/release reducer for registered links. Activation
+/// is deliberately delayed through the 500 ms multi-click window so a second
+/// click on the same semantic link can cancel it and become explicit URL
+/// double-click selection. A new press, capture transition, render
+/// generation, movement, or unrelated button tombstones the pending
+/// activation token so any queued timer is inert.
+#[derive(Debug, Default)]
+pub struct LinkPointerGesture {
+    pending: Option<PendingLinkPress>,
+    /// Pending activation after a matching release, awaiting the
+    /// multi-click window to expire.
+    pending_activation: Option<PendingActivation>,
+    /// The semantic link URL of the first click in the current sequence.
+    sequence_url: Option<String>,
+    /// The timestamp of the first click in the current sequence.
+    sequence_started: Option<Instant>,
+    /// Click count in the current multi-click sequence.
+    click_count: u32,
+    next_token: u64,
+}
+
+impl LinkPointerGesture {
+    pub fn handle(
+        &mut self,
+        kind: crossterm::event::MouseEventKind,
+        column: u16,
+        row: u16,
+        hit_url: Option<&str>,
+        registry_generation: u64,
+        now: Instant,
+    ) -> LinkGestureOutcome {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        match kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(url) = hit_url else {
+                    self.cancel();
+                    return LinkGestureOutcome::Unhandled;
+                };
+                // A second press on the same semantic link within the
+                // window tombstones the pending activation. The release
+                // will then be a double-click.
+                self.tombstone_activation();
+
+                // Determine multi-click sequence.
+                let same_target = self.sequence_url.as_deref() == Some(url);
+                let expired = self.sequence_started.is_some_and(|started| {
+                    now.saturating_duration_since(started) > LINK_RELEASE_WINDOW
+                });
+                if !same_target || expired {
+                    self.click_count = 0;
+                    self.sequence_url = Some(url.to_string());
+                    self.sequence_started = Some(now);
+                }
+                self.click_count = self.click_count.saturating_add(1);
+
+                self.pending = Some(PendingLinkPress {
+                    url: url.to_string(),
+                    column,
+                    row,
+                    registry_generation,
+                    pressed_at: now,
+                });
+                LinkGestureOutcome::Consumed
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let Some(pending) = self.pending.take() else {
+                    return LinkGestureOutcome::Unhandled;
+                };
+                let matches = pending.column == column
+                    && pending.row == row
+                    && pending.registry_generation == registry_generation
+                    && hit_url == Some(pending.url.as_str());
+
+                if !matches {
+                    return LinkGestureOutcome::Consumed;
+                }
+
+                // Double-click on the same semantic link → cancel
+                // activation and select the URL.
+                if self.click_count >= 2 {
+                    self.tombstone_activation();
+                    self.click_count = 0;
+                    self.sequence_url = None;
+                    self.sequence_started = None;
+                    return LinkGestureOutcome::SelectUrl(pending.url);
+                }
+
+                // Single click release → schedule delayed activation.
+                let token = self.fresh_token();
+                let deadline = now + LINK_RELEASE_WINDOW;
+                let pa = PendingActivation {
+                    url: pending.url.clone(),
+                    token,
+                    deadline,
+                };
+                self.pending_activation = Some(pa.clone());
+                LinkGestureOutcome::ScheduleActivation(pa)
+            }
+            MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                self.cancel();
+                LinkGestureOutcome::Unhandled
+            }
+            _ => LinkGestureOutcome::Unhandled,
+        }
+    }
+
+    /// Check whether the pending activation token is still current and
+    /// the deadline has passed. Called by the host after the timer fires.
+    /// Returns `Activate(url)` if current, `Consumed` otherwise.
+    pub fn check_activation(&mut self, token: u64, now: Instant) -> LinkGestureOutcome {
+        if let Some(pa) = &self.pending_activation
+            && pa.token == token
+            && now >= pa.deadline
+        {
+            let url = pa.url.clone();
+            self.pending_activation = None;
+            self.click_count = 0;
+            self.sequence_url = None;
+            self.sequence_started = None;
+            return LinkGestureOutcome::Activate(url);
+        }
+        LinkGestureOutcome::Consumed
+    }
+
+    /// The URL of the pending activation, if any.
+    pub fn pending_activation_url(&self) -> Option<&str> {
+        self.pending_activation.as_ref().map(|pa| pa.url.as_str())
+    }
+
+    fn fresh_token(&mut self) -> u64 {
+        let t = self.next_token;
+        self.next_token = self.next_token.wrapping_add(1).max(1);
+        t
+    }
+
+    fn tombstone_activation(&mut self) {
+        self.pending_activation = None;
+    }
+
+    pub fn cancel(&mut self) {
+        self.pending = None;
+        self.tombstone_activation();
+        self.click_count = 0;
+        self.sequence_url = None;
+        self.sequence_started = None;
     }
 }
 
@@ -240,5 +437,184 @@ mod tests {
         assert!(links.update_hover(1, 2));
         let after = osc8_bytes(&links, true, true);
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn pointer_gesture_schedules_activation_then_fires_after_window() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let now = Instant::now();
+        let mut gesture = LinkPointerGesture::default();
+
+        // Press on a link — consumed, no activation.
+        assert_eq!(
+            gesture.handle(
+                MouseEventKind::Down(MouseButton::Left),
+                4,
+                7,
+                Some("https://x.test"),
+                9,
+                now,
+            ),
+            LinkGestureOutcome::Consumed
+        );
+
+        // Release on the same link — schedules activation (does not
+        // activate synchronously).
+        let outcome = gesture.handle(
+            MouseEventKind::Up(MouseButton::Left),
+            4,
+            7,
+            Some("https://x.test"),
+            9,
+            now + Duration::from_millis(10),
+        );
+        let pa = match outcome {
+            LinkGestureOutcome::ScheduleActivation(pa) => pa,
+            other => panic!("expected ScheduleActivation, got {other:?}"),
+        };
+        assert_eq!(pa.url, "https://x.test");
+        assert_eq!(
+            pa.deadline,
+            now + Duration::from_millis(10) + LINK_RELEASE_WINDOW
+        );
+
+        // Before the deadline — check_activation is inert.
+        assert_eq!(
+            gesture.check_activation(pa.token, now + Duration::from_millis(100)),
+            LinkGestureOutcome::Consumed,
+        );
+
+        // At/after the deadline — activates.
+        assert_eq!(
+            gesture.check_activation(pa.token, pa.deadline),
+            LinkGestureOutcome::Activate("https://x.test".into())
+        );
+
+        // A second check with the same token is inert (already consumed).
+        assert_eq!(
+            gesture.check_activation(pa.token, pa.deadline + Duration::from_secs(1)),
+            LinkGestureOutcome::Consumed,
+        );
+    }
+
+    #[test]
+    fn pointer_gesture_second_click_cancels_activation_and_selects_url() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let now = Instant::now();
+        let mut gesture = LinkPointerGesture::default();
+
+        // First press + release → schedule activation.
+        assert_eq!(
+            gesture.handle(
+                MouseEventKind::Down(MouseButton::Left),
+                4,
+                7,
+                Some("https://x.test"),
+                9,
+                now,
+            ),
+            LinkGestureOutcome::Consumed
+        );
+        let outcome = gesture.handle(
+            MouseEventKind::Up(MouseButton::Left),
+            4,
+            7,
+            Some("https://x.test"),
+            9,
+            now + Duration::from_millis(10),
+        );
+        let pa = match outcome {
+            LinkGestureOutcome::ScheduleActivation(pa) => pa,
+            other => panic!("expected ScheduleActivation, got {other:?}"),
+        };
+
+        // Second press on the same link within the window — tombstones
+        // the activation. The press is consumed.
+        assert_eq!(
+            gesture.handle(
+                MouseEventKind::Down(MouseButton::Left),
+                4,
+                7,
+                Some("https://x.test"),
+                9,
+                now + Duration::from_millis(200),
+            ),
+            LinkGestureOutcome::Consumed
+        );
+
+        // Second release — double-click selects the URL.
+        assert_eq!(
+            gesture.handle(
+                MouseEventKind::Up(MouseButton::Left),
+                4,
+                7,
+                Some("https://x.test"),
+                9,
+                now + Duration::from_millis(210),
+            ),
+            LinkGestureOutcome::SelectUrl("https://x.test".into())
+        );
+
+        // The stale timer is inert.
+        assert_eq!(
+            gesture.check_activation(pa.token, pa.deadline + Duration::from_secs(1)),
+            LinkGestureOutcome::Consumed,
+        );
+    }
+
+    #[test]
+    fn pointer_gesture_render_generation_invalidates_press() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let now = Instant::now();
+        let mut gesture = LinkPointerGesture::default();
+
+        // Press with generation 9.
+        assert_eq!(
+            gesture.handle(
+                MouseEventKind::Down(MouseButton::Left),
+                4,
+                7,
+                Some("https://x.test"),
+                9,
+                now,
+            ),
+            LinkGestureOutcome::Consumed
+        );
+        // Release with generation 10 — mismatch, consumed (no activation).
+        assert_eq!(
+            gesture.handle(
+                MouseEventKind::Up(MouseButton::Left),
+                4,
+                7,
+                Some("https://x.test"),
+                10,
+                now + Duration::from_millis(1),
+            ),
+            LinkGestureOutcome::Consumed,
+            "render generation invalidates the press"
+        );
+
+        // Press again with generation 10, then cancel, then release —
+        // unhandled (no pending press).
+        let _ = gesture.handle(
+            MouseEventKind::Down(MouseButton::Left),
+            4,
+            7,
+            Some("https://x.test"),
+            10,
+            now,
+        );
+        gesture.cancel();
+        assert_eq!(
+            gesture.handle(
+                MouseEventKind::Up(MouseButton::Left),
+                4,
+                7,
+                Some("https://x.test"),
+                10,
+                now,
+            ),
+            LinkGestureOutcome::Unhandled
+        );
     }
 }

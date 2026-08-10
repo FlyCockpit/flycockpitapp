@@ -37,16 +37,10 @@ fn write_config(cwd: &std::path::Path, cfg: &ProvidersConfig) {
     }
 }
 
-fn write_raw_config(cwd: &std::path::Path, json: &str) {
-    let cockpit = cwd.join(".cockpit");
-    std::fs::create_dir_all(&cockpit).unwrap();
-    std::fs::write(cockpit.join("config.json"), json).unwrap();
-}
-
 fn with_trusted_workspace<T>(cwd: &std::path::Path, f: impl FnOnce() -> T) -> T {
     let policy = cockpit_config::trust::WorkspaceTrustPolicy {
         root: cockpit_config::trust::resolve_trust_root(cwd).unwrap(),
-        mode: cockpit_db::workspace_trust::WorkspaceTrustMode::Trust,
+        mode: cockpit_config::WorkspaceTrustMode::Trust,
     };
     cockpit_config::trust::with_workspace_trust_policy(policy, f)
 }
@@ -72,7 +66,6 @@ fn daemon_autostart_ask_shows_modal() {
         cockpit_core::daemon::DaemonStatus::NotRunning,
         daemon_paths(&tmp),
         cockpit_config::extended::DaemonAutostart::Ask,
-        None,
         false,
         || panic!("ask mode must not spawn"),
     );
@@ -89,7 +82,6 @@ fn daemon_autostart_failure_falls_back_to_modal() {
         cockpit_core::daemon::DaemonStatus::NotRunning,
         daemon_paths(&tmp),
         cockpit_config::extended::DaemonAutostart::Shared,
-        None,
         false,
         || anyhow::bail!("boom"),
     );
@@ -99,48 +91,12 @@ fn daemon_autostart_failure_falls_back_to_modal() {
     assert!(state.notice.is_none());
 }
 
-#[tokio::test]
-async fn daemon_autostart_notice_shows_once() {
-    let tmp = tempfile::tempdir().unwrap();
-    let db = cockpit_db::Db::open_in_memory().unwrap();
-    let first = daemon_not_running_state_with_spawn(
-        cockpit_core::daemon::DaemonStatus::NotRunning,
-        daemon_paths(&tmp),
-        cockpit_config::extended::DaemonAutostart::Private,
-        Some(&db),
-        db.app_flag_seen(DAEMON_AUTOSTART_NOTICE_FLAG)
-            .await
-            .unwrap(),
-        || panic!("private mode must not spawn"),
-    );
-    assert!(first.notice.is_some());
-    db.mark_app_flag_seen(DAEMON_AUTOSTART_NOTICE_FLAG)
-        .await
-        .unwrap();
-    let second = daemon_not_running_state_with_spawn(
-        cockpit_core::daemon::DaemonStatus::NotRunning,
-        daemon_paths(&tmp),
-        cockpit_config::extended::DaemonAutostart::Private,
-        Some(&db),
-        db.app_flag_seen(DAEMON_AUTOSTART_NOTICE_FLAG)
-            .await
-            .unwrap(),
-        || panic!("private mode must not spawn"),
-    );
-
-    assert!(second.notice.is_none());
-}
-
 #[test]
 fn first_run_chains_provider_then_model() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_config(tmp.path(), &ProvidersConfig::default());
-    let mut app = App::new_with_db(
-        Some(tmp.path()),
-        false,
-        cockpit_db::Db::open_in_memory().unwrap(),
-    );
+    let mut app = App::new(Some(tmp.path()), false);
     app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::open_providers_add(tmp.path());
     write_config(tmp.path(), &config_with_provider("p", "m"));
@@ -175,11 +131,7 @@ fn first_run_flow_completes_end_to_end() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_config(tmp.path(), &ProvidersConfig::default());
-    let mut app = App::new_with_db(
-        Some(tmp.path()),
-        false,
-        cockpit_db::Db::open_in_memory().unwrap(),
-    );
+    let mut app = App::new(Some(tmp.path()), false);
     app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::open_providers_add(tmp.path());
     write_config(tmp.path(), &config_with_provider("p", "m"));
@@ -200,11 +152,7 @@ fn first_run_configuration_queues_held_draft_behind_selected_model() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_config(tmp.path(), &ProvidersConfig::default());
-    let mut app = App::new_with_db(
-        Some(tmp.path()),
-        false,
-        cockpit_db::Db::open_in_memory().unwrap(),
-    );
+    let mut app = App::new(Some(tmp.path()), false);
     app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     app.composer.set("draft from first run".to_string());
@@ -249,11 +197,7 @@ fn no_provider_status_is_surfaced_and_draft_preserved() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_config(tmp.path(), &ProvidersConfig::default());
-    let mut app = App::new_with_db(
-        Some(tmp.path()),
-        false,
-        cockpit_db::Db::open_in_memory().unwrap(),
-    );
+    let mut app = App::new(Some(tmp.path()), false);
     app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     app.composer.set("draft message".to_string());
@@ -277,11 +221,7 @@ fn no_provider_send_opens_provider_setup_preserves_input() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     write_config(tmp.path(), &ProvidersConfig::default());
-    let mut app = App::new_with_db(
-        Some(tmp.path()),
-        false,
-        cockpit_db::Db::open_in_memory().unwrap(),
-    );
+    let mut app = App::new(Some(tmp.path()), false);
     app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
     app.composer.set("draft message".to_string());
@@ -307,10 +247,9 @@ fn stacked_modal_focus_matches_render_order() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = TestEnvGuard::isolate_cockpit_home_at(tmp.path());
     let root = cockpit_config::trust::resolve_trust_root(tmp.path()).unwrap();
-    let mut app = App::new_with_db_and_workspace_trust(
+    let mut app = App::new_with_workspace_trust(
         Some(tmp.path()),
         false,
-        cockpit_db::Db::open_in_memory().unwrap(),
         StartupWorkspaceTrust::Pending(root),
     );
     app.daemon_prompt = Some(daemon_prompt(&tmp));
@@ -336,12 +275,10 @@ fn stacked_modal_focus_matches_render_order() {
 async fn keypress_does_not_record_hidden_trust_decision() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
-    let db = cockpit_db::Db::open_in_memory().unwrap();
     let root = cockpit_config::trust::resolve_trust_root(tmp.path()).unwrap();
-    let mut app = App::new_with_db_and_workspace_trust(
+    let mut app = App::new_with_workspace_trust(
         Some(tmp.path()),
         false,
-        db.clone(),
         StartupWorkspaceTrust::Pending(root.clone()),
     );
     app.daemon_prompt = Some(daemon_prompt(&tmp));
@@ -350,19 +287,7 @@ async fn keypress_does_not_record_hidden_trust_decision() {
         app.startup_modal_on_top(),
         Some(StartupModal::WorkspaceTrust)
     );
-    assert!(
-        db.workspace_trust_by_root(&root.root)
-            .await
-            .unwrap()
-            .is_none()
-    );
     assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
-    assert!(
-        db.workspace_trust_by_root(&root.root)
-            .await
-            .unwrap()
-            .is_none()
-    );
     cockpit_config::trust::clear_runtime_policy_for_tests();
 }
 
@@ -370,80 +295,14 @@ async fn keypress_does_not_record_hidden_trust_decision() {
 async fn onboarding_never_auto_trusts() {
     let tmp = tempfile::tempdir().unwrap();
     let _home = TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
-    let db = cockpit_db::Db::open_in_memory().unwrap();
     let root = cockpit_config::trust::resolve_trust_root(tmp.path()).unwrap();
-    let mut app = App::new_with_db_and_workspace_trust(
+    let mut app = App::new_with_workspace_trust(
         Some(tmp.path()),
         false,
-        db.clone(),
         StartupWorkspaceTrust::Pending(root.clone()),
     );
 
     app.service_first_run_flow();
     assert_eq!(app.dialog.test_page_name(), Some("workspace_trust"));
-    assert!(
-        db.workspace_trust_by_root(&root.root)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    cockpit_config::trust::clear_runtime_policy_for_tests();
-}
-
-#[tokio::test]
-async fn trusting_fresh_workspace_opens_provider_setup_without_manual_reentry() {
-    let tmp = tempfile::tempdir().unwrap();
-    let _home = TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
-    write_config(tmp.path(), &ProvidersConfig::default());
-    let db = cockpit_db::Db::open_in_memory().unwrap();
-    let root = cockpit_config::trust::resolve_trust_root(tmp.path()).unwrap();
-    let mut app = App::new_with_db_and_workspace_trust(
-        Some(tmp.path()),
-        false,
-        db,
-        StartupWorkspaceTrust::Pending(root.clone()),
-    );
-    app.daemon_prompt = None;
-
-    assert_eq!(app.dialog.test_page_name(), Some("workspace_trust"));
-    assert!(!app.apply_workspace_trust_choice(
-        root,
-        cockpit_db::workspace_trust::WorkspaceTrustMode::Trust,
-    ));
-
-    assert!(app.dialog.test_provider_is_add());
-    assert_eq!(app.first_run_flow, FirstRunFlow::AwaitProvider);
-    cockpit_config::trust::clear_runtime_policy_for_tests();
-}
-
-#[tokio::test]
-async fn trust_dialog_persists_decision() {
-    let tmp = tempfile::tempdir().unwrap();
-    let _home = TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
-    write_raw_config(tmp.path(), r#"{"daemon":{"autostart":"ask"}}"#);
-    let db = cockpit_db::Db::open_in_memory().unwrap();
-    let root = cockpit_config::trust::resolve_trust_root(tmp.path()).unwrap();
-    let mut app = App::new_with_db_and_workspace_trust(
-        Some(tmp.path()),
-        false,
-        db.clone(),
-        StartupWorkspaceTrust::Pending(root.clone()),
-    );
-
-    assert_eq!(app.dialog.test_page_name(), Some("workspace_trust"));
-    assert!(!app.apply_workspace_trust_choice(
-        root.clone(),
-        cockpit_db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
-    ));
-
-    let decision = db
-        .workspace_trust_by_root(&root.root)
-        .await
-        .unwrap()
-        .expect("trust decision persisted");
-    assert_eq!(
-        decision.mode,
-        cockpit_db::workspace_trust::WorkspaceTrustMode::IgnoreConfig
-    );
     cockpit_config::trust::clear_runtime_policy_for_tests();
 }

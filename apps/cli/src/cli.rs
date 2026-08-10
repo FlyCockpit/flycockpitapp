@@ -235,6 +235,43 @@ pub enum AssistantCommand {
     },
     /// Turn local paths, URLs, text, or a recent workflow into a reusable skill.
     Learn(LearnArgs),
+    /// Inspect or repair durable media accounting.
+    Media {
+        #[command(subcommand)]
+        command: AssistantMediaCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AssistantMediaCommand {
+    Accounting {
+        #[command(subcommand)]
+        command: MediaAccountingCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MediaAccountingCommand {
+    Diagnose {
+        #[arg(long, value_parser=["global","project","session"])]
+        scope: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long, required = true)]
+        json: bool,
+    },
+    Repair {
+        #[arg(long, value_parser=["global","project","session"])]
+        scope: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        expected_block_generation: u64,
+        #[arg(long)]
+        repair_plan_digest: String,
+        #[arg(long)]
+        idempotency_key: String,
+    },
 }
 
 #[derive(Debug, clap::Args)]
@@ -375,12 +412,25 @@ pub struct SkillCuratorRollbackArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ConfigCommand {
+    /// Show or save explicit image-generation spend policy.
+    #[command(name = "image-spend")]
+    ImageSpend(ImageSpendArgs),
     /// Export portable provider/model policy JSON without credentials.
     #[command(name = "export-policy")]
     ExportPolicy(ConfigExportPolicyArgs),
     /// Import portable provider/model policy JSON without credentials.
     #[command(name = "import-policy")]
     ImportPolicy(ConfigImportPolicyArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ImageSpendArgs {
+    /// Save the reviewed JSON policy from this file.
+    #[arg(long, value_name = "FILE")]
+    pub save: Option<std::path::PathBuf>,
+    /// Stable project ledger key required when saving.
+    #[arg(long)]
+    pub project_key: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -438,6 +488,10 @@ pub struct DoctorArgs {
     /// Skip provider network checks. Static config, credential, git, and container checks still run.
     #[arg(long)]
     pub offline: bool,
+
+    /// Emit the versioned, secret-safe dependency snapshot as JSON.
+    #[arg(long)]
+    pub dependencies_json: bool,
 }
 
 #[derive(Debug, clap::Args)]

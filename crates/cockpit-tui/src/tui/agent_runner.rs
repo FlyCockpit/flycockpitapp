@@ -551,6 +551,10 @@ impl AgentRunner {
             && self.last_applied_seq.is_some()
     }
 
+    pub(crate) fn has_attached_client(&self) -> bool {
+        self.current_client.is_some()
+    }
+
     pub fn switch_session_task(
         &self,
         target: SessionTarget,
@@ -2459,6 +2463,13 @@ pub(crate) fn control_response_outcome(result: Result<Response, String>) -> Cont
         Ok(Response::Unknown) => {
             ControlRequestOutcome::Rejected("unexpected daemon response: Unknown".to_string())
         }
+        Ok(Response::ConfigRefreshed {
+            applied_generation,
+            changed,
+        }) => ControlRequestOutcome::ConfigRefreshed {
+            applied_generation,
+            changed,
+        },
         Ok(_) => ControlRequestOutcome::Applied,
         Err(error) => ControlRequestOutcome::Rejected(error),
     }
@@ -2616,6 +2627,47 @@ pub fn daemon_request_blocking(req: Request) -> Result<Response, String> {
                 .request_ok(req)
                 .await
                 .map_err(|e| format!("daemon request: {e}"))
+        })
+    })
+}
+
+#[derive(Debug)]
+pub(crate) enum BlockingDaemonRequestError {
+    Conflict(String),
+    Other(String),
+}
+
+/// Blocking request variant that preserves optimistic-concurrency conflicts.
+pub(crate) fn daemon_request_blocking_classified(
+    req: Request,
+) -> Result<Response, BlockingDaemonRequestError> {
+    use cockpit_core::daemon::{DaemonStatus, discover};
+    let runtime = tokio::runtime::Handle::try_current()
+        .map_err(|_| BlockingDaemonRequestError::Other("no tokio runtime".to_string()))?;
+    tokio::task::block_in_place(|| {
+        runtime.block_on(async {
+            let probe = discover().await;
+            if !matches!(probe.status, DaemonStatus::Running) {
+                return Err(BlockingDaemonRequestError::Other(
+                    "daemon not running".to_string(),
+                ));
+            }
+            let client = cockpit_core::daemon::client::DaemonClient::connect(&probe.paths.socket)
+                .await
+                .map_err(|error| {
+                    BlockingDaemonRequestError::Other(format!("daemon connect: {error}"))
+                })?;
+            match client.request(req).await.map_err(|error| {
+                BlockingDaemonRequestError::Other(format!("daemon request: {error}"))
+            })? {
+                Ok(response) => Ok(response),
+                Err(error) if error.code == cockpit_core::daemon::proto::ErrorCode::Conflict => {
+                    Err(BlockingDaemonRequestError::Conflict(error.message))
+                }
+                Err(error) => Err(BlockingDaemonRequestError::Other(format!(
+                    "daemon request: {error}"
+                ))),
+            }
         })
     })
 }
@@ -2959,7 +3011,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | HistoryReplay { session_id, .. }
         | InterruptQueueChanged { session_id, .. }
         | AgentIdle { session_id, .. }
-        | GoalVerificationProgress { session_id, .. }
+        | GoalSupervisionProgress { session_id, .. }
         | PrimarySwapped { session_id, .. }
         | LlmModeChanged { session_id, .. }
         | SessionEnded { session_id, .. }
@@ -3645,8 +3697,8 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         AgentIdle {
             turn_id, reason, ..
         } => TurnEvent::AgentIdle { turn_id, reason },
-        GoalVerificationProgress { done, total, .. } => {
-            TurnEvent::GoalVerificationProgress { done, total }
+        GoalSupervisionProgress { done, total, .. } => {
+            TurnEvent::GoalSupervisionProgress { done, total }
         }
         PausedWorkAvailable {
             session_id, items, ..
@@ -3932,6 +3984,7 @@ mod tests {
             expected_model_state_generation: None,
             expected_model: None,
             kind: cockpit_core::engine::message::UserSubmissionKind::User,
+            origin: Default::default(),
             text: "wire text with expanded tag and image sentinel".to_string(),
             display_text: Some("visible @src/lib.rs [image]".to_string()),
             tag_expansions: vec![proto::TagExpansionMeta {
@@ -4034,7 +4087,7 @@ mod tests {
                 RecvFrame::Unknown { .. } => panic!("unexpected unknown frame"),
                 RecvFrame::VersionMismatch { .. } => panic!("unexpected version mismatch"),
             };
-            let Body::Request { id, request } = env.body else {
+            let Body::Request { id, request, .. } = env.body else {
                 panic!("expected request envelope");
             };
             match request {
@@ -6253,5 +6306,42 @@ mod tests {
         drop(runner);
 
         assert_task_future_dropped(dropped).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_config_control_outcome_preserves_generation_and_changed() {
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let notify = Arc::new(Notify::new());
+        let notified = notify.notified();
+        send_control_request(
+            &control_tx,
+            &events,
+            &notify,
+            ControlRequestId(41),
+            Uuid::new_v4(),
+            3,
+            Request::RefreshConfig,
+        )
+        .unwrap();
+        let request = control_rx.recv().await.unwrap();
+        request
+            .response_tx
+            .send(Ok(Response::ConfigRefreshed {
+                applied_generation: 17,
+                changed: false,
+            }))
+            .unwrap();
+        notified.await;
+        assert!(matches!(
+            events.lock().unwrap().as_slice(),
+            [TurnEvent::ControlRequestFinished {
+                request_id: ControlRequestId(41),
+                outcome: ControlRequestOutcome::ConfigRefreshed {
+                    applied_generation: 17,
+                    changed: false
+                }
+            }]
+        ));
     }
 }

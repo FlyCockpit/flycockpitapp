@@ -136,3 +136,25 @@ pub fn publish_no_clobber(
         Err(PublishError::UnsupportedAtomicNoClobber)
     }
 }
+
+/// Same held-directory atomic primitive for already protocol-bounded export
+/// bytes. The export transfer applies its own authenticated class ceiling.
+pub(crate) fn publish_no_clobber_bounded_elsewhere(
+    target: &Path,
+    bytes: &[u8],
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Published, PublishError> {
+    #[cfg(unix)]
+    {
+        unix::publish(target, bytes, is_cancelled)
+    }
+    #[cfg(windows)]
+    {
+        windows::publish(target, bytes, is_cancelled)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (target, bytes, is_cancelled);
+        Err(PublishError::UnsupportedAtomicNoClobber)
+    }
+}

@@ -456,7 +456,6 @@ fn with_recall_tools(tb: ToolBox, args: &SpawnArgs) -> ToolBox {
     tb.with(Arc::new(crate::tools::session_search::SessionSearchTool))
         .with(Arc::new(crate::tools::session_read::SessionReadTool))
         .with(Arc::new(crate::tools::todo::TodoTool))
-        .with(Arc::new(crate::tools::goal::GoalTool))
 }
 
 fn with_tiered_recall_tools(
@@ -475,7 +474,6 @@ fn with_tiered_recall_tools(
         "session_read",
         "session_lineage_search",
         "todo",
-        "goal",
     ] {
         if is_assistant
             && !grant_has_mcp
@@ -558,7 +556,6 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "session_read",
         "session_lineage_search",
         "todo",
-        "goal",
         "write",
         "edit",
         "unlock",
@@ -887,7 +884,6 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::todo::TodoTool),
         Arc::new(tools::tool_result_retrieve::ToolResultRetrieveTool),
         Arc::new(tools::delegation_payload_retrieve::DelegationPayloadRetrieveTool),
-        Arc::new(tools::goal::GoalTool),
         Arc::new(tools::spawn::SpawnTool::for_depth(0, 1)),
         Arc::new(tools::grep::GrepTool),
         Arc::new(tools::glob::GlobTool),
@@ -946,7 +942,6 @@ fn materialize_tool_by_name(
         "plan_edit" => tb.with(Arc::new(tools::plan_doc::PlanEditTool)),
         "start_build" => tb.with(Arc::new(tools::plan_doc::StartBuildTool)),
         "todo" => tb.with(Arc::new(tools::todo::TodoTool)),
-        "goal" => tb.with(Arc::new(tools::goal::GoalTool)),
         "defer_to_orchestrator" => tb.with(Arc::new(tools::defer::DeferTool)),
         "harness_list" => tb.with(Arc::new(tools::harness::HarnessListTool)),
         "harness_invoke" => tb.with(Arc::new(tools::harness::HarnessInvokeTool)),
@@ -1309,7 +1304,6 @@ pub(crate) fn default_discoverable_tools_for(name: &str) -> &'static [&'static s
             "session_search",
             "session_read",
             "session_lineage_search",
-            "goal",
             "lsp",
         ],
         "Careful" => &[
@@ -1325,7 +1319,6 @@ pub(crate) fn default_discoverable_tools_for(name: &str) -> &'static [&'static s
             "session_read",
             "session_lineage_search",
             "todo",
-            "goal",
             "webfetch",
             "websearch",
         ],
@@ -1335,7 +1328,6 @@ pub(crate) fn default_discoverable_tools_for(name: &str) -> &'static [&'static s
             "session_search",
             "session_read",
             "session_lineage_search",
-            "goal",
             "lsp",
         ],
         _ => &[],
@@ -1352,12 +1344,7 @@ pub(crate) fn default_disabled_tools_for(name: &str) -> &'static [&'static str] 
 }
 
 fn default_assistant_discoverable_tools() -> &'static [&'static str] {
-    &[
-        "session_search",
-        "session_read",
-        "session_lineage_search",
-        "goal",
-    ]
+    &["session_search", "session_read", "session_lineage_search"]
 }
 
 fn effective_tool_tier(
@@ -1794,7 +1781,6 @@ fn default_assistant_tools() -> Vec<String> {
             "session_search",
             "session_read",
             "session_lineage_search",
-            "goal",
             "skill_manage",
         ]
         .into_iter()
@@ -2268,6 +2254,61 @@ pub fn scout(args: &SpawnArgs) -> Agent {
         write_scope: args.write_scope.clone(),
         delegated: args.delegated,
         delegation_recursion: args.delegation_recursion.clone(),
+        env_overlay: args.env_overlay.clone(),
+    }
+}
+
+/// Scheduler-only goal control worker. These roles cannot be resolved from
+/// agent files or selected by a model. The evaluator has no tools; the other
+/// roles receive only Cockpit's path-contained read primitive.
+pub fn goal_control(
+    role: crate::engine::schedule::authority::SpawnWorkerKind,
+    args: &SpawnArgs,
+) -> Agent {
+    use crate::engine::schedule::authority::SpawnWorkerKind;
+    let (name, system, tools) = match role {
+        SpawnWorkerKind::GoalPlanner => (
+            "goal-planner",
+            "You are the host goal contract planner. Investigate read-only and return only the requested strict JSON contract. State observable outcomes, not file prescriptions.",
+            ToolBox::new().with(Arc::new(crate::tools::read::ReadTool)),
+        ),
+        SpawnWorkerKind::GoalEvaluator => (
+            "goal-evaluator",
+            "You are the host goal evaluator. You have no tools. Return only the requested strict JSON decision from supplied evidence.",
+            ToolBox::new(),
+        ),
+        SpawnWorkerKind::GoalGatekeeper => (
+            "goal-gatekeeper",
+            "You are a resumed gap gatekeeper. Recheck only prior unresolved gaps. Uncertainty refutes. Return only strict JSON.",
+            ToolBox::new().with(Arc::new(crate::tools::read::ReadTool)),
+        ),
+        SpawnWorkerKind::GoalColdSkeptic => (
+            "goal-cold-skeptic",
+            "You are an independent cold completion skeptic. Try to refute the immutable contract from evidence. Uncertainty refutes. Return only strict JSON.",
+            ToolBox::new().with(Arc::new(crate::tools::read::ReadTool)),
+        ),
+        SpawnWorkerKind::Bee | SpawnWorkerKind::Scout => {
+            unreachable!("ordinary swarm workers are built by their dedicated factories")
+        }
+    };
+    Agent {
+        name: name.to_string(),
+        system: compose_system_prompt_for_effective_model(system, args),
+        role_prompt: system.to_string(),
+        tools,
+        model: args.effective_model(),
+        params: args.params.clone(),
+        scan_tool_results: true,
+        llm_mode: args.llm_mode,
+        lock_identity: name.to_string(),
+        write_scope: None,
+        delegated: true,
+        delegation_recursion: DelegationRecursionContext {
+            enabled: false,
+            remaining_depth: 0,
+            allowed_targets: Vec::new(),
+            same_model_only: true,
+        },
         env_overlay: args.env_overlay.clone(),
     }
 }
@@ -2925,7 +2966,7 @@ mod tests {
             tool_tiers: std::collections::BTreeMap::new(),
             tool_descriptions: std::collections::BTreeMap::new(),
             scan_tool_results: None,
-            goal_verification: crate::agents::GoalSettingsOverride::default(),
+            goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
             fork_eligible: false,
             prompt: "body".to_string(),
@@ -2969,7 +3010,7 @@ mod tests {
             tool_tiers,
             tool_descriptions: std::collections::BTreeMap::new(),
             scan_tool_results: Some(true),
-            goal_verification: crate::agents::GoalSettingsOverride::default(),
+            goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
             fork_eligible: false,
             prompt: "body".to_string(),
@@ -3086,7 +3127,7 @@ mod tests {
             tool_tiers,
             tool_descriptions: std::collections::BTreeMap::new(),
             scan_tool_results: Some(true),
-            goal_verification: crate::agents::GoalSettingsOverride::default(),
+            goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
             fork_eligible: false,
             prompt: "body".to_string(),
@@ -3114,7 +3155,6 @@ mod tests {
             "session_search",
             "session_read",
             "session_lineage_search",
-            "goal",
         ] {
             assert!(
                 !names.contains(&tool),
@@ -3184,7 +3224,7 @@ mod tests {
             tool_tiers: std::collections::BTreeMap::new(),
             tool_descriptions: std::collections::BTreeMap::new(),
             scan_tool_results: None,
-            goal_verification: crate::agents::GoalSettingsOverride::default(),
+            goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
             fork_eligible: false,
             prompt: "body".to_string(),
@@ -3240,7 +3280,7 @@ mod tests {
             tool_tiers: std::collections::BTreeMap::new(),
             tool_descriptions: std::collections::BTreeMap::new(),
             scan_tool_results: Some(true),
-            goal_verification: crate::agents::GoalSettingsOverride::default(),
+            goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
             fork_eligible: false,
             prompt: "body".to_string(),
@@ -3253,12 +3293,7 @@ mod tests {
         assert!(names.contains(&"skill_manage"), "{names:?}");
         assert!(names.contains(&"mcp"), "{names:?}");
         let host = host_for_agent(&agent, tmp.path());
-        for tool in [
-            "session_search",
-            "session_read",
-            "session_lineage_search",
-            "goal",
-        ] {
+        for tool in ["session_search", "session_read", "session_lineage_search"] {
             assert!(
                 !names.contains(&tool),
                 "{tool} should not be directly injected"
@@ -3283,7 +3318,7 @@ mod tests {
             tool_tiers: std::collections::BTreeMap::new(),
             tool_descriptions: std::collections::BTreeMap::new(),
             scan_tool_results: Some(true),
-            goal_verification: crate::agents::GoalSettingsOverride::default(),
+            goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
             fork_eligible: false,
             prompt: "body".to_string(),
@@ -3300,12 +3335,7 @@ mod tests {
             !discoverable.is_empty() && names.contains(&"mcp"),
             "discoverable tools {discoverable:?} must be reachable through `mcp`"
         );
-        for tool in [
-            "session_search",
-            "session_read",
-            "session_lineage_search",
-            "goal",
-        ] {
+        for tool in ["session_search", "session_read", "session_lineage_search"] {
             assert!(
                 discoverable.iter().any(|name| name == tool),
                 "{tool} should be discoverable through monty: {discoverable:?}"
@@ -3333,7 +3363,7 @@ mod tests {
             tool_tiers: std::collections::BTreeMap::new(),
             tool_descriptions: std::collections::BTreeMap::new(),
             scan_tool_results: Some(true),
-            goal_verification: crate::agents::GoalSettingsOverride::default(),
+            goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
             fork_eligible: false,
             prompt: "body".to_string(),
@@ -3424,7 +3454,7 @@ mod tests {
             tool_tiers,
             tool_descriptions: std::collections::BTreeMap::new(),
             scan_tool_results: Some(true),
-            goal_verification: crate::agents::GoalSettingsOverride::default(),
+            goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
             fork_eligible: false,
             prompt: "body".to_string(),
@@ -3561,7 +3591,6 @@ mod tests {
             "session_read",
             "session_lineage_search",
             "todo",
-            "goal",
             "webfetch",
             "websearch",
         ] {
@@ -3837,7 +3866,7 @@ mod tests {
                 tool_tiers: std::collections::BTreeMap::new(),
                 tool_descriptions: std::collections::BTreeMap::new(),
                 scan_tool_results: None,
-                goal_verification: crate::agents::GoalSettingsOverride::default(),
+                goal_supervision: crate::agents::GoalSettingsOverride::default(),
                 permission: None,
                 fork_eligible: false,
                 prompt: "body".to_string(),
@@ -5361,7 +5390,7 @@ mod tests {
             tool_tiers: std::collections::BTreeMap::new(),
             tool_descriptions,
             scan_tool_results: Some(true),
-            goal_verification: crate::agents::GoalSettingsOverride::default(),
+            goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
             fork_eligible: false,
             prompt: "body".to_string(),
@@ -5409,7 +5438,7 @@ mod tests {
             tool_tiers: std::collections::BTreeMap::new(),
             tool_descriptions: std::collections::BTreeMap::new(),
             scan_tool_results: Some(true),
-            goal_verification: crate::agents::GoalSettingsOverride::default(),
+            goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
             fork_eligible: false,
             prompt: "body".to_string(),
@@ -5602,7 +5631,7 @@ mod tests {
             tool_tiers: std::collections::BTreeMap::new(),
             tool_descriptions: std::collections::BTreeMap::new(),
             scan_tool_results: None,
-            goal_verification: crate::agents::GoalSettingsOverride::default(),
+            goal_supervision: crate::agents::GoalSettingsOverride::default(),
             permission: None,
             fork_eligible: false,
             prompt: "body".to_string(),

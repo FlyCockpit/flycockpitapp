@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use super::schema::{
-    DependencyImportance, ExternalRuntimeId, HostPlatform, RemedyKind, RequirementGroup,
+    DependencyImportance, ExternalRuntimeDescriptor, ExternalRuntimeId, HostPlatform, RemedyKind,
+    RequirementGroup,
 };
 use crate::capabilities::ExecutionTarget;
 
@@ -53,6 +54,8 @@ impl HealthState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum HealthCause {
+    /// No probe has completed for this in-memory view yet.
+    NeverProbed,
     SpawnFailed {
         failure: SpawnFailureKind,
     },
@@ -239,6 +242,11 @@ struct StoreInner {
     /// Highest generation number reserved via [`HealthSnapshotStore::begin_refresh`].
     next_generation: u64,
     current: Option<Arc<ExternalRuntimeSnapshot>>,
+    descriptors: Vec<ExternalRuntimeDescriptor>,
+    /// True only after a full roster refresh. A live launch-gate publication
+    /// from an empty store is useful evidence but not a complete first-paint
+    /// catalog.
+    current_is_complete: bool,
 }
 
 impl HealthSnapshotStore {
@@ -259,7 +267,37 @@ impl HealthSnapshotStore {
     /// Returns true when the snapshot became current. Older in-flight refreshes
     /// that complete after a newer refresh was reserved are discarded even if
     /// nothing has been published yet.
+    #[cfg(test)]
     pub fn publish(&self, snapshot: ExternalRuntimeSnapshot) -> bool {
+        self.publish_bundle(snapshot, Vec::new())
+    }
+
+    /// Publish a generation-gated partial snapshot and its exact roster.
+    /// Safety-only refreshes use this path and must not masquerade as a full
+    /// Settings/doctor catalog.
+    pub fn publish_bundle(
+        &self,
+        snapshot: ExternalRuntimeSnapshot,
+        descriptors: Vec<ExternalRuntimeDescriptor>,
+    ) -> bool {
+        self.publish_bundle_with_completeness(snapshot, descriptors, false)
+    }
+
+    /// Publish a generation-gated full Settings/doctor roster.
+    pub fn publish_complete_bundle(
+        &self,
+        snapshot: ExternalRuntimeSnapshot,
+        descriptors: Vec<ExternalRuntimeDescriptor>,
+    ) -> bool {
+        self.publish_bundle_with_completeness(snapshot, descriptors, true)
+    }
+
+    fn publish_bundle_with_completeness(
+        &self,
+        snapshot: ExternalRuntimeSnapshot,
+        descriptors: Vec<ExternalRuntimeDescriptor>,
+        complete: bool,
+    ) -> bool {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         // Must be the latest reserved generation — supersedes older in-flight work.
         if snapshot.generation != inner.next_generation {
@@ -271,6 +309,8 @@ impl HealthSnapshotStore {
             return false;
         }
         inner.current = Some(Arc::new(snapshot));
+        inner.descriptors = descriptors;
+        inner.current_is_complete = complete;
         true
     }
 
@@ -280,15 +320,42 @@ impl HealthSnapshotStore {
         inner.current.clone()
     }
 
+    pub fn current_bundle(
+        &self,
+    ) -> Option<(Arc<ExternalRuntimeSnapshot>, Vec<ExternalRuntimeDescriptor>)> {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner
+            .current
+            .clone()
+            .map(|snapshot| (snapshot, inner.descriptors.clone()))
+    }
+
+    /// Return a bundle only when it originated from a complete roster
+    /// refresh (possibly followed by atomic live-entry updates).
+    pub fn current_complete_bundle(
+        &self,
+    ) -> Option<(Arc<ExternalRuntimeSnapshot>, Vec<ExternalRuntimeDescriptor>)> {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if !inner.current_is_complete {
+            return None;
+        }
+        inner
+            .current
+            .clone()
+            .map(|snapshot| (snapshot, inner.descriptors.clone()))
+    }
+
     /// Atomically assign a new generation, merge `entry` into the published
     /// snapshot, and return `(published_snapshot, generation)`.
     ///
     /// Used by live launch gates so concurrent multi-id handoffs each publish
     /// a strictly newer generation without racing `begin_refresh` reservations
-    /// (full Settings/doctor refreshes still use begin_refresh + publish).
+    /// (full Settings/doctor refreshes still use begin_refresh +
+    /// publish_bundle).
     pub fn publish_live_entry(
         &self,
         entry: HealthEntry,
+        descriptor: ExternalRuntimeDescriptor,
         platform: HostPlatform,
     ) -> (Arc<ExternalRuntimeSnapshot>, u64) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -305,6 +372,18 @@ impl HealthSnapshotStore {
         snapshot
             .entries
             .insert(entry.id.as_str().to_string(), entry);
+        if let Some(existing) = inner
+            .descriptors
+            .iter_mut()
+            .find(|current| current.id == descriptor.id)
+        {
+            *existing = descriptor;
+        } else {
+            inner.descriptors.push(descriptor);
+            inner
+                .descriptors
+                .sort_by(|left, right| left.id.cmp(&right.id));
+        }
         let arc = Arc::new(snapshot);
         inner.current = Some(arc.clone());
         (arc, generation)
@@ -313,5 +392,7 @@ impl HealthSnapshotStore {
     pub fn clear(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.current = None;
+        inner.descriptors.clear();
+        inner.current_is_complete = false;
     }
 }

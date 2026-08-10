@@ -19,6 +19,7 @@ import { env, VIDEO_ENABLE_4K } from "@flycockpit/env/shared";
 import type { TranscodeVideoJobData } from "@flycockpit/queue";
 import type { Job } from "bullmq";
 import { mapWithConcurrency } from "../lib/concurrency.js";
+import { mediaRuntimePair } from "../lib/media-runtime.js";
 
 /**
  * Transcode a raw uploaded video into an HLS adaptive ladder + sprite-sheet
@@ -310,8 +311,12 @@ type Probe = {
 };
 
 async function runFfprobe(args: string[]): Promise<string> {
+  const runtime = await mediaRuntimePair({
+    ffmpeg: env.VIDEO_FFMPEG_PATH,
+    ffprobe: env.VIDEO_FFPROBE_PATH,
+  });
   return await new Promise<string>((resolve, reject) => {
-    const child = spawn(env.VIDEO_FFPROBE_PATH, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(runtime.ffprobe, args, { stdio: ["ignore", "pipe", "pipe"] });
     const timeoutMs = 30_000;
     const timeout = setTimeout(() => {
       child.kill("SIGKILL");
@@ -580,6 +585,10 @@ function formatVttTime(seconds: number): string {
 }
 
 async function runFfmpeg(args: string[]): Promise<void> {
+  const runtime = await mediaRuntimePair({
+    ffmpeg: env.VIDEO_FFMPEG_PATH,
+    ffprobe: env.VIDEO_FFPROBE_PATH,
+  });
   await new Promise<void>((resolve, reject) => {
     const boundedArgs = [
       "-threads",
@@ -592,7 +601,7 @@ async function runFfmpeg(args: string[]): Promise<void> {
       String(env.VIDEO_FFMPEG_TIMELIMIT_SECONDS),
       ...args,
     ];
-    const child = spawn(env.VIDEO_FFMPEG_PATH, boundedArgs, { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(runtime.ffmpeg, boundedArgs, { stdio: ["ignore", "pipe", "pipe"] });
     const timeoutMs = (env.VIDEO_FFMPEG_TIMELIMIT_SECONDS + 30) * 1000;
     const timeout = setTimeout(() => {
       child.kill("SIGKILL");

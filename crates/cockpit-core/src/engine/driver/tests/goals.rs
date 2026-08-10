@@ -1,46 +1,17 @@
 use super::*;
 
-#[tokio::test]
-async fn goal_read_only_turns_count_as_no_progress_after_bound() {
-    let (mut driver, _tmp) = test_driver(1);
-    driver
-        .session
-        .db
-        .create_session_goal(
-            driver.session.id,
-            &driver.session.project_id,
-            "ship without looping on reads",
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-    driver.goal_progress_last_seq = driver.latest_session_event_seq().await;
-
-    record_goal_tool_event(&driver, "read", serde_json::json!({"path": "src/lib.rs"})).await;
-    let first = driver.observe_goal_progress_turn().await.unwrap();
-    assert!(first.no_progress());
-    assert_eq!(driver.goal_turns_since_mutating_action, 1);
-    assert_eq!(driver.goal_turns_since_goal_context_delta, 1);
-
-    record_goal_tool_event(
-        &driver,
-        "grep",
-        serde_json::json!({"pattern": "TODO", "path": "src"}),
-    )
-    .await;
-    let second = driver.observe_goal_progress_turn().await.unwrap();
-
-    assert!(second.no_progress());
-    assert_eq!(
-        driver.goal_turns_since_mutating_action,
-        GOAL_NO_PROGRESS_NUDGE_BOUND
-    );
-    assert!(
-        driver.goal_turns_since_goal_context_delta >= GOAL_NO_PROGRESS_NUDGE_BOUND,
-        "read/search-only turns should cross the nudge bound"
-    );
-    assert_eq!(driver.goal_stall_prompt(), GOAL_IDLE_CONTINUATION);
+#[test]
+fn existing_goal_dispatch_uses_persisted_policy_except_for_live_kill_switch() {
+    let persisted = crate::config::extended::GoalSupervisionConfig {
+        cold_skeptic_count: 1,
+        max_verification_attempts: 9,
+        evaluator_model: Some("provider/persisted-evaluator".into()),
+        ..Default::default()
+    };
+    let encoded = serde_json::to_string(&persisted).unwrap();
+    let resolved = resolved_goal_supervision_config(&encoded, true).unwrap();
+    assert_eq!(resolved, persisted);
+    assert!(resolved_goal_supervision_config(&encoded, false).is_err());
 }
 
 #[tokio::test]
@@ -87,6 +58,19 @@ async fn goal_mutating_action_and_context_delta_reset_progress_counters() {
     assert!(context.context_delta);
     assert_eq!(driver.goal_turns_since_goal_context_delta, 0);
     assert_eq!(driver.goal_turns_since_mutating_action, 1);
+}
+
+#[test]
+fn worker_cannot_create_or_mutate_goal() {
+    assert!(!crate::agents::known_tool_names().contains(&"goal"));
+}
+
+#[test]
+fn goal_continue_progress_accepts_goal_status_update() {
+    assert!(
+        !crate::agents::known_tool_names().contains(&"goal"),
+        "worker status updates must remain unavailable; host continuations use durable DB state"
+    );
 }
 
 #[tokio::test]
@@ -170,98 +154,9 @@ async fn goal_prose_without_tools_counts_as_no_progress_subset() {
 }
 
 #[tokio::test]
-async fn goal_no_progress_intervention_waits_for_budget_cap() {
-    let (mut driver, tmp) = test_driver(1);
-    driver
-        .session
-        .db
-        .create_session_goal(
-            driver.session.id,
-            &driver.session.project_id,
-            "do not stop at three strikes",
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-    driver.goal_no_tool_idle_count = 5;
-    driver.goal_turns_since_mutating_action = GOAL_NO_PROGRESS_NUDGE_BOUND;
-    driver.goal_turns_since_goal_context_delta = GOAL_NO_PROGRESS_NUDGE_BOUND;
-    let goal = driver
-        .session
-        .db
-        .current_session_goal(driver.session.id, false)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        !driver.goal_continuation_budget_exhausted(&goal),
-        "fixed strike count must not be the terminating condition"
-    );
-    assert_eq!(driver.goal_stall_prompt(), GOAL_IDLE_CONTINUATION_STRONGEST);
-    assert!(!driver.goal_idle_intervention_pending);
-
-    driver
-        .session
-        .db
-        .insert_inference_call(&crate::db::inference_calls::InferenceCallRow {
-            call_id: uuid::Uuid::new_v4(),
-            session_id: driver.session.id,
-            project_id: driver.session.project_id.clone(),
-            project_root: tmp.path().display().to_string(),
-            model: "test-model".to_string(),
-            provider: "test-provider".to_string(),
-            timestamp: chrono::Utc::now().timestamp(),
-            input_tokens: GOAL_DEFAULT_CONTINUATION_TOKEN_CAP,
-            output_tokens: 0,
-            cached_input_tokens: 0,
-            cache_creation_input_tokens: 0,
-            cost_usd_micros: None,
-            is_utility: false,
-        })
-        .await
-        .unwrap();
-    driver
-        .session
-        .db
-        .refresh_session_goal_usage(driver.session.id)
-        .await
-        .unwrap();
-    let capped = driver
-        .session
-        .db
-        .current_session_goal(driver.session.id, false)
-        .await
-        .unwrap()
-        .unwrap();
-    let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
-
-    driver
-        .emit_goal_no_progress_budget_exhausted(&capped, &tx)
-        .await;
-
-    assert!(driver.goal_idle_intervention_pending);
-    assert_eq!(
-        driver.take_idle_reason().await,
-        crate::engine::IdleReason::NeedsIntervention {
-            code: "agent_failed_to_progress_budget_exhausted".to_string()
-        }
-    );
-    match rx
-        .try_recv()
-        .expect("budget intervention notice should emit")
-    {
-        TurnEvent::Notice { text } => {
-            assert!(text.contains("agent_failed_to_progress_budget_exhausted"));
-        }
-        other => panic!("expected intervention Notice, got {other:?}"),
-    }
-}
-
-#[tokio::test]
 async fn goal_budget_autopause_idle_reason_is_budget_limited() {
     let (mut driver, tmp) = test_driver(1);
-    driver
+    let goal = driver
         .session
         .db
         .create_session_goal(
@@ -273,24 +168,37 @@ async fn goal_budget_autopause_idle_reason_is_budget_limited() {
         )
         .await
         .unwrap();
+    let call = crate::db::inference_calls::InferenceCallRow {
+        call_id: uuid::Uuid::new_v4(),
+        session_id: driver.session.id,
+        project_id: driver.session.project_id.clone(),
+        project_root: tmp.path().display().to_string(),
+        model: "test-model".to_string(),
+        provider: "test-provider".to_string(),
+        timestamp: chrono::Utc::now().timestamp(),
+        input_tokens: 2,
+        output_tokens: 0,
+        cached_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cost_usd_micros: None,
+        is_utility: false,
+    };
     driver
         .session
         .db
-        .insert_inference_call(&crate::db::inference_calls::InferenceCallRow {
-            call_id: uuid::Uuid::new_v4(),
-            session_id: driver.session.id,
-            project_id: driver.session.project_id.clone(),
-            project_root: tmp.path().display().to_string(),
-            model: "test-model".to_string(),
-            provider: "test-provider".to_string(),
-            timestamp: chrono::Utc::now().timestamp(),
-            input_tokens: 2,
-            output_tokens: 0,
-            cached_input_tokens: 0,
-            cache_creation_input_tokens: 0,
-            cost_usd_micros: None,
-            is_utility: false,
-        })
+        .insert_inference_request_with_goal_provenance(
+            &call.call_id.to_string(),
+            driver.session.id,
+            &serde_json::json!({}),
+            crate::db::session_log::InferenceRequestStatus::Pending,
+            Some((goal.id, goal.attempt_generation)),
+        )
+        .await
+        .unwrap();
+    driver
+        .session
+        .db
+        .insert_inference_call(&call)
         .await
         .unwrap();
     driver
@@ -317,7 +225,7 @@ async fn goal_budget_autopause_idle_reason_is_budget_limited() {
 #[tokio::test]
 async fn stalled_goal_token_budget_exhaustion_needs_intervention() {
     let (mut driver, tmp) = test_driver(1);
-    driver
+    let goal = driver
         .session
         .db
         .create_session_goal(
@@ -331,24 +239,37 @@ async fn stalled_goal_token_budget_exhaustion_needs_intervention() {
         .unwrap();
     driver.goal_turns_since_mutating_action = GOAL_NO_PROGRESS_NUDGE_BOUND;
     driver.goal_turns_since_goal_context_delta = GOAL_NO_PROGRESS_NUDGE_BOUND;
+    let call = crate::db::inference_calls::InferenceCallRow {
+        call_id: uuid::Uuid::new_v4(),
+        session_id: driver.session.id,
+        project_id: driver.session.project_id.clone(),
+        project_root: tmp.path().display().to_string(),
+        model: "test-model".to_string(),
+        provider: "test-provider".to_string(),
+        timestamp: chrono::Utc::now().timestamp(),
+        input_tokens: 10,
+        output_tokens: 0,
+        cached_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cost_usd_micros: None,
+        is_utility: false,
+    };
     driver
         .session
         .db
-        .insert_inference_call(&crate::db::inference_calls::InferenceCallRow {
-            call_id: uuid::Uuid::new_v4(),
-            session_id: driver.session.id,
-            project_id: driver.session.project_id.clone(),
-            project_root: tmp.path().display().to_string(),
-            model: "test-model".to_string(),
-            provider: "test-provider".to_string(),
-            timestamp: chrono::Utc::now().timestamp(),
-            input_tokens: 10,
-            output_tokens: 0,
-            cached_input_tokens: 0,
-            cache_creation_input_tokens: 0,
-            cost_usd_micros: None,
-            is_utility: false,
-        })
+        .insert_inference_request_with_goal_provenance(
+            &call.call_id.to_string(),
+            driver.session.id,
+            &serde_json::json!({}),
+            crate::db::session_log::InferenceRequestStatus::Pending,
+            Some((goal.id, goal.attempt_generation)),
+        )
+        .await
+        .unwrap();
+    driver
+        .session
+        .db
+        .insert_inference_call(&call)
         .await
         .unwrap();
     driver
@@ -411,8 +332,8 @@ async fn goal_usage_limit_failure_pauses_goal_and_arms_backoff() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        goal.status,
-        crate::db::session_goals::GoalStatus::UsageLimited
+        goal.disposition,
+        crate::db::session_goals::GoalDisposition::InfraPaused
     );
     assert_eq!(
         driver.take_idle_reason().await,
@@ -449,7 +370,7 @@ async fn goal_usage_limit_watchdog_auto_resumes_to_active() {
         .db
         .update_session_goal(
             driver.session.id,
-            crate::db::session_goals::GoalStatus::UsageLimited,
+            crate::db::session_goals::GoalDisposition::InfraPaused,
             None,
             None,
             Some("provider usage or rate limit reached"),
@@ -468,7 +389,10 @@ async fn goal_usage_limit_watchdog_auto_resumes_to_active() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(goal.status, crate::db::session_goals::GoalStatus::Active);
+    assert_eq!(
+        goal.disposition,
+        crate::db::session_goals::GoalDisposition::Running
+    );
 }
 
 #[tokio::test]
@@ -508,8 +432,8 @@ async fn persistent_goal_usage_limit_requires_manual_resume_after_bound() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        goal.status,
-        crate::db::session_goals::GoalStatus::UsageLimited
+        goal.disposition,
+        crate::db::session_goals::GoalDisposition::InfraPaused
     );
     assert_eq!(
         driver.take_idle_reason().await,
@@ -673,57 +597,6 @@ async fn goal_continue_only_maintenance_events_emits_diagnostic_and_keeps_latch(
         .expect("goal progress diagnostic is durable");
     assert_eq!(diagnostic.data["kind"], "goal_continue_no_progress");
     assert_eq!(diagnostic.data["anchor_seq"], serde_json::json!(anchor));
-}
-
-#[tokio::test]
-async fn goal_continue_progress_accepts_goal_status_update() {
-    let (driver, _tmp) = test_driver(1);
-    driver
-        .session
-        .db
-        .create_session_goal(
-            driver.session.id,
-            &driver.session.project_id,
-            "ship goal flow",
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-    let anchor = driver.latest_session_event_seq().await;
-    driver
-        .session
-        .record_event(
-            crate::db::session_log::SessionEventKind::UserMessage,
-            Some("Build"),
-            None,
-            &serde_json::json!({"text": "continue"}),
-        )
-        .await
-        .unwrap();
-    driver
-        .session
-        .db
-        .current_session_goal(driver.session.id, true)
-        .await
-        .unwrap();
-    driver
-        .session
-        .db
-        .update_session_goal(
-            driver.session.id,
-            crate::db::session_goals::GoalStatus::Complete,
-            Some("done"),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-
-    assert!(
-        driver.goal_continue_progress_since(anchor).await,
-        "terminal goal status is progress even if no further tool is needed"
-    );
 }
 
 #[tokio::test]

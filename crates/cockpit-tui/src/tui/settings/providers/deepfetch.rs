@@ -93,6 +93,20 @@ impl DeepFetchState {
         });
     }
 
+    pub(super) fn set_pointer_choice(&mut self, choice: usize) -> bool {
+        if self.phase != DeepFetchPhase::Confirm || choice > 1 {
+            return false;
+        }
+        self.cursor = choice;
+        true
+    }
+
+    pub(super) fn scroll_pointer_choice(&mut self, delta: isize) {
+        if self.phase == DeepFetchPhase::Confirm {
+            self.cursor = self.cursor.saturating_add_signed(delta).min(1);
+        }
+    }
+
     fn drain(&mut self) -> Option<Result<String, String>> {
         let mut progress = self.progress.lock().ok()?;
         progress.result.take()
@@ -350,6 +364,7 @@ impl SettingsCx {
             ]),
             Line::default(),
         ];
+        let mut bindings = Vec::new();
         match state.phase {
             DeepFetchPhase::Confirm => {
                 lines.push(Line::from(Span::styled(
@@ -359,6 +374,21 @@ impl SettingsCx {
                 lines.push(Line::default());
                 for (index, label) in ["Run deep fetch", "Cancel"].iter().enumerate() {
                     let selected = state.cursor == index;
+                    bindings.push((
+                        lines.len(),
+                        super::super::pointer_actions::SettingsPointerAction::Providers(
+                            super::super::pointer_actions::ProvidersAction::DeepFetchChoice(
+                                super::super::pointer_actions::ProviderId(
+                                    state.provider_id.clone(),
+                                ),
+                                if index == 0 {
+                                    super::super::pointer_actions::DeepFetchChoice::Fetch
+                                } else {
+                                    super::super::pointer_actions::DeepFetchChoice::Cancel
+                                },
+                            ),
+                        ),
+                    ));
                     lines.push(Line::from(Span::styled(
                         format!("{}{}", if selected { "▸ " } else { "  " }, label),
                         if selected {
@@ -406,8 +436,18 @@ impl SettingsCx {
                 );
             }
         }
-        self.scroll_states
-            .render_lines(frame, area, "providers:deep-fetch", lines, None);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "providers:deep-fetch",
+            (lines, None),
+            bindings,
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("providers:deep-fetch"),
+            )
+                .into(),
+        );
     }
 }
 

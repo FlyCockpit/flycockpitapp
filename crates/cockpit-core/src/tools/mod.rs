@@ -24,7 +24,6 @@ pub mod docs;
 pub mod edit;
 pub mod escalate;
 pub mod glob;
-pub mod goal;
 pub mod grep;
 pub mod harness;
 pub mod intel;

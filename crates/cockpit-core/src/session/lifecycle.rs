@@ -273,6 +273,8 @@ impl Session {
             assistant_name: row.assistant_name,
             started_at,
             db,
+            external_journal: Mutex::new(None),
+            allow_unjournaled_inference: std::sync::atomic::AtomicBool::new(false),
             short_id,
             parent_session_id: row.parent_session_id,
             fork_point_turn_id: row.fork_point_turn_id,

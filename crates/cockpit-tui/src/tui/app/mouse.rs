@@ -39,11 +39,56 @@ impl App {
         {
             self.toast = None;
         }
+        // The keys overlay is visually topmost and therefore owns pointer
+        // input before links or settings targets underneath it.
+        if let Some(overlay) = self.keys_overlay.as_mut() {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => overlay.scroll_up(),
+                MouseEventKind::ScrollDown => overlay.scroll_down(),
+                _ => {}
+            }
+            return;
+        }
+        // A visible context menu is the next modal layer. It must preempt a
+        // settings dialog that may still be rendered underneath it.
+        if let Some(menu) = self.context_menu.clone() {
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let full = ratatui::layout::Rect::new(0, 0, u16::MAX, u16::MAX);
+                    if let Some(action) = menu.hit_test(mouse.column, mouse.row, full) {
+                        self.context_menu = None;
+                        self.execute_context_menu_action(action, menu.clicked_chat_row);
+                    } else {
+                        self.context_menu = None;
+                    }
+                }
+                MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    self.context_menu = None;
+                }
+                _ => {}
+            }
+            return;
+        }
         if matches!(mouse.kind, MouseEventKind::Moved) {
             if self.mouse_capture {
                 let _link_hover_changed = self.link_registry.update_hover(mouse.column, mouse.row);
             } else {
                 self.link_registry.clear_hover();
+            }
+            if self.link_registry.hovered().is_some() {
+                self.dialog.clear_settings_pointer_hover();
+                self.hovered_suggestion = None;
+                self.hovered_control_chip = None;
+                self.hovered_affordance = None;
+                self.hovered_footer_control = None;
+                return;
+            }
+            if self.mouse_capture && self.dialog.handle_settings_pointer(mouse).is_some() {
+                self.hovered_suggestion = None;
+                self.hovered_control_chip = None;
+                self.hovered_affordance = None;
+                self.hovered_footer_control = None;
+                return;
             }
             self.update_hovered_affordance(&mouse);
             if self.link_registry.hovered().is_some() {
@@ -55,13 +100,56 @@ impl App {
             self.update_hovered_footer_control(mouse.column, mouse.row);
             return;
         }
-        if self.mouse_capture
-            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            && let Some(url) = self
-                .link_registry
-                .at(mouse.column, mouse.row)
-                .map(|link| link.url.clone())
-        {
+        if !self.mouse_capture {
+            self.link_pointer_gesture.cancel();
+            self.pending_link_activation = None;
+        }
+        let hit_url = self
+            .link_registry
+            .at(mouse.column, mouse.row)
+            .map(|link| link.url.clone());
+        let link_outcome = if self.mouse_capture {
+            self.link_pointer_gesture.handle(
+                mouse.kind,
+                mouse.column,
+                mouse.row,
+                hit_url.as_deref(),
+                self.link_registry.generation(),
+                std::time::Instant::now(),
+            )
+        } else {
+            crate::tui::links::LinkGestureOutcome::Unhandled
+        };
+        if matches!(
+            link_outcome,
+            crate::tui::links::LinkGestureOutcome::Consumed
+        ) {
+            return;
+        }
+        // Double-click on the same semantic link: cancel activation and
+        // select the URL. This is an explicit selection — no copy here
+        // (the copy-on-release path handles that if enabled).
+        if let crate::tui::links::LinkGestureOutcome::SelectUrl(_url) = &link_outcome {
+            // Create a word selection at the click point. The host's
+            // semantic extraction will resolve the URL text from the
+            // selection.
+            self.selection = Some(Selection {
+                anchor: (mouse.column, mouse.row),
+                focus: (mouse.column, mouse.row),
+                active: false,
+            });
+            return;
+        }
+        // Scheduled activation: the host starts a timer; the actual
+        // activation happens after the 500 ms multi-click window if the
+        // token remains current. We store the pending activation so the
+        // event loop can check it.
+        if let crate::tui::links::LinkGestureOutcome::ScheduleActivation(pa) = &link_outcome {
+            // Store the pending activation for the event loop to check.
+            self.pending_link_activation = Some(pa.clone());
+            return;
+        }
+        if let crate::tui::links::LinkGestureOutcome::Activate(url) = link_outcome {
             if cockpit_core::sysinfo::is_ssh() {
                 match crate::clipboard::copy_plain(&url, self.clipboard_recovery) {
                     Ok(result) => {
@@ -82,6 +170,16 @@ impl App {
                         self.show_toast(format!("Could not open link: {error}"), ToastKind::Error)
                     }
                 }
+            }
+            return;
+        }
+        if self.mouse_capture
+            && let Some(outcome) = self.dialog.handle_settings_pointer(mouse)
+        {
+            if matches!(outcome, crate::tui::settings::SettingsPointerOutcome::Close) {
+                self.dialog = crate::tui::settings::Dialog::None;
+                self.sync_mouse_capture_from_dialog();
+                self.resync_config_after_local_write();
             }
             return;
         }
@@ -112,17 +210,6 @@ impl App {
                 .is_some_and(|rect| point_in(rect, mouse.column, mouse.row))
         {
             self.open_auth_failure_provider();
-            return;
-        }
-        // Which-key overlay (`which-key-overlay.md`): rendered on top of every
-        // pane, so it intercepts the wheel first. Wheel scrolls it; every other
-        // mouse event is eaten so nothing reaches the pane/chat underneath.
-        if let Some(overlay) = self.keys_overlay.as_mut() {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => overlay.scroll_up(),
-                MouseEventKind::ScrollDown => overlay.scroll_down(),
-                _ => {}
-            }
             return;
         }
         if self.mouse_capture
@@ -280,30 +367,6 @@ impl App {
         if self.pane.is_some() && self.handle_pane_mouse(&mouse) {
             return;
         }
-        // Context menu is modal too — clicks either hit an item or
-        // dismiss. Wheel events while it's open are eaten so we don't
-        // accidentally scroll chat underneath.
-        if let Some(menu) = self.context_menu.clone() {
-            match mouse.kind {
-                MouseEventKind::Down(MouseButton::Left) => {
-                    let full = ratatui::layout::Rect::new(0, 0, u16::MAX, u16::MAX);
-                    if let Some(action) = menu.hit_test(mouse.column, mouse.row, full) {
-                        self.context_menu = None;
-                        self.execute_context_menu_action(action, menu.clicked_chat_row);
-                    } else {
-                        // Click outside the menu dismisses it without
-                        // executing anything.
-                        self.context_menu = None;
-                    }
-                }
-                MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                    self.context_menu = None;
-                }
-                _ => {}
-            }
-            return;
-        }
-
         if self.mouse_capture
             && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             && let Some(hit) = self.footer_hit_areas.iter().find(|hit| {
@@ -403,10 +466,17 @@ impl App {
 
         // Release finalizes the selection. It persists in
         // `self.selection` until cleared (Esc, new click outside chat,
-        // wheel scroll).
+        // wheel scroll). When `copy_on_release` is enabled and the
+        // selection was an active drag, schedule a copy through the
+        // centralized clipboard service. Auto-copy retains the
+        // highlight for every CopyOutcome.
         if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+            let was_active_drag = self.selection.is_some_and(|sel| sel.active);
             if let Some(sel) = self.selection.as_mut() {
                 sel.active = false;
+            }
+            if was_active_drag && self.copy_on_release {
+                self.copy_selection_plaintext_auto();
             }
             return;
         }
@@ -632,6 +702,49 @@ impl App {
             PaneSide::Full => return,
         };
         self.pane_ratio = ratio.clamp(0.15, 0.85);
+    }
+
+    /// Check the pending delayed link activation. Called on every pump
+    /// tick. If the deadline has passed and the token is still current,
+    /// the link is activated (browser open or SSH copy). Returns `true`
+    /// when the activation fired (so the pump knows to redraw).
+    pub(super) fn check_pending_link_activation(&mut self) -> bool {
+        let Some(pa) = self.pending_link_activation.clone() else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        if now < pa.deadline {
+            return false;
+        }
+        // Check the token against the link gesture's current state.
+        let outcome = self.link_pointer_gesture.check_activation(pa.token, now);
+        self.pending_link_activation = None;
+        if let crate::tui::links::LinkGestureOutcome::Activate(url) = outcome {
+            if cockpit_core::sysinfo::is_ssh() {
+                match crate::clipboard::copy_plain(&url, self.clipboard_recovery) {
+                    Ok(result) => {
+                        let (msg, kind) = super::copy_actions::describe_delivered(
+                            &result,
+                            "Link copied (SSH session).".to_string(),
+                        );
+                        self.show_toast(msg, kind);
+                    }
+                    Err(error) => {
+                        self.show_toast(format!("Copy failed: {error}"), ToastKind::Error)
+                    }
+                }
+            } else {
+                match crate::tui::links::open_browser(&url) {
+                    Ok(()) => self.show_toast("Opened link in browser", ToastKind::Success),
+                    Err(error) => {
+                        self.show_toast(format!("Could not open link: {error}"), ToastKind::Error)
+                    }
+                }
+            }
+            true
+        } else {
+            false
+        }
     }
 
     /// Clamp `(col, row)` into the current chat area. Used while
@@ -1142,6 +1255,19 @@ mod affordance_hover_tests {
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::layout::Rect;
 
+    async fn await_at_suggestions(app: &mut App) {
+        let kind = app.autocomplete_blocking_operation().action_kind();
+        while app.async_actions.has_pending_kind(&kind) {
+            let notify = app.async_actions.notifier();
+            let notified = notify.notified();
+            app.drain_async_actions();
+            if !app.async_actions.has_pending_kind(&kind) {
+                break;
+            }
+            notified.await;
+        }
+    }
+
     fn meta(
         chip_target: Option<usize>,
         tool_box_target: Option<usize>,
@@ -1164,6 +1290,11 @@ mod affordance_hover_tests {
             fork_hit: None,
             continuation: false,
             selectable: false,
+            copy_cells: Vec::new(),
+            copy_fragments: std::rc::Rc::new(Vec::new()),
+            copy_newlines_before: 0,
+            copy_fallback_if_unmapped: false,
+            copy_provenance_present: false,
         }
     }
 
@@ -1375,8 +1506,8 @@ mod affordance_hover_tests {
         assert_eq!(app.slash_scroll, 1);
     }
 
-    #[test]
-    fn wheel_over_at_suggestions_scrolls_window_not_selection() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn wheel_over_at_suggestions_scrolls_window_not_selection() {
         let tmp = tempfile::tempdir().unwrap();
         for name in [
             "alpha.rs",
@@ -1395,6 +1526,7 @@ mod affordance_hover_tests {
         app.mouse_capture = true;
         app.composer.set("@".to_string());
         app.reset_at_window();
+        await_at_suggestions(&mut app).await;
         assert!(app.at_suggestions().len() > AUTOCOMPLETE_ROWS as usize);
         app.suggestion_box_area = Some(Rect::new(0, 5, 80, 8));
 
@@ -1429,8 +1561,8 @@ mod affordance_hover_tests {
         assert!(app.history.is_empty());
     }
 
-    #[test]
-    fn click_at_file_finalizes_and_click_at_dir_descends() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn click_at_file_finalizes_and_click_at_dir_descends() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("alpha.rs"), "").unwrap();
         std::fs::create_dir(tmp.path().join("beta")).unwrap();
@@ -1438,6 +1570,7 @@ mod affordance_hover_tests {
         app.mouse_capture = true;
         app.composer.set("@alpha".to_string());
         app.reset_at_window();
+        await_at_suggestions(&mut app).await;
         let file_index = app
             .at_suggestions()
             .iter()
@@ -1456,6 +1589,7 @@ mod affordance_hover_tests {
         app.composer.set("@beta".to_string());
         app.at_dismissed = false;
         app.reset_at_window();
+        await_at_suggestions(&mut app).await;
         let dir_index = app
             .at_suggestions()
             .iter()

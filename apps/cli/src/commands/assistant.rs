@@ -4,7 +4,10 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 
 use crate::assistants::{create_assistant, default_home_dir, spec_from_wizard};
-use crate::cli::{AssistantCommand, AssistantDeleteArgs, AssistantNewArgs};
+use crate::cli::{
+    AssistantCommand, AssistantDeleteArgs, AssistantMediaCommand, AssistantNewArgs,
+    MediaAccountingCommand,
+};
 use crate::commands::setup::{TerminalActionHandler, TerminalIo, run_terminal_wizard};
 use crate::db::Db;
 use crate::session::project_id_for;
@@ -22,7 +25,63 @@ pub async fn run(
         AssistantCommand::Delete(args) => delete(args).await,
         AssistantCommand::Chat { name } => chat(&name, no_sandbox, launch_start).await,
         AssistantCommand::Learn(args) => crate::commands::learn::run(args, no_sandbox).await,
+        AssistantCommand::Media { command } => media(command).await,
     }
+}
+
+struct DiagnosticClock;
+impl crate::media_reservation::MonotonicClock for DiagnosticClock {
+    fn now_ms(&self) -> u64 {
+        0
+    }
+}
+
+async fn media(command: AssistantMediaCommand) -> Result<()> {
+    let db = Db::open_default().context("opening cockpit DB")?;
+    let ledger = crate::media_reservation::MediaReservationLedger::new(
+        db,
+        std::sync::Arc::new(DiagnosticClock),
+    );
+    match command {
+        AssistantMediaCommand::Accounting {
+            command: MediaAccountingCommand::Diagnose { scope, id, json: _ },
+        } => {
+            println!(
+                "{}",
+                serde_json::to_string(&ledger.diagnose_accounting(&scope, &id).await?)?
+            );
+        }
+        AssistantMediaCommand::Accounting {
+            command:
+                MediaAccountingCommand::Repair {
+                    scope,
+                    id,
+                    expected_block_generation,
+                    repair_plan_digest,
+                    idempotency_key,
+                },
+        } => {
+            let outcome = ledger
+                .repair_accounting(
+                    crate::media_reservation::AccountingRepairRequest {
+                        attempt_id: uuid::Uuid::new_v4().to_string(),
+                        scope_kind: scope,
+                        scope_id: id,
+                        expected_block_generation,
+                        repair_plan_digest,
+                        idempotency_key,
+                        wall_ms: chrono::Utc::now()
+                            .timestamp_millis()
+                            .try_into()
+                            .unwrap_or(0),
+                    },
+                    &crate::daemon::principal::ClientPrincipal::owner(),
+                )
+                .await?;
+            println!("{}", outcome.code());
+        }
+    }
+    Ok(())
 }
 
 async fn new(args: AssistantNewArgs) -> Result<()> {

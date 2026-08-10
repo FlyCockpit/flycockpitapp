@@ -1046,7 +1046,6 @@ dependencies = [
  "sqlite-vec",
  "tempfile",
  "thiserror 2.0.19",
- "tiktoken-rs",
  "tokio",
  "tokio-tungstenite 0.29.0",
  "tokio-util",
@@ -1080,6 +1079,7 @@ dependencies = [
  "chrono",
  "cockpit-db",
  "cockpit-test-support",
+ "cockpit-tokenizer",
  "dirs",
  "libc",
  "reqwest 0.13.4",
@@ -1113,6 +1113,7 @@ dependencies = [
  "cockpit-db",
  "cockpit-proto",
  "cockpit-test-support",
+ "cockpit-tokenizer",
  "croner",
  "csv",
  "dirs",
@@ -1143,6 +1144,7 @@ dependencies = [
  "objc2-core-graphics",
  "objc2-foundation",
  "predicates",
+ "quick-xml 0.39.4",
  "rand 0.10.2",
  "rayon",
  "regex",
@@ -1156,9 +1158,9 @@ dependencies = [
  "shellexpand",
  "similar 3.1.2",
  "sqlite-vec",
+ "svg-hush",
  "tempfile",
  "thiserror 2.0.19",
- "tiktoken-rs",
  "tokio",
  "tokio-tungstenite 0.29.0",
  "tokio-util",
@@ -1198,6 +1200,7 @@ dependencies = [
  "chrono",
  "cockpit-test-support",
  "dirs",
+ "jiff",
  "libc",
  "proc-macro2",
  "rand 0.10.2",
@@ -1222,12 +1225,16 @@ dependencies = [
  "cockpit-config",
  "cockpit-db",
  "futures",
+ "quote",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "syn 2.0.119",
  "thiserror 2.0.19",
  "tokio",
  "tokio-util",
+ "unicode-normalization",
+ "url",
  "uuid",
 ]
 
@@ -1238,6 +1245,15 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "cockpit-tokenizer"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tiktoken-rs",
 ]
 
 [[package]]
@@ -1252,7 +1268,6 @@ dependencies = [
  "chrono",
  "cockpit-config",
  "cockpit-core",
- "cockpit-db",
  "cockpit-proto",
  "cockpit-test-support",
  "crossterm",
@@ -1276,8 +1291,8 @@ dependencies = [
  "similar 3.1.2",
  "tempfile",
  "thiserror 2.0.19",
- "tiktoken-rs",
  "tokio",
+ "toml",
  "tracing",
  "tree-sitter",
  "tree-sitter-c",
@@ -1716,6 +1731,12 @@ name = "data-encoding"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
+
+[[package]]
+name = "data-url"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 
 [[package]]
 name = "defmt"
@@ -2290,6 +2311,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -5051,6 +5073,15 @@ checksum = "a993555f31e5a609f617c12db6250dedcac1b0a85076912c436e6fc9b2c8e6a3"
 
 [[package]]
 name = "quick-xml"
+version = "0.39.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cdcc8dd4e2f670d309a5f0e83fe36dfdc05af317008fea29144da1a2ac858e5e"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "quick-xml"
 version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
@@ -6816,6 +6847,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
+name = "svg-hush"
+version = "0.9.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "929223e80cdcec0482207576ea09692dd71b2b559057fc172e292ecec9a97559"
+dependencies = [
+ "base64",
+ "data-url",
+ "quick-error",
+ "url",
+ "xml",
+]
+
+[[package]]
 name = "syn"
 version = "1.0.109"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8119,7 +8163,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "338e30461b3a2b67d70eb30a6d89f8e0c93a833e07d2ae89085cd070c4a00ac0"
 dependencies = [
  "proc-macro2",
- "quick-xml",
+ "quick-xml 0.41.0",
  "quote",
 ]
 
@@ -8791,6 +8835,12 @@ dependencies = [
  "thiserror 2.0.19",
  "time",
 ]
+
+[[package]]
+name = "xml"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f45bb2c13fec6a6cb4c0f76a7e94839e110a14ec803ec2940777a94c347bc52"
 
 [[package]]
 name = "yasna"

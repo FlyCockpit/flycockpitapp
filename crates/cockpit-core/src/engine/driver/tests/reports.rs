@@ -217,6 +217,7 @@ async fn set_swarm_config_threads_caps_to_authority() {
                 .schedule
                 .spawn_swarm(crate::engine::schedule::authority::SpawnSpec {
                     job_id: None,
+                    goal_provenance: None,
                     worker: crate::engine::schedule::authority::SpawnWorkerKind::Bee,
                     prompt: "s".into(),
                     write_scope: "/tmp/o".into(),

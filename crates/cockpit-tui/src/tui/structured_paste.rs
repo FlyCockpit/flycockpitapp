@@ -54,6 +54,8 @@ pub enum ClassifierDecision {
     Replay {
         keys: Vec<KeyEvent>,
         boundary: Option<Event>,
+        boundary_paste_source: Option<PasteSource>,
+        boundary_correlation_id: Option<Uuid>,
         shortcut_intent: bool,
         paste_unavailable: bool,
     },
@@ -62,6 +64,7 @@ pub enum ClassifierDecision {
     Paste {
         source: PasteSource,
         text: String,
+        correlation_id: Uuid,
     },
     Pending,
 }
@@ -70,28 +73,52 @@ pub enum ClassifierDecision {
 pub struct TerminalPasteClassifier {
     rapid: Vec<BufferedKey>,
     shortcut_at: Option<Duration>,
+    shortcut_correlation_id: Option<Uuid>,
+    rapid_correlation_id: Option<Uuid>,
 }
 
 impl TerminalPasteClassifier {
+    pub fn pending_shortcut_correlation_id(&self) -> Option<Uuid> {
+        self.shortcut_correlation_id
+    }
     /// Resolve only the local shortcut intent after a native clipboard image
     /// commits. Buffered rapid keys retain their ordinary ownership.
     pub fn resolve_shortcut_intent(&mut self) {
         self.shortcut_at = None;
+        self.shortcut_correlation_id = None;
     }
 
     pub fn observe(&mut self, event: Event, observed_at: Duration) -> ClassifierDecision {
+        self.observe_with_paste_source(event, observed_at, PasteSource::BracketedPty, None)
+    }
+
+    pub fn observe_with_paste_source(
+        &mut self,
+        event: Event,
+        observed_at: Duration,
+        paste_source: PasteSource,
+        intake_correlation_id: Option<Uuid>,
+    ) -> ClassifierDecision {
         if let Event::Paste(text) = event {
             let replay = self.take_replay();
             self.shortcut_at = None;
+            let correlation_id = self
+                .shortcut_correlation_id
+                .take()
+                .or(intake_correlation_id)
+                .unwrap_or_else(Uuid::new_v4);
             if replay.is_empty() {
                 return ClassifierDecision::Paste {
-                    source: PasteSource::BracketedPty,
+                    source: paste_source,
                     text,
+                    correlation_id,
                 };
             }
             return ClassifierDecision::Replay {
                 keys: replay,
                 boundary: Some(Event::Paste(text)),
+                boundary_paste_source: Some(paste_source),
+                boundary_correlation_id: Some(correlation_id),
                 shortcut_intent: false,
                 paste_unavailable: false,
             };
@@ -102,12 +129,15 @@ impl TerminalPasteClassifier {
         {
             let replay = self.take_replay();
             self.shortcut_at = Some(observed_at);
+            self.shortcut_correlation_id = Some(Uuid::new_v4());
             return if replay.is_empty() {
                 ClassifierDecision::ShortcutIntent
             } else {
                 ClassifierDecision::Replay {
                     keys: replay,
                     boundary: None,
+                    boundary_paste_source: None,
+                    boundary_correlation_id: None,
                     shortcut_intent: true,
                     paste_unavailable: false,
                 }
@@ -118,9 +148,12 @@ impl TerminalPasteClassifier {
             && observed_at.saturating_sub(started) >= SHORTCUT_DEADLINE
         {
             self.shortcut_at = None;
+            self.shortcut_correlation_id = None;
             return ClassifierDecision::Replay {
                 keys: self.take_replay(),
                 boundary: Some(event),
+                boundary_paste_source: None,
+                boundary_correlation_id: None,
                 shortcut_intent: false,
                 paste_unavailable: true,
             };
@@ -134,6 +167,8 @@ impl TerminalPasteClassifier {
                 ClassifierDecision::Replay {
                     keys: replay,
                     boundary: Some(event),
+                    boundary_paste_source: None,
+                    boundary_correlation_id: None,
                     shortcut_intent: false,
                     paste_unavailable: false,
                 }
@@ -149,9 +184,12 @@ impl TerminalPasteClassifier {
                 observed_at,
                 bytes,
             });
+            self.rapid_correlation_id = Some(Uuid::new_v4());
             return ClassifierDecision::Replay {
                 keys: replay,
                 boundary: None,
+                boundary_paste_source: None,
+                boundary_correlation_id: None,
                 shortcut_intent: false,
                 paste_unavailable: false,
             };
@@ -161,6 +199,9 @@ impl TerminalPasteClassifier {
             observed_at,
             bytes,
         });
+        if self.rapid.len() == 1 {
+            self.rapid_correlation_id = Some(Uuid::new_v4());
+        }
         ClassifierDecision::Pending
     }
 
@@ -176,14 +217,22 @@ impl TerminalPasteClassifier {
             let text = String::from_utf8(self.rapid.drain(..).flat_map(|key| key.bytes).collect())
                 .expect("rapid candidates are valid UTF-8");
             self.shortcut_at = None;
+            let correlation_id = self
+                .shortcut_correlation_id
+                .take()
+                .or_else(|| self.rapid_correlation_id.take())
+                .unwrap_or_else(Uuid::new_v4);
             ClassifierDecision::Paste {
                 source: PasteSource::RapidPty,
                 text,
+                correlation_id,
             }
         } else {
             ClassifierDecision::Replay {
                 keys: self.take_replay(),
                 boundary: None,
+                boundary_paste_source: None,
+                boundary_correlation_id: None,
                 shortcut_intent: false,
                 paste_unavailable: false,
             }
@@ -200,6 +249,7 @@ impl TerminalPasteClassifier {
             .is_some_and(|started| now.saturating_sub(started) >= SHORTCUT_DEADLINE)
         {
             self.shortcut_at = None;
+            self.shortcut_correlation_id = None;
             return ClassifierDecision::PasteUnavailable;
         }
         ClassifierDecision::Pending
@@ -221,10 +271,12 @@ impl TerminalPasteClassifier {
 
     pub fn cancel(&mut self) -> Vec<KeyEvent> {
         self.shortcut_at = None;
+        self.shortcut_correlation_id = None;
         self.take_replay()
     }
 
     fn take_replay(&mut self) -> Vec<KeyEvent> {
+        self.rapid_correlation_id = None;
         self.rapid.drain(..).map(|key| key.event).collect()
     }
 }
@@ -339,6 +391,7 @@ pub fn user_submission_wire_digest(
 
     let cockpit_core::engine::message::UserSubmission {
         kind,
+        origin,
         expected_model_state_generation,
         expected_model,
         text,
@@ -357,6 +410,7 @@ pub fn user_submission_wire_digest(
     } = submission;
     let bytes = serde_json::to_vec(&(
         kind,
+        origin,
         expected_model_state_generation,
         expected_model,
         text,
@@ -556,6 +610,26 @@ impl SubmissionOrderCoordinator {
 }
 
 impl PasteCorrelationCache {
+    pub fn existing(
+        &mut self,
+        id: Uuid,
+        host: HostIdentity,
+        now: Duration,
+    ) -> Option<(u64, DedupResult)> {
+        self.expire(now);
+        let entry = self.entries.get(&id)?;
+        Some((
+            entry.paste_generation,
+            if entry.host != host {
+                DedupResult::HostMismatch
+            } else if entry.committed {
+                DedupResult::Committed
+            } else {
+                DedupResult::Busy
+            },
+        ))
+    }
+
     pub fn claim(
         &mut self,
         id: Uuid,
@@ -708,7 +782,7 @@ mod tests {
             ));
         }
         match classifier.flush_idle(Duration::from_millis(47)) {
-            ClassifierDecision::Paste { source, text } => {
+            ClassifierDecision::Paste { source, text, .. } => {
                 assert_eq!(source, PasteSource::RapidPty);
                 assert_eq!(text, "12345678");
             }
@@ -870,6 +944,7 @@ mod tests {
             ClassifierDecision::Paste {
                 source: PasteSource::BracketedPty,
                 text,
+                ..
             } if text == "browser text"
         ));
         let mut rapid = TerminalPasteClassifier::default();

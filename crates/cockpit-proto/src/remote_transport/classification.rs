@@ -298,6 +298,11 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
+        "create_goal",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
         "goal_status",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
@@ -812,12 +817,47 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteMessageClass::Liveness,
         RemoteInlinePayloadBound::Bounded,
     ),
+    row(
+        "operation_status",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "set_workspace_trust",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "get_startup_disclosures",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "get_app_flag",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "mark_app_flag_seen",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "resolve_assistant_session",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
 ];
 
 /// Every `Response` variant.
 pub const RESPONSE_CLASSIFICATION: &[RemoteMessageClassification] = &[
     row(
         "ack",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "config_refreshed",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
@@ -1181,6 +1221,41 @@ pub const RESPONSE_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteMessageClass::Cancel,
         RemoteInlinePayloadBound::Bounded,
     ),
+    row(
+        "remote_operation_status",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "workspace_trust_set",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "startup_disclosures",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "app_flag",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "app_flag_seen",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "assistant_session_resolved",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "remote_goal_outcome",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
 ];
 
 /// Every `Event` variant.
@@ -1406,7 +1481,7 @@ pub const EVENT_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
-        "goal_verification_progress",
+        "goal_supervision_progress",
         RemoteMessageClass::BoundedEvent,
         RemoteInlinePayloadBound::Bounded,
     ),
@@ -1784,8 +1859,8 @@ mod tests {
         }
 
         // Exact table sizes, so a silent shrink is caught.
-        assert_eq!(REQUEST_CLASSIFICATION.len(), 115);
-        assert_eq!(RESPONSE_CLASSIFICATION.len(), 73);
+        assert_eq!(REQUEST_CLASSIFICATION.len(), 122);
+        assert_eq!(RESPONSE_CLASSIFICATION.len(), 81);
         assert_eq!(EVENT_CLASSIFICATION.len(), 76);
     }
 

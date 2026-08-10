@@ -21,6 +21,19 @@ pub(crate) enum ProviderRequestKind {
     Copilot,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ResolvedProviderOrigin(Option<&'static str>);
+
+impl ResolvedProviderOrigin {
+    fn template(id: &'static str) -> Self {
+        Self(Some(id))
+    }
+
+    pub(crate) fn is_template(&self, id: &str) -> bool {
+        self.0 == Some(id)
+    }
+}
+
 pub(crate) enum OAuthCredential {
     Bearer(String),
     Codex(crate::auth::codex_oauth::StoredTokens),
@@ -284,6 +297,29 @@ impl ProviderRegistry {
         first
             .map(|provider| provider.as_ref())
             .unwrap_or(self.template.as_ref())
+    }
+
+    pub(crate) fn resolve_origin(
+        &self,
+        provider_id: &str,
+        entry: &ProviderEntry,
+    ) -> Result<ResolvedProviderOrigin> {
+        let Some(template_id) = entry.template.as_deref() else {
+            return Ok(ResolvedProviderOrigin::default());
+        };
+        let template = crate::providers::template_by_id(template_id).ok_or_else(|| {
+            anyhow!("provider `{provider_id}` references unknown template `{template_id}`")
+        })?;
+        let provider = self.provider_for(provider_id, entry);
+        if provider.id() != self.template.id() {
+            if provider.id() == template.id {
+                return Ok(ResolvedProviderOrigin::default());
+            }
+            return Err(anyhow!(
+                "provider `{provider_id}` has conflicting template and special-provider identity"
+            ));
+        }
+        Ok(ResolvedProviderOrigin::template(template.id))
     }
 
     pub fn provider_id_for(&self, provider_id: &str, entry: &ProviderEntry) -> &'static str {

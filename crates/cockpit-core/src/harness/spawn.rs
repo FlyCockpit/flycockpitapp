@@ -82,7 +82,18 @@ pub async fn run_to_completion(
         .map(|_| ())
     };
     gate.map_err(|err| {
-        anyhow::anyhow!("harness launch blocked by external-runtime health: {err}")
+        let id = if crate::external_runtime::known_harness_preset_names().contains(&harness_name)
+            && command == harness_name
+        {
+            format!("harness.{harness_name}")
+        } else {
+            format!("harness.custom.{harness_name}")
+        };
+        anyhow::anyhow!(
+            "{}",
+            crate::external_runtime::current_dependency_context_line(&id)
+                .unwrap_or_else(|| err.to_string())
+        )
     })?;
     let mut cmd = Command::new(command);
     cmd.args(args)

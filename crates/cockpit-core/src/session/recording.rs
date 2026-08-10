@@ -313,8 +313,25 @@ impl Session {
         payload: &Value,
         status: crate::db::session_log::InferenceRequestStatus,
     ) -> Result<()> {
+        self.record_inference_request_with_goal_provenance(call_id, payload, status, None)
+            .await
+    }
+
+    pub(crate) async fn record_inference_request_with_goal_provenance(
+        &self,
+        call_id: Uuid,
+        payload: &Value,
+        status: crate::db::session_log::InferenceRequestStatus,
+        provenance: Option<(Uuid, i64)>,
+    ) -> Result<()> {
         self.db
-            .insert_inference_request(&call_id.to_string(), self.id, payload, status)
+            .insert_inference_request_with_goal_provenance(
+                &call_id.to_string(),
+                self.id,
+                payload,
+                status,
+                provenance,
+            )
             .await
             .context("inserting inference_request")
     }
@@ -328,6 +345,17 @@ impl Session {
         payload: Value,
         status: crate::db::session_log::InferenceRequestStatus,
     ) -> Result<()> {
+        self.record_inference_request_async_with_goal_provenance(call_id, payload, status, None)
+            .await
+    }
+
+    pub(crate) async fn record_inference_request_async_with_goal_provenance(
+        &self,
+        call_id: Uuid,
+        payload: Value,
+        status: crate::db::session_log::InferenceRequestStatus,
+        provenance: Option<(Uuid, i64)>,
+    ) -> Result<()> {
         let payload_json =
             serde_json::to_string(&payload).context("serializing request payload")?;
         let ts_ms = crate::db::session_log::now_ms();
@@ -337,12 +365,20 @@ impl Session {
             .write(move |conn| {
                 conn.execute(
                     "INSERT INTO inference_requests
-                       (call_id, session_id, ts_ms, payload_json, status)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
+                       (call_id, session_id, ts_ms, payload_json, status, goal_id, goal_attempt_generation)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                      ON CONFLICT(call_id) DO UPDATE SET
                        payload_json = excluded.payload_json,
                        status       = excluded.status",
-                    params![call_id, session_id, ts_ms, payload_json, status.as_str()],
+                    params![
+                        call_id,
+                        session_id,
+                        ts_ms,
+                        payload_json,
+                        status.as_str(),
+                        provenance.map(|(goal_id, _)| goal_id.to_string()),
+                        provenance.map(|(_, generation)| generation),
+                    ],
                 )
                 .context("inserting inference_request")?;
                 Ok(())

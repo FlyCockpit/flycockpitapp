@@ -180,6 +180,84 @@ impl App {
         });
     }
 
+    /// Auto-copy on release: copies the selection but **retains the
+    /// highlight** for every CopyOutcome (confirmed, unverified, failed,
+    /// empty). This is the copy-on-release path; the explicit
+    /// `/copy`-keybind path uses [`copy_selection_plaintext`] which
+    /// clears the selection after an accepted copy.
+    pub(super) fn copy_selection_plaintext_auto(&mut self) {
+        let recovery = self.clipboard_recovery;
+        self.copy_selection_plaintext_auto_with(move |text| {
+            crate::clipboard::copy_plain(text, recovery)
+        });
+    }
+
+    pub(super) fn copy_selection_plaintext_auto_with(
+        &mut self,
+        copy_plain: impl FnOnce(
+            &str,
+        )
+            -> Result<crate::clipboard::DeliveryResult, crate::clipboard::CopyError>,
+    ) {
+        let Some(sel) = self.selection else {
+            return;
+        };
+        let Some(area) = self.chat_area else {
+            return;
+        };
+        let (start, end) = sel.ordered();
+        if start.1 < area.y
+            || end.1 >= area.y + area.height
+            || start.0 < area.x
+            || end.0 >= area.x + area.width
+        {
+            self.selection = None;
+            return;
+        }
+        if self.chat_text_grid.len() != area.height as usize
+            || self
+                .chat_text_grid
+                .iter()
+                .any(|row| row.len() != area.width as usize)
+        {
+            return;
+        }
+        let text_to_copy = extract_selection_semantic(&self.chat_row_meta, area, sel)
+            .unwrap_or_else(|| {
+                extract_selection_plaintext(&self.chat_text_grid, &self.chat_row_meta, area, sel)
+            });
+        if text_to_copy.is_empty() {
+            return;
+        }
+        match copy_plain(&text_to_copy) {
+            Ok(result) => {
+                let (msg, kind) = describe_delivered(
+                    &result,
+                    format!(
+                        "Copied {} chars to clipboard.",
+                        text_to_copy.chars().count()
+                    ),
+                );
+                if matches!(kind, ToastKind::Success) {
+                    self.show_copy_ok_or_tmux_hint(msg);
+                } else {
+                    self.show_toast(msg, kind);
+                }
+                // Auto-copy retains highlight for every CopyOutcome —
+                // do NOT clear the selection here. The explicit copy
+                // path clears it; auto-copy lets the user see what
+                // was copied.
+            }
+            Err(crate::clipboard::CopyError::TooLarge { .. }) => {
+                self.show_toast(
+                    "Selection too large to copy (max sequence size) — copy a smaller range.",
+                    ToastKind::Error,
+                );
+            }
+            Err(e) => self.show_toast(format!("Copy failed: {e}"), ToastKind::Error),
+        }
+    }
+
     pub(super) fn copy_selection_plaintext_with(
         &mut self,
         copy_plain: impl FnOnce(
@@ -213,16 +291,10 @@ impl App {
         {
             return;
         }
-        let text_to_copy =
-            extract_selection_markdown_source(&self.history, &self.chat_row_meta, area, sel)
-                .unwrap_or_else(|| {
-                    extract_selection_plaintext(
-                        &self.chat_text_grid,
-                        &self.chat_row_meta,
-                        area,
-                        sel,
-                    )
-                });
+        let text_to_copy = extract_selection_semantic(&self.chat_row_meta, area, sel)
+            .unwrap_or_else(|| {
+                extract_selection_plaintext(&self.chat_text_grid, &self.chat_row_meta, area, sel)
+            });
         if text_to_copy.is_empty() {
             return;
         }

@@ -542,8 +542,7 @@ impl App {
                         if let Some(fence) = self.submission_fences.remove(id) {
                             self.submission_order.cancel(fence.fence_sequence);
                         }
-                        self.pending_paste_probes
-                            .retain(|_, probe| probe.owner_fence != Some(*id));
+                        self.cancel_paste_probes_matching(|probe| probe.owner_fence == Some(*id));
                     }
                     if !cancelled.is_empty() {
                         self.show_toast("Paste unavailable", ToastKind::Error);
@@ -1496,7 +1495,7 @@ impl App {
                 // accounts for it.
                 self.estimate_at_last_usage = self.estimate_context_tokens();
             }
-            TurnEvent::GoalVerificationProgress { done, total } => {
+            TurnEvent::GoalSupervisionProgress { done, total } => {
                 self.idle_reason_status = Some(super::IdleReasonStatus {
                     text: format!("verifying completion ({done}/{total})..."),
                     kind: super::ToastKind::Info,
@@ -2011,14 +2010,15 @@ impl App {
                 relay_region,
                 last_error,
             } => {
-                self.connector_disclosure = Some(cockpit_db::connector::ConnectorDisclosure {
-                    enabled,
-                    status,
-                    relay_url,
-                    relay_id,
-                    relay_region,
-                    last_error,
-                });
+                self.connector_disclosure =
+                    Some(cockpit_core::daemon::proto::ConnectorDisclosure {
+                        enabled,
+                        status,
+                        relay_url,
+                        relay_id,
+                        relay_region,
+                        last_error,
+                    });
             }
             TurnEvent::DaemonDraining { forced } => {
                 // Daemon-global drain notice

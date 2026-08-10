@@ -617,7 +617,16 @@ impl LspClient {
             &input,
             &root,
         )
-        .map_err(|err| anyhow::anyhow!("LSP launch blocked by external-runtime health: {err}"))?;
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "{}",
+                crate::external_runtime::current_dependency_context_line(&format!(
+                    "lsp.{}",
+                    recipe.id
+                ))
+                .unwrap_or_else(|| err.to_string())
+            )
+        })?;
         let mut cmd = Command::new(&recipe.command[0]);
         cmd.args(&recipe.command[1..])
             .current_dir(&root)

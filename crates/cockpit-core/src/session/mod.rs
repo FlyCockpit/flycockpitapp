@@ -21,7 +21,7 @@
 #![allow(deprecated)]
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -123,6 +123,10 @@ pub struct Session {
     #[allow(dead_code)]
     pub started_at: DateTime<Utc>,
     pub db: Db,
+    /// Daemon-owned external side-effect journal. Installed by the registry
+    /// before the worker starts; absent in isolated unit sessions.
+    external_journal: Mutex<Option<Arc<crate::external_journal::ExternalJournal>>>,
+    allow_unjournaled_inference: std::sync::atomic::AtomicBool,
     /// Private per-session tmp dir under the system temp location
     /// (sandboxing part 2). Read+write inside the sandboxed shell and
     /// counted as "inside the boundary" for native-tool path checks, so
@@ -338,6 +342,27 @@ struct LastRecoverableToolCall {
 }
 
 impl Session {
+    pub(crate) fn set_external_journal(
+        &self,
+        journal: Option<Arc<crate::external_journal::ExternalJournal>>,
+    ) {
+        *self.external_journal.lock().unwrap() = journal;
+    }
+
+    pub(crate) fn external_journal(&self) -> Option<Arc<crate::external_journal::ExternalJournal>> {
+        self.external_journal.lock().unwrap().clone()
+    }
+
+    pub fn allow_unjournaled_inference(&self) {
+        self.allow_unjournaled_inference
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn unjournaled_inference_allowed(&self) -> bool {
+        self.allow_unjournaled_inference
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub fn set_active_tool_names<'a>(
         &self,
         names: impl IntoIterator<Item = &'a str>,
@@ -791,9 +816,9 @@ fn approval_mode_from_u8(v: u8) -> crate::config::extended::ApprovalMode {
 
 /// Hash the project root into a 12-char hex id. Stable across symlink
 /// shifts because the input is the realpath when available.
-pub fn project_id_for(root: &PathBuf) -> String {
+pub fn project_id_for(root: &Path) -> String {
     use sha2::{Digest, Sha256};
-    let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+    let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let s = canon.to_string_lossy();
     let mut h = Sha256::new();
     h.update(s.as_bytes());
@@ -1888,7 +1913,7 @@ mod tests {
             .unwrap();
         s.set_tool_surface_override_json(Some(override_json.to_string()))
             .unwrap();
-        let goal_override_json = r#"{"enabled":false,"skepticCount":2}"#;
+        let goal_override_json = r#"{"enabled":false,"coldSkepticCount":2}"#;
         s.set_goal_settings_override_json(Some(goal_override_json.to_string()))
             .unwrap();
         assert!(db.get_session(s.id).await.unwrap().is_none());

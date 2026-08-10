@@ -211,7 +211,7 @@ impl ToolsPane {
     }
 
     pub(crate) fn render(&mut self, frame: &mut Frame, area: Rect) {
-        let (lines, selected_line) = tool_surface_lines(
+        let (lines, selected_line, _) = tool_surface_lines(
             &self.picker,
             &self.draft,
             ToolSurfaceRender {
@@ -345,7 +345,7 @@ mod tests {
                 .collect(),
             tool_descriptions: BTreeMap::new(),
             scan_tool_results: None,
-            goal_verification: cockpit_core::agents::GoalSettingsOverride::default(),
+            goal_supervision: cockpit_core::agents::GoalSettingsOverride::default(),
             permission: None,
             fork_eligible: false,
             prompt: "body".to_string(),

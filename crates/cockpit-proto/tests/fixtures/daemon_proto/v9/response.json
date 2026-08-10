@@ -1,6 +1,57 @@
 {
+  "app_flag": {
+    "data": { "key": "daemon_autostart_notice", "seen": false, "version": 7 },
+    "response": "app_flag"
+  },
+  "app_flag_seen": {
+    "data": { "changed": true, "key": "daemon_autostart_notice", "version": 8 },
+    "response": "app_flag_seen"
+  },
+  "assistant_session_resolved": {
+    "data": {
+      "created": true,
+      "session": {
+        "active_agent": "helper-bot",
+        "activity_state": "parked",
+        "created_by_principal": "flycockpit:user",
+        "descendant_count": 0,
+        "fork_count": 0,
+        "last_active_at": 1700000001,
+        "latest_activity_at": 1700000001,
+        "open_interrupts": 0,
+        "pin_count": 0,
+        "project_id": "proj",
+        "project_root": "/tmp/project",
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "shared_with_collaborators": false,
+        "short_id": "abc123",
+        "started_at": 1700000000,
+        "turns": 0
+      }
+    },
+    "response": "assistant_session_resolved"
+  },
+  "startup_disclosures": {
+    "data": {
+      "config_generation": 7,
+      "connector": { "enabled": true, "status": "connected" },
+      "org_sync": { "cursor_seq": 4, "org_id": "org-fixture" }
+    },
+    "response": "startup_disclosures"
+  },
+  "workspace_trust_set": {
+    "data": { "config_generation": 8 },
+    "response": "workspace_trust_set"
+  },
   "ack": {
     "response": "ack"
+  },
+  "config_refreshed": {
+    "data": {
+      "applied_generation": 3,
+      "changed": true
+    },
+    "response": "config_refreshed"
   },
   "approval_mode_state": {
     "data": {
@@ -404,9 +455,30 @@
         "objective": "ship fixture",
         "project_id": "project_id-fixture",
         "session_id": "11111111-1111-4111-8111-111111111111",
-        "status": "active",
+        "disposition": "running",
+        "phase": "executing",
+        "contract_available": true,
+        "verification_attempts": 1,
+        "max_verification_attempts": 4,
+        "attempt_generation": 2,
         "token_budget": 100,
         "tokens_used": 7,
+        "remaining_tokens": 93,
+        "elapsed_active_ms": 2000,
+        "lifecycle_history": [
+          {
+            "at": 1700000000,
+            "disposition": "running",
+            "phase": "planning",
+            "reason": null
+          },
+          {
+            "at": 1700000001,
+            "disposition": "running",
+            "phase": "executing",
+            "reason": null
+          }
+        ],
         "updated_at": 1700000002
       }
     },
@@ -423,13 +495,60 @@
         "objective": "ship fixture",
         "project_id": "project_id-fixture",
         "session_id": "11111111-1111-4111-8111-111111111111",
-        "status": "paused",
+        "disposition": "user_paused",
+        "resume_phase": "executing",
+        "pause_reason": { "kind": "user" },
+        "contract_available": true,
+        "verification_attempts": 1,
+        "max_verification_attempts": 4,
+        "attempt_generation": 2,
         "token_budget": 100,
         "tokens_used": 7,
+        "remaining_tokens": 93,
+        "elapsed_active_ms": 2000,
+        "lifecycle_history": [
+          {
+            "at": 1700000000,
+            "disposition": "running",
+            "phase": "executing",
+            "reason": null
+          },
+          {
+            "at": 1700000002,
+            "disposition": "user_paused",
+            "phase": null,
+            "reason": { "kind": "user" }
+          }
+        ],
         "updated_at": 1700000002
       }
     },
     "response": "goal_updated"
+  },
+  "remote_goal_outcome": {
+    "data": {
+      "outcome": {
+        "schema_version": 1,
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "goal_id": "22222222-2222-4222-8222-222222222222",
+        "attempt_generation": 2,
+        "disposition": "user_paused"
+      }
+    },
+    "response": "remote_goal_outcome"
+  },
+  "remote_operation_status": {
+    "data": {
+      "status": {
+        "schema_version": 1,
+        "operation_id": "018f3f24-7a10-7cc2-8f55-666666666666",
+        "state": "committed",
+        "operation_seq": "42",
+        "safe_response": [72, 101, 108, 108, 111],
+        "event_high_water_mark": "100"
+      }
+    },
+    "response": "remote_operation_status"
   },
   "guidance_estimate": {
     "data": {

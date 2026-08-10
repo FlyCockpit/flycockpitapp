@@ -41,6 +41,7 @@ const { default: prisma } = await import("@flycockpit/db");
 const { enterpriseLogExportQueue } = await import("@flycockpit/queue");
 
 const db = prisma as unknown as {
+  $transaction: MockInstance;
   appSetting: { findMany: MockInstance };
   cockpitInstance: { findUnique: MockInstance; findMany: MockInstance };
   enterpriseOrg: { findFirst: MockInstance; create: MockInstance; update: MockInstance };
@@ -54,6 +55,9 @@ const db = prisma as unknown as {
   enterpriseLogEvent: { createMany: MockInstance; count: MockInstance; findFirst: MockInstance };
   enterpriseLogExport: { create: MockInstance; findMany: MockInstance; findUnique: MockInstance };
   enterpriseAuditLog: { create: MockInstance };
+  remoteAdminRegistry: { findUnique: MockInstance };
+  remoteAdminApproval: { findMany: MockInstance; updateMany: MockInstance };
+  remoteAdminCeremony: { create: MockInstance };
 };
 const exportQueue = enterpriseLogExportQueue as unknown as { add: MockInstance };
 
@@ -138,6 +142,39 @@ describe("enterpriseRouter", () => {
     db.enterpriseLogEvent.count.mockResolvedValue(0);
     db.enterpriseLogBatch.count.mockResolvedValue(0);
     db.enterpriseLogEvent.findFirst.mockResolvedValue(null);
+    db.$transaction.mockImplementation((callback: (tx: typeof db) => unknown) => callback(db));
+  });
+
+  it("requires an approving administrator to initiate governed security registration", async () => {
+    const client = createRouterClient(enterpriseRouter, { context: buildContext() });
+    db.remoteAdminRegistry.findUnique.mockResolvedValue({
+      id: "registry-1",
+      generation: 2n,
+      securityAdminBootstrapSealed: true,
+    });
+    db.enterpriseOrgMember.findUnique
+      .mockResolvedValueOnce({ userId: "nominee-1", role: "MEMBER" })
+      .mockResolvedValueOnce({ userId: "admin-1", role: "OWNER" });
+    db.remoteAdminApproval.findMany.mockResolvedValue([
+      { id: "11111111-1111-4111-8111-111111111111", principalId: "owner-2", role: "OWNER" },
+      {
+        id: "22222222-2222-4222-8222-222222222222",
+        principalId: "security-2",
+        role: "SECURITY_ADMIN",
+      },
+    ]);
+    await expect(
+      client.beginGovernedSecurityAdminRegistration({
+        orgId: "org-1",
+        nomineeId: "nominee-1",
+        canonicalRequestDigest: Buffer.alloc(32).toString("base64url"),
+        operationEpoch: "1",
+        ownerApprovalId: "11111111-1111-4111-8111-111111111111",
+        securityApprovalId: "22222222-2222-4222-8222-222222222222",
+      }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    expect(db.remoteAdminApproval.updateMany).not.toHaveBeenCalled();
+    expect(db.remoteAdminCeremony.create).not.toHaveBeenCalled();
   });
 
   it("ingests only event kinds enabled by policy and returns the policy version", async () => {
@@ -239,8 +276,8 @@ describe("enterpriseRouter", () => {
     });
   });
 
-  it("allows org admins to create exports and writes an audit row", async () => {
-    db.enterpriseOrgMember.findUnique.mockResolvedValue({ role: "ORG_ADMIN" });
+  it("allows owners to create exports and writes an audit row", async () => {
+    db.enterpriseOrgMember.findUnique.mockResolvedValue({ role: "OWNER" });
     db.enterpriseLogExport.create.mockResolvedValue({
       id: "export-1",
       orgId: "org-1",
@@ -261,7 +298,7 @@ describe("enterpriseRouter", () => {
     );
   });
 
-  it("blocks non-org-admin export creation", async () => {
+  it("blocks members from export creation", async () => {
     db.enterpriseOrgMember.findUnique.mockResolvedValue({ role: "MEMBER" });
     const client = createRouterClient(enterpriseRouter, { context: buildContext() });
     await expect(

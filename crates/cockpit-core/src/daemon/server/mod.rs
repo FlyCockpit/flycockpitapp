@@ -158,6 +158,10 @@ fn scrub_history_entry(
 fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTable) {
     match response {
         proto::Response::Ack => {}
+        proto::Response::ConfigRefreshed {
+            applied_generation: _,
+            changed: _,
+        } => {}
         proto::Response::UserMessageQueued { item, queue } => {
             scrub_queue_item(item, redact);
             scrub_queue(queue, redact);
@@ -310,6 +314,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             }
         }
         proto::Response::GoalUpdated { goal } => scrub_goal_summary(goal, redact),
+        proto::Response::RemoteGoalOutcome { .. } => {}
         proto::Response::GoalCleared { cleared: _ } => {}
         proto::Response::Assistants { assistants } => {
             for assistant in assistants {
@@ -456,6 +461,33 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             scrub_string(&mut note.content, redact);
         }
         proto::Response::ProjectNoteRenamed { name } => scrub_string(name, redact),
+        proto::Response::WorkspaceTrustSet {
+            config_generation: _,
+        }
+        | proto::Response::AppFlag { .. }
+        | proto::Response::AppFlagSeen { .. } => {}
+        proto::Response::StartupDisclosures {
+            org_sync,
+            connector,
+            config_generation: _,
+        } => {
+            if let Some(org) = org_sync {
+                scrub_string(&mut org.org_id, redact);
+            }
+            if let Some(connector) = connector {
+                scrub_string(&mut connector.status, redact);
+                scrub_option_string(&mut connector.relay_url, redact);
+                scrub_option_string(&mut connector.relay_id, redact);
+                scrub_option_string(&mut connector.relay_region, redact);
+                scrub_option_string(&mut connector.last_error, redact);
+            }
+        }
+        proto::Response::AssistantSessionResolved {
+            session,
+            created: _,
+        } => {
+            scrub_session_summary(session, redact);
+        }
         proto::Response::AssistantUpserted { assistant } => {
             scrub_assistant_summary(assistant, redact)
         }
@@ -467,7 +499,8 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         | proto::Response::BulkTransferChunkAccepted { .. } => {}
         // Content-free run-invocation responses: safe fields only; nothing to scrub.
         proto::Response::RunInvocationStatus { .. }
-        | proto::Response::RunInvocationCancelResult { .. } => {}
+        | proto::Response::RunInvocationCancelResult { .. }
+        | proto::Response::RemoteOperationStatus { .. } => {}
         proto::Response::Unknown => {}
     }
 }
@@ -519,7 +552,7 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             turn_id: _,
             reason: _,
         }
-        | proto::Event::GoalVerificationProgress {
+        | proto::Event::GoalSupervisionProgress {
             session_id: _,
             done: _,
             total: _,
@@ -1180,9 +1213,20 @@ fn scrub_goal_summary(goal: &mut proto::GoalSummary, redact: &RedactionTable) {
         project_id,
         objective,
         context,
-        status: _,
+        disposition: _,
+        phase: _,
+        resume_phase: _,
+        pause_reason: _,
+        contract_available: _,
+        latest_gap_or_blocker,
+        verification_attempts: _,
+        max_verification_attempts: _,
+        attempt_generation: _,
         token_budget: _,
         tokens_used: _,
+        remaining_tokens: _,
+        elapsed_active_ms: _,
+        lifecycle_history: _,
         blocked_attempts: _,
         last_read_at: _,
         created_at: _,
@@ -1191,6 +1235,7 @@ fn scrub_goal_summary(goal: &mut proto::GoalSummary, redact: &RedactionTable) {
     scrub_string(project_id, redact);
     scrub_string(objective, redact);
     scrub_option_string(context, redact);
+    scrub_option_string(latest_gap_or_blocker, redact);
 }
 
 fn scrub_assistant_summary(assistant: &mut proto::AssistantSummary, redact: &RedactionTable) {
@@ -1666,8 +1711,17 @@ fn scrub_strings(values: &mut [String], redact: &RedactionTable) {
 /// share without copying.
 pub struct DaemonContext {
     pub db: Db,
+    /// Shared durable media authority. Production media entry points consult
+    /// `media_admission_open` before accepting work.
+    pub media_ledger: crate::media_reservation::MediaReservationLedger,
+    pub media_admission_open: Arc<std::sync::atomic::AtomicBool>,
     pub registry: SessionRegistry,
     pub paths: DaemonPaths,
+    /// Canonical process cwd captured once at daemon construction. Remote
+    /// operation resources never trust a caller-supplied fallback cwd.
+    pub canonical_cwd: PathBuf,
+    #[cfg(test)]
+    pub(crate) fcor_resolver_calls: std::sync::atomic::AtomicUsize,
     pub started_at: Instant,
     /// Caffeination authority (`/caffeinate`, GOALS §1a chrome glyph).
     /// Holds the OS sleep assertion **in the daemon process** so it
@@ -1725,6 +1779,26 @@ pub struct DaemonContext {
     pub write_scope: Option<std::sync::Arc<crate::write_scope::WriteScopeCoordinator>>,
 }
 
+#[cfg(test)]
+pub(crate) fn test_context_for_daemon_modules() -> Arc<DaemonContext> {
+    let db = Db::open_in_memory().expect("in-memory test db");
+    let locks = Arc::new(crate::locks::LockManager::in_memory(db.clone()));
+    Arc::new(DaemonContext::new(
+        db,
+        locks,
+        DaemonPaths {
+            socket: PathBuf::from("/tmp/cockpit-module-test.sock"),
+            pid_file: PathBuf::from("/tmp/cockpit-module-test.pid"),
+            ephemeral: true,
+        },
+        crate::daemon::terminal::test_host_factory(),
+        crate::daemon::config_source::ConfigSource::fixed(
+            crate::config::providers::ProvidersConfig::default(),
+            crate::config::extended::ExtendedConfig::default(),
+        ),
+    ))
+}
+
 impl DaemonContext {
     fn caffeinate_state_event(&self) -> proto::Event {
         let snap = self.caffeinate.snapshot();
@@ -1751,6 +1825,8 @@ impl DaemonContext {
         terminal_factory: crate::daemon::terminal::TerminalHostFactory,
         config_source: crate::daemon::config_source::ConfigSource,
     ) -> Self {
+        let daemon_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let canonical_cwd = daemon_cwd.canonicalize().unwrap_or(daemon_cwd);
         // The daemon-wide graceful-shutdown gate
         // (`daemon-graceful-drain-shutdown.md`) — the central drain
         // authority. Built here and shared into the registry (which installs
@@ -1802,11 +1878,27 @@ impl DaemonContext {
         if let Some(handle) = &scheduler {
             registry.set_scheduler(handle.clone());
         }
+        struct DaemonMediaClock(Instant);
+        impl crate::media_reservation::MonotonicClock for DaemonMediaClock {
+            fn now_ms(&self) -> u64 {
+                u64::try_from(self.0.elapsed().as_millis()).unwrap_or(u64::MAX)
+            }
+        }
+        let started_at = Instant::now();
+        let media_ledger = crate::media_reservation::MediaReservationLedger::new(
+            db.clone(),
+            Arc::new(DaemonMediaClock(started_at)),
+        );
         Self {
             db,
+            media_ledger,
+            media_admission_open: Arc::new(std::sync::atomic::AtomicBool::new(cfg!(test))),
             registry,
             paths,
-            started_at: Instant::now(),
+            canonical_cwd,
+            #[cfg(test)]
+            fcor_resolver_calls: std::sync::atomic::AtomicUsize::new(0),
+            started_at,
             caffeinate: Arc::new(crate::daemon::caffeinate::CaffeineController::new()),
             global_events,
             global_redaction,
@@ -2006,6 +2098,8 @@ pub(crate) async fn boot_with_db(
     timer: &mut crate::startup::PhaseTimer,
     terminal_factory: crate::daemon::terminal::TerminalHostFactory,
 ) -> Result<DaemonContext> {
+    #[cfg(not(test))]
+    let mut containment_recovered = false;
     timer.phase("db_open_and_migrate");
     let locks = Arc::new(
         LockManager::from_db(db.clone())
@@ -2096,6 +2190,7 @@ pub(crate) async fn boot_with_db(
         ctx.attach_process_containment_actor(actor);
         match handle.recover().await {
             Ok(outcomes) => {
+                containment_recovered = true;
                 tracing::info!(
                     recovered = outcomes.len(),
                     "process containment recovery finished"
@@ -2170,11 +2265,12 @@ pub(crate) async fn boot_with_db(
                             released_without_medium = report.released_without_medium,
                             "external side-effect journal recovery finished"
                         );
-                        ctx.external_journal = Some(std::sync::Arc::new(journal));
+                        let journal = std::sync::Arc::new(journal);
+                        ctx.registry.set_external_journal(journal.clone());
+                        ctx.external_journal = Some(journal);
                         timer.phase("external_journal");
                     }
                     Err(error) => {
-                        // Fail closed: no handle means no new external effects.
                         tracing::warn!(
                             error = %error,
                             "external side-effect journal startup failed; \
@@ -2197,6 +2293,55 @@ pub(crate) async fn boot_with_db(
     {
         timer.phase("external_journal_skipped");
     }
+    let recovery_wall_ms = chrono::Utc::now()
+        .timestamp_millis()
+        .try_into()
+        .unwrap_or(0);
+    #[cfg(not(test))]
+    if containment_recovered {
+        // The only production local media owner is currently the attachment
+        // path, whose collected and decoded bytes are process memory. Reaped
+        // daemon containment is therefore positive cleanup evidence for every
+        // local reservation this binary can create. This contract must grow an
+        // owner-specific deleter before any file-backed producer is added.
+        match ctx
+            .media_ledger
+            .recover_after_restart(recovery_wall_ms, &RestartEphemeralMediaCleanup)
+            .await
+        {
+            Ok(recovered) => {
+                tracing::info!(recovered, "media reservation restart recovery finished");
+                timer.phase("media_reservation_recovered");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "media reservation restart recovery failed");
+                timer.phase("media_reservation_recovery_blocked");
+            }
+        }
+    }
+    if let Err(error) = ctx
+        .media_ledger
+        .recover_ephemeral_attachment_uploads(recovery_wall_ms)
+        .await
+    {
+        tracing::warn!(%error, "ephemeral attachment reservation recovery failed");
+    }
+    if let Err(error) = ctx
+        .media_ledger
+        .reconcile_terminal_downstream_ownership(recovery_wall_ms)
+        .await
+    {
+        tracing::warn!(%error, "terminal downstream media ownership reconciliation failed");
+    }
+    let recovery_complete = ctx.media_ledger.recovery_complete().await.unwrap_or(false);
+    ctx.media_admission_open
+        .store(recovery_complete, std::sync::atomic::Ordering::Release);
+    if recovery_complete {
+        timer.phase("media_reservation_admission_open");
+    } else {
+        tracing::warn!("media admission is closed until durable reservations are recovered");
+        timer.phase("media_reservation_admission_blocked");
+    }
     if let Some(handle) = &ctx.scheduler
         && let Err(error) = crate::skills::curator::register_scheduler(handle, ctx.db.clone()).await
     {
@@ -2206,6 +2351,18 @@ pub(crate) async fn boot_with_db(
 }
 
 const TERMINAL_REAPER_POLL: Duration = Duration::from_secs(30);
+
+#[cfg(not(test))]
+struct RestartEphemeralMediaCleanup;
+
+#[cfg(not(test))]
+impl crate::media_reservation::LocalExpiryCleanup for RestartEphemeralMediaCleanup {
+    fn kill_reap_and_cleanup(&self, reservation_id: &str) -> anyhow::Result<String> {
+        Ok(format!(
+            "daemon-restart-ephemeral-media-destroyed:{reservation_id}"
+        ))
+    }
+}
 
 fn spawn_terminal_reaper(
     terminal_host: crate::daemon::terminal::TerminalHostHandle,
@@ -2564,7 +2721,7 @@ impl MutableClientState {
             pending_uploads: HashMap::new(),
             ready_attachments: HashMap::new(),
             upload_accounting,
-            upload_limits: AttachmentUploadLimits::default(),
+            upload_limits: AttachmentUploadLimits,
             terminal_views: HashMap::new(),
             terminal_host,
         }
@@ -2625,19 +2782,8 @@ fn next_terminal_connection_epoch() -> u64 {
     NEXT_TERMINAL_CONNECTION_EPOCH.fetch_add(1, Ordering::Relaxed)
 }
 
-#[derive(Debug, Clone, Copy)]
-struct AttachmentUploadLimits {
-    per_client_uploads: usize,
-    global_uploads: usize,
-    per_upload_bytes: usize,
-    global_bytes: usize,
-}
-
-impl Default for AttachmentUploadLimits {
-    fn default() -> Self {
-        DaemonUploadLimitsConfig::default().into()
-    }
-}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AttachmentUploadLimits;
 
 impl AttachmentUploadLimits {
     fn from_config(config: DaemonUploadLimitsConfig) -> Self {
@@ -2649,16 +2795,8 @@ impl AttachmentUploadLimits {
     }
 
     fn from_config_with_warning(config: DaemonUploadLimitsConfig) -> (Self, Option<String>) {
-        let (per_upload_bytes, warning) = normalize_per_upload_bytes(config.per_upload_bytes);
-        (
-            Self {
-                per_client_uploads: config.per_client_uploads,
-                global_uploads: config.global_uploads,
-                per_upload_bytes,
-                global_bytes: config.global_bytes,
-            },
-            warning,
-        )
+        let (_, warning) = normalize_per_upload_bytes(config.per_upload_bytes);
+        (Self, warning)
     }
 }
 
@@ -2711,46 +2849,10 @@ struct UploadAccounting {
 }
 
 impl UploadAccounting {
-    fn pending_bytes(&self) -> usize {
-        self.pending.values().sum()
-    }
-
-    fn consumed_bytes(&self) -> usize {
-        self.consumed_message_attachments
-            .values()
-            .map(|consumed| consumed.attachment.bytes.len())
-            .sum()
-    }
-
-    fn reserve(
-        &mut self,
-        upload_id: Uuid,
-        byte_len: usize,
-        limits: AttachmentUploadLimits,
-    ) -> std::result::Result<(), ErrorPayload> {
-        let retained_count = self.consumed_message_attachments.len();
-        if self.pending.len() + retained_count >= limits.global_uploads {
-            return Err(bad_request(format!(
-                "too many retained or pending attachment uploads: daemon has {} retained and {} pending, limit {}",
-                retained_count,
-                self.pending.len(),
-                limits.global_uploads
-            )));
-        }
-        let pending_bytes = self.pending_bytes();
-        let consumed_bytes = self.consumed_bytes();
-        if pending_bytes
-            .saturating_add(consumed_bytes)
-            .saturating_add(byte_len)
-            > limits.global_bytes
-        {
-            return Err(bad_request(format!(
-                "retained and pending attachment uploads exceed daemon byte limit: {} + {} + {} bytes exceeds {}",
-                consumed_bytes, pending_bytes, byte_len, limits.global_bytes
-            )));
-        }
+    /// Track which in-memory upload owns bytes. Durable evaluated ledger plans
+    /// are the sole capacity/admission authority.
+    fn track_pending(&mut self, upload_id: Uuid, byte_len: usize) {
         self.pending.insert(upload_id, byte_len);
-        Ok(())
     }
 
     fn release(&mut self, upload_id: &Uuid) {
@@ -2769,6 +2871,7 @@ where
 }
 
 struct PendingAttachmentUpload {
+    media_reservation: Option<crate::media_reservation::ReservationReceipt>,
     session_id: Option<Uuid>,
     mime: String,
     byte_len: usize,
@@ -2780,6 +2883,7 @@ struct PendingAttachmentUpload {
 
 #[derive(Debug)]
 struct ReadyAttachment {
+    media_reservation: Option<crate::media_reservation::ReservationReceipt>,
     session_id: Uuid,
     mime: String,
     bytes: Vec<u8>,
@@ -2851,7 +2955,7 @@ async fn run_in_process_client(
         Err(mpsc::error::TrySendError::Closed(_)) => return,
     }
 
-    loop {
+    'client: loop {
         let event_branch = async {
             match session_event_rx.as_mut() {
                 Some(rx) => Some(rx.recv().await),
@@ -2868,7 +2972,7 @@ async fn run_in_process_client(
                             permit.send(event);
                         }
                     }
-                    Err(_) => return,
+                    Err(_) => break 'client,
                 }
             }
             Some(joined) = concurrent_tasks.join_next(), if !concurrent_tasks.is_empty() => {
@@ -2880,19 +2984,19 @@ async fn run_in_process_client(
                 match global {
                     Ok(envelope) => {
                         if !try_send_in_process_event(&event_tx, envelope.event, None, &mut pending_lag) {
-                            return;
+                            break 'client;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!(missed = n, "in-process client global event stream lagged");
                         pending_lag.record_many(n, None);
                         if !try_send_in_process_event(&event_tx, ctx.caffeinate_state_event(), None, &mut pending_lag) {
-                            return;
+                            break 'client;
                         }
                         if let Some(event) = ctx.drain_state_event()
                             && !try_send_in_process_event(&event_tx, event, None, &mut pending_lag)
                         {
-                            return;
+                            break 'client;
                         }
                     }
                     Err(broadcast::error::RecvError::Closed) => {}
@@ -2911,7 +3015,7 @@ async fn run_in_process_client(
                             session_id,
                             &mut pending_lag,
                         ) {
-                            return;
+                            break 'client;
                         }
                     }
                     Some(Err(broadcast::error::RecvError::Lagged(n))) => {
@@ -2932,11 +3036,11 @@ async fn run_in_process_client(
             }
             cmd = request_rx.recv() => {
                 let Some(InProcessRequest { request, reply }) = cmd else {
-                    return;
+                    break 'client;
                 };
                 if principal::request_ordering(&request) == principal::RequestOrdering::Concurrent {
                     let Ok(permit) = concurrent_permits.clone().acquire_owned().await else {
-                        return;
+                        break 'client;
                     };
                     let shared = shared.clone();
                     let ctx = ctx.clone();
@@ -2969,13 +3073,13 @@ async fn run_in_process_client(
                         .map(|attached| attached.handle.session_id);
                     for event in std::mem::take(&mut state.pending_replay) {
                         if !try_send_in_process_event(&event_tx, event, session_id, &mut pending_lag) {
-                            return;
+                            break 'client;
                         }
                     }
                     if let Some(event) = ctx.drain_state_event()
                         && !try_send_in_process_event(&event_tx, event, None, &mut pending_lag)
                     {
-                        return;
+                        break 'client;
                     }
                 }
                 if let Some(rx) = effects.session_event_rx.take() {
@@ -2985,6 +3089,11 @@ async fn run_in_process_client(
                 }
             }
         }
+    }
+    if let Err(error) =
+        attachments::drain_client_attachment_ownership(&mut state, &ctx, "disconnect").await
+    {
+        tracing::warn!(message=%error.message,"in-process attachment ownership drain failed; durable charges remain for startup recovery");
     }
 }
 
@@ -3449,6 +3558,9 @@ async fn run_client_executor(
             }
             input = executor_rx.recv() => {
                 let Some(input) = input else {
+                    if let Err(error) = attachments::drain_client_attachment_ownership(&mut state, &ctx, "disconnect").await {
+                        tracing::warn!(message=%error.message,"attachment ownership drain failed during disconnect; durable charges remain for retry recovery");
+                    }
                     return;
                 };
                 match input {
@@ -3543,6 +3655,78 @@ async fn handle_client_frame(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RemoteOperationContext {
+    pub(super) request_id: Uuid,
+    pub(super) logical_attachment_id: Uuid,
+    pub(super) operation_id: Uuid,
+    pub(super) authenticated_device_id: Uuid,
+    pub(super) authenticated_device_generation: u64,
+}
+
+fn remote_operation_denied() -> ErrorPayload {
+    ErrorPayload {
+        code: ErrorCode::Authorization,
+        message: "remote operations require a valid server-authenticated actor binding and operation identity"
+            .to_string(),
+    }
+}
+
+fn admit_remote_operation(
+    principal: &ClientPrincipal,
+    request_id: Uuid,
+    operation: Option<proto::RemoteOperationIdentityV1>,
+    request: &Request,
+) -> std::result::Result<Option<RemoteOperationContext>, ErrorPayload> {
+    if principal.is_owner() {
+        return Ok(None);
+    }
+    let class = request
+        .remote_operation_class()
+        .map_err(|_| remote_operation_denied())?;
+    if class == proto::RemoteOperationClass::ReadOnly && operation.is_none() {
+        return Ok(None);
+    }
+    let ClientPrincipal::Remote(remote) = principal else {
+        unreachable!("owner principal returned above")
+    };
+    // A relay-authenticated principal without a device actor binding is not
+    // participating in cross-transport remote operations. It is admitted
+    // without an operation identity; the regular authorization layer
+    // enforces session/project/terminal grants independently.
+    if remote.actor_binding.is_none() {
+        return Ok(None);
+    }
+    let (Some(actor), Some(operation)) = (remote.actor_binding.as_ref(), operation) else {
+        return Err(remote_operation_denied());
+    };
+    let operation_valid = operation.schema_version == 1
+        && !operation.logical_attachment_id.is_nil()
+        && operation.logical_attachment_id.get_variant() == uuid::Variant::RFC4122
+        && !operation.operation_id.is_nil()
+        && operation.operation_id.get_variant() == uuid::Variant::RFC4122
+        && operation.operation_id.get_version_num() == 7;
+    let actor_valid = actor.schema_version == 1
+        && actor.device_generation > 0
+        && !actor.device_id.is_nil()
+        && actor.device_id.get_variant() == uuid::Variant::RFC4122
+        && !actor.logical_attachment_id.is_nil()
+        && actor.logical_attachment_id.get_variant() == uuid::Variant::RFC4122;
+    if !operation_valid
+        || !actor_valid
+        || actor.logical_attachment_id != operation.logical_attachment_id
+    {
+        return Err(remote_operation_denied());
+    }
+    Ok(Some(RemoteOperationContext {
+        request_id,
+        logical_attachment_id: operation.logical_attachment_id,
+        operation_id: operation.operation_id,
+        authenticated_device_id: actor.device_id,
+        authenticated_device_generation: actor.device_generation,
+    }))
+}
+
 async fn handle_envelope(
     env: Envelope,
     state: &mut MutableClientState,
@@ -3553,7 +3737,20 @@ async fn handle_envelope(
     concurrent: &mut ConcurrentRequestRuntime,
 ) -> Result<()> {
     match env.body {
-        Body::Request { id, request } => {
+        Body::Request {
+            id,
+            operation,
+            request,
+        } => {
+            let remote_operation =
+                match admit_remote_operation(&state.principal, id, operation, &request) {
+                    Ok(context) => context,
+                    Err(error) => {
+                        let envelope = Envelope::error(Some(id), error);
+                        let _ = send_writer_envelope(writer_tx, envelope).await;
+                        return Ok(());
+                    }
+                };
             if principal::request_ordering(&request) == principal::RequestOrdering::Concurrent {
                 let Ok(permit) = concurrent.permits.clone().acquire_owned().await else {
                     return Ok(());
@@ -3564,8 +3761,13 @@ async fn handle_envelope(
                 concurrent.tasks.spawn(async move {
                     let _permit = permit;
                     let response_shared = request_shared.clone();
-                    let result =
-                        run_concurrent_request_catching_panic(request, request_shared, ctx).await;
+                    let result = run_concurrent_request_catching_panic_with_remote_operation(
+                        request,
+                        request_shared,
+                        ctx,
+                        remote_operation,
+                    )
+                    .await;
                     let envelope = response_envelope_for_shared(id, result, &response_shared);
                     let _ = send_writer_envelope(&writer_tx, envelope).await;
                 });
@@ -3573,9 +3775,15 @@ async fn handle_envelope(
             }
             let is_attach = matches!(&request, Request::Attach { .. });
             let mut effects = ClientRequestEffects::default();
-            let result =
-                dispatch::handle_serialized_request(request, state, shared, ctx, &mut effects)
-                    .await;
+            let result = Box::pin(dispatch::handle_serialized_request_with_remote_operation(
+                request,
+                state,
+                shared,
+                ctx,
+                &mut effects,
+                remote_operation.as_ref(),
+            ))
+            .await;
             let attached = matches!(&result, Ok(Response::Attached { .. }));
             if (is_attach && attached) || state.attached.is_none() {
                 *shared = state.shared_snapshot();
@@ -3629,6 +3837,150 @@ async fn handle_envelope(
                 let _ = event_cmd_tx.send(ClientEventCommand::Detach).await;
             }
         }
+        Body::RemoteReplayRequest(proto::RemoteReplayRequestV2 {
+            id,
+            after_event_seq,
+            limit,
+        }) => {
+            let ClientPrincipal::Remote(remote) = &state.principal else {
+                let _ = send_writer_envelope(
+                    writer_tx,
+                    Envelope::error(
+                        Some(id),
+                        ErrorPayload {
+                            code: ErrorCode::Authorization,
+                            message: "remote replay requires an authenticated actor".into(),
+                        },
+                    ),
+                )
+                .await;
+                return Ok(());
+            };
+            let Some(actor) = remote.actor_binding.as_ref() else {
+                let _ = send_writer_envelope(
+                    writer_tx,
+                    Envelope::error(
+                        Some(id),
+                        ErrorPayload {
+                            code: ErrorCode::Authorization,
+                            message: "legacy actorless transport cannot replay mutations".into(),
+                        },
+                    ),
+                )
+                .await;
+                return Ok(());
+            };
+            let attachment = actor.logical_attachment_id.to_string();
+            let consumer = format!("t:{}:{}", actor.device_id.simple(), actor.device_generation);
+            let mut cursor = after_event_seq
+                .as_ref()
+                .map(|value| value.value())
+                .unwrap_or(0);
+            let mut events = Vec::with_capacity(limit.get() as usize);
+            for _ in 0..limit.get() {
+                let Some(lease) = ctx
+                    .db
+                    .claim_remote_outbox_delivery(
+                        &consumer,
+                        "*",
+                        Some(&attachment),
+                        Some(cursor),
+                        chrono::Utc::now().timestamp_millis(),
+                        30_000,
+                    )
+                    .await?
+                else {
+                    break;
+                };
+                cursor = lease.event_seq;
+                events.push(proto::RemoteOutboxDeliveryV1 {
+                    event_seq: proto::remote_protocol_id::CanonicalU64DecimalStringV1::from_u64(
+                        lease.event_seq,
+                    ),
+                    delivery_id: proto::CanonicalRfcUuidV1::new(Uuid::parse_str(
+                        &lease.delivery_id,
+                    )?)?,
+                    kind: lease.kind,
+                    canonical_payload: lease.canonical_payload,
+                    lease_token: proto::CanonicalRfcUuidV1::new(Uuid::parse_str(&lease.lease_id)?)?,
+                    lease_expires_at_ms: lease.lease_expires_at_ms,
+                });
+            }
+            let high_water = ctx.db.remote_outbox_high_water(&attachment).await?;
+            let envelope = Envelope {
+                v: proto::PROTOCOL_VERSION,
+                body: Body::RemoteReplayResponse(proto::RemoteReplayResponseV2 {
+                    id,
+                    events,
+                    high_water_mark:
+                        proto::remote_protocol_id::CanonicalU64DecimalStringV1::from_u64(high_water),
+                }),
+            };
+            let _ = send_writer_envelope(writer_tx, envelope).await;
+        }
+        Body::RemoteReplayAck(proto::RemoteReplayAckV2 {
+            id,
+            delivery_id,
+            lease_token,
+        }) => {
+            let ClientPrincipal::Remote(remote) = &state.principal else {
+                let _ = send_writer_envelope(
+                    writer_tx,
+                    Envelope::error(
+                        Some(id),
+                        ErrorPayload {
+                            code: ErrorCode::Authorization,
+                            message:
+                                "remote replay acknowledgement requires an authenticated actor"
+                                    .into(),
+                        },
+                    ),
+                )
+                .await;
+                return Ok(());
+            };
+            let Some(actor) = remote.actor_binding.as_ref() else {
+                let _ = send_writer_envelope(
+                    writer_tx,
+                    Envelope::error(
+                        Some(id),
+                        ErrorPayload {
+                            code: ErrorCode::Authorization,
+                            message: "legacy actorless transport cannot acknowledge replay".into(),
+                        },
+                    ),
+                )
+                .await;
+                return Ok(());
+            };
+            let attachment = actor.logical_attachment_id.to_string();
+            let consumer = format!("t:{}:{}", actor.device_id.simple(), actor.device_generation);
+            let acked = ctx
+                .db
+                .ack_remote_outbox_delivery(
+                    &attachment,
+                    &delivery_id.get().to_string(),
+                    &consumer,
+                    &lease_token.get().to_string(),
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await?;
+            let _ = send_writer_envelope(
+                writer_tx,
+                Envelope {
+                    v: proto::PROTOCOL_VERSION,
+                    body: Body::RemoteReplayAckResponse(proto::RemoteReplayAckResponseV2 {
+                        id,
+                        acked,
+                    }),
+                },
+            )
+            .await;
+        }
+        Body::RemoteReplayResponse(proto::RemoteReplayResponseV2 { id, .. })
+        | Body::RemoteReplayAckResponse(proto::RemoteReplayAckResponseV2 { id, .. }) => {
+            tracing::warn!(%id, "client sent a replay response; ignoring");
+        }
         Body::Response { id, .. } => {
             tracing::warn!(id = %id, "client sent a response envelope; ignoring");
         }
@@ -3650,9 +4002,23 @@ async fn run_concurrent_request_catching_panic(
     shared: Arc<SharedClientState>,
     ctx: Arc<DaemonContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
-    match AssertUnwindSafe(dispatch::handle_concurrent_request(request, shared, ctx))
-        .catch_unwind()
-        .await
+    run_concurrent_request_catching_panic_with_remote_operation(request, shared, ctx, None).await
+}
+
+async fn run_concurrent_request_catching_panic_with_remote_operation(
+    request: Request,
+    shared: Arc<SharedClientState>,
+    ctx: Arc<DaemonContext>,
+    remote_operation: Option<RemoteOperationContext>,
+) -> std::result::Result<Response, ErrorPayload> {
+    match AssertUnwindSafe(dispatch::handle_concurrent_request_with_remote_operation(
+        request,
+        shared,
+        ctx,
+        remote_operation,
+    ))
+    .catch_unwind()
+    .await
     {
         Ok(result) => result,
         Err(_) => Err(ErrorPayload {
@@ -3776,6 +4142,10 @@ fn envelope_kind(envelope: &Envelope) -> &'static str {
         Body::Error { .. } => "error",
         Body::Request { .. } => "request",
         Body::Event { .. } => "event",
+        Body::RemoteReplayRequest(_) => "replay_request",
+        Body::RemoteReplayResponse(_) => "replay_response",
+        Body::RemoteReplayAck(_) => "replay_ack",
+        Body::RemoteReplayAckResponse(_) => "replay_ack_response",
         Body::Unknown => "unknown",
     }
 }

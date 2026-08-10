@@ -4,6 +4,7 @@ import { ORPCError } from "@orpc/server";
 import { can } from "../lib/entitlements";
 import { parseInstanceToken, verifyInstanceSecret } from "../lib/instance-credentials";
 import type { EnterpriseEventKind } from "./contracts";
+import { type RemoteAdminAction, roleCanStartAction } from "./remote-admin-roles";
 
 export type EnterpriseOrgPolicy = {
   orgId: string;
@@ -69,14 +70,16 @@ export async function requireEnterpriseLogExport(userId: string) {
   }
 }
 
-export async function requireOrgAdmin(userId: string, orgId: string) {
+export async function requireOrgAdmin(userId: string, orgId: string, action: RemoteAdminAction) {
   await requireEnterpriseLogExport(userId);
   const member = await prisma.enterpriseOrgMember.findUnique({
     where: { orgId_userId: { orgId, userId } },
     select: { role: true },
   });
-  if (member?.role !== "ORG_ADMIN") {
-    throw new ORPCError("FORBIDDEN", { message: "Only org admins can manage enterprise exports." });
+  if (!member || !roleCanStartAction(member.role, action)) {
+    throw new ORPCError("FORBIDDEN", {
+      message: "This enterprise role cannot perform the action.",
+    });
   }
   return member;
 }

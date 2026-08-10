@@ -18,6 +18,10 @@ pub enum ControlRequestOutcome {
     NotDelivered(ControlRequestNotDelivered),
     Rejected(String),
     Applied,
+    ConfigRefreshed {
+        applied_generation: u64,
+        changed: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -451,7 +455,7 @@ pub enum TurnEvent {
     /// A pending goal-completion verification round progressed. UI-only:
     /// the TUI renders this instead of a success toast while skeptic checks
     /// are still in flight.
-    GoalVerificationProgress { done: usize, total: usize },
+    GoalSupervisionProgress { done: usize, total: usize },
 
     /// The primary (root-frame) agent was swapped in place (`/plan` →
     /// `Plan`, `/build` → `Build`, `plan.md §4.6.d`). Emitted by the driver

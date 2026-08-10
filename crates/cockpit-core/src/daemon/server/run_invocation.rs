@@ -101,7 +101,9 @@ fn row_to_status_v1(row: &RunInvocationRow) -> Result<proto::RunInvocationStatus
     })
 }
 
-fn parse_lifecycle_state(raw: &str) -> Result<proto::RunInvocationLifecycleState, ErrorPayload> {
+pub(super) fn parse_lifecycle_state(
+    raw: &str,
+) -> Result<proto::RunInvocationLifecycleState, ErrorPayload> {
     use proto::RunInvocationLifecycleState::*;
     Ok(match raw {
         "accepted" => Accepted,

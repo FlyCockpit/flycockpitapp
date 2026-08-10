@@ -16,6 +16,188 @@ fn ctx(platform: HostPlatform) -> EvaluationContext {
     EvaluationContext::new(platform)
 }
 
+#[test]
+fn media_catalog_pair_gates_complete_snapshot_fail_closed() {
+    fn snapshot(ffmpeg: Option<&str>, ffprobe: Option<&str>) -> ExternalRuntimeSnapshot {
+        let mut executor = RecordingProbeExecutor::new();
+        if ffmpeg.is_some() {
+            executor = executor.with_resolve("ffmpeg", "/tools/ffmpeg");
+        }
+        if ffprobe.is_some() {
+            executor = executor.with_resolve("ffprobe", "/tools/ffprobe");
+        }
+        let ffmpeg = ffmpeg.map(str::to_owned);
+        let ffprobe = ffprobe.map(str::to_owned);
+        executor.set_handler(move |program, _| {
+            let value = if program.ends_with("ffmpeg") {
+                ffmpeg.as_deref().unwrap_or("")
+            } else {
+                ffprobe.as_deref().unwrap_or("")
+            };
+            ProbeCommandResult {
+                exit_code: Some(0),
+                stdout: format!("{value}\n").into_bytes(),
+                stderr: Vec::new(),
+                timed_out: false,
+                cancelled: false,
+                spawn_error: None,
+            }
+        });
+        let descriptors: Vec<_> = catalog_adapter_descriptors()
+            .into_iter()
+            .filter(|item| matches!(item.id.as_str(), ID_MEDIA_FFMPEG | ID_MEDIA_FFPROBE))
+            .collect();
+        refresh_snapshot(
+            1,
+            &descriptors,
+            &executor,
+            None,
+            Path::new("."),
+            &ctx(HostPlatform::GenericLinux).with_features(["media.decode"]),
+            ProbeDeadlines::default(),
+            &CancelToken::new(),
+        )
+    }
+
+    let available = snapshot(Some("ffmpeg version 7.1"), Some("ffprobe version 7.0"));
+    assert!(media_runtime_pair_is_compatible(&available));
+    assert_eq!(
+        select_media_runtime_pair(&available),
+        Ok((Path::new("/tools/ffmpeg"), Path::new("/tools/ffprobe")))
+    );
+    assert!(matches!(
+        available.get(ID_MEDIA_FFMPEG).unwrap().state,
+        HealthState::Available { .. }
+    ));
+
+    for unhealthy in [
+        snapshot(Some("ffmpeg version 7.1"), None),
+        snapshot(Some("ffmpeg version 7.1"), Some("ffprobe version 6.1")),
+        snapshot(Some("version unknown"), Some("version unknown")),
+    ] {
+        assert!(!media_runtime_pair_is_compatible(&unhealthy));
+        assert!(select_media_runtime_pair(&unhealthy).is_err());
+        assert!(unhealthy.entries.values().any(|entry| {
+            matches!(
+                entry.state,
+                HealthState::Missing | HealthState::Incompatible { .. }
+            )
+        }));
+    }
+}
+
+#[test]
+fn dependency_headless_schema_and_shared_reason_are_stable() {
+    let descriptor = ExternalRuntimeDescriptor::builder("runtime.test")
+        .owner("test", "selected")
+        .probe_policy(ProbePolicy::configured_command("test-runtime", None))
+        .importance(DependencyImportance::RequiredWhenFeatureSelected)
+        .remedy(RemedyKind::config_guidance(
+            "configure an absolute executable path",
+        ))
+        .build()
+        .unwrap();
+    let unknown = project_dependencies(None, std::slice::from_ref(&descriptor));
+    assert_eq!(unknown.schema_version, DEPENDENCY_HEADLESS_SCHEMA_VERSION);
+    assert_eq!(unknown.rows[0].state, DependencyViewState::Unknown);
+    let json = serde_json::to_string(&unknown).unwrap();
+    assert!(!json.contains("PATH="));
+    assert!(!json.contains("environment"));
+    assert_eq!(
+        unknown.render_lines()[0],
+        format!("runtime.test: {}", unknown.rows[0].reason)
+    );
+    assert_eq!(
+        unknown.contextual_line("runtime.test").as_deref(),
+        Some(unknown.render_lines()[0].as_str()),
+        "Settings/doctor/context/headless must use byte-identical row text"
+    );
+}
+
+#[test]
+fn dependency_headless_fixture_matches_rust_schema() {
+    let fixture: DependencyProjection = serde_json::from_str(include_str!(
+        "../../../../packages/cockpit-protocol/fixtures/dependency-health-v1.json"
+    ))
+    .unwrap();
+    assert_eq!(fixture.schema_version, DEPENDENCY_HEADLESS_SCHEMA_VERSION);
+    assert_eq!(fixture.rows[0].id, "git");
+    assert_eq!(fixture.rows[0].state, DependencyViewState::Available);
+}
+
+#[test]
+fn dependency_settings_first_paint_and_refresh_generation() {
+    let descriptor = ExternalRuntimeDescriptor::builder("runtime.test")
+        .owner("test", "optional")
+        .probe_policy(ProbePolicy::configured_command("runtime", None))
+        .build()
+        .unwrap();
+    let mut page = DependenciesPageState::first_paint(None, std::slice::from_ref(&descriptor));
+    assert_eq!(page.displayed.rows[0].state, DependencyViewState::Unknown);
+    let older = page.begin_refresh();
+    let newer = page.begin_refresh();
+    let mut completed = ExternalRuntimeSnapshot::empty(newer, HostPlatform::GenericLinux);
+    completed.entries.insert(
+        "runtime.test".into(),
+        HealthEntry {
+            id: "runtime.test".into(),
+            state: HealthState::Available {
+                resolved_path: None,
+                version_evidence: Some("1.2.3".into()),
+            },
+            importance: DependencyImportance::OptionalIntegration,
+            target: ExecutionTarget::Host,
+            remedy: None,
+            platform: HostPlatform::GenericLinux,
+        },
+    );
+    let projected = project_dependencies(Some(&completed), std::slice::from_ref(&descriptor));
+    assert!(!page.apply_success(older, projected.clone()));
+    assert!(page.apply_success(newer, projected));
+    let generation = page.begin_refresh();
+    assert!(page.apply_failure(generation, "probe construction failed"));
+    assert_eq!(page.displayed.rows[0].state, DependencyViewState::Available);
+    page.close();
+    assert!(!page.apply_success(generation, page.displayed.clone()));
+}
+
+#[test]
+fn dependency_deadline_and_startup_policy_are_deterministic() {
+    let mut snapshot = ExternalRuntimeSnapshot::empty(1, HostPlatform::GenericLinux);
+    snapshot.entries.insert(
+        "required.pending".into(),
+        HealthEntry {
+            id: "required.pending".into(),
+            state: HealthState::Pending,
+            importance: DependencyImportance::RequiredForDefaultSafety,
+            target: ExecutionTarget::Host,
+            remedy: None,
+            platform: HostPlatform::GenericLinux,
+        },
+    );
+    snapshot.entries.insert(
+        "optional.missing".into(),
+        HealthEntry {
+            id: "optional.missing".into(),
+            state: HealthState::Missing,
+            importance: DependencyImportance::OptionalAccelerator,
+            target: ExecutionTarget::Host,
+            remedy: None,
+            platform: HostPlatform::GenericLinux,
+        },
+    );
+    let frozen = freeze_pending_as_timed_out(&snapshot);
+    let projection = project_dependencies(Some(&frozen), &[]);
+    assert_eq!(projection.rows[0].state, DependencyViewState::TimedOut);
+    assert_eq!(projection.rows[1].state, DependencyViewState::Missing);
+    let policy = startup_dependency_policy(&projection);
+    assert!(!policy.allowed);
+    assert_eq!(
+        policy.summary.as_deref(),
+        Some("required dependencies unavailable: required.pending: timed out")
+    );
+}
+
 fn ctx_features(platform: HostPlatform, features: &[&str]) -> EvaluationContext {
     EvaluationContext::new(platform).with_features(features.iter().copied())
 }
@@ -881,25 +1063,38 @@ fn external_dependency_snapshot_atomicity() {
 
     // Older in-flight refresh completing after a newer generation was reserved
     // must not publish even when nothing is current yet.
-    assert!(!store.publish(snap1.clone()));
+    let descriptor1 = ExternalRuntimeDescriptor::builder("a")
+        .owner("test", "old")
+        .probe_policy(ProbePolicy::configured_command("old", None))
+        .build()
+        .unwrap();
+    let descriptor2 = ExternalRuntimeDescriptor::builder("a")
+        .owner("test", "new")
+        .probe_policy(ProbePolicy::configured_command("new", None))
+        .build()
+        .unwrap();
+    assert!(!store.publish_complete_bundle(snap1.clone(), vec![descriptor1.clone()]));
     assert!(store.current().is_none());
 
     // Latest reserved generation publishes.
-    assert!(store.publish(snap2.clone()));
-    let current = store.current().unwrap();
+    assert!(store.publish_complete_bundle(snap2.clone(), vec![descriptor2.clone()]));
+    let (current, descriptors) = store.current_bundle().unwrap();
     assert_eq!(current.generation, g2);
+    assert_eq!(descriptors, vec![descriptor2.clone()]);
     assert!(matches!(
         current.get("a").unwrap().state,
         HealthState::Missing
     ));
 
     // Late older generation discarded — readers still see complete g2 only
-    assert!(!store.publish(snap1));
-    let current = store.current().unwrap();
+    assert!(!store.publish_complete_bundle(snap1, vec![descriptor1]));
+    let (current, descriptors) = store.current_bundle().unwrap();
     assert_eq!(current.generation, g2);
+    assert_eq!(descriptors, vec![descriptor2.clone()]);
 
     // Equal/stale generation rejected
-    assert!(!store.publish(snap2));
+    assert!(!store.publish_complete_bundle(snap2, vec![]));
+    assert_eq!(store.current_bundle().unwrap().1, vec![descriptor2]);
 
     // Readers never observe a partial generation: only complete Arc snapshots.
     let g3 = store.begin_refresh();
@@ -908,6 +1103,75 @@ fn external_dependency_snapshot_atomicity() {
     let seen = store.current().unwrap();
     assert_eq!(seen.generation, g3);
     assert!(seen.entries.is_empty());
+
+    // Live publication inserts its exact descriptor into an empty bundle and
+    // replaces the descriptor by stable id on later handoffs.
+    store.clear();
+    let live_entry = HealthEntry {
+        id: ExternalRuntimeId::new("live"),
+        state: HealthState::Available {
+            resolved_path: None,
+            version_evidence: None,
+        },
+        importance: DependencyImportance::RequiredWhenFeatureSelected,
+        target: ExecutionTarget::Host,
+        remedy: None,
+        platform: HostPlatform::GenericLinux,
+    };
+    let live_old = ExternalRuntimeDescriptor::builder("live")
+        .owner("test", "old")
+        .probe_policy(ProbePolicy::configured_command("old", None))
+        .build()
+        .unwrap();
+    let live_new = ExternalRuntimeDescriptor::builder("live")
+        .owner("test", "new")
+        .probe_policy(ProbePolicy::configured_command("new", None))
+        .build()
+        .unwrap();
+    store.publish_live_entry(live_entry.clone(), live_old, HostPlatform::GenericLinux);
+    assert!(
+        store.current_complete_bundle().is_none(),
+        "a live entry from an empty store is partial, not a complete catalog"
+    );
+    assert_eq!(store.current_bundle().unwrap().1[0].owner.feature, "old");
+    store.publish_live_entry(live_entry, live_new, HostPlatform::GenericLinux);
+    let (snapshot, descriptors) = store.current_bundle().unwrap();
+    assert!(snapshot.get("live").is_some());
+    assert_eq!(descriptors.len(), 1);
+    assert_eq!(descriptors[0].owner.feature, "new");
+
+    let complete_generation = store.begin_refresh();
+    let complete = ExternalRuntimeSnapshot::empty(complete_generation, HostPlatform::GenericLinux);
+    assert!(store.publish_complete_bundle(complete, Vec::new()));
+    store.publish_live_entry(
+        HealthEntry {
+            id: ExternalRuntimeId::new("after-complete"),
+            state: HealthState::Missing,
+            importance: DependencyImportance::OptionalIntegration,
+            target: ExecutionTarget::Host,
+            remedy: None,
+            platform: HostPlatform::GenericLinux,
+        },
+        ExternalRuntimeDescriptor::builder("after-complete")
+            .owner("test", "live")
+            .probe_policy(ProbePolicy::configured_command("live", None))
+            .build()
+            .unwrap(),
+        HostPlatform::GenericLinux,
+    );
+    assert!(
+        store.current_complete_bundle().is_some(),
+        "atomic live updates preserve an existing complete roster"
+    );
+    let partial_generation = store.begin_refresh();
+    assert!(store.publish_bundle(
+        ExternalRuntimeSnapshot::empty(partial_generation, HostPlatform::GenericLinux),
+        Vec::new(),
+    ));
+    assert!(
+        store.current_complete_bundle().is_none(),
+        "a later partial refresh must invalidate prior catalog completeness"
+    );
 }
 
 #[test]

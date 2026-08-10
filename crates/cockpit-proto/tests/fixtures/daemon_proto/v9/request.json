@@ -1,4 +1,32 @@
 {
+  "get_app_flag": {
+    "params": { "key": "daemon_autostart_notice" },
+    "request": "get_app_flag"
+  },
+  "get_startup_disclosures": {
+    "params": { "project_root": "/tmp/project" },
+    "request": "get_startup_disclosures"
+  },
+  "mark_app_flag_seen": {
+    "params": { "expected_version": 7, "key": "daemon_autostart_notice" },
+    "request": "mark_app_flag_seen"
+  },
+  "resolve_assistant_session": {
+    "params": {
+      "assistant_id": "helper-bot",
+      "mode": "most_recent_or_create",
+      "project_root": "/tmp/project"
+    },
+    "request": "resolve_assistant_session"
+  },
+  "set_workspace_trust": {
+    "params": {
+      "expected_config_generation": 7,
+      "mode": "trust",
+      "project_root": "/tmp/project"
+    },
+    "request": "set_workspace_trust"
+  },
   "archive_session": {
     "params": {
       "cascade": true,
@@ -96,6 +124,14 @@
       "session_id": "11111111-1111-4111-8111-111111111111"
     },
     "request": "clear_goal"
+  },
+  "create_goal": {
+    "params": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "objective": "ship fixture",
+      "token_budget": 200000
+    },
+    "request": "create_goal"
   },
   "close_terminal": {
     "params": {
@@ -631,6 +667,12 @@
     },
     "request": "get_run_invocation_status"
   },
+  "operation_status": {
+    "params": {
+      "operation_id": "018f3f24-7a10-7cc2-8f55-666666666666"
+    },
+    "request": "operation_status"
+  },
   "cancel_run_invocation": {
     "params": {
       "client_submission_id": "11111111-1111-4111-8111-111111111111"
@@ -695,7 +737,7 @@
   },
   "set_goal_settings_override": {
     "params": {
-      "override_json": "{\"enabled\":false,\"skepticCount\":2}",
+      "override_json": "{\"enabled\":false,\"coldSkepticCount\":2}",
       "persist_session": true
     },
     "request": "set_goal_settings_override"
@@ -703,7 +745,7 @@
   "set_goal_status": {
     "params": {
       "session_id": "11111111-1111-4111-8111-111111111111",
-      "status": "paused"
+      "status": "user_paused"
     },
     "request": "set_goal_status"
   },

@@ -14,6 +14,7 @@ mod agent_inventory;
 mod async_actions;
 mod attach_lifecycle;
 mod attention;
+mod blocking_operations;
 mod btw_pane;
 mod config_reload;
 mod copy_actions;
@@ -31,6 +32,7 @@ mod local_commands;
 mod model_controls;
 mod models_refresh;
 mod mouse;
+mod mouse_gesture;
 mod overlay_actions;
 mod panes;
 mod pins;
@@ -63,7 +65,7 @@ use events::{
     tool_invocation,
 };
 use input::accepts_key;
-use render::{extract_selection_markdown_source, extract_selection_plaintext, is_edit_tool};
+use render::{extract_selection_plaintext, extract_selection_semantic, is_edit_tool};
 #[cfg(test)]
 use slash::{
     AgentCommandOutcome, CopyCommand, CopyFormat, McpAction, SLASH_COMMANDS, SandboxCommand,
@@ -89,7 +91,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, KeyboardEnhancementFlags, MouseButton,
@@ -103,8 +105,8 @@ use unicode_width::UnicodeWidthChar;
 use crate::tui::agent_runner::{self, AgentRunner};
 use crate::tui::app::btw_pane::BtwPane;
 use crate::tui::async_action::{
-    AsyncActionKey, AsyncActionKind, AsyncActionPayload, AsyncActionPolicy, AsyncActionResult,
-    AsyncActionRunner, AsyncActionStart,
+    AsyncActionCancellation, AsyncActionKey, AsyncActionKind, AsyncActionPayload,
+    AsyncActionPolicy, AsyncActionResult, AsyncActionRunner, AsyncActionStart,
 };
 use crate::tui::composer::{Composer, VimMode, input_prefix_width};
 use crate::tui::geometry::PaneGeometry;
@@ -318,7 +320,6 @@ pub(crate) struct PendingModelSelection {
 
 pub(crate) struct QueuedModelSubmission {
     pub client_submission_id: uuid::Uuid,
-    pub fence_sequence: u64,
     /// Composer buffer at the instant this submission was held. A matching
     /// applied result may clear only this exact draft; later edits remain.
     pub composer_text: String,
@@ -329,10 +330,16 @@ pub(crate) struct QueuedModelSubmission {
 
 pub(crate) struct PendingPasteProbe {
     pub request: crate::tui::structured_paste::PasteRequest,
+    /// Exact payload which created this probe. Repeated delivery of a
+    /// correlation may wait on the same work, but may never replace its
+    /// payload. The sole exception is an empty native shortcut probe being
+    /// completed by the terminal's authoritative paste event.
+    pub original_data: String,
     pub source_draft_generation: u64,
     pub owner_fence: Option<uuid::Uuid>,
     pub original_offset: usize,
     pub deadline: std::time::Duration,
+    pub async_action_id: Option<crate::tui::async_action::AsyncActionId>,
 }
 
 pub(crate) struct DeferredFenceDispatch {
@@ -458,11 +465,8 @@ fn resolve_tui_llm_mode(
     providers.resolve_mode(provider, model, global)
 }
 
-const DAEMON_AUTOSTART_NOTICE_FLAG: &str = "daemon-autostart-notice-v1";
-
 fn startup_daemon_state(
     autostart: cockpit_config::extended::DaemonAutostart,
-    db: Option<&cockpit_db::Db>,
 ) -> StartupDaemonState {
     let notice_seen = false;
     match cockpit_core::daemon::DaemonPaths::resolve() {
@@ -474,7 +478,7 @@ fn startup_daemon_state(
                 daemonless: false,
                 notice: None,
             },
-            status => daemon_not_running_state(status, paths, autostart, db, notice_seen),
+            status => daemon_not_running_state(status, paths, autostart, notice_seen),
         },
         Ok(_) => {
             let probe = cockpit_core::daemon::discover_blocking();
@@ -486,7 +490,7 @@ fn startup_daemon_state(
                     daemonless: false,
                     notice: None,
                 },
-                status => daemon_not_running_state(status, probe.paths, autostart, db, notice_seen),
+                status => daemon_not_running_state(status, probe.paths, autostart, notice_seen),
             }
         }
         Err(_) => StartupDaemonState {
@@ -503,10 +507,9 @@ fn daemon_not_running_state(
     status: cockpit_core::daemon::DaemonStatus,
     paths: cockpit_core::daemon::DaemonPaths,
     autostart: cockpit_config::extended::DaemonAutostart,
-    db: Option<&cockpit_db::Db>,
     notice_seen: bool,
 ) -> StartupDaemonState {
-    daemon_not_running_state_with_spawn(status, paths, autostart, db, notice_seen, || {
+    daemon_not_running_state_with_spawn(status, paths, autostart, notice_seen, || {
         cockpit_core::daemon::spawn_detached(false)
     })
 }
@@ -515,7 +518,6 @@ fn daemon_not_running_state_with_spawn(
     status: cockpit_core::daemon::DaemonStatus,
     paths: cockpit_core::daemon::DaemonPaths,
     autostart: cockpit_config::extended::DaemonAutostart,
-    db: Option<&cockpit_db::Db>,
     notice_seen: bool,
     spawn_shared: impl FnOnce() -> anyhow::Result<u32>,
 ) -> StartupDaemonState {
@@ -535,7 +537,6 @@ fn daemon_not_running_state_with_spawn(
             socket: None,
             daemonless: true,
             notice: daemon_autostart_notice(
-                db,
                 notice_seen,
                 "started a private cockpit daemon for this window only",
             ),
@@ -547,7 +548,6 @@ fn daemon_not_running_state_with_spawn(
                 socket: Some(paths.socket.clone()),
                 daemonless: false,
                 notice: daemon_autostart_notice(
-                    db,
                     notice_seen,
                     &format!(
                         "started the cockpit daemon (pid {pid}) — persists across windows; `cockpit daemon stop` to stop"
@@ -569,15 +569,10 @@ fn daemon_not_running_state_with_spawn(
     }
 }
 
-fn daemon_autostart_notice(
-    db: Option<&cockpit_db::Db>,
-    notice_seen: bool,
-    text: &str,
-) -> Option<String> {
+fn daemon_autostart_notice(notice_seen: bool, text: &str) -> Option<String> {
     if notice_seen {
         return None;
     }
-    db?;
     Some(text.to_string())
 }
 
@@ -587,7 +582,7 @@ pub(crate) fn trusted_workspace_policy_for_tests(
 ) -> cockpit_config::trust::WorkspaceTrustPolicy {
     cockpit_config::trust::WorkspaceTrustPolicy {
         root: cockpit_config::trust::resolve_trust_root(cwd).unwrap(),
-        mode: cockpit_db::workspace_trust::WorkspaceTrustMode::Trust,
+        mode: cockpit_config::WorkspaceTrustMode::Trust,
     }
 }
 
@@ -628,38 +623,43 @@ impl App {
         }
     }
 
-    /// The sole database connection opened during TUI startup. UI surfaces clone
-    /// this handle instead of reopening SQLite and revalidating migrations.
-    pub(super) fn shared_db(&self) -> Option<cockpit_db::Db> {
-        self.startup_background.db.clone()
-    }
-
     pub(super) fn apply_workspace_trust_choice(
         &mut self,
         root: cockpit_config::trust::TrustRoot,
-        mode: cockpit_db::workspace_trust::WorkspaceTrustMode,
+        mode: cockpit_config::WorkspaceTrustMode,
     ) -> bool {
-        let Some(db) = self.startup_background.db.clone() else {
-            self.show_toast("workspace trust could not be saved", ToastKind::Error);
-            return false;
+        let rpc_mode = match mode {
+            cockpit_config::WorkspaceTrustMode::Trust => {
+                cockpit_core::daemon::proto::WorkspaceTrustMode::Trust
+            }
+            cockpit_config::WorkspaceTrustMode::IgnoreConfig => {
+                cockpit_core::daemon::proto::WorkspaceTrustMode::IgnoreConfig
+            }
+            cockpit_config::WorkspaceTrustMode::Untrusted => {
+                cockpit_core::daemon::proto::WorkspaceTrustMode::Untrusted
+            }
         };
-        let normalized_root = root.root.to_string_lossy().into_owned();
-        if let Err(error) = db.blocking_write_for_sync_ui(move |conn| {
-            cockpit_db::Db::set_workspace_trust_conn(
-                conn,
-                &normalized_root,
-                mode,
-                chrono::Utc::now().timestamp(),
-            )
-            .map(|_| ())
-        }) {
-            self.show_toast(
-                format!("workspace trust could not be saved: {error}"),
-                ToastKind::Error,
-            );
-            return false;
-        }
-        if mode == cockpit_db::workspace_trust::WorkspaceTrustMode::Untrusted {
+        let project_root = root.root.to_string_lossy().into_owned();
+        let config_generation = match set_workspace_trust_with_retry(
+            &project_root,
+            rpc_mode,
+            self.config_snapshot.generation,
+            crate::tui::agent_runner::daemon_request_blocking_classified,
+        ) {
+            Ok(generation) => generation,
+            Err(error) => {
+                self.show_toast(
+                    format!("workspace trust could not be saved: {error}"),
+                    ToastKind::Error,
+                );
+                return false;
+            }
+        };
+        self.config_snapshot.generation = config_generation;
+        self.config_snapshot
+            .providers
+            .set_resolution_generation(config_generation);
+        if mode == cockpit_config::WorkspaceTrustMode::Untrusted {
             self.push_plain(format!(
                 "workspace {} is untrusted and cannot be opened",
                 root.root.display()
@@ -670,7 +670,7 @@ impl App {
             self.show_toast(format!("workspace trust failed: {error}"), ToastKind::Error);
             return false;
         }
-        if mode == cockpit_db::workspace_trust::WorkspaceTrustMode::Trust {
+        if mode == cockpit_config::WorkspaceTrustMode::Trust {
             self.resync_config_after_local_write();
         }
         self.dialog = Dialog::None;
@@ -678,6 +678,63 @@ impl App {
             self.maybe_open_add_provider_wizard();
         }
         false
+    }
+}
+
+fn set_workspace_trust_with_retry(
+    project_root: &str,
+    mode: cockpit_core::daemon::proto::WorkspaceTrustMode,
+    mut expected_generation: u64,
+    mut request: impl FnMut(
+        cockpit_core::daemon::proto::Request,
+    ) -> Result<
+        cockpit_core::daemon::proto::Response,
+        crate::tui::agent_runner::BlockingDaemonRequestError,
+    >,
+) -> Result<u64, String> {
+    for attempt in 0..=1 {
+        let response = request(cockpit_core::daemon::proto::Request::SetWorkspaceTrust {
+            project_root: project_root.to_string(),
+            mode,
+            expected_config_generation: expected_generation,
+        });
+        match response {
+            Ok(cockpit_core::daemon::proto::Response::WorkspaceTrustSet { config_generation }) => {
+                return Ok(config_generation);
+            }
+            Ok(other) => return Err(format!("unexpected workspace trust response: {other:?}")),
+            Err(crate::tui::agent_runner::BlockingDaemonRequestError::Conflict(_))
+                if attempt == 0 =>
+            {
+                expected_generation = match request(
+                    cockpit_core::daemon::proto::Request::GetStartupDisclosures {
+                        project_root: project_root.to_string(),
+                    },
+                ) {
+                    Ok(cockpit_core::daemon::proto::Response::StartupDisclosures {
+                        config_generation,
+                        ..
+                    }) => config_generation,
+                    Ok(other) => {
+                        return Err(format!(
+                            "unexpected config generation refresh response: {other:?}"
+                        ));
+                    }
+                    Err(error) => return Err(blocking_request_error(error)),
+                };
+            }
+            Err(error) => return Err(blocking_request_error(error)),
+        }
+    }
+    unreachable!("the retry loop returns after its second attempt")
+}
+
+fn blocking_request_error(error: crate::tui::agent_runner::BlockingDaemonRequestError) -> String {
+    match error {
+        crate::tui::agent_runner::BlockingDaemonRequestError::Conflict(message) => {
+            format!("config conflict after refresh: {message}")
+        }
+        crate::tui::agent_runner::BlockingDaemonRequestError::Other(message) => message,
     }
 }
 
@@ -1522,17 +1579,6 @@ fn mcp_load_call_count() -> usize {
     MCP_LOAD_CALLS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-fn build_goal_clarification_prompt(objective: &str) -> String {
-    format!(
-        "The user started `/goal` with this rough objective:\n\n{objective}\n\n\
-         Act as Build. First investigate the working directory read-only using normal tools and identify relevant repo facts. \
-         Then propose a clarified goal for user review with exactly these parts: `goal` (terse, stable, acceptance-oriented), \
-         `context` (repo findings, constraints, relevant files, user preferences), acceptance criteria, and an initial task/todo breakdown when useful. \
-         Continue the clarification loop until the user confirms. Only after confirmation call goal(action=\"create\", objective, context, token_budget if specified). \
-         After goal creation, continue normal Build execution toward the active goal using goal(action=\"get\"), goal(action=\"update\"), and durable todos."
-    )
-}
-
 /// Where an embedded pane (`/editor`, `/lazygit`) sits in the chat-body
 /// region (GOALS §1i). `Full` fills the body; the others split it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1547,7 +1593,6 @@ pub(super) enum PaneSide {
 #[derive(Debug, Clone)]
 struct StartupBackground {
     daemon_socket: Option<PathBuf>,
-    db: Option<cockpit_db::Db>,
     started: bool,
 }
 
@@ -1626,6 +1671,11 @@ pub struct App {
     /// Daemon-pushed config the TUI renders from; see [`HeldConfig`].
     pub(super) config_snapshot: HeldConfig,
     pub(super) active_model_state_generation: u64,
+    /// Security disclosures must be fetched from the daemon before a session
+    /// attachment can be created. Failures leave this false and user actions
+    /// retry the RPC rather than silently entering the session.
+    pub(super) startup_disclosures_ready: bool,
+    pub(super) startup_disclosures_generation: u64,
     /// True only after this attach epoch receives authoritative model state
     /// from the daemon. Config-derived display defaults must never fence a
     /// submission.
@@ -1835,10 +1885,16 @@ pub struct App {
     /// blocking filesystem/subprocess probes can complete through this tick
     /// drain instead of freezing the event loop.
     pub(super) async_actions: AsyncActionRunner,
+    // Declared after `async_actions`: Rust drops fields in declaration order,
+    // so every export owner is released before the process reaper drains.
+    pub(super) _export_reaper_guard: crate::tui::async_action::ExportTempReaperGuard,
     pub(super) completed_async_actions: Vec<AsyncActionResult>,
     pub(super) skills_pane_generation: u64,
     startup_background: StartupBackground,
     startup_daemon_notice: Option<String>,
+    /// Non-blocking projection of the latest complete dependency snapshot.
+    /// Startup never probes here; Settings owns background refreshes.
+    startup_dependency_notice: Option<String>,
     /// Last-rendered chat area `Rect`. Used to translate absolute
     /// terminal mouse coordinates into chat-relative coordinates so
     /// click-to-expand works on thinking blocks.
@@ -1886,6 +1942,20 @@ pub struct App {
     /// committed on release. `Ctrl+Shift+C` copies the underlying
     /// plaintext via `clipboard::copy_plain` (OSC52 → SSH-safe).
     pub(super) selection: Option<Selection>,
+    /// Pure gesture reducer state for explicit mouse selection and
+    /// copy-on-release. Carries press/activation generations and tokens
+    /// so late timer/clipboard results cannot overwrite newer state.
+    /// The pure reducer is unit-tested independently; production mouse
+    /// routing uses the `LinkPointerGesture` and existing handlers.
+    #[allow(dead_code)]
+    pub(super) mouse_gesture_state: mouse_gesture::GestureState,
+    /// Pending delayed link activation, set when a single link click
+    /// release schedules activation through the 500 ms multi-click
+    /// window. The event loop checks this on each tick; if the deadline
+    /// has passed and the token is still current, the link is activated.
+    /// A second click, movement, view change, or cancellation
+    /// tombstones it.
+    pub(super) pending_link_activation: Option<crate::tui::links::PendingActivation>,
     /// Snapshot of the chat area's rendered cells, one row per outer
     /// element, one cell per inner element. Each cell's `String` is
     /// the cell's `symbol()` — typically one char, but multi-byte for
@@ -1941,6 +2011,11 @@ pub struct App {
     /// `@`-query string; recomputed when the query changes. `RefCell`
     /// because `at_suggestions` is called from `&self` render paths.
     pub(super) at_cache: std::cell::RefCell<Option<(String, Vec<cockpit_core::tags::Suggestion>)>>,
+    /// Distinguishes an in-flight filesystem query from a completed query
+    /// with zero matches; rendering must never infer loading from emptiness.
+    pub(super) at_suggestions_loading: bool,
+    pub(super) at_suggestions_loaded_query: Option<String>,
+    pub(super) at_suggestions_error: Option<String>,
     /// Accepted `@`-tag paths that contain a space / shell-special char.
     /// Tracked so the submit-time pass can wrap them in quotes (the
     /// composer shows them unquoted; the wire payload needs the quotes
@@ -1971,6 +2046,7 @@ pub struct App {
     /// Latest injected TerminalInput clock sample used by App-owned deadline
     /// reducers. Tests advance this without sleeping.
     pub(super) event_loop_monotonic_now: std::time::Duration,
+    pub(super) async_action_clock_origin: std::time::Instant,
     pub(super) delivery_unconfirmed_records:
         std::collections::HashMap<uuid::Uuid, DeliveryUnconfirmedRecord>,
     /// Pending vim text-object selector: `Some(true)` after `a` (around),
@@ -2180,6 +2256,7 @@ pub struct App {
     pub(super) mouse_capture: bool,
     pub(super) hyperlinks: bool,
     pub(super) link_registry: crate::tui::links::LinkRegistry,
+    pub(super) link_pointer_gesture: crate::tui::links::LinkPointerGesture,
     /// User's `tui.exit_tail_lines` setting (GOALS §1d). Cached at
     /// startup so the exit-tail dump survives the dialog being closed.
     pub(super) exit_tail_lines: i32,
@@ -2187,6 +2264,11 @@ pub struct App {
     /// keybind that copies the last agent message as HTML to the
     /// system clipboard (plan.md T8.g).
     pub(super) rich_text_copy: bool,
+    /// User's `tui.copy_on_release` setting. When true, a finalized drag
+    /// or explicit double/triple selection schedules a copy through the
+    /// centralized clipboard service. When false, the same gestures
+    /// finalize selection without copying.
+    pub(super) copy_on_release: bool,
     /// User's `tui.clipboard_recovery` setting. Passed to every clipboard
     /// delivery call so a failed/unverified copy writes its private
     /// recovery artifact only when explicitly opted in.
@@ -2373,10 +2455,10 @@ pub struct App {
     pub(super) pending_tandem_options: Vec<(String, String)>,
     /// Persistent enterprise org-policy session-log sync disclosure. Loaded
     /// from durable sync state at startup; absence means no active policy.
-    pub(super) org_sync_disclosure: Option<cockpit_db::org_sync::OrgSyncDisclosure>,
+    pub(super) org_sync_disclosure: Option<cockpit_core::daemon::proto::OrgSyncDisclosure>,
     /// Persisted/daemon-broadcast remote connector status. Drives the additive
     /// remote-access chrome slot while connector access is enabled.
-    pub(super) connector_disclosure: Option<cockpit_db::connector::ConnectorDisclosure>,
+    pub(super) connector_disclosure: Option<cockpit_core::daemon::proto::ConnectorDisclosure>,
     has_no_providers_at_startup: bool,
     first_run_flow: FirstRunFlow,
     /// An open `/side` side conversation, or `None` in the main session. While
@@ -2979,65 +3061,43 @@ pub(crate) fn startup_first_paint_log_count() -> usize {
 impl App {
     #[cfg(test)]
     pub fn new(project: Option<&Path>, no_sandbox: bool) -> Self {
-        Self::new_inner(
-            project,
-            no_sandbox,
-            None,
-            StartupWorkspaceTrust::Decided,
-            None,
-        )
+        Self::new_inner(project, no_sandbox, StartupWorkspaceTrust::Decided, None)
     }
 
-    #[cfg(test)]
-    pub fn new_with_db(project: Option<&Path>, no_sandbox: bool, db: cockpit_db::Db) -> Self {
-        Self::new_inner(
-            project,
-            no_sandbox,
-            Some(db),
-            StartupWorkspaceTrust::Decided,
-            None,
-        )
-    }
-
-    pub fn new_with_db_and_workspace_trust(
+    pub fn new_with_workspace_trust(
         project: Option<&Path>,
         no_sandbox: bool,
-        db: cockpit_db::Db,
         trust: StartupWorkspaceTrust,
     ) -> Self {
-        Self::new_with_db_and_workspace_trust_and_launch_start(project, no_sandbox, db, trust, None)
+        Self::new_with_workspace_trust_and_launch_start(project, no_sandbox, trust, None)
     }
 
-    pub fn new_with_db_and_workspace_trust_and_launch_start(
+    pub fn new_with_workspace_trust_and_launch_start(
         project: Option<&Path>,
         no_sandbox: bool,
-        db: cockpit_db::Db,
         trust: StartupWorkspaceTrust,
         launch_start: Option<Instant>,
     ) -> Self {
-        Self::new_inner(project, no_sandbox, Some(db), trust, launch_start)
+        Self::new_inner(project, no_sandbox, trust, launch_start)
     }
 
-    pub fn new_with_db_and_session(
+    pub fn new_with_session(
         project: Option<&Path>,
         no_sandbox: bool,
-        db: cockpit_db::Db,
         session_id: uuid::Uuid,
     ) -> Self {
-        Self::new_with_db_and_session_and_launch_start(project, no_sandbox, db, session_id, None)
+        Self::new_with_session_and_launch_start(project, no_sandbox, session_id, None)
     }
 
-    pub fn new_with_db_and_session_and_launch_start(
+    pub fn new_with_session_and_launch_start(
         project: Option<&Path>,
         no_sandbox: bool,
-        db: cockpit_db::Db,
         session_id: uuid::Uuid,
         launch_start: Option<Instant>,
     ) -> Self {
         let mut app = Self::new_inner(
             project,
             no_sandbox,
-            Some(db),
             StartupWorkspaceTrust::Decided,
             launch_start,
         );
@@ -3054,7 +3114,6 @@ impl App {
     fn new_inner(
         project: Option<&Path>,
         no_sandbox: bool,
-        startup_db: Option<cockpit_db::Db>,
         startup_trust: StartupWorkspaceTrust,
         launch_start: Option<Instant>,
     ) -> Self {
@@ -3104,6 +3163,10 @@ impl App {
         let preflight_enabled = extended.preflight.enabled;
         let sandbox_escalation_enabled = extended.sandbox_escalation_enabled;
         let has_no_providers_at_startup = providers.providers.is_empty();
+        let startup_dependency_notice =
+            cockpit_core::external_runtime::current_startup_dependency_policy()
+                .and_then(|policy| policy.summary)
+                .map(|summary| format!("Dependency warning: {summary}"));
         let vim_setting = tui_cfg.vim_mode;
         let thinking_setting = tui_cfg.thinking;
         let markdown_opts = MarkdownOpts {
@@ -3122,7 +3185,7 @@ impl App {
         // Probe the daemon synchronously up front so startup can either
         // autostart it per config or show the ask-mode/failure prompt on the
         // first frame.
-        let daemon_state = startup_daemon_state(extended.daemon.autostart, startup_db.as_ref());
+        let daemon_state = startup_daemon_state(extended.daemon.autostart);
         timer.phase("daemon_probe");
         let org_sync_disclosure = None;
         let connector_disclosure = None;
@@ -3134,6 +3197,7 @@ impl App {
         let hyperlinks = tui_cfg.hyperlinks;
         let exit_tail_lines = tui_cfg.exit_tail_lines;
         let rich_text_copy = tui_cfg.rich_text_copy;
+        let copy_on_release = tui_cfg.copy_on_release;
         let clipboard_recovery = tui_cfg.clipboard_recovery;
         // Startup reconciliation (spec: "startup retains newest/removes
         // older after containment checks"). `Off` never reaches this
@@ -3168,6 +3232,10 @@ impl App {
             launch,
             config_snapshot,
             active_model_state_generation: 0,
+            // Existing unit harnesses construct App without an event loop or
+            // daemon fake; gate-focused tests explicitly set this false.
+            startup_disclosures_ready: cfg!(test),
+            startup_disclosures_generation: 0,
             active_model_state_confirmed: false,
             active_model_selection,
             composer,
@@ -3224,14 +3292,15 @@ impl App {
             agent_runner: None,
             display_attach_backoff: DisplayAttachBackoff::default(),
             async_actions: AsyncActionRunner::default(),
+            _export_reaper_guard: crate::tui::async_action::ExportTempReaperGuard::new(),
             completed_async_actions: Vec::new(),
             skills_pane_generation: 0,
             startup_background: StartupBackground {
                 daemon_socket: daemon_state.socket,
-                db: startup_db,
                 started: false,
             },
             startup_daemon_notice: daemon_state.notice,
+            startup_dependency_notice,
             chat_area: None,
             input_area: None,
             suggestion_box_area: None,
@@ -3262,6 +3331,9 @@ impl App {
             at_selected: 0,
             at_scroll: 0,
             at_cache: std::cell::RefCell::new(None),
+            at_suggestions_loading: false,
+            at_suggestions_loaded_query: None,
+            at_suggestions_error: None,
             accepted_tags: Vec::new(),
             paste_registry: crate::tui::paste::PasteRegistry::new(),
             terminal_paste_classifier:
@@ -3276,6 +3348,7 @@ impl App {
             pending_session_switch_order: None,
             pending_session_switch_reconcile_started_at: None,
             event_loop_monotonic_now: std::time::Duration::ZERO,
+            async_action_clock_origin: std::time::Instant::now(),
             delivery_unconfirmed_records: Default::default(),
             pending_text_object: None,
             at_dismissed: false,
@@ -3335,8 +3408,12 @@ impl App {
             mouse_capture,
             hyperlinks,
             link_registry: crate::tui::links::LinkRegistry::default(),
+            link_pointer_gesture: crate::tui::links::LinkPointerGesture::default(),
+            mouse_gesture_state: mouse_gesture::GestureState::new(),
+            pending_link_activation: None,
             exit_tail_lines,
             rich_text_copy,
+            copy_on_release,
             clipboard_recovery,
             copy_file_cancel: None,
             tmux_copy_hint_shown: false,
@@ -3437,17 +3514,37 @@ impl App {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        if let Some(notice) = self.startup_daemon_notice.take()
-            && let Some(db) = self.startup_background.db.as_ref()
-        {
-            let notice_seen = db
-                .app_flag_seen(DAEMON_AUTOSTART_NOTICE_FLAG)
-                .await
-                .unwrap_or(false);
-            if !notice_seen {
-                let _ = db.mark_app_flag_seen(DAEMON_AUTOSTART_NOTICE_FLAG).await;
-                self.show_toast(notice, ToastKind::Info);
+        export_actions::recover_deferred_export_cleanup(
+            &self.launch.cwd.join(".cockpit").join("exports"),
+        )
+        .await;
+        if let Some(notice) = self.startup_daemon_notice.take() {
+            let key = cockpit_core::daemon::proto::AppFlagKey::DaemonAutostartNotice;
+            let state = crate::tui::agent_runner::daemon_request_blocking(
+                cockpit_core::daemon::proto::Request::GetAppFlag { key },
+            );
+            match state {
+                Ok(cockpit_core::daemon::proto::Response::AppFlag { seen: true, .. }) => {}
+                Ok(cockpit_core::daemon::proto::Response::AppFlag {
+                    seen: false,
+                    version,
+                    ..
+                }) => {
+                    let _ = crate::tui::agent_runner::daemon_request_blocking(
+                        cockpit_core::daemon::proto::Request::MarkAppFlagSeen {
+                            key,
+                            expected_version: version,
+                        },
+                    );
+                    self.show_toast(notice, ToastKind::Info);
+                }
+                _ => self.show_toast(notice, ToastKind::Info),
             }
+        }
+        // Apply the latest completed dependency policy after any one-shot
+        // daemon notice so the required-dependency warning remains visible.
+        if let Some(notice) = self.startup_dependency_notice.take() {
+            self.show_toast(notice, ToastKind::Warning);
         }
 
         // The launch banner now renders *inside* the alt screen as the
@@ -3515,7 +3612,7 @@ impl App {
         if self.side_conversation.is_some() {
             self.end_side_conversation(false);
         }
-        if self.btw_pane.is_some() {
+        if run_post_loop_btw_teardown(self.btw_pane.is_some(), || {
             if let Some(Ok(runner)) = self.agent_runner.as_ref() {
                 let _ = agent_runner::attached_request_tx_blocking(
                     runner.attached_request_binding(),
@@ -3524,9 +3621,18 @@ impl App {
                     },
                 );
             }
+        }) {
             self.close_btw_pane();
         }
-
+        let async_shutdown = self.async_actions.shutdown_and_reap().await;
+        if async_shutdown.export_cleanup_failed > 0 || async_shutdown.export_cleanup_timed_out > 0 {
+            eprintln!(
+                "cockpit: export cleanup needed recovery (failed={}, timed_out={}, retry_scheduled={})",
+                async_shutdown.export_cleanup_failed,
+                async_shutdown.export_cleanup_timed_out,
+                async_shutdown.export_cleanup_retry_scheduled,
+            );
+        }
         // Daemonless teardown (happy path): reap the owned ephemeral daemon
         // and stop its signal watcher. The guard routes a synchronous
         // `StopDaemon` through the daemon's single graceful drain path, so
@@ -3576,8 +3682,11 @@ impl App {
     }
 
     pub(super) async fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
-        self.event_loop_with_input(terminal, TerminalInput::new())
-            .await
+        let mut input = TerminalInput::new();
+        input.install_native_paste_adapter();
+        let result = self.event_loop_with_input(terminal, input).await;
+        crate::tui::input_source::clear_native_paste_adapter();
+        result
     }
 
     async fn event_loop_with_input(
@@ -3724,6 +3833,7 @@ impl App {
         terminal_input: &mut TerminalInput,
     ) -> Result<bool> {
         let mut changed = false;
+        self.dialog.set_runtime_sandbox_enabled(!self.no_sandbox);
         self.event_loop_monotonic_now = terminal_input.now();
         changed |= self.expire_pending_paste_probes();
         changed |= self.service_delivery_unconfirmed_reconciliation();
@@ -3741,6 +3851,7 @@ impl App {
         self.sync_mouse_capture_from_dialog();
         changed |= self.tick_toast();
         changed |= self.tick_ctrl_c_window();
+        changed |= self.check_pending_link_activation();
         self.dialog.tick();
         changed |= self.service_first_run_flow();
         // Auto-close the embedded pane when its child has exited
@@ -3770,6 +3881,8 @@ impl App {
                     event,
                     observed.observed_at,
                     observed.terminal_generation,
+                    observed.paste_source,
+                    observed.paste_correlation_id,
                 )),
                 Err(error) => Err(error.into()),
             },
@@ -3788,7 +3901,13 @@ impl App {
                 self.handle_mouse(mouse);
                 false
             }
-            Event::Resize(_, _) => false,
+            Event::Resize(_, _) => {
+                self.link_pointer_gesture.cancel();
+                self.link_registry.invalidate_pointer_generation();
+                self.pending_link_activation = None;
+                self.dialog.cancel_settings_pointer_transients();
+                false
+            }
             _ => false,
         }
     }
@@ -3798,6 +3917,8 @@ impl App {
         event: Event,
         observed_at: std::time::Duration,
         terminal_generation: u64,
+        paste_source: Option<crate::tui::structured_paste::PasteSource>,
+        paste_correlation_id: Option<uuid::Uuid>,
     ) -> bool {
         if self.terminal_input_generation != Some(terminal_generation) {
             let replay = self.terminal_paste_classifier.cancel();
@@ -3811,7 +3932,7 @@ impl App {
                 .pending_paste_probes
                 .values()
                 .any(|probe| probe.owner_fence.is_none());
-            self.pending_paste_probes.clear();
+            self.cancel_paste_probes_matching(|_| true);
             for id in cancelled_fences {
                 self.deferred_fence_dispatches.remove(&id);
                 if let Some(fence) = self.submission_fences.remove(&id) {
@@ -3824,20 +3945,38 @@ impl App {
             }
             self.terminal_input_generation = Some(terminal_generation);
             for key in replay {
-                if self.handle_key(key) {
+                if self.handle_frozen_composer_key(key) {
                     return true;
                 }
             }
         }
         if !self.structured_paste_composer_eligible() {
+            self.cancel_paste_probes_matching(|probe| {
+                probe.owner_fence.is_none()
+                    && probe.request.source
+                        == crate::tui::structured_paste::PasteSource::NativePaste
+            });
             for key in self.terminal_paste_classifier.cancel() {
-                if self.handle_key(key) {
+                if self.handle_frozen_composer_key(key) {
                     return true;
                 }
             }
-            return self.handle_terminal_event(event);
+            let is_literal_paste = matches!(event, Event::Paste(_));
+            let exit = self.handle_terminal_event(event);
+            if is_literal_paste && let Some(correlation_id) = paste_correlation_id {
+                crate::tui::input_source::acknowledge_native_paste(
+                    correlation_id,
+                    crate::tui::structured_paste::DedupResult::Committed,
+                );
+            }
+            return exit;
         }
-        let decision = self.terminal_paste_classifier.observe(event, observed_at);
+        let decision = self.terminal_paste_classifier.observe_with_paste_source(
+            event,
+            observed_at,
+            paste_source.unwrap_or(crate::tui::structured_paste::PasteSource::BracketedPty),
+            paste_correlation_id,
+        );
         self.apply_terminal_paste_decision(decision)
     }
 
@@ -3851,49 +3990,90 @@ impl App {
             ClassifierDecision::Replay {
                 keys,
                 boundary,
+                boundary_paste_source,
+                boundary_correlation_id,
                 shortcut_intent,
                 paste_unavailable,
             } => {
                 let mut exit = false;
                 for key in keys {
-                    exit |= self.handle_key(key);
+                    exit |= self.handle_frozen_composer_key(key);
                 }
                 if shortcut_intent {
                     // The shortcut is an intent, never literal composer text.
-                    self.handle_paste(String::new());
+                    let correlation_id = self
+                        .terminal_paste_classifier
+                        .pending_shortcut_correlation_id()
+                        .unwrap_or_else(uuid::Uuid::new_v4);
+                    self.handle_identified_paste(
+                        String::new(),
+                        crate::tui::structured_paste::PasteSource::NativePaste,
+                        correlation_id,
+                    );
                 }
                 if paste_unavailable {
+                    self.cancel_paste_probes_matching(|probe| {
+                        probe.owner_fence.is_none()
+                            && probe.request.source
+                                == crate::tui::structured_paste::PasteSource::NativePaste
+                    });
                     self.show_toast("Paste unavailable", ToastKind::Error);
                 }
                 if let Some(event) = boundary {
-                    exit |= self.handle_terminal_event(event);
+                    if let Event::Paste(text) = event {
+                        self.handle_identified_paste(
+                            text,
+                            boundary_paste_source
+                                .unwrap_or(crate::tui::structured_paste::PasteSource::BracketedPty),
+                            boundary_correlation_id.unwrap_or_else(uuid::Uuid::new_v4),
+                        );
+                    } else {
+                        exit |= self.handle_terminal_event(event);
+                    }
                 }
                 exit
             }
-            ClassifierDecision::Paste { text, source } => {
+            ClassifierDecision::Paste {
+                text,
+                source,
+                correlation_id,
+            } => {
                 if matches!(
                     source,
                     crate::tui::structured_paste::PasteSource::BracketedPty
                         | crate::tui::structured_paste::PasteSource::RapidPty
                 ) {
-                    self.pending_paste_probes.retain(|_, probe| {
-                        probe.owner_fence.is_some()
-                            || probe.request.source
-                                != crate::tui::structured_paste::PasteSource::NativePaste
+                    self.cancel_paste_probes_matching(|probe| {
+                        probe.owner_fence.is_none()
+                            && probe.request.source
+                                == crate::tui::structured_paste::PasteSource::NativePaste
                     });
                 }
-                self.handle_paste(text);
+                self.handle_identified_paste(text, source, correlation_id);
                 false
             }
             ClassifierDecision::ShortcutIntent => {
                 // A native shortcut may represent image-only clipboard data;
                 // probe it off-loop while the classifier retains the intent
                 // for a possible authoritative text/bracketed event.
-                self.handle_paste(String::new());
+                let correlation_id = self
+                    .terminal_paste_classifier
+                    .pending_shortcut_correlation_id()
+                    .unwrap_or_else(uuid::Uuid::new_v4);
+                self.handle_identified_paste(
+                    String::new(),
+                    crate::tui::structured_paste::PasteSource::NativePaste,
+                    correlation_id,
+                );
                 false
             }
             ClassifierDecision::Pending => false,
             ClassifierDecision::PasteUnavailable => {
+                self.cancel_paste_probes_matching(|probe| {
+                    probe.owner_fence.is_none()
+                        && probe.request.source
+                            == crate::tui::structured_paste::PasteSource::NativePaste
+                });
                 self.show_toast("Paste unavailable", ToastKind::Error);
                 false
             }
@@ -3928,6 +4108,13 @@ impl App {
                 .pending_any_kind_elapsed(&session_switches, now)
                 .is_some_and(|elapsed| elapsed >= SESSION_SWITCH_SPINNER_THRESHOLD)
     }
+}
+
+fn run_post_loop_btw_teardown(open: bool, teardown: impl FnOnce()) -> bool {
+    if open {
+        teardown();
+    }
+    open
 }
 
 fn editor_argv_for_cwd(editor: &std::ffi::OsStr, cwd: &std::path::Path) -> Vec<String> {
@@ -3979,6 +4166,8 @@ mod async_action_app_tests;
 #[cfg(test)]
 mod attention_interrupt_surface_tests;
 #[cfg(test)]
+mod blocking_operation_tests;
+#[cfg(test)]
 mod caffeinate_toast_tests;
 #[cfg(test)]
 mod config_snapshot_tests;
@@ -4027,6 +4216,8 @@ mod sandbox_notice_tests;
 #[cfg(test)]
 mod session_schedule_tests;
 #[cfg(test)]
+pub(crate) mod settings_pointer_tests;
+#[cfg(test)]
 mod skill_auto_injected_tests;
 #[cfg(test)]
 mod skills_pane_attached_tests;
@@ -4038,6 +4229,8 @@ mod startup_first_paint_tests;
 mod startup_timing_tests;
 #[cfg(test)]
 mod subagent_settle_tests;
+#[cfg(test)]
+mod trust_rpc_regression_tests;
 #[cfg(test)]
 mod vim_mouse_pending_state_tests;
 #[cfg(test)]

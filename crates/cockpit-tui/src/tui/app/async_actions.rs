@@ -1,5 +1,21 @@
 use super::*;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StartupDisclosureIdentity<'a> {
+    project_root: &'a str,
+    generation: u64,
+    socket: Option<&'a std::path::Path>,
+    launch_session_id: Option<uuid::Uuid>,
+    attachment: Option<(uuid::Uuid, u64)>,
+}
+
+fn startup_disclosure_completion_is_current(
+    current: StartupDisclosureIdentity<'_>,
+    completed: StartupDisclosureIdentity<'_>,
+) -> bool {
+    current == completed
+}
+
 fn reconnectable_session_switch_error(error: &str) -> bool {
     error.contains("connection closed")
         || error.contains("broken pipe")
@@ -15,6 +31,27 @@ fn floor_char_boundary(text: &str, requested: usize) -> usize {
 }
 
 impl App {
+    pub(super) fn cancel_paste_probes_matching(
+        &mut self,
+        mut predicate: impl FnMut(&PendingPasteProbe) -> bool,
+    ) {
+        let cancelled = self
+            .pending_paste_probes
+            .iter()
+            .filter_map(|(id, probe)| predicate(probe).then_some((*id, probe.async_action_id)))
+            .collect::<Vec<_>>();
+        for (id, action_id) in cancelled {
+            if let Some(action_id) = action_id {
+                self.async_actions.abort_id(action_id);
+            }
+            self.pending_paste_probes.remove(&id);
+            crate::tui::input_source::acknowledge_native_paste(
+                id,
+                crate::tui::structured_paste::DedupResult::Busy,
+            );
+        }
+    }
+
     pub(super) fn expire_pending_paste_probes(&mut self) -> bool {
         let expired = self
             .pending_paste_probes
@@ -24,17 +61,28 @@ impl App {
                     *id,
                     probe.request.paste_generation,
                     probe.source_draft_generation,
+                    probe.async_action_id,
                 ))
             })
             .collect::<Vec<_>>();
-        for (id, generation, draft_generation) in &expired {
+        for (id, generation, draft_generation, action_id) in &expired {
+            if let Some(action_id) = action_id {
+                self.async_actions.abort_id(*action_id);
+            }
             self.settle_paste_probe(*id, *generation, *draft_generation, 0, None, true);
         }
         !expired.is_empty()
     }
 
     pub(super) fn drain_async_actions(&mut self) -> bool {
-        let results = self.async_actions.drain_completed();
+        // Cancellation is a terminal runner outcome, but ownership ended, so
+        // it is intentionally acknowledged without applying UI mutations.
+        let _cancelled = self.async_actions.drain_cancelled();
+        let mut results = self.async_actions.expire_blocking(
+            self.async_action_clock_origin + self.event_loop_monotonic_now,
+            std::time::Duration::from_secs(30),
+        );
+        results.extend(self.async_actions.drain_completed());
         let changed = !results.is_empty();
         let oauth_completed = results.iter().any(|result| {
             matches!(
@@ -287,6 +335,16 @@ impl App {
                     }
                 }
             }
+            AsyncActionKind::Internal("startup.dependencies") => {
+                if let Ok(AsyncActionPayload::StartupDependencyProjection(projection)) =
+                    result.payload
+                    && let Some(summary) =
+                        cockpit_core::external_runtime::startup_dependency_policy(&projection)
+                            .summary
+                {
+                    self.show_toast(format!("Dependency warning: {summary}"), ToastKind::Warning);
+                }
+            }
             AsyncActionKind::Internal(label @ ("session.switch" | "session.resume")) => {
                 match result.payload {
                     Ok(AsyncActionPayload::SessionSwitched(outcome)) => {
@@ -464,13 +522,62 @@ impl App {
                     self.container_availability = availability;
                 }
             }
-            AsyncActionKind::Internal("startup.remote_disclosures") => {
-                if let Ok(AsyncActionPayload::RemoteDisclosures { org, connector }) = result.payload
-                {
-                    self.org_sync_disclosure = org;
-                    self.connector_disclosure = connector;
+            AsyncActionKind::Internal("startup.remote_disclosures") => match result.payload {
+                Ok(AsyncActionPayload::RemoteDisclosures {
+                    project_root,
+                    request_generation,
+                    socket,
+                    launch_session_id,
+                    session_id,
+                    attachment_epoch,
+                    org,
+                    connector,
+                }) => {
+                    let current_attachment = self
+                        .agent_runner
+                        .as_ref()
+                        .and_then(|runner| runner.as_ref().ok())
+                        .filter(|runner| runner.has_attached_client())
+                        .map(|runner| (runner.session_id(), runner.attachment_epoch()));
+                    if startup_disclosure_completion_is_current(
+                        StartupDisclosureIdentity {
+                            project_root: &self.launch.cwd.to_string_lossy(),
+                            generation: self.startup_disclosures_generation,
+                            socket: self.startup_background.daemon_socket.as_deref(),
+                            launch_session_id: self.launch.session_id,
+                            attachment: current_attachment,
+                        },
+                        StartupDisclosureIdentity {
+                            project_root: &project_root,
+                            generation: request_generation,
+                            socket: socket.as_deref(),
+                            launch_session_id,
+                            attachment: session_id.zip(attachment_epoch),
+                        },
+                    ) {
+                        self.startup_disclosures_ready = true;
+                        self.org_sync_disclosure = org;
+                        self.connector_disclosure = connector;
+                    }
                 }
-            }
+                Ok(_) => {}
+                Err(error) => self.show_toast(
+                    format!("Startup disclosures Unavailable — {error}; Retry"),
+                    ToastKind::Warning,
+                ),
+            },
+            AsyncActionKind::DaemonRpc("assistant.resolve") => match result.payload {
+                Ok(AsyncActionPayload::AssistantSessionResolved {
+                    session_id,
+                    source_session_id,
+                }) => {
+                    if self.launch.session_id == source_session_id {
+                        self.resume_session(session_id);
+                    }
+                }
+                Ok(_) => self.push_plain("/assistant: unexpected daemon response".to_string()),
+                Err(error) => self.push_plain(format!("/assistant: Unavailable — {error}; Retry")),
+            },
             AsyncActionKind::Refresh("stats.rollup") => {
                 if let Overlay::Stats(pane) = &mut self.overlay
                     && let Ok(AsyncActionPayload::StatsRollup(result)) = result.payload
@@ -620,39 +727,102 @@ impl App {
                 }
                 Err(e) => self.show_toast(format!("/resources: {e}"), ToastKind::Error),
             },
-            AsyncActionKind::Internal("notes.db") => {
+            AsyncActionKind::Internal("notes.rpc") => {
                 if let Overlay::Notes(pane) = &mut self.overlay {
                     let payload = match result.payload {
-                        Ok(AsyncActionPayload::NotesDb(result)) => Ok(result),
+                        Ok(AsyncActionPayload::NotesRpc(result)) => Ok(result),
                         Ok(_) => Err("notes db returned an unexpected response".to_string()),
                         Err(e) => Err(e),
                     };
-                    pane.apply_db_result(payload);
+                    pane.apply_rpc_result(payload);
                 }
             }
-            AsyncActionKind::DaemonRpc("goal.status" | "goal.set" | "goal.clear") => {
-                match result.payload {
-                    Ok(AsyncActionPayload::Text(message)) => self.push_plain(message),
-                    Ok(_) => self.push_plain("/goal: unexpected daemon response".to_string()),
-                    Err(error) => self.history.push(HistoryEntry::CommandError {
-                        line: format!("/goal: {error}"),
-                    }),
-                }
-            }
-            AsyncActionKind::Internal("curator.command") => match result.payload {
+            AsyncActionKind::DaemonRpc(
+                "goal.create" | "goal.disposition" | "goal.set" | "goal.clear",
+            ) => match result.payload {
+                Ok(AsyncActionPayload::Text(message)) => self.push_plain(message),
+                Ok(_) => self.push_plain("/goal: unexpected daemon response".to_string()),
+                Err(error) => self.history.push(HistoryEntry::CommandError {
+                    line: format!("/goal: {error}"),
+                }),
+            },
+            AsyncActionKind::Blocking("curator.command") => match result.payload {
                 Ok(AsyncActionPayload::Text(message)) => self.push_plain(message),
                 Ok(_) => self.push_plain("/curator: unexpected async response".to_string()),
                 Err(e) => self.push_plain(format!("/curator: {e}")),
             },
-            AsyncActionKind::Internal("export.transcript") => match result.payload {
+            AsyncActionKind::Blocking("export.transcript") => match result.payload {
                 Ok(AsyncActionPayload::Text(message)) => self.push_plain(message),
                 Ok(_) => self.push_plain("/export: unexpected async response".to_string()),
                 Err(e) => self.push_plain(e),
             },
-            AsyncActionKind::Internal("export.debug") => match result.payload {
+            AsyncActionKind::Blocking("export.debug") => match result.payload {
                 Ok(AsyncActionPayload::Text(message)) => self.push_plain(message),
                 Ok(_) => self.push_plain("/export debug: unexpected async response".to_string()),
                 Err(e) => self.push_plain(e),
+            },
+            AsyncActionKind::Blocking("doctor.snapshot") => match result.payload {
+                Ok(AsyncActionPayload::DoctorSnapshot(rendered)) => self.push_plain(rendered),
+                Ok(_) => self.push_plain("/doctor: unexpected async response".to_string()),
+                Err(error) => self.push_plain(error),
+            },
+            AsyncActionKind::Blocking("autocomplete.files") => match result.payload {
+                Ok(AsyncActionPayload::FileSuggestions { query, suggestions })
+                    if self.composer.at_query() == Some(query.as_str()) =>
+                {
+                    self.at_suggestions_loading = false;
+                    self.at_suggestions_loaded_query = Some(query.clone());
+                    self.at_suggestions_error = None;
+                    *self.at_cache.borrow_mut() = Some((query, suggestions));
+                }
+                Err(error) => {
+                    self.at_suggestions_loading = false;
+                    self.at_suggestions_loaded_query = self.composer.at_query().map(str::to_string);
+                    self.at_suggestions_error = Some(error);
+                }
+                _ => {}
+            },
+            AsyncActionKind::Blocking("queue.edit") => {
+                let outcome = match result.payload {
+                    Ok(AsyncActionPayload::DaemonResponse(response)) => {
+                        self.remove_editable_queued_messages_with(|| Ok(*response))
+                    }
+                    _ => input::QueueEditOutcome::TransportError,
+                };
+                self.apply_queue_edit_outcome(outcome);
+            }
+            AsyncActionKind::Blocking("btw.teardown") => match result.payload {
+                Ok(AsyncActionPayload::BtwTransition {
+                    created,
+                    ended,
+                    question,
+                    error,
+                }) => {
+                    if ended {
+                        self.close_btw_pane();
+                    }
+                    if let Some(info) = created {
+                        self.open_btw_pane_from_info(info, true);
+                    }
+                    if let Some(error) = error {
+                        self.push_plain(format!("/btw: {error}"));
+                    } else if let Some(pane) = self.btw_pane.as_mut() {
+                        pane.focused = true;
+                        if let Some(question) = question
+                            && let Err(error) = pane.send_text(question)
+                        {
+                            pane.history.push(HistoryEntry::InferenceError {
+                                summary: error.clone(),
+                                detail: error,
+                                expanded: false,
+                            });
+                        }
+                    } else if !ended {
+                        self.push_plain("/btw: no live fork".to_string());
+                    }
+                }
+                Ok(_) => self.push_plain("/btw: unexpected async response".to_string()),
+                Err(error) => self.push_plain(format!("/btw: {error}")),
             },
             AsyncActionKind::DaemonRpc("rename") => match result.payload {
                 Ok(AsyncActionPayload::Text(title)) => {
@@ -946,12 +1116,13 @@ impl App {
         {
             return;
         }
-        let _ = self.paste_correlations.commit(
+        let commit = self.paste_correlations.commit(
             request_id,
             request_generation,
             probe.request.host,
             self.event_loop_monotonic_now,
         );
+        crate::tui::input_source::acknowledge_native_paste(request_id, commit);
         let Some(fence_id) = probe.owner_fence else {
             if source_draft_generation != self.draft_generation {
                 return;
@@ -1011,13 +1182,11 @@ impl App {
         for slot in &fence.slots {
             if let crate::tui::structured_paste::PasteSlotState::Ready {
                 original_offset,
-                png,
+                png: Some(png),
                 ..
             } = slot
             {
-                if let Some(png) = png {
-                    resolved_images.push((*original_offset, png.clone()));
-                }
+                resolved_images.push((*original_offset, png.clone()));
             }
         }
         resolved_images.sort_by_key(|(offset, _)| *offset);
@@ -1169,17 +1338,8 @@ impl App {
             fence.lifecycle = crate::tui::structured_paste::FenceLifecycle::PossiblySent;
         }
         if was_busy {
-            let terminal_notices = self
-                .history
-                .drain(optimistic_history_start..)
-                .filter(|entry| {
-                    matches!(
-                        entry,
-                        HistoryEntry::InferenceError { .. } | HistoryEntry::CommandError { .. }
-                    )
-                })
-                .collect::<Vec<_>>();
-            self.history.extend(terminal_notices);
+            self.history
+                .retain_terminal_notices_since(optimistic_history_start);
             if outcome != DispatchOutcome::Sent {
                 self.queue.retain(|item| item.id != fence_id);
             }
@@ -1415,13 +1575,13 @@ impl App {
         &mut self,
         key: crate::tui::stats_pane::StatsPaneFetchKey,
     ) {
-        let db = self.startup_background.db.clone();
-        self.async_actions.start(
+        let socket = self.startup_background.daemon_socket.clone();
+        self.async_actions.start_blocking(
             AsyncActionKind::Refresh("stats.rollup"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("stats.rollup")),
-            async move {
+            move || {
                 Ok(AsyncActionPayload::StatsRollup(
-                    crate::tui::stats_pane::fetch_stats_rollup(db, key).await,
+                    crate::tui::stats_pane::fetch_stats_rollup(socket.as_deref(), key),
                 ))
             },
         );
@@ -1435,5 +1595,65 @@ impl App {
             return true;
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod startup_disclosure_generation_tests {
+    use super::{StartupDisclosureIdentity, startup_disclosure_completion_is_current};
+    use std::path::Path;
+    use uuid::Uuid;
+
+    #[test]
+    fn stale_or_detached_disclosure_completions_are_rejected_for_same_project() {
+        fn identity<'a>(
+            project_root: &'a str,
+            generation: u64,
+            socket: Option<&'a Path>,
+            launch_session_id: Option<Uuid>,
+            attachment: Option<(Uuid, u64)>,
+        ) -> StartupDisclosureIdentity<'a> {
+            StartupDisclosureIdentity {
+                project_root,
+                generation,
+                socket,
+                launch_session_id,
+                attachment,
+            }
+        }
+
+        let session = Uuid::new_v4();
+        let current = Some((session, 4));
+        let socket = Some(Path::new("/tmp/cockpit.sock"));
+        let completed = identity("/repo", 8, socket, Some(session), current);
+        assert!(startup_disclosure_completion_is_current(
+            completed, completed
+        ));
+        assert!(!startup_disclosure_completion_is_current(
+            identity("/repo", 9, socket, Some(session), current),
+            completed,
+        ));
+        assert!(!startup_disclosure_completion_is_current(
+            identity("/repo", 8, socket, Some(session), None),
+            completed,
+        ));
+        assert!(!startup_disclosure_completion_is_current(
+            identity("/repo", 8, socket, Some(session), Some((session, 5))),
+            completed,
+        ));
+        assert!(!startup_disclosure_completion_is_current(
+            identity(
+                "/repo",
+                8,
+                Some(Path::new("/tmp/replacement.sock")),
+                Some(session),
+                current,
+            ),
+            completed,
+        ));
+        assert!(!startup_disclosure_completion_is_current(
+            identity("/repo", 8, socket, None, current),
+            completed,
+        ));
     }
 }

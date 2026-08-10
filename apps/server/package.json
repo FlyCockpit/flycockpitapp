@@ -20,6 +20,7 @@
     "@orpc/zod": "catalog:",
     "@flycockpit/api": "workspace:*",
     "@flycockpit/auth": "workspace:*",
+    "@flycockpit/cockpit-protocol": "workspace:*",
     "@flycockpit/db": "workspace:*",
     "@flycockpit/env": "workspace:*",
     "@flycockpit/queue": "workspace:*",

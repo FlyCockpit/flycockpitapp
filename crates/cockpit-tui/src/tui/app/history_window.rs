@@ -111,6 +111,26 @@ impl HistoryWindow {
         }
     }
 
+    pub(super) fn retain_terminal_notices_since(&mut self, start: usize) {
+        let terminal_notices = self
+            .log
+            .iter()
+            .skip(start)
+            .filter(|entry| {
+                matches!(
+                    entry,
+                    HistoryEntry::InferenceError { .. } | HistoryEntry::CommandError { .. }
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        // This is a tail rewrite, not a history reset. In particular, a busy
+        // optimistic dispatch can begin at index zero while the window still
+        // has daemon-backed pages before `older_cursor`.
+        self.log.truncate(start);
+        self.extend(terminal_notices);
+    }
+
     #[allow(dead_code)]
     pub(super) fn pop(&mut self) -> Option<HistoryEntry> {
         self.log.pop()
@@ -217,5 +237,60 @@ fn entry_cursor(entry: &HistoryEntry) -> Option<i64> {
     match entry {
         HistoryEntry::User { seq, .. } | HistoryEntry::Agent { seq, .. } => *seq,
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retain_terminal_notices_since_removes_only_optimistic_tail_rows() {
+        let mut history = HistoryWindow::from(vec![HistoryEntry::Plain {
+            line: "resident".to_string(),
+        }]);
+        let start = history.len();
+        history.push(HistoryEntry::Plain {
+            line: "optimistic".to_string(),
+        });
+        history.push(HistoryEntry::CommandError {
+            line: "dispatch failed".to_string(),
+        });
+        history.push(HistoryEntry::InferenceError {
+            summary: "provider failed".to_string(),
+            detail: "detail".to_string(),
+            expanded: false,
+        });
+
+        history.retain_terminal_notices_since(start);
+
+        assert_eq!(history.len(), 3);
+        assert!(matches!(&history[0], HistoryEntry::Plain { line } if line == "resident"));
+        assert!(
+            matches!(&history[1], HistoryEntry::CommandError { line } if line == "dispatch failed")
+        );
+        assert!(
+            matches!(&history[2], HistoryEntry::InferenceError { summary, .. } if summary == "provider failed")
+        );
+    }
+
+    #[test]
+    fn retain_terminal_notices_since_preserves_pagination_at_zero() {
+        let mut history = HistoryWindow::from_history_page(
+            vec![HistoryEntry::CommandError {
+                line: "dispatch failed".to_string(),
+            }],
+            Some(41),
+            true,
+        );
+
+        history.retain_terminal_notices_since(0);
+
+        assert_eq!(history.len(), 1);
+        assert!(
+            matches!(&history[0], HistoryEntry::CommandError { line } if line == "dispatch failed")
+        );
+        assert_eq!(history.older_cursor(), Some(41));
+        assert!(history.has_older());
     }
 }

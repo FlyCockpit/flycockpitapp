@@ -152,28 +152,69 @@ impl App {
             },
         );
 
-        let db = self.startup_background.db.clone();
-        self.async_actions.start(
+        let dependency_cwd = self.launch.cwd.clone();
+        let sandbox_enabled = !self.no_sandbox;
+        self.async_actions.start_blocking(
+            AsyncActionKind::Internal("startup.dependencies"),
+            AsyncActionPolicy::Dedupe(AsyncActionKey::new("startup.dependencies")),
+            move || {
+                cockpit_core::diagnostics::dependency_projection_with_deadline_and_publish_for_run(
+                    dependency_cwd,
+                    std::time::Duration::from_secs(2),
+                    sandbox_enabled,
+                )
+                .map(AsyncActionPayload::StartupDependencyProjection)
+                .map_err(|error| error.to_string())
+            },
+        );
+
+        self.start_startup_disclosures_fetch();
+    }
+
+    pub(super) fn start_startup_disclosures_fetch(&mut self) {
+        self.startup_disclosures_generation = self.startup_disclosures_generation.wrapping_add(1);
+        let request_generation = self.startup_disclosures_generation;
+        let disclosure_root = self.launch.cwd.to_string_lossy().into_owned();
+        let disclosure_socket = self.startup_background.daemon_socket.clone();
+        let launch_session_id = self.launch.session_id;
+        let (session_id, attachment_epoch) = self
+            .agent_runner
+            .as_ref()
+            .and_then(|runner| runner.as_ref().ok())
+            .filter(|runner| runner.has_attached_client())
+            .map(|runner| (Some(runner.session_id()), Some(runner.attachment_epoch())))
+            .unwrap_or((None, None));
+        let request_socket = disclosure_socket.clone();
+        self.async_actions.start_blocking(
             AsyncActionKind::Internal("startup.remote_disclosures"),
-            AsyncActionPolicy::Dedupe(AsyncActionKey::new("startup.remote_disclosures")),
-            async move {
-                let Some(credential) = cockpit_core::auth::flycockpit::maybe_load_credential()
-                else {
-                    return Ok(AsyncActionPayload::RemoteDisclosures {
-                        org: None,
-                        connector: None,
-                    });
+            AsyncActionPolicy::Replace(AsyncActionKey::new("startup.remote_disclosures")),
+            move || {
+                let request = cockpit_core::daemon::proto::Request::GetStartupDisclosures {
+                    project_root: disclosure_root.clone(),
                 };
-                let db = db.ok_or_else(|| "database unavailable during startup".to_string())?;
-                let org = db
-                    .org_sync_disclosure_for_server(&credential.server_url)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let connector = db
-                    .connector_disclosure(&credential.server_url, &credential.instance_id)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                Ok(AsyncActionPayload::RemoteDisclosures { org, connector })
+                let response = match disclosure_socket.as_deref() {
+                    Some(socket) => agent_runner::daemon_request_at_blocking(socket, request),
+                    None => agent_runner::daemon_request_blocking(request),
+                }?;
+                match response {
+                    cockpit_core::daemon::proto::Response::StartupDisclosures {
+                        org_sync,
+                        connector,
+                        ..
+                    } => Ok(AsyncActionPayload::RemoteDisclosures {
+                        project_root: disclosure_root,
+                        request_generation,
+                        socket: request_socket,
+                        launch_session_id,
+                        session_id,
+                        attachment_epoch,
+                        org: org_sync,
+                        connector,
+                    }),
+                    other => Err(format!(
+                        "unexpected startup disclosures response: {other:?}"
+                    )),
+                }
             },
         );
     }

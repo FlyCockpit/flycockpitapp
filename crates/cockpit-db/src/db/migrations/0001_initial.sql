@@ -652,6 +652,92 @@ CREATE TABLE client_submission_terminal_receipts (
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
 
+-- Authoritative exactly-once ledger for typed user-message submissions. UUID
+-- identities that cross the canonical binary boundary are RFC-byte BLOBs;
+-- actor identity is deliberately absent for the local-owner tuple.
+CREATE TABLE message_operation_receipts (
+    session_id             TEXT NOT NULL,
+    operation_id           BLOB NOT NULL CHECK (typeof(operation_id) = 'blob' AND length(operation_id) = 16 AND operation_id <> zeroblob(16)),
+    actor_kind             TEXT NOT NULL CHECK (actor_kind IN ('local_owner', 'remote_device')),
+    actor_id               BLOB,
+    -- Canonical unsigned big-endian u64: zeroblob(8) for local owner and a
+    -- nonzero value for a remote-device generation.
+    actor_generation       BLOB NOT NULL CHECK (typeof(actor_generation) = 'blob' AND length(actor_generation) = 8),
+    request_hash           BLOB NOT NULL CHECK (typeof(request_hash) = 'blob' AND length(request_hash) = 32),
+    message_request_digest BLOB NOT NULL CHECK (typeof(message_request_digest) = 'blob' AND length(message_request_digest) = 32),
+    client_submission_id   BLOB NOT NULL CHECK (typeof(client_submission_id) = 'blob' AND length(client_submission_id) = 16 AND client_submission_id <> zeroblob(16)),
+    state                  TEXT NOT NULL CHECK (state IN ('accepted', 'materialized', 'terminal_rejected', 'removed')),
+    safe_outcome           BLOB NOT NULL CHECK (typeof(safe_outcome) = 'blob'),
+    outbox_sequence        INTEGER NOT NULL CHECK (outbox_sequence >= 0),
+    created_at             INTEGER NOT NULL,
+    updated_at             INTEGER NOT NULL,
+    PRIMARY KEY (session_id, operation_id),
+    UNIQUE (session_id, client_submission_id),
+    UNIQUE (session_id, operation_id, client_submission_id, message_request_digest),
+    CHECK (
+      (actor_kind = 'local_owner' AND actor_id IS NULL AND actor_generation = zeroblob(8)) OR
+      (actor_kind = 'remote_device' AND typeof(actor_id) = 'blob' AND length(actor_id) = 16 AND actor_id <> zeroblob(16) AND actor_generation <> zeroblob(8))
+    ),
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+);
+
+CREATE TABLE message_submission_receipts (
+    session_id             TEXT NOT NULL,
+    client_submission_id   BLOB NOT NULL CHECK (typeof(client_submission_id) = 'blob' AND length(client_submission_id) = 16 AND client_submission_id <> zeroblob(16)),
+    operation_id           BLOB NOT NULL CHECK (typeof(operation_id) = 'blob' AND length(operation_id) = 16 AND operation_id <> zeroblob(16)),
+    message_request_digest BLOB NOT NULL CHECK (typeof(message_request_digest) = 'blob' AND length(message_request_digest) = 32),
+    attachment_set_digest  BLOB NOT NULL CHECK (typeof(attachment_set_digest) = 'blob' AND length(attachment_set_digest) = 32),
+    state                  TEXT NOT NULL CHECK (state IN ('accepted', 'materialized', 'terminal_rejected', 'removed')),
+    queue_item_id          BLOB NOT NULL CHECK (typeof(queue_item_id) = 'blob' AND length(queue_item_id) = 16 AND queue_item_id <> zeroblob(16)),
+    message_seq            INTEGER CHECK (message_seq IS NULL OR message_seq > 0),
+    fold_ordinal           INTEGER CHECK (fold_ordinal IS NULL OR fold_ordinal >= 0),
+    safe_outcome           BLOB NOT NULL CHECK (typeof(safe_outcome) = 'blob'),
+    created_at             INTEGER NOT NULL,
+    updated_at             INTEGER NOT NULL,
+    PRIMARY KEY (session_id, client_submission_id),
+    UNIQUE (session_id, operation_id),
+    UNIQUE (session_id, operation_id, client_submission_id, message_request_digest),
+    CHECK ((state = 'materialized') = (message_seq IS NOT NULL AND fold_ordinal IS NOT NULL)),
+    FOREIGN KEY (session_id, operation_id)
+      REFERENCES message_operation_receipts(session_id, operation_id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id, operation_id, client_submission_id, message_request_digest)
+      REFERENCES message_operation_receipts(session_id, operation_id, client_submission_id, message_request_digest)
+      ON DELETE CASCADE
+);
+
+CREATE TABLE message_queue_items (
+    session_id           TEXT NOT NULL,
+    queue_item_id        BLOB NOT NULL CHECK (typeof(queue_item_id) = 'blob' AND length(queue_item_id) = 16 AND queue_item_id <> zeroblob(16)),
+    client_submission_id BLOB NOT NULL CHECK (typeof(client_submission_id) = 'blob' AND length(client_submission_id) = 16 AND client_submission_id <> zeroblob(16)),
+    canonical_message    BLOB NOT NULL CHECK (typeof(canonical_message) = 'blob' AND length(canonical_message) <= 2631500),
+    state                TEXT NOT NULL CHECK (state IN ('accepted', 'folding', 'materialized', 'terminal_rejected', 'removed')),
+    created_at           INTEGER NOT NULL,
+    updated_at           INTEGER NOT NULL,
+    PRIMARY KEY (session_id, queue_item_id),
+    UNIQUE (session_id, client_submission_id),
+    FOREIGN KEY (session_id, client_submission_id)
+      REFERENCES message_submission_receipts(session_id, client_submission_id) ON DELETE CASCADE
+);
+
+CREATE TABLE message_attachment_references (
+    session_id           TEXT NOT NULL,
+    client_submission_id BLOB NOT NULL CHECK (typeof(client_submission_id) = 'blob' AND length(client_submission_id) = 16 AND client_submission_id <> zeroblob(16)),
+    ordinal              INTEGER NOT NULL CHECK (ordinal >= 0 AND ordinal < 16),
+    attachment_id        BLOB NOT NULL CHECK (typeof(attachment_id) = 'blob' AND length(attachment_id) = 16 AND attachment_id <> zeroblob(16)),
+    -- Canonical unsigned big-endian u64. SQLite INTEGER cannot represent the
+    -- upper half of the wire domain without lossy signed coercion.
+    attachment_version   BLOB NOT NULL CHECK (typeof(attachment_version) = 'blob' AND length(attachment_version) = 8 AND attachment_version <> zeroblob(8)),
+    checksum             BLOB NOT NULL CHECK (typeof(checksum) = 'blob' AND length(checksum) = 32),
+    kind                 INTEGER NOT NULL CHECK (kind IN (1, 2, 3)),
+    acquired_at          INTEGER NOT NULL,
+    released_at          INTEGER,
+    PRIMARY KEY (session_id, client_submission_id, ordinal),
+    UNIQUE (session_id, client_submission_id, attachment_id),
+    CHECK (released_at IS NULL OR released_at >= acquired_at),
+    FOREIGN KEY (session_id, client_submission_id)
+      REFERENCES message_submission_receipts(session_id, client_submission_id) ON DELETE CASCADE
+);
+
 -- Large compaction records spill out of the inline event JSON as one canonical
 -- payload (brief + handoff + serialized tail). The `session_compacted` event
 -- remains authoritative and carries this opaque, session-scoped id.
@@ -2536,4 +2622,375 @@ BEFORE UPDATE ON sealed_action_grants
 WHEN NEW.use_epoch < OLD.use_epoch
 BEGIN
     SELECT RAISE(ABORT, 'sealed action grant use epoch is monotonic');
+END;
+
+-- ---- remote attachment operation ledger ----------------------------------
+-- Canonical request bytes and transport metadata are deliberately absent.
+-- The daemon retains only their SHA-256 digest and a bounded safe response.
+CREATE TABLE remote_attachment_operations (
+    logical_attachment_id          TEXT    NOT NULL CHECK (
+        length(logical_attachment_id) = 36 AND logical_attachment_id = lower(logical_attachment_id)
+        AND substr(logical_attachment_id, 9, 1) = '-' AND substr(logical_attachment_id, 14, 1) = '-'
+        AND substr(logical_attachment_id, 19, 1) = '-' AND substr(logical_attachment_id, 24, 1) = '-'
+        AND substr(logical_attachment_id, 20, 1) GLOB '[89ab]'
+        AND length(replace(logical_attachment_id, '-', '')) = 32
+        AND replace(logical_attachment_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+        AND replace(logical_attachment_id, '-', '') <> '00000000000000000000000000000000'
+    ),
+    operation_id                   TEXT    NOT NULL CHECK (
+        length(operation_id) = 36 AND operation_id = lower(operation_id)
+        AND substr(operation_id, 9, 1) = '-' AND substr(operation_id, 14, 1) = '-'
+        AND substr(operation_id, 15, 1) = '7'
+        AND substr(operation_id, 19, 1) = '-' AND substr(operation_id, 20, 1) GLOB '[89ab]'
+        AND substr(operation_id, 24, 1) = '-'
+        AND length(replace(operation_id, '-', '')) = 32
+        AND replace(operation_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+        AND replace(operation_id, '-', '') <> '00000000000000000000000000000000'
+    ),
+    authenticated_device_id        TEXT    NOT NULL CHECK (
+        length(authenticated_device_id) = 36 AND authenticated_device_id = lower(authenticated_device_id)
+        AND substr(authenticated_device_id, 9, 1) = '-' AND substr(authenticated_device_id, 14, 1) = '-'
+        AND substr(authenticated_device_id, 19, 1) = '-' AND substr(authenticated_device_id, 24, 1) = '-'
+        AND substr(authenticated_device_id, 20, 1) GLOB '[89ab]'
+        AND length(replace(authenticated_device_id, '-', '')) = 32
+        AND replace(authenticated_device_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+        AND replace(authenticated_device_id, '-', '') <> '00000000000000000000000000000000'
+    ),
+    authenticated_device_generation INTEGER NOT NULL CHECK (authenticated_device_generation > 0),
+    operation_seq                  INTEGER NOT NULL CHECK (operation_seq > 0),
+    operation_class                TEXT    NOT NULL CHECK (operation_class IN (
+        'transactional_mutation', 'idempotent_adapter_mutation', 'nonrepeatable_mutation'
+    )),
+    operation_kind                 TEXT    NOT NULL DEFAULT 'generic' CHECK (operation_kind IN ('generic','staged_rename')),
+    state                          TEXT    NOT NULL CHECK (state IN (
+        'reserved', 'dispatched', 'committed', 'rejected', 'outcome_unknown'
+    )),
+    dispatch_generation            INTEGER NOT NULL DEFAULT 0 CHECK (dispatch_generation >= 0),
+    request_hash                   BLOB    NOT NULL CHECK (length(request_hash) = 32),
+    safe_response                  BLOB CHECK (safe_response IS NULL OR length(safe_response) <= 524288),
+    event_high_water_mark          INTEGER CHECK (event_high_water_mark IS NULL OR event_high_water_mark >= 0),
+    created_at_ms                  INTEGER NOT NULL,
+    updated_at_ms                  INTEGER NOT NULL,
+    retire_at_ms                   INTEGER,
+    CHECK (
+        (state IN ('reserved', 'dispatched') AND safe_response IS NULL AND event_high_water_mark IS NULL)
+        OR (state IN ('committed', 'rejected') AND safe_response IS NOT NULL AND event_high_water_mark IS NOT NULL)
+        OR (state = 'outcome_unknown' AND safe_response IS NOT NULL)
+    ),
+    PRIMARY KEY (logical_attachment_id, operation_id),
+    UNIQUE (logical_attachment_id, operation_seq)
+);
+
+CREATE INDEX idx_remote_attachment_operations_retire
+    ON remote_attachment_operations (retire_at_ms)
+    WHERE retire_at_ms IS NOT NULL;
+
+CREATE TABLE remote_attachment_lifecycle (
+    logical_attachment_id TEXT PRIMARY KEY CHECK (
+        length(logical_attachment_id) = 36 AND logical_attachment_id = lower(logical_attachment_id)
+        AND substr(logical_attachment_id, 9, 1) = '-' AND substr(logical_attachment_id, 14, 1) = '-'
+        AND substr(logical_attachment_id, 19, 1) = '-' AND substr(logical_attachment_id, 24, 1) = '-'
+        AND substr(logical_attachment_id, 20, 1) GLOB '[89ab]'
+        AND length(replace(logical_attachment_id, '-', '')) = 32
+        AND replace(logical_attachment_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+        AND replace(logical_attachment_id, '-', '') <> '00000000000000000000000000000000'
+    ),
+    closed_at_ms INTEGER NOT NULL CHECK(closed_at_ms >= 0),
+    retain_until_ms INTEGER NOT NULL CHECK(retain_until_ms >= closed_at_ms),
+    CHECK(retain_until_ms - closed_at_ms = 2592000000)
+);
+
+CREATE TRIGGER remote_attachment_lifecycle_immutable
+BEFORE UPDATE ON remote_attachment_lifecycle
+BEGIN
+    SELECT RAISE(ABORT, 'remote attachment close authority is immutable');
+END;
+
+CREATE TABLE remote_rename_journal (
+    logical_attachment_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL UNIQUE CHECK (
+      length(artifact_id)=36 AND artifact_id=lower(artifact_id)
+      AND substr(artifact_id,9,1)='-' AND substr(artifact_id,14,1)='-'
+      AND substr(artifact_id,19,1)='-' AND substr(artifact_id,24,1)='-'
+      AND substr(artifact_id,20,1) GLOB '[89ab]'
+      AND length(replace(artifact_id,'-',''))=32
+      AND replace(artifact_id,'-','') NOT GLOB '*[^0-9a-f]*'
+      AND replace(artifact_id,'-','')<>'00000000000000000000000000000000'
+    ),
+    source_identity BLOB NOT NULL CHECK(length(source_identity) = 57 AND substr(source_identity,1,4)=X'52464931' AND ((substr(source_identity,29,1)=X'01' AND substr(hex(source_identity),79,1)='8') OR (substr(source_identity,29,1)=X'02' AND substr(hex(source_identity),79,1)='4')) AND substr(source_identity,50,8)<>zeroblob(8)),
+    source_parent_identity BLOB NOT NULL CHECK(length(source_parent_identity) = 57 AND substr(source_parent_identity,1,4)=X'52464931' AND substr(source_parent_identity,29,1)=X'02' AND substr(hex(source_parent_identity),79,1)='4' AND substr(source_parent_identity,50,8)<>zeroblob(8)),
+    target_parent_identity BLOB NOT NULL CHECK(length(target_parent_identity) = 57 AND substr(target_parent_identity,1,4)=X'52464931' AND substr(target_parent_identity,29,1)=X'02' AND substr(hex(target_parent_identity),79,1)='4' AND substr(target_parent_identity,50,8)<>zeroblob(8)),
+    observed_target_identity BLOB CHECK(observed_target_identity IS NULL OR (length(observed_target_identity)=57 AND substr(observed_target_identity,1,4)=X'52464931')),
+    dispatch_generation INTEGER NOT NULL CHECK(dispatch_generation > 0),
+    state TEXT NOT NULL CHECK(state IN ('prepared','artifact_synced','renamed','source_parent_synced','target_parent_synced','applied','applied_mismatch','effect_unknown','ledger_committed')),
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    CHECK((state='applied_mismatch') = (observed_target_identity IS NOT NULL)),
+    PRIMARY KEY(logical_attachment_id,operation_id),
+    FOREIGN KEY(logical_attachment_id,operation_id)
+      REFERENCES remote_attachment_operations(logical_attachment_id,operation_id) ON DELETE CASCADE
+);
+
+CREATE TRIGGER remote_rename_journal_insert_authority
+BEFORE INSERT ON remote_rename_journal
+WHEN NOT EXISTS (
+  SELECT 1 FROM remote_attachment_operations
+  WHERE logical_attachment_id=NEW.logical_attachment_id
+    AND operation_id=NEW.operation_id
+    AND operation_kind='staged_rename'
+    AND operation_class='idempotent_adapter_mutation'
+    AND state='dispatched'
+    AND dispatch_generation=NEW.dispatch_generation
+)
+BEGIN
+    SELECT RAISE(ABORT, 'remote rename journal requires staged rename authority');
+END;
+
+CREATE TRIGGER remote_rename_journal_guard
+BEFORE UPDATE ON remote_rename_journal
+WHEN NEW.logical_attachment_id IS NOT OLD.logical_attachment_id
+  OR NEW.operation_id IS NOT OLD.operation_id
+  OR NEW.artifact_id IS NOT OLD.artifact_id
+  OR NEW.source_identity IS NOT OLD.source_identity
+  OR NEW.source_parent_identity IS NOT OLD.source_parent_identity
+  OR NEW.target_parent_identity IS NOT OLD.target_parent_identity
+  OR (OLD.observed_target_identity IS NOT NULL AND NEW.observed_target_identity IS NOT OLD.observed_target_identity)
+  OR NEW.dispatch_generation < OLD.dispatch_generation
+  OR NEW.updated_at_ms < OLD.updated_at_ms
+  OR CASE OLD.state
+       WHEN 'prepared' THEN NEW.state NOT IN ('prepared','artifact_synced','effect_unknown')
+       WHEN 'artifact_synced' THEN NEW.state NOT IN ('artifact_synced','renamed','applied_mismatch','effect_unknown')
+       WHEN 'renamed' THEN NEW.state NOT IN ('renamed','source_parent_synced','effect_unknown')
+       WHEN 'source_parent_synced' THEN NEW.state NOT IN ('source_parent_synced','target_parent_synced','effect_unknown')
+       WHEN 'target_parent_synced' THEN NEW.state NOT IN ('target_parent_synced','applied','effect_unknown')
+       WHEN 'applied' THEN NEW.state NOT IN ('applied','ledger_committed')
+       WHEN 'applied_mismatch' THEN NEW.state <> OLD.state
+       WHEN 'effect_unknown' THEN NEW.state <> OLD.state
+       ELSE NEW.state <> OLD.state
+     END
+BEGIN
+    SELECT RAISE(ABORT, 'remote rename journal is immutable, monotonic, and generation bound');
+END;
+
+CREATE TABLE remote_rename_artifact_cleanup_intents (
+    logical_attachment_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    PRIMARY KEY(logical_attachment_id,operation_id),
+    FOREIGN KEY(logical_attachment_id,operation_id)
+      REFERENCES remote_rename_journal(logical_attachment_id,operation_id) ON DELETE CASCADE
+);
+
+CREATE TRIGGER remote_rename_artifact_cleanup_intents_immutable
+BEFORE UPDATE ON remote_rename_artifact_cleanup_intents
+BEGIN
+    SELECT RAISE(ABORT, 'remote rename artifact cleanup intent is immutable');
+END;
+
+CREATE TRIGGER remote_rename_journal_cleanup_obligation
+BEFORE DELETE ON remote_rename_journal
+WHEN EXISTS (
+    SELECT 1 FROM remote_rename_artifact_cleanup_intents
+    WHERE logical_attachment_id=OLD.logical_attachment_id
+      AND operation_id=OLD.operation_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'remote rename artifact cleanup remains outstanding');
+END;
+
+CREATE TRIGGER remote_attachment_operation_reservation_insert
+BEFORE INSERT ON remote_attachment_operations
+WHEN NEW.state <> 'reserved' OR NEW.safe_response IS NOT NULL OR NEW.event_high_water_mark IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'remote operation insert must be a bounded reservation');
+END;
+
+CREATE TRIGGER remote_attachment_operation_capacity_insert
+BEFORE INSERT ON remote_attachment_operations
+WHEN (SELECT COUNT(*) FROM remote_attachment_operations
+      WHERE logical_attachment_id = NEW.logical_attachment_id) >= 100000
+BEGIN
+    SELECT RAISE(ABORT, 'attachment_ledger_capacity');
+END;
+
+CREATE TRIGGER remote_attachment_operation_response_capacity
+BEFORE UPDATE OF safe_response ON remote_attachment_operations
+WHEN (SELECT COALESCE(SUM(length(safe_response)), 0)
+      FROM remote_attachment_operations
+      WHERE logical_attachment_id = NEW.logical_attachment_id)
+     - COALESCE(length(OLD.safe_response), 0)
+     + COALESCE(length(NEW.safe_response), 0) > 536870912
+BEGIN
+    SELECT RAISE(ABORT, 'attachment_ledger_capacity');
+END;
+
+-- Operation identity, actor binding, request digest, class, and sequence are
+-- immutable after reservation. Reuse with changed bytes or actor generation
+-- is resolved as a typed conflict by the reservation API, never by UPDATE.
+CREATE TRIGGER remote_attachment_operation_binding_immutable
+BEFORE UPDATE ON remote_attachment_operations
+WHEN NEW.logical_attachment_id IS NOT OLD.logical_attachment_id
+  OR NEW.operation_id IS NOT OLD.operation_id
+  OR NEW.authenticated_device_id IS NOT OLD.authenticated_device_id
+  OR NEW.authenticated_device_generation IS NOT OLD.authenticated_device_generation
+  OR NEW.operation_seq IS NOT OLD.operation_seq
+  OR NEW.operation_class IS NOT OLD.operation_class
+  OR (NEW.operation_kind IS NOT OLD.operation_kind AND NOT (
+      OLD.operation_kind='generic' AND NEW.operation_kind='staged_rename' AND OLD.state='reserved'
+  ))
+  OR NEW.request_hash IS NOT OLD.request_hash
+  OR NEW.created_at_ms IS NOT OLD.created_at_ms
+BEGIN
+    SELECT RAISE(ABORT, 'remote attachment operation binding is immutable');
+END;
+
+CREATE TRIGGER remote_attachment_operation_transition_guard
+BEFORE UPDATE ON remote_attachment_operations
+WHEN (OLD.state NOT IN ('reserved', 'dispatched') AND NEW.state <> OLD.state)
+  OR (OLD.state = 'reserved' AND NEW.state NOT IN ('reserved', 'dispatched', 'committed', 'rejected', 'outcome_unknown'))
+  OR (OLD.state = 'dispatched' AND NEW.state NOT IN ('dispatched', 'committed', 'rejected', 'outcome_unknown'))
+  OR NEW.dispatch_generation < OLD.dispatch_generation
+  OR NEW.updated_at_ms < OLD.updated_at_ms
+  OR (OLD.safe_response IS NOT NULL AND NEW.safe_response IS NOT OLD.safe_response)
+  OR (OLD.event_high_water_mark IS NOT NULL
+      AND (NEW.event_high_water_mark IS NULL OR NEW.event_high_water_mark < OLD.event_high_water_mark))
+  OR (OLD.retire_at_ms IS NOT NULL
+      AND (NEW.retire_at_ms IS NULL OR NEW.retire_at_ms <> OLD.retire_at_ms))
+  OR (NEW.state IN ('committed', 'rejected') AND NOT EXISTS (
+      SELECT 1 FROM remote_attachment_outbox
+      WHERE logical_attachment_id = OLD.logical_attachment_id
+        AND operation_seq = OLD.operation_seq
+        AND event_seq = NEW.event_high_water_mark
+  ))
+BEGIN
+    SELECT RAISE(ABORT, 'illegal remote attachment operation transition');
+END;
+
+CREATE TABLE remote_attachment_outbox (
+    logical_attachment_id TEXT    NOT NULL,
+    event_seq              INTEGER NOT NULL CHECK (event_seq > 0),
+    delivery_id            TEXT    NOT NULL CHECK (
+        length(delivery_id) = 36 AND delivery_id = lower(delivery_id)
+        AND substr(delivery_id, 9, 1) = '-' AND substr(delivery_id, 14, 1) = '-'
+        AND substr(delivery_id, 19, 1) = '-' AND substr(delivery_id, 20, 1) GLOB '[89ab]'
+        AND substr(delivery_id, 24, 1) = '-'
+        AND length(replace(delivery_id, '-', '')) = 32
+        AND replace(delivery_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+        AND replace(delivery_id, '-', '') <> '00000000000000000000000000000000'
+    ),
+    operation_seq          INTEGER CHECK (operation_seq IS NULL OR operation_seq > 0),
+    kind                   TEXT    NOT NULL CHECK (length(kind) BETWEEN 1 AND 255),
+    canonical_payload      BLOB    NOT NULL CHECK (length(canonical_payload) <= 524288),
+    created_at_ms          INTEGER NOT NULL,
+    PRIMARY KEY (logical_attachment_id, event_seq),
+    UNIQUE (logical_attachment_id, delivery_id),
+    FOREIGN KEY (logical_attachment_id, operation_seq)
+        REFERENCES remote_attachment_operations(logical_attachment_id, operation_seq)
+        ON DELETE RESTRICT
+);
+
+CREATE INDEX idx_remote_attachment_outbox_operation
+    ON remote_attachment_outbox (logical_attachment_id, operation_seq)
+    WHERE operation_seq IS NOT NULL;
+
+-- Delivery attempts are consumer-local and never authorize replay compaction.
+-- The immutable event row remains the sole application replay authority.
+CREATE TABLE remote_attachment_outbox_deliveries (
+    logical_attachment_id TEXT NOT NULL,
+    delivery_id TEXT NOT NULL,
+    consumer_kind TEXT NOT NULL CHECK (length(consumer_kind) BETWEEN 1 AND 64),
+    state TEXT NOT NULL CHECK (state IN ('leased', 'acked')),
+    lease_id TEXT CHECK (lease_id IS NULL OR (
+        length(lease_id) = 36 AND lease_id = lower(lease_id)
+        AND substr(lease_id, 9, 1) = '-' AND substr(lease_id, 14, 1) = '-'
+        AND substr(lease_id, 19, 1) = '-' AND substr(lease_id, 20, 1) GLOB '[89ab]'
+        AND substr(lease_id, 24, 1) = '-'
+        AND length(replace(lease_id, '-', '')) = 32
+        AND replace(lease_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+        AND replace(lease_id, '-', '') <> '00000000000000000000000000000000'
+    )),
+    lease_expires_at_ms INTEGER,
+    attempts INTEGER NOT NULL CHECK (attempts BETWEEN 1 AND 1000000),
+    first_claimed_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    acked_at_ms INTEGER,
+    PRIMARY KEY (logical_attachment_id, delivery_id, consumer_kind),
+    FOREIGN KEY (logical_attachment_id, delivery_id)
+        REFERENCES remote_attachment_outbox(logical_attachment_id, delivery_id)
+        ON DELETE CASCADE,
+    CHECK ((state = 'leased' AND lease_id IS NOT NULL AND lease_expires_at_ms IS NOT NULL AND acked_at_ms IS NULL)
+        OR (state = 'acked' AND lease_id IS NULL AND lease_expires_at_ms IS NULL AND acked_at_ms IS NOT NULL)),
+    CHECK (updated_at_ms >= first_claimed_at_ms),
+    CHECK (acked_at_ms IS NULL OR acked_at_ms >= first_claimed_at_ms)
+);
+
+CREATE INDEX idx_remote_attachment_outbox_deliveries_claim
+    ON remote_attachment_outbox_deliveries (consumer_kind, state, lease_expires_at_ms);
+
+CREATE TRIGGER remote_attachment_outbox_delivery_monotonic
+BEFORE UPDATE ON remote_attachment_outbox_deliveries
+WHEN NEW.logical_attachment_id <> OLD.logical_attachment_id
+  OR NEW.delivery_id <> OLD.delivery_id
+  OR NEW.consumer_kind <> OLD.consumer_kind
+  OR NEW.first_claimed_at_ms <> OLD.first_claimed_at_ms
+  OR NEW.attempts < OLD.attempts
+  OR NEW.updated_at_ms < OLD.updated_at_ms
+  OR OLD.state = 'acked'
+BEGIN
+    SELECT RAISE(ABORT, 'illegal remote outbox delivery transition');
+END;
+
+CREATE TRIGGER remote_attachment_outbox_capacity_insert
+BEFORE INSERT ON remote_attachment_outbox
+WHEN (SELECT COUNT(*) FROM remote_attachment_outbox
+      WHERE logical_attachment_id = NEW.logical_attachment_id) >= 200000
+  OR (SELECT COALESCE(SUM(length(canonical_payload)), 0)
+      FROM remote_attachment_outbox
+      WHERE logical_attachment_id = NEW.logical_attachment_id)
+     + length(NEW.canonical_payload) > 2147483648
+BEGIN
+    SELECT RAISE(ABORT, 'attachment_outbox_capacity');
+END;
+
+CREATE TRIGGER remote_attachment_outbox_immutable
+BEFORE UPDATE ON remote_attachment_outbox
+BEGIN
+    SELECT RAISE(ABORT, 'remote attachment outbox is append-only');
+END;
+
+CREATE TRIGGER remote_attachment_outbox_delete_forbidden
+BEFORE DELETE ON remote_attachment_outbox
+WHEN NOT EXISTS (
+    SELECT 1 FROM remote_attachment_outbox_snapshots
+    WHERE logical_attachment_id = OLD.logical_attachment_id
+      AND compacted_through_event_seq >= OLD.event_seq
+)
+BEGIN
+    SELECT RAISE(ABORT, 'remote attachment outbox deletion lacks snapshot authority');
+END;
+
+CREATE TABLE remote_attachment_outbox_snapshots (
+    logical_attachment_id       TEXT PRIMARY KEY CHECK (
+        length(logical_attachment_id) = 36 AND logical_attachment_id = lower(logical_attachment_id)
+        AND substr(logical_attachment_id, 9, 1) = '-' AND substr(logical_attachment_id, 14, 1) = '-'
+        AND substr(logical_attachment_id, 19, 1) = '-' AND substr(logical_attachment_id, 24, 1) = '-'
+        AND substr(logical_attachment_id, 20, 1) GLOB '[89ab]'
+        AND length(replace(logical_attachment_id, '-', '')) = 32
+        AND replace(logical_attachment_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+        AND replace(logical_attachment_id, '-', '') <> '00000000000000000000000000000000'
+    ),
+    compacted_through_event_seq INTEGER NOT NULL CHECK (compacted_through_event_seq >= 0),
+    snapshot_high_water_mark    INTEGER NOT NULL CHECK (snapshot_high_water_mark >= compacted_through_event_seq),
+    updated_at_ms               INTEGER NOT NULL
+);
+
+CREATE TRIGGER remote_attachment_snapshot_monotonic
+BEFORE UPDATE ON remote_attachment_outbox_snapshots
+WHEN NEW.compacted_through_event_seq < OLD.compacted_through_event_seq
+  OR NEW.snapshot_high_water_mark < OLD.snapshot_high_water_mark
+  OR NEW.updated_at_ms < OLD.updated_at_ms
+BEGIN
+    SELECT RAISE(ABORT, 'remote attachment snapshot cursor is monotonic');
 END;

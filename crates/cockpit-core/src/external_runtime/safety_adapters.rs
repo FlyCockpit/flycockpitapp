@@ -204,13 +204,15 @@ fn bubblewrap_descriptor() -> Result<ExternalRuntimeDescriptor, super::schema::S
     ExternalRuntimeDescriptor::builder(ID_BUBBLEWRAP)
         .owner("cockpit-core", "shell-sandbox")
         .candidates(["bwrap"])
-        .applicability(Applicability::Platforms(vec![
-            HostPlatform::DebianUbuntu,
-            HostPlatform::FedoraRhel,
-            HostPlatform::Arch,
-            HostPlatform::GenericLinux,
-            HostPlatform::OtherUnix,
-        ]))
+        .applicability(Applicability::WhenFeatureSelectedOnPlatforms {
+            platforms: vec![
+                HostPlatform::DebianUbuntu,
+                HostPlatform::FedoraRhel,
+                HostPlatform::Arch,
+                HostPlatform::GenericLinux,
+                HostPlatform::OtherUnix,
+            ],
+        })
         .importance(DependencyImportance::RequiredWhenFeatureSelected)
         .target(ExecutionTarget::Host)
         .probe_policy(version_first_line())
@@ -267,6 +269,20 @@ fn podman_descriptor() -> Result<ExternalRuntimeDescriptor, super::schema::Schem
             ),
         ))
         .build()
+}
+
+/// Exact mode-aware engine roster for one diagnostics invocation. Disabled
+/// contributes no engine rows; explicit modes contribute only their selected
+/// engine; Auto contributes both alternatives.
+pub(crate) fn container_engine_descriptors(
+    mode: ContainerEngineMode,
+) -> Result<Vec<ExternalRuntimeDescriptor>, super::schema::SchemaError> {
+    match mode {
+        ContainerEngineMode::Disabled => Ok(Vec::new()),
+        ContainerEngineMode::Docker => Ok(vec![docker_descriptor()?]),
+        ContainerEngineMode::Podman => Ok(vec![podman_descriptor()?]),
+        ContainerEngineMode::Auto => Ok(vec![docker_descriptor()?, podman_descriptor()?]),
+    }
 }
 
 fn computer_leaf(
@@ -663,6 +679,33 @@ pub fn refresh_safety_snapshot(
     generation: u64,
     mode: ContainerEngineMode,
 ) -> ExternalRuntimeSnapshot {
+    refresh_safety_snapshot_with_observer(
+        registry,
+        executor,
+        path_env,
+        cwd,
+        ctx,
+        deadlines,
+        cancel,
+        generation,
+        mode,
+        |_| {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn refresh_safety_snapshot_with_observer(
+    registry: &ExternalRuntimeRegistry,
+    executor: &dyn ProbeExecutor,
+    path_env: Option<&str>,
+    cwd: &Path,
+    ctx: &EvaluationContext,
+    deadlines: ProbeDeadlines,
+    cancel: &CancelToken,
+    generation: u64,
+    mode: ContainerEngineMode,
+    mut observer: impl FnMut(&ExternalRuntimeSnapshot),
+) -> ExternalRuntimeSnapshot {
     let _ = ensure_container_engine_adapters_registered(registry);
     let descriptors: Vec<_> = known_safety_adapter_ids()
         .iter()
@@ -677,23 +720,44 @@ pub fn refresh_safety_snapshot(
             ContainerEngineMode::Podman => id == ID_DOCKER,
             ContainerEngineMode::Auto => false,
         };
-        if skip_container {
-            entries.insert(
-                id.to_string(),
-                HealthEntry {
-                    id: descriptor.id.clone(),
-                    state: HealthState::NotApplicable,
-                    importance: descriptor.importance,
-                    target: descriptor.target,
-                    remedy: None,
-                    platform: ctx.platform,
+        entries.insert(
+            id.to_string(),
+            HealthEntry {
+                id: descriptor.id.clone(),
+                state: if skip_container {
+                    HealthState::NotApplicable
+                } else {
+                    HealthState::Pending
                 },
-            );
+                importance: descriptor.importance,
+                target: descriptor.target,
+                remedy: (!skip_container).then(|| descriptor.remedy.clone()),
+                platform: ctx.platform,
+            },
+        );
+    }
+    observer(&ExternalRuntimeSnapshot {
+        generation,
+        platform: ctx.platform,
+        entries: entries.clone(),
+        groups: BTreeMap::new(),
+    });
+    for descriptor in &descriptors {
+        if entries
+            .get(descriptor.id.as_str())
+            .is_some_and(|entry| matches!(entry.state, HealthState::NotApplicable))
+        {
             continue;
         }
         let entry =
             evaluate_descriptor(descriptor, executor, path_env, cwd, ctx, deadlines, cancel);
         entries.insert(descriptor.id.as_str().to_string(), entry);
+        observer(&ExternalRuntimeSnapshot {
+            generation,
+            platform: ctx.platform,
+            entries: entries.clone(),
+            groups: BTreeMap::new(),
+        });
     }
     let mut snapshot = ExternalRuntimeSnapshot {
         generation,
@@ -732,7 +796,12 @@ pub fn publish_safety_refresh(
     let snapshot = refresh_safety_snapshot(
         registry, executor, path_env, cwd, ctx, deadlines, cancel, generation, mode,
     );
-    if store.publish(snapshot.clone()) {
+    let descriptors = registry
+        .descriptors()
+        .into_iter()
+        .filter(|descriptor| snapshot.entries.contains_key(descriptor.id.as_str()))
+        .collect();
+    if store.publish_bundle(snapshot.clone(), descriptors) {
         Some(snapshot)
     } else {
         None
@@ -1422,6 +1491,33 @@ mod tests {
             launch.availability.runtime,
             Some(ContainerRuntimeKind::Docker)
         );
+
+        let bundled_store = HealthSnapshotStore::new();
+        let published = publish_safety_refresh(
+            &bundled_store,
+            &registry,
+            &executor_new,
+            None,
+            Path::new("/"),
+            &ctx,
+            ProbeDeadlines::default(),
+            &CancelToken::new(),
+            ContainerEngineMode::Docker,
+        )
+        .expect("latest safety refresh publishes");
+        let (bundled, descriptors) = bundled_store.current_bundle().expect("atomic bundle");
+        assert!(
+            bundled_store.current_complete_bundle().is_none(),
+            "a safety-only refresh is not a complete dependency catalog"
+        );
+        assert_eq!(bundled, std::sync::Arc::new(published));
+        let descriptor_ids: std::collections::BTreeSet<_> = descriptors
+            .iter()
+            .map(|descriptor| descriptor.id.as_str())
+            .collect();
+        let entry_ids: std::collections::BTreeSet<_> =
+            bundled.entries.keys().map(String::as_str).collect();
+        assert_eq!(descriptor_ids, entry_ids);
 
         // Cancellation during probe → Unknown, not available for launch.
         let cancel = CancelToken::new();

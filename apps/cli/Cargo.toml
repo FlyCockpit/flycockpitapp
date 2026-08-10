@@ -176,11 +176,6 @@ zerobox = { workspace = true }
 aho-corasick = { workspace = true }
 dotenvy = { workspace = true }
 
-# Tokenizer (cl100k_base) — used as the fallback counter when the
-# active provider doesn't expose its own. Singleton-backed; the BPE
-# vocab is built once on first call.
-tiktoken-rs = { workspace = true }
-
 # Cross-platform sleep-assertion crate for `/caffeinate` (daemon holds
 # the assertion). Pure-Rust: `SetThreadExecutionState` (Windows),
 # `IOPMAssertionCreateWithName` (macOS), logind `idle`/`sleep`

@@ -12,20 +12,26 @@
 //! into the five [`super::category`] pages, and these drill-ins were
 //! re-homed under the categories where their fields now live.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use unicode_width::UnicodeWidthStr;
 
 use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
 use cockpit_config::providers::ProvidersConfig;
 
 use super::grab;
-use super::shell::{SettingsScrollStates, push_wrapped_text, selected_line_from_marker};
-use super::{Nav, SettingsCx, SettingsPage, save_status};
+use super::pointer_actions::{
+    ListAction, ListKind, ListRowId, SettingsPointerAction, UtilityModelAction,
+};
+use super::shell::{
+    SettingsPointerSurface, SettingsPointerTarget, SettingsScrollRegionId, SettingsScrollStates,
+    push_wrapped_text, selected_line_from_marker,
+};
+use super::{Nav, RowDeleteConfirm, SettingsCx, SettingsPage, save_status};
 
 // ── Utility-model picker ─────────────────────────────────────────────────
 
@@ -163,6 +169,7 @@ pub(crate) struct InstructionsPage {
     pub(super) cursor: usize,
     pub(super) grabbed: Option<GrabState>,
     pub(super) status: Option<String>,
+    pub(super) delete: RowDeleteConfirm,
 }
 
 impl InstructionsPage {
@@ -171,6 +178,7 @@ impl InstructionsPage {
             cursor: 0,
             grabbed: None,
             status: None,
+            delete: RowDeleteConfirm::default(),
         }
     }
 }
@@ -182,6 +190,7 @@ pub(crate) struct RedactPatternsPage {
     pub(super) cursor: usize,
     pub(super) grabbed: Option<GrabState>,
     pub(super) status: Option<String>,
+    pub(super) delete: RowDeleteConfirm,
 }
 
 impl RedactPatternsPage {
@@ -190,6 +199,7 @@ impl RedactPatternsPage {
             cursor: 0,
             grabbed: None,
             status: None,
+            delete: RowDeleteConfirm::default(),
         }
     }
 }
@@ -264,20 +274,27 @@ impl SettingsCx {
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 p.cursor = crate::tui::nav::wrap_prev(p.cursor, nav_len);
+                p.delete.disarm();
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 p.cursor = crate::tui::nav::wrap_next(p.cursor, nav_len);
+                p.delete.disarm();
             }
-            KeyCode::Char('a') => self.start_instructions_grab_on_new(p),
+            KeyCode::Char('a') => {
+                p.delete.disarm();
+                self.start_instructions_grab_on_new(p);
+            }
             KeyCode::Char('d') | KeyCode::Delete
                 if p.cursor < self.extended.agent_guidance_files.len() =>
             {
+                p.delete.disarm();
                 self.extended.agent_guidance_files.remove(p.cursor);
                 let total = self.extended.agent_guidance_files.len();
                 p.cursor = p.cursor.min(total.saturating_sub(1));
                 p.status = save_status(self.save_extended());
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                p.delete.disarm();
                 if p.cursor < self.extended.agent_guidance_files.len() {
                     let cur = self.extended.agent_guidance_files[p.cursor].clone();
                     p.grabbed = Some(GrabState::existing(cur, p.cursor));
@@ -286,7 +303,9 @@ impl SettingsCx {
                     self.start_instructions_grab_on_new(p);
                 }
             }
-            _ => {}
+            _ => {
+                p.delete.disarm();
+            }
         }
         Nav::Stay
     }
@@ -364,6 +383,7 @@ impl SettingsCx {
     ) {
         render_grab_list(
             &self.scroll_states,
+            &self.pointer_surface,
             "instructions",
             frame,
             area,
@@ -376,6 +396,7 @@ impl SettingsCx {
             "[+ add filename]",
             "  (type filename)",
             p.status.as_deref(),
+            &p.delete,
         );
     }
 
@@ -422,20 +443,27 @@ impl SettingsCx {
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 p.cursor = crate::tui::nav::wrap_prev(p.cursor, nav_len);
+                p.delete.disarm();
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 p.cursor = crate::tui::nav::wrap_next(p.cursor, nav_len);
+                p.delete.disarm();
             }
-            KeyCode::Char('a') => self.start_redact_pattern_grab_on_new(p),
+            KeyCode::Char('a') => {
+                p.delete.disarm();
+                self.start_redact_pattern_grab_on_new(p);
+            }
             KeyCode::Char('d') | KeyCode::Delete
                 if p.cursor < self.extended.redact.dotenv_patterns.len() =>
             {
+                p.delete.disarm();
                 self.extended.redact.dotenv_patterns.remove(p.cursor);
                 let total = self.extended.redact.dotenv_patterns.len();
                 p.cursor = p.cursor.min(total.saturating_sub(1));
                 p.status = save_status(self.save_extended());
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                p.delete.disarm();
                 if p.cursor < self.extended.redact.dotenv_patterns.len() {
                     let cur = self.extended.redact.dotenv_patterns[p.cursor].clone();
                     p.grabbed = Some(GrabState::existing(cur, p.cursor));
@@ -444,7 +472,7 @@ impl SettingsCx {
                     self.start_redact_pattern_grab_on_new(p);
                 }
             }
-            _ => {}
+            _ => p.delete.disarm(),
         }
         Nav::Stay
     }
@@ -524,6 +552,7 @@ impl SettingsCx {
     ) {
         render_grab_list(
             &self.scroll_states,
+            &self.pointer_surface,
             "redact-patterns",
             frame,
             area,
@@ -537,6 +566,7 @@ impl SettingsCx {
             "[+ add pattern]",
             "  (type pattern)",
             p.status.as_deref(),
+            &p.delete,
         );
     }
 
@@ -547,10 +577,13 @@ impl SettingsCx {
         frame: &mut Frame,
         area: Rect,
         picker: &UtilityModelPicker,
+        target: super::category::SettingId,
     ) {
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
         let yellow = Style::default().fg(Color::Yellow);
+        let pointer_enabled = self.pointer_surface.enabled.get();
         let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut bindings = Vec::new();
 
         lines.push(Line::from(Span::styled(
             "Utility model — picks the cheap background model".to_string(),
@@ -565,6 +598,10 @@ impl SettingsCx {
                     muted,
                 )));
                 let (before, after) = buf.split_at_cursor();
+                bindings.push((
+                    lines.len(),
+                    SettingsPointerAction::UtilityModel(UtilityModelAction::EditCustom),
+                ));
                 lines.push(Line::from(vec![
                     Span::styled("› ".to_string(), muted),
                     Span::styled(before.to_string(), Style::default().fg(Color::White)),
@@ -580,8 +617,28 @@ impl SettingsCx {
                         muted,
                     )));
                 }
+                bindings.push((
+                    lines.len(),
+                    SettingsPointerAction::UtilityModel(UtilityModelAction::CommitCustom),
+                ));
                 lines.push(Line::from(Span::styled(
-                    "enter: accept (blank clears)  esc: back".to_string(),
+                    if pointer_enabled {
+                        "[Save custom]"
+                    } else {
+                        "Save custom"
+                    },
+                    muted,
+                )));
+                bindings.push((
+                    lines.len(),
+                    SettingsPointerAction::UtilityModel(UtilityModelAction::CancelCustom),
+                ));
+                lines.push(Line::from(Span::styled(
+                    if pointer_enabled {
+                        "[Cancel]"
+                    } else {
+                        "Cancel"
+                    },
                     muted,
                 )));
             }
@@ -607,17 +664,34 @@ impl SettingsCx {
                 } else {
                     ""
                 };
+                bindings.push((
+                    lines.len(),
+                    SettingsPointerAction::UtilityModel(UtilityModelAction::Clear),
+                ));
                 lines.push(Line::from(vec![
                     Span::raw(if clear_active { "▸ " } else { "  " }),
                     Span::styled(
-                        format!("[clear — unset]{clear_suffix}"),
+                        if pointer_enabled {
+                            format!("[clear — unset]{clear_suffix}")
+                        } else {
+                            format!("clear — unset{clear_suffix}")
+                        },
                         action_style(clear_active),
                     ),
                 ]));
+                bindings.push((
+                    lines.len(),
+                    SettingsPointerAction::UtilityModel(UtilityModelAction::OpenCustom),
+                ));
                 lines.push(Line::from(vec![
                     Span::raw(if custom_active { "▸ " } else { "  " }),
                     Span::styled(
-                        "[custom provider:model-id…]".to_string(),
+                        if pointer_enabled {
+                            "[custom provider:model-id…]"
+                        } else {
+                            "custom provider:model-id…"
+                        }
+                        .to_string(),
                         action_style(custom_active),
                     ),
                 ]));
@@ -657,7 +731,31 @@ impl SettingsCx {
                     if !suffix.is_empty() {
                         spans.push(Span::styled(suffix.to_string(), yellow));
                     }
+                    bindings.push((
+                        lines.len(),
+                        SettingsPointerAction::UtilityModel(UtilityModelAction::Select(
+                            super::pointer_actions::UtilityModelId(value.clone()),
+                        )),
+                    ));
                     lines.push(Line::from(spans));
+                }
+
+                if let Some(entry) = cursor
+                    .checked_sub(PICKER_ACTION_ROWS)
+                    .and_then(|index| picker.entries.get(index))
+                    .or_else(|| picker.entries.first())
+                {
+                    lines.push(Line::default());
+                    bindings.push((
+                        lines.len(),
+                        SettingsPointerAction::Category(
+                            super::pointer_actions::CategoryAction::PickerSelect(
+                                target,
+                                super::pointer_actions::PickerOptionId(entry.value()),
+                            ),
+                        ),
+                    ));
+                    lines.push(Line::from("[Select highlighted model]"));
                 }
 
                 lines.push(Line::default());
@@ -665,10 +763,27 @@ impl SettingsCx {
                     "↑/↓  enter: select  esc: cancel".to_string(),
                     muted,
                 )));
+                bindings.push((
+                    lines.len(),
+                    SettingsPointerAction::UtilityModel(UtilityModelAction::Back),
+                ));
+                lines.push(Line::from("[Back]"));
             }
         }
 
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        let selected_line = selected_line_from_marker(&lines);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "category:utility-picker",
+            (lines, selected_line),
+            bindings,
+            (
+                &self.pointer_surface,
+                SettingsScrollRegionId("category:utility-picker"),
+            )
+                .into(),
+        );
     }
 }
 
@@ -676,6 +791,7 @@ impl SettingsCx {
 #[allow(clippy::too_many_arguments)]
 fn render_grab_list(
     scroll_states: &SettingsScrollStates,
+    pointer_surface: &SettingsPointerSurface,
     key: &'static str,
     frame: &mut Frame,
     area: Rect,
@@ -687,6 +803,7 @@ fn render_grab_list(
     add_label: &str,
     empty_hint: &str,
     status: Option<&str>,
+    delete: &RowDeleteConfirm,
 ) {
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
     let yellow = Style::default().fg(Color::Yellow);
@@ -697,8 +814,12 @@ fn render_grab_list(
         )),
         Line::default(),
     ];
+    let mut controls = vec![None; lines.len()];
+    let mut confirmation_lines = Vec::new();
     push_wrapped_text(&mut lines, area.width, intro, muted);
+    controls.resize(lines.len(), None);
     lines.push(Line::default());
+    controls.push(None);
 
     for (i, item) in items.iter().enumerate() {
         let is_grabbed = grabbed.is_some() && i == cursor;
@@ -709,6 +830,11 @@ fn render_grab_list(
                 grabbed.buf.text(),
                 grabbed.buf.cursor(),
                 empty_hint,
+            )));
+            controls.push(Some((
+                SettingsPointerAction::List(ListAction::Edit(grab_list_row_id(key, i, item))),
+                true,
+                None,
             )));
             continue;
         }
@@ -726,6 +852,28 @@ fn render_grab_list(
             Span::raw(marker),
             Span::styled(item.clone(), style),
         ]));
+        controls.push(Some((
+            SettingsPointerAction::List(ListAction::Edit(grab_list_row_id(key, i, item))),
+            true,
+            None,
+        )));
+        let id = grab_list_row_id(key, i, item);
+        let pending = delete.is_pending_for(i);
+        lines.push(Line::from(if pending {
+            format!("    Delete {item}? [Delete] [Cancel]")
+        } else {
+            format!("    [Delete {item}]")
+        }));
+        if pending {
+            controls.push(None);
+            confirmation_lines.push((lines.len() - 1, 13 + item.as_str().width(), id));
+        } else {
+            controls.push(Some((
+                SettingsPointerAction::List(ListAction::Delete(id)),
+                true,
+                None,
+            )));
+        }
     }
 
     if grabbed.is_none() {
@@ -745,29 +893,206 @@ fn render_grab_list(
             Span::raw(marker),
             Span::styled(add_label.to_string(), style),
         ]));
+        controls.push(Some((
+            SettingsPointerAction::List(ListAction::Add),
+            true,
+            None,
+        )));
     }
 
     if grabbed.is_some() {
         lines.push(Line::default());
+        controls.push(None);
+        let can_up = cursor > 0;
+        let can_down = cursor + 1 < items.len();
+        let row_id = grab_list_row_id(key, cursor, &items[cursor]);
+        for (action, label, enabled, reason) in [
+            (
+                ListAction::MoveUp(row_id.clone()),
+                "[Move up]",
+                can_up,
+                "already first",
+            ),
+            (
+                ListAction::MoveDown(row_id),
+                "[Move down]",
+                can_down,
+                "already last",
+            ),
+            (ListAction::Save, "[Save]", true, ""),
+            (ListAction::Cancel, "[Cancel]", true, ""),
+        ] {
+            lines.push(Line::from(label));
+            controls.push(Some((
+                SettingsPointerAction::List(action),
+                enabled,
+                (!enabled).then_some(reason),
+            )));
+        }
         lines.push(grab::grab_hint_line(grab::GRAB_HINT));
+        controls.push(None);
     }
 
     if let Some(status) = status {
         lines.push(Line::default());
+        controls.push(None);
         lines.push(Line::from(Span::styled(status.to_string(), yellow)));
+        controls.push(None);
     }
 
     let selected_line = selected_line_from_marker(&lines);
-    scroll_states.render_lines(frame, area, key, lines, selected_line);
+    scroll_states.render_control_lines(
+        frame,
+        area,
+        key,
+        (lines, selected_line),
+        controls,
+        (pointer_surface, SettingsScrollRegionId(key)).into(),
+    );
+    let offset = scroll_states.offset_for(key);
+    for (line, delete_column, id) in confirmation_lines {
+        if let Some(row) = line
+            .checked_sub(offset)
+            .filter(|row| *row < usize::from(area.height))
+        {
+            for (column, action) in [
+                (delete_column, ListAction::Delete(id.clone())),
+                (delete_column + 9, ListAction::Cancel),
+            ] {
+                pointer_surface.register(SettingsPointerTarget {
+                    rect: Rect::new(
+                        area.x.saturating_add(column as u16),
+                        area.y.saturating_add(row as u16),
+                        8,
+                        1,
+                    ),
+                    action: super::shell::SettingsPointerAction::Page(SettingsPointerAction::List(
+                        action,
+                    )),
+                    enabled: true,
+                    disabled_reason: None,
+                });
+            }
+        }
+    }
+}
+
+fn grab_list_row_id(key: &str, index: usize, value: &str) -> ListRowId {
+    let kind = match key {
+        "instructions" => ListKind::Instructions,
+        "redact-patterns" => ListKind::RedactPatterns,
+        _ => unreachable!("list source key is sealed by its page"),
+    };
+    ListRowId {
+        kind,
+        index,
+        value: value.into(),
+    }
 }
 
 impl SettingsPage for InstructionsPage {
+    fn pointer_surface_kind(&self) -> super::SettingsPointerSurfaceKind {
+        super::SettingsPointerSurfaceKind::Instructions
+    }
+
+    fn resolve_header_back(&self) -> super::SettingsLocalBack {
+        if self.grabbed.is_some() {
+            super::SettingsLocalBack::LocalBack
+        } else {
+            super::SettingsLocalBack::NoLocalBack
+        }
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         cx.handle_instructions_page_key(key, self)
     }
 
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         cx.render_instructions_page(frame, area, self);
+    }
+
+    fn handle_pointer_control(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: SettingsPointerAction,
+    ) -> Nav {
+        let SettingsPointerAction::List(action) = action else {
+            return Nav::Stay;
+        };
+        if self.grabbed.is_some() {
+            let current = cx
+                .extended
+                .agent_guidance_files
+                .get(self.cursor)
+                .map(|value| grab_list_row_id("instructions", self.cursor, value));
+            let key = match action {
+                ListAction::MoveUp(id) if current.as_ref() == Some(&id) => KeyCode::Up,
+                ListAction::MoveDown(id) if current.as_ref() == Some(&id) => KeyCode::Down,
+                ListAction::Save => KeyCode::Enter,
+                ListAction::Cancel => KeyCode::Esc,
+                _ => return Nav::Stay,
+            };
+            return cx.handle_instructions_page_key(KeyEvent::new(key, KeyModifiers::NONE), self);
+        }
+        let index = match action {
+            ListAction::Add => cx.extended.agent_guidance_files.len(),
+            ListAction::Edit(id) => cx
+                .extended
+                .agent_guidance_files
+                .iter()
+                .enumerate()
+                .position(|(index, value)| grab_list_row_id("instructions", index, value) == id)
+                .unwrap_or(usize::MAX),
+            ListAction::Delete(id) => {
+                let Some(index) = cx
+                    .extended
+                    .agent_guidance_files
+                    .iter()
+                    .enumerate()
+                    .position(|(index, value)| {
+                        grab_list_row_id("instructions", index, value) == id
+                    })
+                else {
+                    return Nav::Stay;
+                };
+                self.cursor = index;
+                if self.delete.arm_or_confirm(index) {
+                    cx.extended.agent_guidance_files.remove(index);
+                    self.cursor =
+                        index.min(cx.extended.agent_guidance_files.len().saturating_sub(1));
+                    self.status = save_status(cx.save_extended());
+                } else {
+                    self.status = Some("confirm deletion or cancel".into());
+                }
+                return Nav::Stay;
+            }
+            ListAction::Cancel if self.delete.is_pending_for(self.cursor) => {
+                self.delete.disarm();
+                self.status = None;
+                return Nav::Stay;
+            }
+            _ => return Nav::Stay,
+        };
+        if index > cx.extended.agent_guidance_files.len() {
+            return Nav::Stay;
+        }
+        self.cursor = index;
+        cx.handle_instructions_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
+    }
+
+    fn handle_pointer_scroll(
+        &mut self,
+        cx: &mut SettingsCx,
+        region: SettingsScrollRegionId,
+        delta: isize,
+    ) -> Nav {
+        if region == SettingsScrollRegionId("instructions") && self.grabbed.is_none() {
+            self.cursor = self
+                .cursor
+                .saturating_add_signed(delta)
+                .min(cx.extended.agent_guidance_files.len());
+        }
+        Nav::Stay
     }
 
     fn title(&self, cx: &SettingsCx) -> String {
@@ -798,12 +1123,112 @@ impl SettingsPage for InstructionsPage {
 }
 
 impl SettingsPage for RedactPatternsPage {
+    fn pointer_surface_kind(&self) -> super::SettingsPointerSurfaceKind {
+        super::SettingsPointerSurfaceKind::RedactPatterns
+    }
+
+    fn resolve_header_back(&self) -> super::SettingsLocalBack {
+        if self.grabbed.is_some() {
+            super::SettingsLocalBack::LocalBack
+        } else {
+            super::SettingsLocalBack::NoLocalBack
+        }
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         cx.handle_redact_patterns_page_key(key, self)
     }
 
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         cx.render_redact_patterns_page(frame, area, self);
+    }
+
+    fn handle_pointer_control(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: SettingsPointerAction,
+    ) -> Nav {
+        let SettingsPointerAction::List(action) = action else {
+            return Nav::Stay;
+        };
+        if self.grabbed.is_some() {
+            let current = cx
+                .extended
+                .redact
+                .dotenv_patterns
+                .get(self.cursor)
+                .map(|value| grab_list_row_id("redact-patterns", self.cursor, value));
+            let key = match action {
+                ListAction::MoveUp(id) if current.as_ref() == Some(&id) => KeyCode::Up,
+                ListAction::MoveDown(id) if current.as_ref() == Some(&id) => KeyCode::Down,
+                ListAction::Save => KeyCode::Enter,
+                ListAction::Cancel => KeyCode::Esc,
+                _ => return Nav::Stay,
+            };
+            return cx
+                .handle_redact_patterns_page_key(KeyEvent::new(key, KeyModifiers::NONE), self);
+        }
+        let index = match action {
+            ListAction::Add => cx.extended.redact.dotenv_patterns.len(),
+            ListAction::Edit(id) => cx
+                .extended
+                .redact
+                .dotenv_patterns
+                .iter()
+                .enumerate()
+                .position(|(index, value)| grab_list_row_id("redact-patterns", index, value) == id)
+                .unwrap_or(usize::MAX),
+            ListAction::Delete(id) => {
+                let Some(index) = cx
+                    .extended
+                    .redact
+                    .dotenv_patterns
+                    .iter()
+                    .enumerate()
+                    .position(|(index, value)| {
+                        grab_list_row_id("redact-patterns", index, value) == id
+                    })
+                else {
+                    return Nav::Stay;
+                };
+                self.cursor = index;
+                if self.delete.arm_or_confirm(index) {
+                    cx.extended.redact.dotenv_patterns.remove(index);
+                    self.cursor =
+                        index.min(cx.extended.redact.dotenv_patterns.len().saturating_sub(1));
+                    self.status = save_status(cx.save_extended());
+                } else {
+                    self.status = Some("confirm deletion or cancel".into());
+                }
+                return Nav::Stay;
+            }
+            ListAction::Cancel if self.delete.is_pending_for(self.cursor) => {
+                self.delete.disarm();
+                self.status = None;
+                return Nav::Stay;
+            }
+            _ => return Nav::Stay,
+        };
+        if index > cx.extended.redact.dotenv_patterns.len() {
+            return Nav::Stay;
+        }
+        self.cursor = index;
+        cx.handle_redact_patterns_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
+    }
+
+    fn handle_pointer_scroll(
+        &mut self,
+        cx: &mut SettingsCx,
+        region: SettingsScrollRegionId,
+        delta: isize,
+    ) -> Nav {
+        if region == SettingsScrollRegionId("redact-patterns") && self.grabbed.is_none() {
+            self.cursor = self
+                .cursor
+                .saturating_add_signed(delta)
+                .min(cx.extended.redact.dotenv_patterns.len());
+        }
+        Nav::Stay
     }
 
     fn title(&self, cx: &SettingsCx) -> String {

@@ -88,8 +88,21 @@ pub fn read_image_as_png() -> Result<Option<Vec<u8>>, CopyError> {
         Ok(img) => img,
         Err(_) => return Ok(None),
     };
-    let w = img.width as u32;
-    let h = img.height as u32;
+    const MAX_DIMENSION: usize = 8_192;
+    const MAX_PIXELS: usize = 40_000_000;
+    const MAX_RGBA_BYTES: usize = 160_000_000;
+    if img.width > MAX_DIMENSION
+        || img.height > MAX_DIMENSION
+        || img
+            .width
+            .checked_mul(img.height)
+            .is_none_or(|pixels| pixels > MAX_PIXELS)
+        || img.bytes.len() > MAX_RGBA_BYTES
+    {
+        return Err(CopyError::Backend);
+    }
+    let w = u32::try_from(img.width).map_err(|_| CopyError::Backend)?;
+    let h = u32::try_from(img.height).map_err(|_| CopyError::Backend)?;
     let Some(rgba) = image::RgbaImage::from_raw(w, h, img.bytes.into_owned()) else {
         return Err(CopyError::Backend);
     };

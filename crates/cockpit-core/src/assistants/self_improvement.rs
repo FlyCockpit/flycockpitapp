@@ -156,6 +156,10 @@ async fn run_review_turn(
     tx: &mpsc::Sender<TurnEvent>,
 ) -> Result<Option<String>> {
     let session = scratch_session(&cwd)?;
+    // This caged background utility intentionally retains its isolated
+    // in-memory database; a daemon journal is bound to a different DB and
+    // cannot safely be attached.
+    session.allow_unjournaled_inference();
     let locks = Arc::new(crate::locks::LockManager::from_db(session.db.clone()).await?);
     let cage = ReviewCage::skills_review_with_package_roots(review_package_roots(
         &cwd,
@@ -193,6 +197,7 @@ async fn run_review_turn(
             ContextUsageSnapshot::unavailable(),
             crate::engine::deferred::DeferredLog::new(),
             uuid::Uuid::new_v4(),
+            None,
             None,
             None,
             tx,

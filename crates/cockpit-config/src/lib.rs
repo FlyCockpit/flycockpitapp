@@ -7,8 +7,9 @@
 //! rendering code.
 
 pub use cockpit_db as db;
+pub use cockpit_db::workspace_trust::WorkspaceTrustMode;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 mod test_env;
 
 pub mod config;

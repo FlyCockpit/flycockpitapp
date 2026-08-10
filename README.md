@@ -48,7 +48,14 @@ Or with Homebrew:
 brew install flycockpit/tap/cockpit
 ```
 
-See [`apps/cli/README.md`](apps/cli/README.md) for Windows install, usage, and configuration. The CLI is a standalone Rust crate; the pnpm workspace and turbo tasks do not build it. Its CI and releases run through `.github/workflows/cli-ci.yml` and `.github/workflows/release.yml`.
+See [`apps/cli/README.md`](apps/cli/README.md) for Windows install, usage,
+configuration, completions, man pages, and uninstall steps. Cockpit never
+bundles or installs Bubblewrap, FFmpeg, or FFprobe; the generated
+[runtime prerequisite matrix](apps/docs/src/content/docs/reference/runtime-prerequisites.md)
+contains the official install and verification guidance. The CLI is a
+standalone Rust crate; the pnpm workspace and turbo tasks do not build it. Its
+CI and releases run through `.github/workflows/cli-ci.yml` and
+`.github/workflows/release.yml`.
 
 FlyCockpit is not affiliated with or endorsed by OpenAI, xAI, GitHub, or Anthropic.
 

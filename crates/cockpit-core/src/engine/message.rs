@@ -38,6 +38,11 @@ pub use crate::daemon::proto::IMAGE_PART_SENTINEL;
 pub struct UserSubmission {
     #[serde(default)]
     pub kind: UserSubmissionKind,
+    /// Trustworthy construction-site classification for compaction activity
+    /// gating. Transport retries preserve this value; they never reclassify
+    /// retained work as fresh user activity.
+    #[serde(default)]
+    pub origin: SubmissionOrigin,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_model_state_generation: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -135,6 +140,26 @@ pub enum UserSubmissionKind {
     #[default]
     User,
     Compact,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubmissionOrigin {
+    ExternalRoot,
+    GoalContinuation,
+    ScheduledJob,
+    AutoContinue,
+    RetryRecovery,
+    ToolResult,
+    CompactNotice,
+    #[default]
+    Internal,
+}
+
+impl SubmissionOrigin {
+    pub fn advances_activity_epoch(self) -> bool {
+        matches!(self, Self::ExternalRoot)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -594,6 +619,21 @@ impl UserSubmissionQueue {
         });
     }
 
+    /// Release a staged claim when the enclosing remote operation is rejected
+    /// before any durable terminal receipt is written.
+    pub async fn abort_staged_removal(&self, staged: &StagedQueueRemoval) {
+        {
+            let mut state = self.inner.lock().await;
+            assert_staged_removal(&state, staged);
+            state.staged_removal = None;
+            state.staged_removal_failed = false;
+        }
+        self.stage_updates.send_modify(|revision| {
+            *revision = revision.saturating_add(1);
+        });
+        self.notify.notify_one();
+    }
+
     /// Make a staged removal visible only after its terminal receipts are
     /// durable. Consumers resume from the remaining queue at this boundary.
     pub async fn commit_staged_removal(
@@ -1044,6 +1084,7 @@ impl UserSubmission {
     pub fn compact_notice() -> Self {
         Self {
             kind: UserSubmissionKind::Compact,
+            origin: SubmissionOrigin::CompactNotice,
             text: "/compact: assembling handoff (prune-first, model brief, deterministic appendix, context tags)...".to_string(),
             ..Self::default()
         }
@@ -1310,6 +1351,26 @@ mod tests {
         let parts = user_parts(&msg);
         assert_eq!(parts.len(), 1);
         assert!(matches!(parts[0], UserContent::Text(_)));
+    }
+
+    #[test]
+    fn submission_origin_only_external_root_advances_compaction_activity() {
+        assert!(SubmissionOrigin::ExternalRoot.advances_activity_epoch());
+        for origin in [
+            SubmissionOrigin::GoalContinuation,
+            SubmissionOrigin::ScheduledJob,
+            SubmissionOrigin::AutoContinue,
+            SubmissionOrigin::RetryRecovery,
+            SubmissionOrigin::ToolResult,
+            SubmissionOrigin::CompactNotice,
+            SubmissionOrigin::Internal,
+        ] {
+            assert!(!origin.advances_activity_epoch(), "{origin:?}");
+        }
+        assert_eq!(
+            UserSubmission::compact_notice().origin,
+            SubmissionOrigin::CompactNotice
+        );
     }
 
     #[test]

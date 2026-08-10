@@ -678,14 +678,28 @@ impl App {
             return;
         };
         self.start_goal_request(
-            "goal.status",
+            "goal.disposition",
             cockpit_core::daemon::proto::Request::GoalStatus { session_id },
+        );
+    }
+
+    pub(super) fn create_goal(&mut self, objective: String, token_budget: Option<i64>) {
+        let Some(session_id) = self.goal_session_id("/goal") else {
+            return;
+        };
+        self.start_goal_request(
+            "goal.create",
+            cockpit_core::daemon::proto::Request::CreateGoal {
+                session_id,
+                objective,
+                token_budget,
+            },
         );
     }
 
     pub(super) fn set_goal_status(
         &mut self,
-        status: cockpit_db::session_goals::GoalStatus,
+        status: cockpit_core::daemon::proto::GoalDisposition,
         label: &str,
     ) {
         let Some(session_id) = self.goal_session_id(label) else {
@@ -736,16 +750,25 @@ impl App {
                 let response = attached_request.request(request).await?;
                 match response {
                     cockpit_core::daemon::proto::Response::GoalStatus { goal: Some(goal) } => {
-                        let budget = goal
-                            .token_budget
-                            .map(|n| n.to_string())
-                            .unwrap_or_else(|| "none".to_string());
+                        let phase = goal.phase.map(|phase| format!("/{phase:?}")).unwrap_or_default();
+                        let detail = goal.latest_gap_or_blocker.as_deref().unwrap_or("no actionable gap");
                         Ok(AsyncActionPayload::Text(format!(
-                            "/goal: {} · {} · tokens {}/{} · subcommands: status, pause, resume, clear, edit",
-                            goal.status.as_str(),
+                            "/goal: {}{} · {} · contract {} · pause {} · verification {}/{} · tokens {}/{} ({} remaining) · active {}ms · {} transitions · {} · subcommands: status, pause, resume, clear, edit",
+                            goal.disposition.as_str(),
+                            phase.to_ascii_lowercase(),
                             goal.objective,
+                            if goal.contract_available { "ready" } else { "planning" },
+                            goal.pause_reason
+                                .map(|reason| reason.as_str())
+                                .unwrap_or("none"),
+                            goal.verification_attempts,
+                            goal.max_verification_attempts,
                             goal.tokens_used,
-                            budget
+                            goal.token_budget,
+                            goal.remaining_tokens,
+                            goal.elapsed_active_ms,
+                            goal.lifecycle_history.len(),
+                            detail,
                         )))
                     }
                     cockpit_core::daemon::proto::Response::GoalStatus { goal: None } => Ok(
@@ -755,9 +778,24 @@ impl App {
                         ),
                     ),
                     cockpit_core::daemon::proto::Response::GoalUpdated { goal } => {
+                        let state = match goal.disposition {
+                            cockpit_core::daemon::proto::GoalDisposition::Running => "active",
+                            cockpit_core::daemon::proto::GoalDisposition::UserPaused => "paused",
+                            cockpit_core::daemon::proto::GoalDisposition::InfraPaused => {
+                                "paused by infrastructure"
+                            }
+                            cockpit_core::daemon::proto::GoalDisposition::Blocked => "blocked",
+                            cockpit_core::daemon::proto::GoalDisposition::NoProgressPaused => {
+                                "paused for no progress"
+                            }
+                            cockpit_core::daemon::proto::GoalDisposition::BudgetLimited => {
+                                "budget limited"
+                            }
+                            cockpit_core::daemon::proto::GoalDisposition::Complete => "complete",
+                            cockpit_core::daemon::proto::GoalDisposition::Cleared => "cleared",
+                        };
                         Ok(AsyncActionPayload::Text(format!(
-                            "/goal: goal is now {}.",
-                            goal.status.as_str()
+                            "/goal: goal is now {state}."
                         )))
                     }
                     cockpit_core::daemon::proto::Response::GoalCleared { cleared: true } => Ok(
@@ -769,19 +807,6 @@ impl App {
                     other => Err(format!("unexpected goal response: {other:?}")),
                 }
             },
-        );
-    }
-
-    pub(super) fn dispatch_goal_turn(&mut self, display: &str, wire: String) {
-        self.pin_chat_to_tail();
-        self.begin_working_span();
-        let submission = cockpit_core::engine::message::UserSubmission::text(wire);
-        self.dispatch_optimistic_user_submission(
-            format!("/goal {display}"),
-            submission,
-            "/goal",
-            true,
-            &[],
         );
     }
 
@@ -802,6 +827,7 @@ impl App {
             expected_model_state_generation: None,
             expected_model: None,
             kind: cockpit_core::engine::message::UserSubmissionKind::User,
+            origin: cockpit_core::engine::message::SubmissionOrigin::ExternalRoot,
             text: args.trim().to_string(),
             display_text: None,
             tag_expansions: Vec::new(),

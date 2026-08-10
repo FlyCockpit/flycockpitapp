@@ -1,4 +1,8 @@
 {
+  "dependencies": {
+    "title": "Dependencias",
+    "refreshFailed": "La actualización de dependencias falló; se muestra la última instantánea completa."
+  },
   "navProfile": "Perfil",
   "navSecurity": "Seguridad",
   "profile": {

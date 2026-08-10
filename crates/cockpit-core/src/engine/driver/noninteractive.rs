@@ -792,6 +792,7 @@ impl Driver {
             fork_point,
         )
         .context("creating forked task session")?;
+        session.set_external_journal(self.session.external_journal());
         Ok((Arc::new(session), history))
     }
 
@@ -952,6 +953,7 @@ impl Driver {
                 }
                 input_rx.finish(&queue_item_ids).await;
                 Ok(crate::engine::message::build_user_message(UserSubmission {
+                    origin: crate::engine::message::SubmissionOrigin::ExternalRoot,
                     expected_model_state_generation: None,
                     expected_model: None,
                     kind: UserSubmissionKind::User,
@@ -2667,6 +2669,7 @@ impl Driver {
                 }
                 input_rx.finish(&queue_item_ids).await;
                 Ok(crate::engine::message::build_user_message(UserSubmission {
+                    origin: crate::engine::message::SubmissionOrigin::ExternalRoot,
                     expected_model_state_generation: None,
                     expected_model: None,
                     kind: UserSubmissionKind::User,
@@ -4089,6 +4092,7 @@ pub(crate) async fn run_noninteractive_resumable(
             deferred_log.clone(),
             call_id,
             tandem.as_ref(),
+            None,
             None,
             &child_tx,
             Some(&mut turn_metadata),

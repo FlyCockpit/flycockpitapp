@@ -6,17 +6,15 @@ fn reset_startup_counters() {
     cockpit_config::providers::reset_load_effective_call_count();
     cockpit_core::container::reset_detect_runtime_call_count();
     cockpit_core::daemon::reset_blocking_probe_call_count();
-    cockpit_db::reset_open_default_call_count();
     cockpit_core::tokens::reset_count_call_count();
 }
 
 #[test]
 fn app_new_loads_launch_config_once_and_defers_first_paint_work() {
     let tmp = tempfile::tempdir().unwrap();
-    let db = cockpit_db::Db::open_in_memory().unwrap();
     reset_startup_counters();
 
-    let app = App::new_with_db(Some(tmp.path()), false, db);
+    let app = App::new(Some(tmp.path()), false);
 
     assert_eq!(cockpit_config::extended::load_for_cwd_call_count(), 1);
     // Provider/credential resolution moved daemon-side (`tui-config-single-source`):
@@ -24,7 +22,6 @@ fn app_new_loads_launch_config_once_and_defers_first_paint_work() {
     // credentials, so it never calls the credential-aware `load_effective`.
     assert_eq!(cockpit_config::providers::load_effective_call_count(), 0);
     assert_eq!(cockpit_core::daemon::blocking_probe_call_count(), 1);
-    assert_eq!(cockpit_db::open_default_call_count(), 0);
     assert_eq!(cockpit_core::container::detect_runtime_call_count(), 0);
     assert_eq!(cockpit_core::tokens::count_call_count(), 0);
     assert!(app.guidance_estimate.is_none());
@@ -34,11 +31,7 @@ fn app_new_loads_launch_config_once_and_defers_first_paint_work() {
 #[test]
 fn startup_guidance_backfill_discards_stale_session_or_model() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new_with_db(
-        Some(tmp.path()),
-        false,
-        cockpit_db::Db::open_in_memory().unwrap(),
-    );
+    let mut app = App::new(Some(tmp.path()), false);
     app.launch.active_model = Some(("provider".to_string(), "model-a".to_string()));
     let estimate = GuidanceEstimate {
         file: Some("AGENTS.md".to_string()),
@@ -75,11 +68,7 @@ fn startup_guidance_backfill_discards_stale_session_or_model() {
 #[tokio::test]
 async fn startup_background_tasks_are_explicitly_started_after_construction() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new_with_db(
-        Some(tmp.path()),
-        false,
-        cockpit_db::Db::open_in_memory().unwrap(),
-    );
+    let mut app = App::new(Some(tmp.path()), false);
     assert!(!app.startup_background.started);
     assert_eq!(app.async_actions.pending_count(), 0);
 

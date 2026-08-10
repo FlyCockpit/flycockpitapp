@@ -1,7 +1,7 @@
 //! `/settings -> Tools` page: effective web tools, builtin inventory,
 //! user-defined command tools, and MCP catalog visibility.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -17,9 +17,11 @@ use cockpit_core::mcp::protocol::{ToolDescriptor, sanitize_tool_descriptor};
 
 use super::mcp_page::{ListState as McpListState, McpPage};
 use super::reset::{ResetButton, ResetOutcome};
+use super::shell;
 use super::shell::{
-    WrappedValueLayout, focused_field_style, muted_style, push_text_field_at_cursor,
-    push_wrapped_prefixed_value, selected_line_from_marker, selected_style, warning_style,
+    SettingsControlId, SettingsScrollRegionId, WrappedValueLayout, focused_field_style,
+    muted_style, push_text_field_at_cursor, push_wrapped_prefixed_value, selected_line_from_marker,
+    selected_style, warning_style,
 };
 use super::{Nav, SettingsCx, SettingsPage, save_status};
 
@@ -529,28 +531,63 @@ impl SettingsCx {
     }
 
     pub(super) fn build_tools_page_lines(&self, width: u16, p: &ToolsPage) -> Vec<Line<'static>> {
+        self.build_tools_page_lines_with_bindings(width, p).0
+    }
+
+    fn build_tools_page_lines_with_bindings(&self, width: u16, p: &ToolsPage) -> ToolsPageLines {
         let muted = muted_style();
         let mut lines = Vec::new();
+        let mut bindings = Vec::new();
         let mut row_idx = 0usize;
 
         push_section(&mut lines, "Web tools");
-        self.push_web_tools_lines(width, p, &mut lines, &mut row_idx);
+        self.push_web_tools_lines(width, p, &mut lines, &mut row_idx, &mut bindings);
 
         push_section(&mut lines, "Built-in tools");
-        self.push_builtin_tools_lines(width, p, &mut lines, &mut row_idx);
+        self.push_builtin_tools_lines(width, p, &mut lines, &mut row_idx, &mut bindings);
 
         push_section(&mut lines, "User-defined tools");
-        self.push_user_defined_tools_lines(width, p, &mut lines, &mut row_idx);
+        self.push_user_defined_tools_lines(width, p, &mut lines, &mut row_idx, &mut bindings);
 
         push_section(&mut lines, "MCP tools");
-        self.push_mcp_tools_lines(width, p, &mut lines, &mut row_idx);
+        self.push_mcp_tools_lines(width, p, &mut lines, &mut row_idx, &mut bindings);
 
         lines.push(Line::default());
         let reset_row = row_idx;
+        bindings.push((lines.len(), SettingsControlId(reset_row as u64)));
         lines.push(
             p.reset
                 .render_line(p.cursor == reset_row, "reset to defaults"),
         );
+
+        if let Some(row) = self.tools_page_rows().get(p.cursor) {
+            match row {
+                ToolRow::UserTool(name) if p.delete_pending.as_deref() == Some(name) => {
+                    lines.push(Line::default());
+                    lines.push(Line::from(format!("Delete {name}?")));
+                    bindings.push((lines.len(), SettingsControlId(10_000)));
+                    lines.push(Line::from("[Delete]"));
+                    bindings.push((lines.len(), SettingsControlId(10_001)));
+                    lines.push(Line::from("[Cancel]"));
+                }
+                ToolRow::UserTool(_) => {
+                    bindings.push((lines.len(), SettingsControlId(10_002)));
+                    lines.push(Line::from("[Enable/disable]"));
+                    bindings.push((lines.len(), SettingsControlId(10_003)));
+                    lines.push(Line::from("[Delete]"));
+                }
+                ToolRow::FirecrawlBaseUrl
+                | ToolRow::WebFetchCommand
+                | ToolRow::WebSearchCommand => {
+                    bindings.push((lines.len(), SettingsControlId(10_004)));
+                    lines.push(Line::from("[Reset field]"));
+                }
+                ToolRow::Builtin(_) | ToolRow::McpTool { .. } => {
+                    lines.push(Line::from(Span::styled("[Read only]", muted_style())));
+                }
+                _ => {}
+            }
+        }
 
         if let Some(field) = &p.editing {
             let label = match field {
@@ -585,7 +622,95 @@ impl SettingsCx {
             muted,
         )));
 
-        lines
+        let rows = self.tools_page_rows();
+        let read_only = bindings
+            .iter()
+            .filter_map(|(line, id)| {
+                matches!(
+                    rows.get(id.0 as usize),
+                    Some(ToolRow::Builtin(_) | ToolRow::McpTool { .. })
+                )
+                .then(|| {
+                    self.tools_pointer_action(p, id.0 as usize)
+                        .map(|action| (*line, action))
+                })
+                .flatten()
+            })
+            .collect::<Vec<_>>();
+        bindings.retain(|(_, id)| {
+            id.0 >= 10_000
+                || !matches!(
+                    rows.get(id.0 as usize),
+                    Some(ToolRow::Builtin(_) | ToolRow::McpTool { .. })
+                )
+        });
+        let semantic = bindings
+            .into_iter()
+            .filter_map(|(line, control)| {
+                self.tools_pointer_action(p, control.0 as usize)
+                    .map(|action| (line, action))
+            })
+            .collect();
+        (lines, semantic, read_only)
+    }
+
+    fn tools_pointer_action(
+        &self,
+        p: &ToolsPage,
+        index: usize,
+    ) -> Option<super::pointer_actions::SettingsPointerAction> {
+        use super::pointer_actions::{
+            BuiltinToolId, CredentialKind, McpServerId, McpToolId, SettingsPointerAction,
+            ToolFieldId, ToolsAction, UserToolId,
+        };
+        let rows = self.tools_page_rows();
+        let selected = rows.get(p.cursor);
+        let action = match index {
+            10_000 => ToolsAction::DeleteUserTool(UserToolId(p.delete_pending.clone()?)),
+            10_001 => ToolsAction::ToggleUserTool(UserToolId("cancel-delete".into())),
+            10_002 => match selected? {
+                ToolRow::UserTool(name) => ToolsAction::ToggleUserTool(UserToolId(name.clone())),
+                _ => return None,
+            },
+            10_003 => match selected? {
+                ToolRow::UserTool(name) => ToolsAction::DeleteUserTool(UserToolId(name.clone())),
+                _ => return None,
+            },
+            10_004 => match selected? {
+                ToolRow::FirecrawlBaseUrl => {
+                    ToolsAction::ResetToolField(ToolFieldId::FirecrawlBaseUrl)
+                }
+                ToolRow::WebFetchCommand => {
+                    ToolsAction::ResetToolField(ToolFieldId::WebFetchCommand)
+                }
+                ToolRow::WebSearchCommand => {
+                    ToolsAction::ResetToolField(ToolFieldId::WebSearchCommand)
+                }
+                _ => return None,
+            },
+            _ => match rows.get(index)? {
+                ToolRow::WebProvider => ToolsAction::CycleWebProvider,
+                ToolRow::FirecrawlBaseUrl => ToolsAction::EditFirecrawlBaseUrl,
+                ToolRow::FirecrawlKey => ToolsAction::EditCredential(CredentialKind::Firecrawl),
+                ToolRow::TinyFishKey => ToolsAction::EditCredential(CredentialKind::TinyFish),
+                ToolRow::WebFetchCommand => ToolsAction::EditWebFetchCommand,
+                ToolRow::WebSearchCommand => ToolsAction::EditWebSearchCommand,
+                ToolRow::Builtin(name) => {
+                    ToolsAction::ReadOnlyBuiltin(BuiltinToolId((*name).into()))
+                }
+                ToolRow::UserTool(name) => {
+                    ToolsAction::EditUserToolCommand(UserToolId(name.clone()))
+                }
+                ToolRow::AddUserTool => ToolsAction::AddUserTool,
+                ToolRow::McpTool { server, tool } => ToolsAction::ReadOnlyMcpTool(
+                    McpServerId(server.clone()),
+                    McpToolId(tool.clone()),
+                ),
+                ToolRow::McpJump => ToolsAction::McpJump,
+                ToolRow::Reset => ToolsAction::Reset,
+            },
+        };
+        Some(SettingsPointerAction::Tools(action))
     }
 
     fn push_web_tools_lines(
@@ -594,18 +719,22 @@ impl SettingsCx {
         p: &ToolsPage,
         lines: &mut Vec<Line<'static>>,
         row_idx: &mut usize,
+        bindings: &mut Vec<(usize, SettingsControlId)>,
     ) {
         push_selectable_row(
             lines,
             width,
             p,
             row_idx,
-            "provider",
-            &format!(
-                "{} (enter cycles Firecrawl, TinyFish, Custom)",
-                provider_label(self.extended.web.provider)
-            ),
-            muted_style(),
+            bindings,
+            ToolRowContent {
+                label: "provider",
+                value: &format!(
+                    "{} (enter cycles Firecrawl, TinyFish, Custom)",
+                    provider_label(self.extended.web.provider)
+                ),
+                value_style: muted_style(),
+            },
         );
         match self.extended.web.provider {
             ConfigWebProvider::Firecrawl => {
@@ -614,12 +743,15 @@ impl SettingsCx {
                     width,
                     p,
                     row_idx,
-                    "api key",
-                    &format!(
-                        "{}; env wins over stored credentials",
-                        web_key_status_label(self.web_key_status(WebKeyProvider::Firecrawl))
-                    ),
-                    muted_style(),
+                    bindings,
+                    ToolRowContent {
+                        label: "api key",
+                        value: &format!(
+                            "{}; env wins over stored credentials",
+                            web_key_status_label(self.web_key_status(WebKeyProvider::Firecrawl))
+                        ),
+                        value_style: muted_style(),
+                    },
                 );
                 let env_override = (self.env_lookup)("FIRECRAWL_API_URL")
                     .filter(|v| !v.trim().is_empty())
@@ -630,16 +762,19 @@ impl SettingsCx {
                     width,
                     p,
                     row_idx,
-                    "base url",
-                    &format!(
-                        "{} ({env_override})",
-                        self.extended
-                            .web
-                            .firecrawl_base_url
-                            .as_deref()
-                            .unwrap_or("default")
-                    ),
-                    muted_style(),
+                    bindings,
+                    ToolRowContent {
+                        label: "base url",
+                        value: &format!(
+                            "{} ({env_override})",
+                            self.extended
+                                .web
+                                .firecrawl_base_url
+                                .as_deref()
+                                .unwrap_or("default")
+                        ),
+                        value_style: muted_style(),
+                    },
                 );
             }
             ConfigWebProvider::Tinyfish => {
@@ -648,15 +783,18 @@ impl SettingsCx {
                     width,
                     p,
                     row_idx,
-                    "api key",
-                    &format!(
-                        "{}; env wins over stored credentials",
-                        web_key_status_label(self.web_key_status(WebKeyProvider::TinyFish))
-                    ),
-                    if self.web_key_status(WebKeyProvider::TinyFish).is_some() {
-                        muted_style()
-                    } else {
-                        warning_style()
+                    bindings,
+                    ToolRowContent {
+                        label: "api key",
+                        value: &format!(
+                            "{}; env wins over stored credentials",
+                            web_key_status_label(self.web_key_status(WebKeyProvider::TinyFish))
+                        ),
+                        value_style: if self.web_key_status(WebKeyProvider::TinyFish).is_some() {
+                            muted_style()
+                        } else {
+                            warning_style()
+                        },
                     },
                 );
             }
@@ -667,12 +805,17 @@ impl SettingsCx {
                     width,
                     p,
                     row_idx,
-                    "webfetch",
-                    &web_command_status(fetch_command, "{url}"),
-                    if fetch_command.is_some_and(|command| !command.trim().is_empty()) {
-                        muted_style()
-                    } else {
-                        warning_style()
+                    bindings,
+                    ToolRowContent {
+                        label: "webfetch",
+                        value: &web_command_status(fetch_command, "{url}"),
+                        value_style: if fetch_command
+                            .is_some_and(|command| !command.trim().is_empty())
+                        {
+                            muted_style()
+                        } else {
+                            warning_style()
+                        },
                     },
                 );
                 let search_command = self.extended.web.custom.search_command.as_deref();
@@ -681,12 +824,17 @@ impl SettingsCx {
                     width,
                     p,
                     row_idx,
-                    "websearch",
-                    &web_command_status(search_command, "{query}"),
-                    if search_command.is_some_and(|command| !command.trim().is_empty()) {
-                        muted_style()
-                    } else {
-                        warning_style()
+                    bindings,
+                    ToolRowContent {
+                        label: "websearch",
+                        value: &web_command_status(search_command, "{query}"),
+                        value_style: if search_command
+                            .is_some_and(|command| !command.trim().is_empty())
+                        {
+                            muted_style()
+                        } else {
+                            warning_style()
+                        },
                     },
                 );
             }
@@ -699,6 +847,7 @@ impl SettingsCx {
         p: &ToolsPage,
         lines: &mut Vec<Line<'static>>,
         row_idx: &mut usize,
+        bindings: &mut Vec<(usize, SettingsControlId)>,
     ) {
         let mut last_family = "";
         for tool in builtin_tool_inventory() {
@@ -713,7 +862,18 @@ impl SettingsCx {
                 Some(condition) => format!("{} ({condition})", tool.summary),
                 None => tool.summary.to_string(),
             };
-            push_selectable_row(lines, width, p, row_idx, tool.name, &value, muted_style());
+            push_selectable_row(
+                lines,
+                width,
+                p,
+                row_idx,
+                bindings,
+                ToolRowContent {
+                    label: tool.name,
+                    value: &value,
+                    value_style: muted_style(),
+                },
+            );
         }
     }
 
@@ -723,6 +883,7 @@ impl SettingsCx {
         p: &ToolsPage,
         lines: &mut Vec<Line<'static>>,
         row_idx: &mut usize,
+        bindings: &mut Vec<(usize, SettingsControlId)>,
     ) {
         let mut names = self.extended.tools.keys().cloned().collect::<Vec<_>>();
         names.sort();
@@ -759,12 +920,15 @@ impl SettingsCx {
                 width,
                 p,
                 row_idx,
-                &name,
-                &value,
-                if tool.command.trim().is_empty() {
-                    warning_style()
-                } else {
-                    muted_style()
+                bindings,
+                ToolRowContent {
+                    label: &name,
+                    value: &value,
+                    value_style: if tool.command.trim().is_empty() {
+                        warning_style()
+                    } else {
+                        muted_style()
+                    },
                 },
             );
         }
@@ -773,9 +937,12 @@ impl SettingsCx {
             width,
             p,
             row_idx,
-            "[+ add tool]",
-            "create a user-defined bash-command tool",
-            Style::default().add_modifier(Modifier::BOLD),
+            bindings,
+            ToolRowContent {
+                label: "[+ add tool]",
+                value: "create a user-defined bash-command tool",
+                value_style: Style::default().add_modifier(Modifier::BOLD),
+            },
         );
     }
 
@@ -785,6 +952,7 @@ impl SettingsCx {
         p: &ToolsPage,
         lines: &mut Vec<Line<'static>>,
         row_idx: &mut usize,
+        bindings: &mut Vec<(usize, SettingsControlId)>,
     ) {
         let cfg = self.load_mcp();
         let enabled_servers = cfg.enabled_servers();
@@ -811,9 +979,12 @@ impl SettingsCx {
                         width,
                         p,
                         row_idx,
-                        &format!("{server_name}/{}", tool.name),
-                        first_line_or_default(&tool.description),
-                        muted_style(),
+                        bindings,
+                        ToolRowContent {
+                            label: &format!("{server_name}/{}", tool.name),
+                            value: first_line_or_default(&tool.description),
+                            value_style: muted_style(),
+                        },
                     );
                 }
             }
@@ -829,19 +1000,51 @@ impl SettingsCx {
             width,
             p,
             row_idx,
-            "configure in MCP ->",
-            "jump to MCP server settings",
-            Style::default().add_modifier(Modifier::BOLD),
+            bindings,
+            ToolRowContent {
+                label: "configure in MCP ->",
+                value: "jump to MCP server settings",
+                value_style: Style::default().add_modifier(Modifier::BOLD),
+            },
         );
     }
 
     pub(super) fn render_tools_page(&self, frame: &mut Frame, area: Rect, p: &ToolsPage) {
-        let lines = self.build_tools_page_lines(area.width, p);
+        let (lines, bindings, read_only) = self.build_tools_page_lines_with_bindings(area.width, p);
         let selected_line = selected_line_from_marker(&lines);
-        self.scroll_states
-            .render_lines(frame, area, "tools", lines, selected_line);
+        self.scroll_states.render_bound_lines(
+            frame,
+            area,
+            "tools",
+            (lines, selected_line),
+            bindings,
+            (&self.pointer_surface, SettingsScrollRegionId("tools")).into(),
+        );
+        let offset = self.scroll_states.offset_for("tools");
+        for (line, action) in read_only {
+            let Some(screen_row) = line.checked_sub(offset) else {
+                continue;
+            };
+            if screen_row >= usize::from(area.height) {
+                continue;
+            }
+            self.pointer_surface.register(shell::SettingsPointerTarget {
+                rect: Rect::new(
+                    area.x,
+                    area.y.saturating_add(screen_row as u16),
+                    area.width,
+                    1,
+                ),
+                action: shell::SettingsPointerAction::Page(action),
+                enabled: false,
+                disabled_reason: Some("read-only inventory row"),
+            });
+        }
     }
 }
+
+type ActionBinding = (usize, super::pointer_actions::SettingsPointerAction);
+type ToolsPageLines = (Vec<Line<'static>>, Vec<ActionBinding>, Vec<ActionBinding>);
 
 fn web_command_status(command: Option<&str>, placeholder: &str) -> String {
     match command.map(str::trim).filter(|value| !value.is_empty()) {
@@ -875,10 +1078,10 @@ fn push_selectable_row(
     width: u16,
     p: &ToolsPage,
     row_idx: &mut usize,
-    label: &str,
-    value: &str,
-    value_style: Style,
+    bindings: &mut Vec<(usize, SettingsControlId)>,
+    content: ToolRowContent<'_>,
 ) {
+    let first_line = lines.len();
     let selected = p.cursor == *row_idx;
     let marker = if selected { "▸ " } else { "  " };
     let label_style = if selected {
@@ -886,18 +1089,24 @@ fn push_selectable_row(
     } else {
         focused_field_style()
     };
-    push_tool_value_row(lines, width, marker, label, label_style, value, value_style);
+    push_tool_value_row(lines, width, marker, label_style, content);
+    bindings
+        .extend((first_line..lines.len()).map(|line| (line, SettingsControlId(*row_idx as u64))));
     *row_idx += 1;
+}
+
+struct ToolRowContent<'a> {
+    label: &'a str,
+    value: &'a str,
+    value_style: Style,
 }
 
 fn push_tool_value_row(
     lines: &mut Vec<Line<'static>>,
     width: u16,
     marker: &str,
-    label: &str,
     label_style: Style,
-    value: &str,
-    value_style: Style,
+    content: ToolRowContent<'_>,
 ) {
     push_wrapped_prefixed_value(
         lines,
@@ -905,25 +1114,143 @@ fn push_tool_value_row(
         WrappedValueLayout {
             first_prefix: vec![
                 Span::raw(marker.to_string()),
-                Span::styled(format!("{:<TOOL_ROW_LABEL_WIDTH$}", label), label_style),
+                Span::styled(
+                    format!("{:<TOOL_ROW_LABEL_WIDTH$}", content.label),
+                    label_style,
+                ),
                 Span::raw(" ".repeat(TOOL_ROW_GAP_WIDTH)),
             ],
             prefix_width: TOOL_ROW_VALUE_INDENT,
             continuation_prefix: vec![Span::raw(" ".repeat(TOOL_ROW_VALUE_INDENT))],
             suffix: None,
         },
-        value,
-        value_style,
+        content.value,
+        content.value_style,
     );
 }
 
 impl SettingsPage for ToolsPage {
+    fn pointer_surface_kind(&self) -> super::SettingsPointerSurfaceKind {
+        super::SettingsPointerSurfaceKind::Tools
+    }
+
+    fn resolve_header_back(&self) -> super::SettingsLocalBack {
+        if self.editing.is_some() || self.delete_pending.is_some() {
+            super::SettingsLocalBack::LocalBack
+        } else {
+            super::SettingsLocalBack::NoLocalBack
+        }
+    }
+
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         cx.handle_tools_page_key(key, self)
     }
 
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         cx.render_tools_page(frame, area, self);
+    }
+
+    fn handle_pointer_control(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: super::pointer_actions::SettingsPointerAction,
+    ) -> Nav {
+        let super::pointer_actions::SettingsPointerAction::Tools(action) = action else {
+            return Nav::Stay;
+        };
+        use super::pointer_actions::{ToolFieldId, ToolsAction};
+        let key = match &action {
+            ToolsAction::DeleteUserTool(_) if self.delete_pending.is_some() => {
+                Some(KeyCode::Char('d'))
+            }
+            ToolsAction::ToggleUserTool(id)
+                if self.delete_pending.is_some() && id.0 == "cancel-delete" =>
+            {
+                self.delete_pending = None;
+                self.status = Some("delete cancelled".into());
+                return Nav::Stay;
+            }
+            ToolsAction::ToggleUserTool(_) if self.delete_pending.is_none() => {
+                Some(KeyCode::Char('t'))
+            }
+            ToolsAction::DeleteUserTool(_) if self.delete_pending.is_none() => {
+                Some(KeyCode::Char('d'))
+            }
+            ToolsAction::ResetToolField(field) => {
+                let rows = cx.tools_page_rows();
+                let matches = matches!(
+                    (*field, rows.get(self.cursor)),
+                    (
+                        ToolFieldId::FirecrawlBaseUrl,
+                        Some(ToolRow::FirecrawlBaseUrl)
+                    ) | (ToolFieldId::WebFetchCommand, Some(ToolRow::WebFetchCommand))
+                        | (
+                            ToolFieldId::WebSearchCommand,
+                            Some(ToolRow::WebSearchCommand)
+                        )
+                );
+                if !matches {
+                    return Nav::Stay;
+                }
+                Some(KeyCode::Char('r'))
+            }
+            _ => None,
+        };
+        if let Some(key) = key {
+            return cx.handle_tools_page_key(KeyEvent::new(key, KeyModifiers::NONE), self);
+        }
+        let rows = cx.tools_page_rows();
+        let index = rows.iter().position(|row| match (&action, row) {
+            (ToolsAction::CycleWebProvider, ToolRow::WebProvider)
+            | (ToolsAction::EditFirecrawlBaseUrl, ToolRow::FirecrawlBaseUrl)
+            | (ToolsAction::EditWebFetchCommand, ToolRow::WebFetchCommand)
+            | (ToolsAction::EditWebSearchCommand, ToolRow::WebSearchCommand)
+            | (ToolsAction::AddUserTool, ToolRow::AddUserTool)
+            | (ToolsAction::McpJump, ToolRow::McpJump)
+            | (ToolsAction::Reset, ToolRow::Reset) => true,
+            (
+                ToolsAction::EditCredential(super::pointer_actions::CredentialKind::Firecrawl),
+                ToolRow::FirecrawlKey,
+            )
+            | (
+                ToolsAction::EditCredential(super::pointer_actions::CredentialKind::TinyFish),
+                ToolRow::TinyFishKey,
+            ) => true,
+            (ToolsAction::EditUserToolCommand(id), ToolRow::UserTool(name)) => id.0 == *name,
+            (ToolsAction::ReadOnlyBuiltin(id), ToolRow::Builtin(name)) => id.0 == *name,
+            (
+                ToolsAction::ReadOnlyMcpTool(server_id, tool_id),
+                ToolRow::McpTool { server, tool },
+            ) => server_id.0 == *server && tool_id.0 == *tool,
+            _ => false,
+        });
+        let Some(index) = index else {
+            return Nav::Stay;
+        };
+        self.cursor = index;
+        cx.handle_tools_page_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), self)
+    }
+
+    fn handle_pointer_scroll(
+        &mut self,
+        cx: &mut SettingsCx,
+        region: SettingsScrollRegionId,
+        delta: isize,
+    ) -> Nav {
+        if region == SettingsScrollRegionId("tools") && self.editing.is_none() {
+            self.delete_pending = None;
+            self.reset.disarm();
+            self.cursor = self
+                .cursor
+                .saturating_add_signed(delta)
+                .min(cx.tools_page_rows().len().saturating_sub(1));
+        }
+        Nav::Stay
+    }
+
+    fn cancel_pointer_transients(&mut self) {
+        self.delete_pending = None;
+        self.reset.disarm();
     }
 
     fn title(&self, cx: &SettingsCx) -> String {

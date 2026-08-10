@@ -9,12 +9,19 @@ pub use crate::daemon::proto::InferenceErrorClass;
 /// a real error. Downcast through the `anyhow` chain to detect it.
 #[derive(Debug, thiserror::Error)]
 #[error("inference cancelled by user")]
-pub struct InferenceCancelled;
+pub struct InferenceCancelled {
+    pub phase: InferencePhase,
+}
 
 /// Returns `true` when `err`'s chain carries an [`InferenceCancelled`]
 /// sentinel — i.e. the turn was aborted by the user, not a real failure.
 pub fn is_cancelled(err: &anyhow::Error) -> bool {
     err.downcast_ref::<InferenceCancelled>().is_some()
+}
+
+pub fn cancellation_phase(err: &anyhow::Error) -> Option<InferencePhase> {
+    err.downcast_ref::<InferenceCancelled>()
+        .map(|cancelled| cancelled.phase)
 }
 
 /// Sentinel returned at the inference-dispatch chokepoint when the daemon

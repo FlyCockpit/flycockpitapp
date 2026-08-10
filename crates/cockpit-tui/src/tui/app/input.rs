@@ -16,18 +16,48 @@ use super::{
     TranscriptFind,
 };
 use crate::tui::agent_runner;
+use crate::tui::async_action::{AsyncActionKey, AsyncActionPayload, AsyncActionPolicy};
 use crate::tui::settings::Dialog;
 use cockpit_core::daemon::proto::{self, Request, Response};
 use cockpit_core::engine::message::{QueueItemStatus, QueuedUserMessage};
 
 impl App {
+    /// Replay a rapid-paste candidate through the composer route that owned
+    /// it at intake, without allowing a subsequently opened pane/modal to
+    /// steal those buffered keys.
+    pub(super) fn handle_frozen_composer_key(&mut self, key: KeyEvent) -> bool {
+        self.selection = None;
+        let before = self.composer.text().to_string();
+        let exit = if self.composer.vim_enabled() {
+            match self.composer.vim_mode() {
+                VimMode::Normal => self.handle_key_normal(key),
+                VimMode::Operator(op) => self.handle_key_operator(key, op),
+                VimMode::Visual | VimMode::VisualLine => self.handle_key_visual(key),
+                VimMode::Insert => self.handle_key_insert(key),
+            }
+        } else {
+            self.handle_key_insert(key)
+        };
+        if self.composer.text() != before {
+            self.last_composer_edit_at = Some(Instant::now());
+        }
+        exit
+    }
+
     fn allocate_paste_request(
         &mut self,
         source: crate::tui::structured_paste::PasteSource,
     ) -> Option<crate::tui::structured_paste::PasteRequest> {
+        self.allocate_paste_request_with_id(source, uuid::Uuid::new_v4())
+    }
+
+    fn allocate_paste_request_with_id(
+        &mut self,
+        source: crate::tui::structured_paste::PasteSource,
+        id: uuid::Uuid,
+    ) -> Option<crate::tui::structured_paste::PasteRequest> {
         let generation = self.next_paste_generation.checked_add(1)?;
         self.next_paste_generation = generation;
-        let id = uuid::Uuid::new_v4();
         let host = crate::tui::structured_paste::HostIdentity {
             client_instance_id: self.paste_client_instance_id,
             connection_epoch: self
@@ -44,6 +74,20 @@ impl App {
             terminal_generation: self.terminal_input_generation.unwrap_or_default(),
         };
         let now = self.event_loop_monotonic_now;
+        if let Some((existing_generation, result)) = self.paste_correlations.existing(id, host, now)
+        {
+            return match result {
+                crate::tui::structured_paste::DedupResult::Committed => {
+                    Some(crate::tui::structured_paste::PasteRequest {
+                        paste_generation: existing_generation,
+                        paste_correlation_id: id,
+                        source,
+                        host,
+                    })
+                }
+                _ => None,
+            };
+        }
         if self.paste_correlations.claim(id, generation, host, now)
             != crate::tui::structured_paste::DedupResult::Claimed
         {
@@ -55,6 +99,213 @@ impl App {
             source,
             host,
         })
+    }
+
+    pub(super) fn handle_identified_paste(
+        &mut self,
+        data: String,
+        source: crate::tui::structured_paste::PasteSource,
+        correlation_id: uuid::Uuid,
+    ) {
+        let host = crate::tui::structured_paste::HostIdentity {
+            client_instance_id: self.paste_client_instance_id,
+            connection_epoch: self
+                .agent_runner
+                .as_ref()
+                .and_then(|runner| runner.as_ref().ok())
+                .map(|runner| {
+                    runner
+                        .attachment_epoch
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                })
+                .unwrap_or_default(),
+            session_id: self.launch.session_id.unwrap_or(uuid::Uuid::nil()),
+            terminal_generation: self.terminal_input_generation.unwrap_or_default(),
+        };
+        if self
+            .paste_correlations
+            .existing(correlation_id, host, self.event_loop_monotonic_now)
+            .is_some_and(|(_, result)| {
+                result == crate::tui::structured_paste::DedupResult::Committed
+            })
+        {
+            crate::tui::input_source::acknowledge_native_paste(
+                correlation_id,
+                crate::tui::structured_paste::DedupResult::Committed,
+            );
+            return;
+        }
+        if let Some(probe) = self.pending_paste_probes.get(&correlation_id) {
+            let authoritative_shortcut_completion = probe.request.source
+                == crate::tui::structured_paste::PasteSource::NativePaste
+                && probe.original_data.is_empty()
+                && !data.is_empty()
+                && matches!(
+                    source,
+                    crate::tui::structured_paste::PasteSource::BracketedPty
+                        | crate::tui::structured_paste::PasteSource::RapidPty
+                );
+            if !authoritative_shortcut_completion {
+                if probe.request.source == source && probe.original_data == data {
+                    // The input source has already attached its acknowledgement
+                    // waiter to this correlation. Leave the original probe and
+                    // its fixed deadline running; its terminal result releases
+                    // every waiter together.
+                    return;
+                }
+                // Acknowledgements are correlation-wide, so acknowledging this
+                // conflicting delivery as Busy would also incorrectly release
+                // the original probe's waiter. Reject it locally and let the
+                // preserved probe publish the one authoritative result.
+                self.show_toast("Paste unavailable", super::ToastKind::Error);
+                return;
+            }
+        }
+        if let Some(probe) = self.pending_paste_probes.get(&correlation_id)
+            && let Some(fence_id) = probe.owner_fence
+        {
+            let request_generation = probe.request.paste_generation;
+            let host = probe.request.host;
+            let source_draft_generation = probe.source_draft_generation;
+            let action_id = probe.async_action_id;
+            let original_offset = probe.original_offset;
+            let deadline = probe.deadline;
+            self.pending_paste_probes.remove(&correlation_id);
+            if let Some(action_id) = action_id {
+                self.async_actions.abort_id(action_id);
+            }
+            if let Some(path) =
+                crate::tui::structured_paste::parse_private_image_path_literal(&data)
+            {
+                let kind =
+                    crate::tui::async_action::AsyncActionKind::Internal("paste.image_path_probe");
+                let Some(fence_request) =
+                    self.submission_fences.get_mut(&fence_id).and_then(|fence| {
+                        fence.slots.iter_mut().find_map(|slot| match slot {
+                            crate::tui::structured_paste::PasteSlotState::Pending {
+                                request,
+                                ..
+                            } if request.paste_correlation_id == correlation_id => {
+                                request.source = source;
+                                Some(request.clone())
+                            }
+                            _ => None,
+                        })
+                    })
+                else {
+                    return;
+                };
+                self.pending_paste_probes.insert(
+                    correlation_id,
+                    super::PendingPasteProbe {
+                        request: fence_request,
+                        original_data: data.clone(),
+                        source_draft_generation,
+                        owner_fence: Some(fence_id),
+                        original_offset,
+                        deadline,
+                        async_action_id: None,
+                    },
+                );
+                let original = data;
+                let terminal_generation = self.terminal_input_generation;
+                let action_id = self
+                    .async_actions
+                    .start(
+                        kind,
+                        crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
+                        async move {
+                            let png = tokio::task::spawn_blocking(move || {
+                                crate::tui::image_path_probe::normalize_private_image(&path)
+                            })
+                            .await
+                            .ok()
+                            .and_then(Result::ok);
+                            Ok(
+                                crate::tui::async_action::AsyncActionPayload::ImagePathProbe {
+                                    request_id: correlation_id,
+                                    request_generation,
+                                    terminal_generation,
+                                    original,
+                                    source_draft_generation,
+                                    cursor: original_offset,
+                                    png,
+                                },
+                            )
+                        },
+                    )
+                    .id();
+                if let Some(probe) = self.pending_paste_probes.get_mut(&correlation_id) {
+                    probe.async_action_id = Some(action_id);
+                }
+                return;
+            }
+            let commit = self.paste_correlations.commit(
+                correlation_id,
+                request_generation,
+                host,
+                self.event_loop_monotonic_now,
+            );
+            crate::tui::input_source::acknowledge_native_paste(correlation_id, commit);
+            if let Some(fence) = self.submission_fences.get_mut(&fence_id) {
+                if let Some(crate::tui::structured_paste::PasteSlotState::Pending {
+                    request,
+                    ..
+                }) = fence.slots.iter_mut().find(|slot| {
+                    matches!(slot, crate::tui::structured_paste::PasteSlotState::Pending { request, .. }
+                        if request.paste_correlation_id == correlation_id)
+                }) {
+                    request.source = source;
+                }
+                let _ = fence.settle_slot(
+                    correlation_id,
+                    request_generation,
+                    source_draft_generation,
+                    Some((data.clone(), data, None)),
+                );
+            }
+            self.dispatch_next_ready_paste_fence();
+            return;
+        }
+        let existing_probe = self
+            .pending_paste_probes
+            .remove(&correlation_id)
+            .map(|mut probe| {
+                if let Some(action_id) = probe.async_action_id.take() {
+                    self.async_actions.abort_id(action_id);
+                }
+                probe.request.source = source;
+                probe
+            });
+        let identified_probe = if let Some(probe) = existing_probe {
+            Some(probe)
+        } else if let Some(request) = self.allocate_paste_request_with_id(source, correlation_id) {
+            Some(super::PendingPasteProbe {
+                request,
+                original_data: data.clone(),
+                source_draft_generation: self.draft_generation,
+                owner_fence: None,
+                original_offset: self.composer.cursor(),
+                deadline: self.event_loop_monotonic_now + std::time::Duration::from_secs(2),
+                async_action_id: None,
+            })
+        } else {
+            crate::tui::input_source::acknowledge_native_paste(
+                correlation_id,
+                crate::tui::structured_paste::DedupResult::Busy,
+            );
+            self.show_toast("Paste unavailable", super::ToastKind::Error);
+            return;
+        };
+        self.handle_paste_inner(data, identified_probe);
+        if !self.pending_paste_probes.contains_key(&correlation_id) {
+            let result = self
+                .paste_correlations
+                .existing(correlation_id, host, self.event_loop_monotonic_now)
+                .map(|(_, result)| result)
+                .unwrap_or(crate::tui::structured_paste::DedupResult::Busy);
+            crate::tui::input_source::acknowledge_native_paste(correlation_id, result);
+        }
     }
 
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> bool {
@@ -74,12 +325,11 @@ impl App {
                     && probe.request.source
                         == crate::tui::structured_paste::PasteSource::BracketedPty
             });
-            let before = self.pending_paste_probes.len();
             let draft_generation = self.draft_generation;
-            self.pending_paste_probes.retain(|_, probe| {
-                probe.owner_fence.is_some() || probe.source_draft_generation != draft_generation
+            self.cancel_paste_probes_matching(|probe| {
+                probe.owner_fence.is_none() && probe.source_draft_generation == draft_generation
             });
-            if self.pending_paste_probes.len() != before && cancelled_path_probe {
+            if cancelled_path_probe {
                 self.show_toast("Paste unavailable", super::ToastKind::Error);
             }
         }
@@ -675,9 +925,9 @@ impl App {
                     crate::tui::notes_pane::NotesOutcome::Stay => {
                         self.overlay = Overlay::Notes(pane);
                     }
-                    crate::tui::notes_pane::NotesOutcome::Db(action) => {
+                    crate::tui::notes_pane::NotesOutcome::Rpc(action) => {
                         self.overlay = Overlay::Notes(pane);
-                        self.start_notes_db_action(action);
+                        self.start_notes_rpc_action(action);
                     }
                 }
                 return false;
@@ -1384,6 +1634,37 @@ impl App {
     pub(super) fn reset_at_window(&mut self) {
         self.at_selected = 0;
         self.at_scroll = 0;
+        let Some(query) = self.composer.at_query().map(str::to_string) else {
+            self.at_cache.borrow_mut().take();
+            self.at_suggestions_loading = false;
+            self.at_suggestions_loaded_query = None;
+            self.at_suggestions_error = None;
+            self.async_actions
+                .abort_key(&AsyncActionKey::new("autocomplete.files"));
+            return;
+        };
+        let cwd = self.launch.cwd.clone();
+        let usage_tags = self.usage_tags.clone();
+        let session_allow = self.gitignore_session_allow.clone();
+        let result_query = query.clone();
+        self.at_suggestions_loading = true;
+        self.at_suggestions_loaded_query = None;
+        self.at_suggestions_error = None;
+        let operation = self.autocomplete_blocking_operation();
+        self.start_owned_blocking_action(
+            operation,
+            AsyncActionPolicy::Replace(AsyncActionKey::new("autocomplete.files")),
+            move || {
+                let mut allow = cockpit_config::extended::resolve_gitignore_allow(&cwd);
+                allow.extend(session_allow);
+                let suggestions =
+                    cockpit_core::tags::suggestions(&cwd, &query, &usage_tags, &allow);
+                Ok(AsyncActionPayload::FileSuggestions {
+                    query: result_query,
+                    suggestions,
+                })
+            },
+        );
     }
 
     /// Reset the slash-popup highlight + scroll window to the top (the
@@ -2380,6 +2661,7 @@ impl App {
                 .then(|| self.active_model_selection.clone())
                 .flatten(),
             kind: cockpit_core::engine::message::UserSubmissionKind::User,
+            origin: cockpit_core::engine::message::SubmissionOrigin::ExternalRoot,
             text: wire.clone(),
             display_text: Some(submitted.clone()),
             tag_expansions: tag_expansions.clone(),
@@ -2394,6 +2676,26 @@ impl App {
             pending_terminal_disposition: None,
             run_invocation_id: None,
         };
+        // A model switch is itself the earlier ordered intent. Attach this
+        // fence to that transaction rather than treating it as a generic
+        // deferred fence: the terminal model result completes the switch,
+        // installs the exact queued payload below, and then releases this
+        // already-ordered fence.
+        if let Some(pending) = self.pending_model_selection.as_mut() {
+            let status = format!(
+                "Switching to {}/{}; message will send when ready.",
+                pending.requested.provider, pending.requested.model
+            );
+            pending.queued_submission = Some(super::QueuedModelSubmission {
+                client_submission_id,
+                composer_text: self.composer.text().to_string(),
+                display: submitted,
+                submission,
+                tag_expansions,
+            });
+            self.push_plain(status);
+            return false;
+        }
         let order_front = self.submission_order.front();
         let stages_behind_session_switch = self.has_pending_session_switch_action()
             && matches!(
@@ -2428,23 +2730,6 @@ impl App {
             self.dispatch_next_ready_paste_fence();
             return false;
         }
-        if let Some(pending) = self.pending_model_selection.as_mut() {
-            let status = format!(
-                "Switching to {}/{}; message will send when ready.",
-                pending.requested.provider, pending.requested.model
-            );
-            pending.queued_submission = Some(super::QueuedModelSubmission {
-                client_submission_id,
-                fence_sequence,
-                composer_text: self.composer.text().to_string(),
-                display: submitted,
-                submission,
-                tag_expansions,
-            });
-            self.push_plain(status);
-            return false;
-        }
-
         // If a turn is in flight, the daemon will queue this message
         // and fold it into the next inference call (GOALS §1c). Track
         // it locally so the user sees what's pending; cleared when the
@@ -2776,27 +3061,74 @@ impl App {
     }
 }
 
-enum QueueEditOutcome {
+pub(super) enum QueueEditOutcome {
     Edited { text: String, partial: bool },
     AlreadyStarted,
     Fallthrough,
-    NotConnected,
     TransportError,
 }
 
+const QUEUE_EDIT_PENDING_NOTICE: &str = "retrieving queued messages…";
+
 impl App {
     fn edit_queued_messages(&mut self) -> bool {
-        let outcome = self.remove_editable_queued_messages();
-        self.apply_queue_edit_outcome(outcome)
+        let operation = self.queue_blocking_operation();
+        #[cfg(test)]
+        let barrier = self.take_owned_test_barrier(operation);
+        let attached_request = self
+            .agent_runner
+            .as_ref()
+            .and_then(|runner| runner.as_ref().ok())
+            .map(|runner| runner.attached_request_binding());
+        if attached_request.is_none() {
+            #[cfg(test)]
+            if barrier.is_some() {
+                // The injected callable is the external-work boundary.
+            } else {
+                self.push_queue_edit_notice("not connected to the session");
+                return true;
+            }
+            #[cfg(not(test))]
+            {
+                self.push_queue_edit_notice("not connected to the session");
+                return true;
+            }
+        }
+        self.push_queue_edit_notice(QUEUE_EDIT_PENDING_NOTICE);
+        let action_kind = operation.action_kind();
+        let request = Request::RemoveEditableQueuedUserMessages { target_id: None };
+        self.async_actions.start_serialized(
+            action_kind,
+            AsyncActionKey::new("queue.edit"),
+            async move {
+                #[cfg(test)]
+                if let Some(barrier) = barrier {
+                    tokio::task::spawn_blocking(move || barrier.arrive_and_wait())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    return Ok(AsyncActionPayload::Unit);
+                }
+                attached_request
+                    .expect("queue dispatch checked attached request")
+                    .request(request)
+                    .await
+                    .map(|response| AsyncActionPayload::DaemonResponse(Box::new(response)))
+            },
+        );
+        true
     }
 
-    fn apply_queue_edit_outcome(&mut self, outcome: QueueEditOutcome) -> bool {
+    pub(super) fn apply_queue_edit_outcome(&mut self, outcome: QueueEditOutcome) -> bool {
         match outcome {
             QueueEditOutcome::Edited { text, partial } => {
                 self.composer.set(text);
                 self.paste_registry.clear();
                 if partial {
-                    self.push_queue_edit_notice("some queued messages already started");
+                    if self.toast.is_none() || self.has_owned_queue_edit_pending_notice() {
+                        self.push_queue_edit_notice("some queued messages already started");
+                    }
+                } else if self.has_owned_queue_edit_pending_notice() {
+                    self.toast = None;
                 }
                 true
             }
@@ -2805,10 +3137,6 @@ impl App {
                 true
             }
             QueueEditOutcome::Fallthrough => false,
-            QueueEditOutcome::NotConnected => {
-                self.push_queue_edit_notice("not connected to the session");
-                true
-            }
             QueueEditOutcome::TransportError => {
                 self.push_queue_edit_notice("could not reach the session");
                 true
@@ -2820,20 +3148,15 @@ impl App {
         self.show_toast(text, super::ToastKind::Info);
     }
 
-    fn remove_editable_queued_messages(&mut self) -> QueueEditOutcome {
-        let attached_request = match self.agent_runner.as_ref() {
-            Some(Ok(runner)) => runner.attached_request_binding(),
-            _ => return QueueEditOutcome::NotConnected,
-        };
-        self.remove_editable_queued_messages_with(|| {
-            crate::tui::agent_runner::attached_request_tx_blocking(
-                attached_request,
-                Request::RemoveEditableQueuedUserMessages { target_id: None },
-            )
+    fn has_owned_queue_edit_pending_notice(&self) -> bool {
+        self.toast.as_ref().is_some_and(|toast| {
+            toast.kind == super::ToastKind::Info
+                && !toast.persistent
+                && toast.text == QUEUE_EDIT_PENDING_NOTICE
         })
     }
 
-    fn remove_editable_queued_messages_with<F>(&mut self, remove: F) -> QueueEditOutcome
+    pub(super) fn remove_editable_queued_messages_with<F>(&mut self, remove: F) -> QueueEditOutcome
     where
         F: FnOnce() -> Result<Response, String>,
     {
@@ -2987,16 +3310,24 @@ impl App {
     /// if the cursor sits at a matching text block's right edge, else
     /// condense-or-insert by the threshold rule.
     pub(super) fn handle_paste(&mut self, data: String) {
+        self.handle_paste_inner(data, None);
+    }
+
+    fn handle_paste_inner(
+        &mut self,
+        data: String,
+        mut identified_probe: Option<super::PendingPasteProbe>,
+    ) {
         // Any authoritative non-empty paste supersedes an unclaimed native
         // clipboard probe from the same shortcut before routing is frozen.
         // Do this ahead of every literal/non-input early return: focus can
         // change while the clipboard read is parked, and its late result must
         // never mutate the composer after the text was routed elsewhere.
         if !data.is_empty() {
-            self.pending_paste_probes.retain(|_, probe| {
-                probe.owner_fence.is_some()
-                    || probe.request.source
-                        != crate::tui::structured_paste::PasteSource::NativePaste
+            self.cancel_paste_probes_matching(|probe| {
+                probe.owner_fence.is_none()
+                    && probe.request.source
+                        == crate::tui::structured_paste::PasteSource::NativePaste
             });
         }
         if self.btw_pane.as_ref().is_some_and(|pane| pane.focused) {
@@ -3076,52 +3407,55 @@ impl App {
                 self.show_toast("Paste unavailable", super::ToastKind::Error);
                 return;
             }
-            let Some(request) =
+            let Some(mut probe) = identified_probe.take().or_else(|| {
                 self.allocate_paste_request(crate::tui::structured_paste::PasteSource::NativePaste)
-            else {
+                    .map(|request| super::PendingPasteProbe {
+                        request,
+                        original_data: data.clone(),
+                        source_draft_generation: self.draft_generation,
+                        owner_fence: None,
+                        original_offset: self.composer.cursor(),
+                        deadline: self.event_loop_monotonic_now + std::time::Duration::from_secs(2),
+                        async_action_id: None,
+                    })
+            }) else {
                 self.show_toast("Paste unavailable", super::ToastKind::Error);
                 return;
             };
-            let request_id = request.paste_correlation_id;
-            let request_generation = request.paste_generation;
-            self.pending_paste_probes.insert(
-                request_id,
-                super::PendingPasteProbe {
-                    request,
-                    source_draft_generation: self.draft_generation,
-                    owner_fence: None,
-                    original_offset: self.composer.cursor(),
-                    deadline: self.event_loop_monotonic_now + std::time::Duration::from_secs(2),
-                },
-            );
+            let request_id = probe.request.paste_correlation_id;
+            let request_generation = probe.request.paste_generation;
+            probe.original_data = data.clone();
+            let source_draft_generation = probe.source_draft_generation;
+            let cursor = probe.original_offset;
+            self.pending_paste_probes.insert(request_id, probe);
             let terminal_generation = self.terminal_input_generation;
-            let source_draft_generation = self.draft_generation;
-            let cursor = self.composer.cursor();
-            self.async_actions.start(
-                native_kind,
-                crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
-                async move {
-                    let png = tokio::time::timeout(
-                        std::time::Duration::from_secs(2),
-                        tokio::task::spawn_blocking(crate::clipboard::read_image_as_png),
-                    )
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .and_then(Result::ok)
-                    .flatten();
-                    Ok(
-                        crate::tui::async_action::AsyncActionPayload::NativeImagePaste {
-                            request_id,
-                            request_generation,
-                            terminal_generation,
-                            source_draft_generation,
-                            cursor,
-                            png,
-                        },
-                    )
-                },
-            );
+            let action_id = self
+                .async_actions
+                .start(
+                    native_kind,
+                    crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
+                    async move {
+                        let png = tokio::task::spawn_blocking(crate::clipboard::read_image_as_png)
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .flatten();
+                        Ok(
+                            crate::tui::async_action::AsyncActionPayload::NativeImagePaste {
+                                request_id,
+                                request_generation,
+                                terminal_generation,
+                                source_draft_generation,
+                                cursor,
+                                png,
+                            },
+                        )
+                    },
+                )
+                .id();
+            if let Some(probe) = self.pending_paste_probes.get_mut(&request_id) {
+                probe.async_action_id = Some(action_id);
+            }
             return;
         }
 
@@ -3132,58 +3466,70 @@ impl App {
                 self.show_toast("Paste unavailable", super::ToastKind::Error);
                 return;
             }
-            let Some(request) = self
-                .allocate_paste_request(crate::tui::structured_paste::PasteSource::BracketedPty)
-            else {
+            let Some(mut probe) = identified_probe.take().or_else(|| {
+                self.allocate_paste_request(crate::tui::structured_paste::PasteSource::BracketedPty)
+                    .map(|request| super::PendingPasteProbe {
+                        request,
+                        original_data: data.clone(),
+                        source_draft_generation: self.draft_generation,
+                        owner_fence: None,
+                        original_offset: self.composer.cursor(),
+                        deadline: self.event_loop_monotonic_now + std::time::Duration::from_secs(2),
+                        async_action_id: None,
+                    })
+            }) else {
                 self.show_toast("Paste unavailable", super::ToastKind::Error);
                 return;
             };
-            let request_id = request.paste_correlation_id;
-            let request_generation = request.paste_generation;
-            self.pending_paste_probes.insert(
-                request_id,
-                super::PendingPasteProbe {
-                    request,
-                    source_draft_generation: self.draft_generation,
-                    owner_fence: None,
-                    original_offset: self.composer.cursor(),
-                    deadline: self.event_loop_monotonic_now + std::time::Duration::from_secs(2),
-                },
-            );
+            let request_id = probe.request.paste_correlation_id;
+            let request_generation = probe.request.paste_generation;
+            probe.original_data = data.clone();
+            let source_draft_generation = probe.source_draft_generation;
+            let cursor = probe.original_offset;
+            self.pending_paste_probes.insert(request_id, probe);
             let original = data.clone();
             let terminal_generation = self.terminal_input_generation;
-            let source_draft_generation = self.draft_generation;
-            let cursor = self.composer.cursor();
-            self.async_actions.start(
-                kind,
-                crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
-                async move {
-                    let normalized = tokio::time::timeout(
-                        std::time::Duration::from_secs(2),
-                        tokio::task::spawn_blocking(move || {
+            let action_id = self
+                .async_actions
+                .start(
+                    kind,
+                    crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
+                    async move {
+                        let normalized = tokio::task::spawn_blocking(move || {
                             crate::tui::image_path_probe::normalize_private_image(&path)
-                        }),
-                    )
-                    .await
-                    .ok()
-                    .and_then(|joined| joined.ok())
-                    .and_then(Result::ok);
-                    Ok(
-                        crate::tui::async_action::AsyncActionPayload::ImagePathProbe {
-                            request_id,
-                            request_generation,
-                            terminal_generation,
-                            original,
-                            source_draft_generation,
-                            cursor,
-                            png: normalized,
-                        },
-                    )
-                },
-            );
+                        })
+                        .await
+                        .ok()
+                        .and_then(Result::ok);
+                        Ok(
+                            crate::tui::async_action::AsyncActionPayload::ImagePathProbe {
+                                request_id,
+                                request_generation,
+                                terminal_generation,
+                                original,
+                                source_draft_generation,
+                                cursor,
+                                png: normalized,
+                            },
+                        )
+                    },
+                )
+                .id();
+            if let Some(probe) = self.pending_paste_probes.get_mut(&request_id) {
+                probe.async_action_id = Some(action_id);
+            }
             return;
         }
 
+        if let Some(probe) = identified_probe.take() {
+            let request = probe.request;
+            let _ = self.paste_correlations.commit(
+                request.paste_correlation_id,
+                request.paste_generation,
+                request.host,
+                self.event_loop_monotonic_now,
+            );
+        }
         self.last_composer_edit_at = Some(Instant::now());
 
         // Re-paste-to-expand: cursor at a text block's right edge + the
@@ -4315,7 +4661,9 @@ mod tag_delete_tests {
 
 #[cfg(test)]
 mod queued_message_edit_tests {
-    use super::{optimistic_queue_item, queue_item_from_proto};
+    use super::{
+        QUEUE_EDIT_PENDING_NOTICE, QueueEditOutcome, optimistic_queue_item, queue_item_from_proto,
+    };
     use crate::tui::agent_runner::{AgentRunner, AttachedRequest, ClientTasks, UsageCounts};
     use crate::tui::app::App;
     use cockpit_core::daemon::proto::{
@@ -4627,11 +4975,43 @@ mod queued_message_edit_tests {
 
         app.history_up();
         responder.await.unwrap();
+        let kind = app.queue_blocking_operation().action_kind();
+        while app.async_actions.has_pending_kind(&kind) {
+            let notify = app.async_actions.notifier();
+            let notified = notify.notified();
+            app.drain_async_actions();
+            if !app.async_actions.has_pending_kind(&kind) {
+                break;
+            }
+            notified.await;
+        }
 
         assert_eq!(app.composer.text(), "queued");
         assert_eq!(app.prompt_history_cursor, 0);
         assert!(app.queue.is_empty());
         assert!(app.toast.is_none());
+    }
+
+    #[test]
+    fn queue_edit_success_does_not_clear_or_replace_a_newer_toast() {
+        for partial in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut app = App::new(Some(tmp.path()), false);
+            app.push_queue_edit_notice(QUEUE_EDIT_PENDING_NOTICE);
+            app.show_toast("newer notice", crate::tui::app::ToastKind::Warning);
+
+            app.apply_queue_edit_outcome(QueueEditOutcome::Edited {
+                text: "queued".to_string(),
+                partial,
+            });
+
+            assert!(matches!(
+                &app.toast,
+                Some(toast)
+                    if toast.text == "newer notice"
+                        && toast.kind == crate::tui::app::ToastKind::Warning
+            ));
+        }
     }
 
     #[test]
@@ -4735,7 +5115,7 @@ mod paste_routing_tests {
     use crate::tui::paste::{PasteKind, PasteRegistry};
     use crate::tui::pins_overlay::{CopyPick, ForkPick, PinPick, PinsReview};
     use crate::tui::settings::Dialog;
-    use cockpit_db::pins::PinnedMessage;
+    use cockpit_core::daemon::proto::PinnedMessage;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -5135,10 +5515,12 @@ mod paste_routing_tests {
             stale_native_id,
             crate::tui::app::PendingPasteProbe {
                 request: stale_native,
+                original_data: String::new(),
                 source_draft_generation: app.draft_generation,
                 owner_fence: None,
                 original_offset: 0,
                 deadline: std::time::Duration::from_secs(2),
+                async_action_id: None,
             },
         );
         app.overlay = Overlay::Notes(crate::tui::notes_pane::NotesPane::editing_for_test(
@@ -5171,10 +5553,12 @@ mod paste_routing_tests {
             request_id,
             crate::tui::app::PendingPasteProbe {
                 request,
+                original_data: String::new(),
                 source_draft_generation: app.draft_generation,
                 owner_fence: None,
                 original_offset: 0,
                 deadline: std::time::Duration::from_secs(2),
+                async_action_id: None,
             },
         );
 
@@ -5185,6 +5569,136 @@ mod paste_routing_tests {
         app.event_loop_monotonic_now = std::time::Duration::from_millis(2_000);
         assert!(app.expire_pending_paste_probes());
         assert!(!app.pending_paste_probes.contains_key(&request_id));
+    }
+
+    #[test]
+    fn identified_paste_duplicate_preserves_owned_and_unowned_probe() {
+        for owner_fence in [None, Some(uuid::Uuid::new_v4())] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut app = input_ready_app(&tmp);
+            let request = app
+                .allocate_paste_request(crate::tui::structured_paste::PasteSource::BracketedPty)
+                .expect("fixture claims correlation");
+            let request_id = request.paste_correlation_id;
+            let generation = request.paste_generation;
+            let deadline = std::time::Duration::from_millis(1_234);
+            app.pending_paste_probes.insert(
+                request_id,
+                crate::tui::app::PendingPasteProbe {
+                    request,
+                    original_data: "same payload".to_string(),
+                    source_draft_generation: app.draft_generation,
+                    owner_fence,
+                    original_offset: 7,
+                    deadline,
+                    async_action_id: None,
+                },
+            );
+
+            app.event_loop_monotonic_now = std::time::Duration::from_millis(900);
+            app.handle_identified_paste(
+                "same payload".to_string(),
+                crate::tui::structured_paste::PasteSource::BracketedPty,
+                request_id,
+            );
+
+            let preserved = app
+                .pending_paste_probes
+                .get(&request_id)
+                .expect("duplicate attaches to the original probe");
+            assert_eq!(preserved.request.paste_generation, generation);
+            assert_eq!(preserved.owner_fence, owner_fence);
+            assert_eq!(preserved.deadline, deadline);
+            assert_eq!(preserved.original_data, "same payload");
+        }
+    }
+
+    #[test]
+    fn identified_paste_rejects_payload_replacement_without_resetting_deadline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = input_ready_app(&tmp);
+        let request = app
+            .allocate_paste_request(crate::tui::structured_paste::PasteSource::RapidPty)
+            .expect("fixture claims correlation");
+        let request_id = request.paste_correlation_id;
+        let generation = request.paste_generation;
+        let deadline = std::time::Duration::from_millis(1_111);
+        app.pending_paste_probes.insert(
+            request_id,
+            crate::tui::app::PendingPasteProbe {
+                request,
+                original_data: "original".to_string(),
+                source_draft_generation: app.draft_generation,
+                owner_fence: None,
+                original_offset: 3,
+                deadline,
+                async_action_id: None,
+            },
+        );
+
+        app.event_loop_monotonic_now = std::time::Duration::from_millis(1_000);
+        app.handle_identified_paste(
+            "replacement".to_string(),
+            crate::tui::structured_paste::PasteSource::RapidPty,
+            request_id,
+        );
+
+        let preserved = app
+            .pending_paste_probes
+            .get(&request_id)
+            .expect("differing payload cannot replace in-flight work");
+        assert_eq!(preserved.request.paste_generation, generation);
+        assert_eq!(preserved.deadline, deadline);
+        assert_eq!(preserved.original_data, "original");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn identified_path_literal_completion_preserves_unowned_probe_capture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = input_ready_app(&tmp);
+        let request = app
+            .allocate_paste_request(crate::tui::structured_paste::PasteSource::NativePaste)
+            .expect("fixture claims native shortcut correlation");
+        let request_id = request.paste_correlation_id;
+        let generation = request.paste_generation;
+        let deadline = std::time::Duration::from_millis(1_111);
+        app.pending_paste_probes.insert(
+            request_id,
+            crate::tui::app::PendingPasteProbe {
+                request,
+                original_data: String::new(),
+                source_draft_generation: 77,
+                owner_fence: None,
+                original_offset: 5,
+                deadline,
+                async_action_id: None,
+            },
+        );
+
+        app.event_loop_monotonic_now = std::time::Duration::from_millis(1_000);
+        app.handle_identified_paste(
+            "'/tmp/authoritative.png'".to_string(),
+            crate::tui::structured_paste::PasteSource::BracketedPty,
+            request_id,
+        );
+        // Let the production path-probe task enter the current-thread
+        // scheduler. The probe remains authoritative until that real task
+        // reports its result through the async-action runner.
+        tokio::task::yield_now().await;
+
+        let preserved = app
+            .pending_paste_probes
+            .get(&request_id)
+            .expect("path probe keeps the native shortcut's original capture");
+        assert_eq!(preserved.request.paste_generation, generation);
+        assert_eq!(
+            preserved.request.source,
+            crate::tui::structured_paste::PasteSource::BracketedPty
+        );
+        assert_eq!(preserved.source_draft_generation, 77);
+        assert_eq!(preserved.original_offset, 5);
+        assert_eq!(preserved.deadline, deadline);
+        assert!(preserved.async_action_id.is_some());
     }
 
     #[test]
@@ -5798,15 +6312,30 @@ mod shift_enter_keyboard_protocol_tests {
         app
     }
 
-    fn at_popup_app(tmp: &tempfile::TempDir) -> App {
+    async fn at_popup_app(tmp: &tempfile::TempDir) -> App {
         let mut app = app(tmp);
         let cwd = app.launch.cwd.clone();
         fs::create_dir(cwd.join(".git")).unwrap();
         fs::write(cwd.join("kept.rs"), "").unwrap();
         app.composer.insert_str("@kept");
+        app.reset_at_window();
+        await_at_suggestions(&mut app).await;
         assert!(app.at_popup_active());
         assert_eq!(app.at_suggestions().len(), 1);
         app
+    }
+
+    async fn await_at_suggestions(app: &mut App) {
+        let kind = app.autocomplete_blocking_operation().action_kind();
+        while app.async_actions.has_pending_kind(&kind) {
+            let notify = app.async_actions.notifier();
+            let notified = notify.notified();
+            app.drain_async_actions();
+            if !app.async_actions.has_pending_kind(&kind) {
+                break;
+            }
+            notified.await;
+        }
     }
 
     #[test]
@@ -5833,10 +6362,10 @@ mod shift_enter_keyboard_protocol_tests {
         assert_eq!(app.composer.text(), "");
     }
 
-    #[test]
-    fn shift_enter_with_at_popup_inserts_newline_instead_of_accepting_suggestion() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn shift_enter_with_at_popup_inserts_newline_instead_of_accepting_suggestion() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut app = at_popup_app(&tmp);
+        let mut app = at_popup_app(&tmp).await;
 
         let exit = app.handle_key(key(KeyCode::Enter, KeyModifiers::SHIFT));
 

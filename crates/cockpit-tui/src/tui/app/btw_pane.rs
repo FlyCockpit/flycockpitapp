@@ -3,6 +3,8 @@ use ratatui::layout::Rect;
 use uuid::Uuid;
 
 use crate::tui::agent_runner::{self, AgentRunner};
+#[cfg(test)]
+use crate::tui::async_action::AsyncActionPayload;
 use crate::tui::composer::Composer;
 use crate::tui::history::{HistoryEntry, PendingMsg, route_text_delta};
 use cockpit_core::daemon::proto::{self, Request, Response};
@@ -481,6 +483,7 @@ impl BtwPane {
             expected_model_state_generation: None,
             expected_model: None,
             kind: cockpit_core::engine::message::UserSubmissionKind::User,
+            origin: cockpit_core::engine::message::SubmissionOrigin::ExternalRoot,
             text: text.clone(),
             display_text: Some(text.clone()),
             tag_expansions: Vec::new(),
@@ -802,87 +805,93 @@ impl App {
         }
 
         let existing_mode = self.btw_pane.as_ref().map(BtwPane::mode);
-        let parent_session_id = match self.agent_runner.as_ref() {
-            Some(Ok(runner)) => runner.session_id(),
-            _ => {
-                self.ensure_agent_runner();
-                match self.agent_runner.as_ref() {
-                    Some(Ok(runner)) => runner.session_id(),
-                    _ => {
-                        self.history.push(HistoryEntry::CommandError {
-                            line: "/btw: no daemon connection".to_string(),
-                        });
-                        return;
-                    }
-                }
-            }
-        };
-        let attached_request = match self.agent_runner.as_ref() {
-            Some(Ok(runner)) => runner.attached_request_binding(),
-            _ => unreachable!("runner checked above"),
-        };
+        let operation = self.btw_blocking_operation();
+        #[cfg(test)]
+        let barrier = self.take_owned_test_barrier(operation);
+        #[cfg(test)]
+        let has_test_gate = barrier.is_some();
+        #[cfg(not(test))]
+        let has_test_gate = false;
+        let mut runner = self
+            .agent_runner
+            .as_ref()
+            .and_then(|runner| runner.as_ref().ok());
+        if runner.is_none() && !has_test_gate {
+            self.ensure_agent_runner();
+            runner = self
+                .agent_runner
+                .as_ref()
+                .and_then(|runner| runner.as_ref().ok());
+        }
+        if runner.is_none() && !has_test_gate {
+            self.history.push(HistoryEntry::CommandError {
+                line: "/btw: no daemon connection".to_string(),
+            });
+            return;
+        }
+        let parent_session_id = runner
+            .map(|runner| runner.session_id())
+            .unwrap_or_else(uuid::Uuid::nil);
+        let attached_request = runner.map(|runner| runner.attached_request_binding());
 
-        let plan = plan_btw_rpcs(&command, existing_mode);
-        let mut created_info = None;
-        for rpc in plan {
-            let request = match rpc {
+        let requests = plan_btw_rpcs(&command, existing_mode)
+            .into_iter()
+            .map(|rpc| match rpc {
                 BtwRpcPlan::End => Request::EndBtwFork { parent_session_id },
                 BtwRpcPlan::Create { mode } => Request::CreateBtwFork {
                     parent_session_id,
                     tangent: mode.tangent(),
                 },
-            };
-            match agent_runner::attached_request_tx_blocking(attached_request.clone(), request) {
-                Ok(Response::Ack) => {
-                    self.close_btw_pane();
-                }
-                Ok(Response::BtwFork { info, .. }) => {
-                    created_info = Some(info);
-                }
-                Ok(other) => {
-                    self.history.push(HistoryEntry::CommandError {
-                        line: format!("/btw: unexpected daemon response: {other:?}"),
-                    });
-                    return;
-                }
-                Err(error) => {
-                    self.history.push(HistoryEntry::CommandError {
-                        line: format!("/btw: {error}"),
-                    });
-                    return;
-                }
-            }
-        }
-
-        if let Some(info) = created_info {
-            self.open_btw_pane_from_info(info, true);
-        } else if matches!(command, BtwCommand::End) {
-            self.close_btw_pane();
-            return;
-        } else if self.btw_pane.is_none() {
-            self.history.push(HistoryEntry::CommandError {
-                line: "/btw: no live fork".to_string(),
-            });
-            return;
-        }
-
+            })
+            .collect::<Vec<_>>();
         let question = match command {
             BtwCommand::Open { question } | BtwCommand::New { question } => question,
             BtwCommand::Tangent { question } => Some(question),
             BtwCommand::End | BtwCommand::NotYetAvailable(_) => None,
         };
-        if let Some(pane) = self.btw_pane.as_mut() {
-            pane.focused = true;
-            if let Some(question) = question
-                && let Err(error) = pane.send_text(question.clone())
-            {
-                pane.history.push(HistoryEntry::InferenceError {
-                    summary: error.clone(),
-                    detail: error,
-                    expanded: false,
-                });
-            }
-        }
+        self.push_plain("/btw: pending".to_string());
+        let action_kind = operation.action_kind();
+        self.async_actions.start(
+            action_kind,
+            crate::tui::async_action::AsyncActionPolicy::Replace(
+                crate::tui::async_action::AsyncActionKey::new("btw.transition"),
+            ),
+            async move {
+                #[cfg(test)]
+                if let Some(barrier) = barrier {
+                    tokio::task::spawn_blocking(move || barrier.arrive_and_wait())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    return Ok(AsyncActionPayload::Unit);
+                }
+                let attached_request = attached_request.expect("BTW dispatch checked runner");
+                let mut created = None;
+                let mut ended = false;
+                let mut error = None;
+                for request in requests {
+                    match attached_request.request(request).await {
+                        Ok(Response::Ack) => ended = true,
+                        Ok(Response::BtwFork { info, .. }) => created = Some(info),
+                        Ok(other) => {
+                            error = Some(format!("unexpected daemon response: {other:?}"));
+                            break;
+                        }
+                        Err(rpc_error) => {
+                            error = Some(rpc_error);
+                            break;
+                        }
+                    }
+                }
+                Ok(
+                    crate::tui::async_action::AsyncActionPayload::BtwTransition {
+                        created,
+                        ended,
+                        question,
+                        error,
+                    },
+                )
+            },
+        );
     }
 
     pub(super) fn open_btw_pane_from_info(&mut self, info: proto::BtwForkInfo, attach: bool) {
@@ -895,6 +904,10 @@ impl App {
     }
 
     pub(super) fn close_btw_pane(&mut self) {
+        self.async_actions
+            .abort_key(&crate::tui::async_action::AsyncActionKey::new(
+                "btw.transition",
+            ));
         self.btw_pane = None;
     }
 
@@ -1596,5 +1609,33 @@ mod tests {
         );
         assert_eq!(app.composer.text(), "main");
         assert_eq!(pane.composer.text(), "s");
+    }
+
+    #[tokio::test]
+    async fn end_ack_then_create_failure_closes_dead_pane() {
+        let mut app = App::new(None, false);
+        app.open_btw_pane_from_info(info(false), false);
+        app.async_actions.start(
+            crate::tui::async_action::AsyncActionKind::Blocking("btw.teardown"),
+            crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
+            async {
+                Ok(
+                    crate::tui::async_action::AsyncActionPayload::BtwTransition {
+                        created: None,
+                        ended: true,
+                        question: None,
+                        error: Some("create failed".to_string()),
+                    },
+                )
+            },
+        );
+        app.async_actions.notifier().notified().await;
+        app.drain_async_actions();
+
+        assert!(app.btw_pane.is_none());
+        assert!(matches!(
+            app.history.last(),
+            Some(HistoryEntry::Plain { line }) if line.contains("create failed")
+        ));
     }
 }

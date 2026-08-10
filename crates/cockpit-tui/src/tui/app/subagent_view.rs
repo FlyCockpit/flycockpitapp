@@ -133,42 +133,42 @@ impl App {
         task_call_id: String,
         label: String,
     ) {
-        let db = self.startup_background.db.clone();
+        let Some(socket) = self.startup_background.daemon_socket.clone() else {
+            self.push_plain(
+                "Subagent history unavailable — reconnect to the daemon, then Retry".to_string(),
+            );
+            return;
+        };
         let key = format!("subagent.history:{session_id}:{task_call_id}:{label}");
-        self.async_actions.start(
+        self.async_actions.start_blocking(
             AsyncActionKind::Internal("subagent.history"),
             AsyncActionPolicy::Replace(AsyncActionKey::new(key)),
-            async move {
-                let (history, has_more, oldest_seq) = match db {
-                    Some(db) => {
-                        let query_task_call_id = task_call_id.clone();
-                        let query_label = label.clone();
-                        let page = db
-                            .read(move |conn| {
-                                cockpit_core::engine::rehydrate::subagent_history_page_before_conn(
-                                    conn,
-                                    session_id,
-                                    &query_task_call_id,
-                                    &query_label,
-                                    None,
-                                    HISTORY_WINDOW_TARGET_ENTRIES as u32,
-                                )
-                            })
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        (
-                            wire_history_to_entries(page.entries),
-                            page.has_more,
-                            page.oldest_seq,
-                        )
-                    }
-                    None => (Vec::new(), false, None),
+            move || {
+                let request = cockpit_core::daemon::proto::Request::ReadSubagentHistoryPage {
+                    session_id,
+                    task_call_id: task_call_id.clone(),
+                    label: label.clone(),
+                    before_seq: None,
+                    limit: HISTORY_WINDOW_TARGET_ENTRIES as u32,
+                };
+                let response =
+                    crate::tui::agent_runner::daemon_request_at_blocking(&socket, request)?;
+                let cockpit_core::daemon::proto::Response::SubagentHistoryPage {
+                    entries,
+                    has_more,
+                    oldest_seq,
+                    ..
+                } = response
+                else {
+                    return Err(format!(
+                        "unexpected subagent history response: {response:?}"
+                    ));
                 };
                 Ok(AsyncActionPayload::SubagentHistory {
                     session_id,
                     task_call_id,
                     label,
-                    history,
+                    history: wire_history_to_entries(entries),
                     has_more,
                     oldest_seq,
                 })

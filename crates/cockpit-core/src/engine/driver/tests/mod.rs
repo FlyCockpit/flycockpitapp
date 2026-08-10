@@ -806,6 +806,7 @@ async fn assert_unwind_reason(reason: StackUnwindReason, expected: &str) {
         expected_model_state_generation: None,
         expected_model: None,
         kind: UserSubmissionKind::User,
+        origin: Default::default(),
         text: "next root message".into(),
         display_text: None,
         tag_expansions: Vec::new(),

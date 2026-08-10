@@ -343,6 +343,12 @@ impl ExternalRuntimeDescriptor {
     pub fn builder(id: impl Into<ExternalRuntimeId>) -> ExternalRuntimeDescriptorBuilder {
         ExternalRuntimeDescriptorBuilder::new(id)
     }
+
+    /// Attach a catalog-owned compatibility rule while preserving the closed descriptor.
+    pub fn with_compatibility(mut self, rule: CompatibilityRule) -> Self {
+        self.compatibility = Some(rule);
+        self
+    }
 }
 
 /// Fluent builder for catalog descriptors.

@@ -99,6 +99,32 @@ pub(crate) trait HttpsMediaFetcher: Send + Sync {
 pub(crate) struct SystemHttpsMediaFetcher;
 
 #[async_trait]
+trait HttpsHopExecutor: Send + Sync {
+    async fn execute(
+        &self,
+        hop: &VettedHttpsHop,
+        limits: &HttpsFetchLimits,
+    ) -> Result<reqwest::Response>;
+}
+
+struct ReqwestHttpsHopExecutor;
+
+#[async_trait]
+impl HttpsHopExecutor for ReqwestHttpsHopExecutor {
+    async fn execute(
+        &self,
+        hop: &VettedHttpsHop,
+        limits: &HttpsFetchLimits,
+    ) -> Result<reqwest::Response> {
+        hop.bound_client(limits)?
+            .get(hop.url().clone())
+            .send()
+            .await
+            .context("execute retained-media HTTPS request")
+    }
+}
+
+#[async_trait]
 impl HttpsMediaFetcher for SystemHttpsMediaFetcher {
     async fn fetch(
         &self,
@@ -133,18 +159,24 @@ async fn fetch_retained_https_before_deadline<W: AsyncWrite + Unpin>(
     sink: &mut W,
     limits: &HttpsFetchLimits,
 ) -> Result<RetainedHttpsFetchEvidence> {
+    fetch_retained_https_with_executor(raw_url, resolver, sink, limits, &ReqwestHttpsHopExecutor)
+        .await
+}
+
+async fn fetch_retained_https_with_executor<W: AsyncWrite + Unpin>(
+    raw_url: &str,
+    resolver: &dyn HttpsDnsResolver,
+    sink: &mut W,
+    limits: &HttpsFetchLimits,
+    executor: &dyn HttpsHopExecutor,
+) -> Result<RetainedHttpsFetchEvidence> {
     let initial_url = parse_fetch_url(raw_url)?;
     let answers = resolve_url(resolver, &initial_url).await?;
     let mut hop = vetted_hop(initial_url, &answers, 0)?;
     let mut provenance = RedactedHttpsProvenance::initial(&hop)?;
 
     loop {
-        let response = hop
-            .bound_client(limits)?
-            .get(hop.url().clone())
-            .send()
-            .await
-            .context("execute retained-media HTTPS request")?;
+        let response = executor.execute(&hop, limits).await?;
         if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
             let location = response
                 .headers()

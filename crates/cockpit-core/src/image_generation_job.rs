@@ -3061,14 +3061,14 @@ mod tests {
         let root = open_image_generation_artifact_root(&managed).unwrap();
         let artifact_id = fixture.artifact_id;
         let resource = fixture.media_reservation_id.clone();
-        fixture.db.transaction(move|conn|{
+        fixture.db.blocking_for_sync_cli(move|conn|{
             retain_generated_image_artifact(conn,&root,&RetainGeneratedImageArtifact{artifact_id,job_id,slot_id,component_id:Uuid::now_v7(),format:GeneratedImageArtifactFormat::Svg,expected_width:1,expected_height:1,bytes:br#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><path d="M0 0h1v1z"/></svg>"#,resource_reservation_id:resource,release_operation_id:Uuid::now_v7(),late_quarantined:true,now_unix_ms:7})?;
             let state:String=conn.query_row("SELECT state FROM image_generation_artifacts WHERE artifact_id=?1",[artifact_id.to_string()],|row|row.get(0))?;
             assert_eq!(state,"late_quarantined");
             let ordinary:i64=conn.query_row("SELECT count(*) FROM image_generation_artifact_authorization_facts WHERE artifact_id=?1",[artifact_id.to_string()],|row|row.get(0))?;
             assert_eq!(ordinary,0);
             Ok(())
-        }).await.unwrap();
+        }).unwrap();
 
         let publication_operation_id = Uuid::now_v7();
         let worker_boot_id = Uuid::now_v7();

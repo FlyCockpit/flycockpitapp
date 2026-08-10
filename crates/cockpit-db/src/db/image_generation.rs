@@ -668,6 +668,21 @@ pub struct CommitImageGenerationPublication {
     pub artifact_generation: u64,
     pub now_unix_ms: i64,
 }
+pub struct BeginImageGenerationDownload {
+    pub job_id: Uuid,
+    pub slot_id: Uuid,
+    pub attempt_number: u32,
+    pub expected_job_version: u64,
+    pub expected_slot_version: u64,
+    pub expected_attempt_version: u64,
+    pub at_unix_ms: i64,
+}
+pub struct CommitImageGenerationValidation {
+    pub job_id: Uuid,
+    pub slot_id: Uuid,
+    pub expected_slot_version: u64,
+    pub at_unix_ms: i64,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestImageGenerationCancellation<'a> {
@@ -1340,6 +1355,37 @@ impl Db {
     ) -> Result<ResponseAdoptionOrdering> {
         atomic_conn(conn, "image_generation_adopt", || {
             Self::adopt_image_generation_response_inner(conn, input)
+        })
+    }
+
+    pub fn begin_image_generation_download_conn(
+        conn: &Connection,
+        input: &BeginImageGenerationDownload,
+    ) -> Result<()> {
+        atomic_conn(conn, "image_generation_begin_download", || {
+            ensure!(conn.execute("UPDATE image_generation_attempts SET state='downloading',version=version+1 WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND state='accepted' AND version=?4",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?])?==1,"image generation attempt download compare-and-set lost");
+            ensure!(conn.execute("UPDATE image_generation_slots SET state='downloading',version=version+1 WHERE job_id=?1 AND slot_id=?2 AND state='running' AND version=?3",params![input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.expected_slot_version)?])?==1,"image generation slot download compare-and-set lost");
+            ensure!(conn.execute("UPDATE image_generation_jobs SET state='downloading',version=version+1,updated_at_unix_ms=?1 WHERE job_id=?2 AND state='running' AND version=?3",params![input.at_unix_ms,input.job_id.to_string(),i64::try_from(input.expected_job_version)?])?==1,"image generation job download compare-and-set lost");
+            Ok(())
+        })
+    }
+
+    pub fn commit_image_generation_validation_conn(
+        conn: &Connection,
+        input: &CommitImageGenerationValidation,
+    ) -> Result<ImageGenerationSlotState> {
+        atomic_conn(conn, "image_generation_validate_output", || {
+            let after_cancel:bool=conn.query_row("SELECT result_after_cancel=1 AND applied_cancellation_version IS NOT NULL FROM image_generation_slots WHERE job_id=?1 AND slot_id=?2 AND state='validating' AND version=?3",params![input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.expected_slot_version)?],|row|row.get(0)).context("image generation validation authority is unavailable")?;
+            let next = if after_cancel {
+                ImageGenerationSlotState::LateQuarantined
+            } else {
+                ImageGenerationSlotState::ReadyToPublish
+            };
+            ensure!(conn.execute("UPDATE image_generation_slots SET state=?1,version=version+1 WHERE job_id=?2 AND slot_id=?3 AND state='validating' AND version=?4",params![next.as_str(),input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.expected_slot_version)?])?==1,"image generation validation compare-and-set lost");
+            if after_cancel {
+                conn.execute("UPDATE image_generation_jobs SET state='completed_after_cancel',version=version+1,updated_at_unix_ms=?1 WHERE job_id=?2 AND state='cancellation_requested'",params![input.at_unix_ms,input.job_id.to_string()])?;
+            }
+            Ok(next)
         })
     }
 

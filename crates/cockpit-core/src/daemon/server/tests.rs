@@ -5675,6 +5675,108 @@ async fn remote_fs_mutations_are_audited_with_path() {
 }
 
 #[tokio::test]
+async fn remote_fs_write_real_ingress_applies_once_replays_and_conflicts_on_changed_bytes() {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let logical_attachment_id = Uuid::parse_str("22222222-2222-4222-8222-222222222224").unwrap();
+    let operation_id = Uuid::parse_str("018f3f24-7a10-7cc2-8f55-111111111114").unwrap();
+    let actor = crate::daemon::relay_envelope::ClientActorBindingV1 {
+        schema_version: 1,
+        device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333334").unwrap(),
+        device_generation: 4,
+        logical_attachment_id,
+    };
+    let mut state = remote_state_with_grants(vec![project_files_grant(root)]);
+    let ClientPrincipal::Remote(principal) = &mut state.principal else {
+        panic!("remote fixture")
+    };
+    principal.actor_binding = Some(actor);
+    let mut shared = state.shared_snapshot();
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_cmd_tx, _event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let mut concurrent = ConcurrentRequestRuntime::new();
+    let operation =
+        proto::RemoteOperationIdentityV1::new(logical_attachment_id, operation_id).unwrap();
+    let request = |content: &str| Request::FsWrite {
+        project_root: root.to_string_lossy().into_owned(),
+        path: "once.txt".into(),
+        content: content.into(),
+        base_hash: None,
+    };
+
+    for expected_content in ["first", "first"] {
+        let request_id = Uuid::new_v4();
+        handle_envelope(
+            Envelope::remote_request(request_id, operation, request(expected_content)),
+            &mut state,
+            &mut shared,
+            &ctx,
+            &event_cmd_tx,
+            &writer_tx,
+            &mut concurrent,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            recv_writer_body(&mut writer_rx, "fs write outcome").await,
+            Body::Response { id, response }
+                if id == request_id && matches!(*response, Response::FsWrite { .. })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(root.join("once.txt")).unwrap(),
+            "first"
+        );
+    }
+    let conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(conflict_id, operation, request("changed")),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "fs write conflict").await,
+        Body::Error { id: Some(id), error }
+            if id == conflict_id && error.code == ErrorCode::Conflict
+    ));
+    assert_eq!(
+        std::fs::read_to_string(root.join("once.txt")).unwrap(),
+        "first"
+    );
+    let attachment = logical_attachment_id.to_string();
+    let operation_text = operation_id.to_string();
+    let (generation, events): (i64, i64) = ctx
+        .db
+        .read(move |conn| {
+            let generation = conn.query_row(
+                "SELECT dispatch_generation FROM remote_attachment_operations
+                 WHERE logical_attachment_id=?1 AND operation_id=?2",
+                rusqlite::params![attachment, operation_text],
+                |row| row.get(0),
+            )?;
+            let events = conn.query_row(
+                "SELECT COUNT(*) FROM remote_attachment_outbox WHERE kind='fs_write'",
+                [],
+                |row| row.get(0),
+            )?;
+            Ok((generation, events))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        (generation, events),
+        (1, 1),
+        "replay performs no second dispatch"
+    );
+}
+
+#[tokio::test]
 async fn resource_scheduler_is_shared_only_for_persistent_daemons() {
     let persistent_db = Db::open_in_memory().expect("in-memory db");
     let persistent_locks = Arc::new(LockManager::in_memory(persistent_db.clone()));

@@ -3242,6 +3242,22 @@ CREATE TABLE image_generation_handoff_evidence (
 CREATE TRIGGER image_generation_handoff_evidence_immutable BEFORE UPDATE ON image_generation_handoff_evidence BEGIN SELECT RAISE(ABORT,'image generation handoff evidence is immutable'); END;
 CREATE TRIGGER image_generation_handoff_evidence_no_delete BEFORE DELETE ON image_generation_handoff_evidence BEGIN SELECT RAISE(ABORT,'image generation handoff evidence is immutable'); END;
 
+CREATE TABLE image_generation_response_fetches (
+ job_id TEXT NOT NULL, slot_id TEXT NOT NULL, attempt_number INTEGER NOT NULL,
+ response_digest TEXT NOT NULL CHECK(length(response_digest)=64),
+ response_bytes BLOB NOT NULL CHECK(length(response_bytes) BETWEEN 1 AND 67108864),
+ fetch_evidence BLOB NOT NULL CHECK(length(fetch_evidence) BETWEEN 1 AND 65536),
+ fetch_evidence_digest TEXT NOT NULL CHECK(length(fetch_evidence_digest)=64),
+ fetched_at_unix_ms INTEGER NOT NULL,
+ PRIMARY KEY(job_id,slot_id,attempt_number),
+ FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT
+);
+CREATE TRIGGER image_generation_response_fetch_immutable BEFORE UPDATE ON image_generation_response_fetches BEGIN SELECT RAISE(ABORT,'image generation response fetch is immutable'); END;
+CREATE TRIGGER image_generation_response_fetch_no_delete BEFORE DELETE ON image_generation_response_fetches BEGIN SELECT RAISE(ABORT,'image generation response fetch is immutable'); END;
+CREATE TRIGGER image_generation_response_fetch_guard BEFORE INSERT ON image_generation_response_fetches
+WHEN NOT EXISTS(SELECT 1 FROM image_generation_attempts a JOIN image_generation_handoff_evidence h USING(job_id,slot_id,attempt_number) WHERE a.job_id=NEW.job_id AND a.slot_id=NEW.slot_id AND a.attempt_number=NEW.attempt_number AND a.state IN ('accepted','downloading','cancellation_requested') AND h.outcome='accepted')
+BEGIN SELECT RAISE(ABORT,'response fetch lacks accepted handoff authority'); END;
+
 CREATE TABLE image_generation_scheduler_claims (
  job_id TEXT NOT NULL,
  slot_id TEXT NOT NULL,

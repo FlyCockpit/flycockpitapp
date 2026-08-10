@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 use std::io::{Read as _, Seek as _, SeekFrom, Write};
 use std::path::Path;
 
-use anyhow::{Context as _, Result, ensure};
-use rusqlite::{Connection, OptionalExtension, params};
+use anyhow::{ensure, Context as _, Result};
+use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
@@ -20,25 +20,25 @@ use cockpit_db::db::external_journal::{
     ExternalJournalDigest, ExternalJournalToken, PrepareExternalOperation, ProviderIdempotency,
 };
 use cockpit_db::db::image_generation::{
-    AcquireImageGenerationArtifactLease, AcquiredImageGenerationArtifactLease,
-    AdvanceImageGenerationLatePublication, BlockVerifiedImageGenerationLatePublication,
-    CreateImageGenerationArtifact, CreateImageGenerationArtifactComponent,
-    DispatchingImageGenerationAttempt, ImageGenerationArtifactComponentKind,
-    ImageGenerationArtifactComponentState, ImageGenerationArtifactConsumerPurpose,
-    ImageGenerationArtifactConsumerRoute, ImageGenerationArtifactState,
-    ImageGenerationDispatchCandidate, ImageGenerationHandoffFinishDisposition,
-    ImageGenerationLatePublicationEvidenceV1, ImageGenerationLatePublicationState,
-    PreparedImageGenerationDispatch, ReserveImageGenerationLatePublication,
-    TransitionImageGenerationArtifact, TransitionImageGenerationArtifactComponent,
-    image_generation_component_set_binding,
+    image_generation_component_set_binding, AcquireImageGenerationArtifactLease,
+    AcquiredImageGenerationArtifactLease, AdvanceImageGenerationLatePublication,
+    BlockVerifiedImageGenerationLatePublication, CreateImageGenerationArtifact,
+    CreateImageGenerationArtifactComponent, DispatchingImageGenerationAttempt,
+    ImageGenerationArtifactComponentKind, ImageGenerationArtifactComponentState,
+    ImageGenerationArtifactConsumerPurpose, ImageGenerationArtifactConsumerRoute,
+    ImageGenerationArtifactState, ImageGenerationDispatchCandidate,
+    ImageGenerationHandoffFinishDisposition, ImageGenerationLatePublicationEvidenceV1,
+    ImageGenerationLatePublicationState, PreparedImageGenerationDispatch,
+    ReserveImageGenerationLatePublication, TransitionImageGenerationArtifact,
+    TransitionImageGenerationArtifactComponent,
 };
 use cockpit_db::db::sealed_scope::SealedActionGrantRow;
 use cockpit_db::image_spend::{AttemptMaximum, ImageSpendDispatchEvidence, SpendReservation};
 use cockpit_db::media_attachments::AcquiredMediaComponentLease;
 
 use crate::media_reservation::{
-    MediaExternalHandoffOutcome, ReservationReceipt, ReservationState,
     definitive_rejection_retry_conn, finish_external_handoff_conn, handoff_external_conn,
+    MediaExternalHandoffOutcome, ReservationReceipt, ReservationState,
 };
 
 pub use crate::private_fs::held_directory::{
@@ -47,11 +47,11 @@ pub use crate::private_fs::held_directory::{
 };
 pub use cockpit_db::image_generation_plan::{
     AttemptPlanV1, CapabilityProvenanceV1, GrantRequirementV1, ImageGenerationPlanV1,
+    OutputDirectoryAuthorityV1, OutputSlotPlanV1, ReferenceArtifactV1, RequestedOutputV1,
+    ResolvedOutputV1, ResourceReservationV1, SpendReservationPlanV1, TargetDestinationV1,
+    TargetPlanV1, TypedParameterV1, VectorSanitizerProvenanceV1,
     MAX_IMAGE_GENERATION_ATTEMPTS_PER_SLOT, MAX_IMAGE_GENERATION_DIMENSION,
-    MAX_IMAGE_GENERATION_SLOTS, MAX_IMAGE_GENERATION_TARGETS, OutputDirectoryAuthorityV1,
-    OutputSlotPlanV1, ReferenceArtifactV1, RequestedOutputV1, ResolvedOutputV1,
-    ResourceReservationV1, SpendReservationPlanV1, TargetDestinationV1, TargetPlanV1,
-    TypedParameterV1, VectorSanitizerProvenanceV1,
+    MAX_IMAGE_GENERATION_SLOTS, MAX_IMAGE_GENERATION_TARGETS,
 };
 
 const MAX_AUTHORITY_STRING_BYTES: usize = 1_024;
@@ -138,6 +138,51 @@ pub trait ImageGenerationAdapter: image_generation_adapter_sealed::Sealed + Send
         &self,
         request: &ImageGenerationHandoffRequest,
     ) -> ImageGenerationHandoffResult;
+}
+
+mod accepted_response_fetch_sealed {
+    pub trait Sealed {}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedImageResponseFetchRequest {
+    pub job_id: Uuid,
+    pub slot_id: Uuid,
+    pub attempt_number: u32,
+    pub provider_request_identity: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcceptedImageResponseFetchOutcome {
+    Fetched {
+        bytes: Vec<u8>,
+        evidence: Vec<u8>,
+    },
+    DefinitiveFailure {
+        safe_reason: String,
+        evidence: Vec<u8>,
+    },
+    OutcomeUnknown {
+        evidence: Vec<u8>,
+    },
+}
+
+#[async_trait::async_trait]
+pub trait AcceptedImageResponseFetcher:
+    accepted_response_fetch_sealed::Sealed + Send + Sync
+{
+    async fn fetch(
+        &self,
+        request: &AcceptedImageResponseFetchRequest,
+    ) -> AcceptedImageResponseFetchOutcome;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceptedImageResponseProgress {
+    Retained,
+    LateQuarantined,
+    DefinitiveFailure,
+    OutcomeUnknown,
 }
 
 #[cfg(test)]
@@ -2363,6 +2408,192 @@ pub enum GeneratedImageArtifactFormat {
     Svg,
 }
 
+pub async fn fetch_accepted_image_response<F: AcceptedImageResponseFetcher>(
+    db: cockpit_db::Db,
+    fetcher: &F,
+    job_id: Uuid,
+    slot_id: Uuid,
+    attempt_number: u32,
+    now_unix_ms: i64,
+) -> Result<AcceptedImageResponseFetchOutcome> {
+    let existing = db
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT response_bytes,fetch_evidence FROM image_generation_response_fetches WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3",
+                params![job_id.to_string(), slot_id.to_string(), i64::from(attempt_number)],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+        .await?;
+    if let Some((bytes, evidence)) = existing {
+        return Ok(AcceptedImageResponseFetchOutcome::Fetched { bytes, evidence });
+    }
+    let provider_request_identity = db
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT a.provider_request_identity FROM image_generation_attempts a JOIN image_generation_handoff_evidence h USING(job_id,slot_id,attempt_number) WHERE a.job_id=?1 AND a.slot_id=?2 AND a.attempt_number=?3 AND a.state IN ('accepted','downloading','cancellation_requested') AND h.outcome='accepted'",
+                params![job_id.to_string(), slot_id.to_string(), i64::from(attempt_number)],
+                |row| row.get(0),
+            )
+            .context("accepted response authority is unavailable")
+        })
+        .await?;
+    let outcome = fetcher
+        .fetch(&AcceptedImageResponseFetchRequest {
+            job_id,
+            slot_id,
+            attempt_number,
+            provider_request_identity,
+        })
+        .await;
+    if let AcceptedImageResponseFetchOutcome::Fetched { bytes, evidence } = &outcome {
+        ensure!(
+            !bytes.is_empty()
+                && bytes.len() <= 64 * 1024 * 1024
+                && !evidence.is_empty()
+                && evidence.len() <= MAX_PROVIDER_HANDOFF_EVIDENCE_BYTES,
+            "accepted response fetch exceeds its bound"
+        );
+        let response_digest = crate::intel::hex_lower(&Sha256::digest(bytes));
+        let evidence_digest = crate::intel::hex_lower(&Sha256::digest(evidence));
+        let bytes = bytes.clone();
+        let evidence = evidence.clone();
+        db.write(move |conn| {
+            conn.execute(
+                "INSERT INTO image_generation_response_fetches(job_id,slot_id,attempt_number,response_digest,response_bytes,fetch_evidence,fetch_evidence_digest,fetched_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![job_id.to_string(),slot_id.to_string(),i64::from(attempt_number),response_digest,bytes,evidence,evidence_digest,now_unix_ms],
+            )?;
+            Ok(())
+        }).await?;
+    }
+    Ok(outcome)
+}
+
+pub struct CoordinateAcceptedImageResponse<'a> {
+    pub job_id: Uuid,
+    pub slot_id: Uuid,
+    pub attempt_number: u32,
+    pub expected_job_version: u64,
+    pub expected_slot_version: u64,
+    pub expected_attempt_version: u64,
+    pub external_operation_id: Uuid,
+    pub expected_journal_version: u64,
+    pub bytes: &'a [u8],
+    pub now_unix_ms: i64,
+}
+
+pub fn retain_accepted_image_response_conn(
+    conn: &Connection,
+    root: &HeldImageGenerationArtifactRoot,
+    input: &CoordinateAcceptedImageResponse<'_>,
+) -> Result<AcceptedImageResponseProgress> {
+    let (canonical, digest, artifact_id): (Vec<u8>, String, String) = conn.query_row(
+        "SELECT p.canonical_plan,p.plan_digest,s.managed_artifact_id FROM image_generation_plans p JOIN image_generation_slots s ON s.job_id=p.job_id WHERE p.job_id=?1 AND s.slot_id=?2",
+        params![input.job_id.to_string(), input.slot_id.to_string()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let plan = ImageGenerationPlanV1::from_canonical(&canonical, &digest)?;
+    let target = plan
+        .targets
+        .iter()
+        .find(|target| {
+            target
+                .slots
+                .iter()
+                .any(|slot| slot.slot_id == input.slot_id)
+        })
+        .context("accepted response target is absent")?;
+    let format = match target.resolved.format.as_str() {
+        "png" => GeneratedImageArtifactFormat::Png,
+        "jpeg" | "jpg" => GeneratedImageArtifactFormat::Jpeg,
+        "webp" => GeneratedImageArtifactFormat::Webp,
+        "svg" => GeneratedImageArtifactFormat::Svg,
+        _ => anyhow::bail!("accepted response format is unsupported"),
+    };
+    let attempt_state: String = conn.query_row(
+        "SELECT state FROM image_generation_attempts WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3",
+        params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number)],
+        |row| row.get(0),
+    )?;
+    let downloaded = attempt_state == "accepted";
+    if downloaded {
+        cockpit_db::Db::begin_image_generation_download_conn(
+            conn,
+            &cockpit_db::db::image_generation::BeginImageGenerationDownload {
+                job_id: input.job_id,
+                slot_id: input.slot_id,
+                attempt_number: input.attempt_number,
+                expected_job_version: input.expected_job_version,
+                expected_slot_version: input.expected_slot_version,
+                expected_attempt_version: input.expected_attempt_version,
+                at_unix_ms: input.now_unix_ms,
+            },
+        )?;
+    } else {
+        ensure!(
+            attempt_state == "cancellation_requested",
+            "accepted response is unavailable"
+        );
+    }
+    let response_digest = crate::intel::hex_lower(&Sha256::digest(input.bytes));
+    cockpit_db::Db::adopt_image_generation_response_conn(
+        conn,
+        &cockpit_db::db::image_generation::AdoptImageGenerationResponse {
+            job_id: input.job_id,
+            slot_id: input.slot_id,
+            attempt_number: input.attempt_number,
+            expected_attempt_version: input.expected_attempt_version
+                + if downloaded { 1 } else { 0 },
+            expected_slot_version: input.expected_slot_version + if downloaded { 1 } else { 0 },
+            external_operation_id: input.external_operation_id,
+            expected_journal_version: input.expected_journal_version,
+            response_digest: &response_digest,
+            now_unix_ms: input.now_unix_ms,
+        },
+    )?;
+    let (slot_version, after_cancel): (i64, bool) = conn.query_row(
+        "SELECT version,result_after_cancel=1 FROM image_generation_slots WHERE job_id=?1 AND slot_id=?2",
+        params![input.job_id.to_string(), input.slot_id.to_string()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    retain_generated_image_artifact(
+        conn,
+        root,
+        &RetainGeneratedImageArtifact {
+            artifact_id: Uuid::parse_str(&artifact_id)?,
+            job_id: input.job_id,
+            slot_id: input.slot_id,
+            component_id: Uuid::now_v7(),
+            format,
+            expected_width: target.resolved.width,
+            expected_height: target.resolved.height,
+            bytes: input.bytes,
+            resource_reservation_id: plan.central_resources[0].reservation_identity.clone(),
+            release_operation_id: Uuid::now_v7(),
+            late_quarantined: after_cancel,
+            now_unix_ms: input.now_unix_ms,
+        },
+    )?;
+    let state = cockpit_db::Db::commit_image_generation_validation_conn(
+        conn,
+        &cockpit_db::db::image_generation::CommitImageGenerationValidation {
+            job_id: input.job_id,
+            slot_id: input.slot_id,
+            expected_slot_version: u64::try_from(slot_version)?,
+            at_unix_ms: input.now_unix_ms,
+        },
+    )?;
+    Ok(
+        if state == cockpit_db::db::image_generation::ImageGenerationSlotState::LateQuarantined {
+            AcceptedImageResponseProgress::LateQuarantined
+        } else {
+            AcceptedImageResponseProgress::Retained
+        },
+    )
+}
+
 pub struct RetainGeneratedImageArtifact<'a> {
     pub artifact_id: Uuid,
     pub job_id: Uuid,
@@ -3289,20 +3520,18 @@ mod tests {
             )?;
             assert_eq!(replay.outcome, ImageSpendDispatchEvidence::Accepted);
             assert_eq!(replay.bytes, b"accepted");
-            assert!(
-                conn.execute(
+            assert!(conn
+                .execute(
                     "UPDATE image_generation_handoff_evidence SET evidence=X'00' WHERE job_id=?1",
                     [job_id.to_string()]
                 )
-                .is_err()
-            );
-            assert!(
-                conn.execute(
+                .is_err());
+            assert!(conn
+                .execute(
                     "DELETE FROM image_generation_handoff_evidence WHERE job_id=?1",
                     [job_id.to_string()]
                 )
-                .is_err()
-            );
+                .is_err());
             Ok(())
         })
         .await
@@ -4748,11 +4977,9 @@ mod tests {
         for count in [MAX_IMAGE_GENERATION_SLOTS - 1, MAX_IMAGE_GENERATION_SLOTS] {
             assert!(with_slots(count).validate().is_ok());
         }
-        assert!(
-            with_slots(MAX_IMAGE_GENERATION_SLOTS + 1)
-                .validate()
-                .is_err()
-        );
+        assert!(with_slots(MAX_IMAGE_GENERATION_SLOTS + 1)
+            .validate()
+            .is_err());
         for dimension in [
             MAX_IMAGE_GENERATION_DIMENSION - 1,
             MAX_IMAGE_GENERATION_DIMENSION,
@@ -4857,7 +5084,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn output_authority_is_held_private_and_nofollow() {
-        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::os::unix::fs::{symlink, PermissionsExt};
         let temporary = tempfile::TempDir::new().unwrap();
         let output = temporary.path().join("output");
         std::fs::create_dir(&output).unwrap();
@@ -4882,10 +5109,13 @@ mod tests {
         let widened = temporary.path().join("widened");
         std::fs::create_dir(&widened).unwrap();
         std::fs::set_permissions(&widened, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(
-            open_image_generation_output_directory(&widened, 1, "generated".into(), "png".into())
-                .is_err()
-        );
+        assert!(open_image_generation_output_directory(
+            &widened,
+            1,
+            "generated".into(),
+            "png".into()
+        )
+        .is_err());
         let link = temporary.path().join("link");
         symlink(&output, &link).unwrap();
         assert!(
@@ -4977,10 +5207,9 @@ mod tests {
             HeldDirectoryEffectOutcome::AppliedDurable(_)
         ));
         std::fs::write(root.join("mutated.bin"), b"changed").unwrap();
-        assert!(
-            held.open_verified_component("mutated.bin", &evidence)
-                .is_err()
-        );
+        assert!(held
+            .open_verified_component("mutated.bin", &evidence)
+            .is_err());
     }
 
     #[cfg(windows)]
@@ -4991,16 +5220,22 @@ mod tests {
         let output = temporary.path().join("output");
         std::fs::create_dir(&output).unwrap();
         crate::goal_scratch::set_private(&output).unwrap();
-        assert!(
-            open_image_generation_output_directory(&output, 1, "generated".into(), "png".into())
-                .is_ok()
-        );
+        assert!(open_image_generation_output_directory(
+            &output,
+            1,
+            "generated".into(),
+            "png".into()
+        )
+        .is_ok());
         let link = temporary.path().join("link");
         if symlink_dir(&output, &link).is_ok() {
-            assert!(
-                open_image_generation_output_directory(&link, 1, "generated".into(), "png".into())
-                    .is_err()
-            );
+            assert!(open_image_generation_output_directory(
+                &link,
+                1,
+                "generated".into(),
+                "png".into()
+            )
+            .is_err());
         }
     }
 }

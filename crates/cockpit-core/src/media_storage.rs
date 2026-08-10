@@ -708,69 +708,90 @@ impl MediaStorageRecovery {
         };
         let selected_video_stream = None;
         let mut selected_audio_stream = None;
+        let mut av_terminal = None;
         let av_derivatives = if media_kind == MediaKind::Audio {
-            held.seek(SeekFrom::Start(0))?;
-            let mut bytes = Vec::new();
-            held.read_to_end(&mut bytes)?;
-            let health = crate::external_runtime::global_health_store()
-                .current()
-                .context("model_runtime_unavailable")?;
-            let runtime = approved_av_runtime(&health)?;
-            let (document, _) = run_bounded_ffprobe(&runtime, bytes.clone()).await?;
-            let streams = document
-                .streams
-                .iter()
-                .map(|stream| AvProbeStream {
-                    index: stream.index,
-                    kind: if stream.codec_type == "audio" {
-                        "audio"
-                    } else if stream.codec_type == "video" {
-                        "video"
+            let prepared: Result<(
+                Vec<(&'static str, Uuid, Vec<u8>, Option<(u32, u32)>)>,
+                SelectedMediaStream,
+            )> = async {
+                held.seek(SeekFrom::Start(0))?;
+                let mut bytes = Vec::new();
+                held.read_to_end(&mut bytes)?;
+                let health = crate::external_runtime::global_health_store()
+                    .current()
+                    .context("model_runtime_unavailable")?;
+                let runtime = approved_av_runtime(&health)?;
+                let (document, _) = run_bounded_ffprobe(&runtime, bytes.clone()).await?;
+                let streams = document
+                    .streams
+                    .iter()
+                    .map(|stream| AvProbeStream {
+                        index: stream.index,
+                        kind: if stream.codec_type == "audio" {
+                            "audio"
+                        } else if stream.codec_type == "video" {
+                            "video"
+                        } else {
+                            "other"
+                        },
+                        codec: stream.codec_name.clone(),
+                        default_disposition: stream
+                            .disposition
+                            .as_ref()
+                            .is_some_and(|value| value.default == 1),
+                    })
+                    .collect::<Vec<_>>();
+                let (video, audio) = select_av_streams(canonical_container, &streams)?;
+                let audio = audio.context("invalid_media")?;
+                decode_selected_streams(
+                    &runtime,
+                    bytes.clone(),
+                    video.as_ref().map(|value| value.index),
+                    Some(audio.index),
+                )
+                .await?;
+                let probe = document
+                    .streams
+                    .iter()
+                    .find(|stream| stream.index == audio.index)
+                    .context("invalid_media")?;
+                let rate = probe
+                    .sample_rate
+                    .as_deref()
+                    .context("invalid_media")?
+                    .parse::<u32>()?;
+                let channels = probe.channels.context("invalid_media")?;
+                let argv = audio_normalization_argv(audio.index, rate, channels)?;
+                let output = run_bounded_runtime(
+                    &runtime.ffmpeg,
+                    &argv,
+                    bytes,
+                    100 * 1024 * 1024,
+                    std::time::Duration::from_secs(120),
+                )
+                .await?;
+                let wav = canonicalize_pcm_wav(&output.stdout)?;
+                let selected = SelectedMediaStream {
+                    index: audio.index,
+                    codec: audio.codec,
+                };
+                Ok((vec![("audio_model", Uuid::now_v7(), wav, None)], selected))
+            }
+            .await;
+            match prepared {
+                Ok((derivatives, selected)) => {
+                    selected_audio_stream = Some(selected);
+                    Some(derivatives)
+                }
+                Err(error) => {
+                    av_terminal = Some(if error.to_string().contains("model_runtime") {
+                        MediaAvailability::ModelDerivativeUnavailable
                     } else {
-                        "other"
-                    },
-                    codec: stream.codec_name.clone(),
-                    default_disposition: stream
-                        .disposition
-                        .as_ref()
-                        .is_some_and(|value| value.default == 1),
-                })
-                .collect::<Vec<_>>();
-            let (video, audio) = select_av_streams(canonical_container, &streams)?;
-            let audio = audio.context("invalid_media")?;
-            decode_selected_streams(
-                &runtime,
-                bytes.clone(),
-                video.as_ref().map(|value| value.index),
-                Some(audio.index),
-            )
-            .await?;
-            let probe = document
-                .streams
-                .iter()
-                .find(|stream| stream.index == audio.index)
-                .context("invalid_media")?;
-            let rate = probe
-                .sample_rate
-                .as_deref()
-                .context("invalid_media")?
-                .parse::<u32>()?;
-            let channels = probe.channels.context("invalid_media")?;
-            let argv = audio_normalization_argv(audio.index, rate, channels)?;
-            let output = run_bounded_runtime(
-                &runtime.ffmpeg,
-                &argv,
-                bytes,
-                100 * 1024 * 1024,
-                std::time::Duration::from_secs(120),
-            )
-            .await?;
-            let wav = canonicalize_pcm_wav(&output.stdout)?;
-            selected_audio_stream = Some(SelectedMediaStream {
-                index: audio.index,
-                codec: audio.codec,
-            });
-            Some(vec![("audio_model", Uuid::now_v7(), wav, None)])
+                        MediaAvailability::Failed
+                    });
+                    None
+                }
+            }
         } else {
             None
         };
@@ -934,9 +955,11 @@ impl MediaStorageRecovery {
             updated_at_unix_ms: now_unix_ms,
         };
         let ready = !derivative_components.is_empty();
+        let processed = ready || av_terminal.is_some();
+        let final_availability = av_terminal.unwrap_or(MediaAvailability::Ready);
         let reservation_id = snapshot.5.clone();
         let transition_operation_id = mutation.local_operation_id;
-        let result=self.db.transaction(move|conn|{if let Some(receipt)=preflight_local_operation(conn,mutation.local_operation_id,"finalize",&domain,&request_digest,&semantic_digest,now_unix_ms)?{return Ok((receipt,false))}cockpit_db::Db::insert_media_attachment_conn(conn,&record)?;cockpit_db::Db::insert_media_attachment_component_conn(conn,&component_record)?;if ready {for (kind,storage,identity,length,checksum,dimensions) in derivative_components {let id=Uuid::now_v7();let component=MediaAttachmentComponent{component_id:id,attachment_id:attachment,attachment_version:1,component_kind:kind,storage_id:storage,lifecycle_state:"ready".into(),component_generation:1,stable_identity_digest:identity,byte_length:length,sha256:checksum,reservation_id:reservation_id.clone(),created_at_unix_ms:now_unix_ms,updated_at_unix_ms:now_unix_ms};cockpit_db::Db::insert_media_attachment_component_conn(conn,&component)?;if let Some((width,height))=dimensions{conn.execute("INSERT INTO media_image_component_dimensions(component_id,width,height) VALUES(?1,?2,?3)",params![id.to_string(),width,height])?;}}let mut availability=MediaAvailability::Quarantined;let mut available_generation=1;for next_state in [MediaAvailability::Probing,MediaAvailability::Decoding,MediaAvailability::Normalizing,MediaAvailability::Ready]{cockpit_db::Db::transition_media_attachment_conn(conn,attachment,1,available_generation,next_state,now_unix_ms)?;let next_generation=available_generation.checked_add(1).context("availability generation overflow")?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![attachment.to_string(),next_generation.to_string(),availability.as_str(),next_state.as_str(),transition_operation_id.to_string(),now_unix_ms])?;availability=next_state;available_generation=next_generation;}ensure!(availability==MediaAvailability::Ready,"media readiness transition failed");}conn.execute("INSERT INTO media_attachment_upload_origins(attachment_id,client_draft_id,upload_id,upload_generation) VALUES(?1,?2,?3,?4)",params![attachment.to_string(),draft.to_string(),upload.to_string(),next.to_string()])?;let changed=conn.execute("UPDATE media_uploads SET state='materialized',upload_generation=?1,next_chunk_index=NULL,attachment_id=?2,attachment_version='1',last_transition_json=?3,updated_at_unix_ms=?4 WHERE upload_id=?5 AND upload_generation=?6 AND state='open'",params![next.to_string(),attachment.to_string(),serde_json::to_string(&transition)?,now_unix_ms,upload.to_string(),generation.to_string()])?;ensure!(changed==1,"upload finalize lost compare-and-swap");let receipt=LocalMediaMutationReceiptV1{schema_version:1,kind:"localMediaMutationReceipt".into(),receipt_id:Uuid::now_v7(),local_operation_id:mutation.local_operation_id,actor_principal_digest:mutation.actor_principal_digest,action:"finalize".into(),subject_kind:LocalMediaSubjectKindV1::Upload,subject_id:upload,operation_request_digest:request_digest.clone(),semantic_command_digest:semantic_digest.clone(),outcome:LocalMediaMutationOutcomeV1::Applied,transition:LocalMediaMutationTransitionV1::UploadToAttachment{upload_generation_before:generation,upload_generation_after:next,attachment_version:1,availability_generation:if ready{5}else{1},reference_generation:1},discard_result:None,discard_result_digest:None,committed_at_unix_ms:now_unix_ms};commit_local_operation(conn,&receipt,"finalize",&domain,&request_digest,&semantic_digest,now_unix_ms)?;Ok((receipt,true))}).await;
+        let result=self.db.transaction(move|conn|{if let Some(receipt)=preflight_local_operation(conn,mutation.local_operation_id,"finalize",&domain,&request_digest,&semantic_digest,now_unix_ms)?{return Ok((receipt,false))}cockpit_db::Db::insert_media_attachment_conn(conn,&record)?;cockpit_db::Db::insert_media_attachment_component_conn(conn,&component_record)?;if ready {for (kind,storage,identity,length,checksum,dimensions) in derivative_components {let id=Uuid::now_v7();let component=MediaAttachmentComponent{component_id:id,attachment_id:attachment,attachment_version:1,component_kind:kind,storage_id:storage,lifecycle_state:"ready".into(),component_generation:1,stable_identity_digest:identity,byte_length:length,sha256:checksum,reservation_id:reservation_id.clone(),created_at_unix_ms:now_unix_ms,updated_at_unix_ms:now_unix_ms};cockpit_db::Db::insert_media_attachment_component_conn(conn,&component)?;if let Some((width,height))=dimensions{conn.execute("INSERT INTO media_image_component_dimensions(component_id,width,height) VALUES(?1,?2,?3)",params![id.to_string(),width,height])?;}}}if processed{let mut availability=MediaAvailability::Quarantined;let mut available_generation=1;for next_state in [MediaAvailability::Probing,MediaAvailability::Decoding,MediaAvailability::Normalizing,final_availability]{cockpit_db::Db::transition_media_attachment_conn(conn,attachment,1,available_generation,next_state,now_unix_ms)?;let next_generation=available_generation.checked_add(1).context("availability generation overflow")?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![attachment.to_string(),next_generation.to_string(),availability.as_str(),next_state.as_str(),transition_operation_id.to_string(),now_unix_ms])?;availability=next_state;available_generation=next_generation;}ensure!(availability==final_availability,"media terminal transition failed");}conn.execute("INSERT INTO media_attachment_upload_origins(attachment_id,client_draft_id,upload_id,upload_generation) VALUES(?1,?2,?3,?4)",params![attachment.to_string(),draft.to_string(),upload.to_string(),next.to_string()])?;let changed=conn.execute("UPDATE media_uploads SET state='materialized',upload_generation=?1,next_chunk_index=NULL,attachment_id=?2,attachment_version='1',last_transition_json=?3,updated_at_unix_ms=?4 WHERE upload_id=?5 AND upload_generation=?6 AND state='open'",params![next.to_string(),attachment.to_string(),serde_json::to_string(&transition)?,now_unix_ms,upload.to_string(),generation.to_string()])?;ensure!(changed==1,"upload finalize lost compare-and-swap");let receipt=LocalMediaMutationReceiptV1{schema_version:1,kind:"localMediaMutationReceipt".into(),receipt_id:Uuid::now_v7(),local_operation_id:mutation.local_operation_id,actor_principal_digest:mutation.actor_principal_digest,action:"finalize".into(),subject_kind:LocalMediaSubjectKindV1::Upload,subject_id:upload,operation_request_digest:request_digest.clone(),semantic_command_digest:semantic_digest.clone(),outcome:LocalMediaMutationOutcomeV1::Applied,transition:LocalMediaMutationTransitionV1::UploadToAttachment{upload_generation_before:generation,upload_generation_after:next,attachment_version:1,availability_generation:if processed{5}else{1},reference_generation:1},discard_result:None,discard_result_digest:None,committed_at_unix_ms:now_unix_ms};commit_local_operation(conn,&receipt,"finalize",&domain,&request_digest,&semantic_digest,now_unix_ms)?;Ok((receipt,true))}).await;
         if result.as_ref().is_err() || result.as_ref().is_ok_and(|(_, applied)| !*applied) {
             self.owned_root
                 .rename_into_noreplace(&target, &self.owned_root, &snapshot.0)

@@ -61,6 +61,14 @@ pub async fn activate_saved_policy_default(
     .await
 }
 
+pub async fn current_saved_policy_default(
+    project_key: String,
+) -> anyhow::Result<Option<CurrentImageSpendPolicy>> {
+    cockpit_db::Db::open_default()?
+        .current_image_spend_policy(project_key)
+        .await
+}
+
 /// Editable UI suggestions. These values are not a default and must never be
 /// merged into [`ImageSpendSettings`] by a loader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

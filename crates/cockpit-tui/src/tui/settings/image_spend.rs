@@ -1,48 +1,314 @@
-#![allow(dead_code)]
-//! Presentation-only image spend settings model.
+//! Interactive image-generation spend policy settings page.
+
+use std::any::Any;
+use std::sync::{Mutex, mpsc};
 
 use cockpit_config::config::image_spend::{
-    BudgetBlockReason, ImageSpendSettings, ImageSpendSuggestions,
+    BudgetPolicy, CurrentImageSpendPolicy, ImageSpendSettings, ImageSpendSuggestions,
+    ProjectEpochPolicy,
 };
+use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::Frame;
+use ratatui::layout::Rect;
+use ratatui::text::Line;
+use ratatui::widgets::{Paragraph, Wrap};
 
-pub(crate) struct ImageSpendSettingsView {
-    pub(crate) saved: ImageSpendSettings,
-    pub(crate) suggestions: ImageSpendSuggestions,
-    pub(crate) block_reason: Option<BudgetBlockReason>,
+use super::{Nav, PageBox, SettingsCx, SettingsPage, SettingsPointerSurfaceKind};
+
+type LoadResult = Result<Option<CurrentImageSpendPolicy>, String>;
+
+pub(super) fn page(project_key: String) -> PageBox {
+    let (tx, rx) = mpsc::sync_channel(1);
+    let key = project_key.clone();
+    std::thread::spawn(move || {
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())
+            .and_then(|runtime| {
+                runtime
+                    .block_on(
+                        cockpit_config::config::image_spend::current_saved_policy_default(key),
+                    )
+                    .map_err(|error| error.to_string())
+            });
+        let _ = tx.send(result);
+    });
+    Box::new(ImageSpendPage {
+        project_key,
+        cursor: 0,
+        draft: ImageSpendSettings::default(),
+        saved: ImageSpendSettings::default(),
+        version: None,
+        status: "Loading saved policy…".into(),
+        load: Mutex::new(Some(rx)),
+        save: Mutex::new(None),
+    })
 }
 
-impl ImageSpendSettingsView {
-    pub(crate) fn from_saved(saved: ImageSpendSettings) -> Self {
-        let block_reason = saved.validate().err();
-        Self {
-            saved,
-            suggestions: ImageSpendSuggestions::DISPLAY_ONLY,
-            block_reason,
+pub(super) struct ImageSpendPage {
+    project_key: String,
+    cursor: usize,
+    draft: ImageSpendSettings,
+    saved: ImageSpendSettings,
+    version: Option<u64>,
+    status: String,
+    load: Mutex<Option<mpsc::Receiver<LoadResult>>>,
+    save: Mutex<Option<mpsc::Receiver<Result<CurrentImageSpendPolicy, String>>>>,
+}
+
+impl ImageSpendPage {
+    pub(super) fn poll(&mut self) {
+        if let Some(result) = self
+            .load
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        {
+            *self.load.lock().unwrap() = None;
+            match result {
+                Ok(Some(current)) => {
+                    self.version = Some(current.policy_version);
+                    self.saved = current.settings.clone();
+                    self.draft = current.settings;
+                    self.status = "Saved policy loaded.".into();
+                }
+                Ok(None) => self.status = "No saved policy; paid dispatch is blocked.".into(),
+                Err(error) => self.status = format!("Could not load policy: {error}"),
+            }
+        }
+        if let Some(result) = self
+            .save
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        {
+            *self.save.lock().unwrap() = None;
+            match result {
+                Ok(current) => {
+                    self.version = Some(current.policy_version);
+                    self.saved = current.settings.clone();
+                    self.draft = current.settings;
+                    self.status = format!("Saved policy version {}.", current.policy_version);
+                }
+                Err(error) => self.status = format!("Policy was not saved: {error}"),
+            }
         }
     }
 
-    pub(crate) fn replace_reviewed(&mut self, reviewed: ImageSpendSettings) {
-        self.block_reason = reviewed.validate().err();
-        self.saved = reviewed;
+    fn cycle_scope(policy: &mut BudgetPolicy, suggestion: u64) {
+        *policy = match policy {
+            BudgetPolicy::Unconfigured => BudgetPolicy::Finite {
+                usd_micros: suggestion,
+            },
+            BudgetPolicy::Finite { .. } => BudgetPolicy::Unlimited,
+            BudgetPolicy::Unlimited => BudgetPolicy::Unconfigured,
+        };
     }
 
-    /// Persist the exact reviewed editor value and refresh version state. The
-    /// display-only suggestions never enter this path.
-    pub(crate) async fn save(
-        &mut self,
-        project_key: String,
-        expected_version: Option<u64>,
-        saved_at_ms: i64,
-    ) -> anyhow::Result<u64> {
-        let current = cockpit_config::config::image_spend::activate_saved_policy_default(
-            project_key,
-            self.saved.clone(),
-            expected_version,
-            saved_at_ms,
-        )
-        .await?;
-        self.block_reason = None;
-        Ok(current.policy_version)
+    fn save(&mut self) {
+        if let Err(reason) = self.draft.validate() {
+            self.status = format!("Not saved: {reason:?}. Review every required choice.");
+            return;
+        }
+        let (tx, rx) = mpsc::sync_channel(1);
+        let project_key = self.project_key.clone();
+        let draft = self.draft.clone();
+        let version = self.version;
+        std::thread::spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())
+                .and_then(|runtime| {
+                    runtime
+                        .block_on(
+                            cockpit_config::config::image_spend::activate_saved_policy_default(
+                                project_key,
+                                draft,
+                                version,
+                                chrono::Utc::now().timestamp_millis(),
+                            ),
+                        )
+                        .map_err(|error| error.to_string())
+                });
+            let _ = tx.send(result);
+        });
+        *self.save.lock().unwrap() = Some(rx);
+        self.status = "Saving reviewed policy…".into();
+    }
+
+    fn adjust_selected(&mut self, increase: bool) {
+        let policy = match self.cursor {
+            0 => &mut self.draft.request,
+            1 => &mut self.draft.session,
+            2 => &mut self.draft.project,
+            3 => {
+                if let Some(ProjectEpochPolicy::Rolling {
+                    duration_seconds, ..
+                }) = &mut self.draft.project_epoch
+                {
+                    *duration_seconds = if increase {
+                        duration_seconds.saturating_add(86_400).min(31_622_400)
+                    } else {
+                        duration_seconds.saturating_sub(86_400).max(86_400)
+                    };
+                }
+                return;
+            }
+            _ => return,
+        };
+        if let BudgetPolicy::Finite { usd_micros } = policy {
+            *usd_micros = if increase {
+                usd_micros.saturating_add(1_000_000)
+            } else {
+                usd_micros.saturating_sub(1_000_000).max(1)
+            };
+        }
+    }
+}
+
+fn policy_label(policy: BudgetPolicy) -> String {
+    match policy {
+        BudgetPolicy::Unconfigured => "unconfigured (blocked)".into(),
+        BudgetPolicy::Finite { usd_micros } => format!(
+            "finite ${}.{:06}",
+            usd_micros / 1_000_000,
+            usd_micros % 1_000_000
+        ),
+        BudgetPolicy::Unlimited => "unlimited (explicit)".into(),
+    }
+}
+
+impl SettingsPage for ImageSpendPage {
+    fn pointer_surface_kind(&self) -> SettingsPointerSurfaceKind {
+        SettingsPointerSurfaceKind::Category
+    }
+
+    fn handle_key(&mut self, _cx: &mut SettingsCx, key: KeyEvent) -> Nav {
+        self.poll();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left | KeyCode::Char('h') => Nav::Back,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.cursor = self.cursor.saturating_sub(1);
+                Nav::Stay
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.cursor = (self.cursor + 1).min(4);
+                Nav::Stay
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                let suggestions = ImageSpendSuggestions::DISPLAY_ONLY;
+                match self.cursor {
+                    0 => Self::cycle_scope(&mut self.draft.request, suggestions.request_usd_micros),
+                    1 => Self::cycle_scope(&mut self.draft.session, suggestions.session_usd_micros),
+                    2 => Self::cycle_scope(&mut self.draft.project, suggestions.project_usd_micros),
+                    3 => {
+                        self.draft.project_epoch = match self.draft.project_epoch {
+                            None => Some(ProjectEpochPolicy::CalendarMonth {
+                                time_zone: "UTC".into(),
+                            }),
+                            Some(ProjectEpochPolicy::CalendarMonth { .. }) => {
+                                Some(ProjectEpochPolicy::Rolling {
+                                    duration_seconds: 30 * 86_400,
+                                    anchor: cockpit_config::config::image_spend::SavedInstant {
+                                        unix_ms: chrono::Utc::now().timestamp_millis(),
+                                        monotonic_sequence: 1,
+                                    },
+                                })
+                            }
+                            Some(ProjectEpochPolicy::Rolling { .. }) => None,
+                        }
+                    }
+                    4 => self.save(),
+                    _ => {}
+                }
+                Nav::Stay
+            }
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                self.adjust_selected(true);
+                Nav::Stay
+            }
+            KeyCode::Char('-') => {
+                self.adjust_selected(false);
+                Nav::Stay
+            }
+            KeyCode::Char('t') if self.cursor == 3 => {
+                if let Some(ProjectEpochPolicy::CalendarMonth { time_zone }) =
+                    &mut self.draft.project_epoch
+                {
+                    *time_zone = if time_zone == "UTC" {
+                        "America/Chicago".into()
+                    } else {
+                        "UTC".into()
+                    };
+                }
+                Nav::Stay
+            }
+            _ => Nav::Stay,
+        }
+    }
+
+    fn render(&self, _cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+        let marker = |row| if self.cursor == row { ">" } else { " " };
+        let suggestions = ImageSpendSuggestions::DISPLAY_ONLY;
+        let epoch = match &self.draft.project_epoch {
+            None => "unconfigured (blocked when project is finite)".into(),
+            Some(ProjectEpochPolicy::CalendarMonth { time_zone }) => {
+                format!("calendar month ({time_zone})")
+            }
+            Some(ProjectEpochPolicy::Rolling {
+                duration_seconds, ..
+            }) => format!("rolling ({duration_seconds}s, saved anchor)"),
+        };
+        let lines = vec![
+            Line::from("Image generation spend policy"),
+            Line::from("Suggestions are display-only until you select and save them."),
+            Line::from(format!(
+                "{} Request: {}  [suggestion $1]",
+                marker(0),
+                policy_label(self.draft.request)
+            )),
+            Line::from(format!(
+                "{} Session: {}  [suggestion $10]",
+                marker(1),
+                policy_label(self.draft.session)
+            )),
+            Line::from(format!(
+                "{} Project: {}  [suggestion $100]",
+                marker(2),
+                policy_label(self.draft.project)
+            )),
+            Line::from(format!("{} Project window: {epoch}", marker(3))),
+            Line::from(format!("{} Save reviewed choices", marker(4))),
+            Line::from(format!("Status: {}", self.status)),
+            Line::from(format!(
+                "Display suggestions: {}/{}/{} micros",
+                suggestions.request_usd_micros,
+                suggestions.session_usd_micros,
+                suggestions.project_usd_micros
+            )),
+        ];
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    }
+
+    fn title(&self, _cx: &SettingsCx) -> String {
+        "Image spend budgets".into()
+    }
+    fn help_text(&self, _cx: &SettingsCx) -> &'static str {
+        "↑/↓: select  enter: choose/save  +/-: edit finite/rolling  t: timezone  esc: back"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+    #[cfg(test)]
+    fn test_name(&self) -> &'static str {
+        "ImageSpend"
     }
 }
 
@@ -50,14 +316,63 @@ impl ImageSpendSettingsView {
 mod tests {
     use super::*;
 
+    fn fixture() -> ImageSpendPage {
+        ImageSpendPage {
+            project_key: "project".into(),
+            cursor: 0,
+            draft: ImageSpendSettings::default(),
+            saved: ImageSpendSettings::default(),
+            version: None,
+            status: String::new(),
+            load: Mutex::new(None),
+            save: Mutex::new(None),
+        }
+    }
+
     #[test]
-    fn suggestions_never_mutate_saved_policy() {
-        let view = ImageSpendSettingsView::from_saved(ImageSpendSettings::default());
-        assert_eq!(view.saved, ImageSpendSettings::default());
-        assert_eq!(
-            view.block_reason,
-            Some(BudgetBlockReason::RequestUnconfigured)
+    fn suggestions_require_explicit_selection_and_invalid_save_does_not_mutate_saved() {
+        let mut page = fixture();
+        assert_eq!(page.draft, ImageSpendSettings::default());
+        assert_eq!(page.saved, ImageSpendSettings::default());
+        ImageSpendPage::cycle_scope(
+            &mut page.draft.request,
+            ImageSpendSuggestions::DISPLAY_ONLY.request_usd_micros,
         );
-        assert_eq!(view.suggestions.project_usd_micros, 100_000_000);
+        assert_eq!(
+            page.draft.request,
+            BudgetPolicy::Finite {
+                usd_micros: 1_000_000
+            }
+        );
+        page.save();
+        assert_eq!(page.saved, ImageSpendSettings::default());
+        assert!(page.save.lock().unwrap().is_none());
+        assert!(page.status.contains("SessionUnconfigured"));
+    }
+
+    #[test]
+    fn loaded_policy_reopens_exact_explicit_scopes_and_epoch() {
+        let mut page = fixture();
+        let settings = ImageSpendSettings {
+            request: BudgetPolicy::Unlimited,
+            session: BudgetPolicy::Finite { usd_micros: 2 },
+            project: BudgetPolicy::Finite { usd_micros: 3 },
+            project_epoch: Some(ProjectEpochPolicy::CalendarMonth {
+                time_zone: "America/Chicago".into(),
+            }),
+        };
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(Ok(Some(CurrentImageSpendPolicy {
+            settings: settings.clone(),
+            policy_version: 4,
+            epoch_policy_version: 2,
+            epoch_sequence: Some(8),
+        })))
+        .unwrap();
+        *page.load.lock().unwrap() = Some(rx);
+        page.poll();
+        assert_eq!(page.draft, settings);
+        assert_eq!(page.saved, settings);
+        assert_eq!(page.version, Some(4));
     }
 }

@@ -2344,6 +2344,7 @@ fn security_recovery_affected_set_digest(
     hex_lower(&affected.finalize())
 }
 
+#[cfg(test)]
 fn component_recorded_evidence_digest(component: &VerifiedBlockedComponent) -> String {
     fn field(hasher: &mut Sha256, bytes: &[u8]) {
         hasher.update((bytes.len() as u64).to_be_bytes());
@@ -2518,8 +2519,23 @@ macro_rules! text_enum {
 
 text_enum!(MediaKind, { Image => "image", Audio => "audio", Video => "video" });
 text_enum!(MediaSourceKind, { LocalPath => "local_path", RetainedHttps => "retained_https", AuthenticatedSessionUpload => "authenticated_session_upload" });
-text_enum!(MediaReferenceConsumerKind, { Message => "message", Tool => "tool", Job => "job" });
-text_enum!(MediaComponentLeaseKind, { Preview => "preview", Model => "model" });
+impl MediaReferenceConsumerKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Message => "message",
+            Self::Tool => "tool",
+            Self::Job => "job",
+        }
+    }
+}
+impl MediaComponentLeaseKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Preview => "preview",
+            Self::Model => "model",
+        }
+    }
+}
 text_enum!(MediaAvailability, {
     Registered => "registered", Quarantined => "quarantined", Probing => "probing", Decoding => "decoding",
     Normalizing => "normalizing", Ready => "ready", ModelDerivativeUnavailable => "model_derivative_unavailable",

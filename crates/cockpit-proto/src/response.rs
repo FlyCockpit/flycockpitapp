@@ -706,6 +706,13 @@ macro_rules! response_variants {
     ($with_variants:ident $(, $context:ident)*) => {
         $with_variants! { ($($context),*) [
             (Response::Ack, "ack");
+            (Response::MediaOwnerRecovery(..), "media_owner_recovery");
+            (Response::LocalPathMediaRegistration(..), "local_path_media_registration");
+            (Response::RetainedHttpsMedia(..), "retained_https_media");
+            (Response::MediaAttachmentStatus(..), "media_attachment_status");
+            (Response::MediaAttachmentPreview(..), "media_attachment_preview");
+            (Response::LocalMediaMutation(..), "local_media_mutation");
+            (Response::MediaUploadStatus(..), "media_upload_status");
             (Response::ConfigRefreshed { .. }, "config_refreshed");
             (Response::RestartDecision { .. }, "restart_decision");
             (Response::UserMessageQueued { .. }, "user_message_queued");

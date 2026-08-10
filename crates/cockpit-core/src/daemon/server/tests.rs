@@ -6032,7 +6032,10 @@ async fn staged_rename_executor_applies_commits_and_replays_without_second_effec
         Err(_) => panic!("test context unexpectedly shared"),
     };
     owned.external_journal = Some(Arc::new(
-        crate::external_journal::ExternalJournal::for_test_at(owned.db.clone(), spool.path()),
+        crate::external_journal::ExternalJournal::for_test_at(
+            owned.db.clone(),
+            &spool.path().join("journal"),
+        ),
     ));
     let ctx = Arc::new(owned);
     let request = Request::FsRename {

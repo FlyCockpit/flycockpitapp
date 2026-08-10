@@ -3257,6 +3257,21 @@ CREATE TRIGGER image_generation_response_fetch_no_delete BEFORE DELETE ON image_
 CREATE TRIGGER image_generation_response_fetch_guard BEFORE INSERT ON image_generation_response_fetches
 WHEN NOT EXISTS(SELECT 1 FROM image_generation_attempts a JOIN image_generation_handoff_evidence h USING(job_id,slot_id,attempt_number) WHERE a.job_id=NEW.job_id AND a.slot_id=NEW.slot_id AND a.attempt_number=NEW.attempt_number AND a.state IN ('accepted','downloading','cancellation_requested') AND h.outcome='accepted')
 BEGIN SELECT RAISE(ABORT,'response fetch lacks accepted handoff authority'); END;
+CREATE TABLE image_generation_response_fetch_outcomes (
+ job_id TEXT NOT NULL, slot_id TEXT NOT NULL, attempt_number INTEGER NOT NULL,
+ outcome TEXT NOT NULL CHECK(outcome IN ('fetched','definitive_failure','outcome_unknown')),
+ safe_reason TEXT CHECK((outcome='definitive_failure' AND length(safe_reason) BETWEEN 1 AND 128) OR (outcome!='definitive_failure' AND safe_reason IS NULL)),
+ evidence BLOB NOT NULL CHECK(length(evidence) BETWEEN 1 AND 65536),
+ evidence_digest TEXT NOT NULL CHECK(length(evidence_digest)=64),
+ recorded_at_unix_ms INTEGER NOT NULL,
+ PRIMARY KEY(job_id,slot_id,attempt_number),
+ FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT
+);
+CREATE TRIGGER image_generation_response_fetch_outcome_immutable BEFORE UPDATE ON image_generation_response_fetch_outcomes BEGIN SELECT RAISE(ABORT,'image generation response fetch outcome is immutable'); END;
+CREATE TRIGGER image_generation_response_fetch_outcome_no_delete BEFORE DELETE ON image_generation_response_fetch_outcomes BEGIN SELECT RAISE(ABORT,'image generation response fetch outcome is immutable'); END;
+CREATE TRIGGER image_generation_response_fetch_outcome_guard BEFORE INSERT ON image_generation_response_fetch_outcomes
+WHEN NOT EXISTS(SELECT 1 FROM image_generation_attempts a JOIN image_generation_handoff_evidence h USING(job_id,slot_id,attempt_number) WHERE a.job_id=NEW.job_id AND a.slot_id=NEW.slot_id AND a.attempt_number=NEW.attempt_number AND a.state IN ('accepted','downloading','cancellation_requested') AND h.outcome='accepted')
+BEGIN SELECT RAISE(ABORT,'response fetch outcome lacks accepted handoff authority'); END;
 
 CREATE TABLE image_generation_scheduler_claims (
  job_id TEXT NOT NULL,

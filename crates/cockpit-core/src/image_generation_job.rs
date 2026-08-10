@@ -1363,7 +1363,7 @@ impl ImageGenerationOwnerContextAuthority {
         )?;
         let digest = crate::intel::hex_lower(&Sha256::digest(evidence));
         ensure!(
-            conn.execute(
+            tx.execute(
                 "UPDATE image_generation_artifact_security_recovery_attempts SET state=?1,outcome_digest=?2,decided_at_unix_ms=?3 WHERE recovery_operation_id=?4 AND principal_digest=?5 AND state='received'",
                 params![state, digest, now, operation_id.to_string(), self.principal_digest],
             )? == 1,
@@ -2419,16 +2419,27 @@ pub async fn fetch_accepted_image_response<F: AcceptedImageResponseFetcher>(
     let existing = db
         .read(move |conn| {
             conn.query_row(
-                "SELECT response_bytes,fetch_evidence FROM image_generation_response_fetches WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3",
+                "SELECT o.outcome,o.safe_reason,o.evidence,f.response_bytes FROM image_generation_response_fetch_outcomes o LEFT JOIN image_generation_response_fetches f USING(job_id,slot_id,attempt_number) WHERE o.job_id=?1 AND o.slot_id=?2 AND o.attempt_number=?3",
                 params![job_id.to_string(), slot_id.to_string(), i64::from(attempt_number)],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                |row| Ok((row.get::<_, String>(0)?,row.get::<_, Option<String>>(1)?,row.get::<_, Vec<u8>>(2)?,row.get::<_, Option<Vec<u8>>>(3)?)),
             )
             .optional()
             .map_err(Into::into)
         })
         .await?;
-    if let Some((bytes, evidence)) = existing {
-        return Ok(AcceptedImageResponseFetchOutcome::Fetched { bytes, evidence });
+    if let Some((outcome, safe_reason, evidence, bytes)) = existing {
+        return match outcome.as_str() {
+            "fetched" => Ok(AcceptedImageResponseFetchOutcome::Fetched {
+                bytes: bytes.context("fetched response bytes are absent")?,
+                evidence,
+            }),
+            "definitive_failure" => Ok(AcceptedImageResponseFetchOutcome::DefinitiveFailure {
+                safe_reason: safe_reason.context("response failure reason is absent")?,
+                evidence,
+            }),
+            "outcome_unknown" => Ok(AcceptedImageResponseFetchOutcome::OutcomeUnknown { evidence }),
+            _ => anyhow::bail!("unknown accepted response fetch outcome"),
+        };
     }
     let provider_request_identity = db
         .read(move |conn| {
@@ -2448,26 +2459,56 @@ pub async fn fetch_accepted_image_response<F: AcceptedImageResponseFetcher>(
             provider_request_identity,
         })
         .await;
-    if let AcceptedImageResponseFetchOutcome::Fetched { bytes, evidence } = &outcome {
-        ensure!(
-            !bytes.is_empty()
-                && bytes.len() <= 64 * 1024 * 1024
-                && !evidence.is_empty()
-                && evidence.len() <= MAX_PROVIDER_HANDOFF_EVIDENCE_BYTES,
-            "accepted response fetch exceeds its bound"
-        );
-        let response_digest = crate::intel::hex_lower(&Sha256::digest(bytes));
-        let evidence_digest = crate::intel::hex_lower(&Sha256::digest(evidence));
-        let bytes = bytes.clone();
-        let evidence = evidence.clone();
-        db.write(move |conn| {
-            conn.execute(
+    let (outcome_name, safe_reason, evidence, bytes) = match &outcome {
+        AcceptedImageResponseFetchOutcome::Fetched { bytes, evidence } => {
+            ensure!(
+                !bytes.is_empty() && bytes.len() <= 64 * 1024 * 1024,
+                "accepted response bytes exceed their bound"
+            );
+            ("fetched", None, evidence.clone(), Some(bytes.clone()))
+        }
+        AcceptedImageResponseFetchOutcome::DefinitiveFailure {
+            safe_reason,
+            evidence,
+        } => {
+            ensure!(
+                !safe_reason.is_empty()
+                    && safe_reason.len() <= 128
+                    && safe_reason
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
+                "accepted response failure reason is invalid"
+            );
+            (
+                "definitive_failure",
+                Some(safe_reason.clone()),
+                evidence.clone(),
+                None,
+            )
+        }
+        AcceptedImageResponseFetchOutcome::OutcomeUnknown { evidence } => {
+            ("outcome_unknown", None, evidence.clone(), None)
+        }
+    };
+    ensure!(
+        !evidence.is_empty() && evidence.len() <= MAX_PROVIDER_HANDOFF_EVIDENCE_BYTES,
+        "accepted response evidence exceeds its bound"
+    );
+    let evidence_digest = crate::intel::hex_lower(&Sha256::digest(&evidence));
+    let response_digest = bytes
+        .as_ref()
+        .map(|bytes| crate::intel::hex_lower(&Sha256::digest(bytes)));
+    db.write(move |conn| {
+            let tx=conn.unchecked_transaction()?;
+            tx.execute("INSERT INTO image_generation_response_fetch_outcomes(job_id,slot_id,attempt_number,outcome,safe_reason,evidence,evidence_digest,recorded_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![job_id.to_string(),slot_id.to_string(),i64::from(attempt_number),outcome_name,safe_reason,evidence,evidence_digest,now_unix_ms])?;
+            if let (Some(bytes),Some(response_digest))=(bytes,response_digest) {
+            tx.execute(
                 "INSERT INTO image_generation_response_fetches(job_id,slot_id,attempt_number,response_digest,response_bytes,fetch_evidence,fetch_evidence_digest,fetched_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-                params![job_id.to_string(),slot_id.to_string(),i64::from(attempt_number),response_digest,bytes,evidence,evidence_digest,now_unix_ms],
+                params![job_id.to_string(),slot_id.to_string(),i64::from(attempt_number),response_digest,bytes,tx.query_row::<Vec<u8>,_,_>("SELECT evidence FROM image_generation_response_fetch_outcomes WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3",params![job_id.to_string(),slot_id.to_string(),i64::from(attempt_number)],|row|row.get(0))?,tx.query_row::<String,_,_>("SELECT evidence_digest FROM image_generation_response_fetch_outcomes WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3",params![job_id.to_string(),slot_id.to_string(),i64::from(attempt_number)],|row|row.get(0))?,now_unix_ms],
             )?;
-            Ok(())
+            }
+            tx.commit()?; Ok(())
         }).await?;
-    }
     Ok(outcome)
 }
 
@@ -5181,10 +5222,13 @@ mod tests {
                 Ok(())
             }
         }
-        assert!(
-            write_verified_artifact_component(&held, &full, evidence.sha256(), &mut Disconnected,)
-                .is_err()
-        );
+        assert!(write_verified_artifact_component(
+            &held,
+            &full,
+            evidence.sha256(),
+            &mut Disconnected,
+        )
+        .is_err());
         let mut reopened = held
             .open_verified_component("component.bin", &evidence)
             .unwrap();

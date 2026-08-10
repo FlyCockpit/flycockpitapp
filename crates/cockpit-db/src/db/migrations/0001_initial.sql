@@ -3138,6 +3138,46 @@ CREATE TABLE image_generation_jobs (
     CHECK(terminal_event_version IS NULL OR terminal_event_version >= 1)
 );
 
+CREATE TABLE image_generation_terminal_events (
+    event_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL UNIQUE REFERENCES image_generation_jobs(job_id) ON DELETE RESTRICT,
+    job_version INTEGER NOT NULL CHECK(job_version>=1),
+    terminal_state TEXT NOT NULL CHECK(terminal_state IN ('completed','completed_after_cancel','partially_failed','failed','cancelled')),
+    slot_count INTEGER NOT NULL CHECK(slot_count>0),
+    published_count INTEGER NOT NULL CHECK(published_count>=0),
+    failed_count INTEGER NOT NULL CHECK(failed_count>=0),
+    cancelled_count INTEGER NOT NULL CHECK(cancelled_count>=0),
+    late_count INTEGER NOT NULL CHECK(late_count>=0),
+    emitted_at_unix_ms INTEGER NOT NULL,
+    UNIQUE(job_id,job_version),
+    CHECK(published_count+failed_count+cancelled_count+late_count<=slot_count)
+);
+CREATE TRIGGER image_generation_terminal_event_immutable BEFORE UPDATE ON image_generation_terminal_events BEGIN SELECT RAISE(ABORT,'image generation terminal event is immutable'); END;
+CREATE TRIGGER image_generation_terminal_event_no_delete BEFORE DELETE ON image_generation_terminal_events BEGIN SELECT RAISE(ABORT,'image generation terminal event is immutable'); END;
+CREATE TRIGGER image_generation_terminal_event_insert_guard BEFORE INSERT ON image_generation_terminal_events
+WHEN NOT EXISTS(
+  SELECT 1 FROM image_generation_jobs j WHERE j.job_id=NEW.job_id AND j.terminal_event_version IS NULL AND NEW.job_version=j.version+1
+) OR NEW.slot_count<>(SELECT count(*) FROM image_generation_slots s WHERE s.job_id=NEW.job_id)
+ OR NEW.published_count<>(SELECT count(*) FROM image_generation_slots s WHERE s.job_id=NEW.job_id AND s.state='published')
+ OR NEW.failed_count<>(SELECT count(*) FROM image_generation_slots s WHERE s.job_id=NEW.job_id AND s.state='failed')
+ OR NEW.cancelled_count<>(SELECT count(*) FROM image_generation_slots s WHERE s.job_id=NEW.job_id AND s.state='cancelled')
+ OR NEW.late_count<>(SELECT count(*) FROM image_generation_slots s WHERE s.job_id=NEW.job_id AND s.result_after_cancel=1)
+ OR EXISTS(SELECT 1 FROM image_generation_slots s WHERE s.job_id=NEW.job_id AND s.state NOT IN ('published','failed','cancelled','discarded','late_quarantined'))
+ OR NEW.terminal_state<>(CASE
+   WHEN NEW.late_count>0 THEN 'completed_after_cancel'
+   WHEN NEW.published_count=NEW.slot_count THEN 'completed'
+   WHEN NEW.published_count>0 THEN 'partially_failed'
+   WHEN NEW.failed_count>0 THEN 'failed'
+   ELSE 'cancelled' END)
+BEGIN SELECT RAISE(ABORT,'image generation terminal event projection differs'); END;
+CREATE TRIGGER image_generation_job_terminal_event_required BEFORE UPDATE ON image_generation_jobs
+WHEN NEW.state IN ('completed','completed_after_cancel','partially_failed','failed','cancelled')
+ AND NOT EXISTS(SELECT 1 FROM image_generation_terminal_events e WHERE e.job_id=NEW.job_id AND e.job_version=NEW.version AND e.terminal_state=NEW.state AND NEW.terminal_event_version=NEW.version)
+BEGIN SELECT RAISE(ABORT,'image generation terminal state requires exact event'); END;
+CREATE TRIGGER image_generation_job_terminal_event_forbidden BEFORE UPDATE ON image_generation_jobs
+WHEN NEW.state NOT IN ('completed','completed_after_cancel','partially_failed','failed','cancelled') AND NEW.terminal_event_version IS NOT NULL
+BEGIN SELECT RAISE(ABORT,'nonterminal image generation job cannot cite terminal event'); END;
+
 CREATE TABLE image_generation_slots (
     job_id TEXT NOT NULL REFERENCES image_generation_jobs(job_id) ON DELETE RESTRICT,
     slot_id TEXT NOT NULL,

@@ -1604,6 +1604,65 @@ fn release_dimension_balance(
     }
     Ok(())
 }
+
+/// Transaction-composable byte release used by the media cleanup verifier.
+/// The caller supplies a digest of already-committed per-component deletion
+/// evidence; no filesystem assertion is accepted at this boundary.
+pub(crate) fn destroy_verified_media_artifacts_conn(
+    conn: &rusqlite::Connection,
+    id: &str,
+    cleanup_checksum: &str,
+    wall_ms: u64,
+) -> Result<()> {
+    if cleanup_checksum.is_empty() {
+        bail!("cleanup attestation checksum required");
+    }
+    let (state, version): (String, u64) = conn.query_row(
+        "SELECT state,version FROM media_reservations WHERE reservation_id=?1",
+        [id],
+        |row| Ok((row.get(0)?, row_u64(row, 1)?)),
+    )?;
+    let current = ReservationState::parse(&state)?;
+    if !matches!(
+        current,
+        ReservationState::Settling
+            | ReservationState::CancellationRequested
+            | ReservationState::OverageQuarantined
+            | ReservationState::ExecutingLocal
+    ) {
+        bail!("invalid_transition");
+    }
+    let next_version = version
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("accounting_overflow"))?;
+    for dimension in [
+        MediaDimension::EncodedBytesPerObject,
+        MediaDimension::RetainedBytesPerSession,
+        MediaDimension::DecodedEdgePixels,
+        MediaDimension::DecodedImagePixels,
+        MediaDimension::AggregateDecodedPixelsPerRequest,
+        MediaDimension::LocalCpuJobsGlobal,
+    ] {
+        let name = dimension_name(dimension);
+        conn.execute("INSERT OR IGNORE INTO media_cleanup_attestations(reservation_id,dimension,attestation_kind,checksum,created_wall_ms) VALUES(?1,?2,'zero_materialized_or_verified_cleaned',?3,?4)",params![id,name,cleanup_checksum,sqlite_i64(wall_ms)?])?;
+        release_dimension_balance(conn, id, next_version, &name, wall_ms)?;
+    }
+    let next = if has_releasable_balance(conn, id)? {
+        ReservationState::Settling
+    } else {
+        ReservationState::Released
+    };
+    conn.execute(
+        "UPDATE media_reservations SET state=?1,version=?2 WHERE reservation_id=?3 AND version=?4",
+        params![
+            next.as_str(),
+            sqlite_i64(next_version)?,
+            id,
+            sqlite_i64(version)?
+        ],
+    )?;
+    Ok(())
+}
 fn deletion_is_proven(conn: &rusqlite::Connection, id: &str, dimension: &str) -> Result<bool> {
     if conn
         .query_row(

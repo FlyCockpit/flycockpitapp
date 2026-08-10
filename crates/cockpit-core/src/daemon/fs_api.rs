@@ -483,6 +483,27 @@ fn rename_sidecar(root: &Path, to_path: &str, artifact_id: &str) -> Result<PathB
     Ok(parent.join(format!(".flycockpit-rename-{artifact_id}")))
 }
 
+pub(crate) fn cleanup_remote_rename_sidecar(
+    project_root: &str,
+    to_path: &str,
+    artifact_id: &str,
+) -> Result<(), ErrorPayload> {
+    let root = canonical_project_root(project_root)?;
+    let sidecar = rename_sidecar(&root, to_path, artifact_id)?;
+    match std::fs::remove_file(&sidecar) {
+        Ok(()) => {
+            if let Some(parent) = sidecar.parent() {
+                std::fs::File::open(parent)
+                    .and_then(|dir| dir.sync_all())
+                    .map_err(internal)?;
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(internal(error)),
+    }
+}
+
 pub(crate) fn stage_remote_rename_sync(
     project_root: &str,
     to_path: &str,

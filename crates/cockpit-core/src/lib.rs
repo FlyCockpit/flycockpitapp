@@ -43,6 +43,7 @@ pub mod jitter;
 pub mod knowledge;
 pub mod locks;
 pub mod mcp;
+mod media_https;
 pub mod media_reservation;
 mod media_storage;
 pub mod model_system_prompt;

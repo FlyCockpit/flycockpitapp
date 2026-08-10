@@ -1,0 +1,317 @@
+//! HTTPS retained-media ingress policy.
+//!
+//! Resolution and connection planning deliberately share this private module:
+//! callers cannot turn a checked host back into a hostname-only request which
+//! the HTTP stack could resolve a second time.
+
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
+
+use anyhow::{Context, Result, bail, ensure};
+use reqwest::Url;
+
+const MAX_REDIRECTS: u8 = 5;
+const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_RETAINED_BYTES: u64 = 512 * 1024 * 1024;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HttpsFetchLimits {
+    pub(crate) timeout: Duration,
+    pub(crate) max_bytes: u64,
+}
+
+impl Default for HttpsFetchLimits {
+    fn default() -> Self {
+        Self {
+            timeout: FETCH_TIMEOUT,
+            max_bytes: MAX_RETAINED_BYTES,
+        }
+    }
+}
+
+/// A single HTTP hop whose socket peer is one of the answers checked below.
+/// Fields are private so no hostname-only request can be constructed from it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct VettedHttpsHop {
+    url: Url,
+    socket_addrs: Vec<SocketAddr>,
+    forward_explicit_authorization: bool,
+    redirect_depth: u8,
+}
+
+impl VettedHttpsHop {
+    pub(crate) fn url(&self) -> &Url {
+        &self.url
+    }
+
+    pub(crate) fn socket_addrs(&self) -> &[SocketAddr] {
+        &self.socket_addrs
+    }
+
+    pub(crate) fn forwards_explicit_authorization(&self) -> bool {
+        self.forward_explicit_authorization
+    }
+
+    /// Build the only HTTP client permitted to execute this hop. Redirects are
+    /// disabled because each Location must return through `redirected_https_hop`.
+    /// Reqwest keeps the URL hostname for Host and TLS SNI while dialing only
+    /// the supplied socket addresses.
+    pub(crate) fn bound_client(&self, limits: &HttpsFetchLimits) -> Result<reqwest::Client> {
+        let host = self.url.host_str().context("vetted HTTPS hop lost host")?;
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .referer(false)
+            .timeout(limits.timeout)
+            .resolve_to_addrs(host, &self.socket_addrs)
+            .build()
+            .context("build connection-bound HTTPS media client")
+    }
+}
+
+pub(crate) fn initial_https_hop(url: &str, answers: &[IpAddr]) -> Result<VettedHttpsHop> {
+    let url = parse_fetch_url(url)?;
+    vetted_hop(url, answers, false, 0)
+}
+
+pub(crate) fn redirected_https_hop(
+    previous: &VettedHttpsHop,
+    location: &str,
+    answers: &[IpAddr],
+) -> Result<VettedHttpsHop> {
+    ensure!(
+        previous.redirect_depth < MAX_REDIRECTS,
+        "too many redirects"
+    );
+    let url = previous
+        .url
+        .join(location)
+        .context("invalid HTTPS redirect location")?;
+    validate_url(&url)?;
+    let same_origin = origin(&previous.url) == origin(&url);
+    vetted_hop(
+        url,
+        answers,
+        previous.forward_explicit_authorization && same_origin,
+        previous.redirect_depth + 1,
+    )
+}
+
+fn parse_fetch_url(value: &str) -> Result<Url> {
+    let url = Url::parse(value).context("invalid retained-media URL")?;
+    validate_url(&url)?;
+    Ok(url)
+}
+
+fn validate_url(url: &Url) -> Result<()> {
+    ensure!(url.scheme() == "https", "retained media requires HTTPS");
+    ensure!(url.host_str().is_some(), "HTTPS URL has no host");
+    ensure!(url.username().is_empty(), "URL userinfo is forbidden");
+    ensure!(url.password().is_none(), "URL userinfo is forbidden");
+    ensure!(url.fragment().is_none(), "URL fragments are forbidden");
+    Ok(())
+}
+
+fn vetted_hop(
+    url: Url,
+    answers: &[IpAddr],
+    forward_explicit_authorization: bool,
+    redirect_depth: u8,
+) -> Result<VettedHttpsHop> {
+    ensure!(!answers.is_empty(), "HTTPS host has no addresses");
+    // Reject the complete answer set when even one answer is unsafe. Choosing
+    // only a public member would leave DNS-order/retry behavior as an SSRF
+    // bypass and would make rebinding behavior client-dependent.
+    ensure!(
+        answers.iter().all(|ip| is_public_destination(*ip)),
+        "HTTPS host resolved to a forbidden destination"
+    );
+    let port = url
+        .port_or_known_default()
+        .context("HTTPS URL has no port")?;
+    let socket_addrs = answers
+        .iter()
+        .copied()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect();
+    Ok(VettedHttpsHop {
+        url,
+        socket_addrs,
+        forward_explicit_authorization,
+        redirect_depth,
+    })
+}
+
+fn origin(url: &Url) -> (&str, &str, u16) {
+    (
+        url.scheme(),
+        url.host_str().expect("validated URL has host"),
+        url.port_or_known_default()
+            .expect("validated HTTPS has port"),
+    )
+}
+
+fn is_public_destination(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => is_public_v4(ip),
+        IpAddr::V6(ip) => is_public_v6(ip),
+    }
+}
+
+fn is_public_v4(ip: Ipv4Addr) -> bool {
+    let [a, b, c, _] = ip.octets();
+    !(a == 0
+        || a == 10
+        || a == 127
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 169 && b == 254)
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 192 && b == 0 && c == 2)
+        || (a == 192 && b == 168)
+        || (a == 198 && (b == 18 || b == 19))
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+        || a >= 224)
+}
+
+fn is_public_v6(ip: Ipv6Addr) -> bool {
+    let octets = ip.octets();
+    !(ip.is_unspecified()
+        || ip.is_loopback()
+        || (octets[0] & 0xfe) == 0xfc // unique-local fc00::/7
+        || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80) // link-local fe80::/10
+        || octets[0] == 0xff // multicast
+        || (octets[..4] == [0x20, 0x01, 0x0d, 0xb8]) // documentation
+        || ip.to_ipv4_mapped().is_some_and(|v4| !is_public_v4(v4)))
+}
+
+pub(crate) fn checked_content_length(value: Option<u64>, limits: &HttpsFetchLimits) -> Result<()> {
+    if let Some(value) = value {
+        ensure!(value > 0, "empty retained media is forbidden");
+        ensure!(
+            value <= limits.max_bytes,
+            "retained media exceeds byte limit"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn checked_body_progress(
+    total: u64,
+    chunk: usize,
+    limits: &HttpsFetchLimits,
+) -> Result<u64> {
+    let chunk = u64::try_from(chunk).context("body chunk length overflow")?;
+    let next = total.checked_add(chunk).context("body length overflow")?;
+    if next > limits.max_bytes {
+        bail!("retained media exceeds byte limit");
+    }
+    Ok(next)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ip(value: &str) -> IpAddr {
+        value.parse().unwrap()
+    }
+
+    #[test]
+    fn https_media_ingest_binds_every_vetted_dns_answer_to_socket_plan() {
+        let hop = initial_https_hop(
+            "https://media.example.test/a",
+            &[
+                ip("93.184.216.34"),
+                ip("2606:2800:220:1:248:1893:25c8:1946"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            hop.socket_addrs(),
+            &[
+                "93.184.216.34:443".parse().unwrap(),
+                "[2606:2800:220:1:248:1893:25c8:1946]:443".parse().unwrap()
+            ]
+        );
+        assert_eq!(hop.url().host_str(), Some("media.example.test"));
+    }
+
+    #[test]
+    fn https_media_ingest_rejects_mixed_or_rebound_answers() {
+        assert!(
+            initial_https_hop(
+                "https://media.example.test/a",
+                &[ip("93.184.216.34"), ip("127.0.0.1")]
+            )
+            .is_err()
+        );
+        let first =
+            initial_https_hop("https://media.example.test/a", &[ip("93.184.216.34")]).unwrap();
+        assert!(redirected_https_hop(&first, "/b", &[ip("169.254.169.254")]).is_err());
+    }
+
+    #[test]
+    fn https_media_ingest_redirect_revalidates_scheme_and_origin_credentials() {
+        let mut first =
+            initial_https_hop("https://media.example.test/a", &[ip("93.184.216.34")]).unwrap();
+        first.forward_explicit_authorization = true;
+        let same = redirected_https_hop(&first, "/b", &[ip("93.184.216.34")]).unwrap();
+        assert!(same.forwards_explicit_authorization());
+        let other =
+            redirected_https_hop(&same, "https://cdn.example.test/c", &[ip("93.184.216.35")])
+                .unwrap();
+        assert!(!other.forwards_explicit_authorization());
+        assert!(
+            redirected_https_hop(
+                &first,
+                "http://media.example.test/b",
+                &[ip("93.184.216.34")]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn https_media_ingest_timeout_and_size_limits_are_closed_without_network() {
+        let limits = HttpsFetchLimits {
+            timeout: Duration::from_millis(1),
+            max_bytes: 4,
+        };
+        assert_eq!(limits.timeout, Duration::from_millis(1));
+        checked_content_length(Some(4), &limits).unwrap();
+        assert!(checked_content_length(Some(5), &limits).is_err());
+        assert_eq!(checked_body_progress(2, 2, &limits).unwrap(), 4);
+        assert!(checked_body_progress(4, 1, &limits).is_err());
+    }
+
+    #[test]
+    fn https_media_ingest_rejects_url_credentials_fragments_and_reserved_ranges() {
+        for url in [
+            "http://example.test/a",
+            "https://user@example.test/a",
+            "https://example.test/a#secret",
+        ] {
+            assert!(
+                initial_https_hop(url, &[ip("93.184.216.34")]).is_err(),
+                "{url}"
+            );
+        }
+        for address in [
+            "10.0.0.1",
+            "100.64.0.1",
+            "192.168.0.1",
+            "224.0.0.1",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "2001:db8::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(
+                initial_https_hop("https://example.test/a", &[ip(address)]).is_err(),
+                "{address}"
+            );
+        }
+    }
+}

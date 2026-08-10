@@ -351,17 +351,54 @@ pub struct ConnectionProof {
     /// Initial connection followed by every redirect connection, in order.
     pub hops: Vec<ConnectionHop>,
 }
+pub struct BoundProbeResponse {
+    pub status: reqwest::StatusCode,
+    pub body: Vec<u8>,
+    pub connection: ConnectionProof,
+}
+
+impl fmt::Debug for BoundProbeResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BoundProbeResponse")
+            .field("status", &self.status)
+            .field("body_bytes", &self.body.len())
+            .field("connection", &self.connection)
+            .finish()
+    }
+}
+
+pub struct ReadOnlyProbeRequest {
+    pub url: reqwest::Url,
+    headers: reqwest::header::HeaderMap,
+}
+
+impl ReadOnlyProbeRequest {
+    pub fn new(url: reqwest::Url, headers: reqwest::header::HeaderMap) -> Self {
+        Self { url, headers }
+    }
+}
+
+impl fmt::Debug for ReadOnlyProbeRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReadOnlyProbeRequest")
+            .field("url", &self.url)
+            .field("header_count", &self.headers.len())
+            .finish()
+    }
+}
 /// Establishes sockets only to `candidates`, retaining `authority` for Host,
 /// TLS SNI and certificate checks. Redirects must be resolved independently,
 /// constrained to `required_location`, and returned in `ConnectionProof::hops`.
 pub trait BoundConnector: Send + Sync {
-    fn connect<'a>(
+    fn execute<'a>(
         &'a self,
-        origin: &'a reqwest::Url,
+        request: ReadOnlyProbeRequest,
         candidates: &'a [IpAddr],
         required_location: AddressClass,
         limits: ProbeLimits,
-    ) -> Pin<Box<dyn Future<Output = Result<ConnectionProof, RuntimeError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<BoundProbeResponse, RuntimeError>> + Send + 'a>>;
 }
 
 pub struct ReqwestPinnedConnector {
@@ -372,6 +409,7 @@ struct PinnedResponse {
     status: reqwest::StatusCode,
     location: Option<String>,
     connected_ip: IpAddr,
+    body: Vec<u8>,
 }
 
 impl ReqwestPinnedConnector {
@@ -384,6 +422,7 @@ impl ReqwestPinnedConnector {
         url: &reqwest::Url,
         ip: IpAddr,
         limits: ProbeLimits,
+        headers: &reqwest::header::HeaderMap,
     ) -> Result<PinnedResponse, RuntimeError> {
         let hostname = url.host_str().ok_or(RuntimeError::new(
             RuntimeErrorCode::Dns,
@@ -405,22 +444,25 @@ impl ReqwestPinnedConnector {
                     "Check the endpoint certificate and configured hostname.",
                 )
             })?;
-        let response = tokio::time::timeout(limits.header_timeout, client.get(url.clone()).send())
-            .await
-            .map_err(|_| {
-                RuntimeError::new(
-                    RuntimeErrorCode::HeaderTimeout,
-                    "The provider did not return response headers in time.",
-                )
-            })?
-            .map_err(|error| {
-                let code = if error.is_connect() && url.scheme() == "https" {
-                    RuntimeErrorCode::Tls
-                } else {
-                    RuntimeErrorCode::ConnectTimeout
-                };
-                RuntimeError::new(code, health_state_for_error(code).remediation())
-            })?;
+        let response = tokio::time::timeout(
+            limits.header_timeout,
+            client.get(url.clone()).headers(headers.clone()).send(),
+        )
+        .await
+        .map_err(|_| {
+            RuntimeError::new(
+                RuntimeErrorCode::HeaderTimeout,
+                "The provider did not return response headers in time.",
+            )
+        })?
+        .map_err(|error| {
+            let code = if error.is_connect() && url.scheme() == "https" {
+                RuntimeErrorCode::Tls
+            } else {
+                RuntimeErrorCode::ConnectTimeout
+            };
+            RuntimeError::new(code, health_state_for_error(code).remediation())
+        })?;
         let connected_ip =
             response
                 .remote_addr()
@@ -436,6 +478,7 @@ impl ReqwestPinnedConnector {
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
         let mut body_bytes = 0usize;
+        let mut body = Vec::new();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = tokio::time::timeout(limits.header_timeout, stream.next())
             .await
@@ -464,25 +507,28 @@ impl ReqwestPinnedConnector {
                     "The provider response exceeded the inspection limit.",
                 ));
             }
+            body.extend_from_slice(&chunk);
         }
         Ok(PinnedResponse {
             status,
             location,
             connected_ip,
+            body,
         })
     }
 }
 
 impl BoundConnector for ReqwestPinnedConnector {
-    fn connect<'a>(
+    fn execute<'a>(
         &'a self,
-        origin: &'a reqwest::Url,
+        request: ReadOnlyProbeRequest,
         candidates: &'a [IpAddr],
         required_location: AddressClass,
         limits: ProbeLimits,
-    ) -> Pin<Box<dyn Future<Output = Result<ConnectionProof, RuntimeError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<BoundProbeResponse, RuntimeError>> + Send + 'a>> {
         Box::pin(async move {
-            let mut url = origin.clone();
+            let mut url = request.url;
+            let initial_headers = request.headers;
             let mut candidates = candidates.to_vec();
             let mut hops = Vec::new();
             for redirect_count in 0..=limits.redirect_limit {
@@ -495,7 +541,16 @@ impl BoundConnector for ReqwestPinnedConnector {
                     "Correct the endpoint hostname.",
                 ))?;
                 let authority = origin_authority(&url, hostname);
-                let response = self.pinned_read_only(&url, ip, limits).await?;
+                let headers = if redirect_count == 0 {
+                    &initial_headers
+                } else {
+                    // Credentials and attribution are never forwarded across
+                    // a redirect boundary.
+                    static EMPTY: std::sync::LazyLock<reqwest::header::HeaderMap> =
+                        std::sync::LazyLock::new(reqwest::header::HeaderMap::new);
+                    &EMPTY
+                };
+                let response = self.pinned_read_only(&url, ip, limits, headers).await?;
                 let connected_ip = response.connected_ip;
                 if !candidates.contains(&connected_ip)
                     || classify_address(connected_ip) != required_location
@@ -513,12 +568,16 @@ impl BoundConnector for ReqwestPinnedConnector {
                 });
                 if !response.status.is_redirection() {
                     let first = &hops[0];
-                    return Ok(ConnectionProof {
-                        authority: first.authority.clone(),
-                        connected_ip: first.connected_ip,
-                        location: required_location,
-                        established_at: 0,
-                        hops,
+                    return Ok(BoundProbeResponse {
+                        status: response.status,
+                        body: response.body,
+                        connection: ConnectionProof {
+                            authority: first.authority.clone(),
+                            connected_ip: first.connected_ip,
+                            location: required_location,
+                            established_at: 0,
+                            hops,
+                        },
                     });
                 }
                 if redirect_count == limits.redirect_limit {
@@ -648,7 +707,7 @@ pub struct ProbeRequest {
     pub request_id: u64,
     pub kind: RefreshKind,
     pub credential_identity_digest: CredentialIdentityDigest,
-    pub connection: ConnectionProof,
+    resolved_headers: reqwest::header::HeaderMap,
     pub limits: ProbeLimits,
 }
 impl fmt::Debug for ProbeRequest {
@@ -663,9 +722,14 @@ impl fmt::Debug for ProbeRequest {
             .field("request_id", &self.request_id)
             .field("kind", &self.kind)
             .field("credential_identity_digest", &"<redacted>")
-            .field("connection", &self.connection)
+            .field("resolved_header_count", &self.resolved_headers.len())
             .field("limits", &self.limits)
             .finish()
+    }
+}
+impl ProbeRequest {
+    pub fn read_only_request(&self, url: reqwest::Url) -> ReadOnlyProbeRequest {
+        ReadOnlyProbeRequest::new(url, self.resolved_headers.clone())
     }
 }
 #[derive(Debug, Clone)]
@@ -675,16 +739,22 @@ pub struct ProbeResult {
     pub model_or_workflow_digest: Option<String>,
     pub unavailable_reason: Option<RuntimeErrorCode>,
 }
-pub trait ImageRuntimeAdapter: Send + Sync {
+mod adapter_sealed {
+    pub trait Sealed {}
+}
+
+pub trait ImageRuntimeAdapter: adapter_sealed::Sealed + Send + Sync {
     fn kind(&self) -> ImageAdapterKind;
-    /// Performs only bounded, read-only inspection over the bound connection
-    /// represented by `request.connection`. Implementations must not resolve a
-    /// second destination, open an unvalidated socket, or follow redirects that
-    /// are absent from the connector's proof.
-    fn probe<'a>(
-        &'a self,
-        request: ProbeRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<ProbeResult, RuntimeError>> + Send + 'a>>;
+    /// Purely describes a read-only request. Header values remain ephemeral in
+    /// the registry-owned transport and are never returned in snapshots.
+    fn request(&self, request: &ProbeRequest) -> Result<ReadOnlyProbeRequest, RuntimeError>;
+    /// Purely parses an already bounded response. This synchronous sealed hook
+    /// has no transport capability and cannot follow redirects or open sockets.
+    fn parse(
+        &self,
+        request: &ProbeRequest,
+        response: &BoundProbeResponse,
+    ) -> Result<ProbeResult, RuntimeError>;
 }
 
 /// Exhaustive production registration: adding an adapter kind to config makes
@@ -769,6 +839,63 @@ pub struct ImageRuntimeRegistry {
 }
 
 impl ImageRuntimeRegistry {
+    fn resolve_ephemeral_headers(
+        endpoint: &ImageEndpoint,
+    ) -> Result<reqwest::header::HeaderMap, RuntimeError> {
+        let (headers, missing) = crate::providers::models_fetch::resolve_headers(&endpoint.headers);
+        if !missing.is_empty() {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::Authentication,
+                "Check the configured credential reference.",
+            ));
+        }
+        let mut resolved = reqwest::header::HeaderMap::new();
+        for header in headers {
+            let name =
+                reqwest::header::HeaderName::from_bytes(header.name.as_bytes()).map_err(|_| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::Authentication,
+                        "Correct the configured probe headers.",
+                    )
+                })?;
+            let value = reqwest::header::HeaderValue::from_str(&header.value).map_err(|_| {
+                RuntimeError::new(
+                    RuntimeErrorCode::Authentication,
+                    "Correct the configured probe headers.",
+                )
+            })?;
+            if resolved.insert(name, value).is_some() {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::Authentication,
+                    "Correct duplicate configured probe headers.",
+                ));
+            }
+        }
+        if let Some(reference) = &endpoint.credential_ref
+            && !resolved.contains_key(reqwest::header::AUTHORIZATION)
+        {
+            let store =
+                crate::credentials::CredentialStore::open_default_readonly().map_err(|_| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::Authentication,
+                        "Check the configured credential reference.",
+                    )
+                })?;
+            let secret = store.named_secret(reference).ok_or(RuntimeError::new(
+                RuntimeErrorCode::Authentication,
+                "Check the configured credential reference.",
+            ))?;
+            let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {secret}"))
+                .map_err(|_| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::Authentication,
+                        "Check the configured credential reference.",
+                    )
+                })?;
+            resolved.insert(reqwest::header::AUTHORIZATION, value);
+        }
+        Ok(resolved)
+    }
     fn invalidate_target_cache(&self, endpoint_id: &str, target_id: &str) {
         self.inner.cache.lock().unwrap().remove(&CacheKey {
             endpoint: endpoint_id.to_owned(),
@@ -1185,10 +1312,28 @@ impl ImageRuntimeRegistry {
         } else {
             ProbeLimits::health()
         };
+        let probe = ProbeRequest {
+            endpoint: endpoint.clone(),
+            target_id: target_id.clone(),
+            config_generation: generation,
+            refresh_epoch: epoch,
+            request_id,
+            kind,
+            credential_identity_digest: credential_identity_digest.clone(),
+            resolved_headers: Self::resolve_ephemeral_headers(&endpoint)?,
+            limits,
+        };
+        let request = adapter.request(&probe)?;
+        if request.url.origin() != url.origin() {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::DnsDenied,
+                "Keep runtime probes within the configured endpoint origin.",
+            ));
+        }
         let connect_deadline = header_deadline.min(tokio::time::Instant::now() + CONNECT_TIMEOUT);
-        let connection = match tokio::time::timeout_at(
+        let response = match tokio::time::timeout_at(
             connect_deadline,
-            self.connector.connect(&url, &allowed, wanted, limits),
+            self.connector.execute(request, &allowed, wanted, limits),
         )
         .await
         .map_err(|_| {
@@ -1215,6 +1360,7 @@ impl ImageRuntimeRegistry {
                 return Err(error);
             }
         };
+        let connection = &response.connection;
         if !allowed.contains(&connection.connected_ip)
             || connection.authority != authority
             || connection.location != wanted
@@ -1247,29 +1393,7 @@ impl ImageRuntimeRegistry {
             )?;
             return Err(error);
         }
-        let result = match tokio::time::timeout_at(
-            header_deadline,
-            adapter.probe(ProbeRequest {
-                endpoint: endpoint.clone(),
-                target_id: target_id.clone(),
-                config_generation: generation,
-                refresh_epoch: epoch,
-                request_id,
-                kind,
-                credential_identity_digest: credential_identity_digest.clone(),
-                connection: connection.clone(),
-                limits,
-            }),
-        )
-        .await
-        .map_err(|_| {
-            RuntimeError::new(
-                RuntimeErrorCode::HeaderTimeout,
-                "The provider did not return response headers in time.",
-            )
-        })
-        .and_then(|result| result)
-        {
+        let result = match adapter.parse(&probe, &response) {
             Ok(value) => value,
             Err(error) => {
                 let state = health_state_for_error(error.code);
@@ -1377,7 +1501,7 @@ impl ImageRuntimeRegistry {
             retrieved_at: now,
             expires_at: now.saturating_add(ttl.as_millis() as u64),
             endpoint_origin: endpoint.origin.clone(),
-            connection: Some(connection),
+            connection: Some(response.connection),
             model_or_workflow_digest: result.model_or_workflow_digest,
             capability,
             unavailable_reason: result.unavailable_reason,
@@ -1633,8 +1757,14 @@ impl ImageRuntimeRegistry {
         let allowed = ips;
         let proof = self
             .connector
-            .connect(&url, &allowed, class, ProbeLimits::health())
+            .execute(
+                ReadOnlyProbeRequest::new(url.clone(), Self::resolve_ephemeral_headers(endpoint)?),
+                &allowed,
+                class,
+                ProbeLimits::health(),
+            )
             .await?;
+        let proof = proof.connection;
         if !allowed.contains(&proof.connected_ip)
             || proof.location != class
             || proof.authority != authority

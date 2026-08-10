@@ -28,40 +28,45 @@ impl DnsResolver for SequenceDns {
 }
 struct Connector;
 impl BoundConnector for Connector {
-    fn connect<'a>(
+    fn execute<'a>(
         &'a self,
-        origin: &'a reqwest::Url,
+        request: ReadOnlyProbeRequest,
         candidates: &'a [IpAddr],
         _required_location: AddressClass,
         _: ProbeLimits,
-    ) -> Pin<Box<dyn Future<Output = Result<ConnectionProof, RuntimeError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<BoundProbeResponse, RuntimeError>> + Send + 'a>> {
         Box::pin(async move {
+            let origin = request.url;
             let hostname = origin.host_str().unwrap();
-            let authority = origin_authority(origin, hostname);
-            Ok(ConnectionProof {
-                authority: authority.clone(),
-                connected_ip: candidates[0],
-                location: classify_address(candidates[0]),
-                established_at: 0,
-                hops: vec![ConnectionHop {
-                    authority,
-                    hostname: hostname.into(),
+            let authority = origin_authority(&origin, hostname);
+            Ok(BoundProbeResponse {
+                status: reqwest::StatusCode::OK,
+                body: Vec::new(),
+                connection: ConnectionProof {
+                    authority: authority.clone(),
                     connected_ip: candidates[0],
                     location: classify_address(candidates[0]),
-                }],
+                    established_at: 0,
+                    hops: vec![ConnectionHop {
+                        authority,
+                        hostname: hostname.into(),
+                        connected_ip: candidates[0],
+                        location: classify_address(candidates[0]),
+                    }],
+                },
             })
         })
     }
 }
 struct ErrorConnector(RuntimeErrorCode);
 impl BoundConnector for ErrorConnector {
-    fn connect<'a>(
+    fn execute<'a>(
         &'a self,
-        _: &'a reqwest::Url,
+        _: ReadOnlyProbeRequest,
         _: &'a [IpAddr],
         _: AddressClass,
         _: ProbeLimits,
-    ) -> Pin<Box<dyn Future<Output = Result<ConnectionProof, RuntimeError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<BoundProbeResponse, RuntimeError>> + Send + 'a>> {
         Box::pin(async move {
             Err(RuntimeError::new(
                 self.0,
@@ -72,33 +77,37 @@ impl BoundConnector for ErrorConnector {
 }
 struct PendingConnector;
 impl BoundConnector for PendingConnector {
-    fn connect<'a>(
+    fn execute<'a>(
         &'a self,
-        _: &'a reqwest::Url,
+        _: ReadOnlyProbeRequest,
         _: &'a [IpAddr],
         _: AddressClass,
         _: ProbeLimits,
-    ) -> Pin<Box<dyn Future<Output = Result<ConnectionProof, RuntimeError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<BoundProbeResponse, RuntimeError>> + Send + 'a>> {
         Box::pin(std::future::pending())
     }
 }
 struct MismatchedConnector;
 impl BoundConnector for MismatchedConnector {
-    fn connect<'a>(
+    fn execute<'a>(
         &'a self,
-        origin: &'a reqwest::Url,
+        request: ReadOnlyProbeRequest,
         _: &'a [IpAddr],
         _: AddressClass,
         _: ProbeLimits,
-    ) -> Pin<Box<dyn Future<Output = Result<ConnectionProof, RuntimeError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<BoundProbeResponse, RuntimeError>> + Send + 'a>> {
         Box::pin(async move {
-            let authority = origin_authority(origin, origin.host_str().unwrap());
-            Ok(ConnectionProof {
-                authority: format!("wrong.{authority}"),
-                connected_ip: "1.1.1.1".parse().unwrap(),
-                location: AddressClass::PublicRemote,
-                established_at: 0,
-                hops: vec![],
+            let authority = origin_authority(&request.url, request.url.host_str().unwrap());
+            Ok(BoundProbeResponse {
+                status: reqwest::StatusCode::OK,
+                body: Vec::new(),
+                connection: ConnectionProof {
+                    authority: format!("wrong.{authority}"),
+                    connected_ip: "1.1.1.1".parse().unwrap(),
+                    location: AddressClass::PublicRemote,
+                    established_at: 0,
+                    hops: vec![],
+                },
             })
         })
     }
@@ -107,14 +116,12 @@ struct Adapter {
     kind: ImageAdapterKind,
     calls: AtomicUsize,
 }
+impl adapter_sealed::Sealed for Adapter {}
 impl ImageRuntimeAdapter for Adapter {
     fn kind(&self) -> ImageAdapterKind {
         self.kind
     }
-    fn probe<'a>(
-        &'a self,
-        r: ProbeRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<ProbeResult, RuntimeError>> + Send + 'a>> {
+    fn request(&self, r: &ProbeRequest) -> Result<ReadOnlyProbeRequest, RuntimeError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(
             r.limits,
@@ -124,20 +131,26 @@ impl ImageRuntimeAdapter for Adapter {
                 ProbeLimits::health()
             }
         );
-        Box::pin(async move {
-            Ok(ProbeResult {
-                state: ImageHealthState::Healthy,
-                capability: Some(CapabilitySnapshot {
-                    target_id: "target".into(),
-                    model_or_workflow_digest: "digest".into(),
-                    retrieved_at: 0,
-                    expires_at: CAPABILITY_DISPATCH_TTL.as_millis() as u64,
-                    provenance: SnapshotProvenance::Live,
-                    constraints: BTreeMap::new(),
-                }),
-                model_or_workflow_digest: Some("digest".into()),
-                unavailable_reason: None,
-            })
+        let url = reqwest::Url::parse(&r.endpoint.origin).unwrap();
+        Ok(r.read_only_request(url))
+    }
+    fn parse(
+        &self,
+        _request: &ProbeRequest,
+        _response: &BoundProbeResponse,
+    ) -> Result<ProbeResult, RuntimeError> {
+        Ok(ProbeResult {
+            state: ImageHealthState::Healthy,
+            capability: Some(CapabilitySnapshot {
+                target_id: "target".into(),
+                model_or_workflow_digest: "digest".into(),
+                retrieved_at: 0,
+                expires_at: CAPABILITY_DISPATCH_TTL.as_millis() as u64,
+                provenance: SnapshotProvenance::Live,
+                constraints: BTreeMap::new(),
+            }),
+            model_or_workflow_digest: Some("digest".into()),
+            unavailable_reason: None,
         })
     }
 }
@@ -147,7 +160,7 @@ fn endpoint() -> ImageEndpoint {
         adapter: ImageAdapterKind::OpenaiImages,
         origin: "https://example.com".into(),
         path_prefix: None,
-        credential_ref: Some("secret-ref".into()),
+        credential_ref: None,
         headers: vec![],
         allow_insecure_transport: false,
         location: ImageLocationClass::PublicCloud,
@@ -667,6 +680,25 @@ fn image_generation_credential_identity_is_typed_and_redacted() {
 }
 
 #[test]
+fn image_generation_adapter_boundary_is_sealed_and_parse_only() {
+    let source = include_str!("../image_generation_runtime.rs");
+    let trait_body = source
+        .split("pub trait ImageRuntimeAdapter")
+        .nth(1)
+        .and_then(|tail| tail.split("/// Exhaustive production registration").next())
+        .unwrap();
+    assert!(trait_body.contains("adapter_sealed::Sealed"));
+    assert!(trait_body.contains("fn request("));
+    assert!(trait_body.contains("fn parse("));
+    for forbidden in ["Future<", ".send()", "TcpStream", "lookup_host"] {
+        assert!(
+            !trait_body.contains(forbidden),
+            "adapter authority contains {forbidden}"
+        );
+    }
+}
+
+#[test]
 fn image_generation_runtime_revalidates_every_redirect_hop() {
     let proof = ConnectionProof {
         authority: "example.com:443".into(),
@@ -825,9 +857,16 @@ async fn image_generation_pinned_connector_preserves_authority_and_revalidates_r
     let dns: Arc<dyn DnsResolver> = Arc::new(Dns(IpAddr::V4(Ipv4Addr::LOCALHOST)));
     let connector = ReqwestPinnedConnector::new(dns);
     let origin = reqwest::Url::parse(&format!("http://origin.test:{port}/health")).unwrap();
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        reqwest::header::HeaderValue::from_static("Bearer fixture-super-secret"),
+    );
+    let request = ReadOnlyProbeRequest::new(origin, headers);
+    assert!(!format!("{request:?}").contains("fixture-super-secret"));
     let proof = connector
-        .connect(
-            &origin,
+        .execute(
+            request,
             &[IpAddr::V4(Ipv4Addr::LOCALHOST)],
             AddressClass::Loopback,
             ProbeLimits::health(),
@@ -840,14 +879,22 @@ async fn image_generation_pinned_connector_preserves_authority_and_revalidates_r
             .to_ascii_lowercase()
             .contains(&format!("host: origin.test:{port}"))
     );
+    assert!(requests[0].contains("Bearer fixture-super-secret"));
     assert!(
         requests[1]
             .to_ascii_lowercase()
             .contains(&format!("host: redirect.test:{port}"))
     );
-    assert_eq!(proof.hops.len(), 2);
-    assert_eq!(proof.hops[0].connected_ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
-    assert_eq!(proof.hops[1].connected_ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    assert!(!requests[1].contains("fixture-super-secret"));
+    assert_eq!(proof.connection.hops.len(), 2);
+    assert_eq!(
+        proof.connection.hops[0].connected_ip,
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    );
+    assert_eq!(
+        proof.connection.hops[1].connected_ip,
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    );
 }
 
 #[tokio::test]
@@ -875,8 +922,8 @@ async fn image_generation_pinned_connector_enforces_body_limit_while_reading() {
     let origin = reqwest::Url::parse(&format!("http://body.test:{port}/health")).unwrap();
     assert!(matches!(
         connector
-            .connect(
-                &origin,
+            .execute(
+                ReadOnlyProbeRequest::new(origin, reqwest::header::HeaderMap::new()),
                 &[IpAddr::V4(Ipv4Addr::LOCALHOST)],
                 AddressClass::Loopback,
                 ProbeLimits::health(),

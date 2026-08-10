@@ -3748,12 +3748,14 @@ mod tests {
         let media_digest = hex_lower(&Sha256::digest(&media));
         {
             let db = Db::open(&path).unwrap();
-            db.blocking_for_sync_cli(|conn|{
+            let setup_media = media.clone();
+            let setup_media_digest = media_digest.clone();
+            db.blocking_for_sync_cli(move |conn|{
                 let(plan,digest)=canonical_test_plan(job_id,slot_id,artifact_id,1,1,100);
                 let verified=CreateImageGenerationJob::from_verified_canonical_plan(&plan,&digest,1)?;
                 Db::create_image_generation_graph_conn(conn,&verified,&[CreateImageGenerationSlot{slot_id,slot_index:0,sample_index:0,managed_artifact_id:artifact_id,attempts:vec![CreateImageGenerationAttempt{attempt_number:1,provider_request_identity:"request:1".into(),provider_idempotency_identity:"idem:1".into()}]}])?;
                 let authority=Db::image_generation_queue_authority_conn(conn,job_id)?;
-                Db::queue_image_generation_job_conn(conn,authority,&ImageGenerationMediaPlanSnapshot{canonical_bytes:&media,digest:&media_digest},1)?;
+                Db::queue_image_generation_job_conn(conn,authority,&ImageGenerationMediaPlanSnapshot{canonical_bytes:&setup_media,digest:&setup_media_digest},1)?;
                 assert!(conn.execute("UPDATE image_generation_attempt_media_snapshots SET canonical_media_plan=X'00' WHERE job_id=?1",[job_id.to_string()]).is_err());
                 assert!(conn.execute("DELETE FROM image_generation_attempt_media_snapshots WHERE job_id=?1",[job_id.to_string()]).is_err());
                 Ok(())
@@ -3761,7 +3763,7 @@ mod tests {
         }
         let reopened = Db::open(&path).unwrap();
         reopened
-            .blocking_for_sync_cli(|conn| {
+            .blocking_for_sync_cli(move |conn| {
                 let rows = Db::scan_image_generation_dispatch_candidates_conn(
                     conn,
                     DeadlineObservationV1::new(

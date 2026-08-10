@@ -5942,7 +5942,7 @@ async fn staged_rename_cleanup_intent_survives_unlink_fsync_failure_and_reopen()
     std::fs::write(root.path().join("from.txt"), b"value").unwrap();
     let ctx = disk_test_ctx(&db_path, &spool_path);
     let journal = ctx.external_journal.as_ref().unwrap();
-    journal.fail_next_remote_rename_cleanup_sync();
+    journal.fail_next_remote_rename_cleanup_unlink();
     let request = Request::FsRename {
         project_root: root.path().to_string_lossy().into_owned(),
         from_path: "from.txt".into(),
@@ -5994,7 +5994,38 @@ async fn staged_rename_cleanup_intent_survives_unlink_fsync_failure_and_reopen()
             .len(),
         1
     );
+    assert!(
+        std::fs::read_dir(spool_path.join("remote-operations"))
+            .unwrap()
+            .next()
+            .is_some()
+    );
     drop(ctx);
+    let reopened = disk_test_ctx(&db_path, &spool_path);
+    reopened
+        .external_journal
+        .as_ref()
+        .unwrap()
+        .fail_next_remote_rename_cleanup_sync();
+    assert!(
+        reopened
+            .external_journal
+            .as_ref()
+            .unwrap()
+            .drain_remote_rename_artifact_cleanup()
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        reopened
+            .db
+            .remote_rename_artifact_cleanup_intents()
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(reopened);
     let reopened = disk_test_ctx(&db_path, &spool_path);
     reopened
         .external_journal

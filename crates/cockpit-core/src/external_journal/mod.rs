@@ -390,6 +390,8 @@ pub struct ExternalJournal {
     db_faults: Arc<Mutex<DbFaults>>,
     #[cfg(test)]
     fail_remote_rename_cleanup_sync: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_remote_rename_cleanup_unlink: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for ExternalJournal {
@@ -478,6 +480,15 @@ impl ExternalJournal {
             };
             if !generation.is_empty() && generation.bytes().all(|byte| byte.is_ascii_digit()) {
                 let held = dir.open_file_verified(&name)?;
+                #[cfg(test)]
+                if self
+                    .fail_remote_rename_cleanup_unlink
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(ExternalJournalError::Spool(
+                        "injected rename artifact unlink failure".into(),
+                    ));
+                }
                 dir.remove_file(&name)?;
                 #[cfg(unix)]
                 {
@@ -514,6 +525,12 @@ impl ExternalJournal {
     #[cfg(test)]
     pub(crate) fn fail_next_remote_rename_cleanup_sync(&self) {
         self.fail_remote_rename_cleanup_sync
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_remote_rename_cleanup_unlink(&self) {
+        self.fail_remote_rename_cleanup_unlink
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -556,6 +573,8 @@ impl ExternalJournal {
             db_faults: Arc::new(Mutex::new(DbFaults::default())),
             #[cfg(test)]
             fail_remote_rename_cleanup_sync: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_remote_rename_cleanup_unlink: std::sync::atomic::AtomicBool::new(false),
         }
     }
 

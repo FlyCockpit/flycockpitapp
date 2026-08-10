@@ -584,7 +584,7 @@
       "tag": "list_sealed_values",
       "fcorSchema": "session_id:Uuid",
       "fcorCanonicalSchema": "session_id:uuid",
-      "class": "read_only",
+      "class": "local_only",
       "strategy": "none",
       "evidence": null,
       "fcorRoles": [
@@ -599,8 +599,8 @@
       "tag": "delete_sealed_value",
       "fcorSchema": "session_id:Uuid|value_id:String",
       "fcorCanonicalSchema": "session_id:uuid|value_id:string",
-      "class": "transactional_mutation",
-      "strategy": "sql_transaction",
+      "class": "local_only",
+      "strategy": "none",
       "evidence": null,
       "fcorRoles": [
         {
@@ -619,7 +619,7 @@
       "tag": "list_project_notes",
       "fcorSchema": "project_root:String",
       "fcorCanonicalSchema": "project_root:string",
-      "class": "read_only",
+      "class": "local_only",
       "strategy": "none",
       "evidence": null,
       "fcorRoles": [
@@ -634,8 +634,8 @@
       "tag": "create_project_note",
       "fcorSchema": "project_root:String|name:String",
       "fcorCanonicalSchema": "project_root:string|name:string",
-      "class": "transactional_mutation",
-      "strategy": "sql_transaction",
+      "class": "local_only",
+      "strategy": "none",
       "evidence": null,
       "fcorRoles": [
         {
@@ -654,8 +654,8 @@
       "tag": "set_project_note_content",
       "fcorSchema": "project_root:String|id:Uuid|content:String",
       "fcorCanonicalSchema": "project_root:string|id:uuid|content:string",
-      "class": "transactional_mutation",
-      "strategy": "sql_transaction",
+      "class": "local_only",
+      "strategy": "none",
       "evidence": null,
       "fcorRoles": [
         {
@@ -679,8 +679,8 @@
       "tag": "rename_project_note",
       "fcorSchema": "project_root:String|id:Uuid|name:String",
       "fcorCanonicalSchema": "project_root:string|id:uuid|name:string",
-      "class": "transactional_mutation",
-      "strategy": "sql_transaction",
+      "class": "local_only",
+      "strategy": "none",
       "evidence": null,
       "fcorRoles": [
         {
@@ -704,8 +704,8 @@
       "tag": "delete_project_note",
       "fcorSchema": "project_root:String|id:Uuid",
       "fcorCanonicalSchema": "project_root:string|id:uuid",
-      "class": "transactional_mutation",
-      "strategy": "sql_transaction",
+      "class": "local_only",
+      "strategy": "none",
       "evidence": null,
       "fcorRoles": [
         {
@@ -724,9 +724,9 @@
       "tag": "set_workspace_trust",
       "fcorSchema": "project_root:String|mode:WorkspaceTrustMode|expected_config_generation:u64",
       "fcorCanonicalSchema": "project_root:string|mode:enum16:WorkspaceTrustMode|expected_config_generation:u64",
-      "class": "idempotent_adapter_mutation",
-      "strategy": "durable_desired_state",
-      "evidence": "desired_state_generation_and_observed_digest",
+      "class": "local_only",
+      "strategy": "none",
+      "evidence": null,
       "fcorRoles": [
         {
           "field": "project_root",
@@ -749,7 +749,7 @@
       "tag": "get_startup_disclosures",
       "fcorSchema": "project_root:String",
       "fcorCanonicalSchema": "project_root:string",
-      "class": "read_only",
+      "class": "local_only",
       "strategy": "none",
       "evidence": null,
       "fcorRoles": [
@@ -764,7 +764,7 @@
       "tag": "get_app_flag",
       "fcorSchema": "key:AppFlagKey",
       "fcorCanonicalSchema": "key:enum16:AppFlagKey",
-      "class": "read_only",
+      "class": "local_only",
       "strategy": "none",
       "evidence": null,
       "fcorRoles": [
@@ -779,8 +779,8 @@
       "tag": "mark_app_flag_seen",
       "fcorSchema": "key:AppFlagKey|expected_version:u64",
       "fcorCanonicalSchema": "key:enum16:AppFlagKey|expected_version:u64",
-      "class": "transactional_mutation",
-      "strategy": "sql_transaction",
+      "class": "local_only",
+      "strategy": "none",
       "evidence": null,
       "fcorRoles": [
         {
@@ -799,8 +799,8 @@
       "tag": "resolve_assistant_session",
       "fcorSchema": "assistant_id:String|project_root:String|mode:AssistantSessionResolutionMode",
       "fcorCanonicalSchema": "assistant_id:string|project_root:string|mode:enum16:AssistantSessionResolutionMode",
-      "class": "transactional_mutation",
-      "strategy": "sql_transaction",
+      "class": "local_only",
+      "strategy": "none",
       "evidence": null,
       "fcorRoles": [
         {
@@ -824,7 +824,7 @@
       "tag": "list_assistants",
       "fcorSchema": "-",
       "fcorCanonicalSchema": "-",
-      "class": "read_only",
+      "class": "local_only",
       "strategy": "none",
       "evidence": null,
       "fcorRoles": []
@@ -833,8 +833,8 @@
       "tag": "upsert_assistant",
       "fcorSchema": "name:String|home_dir:String|config_json:String|content_hash:String",
       "fcorCanonicalSchema": "name:string|home_dir:string|config_json:string|content_hash:string",
-      "class": "transactional_mutation",
-      "strategy": "sql_transaction",
+      "class": "local_only",
+      "strategy": "none",
       "evidence": null,
       "fcorRoles": [
         {
@@ -863,8 +863,8 @@
       "tag": "create_assistant_session",
       "fcorSchema": "name:String|project_root:String|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|env_snapshot:Option<EnvSnapshotWire>",
       "fcorCanonicalSchema": "name:string|project_root:string|initial_model:option<struct:ActiveModelRef:v1>|no_sandbox:bool|env_snapshot:option<struct:EnvSnapshotWire:v1>",
-      "class": "transactional_mutation",
-      "strategy": "sql_transaction",
+      "class": "local_only",
+      "strategy": "none",
       "evidence": null,
       "fcorRoles": [
         {
@@ -913,7 +913,7 @@
       "tag": "export_session_data",
       "fcorSchema": "session_id:Uuid|kind:ExportSessionKind|include_generated_artifacts:bool|include_sensitive:bool",
       "fcorCanonicalSchema": "session_id:uuid|kind:enum16:ExportSessionKind|include_generated_artifacts:bool|include_sensitive:bool",
-      "class": "read_only",
+      "class": "local_only",
       "strategy": "none",
       "evidence": null,
       "fcorRoles": [
@@ -943,8 +943,8 @@
       "tag": "import_session_archive",
       "fcorSchema": "transfer:crate::remote_transport::bulk::RemoteBulkTransferRef|as_new:bool",
       "fcorCanonicalSchema": "transfer:struct:RemoteBulkTransferRef:v1|as_new:bool",
-      "class": "transactional_mutation",
-      "strategy": "sql_transaction",
+      "class": "local_only",
+      "strategy": "none",
       "evidence": null,
       "fcorRoles": [
         {
@@ -963,8 +963,8 @@
       "tag": "write_bulk_transfer_chunk",
       "fcorSchema": "transfer:crate::remote_transport::bulk::RemoteBulkTransferRef|chunk_index:u32|data_base64:String",
       "fcorCanonicalSchema": "transfer:struct:RemoteBulkTransferRef:v1|chunk_index:u32|data_base64:string",
-      "class": "nonrepeatable_mutation",
-      "strategy": "nonrepeatable_dispatch",
+      "class": "local_only",
+      "strategy": "none",
       "evidence": null,
       "fcorRoles": [
         {
@@ -988,7 +988,7 @@
       "tag": "read_bulk_transfer_chunk",
       "fcorSchema": "transfer_id:crate::remote_protocol_id::RemoteTransferId|chunk_index:u32",
       "fcorCanonicalSchema": "transfer_id:struct:RemoteTransferId:v1|chunk_index:u32",
-      "class": "read_only",
+      "class": "local_only",
       "strategy": "none",
       "evidence": null,
       "fcorRoles": [
@@ -1008,9 +1008,9 @@
       "tag": "curator",
       "fcorSchema": "project_root:String|action:CuratorAction",
       "fcorCanonicalSchema": "project_root:string|action:enum16:CuratorAction",
-      "class": "idempotent_adapter_mutation",
-      "strategy": "durable_dispatch_key",
-      "evidence": "dispatch_key_and_generation",
+      "class": "local_only",
+      "strategy": "none",
+      "evidence": null,
       "fcorRoles": [
         {
           "field": "project_root",
@@ -1182,9 +1182,9 @@
       "tag": "fs_delete",
       "fcorSchema": "project_root:String|path:String",
       "fcorCanonicalSchema": "project_root:string|path:string",
-      "class": "idempotent_adapter_mutation",
-      "strategy": "staged_filesystem_commit",
-      "evidence": "staged_artifact_fingerprints_and_fsync_barriers",
+      "class": "local_only",
+      "strategy": "none",
+      "evidence": null,
       "fcorRoles": [
         {
           "field": "project_root",
@@ -1662,8 +1662,8 @@
       "tag": "share_session",
       "fcorSchema": "session_id:Uuid|shared:bool",
       "fcorCanonicalSchema": "session_id:uuid|shared:bool",
-      "class": "transactional_mutation",
-      "strategy": "sql_transaction",
+      "class": "local_only",
+      "strategy": "none",
       "evidence": null,
       "fcorRoles": [
         {
@@ -1742,7 +1742,7 @@
       "tag": "resource_snapshot",
       "fcorSchema": "-",
       "fcorCanonicalSchema": "-",
-      "class": "read_only",
+      "class": "local_only",
       "strategy": "none",
       "evidence": null,
       "fcorRoles": []
@@ -1751,9 +1751,9 @@
       "tag": "promote_resource",
       "fcorSchema": "request_id:String|session_id:Option<Uuid>",
       "fcorCanonicalSchema": "request_id:string|session_id:option<uuid>",
-      "class": "idempotent_adapter_mutation",
-      "strategy": "durable_dispatch_key",
-      "evidence": "dispatch_key_and_generation",
+      "class": "local_only",
+      "strategy": "none",
+      "evidence": null,
       "fcorRoles": [
         {
           "field": "request_id",
@@ -1786,7 +1786,7 @@
       "tag": "list_scheduled_jobs",
       "fcorSchema": "owner:Option<String>",
       "fcorCanonicalSchema": "owner:option<string>",
-      "class": "read_only",
+      "class": "local_only",
       "strategy": "none",
       "evidence": null,
       "fcorRoles": [
@@ -1851,9 +1851,9 @@
       "tag": "set_model_favorite",
       "fcorSchema": "provider:String|model:String|favorite:bool",
       "fcorCanonicalSchema": "provider:string|model:string|favorite:bool",
-      "class": "idempotent_adapter_mutation",
-      "strategy": "staged_filesystem_commit",
-      "evidence": "staged_artifact_fingerprints_and_fsync_barriers",
+      "class": "local_only",
+      "strategy": "none",
+      "evidence": null,
       "fcorRoles": [
         {
           "field": "provider",
@@ -1876,9 +1876,9 @@
       "tag": "set_default_model",
       "fcorSchema": "default_update_id:Uuid|provider:Option<String>|model:Option<String>|reasoning_effort:Option<String>|thinking_mode:Option<cockpit_config::config::providers::ThinkingMode>|prompt_cache_retention:Option<PromptCacheRetention>|clear:bool",
       "fcorCanonicalSchema": "default_update_id:uuid|provider:option<string>|model:option<string>|reasoning_effort:option<string>|thinking_mode:option<enum16:ThinkingMode>|prompt_cache_retention:option<enum16:PromptCacheRetention>|clear:bool",
-      "class": "idempotent_adapter_mutation",
-      "strategy": "staged_filesystem_commit",
-      "evidence": "staged_artifact_fingerprints_and_fsync_barriers",
+      "class": "local_only",
+      "strategy": "none",
+      "evidence": null,
       "fcorRoles": [
         {
           "field": "default_update_id",
@@ -2206,9 +2206,9 @@
       "tag": "set_caffeinate",
       "fcorSchema": "mode:CaffeinateMode",
       "fcorCanonicalSchema": "mode:enum16:CaffeinateMode",
-      "class": "idempotent_adapter_mutation",
-      "strategy": "durable_desired_state",
-      "evidence": "desired_state_generation_and_observed_digest",
+      "class": "local_only",
+      "strategy": "none",
+      "evidence": null,
       "fcorRoles": [
         {
           "field": "mode",
@@ -2269,9 +2269,9 @@
       "tag": "store_flycockpit_credential",
       "fcorSchema": "credential:StoredFlycockpitCredential",
       "fcorCanonicalSchema": "credential:struct:StoredFlycockpitCredential:v1",
-      "class": "idempotent_adapter_mutation",
-      "strategy": "staged_filesystem_commit",
-      "evidence": "staged_artifact_fingerprints_and_fsync_barriers",
+      "class": "local_only",
+      "strategy": "none",
+      "evidence": null,
       "fcorRoles": [
         {
           "field": "credential",
@@ -2284,9 +2284,9 @@
       "tag": "clear_flycockpit_credential",
       "fcorSchema": "-",
       "fcorCanonicalSchema": "-",
-      "class": "idempotent_adapter_mutation",
-      "strategy": "staged_filesystem_commit",
-      "evidence": "staged_artifact_fingerprints_and_fsync_barriers",
+      "class": "local_only",
+      "strategy": "none",
+      "evidence": null,
       "fcorRoles": []
     },
     {
@@ -2326,8 +2326,8 @@
       "tag": "record_usage",
       "fcorSchema": "kind:UsageKind|key:String|project_id:Option<String>",
       "fcorCanonicalSchema": "kind:enum16:UsageKind|key:string|project_id:option<string>",
-      "class": "transactional_mutation",
-      "strategy": "sql_transaction",
+      "class": "local_only",
+      "strategy": "none",
       "evidence": null,
       "fcorRoles": [
         {
@@ -2351,7 +2351,7 @@
       "tag": "get_usage_counts",
       "fcorSchema": "project_id:Option<String>",
       "fcorCanonicalSchema": "project_id:option<string>",
-      "class": "read_only",
+      "class": "local_only",
       "strategy": "none",
       "evidence": null,
       "fcorRoles": [
@@ -2366,7 +2366,7 @@
       "tag": "stats_rollup",
       "fcorSchema": "project_id:Option<String>|range:StatsRange|by_role:bool",
       "fcorCanonicalSchema": "project_id:option<string>|range:enum16:StatsRange|by_role:bool",
-      "class": "read_only",
+      "class": "local_only",
       "strategy": "none",
       "evidence": null,
       "fcorRoles": [
@@ -2416,8 +2416,8 @@
       "tag": "stop_daemon",
       "fcorSchema": "grace_secs:Option<u64>",
       "fcorCanonicalSchema": "grace_secs:option<u64>",
-      "class": "nonrepeatable_mutation",
-      "strategy": "nonrepeatable_dispatch",
+      "class": "local_only",
+      "strategy": "none",
       "evidence": null,
       "fcorRoles": [
         {
@@ -2431,8 +2431,8 @@
       "tag": "restart_if_idle",
       "fcorSchema": "-",
       "fcorCanonicalSchema": "-",
-      "class": "nonrepeatable_mutation",
-      "strategy": "nonrepeatable_dispatch",
+      "class": "local_only",
+      "strategy": "none",
       "evidence": null,
       "fcorRoles": []
     },

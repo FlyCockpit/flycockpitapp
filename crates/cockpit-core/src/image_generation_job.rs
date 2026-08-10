@@ -1433,7 +1433,7 @@ impl ImageGenerationOwnerContextAuthority {
             .checked_add(1)
             .context("external publication recovery version overflow")?;
         let pre_effect = conn.unchecked_transaction()?;
-        let changed = pre_effect.execute("UPDATE image_generation_late_publication_leases SET state='delete_authorized',version=version+1 WHERE publication_operation_id=?1 AND artifact_id=?2 AND artifact_generation=?3 AND state='security_blocked' AND version=?4 AND output_evidence_json IS NOT NULL AND EXISTS(SELECT 1 FROM image_generation_artifact_security_recovery_audits r WHERE r.recovery_operation_id=?5 AND r.publication_operation_id=image_generation_late_publication_leases.publication_operation_id AND r.publication_lease_version=image_generation_late_publication_leases.version AND r.output_identity_digest=?6 AND r.disposition='remove_verified_external_copy' AND r.state='recorded')",params![operation.to_string(),recorded.artifact_id.to_string(),i64::try_from(recorded.artifact_generation)?,i64::try_from(version)?,recorded.operation_id.to_string(),recorded.output_identity_digest])?;
+        let changed = pre_effect.execute("UPDATE image_generation_late_publication_leases SET state='delete_authorized',version=version+1,decided_at_unix_ms=NULL WHERE publication_operation_id=?1 AND artifact_id=?2 AND artifact_generation=?3 AND state='security_blocked' AND version=?4 AND output_evidence_json IS NOT NULL AND recovery_evidence_json IS NOT NULL AND decided_at_unix_ms IS NOT NULL AND EXISTS(SELECT 1 FROM image_generation_artifact_security_recovery_audits r WHERE r.recovery_operation_id=?5 AND r.publication_operation_id=image_generation_late_publication_leases.publication_operation_id AND r.publication_lease_version=image_generation_late_publication_leases.version AND r.output_identity_digest=?6 AND r.disposition='remove_verified_external_copy' AND r.state='recorded')",params![operation.to_string(),recorded.artifact_id.to_string(),i64::try_from(recorded.artifact_generation)?,i64::try_from(version)?,recorded.operation_id.to_string(),recorded.output_identity_digest])?;
         if changed == 0 {
             ensure!(pre_effect.query_row("SELECT EXISTS(SELECT 1 FROM image_generation_late_publication_leases WHERE publication_operation_id=?1 AND artifact_id=?2 AND artifact_generation=?3 AND state='delete_authorized' AND version=?4)",params![operation.to_string(),recorded.artifact_id.to_string(),i64::try_from(recorded.artifact_generation)?,i64::try_from(authorized_version)?],|row|row.get::<_,bool>(0))?,"external publication deletion authority is unavailable");
         }
@@ -3498,12 +3498,15 @@ mod tests {
         fixture
             .db
             .read(move |conn| {
-                let state: String = conn.query_row(
-                    "SELECT state FROM image_generation_late_publication_leases WHERE publication_operation_id=?1",
+                let state: (String, bool, bool, Option<i64>) = conn.query_row(
+                    "SELECT state,output_evidence_json IS NOT NULL,recovery_evidence_json IS NOT NULL,decided_at_unix_ms FROM image_generation_late_publication_leases WHERE publication_operation_id=?1",
                     [publication_operation_id.to_string()],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )?;
-                anyhow::ensure!(state == "delete_authorized", "deletion authority was not durable before the filesystem effect");
+                anyhow::ensure!(
+                    state == ("delete_authorized".into(), true, true, None),
+                    "deletion authority was not durable before the filesystem effect"
+                );
                 Ok(())
             })
             .await

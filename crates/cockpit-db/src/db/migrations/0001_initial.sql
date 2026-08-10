@@ -3434,6 +3434,7 @@ CREATE TABLE image_generation_late_publication_leases (
  CHECK((state='reserved' AND temporary_evidence_json IS NULL AND output_evidence_json IS NULL AND decided_at_unix_ms IS NULL) OR
        (state='copy_authorized' AND temporary_evidence_json IS NOT NULL AND output_evidence_json IS NULL AND recovery_evidence_json IS NULL AND decided_at_unix_ms IS NULL) OR
        (state='copy_committed' AND temporary_evidence_json IS NOT NULL AND output_evidence_json IS NOT NULL AND recovery_evidence_json IS NULL AND decided_at_unix_ms IS NULL) OR
+       (state='delete_authorized' AND temporary_evidence_json IS NOT NULL AND output_evidence_json IS NOT NULL AND recovery_evidence_json IS NOT NULL AND json_valid(output_evidence_json) AND json_extract(output_evidence_json,'$.kind')='output_durable' AND json_valid(recovery_evidence_json) AND json_extract(recovery_evidence_json,'$.kind')='security_ambiguous' AND decided_at_unix_ms IS NULL) OR
        (state='published' AND output_evidence_json IS NOT NULL AND decided_at_unix_ms IS NOT NULL) OR
        (state IN ('aborted','expired','security_blocked') AND recovery_evidence_json IS NOT NULL AND decided_at_unix_ms IS NOT NULL))
 );
@@ -3584,6 +3585,7 @@ BEGIN SELECT RAISE(ABORT,'late publication reservation lacks exact authority'); 
 CREATE TRIGGER image_generation_late_publication_evidence_guard BEFORE UPDATE OF state ON image_generation_late_publication_leases
 WHEN (NEW.state='copy_authorized' AND (NEW.temporary_evidence_json IS NULL OR OLD.state!='reserved' OR CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)>=OLD.deadline_unix_ms))
  OR (NEW.state='copy_committed' AND (NEW.output_evidence_json IS NULL OR OLD.state!='copy_authorized'))
+ OR (NEW.state='delete_authorized' AND (OLD.state!='security_blocked' OR NEW.output_evidence_json IS NULL OR NEW.recovery_evidence_json IS NULL OR NEW.decided_at_unix_ms IS NOT NULL))
  OR (NEW.state IN ('aborted','expired','security_blocked') AND NEW.recovery_evidence_json IS NULL)
  OR (NEW.state='expired' AND (OLD.state!='reserved' OR CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)<OLD.deadline_unix_ms))
  OR (NEW.state='published' AND (OLD.state NOT IN ('copy_committed','security_blocked') OR NOT EXISTS(SELECT 1 FROM image_generation_user_published_outputs o WHERE o.publication_operation_id=NEW.publication_operation_id AND o.artifact_id=NEW.artifact_id AND o.artifact_generation=NEW.artifact_generation AND o.output_authority_digest=NEW.output_authority_digest AND o.output_authority_generation=NEW.output_authority_generation AND o.destination_name=NEW.destination_name AND o.output_evidence_json=NEW.output_evidence_json)))
@@ -3653,10 +3655,10 @@ CREATE TRIGGER image_generation_late_publication_claim_guard BEFORE UPDATE OF wo
 WHEN OLD.state!='reserved' OR NEW.state!='reserved' OR NEW.worker_boot_id IS NULL OR NEW.claim_generation IS NULL OR NEW.claim_generation<=COALESCE(OLD.claim_generation,0) OR (OLD.claim_generation IS NOT NULL AND NEW.recovery_evidence_json IS NULL) OR CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)>=OLD.deadline_unix_ms
 BEGIN SELECT RAISE(ABORT,'late publication claim lacks fresh fenced authority'); END;
 CREATE TRIGGER image_generation_late_publication_evidence_immutable BEFORE UPDATE OF temporary_evidence_json,output_evidence_json,recovery_evidence_json ON image_generation_late_publication_leases
-WHEN (OLD.temporary_evidence_json IS NOT NULL AND NEW.temporary_evidence_json!=OLD.temporary_evidence_json) OR (OLD.output_evidence_json IS NOT NULL AND NEW.output_evidence_json!=OLD.output_evidence_json) OR (OLD.recovery_evidence_json IS NOT NULL AND NEW.recovery_evidence_json!=OLD.recovery_evidence_json)
+WHEN (OLD.temporary_evidence_json IS NOT NULL AND NEW.temporary_evidence_json!=OLD.temporary_evidence_json) OR (OLD.output_evidence_json IS NOT NULL AND NEW.output_evidence_json!=OLD.output_evidence_json) OR (OLD.recovery_evidence_json IS NOT NULL AND NEW.recovery_evidence_json!=OLD.recovery_evidence_json AND NOT (OLD.state='delete_authorized' AND NEW.state='aborted' AND json_valid(NEW.recovery_evidence_json) AND json_extract(NEW.recovery_evidence_json,'$.schema_version')=1 AND json_extract(NEW.recovery_evidence_json,'$.kind') IN ('temporary_deleted','exact_absence')))
 BEGIN SELECT RAISE(ABORT,'late publication evidence is immutable'); END;
 CREATE TRIGGER image_generation_late_publication_decision_immutable BEFORE UPDATE OF decided_at_unix_ms ON image_generation_late_publication_leases
-WHEN OLD.decided_at_unix_ms IS NOT NULL OR NEW.decided_at_unix_ms IS NULL
+WHEN NOT ((OLD.decided_at_unix_ms IS NULL AND NEW.decided_at_unix_ms IS NOT NULL) OR (OLD.state='security_blocked' AND NEW.state='delete_authorized' AND OLD.decided_at_unix_ms IS NOT NULL AND NEW.decided_at_unix_ms IS NULL))
 BEGIN SELECT RAISE(ABORT,'late publication decision is immutable'); END;
 CREATE TRIGGER image_generation_user_published_output_immutable BEFORE UPDATE ON image_generation_user_published_outputs BEGIN SELECT RAISE(ABORT,'published output evidence is immutable'); END;
 CREATE TRIGGER image_generation_user_published_output_delete_forbidden BEFORE DELETE ON image_generation_user_published_outputs BEGIN SELECT RAISE(ABORT,'published output evidence is durable'); END;

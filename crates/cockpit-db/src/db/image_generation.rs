@@ -3,22 +3,22 @@
 //! Transition legality lives here so repository reducers and protocol
 //! projections cannot develop separate interpretations of persisted states.
 
-use anyhow::{Context as _, Result, ensure};
-use rusqlite::{Connection, OptionalExtension, params};
+use anyhow::{ensure, Context as _, Result};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
-use super::Db;
 use super::external_journal::{
-    ExternalJournalRecord, ExternalJournalState, ExternalTransitionOutcome,
-    PrepareExternalOperation, transition_external_operation_conn,
+    transition_external_operation_conn, ExternalJournalRecord, ExternalJournalState,
+    ExternalTransitionOutcome, PrepareExternalOperation,
 };
-use super::image_generation_plan::ImageGenerationPlanV1;
+use super::image_generation_plan::{AttemptPlanV1, ImageGenerationPlanV1};
 use super::image_spend::{
-    ImageSpendDispatchEvidence, finish_reserved_image_spend_dispatch_conn,
-    prepare_reserved_image_spend_dispatch_conn,
+    finish_reserved_image_spend_dispatch_conn, prepare_reserved_image_spend_dispatch_conn,
+    ImageSpendDispatchEvidence,
 };
+use super::Db;
 
 const MAX_IMAGE_GENERATION_RECONCILIATION_EVIDENCE_BYTES: usize = 64 * 1024;
 
@@ -710,6 +710,7 @@ pub struct PrepareImageGenerationDispatch<'a> {
     pub spend_reservation_id: &'a str,
     pub spend_attempt_id: &'a str,
     pub media_reservation_id: &'a str,
+    pub media_plan_digest: &'a str,
     pub expected_media_reservation_version: u64,
     pub journal: &'a PrepareExternalOperation,
     pub at_unix_ms: i64,
@@ -888,8 +889,39 @@ pub struct ImageGenerationQueueAuthority {
 }
 
 pub struct ImageGenerationMediaPlanSnapshot<'a> {
+    pub slot_id: Uuid,
+    pub attempt_number: u32,
     pub canonical_bytes: &'a [u8],
     pub digest: &'a str,
+}
+
+fn validate_attempt_media_snapshot(
+    attempt: &AttemptPlanV1,
+    media: &ImageGenerationMediaPlanSnapshot<'_>,
+) -> Result<()> {
+    ensure!(
+        !media.canonical_bytes.is_empty()
+            && media.canonical_bytes.len() <= 65_536
+            && media.digest.len() == 64
+            && hex_lower(&Sha256::digest(media.canonical_bytes)) == media.digest,
+        "image generation media snapshot is invalid"
+    );
+    let value: serde_json::Value = serde_json::from_slice(media.canonical_bytes)?;
+    let dimension = value
+        .get("dimension")
+        .and_then(serde_json::Value::as_str)
+        .context("image generation media snapshot dimension is absent")?;
+    let requested = value
+        .get("requested")
+        .and_then(serde_json::Value::as_u64)
+        .context("image generation media snapshot requested maximum is absent")?;
+    ensure!(
+        attempt.resource_maximum.len() == 1
+            && attempt.resource_maximum[0].resource_kind == dimension
+            && attempt.resource_maximum[0].units == requested,
+        "image generation media snapshot differs from attempt resource maximum"
+    );
+    Ok(())
 }
 
 pub struct PreparedImageGenerationDispatch {
@@ -1069,36 +1101,42 @@ impl Db {
     pub fn queue_image_generation_job_conn(
         conn: &Connection,
         authority: ImageGenerationQueueAuthority,
-        media: &ImageGenerationMediaPlanSnapshot<'_>,
+        media: &[ImageGenerationMediaPlanSnapshot<'_>],
         at_unix_ms: i64,
     ) -> Result<()> {
         atomic_conn(conn, "image_generation_queue", || {
-            ensure!(
-                !media.canonical_bytes.is_empty()
-                    && media.canonical_bytes.len() <= 65_536
-                    && media.digest.len() == 64,
-                "image generation media snapshot is invalid"
-            );
-            let actual = hex_lower(&Sha256::digest(media.canonical_bytes));
-            ensure!(
-                actual == media.digest,
-                "image generation media snapshot digest differs"
-            );
-            let plan_digest: String = conn.query_row(
-                "SELECT plan_digest FROM image_generation_plans WHERE job_id=?1",
+            let (canonical_plan, plan_digest): (Vec<u8>, String) = conn.query_row(
+                "SELECT canonical_plan,plan_digest FROM image_generation_plans WHERE job_id=?1",
                 [authority.job_id.to_string()],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
-            let snapshots=conn.execute("INSERT INTO image_generation_attempt_media_snapshots(job_id,slot_id,attempt_number,plan_digest,canonical_media_plan,media_plan_digest) SELECT job_id,slot_id,attempt_number,?1,?2,?3 FROM image_generation_attempts WHERE job_id=?4",params![plan_digest,media.canonical_bytes,media.digest,authority.job_id.to_string()])?;
-            let attempts: i64 = conn.query_row(
-                "SELECT count(*) FROM image_generation_attempts WHERE job_id=?1",
-                [authority.job_id.to_string()],
-                |row| row.get(0),
-            )?;
+            let plan = ImageGenerationPlanV1::from_canonical(&canonical_plan, &plan_digest)?;
+            let attempts = plan
+                .targets
+                .iter()
+                .flat_map(|target| target.slots.iter())
+                .flat_map(|slot| {
+                    slot.attempts
+                        .iter()
+                        .map(move |attempt| (slot.slot_id, attempt))
+                })
+                .collect::<Vec<_>>();
             ensure!(
-                i64::try_from(snapshots)? == attempts && attempts > 0,
+                !attempts.is_empty() && media.len() == attempts.len(),
                 "image generation media snapshot graph differs"
             );
+            for ((slot_id, attempt), snapshot) in attempts.into_iter().zip(media) {
+                ensure!(
+                    snapshot.slot_id == slot_id
+                        && snapshot.attempt_number == attempt.attempt_number,
+                    "image generation media snapshot order or identity differs"
+                );
+                validate_attempt_media_snapshot(attempt, snapshot)?;
+                conn.execute(
+                    "INSERT INTO image_generation_attempt_media_snapshots(job_id,slot_id,attempt_number,plan_digest,canonical_media_plan,media_plan_digest) VALUES(?1,?2,?3,?4,?5,?6)",
+                    params![authority.job_id.to_string(),slot_id.to_string(),i64::from(attempt.attempt_number),plan_digest,snapshot.canonical_bytes,snapshot.digest],
+                )?;
+            }
             ensure!(conn.execute("UPDATE image_generation_jobs SET state='validating',version=version+1,updated_at_unix_ms=?1 WHERE job_id=?2 AND state='created' AND version=?3",params![at_unix_ms,authority.job_id.to_string(),i64::try_from(authority.job_version)?])?==1,"image generation queue authority is stale");
             ensure!(conn.execute("UPDATE image_generation_jobs SET state='queued',version=version+1,updated_at_unix_ms=?1 WHERE job_id=?2 AND state='validating' AND version=?3",params![at_unix_ms,authority.job_id.to_string(),i64::try_from(authority.job_version+1)?])?==1,"image generation queue validation lost compare-and-set");
             let changed=conn.execute("UPDATE image_generation_slots SET state='queued',version=version+1 WHERE job_id=?1 AND state='planned' AND version=1",[authority.job_id.to_string()])?;
@@ -1173,6 +1211,31 @@ impl Db {
                 }),
                 "image generation media reservation differs from sealed plan"
             );
+            let attempt = plan
+                .targets
+                .iter()
+                .flat_map(|target| &target.slots)
+                .find(|slot| slot.slot_id == input.slot_id)
+                .and_then(|slot| {
+                    slot.attempts
+                        .iter()
+                        .find(|attempt| attempt.attempt_number == input.attempt_number)
+                })
+                .context("image generation dispatch attempt differs from sealed plan")?;
+            let snapshot: (Vec<u8>, String) = conn.query_row("SELECT canonical_media_plan,media_plan_digest FROM image_generation_attempt_media_snapshots WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number)],|row|Ok((row.get(0)?,row.get(1)?)))?;
+            ensure!(
+                snapshot.1 == input.media_plan_digest,
+                "image generation dispatch media snapshot differs"
+            );
+            validate_attempt_media_snapshot(
+                attempt,
+                &ImageGenerationMediaPlanSnapshot {
+                    slot_id: input.slot_id,
+                    attempt_number: input.attempt_number,
+                    canonical_bytes: &snapshot.0,
+                    digest: &snapshot.1,
+                },
+            )?;
             ensure!(conn.execute("UPDATE image_generation_attempts SET state='preparing',version=version+1,external_operation_id=?1,observed_journal_version=?2 WHERE job_id=?3 AND slot_id=?4 AND attempt_number=?5 AND state='planned' AND version=?6",params![operation.operation_id.to_string(),operation.version,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?])?==1,"image generation attempt preparation lost compare-and-set");
             ensure!(conn.execute("UPDATE image_generation_attempts SET state='prepared',version=version+1 WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND state='preparing' AND version=?4",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version+1)?])?==1,"image generation attempt preparation lost compare-and-set");
             ensure!(conn.execute("UPDATE image_generation_slots SET state='dispatching',version=version+1 WHERE job_id=?1 AND slot_id=?2 AND state='queued' AND version=?3",params![input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.expected_slot_version)?])?==1,"image generation slot dispatch lost compare-and-set");
@@ -3498,29 +3561,23 @@ mod tests {
     #[test]
     fn reconciliation_evidence_has_exact_closed_bounds() {
         assert!(reconciliation_evidence_digest(&[]).is_err());
-        assert!(
-            reconciliation_evidence_digest(&vec![
-                0;
-                MAX_IMAGE_GENERATION_RECONCILIATION_EVIDENCE_BYTES
-                    - 1
-            ])
-            .is_ok()
-        );
-        assert!(
-            reconciliation_evidence_digest(&vec![
+        assert!(reconciliation_evidence_digest(&vec![
+            0;
+            MAX_IMAGE_GENERATION_RECONCILIATION_EVIDENCE_BYTES
+                - 1
+        ])
+        .is_ok());
+        assert!(reconciliation_evidence_digest(&vec![
                 0;
                 MAX_IMAGE_GENERATION_RECONCILIATION_EVIDENCE_BYTES
             ])
-            .is_ok()
-        );
-        assert!(
-            reconciliation_evidence_digest(&vec![
-                0;
-                MAX_IMAGE_GENERATION_RECONCILIATION_EVIDENCE_BYTES
-                    + 1
-            ])
-            .is_err()
-        );
+        .is_ok());
+        assert!(reconciliation_evidence_digest(&vec![
+            0;
+            MAX_IMAGE_GENERATION_RECONCILIATION_EVIDENCE_BYTES
+                + 1
+        ])
+        .is_err());
     }
 
     fn canonical_test_plan(
@@ -3864,30 +3921,22 @@ mod tests {
     fn deadline_observation_has_exact_boot_and_boundary_semantics() {
         let boot = Uuid::now_v7();
         let other_boot = Uuid::now_v7();
-        assert!(
-            DeadlineObservationV1::new(boot, 99)
-                .unwrap()
-                .is_before(boot, 100)
-                .unwrap()
-        );
-        assert!(
-            !DeadlineObservationV1::new(boot, 100)
-                .unwrap()
-                .is_before(boot, 100)
-                .unwrap()
-        );
-        assert!(
-            !DeadlineObservationV1::new(boot, 101)
-                .unwrap()
-                .is_before(boot, 100)
-                .unwrap()
-        );
-        assert!(
-            !DeadlineObservationV1::new(other_boot, 0)
-                .unwrap()
-                .is_before(boot, 100)
-                .unwrap()
-        );
+        assert!(DeadlineObservationV1::new(boot, 99)
+            .unwrap()
+            .is_before(boot, 100)
+            .unwrap());
+        assert!(!DeadlineObservationV1::new(boot, 100)
+            .unwrap()
+            .is_before(boot, 100)
+            .unwrap());
+        assert!(!DeadlineObservationV1::new(boot, 101)
+            .unwrap()
+            .is_before(boot, 100)
+            .unwrap());
+        assert!(!DeadlineObservationV1::new(other_boot, 0)
+            .unwrap()
+            .is_before(boot, 100)
+            .unwrap());
         assert!(DeadlineObservationV1::new(Uuid::nil(), 0).is_err());
     }
 
@@ -3898,7 +3947,7 @@ mod tests {
         let job_id = Uuid::now_v7();
         let slot_id = Uuid::now_v7();
         let artifact_id = Uuid::now_v7();
-        let media = br#"{"policyVersion":1}"#.to_vec();
+        let media = br#"{"dimension":"image_samples","requested":1}"#.to_vec();
         let media_digest = hex_lower(&Sha256::digest(&media));
         {
             let db = Db::open(&path).unwrap();
@@ -3909,7 +3958,7 @@ mod tests {
                 let verified=CreateImageGenerationJob::from_verified_canonical_plan(&plan,&digest,1)?;
                 Db::create_image_generation_graph_conn(conn,&verified,&[CreateImageGenerationSlot{slot_id,slot_index:0,sample_index:0,managed_artifact_id:artifact_id,attempts:vec![CreateImageGenerationAttempt{attempt_number:1,provider_request_identity:"request:1".into(),provider_idempotency_identity:"idem:1".into()}]}])?;
                 let authority=Db::image_generation_queue_authority_conn(conn,job_id)?;
-                Db::queue_image_generation_job_conn(conn,authority,&ImageGenerationMediaPlanSnapshot{canonical_bytes:&setup_media,digest:&setup_media_digest},1)?;
+                Db::queue_image_generation_job_conn(conn,authority,&[ImageGenerationMediaPlanSnapshot{slot_id,attempt_number:1,canonical_bytes:&setup_media,digest:&setup_media_digest}],1)?;
                 assert!(conn.execute("UPDATE image_generation_attempt_media_snapshots SET canonical_media_plan=X'00' WHERE job_id=?1",[job_id.to_string()]).is_err());
                 assert!(conn.execute("DELETE FROM image_generation_attempt_media_snapshots WHERE job_id=?1",[job_id.to_string()]).is_err());
                 Ok(())
@@ -3971,6 +4020,134 @@ mod tests {
                     .len(),
                     1
                 );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn heterogeneous_attempt_media_snapshots_bind_exact_maxima_and_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("heterogeneous.db");
+        let job_id = Uuid::now_v7();
+        let slot_id = Uuid::now_v7();
+        let artifact_id = Uuid::now_v7();
+        let first = br#"{"dimension":"image_samples","requested":1}"#.to_vec();
+        let second = br#"{"dimension":"image_samples","requested":7}"#.to_vec();
+        let first_digest = hex_lower(&Sha256::digest(&first));
+        let second_digest = hex_lower(&Sha256::digest(&second));
+        {
+            let db = Db::open(&path).unwrap();
+            db.blocking_for_sync_cli(|conn| {
+                let (canonical, digest) =
+                    canonical_test_plan(job_id, slot_id, artifact_id, 2, 1, 100);
+                let mut plan = ImageGenerationPlanV1::from_canonical(&canonical, &digest)?;
+                plan.targets[0].slots[0].attempts[1].resource_maximum[0].units = 7;
+                plan.central_resources[0].units = 8;
+                let canonical = plan.canonical_bytes()?;
+                let digest = plan.digest()?;
+                let verified =
+                    CreateImageGenerationJob::from_verified_canonical_plan(&canonical, &digest, 1)?;
+                Db::create_image_generation_graph_conn(
+                    conn,
+                    &verified,
+                    &[CreateImageGenerationSlot {
+                        slot_id,
+                        slot_index: 0,
+                        sample_index: 0,
+                        managed_artifact_id: artifact_id,
+                        attempts: vec![
+                            CreateImageGenerationAttempt {
+                                attempt_number: 1,
+                                provider_request_identity: "request:1".into(),
+                                provider_idempotency_identity: "idem:1".into(),
+                            },
+                            CreateImageGenerationAttempt {
+                                attempt_number: 2,
+                                provider_request_identity: "request:2".into(),
+                                provider_idempotency_identity: "idem:2".into(),
+                            },
+                        ],
+                    }],
+                )?;
+                let wrong = [
+                    ImageGenerationMediaPlanSnapshot {
+                        slot_id,
+                        attempt_number: 1,
+                        canonical_bytes: &first,
+                        digest: &first_digest,
+                    },
+                    ImageGenerationMediaPlanSnapshot {
+                        slot_id,
+                        attempt_number: 2,
+                        canonical_bytes: &first,
+                        digest: &first_digest,
+                    },
+                ];
+                assert!(Db::queue_image_generation_job_conn(
+                    conn,
+                    Db::image_generation_queue_authority_conn(conn, job_id)?,
+                    &wrong,
+                    1,
+                )
+                .is_err());
+                let exact = [
+                    ImageGenerationMediaPlanSnapshot {
+                        slot_id,
+                        attempt_number: 1,
+                        canonical_bytes: &first,
+                        digest: &first_digest,
+                    },
+                    ImageGenerationMediaPlanSnapshot {
+                        slot_id,
+                        attempt_number: 2,
+                        canonical_bytes: &second,
+                        digest: &second_digest,
+                    },
+                ];
+                Db::queue_image_generation_job_conn(
+                    conn,
+                    Db::image_generation_queue_authority_conn(conn, job_id)?,
+                    &exact,
+                    2,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        }
+        let reopened = Db::open(&path).unwrap();
+        reopened
+            .blocking_for_sync_cli(|conn| {
+                let rows = Db::scan_image_generation_dispatch_candidates_conn(
+                    conn,
+                    DeadlineObservationV1::new(
+                        Uuid::from_u128(0xaaaaaaaa_aaaa_4aaa_8aaa_aaaaaaaaaaaa),
+                        3,
+                    )?,
+                    2,
+                )?;
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0].attempt_number, 1);
+                assert_eq!(rows[0].canonical_media_plan, first);
+                assert_eq!(rows[1].attempt_number, 2);
+                assert_eq!(rows[1].canonical_media_plan, second);
+                let handed_off = rows
+                    .iter()
+                    .map(|row| {
+                        serde_json::from_slice::<serde_json::Value>(&row.canonical_media_plan)
+                            .unwrap()["requested"]
+                            .as_u64()
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(handed_off, vec![1, 7]);
+                assert_eq!(handed_off.into_iter().sum::<u64>(), 8);
+                assert!(conn
+                    .execute(
+                        "UPDATE image_generation_attempt_media_snapshots SET canonical_media_plan=?1 WHERE job_id=?2 AND attempt_number=2",
+                        params![rows[0].canonical_media_plan, job_id.to_string()],
+                    )
+                    .is_err());
                 Ok(())
             })
             .unwrap();
@@ -4523,28 +4700,24 @@ mod tests {
         let canonical = String::from_utf8(canonical).unwrap();
         let spaced = canonical.replacen("{", "{ ", 1);
         let spaced_digest = hex_lower(&Sha256::digest(spaced.as_bytes()));
-        assert!(
-            CreateImageGenerationJob::from_verified_canonical_plan(
-                spaced.as_bytes(),
-                &spaced_digest,
-                1
-            )
-            .is_err()
-        );
+        assert!(CreateImageGenerationJob::from_verified_canonical_plan(
+            spaced.as_bytes(),
+            &spaced_digest,
+            1
+        )
+        .is_err());
         let duplicate = canonical.replacen(
             "\"jobId\":",
             &format!("\"jobId\":\"{job_id}\",\"jobId\":"),
             1,
         );
         let duplicate_digest = hex_lower(&Sha256::digest(duplicate.as_bytes()));
-        assert!(
-            CreateImageGenerationJob::from_verified_canonical_plan(
-                duplicate.as_bytes(),
-                &duplicate_digest,
-                1
-            )
-            .is_err()
-        );
+        assert!(CreateImageGenerationJob::from_verified_canonical_plan(
+            duplicate.as_bytes(),
+            &duplicate_digest,
+            1
+        )
+        .is_err());
         let reordered = canonical.replacen(
             r#""schemaVersion":1,"kind":"imageGenerationPlan""#,
             r#""kind":"imageGenerationPlan","schemaVersion":1"#,
@@ -4552,14 +4725,12 @@ mod tests {
         );
         assert_ne!(reordered, canonical);
         let reordered_digest = hex_lower(&Sha256::digest(reordered.as_bytes()));
-        assert!(
-            CreateImageGenerationJob::from_verified_canonical_plan(
-                reordered.as_bytes(),
-                &reordered_digest,
-                1
-            )
-            .is_err()
-        );
+        assert!(CreateImageGenerationJob::from_verified_canonical_plan(
+            reordered.as_bytes(),
+            &reordered_digest,
+            1
+        )
+        .is_err());
     }
 
     #[test]
@@ -4635,18 +4806,16 @@ mod tests {
                         now_unix_ms: 10,
                     },
                 )?;
-                assert!(
-                    Db::request_image_generation_cancellation_conn(
-                        conn,
-                        &RequestImageGenerationCancellation {
-                            job_id: fixture.job_id,
-                            cancellation_version: 1,
-                            request_operation_id: "cancel",
-                            requested_at_unix_ms: 11
-                        }
-                    )
-                    .is_err()
-                );
+                assert!(Db::request_image_generation_cancellation_conn(
+                    conn,
+                    &RequestImageGenerationCancellation {
+                        job_id: fixture.job_id,
+                        cancellation_version: 1,
+                        request_operation_id: "cancel",
+                        requested_at_unix_ms: 11
+                    }
+                )
+                .is_err());
                 let facts: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM image_generation_cancellation_facts WHERE job_id=?1",
                     [fixture.job_id.to_string()],

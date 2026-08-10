@@ -7,8 +7,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::{Context as _, Result, ensure};
-use rusqlite::{Connection, OptionalExtension, params};
+use anyhow::{ensure, Context as _, Result};
+use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
@@ -19,23 +19,23 @@ use cockpit_db::db::external_journal::{
     ExternalJournalDigest, ExternalJournalToken, PrepareExternalOperation, ProviderIdempotency,
 };
 use cockpit_db::db::image_generation::{
-    AdvanceImageGenerationLatePublication, BlockVerifiedImageGenerationLatePublication,
-    CreateImageGenerationArtifact, CreateImageGenerationArtifactComponent,
-    DispatchingImageGenerationAttempt, ImageGenerationArtifactComponentKind,
-    ImageGenerationArtifactComponentState, ImageGenerationArtifactConsumerPurpose,
-    ImageGenerationArtifactConsumerRoute, ImageGenerationArtifactState,
-    ImageGenerationDispatchCandidate, ImageGenerationLatePublicationEvidenceV1,
-    ImageGenerationLatePublicationState, PreparedImageGenerationDispatch,
-    ReserveImageGenerationLatePublication, TransitionImageGenerationArtifact,
-    TransitionImageGenerationArtifactComponent, image_generation_component_set_binding,
+    image_generation_component_set_binding, AdvanceImageGenerationLatePublication,
+    BlockVerifiedImageGenerationLatePublication, CreateImageGenerationArtifact,
+    CreateImageGenerationArtifactComponent, DispatchingImageGenerationAttempt,
+    ImageGenerationArtifactComponentKind, ImageGenerationArtifactComponentState,
+    ImageGenerationArtifactConsumerPurpose, ImageGenerationArtifactConsumerRoute,
+    ImageGenerationArtifactState, ImageGenerationDispatchCandidate,
+    ImageGenerationLatePublicationEvidenceV1, ImageGenerationLatePublicationState,
+    PreparedImageGenerationDispatch, ReserveImageGenerationLatePublication,
+    TransitionImageGenerationArtifact, TransitionImageGenerationArtifactComponent,
 };
 use cockpit_db::db::sealed_scope::SealedActionGrantRow;
 use cockpit_db::image_spend::{AttemptMaximum, ImageSpendDispatchEvidence, SpendReservation};
 use cockpit_db::media_attachments::AcquiredMediaComponentLease;
 
 use crate::media_reservation::{
-    MediaExternalHandoffOutcome, ReservationReceipt, ReservationState,
-    finish_external_handoff_conn, handoff_external_conn,
+    finish_external_handoff_conn, handoff_external_conn, MediaExternalHandoffOutcome,
+    ReservationReceipt, ReservationState,
 };
 
 pub use crate::private_fs::held_directory::{
@@ -44,11 +44,11 @@ pub use crate::private_fs::held_directory::{
 };
 pub use cockpit_db::image_generation_plan::{
     AttemptPlanV1, CapabilityProvenanceV1, GrantRequirementV1, ImageGenerationPlanV1,
+    OutputDirectoryAuthorityV1, OutputSlotPlanV1, ReferenceArtifactV1, RequestedOutputV1,
+    ResolvedOutputV1, ResourceReservationV1, SpendReservationPlanV1, TargetDestinationV1,
+    TargetPlanV1, TypedParameterV1, VectorSanitizerProvenanceV1,
     MAX_IMAGE_GENERATION_ATTEMPTS_PER_SLOT, MAX_IMAGE_GENERATION_DIMENSION,
-    MAX_IMAGE_GENERATION_SLOTS, MAX_IMAGE_GENERATION_TARGETS, OutputDirectoryAuthorityV1,
-    OutputSlotPlanV1, ReferenceArtifactV1, RequestedOutputV1, ResolvedOutputV1,
-    ResourceReservationV1, SpendReservationPlanV1, TargetDestinationV1, TargetPlanV1,
-    TypedParameterV1, VectorSanitizerProvenanceV1,
+    MAX_IMAGE_GENERATION_SLOTS, MAX_IMAGE_GENERATION_TARGETS,
 };
 
 const MAX_AUTHORITY_STRING_BYTES: usize = 1_024;
@@ -248,6 +248,30 @@ impl ImageGenerationDispatcher {
                         &candidate.canonical_media_plan,
                         &candidate.media_plan_digest,
                     )?;
+                    let attempt = plan
+                        .targets
+                        .iter()
+                        .flat_map(|target| &target.slots)
+                        .find(|slot| slot.slot_id == candidate.slot_id)
+                        .and_then(|slot| {
+                            slot.attempts
+                                .iter()
+                                .find(|attempt| attempt.attempt_number == candidate.attempt_number)
+                        })
+                        .context("scheduler attempt is absent from immutable plan")?;
+                    let bound = resource_reservation_from_media_reservation(
+                        &media_plan,
+                        attempt
+                            .resource_maximum
+                            .first()
+                            .context("scheduler attempt resource maximum is absent")?
+                            .reservation_identity
+                            .clone(),
+                    )?;
+                    ensure!(
+                        attempt.resource_maximum.as_slice() == [bound],
+                        "scheduler media plan differs from attempt resource maximum"
+                    );
                     Ok(DecodedImageGenerationDispatchCandidate {
                         candidate,
                         plan,
@@ -277,7 +301,7 @@ impl ImageGenerationDispatcher {
             ensure!(spend_exists,"scheduler spend reservation is unavailable");
             let token=ExternalJournalToken::parse(&crate::intel::hex_lower(&Sha256::digest(attempt.provider_idempotency_identity.as_bytes())))?;
             let journal=PrepareExternalOperation{operation_kind:ExternalJournalToken::parse("image_generation")?,owner_session_id:ExternalJournalToken::for_session(candidate.plan.owner_session_id),idempotency_key:token.clone(),payload_digest:ExternalJournalDigest::of(&c.canonical_plan),payload_len:c.canonical_plan.len(),provider_idempotency:Some(ProviderIdempotency{key:token,contract:ExternalJournalToken::parse("image_generation_v1")?})};
-            let prepared=cockpit_db::Db::prepare_image_generation_dispatch_conn(conn,&cockpit_db::db::image_generation::PrepareImageGenerationDispatch{job_id:c.job_id,slot_id:c.slot_id,attempt_number:c.attempt_number,expected_job_version:c.job_version,expected_slot_version:c.slot_version,expected_attempt_version:c.attempt_version,spend_reservation_id:&candidate.plan.spend.reservation_id,spend_attempt_id:&attempt.provider_idempotency_identity,media_reservation_id:&media_id,expected_media_reservation_version:media_version,journal:&journal,at_unix_ms,deadline_observation:cockpit_db::db::image_generation::DeadlineObservationV1::new(worker_boot_id,now_monotonic_ms)?,worker_boot_id,claim_generation})?;
+            let prepared=cockpit_db::Db::prepare_image_generation_dispatch_conn(conn,&cockpit_db::db::image_generation::PrepareImageGenerationDispatch{job_id:c.job_id,slot_id:c.slot_id,attempt_number:c.attempt_number,expected_job_version:c.job_version,expected_slot_version:c.slot_version,expected_attempt_version:c.attempt_version,spend_reservation_id:&candidate.plan.spend.reservation_id,spend_attempt_id:&attempt.provider_idempotency_identity,media_reservation_id:&media_id,media_plan_digest:&c.media_plan_digest,expected_media_reservation_version:media_version,journal:&journal,at_unix_ms,deadline_observation:cockpit_db::db::image_generation::DeadlineObservationV1::new(worker_boot_id,now_monotonic_ms)?,worker_boot_id,claim_generation})?;
             Ok((prepared,vec![candidate.media_plan]))
         }).await
     }
@@ -2941,8 +2965,6 @@ mod tests {
             provider_request_identity.clone();
         sealed.targets[0].slots[0].attempts[0].provider_idempotency_identity =
             provider_idempotency_identity.clone();
-        let canonical = sealed.canonical_bytes().unwrap();
-        let plan_digest = sealed.digest().unwrap();
         let policy = MediaResourcePolicy::default();
         let evaluated = |dimension, requested| {
             policy
@@ -2961,6 +2983,15 @@ mod tests {
         let queued_session = evaluated(MediaDimension::QueuedOperationsPerSession, 1);
         let local = evaluated(MediaDimension::LocalCpuJobsGlobal, 1);
         let handoff = evaluated(MediaDimension::OutboundSubmissionsGlobal, 1);
+        sealed.central_resources[0] = resource_reservation_from_media_reservation(
+            &handoff,
+            sealed.central_resources[0].reservation_identity.clone(),
+        )
+        .unwrap();
+        sealed.targets[0].slots[0].attempts[0].resource_maximum =
+            vec![sealed.central_resources[0].clone()];
+        let canonical = sealed.canonical_bytes().unwrap();
+        let plan_digest = sealed.digest().unwrap();
         let ledger = MediaReservationLedger::new(db.clone(), Arc::new(SchedulerClock));
         let receipt = ledger
             .reserve(ReserveRequest {
@@ -3058,10 +3089,12 @@ mod tests {
             cockpit_db::Db::queue_image_generation_job_conn(
                 conn,
                 authority,
-                &ImageGenerationMediaPlanSnapshot {
+                &[ImageGenerationMediaPlanSnapshot {
+                    slot_id: slot.slot_id,
+                    attempt_number: 1,
                     canonical_bytes: &bytes,
                     digest: &digest,
-                },
+                }],
                 1,
             )
         })
@@ -3103,20 +3136,18 @@ mod tests {
             )?;
             assert_eq!(replay.outcome, ImageSpendDispatchEvidence::Accepted);
             assert_eq!(replay.bytes, b"accepted");
-            assert!(
-                conn.execute(
+            assert!(conn
+                .execute(
                     "UPDATE image_generation_handoff_evidence SET evidence=X'00' WHERE job_id=?1",
                     [job_id.to_string()]
                 )
-                .is_err()
-            );
-            assert!(
-                conn.execute(
+                .is_err());
+            assert!(conn
+                .execute(
                     "DELETE FROM image_generation_handoff_evidence WHERE job_id=?1",
                     [job_id.to_string()]
                 )
-                .is_err()
-            );
+                .is_err());
             Ok(())
         })
         .await
@@ -4352,11 +4383,9 @@ mod tests {
         for count in [MAX_IMAGE_GENERATION_SLOTS - 1, MAX_IMAGE_GENERATION_SLOTS] {
             assert!(with_slots(count).validate().is_ok());
         }
-        assert!(
-            with_slots(MAX_IMAGE_GENERATION_SLOTS + 1)
-                .validate()
-                .is_err()
-        );
+        assert!(with_slots(MAX_IMAGE_GENERATION_SLOTS + 1)
+            .validate()
+            .is_err());
         for dimension in [
             MAX_IMAGE_GENERATION_DIMENSION - 1,
             MAX_IMAGE_GENERATION_DIMENSION,
@@ -4461,7 +4490,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn output_authority_is_held_private_and_nofollow() {
-        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::os::unix::fs::{symlink, PermissionsExt};
         let temporary = tempfile::TempDir::new().unwrap();
         let output = temporary.path().join("output");
         std::fs::create_dir(&output).unwrap();
@@ -4486,10 +4515,13 @@ mod tests {
         let widened = temporary.path().join("widened");
         std::fs::create_dir(&widened).unwrap();
         std::fs::set_permissions(&widened, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(
-            open_image_generation_output_directory(&widened, 1, "generated".into(), "png".into())
-                .is_err()
-        );
+        assert!(open_image_generation_output_directory(
+            &widened,
+            1,
+            "generated".into(),
+            "png".into()
+        )
+        .is_err());
         let link = temporary.path().join("link");
         symlink(&output, &link).unwrap();
         assert!(
@@ -4540,10 +4572,9 @@ mod tests {
             HeldDirectoryEffectOutcome::AppliedDurable(_)
         ));
         std::fs::write(root.join("mutated.bin"), b"changed").unwrap();
-        assert!(
-            held.open_verified_component("mutated.bin", &evidence)
-                .is_err()
-        );
+        assert!(held
+            .open_verified_component("mutated.bin", &evidence)
+            .is_err());
     }
 
     #[cfg(windows)]
@@ -4554,16 +4585,22 @@ mod tests {
         let output = temporary.path().join("output");
         std::fs::create_dir(&output).unwrap();
         crate::goal_scratch::set_private(&output).unwrap();
-        assert!(
-            open_image_generation_output_directory(&output, 1, "generated".into(), "png".into())
-                .is_ok()
-        );
+        assert!(open_image_generation_output_directory(
+            &output,
+            1,
+            "generated".into(),
+            "png".into()
+        )
+        .is_ok());
         let link = temporary.path().join("link");
         if symlink_dir(&output, &link).is_ok() {
-            assert!(
-                open_image_generation_output_directory(&link, 1, "generated".into(), "png".into())
-                    .is_err()
-            );
+            assert!(open_image_generation_output_directory(
+                &link,
+                1,
+                "generated".into(),
+                "png".into()
+            )
+            .is_err());
         }
     }
 }

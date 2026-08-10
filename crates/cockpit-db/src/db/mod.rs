@@ -45,6 +45,7 @@ pub mod external_journal;
 mod files;
 pub mod guidance;
 pub mod image_generation;
+pub mod image_spend;
 pub mod inference_calls;
 pub mod installation_identity;
 pub mod lang;
@@ -2287,7 +2288,12 @@ mod tests {
             // Run invocations retain durable receipts after session deletion
             // (cancelled_session_deleted terminalization; no FK cascade).
             // Tombstones are global UUID receipts with no session column FK.
-            if name == "run_invocations" || name == "run_invocation_tombstones" {
+            // Monetary reservations and debt are immutable billing receipts;
+            // deleting a session must not erase spend or unblock its scopes.
+            if name == "run_invocations"
+                || name == "run_invocation_tombstones"
+                || name == "image_spend_reservations"
+            {
                 continue;
             }
             if !has_cascade_path_to_sessions(conn, &name, &mut std::collections::HashSet::new())? {

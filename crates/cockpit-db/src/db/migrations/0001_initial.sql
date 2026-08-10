@@ -2537,3 +2537,103 @@ WHEN NEW.use_epoch < OLD.use_epoch
 BEGIN
     SELECT RAISE(ABORT, 'sealed action grant use epoch is monotonic');
 END;
+
+-- Explicit, versioned image-generation monetary policy. JSON is validated by
+-- the typed boundary before insertion; old versions remain referenced by the
+-- immutable ledger and are never rewritten by a settings change.
+CREATE TABLE image_spend_policy_versions (
+    project_key  TEXT NOT NULL,
+    version      INTEGER NOT NULL CHECK(version >= 1),
+    epoch_policy_version INTEGER NOT NULL CHECK(epoch_policy_version >= 1),
+    settings_json TEXT NOT NULL,
+    saved_at_ms  INTEGER NOT NULL,
+    PRIMARY KEY(project_key, version)
+);
+
+CREATE TABLE image_spend_reservations (
+    reservation_id TEXT PRIMARY KEY,
+    plan_digest TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    project_key TEXT NOT NULL,
+    policy_version INTEGER NOT NULL CHECK(policy_version >= 1),
+    epoch_policy_version INTEGER NOT NULL CHECK(epoch_policy_version >= 1),
+    epoch_sequence INTEGER NOT NULL CHECK(epoch_sequence >= 0),
+    reserved_usd_micros BLOB CHECK(reserved_usd_micros IS NULL OR length(reserved_usd_micros)=8),
+    cost_unknown INTEGER NOT NULL CHECK(cost_unknown IN (0,1)),
+    state TEXT NOT NULL CHECK(state IN ('reserved','released','reconciled','budget_violation')),
+    release_proof_identity TEXT,
+    created_at_ms INTEGER NOT NULL,
+    released_at_ms INTEGER,
+    FOREIGN KEY(project_key,policy_version) REFERENCES image_spend_policy_versions(project_key,version),
+    CHECK((cost_unknown=1 AND reserved_usd_micros IS NULL) OR (cost_unknown=0 AND reserved_usd_micros IS NOT NULL))
+);
+
+CREATE TABLE image_spend_attempts (
+    reservation_id TEXT NOT NULL,
+    attempt_id TEXT NOT NULL,
+    maximum_usd_micros BLOB CHECK(maximum_usd_micros IS NULL OR length(maximum_usd_micros)=8),
+    PRIMARY KEY(reservation_id,attempt_id),
+    FOREIGN KEY(reservation_id) REFERENCES image_spend_reservations(reservation_id) ON DELETE RESTRICT
+);
+
+-- One immutable external-effect identity per paid attempt. The referenced
+-- journal row is prepared in the same transaction as this binding and must
+-- reach `dispatching` before provider contact. Acceptance ambiguity and
+-- definitive rejection therefore come only from the generic journal graph.
+CREATE TABLE image_spend_attempt_dispatches (
+    reservation_id TEXT NOT NULL,
+    attempt_id TEXT NOT NULL,
+    external_operation_id TEXT NOT NULL UNIQUE,
+    PRIMARY KEY(reservation_id,attempt_id),
+    FOREIGN KEY(reservation_id,attempt_id) REFERENCES image_spend_attempts(reservation_id,attempt_id) ON DELETE RESTRICT,
+    FOREIGN KEY(external_operation_id) REFERENCES external_journal_operations(operation_id) ON DELETE RESTRICT
+);
+
+CREATE TABLE image_spend_scope_usage (
+    reservation_id TEXT NOT NULL,
+    scope_kind TEXT NOT NULL CHECK(scope_kind IN ('request','session','project')),
+    scope_key TEXT NOT NULL,
+    policy_version INTEGER NOT NULL,
+    epoch_policy_version INTEGER NOT NULL CHECK(epoch_policy_version >= 0),
+    epoch_sequence INTEGER NOT NULL CHECK(epoch_sequence >= 0),
+    reserved_usd_micros BLOB NOT NULL CHECK(length(reserved_usd_micros)=8),
+    charged_usd_micros BLOB NOT NULL CHECK(length(charged_usd_micros)=8),
+    debt_usd_micros BLOB NOT NULL CHECK(length(debt_usd_micros)=8),
+    PRIMARY KEY(reservation_id,scope_kind),
+    FOREIGN KEY(reservation_id) REFERENCES image_spend_reservations(reservation_id) ON DELETE RESTRICT
+);
+CREATE INDEX idx_image_spend_scope_budget ON image_spend_scope_usage(scope_kind,scope_key,policy_version,epoch_sequence);
+CREATE INDEX idx_image_spend_reservation_policy ON image_spend_reservations(project_key,policy_version);
+
+-- Raw provider billing payloads are intentionally absent. Only a normalized,
+-- non-secret evidence reference and authoritative integer amount are durable.
+CREATE TABLE image_spend_cost_events (
+    cost_identity TEXT PRIMARY KEY,
+    reservation_id TEXT NOT NULL,
+    attempt_id TEXT NOT NULL,
+    actual_usd_micros BLOB NOT NULL CHECK(length(actual_usd_micros)=8),
+    evidence_ref TEXT NOT NULL,
+    recorded_at_ms INTEGER NOT NULL,
+    FOREIGN KEY(reservation_id,attempt_id) REFERENCES image_spend_attempts(reservation_id,attempt_id) ON DELETE RESTRICT
+);
+CREATE INDEX idx_image_spend_cost_reservation ON image_spend_cost_events(reservation_id);
+CREATE UNIQUE INDEX uq_image_spend_cost_attempt ON image_spend_cost_events(reservation_id,attempt_id);
+
+CREATE TABLE image_spend_debt_resolutions (
+    reservation_id TEXT NOT NULL,
+    resolution_ref TEXT NOT NULL,
+    resolved_debt_usd_micros BLOB NOT NULL CHECK(length(resolved_debt_usd_micros)=8 AND resolved_debt_usd_micros <> X'0000000000000000'),
+    resolved_at_ms INTEGER NOT NULL,
+    PRIMARY KEY(reservation_id,resolution_ref),
+    FOREIGN KEY(reservation_id) REFERENCES image_spend_reservations(reservation_id) ON DELETE RESTRICT
+);
+
+CREATE TABLE image_spend_epoch_heads (
+    project_key TEXT NOT NULL,
+    epoch_policy_version INTEGER NOT NULL,
+    epoch_sequence INTEGER NOT NULL CHECK(epoch_sequence >= 1),
+    membership_key TEXT NOT NULL,
+    interval_start_ms INTEGER NOT NULL,
+    resolved_at_ms INTEGER NOT NULL,
+    PRIMARY KEY(project_key,epoch_policy_version)
+);

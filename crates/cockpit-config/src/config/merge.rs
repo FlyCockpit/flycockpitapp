@@ -8,7 +8,7 @@ pub fn deep_merge_value(base: &mut Value, overlay: &Value) {
     deep_merge_value_at(base, overlay, &mut Vec::new());
 }
 
-pub(crate) const ATOMIC_CONFIG_VALUE_PATHS: &[&[&str]] = &[&["active_model"]];
+pub(crate) const ATOMIC_CONFIG_VALUE_PATHS: &[&[&str]] = &[&["active_model"], &["image_spend"]];
 
 pub(crate) fn deep_merge_value_at(base: &mut Value, overlay: &Value, path: &mut Vec<String>) {
     if is_atomic_config_value_path(path) {

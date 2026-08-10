@@ -1198,6 +1198,7 @@ dependencies = [
  "chrono",
  "cockpit-test-support",
  "dirs",
+ "jiff",
  "libc",
  "proc-macro2",
  "rand 0.10.2",

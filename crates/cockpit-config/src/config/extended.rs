@@ -83,6 +83,11 @@ pub struct ExtendedConfig {
     /// Encoding used exclusively for locally measured response metrics.
     #[serde(default)]
     pub response_metrics_tokenizer: TiktokenEncoding,
+
+    /// Saved image spend choices. Missing is intentionally unconfigured and
+    /// blocks paid dispatch; loaders must not inject display suggestions.
+    #[serde(default)]
+    pub image_spend: crate::config::image_spend::ImageSpendSettings,
     #[serde(default)]
     pub harnesses: HashMap<String, HarnessConfig>,
 
@@ -1546,6 +1551,7 @@ impl Default for ExtendedConfig {
     fn default() -> Self {
         Self {
             response_metrics_tokenizer: TiktokenEncoding::default(),
+            image_spend: crate::config::image_spend::ImageSpendSettings::default(),
             harnesses: HashMap::new(),
             agent_guidance_files: default_agent_guidance_files(),
             concurrency: Concurrency::default(),
@@ -2054,6 +2060,7 @@ impl ExtendedConfigDoc {
 
         parse_field!("harnesses", harnesses);
         parse_field!("response_metrics_tokenizer", response_metrics_tokenizer);
+        parse_field!("image_spend", image_spend);
         parse_field!("agent_guidance_files", agent_guidance_files);
         parse_field!("concurrency", concurrency);
         parse_field!("agent_dirs", agent_dirs);
@@ -2168,6 +2175,16 @@ impl ExtendedConfigDoc {
 
         remove_malformed!("redact", RedactConfig);
         remove_malformed!("response_metrics_tokenizer", TiktokenEncoding);
+        if let Some(value) = obj.get("image_spend")
+            && serde_json::from_value::<crate::config::image_spend::ImageSpendSettings>(
+                value.clone(),
+            )
+            .is_err()
+        {
+            // Invalid policy is an explicit fail-closed layer, not absence
+            // that may reveal and authorize a lower layer's policy.
+            obj.insert("image_spend".into(), serde_json::json!({}));
+        }
         remove_malformed!("tui", TuiConfig);
         remove_malformed!("computer_use", Option<ComputerUseMode>);
         remove_malformed!("project_knowledge", bool);

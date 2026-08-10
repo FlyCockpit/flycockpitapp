@@ -917,13 +917,52 @@ impl<'de> Deserialize<'de> for MediaAttachmentStatusV1 {
             draft_expires_at_unix_ms: Option<i64>,
             #[serde(flatten)]
             detail: MediaAttachmentStatusDetailV1,
-            #[serde(flatten)]
-            unknown: std::collections::BTreeMap<String, serde_json::Value>,
         }
-        let wire = Wire::deserialize(deserializer)?;
-        if let Some(field) = wire.unknown.keys().next() {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| serde::de::Error::custom("media attachment status must be an object"))?;
+        let state = object
+            .get("availabilityState")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| serde::de::Error::custom("missing availabilityState"))?;
+        let mut allowed = std::collections::BTreeSet::from([
+            "schemaVersion",
+            "kind",
+            "attachmentId",
+            "attachmentVersion",
+            "mediaKind",
+            "availabilityGeneration",
+            "referenceGeneration",
+            "canDiscard",
+            "previewAvailable",
+            "draftExpiresAtUnixMs",
+            "availabilityState",
+        ]);
+        match state {
+            "ready" => {
+                allowed.extend(["readyChecksum", "preview"]);
+            }
+            "model_derivative_unavailable"
+            | "failed"
+            | "source_changed"
+            | "security_blocked"
+            | "owned_cleanup_pending"
+            | "borrowed_cleanup_pending"
+            | "retained_copy_deleted"
+            | "borrowed_derivatives_deleted" => {
+                allowed.insert("reason");
+            }
+            "quarantined" | "registered" | "probing" | "decoding" | "normalizing" => {}
+            _ => return Err(serde::de::Error::custom("unknown availabilityState")),
+        }
+        if let Some(field) = object
+            .keys()
+            .find(|field| !allowed.contains(field.as_str()))
+        {
             return Err(serde::de::Error::custom(format!("unknown field `{field}`")));
         }
+        let wire: Wire = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
         Ok(Self {
             schema_version: wire.schema_version,
             kind: wire.kind,
@@ -2747,6 +2786,12 @@ mod tests {
             .unwrap()
             .insert("path".into(), serde_json::json!("/secret"));
         assert!(serde_json::from_value::<MediaAttachmentStatusV1>(unknown).is_err());
+        let mut wrong_variant_field = serde_json::to_value(&status).unwrap();
+        wrong_variant_field
+            .as_object_mut()
+            .unwrap()
+            .insert("reason".into(), serde_json::json!("storage_failure"));
+        assert!(serde_json::from_value::<MediaAttachmentStatusV1>(wrong_variant_field).is_err());
         let request = serde_json::json!({"schemaVersion":1,"kind":"getMediaAttachmentStatus","sessionId":Uuid::now_v7().to_string(),"canonicalProjectDigest":"11".repeat(32),"attachmentId":attachment_id.to_string(),"extra":true});
         assert!(serde_json::from_value::<GetMediaAttachmentStatusV1>(request).is_err());
     }

@@ -50,6 +50,7 @@ use cockpit_db::external_journal::{
     ExternalPrepareOutcome, ExternalTransitionOutcome, PrepareExternalOperation,
 };
 
+pub(crate) use fsguard::DirGuard;
 pub use fsguard::{
     OpenStrictness, SPOOL_DIR_MODE, SPOOL_FILE_MODE, SPOOL_PERMISSION_POLICY, SpoolPermissionPolicy,
 };
@@ -397,6 +398,17 @@ impl std::fmt::Debug for ExternalJournal {
 }
 
 impl ExternalJournal {
+    /// Open the owner-private namespace used by remote operation recovery.
+    /// Callers receive a held no-follow directory authority, never its path.
+    pub(crate) fn remote_operation_artifact_dir(&self) -> Result<DirGuard, ExternalJournalError> {
+        let root = DirGuard::open_root(self.spool.root_path(), false)?;
+        root.verify_private()?;
+        let operations = root.open_child_dir("remote-operations", true)?;
+        operations.verify_private()?;
+        root.sync()?;
+        Ok(operations)
+    }
+
     pub fn new(db: Db, spool: Spool, keys: SpoolKeyRing) -> Self {
         Self {
             db,

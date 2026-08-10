@@ -98,6 +98,38 @@ fn keys_v1() -> SpoolKeyRing {
     SpoolKeyRing::for_test(&[(1, [0x11u8; 32])], 1).expect("key ring")
 }
 
+#[test]
+fn remote_operation_artifact_authority_is_private_held_and_nofollow() {
+    let env = Env::new();
+    let journal = env.journal();
+    let authority = journal.remote_operation_artifact_dir().unwrap();
+    authority.verify_private().unwrap();
+    authority
+        .create_file_exclusive("operation-artifact")
+        .unwrap()
+        .sync_all()
+        .unwrap();
+    authority.sync().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, symlink};
+        let metadata = std::fs::metadata(env.spool_root().join("remote-operations")).unwrap();
+        assert_eq!(metadata.mode() & 0o777, 0o700);
+        std::fs::remove_file(
+            env.spool_root()
+                .join("remote-operations/operation-artifact"),
+        )
+        .unwrap();
+        symlink(
+            "outside",
+            env.spool_root()
+                .join("remote-operations/operation-artifact"),
+        )
+        .unwrap();
+        assert!(authority.open_file_verified("operation-artifact").is_err());
+    }
+}
+
 fn projection() -> SanitizedProjection {
     SanitizedProjection::new(OperationBody::ComputerInput {
         target_digest: Digest::of(b"display-0"),

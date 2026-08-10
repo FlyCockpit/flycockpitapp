@@ -1496,6 +1496,101 @@ async fn remote_queue_envelope_stamps_server_operation_context_into_worker() {
 }
 
 #[tokio::test]
+async fn remote_cancel_turn_dispatches_once_then_replays_or_conflicts() {
+    let ctx = test_ctx();
+    let root = tempfile::tempdir().unwrap();
+    let (mut state, session_id, mut work_rx) =
+        attached_state_with_worker_receiver(&ctx, root.path()).await;
+    ctx.db
+        .set_session_shared_with_collaborators(session_id, true)
+        .await
+        .unwrap();
+    let logical_attachment_id = Uuid::parse_str("22222222-2222-4222-8222-222222222226").unwrap();
+    state.principal = ClientPrincipal::Remote(principal::RemotePrincipal {
+        user_id: "cancel-writer".into(),
+        grants: vec![principal::PrincipalGrant {
+            scope: principal::PrincipalScope::Agent,
+            project_root: Some(
+                root.path()
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        }],
+        actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+            schema_version: 1,
+            device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333337").unwrap(),
+            device_generation: 1,
+            logical_attachment_id,
+        }),
+    });
+    let mut shared = state.shared_snapshot();
+    let operation_id = Uuid::parse_str("018f3f24-7a10-7cc2-8f55-eeeeeeeeeeee").unwrap();
+    let operation =
+        proto::RemoteOperationIdentityV1::new(logical_attachment_id, operation_id).unwrap();
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_cmd_tx, _event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let mut concurrent = ConcurrentRequestRuntime::new();
+    for label in ["apply", "replay"] {
+        let id = Uuid::new_v4();
+        handle_envelope(
+            Envelope::remote_request(id, operation, Request::CancelTurn),
+            &mut state,
+            &mut shared,
+            &ctx,
+            &event_cmd_tx,
+            &writer_tx,
+            &mut concurrent,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(recv_writer_body(&mut writer_rx, label).await,
+            Body::Response { id: response_id, response } if response_id == id && matches!(*response, Response::Ack)));
+    }
+    assert!(matches!(work_rx.try_recv(), Ok(SessionWork::Cancel)));
+    assert!(
+        work_rx.try_recv().is_err(),
+        "replay must not dispatch a second cancel"
+    );
+    state.principal = ClientPrincipal::Remote(principal::RemotePrincipal {
+        user_id: "cancel-writer".into(),
+        grants: vec![principal::PrincipalGrant {
+            scope: principal::PrincipalScope::Agent,
+            project_root: Some(
+                root.path()
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        }],
+        actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+            schema_version: 1,
+            device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333338").unwrap(),
+            device_generation: 1,
+            logical_attachment_id,
+        }),
+    });
+    shared = state.shared_snapshot();
+    let conflict_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(conflict_id, operation, Request::CancelTurn),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(recv_writer_body(&mut writer_rx, "conflict").await,
+        Body::Error { id: Some(id), error } if id == conflict_id && error.code == ErrorCode::Conflict));
+    assert!(work_rx.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn remote_session_note_applies_replays_and_conflicts_before_second_event() {
     let ctx = test_ctx();
     let root = tempfile::tempdir().unwrap();

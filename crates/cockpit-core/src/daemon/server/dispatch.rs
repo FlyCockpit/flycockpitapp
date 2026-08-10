@@ -1898,6 +1898,75 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
 
         Request::CancelTurn => {
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation {
+                let request = Request::CancelTurn;
+                let params = request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&request, &params)?;
+                let request_hash =
+                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let logical_attachment_id = operation.logical_attachment_id.to_string();
+                let operation_id = operation.operation_id.to_string();
+                let device_id = operation.authenticated_device_id.to_string();
+                let now = chrono::Utc::now().timestamp_millis();
+                let begin = ctx.db.begin_nonrepeatable_remote_operation(
+                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                        logical_attachment_id: &logical_attachment_id, operation_id: &operation_id,
+                        authenticated_device_id: &device_id,
+                        authenticated_device_generation: operation.authenticated_device_generation,
+                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::NonrepeatableMutation,
+                        request_hash, now_ms: now,
+                    },
+                ).await.map_err(internal)?;
+                match begin {
+                    crate::db::remote_attachment_operations::BeginNonrepeatableRemoteOperationOutcome::Replay(bytes) =>
+                        return serde_json::from_slice(&bytes).map_err(internal),
+                    crate::db::remote_attachment_operations::BeginNonrepeatableRemoteOperationOutcome::OutcomeUnknown(_) =>
+                        return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation outcome is unknown; it will not be retried".into() }),
+                    crate::db::remote_attachment_operations::BeginNonrepeatableRemoteOperationOutcome::OperationConflict
+                    | crate::db::remote_attachment_operations::BeginNonrepeatableRemoteOperationOutcome::OperationActorConflict =>
+                        return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::BeginNonrepeatableRemoteOperationOutcome::AttachmentLedgerCapacity =>
+                        return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                    crate::db::remote_attachment_operations::BeginNonrepeatableRemoteOperationOutcome::Dispatch { .. } => {}
+                }
+                if let Err(error) = att.handle.send_work(SessionWork::Cancel).await {
+                    let unknown = serde_json::to_vec(&serde_json::json!({"outcome":"unknown"}))
+                        .map_err(internal)?;
+                    ctx.db
+                        .mark_nonrepeatable_remote_operation_outcome_unknown(
+                            &logical_attachment_id,
+                            &operation_id,
+                            &unknown,
+                            chrono::Utc::now().timestamp_millis(),
+                        )
+                        .await
+                        .map_err(internal)?;
+                    return Err(internal(error));
+                }
+                let response = Response::Ack;
+                let bytes = serde_json::to_vec(&response).map_err(internal)?;
+                let delivery_id = Uuid::now_v7().to_string();
+                match ctx.db.commit_remote_attachment_operation(
+                    crate::db::remote_attachment_operations::CommitRemoteOperation {
+                        logical_attachment_id: &logical_attachment_id, operation_id: &operation_id,
+                        safe_response: &bytes, outbox_delivery_id: &delivery_id,
+                        outbox_kind: "cancel_turn", outbox_payload: &bytes,
+                        now_ms: chrono::Utc::now().timestamp_millis(),
+                    },
+                ).await.map_err(internal)? {
+                    crate::db::remote_attachment_operations::CommitRemoteOperationOutcome::Committed { .. } => return Ok(response),
+                    _ => {
+                        let unknown = br#"{"outcome":"unknown"}"#;
+                        ctx.db.mark_nonrepeatable_remote_operation_outcome_unknown(
+                            &logical_attachment_id, &operation_id, unknown,
+                            chrono::Utc::now().timestamp_millis(),
+                        ).await.map_err(internal)?;
+                        return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached after dispatch; outcome is unknown".into() });
+                    }
+                }
+            }
             att.handle
                 .send_work(SessionWork::Cancel)
                 .await

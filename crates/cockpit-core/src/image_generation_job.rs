@@ -2536,7 +2536,14 @@ mod tests {
         assert_eq!(adapter.requests(), vec![request]);
     }
 
-    async fn run_real_ledger_scheduler_fixture(suffix: &str) {
+    struct RealLedgerSchedulerFixture {
+        db: cockpit_db::Db,
+    }
+
+    async fn setup_real_ledger_scheduler_job(
+        db: cockpit_db::Db,
+        suffix: &str,
+    ) -> RealLedgerSchedulerFixture {
         use crate::media_reservation::{
             MediaOwner, MediaReservationLedger, ReservationState, ReserveRequest,
         };
@@ -2550,7 +2557,6 @@ mod tests {
         use cockpit_db::image_spend::{
             AttemptMaximum, BudgetPolicy, ImageSpendSettings, ProjectEpochPolicy, SpendScopeKeys,
         };
-        let db = cockpit_db::Db::open_in_memory().unwrap();
         let sealed = plan();
         let canonical = sealed.canonical_bytes().unwrap();
         let plan_digest = sealed.digest().unwrap();
@@ -2666,6 +2672,14 @@ mod tests {
         })
         .await
         .unwrap();
+        RealLedgerSchedulerFixture { db }
+    }
+
+    async fn run_real_ledger_scheduler_fixture(suffix: &str) {
+        let fixture =
+            setup_real_ledger_scheduler_job(cockpit_db::Db::open_in_memory().unwrap(), suffix)
+                .await;
+        let db = fixture.db;
         let dispatcher = ImageGenerationDispatcher::new(db.clone());
         let adapter = DeterministicImageGenerationAdapter::new(vec![
             ImageGenerationHandoffResult::Accepted {

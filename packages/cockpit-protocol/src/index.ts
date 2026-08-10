@@ -1667,3 +1667,4 @@ export * from "./remote-protocol-id";
 export * from "./remote-signaling-attempt-store";
 export * from "./remote-signaling-payloads";
 export * from "./remote-transport-lanes";
+export * from "./remote-version";

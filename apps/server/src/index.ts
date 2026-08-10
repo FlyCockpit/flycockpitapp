@@ -39,6 +39,7 @@ import {
 import { mountRelayRoutes } from "./relay-routes.js";
 import { mountRemoteAuthorityRoutes } from "./remote-authority-routes.js";
 import { createServerRemoteAuthority } from "./remote-authority-runtime.js";
+import { getRemoteVersionReadiness } from "./remote-version-readiness.js";
 import { validateSameSiteJsonRequest } from "./request-origin.js";
 import { mountSecurityHeaders } from "./security-headers.js";
 import { registerSeoRoutes } from "./seo.js";
@@ -218,7 +219,8 @@ app.get("/ready", async (c) => {
       : true;
     if (!checks.remoteAuthority) return c.json({ ok: false, checks }, 503);
 
-    return c.json({ ok: true, checks });
+    const remoteVersionReadiness = getRemoteVersionReadiness();
+    return c.json({ ok: true, checks, remoteVersionReadiness });
   } catch {
     return c.json({ ok: false, checks }, 503);
   }

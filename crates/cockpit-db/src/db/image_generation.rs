@@ -1615,6 +1615,154 @@ mod tests {
         })
     }
 
+    fn reconciliation_fixture(conn: &Connection) -> Result<RaceFixture> {
+        let job_id = Uuid::now_v7();
+        let slot_id = Uuid::now_v7();
+        let artifact_id = Uuid::now_v7();
+        let operation_id = Uuid::now_v7();
+        let (plan, digest) = canonical_test_plan(job_id, slot_id, artifact_id, 1, 1, 100);
+        let verified = CreateImageGenerationJob::from_verified_canonical_plan(&plan, &digest, 1)?;
+        Db::create_image_generation_graph_conn(
+            conn,
+            &verified,
+            &[CreateImageGenerationSlot {
+                slot_id,
+                slot_index: 0,
+                sample_index: 0,
+                managed_artifact_id: artifact_id,
+                attempts: vec![CreateImageGenerationAttempt {
+                    attempt_number: 1,
+                    provider_request_identity: "request:1".into(),
+                    provider_idempotency_identity: "idem:1".into(),
+                }],
+            }],
+        )?;
+        conn.execute("INSERT INTO external_journal_operations(operation_id,operation_kind,owner_session_id,idempotency_key,payload_digest,payload_len,state,version,created_at_wall_ms,updated_at_wall_ms) VALUES(?1,'image_generation','owner','idem',?2,1,'reconciling',2,1,1)",params![operation_id.to_string(),"1".repeat(64)])?;
+        for (state, version) in [
+            ("preparing", 2),
+            ("prepared", 3),
+            ("dispatching", 4),
+            ("submission_unknown", 5),
+            ("reconciling", 6),
+        ] {
+            conn.execute("UPDATE image_generation_attempts SET state=?1,version=?2,external_operation_id=?3,observed_journal_version=2 WHERE job_id=?4 AND slot_id=?5",params![state,version,operation_id.to_string(),job_id.to_string(),slot_id.to_string()])?;
+        }
+        for (state, version) in [("queued", 2), ("dispatching", 3), ("submission_unknown", 4)] {
+            conn.execute("UPDATE image_generation_slots SET state=?1,version=?2 WHERE job_id=?3 AND slot_id=?4",params![state,version,job_id.to_string(),slot_id.to_string()])?;
+        }
+        for (state, version) in [
+            ("validating", 2),
+            ("queued", 3),
+            ("dispatching", 4),
+            ("submission_unknown", 5),
+        ] {
+            conn.execute(
+                "UPDATE image_generation_jobs SET state=?1,version=?2 WHERE job_id=?3",
+                params![state, version, job_id.to_string()],
+            )?;
+        }
+        let fixture = RaceFixture {
+            job_id,
+            slot_id,
+            operation_id,
+        };
+        Ok(fixture)
+    }
+
+    fn reconciliation_snapshot(conn: &Connection, fixture: &RaceFixture) -> Result<String> {
+        conn.query_row(
+            "SELECT j.state||':'||j.version||':'||a.state||':'||a.version||':'||s.state||':'||s.version||':'||g.state||':'||g.version||':'||(SELECT COUNT(*) FROM image_generation_reconciliation_evidence e WHERE e.job_id=g.job_id) FROM external_journal_operations j JOIN image_generation_attempts a ON a.external_operation_id=j.operation_id JOIN image_generation_slots s ON s.job_id=a.job_id AND s.slot_id=a.slot_id JOIN image_generation_jobs g ON g.job_id=s.job_id WHERE g.job_id=?1",
+            [fixture.job_id.to_string()],
+            |row| row.get(0),
+        ).map_err(Into::into)
+    }
+
+    #[test]
+    fn reconciliation_outcomes_are_atomic_across_every_durable_cut() {
+        for outcome in [
+            ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance,
+            ImageGenerationReconciliationOutcome::AuthoritativeFailure,
+        ] {
+            for (cut, trigger) in [
+                (
+                    "journal",
+                    "CREATE TEMP TRIGGER cut BEFORE UPDATE ON external_journal_operations BEGIN SELECT RAISE(ABORT,'cut'); END",
+                ),
+                (
+                    "evidence",
+                    "CREATE TEMP TRIGGER cut BEFORE INSERT ON image_generation_reconciliation_evidence BEGIN SELECT RAISE(ABORT,'cut'); END",
+                ),
+                (
+                    "attempt",
+                    "CREATE TEMP TRIGGER cut BEFORE UPDATE ON image_generation_attempts BEGIN SELECT RAISE(ABORT,'cut'); END",
+                ),
+                (
+                    "slot",
+                    "CREATE TEMP TRIGGER cut BEFORE UPDATE ON image_generation_slots BEGIN SELECT RAISE(ABORT,'cut'); END",
+                ),
+                (
+                    "job",
+                    "CREATE TEMP TRIGGER cut BEFORE UPDATE ON image_generation_jobs BEGIN SELECT RAISE(ABORT,'cut'); END",
+                ),
+            ] {
+                let db = Db::open_in_memory().unwrap();
+                db.blocking_for_sync_cli(move |conn| {
+                    let fixture = reconciliation_fixture(conn)?;
+                    let before = reconciliation_snapshot(conn, &fixture)?;
+                    conn.execute_batch(trigger)?;
+                    let result = Db::reconcile_image_generation_attempt_conn(
+                        conn,
+                        &ReconcileImageGenerationAttempt {
+                            job_id: fixture.job_id,
+                            slot_id: fixture.slot_id,
+                            attempt_number: 1,
+                            expected_attempt_version: 6,
+                            expected_slot_version: 4,
+                            external_operation_id: fixture.operation_id,
+                            expected_journal_version: 2,
+                            evidence_bytes: b"authoritative provider evidence",
+                            outcome,
+                            now_unix_ms: 20,
+                        },
+                    );
+                    ensure!(result.is_err(), "{cut} cut unexpectedly committed");
+                    conn.execute_batch("DROP TRIGGER cut")?;
+                    ensure!(
+                        reconciliation_snapshot(conn, &fixture)? == before,
+                        "{cut} cut left a partial projection"
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn reconciliation_outcomes_commit_exact_bound_evidence_once() {
+        for outcome in [
+            ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance,
+            ImageGenerationReconciliationOutcome::AuthoritativeFailure,
+        ] {
+            let db = Db::open_in_memory().unwrap();
+            db.blocking_for_sync_cli(move|conn|{
+                let fixture=reconciliation_fixture(conn)?;
+                let result=Db::reconcile_image_generation_attempt_conn(conn,&ReconcileImageGenerationAttempt{job_id:fixture.job_id,slot_id:fixture.slot_id,attempt_number:1,expected_attempt_version:6,expected_slot_version:4,external_operation_id:fixture.operation_id,expected_journal_version:2,evidence_bytes:b"authoritative provider evidence",outcome,now_unix_ms:20})?;
+                assert_eq!(result,ImageGenerationCasOutcome::Applied{version:5});
+                let row:(String,String,String,String,String,i64)=conn.query_row("SELECT e.evidence_digest,e.provider_request_identity,e.provider_idempotency_identity,e.journal_payload_digest,a.state,COUNT(*) FROM image_generation_reconciliation_evidence e JOIN image_generation_attempts a ON a.job_id=e.job_id AND a.slot_id=e.slot_id AND a.attempt_number=e.attempt_number WHERE e.job_id=?1",[fixture.job_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)))?;
+                assert_eq!(row.0,hex_lower(&Sha256::digest(b"authoritative provider evidence")));
+                assert_eq!(row.1,"request:1");
+                assert_eq!(row.2,"idem:1");
+                assert_eq!(row.3,"1".repeat(64));
+                assert_eq!(row.5,1);
+                let expected=match outcome{ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance=>"rejected_not_accepted",ImageGenerationReconciliationOutcome::AuthoritativeFailure=>"failed_after_acceptance"};
+                assert_eq!(row.4,expected);
+                assert!(Db::reconcile_image_generation_attempt_conn(conn,&ReconcileImageGenerationAttempt{job_id:fixture.job_id,slot_id:fixture.slot_id,attempt_number:1,expected_attempt_version:6,expected_slot_version:4,external_operation_id:fixture.operation_id,expected_journal_version:2,evidence_bytes:b"authoritative provider evidence",outcome,now_unix_ms:20}).is_err());
+                Ok(())
+            }).unwrap();
+        }
+    }
+
     #[test]
     fn terminal_reducer_has_exact_precedence() {
         use ImageGenerationJobState as J;

@@ -3163,7 +3163,6 @@ mod tests {
                 conn,
                 publication_operation_id,
                 4,
-                9,
             )?;
             let states: (String, String, String) = conn.query_row(
                 "SELECT p.state,a.state,s.state FROM image_generation_late_publication_leases p JOIN image_generation_artifacts a ON a.artifact_id=p.artifact_id JOIN image_generation_slots s ON s.job_id=p.job_id AND s.slot_id=p.slot_id WHERE p.publication_operation_id=?1",

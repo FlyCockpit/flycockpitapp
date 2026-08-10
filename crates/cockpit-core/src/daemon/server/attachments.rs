@@ -259,7 +259,6 @@ pub(super) fn begin_attachment_upload_with_limits(
         PendingAttachmentUpload {
             media_reservation: None,
             session_id,
-            mime,
             byte_len,
             sha256,
             purpose,
@@ -484,9 +483,7 @@ pub(super) async fn finish_attachment_upload(
             state.ready_attachments.insert(
                 image_ref.id,
                 ReadyAttachment {
-                    media_reservation: upload.media_reservation,
                     session_id,
-                    mime: upload.mime,
                     bytes,
                     purpose: upload.purpose,
                 },
@@ -835,9 +832,6 @@ fn validate_message_attachment(
 ) -> std::result::Result<(), ErrorPayload> {
     if attachment.session_id != session_id {
         return Err(bad_request("image ref belongs to a different session"));
-    }
-    if attachment.mime != proto::IMAGE_ATTACHMENT_MIME_PNG {
-        return Err(bad_request("image ref has unsupported MIME"));
     }
     if attachment.purpose != proto::AttachmentPurpose::UserMessageImage {
         return Err(bad_request("image ref has unsupported purpose"));

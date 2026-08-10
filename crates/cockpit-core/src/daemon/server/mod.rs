@@ -2864,7 +2864,6 @@ where
 struct PendingAttachmentUpload {
     media_reservation: Option<crate::media_reservation::ReservationReceipt>,
     session_id: Option<Uuid>,
-    mime: String,
     byte_len: usize,
     sha256: String,
     purpose: proto::AttachmentPurpose,
@@ -2875,9 +2874,7 @@ struct PendingAttachmentUpload {
 #[cfg(test)]
 #[derive(Debug)]
 struct ReadyAttachment {
-    media_reservation: Option<crate::media_reservation::ReservationReceipt>,
     session_id: Uuid,
-    mime: String,
     bytes: Vec<u8>,
     purpose: proto::AttachmentPurpose,
 }

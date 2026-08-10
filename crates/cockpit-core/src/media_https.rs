@@ -268,6 +268,7 @@ impl VettedHttpsHop {
         &self.url
     }
 
+    #[cfg(test)]
     pub(crate) fn socket_addrs(&self) -> &[SocketAddr] {
         &self.socket_addrs
     }
@@ -309,6 +310,7 @@ impl VettedHttpsHop {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn initial_https_hop(url: &str, answers: &[IpAddr]) -> Result<VettedHttpsHop> {
     let url = parse_fetch_url(url)?;
     vetted_hop(url, answers, 0)

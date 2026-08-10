@@ -56,6 +56,7 @@ pub(crate) struct HeldMediaComponentLease {
 }
 
 impl HeldMediaComponentLease {
+    #[cfg(test)]
     pub(crate) fn authority(&self) -> &AcquiredMediaComponentLease {
         &self.authority
     }
@@ -1029,88 +1030,6 @@ impl MediaStorageRecovery {
             let id: String = conn.query_row("SELECT attachment_id FROM media_uploads WHERE upload_id=?1 AND state='materialized'", [upload.to_string()], |row| row.get(0))?;
             Uuid::parse_str(&id).context("invalid materialized attachment id")
         }).await
-    }
-    pub(crate) async fn acquire_message_image(
-        &self,
-        attachment_id: Uuid,
-        session_id: Uuid,
-        project_digest: String,
-        consumer_id: String,
-        now_unix_ms: i64,
-    ) -> Result<Vec<u8>> {
-        use cockpit_db::media_attachments::{
-            MediaComponentLeaseKind, MediaKind, MediaReferenceConsumerKind,
-        };
-        let lease_id = Uuid::now_v7();
-        let reference_id = Uuid::now_v7();
-        let authority = self
-            .db
-            .transaction(move |conn| {
-                let record = cockpit_db::Db::media_attachment_for_owner_conn(
-                    conn,
-                    attachment_id,
-                    session_id,
-                    &project_digest,
-                )?
-                .context("media_attachment_unavailable")?;
-                ensure!(
-                    record.media_kind == MediaKind::Image && record.availability.is_ready(),
-                    "media_attachment_unavailable"
-                );
-                cockpit_db::Db::acquire_media_reference_conn(
-                    conn,
-                    reference_id,
-                    attachment_id,
-                    record.attachment_version,
-                    session_id,
-                    &project_digest,
-                    MediaReferenceConsumerKind::Message,
-                    &consumer_id,
-                    now_unix_ms,
-                )?;
-                cockpit_db::Db::acquire_media_component_lease_conn(
-                    conn,
-                    lease_id,
-                    attachment_id,
-                    record.attachment_version,
-                    record.availability_generation,
-                    record.captured_capability_generation,
-                    MediaComponentLeaseKind::Model,
-                    now_unix_ms,
-                )
-            })
-            .await?;
-        let opened = (|| -> Result<File> {
-            let mut file = self
-                .owned_root
-                .open_file_verified(&authority.component.storage_id.to_string())
-                .map_err(anyhow::Error::new)?;
-            let before = stable_identity_digest(&file)?;
-            let (length, checksum) = read_full_digest(&mut file)?;
-            ensure!(
-                before == authority.component.stable_identity_digest
-                    && length == authority.component.byte_length
-                    && checksum == authority.component.sha256
-                    && stable_identity_digest(&file)? == before,
-                "storage_security_violation"
-            );
-            file.seek(SeekFrom::Start(0))?;
-            Ok(file)
-        })();
-        let file = match opened {
-            Ok(file) => file,
-            Err(error) => {
-                block_component_lease_after_failed_proof(&self.db, authority, now_unix_ms).await?;
-                return Err(error);
-            }
-        };
-        HeldMediaComponentLease {
-            db: self.db.clone(),
-            authority,
-            file,
-        }
-        .read_verified(now_unix_ms)
-        .await
     }
     async fn block_cleanup_security_ambiguity(
         &self,
@@ -2623,6 +2542,7 @@ impl MediaStorageRecovery {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn open(db: cockpit_db::Db, owned_root: &Path) -> Result<Self> {
         let root = DirGuard::open_root(owned_root, false)
             .map_err(anyhow::Error::new)
@@ -2879,6 +2799,7 @@ fn local_path_plans(
     .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn media_upload_reservation_digest(
     policy: &cockpit_config::config::media_budget::MediaResourcePolicy,
     declared_total_bytes: u64,
@@ -3230,26 +3151,6 @@ struct PreparedAvNormalization {
     derivatives: Vec<AvDerivativePlan>,
     terminal_availability: Option<MediaAvailability>,
     evidence: Option<AvNormalizationEvidence>,
-}
-
-impl PreparedAvNormalization {
-    fn successful(
-        input: AvNormalizationInput,
-        selected_video_stream: Option<SelectedMediaStream>,
-        selected_audio_stream: Option<SelectedMediaStream>,
-        derivatives: Vec<AvDerivativePlan>,
-        evidence: AvNormalizationEvidence,
-    ) -> Self {
-        Self {
-            canonical_container: input.initial_container,
-            canonical_mime: input.initial_mime,
-            selected_video_stream,
-            selected_audio_stream,
-            derivatives,
-            terminal_availability: None,
-            evidence: Some(evidence),
-        }
-    }
 }
 
 fn av_plan_digest(runtime_fingerprint: &str, argv: &[String]) -> String {
@@ -5037,6 +4938,7 @@ fn verify_all_handles(
     Ok(HeldHandleRecoveryProof { _handles: handles })
 }
 
+#[cfg(test)]
 fn source_evidence_digest(
     file: &mut File,
     expected_identity: &str,

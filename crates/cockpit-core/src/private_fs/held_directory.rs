@@ -243,7 +243,7 @@ impl HeldDirectoryAuthority {
         name: &str,
         evidence: &HeldArtifactEvidence,
     ) -> Result<HeldSealedArtifact> {
-        validate_leaf_name(name)?;
+        validate_component(name)?;
         self.imp.open_verified(name, evidence)
     }
 

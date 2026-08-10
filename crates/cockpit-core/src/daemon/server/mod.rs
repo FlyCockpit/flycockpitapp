@@ -3646,6 +3646,9 @@ fn admit_remote_operation(
     let class = request
         .remote_operation_class()
         .map_err(|_| remote_operation_denied())?;
+    if class == proto::RemoteOperationClass::LocalOnly {
+        return Err(remote_operation_denied());
+    }
     if class == proto::RemoteOperationClass::ReadOnly && operation.is_none() {
         return Ok(None);
     }

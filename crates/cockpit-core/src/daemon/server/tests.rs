@@ -811,12 +811,28 @@ fn remote_operation_gate_is_pre_dispatch_and_preserves_correlation() {
         key: proto::AppFlagKey::DaemonAutostartNotice,
         expected_version: 0,
     };
+    let reachable_mutation = Request::CancelRunInvocation {
+        client_submission_id: Uuid::new_v4(),
+    };
     let mut reached_dispatch = 0;
     let cases = [
-        (principal(None), None, &read, true),
-        (principal(None), None, &mutation, false),
-        (principal(Some(actor.clone())), None, &mutation, false),
+        ("actorless_read", principal(None), None, &read, true),
         (
+            "actorless_mutation",
+            principal(None),
+            None,
+            &mutation,
+            false,
+        ),
+        (
+            "missing_operation",
+            principal(Some(actor.clone())),
+            None,
+            &mutation,
+            false,
+        ),
+        (
+            "wrong_schema",
             principal(Some(actor.clone())),
             Some(proto::RemoteOperationIdentityV1 {
                 schema_version: 2,
@@ -826,6 +842,7 @@ fn remote_operation_gate_is_pre_dispatch_and_preserves_correlation() {
             false,
         ),
         (
+            "attachment_mismatch",
             principal(Some(actor.clone())),
             Some(proto::RemoteOperationIdentityV1 {
                 logical_attachment_id: device_id,
@@ -835,6 +852,7 @@ fn remote_operation_gate_is_pre_dispatch_and_preserves_correlation() {
             false,
         ),
         (
+            "zero_generation",
             principal(Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
                 device_generation: 0,
                 ..actor.clone()
@@ -844,6 +862,7 @@ fn remote_operation_gate_is_pre_dispatch_and_preserves_correlation() {
             false,
         ),
         (
+            "non_v7_operation",
             principal(Some(actor.clone())),
             Some(proto::RemoteOperationIdentityV1 {
                 operation_id: Uuid::parse_str("018f3f24-7a10-7cc2-7f55-111111111111").unwrap(),
@@ -853,22 +872,37 @@ fn remote_operation_gate_is_pre_dispatch_and_preserves_correlation() {
             false,
         ),
         (
+            "valid_remote_mutation",
+            principal(Some(actor.clone())),
+            Some(operation),
+            &reachable_mutation,
+            true,
+        ),
+        (
+            "remote_local_only_mutation",
             principal(Some(actor.clone())),
             Some(operation),
             &mutation,
+            false,
+        ),
+        (
+            "owner_local_mutation",
+            ClientPrincipal::owner(),
+            None,
+            &mutation,
             true,
         ),
-        (ClientPrincipal::owner(), None, &mutation, true),
         (
+            "unknown_request",
             principal(Some(actor)),
             Some(operation),
             &Request::Unknown,
             false,
         ),
     ];
-    for (principal, operation, request, allowed) in cases {
+    for (case, principal, operation, request, allowed) in cases {
         let admitted = admit_remote_operation(&principal, request_id, operation, request);
-        assert_eq!(admitted.is_ok(), allowed);
+        assert_eq!(admitted.is_ok(), allowed, "admission case {case}");
         if let Ok(context) = admitted {
             reached_dispatch += 1;
             if let Some(context) = context {
@@ -1249,14 +1283,14 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
             if id == actor_read_id && matches!(*response, Response::DaemonStatus { .. })
     ));
 
+    let submission_id = Uuid::new_v4();
     let actor_mutation_id = Uuid::new_v4();
     handle_envelope(
         Envelope::remote_request(
             actor_mutation_id,
             operation,
-            Request::MarkAppFlagSeen {
-                key: proto::AppFlagKey::DaemonAutostartNotice,
-                expected_version: 0,
+            Request::CancelRunInvocation {
+                client_submission_id: submission_id,
             },
         ),
         &mut state,
@@ -1274,11 +1308,8 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
                 assert_eq!(id, actor_mutation_id);
                 assert!(matches!(
                     &*response,
-                    Response::AppFlagSeen {
-                        version: 1,
-                        changed: true,
-                        ..
-                    }
+                    Response::RunInvocationCancelResult { result }
+                        if result.client_submission_id == submission_id
                 ));
                 serde_json::to_vec(&response).unwrap()
             }
@@ -1290,9 +1321,8 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
         Envelope::remote_request(
             replay_id,
             operation,
-            Request::MarkAppFlagSeen {
-                key: proto::AppFlagKey::DaemonAutostartNotice,
-                expected_version: 0,
+            Request::CancelRunInvocation {
+                client_submission_id: submission_id,
             },
         ),
         &mut state,
@@ -1317,9 +1347,8 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
         Envelope::remote_request(
             conflict_id,
             operation,
-            Request::MarkAppFlagSeen {
-                key: proto::AppFlagKey::DaemonAutostartNotice,
-                expected_version: 1,
+            Request::CancelRunInvocation {
+                client_submission_id: Uuid::new_v4(),
             },
         ),
         &mut state,
@@ -1336,44 +1365,6 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
         Body::Error { id: Some(id), error }
             if id == conflict_id && error.code == ErrorCode::Conflict
     ));
-    let domain_conflict_id = Uuid::new_v4();
-    let domain_conflict_operation = proto::RemoteOperationIdentityV1::new(
-        logical_attachment_id,
-        Uuid::parse_str("018f3f24-7a10-7cc2-8f55-222222222222").unwrap(),
-    )
-    .unwrap();
-    handle_envelope(
-        Envelope::remote_request(
-            domain_conflict_id,
-            domain_conflict_operation,
-            Request::MarkAppFlagSeen {
-                key: proto::AppFlagKey::DaemonAutostartNotice,
-                expected_version: 0,
-            },
-        ),
-        &mut state,
-        &mut shared,
-        &ctx,
-        &event_cmd_tx,
-        &writer_tx,
-        &mut concurrent,
-    )
-    .await
-    .unwrap();
-    assert!(matches!(
-        recv_writer_body(&mut writer_rx, "actor-bound domain conflict").await,
-        Body::Error { id: Some(id), error }
-            if id == domain_conflict_id && error.code == ErrorCode::Conflict
-    ));
-    assert_eq!(
-        ctx.db
-            .read(|conn| crate::db::Db::app_flag_version_conn(conn, "daemon-autostart"))
-            .await
-            .unwrap(),
-        1,
-        "replay and conflict must not execute a second domain mutation"
-    );
-
     // Local owner mutations bypass remote identity requirements and enter the
     // serialized dispatcher (the exact domain result is not a gate denial).
     state.principal = ClientPrincipal::owner();

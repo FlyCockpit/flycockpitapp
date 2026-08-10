@@ -215,7 +215,7 @@ impl VerifiedOutputDirectoryAuthority {
 
 #[derive(Debug)]
 pub struct HeldImageGenerationOutputDirectory {
-    guard: crate::external_journal::fsguard::DirGuard,
+    guard: crate::private_fs::held_directory::HeldDirectoryAuthority,
     authority: VerifiedOutputDirectoryAuthority,
 }
 impl HeldImageGenerationOutputDirectory {
@@ -223,7 +223,18 @@ impl HeldImageGenerationOutputDirectory {
         &self.authority
     }
     pub fn path(&self) -> &Path {
-        self.guard.path()
+        self.guard.diagnostic_path()
+    }
+    pub fn create_temporary_exclusive(&self, name: &str) -> Result<std::fs::File> {
+        self.guard.create_file_exclusive(name)
+    }
+    pub fn publish_temporary_noreplace(&self, temporary: &str, output: &str) -> Result<()> {
+        self.guard.rename_noreplace(temporary, output)?;
+        self.guard.sync()
+    }
+    pub fn remove_temporary(&self, name: &str) -> Result<()> {
+        self.guard.unlink(name)?;
+        self.guard.sync()
     }
 }
 pub fn open_image_generation_output_directory(
@@ -232,14 +243,9 @@ pub fn open_image_generation_output_directory(
     filename_prefix: String,
     extension: String,
 ) -> Result<HeldImageGenerationOutputDirectory> {
-    let guard = crate::external_journal::fsguard::DirGuard::open_root(path, false)
-        .map_err(anyhow::Error::new)?;
-    guard.verify_private().map_err(anyhow::Error::new)?;
-    let parent_identity_digest = guard.stable_identity_digest().map_err(anyhow::Error::new)?;
-    let canonical = std::fs::canonicalize(guard.path())?;
-    let canonical_destination_digest = digest_fields(&[canonical
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("output path is not UTF-8"))?]);
+    let guard = crate::private_fs::held_directory::HeldDirectoryAuthority::open_existing(path)?;
+    let parent_identity_digest = guard.identity().stable_digest.clone();
+    let canonical_destination_digest = guard.identity().canonical_binding_digest.clone();
     let authority = VerifiedOutputDirectoryAuthority::from_held_directory(
         canonical_destination_digest,
         parent_identity_digest,

@@ -36,7 +36,6 @@
 //! both of which fail rather than overwrite, so there is no check-then-rename
 //! window in which a racing process could have its evidence destroyed.
 
-use sha2::{Digest as _, Sha256};
 use std::fs::File;
 use std::path::{Component, Path, PathBuf};
 
@@ -326,19 +325,6 @@ mod imp {
                 )));
             }
             Ok(())
-        }
-
-        pub(crate) fn stable_identity_digest(&self) -> Result<String, ExternalJournalError> {
-            let metadata = self
-                .dir
-                .metadata()
-                .map_err(|error| io("stat held directory", error))?;
-            let mut digest = Sha256::new();
-            digest.update(metadata.dev().to_be_bytes());
-            digest.update(metadata.ino().to_be_bytes());
-            digest.update(metadata.uid().to_be_bytes());
-            digest.update((metadata.mode() & 0o777).to_be_bytes());
-            Ok(crate::intel::hex_lower(&digest.finalize()))
         }
 
         /// Create a file that must not already exist, at exactly `0600`.
@@ -714,27 +700,6 @@ mod imp {
             crate::goal_scratch::verify_private_dacl(&self.path)
                 .map_err(|error| ExternalJournalError::InsecurePermissions(error.to_string()))?;
             Ok(())
-        }
-
-        pub(crate) fn stable_identity_digest(&self) -> Result<String, ExternalJournalError> {
-            self.verify_private()?;
-            #[cfg(windows)]
-            {
-                use std::os::windows::fs::MetadataExt as _;
-                let metadata = std::fs::symlink_metadata(&self.path)
-                    .map_err(|error| io("stat protected directory", error))?;
-                let mut digest = Sha256::new();
-                digest.update(metadata.file_attributes().to_be_bytes());
-                digest.update(metadata.creation_time().to_be_bytes());
-                digest.update(metadata.last_write_time().to_be_bytes());
-                return Ok(crate::intel::hex_lower(&digest.finalize()));
-            }
-            #[cfg(not(windows))]
-            {
-                Err(ExternalJournalError::Containment(
-                    "secure output directories are unsupported on this platform".into(),
-                ))
-            }
         }
 
         pub fn create_file_exclusive(&self, name: &str) -> Result<File, ExternalJournalError> {

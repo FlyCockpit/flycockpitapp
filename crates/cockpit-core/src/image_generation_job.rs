@@ -1246,7 +1246,7 @@ mod tests {
         let baseline = original.digest().unwrap();
         assert_eq!(
             baseline,
-            "3e7894cab2e1fb43b2fdba8b9144e88f1394904130bd177a08c29e06f4a843b4"
+            "d58c8a7a1a22f1709bbafeef63e935f19d89fd1bea0ffccf4da50cb8713710ce"
         );
         assert_eq!(
             verify_canonical_image_generation_plan(&bytes, &baseline).unwrap(),

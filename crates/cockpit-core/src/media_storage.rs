@@ -2016,6 +2016,73 @@ fn select_video_rate(timestamps: &[(u64, u64)]) -> Result<(u32, u32, u32, u32)> 
     Ok((num, den, gop, min_keyint))
 }
 
+fn canonicalize_pcm_wav(bytes: &[u8]) -> Result<Vec<u8>> {
+    ensure!(
+        bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE",
+        "invalid_media"
+    );
+    let declared = u32::from_le_bytes(bytes[4..8].try_into()?) as usize;
+    ensure!(
+        declared.checked_add(8) == Some(bytes.len()),
+        "invalid_media"
+    );
+    let mut offset = 12usize;
+    let (mut format, mut data) = (None, None);
+    while offset + 8 <= bytes.len() {
+        let kind = &bytes[offset..offset + 4];
+        let length = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into()?) as usize;
+        let start = offset + 8;
+        let end = start.checked_add(length).context("invalid_media")?;
+        ensure!(end <= bytes.len(), "invalid_media");
+        match kind {
+            b"fmt " => {
+                ensure!(format.is_none() && length >= 16, "invalid_media");
+                format = Some(&bytes[start..end]);
+            }
+            b"data" => {
+                ensure!(data.is_none(), "invalid_media");
+                data = Some(&bytes[start..end]);
+            }
+            _ => {}
+        }
+        offset = end.checked_add(length & 1).context("invalid_media")?;
+    }
+    ensure!(offset == bytes.len(), "invalid_media");
+    let format = format.context("invalid_media")?;
+    let data = data.context("invalid_media")?;
+    let encoding = u16::from_le_bytes(format[0..2].try_into()?);
+    let channels = u16::from_le_bytes(format[2..4].try_into()?);
+    let rate = u32::from_le_bytes(format[4..8].try_into()?);
+    let byte_rate = u32::from_le_bytes(format[8..12].try_into()?);
+    let align = u16::from_le_bytes(format[12..14].try_into()?);
+    let bits = u16::from_le_bytes(format[14..16].try_into()?);
+    ensure!(
+        encoding == 1
+            && matches!(channels, 1 | 2)
+            && rate > 0
+            && rate <= 48_000
+            && bits == 16
+            && align == channels * 2
+            && byte_rate == rate * u32::from(align)
+            && data.len() % usize::from(align) == 0,
+        "invalid_media"
+    );
+    let riff_size = 4usize + 8 + 16 + 8 + data.len() + (data.len() & 1);
+    ensure!(riff_size <= u32::MAX as usize, "resource_limit");
+    let mut output = Vec::with_capacity(riff_size + 8);
+    output.extend_from_slice(b"RIFF");
+    output.extend_from_slice(&(riff_size as u32).to_le_bytes());
+    output.extend_from_slice(b"WAVEfmt \x10\0\0\0");
+    output.extend_from_slice(&format[..16]);
+    output.extend_from_slice(b"data");
+    output.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    output.extend_from_slice(data);
+    if data.len() & 1 != 0 {
+        output.push(0);
+    }
+    Ok(output)
+}
+
 struct NormalizedImageDerivatives {
     model_png: Vec<u8>,
     thumbnail_png: Vec<u8>,
@@ -3059,6 +3126,29 @@ mod tests {
         assert_eq!((rate.0, rate.1), (4, 1));
         assert!(select_video_rate(&[(0, 1), (0, 1)]).is_err());
         assert!(select_video_rate(&[(0, 1), (1, 0)]).is_err());
+    }
+
+    #[test]
+    fn canonical_wav_strips_metadata_and_rejects_non_pcm() {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"WAVEfmt \x10\0\0\0");
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&48_000u32.to_le_bytes());
+        body.extend_from_slice(&96_000u32.to_le_bytes());
+        body.extend_from_slice(&2u16.to_le_bytes());
+        body.extend_from_slice(&16u16.to_le_bytes());
+        body.extend_from_slice(b"JUNK\x02\0\0\0xxdata\x02\0\0\0\x01\0");
+        let mut wav = b"RIFF".to_vec();
+        wav.extend_from_slice(&u32::try_from(body.len()).unwrap().to_le_bytes());
+        wav.extend_from_slice(&body);
+        let canonical = canonicalize_pcm_wav(&wav).unwrap();
+        assert_eq!(&canonical[12..20], b"fmt \x10\0\0\0");
+        assert_eq!(&canonical[36..40], b"data");
+        assert!(!canonical.windows(4).any(|chunk| chunk == b"JUNK"));
+        let mut invalid = wav;
+        invalid[20] = 3;
+        assert!(canonicalize_pcm_wav(&invalid).is_err());
     }
 
     #[test]

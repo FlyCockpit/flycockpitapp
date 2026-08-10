@@ -5,6 +5,7 @@
 //! provider-dispatch binding; no dispatcher may reinterpret caller input.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -212,6 +213,43 @@ impl VerifiedOutputDirectoryAuthority {
     }
 }
 
+#[derive(Debug)]
+pub struct HeldImageGenerationOutputDirectory {
+    guard: crate::external_journal::fsguard::DirGuard,
+    authority: VerifiedOutputDirectoryAuthority,
+}
+impl HeldImageGenerationOutputDirectory {
+    pub fn authority(&self) -> &VerifiedOutputDirectoryAuthority {
+        &self.authority
+    }
+    pub fn path(&self) -> &Path {
+        self.guard.path()
+    }
+}
+pub fn open_image_generation_output_directory(
+    path: &Path,
+    authority_generation: u64,
+    filename_prefix: String,
+    extension: String,
+) -> Result<HeldImageGenerationOutputDirectory> {
+    let guard = crate::external_journal::fsguard::DirGuard::open_root(path, false)
+        .map_err(anyhow::Error::new)?;
+    guard.verify_private().map_err(anyhow::Error::new)?;
+    let parent_identity_digest = guard.stable_identity_digest().map_err(anyhow::Error::new)?;
+    let canonical = std::fs::canonicalize(guard.path())?;
+    let canonical_destination_digest = digest_fields(&[canonical
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("output path is not UTF-8"))?]);
+    let authority = VerifiedOutputDirectoryAuthority::from_held_directory(
+        canonical_destination_digest,
+        parent_identity_digest,
+        authority_generation,
+        filename_prefix,
+        extension,
+    )?;
+    Ok(HeldImageGenerationOutputDirectory { guard, authority })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageGenerationPreflightTargetV1 {
     pub authority: RuntimeTargetAuthorityV1,
@@ -254,7 +292,7 @@ pub fn plan_image_generation(
     let mut targets = Vec::with_capacity(input.targets.len());
     for target in input.targets {
         ensure!(
-            target.slot_ids.len() > 0,
+            !target.slot_ids.is_empty(),
             "target has no resolved output slots"
         );
         let mut slots = Vec::with_capacity(target.slot_ids.len());
@@ -1079,5 +1117,198 @@ mod tests {
         let mut exact = plan();
         exact.targets[0].resolved.width = MAX_IMAGE_GENERATION_DIMENSION;
         assert!(exact.digest().is_ok());
+    }
+
+    #[test]
+    fn slot_and_dimension_bounds_are_exact_below_equal_above() {
+        fn with_slots(count: usize) -> ImageGenerationPlanV1 {
+            let mut value = plan();
+            let template = value.targets[0].slots[0].clone();
+            value.targets[0].slots = (0..count)
+                .map(|index| {
+                    let mut slot = template.clone();
+                    slot.slot_id = id(100 + index as u128);
+                    slot.managed_artifact_id = id(1000 + index as u128);
+                    slot.slot_index = index as u32;
+                    slot.sample_index = index as u32;
+                    slot.publication_name = format!("generated-{:03}.png", index + 1);
+                    slot.attempts[0].provider_request_identity = format!("request:{index}");
+                    slot.attempts[0].provider_idempotency_identity = format!("idem:{index}");
+                    slot
+                })
+                .collect();
+            value.targets[0].sample_count = count as u32;
+            value.central_resources[0].units = count as u64;
+            value.spend.maximum_usd_micros = Some((count as u64) * 10);
+            value
+        }
+        for count in [MAX_IMAGE_GENERATION_SLOTS - 1, MAX_IMAGE_GENERATION_SLOTS] {
+            assert!(with_slots(count).validate().is_ok());
+        }
+        assert!(
+            with_slots(MAX_IMAGE_GENERATION_SLOTS + 1)
+                .validate()
+                .is_err()
+        );
+        for dimension in [
+            MAX_IMAGE_GENERATION_DIMENSION - 1,
+            MAX_IMAGE_GENERATION_DIMENSION,
+        ] {
+            let mut value = plan();
+            value.requested.width = dimension;
+            value.resolved.width = dimension;
+            assert!(value.validate().is_ok());
+        }
+        let mut above = plan();
+        above.requested.width = MAX_IMAGE_GENERATION_DIMENSION + 1;
+        assert!(above.validate().is_err());
+    }
+
+    #[test]
+    fn every_serialized_scalar_and_list_element_changes_canonical_digest() {
+        fn paths(
+            value: &serde_json::Value,
+            path: String,
+            scalars: &mut Vec<String>,
+            arrays: &mut Vec<String>,
+        ) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (key, value) in map {
+                        paths(
+                            value,
+                            format!("{path}/{}", key.replace('~', "~0").replace('/', "~1")),
+                            scalars,
+                            arrays,
+                        )
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    arrays.push(path.clone());
+                    for (index, value) in values.iter().enumerate() {
+                        paths(value, format!("{path}/{index}"), scalars, arrays)
+                    }
+                }
+                _ => scalars.push(path),
+            }
+        }
+        let mut source = plan();
+        source.targets[0]
+            .reference_artifacts
+            .push(ReferenceArtifactV1 {
+                attachment_id: id(10),
+                attachment_version: 1,
+                component_id: id(11),
+                component_generation: 1,
+                media_kind: "image_model".into(),
+                identity_digest: digest('b'),
+                sha256: digest('c'),
+                byte_length: 1,
+            });
+        let value = serde_json::to_value(source).unwrap();
+        let baseline = serde_json::to_vec(&value).unwrap();
+        let baseline_digest = Sha256::digest(&baseline);
+        let mut scalars = Vec::new();
+        let mut arrays = Vec::new();
+        paths(&value, String::new(), &mut scalars, &mut arrays);
+        for path in scalars {
+            let mut changed = value.clone();
+            let leaf = changed.pointer_mut(&path).unwrap();
+            *leaf = match leaf {
+                serde_json::Value::Bool(value) => serde_json::Value::Bool(!*value),
+                serde_json::Value::Number(value) => {
+                    serde_json::json!(value.as_i64().unwrap_or(0) + 1)
+                }
+                serde_json::Value::String(value) => serde_json::Value::String(format!("{value}x")),
+                serde_json::Value::Null => serde_json::Value::Bool(true),
+                _ => unreachable!(),
+            };
+            assert_ne!(
+                Sha256::digest(serde_json::to_vec(&changed).unwrap()),
+                baseline_digest,
+                "{path}"
+            );
+        }
+        for path in arrays {
+            let length = value
+                .pointer(&path)
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len);
+            for index in 0..length {
+                let mut changed = value.clone();
+                changed
+                    .pointer_mut(&path)
+                    .unwrap()
+                    .as_array_mut()
+                    .unwrap()
+                    .remove(index);
+                assert_ne!(
+                    Sha256::digest(serde_json::to_vec(&changed).unwrap()),
+                    baseline_digest,
+                    "{path}/{index}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_authority_is_held_private_and_nofollow() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let temporary = tempfile::TempDir::new().unwrap();
+        let output = temporary.path().join("output");
+        std::fs::create_dir(&output).unwrap();
+        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let held =
+            open_image_generation_output_directory(&output, 1, "generated".into(), "png".into())
+                .unwrap();
+        assert_eq!(held.path(), output.canonicalize().unwrap());
+        let replacement = temporary.path().join("replacement");
+        std::fs::create_dir(&replacement).unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::rename(&output, temporary.path().join("moved")).unwrap();
+        std::fs::rename(&replacement, &output).unwrap();
+        assert_ne!(
+            held.authority().0.parent_identity_digest,
+            open_image_generation_output_directory(&output, 1, "generated".into(), "png".into())
+                .unwrap()
+                .authority()
+                .0
+                .parent_identity_digest
+        );
+        let widened = temporary.path().join("widened");
+        std::fs::create_dir(&widened).unwrap();
+        std::fs::set_permissions(&widened, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            open_image_generation_output_directory(&widened, 1, "generated".into(), "png".into())
+                .is_err()
+        );
+        let link = temporary.path().join("link");
+        symlink(&output, &link).unwrap();
+        assert!(
+            open_image_generation_output_directory(&link, 1, "generated".into(), "png".into())
+                .is_err()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn output_authority_requires_protected_dacl_and_rejects_reparse() {
+        use std::os::windows::fs::symlink_dir;
+        let temporary = tempfile::TempDir::new().unwrap();
+        let output = temporary.path().join("output");
+        std::fs::create_dir(&output).unwrap();
+        crate::goal_scratch::set_private(&output).unwrap();
+        assert!(
+            open_image_generation_output_directory(&output, 1, "generated".into(), "png".into())
+                .is_ok()
+        );
+        let link = temporary.path().join("link");
+        if symlink_dir(&output, &link).is_ok() {
+            assert!(
+                open_image_generation_output_directory(&link, 1, "generated".into(), "png".into())
+                    .is_err()
+            );
+        }
     }
 }

@@ -5305,7 +5305,7 @@ async fn dispatch_authz_request_after(
 ) -> std::result::Result<Response, ErrorPayload> {
     let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
     let mut client = ProtoStream::new(client_stream);
-    let server = tokio::spawn(handle_client_transport_as(
+    let mut server = tokio::spawn(handle_client_transport_as(
         server_stream,
         ctx.clone(),
         principal,
@@ -5343,13 +5343,39 @@ async fn dispatch_authz_request_after(
         .send(&Envelope::request(id, request))
         .await
         .expect("send dispatch request");
-    let result = recv_dispatch_matrix_response(&mut client, id).await;
+    let (result, server_ended) =
+        recv_dispatch_matrix_response_or_server(&mut client, id, &mut server).await;
     drop(client);
-    server
-        .await
-        .expect("server task joins")
-        .expect("server task succeeds");
+    if !server_ended {
+        server
+            .await
+            .expect("server task joins")
+            .expect("server task succeeds");
+    }
     result
+}
+
+#[cfg(unix)]
+async fn recv_dispatch_matrix_response_or_server<S>(
+    client: &mut ProtoStream<S>,
+    request_id: Uuid,
+    server: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+) -> (std::result::Result<Response, ErrorPayload>, bool)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    tokio::select! {
+        biased;
+        joined = server => {
+            let message = match joined {
+                Ok(Ok(())) => "daemon server ended unexpectedly before response".to_string(),
+                Ok(Err(error)) => format!("daemon server failed before response: {error:#}"),
+                Err(error) => format!("daemon server task failed before response: {error}"),
+            };
+            (Err(ErrorPayload { code: ErrorCode::Internal, message }), true)
+        }
+        response = recv_dispatch_matrix_response(client, request_id) => (response, false),
+    }
 }
 
 #[cfg(unix)]
@@ -16352,6 +16378,25 @@ async fn client_transport_only_accepts_clean_reader_exit() {
         let error = super::flatten_client_task(task.await, label, false).unwrap_err();
         assert_eq!(error.to_string(), format!("{label} ended unexpectedly"));
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dispatch_helper_reports_server_failure_before_client_eof() {
+    let (_server_stream, client_stream) = tokio::io::duplex(64);
+    let mut client = ProtoStream::new(client_stream);
+    let mut server =
+        tokio::spawn(async { Err::<(), _>(anyhow::anyhow!("forced transport root cause")) });
+    let (result, server_ended) =
+        super::recv_dispatch_matrix_response_or_server(&mut client, Uuid::now_v7(), &mut server)
+            .await;
+    assert!(server_ended);
+    let error = result.unwrap_err();
+    assert_eq!(error.code, ErrorCode::Internal);
+    assert_eq!(
+        error.message,
+        "daemon server failed before response: forced transport root cause"
+    );
 }
 
 #[tokio::test]

@@ -3216,16 +3216,12 @@ where
     let reader_ctx = ctx.clone();
     let reader_executor_tx = executor_tx.clone();
     let reader_writer_tx = writer_tx.clone();
-    let reader_task = tokio::spawn(async move {
-        run_client_reader(
-            reader,
-            reader_executor_tx,
-            reader_writer_tx,
-            Some(reader_ctx.caffeinate_state_event()),
-        )
-        .await;
-        Ok::<(), anyhow::Error>(())
-    });
+    let reader_task = tokio::spawn(run_client_reader(
+        reader,
+        reader_executor_tx,
+        reader_writer_tx,
+        Some(reader_ctx.caffeinate_state_event()),
+    ));
     let writer_task = tokio::spawn(async move {
         run_client_writer(writer, writer_rx).await;
         Ok::<(), anyhow::Error>(())
@@ -3357,7 +3353,8 @@ async fn run_client_reader<R>(
     executor_tx: mpsc::Sender<ClientExecutorInput>,
     writer_tx: mpsc::Sender<ClientWriterMessage>,
     initial_event_after_negotiation: Option<proto::Event>,
-) where
+) -> Result<()>
+where
     R: AsyncRead + Unpin + Send + 'static,
 {
     let mut initial_event_after_negotiation = initial_event_after_negotiation;
@@ -3370,7 +3367,7 @@ async fn run_client_reader<R>(
                         .await
                         .is_err()
                     {
-                        return;
+                        anyhow::bail!("client reader lost writer control channel");
                     }
                     if let Some(event) = initial_event_after_negotiation.take()
                         && writer_tx
@@ -3378,7 +3375,7 @@ async fn run_client_reader<R>(
                             .await
                             .is_err()
                     {
-                        return;
+                        anyhow::bail!("client reader lost writer event channel");
                     }
                 }
                 if executor_tx
@@ -3386,14 +3383,11 @@ async fn run_client_reader<R>(
                     .await
                     .is_err()
                 {
-                    return;
+                    anyhow::bail!("client reader lost executor channel");
                 }
             }
-            Ok(None) => return,
-            Err(e) => {
-                tracing::debug!(error = ?e, "envelope decode failed; closing client");
-                return;
-            }
+            Ok(None) => return Ok(()),
+            Err(error) => return Err(anyhow::Error::new(error).context("decoding client envelope")),
         }
     }
 }

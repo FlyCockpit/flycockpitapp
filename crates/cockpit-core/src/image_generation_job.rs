@@ -17,16 +17,21 @@ use crate::image_generation_runtime::ImageHealthSnapshot;
 use cockpit_config::config::media_budget::MediaReservationPlan;
 use cockpit_db::db::image_generation::{
     AdvanceImageGenerationLatePublication, CreateImageGenerationArtifact,
-    CreateImageGenerationArtifactComponent, ImageGenerationArtifactComponentKind,
-    ImageGenerationArtifactComponentState, ImageGenerationArtifactConsumerPurpose,
-    ImageGenerationArtifactConsumerRoute, ImageGenerationArtifactState,
-    ImageGenerationLatePublicationEvidenceV1, ImageGenerationLatePublicationState,
+    CreateImageGenerationArtifactComponent, DispatchingImageGenerationAttempt,
+    ImageGenerationArtifactComponentKind, ImageGenerationArtifactComponentState,
+    ImageGenerationArtifactConsumerPurpose, ImageGenerationArtifactConsumerRoute,
+    ImageGenerationArtifactState, ImageGenerationLatePublicationEvidenceV1,
+    ImageGenerationLatePublicationState, PreparedImageGenerationDispatch,
     TransitionImageGenerationArtifact, TransitionImageGenerationArtifactComponent,
     image_generation_component_set_binding,
 };
 use cockpit_db::db::sealed_scope::SealedActionGrantRow;
-use cockpit_db::image_spend::{AttemptMaximum, SpendReservation};
+use cockpit_db::image_spend::{AttemptMaximum, ImageSpendDispatchEvidence, SpendReservation};
 use cockpit_db::media_attachments::AcquiredMediaComponentLease;
+
+use crate::media_reservation::{
+    MediaExternalHandoffOutcome, finish_external_handoff_conn, handoff_external_conn,
+};
 
 pub use crate::private_fs::held_directory::{
     HeldArtifactEvidence, HeldDirectoryEffectEvidence, HeldDirectoryEffectOutcome,
@@ -42,6 +47,92 @@ pub use cockpit_db::image_generation_plan::{
 };
 
 const MAX_AUTHORITY_STRING_BYTES: usize = 1_024;
+
+/// Owns the single transaction that advances image, spend, journal, and media
+/// reservation state across an external provider handoff.
+#[derive(Clone)]
+pub struct ImageGenerationDispatcher {
+    db: cockpit_db::Db,
+}
+
+impl ImageGenerationDispatcher {
+    pub fn new(db: cockpit_db::Db) -> Self {
+        Self { db }
+    }
+
+    pub async fn begin_external_handoff(
+        &self,
+        prepared: PreparedImageGenerationDispatch,
+        handoff_plans: Vec<MediaReservationPlan>,
+        at_unix_ms: i64,
+        now_monotonic_ms: u64,
+        media_wall_ms: u64,
+    ) -> Result<DispatchingImageGenerationAttempt> {
+        self.db
+            .transaction(move |conn| {
+                let dispatching = cockpit_db::Db::begin_image_generation_handoff_conn(
+                    conn,
+                    prepared,
+                    at_unix_ms,
+                    now_monotonic_ms,
+                )?;
+                let operation_id = dispatching.operation().operation_id.to_string();
+                let (reservation_id, dispatching_version) = dispatching.media_reservation();
+                let expected_version = dispatching_version
+                    .checked_sub(1)
+                    .context("image generation media handoff version underflow")?;
+                handoff_external_conn(
+                    conn,
+                    reservation_id,
+                    expected_version,
+                    &operation_id,
+                    &handoff_plans,
+                    now_monotonic_ms,
+                    media_wall_ms,
+                )?;
+                Ok(dispatching)
+            })
+            .await
+    }
+
+    pub async fn finish_external_handoff(
+        &self,
+        dispatching: DispatchingImageGenerationAttempt,
+        evidence: ImageSpendDispatchEvidence,
+        at_unix_ms: i64,
+    ) -> Result<()> {
+        let operation_id = dispatching.operation().operation_id.to_string();
+        let (reservation_id, reservation_version) = dispatching.media_reservation();
+        let reservation_id = reservation_id.to_owned();
+        let media_outcome = match evidence {
+            ImageSpendDispatchEvidence::Accepted => MediaExternalHandoffOutcome::Accepted,
+            ImageSpendDispatchEvidence::DefinitivelyRejected => {
+                MediaExternalHandoffOutcome::DefinitivelyRejected
+            }
+            ImageSpendDispatchEvidence::SubmissionUnknown => {
+                MediaExternalHandoffOutcome::SubmissionUnknown
+            }
+        };
+        self.db
+            .transaction(move |conn| {
+                cockpit_db::Db::finish_image_generation_handoff_conn(
+                    conn,
+                    dispatching,
+                    evidence,
+                    at_unix_ms,
+                )?;
+                finish_external_handoff_conn(
+                    conn,
+                    &reservation_id,
+                    reservation_version,
+                    &operation_id,
+                    media_outcome,
+                )?;
+                Ok(())
+            })
+            .await
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeTargetAuthorityV1 {

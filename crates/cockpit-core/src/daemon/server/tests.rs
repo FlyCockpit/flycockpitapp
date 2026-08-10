@@ -5854,6 +5854,81 @@ async fn remote_fs_rename_fails_closed_before_reservation_until_held_recovery_is
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
+async fn remote_fs_rename_present_but_blocked_journal_rejects_before_observation_or_reservation() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let durable = tempfile::tempdir().unwrap();
+    let spool_path = durable.path().join("spool");
+    std::fs::write(tmp.path().join("from.txt"), b"value").unwrap();
+    let ctx = disk_test_ctx(&durable.path().join("daemon.db"), &spool_path);
+    std::fs::set_permissions(&spool_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let attachment = Uuid::parse_str("22222222-2222-4222-8222-2222222222bc").unwrap();
+    let operation_id = Uuid::parse_str("018f3f24-7a10-7cc2-8f55-1111111111bc").unwrap();
+    let mut state = remote_state_with_grants(vec![project_files_grant(tmp.path())]);
+    let ClientPrincipal::Remote(principal) = &mut state.principal else {
+        panic!("remote")
+    };
+    principal.actor_binding = Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+        schema_version: 1,
+        device_id: Uuid::parse_str("33333333-3333-4333-8333-3333333333bc").unwrap(),
+        device_generation: 1,
+        logical_attachment_id: attachment,
+    });
+    let mut shared = state.shared_snapshot();
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_tx, _) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let mut concurrent = ConcurrentRequestRuntime::new();
+    let request_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            request_id,
+            proto::RemoteOperationIdentityV1::new(attachment, operation_id).unwrap(),
+            Request::FsRename {
+                project_root: tmp.path().to_string_lossy().into_owned(),
+                from_path: "from.txt".into(),
+                to_path: "to.txt".into(),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(recv_writer_body(&mut writer_rx, "blocked rename journal").await,
+        Body::Error { id: Some(id), error } if id == request_id && error.code == ErrorCode::Unavailable)
+    );
+    let counts: (i64, i64) = ctx
+        .db
+        .read(|conn| {
+            Ok((
+                conn.query_row(
+                    "SELECT COUNT(*) FROM remote_attachment_operations",
+                    [],
+                    |row| row.get(0),
+                )?,
+                conn.query_row("SELECT COUNT(*) FROM remote_rename_journal", [], |row| {
+                    row.get(0)
+                })?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(counts, (0, 0));
+    assert_eq!(
+        std::fs::read(tmp.path().join("from.txt")).unwrap(),
+        b"value"
+    );
+    assert!(!tmp.path().join("to.txt").exists());
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
 async fn remote_fs_rename_real_ingress_applies_replays_and_conflicts_without_second_effect() {
     let tmp = tempfile::tempdir().unwrap();
     let durable = tempfile::tempdir().unwrap();

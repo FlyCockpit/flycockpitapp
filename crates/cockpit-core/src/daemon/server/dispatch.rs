@@ -504,6 +504,13 @@ async fn execute_remote_staged_rename_with_hook(
         code: ErrorCode::Unavailable,
         message: "remote staged rename recovery authority is unavailable".into(),
     })?;
+    journal
+        .ensure_dispatch_allowed()
+        .await
+        .map_err(|error| ErrorPayload {
+            code: ErrorCode::Unavailable,
+            message: format!("remote staged rename recovery authority blocked dispatch: {error}"),
+        })?;
     let paths: Vec<std::path::PathBuf> = authorized
         .fcor_resources
         .iter()

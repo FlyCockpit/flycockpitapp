@@ -377,6 +377,13 @@ CREATE TABLE media_component_deletion_evidence (
     CHECK(length(deletion_evidence_digest)=64 AND deletion_evidence_digest NOT GLOB '*[^0-9a-f]*')
 );
 
+CREATE TABLE media_cleanup_security_evidence (
+    component_id TEXT PRIMARY KEY,
+    attachment_id TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK(reason='storage_security_violation'),
+    recorded_at_unix_ms INTEGER NOT NULL
+);
+
 CREATE TABLE media_security_recovery_operations (
     local_request_id       TEXT PRIMARY KEY,
     owner_principal_digest TEXT NOT NULL,

@@ -135,6 +135,15 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    async fn block_cleanup_security_ambiguity(
+        &self,
+        attachment_id: String,
+        component_id: String,
+        now_unix_ms: i64,
+    ) -> Result<()> {
+        self.db.transaction(move|conn|{let (availability,generation):(String,String)=conn.query_row("SELECT availability,availability_generation FROM media_attachments WHERE attachment_id=?1",[&attachment_id],|row|Ok((row.get(0)?,row.get(1)?)))?;if availability=="security_blocked"{return Ok(());}ensure!(matches!(availability.as_str(),"owned_cleanup_pending"|"borrowed_cleanup_pending"),"cleanup security transition requires pending state");let next=generation.parse::<u64>()?.checked_add(1).context("availability generation overflow")?.to_string();ensure!(conn.execute("UPDATE media_attachments SET availability='security_blocked',availability_generation=?1,updated_at_unix_ms=?2 WHERE attachment_id=?3 AND availability_generation=?4",params![next,now_unix_ms,attachment_id,generation])?==1,"cleanup security aggregate CAS failed");let component_generation:String=conn.query_row("SELECT component_generation FROM media_attachment_components WHERE component_id=?1",[&component_id],|row|row.get(0))?;let component_next=component_generation.parse::<u64>()?.checked_add(1).context("component generation overflow")?.to_string();ensure!(conn.execute("UPDATE media_attachment_components SET lifecycle_state='security_blocked',component_generation=?1,updated_at_unix_ms=?2 WHERE component_id=?3 AND component_generation=?4 AND lifecycle_state='cleanup_pending'",params![component_next,now_unix_ms,component_id,component_generation])?==1,"cleanup security component CAS failed");conn.execute("INSERT INTO media_cleanup_security_evidence(component_id,attachment_id,reason,recorded_at_unix_ms) VALUES(?1,?2,'storage_security_violation',?3)",params![component_id,attachment_id,now_unix_ms])?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,?3,'security_blocked',?4,?5)",params![attachment_id,next,availability,Uuid::now_v7().to_string(),now_unix_ms])?;Ok(())}).await
+    }
+
     /// Starts every due 24-hour orphan-draft or 30-day completed-session
     /// cleanup with one writer CAS. Files are untouched until the exact
     /// component-set intent is durable.
@@ -182,24 +191,42 @@ impl MediaStorageRecovery {
             }
             let intent_digest = crate::intel::hex_lower(&intent_hasher.finalize());
             let existing_intent=self.db.read({let component_id=component_id.clone();move|conn|conn.query_row("SELECT intent_digest FROM media_component_deletion_intents WHERE component_id=?1",[component_id],|row|row.get::<_,String>(0)).optional().map_err(Into::into)}).await?;
-            ensure!(
-                existing_intent
-                    .as_ref()
-                    .is_none_or(|stored| stored == &intent_digest),
-                "storage_security_violation"
-            );
+            if !existing_intent
+                .as_ref()
+                .is_none_or(|stored| stored == &intent_digest)
+            {
+                self.block_cleanup_security_ambiguity(
+                    attachment_id.clone(),
+                    component_id.clone(),
+                    now_unix_ms,
+                )
+                .await?;
+                anyhow::bail!("storage_security_violation");
+            }
             let opened = self.owned_root.open_file_verified(&storage_id);
             let deletion_kind = match opened {
                 Ok(mut file) => {
-                    let before = stable_identity_digest(&file)?;
-                    let (actual_length, actual_checksum) = read_full_digest(&mut file)?;
-                    ensure!(
-                        before == identity
-                            && actual_length == length
-                            && actual_checksum == checksum
-                            && stable_identity_digest(&file)? == before,
-                        "storage_security_violation"
-                    );
+                    let proof = (|| -> Result<()> {
+                        let before = stable_identity_digest(&file)?;
+                        let (actual_length, actual_checksum) = read_full_digest(&mut file)?;
+                        ensure!(
+                            before == identity
+                                && actual_length == length
+                                && actual_checksum == checksum
+                                && stable_identity_digest(&file)? == before,
+                            "storage_security_violation"
+                        );
+                        Ok(())
+                    })();
+                    if let Err(error) = proof {
+                        self.block_cleanup_security_ambiguity(
+                            attachment_id.clone(),
+                            component_id.clone(),
+                            now_unix_ms,
+                        )
+                        .await?;
+                        return Err(error);
+                    }
                     if existing_intent.is_none() {
                         let component = component_id.clone();
                         let attachment = attachment_id.clone();
@@ -209,14 +236,38 @@ impl MediaStorageRecovery {
                         let digest = intent_digest.clone();
                         self.db.transaction(move|conn|{conn.execute("INSERT INTO media_component_deletion_intents(component_id,attachment_id,storage_id,stable_identity_digest,byte_length,sha256,intent_digest,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![component,attachment,storage,identity,length.to_string(),checksum,digest,now_unix_ms])?;Ok(())}).await?;
                     }
-                    self.owned_root
-                        .remove_file(&storage_id)
-                        .map_err(anyhow::Error::new)?;
-                    self.owned_root.sync().map_err(anyhow::Error::new)?;
+                    if let Err(error) = self.owned_root.remove_file(&storage_id) {
+                        self.block_cleanup_security_ambiguity(
+                            attachment_id.clone(),
+                            component_id.clone(),
+                            now_unix_ms,
+                        )
+                        .await?;
+                        return Err(anyhow::Error::new(error)
+                            .context("storage_security_violation during media cleanup"));
+                    }
+                    if let Err(error) = self.owned_root.sync() {
+                        self.block_cleanup_security_ambiguity(
+                            attachment_id.clone(),
+                            component_id.clone(),
+                            now_unix_ms,
+                        )
+                        .await?;
+                        return Err(anyhow::Error::new(error)
+                            .context("storage_security_violation during media cleanup"));
+                    }
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::MetadataExt as _;
-                        ensure!(file.metadata()?.nlink() == 0, "storage_security_violation");
+                        if file.metadata()?.nlink() != 0 {
+                            self.block_cleanup_security_ambiguity(
+                                attachment_id.clone(),
+                                component_id.clone(),
+                                now_unix_ms,
+                            )
+                            .await?;
+                            anyhow::bail!("storage_security_violation");
+                        }
                     }
                     "verified_unlink"
                 }
@@ -226,6 +277,12 @@ impl MediaStorageRecovery {
                     "interrupted_unlink_reconciled"
                 }
                 Err(error) => {
+                    self.block_cleanup_security_ambiguity(
+                        attachment_id.clone(),
+                        component_id.clone(),
+                        now_unix_ms,
+                    )
+                    .await?;
                     return Err(anyhow::Error::new(error)
                         .context("storage_security_violation during media cleanup"));
                 }

@@ -5147,6 +5147,10 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    struct ScriptedAudioRunner {
+        calls: AtomicUsize,
+    }
+
     struct ScriptedHttpsFetcher {
         calls: AtomicUsize,
         bytes: Vec<u8>,
@@ -5226,6 +5230,46 @@ mod tests {
             std::fs::write(output, canonical_video_fixture())?;
             Ok(BoundedRuntimeOutput {
                 stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AvRuntimeRunner for ScriptedAudioRunner {
+        async fn run(
+            &self,
+            _program: &Path,
+            args: &[String],
+            _input: Vec<u8>,
+            _stdout_limit: u64,
+            _deadline: std::time::Duration,
+        ) -> Result<BoundedRuntimeOutput> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if args.iter().any(|arg| arg == "-show_frames") {
+                return Ok(BoundedRuntimeOutput {
+                    stdout: br#"{"streams":[{"index":0,"codec_type":"audio","codec_name":"pcm_s16le","disposition":{"default":1},"sample_rate":"48000","channels":1}],"frames":[]}"#.to_vec(),
+                    stderr: Vec::new(),
+                });
+            }
+            if args.windows(2).any(|pair| pair == ["-f", "null"]) {
+                return Ok(BoundedRuntimeOutput {
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                });
+            }
+            let mut wav = b"RIFF".to_vec();
+            wav.extend_from_slice(&36u32.to_le_bytes());
+            wav.extend_from_slice(b"WAVEfmt ");
+            wav.extend_from_slice(&16u32.to_le_bytes());
+            wav.extend_from_slice(&[1, 0, 1, 0]);
+            wav.extend_from_slice(&48_000u32.to_le_bytes());
+            wav.extend_from_slice(&96_000u32.to_le_bytes());
+            wav.extend_from_slice(&[2, 0, 16, 0]);
+            wav.extend_from_slice(b"data");
+            wav.extend_from_slice(&0u32.to_le_bytes());
+            Ok(BoundedRuntimeOutput {
+                stdout: wav,
                 stderr: Vec::new(),
             })
         }
@@ -6277,6 +6321,153 @@ mod tests {
         );
         let state = db.read(|conn| Ok((conn.query_row("SELECT availability FROM media_attachments", [], |r| r.get::<_, String>(0))?, conn.query_row("SELECT COUNT(*) FROM media_attachment_processing_failure_evidence WHERE reason='model_runtime_unavailable'", [], |r| r.get::<_, i64>(0))?))).await.unwrap();
         assert_eq!(state, ("model_derivative_unavailable".into(), 1));
+    }
+
+    #[tokio::test]
+    async fn retained_av_shared_consumer_success_failure_and_replay() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
+        let session_id = Uuid::now_v7();
+        db.transaction(move |conn| {
+            conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/redacted',1,1)",[session_id.to_string()])?;
+            Ok(())
+        }).await.unwrap();
+        let runtime = ApprovedAvRuntime {
+            ffmpeg: "/approved/ffmpeg".into(),
+            ffprobe: "/approved/ffprobe".into(),
+            fingerprint: "ab".repeat(32),
+        };
+        async fn retain(
+            recovery: &MediaStorageRecovery,
+            session_id: Uuid,
+            draft: Uuid,
+            kind: RequestedLocalPathMediaKind,
+            now: i64,
+        ) {
+            recovery
+                .retain_https_media(
+                    RetainHttpsMediaV1 {
+                        schema_version: 1,
+                        kind: "retainHttpsMedia".into(),
+                        local_operation_id: Uuid::now_v7(),
+                        owner_principal_digest: "22".repeat(32),
+                        session_id,
+                        canonical_project_digest: "11".repeat(32),
+                        client_draft_id: draft,
+                        requested_media_kind: kind,
+                        url: "https://media.example.test/av".into(),
+                    },
+                    &cockpit_config::config::media_budget::MediaResourcePolicy::default(),
+                    now as u64,
+                    now,
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut wav = b"RIFF".to_vec();
+        wav.extend_from_slice(&36u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&[1, 0, 1, 0]);
+        wav.extend_from_slice(&48_000u32.to_le_bytes());
+        wav.extend_from_slice(&96_000u32.to_le_bytes());
+        wav.extend_from_slice(&[2, 0, 16, 0]);
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&0u32.to_le_bytes());
+        let audio_runner = std::sync::Arc::new(ScriptedAudioRunner {
+            calls: AtomicUsize::new(0),
+        });
+        let recovery = MediaStorageRecovery::open_or_create(db.clone(), &temp.path().join("media"))
+            .unwrap()
+            .with_https_fetcher(std::sync::Arc::new(ScriptedHttpsFetcher {
+                calls: AtomicUsize::new(0),
+                bytes: wav,
+            }))
+            .with_av_runtime(runtime.clone())
+            .with_av_runner(audio_runner.clone());
+        retain(
+            &recovery,
+            session_id,
+            Uuid::now_v7(),
+            RequestedLocalPathMediaKind::Audio,
+            10,
+        )
+        .await;
+        assert_eq!(recovery.process_retained_https_jobs(11).await.unwrap(), 1);
+        assert_eq!(
+            recovery
+                .process_retained_https_jobs(1_000_000)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(audio_runner.calls.load(Ordering::SeqCst) >= 3);
+
+        let video_runner = std::sync::Arc::new(ScriptedVideoRunner {
+            fail_encode: AtomicBool::new(false),
+            calls: AtomicUsize::new(0),
+        });
+        let recovery = MediaStorageRecovery::open(db.clone(), &temp.path().join("media"))
+            .unwrap()
+            .with_https_fetcher(std::sync::Arc::new(ScriptedHttpsFetcher {
+                calls: AtomicUsize::new(0),
+                bytes: canonical_video_fixture(),
+            }))
+            .with_av_runtime(runtime.clone())
+            .with_av_runner(video_runner.clone());
+        retain(
+            &recovery,
+            session_id,
+            Uuid::now_v7(),
+            RequestedLocalPathMediaKind::Video,
+            20,
+        )
+        .await;
+        assert_eq!(recovery.process_retained_https_jobs(21).await.unwrap(), 1);
+        assert_eq!(
+            recovery
+                .process_retained_https_jobs(1_000_000)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(video_runner.calls.load(Ordering::SeqCst) >= 4);
+
+        let failing_runner = std::sync::Arc::new(ScriptedVideoRunner {
+            fail_encode: AtomicBool::new(true),
+            calls: AtomicUsize::new(0),
+        });
+        let recovery = MediaStorageRecovery::open(db.clone(), &temp.path().join("media"))
+            .unwrap()
+            .with_https_fetcher(std::sync::Arc::new(ScriptedHttpsFetcher {
+                calls: AtomicUsize::new(0),
+                bytes: canonical_video_fixture(),
+            }))
+            .with_av_runtime(runtime)
+            .with_av_runner(failing_runner);
+        retain(
+            &recovery,
+            session_id,
+            Uuid::now_v7(),
+            RequestedLocalPathMediaKind::Video,
+            30,
+        )
+        .await;
+        assert_eq!(recovery.process_retained_https_jobs(31).await.unwrap(), 1);
+        assert_eq!(
+            recovery
+                .process_retained_https_jobs(1_000_000)
+                .await
+                .unwrap(),
+            0
+        );
+        let states = db.read(|conn| Ok((
+            conn.query_row("SELECT COUNT(*) FROM media_attachments WHERE availability='ready' AND media_kind IN ('audio','video')", [], |r| r.get::<_, i64>(0))?,
+            conn.query_row("SELECT COUNT(*) FROM media_attachments WHERE availability='failed' AND media_kind='video'", [], |r| r.get::<_, i64>(0))?,
+            conn.query_row("SELECT COUNT(*) FROM media_av_normalization_evidence", [], |r| r.get::<_, i64>(0))?,
+        ))).await.unwrap();
+        assert_eq!(states, (2, 1, 2));
     }
 
     #[tokio::test]

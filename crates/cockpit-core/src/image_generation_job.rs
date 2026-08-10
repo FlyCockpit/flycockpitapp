@@ -3091,9 +3091,9 @@ mod tests {
         }
         .canonical_json()
         .unwrap();
-        fixture
+        let output = fixture
             .db
-            .blocking_for_sync_cli(|conn| {
+            .blocking_for_sync_cli(move |conn| {
                 let owner = ImageGenerationOwnerContextAuthority::from_attached_session(
                     conn,
                     owner_session_id,
@@ -3130,7 +3130,7 @@ mod tests {
                         evidence_json: &prepared,
                     },
                 )?;
-                Ok(())
+                Ok(output)
             })
             .unwrap();
         output.force_next_directory_sync_failure();
@@ -3140,7 +3140,7 @@ mod tests {
         else {
             panic!("post-effect sync cut did not yield restart recovery")
         };
-        fixture.db.blocking_for_sync_cli(|conn| {
+        fixture.db.blocking_for_sync_cli(move |conn| {
             let owner = ImageGenerationOwnerContextAuthority::from_attached_session(
                 conn,
                 owner_session_id,

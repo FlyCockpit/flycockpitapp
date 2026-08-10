@@ -2875,12 +2875,103 @@ fn verify_canonical_video_mp4(bytes: &[u8]) -> Result<()> {
         "invalid_media"
     );
     let moov = moov.context("invalid_media")?;
-    for forbidden in [b"edts".as_slice(), b"udta", b"meta", b"chap"] {
+    let mut proof = Mp4StructuralProof::default();
+    walk_mp4_atoms(moov, &mut proof)?;
+    ensure!(
+        proof.avc1_entries == 1
+            && proof.mp4a_entries <= 1
+            && proof.data_references >= 1
+            && proof.data_references == proof.self_contained_data_references,
+        "invalid_media"
+    );
+    Ok(())
+}
+
+#[derive(Default)]
+struct Mp4StructuralProof {
+    avc1_entries: usize,
+    mp4a_entries: usize,
+    data_references: usize,
+    self_contained_data_references: usize,
+}
+
+fn walk_mp4_atoms(bytes: &[u8], proof: &mut Mp4StructuralProof) -> Result<()> {
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        ensure!(offset + 8 <= bytes.len(), "invalid_media");
+        let short = u32::from_be_bytes(bytes[offset..offset + 4].try_into()?) as u64;
+        let kind: [u8; 4] = bytes[offset + 4..offset + 8].try_into()?;
+        let (header, size) = if short == 1 {
+            ensure!(offset + 16 <= bytes.len(), "invalid_media");
+            (
+                16usize,
+                u64::from_be_bytes(bytes[offset + 8..offset + 16].try_into()?),
+            )
+        } else {
+            (8usize, short)
+        };
+        ensure!(size >= header as u64, "invalid_media");
+        let end = offset
+            .checked_add(usize::try_from(size)?)
+            .context("invalid_media")?;
+        ensure!(end <= bytes.len(), "invalid_media");
+        let payload = &bytes[offset + header..end];
         ensure!(
-            !moov.windows(4).any(|value| value == forbidden),
+            !matches!(&kind, b"edts" | b"udta" | b"meta" | b"chap"),
             "invalid_media"
         );
+        if matches!(&kind, b"trak" | b"mdia" | b"minf" | b"stbl" | b"dinf") {
+            walk_mp4_atoms(payload, proof)?;
+        } else if &kind == b"dref" {
+            ensure!(payload.len() >= 8, "invalid_media");
+            let count = u32::from_be_bytes(payload[4..8].try_into()?) as usize;
+            let mut child = 8usize;
+            for _ in 0..count {
+                ensure!(child + 12 <= payload.len(), "invalid_media");
+                let size = u32::from_be_bytes(payload[child..child + 4].try_into()?) as usize;
+                ensure!(
+                    size >= 12
+                        && child
+                            .checked_add(size)
+                            .is_some_and(|end| end <= payload.len()),
+                    "invalid_media"
+                );
+                ensure!(&payload[child + 4..child + 8] == b"url ", "invalid_media");
+                let flags =
+                    u32::from_be_bytes(payload[child + 8..child + 12].try_into()?) & 0x00ff_ffff;
+                proof.data_references += 1;
+                if flags == 1 && size == 12 {
+                    proof.self_contained_data_references += 1;
+                }
+                child += size;
+            }
+            ensure!(child == payload.len(), "invalid_media");
+        } else if &kind == b"stsd" {
+            ensure!(payload.len() >= 8, "invalid_media");
+            let count = u32::from_be_bytes(payload[4..8].try_into()?) as usize;
+            let mut entry = 8usize;
+            for _ in 0..count {
+                ensure!(entry + 8 <= payload.len(), "invalid_media");
+                let size = u32::from_be_bytes(payload[entry..entry + 4].try_into()?) as usize;
+                ensure!(
+                    size >= 8
+                        && entry
+                            .checked_add(size)
+                            .is_some_and(|end| end <= payload.len()),
+                    "invalid_media"
+                );
+                match &payload[entry + 4..entry + 8] {
+                    b"avc1" => proof.avc1_entries += 1,
+                    b"mp4a" => proof.mp4a_entries += 1,
+                    _ => anyhow::bail!("invalid_media"),
+                }
+                entry += size;
+            }
+            ensure!(entry == payload.len(), "invalid_media");
+        }
+        offset = end;
     }
+    ensure!(offset == bytes.len(), "invalid_media");
     Ok(())
 }
 
@@ -3956,13 +4047,35 @@ mod tests {
 
     #[test]
     fn canonical_video_mp4_requires_exact_brands_and_moov_before_mdat() {
+        let atom = |kind: &[u8; 4], payload: &[u8]| {
+            let mut atom = Vec::new();
+            atom.extend_from_slice(&u32::try_from(payload.len() + 8).unwrap().to_be_bytes());
+            atom.extend_from_slice(kind);
+            atom.extend_from_slice(payload);
+            atom
+        };
+        let mut dref = vec![0, 0, 0, 0];
+        dref.extend_from_slice(&1u32.to_be_bytes());
+        dref.extend_from_slice(&12u32.to_be_bytes());
+        dref.extend_from_slice(b"url \0\0\0\x01");
+        let dinf = atom(b"dinf", &atom(b"dref", &dref));
+        let mut stsd = vec![0, 0, 0, 0];
+        stsd.extend_from_slice(&1u32.to_be_bytes());
+        stsd.extend_from_slice(&8u32.to_be_bytes());
+        stsd.extend_from_slice(b"avc1");
+        let stbl = atom(b"stbl", &atom(b"stsd", &stsd));
+        let mut minf_payload = dinf;
+        minf_payload.extend_from_slice(&stbl);
+        let minf = atom(b"minf", &minf_payload);
+        let mdia = atom(b"mdia", &minf);
+        let trak = atom(b"trak", &mdia);
+        let moov = atom(b"moov", &trak);
         let mut output = Vec::new();
         output.extend_from_slice(&32u32.to_be_bytes());
         output.extend_from_slice(b"ftypisom");
         output.extend_from_slice(&512u32.to_be_bytes());
         output.extend_from_slice(b"isomiso2avc1mp41");
-        output.extend_from_slice(&8u32.to_be_bytes());
-        output.extend_from_slice(b"moov");
+        output.extend_from_slice(&moov);
         output.extend_from_slice(&8u32.to_be_bytes());
         output.extend_from_slice(b"mdat");
         verify_canonical_video_mp4(&output).unwrap();
@@ -3970,8 +4083,8 @@ mod tests {
         bad_brand[20..24].copy_from_slice(b"mp42");
         assert!(verify_canonical_video_mp4(&bad_brand).is_err());
         let mut bad_order = output[..32].to_vec();
-        bad_order.extend_from_slice(&output[40..]);
-        bad_order.extend_from_slice(&output[32..40]);
+        bad_order.extend_from_slice(&output[32 + moov.len()..]);
+        bad_order.extend_from_slice(&output[32..32 + moov.len()]);
         assert!(verify_canonical_video_mp4(&bad_order).is_err());
     }
 

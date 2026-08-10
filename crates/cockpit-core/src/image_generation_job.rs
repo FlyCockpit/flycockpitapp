@@ -15,6 +15,9 @@ use uuid::Uuid;
 use crate::daemon::principal::ClientPrincipal;
 use crate::image_generation_runtime::ImageHealthSnapshot;
 use cockpit_config::config::media_budget::MediaReservationPlan;
+use cockpit_db::db::external_journal::{
+    ExternalJournalDigest, ExternalJournalToken, PrepareExternalOperation, ProviderIdempotency,
+};
 use cockpit_db::db::image_generation::{
     AdvanceImageGenerationLatePublication, CreateImageGenerationArtifact,
     CreateImageGenerationArtifactComponent, DispatchingImageGenerationAttempt,
@@ -188,16 +191,6 @@ pub struct DecodedImageGenerationDispatchCandidate {
     pub media_plan: MediaReservationPlan,
 }
 
-#[async_trait::async_trait]
-pub trait ImageGenerationDispatchAuthority: Send + Sync {
-    async fn prepare_claimed(
-        &self,
-        candidate: DecodedImageGenerationDispatchCandidate,
-        worker_boot_id: Uuid,
-        claim_generation: u64,
-    ) -> Result<(PreparedImageGenerationDispatch, Vec<MediaReservationPlan>)>;
-}
-
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ImageGenerationSchedulerPass {
     pub scanned: u32,
@@ -248,10 +241,32 @@ impl ImageGenerationDispatcher {
             .await
     }
 
-    pub async fn run_scheduler_pass<A, P>(
+    async fn prepare_claimed_candidate(
+        &self,
+        candidate: DecodedImageGenerationDispatchCandidate,
+        worker_boot_id: Uuid,
+        claim_generation: u64,
+        at_unix_ms: i64,
+        now_monotonic_ms: u64,
+    ) -> Result<(PreparedImageGenerationDispatch, Vec<MediaReservationPlan>)> {
+        self.db.transaction(move |conn| {
+            let c=&candidate.candidate;
+            ensure!(conn.query_row("SELECT EXISTS(SELECT 1 FROM image_generation_scheduler_claims WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND worker_boot_id=?4 AND claim_generation=?5 AND expires_at_unix_ms>CAST(unixepoch('subsec')*1000 AS INTEGER))",params![c.job_id.to_string(),c.slot_id.to_string(),i64::from(c.attempt_number),worker_boot_id.to_string(),i64::try_from(claim_generation)?],|row|row.get::<_,bool>(0))?,"image generation scheduler claim is stale");
+            let attempt=candidate.plan.targets.iter().flat_map(|target|target.slots.iter()).find(|slot|slot.slot_id==c.slot_id).and_then(|slot|slot.attempts.iter().find(|attempt|attempt.attempt_number==c.attempt_number)).context("scheduler attempt is absent from immutable plan")?;
+            let media_id=candidate.plan.central_resources.first().context("scheduler media reservation is absent")?.reservation_identity.clone();
+            let media_version=u64::try_from(conn.query_row::<i64,_,_>("SELECT version FROM media_reservations WHERE reservation_id=?1 AND state='executing_local' AND owner_session_key=?2 AND deadline_monotonic_ms>?3",params![media_id,candidate.plan.owner_session_id.to_string(),i64::try_from(now_monotonic_ms)?],|row|row.get(0))?)?;
+            let spend_exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM image_spend_reservations r JOIN image_spend_attempts a USING(reservation_id) WHERE r.reservation_id=?1 AND a.attempt_id=?2 AND r.state='reserved')",params![candidate.plan.spend.reservation_id,attempt.provider_idempotency_identity],|row|row.get(0))?;
+            ensure!(spend_exists,"scheduler spend reservation is unavailable");
+            let token=ExternalJournalToken::parse(&crate::intel::hex_lower(&Sha256::digest(attempt.provider_idempotency_identity.as_bytes())))?;
+            let journal=PrepareExternalOperation{operation_kind:ExternalJournalToken::parse("image_generation")?,owner_session_id:ExternalJournalToken::for_session(candidate.plan.owner_session_id),idempotency_key:token.clone(),payload_digest:ExternalJournalDigest::of(&c.canonical_plan),payload_len:c.canonical_plan.len(),provider_idempotency:Some(ProviderIdempotency{key:token,contract:ExternalJournalToken::parse("image_generation_v1")?})};
+            let prepared=cockpit_db::Db::prepare_image_generation_dispatch_conn(conn,&cockpit_db::db::image_generation::PrepareImageGenerationDispatch{job_id:c.job_id,slot_id:c.slot_id,attempt_number:c.attempt_number,expected_job_version:c.job_version,expected_slot_version:c.slot_version,expected_attempt_version:c.attempt_version,spend_reservation_id:&candidate.plan.spend.reservation_id,spend_attempt_id:&attempt.provider_idempotency_identity,media_reservation_id:&media_id,expected_media_reservation_version:media_version,journal:&journal,at_unix_ms,now_monotonic_ms,worker_boot_id,claim_generation})?;
+            Ok((prepared,vec![candidate.media_plan]))
+        }).await
+    }
+
+    pub async fn run_scheduler_pass<A>(
         &self,
         adapter: &A,
-        authority: &P,
         worker_boot_id: Uuid,
         now_monotonic_ms: u64,
         at_unix_ms: i64,
@@ -260,7 +275,6 @@ impl ImageGenerationDispatcher {
     ) -> Result<ImageGenerationSchedulerPass>
     where
         A: ImageGenerationAdapter,
-        P: ImageGenerationDispatchAuthority,
     {
         let candidates = self
             .scan_dispatch_candidates(now_monotonic_ms, limit)
@@ -290,8 +304,14 @@ impl ImageGenerationDispatcher {
             }
             pass.claimed += 1;
             let generation = candidate.candidate.next_claim_generation;
-            let Ok((prepared, plans)) = authority
-                .prepare_claimed(candidate, worker_boot_id, generation)
+            let Ok((prepared, plans)) = self
+                .prepare_claimed_candidate(
+                    candidate,
+                    worker_boot_id,
+                    generation,
+                    at_unix_ms,
+                    now_monotonic_ms,
+                )
                 .await
             else {
                 pass.skipped += 1;

@@ -8,7 +8,6 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Result, ensure};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
@@ -18,15 +17,18 @@ use cockpit_db::db::sealed_scope::SealedActionGrantRow;
 use cockpit_db::image_spend::{AttemptMaximum, SpendReservation};
 use cockpit_db::media_attachments::AcquiredMediaComponentLease;
 
-pub const MAX_IMAGE_GENERATION_TARGETS: usize = 16;
-pub const MAX_IMAGE_GENERATION_SLOTS: usize = 256;
-pub const MAX_IMAGE_GENERATION_ATTEMPTS_PER_SLOT: u32 = 8;
-pub const MAX_IMAGE_GENERATION_DIMENSION: u32 = 16_384;
-const MAX_PLAN_STRING_BYTES: usize = 1_024;
-const MAX_PLAN_LIST_ITEMS: usize = 64;
+pub use cockpit_db::image_generation_plan::{
+    AttemptPlanV1, CapabilityProvenanceV1, GrantRequirementV1, ImageGenerationPlanV1,
+    MAX_IMAGE_GENERATION_ATTEMPTS_PER_SLOT, MAX_IMAGE_GENERATION_DIMENSION,
+    MAX_IMAGE_GENERATION_SLOTS, MAX_IMAGE_GENERATION_TARGETS, OutputDirectoryAuthorityV1,
+    OutputSlotPlanV1, ReferenceArtifactV1, RequestedOutputV1, ResolvedOutputV1,
+    ResourceReservationV1, SpendReservationPlanV1, TargetDestinationV1, TargetPlanV1,
+    TypedParameterV1,
+};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/* DTO declarations live in cockpit-db::image_generation_plan so persistence and
+ * dispatch validate the exact same closed wire schema. */
+/*
 pub struct ImageGenerationPlanV1 {
     pub schema_version: u8,
     pub kind: String,
@@ -174,6 +176,7 @@ pub struct AttemptPlanV1 {
     pub resource_maximum: Vec<ResourceReservationV1>,
     pub maximum_usd_micros: Option<u64>,
 }
+*/
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeTargetAuthorityV1 {
@@ -423,110 +426,106 @@ impl RuntimeTargetAuthorityV1 {
     }
 }
 
-impl ReferenceArtifactV1 {
-    pub fn from_acquired_media_lease(lease: &AcquiredMediaComponentLease) -> Result<Self> {
-        ensure!(
-            lease.component.lifecycle_state == "ready",
-            "reference component is not ready"
-        );
-        ensure!(
-            lease.component.attachment_id == lease.attachment_id
-                && lease.component.attachment_version == lease.attachment_version,
-            "reference lease identity mismatch"
-        );
-        Ok(Self {
-            attachment_id: lease.attachment_id,
-            attachment_version: lease.attachment_version,
-            component_id: lease.component.component_id,
-            component_generation: lease.component.component_generation,
-            media_kind: lease.component.component_kind.clone(),
-            identity_digest: lease.component.stable_identity_digest.clone(),
-            sha256: lease.component.sha256.clone(),
-            byte_length: lease.component.byte_length,
-        })
-    }
+pub fn reference_artifact_from_acquired_media_lease(
+    lease: &AcquiredMediaComponentLease,
+) -> Result<ReferenceArtifactV1> {
+    ensure!(
+        lease.component.lifecycle_state == "ready",
+        "reference component is not ready"
+    );
+    ensure!(
+        lease.component.attachment_id == lease.attachment_id
+            && lease.component.attachment_version == lease.attachment_version,
+        "reference lease identity mismatch"
+    );
+    Ok(ReferenceArtifactV1 {
+        attachment_id: lease.attachment_id,
+        attachment_version: lease.attachment_version,
+        component_id: lease.component.component_id,
+        component_generation: lease.component.component_generation,
+        media_kind: lease.component.component_kind.clone(),
+        identity_digest: lease.component.stable_identity_digest.clone(),
+        sha256: lease.component.sha256.clone(),
+        byte_length: lease.component.byte_length,
+    })
 }
 
-impl GrantRequirementV1 {
-    pub fn from_sealed_grant(grant: &SealedActionGrantRow, now_ms: i64) -> Result<Self> {
-        ensure!(
-            grant.revoked_at_ms.is_none()
-                && grant.expires_at_ms.is_none_or(|expiry| expiry >= now_ms),
-            "sealed grant is not current"
-        );
-        let generation = u64::try_from(grant.use_epoch)?;
-        Ok(Self {
-            grant_kind: grant.action_id.clone(),
-            authority_digest: digest_fields(&[
-                &grant.grant_id,
-                &grant.record_id,
-                &grant.project_key,
-                &grant.session_id,
-                &grant.action_id,
-            ]),
-            generation,
-        })
-    }
+pub fn grant_requirement_from_sealed_grant(
+    grant: &SealedActionGrantRow,
+    now_ms: i64,
+) -> Result<GrantRequirementV1> {
+    ensure!(
+        grant.revoked_at_ms.is_none() && grant.expires_at_ms.is_none_or(|expiry| expiry >= now_ms),
+        "sealed grant is not current"
+    );
+    let generation = u64::try_from(grant.use_epoch)?;
+    Ok(GrantRequirementV1 {
+        grant_kind: grant.action_id.clone(),
+        authority_digest: digest_fields(&[
+            &grant.grant_id,
+            &grant.record_id,
+            &grant.project_key,
+            &grant.session_id,
+            &grant.action_id,
+        ]),
+        generation,
+    })
 }
 
-impl ResourceReservationV1 {
-    pub fn from_media_reservation(
-        plan: &MediaReservationPlan,
-        reservation_identity: String,
-    ) -> Result<Self> {
-        ensure!(
-            plan.requested > 0 && valid_string(&reservation_identity),
-            "media reservation is invalid"
-        );
-        Ok(Self {
-            resource_kind: serde_json::to_value(plan.dimension)?
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("media dimension is not a string"))?
-                .to_owned(),
-            units: plan.requested,
-            reservation_identity,
-        })
-    }
+pub fn resource_reservation_from_media_reservation(
+    plan: &MediaReservationPlan,
+    reservation_identity: String,
+) -> Result<ResourceReservationV1> {
+    ensure!(
+        plan.requested > 0 && valid_string(&reservation_identity),
+        "media reservation is invalid"
+    );
+    Ok(ResourceReservationV1 {
+        resource_kind: serde_json::to_value(plan.dimension)?
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("media dimension is not a string"))?
+            .to_owned(),
+        units: plan.requested,
+        reservation_identity,
+    })
 }
 
-impl SpendReservationPlanV1 {
-    pub fn from_spend_reservation(
-        reservation: &SpendReservation,
-        attempts: &[AttemptMaximum],
-    ) -> Result<Self> {
-        ensure!(!attempts.is_empty(), "spend attempt graph is empty");
-        let maximum =
-            attempts
-                .iter()
-                .try_fold(Some(0_u64), |total, attempt| -> Result<Option<u64>> {
-                    match (total, attempt.usd_micros) {
-                        (Some(total), Some(value)) => {
-                            Ok(Some(total.checked_add(value).ok_or_else(|| {
-                                anyhow::anyhow!("spend maximum overflow")
-                            })?))
-                        }
-                        _ => Ok(None),
+pub fn spend_plan_from_spend_reservation(
+    reservation: &SpendReservation,
+    attempts: &[AttemptMaximum],
+) -> Result<SpendReservationPlanV1> {
+    ensure!(!attempts.is_empty(), "spend attempt graph is empty");
+    let maximum =
+        attempts
+            .iter()
+            .try_fold(Some(0_u64), |total, attempt| -> Result<Option<u64>> {
+                match (total, attempt.usd_micros) {
+                    (Some(total), Some(value)) => {
+                        Ok(Some(total.checked_add(value).ok_or_else(|| {
+                            anyhow::anyhow!("spend maximum overflow")
+                        })?))
                     }
-                })?;
-        ensure!(
-            reservation.reserved_usd_micros == maximum
-                || reservation.cost_unknown && maximum.is_none(),
-            "spend reservation does not cover attempt graph"
-        );
-        let mut fields = vec![reservation.reservation_id.as_str()];
-        for attempt in attempts {
-            fields.push(attempt.attempt_id.as_str());
-        }
-        Ok(Self {
-            required: maximum.is_none_or(|value| value > 0),
-            policy_version: reservation.policy_version,
-            reservation_id: reservation.reservation_id.clone(),
-            maximum_usd_micros: maximum,
-            plan_digest: digest_fields(&fields),
-        })
+                    _ => Ok(None),
+                }
+            })?;
+    ensure!(
+        reservation.reserved_usd_micros == maximum || reservation.cost_unknown && maximum.is_none(),
+        "spend reservation does not cover attempt graph"
+    );
+    let mut fields = vec![reservation.reservation_id.as_str()];
+    for attempt in attempts {
+        fields.push(attempt.attempt_id.as_str());
     }
+    Ok(SpendReservationPlanV1 {
+        required: maximum.is_none_or(|value| value > 0),
+        policy_version: reservation.policy_version,
+        reservation_id: reservation.reservation_id.clone(),
+        maximum_usd_micros: maximum,
+        plan_digest: digest_fields(&fields),
+    })
 }
 
+#[cfg(any())]
 impl ImageGenerationPlanV1 {
     pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
         self.validate()?;
@@ -721,20 +720,10 @@ pub fn verify_canonical_image_generation_plan(
     bytes: &[u8],
     expected_digest: &str,
 ) -> Result<ImageGenerationPlanV1> {
-    validate_digest(expected_digest)?;
-    let plan: ImageGenerationPlanV1 = serde_json::from_slice(bytes)?;
-    plan.validate()?;
-    ensure!(
-        serde_json::to_vec(&plan)? == bytes,
-        "plan bytes are not canonical"
-    );
-    ensure!(
-        crate::intel::hex_lower(&Sha256::digest(bytes)) == expected_digest,
-        "plan digest mismatch"
-    );
-    Ok(plan)
+    ImageGenerationPlanV1::from_canonical(bytes, expected_digest)
 }
 
+#[cfg(any())]
 impl TargetPlanV1 {
     fn validate(&self, operation_deadline_monotonic_ms: u64) -> Result<()> {
         ensure!(

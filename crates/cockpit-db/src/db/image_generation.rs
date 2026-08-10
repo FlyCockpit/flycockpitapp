@@ -13,6 +13,7 @@ use super::Db;
 use super::external_journal::{
     ExternalJournalState, ExternalTransitionOutcome, transition_external_operation_conn,
 };
+use super::image_generation_plan::ImageGenerationPlanV1;
 
 macro_rules! state_enum {
     ($name:ident { $($variant:ident => $text:literal),+ $(,)? }) => {
@@ -354,144 +355,189 @@ impl<'a> CreateImageGenerationJob<'a> {
         plan_digest: &'a str,
         created_at_unix_ms: i64,
     ) -> Result<Self> {
-        ensure!(
-            canonical_plan.first() == Some(&b'{')
-                && canonical_plan.last() == Some(&b'}')
-                && !json_has_unquoted_whitespace(canonical_plan),
-            "plan JSON is not canonical"
-        );
-        reject_duplicate_json_keys(canonical_plan)?;
-        ensure!(
-            json_keys_are_ordered(
-                canonical_plan,
-                &[
-                    "schemaVersion",
-                    "kind",
-                    "jobId",
-                    "ownerSessionId",
-                    "ownerPrincipalDigest",
-                    "projectIdentityDigest",
-                    "configGeneration",
-                    "enqueueStartedMonotonicMs",
-                    "operationDeadlineMonotonicMs",
-                    "requiredGrants",
-                    "centralResources",
-                    "spend",
-                    "outputAuthority",
-                    "targets"
-                ]
-            ),
-            "plan JSON field order is not canonical"
-        );
-        let computed = hex_lower(&Sha256::digest(canonical_plan));
-        ensure!(computed == plan_digest, "sealed plan digest mismatch");
-        let plan: serde_json::Value = serde_json::from_slice(canonical_plan)?;
-        let job_id = Uuid::parse_str(
-            plan.get("jobId")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| anyhow::anyhow!("sealed plan job identity missing"))?,
-        )?;
-        let targets = plan
-            .get("targets")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| anyhow::anyhow!("sealed plan targets missing"))?;
-        let mut slot_count = 0_u32;
-        let mut max_attempt_count = None;
+        let plan = ImageGenerationPlanV1::from_canonical(canonical_plan, plan_digest)?;
         let mut sealed_slots = Vec::new();
-        for target in targets {
-            let attempts = u32::try_from(
-                target
-                    .get("maxAttempts")
-                    .and_then(serde_json::Value::as_u64)
-                    .ok_or_else(|| anyhow::anyhow!("sealed retry bound missing"))?,
-            )?;
-            ensure!(
-                max_attempt_count.is_none_or(|value| value == attempts),
-                "target retry bounds disagree"
-            );
-            max_attempt_count = Some(attempts);
-            let slots = target
-                .get("slots")
-                .and_then(serde_json::Value::as_array)
-                .ok_or_else(|| anyhow::anyhow!("sealed slots missing"))?;
-            slot_count = slot_count
-                .checked_add(u32::try_from(slots.len())?)
-                .ok_or_else(|| anyhow::anyhow!("slot count overflow"))?;
-            for slot in slots {
-                let attempt_values = slot
-                    .get("attempts")
-                    .and_then(serde_json::Value::as_array)
-                    .ok_or_else(|| anyhow::anyhow!("sealed attempts missing"))?;
-                let attempts = attempt_values
-                    .iter()
-                    .map(|attempt| {
-                        Ok(SealedAttempt {
-                            attempt_number: u32::try_from(
-                                attempt
-                                    .get("attemptNumber")
-                                    .and_then(serde_json::Value::as_u64)
-                                    .ok_or_else(|| {
-                                        anyhow::anyhow!("sealed attempt number missing")
-                                    })?,
-                            )?,
-                            provider_request_identity: attempt
-                                .get("providerRequestIdentity")
-                                .and_then(serde_json::Value::as_str)
-                                .ok_or_else(|| anyhow::anyhow!("sealed provider request missing"))?
-                                .to_owned(),
-                            provider_idempotency_identity: attempt
-                                .get("providerIdempotencyIdentity")
-                                .and_then(serde_json::Value::as_str)
-                                .ok_or_else(|| {
-                                    anyhow::anyhow!("sealed provider idempotency missing")
-                                })?
-                                .to_owned(),
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+        let mut max_attempt_count = 0_u32;
+        for target in &plan.targets {
+            max_attempt_count = max_attempt_count.max(target.max_attempts);
+            for slot in &target.slots {
                 sealed_slots.push(SealedSlot {
-                    slot_id: Uuid::parse_str(
-                        slot.get("slotId")
-                            .and_then(serde_json::Value::as_str)
-                            .ok_or_else(|| anyhow::anyhow!("sealed slot id missing"))?,
-                    )?,
-                    slot_index: u32::try_from(
-                        slot.get("slotIndex")
-                            .and_then(serde_json::Value::as_u64)
-                            .ok_or_else(|| anyhow::anyhow!("sealed slot index missing"))?,
-                    )?,
-                    sample_index: u32::try_from(
-                        slot.get("sampleIndex")
-                            .and_then(serde_json::Value::as_u64)
-                            .ok_or_else(|| anyhow::anyhow!("sealed sample index missing"))?,
-                    )?,
-                    managed_artifact_id: Uuid::parse_str(
-                        slot.get("managedArtifactId")
-                            .and_then(serde_json::Value::as_str)
-                            .ok_or_else(|| anyhow::anyhow!("sealed artifact id missing"))?,
-                    )?,
-                    attempts,
+                    slot_id: slot.slot_id,
+                    slot_index: slot.slot_index,
+                    sample_index: slot.sample_index,
+                    managed_artifact_id: slot.managed_artifact_id,
+                    attempts: slot
+                        .attempts
+                        .iter()
+                        .map(|attempt| SealedAttempt {
+                            attempt_number: attempt.attempt_number,
+                            provider_request_identity: attempt.provider_request_identity.clone(),
+                            provider_idempotency_identity: attempt
+                                .provider_idempotency_identity
+                                .clone(),
+                        })
+                        .collect(),
                 });
             }
         }
-        Ok(Self {
-            job_id,
-            plan_digest,
-            canonical_plan,
-            slot_count,
-            max_attempt_count: max_attempt_count
-                .ok_or_else(|| anyhow::anyhow!("sealed attempts missing"))?,
-            enqueue_started_monotonic_ms: plan
-                .get("enqueueStartedMonotonicMs")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| anyhow::anyhow!("enqueue start missing"))?,
-            operation_deadline_monotonic_ms: plan
-                .get("operationDeadlineMonotonicMs")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| anyhow::anyhow!("deadline missing"))?,
-            created_at_unix_ms,
-            sealed_slots,
-        })
+        #[cfg(not(any()))]
+        {
+            Ok(Self {
+                job_id: plan.job_id,
+                plan_digest,
+                canonical_plan,
+                slot_count: u32::try_from(sealed_slots.len())?,
+                max_attempt_count,
+                enqueue_started_monotonic_ms: plan.enqueue_started_monotonic_ms,
+                operation_deadline_monotonic_ms: plan.operation_deadline_monotonic_ms,
+                created_at_unix_ms,
+                sealed_slots,
+            })
+        }
+
+        #[cfg(any())]
+        {
+            ensure!(
+                canonical_plan.first() == Some(&b'{')
+                    && canonical_plan.last() == Some(&b'}')
+                    && !json_has_unquoted_whitespace(canonical_plan),
+                "plan JSON is not canonical"
+            );
+            reject_duplicate_json_keys(canonical_plan)?;
+            ensure!(
+                json_keys_are_ordered(
+                    canonical_plan,
+                    &[
+                        "schemaVersion",
+                        "kind",
+                        "jobId",
+                        "ownerSessionId",
+                        "ownerPrincipalDigest",
+                        "projectIdentityDigest",
+                        "configGeneration",
+                        "enqueueStartedMonotonicMs",
+                        "operationDeadlineMonotonicMs",
+                        "requiredGrants",
+                        "centralResources",
+                        "spend",
+                        "outputAuthority",
+                        "targets"
+                    ]
+                ),
+                "plan JSON field order is not canonical"
+            );
+            let computed = hex_lower(&Sha256::digest(canonical_plan));
+            ensure!(computed == plan_digest, "sealed plan digest mismatch");
+            let plan: serde_json::Value = serde_json::from_slice(canonical_plan)?;
+            let job_id = Uuid::parse_str(
+                plan.get("jobId")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("sealed plan job identity missing"))?,
+            )?;
+            let targets = plan
+                .get("targets")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| anyhow::anyhow!("sealed plan targets missing"))?;
+            let mut slot_count = 0_u32;
+            let mut max_attempt_count = None;
+            let mut sealed_slots = Vec::new();
+            for target in targets {
+                let attempts = u32::try_from(
+                    target
+                        .get("maxAttempts")
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or_else(|| anyhow::anyhow!("sealed retry bound missing"))?,
+                )?;
+                ensure!(
+                    max_attempt_count.is_none_or(|value| value == attempts),
+                    "target retry bounds disagree"
+                );
+                max_attempt_count = Some(attempts);
+                let slots = target
+                    .get("slots")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| anyhow::anyhow!("sealed slots missing"))?;
+                slot_count = slot_count
+                    .checked_add(u32::try_from(slots.len())?)
+                    .ok_or_else(|| anyhow::anyhow!("slot count overflow"))?;
+                for slot in slots {
+                    let attempt_values = slot
+                        .get("attempts")
+                        .and_then(serde_json::Value::as_array)
+                        .ok_or_else(|| anyhow::anyhow!("sealed attempts missing"))?;
+                    let attempts = attempt_values
+                        .iter()
+                        .map(|attempt| {
+                            Ok(SealedAttempt {
+                                attempt_number: u32::try_from(
+                                    attempt
+                                        .get("attemptNumber")
+                                        .and_then(serde_json::Value::as_u64)
+                                        .ok_or_else(|| {
+                                            anyhow::anyhow!("sealed attempt number missing")
+                                        })?,
+                                )?,
+                                provider_request_identity: attempt
+                                    .get("providerRequestIdentity")
+                                    .and_then(serde_json::Value::as_str)
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!("sealed provider request missing")
+                                    })?
+                                    .to_owned(),
+                                provider_idempotency_identity: attempt
+                                    .get("providerIdempotencyIdentity")
+                                    .and_then(serde_json::Value::as_str)
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!("sealed provider idempotency missing")
+                                    })?
+                                    .to_owned(),
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    sealed_slots.push(SealedSlot {
+                        slot_id: Uuid::parse_str(
+                            slot.get("slotId")
+                                .and_then(serde_json::Value::as_str)
+                                .ok_or_else(|| anyhow::anyhow!("sealed slot id missing"))?,
+                        )?,
+                        slot_index: u32::try_from(
+                            slot.get("slotIndex")
+                                .and_then(serde_json::Value::as_u64)
+                                .ok_or_else(|| anyhow::anyhow!("sealed slot index missing"))?,
+                        )?,
+                        sample_index: u32::try_from(
+                            slot.get("sampleIndex")
+                                .and_then(serde_json::Value::as_u64)
+                                .ok_or_else(|| anyhow::anyhow!("sealed sample index missing"))?,
+                        )?,
+                        managed_artifact_id: Uuid::parse_str(
+                            slot.get("managedArtifactId")
+                                .and_then(serde_json::Value::as_str)
+                                .ok_or_else(|| anyhow::anyhow!("sealed artifact id missing"))?,
+                        )?,
+                        attempts,
+                    });
+                }
+            }
+            Ok(Self {
+                job_id,
+                plan_digest,
+                canonical_plan,
+                slot_count,
+                max_attempt_count: max_attempt_count
+                    .ok_or_else(|| anyhow::anyhow!("sealed attempts missing"))?,
+                enqueue_started_monotonic_ms: plan
+                    .get("enqueueStartedMonotonicMs")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| anyhow::anyhow!("enqueue start missing"))?,
+                operation_deadline_monotonic_ms: plan
+                    .get("operationDeadlineMonotonicMs")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| anyhow::anyhow!("deadline missing"))?,
+                created_at_unix_ms,
+                sealed_slots,
+            })
+        }
     }
 }
 

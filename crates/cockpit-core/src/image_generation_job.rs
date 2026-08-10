@@ -2995,7 +2995,27 @@ mod tests {
         run_real_ledger_scheduler_fixture("once").await;
     }
 
-    async fn run_accepted_late_publication_restart_fixture() {
+    struct LatePublicationRecoveryFixture {
+        _temporary: tempfile::TempDir,
+        db: cockpit_db::Db,
+        output: HeldImageGenerationOutputDirectory,
+        output_path: std::path::PathBuf,
+        owner_session_id: Uuid,
+        job_id: Uuid,
+        slot_id: Uuid,
+        slot_generation: u64,
+        artifact_id: Uuid,
+        artifact_generation: u64,
+        component_set_digest: String,
+        components: Vec<RecoverImageArtifactComponentIdentity>,
+        publication_operation_id: Uuid,
+        worker_boot_id: Uuid,
+        publication_recovery: HeldDirectoryRecovery,
+    }
+
+    async fn setup_accepted_late_publication_recovery_fixture(
+        suffix: &str,
+    ) -> LatePublicationRecoveryFixture {
         use cockpit_db::db::image_generation::{
             AdoptImageGenerationResponse, AdvanceImageGenerationLatePublication,
             BeginImageGenerationDownload, ClaimImageGenerationLatePublication,
@@ -3019,7 +3039,7 @@ mod tests {
         .unwrap();
         let fixture = setup_real_ledger_scheduler_job_with_output(
             cockpit_db::Db::open_in_memory().unwrap(),
-            "late-result",
+            suffix,
             Some(output.authority().clone()),
         )
         .await;
@@ -3059,15 +3079,38 @@ mod tests {
         }
         let root = open_image_generation_artifact_root(&managed).unwrap();
         let artifact_id = fixture.artifact_id;
+        let component_id = Uuid::now_v7();
+        let release_operation_id = Uuid::now_v7();
         let resource = fixture.media_reservation_id.clone();
-        fixture.db.write(move|conn|{
-            retain_generated_image_artifact(conn,&root,&RetainGeneratedImageArtifact{artifact_id,job_id,slot_id,component_id:Uuid::now_v7(),format:GeneratedImageArtifactFormat::Svg,expected_width:1,expected_height:1,bytes:br#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><path d="M0 0h1v1z"/></svg>"#,resource_reservation_id:resource,release_operation_id:Uuid::now_v7(),late_quarantined:true,now_unix_ms:7})?;
+        let component_evidence = fixture.db.write(move|conn|{
+            let evidence=retain_generated_image_artifact(conn,&root,&RetainGeneratedImageArtifact{artifact_id,job_id,slot_id,component_id,format:GeneratedImageArtifactFormat::Svg,expected_width:1,expected_height:1,bytes:br#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><path d="M0 0h1v1z"/></svg>"#,resource_reservation_id:resource,release_operation_id,late_quarantined:true,now_unix_ms:7})?;
             let state:String=conn.query_row("SELECT state FROM image_generation_artifacts WHERE artifact_id=?1",[artifact_id.to_string()],|row|row.get(0))?;
             assert_eq!(state,"late_quarantined");
             let ordinary:i64=conn.query_row("SELECT count(*) FROM image_generation_artifact_authorization_facts WHERE artifact_id=?1",[artifact_id.to_string()],|row|row.get(0))?;
             assert_eq!(ordinary,0);
-            Ok(())
+            Ok(evidence)
         }).await.unwrap();
+        let component = CreateImageGenerationArtifactComponent {
+            component_id,
+            kind: ImageGenerationArtifactComponentKind::Primary,
+            relative_storage_key: format!("{artifact_id}-{component_id}.artifact"),
+            byte_length: component_evidence.byte_length(),
+            sha256: component_evidence.sha256().into(),
+            resource_reservation_id: fixture.media_reservation_id.clone(),
+            release_operation_id,
+        };
+        let component_set_digest =
+            image_generation_component_set_binding(std::slice::from_ref(&component))
+                .unwrap()
+                .1;
+        let components = vec![RecoverImageArtifactComponentIdentity {
+            component_id,
+            kind: ImageGenerationArtifactComponentKind::Primary,
+            generation: 3,
+            stable_identity_digest: component_evidence.identity_digest().into(),
+            security_digest: component_evidence.security_digest().into(),
+            sha256: component_evidence.sha256().into(),
+        }];
 
         let publication_operation_id = Uuid::now_v7();
         let worker_boot_id = Uuid::now_v7();
@@ -3140,7 +3183,44 @@ mod tests {
         else {
             panic!("post-effect sync cut did not yield restart recovery")
         };
-        fixture.db.write(move |conn| {
+        LatePublicationRecoveryFixture {
+            _temporary: temporary,
+            db: fixture.db,
+            output,
+            output_path,
+            owner_session_id,
+            job_id,
+            slot_id,
+            slot_generation: 8,
+            artifact_id,
+            artifact_generation: 3,
+            component_set_digest,
+            components,
+            publication_operation_id,
+            worker_boot_id,
+            publication_recovery: recovery,
+        }
+    }
+
+    async fn consume_late_publication_fixture_as_adoption(fixture: LatePublicationRecoveryFixture) {
+        let LatePublicationRecoveryFixture {
+            db,
+            output,
+            output_path,
+            owner_session_id,
+            job_id,
+            slot_id,
+            slot_generation,
+            artifact_id,
+            artifact_generation,
+            component_set_digest,
+            components,
+            publication_operation_id,
+            worker_boot_id,
+            publication_recovery,
+            ..
+        } = fixture;
+        db.write(move |conn| {
             let owner = ImageGenerationOwnerContextAuthority::from_attached_session(
                 conn,
                 owner_session_id,
@@ -3156,7 +3236,7 @@ mod tests {
                     expected_lease_version: 3,
                     worker_boot_id,
                     claim_generation: 1,
-                    recovery: &recovery,
+                    recovery: &publication_recovery,
                 },
             )?;
             cockpit_db::Db::finalize_image_generation_late_publication_conn(
@@ -3170,6 +3250,41 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?;
             assert_eq!(states, ("published".into(), "retained".into(), "published".into()));
+            assert!(block_verified_copy_authorized_publication(
+                conn,
+                &output,
+                &AdoptVerifiedCopyAuthorizedPublication {
+                    publication_operation_id,
+                    expected_lease_version: 5,
+                    worker_boot_id,
+                    claim_generation: 1,
+                    recovery: &publication_recovery,
+                },
+            )
+            .is_err());
+            assert!(owner
+                .record_image_artifact_security_recovery(
+                    conn,
+                    &ClientPrincipal::Owner,
+                    &RecordImageArtifactSecurityRecovery {
+                        operation_id: Uuid::now_v7(),
+                        artifact_id,
+                        artifact_generation: artifact_generation + 1,
+                        job_id,
+                        slot_id,
+                        slot_generation: slot_generation + 1,
+                        component_set_digest,
+                        components,
+                        publication_operation_id: Some(publication_operation_id),
+                        publication_lease_version: Some(5),
+                        output_identity_digest: Some(
+                            publication_recovery.artifact().identity_digest().into(),
+                        ),
+                        disposition:
+                            ImageArtifactSecurityRecoveryDisposition::RemoveVerifiedExternalCopy,
+                    },
+                )
+                .is_err());
             Ok(())
         }).await.unwrap();
         assert_eq!(
@@ -3180,7 +3295,196 @@ mod tests {
 
     #[tokio::test]
     async fn accepted_result_cancelled_during_validation_is_late_quarantined() {
-        run_accepted_late_publication_restart_fixture().await;
+        let fixture = setup_accepted_late_publication_recovery_fixture("late-result").await;
+        consume_late_publication_fixture_as_adoption(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn owner_removal_recovers_post_unlink_sync_cut_after_restart() {
+        use cockpit_db::db::image_generation::{
+            ImageGenerationLatePublicationReplay, ImageGenerationLatePublicationState,
+        };
+
+        let fixture =
+            setup_accepted_late_publication_recovery_fixture("late-delete-recovery").await;
+        let output_evidence = fixture
+            .db
+            .write({
+                let publication_recovery = fixture.publication_recovery.clone();
+                let publication_operation_id = fixture.publication_operation_id;
+                let worker_boot_id = fixture.worker_boot_id;
+                let output = fixture.output;
+                move |conn| {
+                    let evidence = block_verified_copy_authorized_publication(
+                        conn,
+                        &output,
+                        &AdoptVerifiedCopyAuthorizedPublication {
+                            publication_operation_id,
+                            expected_lease_version: 3,
+                            worker_boot_id,
+                            claim_generation: 1,
+                            recovery: &publication_recovery,
+                        },
+                    )?;
+                    Ok((output, evidence))
+                }
+            })
+            .await
+            .unwrap();
+        let (output, output_evidence) = output_evidence;
+        let recovery_operation_id = Uuid::now_v7();
+        let request = RecordImageArtifactSecurityRecovery {
+            operation_id: recovery_operation_id,
+            artifact_id: fixture.artifact_id,
+            artifact_generation: fixture.artifact_generation,
+            job_id: fixture.job_id,
+            slot_id: fixture.slot_id,
+            slot_generation: fixture.slot_generation,
+            component_set_digest: fixture.component_set_digest.clone(),
+            components: fixture.components.clone(),
+            publication_operation_id: Some(fixture.publication_operation_id),
+            publication_lease_version: Some(4),
+            output_identity_digest: Some(output_evidence.identity_digest().into()),
+            disposition: ImageArtifactSecurityRecoveryDisposition::RemoveVerifiedExternalCopy,
+        };
+        let owner_session_id = fixture.owner_session_id;
+        let recorded = fixture
+            .db
+            .write({
+                let request = request.clone();
+                move |conn| {
+                    let owner = ImageGenerationOwnerContextAuthority::from_attached_session(
+                        conn,
+                        owner_session_id,
+                        &ClientPrincipal::Owner,
+                        7,
+                    )?;
+                    owner.record_image_artifact_security_recovery(
+                        conn,
+                        &ClientPrincipal::Owner,
+                        &request,
+                    )
+                }
+            })
+            .await
+            .unwrap();
+        let publication_recovery = fixture.publication_recovery.clone();
+        let removal = fixture
+            .db
+            .write(move |conn| {
+                let owner = ImageGenerationOwnerContextAuthority::from_attached_session(
+                    conn,
+                    owner_session_id,
+                    &ClientPrincipal::Owner,
+                    7,
+                )?;
+                output.force_next_directory_sync_failure();
+                owner.remove_verified_external_copy(conn, recorded, &output, &publication_recovery)
+            })
+            .await
+            .unwrap();
+        let VerifiedExternalCopyRemovalOutcome::RecoveryRequired(delete_recovery) = removal else {
+            panic!("post-unlink sync cut did not require restart recovery")
+        };
+        let publication_operation_id = fixture.publication_operation_id;
+        fixture
+            .db
+            .read(move |conn| {
+                let state: String = conn.query_row(
+                    "SELECT state FROM image_generation_late_publication_leases WHERE publication_operation_id=?1",
+                    [publication_operation_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                anyhow::ensure!(state == "delete_authorized", "deletion authority was not durable before the filesystem effect");
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let reopened = open_image_generation_output_directory(
+            &fixture.output_path,
+            4,
+            "generated".into(),
+            "png".into(),
+        )
+        .unwrap();
+        let replay_recorded = fixture
+            .db
+            .write({
+                let request = request.clone();
+                move |conn| {
+                    let owner = ImageGenerationOwnerContextAuthority::from_attached_session(
+                        conn,
+                        owner_session_id,
+                        &ClientPrincipal::Owner,
+                        7,
+                    )?;
+                    owner.record_image_artifact_security_recovery(
+                        conn,
+                        &ClientPrincipal::Owner,
+                        &request,
+                    )
+                }
+            })
+            .await
+            .unwrap();
+        fixture
+            .db
+            .write(move |conn| {
+                let owner = ImageGenerationOwnerContextAuthority::from_attached_session(
+                    conn,
+                    owner_session_id,
+                    &ClientPrincipal::Owner,
+                    7,
+                )?;
+                let outcome = owner.reconcile_verified_external_copy_removal(
+                    conn,
+                    replay_recorded,
+                    &reopened,
+                    &delete_recovery,
+                )?;
+                anyhow::ensure!(
+                    matches!(outcome, VerifiedExternalCopyRemovalOutcome::RemovedDurably),
+                    "exact-absence reconciliation did not close deletion"
+                );
+                anyhow::ensure!(matches!(
+                    owner.replay_image_artifact_security_recovery_outcome(
+                        conn,
+                        recovery_operation_id
+                    )?,
+                    ImageArtifactSecurityRecoveryReplay::Applied { .. }
+                ));
+                anyhow::ensure!(matches!(
+                    cockpit_db::Db::replay_image_generation_late_publication_conn(
+                        conn,
+                        publication_operation_id
+                    )?,
+                    ImageGenerationLatePublicationReplay::Terminal {
+                        state: ImageGenerationLatePublicationState::Aborted,
+                        ..
+                    }
+                ));
+                let closed = owner.record_image_artifact_security_recovery(
+                    conn,
+                    &ClientPrincipal::Owner,
+                    &request,
+                )?;
+                anyhow::ensure!(
+                    owner
+                        .reconcile_verified_external_copy_removal(
+                            conn,
+                            closed,
+                            &reopened,
+                            &delete_recovery,
+                        )
+                        .is_err(),
+                    "terminal external-copy removal replay reopened deletion"
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(!fixture.output_path.join("generated-late.png").exists());
     }
 
     #[tokio::test]

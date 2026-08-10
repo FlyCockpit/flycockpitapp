@@ -729,10 +729,14 @@ mod imp {
                 }
                 if recovery.source_cleanup_required {
                     match open_named(&self.dir, &recovery.source_name) {
-                        Ok(mut source)
-                            if verify_expected_file(&source, &recovery.artifact, false).is_ok()
-                                && validate_contents(&mut source, &recovery.artifact).is_ok() =>
-                        {
+                        Ok(mut source) => {
+                            if verify_expected_file(&source, &recovery.artifact, false).is_err()
+                                || validate_contents(&mut source, &recovery.artifact).is_err()
+                            {
+                                return Ok(HeldDirectoryEffectOutcome::SecurityAmbiguous(
+                                    recovery.clone(),
+                                ));
+                            }
                             let name = match CString::new(recovery.source_name.as_str()) {
                                 Ok(name) => name,
                                 Err(_) => {
@@ -748,11 +752,6 @@ mod imp {
                                     recovery.clone(),
                                 ));
                             }
-                        }
-                        Ok(_) => {
-                            return Ok(HeldDirectoryEffectOutcome::SecurityAmbiguous(
-                                recovery.clone(),
-                            ));
                         }
                         Err(error) if is_exact_not_found(&error) => {}
                         Err(_) => {
@@ -775,21 +774,20 @@ mod imp {
                 }
             } else {
                 match open_named(&self.dir, &recovery.source_name) {
-                    Ok(mut source)
-                        if verify_expected_file(&source, &recovery.artifact, false).is_ok()
-                            && validate_contents(&mut source, &recovery.artifact).is_ok() =>
-                    {
+                    Ok(mut source) => {
+                        if verify_expected_file(&source, &recovery.artifact, false).is_err()
+                            || validate_contents(&mut source, &recovery.artifact).is_err()
+                        {
+                            return Ok(HeldDirectoryEffectOutcome::SecurityAmbiguous(
+                                recovery.clone(),
+                            ));
+                        }
                         return Ok(HeldDirectoryEffectOutcome::ProvenNotApplied(
                             HeldSealedArtifact {
                                 file: source,
                                 name: recovery.source_name.clone(),
                                 evidence: recovery.artifact.clone(),
                             },
-                        ));
-                    }
-                    Ok(_) => {
-                        return Ok(HeldDirectoryEffectOutcome::SecurityAmbiguous(
-                            recovery.clone(),
                         ));
                     }
                     Err(error) if is_exact_not_found(&error) => {}

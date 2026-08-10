@@ -1043,6 +1043,7 @@ mod tests {
                 job_id: sealed.job_id,
                 owner: ImageGenerationOwnerContextAuthority {
                     session_id: sealed.owner_session_id,
+                    project_id: "fixture-project".into(),
                     principal_digest: sealed.owner_principal_digest,
                     project_identity_digest: sealed.project_identity_digest,
                     config_generation: sealed.config_generation,

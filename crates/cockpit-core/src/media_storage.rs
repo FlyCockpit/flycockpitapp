@@ -3984,6 +3984,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(all(test, unix))]
 mod tests {
     use std::io::Write;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use cockpit_db::media_attachments::{
         MediaAttachmentComponent, MediaAttachmentRecord, MediaAvailability, MediaKind,
@@ -3992,6 +3993,92 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    struct ScriptedVideoRunner {
+        fail_encode: AtomicBool,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl AvRuntimeRunner for ScriptedVideoRunner {
+        async fn run(
+            &self,
+            _program: &Path,
+            args: &[String],
+            _input: Vec<u8>,
+            _stdout_limit: u64,
+            _deadline: std::time::Duration,
+        ) -> Result<BoundedRuntimeOutput> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if args.iter().any(|arg| arg == "-show_frames") {
+                return Ok(BoundedRuntimeOutput {
+                    stdout: br#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264","disposition":{"default":1},"width":640,"height":360,"sample_aspect_ratio":"1:1","time_base":"1/24000","profile":"High","pix_fmt":"yuv420p"}],"frames":[{"media_type":"video","stream_index":0,"best_effort_timestamp":"0","key_frame":1},{"media_type":"video","stream_index":0,"best_effort_timestamp":"1001","key_frame":0},{"media_type":"video","stream_index":0,"best_effort_timestamp":"2002","key_frame":0}]}"#.to_vec(),
+                    stderr: Vec::new(),
+                });
+            }
+            if args.iter().any(|arg| arg == "-encoders") {
+                return Ok(BoundedRuntimeOutput {
+                    stdout: b" V..... libx264 H.264\n A..... aac AAC\n".to_vec(),
+                    stderr: Vec::new(),
+                });
+            }
+            if args.windows(2).any(|pair| pair == ["-f", "null"]) {
+                return Ok(BoundedRuntimeOutput {
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                });
+            }
+            if self.fail_encode.load(Ordering::SeqCst) {
+                anyhow::bail!("injected semantic encoder failure")
+            }
+            let output = args.last().context("missing encoded output")?;
+            std::fs::write(output, canonical_video_fixture())?;
+            Ok(BoundedRuntimeOutput {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    fn mp4_atom(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut atom = Vec::new();
+        atom.extend_from_slice(&u32::try_from(payload.len() + 8).unwrap().to_be_bytes());
+        atom.extend_from_slice(kind);
+        atom.extend_from_slice(payload);
+        atom
+    }
+
+    fn canonical_video_fixture() -> Vec<u8> {
+        let mut dref = vec![0, 0, 0, 0];
+        dref.extend_from_slice(&1u32.to_be_bytes());
+        dref.extend_from_slice(&12u32.to_be_bytes());
+        dref.extend_from_slice(b"url \0\0\0\x01");
+        let dinf = mp4_atom(b"dinf", &mp4_atom(b"dref", &dref));
+        let avcc = mp4_atom(b"avcC", &[1, 100, 0, 31, 0xff, 0xe1, 0]);
+        let mut avc1 = vec![0; 86];
+        avc1[0..4].copy_from_slice(&u32::try_from(86 + avcc.len()).unwrap().to_be_bytes());
+        avc1[4..8].copy_from_slice(b"avc1");
+        avc1.extend_from_slice(&avcc);
+        let mut stsd = vec![0, 0, 0, 0];
+        stsd.extend_from_slice(&1u32.to_be_bytes());
+        stsd.extend_from_slice(&avc1);
+        let stbl = mp4_atom(b"stbl", &mp4_atom(b"stsd", &stsd));
+        let mut minf = dinf;
+        minf.extend_from_slice(&stbl);
+        let moov = mp4_atom(
+            b"moov",
+            &mp4_atom(b"trak", &mp4_atom(b"mdia", &mp4_atom(b"minf", &minf))),
+        );
+        let mut output = Vec::new();
+        output.extend_from_slice(&32u32.to_be_bytes());
+        output.extend_from_slice(b"ftypisom");
+        output.extend_from_slice(&512u32.to_be_bytes());
+        output.extend_from_slice(b"isomiso2avc1mp41");
+        output.extend_from_slice(&moov);
+        output.extend_from_slice(&8u32.to_be_bytes());
+        output.extend_from_slice(b"mdat");
+        output
+    }
 
     #[test]
     fn av_byte_classification_rejects_spoofed_mp3_and_normalizes_audio_signatures() {
@@ -5226,6 +5313,313 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state, "released");
+    }
+
+    #[tokio::test]
+    async fn scripted_video_finalize_fault_success_replay_and_reopen_use_production_path() {
+        use base64::Engine as _;
+        use cockpit_db::media_attachments::{
+            LocalMediaActorRoleV1, LocalMediaMutationPayloadV1, LocalMediaMutationV1,
+        };
+        let temp = tempfile::TempDir::new().unwrap();
+        let database_path = temp.path().join("cockpit.db");
+        let db = cockpit_db::Db::open(&database_path).unwrap();
+        let session_id = Uuid::now_v7();
+        db.transaction(move |conn| {
+            conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'project','/redacted',1,1)",[session_id.to_string()])?;
+            Ok(())
+        }).await.unwrap();
+        let policy = cockpit_config::config::media_budget::MediaResourcePolicy::default();
+        let runtime = ApprovedAvRuntime {
+            ffmpeg: "/approved/ffmpeg".into(),
+            ffprobe: "/approved/ffprobe".into(),
+            fingerprint: "ab".repeat(32),
+        };
+        async fn stage(
+            recovery: &MediaStorageRecovery,
+            policy: &cockpit_config::config::media_budget::MediaResourcePolicy,
+            session_id: Uuid,
+            bytes: &[u8],
+            now: i64,
+        ) -> LocalMediaMutationV1 {
+            let draft = Uuid::now_v7();
+            let length = bytes.len() as u64;
+            let begin = LocalMediaMutationV1 {
+                schema_version: 1,
+                kind: "localMediaMutation".into(),
+                local_operation_id: Uuid::now_v7(),
+                actor_principal_digest: "11".repeat(32),
+                actor_role: LocalMediaActorRoleV1::Owner,
+                payload: LocalMediaMutationPayloadV1::Begin {
+                    session_id,
+                    canonical_project_digest: "22".repeat(32),
+                    client_draft_id: draft,
+                    media_kind: RequestedLocalPathMediaKind::Video,
+                    declared_total_bytes: length,
+                    reservation_digest: digest_json(
+                        b"media-upload-reservation-v1",
+                        &local_path_plans(policy, length).unwrap(),
+                    )
+                    .unwrap(),
+                },
+            };
+            let upload = recovery
+                .begin_media_upload(begin, policy, now, now as u64)
+                .await
+                .unwrap()
+                .subject_id;
+            recovery
+                .append_media_upload_chunk(
+                    cockpit_db::media_attachments::AppendMediaUploadChunkV1 {
+                        mutation: LocalMediaMutationV1 {
+                            schema_version: 1,
+                            kind: "localMediaMutation".into(),
+                            local_operation_id: Uuid::now_v7(),
+                            actor_principal_digest: "11".repeat(32),
+                            actor_role: LocalMediaActorRoleV1::Owner,
+                            payload: LocalMediaMutationPayloadV1::Append {
+                                session_id,
+                                canonical_project_digest: "22".repeat(32),
+                                client_draft_id: draft,
+                                upload_id: upload,
+                                upload_generation: 1,
+                                chunk_index: 0,
+                                chunk_length: length as u32,
+                                chunk_sha256: crate::intel::hex_lower(&Sha256::digest(bytes)),
+                            },
+                        },
+                        data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                    },
+                    now + 1,
+                )
+                .await
+                .unwrap();
+            LocalMediaMutationV1 {
+                schema_version: 1,
+                kind: "localMediaMutation".into(),
+                local_operation_id: Uuid::now_v7(),
+                actor_principal_digest: "11".repeat(32),
+                actor_role: LocalMediaActorRoleV1::Owner,
+                payload: LocalMediaMutationPayloadV1::Finalize {
+                    session_id,
+                    canonical_project_digest: "22".repeat(32),
+                    client_draft_id: draft,
+                    upload_id: upload,
+                    upload_generation: 2,
+                    chunk_count: 1,
+                    total_bytes: length,
+                    object_sha256: crate::intel::hex_lower(&Sha256::digest(bytes)),
+                },
+            }
+        }
+        let bytes = canonical_video_fixture();
+        let failing_runner = std::sync::Arc::new(ScriptedVideoRunner {
+            fail_encode: AtomicBool::new(true),
+            calls: AtomicUsize::new(0),
+        });
+        let recovery = MediaStorageRecovery::open_or_create(db.clone(), &temp.path().join("media"))
+            .unwrap()
+            .with_av_runtime(runtime.clone())
+            .with_av_runner(failing_runner.clone());
+        let failed_request = stage(&recovery, &policy, session_id, &bytes, 10).await;
+        let failed = recovery
+            .finalize_media_upload(failed_request, 12)
+            .await
+            .unwrap();
+        assert!(failing_runner.calls.load(Ordering::SeqCst) >= 4);
+        let failed_upload = failed.subject_id.to_string();
+        assert_eq!(db.read(move |conn| Ok(conn.query_row("SELECT a.availability FROM media_attachments a JOIN media_uploads u ON u.attachment_id=a.attachment_id WHERE u.upload_id=?1",[failed_upload],|row|row.get::<_,String>(0))?)).await.unwrap(), "failed");
+
+        let successful_runner = std::sync::Arc::new(ScriptedVideoRunner {
+            fail_encode: AtomicBool::new(false),
+            calls: AtomicUsize::new(0),
+        });
+        let recovery = MediaStorageRecovery::open(db.clone(), &temp.path().join("media"))
+            .unwrap()
+            .with_av_runtime(runtime.clone())
+            .with_av_runner(successful_runner.clone());
+        let request = stage(&recovery, &policy, session_id, &bytes, 20).await;
+        let receipt = recovery
+            .finalize_media_upload(request.clone(), 22)
+            .await
+            .unwrap();
+        assert!(successful_runner.calls.load(Ordering::SeqCst) >= 5);
+        let upload = receipt.subject_id.to_string();
+        let persisted = db.read(move |conn| Ok((
+            conn.query_row("SELECT a.availability FROM media_attachments a JOIN media_uploads u ON u.attachment_id=a.attachment_id WHERE u.upload_id=?1",[&upload],|row|row.get::<_,String>(0))?,
+            conn.query_row("SELECT COUNT(*) FROM media_av_normalization_evidence e JOIN media_uploads u ON u.attachment_id=e.attachment_id WHERE u.upload_id=?1",[&upload],|row|row.get::<_,i64>(0))?,
+            conn.query_row("SELECT COUNT(*) FROM media_attachment_components c JOIN media_uploads u ON u.attachment_id=c.attachment_id WHERE u.upload_id=?1 AND c.component_kind='video_model' AND c.lifecycle_state='ready'",[&upload],|row|row.get::<_,i64>(0))?
+        ))).await.unwrap();
+        assert_eq!(persisted, ("ready".into(), 1, 1));
+        drop(recovery);
+        drop(db);
+        let reopened_db = cockpit_db::Db::open(&database_path).unwrap();
+        let reopened = MediaStorageRecovery::open(reopened_db, &temp.path().join("media"))
+            .unwrap()
+            .with_av_runtime(runtime)
+            .with_av_runner(successful_runner);
+        assert_eq!(
+            reopened.finalize_media_upload(request, 23).await.unwrap(),
+            receipt
+        );
+    }
+
+    #[tokio::test]
+    async fn executable_ffmpeg_vectors_cover_named_dimensions_and_frame_rates() {
+        fn executable(name: &str) -> Option<std::path::PathBuf> {
+            std::env::var_os("PATH")
+                .into_iter()
+                .flat_map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+                .map(|directory| directory.join(name))
+                .find(|path| path.is_file())
+        }
+        let (Some(ffmpeg), Some(ffprobe)) = (executable("ffmpeg"), executable("ffprobe")) else {
+            return;
+        };
+        let runtime = ApprovedAvRuntime {
+            ffmpeg: ffmpeg.clone(),
+            ffprobe,
+            fingerprint: "cd".repeat(32),
+        };
+        let runner = SystemAvRuntimeRunner;
+        verify_required_video_encoders(&runtime, &runner, false)
+            .await
+            .unwrap();
+        for ((source_width, source_height), sar, expected) in [
+            ((1920, 1080), (1, 1), (1280, 720)),
+            ((640, 360), (1, 1), (640, 360)),
+            ((1440, 1080), (4, 3), (1280, 720)),
+            ((720, 480), (8, 9), (640, 480)),
+            ((3, 3), (1, 1), (2, 2)),
+        ] {
+            let directory = tempfile::TempDir::new().unwrap();
+            let source = directory.path().join("source.mkv");
+            let filter = format!("testsrc=size={source_width}x{source_height}:rate=1");
+            let status = std::process::Command::new(&ffmpeg)
+                .env_clear()
+                .args([
+                    "-nostdin",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &filter,
+                    "-frames:v",
+                    "1",
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv444p",
+                    "-y",
+                ])
+                .arg(&source)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let (document, _) =
+                run_bounded_ffprobe(&runtime, &runner, std::fs::read(source).unwrap())
+                    .await
+                    .unwrap();
+            let video = document
+                .streams
+                .iter()
+                .find(|stream| stream.codec_type == "video")
+                .unwrap();
+            assert_eq!(
+                (video.width.unwrap(), video.height.unwrap()),
+                (source_width, source_height)
+            );
+            assert_eq!(
+                select_video_dimensions(source_width, source_height, sar.0, sar.1).unwrap(),
+                expected
+            );
+        }
+        for (rate, frames, expected) in [
+            ("1", "1", (1, 1)),
+            ("24000/1001", "3", (24_000, 1_001)),
+            ("30000/1001", "3", (24, 1)),
+        ] {
+            let directory = tempfile::TempDir::new().unwrap();
+            let source = directory.path().join("rate.mkv");
+            let filter = format!("color=black:size=16x16:rate={rate}");
+            let status = std::process::Command::new(&ffmpeg)
+                .env_clear()
+                .args([
+                    "-nostdin",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &filter,
+                    "-frames:v",
+                    frames,
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-y",
+                ])
+                .arg(&source)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let (document, _) =
+                run_bounded_ffprobe(&runtime, &runner, std::fs::read(source).unwrap())
+                    .await
+                    .unwrap();
+            let video = document
+                .streams
+                .iter()
+                .find(|stream| stream.codec_type == "video")
+                .unwrap();
+            let actual =
+                select_video_rate(&selected_video_timestamps(&document, video).unwrap()).unwrap();
+            assert_eq!((actual.0, actual.1), expected);
+        }
+        let directory = tempfile::TempDir::new().unwrap();
+        let source = directory.path().join("vfr.mkv");
+        let status = std::process::Command::new(&ffmpeg)
+            .env_clear()
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=black:size=16x16:rate=10",
+                "-frames:v",
+                "3",
+                "-vf",
+                "setpts=if(eq(N\\,0)\\,0\\,if(eq(N\\,1)\\,1\\,5))",
+                "-vsync",
+                "vfr",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-y",
+            ])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let (document, _) = run_bounded_ffprobe(&runtime, &runner, std::fs::read(source).unwrap())
+            .await
+            .unwrap();
+        let video = document
+            .streams
+            .iter()
+            .find(|stream| stream.codec_type == "video")
+            .unwrap();
+        let actual =
+            select_video_rate(&selected_video_timestamps(&document, video).unwrap()).unwrap();
+        assert_eq!((actual.0, actual.1), (4, 1));
     }
 
     #[tokio::test]

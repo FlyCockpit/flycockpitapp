@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 use std::io::{Read as _, Seek as _, SeekFrom, Write};
 use std::path::Path;
 
-use anyhow::{Context as _, Result, ensure};
-use rusqlite::{Connection, OptionalExtension, params};
+use anyhow::{ensure, Context as _, Result};
+use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
@@ -20,25 +20,25 @@ use cockpit_db::db::external_journal::{
     ExternalJournalDigest, ExternalJournalToken, PrepareExternalOperation, ProviderIdempotency,
 };
 use cockpit_db::db::image_generation::{
-    AcquireImageGenerationArtifactLease, AcquiredImageGenerationArtifactLease,
-    AdvanceImageGenerationLatePublication, BlockVerifiedImageGenerationLatePublication,
-    CreateImageGenerationArtifact, CreateImageGenerationArtifactComponent,
-    DispatchingImageGenerationAttempt, ImageGenerationArtifactComponentKind,
-    ImageGenerationArtifactComponentState, ImageGenerationArtifactConsumerPurpose,
-    ImageGenerationArtifactConsumerRoute, ImageGenerationArtifactState,
-    ImageGenerationDispatchCandidate, ImageGenerationHandoffFinishDisposition,
-    ImageGenerationLatePublicationEvidenceV1, ImageGenerationLatePublicationState,
-    PreparedImageGenerationDispatch, ReserveImageGenerationLatePublication,
-    TransitionImageGenerationArtifact, TransitionImageGenerationArtifactComponent,
-    image_generation_component_set_binding,
+    image_generation_component_set_binding, AcquireImageGenerationArtifactLease,
+    AcquiredImageGenerationArtifactLease, AdvanceImageGenerationLatePublication,
+    BlockVerifiedImageGenerationLatePublication, CreateImageGenerationArtifact,
+    CreateImageGenerationArtifactComponent, DispatchingImageGenerationAttempt,
+    ImageGenerationArtifactComponentKind, ImageGenerationArtifactComponentState,
+    ImageGenerationArtifactConsumerPurpose, ImageGenerationArtifactConsumerRoute,
+    ImageGenerationArtifactState, ImageGenerationDispatchCandidate,
+    ImageGenerationHandoffFinishDisposition, ImageGenerationLatePublicationEvidenceV1,
+    ImageGenerationLatePublicationState, PreparedImageGenerationDispatch,
+    ReserveImageGenerationLatePublication, TransitionImageGenerationArtifact,
+    TransitionImageGenerationArtifactComponent,
 };
 use cockpit_db::db::sealed_scope::SealedActionGrantRow;
 use cockpit_db::image_spend::{AttemptMaximum, ImageSpendDispatchEvidence, SpendReservation};
 use cockpit_db::media_attachments::AcquiredMediaComponentLease;
 
 use crate::media_reservation::{
-    MediaExternalHandoffOutcome, ReservationReceipt, ReservationState,
     definitive_rejection_retry_conn, finish_external_handoff_conn, handoff_external_conn,
+    MediaExternalHandoffOutcome, ReservationReceipt, ReservationState,
 };
 
 pub use crate::private_fs::held_directory::{
@@ -47,11 +47,11 @@ pub use crate::private_fs::held_directory::{
 };
 pub use cockpit_db::image_generation_plan::{
     AttemptPlanV1, CapabilityProvenanceV1, GrantRequirementV1, ImageGenerationPlanV1,
+    OutputDirectoryAuthorityV1, OutputSlotPlanV1, ReferenceArtifactV1, RequestedOutputV1,
+    ResolvedOutputV1, ResourceReservationV1, SpendReservationPlanV1, TargetDestinationV1,
+    TargetPlanV1, TypedParameterV1, VectorSanitizerProvenanceV1,
     MAX_IMAGE_GENERATION_ATTEMPTS_PER_SLOT, MAX_IMAGE_GENERATION_DIMENSION,
-    MAX_IMAGE_GENERATION_SLOTS, MAX_IMAGE_GENERATION_TARGETS, OutputDirectoryAuthorityV1,
-    OutputSlotPlanV1, ReferenceArtifactV1, RequestedOutputV1, ResolvedOutputV1,
-    ResourceReservationV1, SpendReservationPlanV1, TargetDestinationV1, TargetPlanV1,
-    TypedParameterV1, VectorSanitizerProvenanceV1,
+    MAX_IMAGE_GENERATION_SLOTS, MAX_IMAGE_GENERATION_TARGETS,
 };
 
 const MAX_AUTHORITY_STRING_BYTES: usize = 1_024;
@@ -3065,6 +3065,23 @@ pub fn retain_accepted_image_response_conn(
             "accepted response is unavailable"
         );
     }
+    // Prefer the live external-journal version. Cancellation advances the
+    // journal without rewriting attempt.observed_journal_version, so binding
+    // only the attempt column loses the adopt compare-and-set after cancel.
+    let (bound_operation_id, observed_journal_version): (String, i64) = conn.query_row(
+        "SELECT a.external_operation_id, o.version FROM image_generation_attempts a JOIN external_journal_operations o ON o.operation_id=a.external_operation_id WHERE a.job_id=?1 AND a.slot_id=?2 AND a.attempt_number=?3",
+        params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number)],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    ensure!(
+        Uuid::parse_str(&bound_operation_id)? == input.external_operation_id,
+        "accepted response journal authority differs"
+    );
+    let observed_journal_version = u64::try_from(observed_journal_version)?;
+    ensure!(
+        observed_journal_version >= input.expected_journal_version,
+        "accepted response journal authority predates the request"
+    );
     let response_digest = crate::intel::hex_lower(&Sha256::digest(&input.bytes));
     cockpit_db::Db::adopt_image_generation_response_conn(
         conn,
@@ -3076,7 +3093,7 @@ pub fn retain_accepted_image_response_conn(
                 + if downloaded { 1 } else { 0 },
             expected_slot_version: input.expected_slot_version + if downloaded { 1 } else { 0 },
             external_operation_id: input.external_operation_id,
-            expected_journal_version: input.expected_journal_version,
+            expected_journal_version: observed_journal_version,
             response_digest: &response_digest,
             now_unix_ms: input.now_unix_ms,
         },
@@ -3163,6 +3180,9 @@ pub async fn coordinate_persisted_accepted_image_response(
         )
     })
     .await?;
+    // One outer transaction so a post-rename cut rolls back adopt/download and
+    // the sealed artifact graph, while the durable publication intent (reserved
+    // above) and any held filesystem artifact remain for restart recovery.
     let result = db
         .transaction(move |conn| retain_accepted_image_response_conn(conn, &root, &input))
         .await;
@@ -3174,7 +3194,8 @@ pub async fn coordinate_persisted_accepted_image_response(
         Err(error) => {
             let failure = crate::intel::hex_lower(&Sha256::digest(format!("{error:#}").as_bytes()));
             let held_recovery = error
-                .downcast_ref::<RecoverableHeldArtifactPublication>()
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<RecoverableHeldArtifactPublication>())
                 .map(|error| error.evidence_json.clone());
             db.write(move |conn| {
                 let names:(String,String)=conn.query_row("SELECT temporary_name,destination_name FROM image_generation_response_publication_intents WHERE publication_operation_id=?1",[operation_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?)))?;
@@ -4297,20 +4318,18 @@ mod tests {
             )?;
             assert_eq!(replay.outcome, ImageSpendDispatchEvidence::Accepted);
             assert_eq!(replay.bytes, b"accepted");
-            assert!(
-                conn.execute(
+            assert!(conn
+                .execute(
                     "UPDATE image_generation_handoff_evidence SET evidence=X'00' WHERE job_id=?1",
                     [job_id.to_string()]
                 )
-                .is_err()
-            );
-            assert!(
-                conn.execute(
+                .is_err());
+            assert!(conn
+                .execute(
                     "DELETE FROM image_generation_handoff_evidence WHERE job_id=?1",
                     [job_id.to_string()]
                 )
-                .is_err()
-            );
+                .is_err());
             Ok(())
         })
         .await
@@ -4874,28 +4893,26 @@ mod tests {
         std::fs::create_dir(&managed).unwrap();
         std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o700)).unwrap();
         let root = std::sync::Arc::new(open_image_generation_artifact_root(&managed).unwrap());
-        assert!(
-            coordinate_persisted_accepted_image_response(
-                fixture.db.clone(),
-                root,
-                CoordinateAcceptedImageResponse {
-                    job_id: fixture.job_id,
-                    slot_id: fixture.slot_id,
-                    attempt_number: 1,
-                    expected_job_version: 5,
-                    expected_slot_version: 4,
-                    expected_attempt_version: 5,
-                    external_operation_id: request.external_operation_id,
-                    expected_journal_version: 3,
-                    component_id: Uuid::now_v7(),
-                    release_operation_id: Uuid::now_v7(),
-                    bytes,
-                    now_unix_ms: 11
-                }
-            )
-            .await
-            .is_err()
-        );
+        assert!(coordinate_persisted_accepted_image_response(
+            fixture.db.clone(),
+            root,
+            CoordinateAcceptedImageResponse {
+                job_id: fixture.job_id,
+                slot_id: fixture.slot_id,
+                attempt_number: 1,
+                expected_job_version: 5,
+                expected_slot_version: 4,
+                expected_attempt_version: 5,
+                external_operation_id: request.external_operation_id,
+                expected_journal_version: 3,
+                component_id: Uuid::now_v7(),
+                release_operation_id: Uuid::now_v7(),
+                bytes,
+                now_unix_ms: 11
+            }
+        )
+        .await
+        .is_err());
         fixture.db.read(move|conn|{let row:(String,i64)=conn.query_row("SELECT state,(SELECT count(*) FROM image_generation_artifacts WHERE job_id=i.job_id) FROM image_generation_response_publication_intents i WHERE job_id=?1",[fixture.job_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?)))?;assert_eq!(row,("security_blocked".into(),0));Ok(())}).await.unwrap();
     }
 
@@ -5061,28 +5078,26 @@ mod tests {
         std::fs::create_dir(&managed).unwrap();
         std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o700)).unwrap();
         let root = std::sync::Arc::new(open_image_generation_artifact_root(&managed).unwrap());
-        assert!(
-            coordinate_persisted_accepted_image_response(
-                fixture.db.clone(),
-                root.clone(),
-                CoordinateAcceptedImageResponse {
-                    job_id: fixture.job_id,
-                    slot_id: fixture.slot_id,
-                    attempt_number: 1,
-                    expected_job_version: 5,
-                    expected_slot_version: 4,
-                    expected_attempt_version: 5,
-                    external_operation_id: request.external_operation_id,
-                    expected_journal_version: 3,
-                    component_id: Uuid::now_v7(),
-                    release_operation_id: Uuid::now_v7(),
-                    bytes,
-                    now_unix_ms: 11
-                }
-            )
-            .await
-            .is_err()
-        );
+        assert!(coordinate_persisted_accepted_image_response(
+            fixture.db.clone(),
+            root.clone(),
+            CoordinateAcceptedImageResponse {
+                job_id: fixture.job_id,
+                slot_id: fixture.slot_id,
+                attempt_number: 1,
+                expected_job_version: 5,
+                expected_slot_version: 4,
+                expected_attempt_version: 5,
+                external_operation_id: request.external_operation_id,
+                expected_journal_version: 3,
+                component_id: Uuid::now_v7(),
+                release_operation_id: Uuid::now_v7(),
+                bytes,
+                now_unix_ms: 11
+            }
+        )
+        .await
+        .is_err());
         fixture
             .db
             .write(|conn| {
@@ -5132,28 +5147,26 @@ mod tests {
         std::fs::create_dir(&managed).unwrap();
         std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o700)).unwrap();
         let root = std::sync::Arc::new(open_image_generation_artifact_root(&managed).unwrap());
-        assert!(
-            coordinate_persisted_accepted_image_response(
-                fixture.db.clone(),
-                root,
-                CoordinateAcceptedImageResponse {
-                    job_id: fixture.job_id,
-                    slot_id: fixture.slot_id,
-                    attempt_number: 1,
-                    expected_job_version: 5,
-                    expected_slot_version: 4,
-                    expected_attempt_version: 5,
-                    external_operation_id: request.external_operation_id,
-                    expected_journal_version: 3,
-                    component_id: Uuid::now_v7(),
-                    release_operation_id: Uuid::now_v7(),
-                    bytes,
-                    now_unix_ms: 11
-                }
-            )
-            .await
-            .is_err()
-        );
+        assert!(coordinate_persisted_accepted_image_response(
+            fixture.db.clone(),
+            root,
+            CoordinateAcceptedImageResponse {
+                job_id: fixture.job_id,
+                slot_id: fixture.slot_id,
+                attempt_number: 1,
+                expected_job_version: 5,
+                expected_slot_version: 4,
+                expected_attempt_version: 5,
+                external_operation_id: request.external_operation_id,
+                expected_journal_version: 3,
+                component_id: Uuid::now_v7(),
+                release_operation_id: Uuid::now_v7(),
+                bytes,
+                now_unix_ms: 11
+            }
+        )
+        .await
+        .is_err());
         assert_eq!(std::fs::read_dir(&managed).unwrap().count(), 0);
         fixture.db.read(move|conn|{let row:(i64,i64)=conn.query_row("SELECT (SELECT count(*) FROM image_generation_response_publication_intents),(SELECT count(*) FROM image_generation_artifacts WHERE job_id=?1)",[fixture.job_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?)))?;assert_eq!(row,(0,0));Ok(())}).await.unwrap();
     }
@@ -5198,28 +5211,26 @@ mod tests {
         let root = std::sync::Arc::new(open_image_generation_artifact_root(&managed).unwrap());
         let component_id = Uuid::now_v7();
         root.force_accepted_response_post_rename_cut(component_id);
-        assert!(
-            coordinate_persisted_accepted_image_response(
-                fixture.db.clone(),
-                root,
-                CoordinateAcceptedImageResponse {
-                    job_id: fixture.job_id,
-                    slot_id: fixture.slot_id,
-                    attempt_number: 1,
-                    expected_job_version: 5,
-                    expected_slot_version: 4,
-                    expected_attempt_version: 5,
-                    external_operation_id: request.external_operation_id,
-                    expected_journal_version: 3,
-                    component_id,
-                    release_operation_id: Uuid::now_v7(),
-                    bytes,
-                    now_unix_ms: 11
-                }
-            )
-            .await
-            .is_err()
-        );
+        assert!(coordinate_persisted_accepted_image_response(
+            fixture.db.clone(),
+            root,
+            CoordinateAcceptedImageResponse {
+                job_id: fixture.job_id,
+                slot_id: fixture.slot_id,
+                attempt_number: 1,
+                expected_job_version: 5,
+                expected_slot_version: 4,
+                expected_attempt_version: 5,
+                external_operation_id: request.external_operation_id,
+                expected_journal_version: 3,
+                component_id,
+                release_operation_id: Uuid::now_v7(),
+                bytes,
+                now_unix_ms: 11
+            }
+        )
+        .await
+        .is_err());
         let job_id = fixture.job_id;
         let artifact_id = fixture.artifact_id;
         drop(fixture);
@@ -5281,7 +5292,7 @@ mod tests {
             .transaction(move |conn| {
                 cockpit_db::Db::request_image_generation_cancellation_conn(
                     conn,
-                    &RequestImageGenerationCancellation {
+                    &cockpit_db::db::image_generation::RequestImageGenerationCancellation {
                         job_id,
                         cancellation_version: 1,
                         request_operation_id: "cancel:reconciled",
@@ -5466,7 +5477,7 @@ mod tests {
                         .transaction(move |conn| {
                             cockpit_db::Db::request_image_generation_cancellation_conn(
                                 conn,
-                                &RequestImageGenerationCancellation {
+                                &cockpit_db::db::image_generation::RequestImageGenerationCancellation {
                                     job_id,
                                     cancellation_version: 1,
                                     request_operation_id: "cancel:before-reconcile",
@@ -5508,18 +5519,45 @@ mod tests {
                         .transaction(move |conn| {
                             cockpit_db::Db::request_image_generation_cancellation_conn(
                                 conn,
-                                &RequestImageGenerationCancellation {
+                                &cockpit_db::db::image_generation::RequestImageGenerationCancellation {
                                     job_id,
                                     cancellation_version: 1,
                                     request_operation_id: "cancel:after-reconcile",
                                     requested_at_unix_ms: 11,
                                 },
-                            )
+                            )?;
+                            Ok(())
                         })
                         .await
                         .is_ok()
                 };
-                let row = fixture.db.read(move|conn|conn.query_row("SELECT a.state,s.state,j.state,m.state,b.state,(SELECT COUNT(*) FROM image_generation_reconciliation_evidence e WHERE e.job_id=a.job_id),(SELECT COUNT(*) FROM image_generation_reconciliation_claim_completions c WHERE c.job_id=a.job_id) FROM image_generation_attempts a JOIN image_generation_slots s USING(job_id,slot_id) JOIN image_generation_jobs j USING(job_id) JOIN media_reservations m ON m.reservation_id=?3 JOIN image_spend_reservations b ON b.reservation_id=?4 WHERE a.job_id=?1 AND a.slot_id=?2 AND a.attempt_number=1",rusqlite::params![job_id.to_string(),slot_id.to_string(),media_id,spend_id],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,i64>(5)?,row.get::<_,i64>(6)?)))).await.unwrap();
+                let row = fixture
+                    .db
+                    .read(move |conn| {
+                        conn.query_row(
+                            "SELECT a.state,s.state,j.state,m.state,b.state,(SELECT COUNT(*) FROM image_generation_reconciliation_evidence e WHERE e.job_id=a.job_id),(SELECT COUNT(*) FROM image_generation_reconciliation_claim_completions c WHERE c.job_id=a.job_id) FROM image_generation_attempts a JOIN image_generation_slots s USING(job_id,slot_id) JOIN image_generation_jobs j USING(job_id) JOIN media_reservations m ON m.reservation_id=?3 JOIN image_spend_reservations b ON b.reservation_id=?4 WHERE a.job_id=?1 AND a.slot_id=?2 AND a.attempt_number=1",
+                            rusqlite::params![
+                                job_id.to_string(),
+                                slot_id.to_string(),
+                                media_id,
+                                spend_id
+                            ],
+                            |row| {
+                                Ok((
+                                    row.get::<_, String>(0)?,
+                                    row.get::<_, String>(1)?,
+                                    row.get::<_, String>(2)?,
+                                    row.get::<_, String>(3)?,
+                                    row.get::<_, String>(4)?,
+                                    row.get::<_, i64>(5)?,
+                                    row.get::<_, i64>(6)?,
+                                ))
+                            },
+                        )
+                        .map_err(Into::into)
+                    })
+                    .await
+                    .unwrap();
                 let expected = match (cancel_first, outcome_name) {
                     (true, "accepted") => (
                         "accepted",
@@ -6534,10 +6572,27 @@ mod tests {
     fn resolver_source_has_no_adapter_or_network_contact_seam() {
         let source = include_str!("image_generation_job.rs");
         let start = source.find("pub fn resolve_image_generation(").unwrap();
-        let end = source[start..]
-            .find("\nimpl RuntimeTargetAuthorityV1")
-            .unwrap()
-            + start;
+        let brace = source[start..]
+            .find('{')
+            .map(|offset| start + offset)
+            .unwrap();
+        let mut depth = 0_i32;
+        let mut end = brace;
+        for (offset, ch) in source[brace..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = brace + offset + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Only the resolver function body is pure; later retained-response
+        // production code legitimately creates sealed artifact graphs.
         let body = &source[start..end];
         for forbidden in [
             "adapter.generate",
@@ -6711,11 +6766,9 @@ mod tests {
         for count in [MAX_IMAGE_GENERATION_SLOTS - 1, MAX_IMAGE_GENERATION_SLOTS] {
             assert!(with_slots(count).validate().is_ok());
         }
-        assert!(
-            with_slots(MAX_IMAGE_GENERATION_SLOTS + 1)
-                .validate()
-                .is_err()
-        );
+        assert!(with_slots(MAX_IMAGE_GENERATION_SLOTS + 1)
+            .validate()
+            .is_err());
         for dimension in [
             MAX_IMAGE_GENERATION_DIMENSION - 1,
             MAX_IMAGE_GENERATION_DIMENSION,
@@ -6820,7 +6873,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn output_authority_is_held_private_and_nofollow() {
-        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::os::unix::fs::{symlink, PermissionsExt};
         let temporary = tempfile::TempDir::new().unwrap();
         let output = temporary.path().join("output");
         std::fs::create_dir(&output).unwrap();
@@ -6845,10 +6898,13 @@ mod tests {
         let widened = temporary.path().join("widened");
         std::fs::create_dir(&widened).unwrap();
         std::fs::set_permissions(&widened, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(
-            open_image_generation_output_directory(&widened, 1, "generated".into(), "png".into())
-                .is_err()
-        );
+        assert!(open_image_generation_output_directory(
+            &widened,
+            1,
+            "generated".into(),
+            "png".into()
+        )
+        .is_err());
         let link = temporary.path().join("link");
         symlink(&output, &link).unwrap();
         assert!(
@@ -6930,10 +6986,13 @@ mod tests {
                 Ok(())
             }
         }
-        assert!(
-            write_verified_artifact_component(&held, &full, evidence.sha256(), &mut Disconnected,)
-                .is_err()
-        );
+        assert!(write_verified_artifact_component(
+            &held,
+            &full,
+            evidence.sha256(),
+            &mut Disconnected,
+        )
+        .is_err());
         let mut reopened = held
             .open_verified_component("component.bin", &evidence)
             .unwrap();
@@ -6956,10 +7015,9 @@ mod tests {
             HeldDirectoryEffectOutcome::AppliedDurable(_)
         ));
         std::fs::write(root.join("mutated.bin"), b"changed").unwrap();
-        assert!(
-            held.open_verified_component("mutated.bin", &evidence)
-                .is_err()
-        );
+        assert!(held
+            .open_verified_component("mutated.bin", &evidence)
+            .is_err());
     }
 
     #[cfg(windows)]
@@ -6970,16 +7028,22 @@ mod tests {
         let output = temporary.path().join("output");
         std::fs::create_dir(&output).unwrap();
         crate::goal_scratch::set_private(&output).unwrap();
-        assert!(
-            open_image_generation_output_directory(&output, 1, "generated".into(), "png".into())
-                .is_ok()
-        );
+        assert!(open_image_generation_output_directory(
+            &output,
+            1,
+            "generated".into(),
+            "png".into()
+        )
+        .is_ok());
         let link = temporary.path().join("link");
         if symlink_dir(&output, &link).is_ok() {
-            assert!(
-                open_image_generation_output_directory(&link, 1, "generated".into(), "png".into())
-                    .is_err()
-            );
+            assert!(open_image_generation_output_directory(
+                &link,
+                1,
+                "generated".into(),
+                "png".into()
+            )
+            .is_err());
         }
     }
 }

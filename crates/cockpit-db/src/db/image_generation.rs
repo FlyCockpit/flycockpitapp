@@ -3284,19 +3284,21 @@ impl Db {
             input.component_set_digest == component_set_digest,
             "component set digest does not bind exact graph"
         );
-        let tx = conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT INTO image_generation_artifacts(artifact_id,job_id,slot_id,state,generation,expected_component_count,component_set_digest,component_set_json,created_at_unix_ms,updated_at_unix_ms) VALUES(?1,?2,?3,'allocating',1,?4,?5,?6,?7,?7)",
-            params![input.artifact_id.to_string(),input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.components.len())?,component_set_digest,component_set_json,input.now_unix_ms],
-        )?;
-        for component in &input.components {
-            tx.execute(
-                "INSERT INTO image_generation_artifact_components(artifact_id,component_id,component_kind,state,generation,relative_storage_key,byte_length_hi,byte_length_lo,sha256,resource_reservation_id,release_operation_id) VALUES(?1,?2,?3,'planned',1,?4,?5,?6,?7,?8,?9)",
-                params![input.artifact_id.to_string(),component.component_id.to_string(),component.kind.as_str(),component.relative_storage_key,i64::from((component.byte_length>>32) as u32),i64::from(component.byte_length as u32),component.sha256,component.resource_reservation_id,component.release_operation_id.to_string()],
+        // Use a savepoint so this reducer composes inside Db::transaction (needed
+        // for accepted-response post-rename crash cuts) without nesting BEGIN.
+        atomic_conn(conn, "image_generation_create_artifact", || {
+            conn.execute(
+                "INSERT INTO image_generation_artifacts(artifact_id,job_id,slot_id,state,generation,expected_component_count,component_set_digest,component_set_json,created_at_unix_ms,updated_at_unix_ms) VALUES(?1,?2,?3,'allocating',1,?4,?5,?6,?7,?7)",
+                params![input.artifact_id.to_string(),input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.components.len())?,component_set_digest,component_set_json,input.now_unix_ms],
             )?;
-        }
-        tx.commit()?;
-        Ok(())
+            for component in &input.components {
+                conn.execute(
+                    "INSERT INTO image_generation_artifact_components(artifact_id,component_id,component_kind,state,generation,relative_storage_key,byte_length_hi,byte_length_lo,sha256,resource_reservation_id,release_operation_id) VALUES(?1,?2,?3,'planned',1,?4,?5,?6,?7,?8,?9)",
+                    params![input.artifact_id.to_string(),component.component_id.to_string(),component.kind.as_str(),component.relative_storage_key,i64::from((component.byte_length>>32) as u32),i64::from(component.byte_length as u32),component.sha256,component.resource_reservation_id,component.release_operation_id.to_string()],
+                )?;
+            }
+            Ok(())
+        })
     }
 
     pub fn transition_image_generation_artifact_conn(

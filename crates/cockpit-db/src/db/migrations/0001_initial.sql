@@ -3453,7 +3453,7 @@ CREATE TABLE image_generation_reconciliation_evidence (
  provider_request_identity TEXT NOT NULL,
  provider_idempotency_identity TEXT NOT NULL,
  journal_payload_digest TEXT NOT NULL CHECK(length(journal_payload_digest)=64 AND journal_payload_digest NOT GLOB '*[^0-9a-f]*'),
- outcome TEXT NOT NULL CHECK(outcome IN ('authoritative_nonacceptance','authoritative_failure')),
+ outcome TEXT NOT NULL CHECK(outcome IN ('authoritative_nonacceptance','authoritative_accepted','authoritative_failure')),
  PRIMARY KEY(job_id,slot_id,attempt_number,journal_version),
  FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT
 );

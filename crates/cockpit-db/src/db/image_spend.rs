@@ -1,7 +1,7 @@
 #![allow(clippy::items_after_test_module)]
 //! Durable, exactly-once image-generation monetary reservations.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, ensure, Context, Result};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;

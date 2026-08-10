@@ -190,6 +190,11 @@ impl HeldDirectoryAuthority {
             )?;
             artifact.file.flush()?;
             artifact.file.sync_all()?;
+            // Test-only one-shot cut: seal must return Recoverable and retain the
+            // held temporary authority instead of dropping it on durability loss.
+            if sync_failure_forced() {
+                anyhow::bail!("directory sync failed while sealing held temporary");
+            }
             artifact.file.seek(SeekFrom::Start(0))?;
             let mut hash = Sha256::new();
             let mut length = 0_u64;

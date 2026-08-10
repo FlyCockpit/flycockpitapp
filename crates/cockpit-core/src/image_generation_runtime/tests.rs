@@ -112,6 +112,44 @@ impl BoundConnector for MismatchedConnector {
         })
     }
 }
+struct ControlledConnector {
+    calls: AtomicUsize,
+    started: tokio::sync::mpsc::UnboundedSender<usize>,
+    releases: Vec<Arc<Notify>>,
+}
+impl BoundConnector for ControlledConnector {
+    fn execute<'a>(
+        &'a self,
+        request: ReadOnlyProbeRequest,
+        candidates: &'a [IpAddr],
+        _: AddressClass,
+        _: ProbeLimits,
+    ) -> Pin<Box<dyn Future<Output = Result<BoundProbeResponse, RuntimeError>> + Send + 'a>> {
+        let index = self.calls.fetch_add(1, Ordering::SeqCst);
+        let _ = self.started.send(index);
+        Box::pin(async move {
+            self.releases[index].notified().await;
+            let hostname = request.url.host_str().unwrap();
+            let authority = origin_authority(&request.url, hostname);
+            Ok(BoundProbeResponse {
+                status: reqwest::StatusCode::OK,
+                body: Vec::new(),
+                connection: ConnectionProof {
+                    authority: authority.clone(),
+                    connected_ip: candidates[0],
+                    location: classify_address(candidates[0]),
+                    established_at: 0,
+                    hops: vec![ConnectionHop {
+                        authority,
+                        hostname: hostname.into(),
+                        connected_ip: candidates[0],
+                        location: classify_address(candidates[0]),
+                    }],
+                },
+            })
+        })
+    }
+}
 struct Adapter {
     kind: ImageAdapterKind,
     calls: AtomicUsize,
@@ -285,6 +323,7 @@ fn image_generation_runtime_limits_are_exact() {
         ProbeLimits {
             connect_timeout: Duration::from_secs(5),
             header_timeout: Duration::from_secs(15),
+            body_timeout: Duration::from_secs(15),
             body_limit: 256 * 1024,
             redirect_limit: 3
         }
@@ -359,7 +398,7 @@ async fn image_generation_runtime_limit_failures_have_stable_results() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn image_generation_runtime_enforces_connect_timeout_around_connector() {
+async fn image_generation_runtime_enforces_total_deadline_around_connector() {
     let registry = ImageRuntimeRegistry::new(
         Arc::new(Clock(AtomicU64::new(0))),
         Arc::new(Dns("8.8.8.8".parse().unwrap())),
@@ -386,10 +425,10 @@ async fn image_generation_runtime_enforces_connect_timeout_around_connector() {
             .await
     });
     tokio::task::yield_now().await;
-    tokio::time::advance(CONNECT_TIMEOUT).await;
+    tokio::time::advance(HEADER_TIMEOUT + BODY_TIMEOUT).await;
     assert!(matches!(
         refresh.await.unwrap(),
-        Err(error) if error.code == RuntimeErrorCode::ConnectTimeout
+        Err(error) if error.code == RuntimeErrorCode::HeaderTimeout
     ));
 }
 
@@ -932,4 +971,199 @@ async fn image_generation_pinned_connector_enforces_body_limit_while_reading() {
         Err(error) if error.code == RuntimeErrorCode::BodyLimit
     ));
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn image_generation_credential_rotation_prevents_old_flight_commit() {
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let releases = vec![Arc::new(Notify::new()), Arc::new(Notify::new())];
+    let connector = Arc::new(ControlledConnector {
+        calls: AtomicUsize::new(0),
+        started: started_tx,
+        releases: releases.clone(),
+    });
+    let adapter = Arc::new(Adapter {
+        kind: ImageAdapterKind::OpenaiImages,
+        calls: AtomicUsize::new(0),
+    });
+    let registry = ImageRuntimeRegistry::new(
+        Arc::new(Clock(AtomicU64::new(0))),
+        Arc::new(Dns("8.8.8.8".parse().unwrap())),
+        connector,
+        vec![adapter],
+    )
+    .unwrap();
+    let endpoint = endpoint();
+    apply_endpoint_and_target(&registry, &endpoint, 1, 1);
+    let old_registry = registry.clone();
+    let old_endpoint = endpoint.clone();
+    let old = tokio::spawn(async move {
+        old_registry
+            .refresh(
+                old_endpoint,
+                "target".into(),
+                1,
+                1,
+                1,
+                RefreshKind::Capabilities,
+                credential_digest(10),
+            )
+            .await
+    });
+    assert_eq!(started_rx.recv().await.unwrap(), 0);
+    let new_registry = registry.clone();
+    let new_endpoint = endpoint.clone();
+    let new = tokio::spawn(async move {
+        new_registry
+            .refresh(
+                new_endpoint,
+                "target".into(),
+                1,
+                1,
+                2,
+                RefreshKind::Capabilities,
+                credential_digest(11),
+            )
+            .await
+    });
+    assert_eq!(started_rx.recv().await.unwrap(), 1);
+    releases[0].notify_one();
+    assert!(matches!(old.await.unwrap(), Err(error) if error.code == RuntimeErrorCode::Obsolete));
+    releases[1].notify_one();
+    let current = new.await.unwrap().unwrap();
+    assert_eq!(current.request_id, 2);
+    assert_eq!(
+        current.credential_identity_digest,
+        Some(credential_digest(11))
+    );
+}
+
+#[tokio::test]
+async fn image_generation_refresh_waiter_drop_cancels_only_the_last_waiter() {
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new(Notify::new());
+    let connector = Arc::new(ControlledConnector {
+        calls: AtomicUsize::new(0),
+        started: started_tx,
+        releases: vec![release.clone()],
+    });
+    let adapter = Arc::new(Adapter {
+        kind: ImageAdapterKind::OpenaiImages,
+        calls: AtomicUsize::new(0),
+    });
+    let registry = ImageRuntimeRegistry::new(
+        Arc::new(Clock(AtomicU64::new(0))),
+        Arc::new(Dns("8.8.8.8".parse().unwrap())),
+        connector,
+        vec![adapter],
+    )
+    .unwrap();
+    let endpoint = endpoint();
+    apply_endpoint_and_target(&registry, &endpoint, 1, 1);
+    let first_registry = registry.clone();
+    let first_endpoint = endpoint.clone();
+    let first = tokio::spawn(async move {
+        first_registry
+            .refresh(
+                first_endpoint,
+                "target".into(),
+                1,
+                1,
+                20,
+                RefreshKind::Capabilities,
+                credential_digest(12),
+            )
+            .await
+    });
+    assert_eq!(started_rx.recv().await.unwrap(), 0);
+    let second_registry = registry.clone();
+    let second_endpoint = endpoint.clone();
+    let second = tokio::spawn(async move {
+        second_registry
+            .refresh(
+                second_endpoint,
+                "target".into(),
+                1,
+                1,
+                21,
+                RefreshKind::Capabilities,
+                credential_digest(12),
+            )
+            .await
+    });
+    for _ in 0..16 {
+        let has_two_waiters = registry
+            .inner
+            .inflight
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .is_some_and(|flight| flight.waiters.load(Ordering::Acquire) == 2);
+        if has_two_waiters {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        registry
+            .inner
+            .inflight
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .waiters
+            .load(Ordering::Acquire),
+        2
+    );
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    release.notify_one();
+    assert_eq!(second.await.unwrap().unwrap().request_id, 21);
+
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let connector = Arc::new(ControlledConnector {
+        calls: AtomicUsize::new(0),
+        started: started_tx,
+        releases: vec![Arc::new(Notify::new())],
+    });
+    let registry = ImageRuntimeRegistry::new(
+        Arc::new(Clock(AtomicU64::new(0))),
+        Arc::new(Dns("8.8.8.8".parse().unwrap())),
+        connector,
+        vec![Arc::new(Adapter {
+            kind: ImageAdapterKind::OpenaiImages,
+            calls: AtomicUsize::new(0),
+        })],
+    )
+    .unwrap();
+    apply_endpoint_and_target(&registry, &endpoint, 1, 1);
+    let cancelled_registry = registry.clone();
+    let cancelled_endpoint = endpoint.clone();
+    let cancelled = tokio::spawn(async move {
+        cancelled_registry
+            .refresh(
+                cancelled_endpoint,
+                "target".into(),
+                1,
+                1,
+                30,
+                RefreshKind::Capabilities,
+                credential_digest(13),
+            )
+            .await
+    });
+    assert_eq!(started_rx.recv().await.unwrap(), 0);
+    cancelled.abort();
+    assert!(cancelled.await.unwrap_err().is_cancelled());
+    for _ in 0..16 {
+        if registry.inner.inflight.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(registry.snapshot(&endpoint.id, "target").is_none());
+    assert!(registry.inner.inflight.lock().unwrap().is_empty());
 }

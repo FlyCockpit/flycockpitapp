@@ -8,7 +8,7 @@ use std::future::Future;
 use std::net::IpAddr;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::Instant;
@@ -41,6 +41,7 @@ pub const CAPABILITY_DISPATCH_TTL: Duration = Duration::from_secs(15 * 60);
 pub const DISPLAY_STALE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const HEADER_TIMEOUT: Duration = Duration::from_secs(15);
+pub const BODY_TIMEOUT: Duration = Duration::from_secs(15);
 pub const DISCOVERY_BODY_LIMIT: usize = 1024 * 1024;
 pub const HEALTH_BODY_LIMIT: usize = 256 * 1024;
 pub const REDIRECT_LIMIT: usize = 3;
@@ -411,6 +412,7 @@ struct PinnedResponse {
     location: Option<String>,
     connected_ip: IpAddr,
     body: Vec<u8>,
+    body_bytes: usize,
 }
 
 impl ReqwestPinnedConnector {
@@ -424,6 +426,9 @@ impl ReqwestPinnedConnector {
         ip: IpAddr,
         limits: ProbeLimits,
         headers: &reqwest::header::HeaderMap,
+        connect_deadline: tokio::time::Instant,
+        header_deadline: tokio::time::Instant,
+        body_deadline: tokio::time::Instant,
     ) -> Result<PinnedResponse, RuntimeError> {
         let hostname = url.host_str().ok_or(RuntimeError::new(
             RuntimeErrorCode::Dns,
@@ -433,10 +438,17 @@ impl ReqwestPinnedConnector {
             RuntimeErrorCode::Dns,
             "Correct the endpoint port.",
         ))?;
+        let connect_timeout = connect_deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(RuntimeError::new(
+                RuntimeErrorCode::ConnectTimeout,
+                "The provider connection did not complete in time.",
+            ))?;
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
-            .connect_timeout(limits.connect_timeout)
+            .connect_timeout(connect_timeout)
             .resolve(hostname, std::net::SocketAddr::new(ip, port))
             .build()
             .map_err(|_| {
@@ -445,8 +457,8 @@ impl ReqwestPinnedConnector {
                     "Check the endpoint certificate and configured hostname.",
                 )
             })?;
-        let response = tokio::time::timeout(
-            limits.header_timeout,
+        let response = tokio::time::timeout_at(
+            header_deadline,
             client.get(url.clone()).headers(headers.clone()).send(),
         )
         .await
@@ -481,7 +493,7 @@ impl ReqwestPinnedConnector {
         let mut body_bytes = 0usize;
         let mut body = Vec::new();
         let mut stream = response.bytes_stream();
-        while let Some(chunk) = tokio::time::timeout(limits.header_timeout, stream.next())
+        while let Some(chunk) = tokio::time::timeout_at(body_deadline, stream.next())
             .await
             .map_err(|_| {
                 RuntimeError::new(
@@ -515,6 +527,7 @@ impl ReqwestPinnedConnector {
             location,
             connected_ip,
             body,
+            body_bytes,
         })
     }
 }
@@ -528,10 +541,14 @@ impl BoundConnector for ReqwestPinnedConnector {
         limits: ProbeLimits,
     ) -> Pin<Box<dyn Future<Output = Result<BoundProbeResponse, RuntimeError>> + Send + 'a>> {
         Box::pin(async move {
+            let connect_deadline = tokio::time::Instant::now() + limits.connect_timeout;
+            let header_deadline = tokio::time::Instant::now() + limits.header_timeout;
+            let body_deadline = tokio::time::Instant::now() + limits.body_timeout;
             let mut url = request.url;
             let initial_headers = request.headers;
             let mut candidates = candidates.to_vec();
             let mut hops = Vec::new();
+            let mut total_body_bytes = 0usize;
             for redirect_count in 0..=limits.redirect_limit {
                 let ip = *candidates.first().ok_or(RuntimeError::new(
                     RuntimeErrorCode::DnsDenied,
@@ -551,7 +568,27 @@ impl BoundConnector for ReqwestPinnedConnector {
                         std::sync::LazyLock::new(reqwest::header::HeaderMap::new);
                     &EMPTY
                 };
-                let response = self.pinned_read_only(&url, ip, limits, headers).await?;
+                let response = self
+                    .pinned_read_only(
+                        &url,
+                        ip,
+                        ProbeLimits {
+                            body_limit: limits.body_limit.saturating_sub(total_body_bytes),
+                            ..limits
+                        },
+                        headers,
+                        connect_deadline,
+                        header_deadline,
+                        body_deadline,
+                    )
+                    .await?;
+                total_body_bytes = total_body_bytes
+                    .checked_add(response.body_bytes)
+                    .filter(|total| *total <= limits.body_limit)
+                    .ok_or(RuntimeError::new(
+                        RuntimeErrorCode::BodyLimit,
+                        "The provider response exceeded the inspection limit.",
+                    ))?;
                 let connected_ip = response.connected_ip;
                 if !candidates.contains(&connected_ip)
                     || classify_address(connected_ip) != required_location
@@ -601,7 +638,15 @@ impl BoundConnector for ReqwestPinnedConnector {
                     RuntimeErrorCode::Dns,
                     "Correct the redirect hostname.",
                 ))?;
-                candidates = self.dns.resolve(redirect_host).await?;
+                candidates =
+                    tokio::time::timeout_at(header_deadline, self.dns.resolve(redirect_host))
+                        .await
+                        .map_err(|_| {
+                            RuntimeError::new(
+                                RuntimeErrorCode::HeaderTimeout,
+                                "Redirect validation exceeded the probe deadline.",
+                            )
+                        })??;
                 if candidates.is_empty()
                     || candidates
                         .iter()
@@ -625,6 +670,7 @@ impl BoundConnector for ReqwestPinnedConnector {
 pub struct ProbeLimits {
     pub connect_timeout: Duration,
     pub header_timeout: Duration,
+    pub body_timeout: Duration,
     pub body_limit: usize,
     pub redirect_limit: usize,
 }
@@ -633,6 +679,7 @@ impl ProbeLimits {
         Self {
             connect_timeout: CONNECT_TIMEOUT,
             header_timeout: HEADER_TIMEOUT,
+            body_timeout: BODY_TIMEOUT,
             body_limit: HEALTH_BODY_LIMIT,
             redirect_limit: REDIRECT_LIMIT,
         }
@@ -809,6 +856,12 @@ struct CurrentIdentity {
     immutable: String,
     location: ImageLocationClass,
     enabled: bool,
+    refresh_authority: Option<RefreshAuthority>,
+}
+#[derive(Clone)]
+struct RefreshAuthority {
+    request_id: u64,
+    credential_identity_digest: CredentialIdentityDigest,
 }
 #[derive(Clone)]
 struct CurrentTargetIdentity {
@@ -823,6 +876,20 @@ struct Flight {
     notify: Notify,
     completed: AtomicBool,
     result: Mutex<Option<Result<ImageHealthSnapshot, RuntimeError>>>,
+    waiters: AtomicUsize,
+    cancelled: AtomicBool,
+    cancel_notify: Notify,
+}
+struct WaiterGuard {
+    flight: Arc<Flight>,
+}
+impl Drop for WaiterGuard {
+    fn drop(&mut self) {
+        if self.flight.waiters.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.flight.cancelled.store(true, Ordering::Release);
+            self.flight.cancel_notify.notify_waiters();
+        }
+    }
 }
 struct Inner {
     adapters: Vec<Arc<dyn ImageRuntimeAdapter>>,
@@ -958,14 +1025,22 @@ impl ImageRuntimeRegistry {
             ))
     }
     pub fn apply_endpoint(&self, endpoint: &ImageEndpoint, generation: u64, epoch: u64) {
-        let identity = CurrentIdentity {
+        let mut identity = CurrentIdentity {
             generation,
             epoch,
             immutable: endpoint.immutable_identity(),
             location: endpoint.location,
             enabled: endpoint.enabled,
+            refresh_authority: None,
         };
         let mut current = self.inner.current.lock().unwrap();
+        if let Some(old) = current.get(&endpoint.id)
+            && old.immutable == identity.immutable
+            && old.generation == identity.generation
+            && old.epoch == identity.epoch
+        {
+            identity.refresh_authority = old.refresh_authority.clone();
+        }
         let invalidate = current.get(&endpoint.id).is_some_and(|old| {
             old.immutable != identity.immutable
                 || old.location != identity.location
@@ -1152,6 +1227,43 @@ impl ImageRuntimeRegistry {
                 RuntimeErrorCode::Obsolete,
                 "Refresh after target configuration changes.",
             ))?;
+        let credential_rotated = {
+            let mut current = self.inner.current.lock().unwrap();
+            let identity = current.get_mut(&endpoint.id).ok_or(RuntimeError::new(
+                RuntimeErrorCode::Obsolete,
+                "Refresh after endpoint configuration changes.",
+            ))?;
+            let rotated = identity
+                .refresh_authority
+                .as_ref()
+                .is_some_and(|authority| {
+                    authority.credential_identity_digest != credential_identity_digest
+                });
+            if identity.refresh_authority.is_none()
+                || identity
+                    .refresh_authority
+                    .as_ref()
+                    .is_some_and(|authority| request_id > authority.request_id)
+            {
+                identity.refresh_authority = Some(RefreshAuthority {
+                    request_id,
+                    credential_identity_digest: credential_identity_digest.clone(),
+                });
+            } else if rotated {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::Obsolete,
+                    "Refresh after credential rotation.",
+                ));
+            }
+            rotated
+        };
+        if credential_rotated {
+            self.inner
+                .cache
+                .lock()
+                .unwrap()
+                .retain(|key, _| key.endpoint != endpoint.id);
+        }
         let key = RefreshKey {
             endpoint: endpoint.id.clone(),
             target: target_id.clone(),
@@ -1181,17 +1293,24 @@ impl ImageRuntimeRegistry {
         let (flight, leader) = {
             let mut flights = self.inner.inflight.lock().unwrap();
             match flights.get(&key) {
-                Some(n) => (n.clone(), false),
-                None => {
+                Some(n) if !n.cancelled.load(Ordering::Acquire) => (n.clone(), false),
+                Some(_) | None => {
                     let n = Arc::new(Flight {
                         notify: Notify::new(),
                         completed: AtomicBool::new(false),
                         result: Mutex::new(None),
+                        waiters: AtomicUsize::new(0),
+                        cancelled: AtomicBool::new(false),
+                        cancel_notify: Notify::new(),
                     });
                     flights.insert(key.clone(), n.clone());
                     (n, true)
                 }
             }
+        };
+        flight.waiters.fetch_add(1, Ordering::AcqRel);
+        let _waiter = WaiterGuard {
+            flight: flight.clone(),
         };
         let mut notified = Box::pin(flight.notify.notified());
         notified.as_mut().enable();
@@ -1200,7 +1319,7 @@ impl ImageRuntimeRegistry {
             let key2 = key.clone();
             let flight2 = flight.clone();
             tokio::spawn(async move {
-                let outcome = AssertUnwindSafe(registry.run_refresh(
+                let work = AssertUnwindSafe(registry.run_refresh(
                     endpoint,
                     target_id,
                     generation,
@@ -1209,19 +1328,39 @@ impl ImageRuntimeRegistry {
                     kind,
                     credential_identity_digest,
                 ))
-                .catch_unwind()
-                .await
-                .map_err(|_| {
-                    RuntimeError::new(
+                .catch_unwind();
+                let mut cancelled = Box::pin(flight2.cancel_notify.notified());
+                cancelled.as_mut().enable();
+                tokio::pin!(work);
+                let outcome = if flight2.cancelled.load(Ordering::Acquire) {
+                    Err(RuntimeError::new(
                         RuntimeErrorCode::Obsolete,
-                        "The refresh ended before producing a result.",
-                    )
-                })
-                .and_then(|result| result);
+                        "The refresh has no current waiters.",
+                    ))
+                } else {
+                    tokio::select! {
+                        result = &mut work => result
+                            .map_err(|_| RuntimeError::new(
+                                RuntimeErrorCode::Obsolete,
+                                "The refresh ended before producing a result.",
+                            ))
+                            .and_then(|result| result),
+                        () = cancelled.as_mut() => Err(RuntimeError::new(
+                            RuntimeErrorCode::Obsolete,
+                            "The refresh has no current waiters.",
+                        )),
+                    }
+                };
                 *flight2.result.lock().unwrap() = Some(outcome);
                 flight2.completed.store(true, Ordering::Release);
                 flight2.notify.notify_waiters();
-                registry.inner.inflight.lock().unwrap().remove(&key2);
+                let mut inflight = registry.inner.inflight.lock().unwrap();
+                if inflight
+                    .get(&key2)
+                    .is_some_and(|current| Arc::ptr_eq(current, &flight2))
+                {
+                    inflight.remove(&key2);
+                }
             });
         }
         if !flight.completed.load(Ordering::Acquire) {
@@ -1250,7 +1389,6 @@ impl ImageRuntimeRegistry {
         kind: RefreshKind,
         credential_identity_digest: CredentialIdentityDigest,
     ) -> Result<ImageHealthSnapshot, RuntimeError> {
-        let header_deadline = tokio::time::Instant::now() + HEADER_TIMEOUT;
         let target_current = self
             .inner
             .current_targets
@@ -1284,7 +1422,7 @@ impl ImageRuntimeRegistry {
             ))?
             .to_owned();
         let authority = origin_authority(&url, &hostname);
-        let resolved = match tokio::time::timeout_at(header_deadline, self.dns.resolve(&hostname))
+        let resolved = match tokio::time::timeout(HEADER_TIMEOUT, self.dns.resolve(&hostname))
             .await
             .map_err(|_| {
                 RuntimeError::new(
@@ -1351,16 +1489,18 @@ impl ImageRuntimeRegistry {
                 "Keep runtime probes within the configured endpoint origin.",
             ));
         }
-        let connect_deadline = header_deadline.min(tokio::time::Instant::now() + CONNECT_TIMEOUT);
+        // DNS and request construction do not consume the connector's one-shot
+        // header/body phase budgets.
+        let connector_deadline = tokio::time::Instant::now() + HEADER_TIMEOUT + BODY_TIMEOUT;
         let response = match tokio::time::timeout_at(
-            connect_deadline,
+            connector_deadline,
             self.connector.execute(request, &allowed, wanted, limits),
         )
         .await
         .map_err(|_| {
             RuntimeError::new(
-                RuntimeErrorCode::ConnectTimeout,
-                "The provider connection did not complete in time.",
+                RuntimeErrorCode::HeaderTimeout,
+                "The provider probe exceeded its total deadline.",
             )
         })
         .and_then(|result| result)
@@ -1641,11 +1781,19 @@ impl ImageRuntimeRegistry {
         immutable_identity: &str,
     ) -> Result<ImageHealthSnapshot, RuntimeError> {
         let current = self.inner.current.lock().unwrap();
+        let authority = current
+            .get(&id)
+            .and_then(|value| value.refresh_authority.clone());
         let valid = current.get(&id).is_some_and(|v| {
             v.generation == generation
                 && v.epoch == epoch
                 && v.immutable == immutable_identity
                 && v.enabled
+                && v.refresh_authority.as_ref().is_some_and(|authority| {
+                    snapshot.credential_identity_digest.as_ref()
+                        == Some(&authority.credential_identity_digest)
+                        && authority.request_id >= snapshot.request_id
+                })
         });
         if !valid {
             return Err(RuntimeError::new(
@@ -1659,6 +1807,9 @@ impl ImageRuntimeRegistry {
             target: snapshot.target_id.clone(),
         };
         let mut snapshot = snapshot;
+        if let Some(authority) = authority {
+            snapshot.request_id = authority.request_id;
+        }
         if let Some(newer_capability) = cache
             .get(&cache_key)
             .filter(|current| {
@@ -1776,15 +1927,23 @@ impl ImageRuntimeRegistry {
             ));
         }
         let allowed = ips;
-        let proof = self
-            .connector
-            .execute(
+        let deadline = tokio::time::Instant::now() + HEADER_TIMEOUT + BODY_TIMEOUT;
+        let proof = tokio::time::timeout_at(
+            deadline,
+            self.connector.execute(
                 ReadOnlyProbeRequest::new(url.clone(), Self::resolve_ephemeral_headers(endpoint)?),
                 &allowed,
                 class,
                 ProbeLimits::health(),
+            ),
+        )
+        .await
+        .map_err(|_| {
+            RuntimeError::new(
+                RuntimeErrorCode::HeaderTimeout,
+                "The dispatch revalidation exceeded its total deadline.",
             )
-            .await?;
+        })??;
         let proof = proof.connection;
         if !allowed.contains(&proof.connected_ip)
             || proof.location != class

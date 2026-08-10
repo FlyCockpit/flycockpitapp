@@ -415,6 +415,7 @@ fn is_public_v4(ip: Ipv4Addr) -> bool {
         || (a == 172 && (16..=31).contains(&b))
         || (a == 192 && b == 0 && c == 0)
         || (a == 192 && b == 0 && c == 2)
+        || (a == 192 && b == 88 && c == 99)
         || (a == 192 && b == 168)
         || (a == 198 && (b == 18 || b == 19))
         || (a == 198 && b == 51 && c == 100)
@@ -434,6 +435,7 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
     }
     let segments = ip.segments();
     !(segments[0] == 0x2001 && segments[1] < 0x0200 // IETF special assignments /23
+        || (segments[0] == 0x2001 && segments[1] == 0x0db8) // documentation /32
         || segments[0] == 0x2002 // 6to4 embeds an unchecked IPv4 destination
         || (segments[0] == 0x3fff && segments[1] & 0xf000 == 0)) // documentation /20
 }
@@ -564,6 +566,7 @@ mod tests {
             "10.0.0.1",
             "100.64.0.1",
             "192.168.0.1",
+            "192.88.99.1",
             "224.0.0.1",
             "::1",
             "fc00::1",

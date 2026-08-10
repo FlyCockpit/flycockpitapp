@@ -1789,6 +1789,124 @@ async fn media_upload_production_dispatch_cancel_finalize_and_status() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn https_media_ingest_daemon_dispatch_is_owner_bound_ready_and_replayable() {
+    use cockpit_db::media_attachments::{
+        HttpsRetentionResultV1, RequestedLocalPathMediaKind, RetainHttpsMediaV1,
+    };
+    use sha2::{Digest as _, Sha256};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Fetcher {
+        calls: AtomicUsize,
+        bytes: Vec<u8>,
+    }
+    #[async_trait::async_trait]
+    impl crate::media_https::HttpsMediaFetcher for Fetcher {
+        async fn fetch(
+            &self,
+            _: &str,
+            sink: &mut tokio::fs::File,
+            _: &crate::media_https::HttpsFetchLimits,
+        ) -> anyhow::Result<crate::media_https::RetainedHttpsFetchEvidence> {
+            use tokio::io::AsyncWriteExt as _;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            sink.write_all(&self.bytes).await?;
+            Ok(crate::media_https::RetainedHttpsFetchEvidence {
+                byte_length: self.bytes.len() as u64,
+                sha256: crate::intel::hex_lower(&Sha256::digest(&self.bytes)),
+                provenance: crate::media_https::RedactedHttpsProvenance {
+                    redirect_classes: vec![],
+                    path_segment_count: 1,
+                    safe_basename: Some("image.png".into()),
+                },
+            })
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        2,
+        2,
+        image::Rgba([1, 2, 3, 255]),
+    ))
+    .write_to(&mut png, image::ImageFormat::Png)
+    .unwrap();
+    let fetcher = Arc::new(Fetcher {
+        calls: AtomicUsize::new(0),
+        bytes: png.into_inner(),
+    });
+    let mut ctx = test_ctx();
+    let db = ctx.db.clone();
+    Arc::get_mut(&mut ctx).unwrap().media_storage_recovery = Some(Arc::new(
+        crate::media_storage::MediaStorageRecovery::open_or_create(
+            db.clone(),
+            &temp.path().join("media"),
+        )
+        .unwrap()
+        .with_https_fetcher(fetcher.clone()),
+    ));
+    let (mut state, session_id) = attached_state(&ctx, &project).await;
+    let project_digest = crate::intel::hex_lower(&Sha256::digest(
+        state
+            .attached
+            .as_ref()
+            .unwrap()
+            .handle
+            .project_root
+            .to_str()
+            .unwrap()
+            .as_bytes(),
+    ));
+    let request = RetainHttpsMediaV1 {
+        schema_version: 1,
+        kind: "retainHttpsMedia".into(),
+        local_operation_id: Uuid::now_v7(),
+        owner_principal_digest: super::run_invocation::principal_digest(&state.principal),
+        session_id,
+        canonical_project_digest: project_digest,
+        client_draft_id: Uuid::now_v7(),
+        requested_media_kind: RequestedLocalPathMediaKind::Image,
+        url: "https://media.example.test/image.png?secret=redacted".into(),
+    };
+    let first = handle_request(Request::RetainHttpsMedia(request.clone()), &mut state, &ctx)
+        .await
+        .unwrap();
+    let Response::RetainedHttpsMedia(receipt) = first else {
+        panic!("unexpected response")
+    };
+    let attachment = match &receipt.result {
+        HttpsRetentionResultV1::Retained { attachment_id, .. } => *attachment_id,
+        _ => panic!("rejected"),
+    };
+    assert_eq!(
+        db.read(move |conn| Ok(conn.query_row(
+            "SELECT availability FROM media_attachments WHERE attachment_id=?1",
+            [attachment.to_string()],
+            |r| r.get::<_, String>(0)
+        )?))
+        .await
+        .unwrap(),
+        "ready"
+    );
+    let replay = handle_request(Request::RetainHttpsMedia(request.clone()), &mut state, &ctx)
+        .await
+        .unwrap();
+    let Response::RetainedHttpsMedia(replay) = replay else {
+        panic!("unexpected replay")
+    };
+    assert_eq!(replay.receipt_id, receipt.receipt_id);
+    assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+    let mut wrong = request;
+    wrong.session_id = Uuid::now_v7();
+    let denied = handle_request(Request::RetainHttpsMedia(wrong), &mut state, &ctx)
+        .await
+        .unwrap_err();
+    assert_eq!(denied.message, "media_attachment_unavailable");
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn owner_local_path_registration_dispatch_replays_before_path_and_hides_authority() {
     use cockpit_db::media_attachments::{
         LocalPathRegistrationResultV1, MediaAttachmentComponent, MediaAvailability,

@@ -2337,6 +2337,10 @@ pub(super) async fn handle_serialized_request(
                         internal(error)
                     }
                 })?;
+            recovery
+                .process_retained_https_jobs(chrono::Utc::now().timestamp_millis())
+                .await
+                .map_err(internal)?;
             Ok(Response::RetainedHttpsMedia(receipt))
         }
         Request::GetMediaAttachmentStatus(request) => {

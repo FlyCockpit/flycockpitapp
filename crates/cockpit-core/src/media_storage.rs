@@ -141,6 +141,114 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    /// Claims and completes retained-HTTPS image work through the same strict
+    /// classifier/canonical image normalizer used by upload Finalize.
+    pub(crate) async fn process_retained_https_jobs(&self, now_unix_ms: i64) -> Result<usize> {
+        let jobs=self.db.read(|conn|{let mut statement=conn.prepare("SELECT j.job_id,j.attachment_id,j.expected_attachment_version,j.expected_availability_generation,j.source_evidence_digest,c.storage_id,c.stable_identity_digest,c.byte_length,c.sha256,c.reservation_id FROM media_attachment_processing_jobs j JOIN media_attachments a ON a.attachment_id=j.attachment_id JOIN media_attachment_components c ON c.attachment_id=a.attachment_id AND c.component_kind='quarantined_original' WHERE j.state='pending' AND a.source_kind='retained_https' AND a.media_kind='image' ORDER BY j.created_at_unix_ms,j.job_id")?;statement.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?)))?.collect::<std::result::Result<Vec<_>,_>>().map_err(Into::into)}).await?;
+        let mut completed = 0;
+        for (
+            job,
+            attachment,
+            version,
+            generation,
+            source_evidence,
+            storage,
+            identity,
+            length,
+            checksum,
+            reservation,
+        ) in jobs
+        {
+            let job_id = Uuid::parse_str(&job)?;
+            let attachment_id = Uuid::parse_str(&attachment)?;
+            let expected_version = version.parse::<u64>()?;
+            let expected_generation = generation.parse::<u64>()?;
+            let claimed=self.db.transaction(move|conn|{let changed=conn.execute("UPDATE media_attachment_processing_jobs SET state='claimed' WHERE job_id=?1 AND state='pending'",[job_id.to_string()])?;if changed==0{return Ok(false)}cockpit_db::Db::transition_media_attachment_conn(conn,attachment_id,expected_version,expected_generation,MediaAvailability::Probing,now_unix_ms)?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,'quarantined','probing',?3,?4)",params![attachment_id.to_string(),(expected_generation+1).to_string(),job_id.to_string(),now_unix_ms])?;Ok(true)}).await?;
+            if !claimed {
+                continue;
+            }
+            let mut held = self
+                .owned_root
+                .open_file_verified(&storage)
+                .map_err(anyhow::Error::new)?;
+            ensure!(
+                stable_identity_digest(&held)? == identity,
+                "storage_security_violation"
+            );
+            let (actual_length, actual_checksum) = read_full_digest(&mut held)?;
+            ensure!(
+                actual_length == length.parse::<u64>()?
+                    && actual_checksum == checksum
+                    && stable_identity_digest(&held)? == identity,
+                "storage_security_violation"
+            );
+            let (container, mime) = probe_upload_container(&mut held, MediaKind::Image)?;
+            held.seek(SeekFrom::Start(0))?;
+            let mut bytes = Vec::new();
+            held.by_ref()
+                .take(10 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            ensure!(bytes.len() <= 10 * 1024 * 1024, "resource_limit");
+            let normalized = normalize_image(&bytes, container)?;
+            let outputs = [
+                (
+                    "image_model",
+                    Uuid::now_v7(),
+                    normalized.model_png,
+                    normalized.width,
+                    normalized.height,
+                ),
+                (
+                    "browser_thumbnail",
+                    Uuid::now_v7(),
+                    normalized.thumbnail_png,
+                    normalized.thumbnail_width,
+                    normalized.thumbnail_height,
+                ),
+            ];
+            let mut components = Vec::new();
+            let mut names = Vec::new();
+            for (kind, id, bytes, width, height) in outputs {
+                let name = id.to_string();
+                let mut file = self
+                    .owned_root
+                    .create_file_exclusive(&name)
+                    .map_err(anyhow::Error::new)?;
+                file.write_all(&bytes)?;
+                file.sync_all()?;
+                let output_identity = stable_identity_digest(&file)?;
+                let (output_length, output_checksum) = read_full_digest(&mut file)?;
+                ensure!(
+                    output_length == bytes.len() as u64
+                        && output_checksum == crate::intel::hex_lower(&Sha256::digest(&bytes))
+                        && stable_identity_digest(&file)? == output_identity,
+                    "storage_security_violation"
+                );
+                names.push(name);
+                components.push((
+                    kind,
+                    id,
+                    output_identity,
+                    output_length,
+                    output_checksum,
+                    width,
+                    height,
+                ));
+            }
+            self.owned_root.sync().map_err(anyhow::Error::new)?;
+            let names_on_error = names.clone();
+            let result=self.db.transaction(move|conn|{for(kind,id,identity,length,checksum,width,height)in components{let component=cockpit_db::media_attachments::MediaAttachmentComponent{component_id:id,attachment_id,attachment_version:expected_version,component_kind:kind.into(),storage_id:id,lifecycle_state:"ready".into(),component_generation:1,stable_identity_digest:identity,byte_length:length,sha256:checksum,reservation_id:reservation.clone(),created_at_unix_ms:now_unix_ms,updated_at_unix_ms:now_unix_ms};cockpit_db::Db::insert_media_attachment_component_conn(conn,&component)?;conn.execute("INSERT INTO media_image_component_dimensions(component_id,width,height) VALUES(?1,?2,?3)",params![id.to_string(),width,height])?;}conn.execute("UPDATE media_attachments SET canonical_container=?1,canonical_mime=?2 WHERE attachment_id=?3",params![container,mime,attachment_id.to_string()])?;let mut current=expected_generation+1;for next in[MediaAvailability::Decoding,MediaAvailability::Normalizing,MediaAvailability::Ready]{cockpit_db::Db::transition_media_attachment_conn(conn,attachment_id,expected_version,current,next,now_unix_ms)?;let after=current+1;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![attachment_id.to_string(),after.to_string(),if current==2{"probing"}else if current==3{"decoding"}else{"normalizing"},next.as_str(),job_id.to_string(),now_unix_ms])?;current=after;}conn.execute("UPDATE media_attachment_processing_jobs SET state='completed',completed_at_unix_ms=?1 WHERE job_id=?2 AND state='claimed' AND source_evidence_digest=?3",params![now_unix_ms,job_id.to_string(),source_evidence])?;Ok(())}).await;
+            if let Err(error) = result {
+                for name in names_on_error {
+                    let _ = self.owned_root.remove_file(&name);
+                }
+                let _ = self.owned_root.sync();
+                return Err(error);
+            }
+            completed += 1;
+        }
+        Ok(completed)
+    }
     pub(crate) async fn retain_https_media(
         &self,
         request: RetainHttpsMediaV1,
@@ -2320,7 +2428,7 @@ impl MediaStorageRecovery {
     }
 
     #[cfg(test)]
-    fn with_https_fetcher(
+    pub(crate) fn with_https_fetcher(
         mut self,
         fetcher: std::sync::Arc<dyn crate::media_https::HttpsMediaFetcher>,
     ) -> Self {
@@ -5443,9 +5551,17 @@ mod tests {
         let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
         let session_id = Uuid::now_v7();
         db.transaction(move |conn| { conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'project','/redacted',1,1)",[session_id.to_string()])?; Ok(()) }).await.unwrap();
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([12, 34, 56, 255]),
+        ))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
         let fetcher = std::sync::Arc::new(ScriptedHttpsFetcher {
             calls: AtomicUsize::new(0),
-            bytes: b"retained https fixture".to_vec(),
+            bytes: png.into_inner(),
         });
         let recovery = MediaStorageRecovery::open_or_create(db.clone(), &temp.path().join("media"))
             .unwrap()
@@ -5477,6 +5593,13 @@ mod tests {
             1
         );
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(recovery.process_retained_https_jobs(10).await.unwrap(), 1);
+        let attachment_id = match &first.result {
+            HttpsRetentionResultV1::Retained { attachment_id, .. } => *attachment_id,
+            _ => unreachable!(),
+        };
+        let ready = db.read(move|conn|Ok(conn.query_row("SELECT availability,(SELECT COUNT(*) FROM media_attachment_components c WHERE c.attachment_id=a.attachment_id AND c.component_kind IN ('image_model','browser_thumbnail')) FROM media_attachments a WHERE attachment_id=?1",[attachment_id.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?)))?)).await.unwrap();
+        assert_eq!(ready, ("ready".into(), 2));
         assert_eq!(
             recovery
                 .retain_https_media(request.clone(), &policy, 2, 11)

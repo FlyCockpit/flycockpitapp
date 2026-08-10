@@ -3126,13 +3126,15 @@ mod tests {
         let queued_session = evaluated(MediaDimension::QueuedOperationsPerSession, 1);
         let local = evaluated(MediaDimension::LocalCpuJobsGlobal, 1);
         let handoff = evaluated(MediaDimension::OutboundSubmissionsGlobal, 1);
-        sealed.central_resources[0] = resource_reservation_from_media_reservation(
+        let per_attempt_resource = resource_reservation_from_media_reservation(
             &handoff,
             sealed.central_resources[0].reservation_identity.clone(),
         )
         .unwrap();
+        sealed.central_resources[0] = per_attempt_resource.clone();
+        sealed.central_resources[0].units = u64::from(max_attempts);
         for attempt in &mut sealed.targets[0].slots[0].attempts {
-            attempt.resource_maximum = vec![sealed.central_resources[0].clone()];
+            attempt.resource_maximum = vec![per_attempt_resource.clone()];
         }
         sealed.spend.maximum_usd_micros = Some(u64::from(max_attempts) * 10);
         let canonical = sealed.canonical_bytes().unwrap();

@@ -2327,6 +2327,68 @@ fn canonicalize_pcm_wav(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(output)
 }
 
+fn verify_canonical_video_mp4(bytes: &[u8]) -> Result<()> {
+    ensure!(bytes.len() >= 24, "invalid_media");
+    let mut offset = 0usize;
+    let mut kinds = Vec::new();
+    let mut ftyp = None;
+    let mut moov = None;
+    while offset < bytes.len() {
+        ensure!(offset + 8 <= bytes.len(), "invalid_media");
+        let short = u32::from_be_bytes(bytes[offset..offset + 4].try_into()?) as u64;
+        let kind: [u8; 4] = bytes[offset + 4..offset + 8].try_into()?;
+        let (header, size) = if short == 1 {
+            ensure!(offset + 16 <= bytes.len(), "invalid_media");
+            (
+                16usize,
+                u64::from_be_bytes(bytes[offset + 8..offset + 16].try_into()?),
+            )
+        } else {
+            (8usize, short)
+        };
+        ensure!(size >= header as u64, "invalid_media");
+        let end = offset
+            .checked_add(usize::try_from(size)?)
+            .context("invalid_media")?;
+        ensure!(end <= bytes.len(), "invalid_media");
+        ensure!(
+            !kinds.contains(&kind) || !matches!(&kind, b"ftyp" | b"moov" | b"mdat"),
+            "invalid_media"
+        );
+        if &kind == b"ftyp" {
+            ftyp = Some(&bytes[offset..end]);
+        }
+        if &kind == b"moov" {
+            moov = Some(&bytes[offset + header..end]);
+        }
+        kinds.push(kind);
+        offset = end;
+    }
+    ensure!(
+        offset == bytes.len()
+            && kinds.first() == Some(b"ftyp")
+            && kinds.iter().position(|kind| kind == b"moov")
+                < kinds.iter().position(|kind| kind == b"mdat"),
+        "invalid_media"
+    );
+    let ftyp = ftyp.context("invalid_media")?;
+    ensure!(
+        ftyp.len() == 32
+            && &ftyp[8..12] == b"isom"
+            && u32::from_be_bytes(ftyp[12..16].try_into()?) == 512
+            && &ftyp[16..] == b"isomiso2avc1mp41",
+        "invalid_media"
+    );
+    let moov = moov.context("invalid_media")?;
+    for forbidden in [b"edts".as_slice(), b"udta", b"meta", b"chap"] {
+        ensure!(
+            !moov.windows(4).any(|value| value == forbidden),
+            "invalid_media"
+        );
+    }
+    Ok(())
+}
+
 struct NormalizedImageDerivatives {
     model_png: Vec<u8>,
     thumbnail_png: Vec<u8>,
@@ -3393,6 +3455,27 @@ mod tests {
         let mut invalid = wav;
         invalid[20] = 3;
         assert!(canonicalize_pcm_wav(&invalid).is_err());
+    }
+
+    #[test]
+    fn canonical_video_mp4_requires_exact_brands_and_moov_before_mdat() {
+        let mut output = Vec::new();
+        output.extend_from_slice(&32u32.to_be_bytes());
+        output.extend_from_slice(b"ftypisom");
+        output.extend_from_slice(&512u32.to_be_bytes());
+        output.extend_from_slice(b"isomiso2avc1mp41");
+        output.extend_from_slice(&8u32.to_be_bytes());
+        output.extend_from_slice(b"moov");
+        output.extend_from_slice(&8u32.to_be_bytes());
+        output.extend_from_slice(b"mdat");
+        verify_canonical_video_mp4(&output).unwrap();
+        let mut bad_brand = output.clone();
+        bad_brand[20..24].copy_from_slice(b"mp42");
+        assert!(verify_canonical_video_mp4(&bad_brand).is_err());
+        let mut bad_order = output[..32].to_vec();
+        bad_order.extend_from_slice(&output[40..]);
+        bad_order.extend_from_slice(&output[32..40]);
+        assert!(verify_canonical_video_mp4(&bad_order).is_err());
     }
 
     #[test]

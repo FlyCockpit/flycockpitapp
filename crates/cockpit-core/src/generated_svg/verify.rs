@@ -221,10 +221,8 @@ fn verify_start(
             _ => {}
         }
     }
-    if kind == Kind::Defs {
-        if std::mem::replace(defs_seen, true) {
-            return fail(SvgSanitizeCode::StructuralVerify, "defs-cardinality");
-        }
+    if kind == Kind::Defs && std::mem::replace(defs_seen, true) {
+        return fail(SvgSanitizeCode::StructuralVerify, "defs-cardinality");
     }
     let definition = if stack.last().is_some_and(|frame| frame.kind == Kind::Defs)
         && kind.reference_kind().is_some()

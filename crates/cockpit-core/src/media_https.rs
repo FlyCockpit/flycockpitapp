@@ -87,6 +87,30 @@ impl HttpsDnsResolver for SystemHttpsDnsResolver {
     }
 }
 
+#[async_trait]
+pub(crate) trait HttpsMediaFetcher: Send + Sync {
+    async fn fetch(
+        &self,
+        raw_url: &str,
+        sink: &mut tokio::fs::File,
+        limits: &HttpsFetchLimits,
+    ) -> Result<RetainedHttpsFetchEvidence>;
+}
+
+pub(crate) struct SystemHttpsMediaFetcher;
+
+#[async_trait]
+impl HttpsMediaFetcher for SystemHttpsMediaFetcher {
+    async fn fetch(
+        &self,
+        raw_url: &str,
+        sink: &mut tokio::fs::File,
+        limits: &HttpsFetchLimits,
+    ) -> Result<RetainedHttpsFetchEvidence> {
+        fetch_retained_https(raw_url, &SystemHttpsDnsResolver, sink, limits).await
+    }
+}
+
 /// Fetch a retained object into a caller-owned held sink. The caller must fsync,
 /// reopen, and verify its storage identity before publication; this function
 /// supplies only the network byte proof.

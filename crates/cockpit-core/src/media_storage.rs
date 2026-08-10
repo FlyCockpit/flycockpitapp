@@ -135,6 +135,7 @@ pub(crate) struct MediaStorageRecovery {
     borrowed_sources:
         std::sync::Arc<std::sync::Mutex<std::collections::HashMap<Uuid, BorrowedSourceHandle>>>,
     av_runner: std::sync::Arc<dyn AvRuntimeRunner>,
+    https_fetcher: std::sync::Arc<dyn crate::media_https::HttpsMediaFetcher>,
     #[cfg(test)]
     av_runtime_override: Option<ApprovedAvRuntime>,
 }
@@ -179,13 +180,14 @@ impl MediaStorageRecovery {
         self.owned_root.sync().map_err(anyhow::Error::new)?;
         let async_file = tokio::fs::File::from_std(held.try_clone()?);
         let mut async_file = async_file;
-        let fetch = crate::media_https::fetch_retained_https(
-            &request.url,
-            &crate::media_https::SystemHttpsDnsResolver,
-            &mut async_file,
-            &crate::media_https::HttpsFetchLimits::default(),
-        )
-        .await;
+        let fetch = self
+            .https_fetcher
+            .fetch(
+                &request.url,
+                &mut async_file,
+                &crate::media_https::HttpsFetchLimits::default(),
+            )
+            .await;
         let fetch = match fetch {
             Ok(fetch) => fetch,
             Err(error) => {
@@ -2252,6 +2254,7 @@ impl MediaStorageRecovery {
             owned_root: std::sync::Arc::new(root),
             borrowed_sources: Default::default(),
             av_runner: std::sync::Arc::new(SystemAvRuntimeRunner),
+            https_fetcher: std::sync::Arc::new(crate::media_https::SystemHttpsMediaFetcher),
             #[cfg(test)]
             av_runtime_override: None,
         })
@@ -2269,6 +2272,7 @@ impl MediaStorageRecovery {
             owned_root: std::sync::Arc::new(root),
             borrowed_sources: Default::default(),
             av_runner: std::sync::Arc::new(SystemAvRuntimeRunner),
+            https_fetcher: std::sync::Arc::new(crate::media_https::SystemHttpsMediaFetcher),
             #[cfg(test)]
             av_runtime_override: None,
         })
@@ -2277,6 +2281,15 @@ impl MediaStorageRecovery {
     #[cfg(test)]
     fn with_av_runner(mut self, runner: std::sync::Arc<dyn AvRuntimeRunner>) -> Self {
         self.av_runner = runner;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_https_fetcher(
+        mut self,
+        fetcher: std::sync::Arc<dyn crate::media_https::HttpsMediaFetcher>,
+    ) -> Self {
+        self.https_fetcher = fetcher;
         self
     }
 

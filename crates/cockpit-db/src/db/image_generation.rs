@@ -1772,6 +1772,37 @@ pub struct AdvanceImageGenerationLatePublication<'a> {
     pub evidence_json: &'a str,
 }
 
+struct LatePublicationFinalizeProjection {
+    artifact_id: String,
+    artifact_generation: i64,
+    job_id: String,
+    slot_id: String,
+    slot_version: i64,
+    output_authority_digest: String,
+    output_authority_generation: i64,
+    destination_name: String,
+    output_evidence_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveImageGenerationLatePublication<'a> {
+    pub publication_operation_id: Uuid,
+    pub expected_version: u64,
+    pub from: ImageGenerationLatePublicationState,
+    pub to: ImageGenerationLatePublicationState,
+    pub recovery_evidence_json: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReclaimImageGenerationLatePublication<'a> {
+    pub publication_operation_id: Uuid,
+    pub expected_version: u64,
+    pub previous_claim_generation: u64,
+    pub worker_boot_id: Uuid,
+    pub claim_generation: u64,
+    pub reconciled_cleanup_evidence_json: &'a str,
+}
+
 impl Db {
     /// Creates the complete expected component graph in the same transaction.
     /// No component or temporary may be introduced outside this sealed graph.
@@ -2044,6 +2075,30 @@ impl Db {
             database_now_unix_ms(conn)?,
         )
     }
+
+    pub fn resolve_image_generation_late_publication_conn(
+        conn: &Connection,
+        input: &ResolveImageGenerationLatePublication<'_>,
+    ) -> Result<()> {
+        resolve_image_generation_late_publication_at_conn(conn, input, database_now_unix_ms(conn)?)
+    }
+
+    pub fn reclaim_image_generation_late_publication_conn(
+        conn: &Connection,
+        input: &ReclaimImageGenerationLatePublication<'_>,
+    ) -> Result<()> {
+        validate_late_evidence(input.reconciled_cleanup_evidence_json)?;
+        ensure!(
+            input.claim_generation > input.previous_claim_generation,
+            "replacement claim is not fenced"
+        );
+        let changed=conn.execute("UPDATE image_generation_late_publication_leases SET worker_boot_id=?1,claim_generation=?2,recovery_evidence_json=?3,version=version+1 WHERE publication_operation_id=?4 AND state='reserved' AND version=?5 AND claim_generation=?6",params![input.worker_boot_id.to_string(),i64::try_from(input.claim_generation)?,input.reconciled_cleanup_evidence_json,input.publication_operation_id.to_string(),i64::try_from(input.expected_version)?,i64::try_from(input.previous_claim_generation)?])?;
+        ensure!(
+            changed == 1,
+            "late publication replacement claim lost its compare-and-set"
+        );
+        Ok(())
+    }
 }
 
 fn reserve_image_generation_late_publication_at_conn(
@@ -2128,7 +2183,7 @@ fn advance_image_generation_late_publication_at_conn(
         _ => unreachable!(),
     };
     let sql = format!(
-        "UPDATE image_generation_late_publication_leases SET state=?1,version=version+1,{evidence_column}=?2 WHERE publication_operation_id=?3 AND state=?4 AND version=?5 AND worker_boot_id=?6 AND claim_generation=?7 AND (?8<deadline_unix_ms OR state!='reserved')"
+        "UPDATE image_generation_late_publication_leases SET state=?1,version=version+1,{evidence_column}=?2 WHERE publication_operation_id=?3 AND state=?4 AND version=?5 AND worker_boot_id=?6 AND claim_generation=?7 AND (?8<deadline_unix_ms OR state!='reserved') AND EXISTS(SELECT 1 FROM image_generation_artifacts a JOIN image_generation_slots s ON s.job_id=a.job_id AND s.slot_id=a.slot_id JOIN image_generation_late_publication_authorization_facts f ON f.authorization_digest=image_generation_late_publication_leases.authorization_digest WHERE a.artifact_id=image_generation_late_publication_leases.artifact_id AND a.generation=image_generation_late_publication_leases.artifact_generation AND a.state='late_quarantined' AND a.active_lease_count=0 AND s.version=image_generation_late_publication_leases.expected_slot_version AND s.state='late_quarantined' AND s.result_after_cancel=1 AND f.revoked_at_unix_ms IS NULL AND f.output_authority_digest=image_generation_late_publication_leases.output_authority_digest AND f.output_authority_generation=image_generation_late_publication_leases.output_authority_generation AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_cleanup_intents i WHERE i.artifact_id=a.artifact_id) AND (SELECT count(*) FROM image_generation_artifact_components c WHERE c.artifact_id=a.artifact_id AND c.state='ready')=a.expected_component_count)"
     );
     let changed = conn.execute(
         &sql,
@@ -2157,11 +2212,97 @@ fn finalize_image_generation_late_publication_at_conn(
     now_unix_ms: i64,
 ) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
-    let (artifact_id,artifact_generation,job_id,slot_id,slot_version):(String,i64,String,String,i64)=tx.query_row("SELECT artifact_id,artifact_generation,job_id,slot_id,expected_slot_version FROM image_generation_late_publication_leases WHERE publication_operation_id=?1 AND state='copy_committed' AND version=?2",params![publication_operation_id.to_string(),i64::try_from(expected_lease_version)?],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).optional()?.context("late publication finalization lost its lease")?;
+    let projection=tx.query_row("SELECT p.artifact_id,p.artifact_generation,p.job_id,p.slot_id,p.expected_slot_version,p.output_authority_digest,p.output_authority_generation,p.destination_name,p.output_evidence_json FROM image_generation_late_publication_leases p JOIN image_generation_artifacts a ON a.artifact_id=p.artifact_id JOIN image_generation_slots s ON s.job_id=p.job_id AND s.slot_id=p.slot_id JOIN image_generation_late_publication_authorization_facts f ON f.authorization_digest=p.authorization_digest WHERE p.publication_operation_id=?1 AND p.state='copy_committed' AND p.version=?2 AND a.state='late_quarantined' AND a.generation=p.artifact_generation AND s.state='late_quarantined' AND s.version=p.expected_slot_version AND s.result_after_cancel=1 AND f.revoked_at_unix_ms IS NULL AND f.output_authority_digest=p.output_authority_digest AND f.output_authority_generation=p.output_authority_generation AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_cleanup_intents i WHERE i.artifact_id=a.artifact_id)",params![publication_operation_id.to_string(),i64::try_from(expected_lease_version)?],|row|Ok(LatePublicationFinalizeProjection{artifact_id:row.get(0)?,artifact_generation:row.get(1)?,job_id:row.get(2)?,slot_id:row.get(3)?,slot_version:row.get(4)?,output_authority_digest:row.get(5)?,output_authority_generation:row.get(6)?,destination_name:row.get(7)?,output_evidence_json:row.get(8)?})).optional()?.context("late publication finalization lost its lease")?;
+    tx.execute("INSERT INTO image_generation_user_published_outputs(publication_operation_id,artifact_id,artifact_generation,output_authority_digest,output_authority_generation,destination_name,output_evidence_json,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![publication_operation_id.to_string(),projection.artifact_id,projection.artifact_generation,projection.output_authority_digest,projection.output_authority_generation,projection.destination_name,projection.output_evidence_json,now_unix_ms])?;
     tx.execute("UPDATE image_generation_late_publication_leases SET state='published',version=version+1 WHERE publication_operation_id=?1 AND state='copy_committed' AND version=?2",params![publication_operation_id.to_string(),i64::try_from(expected_lease_version)?])?;
-    ensure!(tx.execute("UPDATE image_generation_artifacts SET state='retained',generation=generation+1,updated_at_unix_ms=?1 WHERE artifact_id=?2 AND state='late_quarantined' AND generation=?3",params![now_unix_ms,artifact_id,artifact_generation])?==1,"late publication artifact compare-and-set lost");
-    ensure!(tx.execute("UPDATE image_generation_slots SET state='published',version=version+1,published_disposition='late_authorized',published_disposition_generation=version+1 WHERE job_id=?1 AND slot_id=?2 AND state='late_quarantined' AND version=?3 AND result_after_cancel=1 AND applied_cancellation_version IS NOT NULL",params![job_id,slot_id,slot_version])?==1,"late publication slot compare-and-set lost");
+    ensure!(tx.execute("UPDATE image_generation_artifacts SET state='retained',generation=generation+1,updated_at_unix_ms=?1 WHERE artifact_id=?2 AND state='late_quarantined' AND generation=?3",params![now_unix_ms,projection.artifact_id,projection.artifact_generation])?==1,"late publication artifact compare-and-set lost");
+    ensure!(tx.execute("UPDATE image_generation_slots SET state='published',version=version+1,published_disposition='late_authorized',published_disposition_generation=version+1 WHERE job_id=?1 AND slot_id=?2 AND state='late_quarantined' AND version=?3 AND result_after_cancel=1 AND applied_cancellation_version IS NOT NULL",params![projection.job_id,projection.slot_id,projection.slot_version])?==1,"late publication slot compare-and-set lost");
     tx.commit()?;
+    Ok(())
+}
+
+fn resolve_image_generation_late_publication_at_conn(
+    conn: &Connection,
+    input: &ResolveImageGenerationLatePublication<'_>,
+    database_now_unix_ms: i64,
+) -> Result<()> {
+    validate_late_evidence(input.recovery_evidence_json)?;
+    ensure!(
+        matches!(
+            (input.from, input.to),
+            (
+                ImageGenerationLatePublicationState::Reserved,
+                ImageGenerationLatePublicationState::Expired
+            ) | (
+                ImageGenerationLatePublicationState::Reserved,
+                ImageGenerationLatePublicationState::Aborted
+            ) | (
+                ImageGenerationLatePublicationState::CopyAuthorized,
+                ImageGenerationLatePublicationState::Aborted
+            ) | (
+                ImageGenerationLatePublicationState::Reserved
+                    | ImageGenerationLatePublicationState::CopyAuthorized
+                    | ImageGenerationLatePublicationState::CopyCommitted,
+                ImageGenerationLatePublicationState::SecurityBlocked
+            )
+        ),
+        "late publication resolution edge is not specialized"
+    );
+    let deadline_clause = if input.to == ImageGenerationLatePublicationState::Expired {
+        "AND ?6>=deadline_unix_ms"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "UPDATE image_generation_late_publication_leases SET state=?1,version=version+1,recovery_evidence_json=?2,decided_at_unix_ms=?3 WHERE publication_operation_id=?4 AND state=?5 AND version=?6 {deadline_clause}"
+    );
+    // The repeated version parameter keeps the SQL shape closed; expiry uses
+    // a separately bound database-owned clock below.
+    let sql = if input.to == ImageGenerationLatePublicationState::Expired {
+        "UPDATE image_generation_late_publication_leases SET state=?1,version=version+1,recovery_evidence_json=?2,decided_at_unix_ms=?3 WHERE publication_operation_id=?4 AND state=?5 AND version=?6 AND ?7>=deadline_unix_ms"
+    } else {
+        sql.as_str()
+    };
+    let changed = if input.to == ImageGenerationLatePublicationState::Expired {
+        conn.execute(
+            sql,
+            params![
+                input.to.as_str(),
+                input.recovery_evidence_json,
+                database_now_unix_ms,
+                input.publication_operation_id.to_string(),
+                input.from.as_str(),
+                i64::try_from(input.expected_version)?,
+                database_now_unix_ms
+            ],
+        )?
+    } else {
+        conn.execute(
+            sql,
+            params![
+                input.to.as_str(),
+                input.recovery_evidence_json,
+                database_now_unix_ms,
+                input.publication_operation_id.to_string(),
+                input.from.as_str(),
+                i64::try_from(input.expected_version)?
+            ],
+        )?
+    };
+    ensure!(
+        changed == 1,
+        "late publication resolution compare-and-set lost"
+    );
+    Ok(())
+}
+
+fn validate_late_evidence(evidence: &str) -> Result<()> {
+    ensure!(
+        !evidence.is_empty() && evidence.len() <= 64 * 1024,
+        "late publication evidence length is invalid"
+    );
+    let _: serde_json::Value =
+        serde_json::from_str(evidence).context("late publication evidence is invalid JSON")?;
     Ok(())
 }
 
@@ -3560,18 +3701,19 @@ mod tests {
             let authorization_digest="b".repeat(64); let output_digest="c".repeat(64); let destination="image.png"; let temporary=".image.partial";
             conn.execute("INSERT INTO image_generation_late_publication_authorization_facts(authorization_digest,artifact_id,artifact_generation,job_id,slot_id,slot_generation,component_set_digest,output_authority_digest,output_authority_generation,destination_name,temporary_name,principal_digest,created_at_unix_ms) VALUES(?1,?2,3,?3,?4,8,?5,?6,7,?7,?8,?9,5)",params![authorization_digest,artifact_id.to_string(),fixture.job_id.to_string(),fixture.slot_id.to_string(),component_set_digest,output_digest,destination,temporary,"d".repeat(64)])?;
             let operation=Uuid::now_v7();
+            let base=database_now_unix_ms(conn)?;
             let reserve=ReserveImageGenerationLatePublication{publication_operation_id:operation,artifact_id,expected_artifact_generation:3,job_id:fixture.job_id,slot_id:fixture.slot_id,expected_slot_version:8,component_set_digest:&component_set_digest,component_set_json:&component_set_json,authorization_digest:&authorization_digest,output_authority_digest:&output_digest,output_authority_generation:7,destination_name:destination,temporary_name:temporary};
-            assert!(reserve_image_generation_late_publication_at_conn(conn,&reserve,10)?);
-            assert!(!reserve_image_generation_late_publication_at_conn(conn,&reserve,20)?);
-            assert!(claim_image_generation_late_publication_at_conn(conn,&ClaimImageGenerationLatePublication{publication_operation_id:operation,expected_version:1,worker_boot_id:Uuid::now_v7(),claim_generation:1},300_010).is_err());
+            assert!(reserve_image_generation_late_publication_at_conn(conn,&reserve,base)?);
+            assert!(!reserve_image_generation_late_publication_at_conn(conn,&reserve,base+1)?);
+            assert!(claim_image_generation_late_publication_at_conn(conn,&ClaimImageGenerationLatePublication{publication_operation_id:operation,expected_version:1,worker_boot_id:Uuid::now_v7(),claim_generation:1},base+300_000).is_err());
             let worker=Uuid::now_v7();
-            claim_image_generation_late_publication_at_conn(conn,&ClaimImageGenerationLatePublication{publication_operation_id:operation,expected_version:1,worker_boot_id:worker,claim_generation:1},300_009)?;
-            advance_image_generation_late_publication_at_conn(conn,&AdvanceImageGenerationLatePublication{publication_operation_id:operation,expected_version:2,worker_boot_id:worker,claim_generation:1,from:ImageGenerationLatePublicationState::Reserved,to:ImageGenerationLatePublicationState::CopyAuthorized,evidence_json:"{\"temporary\":\"held\"}"},300_009)?;
-            advance_image_generation_late_publication_at_conn(conn,&AdvanceImageGenerationLatePublication{publication_operation_id:operation,expected_version:3,worker_boot_id:worker,claim_generation:1,from:ImageGenerationLatePublicationState::CopyAuthorized,to:ImageGenerationLatePublicationState::CopyCommitted,evidence_json:"{\"output\":\"durable\"}"},400_000)?;
-            finalize_image_generation_late_publication_at_conn(conn,operation,4,400_001)?;
+            claim_image_generation_late_publication_at_conn(conn,&ClaimImageGenerationLatePublication{publication_operation_id:operation,expected_version:1,worker_boot_id:worker,claim_generation:1},base+299_999)?;
+            advance_image_generation_late_publication_at_conn(conn,&AdvanceImageGenerationLatePublication{publication_operation_id:operation,expected_version:2,worker_boot_id:worker,claim_generation:1,from:ImageGenerationLatePublicationState::Reserved,to:ImageGenerationLatePublicationState::CopyAuthorized,evidence_json:"{\"temporary\":\"held\"}"},base+299_999)?;
+            advance_image_generation_late_publication_at_conn(conn,&AdvanceImageGenerationLatePublication{publication_operation_id:operation,expected_version:3,worker_boot_id:worker,claim_generation:1,from:ImageGenerationLatePublicationState::CopyAuthorized,to:ImageGenerationLatePublicationState::CopyCommitted,evidence_json:"{\"output\":\"durable\"}"},base+400_000)?;
+            finalize_image_generation_late_publication_at_conn(conn,operation,4,base+400_001)?;
             let states:(String,String,String)=conn.query_row("SELECT p.state,a.state,s.published_disposition FROM image_generation_late_publication_leases p JOIN image_generation_artifacts a ON a.artifact_id=p.artifact_id JOIN image_generation_slots s ON s.job_id=p.job_id AND s.slot_id=p.slot_id WHERE p.publication_operation_id=?1",[operation.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
             assert_eq!(states,("published".into(),"retained".into(),"late_authorized".into()));
-            assert!(finalize_image_generation_late_publication_at_conn(conn,operation,4,400_001).is_err());
+            assert!(finalize_image_generation_late_publication_at_conn(conn,operation,4,base+400_001).is_err());
             Ok(())
         }).unwrap();
     }

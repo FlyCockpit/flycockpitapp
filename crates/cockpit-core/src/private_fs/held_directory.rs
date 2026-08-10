@@ -121,6 +121,10 @@ pub(crate) struct HeldDirectoryAuthority {
 }
 
 impl HeldDirectoryAuthority {
+    #[cfg(test)]
+    pub(crate) fn force_next_directory_sync_failure(&self) {
+        FORCE_DIRECTORY_SYNC_FAILURE.set(true);
+    }
     pub(crate) fn open_existing(path: &Path) -> Result<Self> {
         let imp = imp::HeldDirectory::open_existing(path)?;
         let identity = imp.identity()?;

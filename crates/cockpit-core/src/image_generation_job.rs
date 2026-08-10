@@ -2253,6 +2253,10 @@ impl HeldImageGenerationOutputDirectory {
     ) -> Result<HeldDirectoryEffectOutcome> {
         self.guard.delete_recovered_destination(recovery)
     }
+    #[cfg(test)]
+    fn force_next_directory_sync_failure(&self) {
+        self.guard.force_next_directory_sync_failure();
+    }
 }
 pub fn open_image_generation_output_directory(
     path: &Path,
@@ -2705,6 +2709,7 @@ mod tests {
 
     struct RealLedgerSchedulerFixture {
         db: cockpit_db::Db,
+        owner_session_id: Uuid,
         job_id: Uuid,
         slot_id: Uuid,
         artifact_id: Uuid,
@@ -2854,6 +2859,7 @@ mod tests {
         .await
         .unwrap();
         let fixture_job_id = sealed.job_id;
+        let fixture_owner_session_id = sealed.owner_session_id;
         let fixture_slot_id = sealed.targets[0].slots[0].slot_id;
         let fixture_artifact_id = sealed.targets[0].slots[0].managed_artifact_id;
         let fixture_spend = sealed.spend.reservation_id.clone();
@@ -2897,6 +2903,7 @@ mod tests {
         .unwrap();
         RealLedgerSchedulerFixture {
             db,
+            owner_session_id: fixture_owner_session_id,
             job_id: fixture_job_id,
             slot_id: fixture_slot_id,
             artifact_id: fixture_artifact_id,
@@ -2938,12 +2945,30 @@ mod tests {
     #[tokio::test]
     async fn accepted_result_cancelled_during_validation_is_late_quarantined() {
         use cockpit_db::db::image_generation::{
-            AdoptImageGenerationResponse, BeginImageGenerationDownload,
-            CommitImageGenerationValidation, RequestImageGenerationCancellation,
+            AdoptImageGenerationResponse, AdvanceImageGenerationLatePublication,
+            BeginImageGenerationDownload, ClaimImageGenerationLatePublication,
+            CommitImageGenerationValidation, ImageGenerationLatePublicationEvidenceV1,
+            ImageGenerationLatePublicationState, RequestImageGenerationCancellation,
         };
-        let fixture = setup_real_ledger_scheduler_job(
+        let temporary = tempfile::TempDir::new().unwrap();
+        let output_path = temporary.path().join("output");
+        std::fs::create_dir(&output_path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&output_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let output = open_image_generation_output_directory(
+            &output_path,
+            4,
+            "generated".into(),
+            "png".into(),
+        )
+        .unwrap();
+        let fixture = setup_real_ledger_scheduler_job_with_output(
             cockpit_db::Db::open_in_memory().unwrap(),
             "late-result",
+            Some(output.authority().clone()),
         )
         .await;
         assert!(
@@ -2973,7 +2998,6 @@ mod tests {
             assert_eq!(persisted,("late_quarantined".into(),"completed_after_cancel".into()));
             Ok(())
         }).await.unwrap();
-        let temporary = tempfile::TempDir::new().unwrap();
         let managed = temporary.path().join("managed");
         std::fs::create_dir(&managed).unwrap();
         #[cfg(unix)]
@@ -2992,6 +3016,114 @@ mod tests {
             assert_eq!(ordinary,0);
             Ok(())
         }).await.unwrap();
+
+        let publication_operation_id = Uuid::now_v7();
+        let worker_boot_id = Uuid::now_v7();
+        let owner_session_id = fixture.owner_session_id;
+        let mut publication_temporary = output
+            .create_temporary_exclusive(".generated-late.partial")
+            .unwrap();
+        use std::io::Write as _;
+        publication_temporary
+            .file_mut()
+            .write_all(b"late publication bytes")
+            .unwrap();
+        let publication_temporary = output.seal_temporary(publication_temporary).unwrap();
+        let prepared = ImageGenerationLatePublicationEvidenceV1::TemporaryPrepared {
+            schema_version: 1,
+            identity_digest: publication_temporary.evidence().identity_digest().into(),
+            security_digest: publication_temporary.evidence().security_digest().into(),
+            byte_length: publication_temporary.evidence().byte_length().to_string(),
+            sha256: publication_temporary.evidence().sha256().into(),
+        }
+        .canonical_json()
+        .unwrap();
+        fixture
+            .db
+            .blocking_for_sync_cli(|conn| {
+                let owner = ImageGenerationOwnerContextAuthority::from_attached_session(
+                    conn,
+                    owner_session_id,
+                    &ClientPrincipal::Owner,
+                    7,
+                )?;
+                let authority = owner.authorize_late_publication(
+                    conn,
+                    &output,
+                    artifact_id,
+                    "generated-late.png",
+                    ".generated-late.partial",
+                    8,
+                )?;
+                assert!(authority.reserve(conn, publication_operation_id)?);
+                cockpit_db::Db::claim_image_generation_late_publication_conn(
+                    conn,
+                    &ClaimImageGenerationLatePublication {
+                        publication_operation_id,
+                        expected_version: 1,
+                        worker_boot_id,
+                        claim_generation: 1,
+                    },
+                )?;
+                cockpit_db::Db::advance_image_generation_late_publication_conn(
+                    conn,
+                    &AdvanceImageGenerationLatePublication {
+                        publication_operation_id,
+                        expected_version: 2,
+                        worker_boot_id,
+                        claim_generation: 1,
+                        from: ImageGenerationLatePublicationState::Reserved,
+                        to: ImageGenerationLatePublicationState::CopyAuthorized,
+                        evidence_json: &prepared,
+                    },
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        output.force_next_directory_sync_failure();
+        let HeldDirectoryEffectOutcome::AppliedUnknown(recovery) = output
+            .publish_temporary_noreplace(publication_temporary, "generated-late.png")
+            .unwrap()
+        else {
+            panic!("post-effect sync cut did not yield restart recovery")
+        };
+        fixture.db.blocking_for_sync_cli(|conn| {
+            let owner = ImageGenerationOwnerContextAuthority::from_attached_session(
+                conn,
+                owner_session_id,
+                &ClientPrincipal::Owner,
+                7,
+            )?;
+            adopt_verified_copy_authorized_publication(
+                conn,
+                &owner,
+                &output,
+                &AdoptVerifiedCopyAuthorizedPublication {
+                    publication_operation_id,
+                    expected_lease_version: 3,
+                    worker_boot_id,
+                    claim_generation: 1,
+                    recovery: &recovery,
+                },
+            )?;
+            cockpit_db::Db::finalize_image_generation_late_publication_conn(
+                conn,
+                publication_operation_id,
+                4,
+                9,
+            )?;
+            let states: (String, String, String) = conn.query_row(
+                "SELECT p.state,a.state,s.state FROM image_generation_late_publication_leases p JOIN image_generation_artifacts a ON a.artifact_id=p.artifact_id JOIN image_generation_slots s ON s.job_id=p.job_id AND s.slot_id=p.slot_id WHERE p.publication_operation_id=?1",
+                [publication_operation_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            assert_eq!(states, ("published".into(), "retained".into(), "published".into()));
+            Ok(())
+        }).unwrap();
+        assert_eq!(
+            std::fs::read(output_path.join("generated-late.png")).unwrap(),
+            b"late publication bytes"
+        );
     }
 
     #[tokio::test]

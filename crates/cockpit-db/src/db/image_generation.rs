@@ -3786,6 +3786,7 @@ mod tests {
             assert!(conn.execute("DELETE FROM image_generation_artifact_security_recovery_attempts WHERE recovery_operation_id=?1",[operation.clone()]).is_err());
             assert!(conn.execute("UPDATE image_generation_artifact_security_recovery_attempts SET outcome_digest=?1 WHERE recovery_operation_id=?2",params!["d".repeat(64),operation]).is_err());
             assert!(conn.execute("INSERT INTO image_generation_artifact_security_recovery_audits(recovery_operation_id,artifact_id,artifact_generation,job_id,slot_id,slot_generation,principal_digest,component_set_digest,component_identity_digest,disposition,state,created_at_unix_ms) VALUES(?1,?2,1,?3,?4,1,?5,?6,?7,'resume_verified_cleanup','recorded',1)",params![Uuid::now_v7().to_string(),Uuid::now_v7().to_string(),Uuid::now_v7().to_string(),Uuid::now_v7().to_string(),"a".repeat(64),"b".repeat(64),"c".repeat(64)]).is_err());
+            assert!(conn.execute("INSERT INTO image_generation_artifact_security_recovery_components(recovery_operation_id,artifact_id,component_id,component_kind,component_generation,stable_identity_digest,security_digest,sha256) VALUES(?1,?2,?3,'primary',1,?4,?5,?6)",params![Uuid::now_v7().to_string(),Uuid::now_v7().to_string(),Uuid::now_v7().to_string(),"a".repeat(64),"b".repeat(64),"c".repeat(64)]).is_err());
             Ok(())
         }).unwrap();
     }
@@ -3927,7 +3928,6 @@ mod tests {
             let base=database_now_unix_ms(conn)?;
             let reserve=ReserveImageGenerationLatePublication{publication_operation_id:operation,artifact_id,expected_artifact_generation:3,job_id:fixture.job_id,slot_id:fixture.slot_id,expected_slot_version:8,component_set_digest:&component_set_digest,component_set_json:&component_set_json,authorization_digest:&authorization_digest,output_authority_digest:&output_digest,output_authority_generation:7,destination_name:destination,temporary_name:temporary};
             let deleted=ImageGenerationLatePublicationEvidenceV1::TemporaryDeleted{schema_version:1,identity_digest:"6".repeat(64),deletion_digest:"7".repeat(64),parent_sync_digest:"8".repeat(64)}.canonical_json()?;
-            let ambiguous=ImageGenerationLatePublicationEvidenceV1::SecurityAmbiguous{schema_version:1,recovery_digest:"9".repeat(64)}.canonical_json()?;
             let mut terminal=reserve.clone(); terminal.publication_operation_id=Uuid::now_v7();
             assert!(reserve_image_generation_late_publication_at_conn(conn,&terminal,base-300_000)?);
             assert!(conn.execute("UPDATE image_generation_late_publication_leases SET state='expired',version=2 WHERE publication_operation_id=?1",[terminal.publication_operation_id.to_string()]).is_err());
@@ -3939,7 +3939,7 @@ mod tests {
             Db::reclaim_image_generation_late_publication_conn(conn,&ReclaimImageGenerationLatePublication{publication_operation_id:terminal.publication_operation_id,expected_version:2,previous_claim_generation:1,worker_boot_id:Uuid::now_v7(),claim_generation:2,reconciled_cleanup_evidence_json:&deleted})?;
             resolve_image_generation_late_publication_at_conn(conn,&ResolveImageGenerationLatePublication{publication_operation_id:terminal.publication_operation_id,expected_version:3,from:ImageGenerationLatePublicationState::Reserved,to:ImageGenerationLatePublicationState::Aborted,recovery_evidence_json:&deleted},base+2)?;
             terminal.publication_operation_id=Uuid::now_v7(); assert!(reserve_image_generation_late_publication_at_conn(conn,&terminal,base)?);
-            resolve_image_generation_late_publication_at_conn(conn,&ResolveImageGenerationLatePublication{publication_operation_id:terminal.publication_operation_id,expected_version:1,from:ImageGenerationLatePublicationState::Reserved,to:ImageGenerationLatePublicationState::SecurityBlocked,recovery_evidence_json:&ambiguous},base+1)?;
+            resolve_image_generation_late_publication_at_conn(conn,&ResolveImageGenerationLatePublication{publication_operation_id:terminal.publication_operation_id,expected_version:1,from:ImageGenerationLatePublicationState::Reserved,to:ImageGenerationLatePublicationState::Aborted,recovery_evidence_json:&deleted},base+1)?;
             assert!(reserve_image_generation_late_publication_at_conn(conn,&reserve,base)?);
             assert!(!reserve_image_generation_late_publication_at_conn(conn,&reserve,base+1)?);
             assert!(claim_image_generation_late_publication_at_conn(conn,&ClaimImageGenerationLatePublication{publication_operation_id:operation,expected_version:1,worker_boot_id:Uuid::now_v7(),claim_generation:1},base+300_000).is_err());

@@ -3456,6 +3456,23 @@ CREATE TABLE image_generation_artifact_security_recovery_attempts (
  decided_at_unix_ms INTEGER,
  CHECK((state='received' AND outcome_digest IS NULL AND decided_at_unix_ms IS NULL) OR (state!='received' AND outcome_digest IS NOT NULL AND decided_at_unix_ms IS NOT NULL))
 );
+CREATE TABLE image_generation_artifact_security_recovery_components (
+ recovery_operation_id TEXT NOT NULL REFERENCES image_generation_artifact_security_recovery_audits(recovery_operation_id) ON DELETE RESTRICT,
+ artifact_id TEXT NOT NULL,
+ component_id TEXT NOT NULL,
+ component_kind TEXT NOT NULL CHECK(component_kind IN ('primary','normalized_raster','sanitized_svg','thumbnail','model_payload')),
+ component_generation INTEGER NOT NULL CHECK(component_generation>=1),
+ stable_identity_digest TEXT NOT NULL CHECK(length(stable_identity_digest)=64 AND stable_identity_digest NOT GLOB '*[^0-9a-f]*'),
+ security_digest TEXT NOT NULL CHECK(length(security_digest)=64 AND security_digest NOT GLOB '*[^0-9a-f]*'),
+ sha256 TEXT NOT NULL CHECK(length(sha256)=64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
+ PRIMARY KEY(recovery_operation_id,component_id),
+ FOREIGN KEY(artifact_id,component_id) REFERENCES image_generation_artifact_components(artifact_id,component_id) ON DELETE RESTRICT
+);
+CREATE TRIGGER image_generation_security_recovery_component_insert_guard BEFORE INSERT ON image_generation_artifact_security_recovery_components
+WHEN NOT EXISTS(SELECT 1 FROM image_generation_artifact_security_recovery_audits r JOIN image_generation_artifact_components c ON c.artifact_id=r.artifact_id WHERE r.recovery_operation_id=NEW.recovery_operation_id AND r.artifact_id=NEW.artifact_id AND r.state='recorded' AND c.component_id=NEW.component_id AND c.component_kind=NEW.component_kind AND c.generation=NEW.component_generation AND c.sha256=NEW.sha256 AND json_valid(c.stable_identity_json)=1 AND json_extract(c.stable_identity_json,'$.identityDigest')=NEW.stable_identity_digest AND json_extract(c.stable_identity_json,'$.securityDigest')=NEW.security_digest AND c.state IN ('ready','security_blocked'))
+BEGIN SELECT RAISE(ABORT,'security recovery component lacks exact held identity'); END;
+CREATE TRIGGER image_generation_security_recovery_component_immutable BEFORE UPDATE ON image_generation_artifact_security_recovery_components BEGIN SELECT RAISE(ABORT,'security recovery component identity is immutable'); END;
+CREATE TRIGGER image_generation_security_recovery_component_delete_forbidden BEFORE DELETE ON image_generation_artifact_security_recovery_components BEGIN SELECT RAISE(ABORT,'security recovery component identity is durable'); END;
 CREATE TRIGGER image_generation_security_recovery_attempt_identity_immutable BEFORE UPDATE OF recovery_operation_id,principal_digest,request_digest,created_at_unix_ms ON image_generation_artifact_security_recovery_attempts BEGIN SELECT RAISE(ABORT,'security recovery attempt identity is immutable'); END;
 CREATE TRIGGER image_generation_security_recovery_attempt_transition_guard BEFORE UPDATE OF state,outcome_digest,decided_at_unix_ms ON image_generation_artifact_security_recovery_attempts WHEN OLD.state!='received' OR NEW.state NOT IN ('validated','denied') OR NEW.outcome_digest IS NULL OR NEW.decided_at_unix_ms IS NULL BEGIN SELECT RAISE(ABORT,'security recovery attempt outcome is invalid'); END;
 CREATE TRIGGER image_generation_security_recovery_attempt_delete_forbidden BEFORE DELETE ON image_generation_artifact_security_recovery_attempts BEGIN SELECT RAISE(ABORT,'security recovery attempt audit is durable'); END;

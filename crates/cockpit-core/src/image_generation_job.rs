@@ -142,6 +142,52 @@ pub trait ImageGenerationAdapter: image_generation_adapter_sealed::Sealed + Send
         &self,
         request: &ImageGenerationHandoffRequest,
     ) -> ImageGenerationHandoffResult;
+    async fn reconcile(
+        &self,
+        request: &ImageGenerationReconcileRequest,
+    ) -> ImageGenerationReconcileResult {
+        let _ = request;
+        ImageGenerationReconcileResult::OutcomeUnknown {
+            evidence: b"reconcile_unavailable".to_vec(),
+        }
+    }
+    async fn cancel(&self, request: &ImageGenerationCancelRequest) -> ImageGenerationCancelResult {
+        let _ = request;
+        ImageGenerationCancelResult::OutcomeUnknown {
+            evidence: b"cancel_unavailable".to_vec(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageGenerationReconcileRequest {
+    pub job_id: Uuid,
+    pub slot_id: Uuid,
+    pub attempt_number: u32,
+    pub external_operation_id: Uuid,
+    pub provider_request_identity: String,
+    pub provider_idempotency_identity: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageGenerationReconcileResult {
+    AuthoritativeNonacceptance { evidence: Vec<u8> },
+    AuthoritativeAccepted { evidence: Vec<u8> },
+    AuthoritativeFailure { evidence: Vec<u8> },
+    OutcomeUnknown { evidence: Vec<u8> },
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageGenerationCancelRequest {
+    pub job_id: Uuid,
+    pub slot_id: Uuid,
+    pub attempt_number: u32,
+    pub external_operation_id: Uuid,
+    pub provider_request_identity: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageGenerationCancelResult {
+    Cancelled { evidence: Vec<u8> },
+    TooLateOrAccepted { evidence: Vec<u8> },
+    OutcomeUnknown { evidence: Vec<u8> },
 }
 
 mod accepted_response_fetch_sealed {
@@ -198,6 +244,12 @@ pub enum AcceptedImageResponseProgress {
 pub(crate) struct DeterministicImageGenerationAdapter {
     outcomes: std::sync::Mutex<std::collections::VecDeque<ImageGenerationHandoffResult>>,
     requests: std::sync::Mutex<Vec<ImageGenerationHandoffRequest>>,
+    reconciliation_outcomes:
+        std::sync::Mutex<std::collections::VecDeque<ImageGenerationReconcileResult>>,
+    reconciliation_requests: std::sync::Mutex<Vec<ImageGenerationReconcileRequest>>,
+    cancellation_outcomes:
+        std::sync::Mutex<std::collections::VecDeque<ImageGenerationCancelResult>>,
+    cancellation_requests: std::sync::Mutex<Vec<ImageGenerationCancelRequest>>,
 }
 
 #[cfg(test)]
@@ -206,11 +258,43 @@ impl DeterministicImageGenerationAdapter {
         Self {
             outcomes: std::sync::Mutex::new(outcomes.into()),
             requests: std::sync::Mutex::new(Vec::new()),
+            reconciliation_outcomes: std::sync::Mutex::new(Vec::new().into()),
+            reconciliation_requests: std::sync::Mutex::new(Vec::new()),
+            cancellation_outcomes: std::sync::Mutex::new(Vec::new().into()),
+            cancellation_requests: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    pub(crate) fn with_recovery(
+        reconciliation: Vec<ImageGenerationReconcileResult>,
+        cancellation: Vec<ImageGenerationCancelResult>,
+    ) -> Self {
+        let adapter = Self::new(Vec::new());
+        *adapter
+            .reconciliation_outcomes
+            .lock()
+            .expect("fake lock poisoned") = reconciliation.into();
+        *adapter
+            .cancellation_outcomes
+            .lock()
+            .expect("fake lock poisoned") = cancellation.into();
+        adapter
     }
 
     pub(crate) fn requests(&self) -> Vec<ImageGenerationHandoffRequest> {
         self.requests.lock().expect("fake lock poisoned").clone()
+    }
+    pub(crate) fn reconciliation_requests(&self) -> Vec<ImageGenerationReconcileRequest> {
+        self.reconciliation_requests
+            .lock()
+            .expect("fake lock poisoned")
+            .clone()
+    }
+    pub(crate) fn cancellation_requests(&self) -> Vec<ImageGenerationCancelRequest> {
+        self.cancellation_requests
+            .lock()
+            .expect("fake lock poisoned")
+            .clone()
     }
 }
 
@@ -290,6 +374,31 @@ impl ImageGenerationAdapter for DeterministicImageGenerationAdapter {
             .expect("fake lock poisoned")
             .pop_front()
             .expect("deterministic image adapter has no configured outcome")
+    }
+    async fn reconcile(
+        &self,
+        request: &ImageGenerationReconcileRequest,
+    ) -> ImageGenerationReconcileResult {
+        self.reconciliation_requests
+            .lock()
+            .expect("fake lock poisoned")
+            .push(request.clone());
+        self.reconciliation_outcomes
+            .lock()
+            .expect("fake lock poisoned")
+            .pop_front()
+            .expect("deterministic image adapter has no reconciliation outcome")
+    }
+    async fn cancel(&self, request: &ImageGenerationCancelRequest) -> ImageGenerationCancelResult {
+        self.cancellation_requests
+            .lock()
+            .expect("fake lock poisoned")
+            .push(request.clone());
+        self.cancellation_outcomes
+            .lock()
+            .expect("fake lock poisoned")
+            .pop_front()
+            .expect("deterministic image adapter has no cancellation outcome")
     }
 }
 
@@ -4765,26 +4874,28 @@ mod tests {
         std::fs::create_dir(&managed).unwrap();
         std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o700)).unwrap();
         let root = std::sync::Arc::new(open_image_generation_artifact_root(&managed).unwrap());
-        assert!(coordinate_persisted_accepted_image_response(
-            fixture.db.clone(),
-            root,
-            CoordinateAcceptedImageResponse {
-                job_id: fixture.job_id,
-                slot_id: fixture.slot_id,
-                attempt_number: 1,
-                expected_job_version: 5,
-                expected_slot_version: 4,
-                expected_attempt_version: 5,
-                external_operation_id: request.external_operation_id,
-                expected_journal_version: 3,
-                component_id: Uuid::now_v7(),
-                release_operation_id: Uuid::now_v7(),
-                bytes,
-                now_unix_ms: 11
-            }
-        )
-        .await
-        .is_err());
+        assert!(
+            coordinate_persisted_accepted_image_response(
+                fixture.db.clone(),
+                root,
+                CoordinateAcceptedImageResponse {
+                    job_id: fixture.job_id,
+                    slot_id: fixture.slot_id,
+                    attempt_number: 1,
+                    expected_job_version: 5,
+                    expected_slot_version: 4,
+                    expected_attempt_version: 5,
+                    external_operation_id: request.external_operation_id,
+                    expected_journal_version: 3,
+                    component_id: Uuid::now_v7(),
+                    release_operation_id: Uuid::now_v7(),
+                    bytes,
+                    now_unix_ms: 11
+                }
+            )
+            .await
+            .is_err()
+        );
         fixture.db.read(move|conn|{let row:(String,i64)=conn.query_row("SELECT state,(SELECT count(*) FROM image_generation_artifacts WHERE job_id=i.job_id) FROM image_generation_response_publication_intents i WHERE job_id=?1",[fixture.job_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?)))?;assert_eq!(row,("security_blocked".into(),0));Ok(())}).await.unwrap();
     }
 
@@ -4950,26 +5061,28 @@ mod tests {
         std::fs::create_dir(&managed).unwrap();
         std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o700)).unwrap();
         let root = std::sync::Arc::new(open_image_generation_artifact_root(&managed).unwrap());
-        assert!(coordinate_persisted_accepted_image_response(
-            fixture.db.clone(),
-            root.clone(),
-            CoordinateAcceptedImageResponse {
-                job_id: fixture.job_id,
-                slot_id: fixture.slot_id,
-                attempt_number: 1,
-                expected_job_version: 5,
-                expected_slot_version: 4,
-                expected_attempt_version: 5,
-                external_operation_id: request.external_operation_id,
-                expected_journal_version: 3,
-                component_id: Uuid::now_v7(),
-                release_operation_id: Uuid::now_v7(),
-                bytes,
-                now_unix_ms: 11
-            }
-        )
-        .await
-        .is_err());
+        assert!(
+            coordinate_persisted_accepted_image_response(
+                fixture.db.clone(),
+                root.clone(),
+                CoordinateAcceptedImageResponse {
+                    job_id: fixture.job_id,
+                    slot_id: fixture.slot_id,
+                    attempt_number: 1,
+                    expected_job_version: 5,
+                    expected_slot_version: 4,
+                    expected_attempt_version: 5,
+                    external_operation_id: request.external_operation_id,
+                    expected_journal_version: 3,
+                    component_id: Uuid::now_v7(),
+                    release_operation_id: Uuid::now_v7(),
+                    bytes,
+                    now_unix_ms: 11
+                }
+            )
+            .await
+            .is_err()
+        );
         fixture
             .db
             .write(|conn| {
@@ -5019,26 +5132,28 @@ mod tests {
         std::fs::create_dir(&managed).unwrap();
         std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o700)).unwrap();
         let root = std::sync::Arc::new(open_image_generation_artifact_root(&managed).unwrap());
-        assert!(coordinate_persisted_accepted_image_response(
-            fixture.db.clone(),
-            root,
-            CoordinateAcceptedImageResponse {
-                job_id: fixture.job_id,
-                slot_id: fixture.slot_id,
-                attempt_number: 1,
-                expected_job_version: 5,
-                expected_slot_version: 4,
-                expected_attempt_version: 5,
-                external_operation_id: request.external_operation_id,
-                expected_journal_version: 3,
-                component_id: Uuid::now_v7(),
-                release_operation_id: Uuid::now_v7(),
-                bytes,
-                now_unix_ms: 11
-            }
-        )
-        .await
-        .is_err());
+        assert!(
+            coordinate_persisted_accepted_image_response(
+                fixture.db.clone(),
+                root,
+                CoordinateAcceptedImageResponse {
+                    job_id: fixture.job_id,
+                    slot_id: fixture.slot_id,
+                    attempt_number: 1,
+                    expected_job_version: 5,
+                    expected_slot_version: 4,
+                    expected_attempt_version: 5,
+                    external_operation_id: request.external_operation_id,
+                    expected_journal_version: 3,
+                    component_id: Uuid::now_v7(),
+                    release_operation_id: Uuid::now_v7(),
+                    bytes,
+                    now_unix_ms: 11
+                }
+            )
+            .await
+            .is_err()
+        );
         assert_eq!(std::fs::read_dir(&managed).unwrap().count(), 0);
         fixture.db.read(move|conn|{let row:(i64,i64)=conn.query_row("SELECT (SELECT count(*) FROM image_generation_response_publication_intents),(SELECT count(*) FROM image_generation_artifacts WHERE job_id=?1)",[fixture.job_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?)))?;assert_eq!(row,(0,0));Ok(())}).await.unwrap();
     }
@@ -5083,26 +5198,28 @@ mod tests {
         let root = std::sync::Arc::new(open_image_generation_artifact_root(&managed).unwrap());
         let component_id = Uuid::now_v7();
         root.force_accepted_response_post_rename_cut(component_id);
-        assert!(coordinate_persisted_accepted_image_response(
-            fixture.db.clone(),
-            root,
-            CoordinateAcceptedImageResponse {
-                job_id: fixture.job_id,
-                slot_id: fixture.slot_id,
-                attempt_number: 1,
-                expected_job_version: 5,
-                expected_slot_version: 4,
-                expected_attempt_version: 5,
-                external_operation_id: request.external_operation_id,
-                expected_journal_version: 3,
-                component_id,
-                release_operation_id: Uuid::now_v7(),
-                bytes,
-                now_unix_ms: 11
-            }
-        )
-        .await
-        .is_err());
+        assert!(
+            coordinate_persisted_accepted_image_response(
+                fixture.db.clone(),
+                root,
+                CoordinateAcceptedImageResponse {
+                    job_id: fixture.job_id,
+                    slot_id: fixture.slot_id,
+                    attempt_number: 1,
+                    expected_job_version: 5,
+                    expected_slot_version: 4,
+                    expected_attempt_version: 5,
+                    external_operation_id: request.external_operation_id,
+                    expected_journal_version: 3,
+                    component_id,
+                    release_operation_id: Uuid::now_v7(),
+                    bytes,
+                    now_unix_ms: 11
+                }
+            )
+            .await
+            .is_err()
+        );
         let job_id = fixture.job_id;
         let artifact_id = fixture.artifact_id;
         drop(fixture);
@@ -5117,6 +5234,80 @@ mod tests {
             .open_verified_component(&destination, &evidence)
             .unwrap();
         assert_eq!(std::fs::read_dir(&managed).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_restarts_without_provider_redispatch_and_cancel_is_evidence_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("reconcile-worker.db");
+        let fixture = setup_real_ledger_scheduler_job(
+            cockpit_db::Db::open(&path).unwrap(),
+            "reconcile-worker",
+        )
+        .await;
+        let job_id = fixture.job_id;
+        let slot_id = fixture.slot_id;
+        let spend_id = fixture.spend_reservation_id.clone();
+        let handoff = DeterministicImageGenerationAdapter::new(vec![
+            ImageGenerationHandoffResult::SubmissionUnknown {
+                evidence: b"handoff-unknown".to_vec(),
+            },
+        ]);
+        ImageGenerationDispatcher::new(fixture.db)
+            .run_scheduler_pass(&handoff, deadline_boot(), 100, 2, 2, 8)
+            .await
+            .unwrap();
+        assert_eq!(handoff.requests().len(), 1);
+        let reopened = cockpit_db::Db::open(&path).unwrap();
+        let recovery = DeterministicImageGenerationAdapter::with_recovery(
+            vec![ImageGenerationReconcileResult::AuthoritativeAccepted {
+                evidence: b"provider-accepted".to_vec(),
+            }],
+            vec![ImageGenerationCancelResult::TooLateOrAccepted {
+                evidence: b"provider-too-late".to_vec(),
+            }],
+        );
+        let dispatcher = ImageGenerationDispatcher::new(reopened.clone());
+        assert_eq!(
+            dispatcher
+                .run_reconciliation_pass(&recovery, Uuid::now_v7(), 10, 8)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(recovery.reconciliation_requests().len(), 1);
+        assert!(recovery.requests().is_empty());
+        reopened
+            .transaction(move |conn| {
+                cockpit_db::Db::request_image_generation_cancellation_conn(
+                    conn,
+                    &RequestImageGenerationCancellation {
+                        job_id,
+                        cancellation_version: 1,
+                        request_operation_id: "cancel:reconciled",
+                        requested_at_unix_ms: 11,
+                    },
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            dispatcher
+                .run_provider_cancel_pass(&recovery, Uuid::now_v7(), 12, 8)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(recovery.cancellation_requests().len(), 1);
+        assert_eq!(
+            dispatcher
+                .run_provider_cancel_pass(&recovery, Uuid::now_v7(), 13, 8)
+                .await
+                .unwrap(),
+            0
+        );
+        reopened.read(move|conn|{let row:(String,String,i64)=conn.query_row("SELECT a.state,s.state,(SELECT COUNT(*) FROM image_generation_provider_cancel_evidence e WHERE e.job_id=a.job_id AND e.slot_id=a.slot_id AND e.attempt_number=a.attempt_number) FROM image_generation_attempts a JOIN image_spend_reservations s ON s.reservation_id=?3 WHERE a.job_id=?1 AND a.slot_id=?2",rusqlite::params![job_id.to_string(),slot_id.to_string(),spend_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;assert_eq!(row.0,"cancellation_requested");assert_ne!(row.1,"released");assert_eq!(row.2,1);Ok(())}).await.unwrap();
     }
 
     #[tokio::test]

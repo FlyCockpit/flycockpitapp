@@ -104,6 +104,9 @@ impl VettedHttpsHop {
     pub(crate) fn bound_client(&self, limits: &HttpsFetchLimits) -> Result<reqwest::Client> {
         let host = self.url.host_str().context("vetted HTTPS hop lost host")?;
         reqwest::Client::builder()
+            // An environment/system proxy would bypass the vetted peer set
+            // and could also receive URL or credential material.
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .referer(false)
             .timeout(limits.timeout)

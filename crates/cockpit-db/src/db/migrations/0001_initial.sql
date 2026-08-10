@@ -3256,7 +3256,8 @@ CREATE TABLE image_generation_artifact_components (
  state TEXT NOT NULL CHECK(state IN ('planned','writing','ready','cleanup_pending','deleting','tombstoned','security_blocked')),
  generation INTEGER NOT NULL CHECK(generation>=1),
  relative_storage_key TEXT NOT NULL,
- byte_length_decimal TEXT NOT NULL CHECK(byte_length_decimal<>'' AND byte_length_decimal NOT GLOB '*[^0-9]*'),
+ byte_length_hi INTEGER NOT NULL CHECK(byte_length_hi BETWEEN 0 AND 4294967295),
+ byte_length_lo INTEGER NOT NULL CHECK(byte_length_lo BETWEEN 0 AND 4294967295),
  sha256 TEXT NOT NULL CHECK(length(sha256)=64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
  stable_identity_json TEXT,
  expected_link_count INTEGER NOT NULL DEFAULT 1 CHECK(expected_link_count=1),
@@ -3333,8 +3334,10 @@ CREATE TABLE image_generation_artifact_leases (
  consumer_purpose TEXT NOT NULL CHECK(consumer_purpose IN ('serve_artifact','serve_thumbnail','tool_input','model_input','internal_verification','internal_cleanup')),
  consumer_route TEXT NOT NULL CHECK(consumer_route IN ('artifact_full','artifact_range','thumbnail','tool','model_payload','verification','cleanup')),
  read_kind TEXT NOT NULL CHECK(read_kind IN ('full','range')),
- range_start_decimal TEXT NOT NULL CHECK(range_start_decimal<>'' AND range_start_decimal NOT GLOB '*[^0-9]*'),
- requested_length_decimal TEXT NOT NULL CHECK(requested_length_decimal<>'' AND requested_length_decimal NOT GLOB '*[^0-9]*'),
+ range_start_hi INTEGER NOT NULL CHECK(range_start_hi BETWEEN 0 AND 4294967295),
+ range_start_lo INTEGER NOT NULL CHECK(range_start_lo BETWEEN 0 AND 4294967295),
+ requested_length_hi INTEGER NOT NULL CHECK(requested_length_hi BETWEEN 0 AND 4294967295),
+ requested_length_lo INTEGER NOT NULL CHECK(requested_length_lo BETWEEN 0 AND 4294967295),
  component_set_digest TEXT NOT NULL CHECK(length(component_set_digest)=64 AND component_set_digest NOT GLOB '*[^0-9a-f]*'),
  authorization_digest TEXT NOT NULL CHECK(length(authorization_digest)=64 AND authorization_digest NOT GLOB '*[^0-9a-f]*'),
  daemon_boot_id TEXT NOT NULL,
@@ -3350,8 +3353,8 @@ CREATE TABLE image_generation_artifact_leases (
        (consumer_purpose='model_input' AND consumer_route='model_payload') OR
        (consumer_purpose='internal_verification' AND consumer_route='verification') OR
        (consumer_purpose='internal_cleanup' AND consumer_route='cleanup')),
- CHECK((read_kind='range' AND consumer_route='artifact_range' AND requested_length_decimal!='0') OR
-       (read_kind='full' AND consumer_route!='artifact_range' AND range_start_decimal='0'))
+ CHECK((read_kind='range' AND consumer_route='artifact_range' AND (requested_length_hi>0 OR requested_length_lo>0)) OR
+       (read_kind='full' AND consumer_route!='artifact_range' AND range_start_hi=0 AND range_start_lo=0))
 );
 
 CREATE TABLE image_generation_late_publication_leases (
@@ -3380,6 +3383,23 @@ CREATE TABLE image_generation_late_publication_leases (
  FOREIGN KEY(job_id,slot_id) REFERENCES image_generation_slots(job_id,slot_id) ON DELETE RESTRICT,
  CHECK(deadline_unix_ms=created_at_unix_ms+300000),
  CHECK((worker_boot_id IS NULL)=(claim_generation IS NULL))
+);
+CREATE TABLE image_generation_late_publication_authorization_facts (
+ authorization_digest TEXT PRIMARY KEY CHECK(length(authorization_digest)=64 AND authorization_digest NOT GLOB '*[^0-9a-f]*'),
+ artifact_id TEXT NOT NULL REFERENCES image_generation_artifacts(artifact_id) ON DELETE RESTRICT,
+ artifact_generation INTEGER NOT NULL CHECK(artifact_generation>=1),
+ job_id TEXT NOT NULL,
+ slot_id TEXT NOT NULL,
+ slot_generation INTEGER NOT NULL CHECK(slot_generation>=1),
+ component_set_digest TEXT NOT NULL CHECK(length(component_set_digest)=64 AND component_set_digest NOT GLOB '*[^0-9a-f]*'),
+ output_authority_digest TEXT NOT NULL CHECK(length(output_authority_digest)=64 AND output_authority_digest NOT GLOB '*[^0-9a-f]*'),
+ output_authority_generation INTEGER NOT NULL CHECK(output_authority_generation>=1),
+ destination_name TEXT NOT NULL,
+ temporary_name TEXT NOT NULL,
+ principal_digest TEXT NOT NULL CHECK(length(principal_digest)=64 AND principal_digest NOT GLOB '*[^0-9a-f]*'),
+ created_at_unix_ms INTEGER NOT NULL,
+ revoked_at_unix_ms INTEGER,
+ FOREIGN KEY(job_id,slot_id) REFERENCES image_generation_slots(job_id,slot_id) ON DELETE RESTRICT
 );
 CREATE UNIQUE INDEX image_generation_one_live_late_publication
 ON image_generation_late_publication_leases(artifact_id)
@@ -3424,7 +3444,7 @@ BEGIN SELECT RAISE(ABORT,'image artifact tombstones are retained'); END;
 CREATE TRIGGER image_generation_component_insert_guard BEFORE INSERT ON image_generation_artifact_components
 WHEN (SELECT state FROM image_generation_artifacts WHERE artifact_id=NEW.artifact_id)!='allocating'
 BEGIN SELECT RAISE(ABORT,'image artifact component graph is sealed'); END;
-CREATE TRIGGER image_generation_component_identity_immutable BEFORE UPDATE OF artifact_id,component_id,component_kind,relative_storage_key,byte_length_decimal,sha256,expected_link_count,resource_reservation_id,release_operation_id ON image_generation_artifact_components
+CREATE TRIGGER image_generation_component_identity_immutable BEFORE UPDATE OF artifact_id,component_id,component_kind,relative_storage_key,byte_length_hi,byte_length_lo,sha256,expected_link_count,resource_reservation_id,release_operation_id ON image_generation_artifact_components
 BEGIN SELECT RAISE(ABORT,'image artifact component identity is immutable'); END;
 CREATE TRIGGER image_generation_component_delete_forbidden BEFORE DELETE ON image_generation_artifact_components
 BEGIN SELECT RAISE(ABORT,'image artifact component tombstones are retained'); END;
@@ -3435,7 +3455,7 @@ CREATE TRIGGER image_generation_cleanup_transition_guard BEFORE UPDATE OF state,
 WHEN NEW.version!=OLD.version+1 OR NOT EXISTS(SELECT 1 FROM image_generation_cleanup_transitions WHERE from_state=OLD.state AND to_state=NEW.state)
 BEGIN SELECT RAISE(ABORT,'forbidden image artifact cleanup transition'); END;
 CREATE TRIGGER image_generation_late_publication_transition_guard BEFORE UPDATE OF state,version ON image_generation_late_publication_leases
-WHEN NEW.version!=OLD.version+1 OR NOT EXISTS(SELECT 1 FROM image_generation_late_publication_transitions WHERE from_state=OLD.state AND to_state=NEW.state)
+WHEN NEW.version!=OLD.version+1 OR ((NEW.state!=OLD.state AND NOT EXISTS(SELECT 1 FROM image_generation_late_publication_transitions WHERE from_state=OLD.state AND to_state=NEW.state)) OR (NEW.state=OLD.state AND NOT (OLD.state='reserved' AND NEW.claim_generation>COALESCE(OLD.claim_generation,0))))
 BEGIN SELECT RAISE(ABORT,'forbidden late image publication transition'); END;
 CREATE TRIGGER image_generation_artifact_retained_projection_guard BEFORE UPDATE OF state ON image_generation_artifacts
 WHEN NEW.state IN ('retained','late_quarantined') AND (((SELECT count(*) FROM image_generation_artifact_components c WHERE c.artifact_id=NEW.artifact_id)!=NEW.expected_component_count) OR ((SELECT count(*) FROM image_generation_artifact_components c WHERE c.artifact_id=NEW.artifact_id AND c.state='ready')!=NEW.expected_component_count))
@@ -3462,12 +3482,38 @@ CREATE TRIGGER image_generation_release_immutable BEFORE UPDATE ON image_generat
 CREATE TRIGGER image_generation_release_delete_forbidden BEFORE DELETE ON image_generation_component_release_facts BEGIN SELECT RAISE(ABORT,'component release evidence is immutable'); END;
 CREATE TRIGGER image_generation_cleanup_identity_immutable BEFORE UPDATE OF cleanup_operation_id,artifact_id,expected_artifact_generation,reason,created_at_unix_ms ON image_generation_artifact_cleanup_intents BEGIN SELECT RAISE(ABORT,'cleanup intent identity is immutable'); END;
 CREATE TRIGGER image_generation_cleanup_delete_forbidden BEFORE DELETE ON image_generation_artifact_cleanup_intents BEGIN SELECT RAISE(ABORT,'cleanup intent is durable'); END;
-CREATE TRIGGER image_generation_lease_identity_immutable BEFORE UPDATE OF lease_id,artifact_id,artifact_generation,owning_job_id,owning_job_generation,owning_slot_id,owning_slot_generation,published_disposition,published_disposition_generation,component_id,component_kind,component_generation,component_checksum,consumer_purpose,consumer_route,read_kind,range_start_decimal,requested_length_decimal,component_set_digest,authorization_digest,daemon_boot_id,committed_at_monotonic,deadline_monotonic ON image_generation_artifact_leases BEGIN SELECT RAISE(ABORT,'artifact lease identity is immutable'); END;
+CREATE TRIGGER image_generation_lease_identity_immutable BEFORE UPDATE OF lease_id,artifact_id,artifact_generation,owning_job_id,owning_job_generation,owning_slot_id,owning_slot_generation,published_disposition,published_disposition_generation,component_id,component_kind,component_generation,component_checksum,consumer_purpose,consumer_route,read_kind,range_start_hi,range_start_lo,requested_length_hi,requested_length_lo,component_set_digest,authorization_digest,daemon_boot_id,committed_at_monotonic,deadline_monotonic ON image_generation_artifact_leases BEGIN SELECT RAISE(ABORT,'artifact lease identity is immutable'); END;
 CREATE TRIGGER image_generation_lease_delete_forbidden BEFORE DELETE ON image_generation_artifact_leases BEGIN SELECT RAISE(ABORT,'artifact lease is durable'); END;
+CREATE TRIGGER image_generation_lease_insert_guard BEFORE INSERT ON image_generation_artifact_leases
+WHEN NOT EXISTS(SELECT 1 FROM image_generation_artifacts a JOIN image_generation_jobs j ON j.job_id=a.job_id JOIN image_generation_slots s ON s.job_id=a.job_id AND s.slot_id=a.slot_id JOIN image_generation_artifact_components c ON c.artifact_id=a.artifact_id JOIN image_generation_artifact_authorization_facts f ON f.authorization_digest=NEW.authorization_digest
+ WHERE a.artifact_id=NEW.artifact_id AND a.state='retained' AND a.generation=NEW.artifact_generation AND a.component_set_digest=NEW.component_set_digest AND a.active_lease_count=(SELECT count(*) FROM image_generation_artifact_leases l WHERE l.artifact_id=a.artifact_id AND l.released_at IS NULL)
+ AND j.job_id=NEW.owning_job_id AND j.version=NEW.owning_job_generation AND s.slot_id=NEW.owning_slot_id AND s.state='published' AND s.version=NEW.owning_slot_generation AND NEW.published_disposition_generation=s.version
+ AND ((NEW.published_disposition='ordinary' AND s.result_after_cancel=0) OR (NEW.published_disposition='late_authorized' AND s.result_after_cancel=1 AND s.applied_cancellation_version IS NOT NULL))
+ AND c.component_id=NEW.component_id AND c.component_kind=NEW.component_kind AND c.state='ready' AND c.generation=NEW.component_generation AND c.sha256=NEW.component_checksum
+ AND f.artifact_id=a.artifact_id AND f.artifact_generation=a.generation AND f.job_id=j.job_id AND f.job_generation=j.version AND f.slot_id=s.slot_id AND f.slot_generation=s.version AND f.consumer_purpose=NEW.consumer_purpose AND f.consumer_route=NEW.consumer_route AND f.revoked_at_unix_ms IS NULL
+ AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_cleanup_intents i WHERE i.artifact_id=a.artifact_id)
+ AND ((NEW.consumer_purpose='serve_artifact' AND NEW.consumer_route IN ('artifact_full','artifact_range')) OR (NEW.consumer_purpose='serve_thumbnail' AND NEW.consumer_route='thumbnail') OR (NEW.consumer_purpose='tool_input' AND NEW.consumer_route='tool') OR (NEW.consumer_purpose='model_input' AND NEW.consumer_route='model_payload') OR (NEW.consumer_purpose='internal_verification' AND NEW.consumer_route='verification') OR (NEW.consumer_purpose='internal_cleanup' AND NEW.consumer_route='cleanup'))
+ AND ((NEW.read_kind='full' AND NEW.consumer_route!='artifact_range' AND NEW.range_start_hi=0 AND NEW.range_start_lo=0 AND NEW.requested_length_hi=c.byte_length_hi AND NEW.requested_length_lo=c.byte_length_lo) OR
+      (NEW.read_kind='range' AND NEW.consumer_route='artifact_range' AND (NEW.requested_length_hi>0 OR NEW.requested_length_lo>0) AND NEW.range_start_hi+NEW.requested_length_hi+CASE WHEN NEW.range_start_lo+NEW.requested_length_lo>=4294967296 THEN 1 ELSE 0 END<=4294967295 AND (NEW.range_start_hi+NEW.requested_length_hi+CASE WHEN NEW.range_start_lo+NEW.requested_length_lo>=4294967296 THEN 1 ELSE 0 END<c.byte_length_hi OR (NEW.range_start_hi+NEW.requested_length_hi+CASE WHEN NEW.range_start_lo+NEW.requested_length_lo>=4294967296 THEN 1 ELSE 0 END=c.byte_length_hi AND (NEW.range_start_lo+NEW.requested_length_lo)%4294967296<=c.byte_length_lo))))
+)
+BEGIN SELECT RAISE(ABORT,'artifact lease lacks exact current authority'); END;
+CREATE TRIGGER image_generation_lease_count_insert AFTER INSERT ON image_generation_artifact_leases
+BEGIN UPDATE image_generation_artifacts SET active_lease_count=active_lease_count+1 WHERE artifact_id=NEW.artifact_id; END;
+CREATE TRIGGER image_generation_lease_release_guard BEFORE UPDATE OF released_at ON image_generation_artifact_leases
+WHEN OLD.released_at IS NOT NULL OR NEW.released_at IS NULL OR NEW.released_at<OLD.committed_at_monotonic
+BEGIN SELECT RAISE(ABORT,'artifact lease release is not monotonic'); END;
+CREATE TRIGGER image_generation_lease_count_release AFTER UPDATE OF released_at ON image_generation_artifact_leases
+WHEN OLD.released_at IS NULL AND NEW.released_at IS NOT NULL
+BEGIN UPDATE image_generation_artifacts SET active_lease_count=active_lease_count-1 WHERE artifact_id=NEW.artifact_id AND active_lease_count>0; END;
+CREATE TRIGGER image_generation_active_lease_count_guard BEFORE UPDATE OF active_lease_count ON image_generation_artifacts
+WHEN NEW.active_lease_count!=(SELECT count(*) FROM image_generation_artifact_leases l WHERE l.artifact_id=NEW.artifact_id AND l.released_at IS NULL)
+BEGIN SELECT RAISE(ABORT,'artifact active lease count differs from durable leases'); END;
 CREATE TRIGGER image_generation_artifact_authorization_immutable BEFORE UPDATE OF authorization_digest,artifact_id,artifact_generation,job_id,job_generation,slot_id,slot_generation,consumer_purpose,consumer_route,principal_digest,created_at_unix_ms ON image_generation_artifact_authorization_facts BEGIN SELECT RAISE(ABORT,'artifact authorization identity is immutable'); END;
 CREATE TRIGGER image_generation_artifact_authorization_delete_forbidden BEFORE DELETE ON image_generation_artifact_authorization_facts BEGIN SELECT RAISE(ABORT,'artifact authorization fact is durable'); END;
 CREATE TRIGGER image_generation_late_publication_identity_immutable BEFORE UPDATE OF publication_operation_id,artifact_id,artifact_generation,job_id,slot_id,expected_slot_version,component_set_digest,component_set_json,authorization_digest,output_authority_digest,output_authority_generation,destination_name,temporary_name,created_at_unix_ms,deadline_unix_ms ON image_generation_late_publication_leases BEGIN SELECT RAISE(ABORT,'late publication identity is immutable'); END;
 CREATE TRIGGER image_generation_late_publication_delete_forbidden BEFORE DELETE ON image_generation_late_publication_leases BEGIN SELECT RAISE(ABORT,'late publication lease is durable'); END;
+CREATE TRIGGER image_generation_late_publication_authorization_immutable BEFORE UPDATE OF authorization_digest,artifact_id,artifact_generation,job_id,slot_id,slot_generation,component_set_digest,output_authority_digest,output_authority_generation,destination_name,temporary_name,principal_digest,created_at_unix_ms ON image_generation_late_publication_authorization_facts BEGIN SELECT RAISE(ABORT,'late publication authorization identity is immutable'); END;
+CREATE TRIGGER image_generation_late_publication_authorization_delete_forbidden BEFORE DELETE ON image_generation_late_publication_authorization_facts BEGIN SELECT RAISE(ABORT,'late publication authorization fact is durable'); END;
 CREATE TRIGGER image_generation_artifact_transition_registry_sealed BEFORE INSERT ON image_generation_artifact_transitions BEGIN SELECT RAISE(ABORT,'image artifact transition registry is sealed'); END;
 CREATE TRIGGER image_generation_artifact_transition_registry_update_sealed BEFORE UPDATE ON image_generation_artifact_transitions BEGIN SELECT RAISE(ABORT,'image artifact transition registry is sealed'); END;
 CREATE TRIGGER image_generation_artifact_transition_registry_delete_sealed BEFORE DELETE ON image_generation_artifact_transitions BEGIN SELECT RAISE(ABORT,'image artifact transition registry is sealed'); END;

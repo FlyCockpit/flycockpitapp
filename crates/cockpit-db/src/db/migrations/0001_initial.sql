@@ -3464,3 +3464,65 @@ WHEN NEW.compacted_through_event_seq < OLD.compacted_through_event_seq
 BEGIN
     SELECT RAISE(ABORT, 'remote attachment snapshot cursor is monotonic');
 END;
+
+
+-- ---- protected redaction history -------------------------------------------
+--
+-- Durable encrypted literal store for redacting historical trusted-provider
+-- artifacts. Each row holds the literal ONLY as ciphertext + nonce, keyed by
+-- an opaque history ID (UUID) and the local key-store key version. No
+-- plaintext, prefix, length, ciphertext, nonce, or key version ever appears
+-- in a generic, protocol, diagnostics, or export query surface — those
+-- columns are consumed solely by the local Owner-sensitive rehydration frame
+-- in `cockpit-core`.
+--
+-- `source` is a closed set: Sealed | Environment | Credential | ContainedLeak.
+-- A row is retired (retired_at_ms set) only after no artifact reference
+-- remains. Deduplication is on (session_id, fingerprint): the same literal
+-- in the same session reuses one encrypted row and increments its ref_count.
+CREATE TABLE protected_redaction_history (
+    history_id       TEXT    PRIMARY KEY,
+    session_id       TEXT    NOT NULL,
+    sealed_record_id TEXT,
+    sealed_version   INTEGER,
+    source           TEXT    NOT NULL CHECK (source IN ('Sealed', 'Environment', 'Credential', 'ContainedLeak')),
+    -- SHA-256 fingerprint of the literal (safe deduplication key; never the
+    -- literal, prefix, or length).
+    fingerprint      TEXT    NOT NULL,
+    -- Encrypted literal material (local rehydration frame only).
+    ciphertext       BLOB    NOT NULL,
+    nonce            BLOB    NOT NULL,
+    key_version      INTEGER NOT NULL CHECK (key_version >= 1),
+    ref_count        INTEGER NOT NULL DEFAULT 0 CHECK (ref_count >= 0),
+    created_at_ms    INTEGER NOT NULL,
+    retired_at_ms    INTEGER,
+    CHECK (length(history_id) = 36),
+    CHECK (length(fingerprint) = 64),
+    CHECK (length(nonce) = 12),
+    -- A retired row may never be re-attached, so its ref_count must be 0.
+    CHECK ((retired_at_ms IS NULL) OR (ref_count = 0)),
+    UNIQUE (session_id, fingerprint)
+);
+
+CREATE INDEX idx_protected_redaction_history_session
+    ON protected_redaction_history (session_id, created_at_ms);
+
+-- Opaque artifact-to-history references. Carries no literal, ciphertext,
+-- nonce, or key version — only opaque IDs and the artifact kind. The
+-- (artifact_kind, artifact_id, history_id) triple is unique so attaches are
+-- idempotent and ref_count transitions are deterministic. A history row may
+-- only be referenced while it is not retired (enforced in the writer).
+CREATE TABLE protected_redaction_artifact_refs (
+    artifact_kind TEXT    NOT NULL CHECK (artifact_kind IN ('request', 'response', 'tool', 'event', 'attempt')),
+    artifact_id   TEXT    NOT NULL,
+    history_id    TEXT    NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (artifact_kind, artifact_id, history_id),
+    FOREIGN KEY (history_id) REFERENCES protected_redaction_history(history_id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_protected_redaction_artifact_refs_history
+    ON protected_redaction_artifact_refs (history_id);
+
+CREATE INDEX idx_protected_redaction_artifact_refs_artifact
+    ON protected_redaction_artifact_refs (artifact_kind, artifact_id);

@@ -46,6 +46,8 @@ use crate::config::extended::RedactConfig;
 
 mod dotenv;
 mod protected;
+#[allow(dead_code)]
+mod protected_redaction_history;
 mod ssh;
 mod structured;
 

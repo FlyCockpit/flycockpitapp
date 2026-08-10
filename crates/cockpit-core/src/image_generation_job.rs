@@ -2540,6 +2540,7 @@ mod tests {
         db: cockpit_db::Db,
         job_id: Uuid,
         slot_id: Uuid,
+        artifact_id: Uuid,
         spend_reservation_id: String,
         media_reservation_id: String,
     }
@@ -2658,6 +2659,7 @@ mod tests {
         .unwrap();
         let fixture_job_id = sealed.job_id;
         let fixture_slot_id = sealed.targets[0].slots[0].slot_id;
+        let fixture_artifact_id = sealed.targets[0].slots[0].managed_artifact_id;
         let fixture_spend = sealed.spend.reservation_id.clone();
         let fixture_media = sealed.central_resources[0].reservation_identity.clone();
         db.transaction(move |conn| {
@@ -2701,6 +2703,7 @@ mod tests {
             db,
             job_id: fixture_job_id,
             slot_id: fixture_slot_id,
+            artifact_id: fixture_artifact_id,
             spend_reservation_id: fixture_spend,
             media_reservation_id: fixture_media,
         }
@@ -2775,6 +2778,25 @@ mod tests {
             assert_eq!(state,cockpit_db::db::image_generation::ImageGenerationSlotState::LateQuarantined);
             let persisted:(String,String)=conn.query_row("SELECT s.state,j.state FROM image_generation_slots s JOIN image_generation_jobs j USING(job_id) WHERE s.job_id=?1 AND s.slot_id=?2",rusqlite::params![job_id.to_string(),slot_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?)))?;
             assert_eq!(persisted,("late_quarantined".into(),"completed_after_cancel".into()));
+            Ok(())
+        }).await.unwrap();
+        let temporary = tempfile::TempDir::new().unwrap();
+        let managed = temporary.path().join("managed");
+        std::fs::create_dir(&managed).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let root = open_image_generation_artifact_root(&managed).unwrap();
+        let artifact_id = fixture.artifact_id;
+        let resource = fixture.media_reservation_id.clone();
+        fixture.db.transaction(move|conn|{
+            retain_generated_image_artifact(conn,&root,&RetainGeneratedImageArtifact{artifact_id,job_id,slot_id,component_id:Uuid::now_v7(),format:GeneratedImageArtifactFormat::Svg,expected_width:1,expected_height:1,bytes:br#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><path d="M0 0h1v1z"/></svg>"#,resource_reservation_id:resource,release_operation_id:Uuid::now_v7(),late_quarantined:true,now_unix_ms:7})?;
+            let state:String=conn.query_row("SELECT state FROM image_generation_artifacts WHERE artifact_id=?1",[artifact_id.to_string()],|row|row.get(0))?;
+            assert_eq!(state,"late_quarantined");
+            let ordinary:i64=conn.query_row("SELECT count(*) FROM image_generation_artifact_authorization_facts WHERE artifact_id=?1",[artifact_id.to_string()],|row|row.get(0))?;
+            assert_eq!(ordinary,0);
             Ok(())
         }).await.unwrap();
     }

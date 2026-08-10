@@ -6005,19 +6005,18 @@ mod tests {
                 requested_media_kind: RequestedLocalPathMediaKind::Image,
                 url: "https://media.example.test/fault.bin".into(),
             };
+            let error = recovery
+                .retain_https_media(
+                    request,
+                    &cockpit_config::config::media_budget::MediaResourcePolicy::default(),
+                    1,
+                    10,
+                )
+                .await
+                .unwrap_err();
             assert!(
-                recovery
-                    .retain_https_media(
-                        request,
-                        &cockpit_config::config::media_budget::MediaResourcePolicy::default(),
-                        1,
-                        10
-                    )
-                    .await
-                    .unwrap_err()
-                    .to_string()
-                    .contains("injected retained HTTPS fault"),
-                "{table}"
+                format!("{error:#}").contains("injected retained HTTPS fault"),
+                "{table}: {error:#}"
             );
             let counts = db
                 .read(|conn| {

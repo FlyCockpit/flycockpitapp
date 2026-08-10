@@ -3241,17 +3241,18 @@ where
     tokio::pin!(event_task);
     tokio::pin!(executor_task);
 
-    tokio::select! {
-        _ = &mut reader_task => {}
-        _ = &mut writer_task => {}
-        _ = &mut event_task => {}
-        _ = &mut executor_task => {}
-    }
+    let completed = tokio::select! {
+        result = &mut reader_task => result.context("client reader task failed"),
+        result = &mut writer_task => result.context("client writer task failed"),
+        result = &mut event_task => result.context("client event task failed"),
+        result = &mut executor_task => result.context("client executor task failed"),
+    };
 
     reader_task.abort();
     writer_task.abort();
     event_task.abort();
     executor_task.abort();
+    completed?;
     Ok(())
 }
 

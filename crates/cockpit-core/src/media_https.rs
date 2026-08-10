@@ -823,7 +823,12 @@ mod tests {
             peers: HashMap::from([("a.example.test".into(), ap), ("b.example.test".into(), bp)]),
             vetted: Mutex::new(Vec::new()),
         };
-        let (mut sink, _) = tokio::io::duplex(16);
+        let (mut sink, mut source) = tokio::io::duplex(16);
+        let drain = tokio::spawn(async move {
+            let mut body = Vec::new();
+            source.read_to_end(&mut body).await.unwrap();
+            body
+        });
         let evidence = fetch_retained_https_with_executor(
             &format!("https://a.example.test:{}/start", ap.port()),
             &resolver,
@@ -833,6 +838,8 @@ mod tests {
         )
         .await
         .unwrap();
+        drop(sink);
+        assert_eq!(drain.await.unwrap(), b"ok");
         assert_eq!(evidence.byte_length, 2);
         assert_eq!(
             *resolver.0.lock().unwrap(),

@@ -470,6 +470,13 @@ pub(crate) fn checked_body_progress(
 mod tests {
     use super::*;
 
+    fn install_test_crypto_provider() {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+    }
+
     fn ip(value: &str) -> IpAddr {
         value.parse().unwrap()
     }
@@ -644,6 +651,7 @@ mod tests {
 
     #[tokio::test]
     async fn https_media_ingest_tls_socket_uses_pinned_peer_and_original_host_sni() {
+        install_test_crypto_provider();
         use rcgen::{CertifiedKey, generate_simple_self_signed};
         use rustls::pki_types::PrivatePkcs8KeyDer;
         use std::sync::Arc;
@@ -707,6 +715,7 @@ mod tests {
 
     #[tokio::test]
     async fn https_media_ingest_tls_redirect_reresolves_and_dials_each_vetted_set() {
+        install_test_crypto_provider();
         use rcgen::{CertifiedKey, generate_simple_self_signed};
         use rustls::pki_types::PrivatePkcs8KeyDer;
         use std::{

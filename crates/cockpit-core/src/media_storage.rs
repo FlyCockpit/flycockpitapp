@@ -313,7 +313,56 @@ impl MediaStorageRecovery {
                 };
             if let Some(terminal) = terminal {
                 let terminal_text = terminal.as_str().to_owned();
-                self.db.transaction(move|conn|{let terminal_generation=expected_generation.checked_add(2).context("availability generation overflow")?;cockpit_db::Db::transition_media_attachment_conn(conn,attachment_id,expected_version,expected_generation+1,terminal,now_unix_ms)?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,'probing',?3,?4,?5)",params![attachment_id.to_string(),terminal_generation.to_string(),terminal_text,job_id.to_string(),now_unix_ms])?;if terminal==MediaAvailability::Failed{conn.execute("INSERT INTO media_attachment_failure_reasons(attachment_id,reason,recorded_at_unix_ms) VALUES(?1,'normalization_failed',?2)",params![attachment_id.to_string(),now_unix_ms])?;}conn.execute("INSERT INTO media_attachment_processing_failure_evidence(job_id,attachment_id,reason,recorded_at_unix_ms) VALUES(?1,?2,?3,?4)",params![job_id.to_string(),attachment_id.to_string(),if terminal==MediaAvailability::ModelDerivativeUnavailable{"model_runtime_unavailable"}else{"processing_failed"},now_unix_ms])?;conn.execute("UPDATE media_attachment_processing_jobs SET state='completed',completed_at_unix_ms=?1 WHERE job_id=?2 AND state='claimed'",params![now_unix_ms,job_id.to_string()])?;Ok(())}).await?;
+                self.db
+                    .transaction(move |conn| {
+                        let mut current_generation = expected_generation
+                            .checked_add(1)
+                            .context("availability generation overflow")?;
+                        if terminal == MediaAvailability::ModelDerivativeUnavailable {
+                            for (from, next) in [
+                                ("probing", MediaAvailability::Decoding),
+                                ("decoding", MediaAvailability::Normalizing),
+                                ("normalizing", MediaAvailability::ModelDerivativeUnavailable),
+                            ] {
+                                cockpit_db::Db::transition_media_attachment_conn(
+                                    conn,
+                                    attachment_id,
+                                    expected_version,
+                                    current_generation,
+                                    next,
+                                    now_unix_ms,
+                                )?;
+                                current_generation = current_generation
+                                    .checked_add(1)
+                                    .context("availability generation overflow")?;
+                                conn.execute(
+                                    "INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",
+                                    params![attachment_id.to_string(),current_generation.to_string(),from,next.as_str(),job_id.to_string(),now_unix_ms],
+                                )?;
+                            }
+                        } else {
+                            cockpit_db::Db::transition_media_attachment_conn(
+                                conn,
+                                attachment_id,
+                                expected_version,
+                                current_generation,
+                                terminal,
+                                now_unix_ms,
+                            )?;
+                            current_generation = current_generation
+                                .checked_add(1)
+                                .context("availability generation overflow")?;
+                            conn.execute(
+                                "INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,'probing',?3,?4,?5)",
+                                params![attachment_id.to_string(),current_generation.to_string(),terminal_text,job_id.to_string(),now_unix_ms],
+                            )?;
+                            conn.execute("INSERT INTO media_attachment_failure_reasons(attachment_id,reason,recorded_at_unix_ms) VALUES(?1,'normalization_failed',?2)",params![attachment_id.to_string(),now_unix_ms])?;
+                        }
+                        conn.execute("INSERT INTO media_attachment_processing_failure_evidence(job_id,attachment_id,reason,recorded_at_unix_ms) VALUES(?1,?2,?3,?4)",params![job_id.to_string(),attachment_id.to_string(),if terminal==MediaAvailability::ModelDerivativeUnavailable{"model_runtime_unavailable"}else{"processing_failed"},now_unix_ms])?;
+                        conn.execute("UPDATE media_attachment_processing_jobs SET state='completed',completed_at_unix_ms=?1 WHERE job_id=?2 AND state='claimed'",params![now_unix_ms,job_id.to_string()])?;
+                        Ok(())
+                    })
+                    .await?;
                 completed += 1;
                 continue;
             }
@@ -6358,8 +6407,11 @@ mod tests {
                 .unwrap(),
             0
         );
-        let state = db.read(|conn| Ok((conn.query_row("SELECT availability FROM media_attachments", [], |r| r.get::<_, String>(0))?, conn.query_row("SELECT COUNT(*) FROM media_attachment_processing_failure_evidence WHERE reason='model_runtime_unavailable'", [], |r| r.get::<_, i64>(0))?))).await.unwrap();
-        assert_eq!(state, ("model_derivative_unavailable".into(), 1));
+        let state = db.read(|conn| Ok((conn.query_row("SELECT availability FROM media_attachments", [], |r| r.get::<_, String>(0))?, conn.query_row("SELECT availability_generation FROM media_attachments", [], |r| r.get::<_, String>(0))?, conn.query_row("SELECT COUNT(*) FROM media_attachment_processing_failure_evidence WHERE reason='model_runtime_unavailable'", [], |r| r.get::<_, i64>(0))?, conn.query_row("SELECT COUNT(*) FROM media_attachment_transition_evidence WHERE to_state IN ('decoding','normalizing','model_derivative_unavailable')", [], |r| r.get::<_, i64>(0))?))).await.unwrap();
+        assert_eq!(
+            state,
+            ("model_derivative_unavailable".into(), "5".into(), 1, 3)
+        );
     }
 
     #[tokio::test]

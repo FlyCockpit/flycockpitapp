@@ -39,6 +39,51 @@ pub(crate) struct VettedHttpsHop {
     redirect_depth: u8,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RedirectLocationClass {
+    SameOrigin,
+    CrossOrigin,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RedactedHttpsProvenance {
+    pub(crate) redirect_classes: Vec<RedirectLocationClass>,
+    pub(crate) path_segment_count: u32,
+    pub(crate) safe_basename: Option<String>,
+}
+
+impl RedactedHttpsProvenance {
+    pub(crate) fn initial(hop: &VettedHttpsHop) -> Result<Self> {
+        let (path_segment_count, safe_basename) = redacted_path_shape(&hop.url)?;
+        Ok(Self {
+            redirect_classes: Vec::new(),
+            path_segment_count,
+            safe_basename,
+        })
+    }
+
+    pub(crate) fn record_redirect(
+        &mut self,
+        previous: &VettedHttpsHop,
+        next: &VettedHttpsHop,
+    ) -> Result<()> {
+        ensure!(
+            self.redirect_classes.len() < usize::from(MAX_REDIRECTS),
+            "too many redirects"
+        );
+        self.redirect_classes
+            .push(if origin(&previous.url) == origin(&next.url) {
+                RedirectLocationClass::SameOrigin
+            } else {
+                RedirectLocationClass::CrossOrigin
+            });
+        let (path_segment_count, safe_basename) = redacted_path_shape(&next.url)?;
+        self.path_segment_count = path_segment_count;
+        self.safe_basename = safe_basename;
+        Ok(())
+    }
+}
+
 impl VettedHttpsHop {
     pub(crate) fn url(&self) -> &Url {
         &self.url
@@ -148,6 +193,25 @@ fn origin(url: &Url) -> (&str, &str, u16) {
         url.port_or_known_default()
             .expect("validated HTTPS has port"),
     )
+}
+
+fn redacted_path_shape(url: &Url) -> Result<(u32, Option<String>)> {
+    let segments = url
+        .path_segments()
+        .context("HTTPS URL cannot carry path segments")?;
+    let segments = segments
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let count = u32::try_from(segments.len()).context("HTTPS URL has too many path segments")?;
+    let basename = segments.last().and_then(|segment| {
+        let safe = segment
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'))
+            .take(128)
+            .collect::<String>();
+        (!safe.is_empty()).then_some(safe)
+    });
+    Ok((count, basename))
 }
 
 fn is_public_destination(ip: IpAddr) -> bool {
@@ -312,6 +376,40 @@ mod tests {
                 initial_https_hop("https://example.test/a", &[ip(address)]).is_err(),
                 "{address}"
             );
+        }
+    }
+
+    #[test]
+    fn https_media_ingest_provenance_never_retains_origin_query_or_fragment() {
+        let first = initial_https_hop(
+            "https://secret.example.test/private/a.png?token=signed",
+            &[ip("93.184.216.34")],
+        )
+        .unwrap();
+        let mut provenance = RedactedHttpsProvenance::initial(&first).unwrap();
+        let next = redirected_https_hop(
+            &first,
+            "https://cdn.example.test/final/b.webp?other=secret",
+            &[ip("93.184.216.35")],
+        )
+        .unwrap();
+        provenance.record_redirect(&first, &next).unwrap();
+        assert_eq!(
+            provenance.redirect_classes,
+            vec![RedirectLocationClass::CrossOrigin]
+        );
+        assert_eq!(provenance.path_segment_count, 2);
+        assert_eq!(provenance.safe_basename.as_deref(), Some("b.webp"));
+        let debug = format!("{provenance:?}");
+        for forbidden in [
+            "secret.example",
+            "cdn.example",
+            "token",
+            "signed",
+            "other=",
+            "private/",
+        ] {
+            assert!(!debug.contains(forbidden));
         }
     }
 }

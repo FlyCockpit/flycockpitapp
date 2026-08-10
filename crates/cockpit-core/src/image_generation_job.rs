@@ -35,6 +35,149 @@ pub struct RuntimeTargetAuthorityV1 {
     pub normalized_config_digest: String,
     pub capability_provenance: CapabilityProvenanceV1,
     pub destination: TargetDestinationV1,
+    pub supported_formats: BTreeMap<String, String>,
+    pub maximum_width: u32,
+    pub maximum_height: u32,
+    pub allowed_parameters: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageGenerationRequestV1 {
+    pub width: u32,
+    pub height: u32,
+    pub format: String,
+    pub samples_per_target: u32,
+    pub target_ids: Vec<String>,
+    pub parameters: BTreeMap<String, TypedParameterV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageGenerationTargetResolutionAuthorityV1 {
+    pub runtime: RuntimeTargetAuthorityV1,
+    pub references: Vec<ReferenceArtifactV1>,
+    pub slot_artifact_ids: Vec<(Uuid, Uuid)>,
+    pub max_attempts: u32,
+    pub attempt_resources: Vec<ResourceReservationV1>,
+    pub attempt_maximum_usd_micros: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageGenerationResolutionAuthorityV1 {
+    pub job_id: Uuid,
+    pub owner_session_id: Uuid,
+    pub owner_principal_digest: String,
+    pub project_identity_digest: String,
+    pub config_generation: u64,
+    pub enqueue_started_monotonic_ms: u64,
+    pub operation_deadline_monotonic_ms: u64,
+    pub required_grants: Vec<GrantRequirementV1>,
+    pub central_resources: Vec<ResourceReservationV1>,
+    pub spend: SpendReservationPlanV1,
+    pub output_authority: VerifiedOutputDirectoryAuthority,
+    pub targets: Vec<ImageGenerationTargetResolutionAuthorityV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageGenerationTargetAlternativeV1 {
+    pub target_id: String,
+    pub supported_formats: Vec<String>,
+    pub maximum_width: u32,
+    pub maximum_height: u32,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageGenerationResolutionV1 {
+    Ready(ImageGenerationPlanV1),
+    Incompatible(Vec<ImageGenerationTargetAlternativeV1>),
+}
+
+pub fn resolve_image_generation(
+    request: ImageGenerationRequestV1,
+    authority: ImageGenerationResolutionAuthorityV1,
+) -> Result<ImageGenerationResolutionV1> {
+    ensure!(
+        request.target_ids.windows(2).all(|pair| pair[0] < pair[1]),
+        "requested targets must be unique and sorted"
+    );
+    let mut alternatives = Vec::new();
+    let mut targets = Vec::new();
+    for target_id in &request.target_ids {
+        let Some(target) = authority
+            .targets
+            .iter()
+            .find(|item| item.runtime.target_id == *target_id)
+        else {
+            alternatives.push(ImageGenerationTargetAlternativeV1 {
+                target_id: target_id.clone(),
+                supported_formats: vec![],
+                maximum_width: 0,
+                maximum_height: 0,
+                reason: "target is not authorized".into(),
+            });
+            continue;
+        };
+        let compatible = target.runtime.supported_formats.get(&request.format);
+        let parameters_valid = request
+            .parameters
+            .keys()
+            .all(|key| target.runtime.allowed_parameters.binary_search(key).is_ok());
+        if compatible.is_none()
+            || request.width > target.runtime.maximum_width
+            || request.height > target.runtime.maximum_height
+            || !parameters_valid
+            || target.slot_artifact_ids.len() != request.samples_per_target as usize
+        {
+            alternatives.push(ImageGenerationTargetAlternativeV1 {
+                target_id: target_id.clone(),
+                supported_formats: target.runtime.supported_formats.keys().cloned().collect(),
+                maximum_width: target.runtime.maximum_width,
+                maximum_height: target.runtime.maximum_height,
+                reason: "request is incompatible with sealed target capability".into(),
+            });
+            continue;
+        }
+        let format = request.format.clone();
+        targets.push(ImageGenerationPreflightTargetV1 {
+            authority: target.runtime.clone(),
+            reference_artifacts: target.references.clone(),
+            requested: RequestedOutputV1 {
+                width: request.width,
+                height: request.height,
+                format: format.clone(),
+            },
+            resolved: ResolvedOutputV1 {
+                width: request.width,
+                height: request.height,
+                format: format.clone(),
+                mime: compatible.unwrap().clone(),
+                vector_sanitization_required: format == "svg",
+            },
+            typed_parameters: request.parameters.clone(),
+            slot_ids: target.slot_artifact_ids.clone(),
+            max_attempts: target.max_attempts,
+            attempt_resource_maximum: target.attempt_resources.clone(),
+            attempt_maximum_usd_micros: target.attempt_maximum_usd_micros,
+        });
+    }
+    if !alternatives.is_empty() {
+        return Ok(ImageGenerationResolutionV1::Incompatible(alternatives));
+    }
+    let plan = plan_image_generation(ImageGenerationPreflightInputV1 {
+        job_id: authority.job_id,
+        owner_session_id: authority.owner_session_id,
+        owner_principal_digest: authority.owner_principal_digest,
+        project_identity_digest: authority.project_identity_digest,
+        config_generation: authority.config_generation,
+        enqueue_started_monotonic_ms: authority.enqueue_started_monotonic_ms,
+        operation_deadline_monotonic_ms: authority.operation_deadline_monotonic_ms,
+        required_grants: authority.required_grants,
+        central_resources: authority.central_resources,
+        spend: authority.spend,
+        output_authority: authority.output_authority,
+        targets,
+    })?;
+    Ok(ImageGenerationResolutionV1::Ready(plan))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,7 +245,7 @@ pub fn open_image_generation_output_directory(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImageGenerationPreflightTargetV1 {
+pub(crate) struct ImageGenerationPreflightTargetV1 {
     pub authority: RuntimeTargetAuthorityV1,
     pub reference_artifacts: Vec<ReferenceArtifactV1>,
     pub requested: RequestedOutputV1,
@@ -114,7 +257,7 @@ pub struct ImageGenerationPreflightTargetV1 {
     pub attempt_maximum_usd_micros: Option<u64>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImageGenerationPreflightInputV1 {
+pub(crate) struct ImageGenerationPreflightInputV1 {
     pub job_id: Uuid,
     pub owner_session_id: Uuid,
     pub owner_principal_digest: String,
@@ -129,7 +272,7 @@ pub struct ImageGenerationPreflightInputV1 {
     pub targets: Vec<ImageGenerationPreflightTargetV1>,
 }
 
-pub fn plan_image_generation(
+pub(crate) fn plan_image_generation(
     input: ImageGenerationPreflightInputV1,
 ) -> Result<ImageGenerationPlanV1> {
     ensure!(
@@ -272,6 +415,37 @@ impl RuntimeTargetAuthorityV1 {
                 credential_identity_digest: credential.plan_identity_hex(),
                 destination_generation: snapshot.config_generation,
             },
+            supported_formats: capability
+                .constraints
+                .get("formats")
+                .into_iter()
+                .flat_map(|value| value.split(','))
+                .filter_map(|format| {
+                    let mime = match format {
+                        "png" => "image/png",
+                        "jpeg" | "jpg" => "image/jpeg",
+                        "webp" => "image/webp",
+                        "svg" => "image/svg+xml",
+                        _ => return None,
+                    };
+                    Some((format.to_owned(), mime.to_owned()))
+                })
+                .collect(),
+            maximum_width: capability
+                .constraints
+                .get("max_width")
+                .ok_or_else(|| anyhow::anyhow!("capability maximum width is missing"))?
+                .parse()?,
+            maximum_height: capability
+                .constraints
+                .get("max_height")
+                .ok_or_else(|| anyhow::anyhow!("capability maximum height is missing"))?
+                .parse()?,
+            allowed_parameters: capability
+                .constraints
+                .get("parameters")
+                .map(|value| value.split(',').map(str::to_owned).collect())
+                .unwrap_or_default(),
         })
     }
 }

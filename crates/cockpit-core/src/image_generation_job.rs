@@ -276,6 +276,32 @@ impl ImageGenerationDispatcher {
     where
         A: ImageGenerationAdapter,
     {
+        self.run_scheduler_pass_with_hook(
+            adapter,
+            worker_boot_id,
+            now_monotonic_ms,
+            at_unix_ms,
+            media_wall_ms,
+            limit,
+            |_| Ok(()),
+        )
+        .await
+    }
+
+    async fn run_scheduler_pass_with_hook<A, H>(
+        &self,
+        adapter: &A,
+        worker_boot_id: Uuid,
+        now_monotonic_ms: u64,
+        at_unix_ms: i64,
+        media_wall_ms: u64,
+        limit: u32,
+        mut before_claim: H,
+    ) -> Result<ImageGenerationSchedulerPass>
+    where
+        A: ImageGenerationAdapter,
+        H: FnMut(&DecodedImageGenerationDispatchCandidate) -> Result<()>,
+    {
         let candidates = self
             .scan_dispatch_candidates(now_monotonic_ms, limit)
             .await?;
@@ -284,6 +310,7 @@ impl ImageGenerationDispatcher {
             ..Default::default()
         };
         for candidate in candidates {
+            before_claim(&candidate)?;
             let claim = cockpit_db::db::image_generation::ClaimImageGenerationDispatch {
                 job_id: candidate.candidate.job_id,
                 slot_id: candidate.candidate.slot_id,

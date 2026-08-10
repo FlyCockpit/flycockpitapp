@@ -714,15 +714,13 @@ impl MediaStorageRecovery {
                         "image_model",
                         Uuid::now_v7(),
                         normalized.model_png,
-                        normalized.width,
-                        normalized.height,
+                        Some((normalized.width, normalized.height)),
                     ),
                     (
                         "browser_thumbnail",
                         Uuid::now_v7(),
                         normalized.thumbnail_png,
-                        normalized.thumbnail_width,
-                        normalized.thumbnail_height,
+                        Some((normalized.thumbnail_width, normalized.thumbnail_height)),
                     ),
                 ]
             })
@@ -733,7 +731,7 @@ impl MediaStorageRecovery {
         let intent_derivatives = serde_json::to_string(
             &planned_derivatives
                 .iter()
-                .map(|(_, id, _, _, _)| id.to_string())
+                .map(|(_, id, _, _)| id.to_string())
                 .collect::<Vec<_>>(),
         )?;
         self.db.transaction(move|conn|{conn.execute("INSERT INTO media_storage_publication_intents(upload_id,temporary_storage_id,quarantine_storage_id,derivative_storage_ids_json,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5)",params![intent_upload,intent_temporary,intent_target,intent_derivatives,now_unix_ms])?;Ok(())}).await?;
@@ -758,7 +756,7 @@ impl MediaStorageRecovery {
         let mut derivative_components = Vec::new();
         if !planned_derivatives.is_empty() {
             let publication = (|| -> Result<()> {
-                for (kind, derivative_storage, bytes, width, height) in planned_derivatives {
+                for (kind, derivative_storage, bytes, dimensions) in planned_derivatives {
                     let derivative_name = derivative_storage.to_string();
                     let mut derivative = self
                         .owned_root
@@ -787,8 +785,7 @@ impl MediaStorageRecovery {
                         identity,
                         persisted_length,
                         checksum,
-                        width,
-                        height,
+                        dimensions,
                     ));
                 }
                 self.owned_root.sync().map_err(anyhow::Error::new)?;
@@ -871,7 +868,7 @@ impl MediaStorageRecovery {
         let ready = !derivative_components.is_empty();
         let reservation_id = snapshot.5.clone();
         let transition_operation_id = mutation.local_operation_id;
-        let result=self.db.transaction(move|conn|{if let Some(receipt)=preflight_local_operation(conn,mutation.local_operation_id,"finalize",&domain,&request_digest,&semantic_digest,now_unix_ms)?{return Ok((receipt,false))}cockpit_db::Db::insert_media_attachment_conn(conn,&record)?;cockpit_db::Db::insert_media_attachment_component_conn(conn,&component_record)?;if ready {for (kind,storage,identity,length,checksum,width,height) in derivative_components {let id=Uuid::now_v7();let component=MediaAttachmentComponent{component_id:id,attachment_id:attachment,attachment_version:1,component_kind:kind,storage_id:storage,lifecycle_state:"ready".into(),component_generation:1,stable_identity_digest:identity,byte_length:length,sha256:checksum,reservation_id:reservation_id.clone(),created_at_unix_ms:now_unix_ms,updated_at_unix_ms:now_unix_ms};cockpit_db::Db::insert_media_attachment_component_conn(conn,&component)?;conn.execute("INSERT INTO media_image_component_dimensions(component_id,width,height) VALUES(?1,?2,?3)",params![id.to_string(),width,height])?;}let mut availability=MediaAvailability::Quarantined;let mut available_generation=1;for next_state in [MediaAvailability::Probing,MediaAvailability::Decoding,MediaAvailability::Normalizing,MediaAvailability::Ready]{cockpit_db::Db::transition_media_attachment_conn(conn,attachment,1,available_generation,next_state,now_unix_ms)?;let next_generation=available_generation.checked_add(1).context("availability generation overflow")?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![attachment.to_string(),next_generation.to_string(),availability.as_str(),next_state.as_str(),transition_operation_id.to_string(),now_unix_ms])?;availability=next_state;available_generation=next_generation;}ensure!(availability==MediaAvailability::Ready,"image readiness transition failed");}conn.execute("INSERT INTO media_attachment_upload_origins(attachment_id,client_draft_id,upload_id,upload_generation) VALUES(?1,?2,?3,?4)",params![attachment.to_string(),draft.to_string(),upload.to_string(),next.to_string()])?;let changed=conn.execute("UPDATE media_uploads SET state='materialized',upload_generation=?1,next_chunk_index=NULL,attachment_id=?2,attachment_version='1',last_transition_json=?3,updated_at_unix_ms=?4 WHERE upload_id=?5 AND upload_generation=?6 AND state='open'",params![next.to_string(),attachment.to_string(),serde_json::to_string(&transition)?,now_unix_ms,upload.to_string(),generation.to_string()])?;ensure!(changed==1,"upload finalize lost compare-and-swap");let receipt=LocalMediaMutationReceiptV1{schema_version:1,kind:"localMediaMutationReceipt".into(),receipt_id:Uuid::now_v7(),local_operation_id:mutation.local_operation_id,actor_principal_digest:mutation.actor_principal_digest,action:"finalize".into(),subject_kind:LocalMediaSubjectKindV1::Upload,subject_id:upload,operation_request_digest:request_digest.clone(),semantic_command_digest:semantic_digest.clone(),outcome:LocalMediaMutationOutcomeV1::Applied,transition:LocalMediaMutationTransitionV1::UploadToAttachment{upload_generation_before:generation,upload_generation_after:next,attachment_version:1,availability_generation:if ready{5}else{1},reference_generation:1},discard_result:None,discard_result_digest:None,committed_at_unix_ms:now_unix_ms};commit_local_operation(conn,&receipt,"finalize",&domain,&request_digest,&semantic_digest,now_unix_ms)?;Ok((receipt,true))}).await;
+        let result=self.db.transaction(move|conn|{if let Some(receipt)=preflight_local_operation(conn,mutation.local_operation_id,"finalize",&domain,&request_digest,&semantic_digest,now_unix_ms)?{return Ok((receipt,false))}cockpit_db::Db::insert_media_attachment_conn(conn,&record)?;cockpit_db::Db::insert_media_attachment_component_conn(conn,&component_record)?;if ready {for (kind,storage,identity,length,checksum,dimensions) in derivative_components {let id=Uuid::now_v7();let component=MediaAttachmentComponent{component_id:id,attachment_id:attachment,attachment_version:1,component_kind:kind,storage_id:storage,lifecycle_state:"ready".into(),component_generation:1,stable_identity_digest:identity,byte_length:length,sha256:checksum,reservation_id:reservation_id.clone(),created_at_unix_ms:now_unix_ms,updated_at_unix_ms:now_unix_ms};cockpit_db::Db::insert_media_attachment_component_conn(conn,&component)?;if let Some((width,height))=dimensions{conn.execute("INSERT INTO media_image_component_dimensions(component_id,width,height) VALUES(?1,?2,?3)",params![id.to_string(),width,height])?;}}let mut availability=MediaAvailability::Quarantined;let mut available_generation=1;for next_state in [MediaAvailability::Probing,MediaAvailability::Decoding,MediaAvailability::Normalizing,MediaAvailability::Ready]{cockpit_db::Db::transition_media_attachment_conn(conn,attachment,1,available_generation,next_state,now_unix_ms)?;let next_generation=available_generation.checked_add(1).context("availability generation overflow")?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![attachment.to_string(),next_generation.to_string(),availability.as_str(),next_state.as_str(),transition_operation_id.to_string(),now_unix_ms])?;availability=next_state;available_generation=next_generation;}ensure!(availability==MediaAvailability::Ready,"media readiness transition failed");}conn.execute("INSERT INTO media_attachment_upload_origins(attachment_id,client_draft_id,upload_id,upload_generation) VALUES(?1,?2,?3,?4)",params![attachment.to_string(),draft.to_string(),upload.to_string(),next.to_string()])?;let changed=conn.execute("UPDATE media_uploads SET state='materialized',upload_generation=?1,next_chunk_index=NULL,attachment_id=?2,attachment_version='1',last_transition_json=?3,updated_at_unix_ms=?4 WHERE upload_id=?5 AND upload_generation=?6 AND state='open'",params![next.to_string(),attachment.to_string(),serde_json::to_string(&transition)?,now_unix_ms,upload.to_string(),generation.to_string()])?;ensure!(changed==1,"upload finalize lost compare-and-swap");let receipt=LocalMediaMutationReceiptV1{schema_version:1,kind:"localMediaMutationReceipt".into(),receipt_id:Uuid::now_v7(),local_operation_id:mutation.local_operation_id,actor_principal_digest:mutation.actor_principal_digest,action:"finalize".into(),subject_kind:LocalMediaSubjectKindV1::Upload,subject_id:upload,operation_request_digest:request_digest.clone(),semantic_command_digest:semantic_digest.clone(),outcome:LocalMediaMutationOutcomeV1::Applied,transition:LocalMediaMutationTransitionV1::UploadToAttachment{upload_generation_before:generation,upload_generation_after:next,attachment_version:1,availability_generation:if ready{5}else{1},reference_generation:1},discard_result:None,discard_result_digest:None,committed_at_unix_ms:now_unix_ms};commit_local_operation(conn,&receipt,"finalize",&domain,&request_digest,&semantic_digest,now_unix_ms)?;Ok((receipt,true))}).await;
         if result.as_ref().is_err() || result.as_ref().is_ok_and(|(_, applied)| !*applied) {
             self.owned_root
                 .rename_into_noreplace(&target, &self.owned_root, &snapshot.0)

@@ -130,14 +130,18 @@ impl ImageSpendPage {
     }
 
     pub(super) fn poll(&mut self) {
-        if let Some(result) = self
-            .load
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|rx| rx.try_recv().ok())
-        {
-            *self.load.lock().unwrap() = None;
+        let load_result = {
+            let load = self.load.lock().unwrap();
+            load.as_ref().and_then(|rx| match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("policy load worker stopped without a result".into()))
+                }
+            })
+        };
+        if let Some(result) = load_result {
+            self.load.lock().unwrap().take();
             match result {
                 Ok(Some(current)) => {
                     self.version = Some(current.policy_version);
@@ -149,14 +153,18 @@ impl ImageSpendPage {
                 Err(error) => self.status = format!("Could not load policy: {error}"),
             }
         }
-        if let Some(result) = self
-            .save
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|rx| rx.try_recv().ok())
-        {
-            *self.save.lock().unwrap() = None;
+        let save_result = {
+            let save = self.save.lock().unwrap();
+            save.as_ref().and_then(|rx| match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("policy save worker stopped without a result".into()))
+                }
+            })
+        };
+        if let Some(result) = save_result {
+            self.save.lock().unwrap().take();
             match result {
                 Ok(current) => {
                     self.version = Some(current.policy_version);

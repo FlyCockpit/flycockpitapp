@@ -13,9 +13,10 @@ use std::time::Duration;
 use std::time::Instant;
 
 use cockpit_config::config::image_generation::{
-    ImageAdapterKind, ImageEndpoint, ImageLocationClass,
+    ImageAdapterKind, ImageEndpoint, ImageGenerationConfig, ImageLocationClass, ImageTargetIdentity,
 };
 use futures::FutureExt;
+use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -411,6 +412,7 @@ impl CapabilitySnapshot {
 pub struct ImageHealthSnapshot {
     pub endpoint_id: String,
     pub target_id: String,
+    pub target_immutable_identity: String,
     pub config_generation: u64,
     pub refresh_epoch: u64,
     pub request_id: u64,
@@ -513,6 +515,15 @@ struct CurrentIdentity {
     location: ImageLocationClass,
     enabled: bool,
 }
+#[derive(Clone)]
+struct CurrentTargetIdentity {
+    endpoint: String,
+    generation: u64,
+    epoch: u64,
+    immutable: String,
+    model_or_workflow_digest: String,
+    enabled: bool,
+}
 struct Flight {
     notify: Notify,
     completed: AtomicBool,
@@ -522,6 +533,7 @@ struct Inner {
     adapters: Vec<Arc<dyn ImageRuntimeAdapter>>,
     cache: Mutex<HashMap<CacheKey, ImageHealthSnapshot>>,
     current: Mutex<HashMap<String, CurrentIdentity>>,
+    current_targets: Mutex<HashMap<String, CurrentTargetIdentity>>,
     inflight: Mutex<HashMap<RefreshKey, Arc<Flight>>>,
 }
 #[derive(Clone)]
@@ -561,6 +573,7 @@ impl ImageRuntimeRegistry {
                 adapters,
                 cache: Mutex::new(HashMap::new()),
                 current: Mutex::new(HashMap::new()),
+                current_targets: Mutex::new(HashMap::new()),
                 inflight: Mutex::new(HashMap::new()),
             }),
             clock,
@@ -618,6 +631,105 @@ impl ImageRuntimeRegistry {
             .lock()
             .unwrap()
             .retain(|key, _| key.endpoint != endpoint_id);
+        self.inner
+            .current_targets
+            .lock()
+            .unwrap()
+            .retain(|_, target| target.endpoint != endpoint_id);
+    }
+    pub fn apply_config(
+        &self,
+        config: &ImageGenerationConfig,
+        generation: u64,
+        epoch: u64,
+    ) -> Result<(), RuntimeError> {
+        let endpoint_ids = config
+            .endpoints()
+            .iter()
+            .map(|endpoint| endpoint.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let existing = self
+            .inner
+            .current
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for removed in existing
+            .into_iter()
+            .filter(|endpoint| !endpoint_ids.contains(endpoint))
+        {
+            self.remove_endpoint(&removed);
+        }
+        for endpoint in config.endpoints() {
+            self.apply_endpoint(endpoint, generation, epoch);
+        }
+        let mut targets = HashMap::new();
+        for target in config.targets() {
+            let immutable = config.target_immutable_identity(&target.id).map_err(|_| {
+                RuntimeError::new(
+                    RuntimeErrorCode::Incompatible,
+                    "Correct the configured image target identity.",
+                )
+            })?;
+            let model_or_workflow_digest = match &target.identity {
+                ImageTargetIdentity::HostedModel { model } => {
+                    format!("{:x}", Sha256::digest(model.as_bytes()))
+                }
+                ImageTargetIdentity::Workflow {
+                    workflow_digest, ..
+                } => workflow_digest.clone(),
+            };
+            targets.insert(
+                target.id.clone(),
+                CurrentTargetIdentity {
+                    endpoint: target.endpoint_id.clone(),
+                    generation,
+                    epoch,
+                    immutable,
+                    model_or_workflow_digest,
+                    enabled: target.enabled,
+                },
+            );
+        }
+        *self.inner.current_targets.lock().unwrap() = targets;
+        self.inner.cache.lock().unwrap().retain(|key, snapshot| {
+            self.inner
+                .current_targets
+                .lock()
+                .unwrap()
+                .get(&key.target)
+                .is_some_and(|target| {
+                    target.endpoint == key.endpoint
+                        && target.generation == snapshot.config_generation
+                        && target.epoch == snapshot.refresh_epoch
+                        && target.enabled
+                })
+        });
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn apply_test_target(
+        &self,
+        target_id: &str,
+        endpoint_id: &str,
+        generation: u64,
+        epoch: u64,
+        model_or_workflow_digest: &str,
+    ) {
+        self.inner.current_targets.lock().unwrap().insert(
+            target_id.to_owned(),
+            CurrentTargetIdentity {
+                endpoint: endpoint_id.to_owned(),
+                generation,
+                epoch,
+                immutable: "test-target-identity".into(),
+                model_or_workflow_digest: model_or_workflow_digest.into(),
+                enabled: true,
+            },
+        );
     }
     pub fn snapshot(&self, endpoint_id: &str, target_id: &str) -> Option<ImageHealthSnapshot> {
         let now = self.clock.now_millis();
@@ -658,6 +770,23 @@ impl ImageRuntimeRegistry {
                 ImageHealthState::Disabled.remediation(),
             ));
         }
+        let target_current = self
+            .inner
+            .current_targets
+            .lock()
+            .unwrap()
+            .get(&target_id)
+            .cloned()
+            .filter(|target| {
+                target.endpoint == endpoint.id
+                    && target.generation == generation
+                    && target.epoch == epoch
+                    && target.enabled
+            })
+            .ok_or(RuntimeError::new(
+                RuntimeErrorCode::Obsolete,
+                "Refresh after target configuration changes.",
+            ))?;
         let key = RefreshKey {
             endpoint: endpoint.id.clone(),
             target: target_id.clone(),
@@ -1002,10 +1131,10 @@ impl ImageRuntimeRegistry {
             )?;
             return Err(error);
         }
-        if capability
-            .as_ref()
-            .is_some_and(|capability| capability.target_id != target_id)
-        {
+        if capability.as_ref().is_some_and(|capability| {
+            capability.target_id != target_id
+                || capability.model_or_workflow_digest != target_current.model_or_workflow_digest
+        }) {
             let error = RuntimeError::new(
                 RuntimeErrorCode::Incompatible,
                 "Refresh capabilities for the configured target identity.",
@@ -1025,6 +1154,7 @@ impl ImageRuntimeRegistry {
         let snapshot = ImageHealthSnapshot {
             endpoint_id: endpoint.id.clone(),
             target_id,
+            target_immutable_identity: target_current.immutable,
             config_generation: generation,
             refresh_epoch: epoch,
             request_id,
@@ -1123,6 +1253,14 @@ impl ImageRuntimeRegistry {
             ImageHealthSnapshot {
                 endpoint_id: endpoint.id.clone(),
                 target_id: target_id.to_owned(),
+                target_immutable_identity: self
+                    .inner
+                    .current_targets
+                    .lock()
+                    .unwrap()
+                    .get(target_id)
+                    .map(|target| target.immutable.clone())
+                    .unwrap_or_default(),
                 config_generation: generation,
                 refresh_epoch: epoch,
                 request_id,
@@ -1220,7 +1358,19 @@ impl ImageRuntimeRegistry {
                     && identity.immutable == endpoint.immutable_identity()
                     && identity.location == endpoint.location
             });
-        if !identity_current || snap.endpoint_origin != endpoint.origin {
+        let target_identity_current = self
+            .inner
+            .current_targets
+            .lock()
+            .unwrap()
+            .get(target_id)
+            .is_some_and(|target| {
+                target.enabled
+                    && target.endpoint == endpoint.id
+                    && target.immutable == snap.target_immutable_identity
+            });
+        if !identity_current || !target_identity_current || snap.endpoint_origin != endpoint.origin
+        {
             self.invalidate_target_cache(&endpoint.id, target_id);
             return Err(RuntimeError::new(
                 RuntimeErrorCode::Obsolete,

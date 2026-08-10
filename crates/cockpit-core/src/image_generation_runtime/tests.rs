@@ -156,6 +156,15 @@ fn endpoint() -> ImageEndpoint {
 fn credential_digest(seed: u8) -> CredentialIdentityDigest {
     CredentialIdentityDigest::from_sha256([seed; 32])
 }
+fn apply_endpoint_and_target(
+    registry: &ImageRuntimeRegistry,
+    endpoint: &ImageEndpoint,
+    generation: u64,
+    epoch: u64,
+) {
+    registry.apply_endpoint(endpoint, generation, epoch);
+    registry.apply_test_target("target", &endpoint.id, generation, epoch, "digest");
+}
 fn registry(clock: Arc<Clock>, adapter: Arc<Adapter>) -> ImageRuntimeRegistry {
     ImageRuntimeRegistry::new(
         clock,
@@ -269,7 +278,7 @@ async fn image_generation_runtime_limit_failures_have_stable_results() {
         )
         .unwrap();
         let endpoint = endpoint();
-        registry.apply_endpoint(&endpoint, 1, 1);
+        apply_endpoint_and_target(&registry, &endpoint, 1, 1);
         assert!(matches!(
             registry
                 .refresh(endpoint.clone(), "target".into(), 1, 1, 1, RefreshKind::Health, credential_digest(1))
@@ -311,7 +320,7 @@ async fn image_generation_runtime_enforces_connect_timeout_around_connector() {
     )
     .unwrap();
     let endpoint = endpoint();
-    registry.apply_endpoint(&endpoint, 1, 1);
+    apply_endpoint_and_target(&registry, &endpoint, 1, 1);
     let refresh = tokio::spawn(async move {
         registry
             .refresh(
@@ -365,7 +374,7 @@ async fn image_generation_runtime_coalesces_and_discards_stale() {
     });
     let registry = registry(clock, adapter.clone());
     let endpoint = endpoint();
-    registry.apply_endpoint(&endpoint, 1, 1);
+    apply_endpoint_and_target(&registry, &endpoint, 1, 1);
     let (a, b) = tokio::join!(
         registry.refresh(
             endpoint.clone(),
@@ -388,7 +397,7 @@ async fn image_generation_runtime_coalesces_and_discards_stale() {
     );
     assert!(a.is_ok() && b.is_ok());
     assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
-    registry.apply_endpoint(&endpoint, 2, 2);
+    apply_endpoint_and_target(&registry, &endpoint, 2, 2);
     let immutable_identity = endpoint.immutable_identity();
     assert!(
         registry
@@ -405,7 +414,7 @@ async fn image_generation_runtime_dns_proof_and_dispatch_gate() {
     });
     let registry = registry(clock.clone(), adapter);
     let endpoint = endpoint();
-    registry.apply_endpoint(&endpoint, 1, 1);
+    apply_endpoint_and_target(&registry, &endpoint, 1, 1);
     let snapshot = registry
         .refresh(
             endpoint.clone(),
@@ -464,7 +473,7 @@ async fn image_generation_runtime_ttls_are_clock_driven_and_stale_is_display_onl
     });
     let registry = registry(clock.clone(), adapter.clone());
     let endpoint = endpoint();
-    registry.apply_endpoint(&endpoint, 1, 1);
+    apply_endpoint_and_target(&registry, &endpoint, 1, 1);
     registry
         .refresh(
             endpoint.clone(),
@@ -538,7 +547,7 @@ async fn image_generation_capability_cache_is_independent_and_waiters_keep_reque
     });
     let registry = registry(clock.clone(), adapter.clone());
     let endpoint = endpoint();
-    registry.apply_endpoint(&endpoint, 1, 1);
+    apply_endpoint_and_target(&registry, &endpoint, 1, 1);
     let first = registry
         .refresh(
             endpoint.clone(),
@@ -578,7 +587,8 @@ async fn image_generation_runtime_binds_capability_to_endpoint_and_target() {
     });
     let registry = registry(clock, adapter);
     let endpoint = endpoint();
-    registry.apply_endpoint(&endpoint, 1, 1);
+    apply_endpoint_and_target(&registry, &endpoint, 1, 1);
+    registry.apply_test_target("other-target", &endpoint.id, 1, 1, "digest");
     let accepted = registry
         .refresh(
             endpoint.clone(),
@@ -687,7 +697,7 @@ async fn image_generation_runtime_blocks_rebinding_and_mismatched_socket_proofs(
         vec![adapter.clone()],
     )
     .unwrap();
-    rebinding.apply_endpoint(&endpoint, 1, 1);
+    apply_endpoint_and_target(&rebinding, &endpoint, 1, 1);
     rebinding
         .refresh(
             endpoint.clone(),
@@ -715,7 +725,7 @@ async fn image_generation_runtime_blocks_rebinding_and_mismatched_socket_proofs(
         vec![adapter],
     )
     .unwrap();
-    mismatch.apply_endpoint(&endpoint, 1, 1);
+    apply_endpoint_and_target(&mismatch, &endpoint, 1, 1);
     assert!(matches!(
         mismatch
             .refresh(endpoint, "target".into(), 1, 1, 1, RefreshKind::Health, credential_digest(5))
@@ -741,7 +751,7 @@ async fn image_generation_runtime_rejects_mixed_dns_location_classes() {
     )
     .unwrap();
     let endpoint = endpoint();
-    registry.apply_endpoint(&endpoint, 1, 1);
+    apply_endpoint_and_target(&registry, &endpoint, 1, 1);
     assert!(matches!(
         registry
             .refresh(

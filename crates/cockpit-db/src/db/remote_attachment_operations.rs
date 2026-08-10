@@ -130,6 +130,27 @@ pub enum BeginIdempotentAdapterRemoteOperationOutcome {
     AttachmentLedgerCapacity,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteRenameEvidence {
+    pub artifact_id: String,
+    pub dispatch_generation: u64,
+    pub state: String,
+    pub source_identity: Vec<u8>,
+    pub source_parent_identity: Vec<u8>,
+    pub target_parent_identity: Vec<u8>,
+    pub target_identity: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrepareRemoteRenameOutcome {
+    Prepared(RemoteRenameEvidence),
+    Reconcile(RemoteRenameEvidence),
+    Replay(Vec<u8>),
+    OperationConflict,
+    OperationActorConflict,
+    AttachmentLedgerCapacity,
+}
+
 pub struct TransactionalRemoteMutation<T> {
     pub value: T,
     pub safe_response: Vec<u8>,
@@ -150,6 +171,107 @@ pub struct RemoteOutboxDeliveryLease {
 }
 
 impl Db {
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prepare_remote_rename_operation(
+        &self,
+        request: ReserveRemoteOperation<'_>,
+        source_identity: Option<&[u8]>,
+        source_parent_identity: Option<&[u8]>,
+        target_parent_identity: Option<&[u8]>,
+        target_identity: Option<&[u8]>,
+    ) -> Result<PrepareRemoteRenameOutcome> {
+        ensure!(
+            request.operation_class == RemoteOperationClass::IdempotentAdapterMutation,
+            "remote rename requires adapter class"
+        );
+        for value in [
+            source_identity,
+            source_parent_identity,
+            target_parent_identity,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            ensure!(
+                !value.is_empty() && value.len() <= 256,
+                "rename identity must be bounded"
+            );
+        }
+        ensure!(
+            target_identity.is_none_or(|value| !value.is_empty() && value.len() <= 256),
+            "target identity must be bounded"
+        );
+        ensure!(
+            target_identity.is_none(),
+            "remote rename is no-replace; target must be absent"
+        );
+        let owned = OwnedReserveRemoteOperation {
+            logical_attachment_id: request.logical_attachment_id.into(),
+            operation_id: request.operation_id.into(),
+            authenticated_device_id: request.authenticated_device_id.into(),
+            authenticated_device_generation: request.authenticated_device_generation,
+            operation_class: request.operation_class,
+            request_hash: request.request_hash,
+            now_ms: request.now_ms,
+        };
+        let source = source_identity.map(<[u8]>::to_vec);
+        let source_parent = source_parent_identity.map(<[u8]>::to_vec);
+        let target_parent = target_parent_identity.map(<[u8]>::to_vec);
+        let target = target_identity.map(<[u8]>::to_vec);
+        self.transaction(move |conn| match reserve_conn(conn,&owned)? {
+            ReserveRemoteOperationOutcome::Reserved(_) => {
+                let source=source.context("new rename lacks source identity")?;
+                let source_parent=source_parent.context("new rename lacks source parent identity")?;
+                let target_parent=target_parent.context("new rename lacks target parent identity")?;
+                let artifact=Uuid::now_v7().to_string();
+                conn.execute("INSERT INTO remote_rename_journal(logical_attachment_id,operation_id,artifact_id,source_identity,source_parent_identity,target_parent_identity,target_identity,dispatch_generation,state,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,1,'prepared',?8,?8)",params![owned.logical_attachment_id,owned.operation_id,artifact,source,source_parent,target_parent,target,owned.now_ms])?;
+                conn.execute("UPDATE remote_attachment_operations SET state='dispatched',dispatch_generation=1 WHERE logical_attachment_id=?1 AND operation_id=?2 AND state='reserved'",params![owned.logical_attachment_id,owned.operation_id])?;
+                Ok(PrepareRemoteRenameOutcome::Prepared(load_remote_rename_evidence(conn,&owned.logical_attachment_id,&owned.operation_id)?))
+            }
+            ReserveRemoteOperationOutcome::Replay(replay) if replay.state=="committed" => Ok(PrepareRemoteRenameOutcome::Replay(replay.safe_response.context("committed rename lacks response")?)),
+            ReserveRemoteOperationOutcome::Replay(replay) if replay.state=="dispatched" => {
+                let stored=load_remote_rename_evidence(conn,&owned.logical_attachment_id,&owned.operation_id)?;
+                let next:i64=conn.query_row("UPDATE remote_attachment_operations SET dispatch_generation=dispatch_generation+1,updated_at_ms=?3 WHERE logical_attachment_id=?1 AND operation_id=?2 AND dispatch_generation=?4 RETURNING dispatch_generation",params![owned.logical_attachment_id,owned.operation_id,owned.now_ms,i64::try_from(stored.dispatch_generation)?],|row|row.get(0))?;
+                let changed=conn.execute("UPDATE remote_rename_journal SET dispatch_generation=?3,updated_at_ms=?4 WHERE logical_attachment_id=?1 AND operation_id=?2 AND dispatch_generation=?5",params![owned.logical_attachment_id,owned.operation_id,next,owned.now_ms,i64::try_from(stored.dispatch_generation)?])?;
+                ensure!(changed==1,"rename journal generation CAS lost");
+                Ok(PrepareRemoteRenameOutcome::Reconcile(load_remote_rename_evidence(conn,&owned.logical_attachment_id,&owned.operation_id)?))
+            }
+            ReserveRemoteOperationOutcome::Replay(_)=>bail!("invalid remote rename state"),
+            ReserveRemoteOperationOutcome::OperationConflict=>Ok(PrepareRemoteRenameOutcome::OperationConflict),
+            ReserveRemoteOperationOutcome::OperationActorConflict=>Ok(PrepareRemoteRenameOutcome::OperationActorConflict),
+            ReserveRemoteOperationOutcome::AttachmentLedgerCapacity=>Ok(PrepareRemoteRenameOutcome::AttachmentLedgerCapacity),
+        }).await
+    }
+
+    pub async fn advance_remote_rename_operation(
+        &self,
+        logical_attachment_id: &str,
+        operation_id: &str,
+        dispatch_generation: u64,
+        from: &str,
+        to: &str,
+        now_ms: i64,
+    ) -> Result<bool> {
+        validate_uuid("logical attachment id", logical_attachment_id)?;
+        validate_operation_id(operation_id)?;
+        ensure!(
+            matches!(
+                (from, to),
+                ("prepared", "artifact_synced")
+                    | ("artifact_synced", "renamed")
+                    | ("renamed", "source_parent_synced")
+                    | ("source_parent_synced", "target_parent_synced")
+                    | ("target_parent_synced", "applied")
+            ),
+            "invalid rename barrier"
+        );
+        let attachment = logical_attachment_id.to_owned();
+        let operation = operation_id.to_owned();
+        let from = from.to_owned();
+        let to = to.to_owned();
+        let generation = i64::try_from(dispatch_generation)?;
+        self.transaction(move|conn|Ok(conn.execute("UPDATE remote_rename_journal SET state=?5,updated_at_ms=?6 WHERE logical_attachment_id=?1 AND operation_id=?2 AND dispatch_generation=?3 AND state=?4",params![attachment,operation,generation,from,to,now_ms])?==1)).await
+    }
     /// Reserves an adapter effect before dispatch. A process restart may claim
     /// the same immutable request again with a higher dispatch generation;
     /// the adapter's durable evidence decides whether to finish or reconcile.
@@ -888,6 +1010,14 @@ fn reserve_conn(
     )?))
 }
 
+fn load_remote_rename_evidence(
+    conn: &Connection,
+    attachment: &str,
+    operation: &str,
+) -> Result<RemoteRenameEvidence> {
+    conn.query_row("SELECT artifact_id,dispatch_generation,state,source_identity,source_parent_identity,target_parent_identity,target_identity FROM remote_rename_journal WHERE logical_attachment_id=?1 AND operation_id=?2",params![attachment,operation],|row|Ok(RemoteRenameEvidence{artifact_id:row.get(0)?,dispatch_generation:row.get::<_,i64>(1)?.try_into().map_err(|error|rusqlite::Error::FromSqlConversionFailure(1,rusqlite::types::Type::Integer,Box::new(error)))?,state:row.get(2)?,source_identity:row.get(3)?,source_parent_identity:row.get(4)?,target_parent_identity:row.get(5)?,target_identity:row.get(6)?})).context("loading remote rename evidence")
+}
+
 fn validate_snapshot_high_water(
     conn: &Connection,
     logical_attachment_id: &str,
@@ -986,6 +1116,17 @@ fn commit_conn(
             request.safe_response,
             next_event_seq,
             request.now_ms,
+        ],
+    )?;
+    conn.execute(
+        "UPDATE remote_rename_journal SET state='ledger_committed',updated_at_ms=?3
+         WHERE logical_attachment_id=?1 AND operation_id=?2 AND state='applied'
+           AND dispatch_generation=(SELECT dispatch_generation FROM remote_attachment_operations
+             WHERE logical_attachment_id=?1 AND operation_id=?2)",
+        params![
+            request.logical_attachment_id,
+            request.operation_id,
+            request.now_ms
         ],
     )?;
     Ok(CommitRemoteOperationOutcome::Committed {
@@ -2063,6 +2204,83 @@ mod tests {
                 .await
                 .unwrap(),
             BeginIdempotentAdapterRemoteOperationOutcome::Replay(b"adapter-safe".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_journal_reopens_with_exact_evidence_and_rejects_stale_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rename.db");
+        let operation = "01890f3e-4c00-7000-8000-0000000000a4";
+        let request = || ReserveRemoteOperation {
+            operation_class: RemoteOperationClass::IdempotentAdapterMutation,
+            ..reserve(operation, [15; 32])
+        };
+        let artifact;
+        {
+            let db = Db::open(&path).unwrap();
+            let PrepareRemoteRenameOutcome::Prepared(evidence) = db
+                .prepare_remote_rename_operation(
+                    request(),
+                    Some(b"source"),
+                    Some(b"source-parent"),
+                    Some(b"target-parent"),
+                    None,
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("prepared")
+            };
+            artifact = evidence.artifact_id;
+            assert!(
+                db.advance_remote_rename_operation(
+                    ATTACHMENT,
+                    operation,
+                    1,
+                    "prepared",
+                    "artifact_synced",
+                    11
+                )
+                .await
+                .unwrap()
+            );
+        }
+        let db = Db::open(&path).unwrap();
+        let PrepareRemoteRenameOutcome::Reconcile(evidence) = db
+            .prepare_remote_rename_operation(request(), None, None, None, None)
+            .await
+            .unwrap()
+        else {
+            panic!("reconcile")
+        };
+        assert_eq!(evidence.artifact_id, artifact);
+        assert_eq!(evidence.dispatch_generation, 2);
+        assert_eq!(evidence.state, "artifact_synced");
+        assert!(
+            !db.advance_remote_rename_operation(
+                ATTACHMENT,
+                operation,
+                1,
+                "artifact_synced",
+                "renamed",
+                12
+            )
+            .await
+            .unwrap(),
+            "late generation cannot advance a barrier"
+        );
+        assert!(
+            db.advance_remote_rename_operation(
+                ATTACHMENT,
+                operation,
+                2,
+                "artifact_synced",
+                "renamed",
+                12
+            )
+            .await
+            .unwrap()
         );
     }
 

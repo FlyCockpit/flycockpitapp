@@ -2705,6 +2705,55 @@ BEGIN
     SELECT RAISE(ABORT, 'remote attachment close authority is immutable');
 END;
 
+CREATE TABLE remote_rename_journal (
+    logical_attachment_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL UNIQUE CHECK (
+      length(artifact_id)=36 AND artifact_id=lower(artifact_id)
+      AND substr(artifact_id,9,1)='-' AND substr(artifact_id,14,1)='-'
+      AND substr(artifact_id,19,1)='-' AND substr(artifact_id,24,1)='-'
+      AND substr(artifact_id,20,1) GLOB '[89ab]'
+      AND length(replace(artifact_id,'-',''))=32
+      AND replace(artifact_id,'-','') NOT GLOB '*[^0-9a-f]*'
+      AND replace(artifact_id,'-','')<>'00000000000000000000000000000000'
+    ),
+    source_identity BLOB NOT NULL CHECK(length(source_identity) BETWEEN 1 AND 256),
+    source_parent_identity BLOB NOT NULL CHECK(length(source_parent_identity) BETWEEN 1 AND 256),
+    target_parent_identity BLOB NOT NULL CHECK(length(target_parent_identity) BETWEEN 1 AND 256),
+    target_identity BLOB CHECK(target_identity IS NULL OR length(target_identity) BETWEEN 1 AND 256),
+    dispatch_generation INTEGER NOT NULL CHECK(dispatch_generation > 0),
+    state TEXT NOT NULL CHECK(state IN ('prepared','artifact_synced','renamed','source_parent_synced','target_parent_synced','applied','ledger_committed')),
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    PRIMARY KEY(logical_attachment_id,operation_id),
+    FOREIGN KEY(logical_attachment_id,operation_id)
+      REFERENCES remote_attachment_operations(logical_attachment_id,operation_id) ON DELETE CASCADE
+);
+
+CREATE TRIGGER remote_rename_journal_guard
+BEFORE UPDATE ON remote_rename_journal
+WHEN NEW.logical_attachment_id IS NOT OLD.logical_attachment_id
+  OR NEW.operation_id IS NOT OLD.operation_id
+  OR NEW.artifact_id IS NOT OLD.artifact_id
+  OR NEW.source_identity IS NOT OLD.source_identity
+  OR NEW.source_parent_identity IS NOT OLD.source_parent_identity
+  OR NEW.target_parent_identity IS NOT OLD.target_parent_identity
+  OR NEW.target_identity IS NOT OLD.target_identity
+  OR NEW.dispatch_generation < OLD.dispatch_generation
+  OR NEW.updated_at_ms < OLD.updated_at_ms
+  OR CASE OLD.state
+       WHEN 'prepared' THEN NEW.state NOT IN ('prepared','artifact_synced')
+       WHEN 'artifact_synced' THEN NEW.state NOT IN ('artifact_synced','renamed')
+       WHEN 'renamed' THEN NEW.state NOT IN ('renamed','source_parent_synced')
+       WHEN 'source_parent_synced' THEN NEW.state NOT IN ('source_parent_synced','target_parent_synced')
+       WHEN 'target_parent_synced' THEN NEW.state NOT IN ('target_parent_synced','applied')
+       WHEN 'applied' THEN NEW.state NOT IN ('applied','ledger_committed')
+       ELSE NEW.state <> OLD.state
+     END
+BEGIN
+    SELECT RAISE(ABORT, 'remote rename journal is immutable, monotonic, and generation bound');
+END;
+
 CREATE TRIGGER remote_attachment_operation_reservation_insert
 BEFORE INSERT ON remote_attachment_operations
 WHEN NEW.state <> 'reserved' OR NEW.safe_response IS NOT NULL OR NEW.event_high_water_mark IS NOT NULL

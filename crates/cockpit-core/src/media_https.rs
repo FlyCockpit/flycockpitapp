@@ -43,13 +43,13 @@ pub(crate) struct VettedHttpsHop {
     redirect_depth: u8,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 pub(crate) enum RedirectLocationClass {
     SameOrigin,
     CrossOrigin,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub(crate) struct RedactedHttpsProvenance {
     pub(crate) redirect_classes: Vec<RedirectLocationClass>,
     pub(crate) path_segment_count: u32,

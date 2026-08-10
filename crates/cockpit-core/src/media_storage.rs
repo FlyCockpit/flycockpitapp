@@ -10,12 +10,14 @@ use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
 use cockpit_db::media_attachments::{
-    AcquiredMediaComponentLease, LocalMediaOwnerReceiptV1, LocalPathRegistrationReceiptV1,
-    LocalPathRegistrationResultV1, MediaAttachmentRecord, MediaAvailability,
-    MediaComponentLeaseKind, MediaKind, MediaSecurityRecoveryComponentTransitionV1,
-    MediaSecurityRecoveryDisposition, MediaSecurityRecoveryOutcome, MediaSourceKind,
-    RecoverSecurityBlockedMediaV1, RegisterLocalPathMediaV1, RequestedLocalPathMediaKind,
-    SecurityRecoverySnapshot, SecurityRecoverySnapshotResult, SelectedMediaStream,
+    AcquiredMediaComponentLease, HttpsRedirectLocationClassV1, HttpsRetentionResultV1,
+    LocalMediaOwnerReceiptV1, LocalPathRegistrationReceiptV1, LocalPathRegistrationResultV1,
+    MediaAttachmentRecord, MediaAvailability, MediaComponentLeaseKind, MediaKind,
+    MediaSecurityRecoveryComponentTransitionV1, MediaSecurityRecoveryDisposition,
+    MediaSecurityRecoveryOutcome, MediaSourceKind, RecoverSecurityBlockedMediaV1,
+    RegisterLocalPathMediaV1, RequestedLocalPathMediaKind, RetainHttpsMediaV1,
+    RetainedHttpsMediaReceiptV1, SecurityRecoverySnapshot, SecurityRecoverySnapshotResult,
+    SelectedMediaStream,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
@@ -138,6 +140,193 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    pub(crate) async fn retain_https_media(
+        &self,
+        request: RetainHttpsMediaV1,
+        policy: &cockpit_config::config::media_budget::MediaResourcePolicy,
+        monotonic_now_ms: u64,
+        now_unix_ms: i64,
+    ) -> Result<RetainedHttpsMediaReceiptV1> {
+        ensure!(
+            request.schema_version == 1 && request.kind == "retainHttpsMedia",
+            "media_attachment_unavailable"
+        );
+        let binding = digest_json(b"retained-https-binding-v1", &request)?;
+        let operation_id = request.local_operation_id.to_string();
+        let binding_preflight = binding.clone();
+        if let Some(receipt) = self.db.read(move |conn| {
+            let row: Option<(String,String)> = conn.query_row("SELECT request_binding_digest,receipt_json FROM media_retained_https_operations WHERE local_operation_id=?1",[operation_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+            match row { Some((stored,json)) => { ensure!(stored == binding_preflight,"idempotency_conflict"); Ok(Some(serde_json::from_str(&json)?)) }, None => Ok(None) }
+        }).await? { return Ok(receipt); }
+
+        let storage_id = Uuid::now_v7();
+        let storage_name = storage_id.to_string();
+        let mut held = self
+            .owned_root
+            .create_file_exclusive(&storage_name)
+            .map_err(anyhow::Error::new)?;
+        let async_file = tokio::fs::File::from_std(held.try_clone()?);
+        let mut async_file = async_file;
+        let fetch = crate::media_https::fetch_retained_https(
+            &request.url,
+            &crate::media_https::SystemHttpsDnsResolver,
+            &mut async_file,
+            &crate::media_https::HttpsFetchLimits::default(),
+        )
+        .await;
+        let fetch = match fetch {
+            Ok(fetch) => fetch,
+            Err(error) => {
+                let _ = self.owned_root.remove_file(&storage_name);
+                return Err(error);
+            }
+        };
+        async_file.sync_all().await?;
+        drop(async_file);
+        held.seek(SeekFrom::Start(0))?;
+        let identity = stable_identity_digest(&held)?;
+        let mut reread = Sha256::new();
+        let reread_length = std::io::copy(&mut held, &mut reread)?;
+        ensure!(
+            reread_length == fetch.byte_length
+                && crate::intel::hex_lower(&reread.finalize()) == fetch.sha256,
+            "storage_security_violation"
+        );
+        ensure!(
+            stable_identity_digest(&held)? == identity,
+            "storage_security_violation"
+        );
+
+        let attachment_id = Uuid::now_v7();
+        let component_id = Uuid::now_v7();
+        let receipt_id = Uuid::now_v7();
+        let reservation_id = format!("retained-https:{attachment_id}");
+        let plans = local_path_plans(policy, fetch.byte_length)?;
+        let reservation_digest = digest_json(b"retained-https-reservation-v1", &plans)?;
+        // Operation identity is request-only; fetched bytes belong exclusively
+        // to source evidence and cannot alter replay classification.
+        let request_digest = binding.clone();
+        let semantic_digest = digest_json(
+            b"retained-https-semantic-v1",
+            &(
+                &request.owner_principal_digest,
+                request.session_id,
+                &request.canonical_project_digest,
+                request.client_draft_id,
+                request.requested_media_kind,
+                &request.url,
+            ),
+        )?;
+        let source_evidence_digest = digest_json(
+            b"retained-https-source-evidence-v1",
+            &(
+                &identity,
+                fetch.byte_length,
+                &fetch.sha256,
+                &fetch.provenance,
+            ),
+        )?;
+        let redirect_classes = fetch
+            .provenance
+            .redirect_classes
+            .iter()
+            .map(|class| match class {
+                crate::media_https::RedirectLocationClass::SameOrigin => {
+                    HttpsRedirectLocationClassV1::SameOrigin
+                }
+                crate::media_https::RedirectLocationClass::CrossOrigin => {
+                    HttpsRedirectLocationClassV1::CrossOrigin
+                }
+            })
+            .collect::<Vec<_>>();
+        let path_segment_count = fetch.provenance.path_segment_count;
+        let safe_basename = fetch.provenance.safe_basename.clone();
+        let media_kind = match request.requested_media_kind {
+            RequestedLocalPathMediaKind::Image => MediaKind::Image,
+            RequestedLocalPathMediaKind::Audio => MediaKind::Audio,
+            RequestedLocalPathMediaKind::Video => MediaKind::Video,
+        };
+        let record = MediaAttachmentRecord {
+            attachment_id,
+            session_id: request.session_id,
+            canonical_project_digest: request.canonical_project_digest.clone(),
+            media_kind,
+            source_kind: MediaSourceKind::RetainedHttps,
+            canonical_container: "application/octet-stream".into(),
+            canonical_mime: "application/octet-stream".into(),
+            availability: MediaAvailability::Quarantined,
+            attachment_version: 1,
+            availability_generation: 1,
+            reference_generation: 1,
+            captured_capability_generation: 1,
+            source_identity_digest: identity.clone(),
+            source_byte_length: fetch.byte_length,
+            source_sha256: fetch.sha256.clone(),
+            selected_video_stream: None,
+            selected_audio_stream: None,
+            created_at_unix_ms: now_unix_ms,
+            updated_at_unix_ms: now_unix_ms,
+            draft_expires_at_unix_ms: None,
+            first_referenced_at_unix_ms: None,
+        };
+        let component = cockpit_db::media_attachments::MediaAttachmentComponent {
+            component_id,
+            attachment_id,
+            attachment_version: 1,
+            component_kind: "quarantined_original".into(),
+            storage_id,
+            lifecycle_state: "ready".into(),
+            component_generation: 1,
+            stable_identity_digest: identity,
+            byte_length: fetch.byte_length,
+            sha256: fetch.sha256,
+            reservation_id: reservation_id.clone(),
+            created_at_unix_ms: now_unix_ms,
+            updated_at_unix_ms: now_unix_ms,
+        };
+        let receipt = RetainedHttpsMediaReceiptV1 {
+            schema_version: 1,
+            kind: "retainedHttpsMediaReceipt".into(),
+            receipt_id,
+            local_operation_id: request.local_operation_id,
+            owner_principal_digest: request.owner_principal_digest.clone(),
+            session_id: request.session_id,
+            canonical_project_digest: request.canonical_project_digest.clone(),
+            client_draft_id: request.client_draft_id,
+            operation_request_digest: request_digest.clone(),
+            semantic_command_digest: semantic_digest.clone(),
+            origin_scheme: "https".into(),
+            redirect_location_classes: redirect_classes.clone(),
+            path_segment_count,
+            safe_basename: safe_basename.clone(),
+            fetched_at_unix_ms: now_unix_ms,
+            result: HttpsRetentionResultV1::Retained {
+                attachment_id,
+                attachment_version: 1,
+                availability_state: "quarantined".into(),
+                availability_generation: 1,
+                reference_generation: 1,
+                reservation_id: reservation_id.clone(),
+                reservation_digest: reservation_digest.clone(),
+                source_evidence_digest: source_evidence_digest.clone(),
+            },
+            committed_at_unix_ms: now_unix_ms,
+        };
+        let receipt_json = serde_json::to_string(&receipt)?;
+        let request_for_tx = request.clone();
+        let result=self.db.transaction(move|conn|{
+            if let Some((authoritative,stored_semantic,json))=conn.query_row("SELECT authoritative_operation_id,semantic_command_digest,receipt_json FROM media_retained_https_operations WHERE session_id=?1 AND canonical_project_digest=?2 AND client_draft_id=?3 AND is_alias=0",params![request_for_tx.session_id.to_string(),request_for_tx.canonical_project_digest,request_for_tx.client_draft_id.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()? { ensure!(stored_semantic==semantic_digest,"idempotency_conflict"); conn.execute("INSERT INTO media_retained_https_operations(local_operation_id,authoritative_operation_id,session_id,canonical_project_digest,client_draft_id,request_binding_digest,operation_request_digest,semantic_command_digest,receipt_json,committed_at_unix_ms,is_alias) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1)",params![request_for_tx.local_operation_id.to_string(),authoritative,request_for_tx.session_id.to_string(),request_for_tx.canonical_project_digest,request_for_tx.client_draft_id.to_string(),binding,request_digest,semantic_digest,json,now_unix_ms])?; return Ok(serde_json::from_str(&json)?); }
+            crate::media_reservation::reserve_conn(conn,crate::media_reservation::ReserveRequest{reservation_id:reservation_id.clone(),recovery_id:reservation_id.clone(),owner:crate::media_reservation::MediaOwner{project_id:request_for_tx.canonical_project_digest.clone(),session_id:request_for_tx.session_id.to_string()},operation:"retained_https_ingest".into(),purpose:"retained_media".into(),plans,wall_ms:u64::try_from(now_unix_ms)?},monotonic_now_ms)?;
+            cockpit_db::Db::insert_media_attachment_conn(conn,&record)?; cockpit_db::Db::insert_media_attachment_component_conn(conn,&component)?;
+            conn.execute("INSERT INTO media_retained_https_evidence(attachment_id,source_evidence_digest,redirect_classes_json,path_segment_count,safe_basename,fetched_at_unix_ms,reservation_id,reservation_digest) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![attachment_id.to_string(),source_evidence_digest,serde_json::to_string(&redirect_classes)?,path_segment_count,safe_basename,now_unix_ms,reservation_id,reservation_digest])?;
+            conn.execute("INSERT INTO media_retained_https_operations(local_operation_id,authoritative_operation_id,session_id,canonical_project_digest,client_draft_id,request_binding_digest,operation_request_digest,semantic_command_digest,receipt_json,committed_at_unix_ms,is_alias) VALUES(?1,?1,?2,?3,?4,?5,?6,?7,?8,?9,0)",params![request_for_tx.local_operation_id.to_string(),request_for_tx.session_id.to_string(),request_for_tx.canonical_project_digest,request_for_tx.client_draft_id.to_string(),binding,request_digest,semantic_digest,receipt_json,now_unix_ms])?;
+            conn.execute("INSERT INTO media_retained_https_audit(local_operation_id,outcome,committed_at_unix_ms) VALUES(?1,'retained',?2)",params![request_for_tx.local_operation_id.to_string(),now_unix_ms])?; Ok(receipt)
+        }).await;
+        if result.as_ref().is_err() || result.as_ref().is_ok_and(|r| r.receipt_id != receipt_id) {
+            let _ = self.owned_root.remove_file(&storage_name);
+        }
+        result
+    }
     pub(crate) async fn discard_media_attachment(
         &self,
         mutation: cockpit_db::media_attachments::LocalMediaMutationV1,

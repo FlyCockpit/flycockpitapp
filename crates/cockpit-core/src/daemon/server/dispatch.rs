@@ -2308,14 +2308,36 @@ pub(super) async fn handle_serialized_request(
             {
                 return Err(unavailable());
             }
-            // The transport authority is deliberately complete before URL
-            // parsing or DNS. Publication is supplied by MediaStorageRecovery
-            // in the following tranche; until present, fail without lookup or
-            // durable operation/evidence rows.
-            Err(ErrorPayload {
-                code: ErrorCode::Unavailable,
-                message: "retained HTTPS media storage is unavailable".into(),
-            })
+            let recovery = ctx
+                .media_storage_recovery
+                .as_ref()
+                .ok_or_else(unavailable)?;
+            let (_, extended) = ctx
+                .config_source
+                .load_effective_for_daemon(
+                    &attached.handle.project_root,
+                    &attached.handle.trust_policy,
+                )
+                .map_err(internal)?;
+            let receipt = recovery
+                .retain_https_media(
+                    request,
+                    &extended.media_resources,
+                    ctx.media_ledger.clock_now_ms(),
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                .map_err(|error| {
+                    if error.to_string().contains("idempotency_conflict") {
+                        ErrorPayload {
+                            code: ErrorCode::Conflict,
+                            message: "idempotency_conflict".into(),
+                        }
+                    } else {
+                        internal(error)
+                    }
+                })?;
+            Ok(Response::RetainedHttpsMedia(receipt))
         }
         Request::GetMediaAttachmentStatus(request) => {
             use sha2::{Digest as _, Sha256};

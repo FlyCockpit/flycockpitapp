@@ -201,6 +201,17 @@ pub struct ImageGenerationSchedulerPass {
     pub trace: Vec<String>,
 }
 
+fn record_scheduler_error(
+    pass: &mut ImageGenerationSchedulerPass,
+    stage: &str,
+    error: &anyhow::Error,
+) {
+    #[cfg(test)]
+    pass.trace.push(format!("{stage}:{error:#}"));
+    #[cfg(not(test))]
+    let _ = (pass, stage, error);
+}
+
 impl ImageGenerationDispatcher {
     pub fn new(db: cockpit_db::Db) -> Self {
         Self { db }
@@ -327,8 +338,7 @@ impl ImageGenerationDispatcher {
                 })
                 .await
             {
-                #[cfg(test)]
-                pass.trace.push(format!("claim:{error:#}"));
+                record_scheduler_error(&mut pass, "claim", &error);
                 pass.skipped += 1;
                 continue;
             }
@@ -346,8 +356,7 @@ impl ImageGenerationDispatcher {
             let (prepared, plans) = match prepared_result {
                 Ok(value) => value,
                 Err(error) => {
-                    #[cfg(test)]
-                    pass.trace.push(format!("prepare:{error:#}"));
+                    record_scheduler_error(&mut pass, "prepare", &error);
                     pass.skipped += 1;
                     continue;
                 }
@@ -363,8 +372,7 @@ impl ImageGenerationDispatcher {
                 )
                 .await
             {
-                #[cfg(test)]
-                pass.trace.push(format!("dispatch:{error:#}"));
+                record_scheduler_error(&mut pass, "dispatch", &error);
                 pass.skipped += 1;
             } else {
                 pass.dispatched += 1;
@@ -2620,7 +2628,13 @@ mod tests {
                 },
                 operation: "image_generation".into(),
                 purpose: format!("scheduler_fixture_{suffix}"),
-                plans: vec![deadline, queued_global, queued_session, local.clone()],
+                plans: vec![
+                    deadline,
+                    queued_global,
+                    queued_session,
+                    local.clone(),
+                    handoff.clone(),
+                ],
                 wall_ms: 1,
             })
             .await

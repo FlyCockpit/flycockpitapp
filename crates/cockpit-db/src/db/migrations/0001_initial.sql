@@ -3238,6 +3238,7 @@ CREATE TABLE image_generation_artifacts (
  expected_component_count INTEGER NOT NULL CHECK(expected_component_count>=1),
  active_lease_count INTEGER NOT NULL DEFAULT 0 CHECK(active_lease_count>=0),
  component_set_digest TEXT NOT NULL CHECK(length(component_set_digest)=64 AND component_set_digest NOT GLOB '*[^0-9a-f]*'),
+ component_set_json TEXT NOT NULL,
  eligibility_at_unix_ms INTEGER,
  immediate_cleanup INTEGER NOT NULL DEFAULT 0 CHECK(immediate_cleanup IN (0,1)),
  terminal_reason TEXT,
@@ -3345,6 +3346,7 @@ CREATE TABLE image_generation_late_publication_leases (
  slot_id TEXT NOT NULL,
  expected_slot_version INTEGER NOT NULL CHECK(expected_slot_version>=1),
  component_set_digest TEXT NOT NULL CHECK(length(component_set_digest)=64 AND component_set_digest NOT GLOB '*[^0-9a-f]*'),
+ component_set_json TEXT NOT NULL,
  authorization_digest TEXT NOT NULL CHECK(length(authorization_digest)=64 AND authorization_digest NOT GLOB '*[^0-9a-f]*'),
  output_authority_digest TEXT NOT NULL CHECK(length(output_authority_digest)=64 AND output_authority_digest NOT GLOB '*[^0-9a-f]*'),
  output_authority_generation INTEGER NOT NULL CHECK(output_authority_generation>=1),
@@ -3359,11 +3361,13 @@ CREATE TABLE image_generation_late_publication_leases (
  temporary_evidence_json TEXT,
  output_evidence_json TEXT,
  recovery_evidence_json TEXT,
- UNIQUE(artifact_id),
  FOREIGN KEY(job_id,slot_id) REFERENCES image_generation_slots(job_id,slot_id) ON DELETE RESTRICT,
  CHECK(deadline_unix_ms=created_at_unix_ms+300000),
  CHECK((worker_boot_id IS NULL)=(claim_generation IS NULL))
 );
+CREATE UNIQUE INDEX image_generation_one_live_late_publication
+ON image_generation_late_publication_leases(artifact_id)
+WHERE state IN ('reserved','copy_authorized','copy_committed');
 
 CREATE TABLE image_generation_artifact_transitions(from_state TEXT NOT NULL,to_state TEXT NOT NULL,PRIMARY KEY(from_state,to_state));
 INSERT INTO image_generation_artifact_transitions VALUES
@@ -3397,6 +3401,17 @@ BEGIN SELECT RAISE(ABORT,'forbidden image artifact transition'); END;
 CREATE TRIGGER image_generation_artifact_slot_binding_guard BEFORE INSERT ON image_generation_artifacts
 WHEN NOT EXISTS(SELECT 1 FROM image_generation_slots s WHERE s.job_id=NEW.job_id AND s.slot_id=NEW.slot_id AND s.managed_artifact_id=NEW.artifact_id)
 BEGIN SELECT RAISE(ABORT,'image artifact is not the sealed slot artifact'); END;
+CREATE TRIGGER image_generation_artifact_identity_immutable BEFORE UPDATE OF artifact_id,job_id,slot_id,expected_component_count,component_set_digest,component_set_json,created_at_unix_ms ON image_generation_artifacts
+BEGIN SELECT RAISE(ABORT,'image artifact identity graph is immutable'); END;
+CREATE TRIGGER image_generation_artifact_delete_forbidden BEFORE DELETE ON image_generation_artifacts
+BEGIN SELECT RAISE(ABORT,'image artifact tombstones are retained'); END;
+CREATE TRIGGER image_generation_component_insert_guard BEFORE INSERT ON image_generation_artifact_components
+WHEN (SELECT state FROM image_generation_artifacts WHERE artifact_id=NEW.artifact_id)!='allocating'
+BEGIN SELECT RAISE(ABORT,'image artifact component graph is sealed'); END;
+CREATE TRIGGER image_generation_component_identity_immutable BEFORE UPDATE OF artifact_id,component_id,component_kind,relative_storage_key,byte_length_decimal,sha256,expected_link_count,resource_reservation_id,release_operation_id ON image_generation_artifact_components
+BEGIN SELECT RAISE(ABORT,'image artifact component identity is immutable'); END;
+CREATE TRIGGER image_generation_component_delete_forbidden BEFORE DELETE ON image_generation_artifact_components
+BEGIN SELECT RAISE(ABORT,'image artifact component tombstones are retained'); END;
 CREATE TRIGGER image_generation_component_transition_guard BEFORE UPDATE OF state,generation ON image_generation_artifact_components
 WHEN NEW.generation!=OLD.generation+1 OR NOT EXISTS(SELECT 1 FROM image_generation_component_transitions WHERE from_state=OLD.state AND to_state=NEW.state)
 BEGIN SELECT RAISE(ABORT,'forbidden image artifact component transition'); END;
@@ -3407,8 +3422,17 @@ CREATE TRIGGER image_generation_late_publication_transition_guard BEFORE UPDATE 
 WHEN NEW.version!=OLD.version+1 OR NOT EXISTS(SELECT 1 FROM image_generation_late_publication_transitions WHERE from_state=OLD.state AND to_state=NEW.state)
 BEGIN SELECT RAISE(ABORT,'forbidden late image publication transition'); END;
 CREATE TRIGGER image_generation_artifact_retained_projection_guard BEFORE UPDATE OF state ON image_generation_artifacts
-WHEN NEW.state IN ('retained','late_quarantined') AND ((SELECT count(*) FROM image_generation_artifact_components c WHERE c.artifact_id=NEW.artifact_id AND c.state='ready')!=NEW.expected_component_count)
+WHEN NEW.state IN ('retained','late_quarantined') AND (((SELECT count(*) FROM image_generation_artifact_components c WHERE c.artifact_id=NEW.artifact_id)!=NEW.expected_component_count) OR ((SELECT count(*) FROM image_generation_artifact_components c WHERE c.artifact_id=NEW.artifact_id AND c.state='ready')!=NEW.expected_component_count))
 BEGIN SELECT RAISE(ABORT,'retained image artifact lacks complete ready component set'); END;
+CREATE TRIGGER image_generation_artifact_late_publication_guard BEFORE UPDATE OF state ON image_generation_artifacts
+WHEN OLD.state='late_quarantined' AND NEW.state='retained' AND NOT EXISTS(SELECT 1 FROM image_generation_late_publication_leases p WHERE p.artifact_id=NEW.artifact_id AND p.state='published' AND p.artifact_generation=OLD.generation)
+BEGIN SELECT RAISE(ABORT,'late artifact retention lacks exact published disposition lease'); END;
+CREATE TRIGGER image_generation_artifact_security_recovery_guard BEFORE UPDATE OF state ON image_generation_artifacts
+WHEN OLD.state='security_blocked' AND NEW.state='cleanup_pending' AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_cleanup_intents i WHERE i.artifact_id=NEW.artifact_id AND i.reason='owner_recovery' AND i.expected_artifact_generation=NEW.generation)
+BEGIN SELECT RAISE(ABORT,'security-blocked artifact lacks Owner recovery intent'); END;
+CREATE TRIGGER image_generation_component_security_recovery_guard BEFORE UPDATE OF state ON image_generation_artifact_components
+WHEN OLD.state='security_blocked' AND NEW.state='cleanup_pending' AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_cleanup_intents i WHERE i.artifact_id=NEW.artifact_id AND i.reason='owner_recovery')
+BEGIN SELECT RAISE(ABORT,'security-blocked component lacks Owner recovery intent'); END;
 CREATE TRIGGER image_generation_artifact_tombstone_projection_guard BEFORE UPDATE OF state ON image_generation_artifacts
 WHEN NEW.state='tombstoned' AND (EXISTS(SELECT 1 FROM image_generation_artifact_components c WHERE c.artifact_id=NEW.artifact_id AND c.state!='tombstoned') OR EXISTS(SELECT 1 FROM image_generation_artifact_components c LEFT JOIN image_generation_component_release_facts r ON r.artifact_id=c.artifact_id AND r.component_id=c.component_id WHERE c.artifact_id=NEW.artifact_id AND r.component_id IS NULL))
 BEGIN SELECT RAISE(ABORT,'image artifact tombstone lacks component deletion and release evidence'); END;
@@ -3418,12 +3442,26 @@ BEGIN SELECT RAISE(ABORT,'component tombstone lacks matching release evidence');
 CREATE TRIGGER image_generation_release_guard BEFORE INSERT ON image_generation_component_release_facts
 WHEN NOT EXISTS(SELECT 1 FROM image_generation_artifact_components c WHERE c.artifact_id=NEW.artifact_id AND c.component_id=NEW.component_id AND c.state='deleting' AND c.release_operation_id=NEW.release_operation_id AND c.deletion_evidence_digest=NEW.deletion_evidence_digest)
 BEGIN SELECT RAISE(ABORT,'resource release precedes verified component deletion evidence'); END;
+CREATE TRIGGER image_generation_release_immutable BEFORE UPDATE ON image_generation_component_release_facts BEGIN SELECT RAISE(ABORT,'component release evidence is immutable'); END;
+CREATE TRIGGER image_generation_release_delete_forbidden BEFORE DELETE ON image_generation_component_release_facts BEGIN SELECT RAISE(ABORT,'component release evidence is immutable'); END;
+CREATE TRIGGER image_generation_cleanup_identity_immutable BEFORE UPDATE OF cleanup_operation_id,artifact_id,expected_artifact_generation,reason,created_at_unix_ms ON image_generation_artifact_cleanup_intents BEGIN SELECT RAISE(ABORT,'cleanup intent identity is immutable'); END;
+CREATE TRIGGER image_generation_cleanup_delete_forbidden BEFORE DELETE ON image_generation_artifact_cleanup_intents BEGIN SELECT RAISE(ABORT,'cleanup intent is durable'); END;
+CREATE TRIGGER image_generation_lease_identity_immutable BEFORE UPDATE OF lease_id,artifact_id,artifact_generation,owning_job_id,owning_job_generation,owning_slot_id,owning_slot_generation,published_disposition,published_disposition_generation,component_id,component_kind,component_generation,component_checksum,consumer_purpose,consumer_route,read_kind,range_start_decimal,requested_length_decimal,component_set_digest,authorization_digest,daemon_boot_id,committed_at_monotonic,deadline_monotonic ON image_generation_artifact_leases BEGIN SELECT RAISE(ABORT,'artifact lease identity is immutable'); END;
+CREATE TRIGGER image_generation_lease_delete_forbidden BEFORE DELETE ON image_generation_artifact_leases BEGIN SELECT RAISE(ABORT,'artifact lease is durable'); END;
+CREATE TRIGGER image_generation_late_publication_identity_immutable BEFORE UPDATE OF publication_operation_id,artifact_id,artifact_generation,job_id,slot_id,expected_slot_version,component_set_digest,component_set_json,authorization_digest,output_authority_digest,output_authority_generation,destination_name,temporary_name,created_at_unix_ms,deadline_unix_ms ON image_generation_late_publication_leases BEGIN SELECT RAISE(ABORT,'late publication identity is immutable'); END;
+CREATE TRIGGER image_generation_late_publication_delete_forbidden BEFORE DELETE ON image_generation_late_publication_leases BEGIN SELECT RAISE(ABORT,'late publication lease is durable'); END;
 CREATE TRIGGER image_generation_artifact_transition_registry_sealed BEFORE INSERT ON image_generation_artifact_transitions BEGIN SELECT RAISE(ABORT,'image artifact transition registry is sealed'); END;
 CREATE TRIGGER image_generation_artifact_transition_registry_update_sealed BEFORE UPDATE ON image_generation_artifact_transitions BEGIN SELECT RAISE(ABORT,'image artifact transition registry is sealed'); END;
 CREATE TRIGGER image_generation_artifact_transition_registry_delete_sealed BEFORE DELETE ON image_generation_artifact_transitions BEGIN SELECT RAISE(ABORT,'image artifact transition registry is sealed'); END;
 CREATE TRIGGER image_generation_component_transition_registry_sealed BEFORE INSERT ON image_generation_component_transitions BEGIN SELECT RAISE(ABORT,'image component transition registry is sealed'); END;
 CREATE TRIGGER image_generation_component_transition_registry_update_sealed BEFORE UPDATE ON image_generation_component_transitions BEGIN SELECT RAISE(ABORT,'image component transition registry is sealed'); END;
 CREATE TRIGGER image_generation_component_transition_registry_delete_sealed BEFORE DELETE ON image_generation_component_transitions BEGIN SELECT RAISE(ABORT,'image component transition registry is sealed'); END;
+CREATE TRIGGER image_generation_cleanup_transition_registry_sealed BEFORE INSERT ON image_generation_cleanup_transitions BEGIN SELECT RAISE(ABORT,'image cleanup transition registry is sealed'); END;
+CREATE TRIGGER image_generation_cleanup_transition_registry_update_sealed BEFORE UPDATE ON image_generation_cleanup_transitions BEGIN SELECT RAISE(ABORT,'image cleanup transition registry is sealed'); END;
+CREATE TRIGGER image_generation_cleanup_transition_registry_delete_sealed BEFORE DELETE ON image_generation_cleanup_transitions BEGIN SELECT RAISE(ABORT,'image cleanup transition registry is sealed'); END;
+CREATE TRIGGER image_generation_late_publication_transition_registry_sealed BEFORE INSERT ON image_generation_late_publication_transitions BEGIN SELECT RAISE(ABORT,'late publication transition registry is sealed'); END;
+CREATE TRIGGER image_generation_late_publication_transition_registry_update_sealed BEFORE UPDATE ON image_generation_late_publication_transitions BEGIN SELECT RAISE(ABORT,'late publication transition registry is sealed'); END;
+CREATE TRIGGER image_generation_late_publication_transition_registry_delete_sealed BEFORE DELETE ON image_generation_late_publication_transitions BEGIN SELECT RAISE(ABORT,'late publication transition registry is sealed'); END;
 
 CREATE TABLE image_generation_job_transitions (from_state TEXT NOT NULL,to_state TEXT NOT NULL,PRIMARY KEY(from_state,to_state));
 INSERT INTO image_generation_job_transitions VALUES

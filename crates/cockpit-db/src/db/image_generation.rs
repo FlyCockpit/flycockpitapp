@@ -1678,7 +1678,6 @@ impl Db {
             !input.components.is_empty(),
             "artifact component set is empty"
         );
-        ensure_digest(&input.component_set_digest, "component set digest")?;
         let mut kinds = std::collections::BTreeSet::new();
         let mut ids = std::collections::BTreeSet::new();
         ensure!(
@@ -1704,10 +1703,15 @@ impl Db {
                 "component reservation is empty"
             );
         }
+        let (component_set_json, component_set_digest) = component_set_binding(&input.components)?;
+        ensure!(
+            input.component_set_digest == component_set_digest,
+            "component set digest does not bind exact graph"
+        );
         let tx = conn.unchecked_transaction()?;
         tx.execute(
-            "INSERT INTO image_generation_artifacts(artifact_id,job_id,slot_id,state,generation,expected_component_count,component_set_digest,created_at_unix_ms,updated_at_unix_ms) VALUES(?1,?2,?3,'allocating',1,?4,?5,?6,?6)",
-            params![input.artifact_id.to_string(),input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.components.len())?,input.component_set_digest,input.now_unix_ms],
+            "INSERT INTO image_generation_artifacts(artifact_id,job_id,slot_id,state,generation,expected_component_count,component_set_digest,component_set_json,created_at_unix_ms,updated_at_unix_ms) VALUES(?1,?2,?3,'allocating',1,?4,?5,?6,?7,?7)",
+            params![input.artifact_id.to_string(),input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.components.len())?,component_set_digest,component_set_json,input.now_unix_ms],
         )?;
         for component in &input.components {
             tx.execute(
@@ -1727,6 +1731,19 @@ impl Db {
             artifact_transition_allowed(input.from, input.to),
             "forbidden image artifact transition"
         );
+        ensure!(
+            !matches!(
+                (input.from, input.to),
+                (
+                    ImageGenerationArtifactState::LateQuarantined,
+                    ImageGenerationArtifactState::Retained
+                ) | (
+                    ImageGenerationArtifactState::SecurityBlocked,
+                    ImageGenerationArtifactState::CleanupPending
+                )
+            ),
+            "artifact transition requires a specialized authority CAS"
+        );
         let changed=conn.execute(
             "UPDATE image_generation_artifacts SET state=?1,generation=generation+1,updated_at_unix_ms=?2,terminal_reason=COALESCE(?3,terminal_reason) WHERE artifact_id=?4 AND state=?5 AND generation=?6",
             params![input.to.as_str(),input.now_unix_ms,input.terminal_reason,input.artifact_id.to_string(),input.from.as_str(),i64::try_from(input.expected_generation)?],
@@ -1742,6 +1759,16 @@ impl Db {
         ensure!(
             artifact_component_transition_allowed(input.from, input.to),
             "forbidden image artifact component transition"
+        );
+        ensure!(
+            !matches!(
+                (input.from, input.to),
+                (
+                    ImageGenerationArtifactComponentState::SecurityBlocked,
+                    ImageGenerationArtifactComponentState::CleanupPending
+                )
+            ),
+            "component transition requires audited Owner recovery"
         );
         if let Some(digest) = &input.deletion_evidence_digest {
             ensure_digest(digest, "deletion evidence digest")?;
@@ -1772,15 +1799,12 @@ impl Db {
             ),
             "artifact state cannot begin cleanup"
         );
-        let tx = conn.unchecked_transaction()?;
-        let changed = tx.execute(
-            "UPDATE image_generation_artifacts SET state='cleanup_pending',generation=generation+1,updated_at_unix_ms=?1 WHERE artifact_id=?2 AND state=?3 AND generation=?4 AND active_lease_count=0 AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_references r WHERE r.artifact_id=image_generation_artifacts.artifact_id AND r.released_at_unix_ms IS NULL) AND NOT EXISTS(SELECT 1 FROM image_generation_late_publication_leases p WHERE p.artifact_id=image_generation_artifacts.artifact_id AND p.state IN ('reserved','copy_authorized','copy_committed')) AND (immediate_cleanup=1 OR (eligibility_at_unix_ms IS NOT NULL AND eligibility_at_unix_ms<=?1) OR ?5 IN ('invalid_output','restart_recovery','owner_recovery'))",
-            params![input.now_unix_ms,input.artifact_id.to_string(),input.expected_state.as_str(),i64::try_from(input.expected_generation)?,input.reason.as_str()],
-        )?;
         ensure!(
-            changed == 1,
-            "artifact cleanup compare-and-set lost or is ineligible"
+            input.expected_state != ImageGenerationArtifactState::SecurityBlocked
+                || input.reason == ImageGenerationArtifactCleanupReason::OwnerRecovery,
+            "security-blocked cleanup requires Owner recovery authority"
         );
+        let tx = conn.unchecked_transaction()?;
         let cleanup_generation = input
             .expected_generation
             .checked_add(1)
@@ -1789,6 +1813,14 @@ impl Db {
             "INSERT INTO image_generation_artifact_cleanup_intents(cleanup_operation_id,artifact_id,expected_artifact_generation,reason,state,version,created_at_unix_ms) VALUES(?1,?2,?3,?4,'pending',1,?5)",
             params![input.cleanup_operation_id.to_string(),input.artifact_id.to_string(),i64::try_from(cleanup_generation)?,input.reason.as_str(),input.now_unix_ms],
         )?;
+        let changed = tx.execute(
+            "UPDATE image_generation_artifacts SET state='cleanup_pending',generation=generation+1,updated_at_unix_ms=?1 WHERE artifact_id=?2 AND state=?3 AND generation=?4 AND active_lease_count=0 AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_references r WHERE r.artifact_id=image_generation_artifacts.artifact_id AND r.released_at_unix_ms IS NULL) AND NOT EXISTS(SELECT 1 FROM image_generation_late_publication_leases p WHERE p.artifact_id=image_generation_artifacts.artifact_id AND p.state IN ('reserved','copy_authorized','copy_committed')) AND (immediate_cleanup=1 OR (eligibility_at_unix_ms IS NOT NULL AND eligibility_at_unix_ms<=?1) OR ?5 IN ('invalid_output','restart_recovery','owner_recovery'))",
+            params![input.now_unix_ms,input.artifact_id.to_string(),input.expected_state.as_str(),i64::try_from(input.expected_generation)?,input.reason.as_str()],
+        )?;
+        ensure!(
+            changed == 1,
+            "artifact cleanup compare-and-set lost or is ineligible"
+        );
         tx.commit()?;
         Ok(())
     }
@@ -1853,6 +1885,29 @@ fn ensure_digest(value: &str, label: &str) -> Result<()> {
         "{label} is not lowercase SHA-256"
     );
     Ok(())
+}
+
+fn component_set_binding(
+    components: &[CreateImageGenerationArtifactComponent],
+) -> Result<(String, String)> {
+    let mut rows = components
+        .iter()
+        .map(|component| {
+            serde_json::json!({
+                "byteLength": component.byte_length.to_string(),
+                "componentId": component.component_id,
+                "kind": component.kind.as_str(),
+                "releaseOperationId": component.release_operation_id,
+                "reservationId": component.resource_reservation_id,
+                "sha256": component.sha256,
+                "storageKey": component.relative_storage_key,
+            })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by_key(serde_json::Value::to_string);
+    let json = serde_json::to_string(&rows)?;
+    let digest = hex_lower(&Sha256::digest(json.as_bytes()));
+    Ok((json, digest))
 }
 
 #[cfg(test)]
@@ -2923,12 +2978,14 @@ mod tests {
             let fixture=race_fixture(conn,false)?;
             let artifact_id=Uuid::parse_str(&conn.query_row::<String,_,_>("SELECT managed_artifact_id FROM image_generation_slots WHERE job_id=?1 AND slot_id=?2",params![fixture.job_id.to_string(),fixture.slot_id.to_string()],|row|row.get(0))?)?;
             let component=CreateImageGenerationArtifactComponent{component_id:Uuid::now_v7(),kind:ImageGenerationArtifactComponentKind::Primary,relative_storage_key:format!("{artifact_id}/primary"),byte_length:u64::MAX,sha256:"a".repeat(64),resource_reservation_id:"resource_1".into(),release_operation_id:Uuid::now_v7()};
-            Db::create_image_generation_artifact_conn(conn,&CreateImageGenerationArtifact{artifact_id,job_id:fixture.job_id,slot_id:fixture.slot_id,component_set_digest:"b".repeat(64),components:vec![component],now_unix_ms:1})?;
+            let component_set_digest=component_set_binding(std::slice::from_ref(&component))?.1;
+            Db::create_image_generation_artifact_conn(conn,&CreateImageGenerationArtifact{artifact_id,job_id:fixture.job_id,slot_id:fixture.slot_id,component_set_digest,components:vec![component],now_unix_ms:1})?;
             let row:(String,i64,i64)=conn.query_row("SELECT state,generation,expected_component_count FROM image_generation_artifacts WHERE artifact_id=?1",[artifact_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
             assert_eq!(row,("allocating".into(),1,1));
             let byte_length:String=conn.query_row("SELECT byte_length_decimal FROM image_generation_artifact_components WHERE artifact_id=?1",[artifact_id.to_string()],|row|row.get(0))?;
             assert_eq!(byte_length,u64::MAX.to_string());
-            let forged=CreateImageGenerationArtifact{artifact_id:Uuid::now_v7(),job_id:fixture.job_id,slot_id:fixture.slot_id,component_set_digest:"c".repeat(64),components:vec![CreateImageGenerationArtifactComponent{component_id:Uuid::now_v7(),kind:ImageGenerationArtifactComponentKind::Primary,relative_storage_key:"forged/primary".into(),byte_length:1,sha256:"d".repeat(64),resource_reservation_id:"resource_2".into(),release_operation_id:Uuid::now_v7()}],now_unix_ms:2};
+            let forged_component=CreateImageGenerationArtifactComponent{component_id:Uuid::now_v7(),kind:ImageGenerationArtifactComponentKind::Primary,relative_storage_key:"forged/primary".into(),byte_length:1,sha256:"d".repeat(64),resource_reservation_id:"resource_2".into(),release_operation_id:Uuid::now_v7()};
+            let forged=CreateImageGenerationArtifact{artifact_id:Uuid::now_v7(),job_id:fixture.job_id,slot_id:fixture.slot_id,component_set_digest:component_set_binding(std::slice::from_ref(&forged_component))?.1,components:vec![forged_component],now_unix_ms:2};
             assert!(Db::create_image_generation_artifact_conn(conn,&forged).is_err());
             let count:i64=conn.query_row("SELECT count(*) FROM image_generation_artifacts",[],|row|row.get(0))?;
             assert_eq!(count,1);
@@ -2944,7 +3001,9 @@ mod tests {
             let artifact_id=Uuid::parse_str(&conn.query_row::<String,_,_>("SELECT managed_artifact_id FROM image_generation_slots WHERE job_id=?1 AND slot_id=?2",params![fixture.job_id.to_string(),fixture.slot_id.to_string()],|row|row.get(0))?)?;
             let component_id=Uuid::now_v7();
             let release_operation_id=Uuid::now_v7();
-            Db::create_image_generation_artifact_conn(conn,&CreateImageGenerationArtifact{artifact_id,job_id:fixture.job_id,slot_id:fixture.slot_id,component_set_digest:"b".repeat(64),components:vec![CreateImageGenerationArtifactComponent{component_id,kind:ImageGenerationArtifactComponentKind::Primary,relative_storage_key:format!("{artifact_id}/primary"),byte_length:9,sha256:"a".repeat(64),resource_reservation_id:"resource_1".into(),release_operation_id}],now_unix_ms:1})?;
+            let component=CreateImageGenerationArtifactComponent{component_id,kind:ImageGenerationArtifactComponentKind::Primary,relative_storage_key:format!("{artifact_id}/primary"),byte_length:9,sha256:"a".repeat(64),resource_reservation_id:"resource_1".into(),release_operation_id};
+            let component_set_digest=component_set_binding(std::slice::from_ref(&component))?.1;
+            Db::create_image_generation_artifact_conn(conn,&CreateImageGenerationArtifact{artifact_id,job_id:fixture.job_id,slot_id:fixture.slot_id,component_set_digest,components:vec![component],now_unix_ms:1})?;
             Db::transition_image_generation_artifact_conn(conn,&TransitionImageGenerationArtifact{artifact_id,expected_generation:1,from:ImageGenerationArtifactState::Allocating,to:ImageGenerationArtifactState::Writing,now_unix_ms:2,terminal_reason:None})?;
             Db::transition_image_generation_artifact_component_conn(conn,&TransitionImageGenerationArtifactComponent{artifact_id,component_id,expected_generation:1,from:ImageGenerationArtifactComponentState::Planned,to:ImageGenerationArtifactComponentState::Writing,stable_identity_json:None,deletion_evidence_digest:None})?;
             Db::transition_image_generation_artifact_component_conn(conn,&TransitionImageGenerationArtifactComponent{artifact_id,component_id,expected_generation:2,from:ImageGenerationArtifactComponentState::Writing,to:ImageGenerationArtifactComponentState::Ready,stable_identity_json:Some("{\"held\":true}".into()),deletion_evidence_digest:None})?;

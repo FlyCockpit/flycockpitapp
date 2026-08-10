@@ -138,6 +138,8 @@ pub(crate) struct MediaStorageRecovery {
     https_fetcher: std::sync::Arc<dyn crate::media_https::HttpsMediaFetcher>,
     #[cfg(test)]
     av_runtime_override: Option<ApprovedAvRuntime>,
+    #[cfg(test)]
+    fail_processing_output_proof: bool,
 }
 
 impl MediaStorageRecovery {
@@ -285,6 +287,11 @@ impl MediaStorageRecovery {
             let mut components = Vec::new();
             let mut names = Vec::new();
             let output_proof = (|| -> Result<()> {
+                #[cfg(test)]
+                ensure!(
+                    !self.fail_processing_output_proof,
+                    "injected processing output proof failure"
+                );
                 for (kind, id, bytes, width, height) in outputs {
                     let name = id.to_string();
                     let mut file = self
@@ -2512,6 +2519,8 @@ impl MediaStorageRecovery {
             https_fetcher: std::sync::Arc::new(crate::media_https::SystemHttpsMediaFetcher),
             #[cfg(test)]
             av_runtime_override: None,
+            #[cfg(test)]
+            fail_processing_output_proof: false,
         })
     }
 
@@ -2530,6 +2539,8 @@ impl MediaStorageRecovery {
             https_fetcher: std::sync::Arc::new(crate::media_https::SystemHttpsMediaFetcher),
             #[cfg(test)]
             av_runtime_override: None,
+            #[cfg(test)]
+            fail_processing_output_proof: false,
         })
     }
 
@@ -2545,6 +2556,12 @@ impl MediaStorageRecovery {
         fetcher: std::sync::Arc<dyn crate::media_https::HttpsMediaFetcher>,
     ) -> Self {
         self.https_fetcher = fetcher;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_processing_output_proof_failure(mut self) -> Self {
+        self.fail_processing_output_proof = true;
         self
     }
 
@@ -5987,7 +6004,15 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
         let session_id = Uuid::now_v7();
-        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/redacted',1,1)",[session_id.to_string()])?;Ok(())}).await.unwrap();
+        db.transaction(move |conn| {
+            conn.execute(
+                "INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/redacted',1,1)",
+                [session_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
         let mut png = std::io::Cursor::new(Vec::new());
         image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
             2,
@@ -6089,6 +6114,83 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state, ("failed".into(), 1));
+    }
+
+    #[tokio::test]
+    async fn https_media_ingest_output_proof_failure_blocks_cleans_and_never_reclaims() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
+        let session_id = Uuid::now_v7();
+        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/redacted',1,1)",[session_id.to_string()])?;Ok(())}).await.unwrap();
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([1, 2, 3, 255]),
+        ))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+        let recovery = MediaStorageRecovery::open_or_create(db.clone(), &temp.path().join("media"))
+            .unwrap()
+            .with_https_fetcher(std::sync::Arc::new(ScriptedHttpsFetcher {
+                calls: AtomicUsize::new(0),
+                bytes: png.into_inner(),
+            }))
+            .with_processing_output_proof_failure();
+        let request = RetainHttpsMediaV1 {
+            schema_version: 1,
+            kind: "retainHttpsMedia".into(),
+            local_operation_id: Uuid::now_v7(),
+            owner_principal_digest: "22".repeat(32),
+            session_id,
+            canonical_project_digest: "11".repeat(32),
+            client_draft_id: Uuid::now_v7(),
+            requested_media_kind: RequestedLocalPathMediaKind::Image,
+            url: "https://media.example.test/image".into(),
+        };
+        recovery
+            .retain_https_media(
+                request,
+                &cockpit_config::config::media_budget::MediaResourcePolicy::default(),
+                1,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovery.process_retained_https_jobs(11).await.unwrap(), 1);
+        assert_eq!(
+            recovery
+                .process_retained_https_jobs(1_000_000)
+                .await
+                .unwrap(),
+            0
+        );
+        let state = db
+            .read(|conn| {
+                Ok((
+                    conn.query_row("SELECT availability FROM media_attachments", [], |r| {
+                        r.get::<_, String>(0)
+                    })?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM media_attachment_processing_output_security_evidence",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM media_attachment_processing_cleanup_evidence",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM media_attachment_components WHERE component_kind IN ('image_model','browser_thumbnail')",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(state, ("security_blocked".into(), 1, 1, 0));
     }
 
     #[tokio::test]

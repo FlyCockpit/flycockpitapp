@@ -1,7 +1,7 @@
 //! Interactive image-generation spend policy settings page.
 
 use std::any::Any;
-use std::sync::{Mutex, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 
 use cockpit_config::config::image_spend::{
     BudgetPolicy, CurrentImageSpendPolicy, ImageSpendSettings, ImageSpendSuggestions,
@@ -17,22 +17,66 @@ use super::{Nav, PageBox, SettingsCx, SettingsPage, SettingsPointerSurfaceKind};
 
 type LoadResult = Result<Option<CurrentImageSpendPolicy>, String>;
 
+trait ImageSpendPersistence: Send + Sync {
+    fn load(&self, project_key: String) -> LoadResult;
+    fn save(
+        &self,
+        project_key: String,
+        settings: ImageSpendSettings,
+        expected_version: Option<u64>,
+    ) -> Result<CurrentImageSpendPolicy, String>;
+}
+
+struct DefaultImageSpendPersistence;
+
+impl ImageSpendPersistence for DefaultImageSpendPersistence {
+    fn load(&self, project_key: String) -> LoadResult {
+        image_spend_runtime()?
+            .block_on(
+                cockpit_config::config::image_spend::current_saved_policy_default(project_key),
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    fn save(
+        &self,
+        project_key: String,
+        settings: ImageSpendSettings,
+        expected_version: Option<u64>,
+    ) -> Result<CurrentImageSpendPolicy, String> {
+        image_spend_runtime()?
+            .block_on(
+                cockpit_config::config::image_spend::activate_saved_policy_default(
+                    project_key,
+                    settings,
+                    expected_version,
+                    chrono::Utc::now().timestamp_millis(),
+                ),
+            )
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn image_spend_runtime() -> Result<tokio::runtime::Runtime, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())
+}
+
 pub(super) fn page(project_key: String) -> PageBox {
+    page_with_persistence(project_key, Arc::new(DefaultImageSpendPersistence))
+}
+
+fn page_with_persistence(
+    project_key: String,
+    persistence: Arc<dyn ImageSpendPersistence>,
+) -> PageBox {
     let (tx, rx) = mpsc::sync_channel(1);
     let key = project_key.clone();
+    let loader = persistence.clone();
     std::thread::spawn(move || {
-        let result = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| error.to_string())
-            .and_then(|runtime| {
-                runtime
-                    .block_on(
-                        cockpit_config::config::image_spend::current_saved_policy_default(key),
-                    )
-                    .map_err(|error| error.to_string())
-            });
-        let _ = tx.send(result);
+        let _ = tx.send(loader.load(key));
     });
     Box::new(ImageSpendPage {
         project_key,
@@ -47,6 +91,7 @@ pub(super) fn page(project_key: String) -> PageBox {
         status: "Loading saved policy…".into(),
         load: Mutex::new(Some(rx)),
         save: Mutex::new(None),
+        persistence,
     })
 }
 
@@ -63,6 +108,7 @@ pub(super) struct ImageSpendPage {
     status: String,
     load: Mutex<Option<mpsc::Receiver<LoadResult>>>,
     save: Mutex<Option<mpsc::Receiver<Result<CurrentImageSpendPolicy, String>>>>,
+    persistence: Arc<dyn ImageSpendPersistence>,
 }
 
 impl ImageSpendPage {
@@ -196,24 +242,9 @@ impl ImageSpendPage {
         let project_key = self.project_key.clone();
         let draft = self.draft.clone();
         let version = self.version;
+        let persistence = self.persistence.clone();
         std::thread::spawn(move || {
-            let result = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| error.to_string())
-                .and_then(|runtime| {
-                    runtime
-                        .block_on(
-                            cockpit_config::config::image_spend::activate_saved_policy_default(
-                                project_key,
-                                draft,
-                                version,
-                                chrono::Utc::now().timestamp_millis(),
-                            ),
-                        )
-                        .map_err(|error| error.to_string())
-                });
-            let _ = tx.send(result);
+            let _ = tx.send(persistence.save(project_key, draft, version));
         });
         *self.save.lock().unwrap() = Some(rx);
         self.status = "Saving reviewed policy…".into();
@@ -428,6 +459,60 @@ impl SettingsPage for ImageSpendPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    struct FilePersistence {
+        path: PathBuf,
+        saved_at_ms: i64,
+    }
+
+    impl ImageSpendPersistence for FilePersistence {
+        fn load(&self, project_key: String) -> LoadResult {
+            let db = cockpit_db::Db::open(&self.path).map_err(|error| error.to_string())?;
+            image_spend_runtime()?
+                .block_on(db.current_image_spend_policy(project_key))
+                .map_err(|error| error.to_string())
+        }
+
+        fn save(
+            &self,
+            project_key: String,
+            settings: ImageSpendSettings,
+            expected_version: Option<u64>,
+        ) -> Result<CurrentImageSpendPolicy, String> {
+            let db = cockpit_db::Db::open(&self.path).map_err(|error| error.to_string())?;
+            image_spend_runtime()?
+                .block_on(cockpit_config::config::image_spend::activate_saved_policy(
+                    &db,
+                    project_key,
+                    settings,
+                    expected_version,
+                    self.saved_at_ms,
+                ))
+                .map_err(|error| error.to_string())
+        }
+    }
+
+    fn poll_until_idle(page: &mut ImageSpendPage) {
+        for _ in 0..100_000 {
+            page.poll();
+            if page.load.lock().unwrap().is_none() && page.save.lock().unwrap().is_none() {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        panic!("image spend persistence worker did not finish");
+    }
+
+    fn persisted_page(path: PathBuf) -> PageBox {
+        page_with_persistence(
+            "project".into(),
+            Arc::new(FilePersistence {
+                path,
+                saved_at_ms: 1_000,
+            }),
+        )
+    }
 
     fn fixture() -> ImageSpendPage {
         ImageSpendPage {
@@ -443,6 +528,7 @@ mod tests {
             status: String::new(),
             load: Mutex::new(None),
             save: Mutex::new(None),
+            persistence: Arc::new(DefaultImageSpendPersistence),
         }
     }
 
@@ -539,5 +625,71 @@ mod tests {
                 usd_micros: u64::MAX
             }
         );
+    }
+
+    #[test]
+    fn page_edits_saves_and_reopens_exact_policy_through_file_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image-spend.db");
+        let mut boxed = persisted_page(path.clone());
+        let page = boxed.as_any_mut().downcast_mut::<ImageSpendPage>().unwrap();
+        poll_until_idle(page);
+
+        page.draft.request = BudgetPolicy::Unlimited;
+        page.draft.session = BudgetPolicy::Finite { usd_micros: 7 };
+        page.draft.project = BudgetPolicy::Finite { usd_micros: 1 };
+        page.draft.project_epoch = Some(ProjectEpochPolicy::CalendarMonth {
+            time_zone: String::new(),
+        });
+        page.editing_time_zone = true;
+        for character in "Pacific/Auckland".chars() {
+            page.edit_time_zone(KeyCode::Char(character));
+        }
+        page.edit_time_zone(KeyCode::Enter);
+        page.editing_micros = Some(2);
+        page.micros_buffer.clear();
+        for character in u64::MAX.to_string().chars() {
+            page.edit_micros(KeyCode::Char(character));
+        }
+        page.edit_micros(KeyCode::Enter);
+        page.save();
+        poll_until_idle(page);
+        assert_eq!(page.version, Some(1));
+
+        drop(boxed);
+        let mut reopened = persisted_page(path.clone());
+        let reopened = reopened
+            .as_any_mut()
+            .downcast_mut::<ImageSpendPage>()
+            .unwrap();
+        poll_until_idle(reopened);
+        assert_eq!(reopened.draft.request, BudgetPolicy::Unlimited);
+        assert_eq!(
+            reopened.draft.session,
+            BudgetPolicy::Finite { usd_micros: 7 }
+        );
+        assert_eq!(
+            reopened.draft.project,
+            BudgetPolicy::Finite {
+                usd_micros: u64::MAX
+            }
+        );
+        assert!(matches!(
+            reopened.draft.project_epoch,
+            Some(ProjectEpochPolicy::CalendarMonth { ref time_zone })
+                if time_zone == "Pacific/Auckland"
+        ));
+
+        reopened.draft.session = BudgetPolicy::Unconfigured;
+        reopened.save();
+        assert!(reopened.save.lock().unwrap().is_none());
+        let db = cockpit_db::Db::open(&path).unwrap();
+        let persisted = image_spend_runtime()
+            .unwrap()
+            .block_on(db.current_image_spend_policy("project".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.policy_version, 1);
+        assert_eq!(persisted.settings, reopened.saved);
     }
 }

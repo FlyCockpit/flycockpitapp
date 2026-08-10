@@ -63,6 +63,7 @@ struct Inner {
     /// Durable write-scope authority. Late-installed like `scheduler`: the
     /// coordinator is built in `boot_with_db`, after this registry exists.
     write_scope: crate::write_scope::WriteScopeSource,
+    external_journal: Arc<Mutex<Option<Arc<crate::external_journal::ExternalJournal>>>>,
     workers: Mutex<WorkerState>,
     /// Live `JoinHandle` per worker, so a graceful drain can *await* the
     /// in-flight turn finishing (and `abort()` it past the deadline).
@@ -354,6 +355,7 @@ impl SessionRegistry {
                 locks,
                 lsp: Arc::new(crate::daemon::lsp::LspManager::new()),
                 write_scope: Arc::new(Mutex::new(None)),
+                external_journal: Arc::new(Mutex::new(None)),
                 resource_scheduler,
                 scheduler: Arc::new(Mutex::new(None)),
                 workers: Mutex::new(WorkerState {
@@ -397,6 +399,14 @@ impl SessionRegistry {
 
     fn write_scope_source(&self) -> crate::write_scope::WriteScopeSource {
         self.inner.write_scope.clone()
+    }
+
+    pub fn set_external_journal(&self, journal: Arc<crate::external_journal::ExternalJournal>) {
+        *crate::sync::lock_or_recover(&self.inner.external_journal) = Some(journal);
+    }
+
+    fn external_journal(&self) -> Option<Arc<crate::external_journal::ExternalJournal>> {
+        crate::sync::lock_or_recover(&self.inner.external_journal).clone()
     }
 
     pub fn scheduler(&self) -> Option<crate::daemon::scheduler::DaemonSchedulerHandle> {
@@ -780,6 +790,7 @@ impl SessionRegistry {
         }
         let model_override = model_override.map(|_| model.clone());
 
+        session.set_external_journal(self.external_journal());
         let session = Arc::new(session);
         let cleanup_inner = Arc::downgrade(&self.inner);
         let cleanup =

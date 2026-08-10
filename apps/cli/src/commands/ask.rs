@@ -39,6 +39,11 @@ async fn run_docs_ask(package_id: &str, question: &str) -> Result<String> {
     let env = EnvSnapshot::from_process(EnvSnapshotSource::ExplicitCli);
     let session =
         Session::create(db.clone(), cwd.clone(), "docs").context("creating docs ask session")?;
+    // This legacy read-only, daemon-less command cannot safely open the
+    // daemon-owned recovery spool concurrently. Its inference remains on the
+    // existing primary-row audit path; daemon/session-worker turns are always
+    // journal-required.
+    session.allow_unjournaled_inference();
     session.set_sandbox_enabled(true);
     session.set_approval_mode(extended.default_approval_mode);
     session.set_shell_compression(extended.shell_compression);

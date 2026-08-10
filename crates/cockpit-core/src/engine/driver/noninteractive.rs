@@ -792,6 +792,7 @@ impl Driver {
             fork_point,
         )
         .context("creating forked task session")?;
+        session.set_external_journal(self.session.external_journal());
         Ok((Arc::new(session), history))
     }
 

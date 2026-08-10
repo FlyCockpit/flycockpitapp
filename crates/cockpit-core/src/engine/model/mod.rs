@@ -105,8 +105,8 @@ pub use dispatch::TandemOutcome;
 #[allow(unused_imports)]
 pub use failure::{
     InferenceCancelled, InferenceErrorClass, InferenceFailure, InferenceGated, InferencePhase,
-    InferenceTiming, as_inference_failure, auth_failure_kind, failure_engages_backup, is_cancelled,
-    is_gated,
+    InferenceTiming, as_inference_failure, auth_failure_kind, cancellation_phase,
+    failure_engages_backup, is_cancelled, is_gated,
 };
 #[allow(unused_imports)]
 pub use http_client::UsageAliasHttpClient;
@@ -157,6 +157,7 @@ pub(crate) struct PreparedCompletionRequest {
     pub history: Vec<Message>,
     pub prompt: Message,
     pub captured: serde_json::Value,
+    pub single_handoff: bool,
 }
 
 /// When set (by `--debug-last-message`), every call to [`Model::complete`]

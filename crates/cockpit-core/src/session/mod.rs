@@ -123,6 +123,10 @@ pub struct Session {
     #[allow(dead_code)]
     pub started_at: DateTime<Utc>,
     pub db: Db,
+    /// Daemon-owned external side-effect journal. Installed by the registry
+    /// before the worker starts; absent in isolated unit sessions.
+    external_journal: Mutex<Option<Arc<crate::external_journal::ExternalJournal>>>,
+    allow_unjournaled_inference: std::sync::atomic::AtomicBool,
     /// Private per-session tmp dir under the system temp location
     /// (sandboxing part 2). Read+write inside the sandboxed shell and
     /// counted as "inside the boundary" for native-tool path checks, so
@@ -338,6 +342,27 @@ struct LastRecoverableToolCall {
 }
 
 impl Session {
+    pub(crate) fn set_external_journal(
+        &self,
+        journal: Option<Arc<crate::external_journal::ExternalJournal>>,
+    ) {
+        *self.external_journal.lock().unwrap() = journal;
+    }
+
+    pub(crate) fn external_journal(&self) -> Option<Arc<crate::external_journal::ExternalJournal>> {
+        self.external_journal.lock().unwrap().clone()
+    }
+
+    pub fn allow_unjournaled_inference(&self) {
+        self.allow_unjournaled_inference
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn unjournaled_inference_allowed(&self) -> bool {
+        self.allow_unjournaled_inference
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub fn set_active_tool_names<'a>(
         &self,
         names: impl IntoIterator<Item = &'a str>,

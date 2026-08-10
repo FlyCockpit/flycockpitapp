@@ -2233,11 +2233,12 @@ pub(crate) async fn boot_with_db(
                             released_without_medium = report.released_without_medium,
                             "external side-effect journal recovery finished"
                         );
-                        ctx.external_journal = Some(std::sync::Arc::new(journal));
+                        let journal = std::sync::Arc::new(journal);
+                        ctx.registry.set_external_journal(journal.clone());
+                        ctx.external_journal = Some(journal);
                         timer.phase("external_journal");
                     }
                     Err(error) => {
-                        // Fail closed: no handle means no new external effects.
                         tracing::warn!(
                             error = %error,
                             "external side-effect journal startup failed; \

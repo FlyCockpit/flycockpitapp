@@ -3792,6 +3792,20 @@ mod tests {
     }
 
     #[test]
+    fn external_deletion_has_only_owned_restartable_edges() {
+        let db = Db::open_in_memory().unwrap();
+        db.blocking_for_sync_cli(|conn| {
+            let mut statement = conn.prepare("SELECT from_state,to_state FROM image_generation_late_publication_transitions WHERE from_state='delete_authorized' OR to_state='delete_authorized' ORDER BY from_state,to_state")?;
+            let edges = statement
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            assert_eq!(edges, vec![("delete_authorized".into(), "aborted".into()), ("delete_authorized".into(), "security_blocked".into()), ("security_blocked".into(), "delete_authorized".into())]);
+            assert!(conn.execute("INSERT INTO image_generation_late_publication_transitions(from_state,to_state) VALUES('delete_authorized','published')",[]).is_err());
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
     fn artifact_graph_creation_is_atomic_and_exactly_bound_to_sealed_slot() {
         let db = Db::open_in_memory().unwrap();
         db.blocking_for_sync_cli(|conn| {

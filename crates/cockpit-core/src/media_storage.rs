@@ -379,6 +379,7 @@ impl MediaStorageRecovery {
             crate::media_reservation::reserve_conn(conn,crate::media_reservation::ReserveRequest{reservation_id:reservation_id.clone(),recovery_id:reservation_id.clone(),owner:crate::media_reservation::MediaOwner{project_id:request_for_tx.canonical_project_digest.clone(),session_id:request_for_tx.session_id.to_string()},operation:"retained_https_ingest".into(),purpose:"retained_media".into(),plans,wall_ms:u64::try_from(now_unix_ms)?},monotonic_now_ms)?;
             cockpit_db::Db::insert_media_attachment_conn(conn,&record)?; cockpit_db::Db::insert_media_attachment_component_conn(conn,&component)?;
             conn.execute("INSERT INTO media_retained_https_evidence(attachment_id,source_evidence_digest,redirect_classes_json,path_segment_count,safe_basename,fetched_at_unix_ms,reservation_id,reservation_digest) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![attachment_id.to_string(),source_evidence_digest,serde_json::to_string(&redirect_classes)?,path_segment_count,safe_basename,now_unix_ms,reservation_id,reservation_digest])?;
+            conn.execute("INSERT INTO media_attachment_processing_jobs(job_id,attachment_id,expected_attachment_version,expected_availability_generation,source_evidence_digest,state,created_at_unix_ms) VALUES(?1,?2,'1','1',?3,'pending',?4)",params![Uuid::now_v7().to_string(),attachment_id.to_string(),source_evidence_digest,now_unix_ms])?;
             conn.execute("INSERT INTO media_retained_https_operations(local_operation_id,authoritative_operation_id,session_id,canonical_project_digest,client_draft_id,request_binding_digest,operation_request_digest,semantic_command_digest,receipt_json,committed_at_unix_ms,is_alias) VALUES(?1,?1,?2,?3,?4,?5,?6,?7,?8,?9,0)",params![request_for_tx.local_operation_id.to_string(),request_for_tx.session_id.to_string(),request_for_tx.canonical_project_digest,request_for_tx.client_draft_id.to_string(),binding,request_digest,semantic_digest,receipt_json,now_unix_ms])?;
             conn.execute("INSERT INTO media_retained_https_audit(local_operation_id,outcome,committed_at_unix_ms) VALUES(?1,'retained',?2)",params![request_for_tx.local_operation_id.to_string(),now_unix_ms])?; conn.execute("DELETE FROM media_retained_https_publication_intents WHERE local_operation_id=?1",[request_for_tx.local_operation_id.to_string()])?; Ok(receipt)
         }).await;
@@ -5465,6 +5466,16 @@ mod tests {
             .retain_https_media(request.clone(), &policy, 1, 10)
             .await
             .unwrap();
+        assert_eq!(
+            db.read(|conn| Ok(conn.query_row(
+                "SELECT COUNT(*) FROM media_attachment_processing_jobs WHERE state='pending'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?))
+            .await
+            .unwrap(),
+            1
+        );
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             recovery
@@ -5514,6 +5525,7 @@ mod tests {
         for table in [
             "media_attachment_components",
             "media_retained_https_evidence",
+            "media_attachment_processing_jobs",
             "media_retained_https_operations",
             "media_retained_https_audit",
         ] {

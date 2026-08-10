@@ -497,6 +497,18 @@ CREATE TABLE media_retained_https_publication_intents (
     created_at_unix_ms INTEGER NOT NULL
 );
 
+CREATE TABLE media_attachment_processing_jobs (
+    job_id                           TEXT PRIMARY KEY,
+    attachment_id                   TEXT NOT NULL UNIQUE,
+    expected_attachment_version     TEXT NOT NULL,
+    expected_availability_generation TEXT NOT NULL,
+    source_evidence_digest          TEXT NOT NULL,
+    state                            TEXT NOT NULL CHECK(state IN ('pending','claimed','completed')),
+    created_at_unix_ms               INTEGER NOT NULL,
+    completed_at_unix_ms             INTEGER,
+    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE
+);
+
 CREATE TABLE media_uploads (
     upload_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, canonical_project_digest TEXT NOT NULL,
     client_draft_id TEXT NOT NULL, media_kind TEXT NOT NULL CHECK(media_kind IN ('image','audio','video')),

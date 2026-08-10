@@ -2915,7 +2915,8 @@ mod tests {
         let applied = Uuid::now_v7();
         let in_use = Uuid::now_v7();
         let overflow = Uuid::now_v7();
-        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at)VALUES(?1,'p','/redacted',1,1)",[session.to_string()])?;for id in [applied,in_use,overflow]{super::super::Db::insert_media_attachment_conn(conn,&make(id))?;}super::super::Db::acquire_media_reference_conn(conn,Uuid::now_v7(),in_use,1,session,&"11".repeat(32),MediaReferenceConsumerKind::Message,"message",2)?;conn.execute("UPDATE media_attachments SET availability_generation=?1 WHERE attachment_id=?2",params![u64::MAX.to_string(),overflow.to_string()])?;Ok(())}).await.unwrap();
+        let reference_id = Uuid::now_v7();
+        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at)VALUES(?1,'p','/redacted',1,1)",[session.to_string()])?;for id in [applied,in_use,overflow]{super::super::Db::insert_media_attachment_conn(conn,&make(id))?;}super::super::Db::acquire_media_reference_conn(conn,reference_id,in_use,1,session,&"11".repeat(32),MediaReferenceConsumerKind::Message,"message",2)?;conn.execute("UPDATE media_attachments SET availability_generation=?1 WHERE attachment_id=?2",params![u64::MAX.to_string(),overflow.to_string()])?;Ok(())}).await.unwrap();
         let request = |id, availability, reference| DiscardUnreferencedMediaAttachmentV1 {
             schema_version: 1,
             kind: "discardUnreferencedMediaAttachment".into(),
@@ -2959,5 +2960,35 @@ mod tests {
         assert_eq!(decisions.2.availability_generation_after, 2);
         let counts=db.read(move|conn|Ok((conn.query_row("SELECT COUNT(*) FROM media_attachment_cleanup_intents WHERE attachment_id=?1",[applied.to_string()],|row|row.get::<_,i64>(0))?,conn.query_row("SELECT COUNT(*) FROM media_attachment_cleanup_intents WHERE attachment_id IN (?1,?2)",params![in_use.to_string(),overflow.to_string()],|row|row.get::<_,i64>(0))?))).await.unwrap();
         assert_eq!(counts, (1, 0));
+        let fresh = db
+            .transaction(move |conn| {
+                assert_eq!(
+                    super::super::Db::release_media_reference_conn(conn, reference_id, 2, 4)?,
+                    3
+                );
+                super::super::Db::discard_unreferenced_media_attachment_conn(
+                    conn,
+                    &DiscardUnreferencedMediaAttachmentV1 {
+                        schema_version: 1,
+                        kind: "discardUnreferencedMediaAttachment".into(),
+                        attachment_id: in_use,
+                        attachment_version: 1,
+                        availability_generation: 1,
+                        reference_generation: 3,
+                        origin_upload: None,
+                    },
+                    5,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(fresh.reason, MediaDiscardReasonV1::DiscardStarted);
+        assert_eq!(
+            (
+                fresh.reference_generation_before,
+                fresh.reference_generation_after
+            ),
+            (3, 3)
+        );
     }
 }

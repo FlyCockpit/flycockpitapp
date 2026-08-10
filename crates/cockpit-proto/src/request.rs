@@ -1047,6 +1047,9 @@ pub enum Request {
     /// Register a project-contained local file while retaining its verified handle.
     RegisterLocalPathMedia(cockpit_db::media_attachments::RegisterLocalPathMediaV1),
 
+    /// Owner-only daemon-local retained HTTPS ingress.
+    RetainHttpsMedia(cockpit_db::media_attachments::RetainHttpsMediaV1),
+
     GetMediaAttachmentStatus(cockpit_db::media_attachments::GetMediaAttachmentStatusV1),
 
     GetMediaAttachmentPreview(cockpit_db::media_attachments::GetMediaAttachmentPreviewV1),
@@ -1331,6 +1334,7 @@ macro_rules! request_variants {
             (Request::GuidanceEstimate { .. }, "guidance_estimate");
             (Request::RecoverSecurityBlockedMedia(..), "recover_security_blocked_media");
             (Request::RegisterLocalPathMedia(..), "register_local_path_media");
+            (Request::RetainHttpsMedia(..), "retain_https_media");
             (Request::GetMediaAttachmentStatus(..), "get_media_attachment_status");
             (Request::GetMediaAttachmentPreview(..), "get_media_attachment_preview");
             (Request::BeginMediaUpload(..), "begin_media_upload");
@@ -1487,6 +1491,7 @@ macro_rules! command {
             (Request::GuidanceEstimate { project_root, .. }, "guidance_estimate", project_read(project_root), none, false, concurrent, none);
             (Request::RecoverSecurityBlockedMedia(..), "recover_security_blocked_media", owner_only, none, true, serialized, none);
             (Request::RegisterLocalPathMedia(..), "register_local_path_media", owner_only, none, true, serialized, none);
+            (Request::RetainHttpsMedia(..), "retain_https_media", owner_only, none, true, serialized, none);
             (Request::GetMediaAttachmentStatus(..), "get_media_attachment_status", public_read, none, false, serialized, none);
             (Request::GetMediaAttachmentPreview(..), "get_media_attachment_preview", public_read, none, false, serialized, none);
             (Request::BeginMediaUpload(..), "begin_media_upload", public_read, none, true, serialized, none);

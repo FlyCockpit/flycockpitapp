@@ -2286,6 +2286,37 @@ pub(super) async fn handle_serialized_request(
                 })?;
             Ok(Response::LocalPathMediaRegistration(receipt))
         }
+        Request::RetainHttpsMedia(request) => {
+            use sha2::{Digest as _, Sha256};
+            let unavailable = || ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: "media_attachment_unavailable".into(),
+            };
+            let attached = require_attached(state).map_err(|_| unavailable())?;
+            let owner = super::run_invocation::principal_digest(&state.principal);
+            let project_text = attached
+                .handle
+                .project_root
+                .to_str()
+                .ok_or_else(unavailable)?;
+            let project_digest = crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes()));
+            if request.schema_version != 1
+                || request.kind != "retainHttpsMedia"
+                || request.owner_principal_digest != owner
+                || request.session_id != attached.handle.session_id
+                || request.canonical_project_digest != project_digest
+            {
+                return Err(unavailable());
+            }
+            // The transport authority is deliberately complete before URL
+            // parsing or DNS. Publication is supplied by MediaStorageRecovery
+            // in the following tranche; until present, fail without lookup or
+            // durable operation/evidence rows.
+            Err(ErrorPayload {
+                code: ErrorCode::Unavailable,
+                message: "retained HTTPS media storage is unavailable".into(),
+            })
+        }
         Request::GetMediaAttachmentStatus(request) => {
             use sha2::{Digest as _, Sha256};
             let unavailable = || ErrorPayload {

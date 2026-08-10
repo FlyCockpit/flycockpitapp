@@ -17,6 +17,8 @@ pub enum Response {
 
     LocalPathMediaRegistration(cockpit_db::media_attachments::LocalPathRegistrationReceiptV1),
 
+    RetainedHttpsMedia(cockpit_db::media_attachments::RetainedHttpsMediaReceiptV1),
+
     MediaAttachmentStatus(cockpit_db::media_attachments::MediaAttachmentStatusV1),
 
     MediaAttachmentPreview(cockpit_db::media_attachments::MediaAttachmentPreviewV1),

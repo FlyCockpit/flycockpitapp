@@ -2576,6 +2576,19 @@ CREATE TABLE image_spend_attempts (
     FOREIGN KEY(reservation_id) REFERENCES image_spend_reservations(reservation_id) ON DELETE RESTRICT
 );
 
+-- One immutable external-effect identity per paid attempt. The referenced
+-- journal row is prepared in the same transaction as this binding and must
+-- reach `dispatching` before provider contact. Acceptance ambiguity and
+-- definitive rejection therefore come only from the generic journal graph.
+CREATE TABLE image_spend_attempt_dispatches (
+    reservation_id TEXT NOT NULL,
+    attempt_id TEXT NOT NULL,
+    external_operation_id TEXT NOT NULL UNIQUE,
+    PRIMARY KEY(reservation_id,attempt_id),
+    FOREIGN KEY(reservation_id,attempt_id) REFERENCES image_spend_attempts(reservation_id,attempt_id) ON DELETE RESTRICT,
+    FOREIGN KEY(external_operation_id) REFERENCES external_journal_operations(operation_id) ON DELETE RESTRICT
+);
+
 CREATE TABLE image_spend_scope_usage (
     reservation_id TEXT NOT NULL,
     scope_kind TEXT NOT NULL CHECK(scope_kind IN ('request','session','project')),

@@ -1055,6 +1055,65 @@ pub fn transition_external_operation_conn(
     Ok(ExternalTransitionOutcome::Committed(record))
 }
 
+/// Prepare a journal row inside a caller-owned transaction. This is the only
+/// seam for domain preflight that must commit its reservation and the durable
+/// external-effect identity atomically.
+pub(crate) fn prepare_external_operation_conn(
+    conn: &Connection,
+    request: &PrepareExternalOperation,
+    now_wall_ms: i64,
+) -> Result<ExternalPrepareOutcome> {
+    if request.payload_len > EXTERNAL_JOURNAL_MAX_PROJECTION_BYTES {
+        bail!(
+            "external journal projection is {} bytes; the encoder cap is {}",
+            request.payload_len,
+            EXTERNAL_JOURNAL_MAX_PROJECTION_BYTES
+        );
+    }
+    let payload_len = i64::try_from(request.payload_len)
+        .context("external journal projection length overflow")?;
+    if let Some(existing) = external_operation_by_identity_conn(
+        conn,
+        &request.operation_kind,
+        &request.owner_session_id,
+        &request.idempotency_key,
+    )? {
+        return Ok(ExternalPrepareOutcome::Existing(existing));
+    }
+    let operation_id = Uuid::new_v4();
+    let (provider_key, provider_contract) = match &request.provider_idempotency {
+        Some(evidence) => (
+            Some(evidence.key.as_str().to_string()),
+            Some(evidence.contract.as_str().to_string()),
+        ),
+        None => (None, None),
+    };
+    conn.execute(
+        "INSERT INTO external_journal_operations (
+             operation_id, operation_kind, owner_session_id, idempotency_key,
+             payload_digest, payload_len, state, version,
+             provider_idempotency_key, provider_idempotency_contract,
+             created_at_wall_ms, updated_at_wall_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'prepared', 1, ?7, ?8, ?9, ?9)",
+        params![
+            operation_id.to_string(),
+            request.operation_kind.as_str(),
+            request.owner_session_id.as_str(),
+            request.idempotency_key.as_str(),
+            request.payload_digest.as_str(),
+            payload_len,
+            provider_key,
+            provider_contract,
+            now_wall_ms,
+        ],
+    )
+    .context("inserting prepared external journal operation")?;
+    let record = external_operation_conn(conn, operation_id)?
+        .context("prepared external journal record vanished")?;
+    insert_event_conn(conn, &record, ExternalJournalState::Prepared, now_wall_ms)?;
+    Ok(ExternalPrepareOutcome::Created(record))
+}
+
 impl Db {
     /// Commit a `prepared` record before any external handoff.
     ///
@@ -1066,58 +1125,8 @@ impl Db {
         request: PrepareExternalOperation,
         now_wall_ms: i64,
     ) -> Result<ExternalPrepareOutcome> {
-        if request.payload_len > EXTERNAL_JOURNAL_MAX_PROJECTION_BYTES {
-            bail!(
-                "external journal projection is {} bytes; the encoder cap is {}",
-                request.payload_len,
-                EXTERNAL_JOURNAL_MAX_PROJECTION_BYTES
-            );
-        }
-        let payload_len = i64::try_from(request.payload_len)
-            .context("external journal projection length overflow")?;
-        self.transaction(move |conn| {
-            if let Some(existing) = external_operation_by_identity_conn(
-                conn,
-                &request.operation_kind,
-                &request.owner_session_id,
-                &request.idempotency_key,
-            )? {
-                return Ok(ExternalPrepareOutcome::Existing(existing));
-            }
-            let operation_id = Uuid::new_v4();
-            let (provider_key, provider_contract) = match &request.provider_idempotency {
-                Some(evidence) => (
-                    Some(evidence.key.as_str().to_string()),
-                    Some(evidence.contract.as_str().to_string()),
-                ),
-                None => (None, None),
-            };
-            conn.execute(
-                "INSERT INTO external_journal_operations (
-                     operation_id, operation_kind, owner_session_id, idempotency_key,
-                     payload_digest, payload_len, state, version,
-                     provider_idempotency_key, provider_idempotency_contract,
-                     created_at_wall_ms, updated_at_wall_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'prepared', 1, ?7, ?8, ?9, ?9)",
-                params![
-                    operation_id.to_string(),
-                    request.operation_kind.as_str(),
-                    request.owner_session_id.as_str(),
-                    request.idempotency_key.as_str(),
-                    request.payload_digest.as_str(),
-                    payload_len,
-                    provider_key,
-                    provider_contract,
-                    now_wall_ms,
-                ],
-            )
-            .context("inserting prepared external journal operation")?;
-            let record = external_operation_conn(conn, operation_id)?
-                .context("prepared external journal record vanished")?;
-            insert_event_conn(conn, &record, ExternalJournalState::Prepared, now_wall_ms)?;
-            Ok(ExternalPrepareOutcome::Created(record))
-        })
-        .await
+        self.transaction(move |conn| prepare_external_operation_conn(conn, &request, now_wall_ms))
+            .await
     }
 
     /// Load one record by id.

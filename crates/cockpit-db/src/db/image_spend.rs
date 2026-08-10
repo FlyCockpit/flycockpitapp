@@ -4,8 +4,15 @@
 use anyhow::{Context, Result, bail};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Deserializer, Serialize};
+use uuid::Uuid;
 
 use super::Db;
+#[cfg(test)]
+use super::external_journal::{ExternalJournalDigest, ExternalJournalToken};
+use super::external_journal::{
+    ExternalJournalRecord, ExternalJournalState, ExternalPrepareOutcome, ExternalTransitionOutcome,
+    PrepareExternalOperation, prepare_external_operation_conn, transition_external_operation_conn,
+};
 
 fn sqlite_u64(value: u64) -> Result<i64> {
     i64::try_from(value).map_err(|_| BudgetBlockReason::ArithmeticOverflow.into())
@@ -46,6 +53,15 @@ pub enum BudgetPolicy {
     Unconfigured,
     Finite { usd_micros: u64 },
     Unlimited,
+}
+
+/// Provider-neutral handoff result recorded immediately after a paid image
+/// attempt returns. `SubmissionUnknown` deliberately retains the full hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageSpendDispatchEvidence {
+    Accepted,
+    DefinitivelyRejected,
+    SubmissionUnknown,
 }
 
 #[cfg(test)]
@@ -165,6 +181,78 @@ mod tests {
             )
             .await
             .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn paid_dispatch_requires_journal_evidence_before_release() {
+        let db = Db::open_in_memory().unwrap();
+        db.save_image_spend_policy("project".into(), finite(10), None, 0)
+            .await
+            .unwrap();
+        db.resolve_image_spend_epoch("project".into(), 1, "2026-08".into(), 0, 0)
+            .await
+            .unwrap();
+        db.reserve_image_spend(
+            "dispatch".into(),
+            keys("plan"),
+            vec![AttemptMaximum {
+                attempt_id: "attempt".into(),
+                usd_micros: Some(5),
+            }],
+            1,
+            0,
+        )
+        .await
+        .unwrap();
+        let prepared = db
+            .prepare_image_spend_dispatch(
+                "dispatch".into(),
+                "attempt".into(),
+                PrepareExternalOperation {
+                    operation_kind: ExternalJournalToken::parse("image_generation").unwrap(),
+                    owner_session_id: ExternalJournalToken::parse("session").unwrap(),
+                    idempotency_key: ExternalJournalToken::parse("attempt-key").unwrap(),
+                    payload_digest: ExternalJournalDigest::of(b"sanitized projection"),
+                    payload_len: 20,
+                    provider_idempotency: None,
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let dispatching = db
+            .begin_image_spend_dispatch(
+                "dispatch".into(),
+                "attempt".into(),
+                prepared.operation_id,
+                prepared.version,
+                2,
+            )
+            .await
+            .unwrap();
+        let unknown = db
+            .finish_image_spend_dispatch(
+                "dispatch".into(),
+                "attempt".into(),
+                prepared.operation_id,
+                dispatching.record().version,
+                ImageSpendDispatchEvidence::SubmissionUnknown,
+                3,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            unknown.record().state,
+            ExternalJournalState::SubmissionUnknown
+        );
+        assert_eq!(
+            db.image_spend_diagnostic("dispatch".into())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "reserved"
         );
     }
 
@@ -763,6 +851,112 @@ impl Db {
         }).await
     }
 
+    /// Atomically bind one already-reserved attempt to a durable external
+    /// journal identity. A provider adapter must obtain this record before it
+    /// can begin handoff; raw prompt/provider payload bytes are never stored.
+    pub async fn prepare_image_spend_dispatch(
+        &self,
+        reservation_id: String,
+        attempt_id: String,
+        journal: PrepareExternalOperation,
+        at_ms: i64,
+    ) -> Result<ExternalJournalRecord> {
+        if journal.operation_kind.as_str() != "image_generation" {
+            bail!("image spend dispatch requires image_generation journal kind");
+        }
+        self.transaction(move |conn| {
+            let session_id: String = conn.query_row(
+                "SELECT r.session_id FROM image_spend_attempts a JOIN image_spend_reservations r USING(reservation_id) WHERE a.reservation_id=?1 AND a.attempt_id=?2 AND r.state='reserved'",
+                params![reservation_id, attempt_id], |row| row.get(0),
+            ).context("image spend attempt is absent or no longer reserved")?;
+            if journal.owner_session_id.as_str() != session_id {
+                bail!("journal owner does not match the reserved image session");
+            }
+            let prepared = prepare_external_operation_conn(conn, &journal, at_ms)?;
+            let record = prepared.record();
+            if let Some(existing_id) = conn.query_row(
+                "SELECT external_operation_id FROM image_spend_attempt_dispatches WHERE reservation_id=?1 AND attempt_id=?2",
+                params![reservation_id, attempt_id], |row| row.get::<_, String>(0),
+            ).optional()? {
+                if existing_id != record.operation_id.to_string() {
+                    bail!("image spend attempt is already bound to another external operation");
+                }
+                return Ok(record.clone());
+            }
+            if matches!(&prepared, ExternalPrepareOutcome::Existing(_)) {
+                bail!("existing external operation is not bound to this image spend attempt");
+            }
+            conn.execute(
+                "INSERT INTO image_spend_attempt_dispatches(reservation_id,attempt_id,external_operation_id) VALUES(?1,?2,?3)",
+                params![reservation_id, attempt_id, record.operation_id.to_string()],
+            )?;
+            Ok(record.clone())
+        }).await
+    }
+
+    /// Commit the durable `dispatching` proof immediately before provider
+    /// contact. A conflict returns the authoritative current journal record.
+    pub async fn begin_image_spend_dispatch(
+        &self,
+        reservation_id: String,
+        attempt_id: String,
+        operation_id: Uuid,
+        expected_version: i64,
+        at_ms: i64,
+    ) -> Result<ExternalTransitionOutcome> {
+        self.transaction(move |conn| {
+            let bound: Option<i64> = conn.query_row(
+                "SELECT 1 FROM image_spend_attempt_dispatches WHERE reservation_id=?1 AND attempt_id=?2 AND external_operation_id=?3",
+                params![reservation_id, attempt_id, operation_id.to_string()], |row| row.get(0),
+            ).optional()?;
+            if bound.is_none() { bail!("external operation is not bound to the image spend attempt"); }
+            transition_external_operation_conn(conn, operation_id, expected_version, ExternalJournalState::Dispatching, at_ms)
+        }).await
+    }
+
+    /// Record authoritative provider handoff evidence. Only a journal-backed
+    /// definitive rejection can release a hold; accepted and ambiguous
+    /// submissions retain it for billing reconciliation.
+    pub async fn finish_image_spend_dispatch(
+        &self,
+        reservation_id: String,
+        attempt_id: String,
+        operation_id: Uuid,
+        expected_version: i64,
+        evidence: ImageSpendDispatchEvidence,
+        at_ms: i64,
+    ) -> Result<ExternalTransitionOutcome> {
+        self.transaction(move |conn| {
+            let bound: Option<i64> = conn.query_row(
+                "SELECT 1 FROM image_spend_attempt_dispatches WHERE reservation_id=?1 AND attempt_id=?2 AND external_operation_id=?3",
+                params![reservation_id, attempt_id, operation_id.to_string()], |row| row.get(0),
+            ).optional()?;
+            if bound.is_none() { bail!("external operation is not bound to the image spend attempt"); }
+            let next = match evidence {
+                ImageSpendDispatchEvidence::Accepted => ExternalJournalState::Accepted,
+                ImageSpendDispatchEvidence::DefinitivelyRejected => ExternalJournalState::Rejected,
+                ImageSpendDispatchEvidence::SubmissionUnknown => ExternalJournalState::SubmissionUnknown,
+            };
+            let outcome = transition_external_operation_conn(conn, operation_id, expected_version, next, at_ms)?;
+            if outcome.record().state == ExternalJournalState::Rejected {
+                let unrejected: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM image_spend_attempts a LEFT JOIN image_spend_attempt_dispatches d USING(reservation_id,attempt_id) LEFT JOIN external_journal_operations o ON o.operation_id=d.external_operation_id WHERE a.reservation_id=?1 AND COALESCE(o.state,'')<>'rejected'",
+                    [&reservation_id], |row| row.get(0),
+                )?;
+                if unrejected == 0 {
+                    let changed = conn.execute(
+                        "UPDATE image_spend_reservations SET state='released',release_proof_identity=?2,released_at_ms=?3 WHERE reservation_id=?1 AND state='reserved'",
+                        params![reservation_id, operation_id.to_string(), at_ms],
+                    )?;
+                    if changed != 0 {
+                        conn.execute("UPDATE image_spend_scope_usage SET reserved_usd_micros=charged_usd_micros WHERE reservation_id=?1", [&reservation_id])?;
+                    }
+                }
+            }
+            Ok(outcome)
+        }).await
+    }
+
     /// Apply one authoritative billing identity exactly once. Actual cost is
     /// never capped; overage becomes debt on every affected finite scope.
     pub async fn reconcile_image_spend(
@@ -791,9 +985,10 @@ impl Db {
         }).await
     }
 
-    /// Release only when non-acceptance is proven. Ambiguous acceptance must
-    /// retain the reservation for recovery or a late cost event.
-    pub async fn release_image_spend_before_acceptance(
+    /// Legacy characterization helper; production release authority is the
+    /// journal-backed `finish_image_spend_dispatch` transition above.
+    #[cfg(test)]
+    async fn release_image_spend_before_acceptance(
         &self,
         reservation_id: String,
         proof_identity: String,

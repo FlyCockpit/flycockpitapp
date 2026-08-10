@@ -680,4 +680,144 @@ mod tests {
         assert_eq!(response.bytes().await.unwrap().as_ref(), b"ok");
         server.await.unwrap();
     }
+
+    #[tokio::test]
+    async fn https_media_ingest_tls_redirect_reresolves_and_dials_each_vetted_set() {
+        use rcgen::{CertifiedKey, generate_simple_self_signed};
+        use rustls::pki_types::PrivatePkcs8KeyDer;
+        use std::{
+            collections::HashMap,
+            sync::{Arc, Mutex},
+        };
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio_rustls::TlsAcceptor;
+        struct Resolver(Mutex<Vec<String>>);
+        #[async_trait]
+        impl HttpsDnsResolver for Resolver {
+            async fn resolve(&self, host: &str, _: u16) -> Result<Vec<IpAddr>> {
+                self.0.lock().unwrap().push(host.into());
+                Ok(vec![if host == "a.example.test" {
+                    ip("93.184.216.34")
+                } else {
+                    ip("93.184.216.35")
+                }])
+            }
+        }
+        struct Executor {
+            roots: Vec<u8>,
+            peers: HashMap<String, SocketAddr>,
+            vetted: Mutex<Vec<Vec<SocketAddr>>>,
+        }
+        #[async_trait]
+        impl HttpsHopExecutor for Executor {
+            async fn execute(
+                &self,
+                hop: &VettedHttpsHop,
+                limits: &HttpsFetchLimits,
+            ) -> Result<reqwest::Response> {
+                self.vetted.lock().unwrap().push(hop.socket_addrs.clone());
+                let host = hop.url.host_str().unwrap();
+                let peer = *self.peers.get(host).unwrap();
+                self.bound(hop, limits, peer)?
+                    .get(hop.url.clone())
+                    .send()
+                    .await
+                    .map_err(Into::into)
+            }
+        }
+        impl Executor {
+            fn bound(
+                &self,
+                hop: &VettedHttpsHop,
+                limits: &HttpsFetchLimits,
+                peer: SocketAddr,
+            ) -> Result<reqwest::Client> {
+                let host = hop.url.host_str().unwrap();
+                hop.bound_client_builder(limits)
+                    .add_root_certificate(reqwest::Certificate::from_der(&self.roots)?)
+                    .resolve_to_addrs(host, &[peer])
+                    .build()
+                    .map_err(Into::into)
+            }
+        }
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec!["a.example.test".into(), "b.example.test".into()])
+                .unwrap();
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into(),
+            )
+            .unwrap();
+        let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ap = a.local_addr().unwrap();
+        let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bp = b.local_addr().unwrap();
+        let serve = |listener: tokio::net::TcpListener,
+                     config: rustls::ServerConfig,
+                     name: &'static str,
+                     response: String| {
+            tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut tls = TlsAcceptor::from(Arc::new(config))
+                    .accept(socket)
+                    .await
+                    .unwrap();
+                assert_eq!(tls.get_ref().1.server_name(), Some(name));
+                let mut bytes = vec![0; 4096];
+                let n = tls.read(&mut bytes).await.unwrap();
+                let text = String::from_utf8(bytes[..n].to_vec()).unwrap();
+                assert!(text.contains(&format!("Host: {name}:")));
+                assert!(!text.to_ascii_lowercase().contains("authorization:"));
+                assert!(!text.to_ascii_lowercase().contains("cookie:"));
+                tls.write_all(response.as_bytes()).await.unwrap()
+            })
+        };
+        let sa = serve(
+            a,
+            config.clone(),
+            "a.example.test",
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: https://b.example.test:{}/final\r\nContent-Length: 0\r\n\r\n",
+                bp.port()
+            ),
+        );
+        let sb = serve(
+            b,
+            config,
+            "b.example.test",
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".into(),
+        );
+        let resolver = Resolver(Mutex::new(Vec::new()));
+        let executor = Executor {
+            roots: cert.der().as_ref().to_vec(),
+            peers: HashMap::from([("a.example.test".into(), ap), ("b.example.test".into(), bp)]),
+            vetted: Mutex::new(Vec::new()),
+        };
+        let (mut sink, _) = tokio::io::duplex(16);
+        let evidence = fetch_retained_https_with_executor(
+            &format!("https://a.example.test:{}/start", ap.port()),
+            &resolver,
+            &mut sink,
+            &HttpsFetchLimits::default(),
+            &executor,
+        )
+        .await
+        .unwrap();
+        assert_eq!(evidence.byte_length, 2);
+        assert_eq!(
+            *resolver.0.lock().unwrap(),
+            vec!["a.example.test", "b.example.test"]
+        );
+        assert_eq!(
+            *executor.vetted.lock().unwrap(),
+            vec![
+                vec![format!("93.184.216.34:{}", ap.port()).parse().unwrap()],
+                vec![format!("93.184.216.35:{}", bp.port()).parse().unwrap()]
+            ]
+        );
+        sa.await.unwrap();
+        sb.await.unwrap();
+    }
 }

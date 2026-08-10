@@ -3138,6 +3138,7 @@ CREATE TABLE image_generation_slots (
     slot_index INTEGER NOT NULL CHECK(slot_index >= 0),
     sample_index INTEGER NOT NULL CHECK(sample_index >= 0),
     managed_artifact_id TEXT NOT NULL,
+    max_attempt_count INTEGER NOT NULL CHECK(max_attempt_count > 0),
     state TEXT NOT NULL CHECK(state IN ('planned','queued','dispatching','submission_unknown','running','cancellation_requested','downloading','validating','ready_to_publish','published','late_quarantined','failed','cancelled','discarded')),
     version INTEGER NOT NULL CHECK(version >= 1),
     applied_cancellation_version INTEGER,
@@ -3275,7 +3276,7 @@ WHEN OLD.state='planned' AND NEW.state='preparing' AND NEW.attempt_number>1 AND 
  AND prior.attempt_number=NEW.attempt_number-1 AND prior.state IN ('failed_not_submitted','rejected_not_accepted'))
 BEGIN SELECT RAISE(ABORT,'image generation retry lacks authoritative nonacceptance'); END;
 CREATE TRIGGER image_generation_attempt_plan_bound_guard BEFORE INSERT ON image_generation_attempts
-WHEN NEW.attempt_number > (SELECT max_attempt_count FROM image_generation_plans WHERE job_id=NEW.job_id)
+WHEN NEW.attempt_number > (SELECT max_attempt_count FROM image_generation_slots WHERE job_id=NEW.job_id AND slot_id=NEW.slot_id)
 BEGIN SELECT RAISE(ABORT,'image generation attempt exceeds sealed plan'); END;
 CREATE TRIGGER image_generation_slot_plan_bound_guard BEFORE INSERT ON image_generation_slots
 WHEN NEW.slot_index >= (SELECT slot_count FROM image_generation_plans WHERE job_id=NEW.job_id)

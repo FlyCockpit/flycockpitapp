@@ -698,7 +698,8 @@ impl Db {
     /// Inserts the sealed plan and its initial projection in the caller's
     /// transaction. Composition with grants, resources, spend and journal
     /// rows therefore needs no second connection or async boundary.
-    pub fn create_image_generation_job_conn(
+    #[cfg(test)]
+    fn create_image_generation_job_conn(
         conn: &Connection,
         input: &CreateImageGenerationJob<'_>,
     ) -> Result<()> {
@@ -753,21 +754,11 @@ impl Db {
                         .get("slots")
                         .and_then(serde_json::Value::as_array)
                         .ok_or_else(|| anyhow::anyhow!("sealed plan slot graph missing"))?;
-                    let sealed_max = target
-                        .get("maxAttempts")
-                        .and_then(serde_json::Value::as_u64)
-                        .ok_or_else(|| anyhow::anyhow!("sealed plan retry bound missing"))?;
-                    ensure!(
-                        sealed_max == u64::from(input.max_attempt_count),
-                        "sealed retry bound mismatch"
-                    );
                     for slot in slots {
                         ensure!(
                             slot.get("attempts")
                                 .and_then(serde_json::Value::as_array)
-                                .is_some_and(
-                                    |attempts| attempts.len() == input.max_attempt_count as usize
-                                ),
+                                .is_some_and(|attempts| !attempts.is_empty()),
                             "sealed attempt graph mismatch"
                         );
                     }
@@ -839,12 +830,12 @@ impl Db {
                 "slot graph is not canonical"
             );
             ensure!(
-                slot.attempts.len() == input.max_attempt_count as usize,
+                slot.attempts.len() == sealed.attempts.len(),
                 "sealed attempt graph does not match plan"
             );
             conn.execute(
-                "INSERT INTO image_generation_slots(job_id,slot_id,slot_index,sample_index,managed_artifact_id,state,version) VALUES(?1,?2,?3,?4,?5,'planned',1)",
-                params![input.job_id.to_string(), slot.slot_id.to_string(), i64::from(slot.slot_index), i64::from(slot.sample_index), slot.managed_artifact_id.to_string()],
+                "INSERT INTO image_generation_slots(job_id,slot_id,slot_index,sample_index,managed_artifact_id,max_attempt_count,state,version) VALUES(?1,?2,?3,?4,?5,?6,'planned',1)",
+                params![input.job_id.to_string(), slot.slot_id.to_string(), i64::from(slot.slot_index), i64::from(slot.sample_index), slot.managed_artifact_id.to_string(), i64::try_from(sealed.attempts.len())?],
             )?;
             for (attempt_index, attempt) in slot.attempts.iter().enumerate() {
                 let sealed_attempt = sealed
@@ -1836,7 +1827,7 @@ mod tests {
                 &verified,
             )?;
             conn.execute(
-                "INSERT INTO image_generation_slots(job_id,slot_id,slot_index,sample_index,managed_artifact_id,state,version) VALUES(?1,?2,0,0,?3,'planned',1)",
+                "INSERT INTO image_generation_slots(job_id,slot_id,slot_index,sample_index,managed_artifact_id,max_attempt_count,state,version) VALUES(?1,?2,0,0,?3,1,'planned',1)",
                 params![job_id.to_string(), slot_id.to_string(), Uuid::now_v7().to_string()],
             )?;
             assert_eq!(

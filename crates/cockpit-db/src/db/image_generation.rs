@@ -371,6 +371,14 @@ pub struct CancelAdoptedImageGenerationResponse<'a> {
     pub requested_at_unix_ms: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestImageGenerationCancellation<'a> {
+    pub job_id: Uuid,
+    pub cancellation_version: u64,
+    pub request_operation_id: &'a str,
+    pub requested_at_unix_ms: i64,
+}
+
 impl Db {
     /// Inserts the sealed plan and its initial projection in the caller's
     /// transaction. Composition with grants, resources, spend and journal
@@ -762,6 +770,182 @@ impl Db {
         })
     }
 
+    pub fn request_image_generation_cancellation_conn(
+        conn: &Connection,
+        input: &RequestImageGenerationCancellation<'_>,
+    ) -> Result<ImageGenerationCasOutcome> {
+        atomic_conn(conn, "image_generation_cancel", || {
+            Self::request_image_generation_cancellation_inner(conn, input)
+        })
+    }
+
+    fn request_image_generation_cancellation_inner(
+        conn: &Connection,
+        input: &RequestImageGenerationCancellation<'_>,
+    ) -> Result<ImageGenerationCasOutcome> {
+        let cancellation_version = i64::try_from(input.cancellation_version)?;
+        conn.execute(
+            "INSERT INTO image_generation_cancellation_facts(job_id,cancellation_version,requested_at_unix_ms,request_operation_id) VALUES(?1,?2,?3,?4)",
+            params![input.job_id.to_string(),cancellation_version,input.requested_at_unix_ms,input.request_operation_id],
+        )?;
+        let mut statement = conn.prepare(
+            "SELECT slot_id,state,version FROM image_generation_slots WHERE job_id=?1 ORDER BY slot_index",
+        )?;
+        let slots = statement
+            .query_map([input.job_id.to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        for (slot_id, slot_state, slot_version) in slots {
+            if matches!(
+                slot_state.as_str(),
+                "published" | "failed" | "cancelled" | "discarded" | "late_quarantined"
+            ) {
+                continue;
+            }
+            let mut attempts_statement = conn.prepare(
+                "SELECT attempt_number,state,version,external_operation_id,observed_journal_version FROM image_generation_attempts WHERE job_id=?1 AND slot_id=?2 ORDER BY attempt_number",
+            )?;
+            let attempts = attempts_statement
+                .query_map(params![input.job_id.to_string(), &slot_id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(attempts_statement);
+            ensure!(
+                !attempts
+                    .iter()
+                    .any(|(_, state, _, _, _)| state == "response_adopted"),
+                "response-adopted cancellation requires the response-bound CAS"
+            );
+            let handoff_possible = attempts.iter().any(|(_, state, _, _, _)| {
+                matches!(
+                    state.as_str(),
+                    "dispatching"
+                        | "accepted"
+                        | "submission_unknown"
+                        | "reconciling"
+                        | "running"
+                        | "downloading"
+                        | "cancellation_requested"
+                )
+            });
+            for (attempt_number, state, version, operation_id, journal_version) in attempts {
+                if matches!(
+                    state.as_str(),
+                    "failed_not_submitted"
+                        | "rejected_not_accepted"
+                        | "cancelled"
+                        | "succeeded"
+                        | "completed_after_cancel"
+                        | "failed_after_acceptance"
+                ) {
+                    continue;
+                }
+                let attempt_handoff_possible = matches!(
+                    state.as_str(),
+                    "dispatching"
+                        | "accepted"
+                        | "submission_unknown"
+                        | "reconciling"
+                        | "running"
+                        | "downloading"
+                        | "cancellation_requested"
+                );
+                if let (Some(operation_id), Some(journal_version)) =
+                    (&operation_id, journal_version)
+                {
+                    let operation_id = Uuid::parse_str(operation_id)?;
+                    let next = if attempt_handoff_possible {
+                        ExternalJournalState::CancellationRequested
+                    } else {
+                        ExternalJournalState::Cancelled
+                    };
+                    match transition_external_operation_conn(
+                        conn,
+                        operation_id,
+                        journal_version,
+                        next,
+                        input.requested_at_unix_ms,
+                    )? {
+                        ExternalTransitionOutcome::Committed(_)
+                        | ExternalTransitionOutcome::Duplicate(_) => {}
+                        ExternalTransitionOutcome::Conflict(_) => {
+                            anyhow::bail!("cancellation lost journal compare-and-set")
+                        }
+                    }
+                }
+                let next = if attempt_handoff_possible {
+                    ImageGenerationAttemptState::CancellationRequested
+                } else {
+                    ImageGenerationAttemptState::Cancelled
+                };
+                ensure!(
+                    attempt_transition_allowed(
+                        ImageGenerationAttemptState::parse(&state)
+                            .ok_or_else(|| anyhow::anyhow!("unknown attempt state"))?,
+                        next
+                    ),
+                    "attempt cannot accept cancellation"
+                );
+                let changed=conn.execute(
+                    "UPDATE image_generation_attempts SET state=?1,version=?2,applied_cancellation_version=?3 WHERE job_id=?4 AND slot_id=?5 AND attempt_number=?6 AND state=?7 AND version=?8",
+                    params![next.as_str(),version+1,cancellation_version,input.job_id.to_string(),&slot_id,attempt_number,&state,version],
+                )?;
+                ensure!(changed == 1, "cancellation lost attempt compare-and-set");
+            }
+            let current = ImageGenerationSlotState::parse(&slot_state)
+                .ok_or_else(|| anyhow::anyhow!("unknown slot state"))?;
+            let next = if handoff_possible {
+                ImageGenerationSlotState::CancellationRequested
+            } else {
+                ImageGenerationSlotState::Cancelled
+            };
+            ensure!(
+                slot_transition_allowed(current, next),
+                "slot cannot accept cancellation"
+            );
+            let changed=conn.execute(
+                "UPDATE image_generation_slots SET state=?1,version=?2,applied_cancellation_version=?3 WHERE job_id=?4 AND slot_id=?5 AND state=?6 AND version=?7",
+                params![next.as_str(),slot_version+1,cancellation_version,input.job_id.to_string(),&slot_id,&slot_state,slot_version],
+            )?;
+            ensure!(changed == 1, "cancellation lost slot compare-and-set");
+        }
+        let (job_state, job_version): (String, i64) = conn.query_row(
+            "SELECT state,version FROM image_generation_jobs WHERE job_id=?1",
+            [input.job_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let current = ImageGenerationJobState::parse(&job_state)
+            .ok_or_else(|| anyhow::anyhow!("unknown job state"))?;
+        let unsettled:i64=conn.query_row("SELECT COUNT(*) FROM image_generation_slots WHERE job_id=?1 AND state NOT IN ('published','failed','cancelled','discarded','late_quarantined')",[input.job_id.to_string()],|row|row.get(0))?;
+        let next = if unsettled > 0 {
+            ImageGenerationJobState::CancellationRequested
+        } else {
+            ImageGenerationJobState::Cancelled
+        };
+        ensure!(
+            job_transition_allowed(current, next),
+            "job cannot accept cancellation"
+        );
+        let changed=conn.execute("UPDATE image_generation_jobs SET state=?1,version=?2,updated_at_unix_ms=?3 WHERE job_id=?4 AND state=?5 AND version=?6",params![next.as_str(),job_version+1,input.requested_at_unix_ms,input.job_id.to_string(),job_state,job_version])?;
+        ensure!(changed == 1, "cancellation lost job compare-and-set");
+        Ok(ImageGenerationCasOutcome::Applied {
+            version: (job_version + 1) as u64,
+        })
+    }
+
     fn cancel_adopted_image_generation_response_inner(
         conn: &Connection,
         input: &CancelAdoptedImageGenerationResponse<'_>,
@@ -983,6 +1167,30 @@ mod tests {
                 ImageGenerationCasOutcome::Conflict
             );
             assert!(Db::cas_image_generation_slot_state_conn(conn, job_id, slot_id, ImageGenerationSlotState::Planned, 1, ImageGenerationSlotState::Published).is_err());
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
+    fn cancellation_cas_settles_every_undispatched_slot_once() {
+        let db = Db::open_in_memory().unwrap();
+        let job_id = Uuid::now_v7();
+        let slot_id = Uuid::now_v7();
+        db.blocking_for_sync_cli(move|conn|{
+            let canonical_plan=format!(r#"{{"schemaVersion":1,"jobId":"{job_id}","targets":[{{"maxAttempts":2,"slots":[{{"attempts":[{{}},{{}}]}}]}}]}}"#);
+            let digest=hex_lower(&Sha256::digest(canonical_plan.as_bytes()));
+            Db::create_image_generation_graph_conn(conn,&CreateImageGenerationJob{job_id,plan_digest:&digest,canonical_plan:canonical_plan.as_bytes(),slot_count:1,max_attempt_count:2,enqueue_started_monotonic_ms:1,operation_deadline_monotonic_ms:10,created_at_unix_ms:1},&[CreateImageGenerationSlot{slot_id,slot_index:0,sample_index:0,managed_artifact_id:Uuid::now_v7(),attempts:vec![CreateImageGenerationAttempt{attempt_number:1},CreateImageGenerationAttempt{attempt_number:2}]}])?;
+            assert!(matches!(Db::cas_image_generation_job_state_conn(conn,job_id,ImageGenerationJobState::Created,1,ImageGenerationJobState::Validating,2)?,ImageGenerationCasOutcome::Applied{..}));
+            assert!(matches!(Db::cas_image_generation_job_state_conn(conn,job_id,ImageGenerationJobState::Validating,2,ImageGenerationJobState::Queued,3)?,ImageGenerationCasOutcome::Applied{..}));
+            assert!(matches!(Db::cas_image_generation_slot_state_conn(conn,job_id,slot_id,ImageGenerationSlotState::Planned,1,ImageGenerationSlotState::Queued)?,ImageGenerationCasOutcome::Applied{..}));
+            assert!(matches!(Db::request_image_generation_cancellation_conn(conn,&RequestImageGenerationCancellation{job_id,cancellation_version:1,request_operation_id:"cancel:1",requested_at_unix_ms:4})?,ImageGenerationCasOutcome::Applied{..}));
+            let job_state:String=conn.query_row("SELECT state FROM image_generation_jobs WHERE job_id=?1",[job_id.to_string()],|row|row.get(0))?;
+            let slot:(String,i64,i64)=conn.query_row("SELECT state,applied_cancellation_version,result_after_cancel FROM image_generation_slots WHERE job_id=?1 AND slot_id=?2",params![job_id.to_string(),slot_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+            let attempts:i64=conn.query_row("SELECT COUNT(*) FROM image_generation_attempts WHERE job_id=?1 AND slot_id=?2 AND state='cancelled' AND applied_cancellation_version=1",params![job_id.to_string(),slot_id.to_string()],|row|row.get(0))?;
+            assert_eq!((job_state,slot,attempts),("cancelled".into(),("cancelled".into(),1,0),2));
+            assert!(Db::request_image_generation_cancellation_conn(conn,&RequestImageGenerationCancellation{job_id,cancellation_version:2,request_operation_id:"cancel:2",requested_at_unix_ms:5}).is_err());
+            let facts:i64=conn.query_row("SELECT COUNT(*) FROM image_generation_cancellation_facts WHERE job_id=?1",[job_id.to_string()],|row|row.get(0))?;
+            assert_eq!(facts,1);
             Ok(())
         }).unwrap();
     }

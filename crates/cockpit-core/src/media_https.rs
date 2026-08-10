@@ -246,6 +246,13 @@ impl VettedHttpsHop {
     /// the supplied socket addresses.
     pub(crate) fn bound_client(&self, limits: &HttpsFetchLimits) -> Result<reqwest::Client> {
         let host = self.url.host_str().context("vetted HTTPS hop lost host")?;
+        self.bound_client_builder(limits)
+            .resolve_to_addrs(host, &self.socket_addrs)
+            .build()
+            .context("build connection-bound HTTPS media client")
+    }
+
+    fn bound_client_builder(&self, limits: &HttpsFetchLimits) -> reqwest::ClientBuilder {
         reqwest::Client::builder()
             // An environment/system proxy would bypass the vetted peer set
             // and could also receive URL or credential material.
@@ -253,6 +260,17 @@ impl VettedHttpsHop {
             .redirect(reqwest::redirect::Policy::none())
             .referer(false)
             .timeout(limits.timeout)
+    }
+
+    #[cfg(test)]
+    fn bound_client_with_test_root(
+        &self,
+        limits: &HttpsFetchLimits,
+        certificate_der: &[u8],
+    ) -> Result<reqwest::Client> {
+        let host = self.url.host_str().context("vetted HTTPS hop lost host")?;
+        self.bound_client_builder(limits)
+            .add_root_certificate(reqwest::Certificate::from_der(certificate_der)?)
             .resolve_to_addrs(host, &self.socket_addrs)
             .build()
             .context("build connection-bound HTTPS media client")
@@ -569,5 +587,65 @@ mod tests {
         ] {
             assert!(!debug.contains(forbidden));
         }
+    }
+
+    #[tokio::test]
+    async fn https_media_ingest_tls_socket_uses_pinned_peer_and_original_host_sni() {
+        use rcgen::{CertifiedKey, generate_simple_self_signed};
+        use rustls::pki_types::PrivatePkcs8KeyDer;
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio_rustls::TlsAcceptor;
+
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec!["pinned.example.test".into()]).unwrap();
+        let server = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into(),
+            )
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, observed_peer) = listener.accept().await.unwrap();
+            assert_eq!(observed_peer.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+            let mut tls = TlsAcceptor::from(Arc::new(server))
+                .accept(socket)
+                .await
+                .unwrap();
+            assert_eq!(tls.get_ref().1.server_name(), Some("pinned.example.test"));
+            let mut request = vec![0; 4096];
+            let length = tls.read(&mut request).await.unwrap();
+            let request = String::from_utf8(request[..length].to_vec()).unwrap();
+            assert!(request.contains("\r\nHost: pinned.example.test:"));
+            assert!(!request.to_ascii_lowercase().contains("authorization:"));
+            assert!(!request.to_ascii_lowercase().contains("cookie:"));
+            tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+        // Construction is normally possible only through vetted_hop. The
+        // loopback peer here is a hermetic stand-in proving that its exact
+        // SocketAddr is dialed while URL authority remains Host/TLS SNI.
+        let hop = VettedHttpsHop {
+            url: Url::parse(&format!(
+                "https://pinned.example.test:{}/media",
+                peer.port()
+            ))
+            .unwrap(),
+            socket_addrs: vec![peer],
+            redirect_depth: 0,
+        };
+        let response = hop
+            .bound_client_with_test_root(&HttpsFetchLimits::default(), cert.der().as_ref())
+            .unwrap()
+            .get(hop.url().clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.bytes().await.unwrap().as_ref(), b"ok");
+        server.await.unwrap();
     }
 }

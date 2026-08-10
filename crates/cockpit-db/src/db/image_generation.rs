@@ -706,6 +706,46 @@ pub struct PrepareImageGenerationDispatch<'a> {
     pub journal: &'a PrepareExternalOperation,
     pub at_unix_ms: i64,
     pub now_monotonic_ms: u64,
+    pub worker_boot_id: Uuid,
+    pub claim_generation: u64,
+}
+
+pub struct ClaimImageGenerationDispatch {
+    pub job_id: Uuid,
+    pub slot_id: Uuid,
+    pub attempt_number: u32,
+    pub worker_boot_id: Uuid,
+    pub claim_generation: u64,
+}
+
+impl Db {
+    pub fn claim_image_generation_dispatch_conn(
+        conn: &Connection,
+        input: &ClaimImageGenerationDispatch,
+    ) -> Result<()> {
+        atomic_conn(conn, "image_generation_scheduler_claim", || {
+            let now = database_now_unix_ms(conn)?;
+            let expires = now
+                .checked_add(60_000)
+                .context("scheduler claim deadline overflow")?;
+            ensure!(
+                input.attempt_number > 0 && input.claim_generation > 0,
+                "invalid scheduler claim"
+            );
+            ensure!(conn.query_row("SELECT EXISTS(SELECT 1 FROM image_generation_jobs j JOIN image_generation_slots s ON s.job_id=j.job_id JOIN image_generation_attempts a ON a.job_id=s.job_id AND a.slot_id=s.slot_id WHERE j.job_id=?1 AND s.slot_id=?2 AND a.attempt_number=?3 AND j.state='queued' AND s.state='queued' AND a.state='planned' AND NOT EXISTS(SELECT 1 FROM image_generation_cancellation_facts c WHERE c.job_id=j.job_id))",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number)],|row|row.get::<_,bool>(0))?,"image generation dispatch is not claimable");
+            let reclaimed=conn.execute("UPDATE image_generation_scheduler_claims SET worker_boot_id=?1,claim_generation=?2,claimed_at_unix_ms=?3,expires_at_unix_ms=?4 WHERE job_id=?5 AND slot_id=?6 AND attempt_number=?7 AND expires_at_unix_ms<=?3 AND claim_generation+1=?2",params![input.worker_boot_id.to_string(),i64::try_from(input.claim_generation)?,now,expires,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number)])?;
+            let inserted = if reclaimed == 0 && input.claim_generation == 1 {
+                conn.execute("INSERT OR IGNORE INTO image_generation_scheduler_claims(job_id,slot_id,attempt_number,worker_boot_id,claim_generation,claimed_at_unix_ms,expires_at_unix_ms) VALUES(?1,?2,?3,?4,1,?5,?6)",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),input.worker_boot_id.to_string(),now,expires])?
+            } else {
+                0
+            };
+            ensure!(
+                reclaimed + inserted == 1,
+                "image generation dispatch is already claimed or reclaim generation differs"
+            );
+            Ok(())
+        })
+    }
 }
 
 pub struct ImageGenerationQueueAuthority {
@@ -874,6 +914,8 @@ impl Db {
         input: &PrepareImageGenerationDispatch<'_>,
     ) -> Result<PreparedImageGenerationDispatch> {
         atomic_conn(conn, "image_generation_prepare_dispatch", || {
+            let database_now = database_now_unix_ms(conn)?;
+            ensure!(conn.query_row("SELECT EXISTS(SELECT 1 FROM image_generation_scheduler_claims WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND worker_boot_id=?4 AND claim_generation=?5 AND expires_at_unix_ms>?6)",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),input.worker_boot_id.to_string(),i64::try_from(input.claim_generation)?,database_now],|row|row.get::<_,bool>(0))?,"image generation scheduler claim is absent or stale");
             let projection = conn
                 .query_row(
                     "SELECT j.state,s.state,a.state,p.plan_digest,p.operation_deadline_monotonic_ms,a.provider_idempotency_identity FROM image_generation_jobs j JOIN image_generation_slots s ON s.job_id=j.job_id JOIN image_generation_attempts a ON a.job_id=s.job_id AND a.slot_id=s.slot_id JOIN image_generation_plans p ON p.job_id=j.job_id WHERE j.job_id=?1 AND s.slot_id=?2 AND a.attempt_number=?3 AND j.version=?4 AND s.version=?5 AND a.version=?6 AND NOT EXISTS(SELECT 1 FROM image_generation_cancellation_facts c WHERE c.job_id=j.job_id)",
@@ -927,6 +969,7 @@ impl Db {
             ensure!(conn.execute("UPDATE image_generation_attempts SET state='prepared',version=version+1 WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND state='preparing' AND version=?4",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version+1)?])?==1,"image generation attempt preparation lost compare-and-set");
             ensure!(conn.execute("UPDATE image_generation_slots SET state='dispatching',version=version+1 WHERE job_id=?1 AND slot_id=?2 AND state='queued' AND version=?3",params![input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.expected_slot_version)?])?==1,"image generation slot dispatch lost compare-and-set");
             ensure!(conn.execute("UPDATE image_generation_jobs SET state='dispatching',version=version+1,updated_at_unix_ms=?1 WHERE job_id=?2 AND state='queued' AND version=?3",params![input.at_unix_ms,input.job_id.to_string(),i64::try_from(input.expected_job_version)?])?==1,"image generation job dispatch lost compare-and-set");
+            ensure!(conn.execute("DELETE FROM image_generation_scheduler_claims WHERE job_id=?1 AND slot_id=?2 AND worker_boot_id=?3 AND claim_generation=?4",params![input.job_id.to_string(),input.slot_id.to_string(),input.worker_boot_id.to_string(),i64::try_from(input.claim_generation)?])?==1,"image generation scheduler claim release lost compare-and-set");
             Ok(PreparedImageGenerationDispatch {
                 job_id: input.job_id,
                 slot_id: input.slot_id,

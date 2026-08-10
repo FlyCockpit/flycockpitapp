@@ -4038,7 +4038,11 @@ mod tests {
         let second_digest = hex_lower(&Sha256::digest(&second));
         {
             let db = Db::open(&path).unwrap();
-            db.blocking_for_sync_cli(|conn| {
+            let queued_first = first.clone();
+            let queued_second = second.clone();
+            let queued_first_digest = first_digest.clone();
+            let queued_second_digest = second_digest.clone();
+            db.blocking_for_sync_cli(move |conn| {
                 let (canonical, digest) =
                     canonical_test_plan(job_id, slot_id, artifact_id, 2, 1, 100);
                 let mut plan = ImageGenerationPlanV1::from_canonical(&canonical, &digest)?;
@@ -4074,14 +4078,14 @@ mod tests {
                     ImageGenerationMediaPlanSnapshot {
                         slot_id,
                         attempt_number: 1,
-                        canonical_bytes: &first,
-                        digest: &first_digest,
+                        canonical_bytes: &queued_first,
+                        digest: &queued_first_digest,
                     },
                     ImageGenerationMediaPlanSnapshot {
                         slot_id,
                         attempt_number: 2,
-                        canonical_bytes: &first,
-                        digest: &first_digest,
+                        canonical_bytes: &queued_first,
+                        digest: &queued_first_digest,
                     },
                 ];
                 assert!(Db::queue_image_generation_job_conn(
@@ -4095,14 +4099,14 @@ mod tests {
                     ImageGenerationMediaPlanSnapshot {
                         slot_id,
                         attempt_number: 1,
-                        canonical_bytes: &first,
-                        digest: &first_digest,
+                        canonical_bytes: &queued_first,
+                        digest: &queued_first_digest,
                     },
                     ImageGenerationMediaPlanSnapshot {
                         slot_id,
                         attempt_number: 2,
-                        canonical_bytes: &second,
-                        digest: &second_digest,
+                        canonical_bytes: &queued_second,
+                        digest: &queued_second_digest,
                     },
                 ];
                 Db::queue_image_generation_job_conn(
@@ -4117,7 +4121,7 @@ mod tests {
         }
         let reopened = Db::open(&path).unwrap();
         reopened
-            .blocking_for_sync_cli(|conn| {
+            .blocking_for_sync_cli(move |conn| {
                 let rows = Db::scan_image_generation_dispatch_candidates_conn(
                     conn,
                     DeadlineObservationV1::new(

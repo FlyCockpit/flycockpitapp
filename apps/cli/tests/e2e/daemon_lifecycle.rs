@@ -27,6 +27,16 @@ async fn typed_client_sends_request_and_receives_event() {
     );
     assert!(status.protocol_version > 0);
 
+    // Every newly connected client receives the daemon's current global
+    // caffeination snapshot before any request-driven broadcasts. Consume
+    // that initial state so the assertion below observes this request's
+    // transition rather than the connection snapshot.
+    let initial = client
+        .next_caffeinate_state(Duration::from_secs(5))
+        .await
+        .expect("initial caffeinate state");
+    assert!(!initial.active);
+
     let response = client
         .set_caffeinate(true)
         .await

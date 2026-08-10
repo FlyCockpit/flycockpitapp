@@ -352,6 +352,79 @@ async fn commit_remote_nonrepeatable(
     }
 }
 
+async fn begin_remote_idempotent_adapter(
+    request: &Request,
+    authorized: &AuthorizedRequestContext,
+    operation: &super::RemoteOperationContext,
+    ctx: &DaemonContext,
+) -> std::result::Result<Option<Response>, ErrorPayload> {
+    let params = request
+        .canonical_remote_operation_params_v1()
+        .map_err(internal)?;
+    let canonical = authorized.encode_fcor(request, &params)?;
+    let request_hash = proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+    let attachment = operation.logical_attachment_id.to_string();
+    let operation_id = operation.operation_id.to_string();
+    let device = operation.authenticated_device_id.to_string();
+    match ctx.db.begin_idempotent_adapter_remote_operation(
+        crate::db::remote_attachment_operations::ReserveRemoteOperation {
+            logical_attachment_id: &attachment,
+            operation_id: &operation_id,
+            authenticated_device_id: &device,
+            authenticated_device_generation: operation.authenticated_device_generation,
+            operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::IdempotentAdapterMutation,
+            request_hash,
+            now_ms: chrono::Utc::now().timestamp_millis(),
+        },
+    ).await.map_err(internal)? {
+        crate::db::remote_attachment_operations::BeginIdempotentAdapterRemoteOperationOutcome::Dispatch { .. } => Ok(None),
+        crate::db::remote_attachment_operations::BeginIdempotentAdapterRemoteOperationOutcome::Replay(bytes) =>
+            serde_json::from_slice(&bytes).map(Some).map_err(internal),
+        crate::db::remote_attachment_operations::BeginIdempotentAdapterRemoteOperationOutcome::OperationConflict
+        | crate::db::remote_attachment_operations::BeginIdempotentAdapterRemoteOperationOutcome::OperationActorConflict =>
+            Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+        crate::db::remote_attachment_operations::BeginIdempotentAdapterRemoteOperationOutcome::AttachmentLedgerCapacity =>
+            Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+    }
+}
+
+async fn commit_remote_idempotent_adapter(
+    operation: &super::RemoteOperationContext,
+    ctx: &DaemonContext,
+    kind: &str,
+    response: Response,
+) -> std::result::Result<Response, ErrorPayload> {
+    let attachment = operation.logical_attachment_id.to_string();
+    let operation_id = operation.operation_id.to_string();
+    let bytes = serde_json::to_vec(&response).map_err(internal)?;
+    let delivery = Uuid::now_v7().to_string();
+    match ctx
+        .db
+        .commit_remote_attachment_operation(
+            crate::db::remote_attachment_operations::CommitRemoteOperation {
+                logical_attachment_id: &attachment,
+                operation_id: &operation_id,
+                safe_response: &bytes,
+                outbox_delivery_id: &delivery,
+                outbox_kind: kind,
+                outbox_payload: &bytes,
+                now_ms: chrono::Utc::now().timestamp_millis(),
+            },
+        )
+        .await
+        .map_err(internal)?
+    {
+        crate::db::remote_attachment_operations::CommitRemoteOperationOutcome::Committed {
+            ..
+        } => Ok(response),
+        _ => Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message: "remote adapter result could not be committed; reconciliation is required"
+                .into(),
+        }),
+    }
+}
+
 pub(super) async fn handle_serialized_request_with_remote_operation(
     request: Request,
     state: &mut MutableClientState,
@@ -2140,6 +2213,31 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             content,
             base_hash,
         } => {
+            if let Some(operation) = remote_operation {
+                let request = Request::FsWrite {
+                    project_root: project_root.clone(),
+                    path: path.clone(),
+                    content: content.clone(),
+                    base_hash: base_hash.clone(),
+                };
+                if let Some(response) =
+                    begin_remote_idempotent_adapter(&request, &authorized_request, operation, ctx)
+                        .await?
+                {
+                    return Ok(response);
+                }
+                let response = crate::daemon::fs_api::fs_write_staged_remote(
+                    ctx.clone(),
+                    project_root,
+                    path,
+                    content,
+                    base_hash,
+                    operation.operation_id.to_string(),
+                )
+                .await?;
+                return commit_remote_idempotent_adapter(operation, ctx, "fs_write", response)
+                    .await;
+            }
             crate::daemon::fs_api::fs_write(ctx.clone(), project_root, path, content, base_hash)
                 .await
         }

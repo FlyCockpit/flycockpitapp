@@ -118,6 +118,18 @@ pub enum BeginNonrepeatableRemoteOperationOutcome {
     AttachmentLedgerCapacity,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BeginIdempotentAdapterRemoteOperationOutcome {
+    Dispatch {
+        operation_seq: u64,
+        dispatch_generation: u64,
+    },
+    Replay(Vec<u8>),
+    OperationConflict,
+    OperationActorConflict,
+    AttachmentLedgerCapacity,
+}
+
 pub struct TransactionalRemoteMutation<T> {
     pub value: T,
     pub safe_response: Vec<u8>,
@@ -138,6 +150,82 @@ pub struct RemoteOutboxDeliveryLease {
 }
 
 impl Db {
+    /// Reserves an adapter effect before dispatch. A process restart may claim
+    /// the same immutable request again with a higher dispatch generation;
+    /// the adapter's durable evidence decides whether to finish or reconcile.
+    pub async fn begin_idempotent_adapter_remote_operation(
+        &self,
+        request: ReserveRemoteOperation<'_>,
+    ) -> Result<BeginIdempotentAdapterRemoteOperationOutcome> {
+        ensure!(
+            request.operation_class == RemoteOperationClass::IdempotentAdapterMutation,
+            "adapter dispatcher requires idempotent_adapter_mutation class"
+        );
+        let owned = OwnedReserveRemoteOperation {
+            logical_attachment_id: request.logical_attachment_id.to_owned(),
+            operation_id: request.operation_id.to_owned(),
+            authenticated_device_id: request.authenticated_device_id.to_owned(),
+            authenticated_device_generation: request.authenticated_device_generation,
+            operation_class: request.operation_class,
+            request_hash: request.request_hash,
+            now_ms: request.now_ms,
+        };
+        self.transaction(move |conn| match reserve_conn(conn, &owned)? {
+            ReserveRemoteOperationOutcome::Reserved(reservation) => {
+                conn.execute(
+                    "UPDATE remote_attachment_operations
+                     SET state='dispatched', dispatch_generation=1, updated_at_ms=?3
+                     WHERE logical_attachment_id=?1 AND operation_id=?2 AND state='reserved'",
+                    params![
+                        owned.logical_attachment_id,
+                        owned.operation_id,
+                        owned.now_ms
+                    ],
+                )?;
+                Ok(BeginIdempotentAdapterRemoteOperationOutcome::Dispatch {
+                    operation_seq: reservation.operation_seq,
+                    dispatch_generation: 1,
+                })
+            }
+            ReserveRemoteOperationOutcome::Replay(replay) if replay.state == "committed" => {
+                Ok(BeginIdempotentAdapterRemoteOperationOutcome::Replay(
+                    replay
+                        .safe_response
+                        .context("committed operation missing safe response")?,
+                ))
+            }
+            ReserveRemoteOperationOutcome::Replay(replay) if replay.state == "dispatched" => {
+                let generation: i64 = conn.query_row(
+                    "UPDATE remote_attachment_operations
+                     SET dispatch_generation=dispatch_generation+1, updated_at_ms=?3
+                     WHERE logical_attachment_id=?1 AND operation_id=?2 AND state='dispatched'
+                     RETURNING dispatch_generation",
+                    params![
+                        owned.logical_attachment_id,
+                        owned.operation_id,
+                        owned.now_ms
+                    ],
+                    |row| row.get(0),
+                )?;
+                Ok(BeginIdempotentAdapterRemoteOperationOutcome::Dispatch {
+                    operation_seq: replay.operation_seq,
+                    dispatch_generation: generation.try_into()?,
+                })
+            }
+            ReserveRemoteOperationOutcome::Replay(_) => bail!("invalid adapter replay state"),
+            ReserveRemoteOperationOutcome::OperationConflict => {
+                Ok(BeginIdempotentAdapterRemoteOperationOutcome::OperationConflict)
+            }
+            ReserveRemoteOperationOutcome::OperationActorConflict => {
+                Ok(BeginIdempotentAdapterRemoteOperationOutcome::OperationActorConflict)
+            }
+            ReserveRemoteOperationOutcome::AttachmentLedgerCapacity => {
+                Ok(BeginIdempotentAdapterRemoteOperationOutcome::AttachmentLedgerCapacity)
+            }
+        })
+        .await
+    }
+
     /// Reserve and durably mark a nonrepeatable operation dispatched in one
     /// writer transaction. The caller may perform the external/in-memory
     /// effect only after receiving `Dispatch`.
@@ -1861,6 +1949,51 @@ mod tests {
             BeginNonrepeatableRemoteOperationOutcome::OutcomeUnknown(
                 br#"{"outcome":"unknown"}"#.to_vec()
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn adapter_dispatch_generation_advances_for_reconciliation_then_replays_commit() {
+        let db = Db::open_in_memory().unwrap();
+        let operation = "01890f3e-4c00-7000-8000-00000000009d";
+        let request = || ReserveRemoteOperation {
+            operation_class: RemoteOperationClass::IdempotentAdapterMutation,
+            ..reserve(operation, [11; 32])
+        };
+        assert!(matches!(
+            db.begin_idempotent_adapter_remote_operation(request())
+                .await
+                .unwrap(),
+            BeginIdempotentAdapterRemoteOperationOutcome::Dispatch {
+                dispatch_generation: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            db.begin_idempotent_adapter_remote_operation(request())
+                .await
+                .unwrap(),
+            BeginIdempotentAdapterRemoteOperationOutcome::Dispatch {
+                dispatch_generation: 2,
+                ..
+            }
+        ));
+        db.commit_remote_attachment_operation(CommitRemoteOperation {
+            logical_attachment_id: ATTACHMENT,
+            operation_id: operation,
+            safe_response: b"adapter-safe",
+            outbox_delivery_id: "00000000-0000-4000-8000-00000000009e",
+            outbox_kind: "adapter_test",
+            outbox_payload: b"adapter-event",
+            now_ms: 12,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            db.begin_idempotent_adapter_remote_operation(request())
+                .await
+                .unwrap(),
+            BeginIdempotentAdapterRemoteOperationOutcome::Replay(b"adapter-safe".to_vec())
         );
     }
 

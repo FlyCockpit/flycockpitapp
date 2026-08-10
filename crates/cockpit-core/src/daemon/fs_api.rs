@@ -240,6 +240,85 @@ pub async fn fs_write(
     .await
 }
 
+pub async fn fs_write_staged_remote(
+    ctx: Arc<DaemonContext>,
+    project_root: String,
+    path: String,
+    content: String,
+    base_hash: Option<String>,
+    operation_id: String,
+) -> Result<Response, ErrorPayload> {
+    join_fs_handler(
+        "fs_write",
+        tokio::task::spawn_blocking(move || {
+            fs_write_staged_sync(
+                &ctx,
+                &project_root,
+                &path,
+                &content,
+                base_hash,
+                &operation_id,
+            )
+        }),
+    )
+    .await
+}
+
+pub(crate) fn fs_write_staged_sync(
+    ctx: &DaemonContext,
+    project_root: &str,
+    path: &str,
+    content: &str,
+    base_hash: Option<String>,
+    operation_id: &str,
+) -> Result<Response, ErrorPayload> {
+    use std::io::Write as _;
+
+    let root = canonical_project_root(project_root)?;
+    let target = resolve_for_write(&root, path)?;
+    let locks = ctx.registry.locks();
+    let _guard = locks
+        .acquire_transient(&target, REMOTE_FILE_AGENT)
+        .map_err(lock_conflict)?;
+    let desired_hash = content_hash(content.as_bytes());
+    let current = match std::fs::read(&target) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => return Err(internal(err)),
+    };
+    let current_hash = content_hash(&current);
+    if current_hash == desired_hash {
+        return Ok(Response::FsWrite { hash: desired_hash });
+    }
+    if let Some(expected) = base_hash.as_deref()
+        && expected != current_hash
+    {
+        return Err(ErrorPayload {
+            code: ErrorCode::HashMismatch,
+            message: format!("file changed before write; current hash is {current_hash}"),
+        });
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| bad_request("write target has no parent"))?;
+    std::fs::create_dir_all(parent).map_err(internal)?;
+    let stage = parent.join(format!(".flycockpit-stage-{operation_id}"));
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&stage)
+        .map_err(internal)?;
+    file.write_all(content.as_bytes()).map_err(internal)?;
+    file.sync_all().map_err(internal)?;
+    drop(file);
+    std::fs::rename(&stage, &target).map_err(internal)?;
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(internal)?;
+    Ok(Response::FsWrite { hash: desired_hash })
+}
+
 pub(crate) fn fs_write_sync(
     ctx: &DaemonContext,
     project_root: &str,
@@ -830,6 +909,53 @@ mod tests {
             )
             .unwrap(),
             root.canonicalize().unwrap().join("missing.txt")
+        );
+    }
+
+    #[test]
+    fn staged_write_reconciles_rename_before_ledger_commit_without_rewriting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        std::fs::create_dir_all(&root).unwrap();
+        let ctx = test_ctx(&root);
+        let root_text = root.to_str().unwrap();
+        let operation = "01890f3e-4c00-7000-8000-00000000009f";
+        let first = fs_write_staged_sync(
+            &ctx,
+            root_text,
+            "nested/value.txt",
+            "durable value",
+            None,
+            operation,
+        )
+        .unwrap();
+        let modified = std::fs::metadata(root.join("nested/value.txt"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let reconciled = fs_write_staged_sync(
+            &ctx,
+            root_text,
+            "nested/value.txt",
+            "durable value",
+            Some(content_hash(b"different base")),
+            operation,
+        )
+        .unwrap();
+        assert_eq!(first, reconciled);
+        assert_eq!(
+            std::fs::metadata(root.join("nested/value.txt"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            modified,
+            "reconciliation observes the desired target and does not rewrite"
+        );
+        assert!(
+            !root
+                .join("nested")
+                .join(format!(".flycockpit-stage-{operation}"))
+                .exists()
         );
     }
 

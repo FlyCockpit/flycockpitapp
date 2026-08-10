@@ -360,6 +360,18 @@ mod tests {
         db.save_image_spend_policy("project".into(), finite(100), None, 0)
             .await
             .unwrap();
+        db.reserve_image_spend(
+            "race-seed".into(),
+            keys("race-seed"),
+            vec![AttemptMaximum {
+                attempt_id: "seed".into(),
+                usd_micros: Some(1),
+            }],
+            1,
+            0,
+        )
+        .await
+        .unwrap();
         let first = db.reserve_image_spend(
             "race-a".into(),
             keys("race-a"),
@@ -699,7 +711,7 @@ mod tests {
             time_zone: "America/Chicago".into(),
         };
         let epoch = valid.resolve_epoch(1_775_000_000_000).unwrap();
-        assert_eq!(epoch.membership_key, "2026-04@America/Chicago");
+        assert_eq!(epoch.membership_key, "2026-03@America/Chicago");
 
         let before_dst = valid.resolve_epoch(1_772_330_400_000).unwrap();
         let after_dst = valid.resolve_epoch(1_773_885_600_000).unwrap();

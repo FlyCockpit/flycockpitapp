@@ -2505,6 +2505,14 @@ fn valid_path_component(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    struct SchedulerClock;
+    impl crate::media_reservation::MonotonicClock for SchedulerClock {
+        fn now_ms(&self) -> u64 {
+            100
+        }
+    }
 
     #[tokio::test]
     async fn deterministic_adapter_records_one_closed_handoff() {
@@ -2526,6 +2534,157 @@ mod tests {
             ImageGenerationHandoffResult::Accepted { .. }
         ));
         assert_eq!(adapter.requests(), vec![request]);
+    }
+
+    #[tokio::test]
+    async fn scheduler_dispatches_one_real_ledger_job_once() {
+        use crate::media_reservation::{
+            MediaOwner, MediaReservationLedger, ReservationState, ReserveRequest,
+        };
+        use cockpit_config::config::media_budget::{
+            MediaDimension, MediaEvaluationRequest, MediaResourcePolicy,
+        };
+        use cockpit_db::db::image_generation::{
+            CreateImageGenerationAttempt, CreateImageGenerationJob, CreateImageGenerationSlot,
+            ImageGenerationMediaPlanSnapshot,
+        };
+        use cockpit_db::image_spend::{
+            AttemptMaximum, BudgetPolicy, ImageSpendSettings, ProjectEpochPolicy, SpendScopeKeys,
+        };
+        let db = cockpit_db::Db::open_in_memory().unwrap();
+        let sealed = plan();
+        let canonical = sealed.canonical_bytes().unwrap();
+        let plan_digest = sealed.digest().unwrap();
+        let policy = MediaResourcePolicy::default();
+        let evaluated = |dimension, requested| {
+            policy
+                .evaluate(MediaEvaluationRequest {
+                    dimension,
+                    requested: Some(requested),
+                    current_scope: 0,
+                    profile: None,
+                    adapter_limit: None,
+                    request_limit: None,
+                })
+                .unwrap()
+        };
+        let deadline = evaluated(MediaDimension::OperationDeadlineSeconds, 1);
+        let queued_global = evaluated(MediaDimension::QueuedOperationsGlobal, 1);
+        let queued_session = evaluated(MediaDimension::QueuedOperationsPerSession, 1);
+        let local = evaluated(MediaDimension::LocalCpuJobsGlobal, 1);
+        let handoff = evaluated(MediaDimension::OutboundSubmissionsGlobal, 1);
+        let ledger = MediaReservationLedger::new(db.clone(), Arc::new(SchedulerClock));
+        let receipt = ledger
+            .reserve(ReserveRequest {
+                reservation_id: sealed.central_resources[0].reservation_identity.clone(),
+                recovery_id: "scheduler-recovery".into(),
+                owner: MediaOwner {
+                    project_id: "fixture-project".into(),
+                    session_id: sealed.owner_session_id.to_string(),
+                },
+                operation: "image_generation".into(),
+                purpose: "scheduler_fixture".into(),
+                plans: vec![deadline, queued_global, queued_session, local.clone()],
+                wall_ms: 1,
+            })
+            .await
+            .unwrap();
+        ledger
+            .mark_execution_ready(&receipt.reservation_id, 2)
+            .await
+            .unwrap();
+        let executing = ledger
+            .claim_ready_fair(&receipt.reservation_id, local, 3)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(executing.state, ReservationState::ExecutingLocal);
+        db.save_image_spend_policy(
+            "fixture-project".into(),
+            ImageSpendSettings {
+                request: BudgetPolicy::Finite { usd_micros: 100 },
+                session: BudgetPolicy::Finite { usd_micros: 100 },
+                project: BudgetPolicy::Finite { usd_micros: 100 },
+                project_epoch: Some(ProjectEpochPolicy::CalendarMonth {
+                    time_zone: "UTC".into(),
+                }),
+            },
+            None,
+            1,
+        )
+        .await
+        .unwrap();
+        db.reserve_image_spend(
+            sealed.spend.reservation_id.clone(),
+            SpendScopeKeys {
+                plan_digest: plan_digest.clone(),
+                session_id: sealed.owner_session_id.to_string(),
+                project_key: "fixture-project".into(),
+            },
+            vec![AttemptMaximum {
+                attempt_id: "idem:1".into(),
+                usd_micros: Some(10),
+            }],
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+        db.transaction(move |conn| {
+            let verified = CreateImageGenerationJob::from_verified_canonical_plan(
+                &canonical,
+                &plan_digest,
+                1,
+            )?;
+            let slot = &sealed.targets[0].slots[0];
+            cockpit_db::Db::create_image_generation_graph_conn(
+                conn,
+                &verified,
+                &[CreateImageGenerationSlot {
+                    slot_id: slot.slot_id,
+                    slot_index: 0,
+                    sample_index: 0,
+                    managed_artifact_id: slot.managed_artifact_id,
+                    attempts: vec![CreateImageGenerationAttempt {
+                        attempt_number: 1,
+                        provider_request_identity: "request:1".into(),
+                        provider_idempotency_identity: "idem:1".into(),
+                    }],
+                }],
+            )?;
+            let authority =
+                cockpit_db::Db::image_generation_queue_authority_conn(conn, sealed.job_id)?;
+            let (bytes, digest) = canonical_media_plan_snapshot(&handoff)?;
+            cockpit_db::Db::queue_image_generation_job_conn(
+                conn,
+                authority,
+                &ImageGenerationMediaPlanSnapshot {
+                    canonical_bytes: &bytes,
+                    digest: &digest,
+                },
+                1,
+            )
+        })
+        .await
+        .unwrap();
+        let dispatcher = ImageGenerationDispatcher::new(db.clone());
+        let adapter = DeterministicImageGenerationAdapter::new(vec![
+            ImageGenerationHandoffResult::Accepted {
+                evidence: b"accepted".to_vec(),
+            },
+        ]);
+        let first = dispatcher
+            .run_scheduler_pass(&adapter, Uuid::now_v7(), 100, 2, 2, 8)
+            .await
+            .unwrap();
+        assert_eq!(first.dispatched, 1);
+        assert_eq!(adapter.requests().len(), 1);
+        let second = dispatcher
+            .run_scheduler_pass(&adapter, Uuid::now_v7(), 100, 3, 3, 8)
+            .await
+            .unwrap();
+        assert_eq!(second.dispatched, 0);
+        assert_eq!(adapter.requests().len(), 1);
     }
 
     #[test]

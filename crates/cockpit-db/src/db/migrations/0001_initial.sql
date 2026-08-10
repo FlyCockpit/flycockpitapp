@@ -3799,7 +3799,19 @@ INSERT INTO image_generation_attempt_transitions VALUES
 ('response_adopted','succeeded'),('response_adopted','completed_after_cancel'),('response_adopted','failed_after_acceptance');
 
 CREATE TRIGGER image_generation_job_transition_guard BEFORE UPDATE OF state,version ON image_generation_jobs
-WHEN NEW.version != OLD.version+1 OR NOT EXISTS(SELECT 1 FROM image_generation_job_transitions WHERE from_state=OLD.state AND to_state=NEW.state)
+WHEN NEW.version != OLD.version+1 OR (
+ NOT EXISTS(SELECT 1 FROM image_generation_job_transitions WHERE from_state=OLD.state AND to_state=NEW.state)
+ AND NOT (
+   OLD.terminal_event_version IS NULL
+   AND NEW.terminal_event_version=NEW.version
+   AND EXISTS(
+     SELECT 1 FROM image_generation_terminal_events e
+     WHERE e.job_id=OLD.job_id
+       AND e.job_version=NEW.version
+       AND e.terminal_state=NEW.state
+   )
+ )
+)
 BEGIN SELECT RAISE(ABORT,'forbidden image generation job transition'); END;
 CREATE TRIGGER image_generation_slot_transition_guard BEFORE UPDATE OF state,version ON image_generation_slots
 WHEN NEW.version != OLD.version+1 OR (

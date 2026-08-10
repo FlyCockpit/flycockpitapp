@@ -1322,6 +1322,7 @@ fn hex_lower(bytes: &[u8]) -> String {
     output
 }
 
+#[cfg(any())]
 fn json_has_unquoted_whitespace(bytes: &[u8]) -> bool {
     let mut quoted = false;
     let mut escaped = false;
@@ -1343,6 +1344,7 @@ fn json_has_unquoted_whitespace(bytes: &[u8]) -> bool {
     quoted || escaped
 }
 
+#[cfg(any())]
 fn json_keys_are_ordered(bytes: &[u8], keys: &[&str]) -> bool {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return false;
@@ -1360,6 +1362,7 @@ fn json_keys_are_ordered(bytes: &[u8], keys: &[&str]) -> bool {
     true
 }
 
+#[cfg(any())]
 fn reject_duplicate_json_keys(bytes: &[u8]) -> Result<()> {
     struct Checked;
     impl<'de> serde::Deserialize<'de> for Checked {

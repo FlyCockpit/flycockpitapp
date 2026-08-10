@@ -4,8 +4,8 @@
 //! safe response bytes. Canonical request bytes, credentials, grants, and
 //! transport metadata have no representation here.
 
-use anyhow::{bail, ensure, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use anyhow::{Context, Result, bail, ensure};
+use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::db::Db;
@@ -235,6 +235,19 @@ pub struct RemoteOutboxDeliveryLease {
 }
 
 impl Db {
+    pub async fn remote_rename_evidence(
+        &self,
+        logical_attachment_id: &str,
+        operation_id: &str,
+    ) -> Result<RemoteRenameEvidence> {
+        validate_uuid("logical attachment id", logical_attachment_id)?;
+        validate_operation_id(operation_id)?;
+        let attachment = logical_attachment_id.to_owned();
+        let operation = operation_id.to_owned();
+        self.read(move |conn| load_remote_rename_evidence(conn, &attachment, &operation))
+            .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn prepare_remote_rename_operation(
         &self,
@@ -361,6 +374,39 @@ impl Db {
                 params![attachment, operation, generation, response, now_ms],
             )?;
             ensure!(operation_changed == 1, "rename mismatch lost operation generation authority");
+            Ok(true)
+        }).await
+    }
+
+    pub async fn record_remote_rename_effect_unknown(
+        &self,
+        logical_attachment_id: &str,
+        operation_id: &str,
+        dispatch_generation: u64,
+        safe_response: &[u8],
+        now_ms: i64,
+    ) -> Result<bool> {
+        validate_uuid("logical attachment id", logical_attachment_id)?;
+        validate_operation_id(operation_id)?;
+        ensure!(
+            !safe_response.is_empty() && safe_response.len() <= MAX_SAFE_RESPONSE_BYTES,
+            "rename unknown response must be bounded and nonempty"
+        );
+        let attachment = logical_attachment_id.to_owned();
+        let operation = operation_id.to_owned();
+        let generation = i64::try_from(dispatch_generation)?;
+        let response = safe_response.to_vec();
+        self.transaction(move |conn| {
+            let journal = conn.execute(
+                "UPDATE remote_rename_journal SET state='effect_unknown',updated_at_ms=?4 WHERE logical_attachment_id=?1 AND operation_id=?2 AND dispatch_generation=?3 AND state IN ('artifact_synced','renamed','source_parent_synced','target_parent_synced')",
+                params![attachment, operation, generation, now_ms],
+            )?;
+            ensure!(journal == 1, "rename unknown requires artifact-synced expected generation");
+            let operation_changed = conn.execute(
+                "UPDATE remote_attachment_operations SET state='outcome_unknown',safe_response=?4,updated_at_ms=?5 WHERE logical_attachment_id=?1 AND operation_id=?2 AND dispatch_generation=?3 AND operation_kind='staged_rename' AND state='dispatched'",
+                params![attachment, operation, generation, response, now_ms],
+            )?;
+            ensure!(operation_changed == 1, "rename unknown lost operation generation authority");
             Ok(true)
         }).await
     }
@@ -1389,8 +1435,8 @@ mod tests {
         let mut failed = request();
         failed.operation_id = failed_operation;
         failed.request_hash = [7; 32];
-        assert!(db
-            .execute_transactional_remote_operation::<(), _>(failed, |conn| {
+        assert!(
+            db.execute_transactional_remote_operation::<(), _>(failed, |conn| {
                 conn.execute(
                     "INSERT INTO app_flags(key,seen_at) VALUES ('rollback-test',1)",
                     [],
@@ -1398,7 +1444,8 @@ mod tests {
                 anyhow::bail!("injected crash")
             })
             .await
-            .is_err());
+            .is_err()
+        );
         assert_eq!(
             db.read(|conn| Db::app_flag_version_conn(conn, "rollback-test"))
                 .await
@@ -1425,14 +1472,15 @@ mod tests {
         let mut wrong_class = request();
         wrong_class.operation_id = "01890f3e-4c00-7000-8000-000000000097";
         wrong_class.operation_class = RemoteOperationClass::IdempotentAdapterMutation;
-        assert!(db
-            .execute_transactional_remote_operation::<(), _>(wrong_class, |_| {
+        assert!(
+            db.execute_transactional_remote_operation::<(), _>(wrong_class, |_| {
                 panic!("wrong-class operation must not execute domain closure")
             })
             .await
             .unwrap_err()
             .to_string()
-            .contains("requires transactional_mutation class"));
+            .contains("requires transactional_mutation class")
+        );
     }
 
     #[tokio::test]
@@ -1471,11 +1519,13 @@ mod tests {
         // Simulate process loss after commit and before the in-memory WakeGoal.
         drop(db);
         let reopened = Db::open(&path).unwrap();
-        assert!(reopened
-            .current_session_goal(session_id, false)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            reopened
+                .current_session_goal(session_id, false)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let replay = reopened
             .execute_transactional_remote_operation(request(), |_| {
                 panic!("reopen replay must not repeat goal transition")
@@ -1615,24 +1665,27 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let mut invalid = reserve("01890f3e-4c00-7000-8000-000000000009", [1; 32]);
         invalid.authenticated_device_generation = 0;
-        assert!(db
-            .reserve_remote_attachment_operation(invalid)
-            .await
-            .is_err());
+        assert!(
+            db.reserve_remote_attachment_operation(invalid)
+                .await
+                .is_err()
+        );
         let invalid = ReserveRemoteOperation {
             operation_id: "00000000000040008000000000000009",
             ..reserve("01890f3e-4c00-7000-8000-000000000009", [1; 32])
         };
-        assert!(db
-            .reserve_remote_attachment_operation(invalid)
-            .await
-            .is_err());
+        assert!(
+            db.reserve_remote_attachment_operation(invalid)
+                .await
+                .is_err()
+        );
         let mut overflow = reserve("01890f3e-4c00-7000-8000-000000000009", [1; 32]);
         overflow.authenticated_device_generation = u64::MAX;
-        assert!(db
-            .reserve_remote_attachment_operation(overflow)
-            .await
-            .is_err());
+        assert!(
+            db.reserve_remote_attachment_operation(overflow)
+                .await
+                .is_err()
+        );
     }
 
     #[test]
@@ -1686,23 +1739,26 @@ mod tests {
             .unwrap();
         conn.execute("INSERT INTO ops VALUES ('a', NULL)", [])
             .unwrap();
-        assert!(conn
-            .execute("INSERT INTO ops VALUES ('a', NULL)", [])
-            .is_err());
+        assert!(
+            conn.execute("INSERT INTO ops VALUES ('a', NULL)", [])
+                .is_err()
+        );
         conn.execute("UPDATE ops SET response = zeroblob(4) WHERE rowid = 1", [])
             .unwrap();
         conn.execute("UPDATE ops SET response = zeroblob(4) WHERE rowid = 2", [])
             .unwrap();
-        assert!(conn
-            .execute("UPDATE ops SET response = zeroblob(5) WHERE rowid = 2", [])
-            .is_err());
+        assert!(
+            conn.execute("UPDATE ops SET response = zeroblob(5) WHERE rowid = 2", [])
+                .is_err()
+        );
         conn.execute("INSERT INTO events VALUES ('a', zeroblob(4))", [])
             .unwrap();
         conn.execute("INSERT INTO events VALUES ('a', zeroblob(4))", [])
             .unwrap();
-        assert!(conn
-            .execute("INSERT INTO events VALUES ('a', zeroblob(1))", [])
-            .is_err());
+        assert!(
+            conn.execute("INSERT INTO events VALUES ('a', zeroblob(1))", [])
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1713,8 +1769,8 @@ mod tests {
             .await
             .unwrap();
         let oversized = vec![0_u8; MAX_SAFE_RESPONSE_BYTES + 1];
-        assert!(db
-            .commit_remote_attachment_operation(CommitRemoteOperation {
+        assert!(
+            db.commit_remote_attachment_operation(CommitRemoteOperation {
                 logical_attachment_id: ATTACHMENT,
                 operation_id: operation,
                 safe_response: &oversized,
@@ -1724,9 +1780,10 @@ mod tests {
                 now_ms: 2,
             })
             .await
-            .is_err());
-        assert!(db
-            .commit_remote_attachment_operation(CommitRemoteOperation {
+            .is_err()
+        );
+        assert!(
+            db.commit_remote_attachment_operation(CommitRemoteOperation {
                 logical_attachment_id: ATTACHMENT,
                 operation_id: operation,
                 safe_response: b"safe",
@@ -1736,7 +1793,8 @@ mod tests {
                 now_ms: 2,
             })
             .await
-            .is_err());
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1778,8 +1836,8 @@ mod tests {
             let db = Db::open_in_memory().unwrap();
             let attachment = attachment.to_owned();
             let device = device.to_owned();
-            assert!(db
-                .write(move |conn| {
+            assert!(
+                db.write(move |conn| {
                     conn.execute(
                         "INSERT INTO remote_attachment_operations
                          (logical_attachment_id, operation_id, authenticated_device_id,
@@ -1792,7 +1850,8 @@ mod tests {
                     Ok(())
                 })
                 .await
-                .is_err());
+                .is_err()
+            );
         }
     }
 
@@ -1953,20 +2012,22 @@ mod tests {
                 );
                 assert!(conn.execute(&sql, params![attachment, operation]).is_err());
             }
-            assert!(conn
-                .execute(
+            assert!(
+                conn.execute(
                     "UPDATE remote_attachment_outbox SET kind = 'changed'
                  WHERE logical_attachment_id = ?1 AND event_seq = 1",
                     [&attachment],
                 )
-                .is_err());
-            assert!(conn
-                .execute(
+                .is_err()
+            );
+            assert!(
+                conn.execute(
                     "DELETE FROM remote_attachment_outbox
                  WHERE logical_attachment_id = ?1 AND event_seq = 1",
                     [&attachment],
                 )
-                .is_err());
+                .is_err()
+            );
             Ok(())
         })
         .await
@@ -2128,11 +2189,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(first.attempts, 1);
-        assert!(db
-            .claim_remote_outbox_delivery("worker", "wake_goal", None, None, 119, 100)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            db.claim_remote_outbox_delivery("worker", "wake_goal", None, None, 119, 100)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let second = db
             .claim_remote_outbox_delivery("worker", "wake_goal", None, None, 120, 100)
             .await
@@ -2141,19 +2203,22 @@ mod tests {
         assert_eq!(second.delivery_id, first.delivery_id);
         assert_eq!(second.attempts, 2);
         assert_ne!(second.lease_id, first.lease_id);
-        assert!(!db
-            .ack_remote_outbox_delivery(ATTACHMENT, delivery, "worker", &first.lease_id, 121)
-            .await
-            .unwrap());
-        assert!(db
-            .ack_remote_outbox_delivery(ATTACHMENT, delivery, "worker", &second.lease_id, 121)
-            .await
-            .unwrap());
-        assert!(db
-            .claim_remote_outbox_delivery("worker", "wake_goal", None, None, 500, 100)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            !db.ack_remote_outbox_delivery(ATTACHMENT, delivery, "worker", &first.lease_id, 121)
+                .await
+                .unwrap()
+        );
+        assert!(
+            db.ack_remote_outbox_delivery(ATTACHMENT, delivery, "worker", &second.lease_id, 121)
+                .await
+                .unwrap()
+        );
+        assert!(
+            db.claim_remote_outbox_delivery("worker", "wake_goal", None, None, 500, 100)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let transport = db
             .claim_remote_outbox_delivery("transport", "wake_goal", None, None, 500, 100)
             .await
@@ -2187,11 +2252,12 @@ mod tests {
             )?;
             Ok(())
         }).await.unwrap();
-        assert!(db
-            .claim_remote_outbox_delivery("transport", "wake_goal", None, None, 700, 100)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            db.claim_remote_outbox_delivery("transport", "wake_goal", None, None, 700, 100)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -2236,11 +2302,12 @@ mod tests {
         }
         {
             let db = Db::open(&path).unwrap();
-            assert!(db
-                .claim_remote_outbox_delivery("worker", "restart_effect", None, None, 109, 100)
-                .await
-                .unwrap()
-                .is_none());
+            assert!(
+                db.claim_remote_outbox_delivery("worker", "restart_effect", None, None, 109, 100)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
             let lease = db
                 .claim_remote_outbox_delivery("worker", "restart_effect", None, None, 110, 100)
                 .await
@@ -2295,15 +2362,16 @@ mod tests {
                 .unwrap(),
             BeginNonrepeatableRemoteOperationOutcome::OutcomeUnknown(_)
         ));
-        assert!(db
-            .mark_nonrepeatable_remote_operation_outcome_unknown(
+        assert!(
+            db.mark_nonrepeatable_remote_operation_outcome_unknown(
                 request().logical_attachment_id,
                 request().operation_id,
                 br#"{"outcome":"unknown"}"#,
                 2,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
         assert_eq!(
             db.begin_nonrepeatable_remote_operation(request())
                 .await
@@ -2384,8 +2452,8 @@ mod tests {
                 panic!("prepared")
             };
             artifact = evidence.artifact_id;
-            assert!(db
-                .advance_remote_rename_operation(
+            assert!(
+                db.advance_remote_rename_operation(
                     ATTACHMENT,
                     operation,
                     1,
@@ -2394,7 +2462,8 @@ mod tests {
                     11
                 )
                 .await
-                .unwrap());
+                .unwrap()
+            );
         }
         let db = Db::open(&path).unwrap();
         let PrepareRemoteRenameOutcome::Reconcile(evidence) = db
@@ -2420,8 +2489,8 @@ mod tests {
             .unwrap(),
             "late generation cannot advance a barrier"
         );
-        assert!(db
-            .advance_remote_rename_operation(
+        assert!(
+            db.advance_remote_rename_operation(
                 ATTACHMENT,
                 operation,
                 2,
@@ -2430,7 +2499,8 @@ mod tests {
                 12
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
         let commit = || CommitRemoteOperation {
             logical_attachment_id: ATTACHMENT,
             operation_id: operation,
@@ -2440,14 +2510,16 @@ mod tests {
             outbox_payload: b"rename",
             now_ms: 20,
         };
-        assert!(db
-            .commit_remote_rename_operation(commit(), 2)
-            .await
-            .is_err());
-        assert!(db
-            .commit_remote_attachment_operation(commit())
-            .await
-            .is_err());
+        assert!(
+            db.commit_remote_rename_operation(commit(), 2)
+                .await
+                .is_err()
+        );
+        assert!(
+            db.commit_remote_attachment_operation(commit())
+                .await
+                .is_err()
+        );
         let (state, outbox): (String, i64) = db
             .transaction(move |conn| {
                 Ok((
@@ -2472,15 +2544,17 @@ mod tests {
             ("source_parent_synced", "target_parent_synced"),
             ("target_parent_synced", "applied"),
         ] {
-            assert!(db
-                .advance_remote_rename_operation(ATTACHMENT, operation, 2, from, to, 21)
-                .await
-                .unwrap());
+            assert!(
+                db.advance_remote_rename_operation(ATTACHMENT, operation, 2, from, to, 21)
+                    .await
+                    .unwrap()
+            );
         }
-        assert!(db
-            .commit_remote_rename_operation(commit(), 1)
-            .await
-            .is_err());
+        assert!(
+            db.commit_remote_rename_operation(commit(), 1)
+                .await
+                .is_err()
+        );
         assert!(matches!(
             db.commit_remote_rename_operation(commit(), 2)
                 .await
@@ -2508,10 +2582,11 @@ mod tests {
             .unwrap();
         assert_eq!(journal_state, "ledger_committed");
         assert_eq!(outbox_count, 1);
-        assert!(db
-            .commit_remote_rename_operation(commit(), 2)
-            .await
-            .is_err());
+        assert!(
+            db.commit_remote_rename_operation(commit(), 2)
+                .await
+                .is_err()
+        );
         let outbox_after_second: i64 = db
             .transaction(move |conn| {
                 Ok(conn.query_row(
@@ -2559,24 +2634,26 @@ mod tests {
             operation_class: RemoteOperationClass::IdempotentAdapterMutation,
             ..reserve(operation, [16; 32])
         };
-        assert!(db
-            .prepare_remote_rename_operation(
+        assert!(
+            db.prepare_remote_rename_operation(
                 request(),
                 Some(filesystem_identity(1, 1)),
                 Some(filesystem_identity(2, 1)),
                 Some(filesystem_identity(3, 2)),
             )
             .await
-            .is_err());
-        assert!(db
-            .prepare_remote_rename_operation(
+            .is_err()
+        );
+        assert!(
+            db.prepare_remote_rename_operation(
                 request(),
                 Some(filesystem_identity(1, 1)),
                 Some(filesystem_identity(2, 2)),
                 Some(filesystem_identity(3, 1)),
             )
             .await
-            .is_err());
+            .is_err()
+        );
         let PrepareRemoteRenameOutcome::Prepared(_) = db
             .prepare_remote_rename_operation(
                 request(),
@@ -2598,8 +2675,8 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(db
-            .commit_remote_attachment_operation(CommitRemoteOperation {
+        assert!(
+            db.commit_remote_attachment_operation(CommitRemoteOperation {
                 logical_attachment_id: ATTACHMENT,
                 operation_id: operation,
                 safe_response: b"forbidden",
@@ -2609,7 +2686,8 @@ mod tests {
                 now_ms: 30,
             })
             .await
-            .is_err());
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -2637,8 +2715,8 @@ mod tests {
             )?;
             Ok(())
         }).await.unwrap();
-        assert!(db
-            .commit_remote_rename_operation(
+        assert!(
+            db.commit_remote_rename_operation(
                 CommitRemoteOperation {
                     logical_attachment_id: ATTACHMENT,
                     operation_id: operation,
@@ -2651,7 +2729,8 @@ mod tests {
                 1
             )
             .await
-            .is_err());
+            .is_err()
+        );
         let (state, outbox): (String, i64) = db.transaction(move |conn| Ok((
             conn.query_row("SELECT state FROM remote_attachment_operations WHERE logical_attachment_id=?1 AND operation_id=?2", params![ATTACHMENT,operation], |row| row.get(0))?,
             conn.query_row("SELECT COUNT(*) FROM remote_attachment_outbox WHERE logical_attachment_id=?1", [ATTACHMENT], |row| row.get(0))?,
@@ -2683,8 +2762,8 @@ mod tests {
                 .unwrap(),
                 PrepareRemoteRenameOutcome::Prepared(_)
             ));
-            assert!(db
-                .advance_remote_rename_operation(
+            assert!(
+                db.advance_remote_rename_operation(
                     ATTACHMENT,
                     operation,
                     1,
@@ -2693,9 +2772,10 @@ mod tests {
                     11,
                 )
                 .await
-                .unwrap());
-            assert!(db
-                .record_remote_rename_applied_mismatch(
+                .unwrap()
+            );
+            assert!(
+                db.record_remote_rename_applied_mismatch(
                     ATTACHMENT,
                     operation,
                     1,
@@ -2704,7 +2784,8 @@ mod tests {
                     12,
                 )
                 .await
-                .unwrap());
+                .unwrap()
+            );
         }
         let db = Db::open(&path).unwrap();
         assert_eq!(
@@ -2719,8 +2800,8 @@ mod tests {
             .unwrap();
         assert_eq!(evidence.state, "applied_mismatch");
         assert_eq!(evidence.observed_target_identity, Some(observed));
-        assert!(db
-            .commit_remote_rename_operation(
+        assert!(
+            db.commit_remote_rename_operation(
                 CommitRemoteOperation {
                     logical_attachment_id: ATTACHMENT,
                     operation_id: operation,
@@ -2733,7 +2814,8 @@ mod tests {
                 1,
             )
             .await
-            .is_err());
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -2781,22 +2863,24 @@ mod tests {
                 .unwrap(),
             0
         );
-        assert!(db
-            .remote_operation_status(ATTACHMENT, operation)
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            db.remote_operation_status(ATTACHMENT, operation)
+                .await
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(
             db.compact_closed_remote_attachment_operation_ledger(ATTACHMENT, 1, 1, deadline)
                 .await
                 .unwrap(),
             1
         );
-        assert!(db
-            .remote_operation_status(ATTACHMENT, operation)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            db.remote_operation_status(ATTACHMENT, operation)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -2821,21 +2905,23 @@ mod tests {
             .close_remote_attachment_operation_ledger(ATTACHMENT, 100)
             .await
             .unwrap();
-        assert!(db
-            .close_remote_attachment_operation_ledger(ATTACHMENT, 101)
-            .await
-            .is_err());
+        assert!(
+            db.close_remote_attachment_operation_ledger(ATTACHMENT, 101)
+                .await
+                .is_err()
+        );
         assert!(
             db.compact_closed_remote_attachment_operation_ledger(ATTACHMENT, 0, 1, deadline)
                 .await
                 .is_err(),
             "an uncovered event FK prevents premature retirement"
         );
-        assert!(db
-            .remote_operation_status(ATTACHMENT, operation)
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            db.remote_operation_status(ATTACHMENT, operation)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]

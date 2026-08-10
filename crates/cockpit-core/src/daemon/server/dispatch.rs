@@ -425,6 +425,385 @@ async fn commit_remote_idempotent_adapter(
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn db_filesystem_identity(
+    value: crate::external_journal::HeldEntryIdentity,
+) -> crate::db::remote_attachment_operations::RemoteFilesystemIdentityV1 {
+    crate::db::remote_attachment_operations::RemoteFilesystemIdentityV1 {
+        filesystem_id: value.filesystem_id,
+        object_id: value.object_id,
+        kind: value.kind,
+        len: value.len,
+        mode: value.mode,
+        owner_id: value.owner_id,
+        link_count: value.link_count,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) async fn execute_remote_staged_rename(
+    request: &Request,
+    authorized: &AuthorizedRequestContext,
+    operation: &super::RemoteOperationContext,
+    ctx: &DaemonContext,
+) -> std::result::Result<Response, ErrorPayload> {
+    use crate::db::remote_attachment_operations::{
+        CommitRemoteOperation, CommitRemoteOperationOutcome, PrepareRemoteRenameOutcome,
+        RemoteOperationClass, ReserveRemoteOperation,
+    };
+    use crate::external_journal::{DirGuard, HeldRenameEffect, RemoteRenameArtifactV1};
+
+    let journal = ctx.external_journal.as_ref().ok_or_else(|| ErrorPayload {
+        code: ErrorCode::Unavailable,
+        message: "remote staged rename recovery authority is unavailable".into(),
+    })?;
+    let paths: Vec<std::path::PathBuf> = authorized
+        .fcor_resources
+        .iter()
+        .filter(|resource| {
+            resource.kind == proto::remote_operation_fcor::RemoteOperationResourceKind::FilePath
+        })
+        .map(|resource| {
+            std::str::from_utf8(&resource.value)
+                .map(std::path::PathBuf::from)
+                .map_err(|error| internal(error))
+        })
+        .collect::<std::result::Result<_, _>>()?;
+    let [source_path, target_path] = paths.as_slice() else {
+        return Err(internal(anyhow::anyhow!(
+            "rename requires exact source and target resources"
+        )));
+    };
+    let source_parent_path = source_path
+        .parent()
+        .ok_or_else(|| internal(anyhow::anyhow!("rename source has no parent")))?;
+    let target_parent_path = target_path
+        .parent()
+        .ok_or_else(|| internal(anyhow::anyhow!("rename target has no parent")))?;
+    let source_name = source_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| internal(anyhow::anyhow!("rename source name is invalid")))?
+        .to_owned();
+    let target_name = target_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| internal(anyhow::anyhow!("rename target name is invalid")))?
+        .to_owned();
+    let source_parent = DirGuard::open_root(source_parent_path, false).map_err(internal)?;
+    let target_parent = DirGuard::open_root(target_parent_path, false).map_err(internal)?;
+    source_parent
+        .require_same_filesystem(&target_parent)
+        .map_err(internal)?;
+
+    let params = request
+        .canonical_remote_operation_params_v1()
+        .map_err(internal)?;
+    let canonical = authorized.encode_fcor(request, &params)?;
+    let request_hash = proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+    let attachment = operation.logical_attachment_id.to_string();
+    let operation_id = operation.operation_id.to_string();
+    let device = operation.authenticated_device_id.to_string();
+    let source_observed = source_parent.open_entry_identity(&source_name).ok();
+    let source_parent_identity =
+        db_filesystem_identity(source_parent.held_identity().map_err(internal)?);
+    let target_parent_identity =
+        db_filesystem_identity(target_parent.held_identity().map_err(internal)?);
+    let outcome = ctx
+        .db
+        .prepare_remote_rename_operation(
+            ReserveRemoteOperation {
+                logical_attachment_id: &attachment,
+                operation_id: &operation_id,
+                authenticated_device_id: &device,
+                authenticated_device_generation: operation.authenticated_device_generation,
+                operation_class: RemoteOperationClass::IdempotentAdapterMutation,
+                request_hash,
+                now_ms: chrono::Utc::now().timestamp_millis(),
+            },
+            source_observed.map(db_filesystem_identity),
+            Some(source_parent_identity),
+            Some(target_parent_identity),
+        )
+        .await
+        .map_err(internal)?;
+    let evidence = match outcome {
+        PrepareRemoteRenameOutcome::Prepared(value)
+        | PrepareRemoteRenameOutcome::Reconcile(value) => value,
+        PrepareRemoteRenameOutcome::Replay(bytes) => {
+            if let Ok(stored) = ctx
+                .db
+                .remote_rename_evidence(&attachment, &operation_id)
+                .await
+                && let Ok(artifact_id) = Uuid::parse_str(&stored.artifact_id)
+            {
+                let _ = journal.remove_all_remote_rename_artifacts(artifact_id);
+            }
+            return serde_json::from_slice(&bytes).map_err(internal);
+        }
+        PrepareRemoteRenameOutcome::OutcomeUnknown(_) => {
+            return Err(ErrorPayload {
+                code: ErrorCode::Conflict,
+                message: "remote rename outcome is unknown and will not be redispatched".into(),
+            });
+        }
+        PrepareRemoteRenameOutcome::OperationConflict
+        | PrepareRemoteRenameOutcome::OperationActorConflict => {
+            return Err(ErrorPayload {
+                code: ErrorCode::Conflict,
+                message: "remote operation conflict".into(),
+            });
+        }
+        PrepareRemoteRenameOutcome::AttachmentLedgerCapacity => {
+            return Err(ErrorPayload {
+                code: ErrorCode::Conflict,
+                message: "remote operation capacity reached".into(),
+            });
+        }
+    };
+    if evidence.state != "applied"
+        && (evidence.source_parent_identity != source_parent_identity
+            || evidence.target_parent_identity != target_parent_identity)
+    {
+        ctx.db
+            .record_remote_rename_effect_unknown(
+                &attachment,
+                &operation_id,
+                evidence.dispatch_generation,
+                b"{\"outcome\":\"unknown\"}",
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(internal)?;
+        return Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message: "rename authority changed during recovery".into(),
+        });
+    }
+    let artifact_id = Uuid::parse_str(&evidence.artifact_id).map_err(internal)?;
+    let artifact = RemoteRenameArtifactV1 {
+        logical_attachment_id: operation.logical_attachment_id,
+        operation_id: operation.operation_id,
+        dispatch_generation: evidence.dispatch_generation,
+        source_identity: evidence.source_identity,
+        source_parent_identity: evidence.source_parent_identity,
+        target_parent_identity: evidence.target_parent_identity,
+        source_name: source_name.clone(),
+        target_name: target_name.clone(),
+    };
+    match journal.read_remote_rename_artifact(artifact_id, evidence.dispatch_generation) {
+        Ok(stored) if stored == artifact => {}
+        Ok(_) => {
+            ctx.db
+                .record_remote_rename_effect_unknown(
+                    &attachment,
+                    &operation_id,
+                    evidence.dispatch_generation,
+                    b"{\"outcome\":\"unknown\"}",
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                .map_err(internal)?;
+            return Err(ErrorPayload {
+                code: ErrorCode::Conflict,
+                message: "rename artifact binding mismatch; outcome is unknown".into(),
+            });
+        }
+        Err(crate::external_journal::ExternalJournalError::CapsuleMissing(_)) => journal
+            .write_remote_rename_artifact(artifact_id, &artifact)
+            .map_err(internal)?,
+        Err(error) => {
+            ctx.db
+                .record_remote_rename_effect_unknown(
+                    &attachment,
+                    &operation_id,
+                    evidence.dispatch_generation,
+                    b"{\"outcome\":\"unknown\"}",
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                .map_err(internal)?;
+            return Err(internal(error));
+        }
+    }
+    if evidence.state == "prepared" {
+        if source_observed.map(db_filesystem_identity) != Some(evidence.source_identity) {
+            return Err(ErrorPayload {
+                code: ErrorCode::Conflict,
+                message: "rename source changed before artifact durability".into(),
+            });
+        }
+        target_parent
+            .require_entry_absent(&target_name)
+            .map_err(internal)?;
+        if !ctx
+            .db
+            .advance_remote_rename_operation(
+                &attachment,
+                &operation_id,
+                evidence.dispatch_generation,
+                "prepared",
+                "artifact_synced",
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(internal)?
+        {
+            return Err(internal(anyhow::anyhow!(
+                "rename artifact barrier generation lost"
+            )));
+        }
+    }
+    let mut state = if evidence.state == "prepared" {
+        "artifact_synced"
+    } else {
+        evidence.state.as_str()
+    };
+    if state == "artifact_synced" {
+        match (
+            source_parent.open_entry_identity(&source_name),
+            target_parent.open_entry_identity(&target_name),
+        ) {
+            (Ok(source), Err(_)) if db_filesystem_identity(source) == evidence.source_identity => {
+                target_parent
+                    .require_entry_absent(&target_name)
+                    .map_err(internal)?;
+                match source_parent
+                    .rename_entry_noreplace_atomic(
+                        &source_name,
+                        &target_parent,
+                        &target_name,
+                        source,
+                    )
+                    .map_err(internal)?
+                {
+                    HeldRenameEffect::Applied(_) => {}
+                    HeldRenameEffect::AppliedIdentityMismatch { observed, .. } => {
+                        ctx.db
+                            .record_remote_rename_applied_mismatch(
+                                &attachment,
+                                &operation_id,
+                                evidence.dispatch_generation,
+                                db_filesystem_identity(observed),
+                                b"{\"outcome\":\"unknown\"}",
+                                chrono::Utc::now().timestamp_millis(),
+                            )
+                            .await
+                            .map_err(internal)?;
+                        return Err(ErrorPayload {
+                            code: ErrorCode::Conflict,
+                            message:
+                                "rename applied an unexpected source identity; outcome is unknown"
+                                    .into(),
+                        });
+                    }
+                }
+            }
+            (Err(_), Ok(target)) if db_filesystem_identity(target) == evidence.source_identity => {}
+            _ => {
+                ctx.db
+                    .record_remote_rename_effect_unknown(
+                        &attachment,
+                        &operation_id,
+                        evidence.dispatch_generation,
+                        b"{\"outcome\":\"unknown\"}",
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await
+                    .map_err(internal)?;
+                return Err(ErrorPayload {
+                    code: ErrorCode::Conflict,
+                    message: "rename filesystem evidence is ambiguous; outcome is unknown".into(),
+                });
+            }
+        }
+        ctx.db
+            .advance_remote_rename_operation(
+                &attachment,
+                &operation_id,
+                evidence.dispatch_generation,
+                "artifact_synced",
+                "renamed",
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(internal)?;
+        state = "renamed";
+    }
+    if state == "renamed" {
+        source_parent.sync().map_err(internal)?;
+        ctx.db
+            .advance_remote_rename_operation(
+                &attachment,
+                &operation_id,
+                evidence.dispatch_generation,
+                "renamed",
+                "source_parent_synced",
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(internal)?;
+        state = "source_parent_synced";
+    }
+    if state == "source_parent_synced" {
+        target_parent.sync().map_err(internal)?;
+        ctx.db
+            .advance_remote_rename_operation(
+                &attachment,
+                &operation_id,
+                evidence.dispatch_generation,
+                "source_parent_synced",
+                "target_parent_synced",
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(internal)?;
+        state = "target_parent_synced";
+    }
+    if state == "target_parent_synced" {
+        ctx.db
+            .advance_remote_rename_operation(
+                &attachment,
+                &operation_id,
+                evidence.dispatch_generation,
+                "target_parent_synced",
+                "applied",
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(internal)?;
+    }
+    let response = Response::Ack;
+    let bytes = serde_json::to_vec(&response).map_err(internal)?;
+    let delivery = Uuid::now_v7().to_string();
+    match ctx
+        .db
+        .commit_remote_rename_operation(
+            CommitRemoteOperation {
+                logical_attachment_id: &attachment,
+                operation_id: &operation_id,
+                safe_response: &bytes,
+                outbox_delivery_id: &delivery,
+                outbox_kind: "fs_rename",
+                outbox_payload: &bytes,
+                now_ms: chrono::Utc::now().timestamp_millis(),
+            },
+            evidence.dispatch_generation,
+        )
+        .await
+        .map_err(internal)?
+    {
+        CommitRemoteOperationOutcome::Committed { .. } => {
+            let _ = journal.remove_all_remote_rename_artifacts(artifact_id);
+            Ok(response)
+        }
+        _ => Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message: "remote rename result could not be committed".into(),
+        }),
+    }
+}
+
 pub(super) async fn handle_serialized_request_with_remote_operation(
     request: Request,
     state: &mut MutableClientState,
@@ -2275,7 +2654,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                         "remote staged rename is unavailable until held-handle recovery is initialized"
                             .into()
                     } else {
-                        "remote staged rename is unavailable on this platform; Windows handle security is deferred"
+                        "remote staged rename is unavailable on this platform; held-handle security is deferred"
                             .into()
                     },
                 });

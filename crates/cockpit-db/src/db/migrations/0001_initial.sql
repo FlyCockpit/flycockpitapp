@@ -2723,7 +2723,7 @@ CREATE TABLE remote_rename_journal (
     target_parent_identity BLOB NOT NULL CHECK(length(target_parent_identity) = 57 AND substr(target_parent_identity,1,4)=X'52464931' AND substr(target_parent_identity,29,1)=X'02' AND substr(hex(target_parent_identity),79,1)='4' AND substr(target_parent_identity,50,8)<>zeroblob(8)),
     observed_target_identity BLOB CHECK(observed_target_identity IS NULL OR (length(observed_target_identity)=57 AND substr(observed_target_identity,1,4)=X'52464931')),
     dispatch_generation INTEGER NOT NULL CHECK(dispatch_generation > 0),
-    state TEXT NOT NULL CHECK(state IN ('prepared','artifact_synced','renamed','source_parent_synced','target_parent_synced','applied','applied_mismatch','ledger_committed')),
+    state TEXT NOT NULL CHECK(state IN ('prepared','artifact_synced','renamed','source_parent_synced','target_parent_synced','applied','applied_mismatch','effect_unknown','ledger_committed')),
     created_at_ms INTEGER NOT NULL,
     updated_at_ms INTEGER NOT NULL,
     CHECK((state='applied_mismatch') = (observed_target_identity IS NOT NULL)),
@@ -2760,12 +2760,13 @@ WHEN NEW.logical_attachment_id IS NOT OLD.logical_attachment_id
   OR NEW.updated_at_ms < OLD.updated_at_ms
   OR CASE OLD.state
        WHEN 'prepared' THEN NEW.state NOT IN ('prepared','artifact_synced')
-       WHEN 'artifact_synced' THEN NEW.state NOT IN ('artifact_synced','renamed','applied_mismatch')
-       WHEN 'renamed' THEN NEW.state NOT IN ('renamed','source_parent_synced')
-       WHEN 'source_parent_synced' THEN NEW.state NOT IN ('source_parent_synced','target_parent_synced')
-       WHEN 'target_parent_synced' THEN NEW.state NOT IN ('target_parent_synced','applied')
+       WHEN 'artifact_synced' THEN NEW.state NOT IN ('artifact_synced','renamed','applied_mismatch','effect_unknown')
+       WHEN 'renamed' THEN NEW.state NOT IN ('renamed','source_parent_synced','effect_unknown')
+       WHEN 'source_parent_synced' THEN NEW.state NOT IN ('source_parent_synced','target_parent_synced','effect_unknown')
+       WHEN 'target_parent_synced' THEN NEW.state NOT IN ('target_parent_synced','applied','effect_unknown')
        WHEN 'applied' THEN NEW.state NOT IN ('applied','ledger_committed')
        WHEN 'applied_mismatch' THEN NEW.state <> OLD.state
+       WHEN 'effect_unknown' THEN NEW.state <> OLD.state
        ELSE NEW.state <> OLD.state
      END
 BEGIN

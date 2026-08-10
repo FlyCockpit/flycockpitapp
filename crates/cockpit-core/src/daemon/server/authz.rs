@@ -8,7 +8,7 @@ pub(super) struct AuthorizedFcorResource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct AuthorizedRequestContext {
+pub(crate) struct AuthorizedRequestContext {
     pub(super) fcor_resources: Vec<AuthorizedFcorResource>,
 }
 

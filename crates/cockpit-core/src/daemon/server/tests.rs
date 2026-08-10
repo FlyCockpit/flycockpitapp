@@ -5832,6 +5832,86 @@ async fn remote_fs_rename_fails_closed_before_reservation_until_held_recovery_is
     );
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn staged_rename_executor_applies_commits_and_replays_without_second_effect() {
+    let tmp = tempfile::tempdir().unwrap();
+    let spool = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("from.txt"), b"value").unwrap();
+    let base = test_ctx();
+    let mut owned = match Arc::try_unwrap(base) {
+        Ok(value) => value,
+        Err(_) => panic!("test context unexpectedly shared"),
+    };
+    owned.external_journal = Some(Arc::new(
+        crate::external_journal::ExternalJournal::for_test_at(owned.db.clone(), spool.path()),
+    ));
+    let ctx = Arc::new(owned);
+    let request = Request::FsRename {
+        project_root: tmp.path().to_string_lossy().into_owned(),
+        from_path: "from.txt".into(),
+        to_path: "to.txt".into(),
+    };
+    let canonical_root = tmp.path().canonicalize().unwrap();
+    let authorized = AuthorizedRequestContext {
+        fcor_resources: vec![
+            AuthorizedFcorResource {
+                kind: proto::remote_operation_fcor::RemoteOperationResourceKind::ProjectRoot,
+                value: canonical_root.to_string_lossy().as_bytes().to_vec(),
+            },
+            AuthorizedFcorResource {
+                kind: proto::remote_operation_fcor::RemoteOperationResourceKind::FilePath,
+                value: canonical_root
+                    .join("from.txt")
+                    .to_string_lossy()
+                    .as_bytes()
+                    .to_vec(),
+            },
+            AuthorizedFcorResource {
+                kind: proto::remote_operation_fcor::RemoteOperationResourceKind::FilePath,
+                value: canonical_root
+                    .join("to.txt")
+                    .to_string_lossy()
+                    .as_bytes()
+                    .to_vec(),
+            },
+        ],
+    };
+    let operation = RemoteOperationContext {
+        request_id: Uuid::new_v4(),
+        logical_attachment_id: Uuid::parse_str("22222222-2222-4222-8222-222222222226").unwrap(),
+        operation_id: Uuid::parse_str("018f3f24-7a10-7cc2-8f55-111111111116").unwrap(),
+        authenticated_device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333336").unwrap(),
+        authenticated_device_generation: 1,
+    };
+    assert_eq!(
+        execute_remote_staged_rename(&request, &authorized, &operation, &ctx)
+            .await
+            .unwrap(),
+        Response::Ack
+    );
+    assert!(!tmp.path().join("from.txt").exists());
+    assert_eq!(std::fs::read(tmp.path().join("to.txt")).unwrap(), b"value");
+    assert_eq!(
+        execute_remote_staged_rename(&request, &authorized, &operation, &ctx)
+            .await
+            .unwrap(),
+        Response::Ack
+    );
+    let events: i64 = ctx
+        .db
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM remote_attachment_outbox WHERE kind='fs_rename'",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(events, 1);
+}
+
 #[tokio::test]
 async fn resource_scheduler_is_shared_only_for_persistent_daemons() {
     let persistent_db = Db::open_in_memory().expect("in-memory db");

@@ -407,6 +407,30 @@ mod imp {
             )
         }
 
+        pub fn require_entry_absent(&self, name: &str) -> Result<(), ExternalJournalError> {
+            check_component(name)?;
+            let name = cstring(name)?;
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            let result = unsafe {
+                libc::fstatat(
+                    self.dir.as_raw_fd(),
+                    name.as_ptr(),
+                    stat.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if result == 0 {
+                return Err(ExternalJournalError::QuarantineNameTaken(
+                    name.to_string_lossy().into_owned(),
+                ));
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(());
+            }
+            Err(io("checking held target absence", error))
+        }
+
         pub fn require_same_filesystem(
             &self,
             other: &DirGuard,
@@ -785,7 +809,7 @@ mod imp {
             use std::os::windows::io::AsRawHandle as _;
             use windows::Win32::Foundation::HANDLE;
             use windows::Win32::Storage::FileSystem::{
-                GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+                BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
             };
 
             // `std::os::windows::fs::MetadataExt::number_of_links` is still
@@ -1027,9 +1051,11 @@ mod tests {
                 guard.open_file_checked("probe.v1", OpenStrictness::Private),
                 Err(ExternalJournalError::InsecurePermissions(_))
             ));
-            assert!(guard
-                .open_file_checked("probe.v1", OpenStrictness::ContainedOnly)
-                .is_ok());
+            assert!(
+                guard
+                    .open_file_checked("probe.v1", OpenStrictness::ContainedOnly)
+                    .is_ok()
+            );
         }
     }
 

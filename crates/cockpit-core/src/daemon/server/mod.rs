@@ -3598,7 +3598,7 @@ async fn handle_client_frame(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct RemoteOperationContext {
+pub(crate) struct RemoteOperationContext {
     pub(super) request_id: Uuid,
     pub(super) logical_attachment_id: Uuid,
     pub(super) operation_id: Uuid,

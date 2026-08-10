@@ -692,8 +692,10 @@ impl MediaStorageRecovery {
             before == after && actual_len == total && actual_sha == expected,
             "finalize object checksum mismatch"
         );
-        let (canonical_container, canonical_mime) =
+        let (container_signature, mime_signature) =
             probe_upload_container(&mut held, media_kind_from_text(&snapshot.6)?)?;
+        let mut canonical_container = container_signature.to_owned();
+        let mut canonical_mime = mime_signature.to_owned();
         let media_kind = media_kind_from_text(&snapshot.6)?;
         let normalized = if media_kind == MediaKind::Image {
             held.seek(SeekFrom::Start(0))?;
@@ -702,14 +704,14 @@ impl MediaStorageRecovery {
                 .take(10 * 1024 * 1024 + 1)
                 .read_to_end(&mut bytes)?;
             ensure!(bytes.len() <= 10 * 1024 * 1024, "resource_limit");
-            Some(normalize_image(&bytes, canonical_container)?)
+            Some(normalize_image(&bytes, &canonical_container)?)
         } else {
             None
         };
         let selected_video_stream = None;
         let mut selected_audio_stream = None;
         let mut av_terminal = None;
-        let av_derivatives = if media_kind == MediaKind::Audio {
+        let av_derivatives = if media_kind != MediaKind::Image {
             let prepared: Result<(
                 Vec<(&'static str, Uuid, Vec<u8>, Option<(u32, u32)>)>,
                 SelectedMediaStream,
@@ -741,7 +743,25 @@ impl MediaStorageRecovery {
                             .is_some_and(|value| value.default == 1),
                     })
                     .collect::<Vec<_>>();
-                let (video, audio) = select_av_streams(canonical_container, &streams)?;
+                if canonical_container == "iso_bmff" {
+                    canonical_container = classify_iso_bmff(
+                        &bytes,
+                        streams.iter().any(|stream| stream.kind == "video"),
+                        usize::from(streams.iter().any(|stream| stream.kind == "audio")),
+                    )?
+                    .into();
+                    canonical_mime = match canonical_container.as_str() {
+                        "m4a" => "audio/mp4",
+                        "mov" => "video/quicktime",
+                        _ => "video/mp4",
+                    }
+                    .into();
+                }
+                let (video, audio) = select_av_streams(&canonical_container, &streams)?;
+                ensure!(
+                    media_kind == MediaKind::Audio,
+                    "model_runtime_unavailable: video normalization unavailable"
+                );
                 let audio = audio.context("invalid_media")?;
                 decode_selected_streams(
                     &runtime,
@@ -922,8 +942,8 @@ impl MediaStorageRecovery {
             canonical_project_digest: project.clone(),
             media_kind,
             source_kind: MediaSourceKind::AuthenticatedSessionUpload,
-            canonical_container: canonical_container.into(),
-            canonical_mime: canonical_mime.into(),
+            canonical_container,
+            canonical_mime,
             availability: MediaAvailability::Quarantined,
             attachment_version: 1,
             availability_generation: 1,
@@ -1666,6 +1686,10 @@ fn probe_upload_container(
         Some((MediaKind::Audio, "ogg", "audio/ogg"))
     } else if valid_mpeg_audio_prefix(bytes) {
         Some((MediaKind::Audio, "mp3", "audio/mpeg"))
+    } else if declared != MediaKind::Image && bytes.len() >= 16 && &bytes[4..8] == b"ftyp" {
+        Some((declared, "iso_bmff", "application/octet-stream"))
+    } else if ebml_doctype_is_webm(bytes)? {
+        Some((MediaKind::Video, "webm", "video/webm"))
     } else {
         None
     };

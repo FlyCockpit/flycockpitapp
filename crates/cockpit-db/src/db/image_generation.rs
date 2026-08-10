@@ -4053,6 +4053,7 @@ mod tests {
             conn.execute("UPDATE image_generation_jobs SET state='validating',version=2 WHERE job_id=?1",[job_id.to_string()])?;
             conn.execute("UPDATE image_generation_jobs SET state='queued',version=3 WHERE job_id=?1",[job_id.to_string()])?;
             conn.execute("UPDATE image_generation_slots SET state='queued',version=2 WHERE job_id=?1 AND slot_id=?2",params![job_id.to_string(),slot_id.to_string()])?;
+            conn.execute("INSERT INTO image_generation_attempt_activation_facts(job_id,slot_id,attempt_number,activation_reason,prior_attempt_number,activated_at_unix_ms) VALUES(?1,?2,1,'initial',NULL,1)",params![job_id.to_string(),slot_id.to_string()])?;
             let first=Uuid::now_v7();
             let claim=|worker_boot_id,claim_generation|ClaimImageGenerationDispatch{job_id,slot_id,attempt_number:1,worker_boot_id,claim_generation};
             claim_image_generation_dispatch_at_conn(conn,&claim(first,1),1_000)?;

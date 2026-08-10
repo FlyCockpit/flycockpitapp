@@ -588,14 +588,17 @@ pub enum ProjectEpochPolicy {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedProjectEpoch {
+    pub membership_key: String,
+    pub interval_start_ms: i64,
+}
+
 impl ProjectEpochPolicy {
     pub fn validate(&self) -> std::result::Result<(), BudgetBlockReason> {
         match self {
             Self::CalendarMonth { time_zone }
-                if time_zone.trim().is_empty()
-                    || time_zone.bytes().any(|b| {
-                        !(b.is_ascii_alphanumeric() || matches!(b, b'/' | b'_' | b'-' | b'+'))
-                    }) =>
+                if time_zone.trim() != time_zone || jiff::tz::TimeZone::get(time_zone).is_err() =>
             {
                 Err(BudgetBlockReason::InvalidProjectEpoch)
             }
@@ -605,6 +608,68 @@ impl ProjectEpochPolicy {
                 Err(BudgetBlockReason::InvalidProjectEpoch)
             }
             _ => Ok(()),
+        }
+    }
+
+    /// Resolve membership from authoritative tzdb/rolling arithmetic. The
+    /// returned start is persisted and the DB monotonic head prevents a wall
+    /// clock rollback from reopening an older interval.
+    pub fn resolve_epoch(
+        &self,
+        now_unix_ms: i64,
+    ) -> std::result::Result<ResolvedProjectEpoch, BudgetBlockReason> {
+        self.validate()?;
+        match self {
+            Self::CalendarMonth { time_zone } => {
+                let zone = jiff::tz::TimeZone::get(time_zone)
+                    .map_err(|_| BudgetBlockReason::InvalidProjectEpoch)?;
+                let now = jiff::Timestamp::from_millisecond(now_unix_ms)
+                    .map_err(|_| BudgetBlockReason::InvalidProjectEpoch)?
+                    .to_zoned(zone.clone());
+                let start = jiff::civil::date(now.year(), now.month(), 1)
+                    .at(0, 0, 0, 0)
+                    .to_zoned(zone)
+                    .map_err(|_| BudgetBlockReason::InvalidProjectEpoch)?;
+                Ok(ResolvedProjectEpoch {
+                    membership_key: format!("{:04}-{:02}@{time_zone}", now.year(), now.month()),
+                    interval_start_ms: start.timestamp().as_millisecond(),
+                })
+            }
+            Self::Rolling {
+                duration_seconds,
+                anchor,
+            } => {
+                let duration_ms = i64::try_from(*duration_seconds)
+                    .ok()
+                    .and_then(|value| value.checked_mul(1_000))
+                    .ok_or(BudgetBlockReason::InvalidProjectEpoch)?;
+                let elapsed = now_unix_ms
+                    .checked_sub(anchor.unix_ms)
+                    .ok_or(BudgetBlockReason::InvalidProjectEpoch)?;
+                if elapsed < 0 {
+                    return Err(BudgetBlockReason::InvalidProjectEpoch);
+                }
+                let offset = elapsed / duration_ms;
+                let start = anchor
+                    .unix_ms
+                    .checked_add(
+                        offset
+                            .checked_mul(duration_ms)
+                            .ok_or(BudgetBlockReason::InvalidProjectEpoch)?,
+                    )
+                    .ok_or(BudgetBlockReason::InvalidProjectEpoch)?;
+                let sequence = anchor
+                    .monotonic_sequence
+                    .checked_add(
+                        u64::try_from(offset)
+                            .map_err(|_| BudgetBlockReason::InvalidProjectEpoch)?,
+                    )
+                    .ok_or(BudgetBlockReason::InvalidProjectEpoch)?;
+                Ok(ResolvedProjectEpoch {
+                    membership_key: format!("rolling:{sequence}"),
+                    interval_start_ms: start,
+                })
+            }
         }
     }
 }

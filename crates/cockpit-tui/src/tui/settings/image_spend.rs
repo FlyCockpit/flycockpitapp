@@ -20,6 +20,32 @@ impl ImageSpendSettingsView {
             block_reason,
         }
     }
+
+    pub(crate) fn replace_reviewed(&mut self, reviewed: ImageSpendSettings) {
+        self.block_reason = reviewed.validate().err();
+        self.saved = reviewed;
+    }
+
+    /// Persist the exact reviewed editor value and refresh version state. The
+    /// display-only suggestions never enter this path.
+    pub(crate) async fn save(
+        &mut self,
+        db: &cockpit_db::Db,
+        project_key: String,
+        expected_version: Option<u64>,
+        saved_at_ms: i64,
+    ) -> anyhow::Result<u64> {
+        let current = cockpit_config::config::image_spend::activate_saved_policy(
+            db,
+            project_key,
+            self.saved.clone(),
+            expected_version,
+            saved_at_ms,
+        )
+        .await?;
+        self.block_reason = None;
+        Ok(current.policy_version)
+    }
 }
 
 #[cfg(test)]

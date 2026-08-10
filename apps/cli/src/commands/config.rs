@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::cli::{ConfigCommand, ConfigExportPolicyArgs, ConfigImportPolicyArgs};
+use crate::cli::{ConfigCommand, ConfigExportPolicyArgs, ConfigImportPolicyArgs, ImageSpendArgs};
 use crate::config::extended::{DeepthinkConfig, ExtendedConfig, ExtendedConfigDoc};
 use crate::config::providers::{HeaderSpec, ProviderEntry, ProvidersConfig};
 
@@ -12,14 +12,36 @@ const POLICY_BUNDLE_VERSION: u32 = 1;
 
 pub async fn run(cmd: ConfigCommand) -> Result<()> {
     match cmd {
-        ConfigCommand::ImageSpend => image_spend_status(),
+        ConfigCommand::ImageSpend(args) => image_spend(args).await,
         ConfigCommand::ExportPolicy(args) => export_policy(args).await,
         ConfigCommand::ImportPolicy(args) => import_policy(args).await,
     }
 }
 
-fn image_spend_status() -> Result<()> {
+async fn image_spend(args: ImageSpendArgs) -> Result<()> {
     let cwd = std::env::current_dir().context("resolving current directory")?;
+    if let Some(file) = args.save {
+        let raw = std::fs::read_to_string(&file)
+            .with_context(|| format!("reading {}", file.display()))?;
+        let settings =
+            serde_json::from_str(&raw).with_context(|| format!("parsing {}", file.display()))?;
+        let db = cockpit_db::Db::open_default().context("opening cockpit database")?;
+        let project_key = args
+            .project_key
+            .context("--project-key is required with --save")?;
+        let current = db.current_image_spend_policy(project_key.clone()).await?;
+        let saved_at_ms = chrono::Utc::now().timestamp_millis();
+        let saved = cockpit_config::config::image_spend::activate_saved_policy(
+            &db,
+            project_key,
+            settings,
+            current.map(|value| value.policy_version),
+            saved_at_ms,
+        )
+        .await?;
+        println!("saved image spend policy version {}", saved.policy_version);
+        return Ok(());
+    }
     let settings = crate::config::extended::load_for_cwd(&cwd).image_spend;
     println!("{}", serde_json::to_string_pretty(&settings)?);
     if let Err(reason) = settings.validate() {

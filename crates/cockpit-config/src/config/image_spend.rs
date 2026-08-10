@@ -9,20 +9,16 @@ pub use cockpit_db::db::image_spend::{
 };
 
 /// Persist a user-reviewed file-backed policy into the immutable ledger and
-/// return the exact version tokens preflight must use. Finite project policy
-/// additionally requires a caller-resolved, explicit window label/start.
+/// return the exact version tokens preflight must use. Epoch membership is
+/// derived here from the reviewed policy and authoritative bundled tzdb.
 pub async fn activate_saved_policy(
     db: &cockpit_db::Db,
     project_key: String,
     saved: ImageSpendSettings,
     expected_current_version: Option<u64>,
-    epoch_membership: Option<(String, i64)>,
     saved_at_ms: i64,
 ) -> anyhow::Result<CurrentImageSpendPolicy> {
     saved.validate().map_err(anyhow::Error::new)?;
-    if matches!(saved.project, BudgetPolicy::Finite { .. }) && epoch_membership.is_none() {
-        return Err(BudgetBlockReason::ProjectEpochUnconfigured.into());
-    }
     let version = db
         .save_image_spend_policy(
             project_key.clone(),
@@ -37,14 +33,19 @@ pub async fn activate_saved_policy(
         .ok_or_else(|| anyhow::anyhow!("saved image spend policy disappeared"))?;
     debug_assert_eq!(current.policy_version, version);
     if matches!(current.settings.project, BudgetPolicy::Finite { .. }) {
-        let (label, start) = epoch_membership
-            .ok_or_else(|| anyhow::Error::new(BudgetBlockReason::ProjectEpochUnconfigured))?;
+        let epoch = current
+            .settings
+            .project_epoch
+            .as_ref()
+            .ok_or_else(|| anyhow::Error::new(BudgetBlockReason::ProjectEpochUnconfigured))?
+            .resolve_epoch(saved_at_ms)
+            .map_err(anyhow::Error::new)?;
         current.epoch_sequence = Some(
             db.resolve_image_spend_epoch(
                 project_key,
                 current.epoch_policy_version,
-                label,
-                start,
+                epoch.membership_key,
+                epoch.interval_start_ms,
                 saved_at_ms,
             )
             .await?,

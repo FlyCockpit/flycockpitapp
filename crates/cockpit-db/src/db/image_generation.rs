@@ -4810,11 +4810,13 @@ mod tests {
                     let provider = first.provider_request_identity.clone();
                     let idempotency = first.provider_idempotency_identity.clone();
                     let payload = first.journal_payload_digest.clone();
+                    let external_operation_id = first.external_operation_id;
+                    let journal_version = first.journal_version;
                     let stale = first.verify(ImageGenerationReconciliationObservation {
                         provider_request_identity: &provider,
                         provider_idempotency_identity: &idempotency,
-                        external_operation_id: first.external_operation_id,
-                        journal_version: first.journal_version,
+                        external_operation_id,
+                        journal_version,
                         journal_payload_digest: &payload,
                         evidence_bytes: b"accepted\0first worker",
                         outcome: ImageGenerationReconciliationOutcome::AuthoritativeAccepted,

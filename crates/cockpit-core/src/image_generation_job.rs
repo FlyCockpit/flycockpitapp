@@ -3523,7 +3523,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(pass.dispatched, 0, "{name}: {pass:#?}");
-            assert_eq!(adapter.requests().len(), 1, name);
+            assert_eq!(adapter.requests().len(), 1, "{name}");
             fixture.db.read(move|conn|{let row:(String,String,i64,i64)=conn.query_row("SELECT a.state,o.state,(SELECT count(*) FROM image_generation_handoff_evidence e WHERE e.job_id=a.job_id),(SELECT count(*) FROM image_generation_attempt_activation_facts f WHERE f.job_id=a.job_id AND f.activation_reason='authoritative_retry') FROM image_generation_attempts a JOIN external_journal_operations o ON o.operation_id=a.external_operation_id WHERE a.job_id=?1 AND a.attempt_number=1",[fixture.job_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;assert_eq!(row,("dispatching".into(),"dispatching".into(),0,0),"{name}");Ok(())}).await.unwrap();
         }
     }

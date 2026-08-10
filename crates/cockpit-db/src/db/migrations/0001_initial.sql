@@ -3227,6 +3227,204 @@ CREATE TABLE image_generation_reconciliation_evidence (
  FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT
 );
 
+-- Managed image artifacts are a separate retained aggregate. They are never
+-- attachment rows and user-published copies are never members of this graph.
+CREATE TABLE image_generation_artifacts (
+ artifact_id TEXT PRIMARY KEY,
+ job_id TEXT NOT NULL,
+ slot_id TEXT NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('allocating','writing','retained','late_quarantined','cleanup_pending','deleting','tombstoned','security_blocked')),
+ generation INTEGER NOT NULL CHECK(generation>=1),
+ expected_component_count INTEGER NOT NULL CHECK(expected_component_count>=1),
+ active_lease_count INTEGER NOT NULL DEFAULT 0 CHECK(active_lease_count>=0),
+ component_set_digest TEXT NOT NULL CHECK(length(component_set_digest)=64 AND component_set_digest NOT GLOB '*[^0-9a-f]*'),
+ eligibility_at_unix_ms INTEGER,
+ immediate_cleanup INTEGER NOT NULL DEFAULT 0 CHECK(immediate_cleanup IN (0,1)),
+ terminal_reason TEXT,
+ created_at_unix_ms INTEGER NOT NULL,
+ updated_at_unix_ms INTEGER NOT NULL,
+ UNIQUE(job_id,slot_id),
+ FOREIGN KEY(job_id,slot_id) REFERENCES image_generation_slots(job_id,slot_id) ON DELETE RESTRICT,
+ CHECK((state='tombstoned' AND terminal_reason IS NOT NULL) OR state!='tombstoned')
+);
+
+CREATE TABLE image_generation_artifact_components (
+ artifact_id TEXT NOT NULL REFERENCES image_generation_artifacts(artifact_id) ON DELETE RESTRICT,
+ component_id TEXT NOT NULL,
+ component_kind TEXT NOT NULL CHECK(component_kind IN ('primary','normalized_raster','sanitized_svg','thumbnail','model_payload')),
+ state TEXT NOT NULL CHECK(state IN ('planned','writing','ready','cleanup_pending','deleting','tombstoned','security_blocked')),
+ generation INTEGER NOT NULL CHECK(generation>=1),
+ relative_storage_key TEXT NOT NULL,
+ byte_length_decimal TEXT NOT NULL CHECK(byte_length_decimal<>'' AND byte_length_decimal NOT GLOB '*[^0-9]*'),
+ sha256 TEXT NOT NULL CHECK(length(sha256)=64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
+ stable_identity_json TEXT,
+ expected_link_count INTEGER NOT NULL DEFAULT 1 CHECK(expected_link_count=1),
+ resource_reservation_id TEXT NOT NULL,
+ release_operation_id TEXT NOT NULL UNIQUE,
+ deletion_evidence_digest TEXT CHECK(deletion_evidence_digest IS NULL OR (length(deletion_evidence_digest)=64 AND deletion_evidence_digest NOT GLOB '*[^0-9a-f]*')),
+ PRIMARY KEY(artifact_id,component_id),
+ UNIQUE(artifact_id,component_kind),
+ UNIQUE(relative_storage_key),
+ CHECK((state='tombstoned' AND deletion_evidence_digest IS NOT NULL) OR state!='tombstoned')
+);
+
+CREATE TABLE image_generation_artifact_cleanup_intents (
+ cleanup_operation_id TEXT PRIMARY KEY,
+ artifact_id TEXT NOT NULL REFERENCES image_generation_artifacts(artifact_id) ON DELETE RESTRICT,
+ expected_artifact_generation INTEGER NOT NULL CHECK(expected_artifact_generation>=1),
+ reason TEXT NOT NULL CHECK(reason IN ('retention_expired','discard_late_result','invalid_output','restart_recovery','owner_recovery')),
+ state TEXT NOT NULL CHECK(state IN ('pending','deleting','completed','security_blocked')),
+ version INTEGER NOT NULL CHECK(version>=1),
+ created_at_unix_ms INTEGER NOT NULL,
+ completed_at_unix_ms INTEGER,
+ UNIQUE(artifact_id),
+ CHECK((state='completed')=(completed_at_unix_ms IS NOT NULL))
+);
+
+CREATE TABLE image_generation_component_release_facts (
+ artifact_id TEXT NOT NULL,
+ component_id TEXT NOT NULL,
+ release_operation_id TEXT NOT NULL,
+ deletion_evidence_digest TEXT NOT NULL CHECK(length(deletion_evidence_digest)=64 AND deletion_evidence_digest NOT GLOB '*[^0-9a-f]*'),
+ committed_at_unix_ms INTEGER NOT NULL,
+ PRIMARY KEY(artifact_id,component_id),
+ UNIQUE(release_operation_id),
+ FOREIGN KEY(artifact_id,component_id) REFERENCES image_generation_artifact_components(artifact_id,component_id) ON DELETE RESTRICT
+);
+
+CREATE TABLE image_generation_artifact_references (
+ reference_id TEXT PRIMARY KEY,
+ artifact_id TEXT NOT NULL REFERENCES image_generation_artifacts(artifact_id) ON DELETE RESTRICT,
+ reference_kind TEXT NOT NULL CHECK(reference_kind IN ('message','tool','publication_operation')),
+ released_at_unix_ms INTEGER
+);
+
+CREATE TABLE image_generation_artifact_leases (
+ lease_id TEXT PRIMARY KEY,
+ artifact_id TEXT NOT NULL,
+ artifact_generation INTEGER NOT NULL CHECK(artifact_generation>=1),
+ owning_job_id TEXT NOT NULL,
+ owning_job_generation INTEGER NOT NULL CHECK(owning_job_generation>=1),
+ owning_slot_id TEXT NOT NULL,
+ owning_slot_generation INTEGER NOT NULL CHECK(owning_slot_generation>=1),
+ published_disposition TEXT NOT NULL CHECK(published_disposition IN ('ordinary','late_authorized')),
+ published_disposition_generation INTEGER NOT NULL CHECK(published_disposition_generation>=1),
+ component_id TEXT NOT NULL,
+ component_kind TEXT NOT NULL CHECK(component_kind IN ('primary','normalized_raster','sanitized_svg','thumbnail','model_payload')),
+ component_generation INTEGER NOT NULL CHECK(component_generation>=1),
+ component_checksum TEXT NOT NULL CHECK(length(component_checksum)=64 AND component_checksum NOT GLOB '*[^0-9a-f]*'),
+ consumer_purpose TEXT NOT NULL CHECK(consumer_purpose IN ('serve_artifact','serve_thumbnail','tool_input','model_input','internal_verification','internal_cleanup')),
+ consumer_route TEXT NOT NULL CHECK(consumer_route IN ('artifact_full','artifact_range','thumbnail','tool','model_payload','verification','cleanup')),
+ read_kind TEXT NOT NULL CHECK(read_kind IN ('full','range')),
+ range_start_decimal TEXT NOT NULL CHECK(range_start_decimal<>'' AND range_start_decimal NOT GLOB '*[^0-9]*'),
+ requested_length_decimal TEXT NOT NULL CHECK(requested_length_decimal<>'' AND requested_length_decimal NOT GLOB '*[^0-9]*'),
+ component_set_digest TEXT NOT NULL CHECK(length(component_set_digest)=64 AND component_set_digest NOT GLOB '*[^0-9a-f]*'),
+ authorization_digest TEXT NOT NULL CHECK(length(authorization_digest)=64 AND authorization_digest NOT GLOB '*[^0-9a-f]*'),
+ daemon_boot_id TEXT NOT NULL,
+ committed_at_monotonic INTEGER NOT NULL CHECK(committed_at_monotonic>=0),
+ deadline_monotonic INTEGER NOT NULL,
+ released_at INTEGER,
+ FOREIGN KEY(artifact_id,component_id) REFERENCES image_generation_artifact_components(artifact_id,component_id) ON DELETE RESTRICT,
+ FOREIGN KEY(owning_job_id,owning_slot_id) REFERENCES image_generation_slots(job_id,slot_id) ON DELETE RESTRICT,
+ CHECK(deadline_monotonic=committed_at_monotonic+60000),
+ CHECK((consumer_purpose='serve_artifact' AND consumer_route IN ('artifact_full','artifact_range')) OR
+       (consumer_purpose='serve_thumbnail' AND consumer_route='thumbnail') OR
+       (consumer_purpose='tool_input' AND consumer_route='tool') OR
+       (consumer_purpose='model_input' AND consumer_route='model_payload') OR
+       (consumer_purpose='internal_verification' AND consumer_route='verification') OR
+       (consumer_purpose='internal_cleanup' AND consumer_route='cleanup')),
+ CHECK((read_kind='range' AND consumer_route='artifact_range' AND requested_length_decimal!='0') OR
+       (read_kind='full' AND consumer_route!='artifact_range' AND range_start_decimal='0'))
+);
+
+CREATE TABLE image_generation_late_publication_leases (
+ publication_operation_id TEXT PRIMARY KEY,
+ artifact_id TEXT NOT NULL REFERENCES image_generation_artifacts(artifact_id) ON DELETE RESTRICT,
+ artifact_generation INTEGER NOT NULL CHECK(artifact_generation>=1),
+ job_id TEXT NOT NULL,
+ slot_id TEXT NOT NULL,
+ expected_slot_version INTEGER NOT NULL CHECK(expected_slot_version>=1),
+ component_set_digest TEXT NOT NULL CHECK(length(component_set_digest)=64 AND component_set_digest NOT GLOB '*[^0-9a-f]*'),
+ authorization_digest TEXT NOT NULL CHECK(length(authorization_digest)=64 AND authorization_digest NOT GLOB '*[^0-9a-f]*'),
+ output_authority_digest TEXT NOT NULL CHECK(length(output_authority_digest)=64 AND output_authority_digest NOT GLOB '*[^0-9a-f]*'),
+ output_authority_generation INTEGER NOT NULL CHECK(output_authority_generation>=1),
+ destination_name TEXT NOT NULL,
+ temporary_name TEXT NOT NULL,
+ created_at_unix_ms INTEGER NOT NULL,
+ deadline_unix_ms INTEGER NOT NULL,
+ worker_boot_id TEXT,
+ claim_generation INTEGER CHECK(claim_generation IS NULL OR claim_generation>=1),
+ state TEXT NOT NULL CHECK(state IN ('reserved','copy_authorized','copy_committed','published','aborted','expired','security_blocked')),
+ version INTEGER NOT NULL CHECK(version>=1),
+ temporary_evidence_json TEXT,
+ output_evidence_json TEXT,
+ recovery_evidence_json TEXT,
+ UNIQUE(artifact_id),
+ FOREIGN KEY(job_id,slot_id) REFERENCES image_generation_slots(job_id,slot_id) ON DELETE RESTRICT,
+ CHECK(deadline_unix_ms=created_at_unix_ms+300000),
+ CHECK((worker_boot_id IS NULL)=(claim_generation IS NULL))
+);
+
+CREATE TABLE image_generation_artifact_transitions(from_state TEXT NOT NULL,to_state TEXT NOT NULL,PRIMARY KEY(from_state,to_state));
+INSERT INTO image_generation_artifact_transitions VALUES
+('allocating','writing'),('allocating','cleanup_pending'),('allocating','security_blocked'),
+('writing','retained'),('writing','late_quarantined'),('writing','cleanup_pending'),('writing','security_blocked'),
+('retained','cleanup_pending'),('retained','security_blocked'),
+('late_quarantined','retained'),('late_quarantined','cleanup_pending'),('late_quarantined','security_blocked'),
+('cleanup_pending','deleting'),('cleanup_pending','security_blocked'),
+('deleting','tombstoned'),('deleting','security_blocked'),
+('security_blocked','cleanup_pending');
+CREATE TABLE image_generation_component_transitions(from_state TEXT NOT NULL,to_state TEXT NOT NULL,PRIMARY KEY(from_state,to_state));
+INSERT INTO image_generation_component_transitions VALUES
+('planned','writing'),('planned','cleanup_pending'),('planned','security_blocked'),
+('writing','ready'),('writing','cleanup_pending'),('writing','security_blocked'),
+('ready','cleanup_pending'),('ready','security_blocked'),
+('cleanup_pending','deleting'),('cleanup_pending','security_blocked'),
+('deleting','tombstoned'),('deleting','security_blocked'),
+('security_blocked','cleanup_pending');
+CREATE TABLE image_generation_cleanup_transitions(from_state TEXT NOT NULL,to_state TEXT NOT NULL,PRIMARY KEY(from_state,to_state));
+INSERT INTO image_generation_cleanup_transitions VALUES
+('pending','deleting'),('pending','security_blocked'),('deleting','completed'),('deleting','security_blocked'),('security_blocked','pending');
+CREATE TABLE image_generation_late_publication_transitions(from_state TEXT NOT NULL,to_state TEXT NOT NULL,PRIMARY KEY(from_state,to_state));
+INSERT INTO image_generation_late_publication_transitions VALUES
+('reserved','copy_authorized'),('reserved','aborted'),('reserved','expired'),('reserved','security_blocked'),
+('copy_authorized','copy_committed'),('copy_authorized','aborted'),('copy_authorized','security_blocked'),
+('copy_committed','published'),('copy_committed','security_blocked'),('security_blocked','published'),('security_blocked','aborted');
+
+CREATE TRIGGER image_generation_artifact_transition_guard BEFORE UPDATE OF state,generation ON image_generation_artifacts
+WHEN NEW.generation!=OLD.generation+1 OR NOT EXISTS(SELECT 1 FROM image_generation_artifact_transitions WHERE from_state=OLD.state AND to_state=NEW.state)
+BEGIN SELECT RAISE(ABORT,'forbidden image artifact transition'); END;
+CREATE TRIGGER image_generation_artifact_slot_binding_guard BEFORE INSERT ON image_generation_artifacts
+WHEN NOT EXISTS(SELECT 1 FROM image_generation_slots s WHERE s.job_id=NEW.job_id AND s.slot_id=NEW.slot_id AND s.managed_artifact_id=NEW.artifact_id)
+BEGIN SELECT RAISE(ABORT,'image artifact is not the sealed slot artifact'); END;
+CREATE TRIGGER image_generation_component_transition_guard BEFORE UPDATE OF state,generation ON image_generation_artifact_components
+WHEN NEW.generation!=OLD.generation+1 OR NOT EXISTS(SELECT 1 FROM image_generation_component_transitions WHERE from_state=OLD.state AND to_state=NEW.state)
+BEGIN SELECT RAISE(ABORT,'forbidden image artifact component transition'); END;
+CREATE TRIGGER image_generation_cleanup_transition_guard BEFORE UPDATE OF state,version ON image_generation_artifact_cleanup_intents
+WHEN NEW.version!=OLD.version+1 OR NOT EXISTS(SELECT 1 FROM image_generation_cleanup_transitions WHERE from_state=OLD.state AND to_state=NEW.state)
+BEGIN SELECT RAISE(ABORT,'forbidden image artifact cleanup transition'); END;
+CREATE TRIGGER image_generation_late_publication_transition_guard BEFORE UPDATE OF state,version ON image_generation_late_publication_leases
+WHEN NEW.version!=OLD.version+1 OR NOT EXISTS(SELECT 1 FROM image_generation_late_publication_transitions WHERE from_state=OLD.state AND to_state=NEW.state)
+BEGIN SELECT RAISE(ABORT,'forbidden late image publication transition'); END;
+CREATE TRIGGER image_generation_artifact_retained_projection_guard BEFORE UPDATE OF state ON image_generation_artifacts
+WHEN NEW.state IN ('retained','late_quarantined') AND ((SELECT count(*) FROM image_generation_artifact_components c WHERE c.artifact_id=NEW.artifact_id AND c.state='ready')!=NEW.expected_component_count)
+BEGIN SELECT RAISE(ABORT,'retained image artifact lacks complete ready component set'); END;
+CREATE TRIGGER image_generation_artifact_tombstone_projection_guard BEFORE UPDATE OF state ON image_generation_artifacts
+WHEN NEW.state='tombstoned' AND (EXISTS(SELECT 1 FROM image_generation_artifact_components c WHERE c.artifact_id=NEW.artifact_id AND c.state!='tombstoned') OR EXISTS(SELECT 1 FROM image_generation_artifact_components c LEFT JOIN image_generation_component_release_facts r ON r.artifact_id=c.artifact_id AND r.component_id=c.component_id WHERE c.artifact_id=NEW.artifact_id AND r.component_id IS NULL))
+BEGIN SELECT RAISE(ABORT,'image artifact tombstone lacks component deletion and release evidence'); END;
+CREATE TRIGGER image_generation_component_tombstone_guard BEFORE UPDATE OF state ON image_generation_artifact_components
+WHEN NEW.state='tombstoned' AND NOT EXISTS(SELECT 1 FROM image_generation_component_release_facts r WHERE r.artifact_id=NEW.artifact_id AND r.component_id=NEW.component_id AND r.deletion_evidence_digest=NEW.deletion_evidence_digest)
+BEGIN SELECT RAISE(ABORT,'component tombstone lacks matching release evidence'); END;
+CREATE TRIGGER image_generation_release_guard BEFORE INSERT ON image_generation_component_release_facts
+WHEN NOT EXISTS(SELECT 1 FROM image_generation_artifact_components c WHERE c.artifact_id=NEW.artifact_id AND c.component_id=NEW.component_id AND c.state='deleting' AND c.release_operation_id=NEW.release_operation_id AND c.deletion_evidence_digest=NEW.deletion_evidence_digest)
+BEGIN SELECT RAISE(ABORT,'resource release precedes verified component deletion evidence'); END;
+CREATE TRIGGER image_generation_artifact_transition_registry_sealed BEFORE INSERT ON image_generation_artifact_transitions BEGIN SELECT RAISE(ABORT,'image artifact transition registry is sealed'); END;
+CREATE TRIGGER image_generation_artifact_transition_registry_update_sealed BEFORE UPDATE ON image_generation_artifact_transitions BEGIN SELECT RAISE(ABORT,'image artifact transition registry is sealed'); END;
+CREATE TRIGGER image_generation_artifact_transition_registry_delete_sealed BEFORE DELETE ON image_generation_artifact_transitions BEGIN SELECT RAISE(ABORT,'image artifact transition registry is sealed'); END;
+CREATE TRIGGER image_generation_component_transition_registry_sealed BEFORE INSERT ON image_generation_component_transitions BEGIN SELECT RAISE(ABORT,'image component transition registry is sealed'); END;
+CREATE TRIGGER image_generation_component_transition_registry_update_sealed BEFORE UPDATE ON image_generation_component_transitions BEGIN SELECT RAISE(ABORT,'image component transition registry is sealed'); END;
+CREATE TRIGGER image_generation_component_transition_registry_delete_sealed BEFORE DELETE ON image_generation_component_transitions BEGIN SELECT RAISE(ABORT,'image component transition registry is sealed'); END;
+
 CREATE TABLE image_generation_job_transitions (from_state TEXT NOT NULL,to_state TEXT NOT NULL,PRIMARY KEY(from_state,to_state));
 INSERT INTO image_generation_job_transitions VALUES
 ('created','validating'),('created','failed'),('created','cancelled'),

@@ -140,6 +140,303 @@ pub struct AppendMediaUploadChunkV1 {
 pub type FinalizeMediaUploadV1 = LocalMediaMutationV1;
 pub type CancelMediaUploadV1 = LocalMediaMutationV1;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DiscardUnreferencedMediaAttachmentV1 {
+    pub schema_version: u8,
+    pub kind: String,
+    #[serde(with = "strict_uuid_v7")]
+    pub attachment_id: Uuid,
+    pub attachment_version: u64,
+    pub availability_generation: u64,
+    pub reference_generation: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_upload: Option<MediaOriginUploadV1>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaDiscardOutcomeV1 {
+    Applied,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaDiscardReasonV1 {
+    DiscardStarted,
+    MediaAttachmentInUse,
+    StaleAttachmentVersion,
+    StaleAvailabilityGeneration,
+    StaleReferenceGeneration,
+    AvailabilityStateIneligible,
+    SecurityRecoveryRequired,
+    AvailabilityGenerationOverflow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "actor",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum MediaDiscardResultV1 {
+    Remote {
+        schema_version: u8,
+        kind: String,
+        #[serde(with = "strict_uuid_v7")]
+        result_id: Uuid,
+        #[serde(with = "strict_uuid_v7")]
+        operation_id: Uuid,
+        request_digest: String,
+        #[serde(with = "strict_uuid_v7")]
+        attachment_id: Uuid,
+        requested_attachment_version: u64,
+        attachment_version_before: u64,
+        requested_availability_generation: u64,
+        availability_generation_before: u64,
+        availability_generation_after: u64,
+        requested_reference_generation: u64,
+        reference_generation_before: u64,
+        reference_generation_after: u64,
+        outcome: MediaDiscardOutcomeV1,
+        reason: MediaDiscardReasonV1,
+    },
+    Local {
+        schema_version: u8,
+        kind: String,
+        #[serde(with = "strict_uuid_v7")]
+        result_id: Uuid,
+        #[serde(with = "strict_uuid_v7")]
+        local_operation_id: Uuid,
+        operation_request_digest: String,
+        semantic_command_digest: String,
+        #[serde(with = "strict_uuid_v7")]
+        attachment_id: Uuid,
+        requested_attachment_version: u64,
+        attachment_version_before: u64,
+        requested_availability_generation: u64,
+        availability_generation_before: u64,
+        availability_generation_after: u64,
+        requested_reference_generation: u64,
+        reference_generation_before: u64,
+        reference_generation_after: u64,
+        outcome: MediaDiscardOutcomeV1,
+        reason: MediaDiscardReasonV1,
+    },
+}
+
+impl MediaDiscardResultV1 {
+    pub fn encode_fcdr(&self) -> Result<Vec<u8>> {
+        let (
+            actor,
+            result_id,
+            operation_id,
+            request_digest,
+            semantic,
+            attachment_id,
+            requested_version,
+            before_version,
+            requested_availability,
+            before_availability,
+            after_availability,
+            requested_reference,
+            before_reference,
+            after_reference,
+            outcome,
+            reason,
+        ) = match self {
+            Self::Remote {
+                schema_version,
+                kind,
+                result_id,
+                operation_id,
+                request_digest,
+                attachment_id,
+                requested_attachment_version,
+                attachment_version_before,
+                requested_availability_generation,
+                availability_generation_before,
+                availability_generation_after,
+                requested_reference_generation,
+                reference_generation_before,
+                reference_generation_after,
+                outcome,
+                reason,
+            } => {
+                ensure!(
+                    *schema_version == 1 && kind == "mediaDiscardResult",
+                    "invalid media discard result"
+                );
+                (
+                    1u8,
+                    *result_id,
+                    *operation_id,
+                    request_digest,
+                    None,
+                    *attachment_id,
+                    *requested_attachment_version,
+                    *attachment_version_before,
+                    *requested_availability_generation,
+                    *availability_generation_before,
+                    *availability_generation_after,
+                    *requested_reference_generation,
+                    *reference_generation_before,
+                    *reference_generation_after,
+                    *outcome,
+                    *reason,
+                )
+            }
+            Self::Local {
+                schema_version,
+                kind,
+                result_id,
+                local_operation_id,
+                operation_request_digest,
+                semantic_command_digest,
+                attachment_id,
+                requested_attachment_version,
+                attachment_version_before,
+                requested_availability_generation,
+                availability_generation_before,
+                availability_generation_after,
+                requested_reference_generation,
+                reference_generation_before,
+                reference_generation_after,
+                outcome,
+                reason,
+            } => {
+                ensure!(
+                    *schema_version == 1 && kind == "mediaDiscardResult",
+                    "invalid media discard result"
+                );
+                (
+                    2u8,
+                    *result_id,
+                    *local_operation_id,
+                    operation_request_digest,
+                    Some(semantic_command_digest),
+                    *attachment_id,
+                    *requested_attachment_version,
+                    *attachment_version_before,
+                    *requested_availability_generation,
+                    *availability_generation_before,
+                    *availability_generation_after,
+                    *requested_reference_generation,
+                    *reference_generation_before,
+                    *reference_generation_after,
+                    *outcome,
+                    *reason,
+                )
+            }
+        };
+        ensure!(
+            is_strict_uuid_v7(result_id)
+                && is_strict_uuid_v7(operation_id)
+                && is_strict_uuid_v7(attachment_id),
+            "discard ids must be UUIDv7"
+        );
+        validate_digest(request_digest, "discard request digest")?;
+        if let Some(value) = semantic {
+            validate_digest(value, "discard semantic digest")?;
+        }
+        ensure!(
+            [
+                requested_version,
+                before_version,
+                requested_availability,
+                before_availability,
+                after_availability,
+                requested_reference,
+                before_reference,
+                after_reference
+            ]
+            .into_iter()
+            .all(|value| value > 0),
+            "discard generations must be positive"
+        );
+        let applied = outcome == MediaDiscardOutcomeV1::Applied;
+        ensure!(
+            applied == (reason == MediaDiscardReasonV1::DiscardStarted),
+            "discard outcome/reason mismatch"
+        );
+        ensure!(
+            if applied {
+                requested_version == before_version
+                    && requested_availability == before_availability
+                    && requested_reference == before_reference
+                    && after_availability
+                        == before_availability
+                            .checked_add(1)
+                            .context("availability generation overflow")?
+                    && after_reference == before_reference
+            } else {
+                after_availability == before_availability && after_reference == before_reference
+            },
+            "invalid discard generation transition"
+        );
+        let digest_bytes = |value: &str| -> Result<[u8; 32]> {
+            validate_digest(value, "discard digest")?;
+            let mut decoded = [0u8; 32];
+            for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+                let nibble = |byte: u8| {
+                    if byte.is_ascii_digit() {
+                        Some(byte - b'0')
+                    } else if (b'a'..=b'f').contains(&byte) {
+                        Some(byte - b'a' + 10)
+                    } else {
+                        None
+                    }
+                };
+                decoded[index] = (nibble(pair[0]).context("invalid digest")? << 4)
+                    | nibble(pair[1]).context("invalid digest")?;
+            }
+            Ok(decoded)
+        };
+        let mut bytes = Vec::with_capacity(if actor == 1 { 153 } else { 185 });
+        bytes.extend_from_slice(b"FCDR");
+        bytes.push(1);
+        bytes.push(actor);
+        bytes.extend_from_slice(result_id.as_bytes());
+        bytes.extend_from_slice(operation_id.as_bytes());
+        bytes.extend_from_slice(&digest_bytes(request_digest)?);
+        bytes.push(u8::from(semantic.is_some()));
+        if let Some(value) = semantic {
+            bytes.extend_from_slice(&digest_bytes(value)?);
+        }
+        bytes.extend_from_slice(attachment_id.as_bytes());
+        for value in [
+            requested_version,
+            before_version,
+            requested_availability,
+            before_availability,
+            after_availability,
+            requested_reference,
+            before_reference,
+            after_reference,
+        ] {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        bytes.push(if applied { 1 } else { 2 });
+        bytes.push(match reason {
+            MediaDiscardReasonV1::DiscardStarted => 1,
+            MediaDiscardReasonV1::MediaAttachmentInUse => 2,
+            MediaDiscardReasonV1::StaleAttachmentVersion => 3,
+            MediaDiscardReasonV1::StaleAvailabilityGeneration => 4,
+            MediaDiscardReasonV1::StaleReferenceGeneration => 5,
+            MediaDiscardReasonV1::AvailabilityStateIneligible => 6,
+            MediaDiscardReasonV1::SecurityRecoveryRequired => 7,
+            MediaDiscardReasonV1::AvailabilityGenerationOverflow => 8,
+        });
+        ensure!(
+            bytes.len() == if actor == 1 { 153 } else { 185 },
+            "invalid FCDR length"
+        );
+        Ok(bytes)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteMediaOperationOutcomeV1 {
@@ -322,7 +619,7 @@ pub struct LocalMediaMutationReceiptV1 {
     pub outcome: LocalMediaMutationOutcomeV1,
     pub transition: LocalMediaMutationTransitionV1,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub discard_result: Option<serde_json::Value>,
+    pub discard_result: Option<MediaDiscardResultV1>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discard_result_digest: Option<String>,
     pub committed_at_unix_ms: i64,
@@ -2406,5 +2703,58 @@ mod tests {
             mutation(&mut changed);
             assert_ne!(component_recorded_evidence_digest(&changed), baseline);
         }
+    }
+
+    #[test]
+    fn discard_fcdr_has_exact_actor_lengths_and_network_order() {
+        let result_id = Uuid::now_v7();
+        let operation_id = Uuid::now_v7();
+        let attachment_id = Uuid::now_v7();
+        let remote = MediaDiscardResultV1::Remote {
+            schema_version: 1,
+            kind: "mediaDiscardResult".into(),
+            result_id,
+            operation_id,
+            request_digest: "11".repeat(32),
+            attachment_id,
+            requested_attachment_version: 1,
+            attachment_version_before: 1,
+            requested_availability_generation: 7,
+            availability_generation_before: 7,
+            availability_generation_after: 8,
+            requested_reference_generation: 3,
+            reference_generation_before: 3,
+            reference_generation_after: 3,
+            outcome: MediaDiscardOutcomeV1::Applied,
+            reason: MediaDiscardReasonV1::DiscardStarted,
+        };
+        let bytes = remote.encode_fcdr().unwrap();
+        assert_eq!(bytes.len(), 153);
+        assert_eq!(&bytes[..6], b"FCDR\x01\x01");
+        assert_eq!(&bytes[87..95], &1u64.to_be_bytes());
+        assert_eq!(&bytes[151..], [1, 1]);
+        let local = MediaDiscardResultV1::Local {
+            schema_version: 1,
+            kind: "mediaDiscardResult".into(),
+            result_id,
+            local_operation_id: operation_id,
+            operation_request_digest: "11".repeat(32),
+            semantic_command_digest: "22".repeat(32),
+            attachment_id,
+            requested_attachment_version: 1,
+            attachment_version_before: 1,
+            requested_availability_generation: 7,
+            availability_generation_before: 7,
+            availability_generation_after: 7,
+            requested_reference_generation: 3,
+            reference_generation_before: 3,
+            reference_generation_after: 3,
+            outcome: MediaDiscardOutcomeV1::Rejected,
+            reason: MediaDiscardReasonV1::MediaAttachmentInUse,
+        };
+        let bytes = local.encode_fcdr().unwrap();
+        assert_eq!(bytes.len(), 185);
+        assert_eq!(&bytes[..6], b"FCDR\x01\x02");
+        assert_eq!(&bytes[183..], [2, 2]);
     }
 }

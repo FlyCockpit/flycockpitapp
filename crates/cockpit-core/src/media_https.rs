@@ -8,7 +8,11 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
+use async_trait::async_trait;
+use futures::StreamExt as _;
 use reqwest::Url;
+use sha2::{Digest as _, Sha256};
+use tokio::io::{AsyncWrite, AsyncWriteExt as _};
 
 const MAX_REDIRECTS: u8 = 5;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -50,6 +54,126 @@ pub(crate) struct RedactedHttpsProvenance {
     pub(crate) redirect_classes: Vec<RedirectLocationClass>,
     pub(crate) path_segment_count: u32,
     pub(crate) safe_basename: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RetainedHttpsFetchEvidence {
+    pub(crate) byte_length: u64,
+    pub(crate) sha256: String,
+    pub(crate) provenance: RedactedHttpsProvenance,
+}
+
+#[async_trait]
+pub(crate) trait HttpsDnsResolver: Send + Sync {
+    async fn resolve(&self, host: &str, port: u16) -> Result<Vec<IpAddr>>;
+}
+
+pub(crate) struct SystemHttpsDnsResolver;
+
+#[async_trait]
+impl HttpsDnsResolver for SystemHttpsDnsResolver {
+    async fn resolve(&self, host: &str, port: u16) -> Result<Vec<IpAddr>> {
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            return Ok(vec![ip]);
+        }
+        let mut answers = tokio::net::lookup_host((host, port))
+            .await
+            .context("resolve retained-media HTTPS host")?
+            .map(|address| address.ip())
+            .collect::<Vec<_>>();
+        answers.sort_unstable();
+        answers.dedup();
+        Ok(answers)
+    }
+}
+
+/// Fetch a retained object into a caller-owned held sink. The caller must fsync,
+/// reopen, and verify its storage identity before publication; this function
+/// supplies only the network byte proof.
+pub(crate) async fn fetch_retained_https<W: AsyncWrite + Unpin>(
+    raw_url: &str,
+    resolver: &dyn HttpsDnsResolver,
+    sink: &mut W,
+    limits: &HttpsFetchLimits,
+) -> Result<RetainedHttpsFetchEvidence> {
+    tokio::time::timeout(
+        limits.timeout,
+        fetch_retained_https_before_deadline(raw_url, resolver, sink, limits),
+    )
+    .await
+    .context("retained-media HTTPS fetch timed out")?
+}
+
+async fn fetch_retained_https_before_deadline<W: AsyncWrite + Unpin>(
+    raw_url: &str,
+    resolver: &dyn HttpsDnsResolver,
+    sink: &mut W,
+    limits: &HttpsFetchLimits,
+) -> Result<RetainedHttpsFetchEvidence> {
+    let initial_url = parse_fetch_url(raw_url)?;
+    let answers = resolve_url(resolver, &initial_url).await?;
+    let mut hop = vetted_hop(initial_url, &answers, false, 0)?;
+    let mut provenance = RedactedHttpsProvenance::initial(&hop)?;
+
+    loop {
+        let response = hop
+            .bound_client(limits)?
+            .get(hop.url().clone())
+            .send()
+            .await
+            .context("execute retained-media HTTPS request")?;
+        if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .context("HTTPS redirect is missing Location")?
+                .to_str()
+                .context("HTTPS redirect Location is not text")?;
+            let next_url = hop
+                .url
+                .join(location)
+                .context("invalid HTTPS redirect location")?;
+            validate_url(&next_url)?;
+            let answers = resolve_url(resolver, &next_url).await?;
+            let next = redirected_https_hop(&hop, location, &answers)?;
+            provenance.record_redirect(&hop, &next)?;
+            hop = next;
+            continue;
+        }
+        ensure!(
+            response.status().is_success(),
+            "HTTPS media source returned a non-success status"
+        );
+        checked_content_length(response.content_length(), limits)?;
+        let mut length = 0_u64;
+        let mut hasher = Sha256::new();
+        let mut body = response.bytes_stream();
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.context("read retained-media HTTPS body")?;
+            length = checked_body_progress(length, chunk.len(), limits)?;
+            hasher.update(&chunk);
+            sink.write_all(&chunk)
+                .await
+                .context("write retained-media quarantine")?;
+        }
+        ensure!(length > 0, "empty retained media is forbidden");
+        sink.flush()
+            .await
+            .context("flush retained-media quarantine")?;
+        return Ok(RetainedHttpsFetchEvidence {
+            byte_length: length,
+            sha256: crate::intel::hex_lower(&hasher.finalize()),
+            provenance,
+        });
+    }
+}
+
+async fn resolve_url(resolver: &dyn HttpsDnsResolver, url: &Url) -> Result<Vec<IpAddr>> {
+    let host = url.host_str().context("HTTPS URL has no host")?;
+    let port = url
+        .port_or_known_default()
+        .context("HTTPS URL has no port")?;
+    resolver.resolve(host, port).await
 }
 
 impl RedactedHttpsProvenance {

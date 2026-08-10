@@ -3436,7 +3436,7 @@ CREATE TABLE image_generation_artifact_security_recovery_audits (
  publication_operation_id TEXT,
  publication_lease_version INTEGER CHECK(publication_lease_version IS NULL OR publication_lease_version>=1),
  output_identity_digest TEXT CHECK(output_identity_digest IS NULL OR (length(output_identity_digest)=64 AND output_identity_digest NOT GLOB '*[^0-9a-f]*')),
- disposition TEXT NOT NULL CHECK(disposition IN ('retain_blocked','resume_verified_cleanup','complete_verified_late_publication')),
+ disposition TEXT NOT NULL CHECK(disposition IN ('retain_blocked','resume_verified_cleanup','remove_verified_external_copy','complete_verified_late_publication')),
  state TEXT NOT NULL CHECK(state IN ('recorded','applied','denied','proof_failed','stale')),
  outcome_digest TEXT CHECK(outcome_digest IS NULL OR (length(outcome_digest)=64 AND outcome_digest NOT GLOB '*[^0-9a-f]*')),
  created_at_unix_ms INTEGER NOT NULL,
@@ -3603,7 +3603,7 @@ CREATE TRIGGER image_generation_security_recovery_audit_identity_immutable BEFOR
 CREATE TRIGGER image_generation_security_recovery_audit_insert_guard BEFORE INSERT ON image_generation_artifact_security_recovery_audits
 WHEN NOT EXISTS(SELECT 1 FROM image_generation_artifacts a JOIN image_generation_slots s ON s.job_id=a.job_id AND s.slot_id=a.slot_id WHERE a.artifact_id=NEW.artifact_id AND a.generation=NEW.artifact_generation AND a.job_id=NEW.job_id AND a.slot_id=NEW.slot_id AND a.component_set_digest=NEW.component_set_digest AND (a.state='security_blocked' OR NEW.disposition='complete_verified_late_publication') AND s.version=NEW.slot_generation)
  OR (NEW.publication_operation_id IS NULL AND NEW.disposition='complete_verified_late_publication')
- OR (NEW.publication_operation_id IS NOT NULL AND (NEW.disposition!='complete_verified_late_publication' OR NOT EXISTS(SELECT 1 FROM image_generation_late_publication_leases p WHERE p.publication_operation_id=NEW.publication_operation_id AND p.artifact_id=NEW.artifact_id AND p.artifact_generation=NEW.artifact_generation AND p.version=NEW.publication_lease_version AND p.state='security_blocked')))
+ OR (NEW.publication_operation_id IS NOT NULL AND (NEW.disposition NOT IN ('complete_verified_late_publication','remove_verified_external_copy') OR NOT EXISTS(SELECT 1 FROM image_generation_late_publication_leases p WHERE p.publication_operation_id=NEW.publication_operation_id AND p.artifact_id=NEW.artifact_id AND p.artifact_generation=NEW.artifact_generation AND p.version=NEW.publication_lease_version AND p.state='security_blocked')))
 BEGIN SELECT RAISE(ABORT,'security recovery audit lacks exact blocked authority'); END;
 CREATE TRIGGER image_generation_security_recovery_audit_transition_guard BEFORE UPDATE OF state ON image_generation_artifact_security_recovery_audits WHEN OLD.state!='recorded' OR NEW.state NOT IN ('applied','denied','proof_failed','stale') BEGIN SELECT RAISE(ABORT,'security recovery audit outcome is immutable'); END;
 CREATE TRIGGER image_generation_security_recovery_audit_delete_forbidden BEFORE DELETE ON image_generation_artifact_security_recovery_audits BEGIN SELECT RAISE(ABORT,'security recovery audit is durable'); END;

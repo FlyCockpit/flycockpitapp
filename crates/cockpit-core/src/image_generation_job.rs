@@ -16,11 +16,13 @@ use crate::daemon::principal::ClientPrincipal;
 use crate::image_generation_runtime::ImageHealthSnapshot;
 use cockpit_config::config::media_budget::MediaReservationPlan;
 use cockpit_db::db::image_generation::{
-    CreateImageGenerationArtifact, CreateImageGenerationArtifactComponent,
-    ImageGenerationArtifactComponentKind, ImageGenerationArtifactComponentState,
-    ImageGenerationArtifactConsumerPurpose, ImageGenerationArtifactConsumerRoute,
-    ImageGenerationArtifactState, TransitionImageGenerationArtifact,
-    TransitionImageGenerationArtifactComponent, image_generation_component_set_binding,
+    AdvanceImageGenerationLatePublication, CreateImageGenerationArtifact,
+    CreateImageGenerationArtifactComponent, ImageGenerationArtifactComponentKind,
+    ImageGenerationArtifactComponentState, ImageGenerationArtifactConsumerPurpose,
+    ImageGenerationArtifactConsumerRoute, ImageGenerationArtifactState,
+    ImageGenerationLatePublicationEvidenceV1, ImageGenerationLatePublicationState,
+    TransitionImageGenerationArtifact, TransitionImageGenerationArtifactComponent,
+    image_generation_component_set_binding,
 };
 use cockpit_db::db::sealed_scope::SealedActionGrantRow;
 use cockpit_db::image_spend::{AttemptMaximum, SpendReservation};
@@ -215,6 +217,7 @@ const fn route_authority_pair_valid(
 pub enum ImageArtifactSecurityRecoveryDisposition {
     RetainBlocked,
     ResumeVerifiedCleanup,
+    RemoveVerifiedExternalCopy,
     CompleteVerifiedLatePublication,
 }
 
@@ -234,6 +237,7 @@ impl ImageArtifactSecurityRecoveryDisposition {
         match self {
             Self::RetainBlocked => "retain_blocked",
             Self::ResumeVerifiedCleanup => "resume_verified_cleanup",
+            Self::RemoveVerifiedExternalCopy => "remove_verified_external_copy",
             Self::CompleteVerifiedLatePublication => "complete_verified_late_publication",
         }
     }
@@ -443,6 +447,11 @@ impl ImageGenerationOwnerContextAuthority {
                 ),
                 (
                     ImageArtifactSecurityRecoveryDisposition::CompleteVerifiedLatePublication,
+                    Some(_),
+                    Some(_),
+                    Some(_)
+                ) | (
+                    ImageArtifactSecurityRecoveryDisposition::RemoveVerifiedExternalCopy,
                     Some(_),
                     Some(_),
                     Some(_)
@@ -681,6 +690,63 @@ impl ImageGenerationOwnerContextAuthority {
         Ok(())
     }
 
+    pub fn remove_verified_external_copy(
+        &self,
+        conn: &Connection,
+        recorded: RecordedImageArtifactSecurityRecovery,
+        output: &HeldImageGenerationOutputDirectory,
+        recovery: &HeldDirectoryRecovery,
+    ) -> Result<()> {
+        ensure!(
+            recorded.disposition
+                == ImageArtifactSecurityRecoveryDisposition::RemoveVerifiedExternalCopy,
+            "security recovery disposition differs"
+        );
+        let operation = recorded
+            .publication_operation_id
+            .context("security recovery publication identity is absent")?;
+        let version = recorded
+            .publication_lease_version
+            .context("security recovery publication version is absent")?;
+        ensure!(
+            recovery.artifact().identity_digest()
+                == recorded
+                    .output_identity_digest
+                    .as_deref()
+                    .context("security recovery output identity is absent")?,
+            "security recovery output identity differs"
+        );
+        let HeldDirectoryEffectOutcome::AppliedDurable(deleted) =
+            output.delete_recovered_publication(recovery)?
+        else {
+            anyhow::bail!("external publication deletion is not durable")
+        };
+        let authority = &output.authority.0;
+        let evidence = ImageGenerationLatePublicationEvidenceV1::TemporaryDeleted {
+            schema_version: 1,
+            identity_digest: deleted.artifact().identity_digest().to_owned(),
+            deletion_digest: crate::intel::hex_lower(&Sha256::digest(format!(
+                "deleted:{}:{}",
+                operation,
+                deleted.artifact().identity_digest()
+            ))),
+            parent_sync_digest: authority.parent_identity_digest.clone(),
+        }
+        .canonical_json()?;
+        let tx = conn.unchecked_transaction()?;
+        let now: i64 = tx.query_row(
+            "SELECT CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)",
+            [],
+            |row| row.get(0),
+        )?;
+        ensure!(tx.execute("UPDATE image_generation_late_publication_leases SET state='aborted',version=version+1,recovery_evidence_json=?1,decided_at_unix_ms=?2 WHERE publication_operation_id=?3 AND artifact_id=?4 AND artifact_generation=?5 AND state='security_blocked' AND version=?6 AND output_evidence_json IS NOT NULL",params![evidence,now,operation.to_string(),recorded.artifact_id.to_string(),i64::try_from(recorded.artifact_generation)?,i64::try_from(version)?])?==1,"external publication recovery compare-and-set lost");
+        let outcome =
+            crate::intel::hex_lower(&Sha256::digest(format!("removed:{operation}:{evidence}")));
+        ensure!(tx.execute("UPDATE image_generation_artifact_security_recovery_audits SET state='applied',outcome_digest=?1,decided_at_unix_ms=?2 WHERE recovery_operation_id=?3 AND principal_digest=?4 AND disposition='remove_verified_external_copy' AND state='recorded'",params![outcome,now,recorded.operation_id.to_string(),self.principal_digest])?==1,"security recovery audit compare-and-set lost");
+        tx.commit()?;
+        Ok(())
+    }
+
     fn complete_verified_late_publication_inner(
         &self,
         conn: &Connection,
@@ -712,7 +778,9 @@ impl ImageGenerationOwnerContextAuthority {
             .context("late publication destination evidence is absent")?;
         let authority = &output.authority.0;
         let evidence=cockpit_db::db::image_generation::ImageGenerationLatePublicationEvidenceV1::OutputDurable{schema_version:1,identity_digest:effect.artifact().identity_digest().to_owned(),security_digest:effect.artifact().security_digest().to_owned(),byte_length:effect.artifact().byte_length().to_string(),sha256:effect.artifact().sha256().to_owned(),parent_sync_digest:authority.parent_identity_digest.clone()}.canonical_json()?;
-        let row=conn.query_row("SELECT p.version,p.destination_name,p.output_authority_digest,p.output_authority_generation,p.expected_slot_version,a.state,p.output_evidence_json FROM image_generation_late_publication_leases p JOIN image_generation_artifacts a ON a.artifact_id=p.artifact_id WHERE p.publication_operation_id=?1 AND p.artifact_id=?2 AND p.artifact_generation=?3 AND p.state='security_blocked'",params![publication_operation_id.to_string(),recorded.artifact_id.to_string(),i64::try_from(recorded.artifact_generation)?],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,i64>(3)?,row.get::<_,i64>(4)?,row.get::<_,String>(5)?,row.get::<_,String>(6)?))).optional()?.context("security-blocked publication is unavailable")?;
+        let tx = conn.unchecked_transaction()?;
+        let row=tx.query_row("SELECT p.version,p.destination_name,p.output_authority_digest,p.output_authority_generation,p.expected_slot_version,a.state,p.output_evidence_json,g.canonical_plan,g.plan_digest FROM image_generation_late_publication_leases p JOIN image_generation_artifacts a ON a.artifact_id=p.artifact_id JOIN image_generation_plans g ON g.job_id=a.job_id JOIN image_generation_late_publication_authorization_facts f ON f.authorization_digest=p.authorization_digest WHERE p.publication_operation_id=?1 AND p.artifact_id=?2 AND p.artifact_generation=?3 AND p.state='security_blocked' AND f.revoked_at_unix_ms IS NULL AND f.principal_digest=?4 AND f.artifact_generation=p.artifact_generation AND f.slot_generation=p.expected_slot_version AND f.output_authority_digest=p.output_authority_digest AND f.output_authority_generation=p.output_authority_generation AND f.destination_name=p.destination_name",params![publication_operation_id.to_string(),recorded.artifact_id.to_string(),i64::try_from(recorded.artifact_generation)?,self.principal_digest],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,i64>(3)?,row.get::<_,i64>(4)?,row.get::<_,String>(5)?,row.get::<_,String>(6)?,row.get::<_,Vec<u8>>(7)?,row.get::<_,String>(8)?))).optional()?.context("security-blocked publication is unavailable")?;
+        let current_plan = ImageGenerationPlanV1::from_canonical(&row.7, &row.8)?;
         let prior = cockpit_db::db::image_generation::ImageGenerationLatePublicationEvidenceV1::from_canonical_json(&row.6)?;
         let prior_identity = match prior {
             cockpit_db::db::image_generation::ImageGenerationLatePublicationEvidenceV1::OutputDurable { identity_digest, .. } => identity_digest,
@@ -725,10 +793,13 @@ impl ImageGenerationOwnerContextAuthority {
                 && row.1 == destination
                 && row.2 == authority.canonical_destination_digest
                 && row.3 == i64::try_from(authority.authority_generation)?
+                && current_plan.owner_session_id == self.session_id
+                && current_plan.owner_principal_digest == self.principal_digest
+                && current_plan.project_identity_digest == self.project_identity_digest
+                && current_plan.config_generation == self.config_generation
                 && matches!(row.5.as_str(), "late_quarantined" | "security_blocked"),
             "late publication authority differs"
         );
-        let tx = conn.unchecked_transaction()?;
         let now: i64 = tx.query_row(
             "SELECT CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)",
             [],
@@ -1165,6 +1236,71 @@ pub struct VerifiedManagedComponentForRecovery {
     kind: ImageGenerationArtifactComponentKind,
     generation: u64,
     held: HeldSealedArtifact,
+}
+
+pub struct AdoptVerifiedCopyAuthorizedPublication<'a> {
+    pub publication_operation_id: Uuid,
+    pub expected_lease_version: u64,
+    pub worker_boot_id: Uuid,
+    pub claim_generation: u64,
+    pub recovery: &'a HeldDirectoryRecovery,
+}
+
+pub fn adopt_verified_copy_authorized_publication(
+    conn: &Connection,
+    owner: &ImageGenerationOwnerContextAuthority,
+    output: &HeldImageGenerationOutputDirectory,
+    input: &AdoptVerifiedCopyAuthorizedPublication<'_>,
+) -> Result<()> {
+    let HeldDirectoryEffectOutcome::AppliedDurable(effect) =
+        output.reconcile_publication(input.recovery)?
+    else {
+        anyhow::bail!("copy-authorized publication is not durably present")
+    };
+    let destination = effect
+        .destination_name()
+        .context("copy-authorized publication destination is absent")?;
+    let authority = &output.authority.0;
+    let binding = conn
+        .query_row(
+            "SELECT l.destination_name,l.output_authority_digest,l.output_authority_generation,p.canonical_plan,p.plan_digest FROM image_generation_late_publication_leases l JOIN image_generation_artifacts a ON a.artifact_id=l.artifact_id JOIN image_generation_plans p ON p.job_id=a.job_id JOIN image_generation_late_publication_authorization_facts f ON f.authorization_digest=l.authorization_digest WHERE l.publication_operation_id=?1 AND l.state='copy_authorized' AND l.version=?2 AND f.revoked_at_unix_ms IS NULL AND f.principal_digest=?3",
+            params![input.publication_operation_id.to_string(), i64::try_from(input.expected_lease_version)?, owner.principal_digest],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?, row.get::<_, Vec<u8>>(3)?, row.get::<_, String>(4)?)),
+        )
+        .optional()?
+        .context("copy-authorized publication authority is unavailable")?;
+    let plan = ImageGenerationPlanV1::from_canonical(&binding.3, &binding.4)?;
+    ensure!(
+        binding.0 == destination
+            && binding.1 == authority.canonical_destination_digest
+            && binding.2 == i64::try_from(authority.authority_generation)?
+            && plan.owner_session_id == owner.session_id
+            && plan.owner_principal_digest == owner.principal_digest
+            && plan.project_identity_digest == owner.project_identity_digest
+            && plan.config_generation == owner.config_generation,
+        "copy-authorized publication authority differs"
+    );
+    let evidence = ImageGenerationLatePublicationEvidenceV1::OutputDurable {
+        schema_version: 1,
+        identity_digest: effect.artifact().identity_digest().to_owned(),
+        security_digest: effect.artifact().security_digest().to_owned(),
+        byte_length: effect.artifact().byte_length().to_string(),
+        sha256: effect.artifact().sha256().to_owned(),
+        parent_sync_digest: authority.parent_identity_digest.clone(),
+    }
+    .canonical_json()?;
+    cockpit_db::Db::advance_image_generation_late_publication_conn(
+        conn,
+        &AdvanceImageGenerationLatePublication {
+            publication_operation_id: input.publication_operation_id,
+            expected_version: input.expected_lease_version,
+            worker_boot_id: input.worker_boot_id,
+            claim_generation: input.claim_generation,
+            from: ImageGenerationLatePublicationState::CopyAuthorized,
+            to: ImageGenerationLatePublicationState::CopyCommitted,
+            evidence_json: &evidence,
+        },
+    )
 }
 
 fn held_artifact_evidence_json(evidence: &HeldArtifactEvidence) -> Result<String> {

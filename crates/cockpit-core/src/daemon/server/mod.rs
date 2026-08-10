@@ -3387,7 +3387,7 @@ where
                 }
             }
             Ok(None) => return Ok(()),
-            Err(error) => return Err(anyhow::Error::new(error).context("decoding client envelope")),
+            Err(error) => return Err(error.context("decoding client envelope")),
         }
     }
 }

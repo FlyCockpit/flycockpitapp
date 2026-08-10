@@ -16388,8 +16388,7 @@ async fn dispatch_helper_reports_server_failure_before_client_eof() {
     let mut server =
         tokio::spawn(async { Err::<(), _>(anyhow::anyhow!("forced transport root cause")) });
     let (result, server_ended) =
-        super::recv_dispatch_matrix_response_or_server(&mut client, Uuid::now_v7(), &mut server)
-            .await;
+        recv_dispatch_matrix_response_or_server(&mut client, Uuid::now_v7(), &mut server).await;
     assert!(server_ended);
     let error = result.unwrap_err();
     assert_eq!(error.code, ErrorCode::Internal);

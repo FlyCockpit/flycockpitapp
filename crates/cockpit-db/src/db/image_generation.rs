@@ -721,6 +721,7 @@ pub struct PreparedImageGenerationDispatch {
     attempt_version: u64,
     spend_reservation_id: String,
     spend_attempt_id: String,
+    provider_request_identity: String,
     media_reservation_id: String,
     media_reservation_version: u64,
     slot_version: u64,
@@ -735,6 +736,7 @@ pub struct DispatchingImageGenerationAttempt {
     attempt_version: u64,
     spend_reservation_id: String,
     spend_attempt_id: String,
+    provider_request_identity: String,
     media_reservation_id: String,
     media_reservation_version: u64,
 }
@@ -753,6 +755,9 @@ impl DispatchingImageGenerationAttempt {
     }
     pub fn media_reservation(&self) -> (&str, u64) {
         (&self.media_reservation_id, self.media_reservation_version)
+    }
+    pub fn provider_dispatch_identity(&self) -> (&str, &str) {
+        (&self.provider_request_identity, &self.spend_attempt_id)
     }
 }
 
@@ -889,6 +894,11 @@ impl Db {
                 projection.5 == input.spend_attempt_id,
                 "image generation spend attempt identity differs"
             );
+            let provider_request_identity: String = conn.query_row(
+                "SELECT provider_request_identity FROM image_generation_attempts WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3",
+                params![input.job_id.to_string(), input.slot_id.to_string(), i64::from(input.attempt_number)],
+                |row| row.get(0),
+            )?;
             let spend_plan: String = conn.query_row("SELECT plan_digest FROM image_spend_reservations WHERE reservation_id=?1 AND state='reserved'", [input.spend_reservation_id], |row| row.get(0)).context("image generation spend reservation is unavailable")?;
             ensure!(
                 spend_plan == projection.3,
@@ -927,6 +937,7 @@ impl Db {
                 job_version: input.expected_job_version + 1,
                 spend_reservation_id: input.spend_reservation_id.into(),
                 spend_attempt_id: input.spend_attempt_id.into(),
+                provider_request_identity,
                 media_reservation_id: input.media_reservation_id.into(),
                 media_reservation_version: input.expected_media_reservation_version,
             })
@@ -964,6 +975,7 @@ impl Db {
                 attempt_version: prepared.attempt_version + 1,
                 spend_reservation_id: prepared.spend_reservation_id,
                 spend_attempt_id: prepared.spend_attempt_id,
+                provider_request_identity: prepared.provider_request_identity,
                 media_reservation_id: prepared.media_reservation_id,
                 media_reservation_version: prepared
                     .media_reservation_version

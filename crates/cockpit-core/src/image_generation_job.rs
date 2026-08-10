@@ -47,6 +47,101 @@ pub use cockpit_db::image_generation_plan::{
 };
 
 const MAX_AUTHORITY_STRING_BYTES: usize = 1_024;
+const MAX_PROVIDER_HANDOFF_EVIDENCE_BYTES: usize = 64 * 1024;
+
+mod image_generation_adapter_sealed {
+    pub trait Sealed {}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageGenerationHandoffRequest {
+    pub job_id: Uuid,
+    pub slot_id: Uuid,
+    pub attempt_number: u32,
+    pub external_operation_id: Uuid,
+    pub provider_request_identity: String,
+    pub provider_idempotency_identity: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageGenerationHandoffResult {
+    Accepted { evidence: Vec<u8> },
+    DefinitivelyRejected { evidence: Vec<u8> },
+    SubmissionUnknown { evidence: Vec<u8> },
+}
+
+impl ImageGenerationHandoffResult {
+    fn validate(&self) -> Result<()> {
+        let evidence = match self {
+            Self::Accepted { evidence }
+            | Self::DefinitivelyRejected { evidence }
+            | Self::SubmissionUnknown { evidence } => evidence,
+        };
+        ensure!(
+            !evidence.is_empty() && evidence.len() <= MAX_PROVIDER_HANDOFF_EVIDENCE_BYTES,
+            "image generation handoff evidence is outside its bound"
+        );
+        Ok(())
+    }
+
+    const fn spend_evidence(&self) -> ImageSpendDispatchEvidence {
+        match self {
+            Self::Accepted { .. } => ImageSpendDispatchEvidence::Accepted,
+            Self::DefinitivelyRejected { .. } => ImageSpendDispatchEvidence::DefinitivelyRejected,
+            Self::SubmissionUnknown { .. } => ImageSpendDispatchEvidence::SubmissionUnknown,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+pub trait ImageGenerationAdapter: image_generation_adapter_sealed::Sealed + Send + Sync {
+    async fn handoff(
+        &self,
+        request: &ImageGenerationHandoffRequest,
+    ) -> Result<ImageGenerationHandoffResult>;
+}
+
+#[cfg(test)]
+pub(crate) struct DeterministicImageGenerationAdapter {
+    outcomes: std::sync::Mutex<std::collections::VecDeque<ImageGenerationHandoffResult>>,
+    requests: std::sync::Mutex<Vec<ImageGenerationHandoffRequest>>,
+}
+
+#[cfg(test)]
+impl DeterministicImageGenerationAdapter {
+    pub(crate) fn new(outcomes: Vec<ImageGenerationHandoffResult>) -> Self {
+        Self {
+            outcomes: std::sync::Mutex::new(outcomes.into()),
+            requests: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn requests(&self) -> Vec<ImageGenerationHandoffRequest> {
+        self.requests.lock().expect("fake lock poisoned").clone()
+    }
+}
+
+#[cfg(test)]
+impl image_generation_adapter_sealed::Sealed for DeterministicImageGenerationAdapter {}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl ImageGenerationAdapter for DeterministicImageGenerationAdapter {
+    async fn handoff(
+        &self,
+        request: &ImageGenerationHandoffRequest,
+    ) -> Result<ImageGenerationHandoffResult> {
+        self.requests
+            .lock()
+            .expect("fake lock poisoned")
+            .push(request.clone());
+        self.outcomes
+            .lock()
+            .expect("fake lock poisoned")
+            .pop_front()
+            .context("deterministic image adapter has no configured outcome")
+    }
+}
 
 /// Owns the single transaction that advances image, spend, journal, and media
 /// reservation state across an external provider handoff.
@@ -131,6 +226,44 @@ impl ImageGenerationDispatcher {
                 Ok(())
             })
             .await
+    }
+
+    /// Performs exactly one provider call after the durable dispatch token is
+    /// committed, then atomically records the closed handoff result.
+    pub async fn dispatch_once<A: ImageGenerationAdapter>(
+        &self,
+        adapter: &A,
+        prepared: PreparedImageGenerationDispatch,
+        handoff_plans: Vec<MediaReservationPlan>,
+        at_unix_ms: i64,
+        now_monotonic_ms: u64,
+        media_wall_ms: u64,
+    ) -> Result<ImageGenerationHandoffResult> {
+        let dispatching = self
+            .begin_external_handoff(
+                prepared,
+                handoff_plans,
+                at_unix_ms,
+                now_monotonic_ms,
+                media_wall_ms,
+            )
+            .await?;
+        let (job_id, slot_id, attempt_number, _) = dispatching.identity();
+        let (provider_request_identity, provider_idempotency_identity) =
+            dispatching.provider_dispatch_identity();
+        let request = ImageGenerationHandoffRequest {
+            job_id,
+            slot_id,
+            attempt_number,
+            external_operation_id: dispatching.operation().operation_id,
+            provider_request_identity: provider_request_identity.to_owned(),
+            provider_idempotency_identity: provider_idempotency_identity.to_owned(),
+        };
+        let result = adapter.handoff(&request).await?;
+        result.validate()?;
+        self.finish_external_handoff(dispatching, result.spend_evidence(), at_unix_ms)
+            .await?;
+        Ok(result)
     }
 }
 

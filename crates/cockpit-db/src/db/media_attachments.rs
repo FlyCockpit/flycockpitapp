@@ -1537,9 +1537,27 @@ impl super::Db {
                     reason: MediaAttachmentReasonV1::ModelRuntimeUnavailable,
                 }
             }
-            MediaAvailability::Failed => MediaAttachmentStatusDetailV1::Failed {
-                reason: MediaAttachmentReasonV1::StorageFailure,
-            },
+            MediaAvailability::Failed => {
+                let reason: String = conn.query_row(
+                    "SELECT reason FROM media_attachment_failure_reasons WHERE attachment_id=?1",
+                    [record.attachment_id.to_string()],
+                    |row| row.get(0),
+                ).context("failed media reason missing")?;
+                let reason = match reason.as_str() {
+                    "ambiguous_or_unsupported_container" => {
+                        MediaAttachmentReasonV1::AmbiguousOrUnsupportedContainer
+                    }
+                    "unsupported_codec" => MediaAttachmentReasonV1::UnsupportedCodec,
+                    "unsupported_color_profile" => MediaAttachmentReasonV1::UnsupportedColorProfile,
+                    "invalid_media" => MediaAttachmentReasonV1::InvalidMedia,
+                    "resource_limit" => MediaAttachmentReasonV1::ResourceLimit,
+                    "decode_failed" => MediaAttachmentReasonV1::DecodeFailed,
+                    "normalization_failed" => MediaAttachmentReasonV1::NormalizationFailed,
+                    "storage_failure" => MediaAttachmentReasonV1::StorageFailure,
+                    _ => anyhow::bail!("invalid persisted media failure reason"),
+                };
+                MediaAttachmentStatusDetailV1::Failed { reason }
+            }
             MediaAvailability::SourceChanged => MediaAttachmentStatusDetailV1::SourceChanged {
                 reason: MediaAttachmentReasonV1::SourceChanged,
             },

@@ -177,6 +177,16 @@ CREATE INDEX idx_media_attachments_session
 CREATE INDEX idx_media_attachments_cleanup
     ON media_attachments(availability, draft_expires_at_unix_ms);
 
+CREATE TABLE media_attachment_failure_reasons (
+    attachment_id TEXT PRIMARY KEY REFERENCES media_attachments(attachment_id) ON DELETE CASCADE,
+    reason TEXT NOT NULL CHECK (reason IN (
+        'ambiguous_or_unsupported_container', 'unsupported_codec',
+        'unsupported_color_profile', 'invalid_media', 'resource_limit',
+        'decode_failed', 'normalization_failed', 'storage_failure'
+    )),
+    recorded_at_unix_ms INTEGER NOT NULL
+);
+
 CREATE TRIGGER media_attachment_identity_immutable
 BEFORE UPDATE ON media_attachments
 WHEN NEW.attachment_id <> OLD.attachment_id

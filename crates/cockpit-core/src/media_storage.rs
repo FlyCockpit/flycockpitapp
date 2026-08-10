@@ -252,7 +252,8 @@ impl MediaStorageRecovery {
                         completed += 1;
                         continue;
                     }
-                    self.db.transaction(move|conn|{let failed_generation=expected_generation.checked_add(2).context("availability generation overflow")?;cockpit_db::Db::transition_media_attachment_conn(conn,attachment_id,expected_version,expected_generation+1,MediaAvailability::Failed,now_unix_ms)?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,'probing','failed',?3,?4)",params![attachment_id.to_string(),failed_generation.to_string(),job_id.to_string(),now_unix_ms])?;conn.execute("INSERT INTO media_attachment_processing_failure_evidence(job_id,attachment_id,reason,recorded_at_unix_ms) VALUES(?1,?2,'processing_failed',?3)",params![job_id.to_string(),attachment_id.to_string(),now_unix_ms])?;conn.execute("UPDATE media_attachment_processing_jobs SET state='completed',completed_at_unix_ms=?1 WHERE job_id=?2 AND state='claimed'",params![now_unix_ms,job_id.to_string()])?;Ok(())}).await?;
+                    let reason = closed_media_failure_reason(&error);
+                    self.db.transaction(move|conn|{let failed_generation=expected_generation.checked_add(2).context("availability generation overflow")?;cockpit_db::Db::transition_media_attachment_conn(conn,attachment_id,expected_version,expected_generation+1,MediaAvailability::Failed,now_unix_ms)?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,'probing','failed',?3,?4)",params![attachment_id.to_string(),failed_generation.to_string(),job_id.to_string(),now_unix_ms])?;conn.execute("INSERT INTO media_attachment_failure_reasons(attachment_id,reason,recorded_at_unix_ms) VALUES(?1,?2,?3)",params![attachment_id.to_string(),reason,now_unix_ms])?;conn.execute("INSERT INTO media_attachment_processing_failure_evidence(job_id,attachment_id,reason,recorded_at_unix_ms) VALUES(?1,?2,'processing_failed',?3)",params![job_id.to_string(),attachment_id.to_string(),now_unix_ms])?;conn.execute("UPDATE media_attachment_processing_jobs SET state='completed',completed_at_unix_ms=?1 WHERE job_id=?2 AND state='claimed'",params![now_unix_ms,job_id.to_string()])?;Ok(())}).await?;
                     completed += 1;
                     continue;
                 }
@@ -312,7 +313,7 @@ impl MediaStorageRecovery {
                 };
             if let Some(terminal) = terminal {
                 let terminal_text = terminal.as_str().to_owned();
-                self.db.transaction(move|conn|{let terminal_generation=expected_generation.checked_add(2).context("availability generation overflow")?;cockpit_db::Db::transition_media_attachment_conn(conn,attachment_id,expected_version,expected_generation+1,terminal,now_unix_ms)?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,'probing',?3,?4,?5)",params![attachment_id.to_string(),terminal_generation.to_string(),terminal_text,job_id.to_string(),now_unix_ms])?;conn.execute("INSERT INTO media_attachment_processing_failure_evidence(job_id,attachment_id,reason,recorded_at_unix_ms) VALUES(?1,?2,?3,?4)",params![job_id.to_string(),attachment_id.to_string(),if terminal==MediaAvailability::ModelDerivativeUnavailable{"model_runtime_unavailable"}else{"processing_failed"},now_unix_ms])?;conn.execute("UPDATE media_attachment_processing_jobs SET state='completed',completed_at_unix_ms=?1 WHERE job_id=?2 AND state='claimed'",params![now_unix_ms,job_id.to_string()])?;Ok(())}).await?;
+                self.db.transaction(move|conn|{let terminal_generation=expected_generation.checked_add(2).context("availability generation overflow")?;cockpit_db::Db::transition_media_attachment_conn(conn,attachment_id,expected_version,expected_generation+1,terminal,now_unix_ms)?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,'probing',?3,?4,?5)",params![attachment_id.to_string(),terminal_generation.to_string(),terminal_text,job_id.to_string(),now_unix_ms])?;if terminal==MediaAvailability::Failed{conn.execute("INSERT INTO media_attachment_failure_reasons(attachment_id,reason,recorded_at_unix_ms) VALUES(?1,'normalization_failed',?2)",params![attachment_id.to_string(),now_unix_ms])?;}conn.execute("INSERT INTO media_attachment_processing_failure_evidence(job_id,attachment_id,reason,recorded_at_unix_ms) VALUES(?1,?2,?3,?4)",params![job_id.to_string(),attachment_id.to_string(),if terminal==MediaAvailability::ModelDerivativeUnavailable{"model_runtime_unavailable"}else{"processing_failed"},now_unix_ms])?;conn.execute("UPDATE media_attachment_processing_jobs SET state='completed',completed_at_unix_ms=?1 WHERE job_id=?2 AND state='claimed'",params![now_unix_ms,job_id.to_string()])?;Ok(())}).await?;
                 completed += 1;
                 continue;
             }
@@ -2172,7 +2173,7 @@ impl MediaStorageRecovery {
         let final_availability = av_terminal.unwrap_or(MediaAvailability::Ready);
         let reservation_id = snapshot.5.clone();
         let transition_operation_id = mutation.local_operation_id;
-        let result=self.db.transaction(move|conn|{if let Some(receipt)=preflight_local_operation(conn,mutation.local_operation_id,"finalize",&domain,&request_digest,&semantic_digest,now_unix_ms)?{return Ok((receipt,false))}cockpit_db::Db::insert_media_attachment_conn(conn,&record)?;cockpit_db::Db::insert_media_attachment_component_conn(conn,&component_record)?;if ready {for (kind,storage,identity,length,checksum,dimensions) in derivative_components {let id=Uuid::now_v7();let component=MediaAttachmentComponent{component_id:id,attachment_id:attachment,attachment_version:1,component_kind:kind,storage_id:storage,lifecycle_state:"ready".into(),component_generation:1,stable_identity_digest:identity,byte_length:length,sha256:checksum,reservation_id:reservation_id.clone(),created_at_unix_ms:now_unix_ms,updated_at_unix_ms:now_unix_ms};cockpit_db::Db::insert_media_attachment_component_conn(conn,&component)?;if let Some((width,height))=dimensions{conn.execute("INSERT INTO media_image_component_dimensions(component_id,width,height) VALUES(?1,?2,?3)",params![id.to_string(),width,height])?;}}}if let Some(evidence)=av_normalization_evidence{conn.execute("INSERT INTO media_av_normalization_evidence(attachment_id,runtime_fingerprint,probe_digest,decode_digest,plan_digest,derivative_checksum) VALUES(?1,?2,?3,?4,?5,?6)",params![attachment.to_string(),evidence.runtime_fingerprint,evidence.probe_digest,evidence.decode_digest,evidence.plan_digest,evidence.derivative_checksum])?;}if processed{let mut availability=MediaAvailability::Quarantined;let mut available_generation=1;for next_state in [MediaAvailability::Probing,MediaAvailability::Decoding,MediaAvailability::Normalizing,final_availability]{cockpit_db::Db::transition_media_attachment_conn(conn,attachment,1,available_generation,next_state,now_unix_ms)?;let next_generation=available_generation.checked_add(1).context("availability generation overflow")?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![attachment.to_string(),next_generation.to_string(),availability.as_str(),next_state.as_str(),transition_operation_id.to_string(),now_unix_ms])?;availability=next_state;available_generation=next_generation;}ensure!(availability==final_availability,"media terminal transition failed");}conn.execute("INSERT INTO media_attachment_upload_origins(attachment_id,client_draft_id,upload_id,upload_generation) VALUES(?1,?2,?3,?4)",params![attachment.to_string(),draft.to_string(),upload.to_string(),next.to_string()])?;let changed=conn.execute("UPDATE media_uploads SET state='materialized',upload_generation=?1,next_chunk_index=NULL,attachment_id=?2,attachment_version='1',last_transition_json=?3,updated_at_unix_ms=?4 WHERE upload_id=?5 AND upload_generation=?6 AND state='open'",params![next.to_string(),attachment.to_string(),serde_json::to_string(&transition)?,now_unix_ms,upload.to_string(),generation.to_string()])?;ensure!(changed==1,"upload finalize lost compare-and-swap");let receipt=LocalMediaMutationReceiptV1{schema_version:1,kind:"localMediaMutationReceipt".into(),receipt_id:Uuid::now_v7(),local_operation_id:mutation.local_operation_id,actor_principal_digest:mutation.actor_principal_digest,action:"finalize".into(),subject_kind:LocalMediaSubjectKindV1::Upload,subject_id:upload,operation_request_digest:request_digest.clone(),semantic_command_digest:semantic_digest.clone(),outcome:LocalMediaMutationOutcomeV1::Applied,transition:LocalMediaMutationTransitionV1::UploadToAttachment{upload_generation_before:generation,upload_generation_after:next,attachment_version:1,availability_generation:if processed{5}else{1},reference_generation:1},discard_result:None,discard_result_digest:None,committed_at_unix_ms:now_unix_ms};commit_local_operation(conn,&receipt,"finalize",&domain,&request_digest,&semantic_digest,now_unix_ms)?;Ok((receipt,true))}).await;
+        let result=self.db.transaction(move|conn|{if let Some(receipt)=preflight_local_operation(conn,mutation.local_operation_id,"finalize",&domain,&request_digest,&semantic_digest,now_unix_ms)?{return Ok((receipt,false))}cockpit_db::Db::insert_media_attachment_conn(conn,&record)?;cockpit_db::Db::insert_media_attachment_component_conn(conn,&component_record)?;if ready {for (kind,storage,identity,length,checksum,dimensions) in derivative_components {let id=Uuid::now_v7();let component=MediaAttachmentComponent{component_id:id,attachment_id:attachment,attachment_version:1,component_kind:kind,storage_id:storage,lifecycle_state:"ready".into(),component_generation:1,stable_identity_digest:identity,byte_length:length,sha256:checksum,reservation_id:reservation_id.clone(),created_at_unix_ms:now_unix_ms,updated_at_unix_ms:now_unix_ms};cockpit_db::Db::insert_media_attachment_component_conn(conn,&component)?;if let Some((width,height))=dimensions{conn.execute("INSERT INTO media_image_component_dimensions(component_id,width,height) VALUES(?1,?2,?3)",params![id.to_string(),width,height])?;}}}if let Some(evidence)=av_normalization_evidence{conn.execute("INSERT INTO media_av_normalization_evidence(attachment_id,runtime_fingerprint,probe_digest,decode_digest,plan_digest,derivative_checksum) VALUES(?1,?2,?3,?4,?5,?6)",params![attachment.to_string(),evidence.runtime_fingerprint,evidence.probe_digest,evidence.decode_digest,evidence.plan_digest,evidence.derivative_checksum])?;}if final_availability==MediaAvailability::Failed{conn.execute("INSERT INTO media_attachment_failure_reasons(attachment_id,reason,recorded_at_unix_ms) VALUES(?1,'normalization_failed',?2)",params![attachment.to_string(),now_unix_ms])?;}if processed{let mut availability=MediaAvailability::Quarantined;let mut available_generation=1;for next_state in [MediaAvailability::Probing,MediaAvailability::Decoding,MediaAvailability::Normalizing,final_availability]{cockpit_db::Db::transition_media_attachment_conn(conn,attachment,1,available_generation,next_state,now_unix_ms)?;let next_generation=available_generation.checked_add(1).context("availability generation overflow")?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![attachment.to_string(),next_generation.to_string(),availability.as_str(),next_state.as_str(),transition_operation_id.to_string(),now_unix_ms])?;availability=next_state;available_generation=next_generation;}ensure!(availability==final_availability,"media terminal transition failed");}conn.execute("INSERT INTO media_attachment_upload_origins(attachment_id,client_draft_id,upload_id,upload_generation) VALUES(?1,?2,?3,?4)",params![attachment.to_string(),draft.to_string(),upload.to_string(),next.to_string()])?;let changed=conn.execute("UPDATE media_uploads SET state='materialized',upload_generation=?1,next_chunk_index=NULL,attachment_id=?2,attachment_version='1',last_transition_json=?3,updated_at_unix_ms=?4 WHERE upload_id=?5 AND upload_generation=?6 AND state='open'",params![next.to_string(),attachment.to_string(),serde_json::to_string(&transition)?,now_unix_ms,upload.to_string(),generation.to_string()])?;ensure!(changed==1,"upload finalize lost compare-and-swap");let receipt=LocalMediaMutationReceiptV1{schema_version:1,kind:"localMediaMutationReceipt".into(),receipt_id:Uuid::now_v7(),local_operation_id:mutation.local_operation_id,actor_principal_digest:mutation.actor_principal_digest,action:"finalize".into(),subject_kind:LocalMediaSubjectKindV1::Upload,subject_id:upload,operation_request_digest:request_digest.clone(),semantic_command_digest:semantic_digest.clone(),outcome:LocalMediaMutationOutcomeV1::Applied,transition:LocalMediaMutationTransitionV1::UploadToAttachment{upload_generation_before:generation,upload_generation_after:next,attachment_version:1,availability_generation:if processed{5}else{1},reference_generation:1},discard_result:None,discard_result_digest:None,committed_at_unix_ms:now_unix_ms};commit_local_operation(conn,&receipt,"finalize",&domain,&request_digest,&semantic_digest,now_unix_ms)?;Ok((receipt,true))}).await;
         if result.as_ref().is_err() || result.as_ref().is_ok_and(|(_, applied)| !*applied) {
             self.owned_root
                 .rename_into_noreplace(&target, &self.owned_root, &snapshot.0)
@@ -2939,6 +2940,27 @@ fn probe_upload_container(
     let (kind, container, mime) = classified.context("ambiguous_or_unsupported_container")?;
     ensure!(kind == declared, "ambiguous_or_unsupported_container");
     Ok((container, mime))
+}
+
+fn closed_media_failure_reason(error: &anyhow::Error) -> &'static str {
+    let text = error.to_string();
+    if error.downcast_ref::<std::io::Error>().is_some() {
+        "storage_failure"
+    } else if text.contains("ambiguous_or_unsupported_container") {
+        "ambiguous_or_unsupported_container"
+    } else if text.contains("unsupported_codec") {
+        "unsupported_codec"
+    } else if text.contains("unsupported_color_profile") {
+        "unsupported_color_profile"
+    } else if text.contains("resource_limit") {
+        "resource_limit"
+    } else if text.contains("decode") {
+        "decode_failed"
+    } else if text.contains("invalid_media") {
+        "invalid_media"
+    } else {
+        "normalization_failed"
+    }
 }
 
 fn valid_mpeg_audio_prefix(bytes: &[u8]) -> bool {
@@ -5142,6 +5164,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn retained_failure_reason_classifier_is_closed_and_redacted() {
+        assert_eq!(
+            closed_media_failure_reason(&anyhow::anyhow!("ambiguous_or_unsupported_container")),
+            "ambiguous_or_unsupported_container"
+        );
+        assert_eq!(
+            closed_media_failure_reason(&anyhow::anyhow!("decode worker rejected bytes")),
+            "decode_failed"
+        );
+        assert_eq!(
+            closed_media_failure_reason(&anyhow::anyhow!("encoder returned private detail")),
+            "normalization_failed"
+        );
+        assert_eq!(
+            closed_media_failure_reason(&anyhow::Error::new(std::io::Error::other("secret path"))),
+            "storage_failure"
+        );
+    }
+
     struct ScriptedVideoRunner {
         fail_encode: AtomicBool,
         calls: AtomicUsize,
@@ -6255,11 +6297,55 @@ mod tests {
                         [],
                         |r| r.get::<_, i64>(0),
                     )?,
+                    conn.query_row(
+                        "SELECT reason FROM media_attachment_failure_reasons",
+                        [],
+                        |r| r.get::<_, String>(0),
+                    )?,
                 ))
             })
             .await
             .unwrap();
-        assert_eq!(state, ("failed".into(), 1));
+        assert_eq!(
+            state,
+            (
+                "failed".into(),
+                1,
+                "ambiguous_or_unsupported_container".into()
+            )
+        );
+        let attachment_id = db
+            .read(|conn| {
+                Ok(Uuid::parse_str(&conn.query_row(
+                    "SELECT attachment_id FROM media_attachments",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )?)?)
+            })
+            .await
+            .unwrap();
+        let status = db
+            .read(move |conn| {
+                cockpit_db::Db::media_attachment_status_for_owner_conn(
+                    conn,
+                    &cockpit_db::media_attachments::GetMediaAttachmentStatusV1 {
+                        schema_version: 1,
+                        kind: "getMediaAttachmentStatus".into(),
+                        session_id,
+                        canonical_project_digest: "11".repeat(32),
+                        attachment_id,
+                    },
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            status.detail,
+            cockpit_db::media_attachments::MediaAttachmentStatusDetailV1::Failed {
+                reason: cockpit_db::media_attachments::MediaAttachmentReasonV1::AmbiguousOrUnsupportedContainer
+            }
+        ));
     }
 
     #[tokio::test]

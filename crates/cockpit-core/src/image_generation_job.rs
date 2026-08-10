@@ -188,6 +188,24 @@ pub struct DecodedImageGenerationDispatchCandidate {
     pub media_plan: MediaReservationPlan,
 }
 
+#[async_trait::async_trait]
+pub trait ImageGenerationDispatchAuthority: Send + Sync {
+    async fn prepare_claimed(
+        &self,
+        candidate: DecodedImageGenerationDispatchCandidate,
+        worker_boot_id: Uuid,
+        claim_generation: u64,
+    ) -> Result<(PreparedImageGenerationDispatch, Vec<MediaReservationPlan>)>;
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ImageGenerationSchedulerPass {
+    pub scanned: u32,
+    pub claimed: u32,
+    pub dispatched: u32,
+    pub skipped: u32,
+}
+
 impl ImageGenerationDispatcher {
     pub fn new(db: cockpit_db::Db) -> Self {
         Self { db }
@@ -228,6 +246,75 @@ impl ImageGenerationDispatcher {
                 .collect()
             })
             .await
+    }
+
+    pub async fn run_scheduler_pass<A, P>(
+        &self,
+        adapter: &A,
+        authority: &P,
+        worker_boot_id: Uuid,
+        now_monotonic_ms: u64,
+        at_unix_ms: i64,
+        media_wall_ms: u64,
+        limit: u32,
+    ) -> Result<ImageGenerationSchedulerPass>
+    where
+        A: ImageGenerationAdapter,
+        P: ImageGenerationDispatchAuthority,
+    {
+        let candidates = self
+            .scan_dispatch_candidates(now_monotonic_ms, limit)
+            .await?;
+        let mut pass = ImageGenerationSchedulerPass {
+            scanned: u32::try_from(candidates.len())?,
+            ..Default::default()
+        };
+        for candidate in candidates {
+            let claim = cockpit_db::db::image_generation::ClaimImageGenerationDispatch {
+                job_id: candidate.candidate.job_id,
+                slot_id: candidate.candidate.slot_id,
+                attempt_number: candidate.candidate.attempt_number,
+                worker_boot_id,
+                claim_generation: candidate.candidate.next_claim_generation,
+            };
+            if self
+                .db
+                .transaction(move |conn| {
+                    cockpit_db::Db::claim_image_generation_dispatch_conn(conn, &claim)
+                })
+                .await
+                .is_err()
+            {
+                pass.skipped += 1;
+                continue;
+            }
+            pass.claimed += 1;
+            let generation = candidate.candidate.next_claim_generation;
+            let Ok((prepared, plans)) = authority
+                .prepare_claimed(candidate, worker_boot_id, generation)
+                .await
+            else {
+                pass.skipped += 1;
+                continue;
+            };
+            if self
+                .dispatch_once(
+                    adapter,
+                    prepared,
+                    plans,
+                    at_unix_ms,
+                    now_monotonic_ms,
+                    media_wall_ms,
+                )
+                .await
+                .is_ok()
+            {
+                pass.dispatched += 1;
+            } else {
+                pass.skipped += 1;
+            }
+        }
+        Ok(pass)
     }
 
     pub async fn begin_external_handoff(

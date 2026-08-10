@@ -729,6 +729,7 @@ pub struct ImageGenerationDispatchCandidate {
     pub plan_digest: String,
     pub canonical_media_plan: Vec<u8>,
     pub media_plan_digest: String,
+    pub next_claim_generation: u64,
 }
 
 struct ImageGenerationDispatchCandidateRow {
@@ -742,6 +743,7 @@ struct ImageGenerationDispatchCandidateRow {
     plan_digest: String,
     canonical_media_plan: Vec<u8>,
     media_plan_digest: String,
+    next_claim_generation: i64,
 }
 
 impl Db {
@@ -752,7 +754,7 @@ impl Db {
     ) -> Result<Vec<ImageGenerationDispatchCandidate>> {
         ensure!((1..=64).contains(&limit), "invalid scheduler scan limit");
         let database_now = database_now_unix_ms(conn)?;
-        let mut statement=conn.prepare("SELECT j.job_id,s.slot_id,a.attempt_number,j.version,s.version,a.version,p.canonical_plan,p.plan_digest,m.canonical_media_plan,m.media_plan_digest FROM image_generation_jobs j JOIN image_generation_slots s ON s.job_id=j.job_id JOIN image_generation_attempts a ON a.job_id=s.job_id AND a.slot_id=s.slot_id JOIN image_generation_plans p ON p.job_id=j.job_id JOIN image_generation_attempt_media_snapshots m ON m.job_id=a.job_id AND m.slot_id=a.slot_id AND m.attempt_number=a.attempt_number LEFT JOIN image_generation_scheduler_claims c ON c.job_id=s.job_id AND c.slot_id=s.slot_id AND c.expires_at_unix_ms>?1 WHERE j.state='queued' AND s.state='queued' AND a.state='planned' AND p.operation_deadline_monotonic_ms>?2 AND c.job_id IS NULL AND NOT EXISTS(SELECT 1 FROM image_generation_cancellation_facts x WHERE x.job_id=j.job_id) ORDER BY j.created_at_unix_ms,j.job_id,s.slot_index,a.attempt_number LIMIT ?3")?;
+        let mut statement=conn.prepare("SELECT j.job_id,s.slot_id,a.attempt_number,j.version,s.version,a.version,p.canonical_plan,p.plan_digest,m.canonical_media_plan,m.media_plan_digest,COALESCE((SELECT claim_generation+1 FROM image_generation_scheduler_claims old WHERE old.job_id=s.job_id AND old.slot_id=s.slot_id),1) FROM image_generation_jobs j JOIN image_generation_slots s ON s.job_id=j.job_id JOIN image_generation_attempts a ON a.job_id=s.job_id AND a.slot_id=s.slot_id JOIN image_generation_plans p ON p.job_id=j.job_id JOIN image_generation_attempt_media_snapshots m ON m.job_id=a.job_id AND m.slot_id=a.slot_id AND m.attempt_number=a.attempt_number LEFT JOIN image_generation_scheduler_claims c ON c.job_id=s.job_id AND c.slot_id=s.slot_id AND c.expires_at_unix_ms>?1 WHERE j.state='queued' AND s.state='queued' AND a.state='planned' AND p.operation_deadline_monotonic_ms>?2 AND c.job_id IS NULL AND NOT EXISTS(SELECT 1 FROM image_generation_cancellation_facts x WHERE x.job_id=j.job_id) ORDER BY j.created_at_unix_ms,j.job_id,s.slot_index,a.attempt_number LIMIT ?3")?;
         let rows = statement.query_map(
             params![
                 database_now,
@@ -771,6 +773,7 @@ impl Db {
                     plan_digest: row.get(7)?,
                     canonical_media_plan: row.get(8)?,
                     media_plan_digest: row.get(9)?,
+                    next_claim_generation: row.get(10)?,
                 })
             },
         )?;
@@ -788,6 +791,7 @@ impl Db {
                 plan_digest: row.plan_digest,
                 canonical_media_plan: row.canonical_media_plan,
                 media_plan_digest: row.media_plan_digest,
+                next_claim_generation: u64::try_from(row.next_claim_generation)?,
             })
         })
         .collect()

@@ -19,15 +19,15 @@ use cockpit_db::db::external_journal::{
     ExternalJournalDigest, ExternalJournalToken, PrepareExternalOperation, ProviderIdempotency,
 };
 use cockpit_db::db::image_generation::{
-    AdvanceImageGenerationLatePublication, CreateImageGenerationArtifact,
-    CreateImageGenerationArtifactComponent, DispatchingImageGenerationAttempt,
-    ImageGenerationArtifactComponentKind, ImageGenerationArtifactComponentState,
-    ImageGenerationArtifactConsumerPurpose, ImageGenerationArtifactConsumerRoute,
-    ImageGenerationArtifactState, ImageGenerationDispatchCandidate,
-    ImageGenerationLatePublicationEvidenceV1, ImageGenerationLatePublicationState,
-    PreparedImageGenerationDispatch, ReserveImageGenerationLatePublication,
-    TransitionImageGenerationArtifact, TransitionImageGenerationArtifactComponent,
-    image_generation_component_set_binding,
+    AdvanceImageGenerationLatePublication, BlockVerifiedImageGenerationLatePublication,
+    CreateImageGenerationArtifact, CreateImageGenerationArtifactComponent,
+    DispatchingImageGenerationAttempt, ImageGenerationArtifactComponentKind,
+    ImageGenerationArtifactComponentState, ImageGenerationArtifactConsumerPurpose,
+    ImageGenerationArtifactConsumerRoute, ImageGenerationArtifactState,
+    ImageGenerationDispatchCandidate, ImageGenerationLatePublicationEvidenceV1,
+    ImageGenerationLatePublicationState, PreparedImageGenerationDispatch,
+    ReserveImageGenerationLatePublication, TransitionImageGenerationArtifact,
+    TransitionImageGenerationArtifactComponent, image_generation_component_set_binding,
 };
 use cockpit_db::db::sealed_scope::SealedActionGrantRow;
 use cockpit_db::image_spend::{AttemptMaximum, ImageSpendDispatchEvidence, SpendReservation};
@@ -2087,16 +2087,25 @@ pub fn block_verified_copy_authorized_publication(
         parent_sync_digest: authority.parent_identity_digest.clone(),
     }
     .canonical_json()?;
-    cockpit_db::Db::advance_image_generation_late_publication_conn(
+    let recovery_evidence = ImageGenerationLatePublicationEvidenceV1::SecurityAmbiguous {
+        schema_version: 1,
+        recovery_digest: crate::intel::hex_lower(&Sha256::digest(format!(
+            "verified-output-block:{}:{}:{}",
+            input.publication_operation_id,
+            artifact.identity_digest(),
+            artifact.security_digest()
+        ))),
+    }
+    .canonical_json()?;
+    cockpit_db::Db::block_verified_image_generation_late_publication_conn(
         conn,
-        &AdvanceImageGenerationLatePublication {
+        &BlockVerifiedImageGenerationLatePublication {
             publication_operation_id: input.publication_operation_id,
             expected_version: input.expected_lease_version,
             worker_boot_id: input.worker_boot_id,
             claim_generation: input.claim_generation,
-            from: ImageGenerationLatePublicationState::CopyAuthorized,
-            to: ImageGenerationLatePublicationState::SecurityBlocked,
-            evidence_json: &evidence,
+            output_evidence_json: &evidence,
+            recovery_evidence_json: &recovery_evidence,
         },
     )?;
     Ok(artifact)

@@ -2299,6 +2299,16 @@ pub struct AdvanceImageGenerationLatePublication<'a> {
     pub evidence_json: &'a str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockVerifiedImageGenerationLatePublication<'a> {
+    pub publication_operation_id: Uuid,
+    pub expected_version: u64,
+    pub worker_boot_id: Uuid,
+    pub claim_generation: u64,
+    pub output_evidence_json: &'a str,
+    pub recovery_evidence_json: &'a str,
+}
+
 struct LatePublicationFinalizeProjection {
     artifact_id: String,
     artifact_generation: i64,
@@ -2727,6 +2737,17 @@ impl Db {
         advance_image_generation_late_publication_at_conn(conn, input, database_now_unix_ms(conn)?)
     }
 
+    pub fn block_verified_image_generation_late_publication_conn(
+        conn: &Connection,
+        input: &BlockVerifiedImageGenerationLatePublication<'_>,
+    ) -> Result<()> {
+        block_verified_image_generation_late_publication_at_conn(
+            conn,
+            input,
+            database_now_unix_ms(conn)?,
+        )
+    }
+
     pub fn finalize_image_generation_late_publication_conn(
         conn: &Connection,
         publication_operation_id: Uuid,
@@ -2915,6 +2936,45 @@ fn advance_image_generation_late_publication_at_conn(
     ensure!(
         changed == 1,
         "late publication advance compare-and-set lost"
+    );
+    Ok(())
+}
+
+fn block_verified_image_generation_late_publication_at_conn(
+    conn: &Connection,
+    input: &BlockVerifiedImageGenerationLatePublication<'_>,
+    database_now_unix_ms: i64,
+) -> Result<()> {
+    let evidence = validate_late_evidence(input.output_evidence_json)?;
+    ensure!(
+        matches!(
+            evidence,
+            ImageGenerationLatePublicationEvidenceV1::OutputDurable { .. }
+        ),
+        "verified late publication block requires durable output evidence"
+    );
+    ensure!(
+        matches!(
+            validate_late_evidence(input.recovery_evidence_json)?,
+            ImageGenerationLatePublicationEvidenceV1::SecurityAmbiguous { .. }
+        ),
+        "verified late publication block requires closed recovery evidence"
+    );
+    let changed = conn.execute(
+        "UPDATE image_generation_late_publication_leases SET state='security_blocked',version=version+1,output_evidence_json=?1,recovery_evidence_json=?2,decided_at_unix_ms=?3 WHERE publication_operation_id=?4 AND state='copy_authorized' AND version=?5 AND worker_boot_id=?6 AND claim_generation=?7 AND EXISTS(SELECT 1 FROM image_generation_artifacts a JOIN image_generation_slots s ON s.job_id=a.job_id AND s.slot_id=a.slot_id JOIN image_generation_late_publication_authorization_facts f ON f.authorization_digest=image_generation_late_publication_leases.authorization_digest WHERE a.artifact_id=image_generation_late_publication_leases.artifact_id AND a.generation=image_generation_late_publication_leases.artifact_generation AND a.state='late_quarantined' AND a.active_lease_count=0 AND s.version=image_generation_late_publication_leases.expected_slot_version AND s.state='late_quarantined' AND s.result_after_cancel=1 AND f.revoked_at_unix_ms IS NULL AND f.output_authority_digest=image_generation_late_publication_leases.output_authority_digest AND f.output_authority_generation=image_generation_late_publication_leases.output_authority_generation AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_cleanup_intents i WHERE i.artifact_id=a.artifact_id) AND (SELECT count(*) FROM image_generation_artifact_components c WHERE c.artifact_id=a.artifact_id AND c.state='ready')=a.expected_component_count)",
+        params![
+            input.output_evidence_json,
+            input.recovery_evidence_json,
+            database_now_unix_ms,
+            input.publication_operation_id.to_string(),
+            i64::try_from(input.expected_version)?,
+            input.worker_boot_id.to_string(),
+            i64::try_from(input.claim_generation)?,
+        ],
+    )?;
+    ensure!(
+        changed == 1,
+        "verified late publication block lost its compare-and-set"
     );
     Ok(())
 }

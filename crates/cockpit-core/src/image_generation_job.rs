@@ -2292,6 +2292,28 @@ fn valid_path_component(value: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn deterministic_adapter_records_one_closed_handoff() {
+        let adapter = DeterministicImageGenerationAdapter::new(vec![
+            ImageGenerationHandoffResult::Accepted {
+                evidence: b"accepted".to_vec(),
+            },
+        ]);
+        let request = ImageGenerationHandoffRequest {
+            job_id: Uuid::now_v7(),
+            slot_id: Uuid::now_v7(),
+            attempt_number: 1,
+            external_operation_id: Uuid::now_v7(),
+            provider_request_identity: "request:1".into(),
+            provider_idempotency_identity: "idempotency:1".into(),
+        };
+        assert!(matches!(
+            adapter.handoff(&request).await,
+            ImageGenerationHandoffResult::Accepted { .. }
+        ));
+        assert_eq!(adapter.requests(), vec![request]);
+    }
+
     #[test]
     fn owner_recovery_authority_rejects_every_remote_write_mode() {
         use crate::daemon::principal::{PrincipalGrant, PrincipalScope, RemotePrincipal};

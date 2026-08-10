@@ -163,9 +163,7 @@
       "class": "read_only",
       "strategy": "none",
       "evidence": null,
-      "fcorRoles": [
-        { "field": "operation_id", "type": "Uuid", "role": "param" }
-      ]
+      "fcorRoles": [{ "field": "operation_id", "type": "Uuid", "role": "param" }]
     },
     {
       "tag": "cancel_run_invocation",
@@ -1773,8 +1771,8 @@
       "tag": "create_scheduled_job",
       "fcorSchema": "job:ScheduledJobCreate",
       "fcorCanonicalSchema": "job:struct:ScheduledJobCreate:v1",
-      "class": "transactional_mutation",
-      "strategy": "sql_transaction",
+      "class": "local_only",
+      "strategy": "none",
       "evidence": null,
       "fcorRoles": [
         {
@@ -1803,8 +1801,8 @@
       "tag": "delete_scheduled_job",
       "fcorSchema": "id:String",
       "fcorCanonicalSchema": "id:string",
-      "class": "transactional_mutation",
-      "strategy": "sql_transaction",
+      "class": "local_only",
+      "strategy": "none",
       "evidence": null,
       "fcorRoles": [
         {
@@ -1818,8 +1816,8 @@
       "tag": "set_scheduled_job_enabled",
       "fcorSchema": "id:String|enabled:bool",
       "fcorCanonicalSchema": "id:string|enabled:bool",
-      "class": "transactional_mutation",
-      "strategy": "sql_transaction",
+      "class": "local_only",
+      "strategy": "none",
       "evidence": null,
       "fcorRoles": [
         {
@@ -1838,9 +1836,9 @@
       "tag": "run_scheduled_job",
       "fcorSchema": "id:String",
       "fcorCanonicalSchema": "id:string",
-      "class": "idempotent_adapter_mutation",
-      "strategy": "durable_dispatch_key",
-      "evidence": "dispatch_key_and_generation",
+      "class": "local_only",
+      "strategy": "none",
+      "evidence": null,
       "fcorRoles": [
         {
           "field": "id",

@@ -2646,6 +2646,92 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
 }
 
 #[tokio::test]
+async fn remote_scheduler_mutation_is_local_only_before_ledger_or_domain_write() {
+    let ctx = test_ctx();
+    ctx.db
+        .insert_scheduled_job(crate::db::scheduler::NewScheduledJobRow {
+            id: "local-job".into(),
+            owner: "owner".into(),
+            schedule_json: r#"{"interval":{"seconds":60}}"#.into(),
+            payload_json: r#"{"callback":{"subsystem":"test"}}"#.into(),
+            enabled: true,
+            missed_run_policy: "skip".into(),
+            created_at: 1,
+            updated_at: 1,
+            next_run_at: Some(61),
+        })
+        .await
+        .unwrap();
+    let logical_attachment_id = Uuid::parse_str("22222222-2222-4222-8222-222222222225").unwrap();
+    let operation_id = Uuid::parse_str("018f3f24-7a10-7cc2-8f55-dddddddddddd").unwrap();
+    let principal = ClientPrincipal::Remote(principal::RemotePrincipal {
+        user_id: "scheduler-remote".into(),
+        grants: vec![principal::PrincipalGrant {
+            scope: principal::PrincipalScope::Agent,
+            project_root: None,
+        }],
+        actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+            schema_version: 1,
+            device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333336").unwrap(),
+            device_generation: 1,
+            logical_attachment_id,
+        }),
+    });
+    let mut state = MutableClientState::detached_with_principal(
+        ctx.upload_accounting.clone(),
+        principal,
+        ctx.terminal_host.clone(),
+    );
+    let mut shared = state.shared_snapshot();
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_cmd_tx, _event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let mut concurrent = ConcurrentRequestRuntime::new();
+    let request_id = Uuid::new_v4();
+    let operation =
+        proto::RemoteOperationIdentityV1::new(logical_attachment_id, operation_id).unwrap();
+    handle_envelope(
+        Envelope::remote_request(
+            request_id,
+            operation,
+            Request::DeleteScheduledJob {
+                id: "local-job".into(),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "local-only scheduler rejection").await,
+        Body::Error { id: Some(id), error } if id == request_id && error.code == ErrorCode::Unauthorized
+    ));
+    assert!(
+        ctx.db
+            .get_scheduled_job("local-job")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        ctx.db
+            .remote_operation_status(
+                &logical_attachment_id.to_string(),
+                &operation_id.to_string(),
+                "33333333-3333-4333-8333-333333333336",
+                1,
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn remote_cancel_invocation_applies_replays_and_conflicts_once() {
     let ctx = test_ctx();
     let logical_attachment_id = Uuid::parse_str("22222222-2222-4222-8222-222222222229").unwrap();

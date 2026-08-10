@@ -1438,11 +1438,11 @@ macro_rules! command {
             (Request::GetInventoryBundle { project_root, session_id, selected_agent }, "get_inventory_bundle", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, path(project_root), "project_root:String|session_id:Uuid|selected_agent:String", [project_root: String => project_root, session_id: Uuid => session, selected_agent: String => param]);
             (Request::ResourceSnapshot, "resource_snapshot", owner_only, none, false, read_only, none, concurrent, none, "-", []);
             (Request::PromoteResource { request_id, session_id }, "promote_resource", owner_only, option_field(session_id), true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "request_id:String|session_id:Option<Uuid>", [request_id: String => param, session_id: Option<Uuid> => session]);
-            (Request::CreateScheduledJob { job }, "create_scheduled_job", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "job:ScheduledJobCreate", [job: ScheduledJobCreate => scheduled]);
+            (Request::CreateScheduledJob { job }, "create_scheduled_job", owner_only, none, true, local_only, none, serialized, none, "job:ScheduledJobCreate", [job: ScheduledJobCreate => scheduled]);
             (Request::ListScheduledJobs { owner }, "list_scheduled_jobs", owner_only, none, false, read_only, none, concurrent, none, "owner:Option<String>", [owner: Option<String> => param]);
-            (Request::DeleteScheduledJob { id }, "delete_scheduled_job", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "id:String", [id: String => param]);
-            (Request::SetScheduledJobEnabled { id, enabled }, "set_scheduled_job_enabled", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "id:String|enabled:bool", [id: String => param, enabled: bool => param]);
-            (Request::RunScheduledJob { id }, "run_scheduled_job", owner_only, none, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "id:String", [id: String => param]);
+            (Request::DeleteScheduledJob { id }, "delete_scheduled_job", owner_only, none, true, local_only, none, serialized, none, "id:String", [id: String => param]);
+            (Request::SetScheduledJobEnabled { id, enabled }, "set_scheduled_job_enabled", owner_only, none, true, local_only, none, serialized, none, "id:String|enabled:bool", [id: String => param, enabled: bool => param]);
+            (Request::RunScheduledJob { id }, "run_scheduled_job", owner_only, none, true, local_only, none, serialized, none, "id:String", [id: String => param]);
             (Request::SetModelFavorite { provider, model, favorite }, "set_model_favorite", owner_only, attached, true, idempotent_adapter_mutation, staged_filesystem_commit(staged_artifact_fingerprints_and_fsync_barriers), serialized, none, "provider:String|model:String|favorite:bool", [provider: String => provider_model_left(model), model: String => provider_model_right(provider), favorite: bool => param]);
             (Request::SetDefaultModel { default_update_id, provider, model, reasoning_effort, thinking_mode, prompt_cache_retention, clear }, "set_default_model", owner_only, attached, true, idempotent_adapter_mutation, staged_filesystem_commit(staged_artifact_fingerprints_and_fsync_barriers), serialized, none, "default_update_id:Uuid|provider:Option<String>|model:Option<String>|reasoning_effort:Option<String>|thinking_mode:Option<cockpit_config::config::providers::ThinkingMode>|prompt_cache_retention:Option<PromptCacheRetention>|clear:bool", [default_update_id: Uuid => param, provider: Option<String> => provider_model_left(model), model: Option<String> => provider_model_right(provider), reasoning_effort: Option<String> => param, thinking_mode: Option<cockpit_config::config::providers::ThinkingMode> => param, prompt_cache_retention: Option<PromptCacheRetention> => param, clear: bool => param]);
             (Request::SetActiveModel { selection_id, provider, model, persist_as_default, trigger, reasoning_effort, thinking_mode, prompt_cache_retention }, "set_active_model", custom(authorize_set_active_model), attached, true, idempotent_adapter_mutation, durable_desired_state(desired_state_generation_and_observed_digest), serialized, none, "selection_id:Uuid|provider:String|model:String|persist_as_default:bool|trigger:ActiveModelSwitchTrigger|reasoning_effort:Option<String>|thinking_mode:Option<cockpit_config::config::providers::ThinkingMode>|prompt_cache_retention:Option<PromptCacheRetention>", [selection_id: Uuid => param, provider: String => provider_model_left(model), model: String => provider_model_right(provider), persist_as_default: bool => param, trigger: ActiveModelSwitchTrigger => param, reasoning_effort: Option<String> => param, thinking_mode: Option<cockpit_config::config::providers::ThinkingMode> => param, prompt_cache_retention: Option<PromptCacheRetention> => param]);
@@ -1570,6 +1570,9 @@ macro_rules! remote_class_value {
     };
     (nonrepeatable_mutation) => {
         Some(RemoteOperationClass::NonrepeatableMutation)
+    };
+    (local_only) => {
+        None
     };
     (rejected) => {
         None
@@ -2192,8 +2195,15 @@ mod tests {
         assert_eq!(unique.len(), rows.len(), "request tags must be unique");
         for (tag, audit_mutating) in rows {
             let class = remote_operation_class_for_tag(tag);
-            if tag == "unknown" {
-                assert_eq!(class, None, "unknown must be rejected before dispatch");
+            if matches!(
+                tag,
+                "unknown"
+                    | "create_scheduled_job"
+                    | "delete_scheduled_job"
+                    | "set_scheduled_job_enabled"
+                    | "run_scheduled_job"
+            ) {
+                assert_eq!(class, None, "{tag} must be rejected before reservation");
                 continue;
             }
             let class = class.unwrap_or_else(|| panic!("{tag} has no remote operation class"));
@@ -2215,6 +2225,19 @@ mod tests {
                     "non-adapter {tag} must not acquire an adapter strategy"
                 ),
             }
+        }
+        for tag in [
+            "create_scheduled_job",
+            "delete_scheduled_job",
+            "set_scheduled_job_enabled",
+            "run_scheduled_job",
+        ] {
+            assert_eq!(
+                remote_operation_class_for_tag(tag),
+                None,
+                "owner-only scheduler mutation must stay local-only"
+            );
+            assert_eq!(remote_adapter_recovery_contract_for_tag(tag), None);
         }
         assert_eq!(
             remote_operation_class_for_tag("terminal_input"),

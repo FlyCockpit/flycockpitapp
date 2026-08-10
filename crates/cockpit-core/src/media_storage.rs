@@ -708,13 +708,14 @@ impl MediaStorageRecovery {
         } else {
             None
         };
-        let selected_video_stream = None;
+        let mut selected_video_stream = None;
         let mut selected_audio_stream = None;
         let mut av_terminal = None;
         let av_derivatives = if media_kind != MediaKind::Image {
             let prepared: Result<(
                 Vec<(&'static str, Uuid, Vec<u8>, Option<(u32, u32)>)>,
-                SelectedMediaStream,
+                Option<SelectedMediaStream>,
+                Option<SelectedMediaStream>,
             )> = async {
                 held.seek(SeekFrom::Start(0))?;
                 let mut bytes = Vec::new();
@@ -758,49 +759,124 @@ impl MediaStorageRecovery {
                     .into();
                 }
                 let (video, audio) = select_av_streams(&canonical_container, &streams)?;
-                ensure!(
-                    media_kind == MediaKind::Audio,
-                    "model_runtime_unavailable: video normalization unavailable"
-                );
-                let audio = audio.context("invalid_media")?;
                 decode_selected_streams(
                     &runtime,
                     bytes.clone(),
                     video.as_ref().map(|value| value.index),
-                    Some(audio.index),
+                    audio.as_ref().map(|value| value.index),
                 )
                 .await?;
-                let probe = document
-                    .streams
-                    .iter()
-                    .find(|stream| stream.index == audio.index)
-                    .context("invalid_media")?;
-                let rate = probe
-                    .sample_rate
-                    .as_deref()
-                    .context("invalid_media")?
-                    .parse::<u32>()?;
-                let channels = probe.channels.context("invalid_media")?;
-                let argv = audio_normalization_argv(audio.index, rate, channels)?;
-                let output = run_bounded_runtime(
-                    &runtime.ffmpeg,
-                    &argv,
-                    bytes,
-                    100 * 1024 * 1024,
-                    std::time::Duration::from_secs(120),
-                )
-                .await?;
-                let wav = canonicalize_pcm_wav(&output.stdout)?;
-                let selected = SelectedMediaStream {
-                    index: audio.index,
-                    codec: audio.codec,
-                };
-                Ok((vec![("audio_model", Uuid::now_v7(), wav, None)], selected))
+                let selected_audio = audio.as_ref().map(|value| SelectedMediaStream {
+                    index: value.index,
+                    codec: value.codec.clone(),
+                });
+                let selected_video = video.as_ref().map(|value| SelectedMediaStream {
+                    index: value.index,
+                    codec: value.codec.clone(),
+                });
+                if let Some(video) = video {
+                    let probe = document
+                        .streams
+                        .iter()
+                        .find(|stream| stream.index == video.index)
+                        .context("invalid_media")?;
+                    let (sar_num, sar_den) = probe
+                        .sample_aspect_ratio
+                        .as_deref()
+                        .map(parse_positive_ratio)
+                        .transpose()?
+                        .unwrap_or((1, 1));
+                    let (width, height) = select_video_dimensions(
+                        probe.width.context("invalid_media")?,
+                        probe.height.context("invalid_media")?,
+                        sar_num,
+                        sar_den,
+                    )?;
+                    let timestamps = selected_video_timestamps(&document, probe)?;
+                    let source_frame_count = timestamps.len();
+                    let (fps_num, fps_den, gop, min_keyint) = select_video_rate(&timestamps)?;
+                    let audio_settings = audio
+                        .as_ref()
+                        .map(|selected| {
+                            let stream = document
+                                .streams
+                                .iter()
+                                .find(|stream| stream.index == selected.index)
+                                .context("invalid_media")?;
+                            Ok((
+                                stream
+                                    .sample_rate
+                                    .as_deref()
+                                    .context("invalid_media")?
+                                    .parse::<u32>()?,
+                                stream.channels.context("invalid_media")?,
+                            ))
+                        })
+                        .transpose()?;
+                    verify_required_video_encoders(&runtime, audio.is_some()).await?;
+                    let argv = video_normalization_argv(
+                        video.index,
+                        audio.as_ref().map(|value| value.index),
+                        audio_settings,
+                        width,
+                        height,
+                        fps_num,
+                        fps_den,
+                        gop,
+                        min_keyint,
+                    )?;
+                    let mp4 = run_video_normalization(&runtime, argv, bytes).await?;
+                    verify_canonical_video_mp4(&mp4)?;
+                    let (encoded, _) = run_bounded_ffprobe(&runtime, mp4.clone()).await?;
+                    verify_encoded_video_provenance(
+                        &encoded,
+                        width,
+                        height,
+                        (fps_num, fps_den),
+                        source_frame_count,
+                        gop,
+                        audio.is_some(),
+                    )?;
+                    Ok((
+                        vec![("video_model", Uuid::now_v7(), mp4, Some((width, height)))],
+                        selected_video,
+                        selected_audio,
+                    ))
+                } else {
+                    let audio = audio.context("invalid_media")?;
+                    let probe = document
+                        .streams
+                        .iter()
+                        .find(|stream| stream.index == audio.index)
+                        .context("invalid_media")?;
+                    let rate = probe
+                        .sample_rate
+                        .as_deref()
+                        .context("invalid_media")?
+                        .parse::<u32>()?;
+                    let channels = probe.channels.context("invalid_media")?;
+                    let argv = audio_normalization_argv(audio.index, rate, channels)?;
+                    let output = run_bounded_runtime(
+                        &runtime.ffmpeg,
+                        &argv,
+                        bytes,
+                        100 * 1024 * 1024,
+                        std::time::Duration::from_secs(120),
+                    )
+                    .await?;
+                    let wav = canonicalize_pcm_wav(&output.stdout)?;
+                    Ok((
+                        vec![("audio_model", Uuid::now_v7(), wav, None)],
+                        None,
+                        selected_audio,
+                    ))
+                }
             }
             .await;
             match prepared {
-                Ok((derivatives, selected)) => {
-                    selected_audio_stream = Some(selected);
+                Ok((derivatives, video, audio)) => {
+                    selected_video_stream = video;
+                    selected_audio_stream = audio;
                     Some(derivatives)
                 }
                 Err(error) => {
@@ -1988,10 +2064,27 @@ struct FfprobeStream {
     disposition: Option<FfprobeDisposition>,
     sample_rate: Option<String>,
     channels: Option<u32>,
+    width: Option<u32>,
+    height: Option<u32>,
+    sample_aspect_ratio: Option<String>,
+    time_base: Option<String>,
+    profile: Option<String>,
+    pix_fmt: Option<String>,
+}
+#[derive(Debug, serde::Deserialize)]
+struct FfprobeFrame {
+    media_type: String,
+    stream_index: u32,
+    #[serde(default)]
+    best_effort_timestamp: Option<String>,
+    #[serde(default)]
+    key_frame: i32,
 }
 #[derive(Debug, serde::Deserialize)]
 struct FfprobeDocument {
     streams: Vec<FfprobeStream>,
+    #[serde(default)]
+    frames: Vec<FfprobeFrame>,
 }
 
 async fn run_bounded_ffprobe(
@@ -2006,6 +2099,7 @@ async fn run_bounded_ffprobe(
         "json",
         "-show_streams",
         "-show_format",
+        "-show_frames",
         "pipe:0",
     ]
     .map(str::to_owned);
@@ -2013,7 +2107,7 @@ async fn run_bounded_ffprobe(
         &runtime.ffprobe,
         &argv,
         input,
-        1_048_576,
+        16 * 1_048_576,
         std::time::Duration::from_secs(30),
     )
     .await?;
@@ -2022,7 +2116,9 @@ async fn run_bounded_ffprobe(
     let document: FfprobeDocument =
         serde_json::from_slice(&output.stdout).context("invalid_media")?;
     ensure!(
-        !document.streams.is_empty() && document.streams.len() <= 64,
+        !document.streams.is_empty()
+            && document.streams.len() <= 64
+            && document.frames.len() <= 250_000,
         "invalid_media"
     );
     Ok((document, digest))
@@ -2084,6 +2180,199 @@ async fn decode_selected_streams(
         hasher.update([0]);
     }
     Ok(crate::intel::hex_lower(&hasher.finalize()))
+}
+
+fn parse_positive_ratio(value: &str) -> Result<(u32, u32)> {
+    let (num, den) = value.split_once([':', '/']).context("invalid_media")?;
+    let num = num.parse::<u32>().context("invalid_media")?;
+    let den = den.parse::<u32>().context("invalid_media")?;
+    ensure!(num > 0 && den > 0, "invalid_media");
+    Ok((num, den))
+}
+
+fn selected_video_timestamps(
+    document: &FfprobeDocument,
+    stream: &FfprobeStream,
+) -> Result<Vec<(u64, u64)>> {
+    let (time_num, time_den) =
+        parse_positive_ratio(stream.time_base.as_deref().context("invalid_media")?)?;
+    let mut timestamps = document
+        .frames
+        .iter()
+        .filter(|frame| frame.media_type == "video" && frame.stream_index == stream.index)
+        .map(|frame| {
+            let pts = frame
+                .best_effort_timestamp
+                .as_deref()
+                .context("invalid_media")?
+                .parse::<u64>()
+                .context("invalid_media")?;
+            let num = pts
+                .checked_mul(u64::from(time_num))
+                .context("resource_limit")?;
+            Ok((num, u64::from(time_den)))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        !timestamps.is_empty() && timestamps.len() <= 250_000,
+        "invalid_media"
+    );
+    ensure!(
+        !timestamps.is_empty()
+            && timestamps.windows(2).all(|pair| {
+                u128::from(pair[0].0) * u128::from(pair[1].1)
+                    < u128::from(pair[1].0) * u128::from(pair[0].1)
+            }),
+        "invalid_media"
+    );
+    Ok(timestamps)
+}
+
+fn verify_encoded_video_provenance(
+    document: &FfprobeDocument,
+    width: u32,
+    height: u32,
+    expected_rate: (u32, u32),
+    source_frames: usize,
+    gop: u32,
+    expect_audio: bool,
+) -> Result<()> {
+    let video = document
+        .streams
+        .iter()
+        .filter(|stream| stream.codec_type == "video")
+        .collect::<Vec<_>>();
+    let audio = document
+        .streams
+        .iter()
+        .filter(|stream| stream.codec_type == "audio")
+        .collect::<Vec<_>>();
+    ensure!(
+        video.len() == 1 && audio.len() == usize::from(expect_audio),
+        "invalid_media"
+    );
+    let video = video[0];
+    ensure!(
+        video.codec_name == "h264"
+            && video.profile.as_deref() == Some("High")
+            && video.pix_fmt.as_deref() == Some("yuv420p")
+            && video.width == Some(width)
+            && video.height == Some(height),
+        "invalid_media"
+    );
+    if let Some(audio) = audio.first() {
+        ensure!(
+            audio.codec_name == "aac"
+                && audio.profile.as_deref() == Some("LC")
+                && matches!(audio.channels, Some(1 | 2))
+                && audio
+                    .sample_rate
+                    .as_deref()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .is_some_and(|rate| rate <= 48_000),
+            "invalid_media"
+        );
+    }
+    let frames = document
+        .frames
+        .iter()
+        .filter(|frame| frame.media_type == "video" && frame.stream_index == video.index)
+        .collect::<Vec<_>>();
+    ensure!(
+        !frames.is_empty() && frames.len() <= source_frames,
+        "invalid_media"
+    );
+    let timestamps = selected_video_timestamps(document, video)?;
+    let actual_rate = select_video_rate(&timestamps)?;
+    ensure!(
+        (actual_rate.0, actual_rate.1) == expected_rate,
+        "invalid_media"
+    );
+    let mut last_keyframe = None;
+    for (index, frame) in frames.iter().enumerate() {
+        if frame.key_frame == 1 {
+            if let Some(previous) = last_keyframe {
+                ensure!(index - previous <= gop as usize, "invalid_media");
+            }
+            last_keyframe = Some(index);
+        }
+    }
+    ensure!(last_keyframe.is_some(), "invalid_media");
+    Ok(())
+}
+
+async fn run_video_normalization(
+    runtime: &ApprovedAvRuntime,
+    mut argv: Vec<String>,
+    input: Vec<u8>,
+) -> Result<Vec<u8>> {
+    use std::io::{Read as _, Seek as _};
+    let mut output = tempfile::Builder::new()
+        .prefix("flycockpit-video-")
+        .tempfile()?;
+    let before = stable_identity_digest(output.as_file())?;
+    let output_path = output
+        .path()
+        .to_str()
+        .context("invalid output path")?
+        .to_owned();
+    let destination = argv.last_mut().context("invalid_media")?;
+    ensure!(destination == "pipe:1", "invalid_media");
+    *destination = output_path;
+    argv.insert(1, "-y".into());
+    let result = run_bounded_runtime(
+        &runtime.ffmpeg,
+        &argv,
+        input,
+        1,
+        std::time::Duration::from_secs(300),
+    )
+    .await?;
+    ensure!(result.stdout.is_empty(), "invalid_media");
+    ensure!(
+        before == stable_identity_digest(output.as_file())?,
+        "invalid_media"
+    );
+    output.as_file_mut().sync_all()?;
+    output.as_file_mut().seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    output
+        .as_file_mut()
+        .take(500 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= 500 * 1024 * 1024, "resource_limit");
+    Ok(bytes)
+}
+
+async fn verify_required_video_encoders(
+    runtime: &ApprovedAvRuntime,
+    require_aac: bool,
+) -> Result<()> {
+    let argv = [
+        "-nostdin".to_owned(),
+        "-hide_banner".to_owned(),
+        "-encoders".to_owned(),
+    ];
+    let output = run_bounded_runtime(
+        &runtime.ffmpeg,
+        &argv,
+        Vec::new(),
+        2 * 1_048_576,
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    .context("model_runtime_unavailable")?;
+    let encoders = std::str::from_utf8(&output.stdout).context("model_runtime_unavailable")?;
+    let has = |name: &str| {
+        encoders.lines().any(|line| {
+            line.split_ascii_whitespace()
+                .nth(1)
+                .is_some_and(|value| value == name)
+        })
+    };
+    ensure!(has("libx264"), "model_runtime_unavailable");
+    ensure!(!require_aac || has("aac"), "model_runtime_unavailable");
+    Ok(())
 }
 
 struct ApprovedAvRuntime {
@@ -2157,6 +2446,7 @@ fn audio_normalization_argv(stream: u32, source_rate: u32, channels: u32) -> Res
 fn video_normalization_argv(
     video_stream: u32,
     audio_stream: Option<u32>,
+    audio_settings: Option<(u32, u32)>,
     width: u32,
     height: u32,
     fps_num: u32,
@@ -2191,7 +2481,11 @@ fn video_normalization_argv(
     .to_vec();
     argv.push(format!("0:{video_stream}"));
     if let Some(audio) = audio_stream {
+        let (source_rate, channels) = audio_settings.context("invalid_media")?;
+        ensure!(source_rate > 0 && channels > 0, "invalid_media");
         argv.extend(["-map".into(), format!("0:{audio}")]);
+    } else {
+        ensure!(audio_settings.is_none(), "invalid_media");
     }
     argv.extend(
         [
@@ -2223,6 +2517,12 @@ fn video_normalization_argv(
     argv.push(format!(
         "threads=1:scenecut=0:keyint={gop}:min-keyint={min_keyint}:bframes=3:ref=3"
     ));
+    if let Some((source_rate, channels)) = audio_settings {
+        argv.extend(["-af", "aresample=resampler=swr:filter_size=32:phase_shift=10:linear_interp=0:exact_rational=1:dither_method=none", "-ac"].map(str::to_owned));
+        argv.push(if channels == 1 { "1" } else { "2" }.into());
+        argv.push("-ar".into());
+        argv.push(source_rate.min(48_000).to_string());
+    }
     argv.extend(
         [
             "-c:a",
@@ -3455,7 +3755,9 @@ mod tests {
                 .any(|pair| pair[0] == "-ar" && pair[1] == "48000")
         );
         assert!(mono.iter().any(|arg| arg.contains("dither_method=none")));
-        let video = video_normalization_argv(2, Some(9), 1280, 720, 24, 1, 240, 24).unwrap();
+        let video =
+            video_normalization_argv(2, Some(9), Some((96_000, 6)), 1280, 720, 24, 1, 240, 24)
+                .unwrap();
         for exact in [
             "scale=1280:720:flags=lanczos,fps=24/1:start_time=0:round=down,format=yuv420p",
             "threads=1:scenecut=0:keyint=240:min-keyint=24:bframes=3:ref=3",

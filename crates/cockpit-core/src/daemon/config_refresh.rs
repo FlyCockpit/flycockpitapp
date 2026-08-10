@@ -50,6 +50,12 @@ pub(crate) async fn refresh_session_config_explicit(
                 ExplicitConfigRefreshError::InvalidConfig(format!("{error:#}"))
             }
         })?;
+    // Resolve hooks under the same workspace-trust scope and generation as
+    // providers/extended config so the hook registry is turn-stable with the
+    // rest of the snapshot.
+    let hooks = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+        crate::config::extended::hooks::resolve_hooks_for_cwd(&handle.project_root)
+    });
     apply_global_goal_supervision_kill_switch(db, &extended)
         .await
         .map_err(|error| {
@@ -59,7 +65,9 @@ pub(crate) async fn refresh_session_config_explicit(
     let (respond_to, response_rx) = oneshot::channel();
     handle
         .send_work(SessionWork::ReplaceConfigSnapshot {
-            snapshot: Box::new(SessionConfigSnapshot::new(0, providers, extended)),
+            snapshot: Box::new(SessionConfigSnapshot::with_hooks(
+                0, providers, extended, hooks,
+            )),
             respond_to,
         })
         .await
@@ -128,10 +136,18 @@ pub(crate) async fn refresh_session_config(
 
     apply_global_goal_supervision_kill_switch(db, &extended).await?;
 
+    // Resolve hooks under the same workspace-trust scope and generation as
+    // providers/extended config.
+    let hooks = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+        crate::config::extended::hooks::resolve_hooks_for_cwd(&handle.project_root)
+    });
+
     let (respond_to, response_rx) = oneshot::channel();
     handle
         .send_work(SessionWork::ReplaceConfigSnapshot {
-            snapshot: Box::new(SessionConfigSnapshot::new(0, providers, extended)),
+            snapshot: Box::new(SessionConfigSnapshot::with_hooks(
+                0, providers, extended, hooks,
+            )),
             respond_to,
         })
         .await?;

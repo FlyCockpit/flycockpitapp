@@ -818,14 +818,22 @@ impl SessionRegistry {
             self.scheduler_source(),
             self.write_scope_source(),
             crate::sync::lock_or_recover(&self.inner.global_bus).clone(),
-            trust_policy,
+            trust_policy.clone(),
             Some(cleanup),
             env_snapshot,
-            session_worker::SessionConfigSnapshot::new(
-                0,
-                providers_cfg.clone(),
-                extended_cfg.clone(),
-            ),
+            {
+                // Resolve hooks under the same workspace-trust scope and
+                // generation as providers/extended config.
+                let hooks = crate::config::trust::with_workspace_trust_policy(trust_policy, || {
+                    crate::config::extended::hooks::resolve_hooks_for_cwd(&project_root)
+                });
+                session_worker::SessionConfigSnapshot::with_hooks(
+                    0,
+                    providers_cfg.clone(),
+                    extended_cfg.clone(),
+                    hooks,
+                )
+            },
         );
 
         crate::sync::lock_or_recover(&self.inner.workers)

@@ -40,6 +40,7 @@ use crate::session::{Session, ToolCallRow};
 mod backup;
 mod events;
 mod gate;
+pub(crate) mod hooks;
 mod loop_guard;
 mod outcome;
 mod recheck;

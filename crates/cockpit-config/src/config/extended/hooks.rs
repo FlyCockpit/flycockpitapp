@@ -214,6 +214,15 @@ impl fmt::Display for HookOrigin {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+impl HookOrigin {
+    /// Construct a `HookOrigin` for tests. The origin must be a valid
+    /// `layer:digest:index` string.
+    pub fn for_test(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct ResolvedHook {
     pub event: HookEvent,

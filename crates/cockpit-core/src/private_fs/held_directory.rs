@@ -5,6 +5,7 @@
 //! carry this capability through every filesystem effect.
 
 use std::fs::File;
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
@@ -15,6 +16,62 @@ pub(crate) struct DirectoryIdentity {
     pub(crate) platform: &'static str,
     pub(crate) stable_digest: String,
     pub(crate) canonical_binding_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldArtifactEvidence {
+    pub(crate) identity_digest: String,
+    pub(crate) security_digest: String,
+    pub(crate) byte_length: u64,
+    pub(crate) sha256: String,
+}
+impl HeldArtifactEvidence {
+    pub fn identity_digest(&self) -> &str {
+        &self.identity_digest
+    }
+    pub fn security_digest(&self) -> &str {
+        &self.security_digest
+    }
+    pub fn byte_length(&self) -> u64 {
+        self.byte_length
+    }
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+}
+
+#[derive(Debug)]
+pub struct HeldTemporaryArtifact {
+    file: File,
+    name: String,
+    identity_digest: String,
+    security_digest: String,
+}
+
+impl HeldTemporaryArtifact {
+    pub fn file_mut(&mut self) -> &mut File {
+        &mut self.file
+    }
+}
+
+#[derive(Debug)]
+pub struct HeldSealedArtifact {
+    file: File,
+    name: String,
+    evidence: HeldArtifactEvidence,
+}
+
+impl HeldSealedArtifact {
+    pub fn evidence(&self) -> &HeldArtifactEvidence {
+        &self.evidence
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldDirectoryEffectOutcome {
+    AppliedDurable,
+    AppliedSyncUnknown,
+    AppliedIdentityUnknown,
 }
 
 #[derive(Debug)]
@@ -39,24 +96,114 @@ impl HeldDirectoryAuthority {
         self.imp.diagnostic_path()
     }
 
-    pub(crate) fn create_file_exclusive(&self, name: &str) -> Result<File> {
+    pub fn create_file_exclusive(&self, name: &str) -> Result<HeldTemporaryArtifact> {
         validate_component(name)?;
-        self.imp.create_file_exclusive(name)
+        let (file, identity_digest, security_digest) = self.imp.create_file_exclusive(name)?;
+        Ok(HeldTemporaryArtifact {
+            file,
+            name: name.to_owned(),
+            identity_digest,
+            security_digest,
+        })
     }
 
-    pub(crate) fn rename_noreplace(&self, from: &str, to: &str) -> Result<()> {
-        validate_component(from)?;
+    pub fn seal(&self, mut artifact: HeldTemporaryArtifact) -> Result<HeldSealedArtifact> {
+        self.imp.revalidate_named(
+            &artifact.name,
+            &artifact.file,
+            &artifact.identity_digest,
+            &artifact.security_digest,
+        )?;
+        artifact.file.flush()?;
+        artifact.file.sync_all()?;
+        artifact.file.seek(SeekFrom::Start(0))?;
+        let mut hash = Sha256::new();
+        let mut length = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = artifact.file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            length = length
+                .checked_add(count as u64)
+                .context("artifact length overflow")?;
+            hash.update(&buffer[..count]);
+        }
+        self.imp.revalidate_named(
+            &artifact.name,
+            &artifact.file,
+            &artifact.identity_digest,
+            &artifact.security_digest,
+        )?;
+        Ok(HeldSealedArtifact {
+            file: artifact.file,
+            name: artifact.name,
+            evidence: HeldArtifactEvidence {
+                identity_digest: artifact.identity_digest,
+                security_digest: artifact.security_digest,
+                byte_length: length,
+                sha256: crate::intel::hex_lower(&hash.finalize()),
+            },
+        })
+    }
+
+    pub fn rename_noreplace(
+        &self,
+        mut artifact: HeldSealedArtifact,
+        to: &str,
+    ) -> Result<HeldDirectoryEffectOutcome> {
         validate_component(to)?;
-        self.imp.rename_noreplace(from, to)
+        self.imp.revalidate_named(
+            &artifact.name,
+            &artifact.file,
+            &artifact.evidence.identity_digest,
+            &artifact.evidence.security_digest,
+        )?;
+        validate_contents(&mut artifact.file, &artifact.evidence)?;
+        self.imp.rename_noreplace(artifact, to)
     }
 
-    pub(crate) fn unlink(&self, name: &str) -> Result<()> {
-        validate_component(name)?;
-        self.imp.unlink(name)
+    pub fn unlink(&self, mut artifact: HeldSealedArtifact) -> Result<HeldDirectoryEffectOutcome> {
+        self.imp.revalidate_named(
+            &artifact.name,
+            &artifact.file,
+            &artifact.evidence.identity_digest,
+            &artifact.evidence.security_digest,
+        )?;
+        validate_contents(&mut artifact.file, &artifact.evidence)?;
+        self.imp.unlink(artifact)
     }
+}
 
-    pub(crate) fn sync(&self) -> Result<()> {
-        self.imp.sync()
+fn validate_contents(file: &mut File, evidence: &HeldArtifactEvidence) -> Result<()> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut hash = Sha256::new();
+    let mut length = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        length = length
+            .checked_add(count as u64)
+            .context("artifact length overflow")?;
+        hash.update(&buffer[..count]);
+    }
+    ensure!(
+        length == evidence.byte_length
+            && crate::intel::hex_lower(&hash.finalize()) == evidence.sha256,
+        "held artifact length/checksum changed"
+    );
+    Ok(())
+}
+
+fn durability_outcome(result: std::io::Result<()>) -> HeldDirectoryEffectOutcome {
+    if result.is_ok() {
+        HeldDirectoryEffectOutcome::AppliedDurable
+    } else {
+        HeldDirectoryEffectOutcome::AppliedSyncUnknown
     }
 }
 
@@ -161,7 +308,22 @@ mod imp {
             &self.diagnostic_path
         }
 
-        pub(super) fn create_file_exclusive(&self, name: &str) -> Result<File> {
+        fn verify_directory_security(&self) -> Result<()> {
+            let metadata = self.dir.metadata()?;
+            ensure!(metadata.is_dir(), "held authority is no longer a directory");
+            ensure!(
+                metadata.uid() == unsafe { libc::geteuid() },
+                "held directory owner changed"
+            );
+            ensure!(
+                metadata.mode() & 0o777 == 0o700,
+                "held directory mode changed"
+            );
+            Ok(())
+        }
+
+        pub(super) fn create_file_exclusive(&self, name: &str) -> Result<(File, String, String)> {
+            self.verify_directory_security()?;
             let name = CString::new(name)?;
             let fd = unsafe {
                 libc::openat(
@@ -179,12 +341,46 @@ mod imp {
                 return Err(std::io::Error::last_os_error())
                     .context("exclusive held-directory create");
             }
-            Ok(unsafe { File::from_raw_fd(fd) })
+            let file = unsafe { File::from_raw_fd(fd) };
+            ensure!(
+                unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } == 0,
+                "fchmod 0600 failed: {}",
+                std::io::Error::last_os_error()
+            );
+            let (identity, security) = file_evidence(&file)?;
+            Ok((file, identity, security))
         }
 
-        pub(super) fn rename_noreplace(&self, from: &str, to: &str) -> Result<()> {
-            let from = CString::new(from)?;
-            let to = CString::new(to)?;
+        pub(super) fn revalidate_named(
+            &self,
+            name: &str,
+            held: &File,
+            identity: &str,
+            security: &str,
+        ) -> Result<()> {
+            self.verify_directory_security()?;
+            let reopened = open_named(&self.dir, name)?;
+            let (held_identity, held_security) = file_evidence(held)?;
+            let (named_identity, named_security) = file_evidence(&reopened)?;
+            ensure!(
+                held_identity == identity
+                    && held_security == security
+                    && named_identity == identity
+                    && named_security == security,
+                "held artifact name or security identity changed"
+            );
+            Ok(())
+        }
+
+        pub(super) fn rename_noreplace(
+            &self,
+            artifact: HeldSealedArtifact,
+            to: &str,
+        ) -> Result<HeldDirectoryEffectOutcome> {
+            self.verify_directory_security()?;
+            let from = CString::new(artifact.name)?;
+            let to_name = to;
+            let to = CString::new(to_name)?;
             #[cfg(target_os = "linux")]
             {
                 let result = unsafe {
@@ -198,7 +394,18 @@ mod imp {
                     )
                 };
                 if result == 0 {
-                    return Ok(());
+                    let Ok(published) = open_named(&self.dir, to_name) else {
+                        return Ok(HeldDirectoryEffectOutcome::AppliedIdentityUnknown);
+                    };
+                    let Ok((identity, security)) = file_evidence(&published) else {
+                        return Ok(HeldDirectoryEffectOutcome::AppliedIdentityUnknown);
+                    };
+                    if identity != artifact.evidence.identity_digest
+                        || security != artifact.evidence.security_digest
+                    {
+                        return Ok(HeldDirectoryEffectOutcome::AppliedIdentityUnknown);
+                    }
+                    return Ok(durability_outcome(self.dir.sync_all()));
                 }
                 let error = std::io::Error::last_os_error();
                 if !matches!(
@@ -208,39 +415,106 @@ mod imp {
                     return Err(error).context("held-directory no-replace rename");
                 }
             }
-            let linked = unsafe {
-                libc::linkat(
-                    self.dir.as_raw_fd(),
-                    from.as_ptr(),
-                    self.dir.as_raw_fd(),
-                    to.as_ptr(),
-                    0,
-                )
-            };
-            if linked != 0 {
-                return Err(std::io::Error::last_os_error())
-                    .context("held-directory no-replace link");
+            #[cfg(target_os = "macos")]
+            {
+                unsafe extern "C" {
+                    fn renameatx_np(
+                        fromfd: i32,
+                        from: *const libc::c_char,
+                        tofd: i32,
+                        to: *const libc::c_char,
+                        flags: u32,
+                    ) -> i32;
+                }
+                const RENAME_EXCL: u32 = 0x0000_0004;
+                ensure!(
+                    unsafe {
+                        renameatx_np(
+                            self.dir.as_raw_fd(),
+                            from.as_ptr(),
+                            self.dir.as_raw_fd(),
+                            to.as_ptr(),
+                            RENAME_EXCL,
+                        )
+                    } == 0,
+                    "held-directory no-replace rename failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                let Ok(published) = open_named(&self.dir, to_name) else {
+                    return Ok(HeldDirectoryEffectOutcome::AppliedIdentityUnknown);
+                };
+                let Ok((identity, security)) = file_evidence(&published) else {
+                    return Ok(HeldDirectoryEffectOutcome::AppliedIdentityUnknown);
+                };
+                if identity != artifact.evidence.identity_digest
+                    || security != artifact.evidence.security_digest
+                {
+                    return Ok(HeldDirectoryEffectOutcome::AppliedIdentityUnknown);
+                }
+                return Ok(durability_outcome(self.dir.sync_all()));
             }
-            let removed = unsafe { libc::unlinkat(self.dir.as_raw_fd(), from.as_ptr(), 0) };
-            if removed != 0 {
-                return Err(std::io::Error::last_os_error())
-                    .context("held-directory source unlink");
+            #[cfg(target_os = "linux")]
+            {
+                anyhow::bail!("renameat2 no-replace is unavailable on this kernel/filesystem")
             }
-            Ok(())
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                anyhow::bail!("atomic no-replace publication is unsupported on this Unix platform")
+            }
         }
 
-        pub(super) fn unlink(&self, name: &str) -> Result<()> {
-            let name = CString::new(name)?;
+        pub(super) fn unlink(
+            &self,
+            artifact: HeldSealedArtifact,
+        ) -> Result<HeldDirectoryEffectOutcome> {
+            self.verify_directory_security()?;
+            let name = CString::new(artifact.name)?;
             ensure!(
                 unsafe { libc::unlinkat(self.dir.as_raw_fd(), name.as_ptr(), 0) } == 0,
                 "held-directory unlink failed: {}",
                 std::io::Error::last_os_error()
             );
-            Ok(())
+            if artifact.file.metadata()?.nlink() != 0 {
+                return Ok(HeldDirectoryEffectOutcome::AppliedIdentityUnknown);
+            }
+            Ok(durability_outcome(self.dir.sync_all()))
         }
-        pub(super) fn sync(&self) -> Result<()> {
-            self.dir.sync_all().context("sync held directory")
-        }
+    }
+
+    fn open_named(dir: &File, name: &str) -> Result<File> {
+        let name = CString::new(name)?;
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        ensure!(
+            fd >= 0,
+            "reopening held artifact failed: {}",
+            std::io::Error::last_os_error()
+        );
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    fn file_evidence(file: &File) -> Result<(String, String)> {
+        let metadata = file.metadata()?;
+        ensure!(
+            metadata.is_file()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.nlink() == 1
+                && metadata.mode() & 0o777 == 0o600,
+            "held artifact is not private singly-linked regular file"
+        );
+        let dev = metadata.dev().to_be_bytes();
+        let ino = metadata.ino().to_be_bytes();
+        let uid = metadata.uid().to_be_bytes();
+        let mode = (metadata.mode() & 0o777).to_be_bytes();
+        Ok((
+            digest(&[b"held-artifact-unix-v1", &dev, &ino]),
+            digest(&[b"held-artifact-security-unix-v1", &uid, &mode]),
+        ))
     }
 
     fn open_absolute_root() -> Result<File> {
@@ -463,7 +737,12 @@ mod imp {
         pub(super) fn diagnostic_path(&self) -> &Path {
             &self.diagnostic_path
         }
-        pub(super) fn create_file_exclusive(&self, name: &str) -> Result<File> {
+        fn verify_directory_security(&self) -> Result<()> {
+            verify_directory_handle(&self.dir)?;
+            verify_private_dacl_handle(&self.dir)
+        }
+        pub(super) fn create_file_exclusive(&self, name: &str) -> Result<(File, String, String)> {
+            self.verify_directory_security()?;
             let wide = std::ffi::OsStr::new(name).encode_wide().collect::<Vec<_>>();
             let file = open_relative(
                 &self.dir,
@@ -477,19 +756,45 @@ mod imp {
                     | FILE_READ_ATTRIBUTES
                     | FILE_WRITE_ATTRIBUTES,
             )?;
-            verify_regular_handle(&file)?;
-            Ok(file)
+            crate::goal_scratch::set_private_dacl_handle(&file)?;
+            let (identity, security) = file_evidence(&file)?;
+            Ok((file, identity, security))
         }
-        pub(super) fn rename_noreplace(&self, from: &str, to: &str) -> Result<()> {
-            let from = std::ffi::OsStr::new(from).encode_wide().collect::<Vec<_>>();
-            let file = open_relative(
+        pub(super) fn revalidate_named(
+            &self,
+            name: &str,
+            held: &File,
+            identity: &str,
+            security: &str,
+        ) -> Result<()> {
+            self.verify_directory_security()?;
+            let wide = std::ffi::OsStr::new(name).encode_wide().collect::<Vec<_>>();
+            let reopened = open_relative(
                 &self.dir,
-                &from,
+                &wide,
                 FILE_OPEN,
                 FILE_NON_DIRECTORY_FILE,
-                GENERIC_READ | GENERIC_WRITE | DELETE | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
+                GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
             )?;
-            let to = std::ffi::OsStr::new(to).encode_wide().collect::<Vec<_>>();
+            let held_evidence = file_evidence(held)?;
+            ensure!(
+                held_evidence.0 == identity
+                    && held_evidence.1 == security
+                    && file_evidence(&reopened)? == held_evidence,
+                "held Windows artifact name/FileId/security changed"
+            );
+            Ok(())
+        }
+        pub(super) fn rename_noreplace(
+            &self,
+            artifact: HeldSealedArtifact,
+            to: &str,
+        ) -> Result<HeldDirectoryEffectOutcome> {
+            self.verify_directory_security()?;
+            let target_name = to;
+            let to = std::ffi::OsStr::new(target_name)
+                .encode_wide()
+                .collect::<Vec<_>>();
             // FILE_RENAME_INFORMATION: ReplaceIfExists=false, RootDirectory=held dir.
             let name_offset = std::mem::offset_of!(FileRenameInformation, file_name);
             let mut buffer = vec![0u8; name_offset + to.len() * 2];
@@ -510,7 +815,7 @@ mod imp {
             };
             let status = unsafe {
                 NtSetInformationFile(
-                    file.as_raw_handle(),
+                    artifact.file.as_raw_handle(),
                     &mut io,
                     buffer.as_ptr().cast(),
                     buffer.len() as u32,
@@ -521,17 +826,36 @@ mod imp {
                 status >= STATUS_SUCCESS_MIN,
                 "held Windows no-replace rename failed with NTSTATUS {status:#x}"
             );
-            Ok(())
-        }
-        pub(super) fn unlink(&self, name: &str) -> Result<()> {
-            let wide = std::ffi::OsStr::new(name).encode_wide().collect::<Vec<_>>();
-            let file = open_relative(
+            let Ok(published) = open_relative(
                 &self.dir,
-                &wide,
+                &to,
                 FILE_OPEN,
                 FILE_NON_DIRECTORY_FILE,
-                DELETE | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
-            )?;
+                GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            ) else {
+                return Ok(HeldDirectoryEffectOutcome::AppliedIdentityUnknown);
+            };
+            let Ok((identity, security)) = file_evidence(&published) else {
+                return Ok(HeldDirectoryEffectOutcome::AppliedIdentityUnknown);
+            };
+            if identity != artifact.evidence.identity_digest
+                || security != artifact.evidence.security_digest
+            {
+                return Ok(HeldDirectoryEffectOutcome::AppliedIdentityUnknown);
+            }
+            Ok(durability_outcome(
+                if unsafe { FlushFileBuffers(self.dir.as_raw_handle()) } != 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                },
+            ))
+        }
+        pub(super) fn unlink(
+            &self,
+            artifact: HeldSealedArtifact,
+        ) -> Result<HeldDirectoryEffectOutcome> {
+            self.verify_directory_security()?;
             let info = FileDispositionInformation { delete_file: 1 };
             let mut io = IoStatusBlock {
                 status: 0,
@@ -539,7 +863,7 @@ mod imp {
             };
             let status = unsafe {
                 NtSetInformationFile(
-                    file.as_raw_handle(),
+                    artifact.file.as_raw_handle(),
                     &mut io,
                     (&info as *const FileDispositionInformation).cast(),
                     size_of::<FileDispositionInformation>() as u32,
@@ -550,15 +874,13 @@ mod imp {
                 status >= STATUS_SUCCESS_MIN,
                 "held Windows unlink failed with NTSTATUS {status:#x}"
             );
-            Ok(())
-        }
-        pub(super) fn sync(&self) -> Result<()> {
-            ensure!(
-                unsafe { FlushFileBuffers(self.dir.as_raw_handle()) } != 0,
-                "syncing held Windows directory failed: {}",
-                std::io::Error::last_os_error()
-            );
-            Ok(())
+            Ok(durability_outcome(
+                if unsafe { FlushFileBuffers(self.dir.as_raw_handle()) } != 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                },
+            ))
         }
     }
 
@@ -646,6 +968,20 @@ mod imp {
         Ok(())
     }
 
+    fn file_evidence(file: &File) -> Result<(String, String)> {
+        verify_regular_handle(file)?;
+        crate::goal_scratch::verify_private_dacl_handle(file)?;
+        let info = handle_information(file)?;
+        let identity = digest(&[
+            b"held-artifact-windows-v1",
+            &info.volume_serial.to_be_bytes(),
+            &info.file_index_high.to_be_bytes(),
+            &info.file_index_low.to_be_bytes(),
+        ]);
+        let security = digest(&[b"held-artifact-security-windows-v1", identity.as_bytes()]);
+        Ok((identity, security))
+    }
+
     fn verify_private_dacl_handle(file: &File) -> Result<()> {
         crate::goal_scratch::verify_private_dacl_handle(file)
     }
@@ -666,16 +1002,20 @@ mod imp {
         pub(super) fn diagnostic_path(&self) -> &Path {
             Path::new("")
         }
-        pub(super) fn create_file_exclusive(&self, _: &str) -> Result<File> {
+        pub(super) fn create_file_exclusive(&self, _: &str) -> Result<(File, String, String)> {
             anyhow::bail!("held directory authority is unavailable")
         }
-        pub(super) fn rename_noreplace(&self, _: &str, _: &str) -> Result<()> {
+        pub(super) fn revalidate_named(&self, _: &str, _: &File, _: &str, _: &str) -> Result<()> {
             anyhow::bail!("held directory authority is unavailable")
         }
-        pub(super) fn unlink(&self, _: &str) -> Result<()> {
+        pub(super) fn rename_noreplace(
+            &self,
+            _: HeldSealedArtifact,
+            _: &str,
+        ) -> Result<HeldDirectoryEffectOutcome> {
             anyhow::bail!("held directory authority is unavailable")
         }
-        pub(super) fn sync(&self) -> Result<()> {
+        pub(super) fn unlink(&self, _: HeldSealedArtifact) -> Result<HeldDirectoryEffectOutcome> {
             anyhow::bail!("held directory authority is unavailable")
         }
     }
@@ -710,7 +1050,7 @@ mod tests {
                 .clone()
         );
         let mut file = held.create_file_exclusive("proof.tmp").unwrap();
-        file.write_all(b"held").unwrap();
+        file.file_mut().write_all(b"held").unwrap();
         assert!(temp.path().join("moved/proof.tmp").is_file());
         assert!(!target.join("proof.tmp").exists());
     }
@@ -720,16 +1060,63 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let held = HeldDirectoryAuthority::open_existing(temp.path()).unwrap();
-        held.create_file_exclusive("temp")
-            .unwrap()
-            .write_all(b"new")
-            .unwrap();
-        held.create_file_exclusive("output")
-            .unwrap()
-            .write_all(b"old")
-            .unwrap();
-        assert!(held.rename_noreplace("temp", "output").is_err());
+        let mut temp_file = held.create_file_exclusive("temp").unwrap();
+        temp_file.file_mut().write_all(b"new").unwrap();
+        let temp_file = held.seal(temp_file).unwrap();
+        let mut output = held.create_file_exclusive("output").unwrap();
+        output.file_mut().write_all(b"old").unwrap();
+        assert!(held.rename_noreplace(temp_file, "output").is_err());
         assert_eq!(std::fs::read(temp.path().join("output")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn sealed_artifact_rejects_link_chmod_content_and_name_swaps() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let held = HeldDirectoryAuthority::open_existing(temp.path()).unwrap();
+        let mut artifact = held.create_file_exclusive("artifact").unwrap();
+        artifact.file_mut().write_all(b"expected").unwrap();
+        let artifact = held.seal(artifact).unwrap();
+        std::fs::hard_link(temp.path().join("artifact"), temp.path().join("extra")).unwrap();
+        assert!(held.rename_noreplace(artifact, "published").is_err());
+
+        let mut artifact = held.create_file_exclusive("third").unwrap();
+        artifact.file_mut().write_all(b"expected").unwrap();
+        let artifact = held.seal(artifact).unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(held.rename_noreplace(artifact, "published").is_err());
+
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut artifact = held.create_file_exclusive("fourth").unwrap();
+        artifact.file_mut().write_all(b"expected").unwrap();
+        let artifact = held.seal(artifact).unwrap();
+        std::fs::write(temp.path().join("fourth"), b"mutated").unwrap();
+        assert!(held.rename_noreplace(artifact, "published").is_err());
+
+        std::fs::remove_file(temp.path().join("extra")).unwrap();
+        let mut artifact = held.create_file_exclusive("second").unwrap();
+        artifact.file_mut().write_all(b"expected").unwrap();
+        let artifact = held.seal(artifact).unwrap();
+        std::fs::rename(temp.path().join("second"), temp.path().join("moved-second")).unwrap();
+        std::fs::write(temp.path().join("second"), b"expected").unwrap();
+        std::fs::set_permissions(
+            temp.path().join("second"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        assert!(held.rename_noreplace(artifact, "published").is_err());
+    }
+
+    #[test]
+    fn post_effect_sync_failure_is_explicitly_unknown() {
+        assert_eq!(
+            durability_outcome(Ok(())),
+            HeldDirectoryEffectOutcome::AppliedDurable
+        );
+        assert_eq!(
+            durability_outcome(Err(std::io::Error::other("injected"))),
+            HeldDirectoryEffectOutcome::AppliedSyncUnknown
+        );
     }
 }
 
@@ -747,15 +1134,12 @@ mod windows_tests {
         std::fs::create_dir(&output).unwrap();
         crate::goal_scratch::set_private(&output).unwrap();
         let held = HeldDirectoryAuthority::open_existing(&output).unwrap();
-        held.create_file_exclusive("temporary")
-            .unwrap()
-            .write_all(b"new")
-            .unwrap();
-        held.create_file_exclusive("published")
-            .unwrap()
-            .write_all(b"old")
-            .unwrap();
-        assert!(held.rename_noreplace("temporary", "published").is_err());
+        let mut temporary = held.create_file_exclusive("temporary").unwrap();
+        temporary.file_mut().write_all(b"new").unwrap();
+        let temporary = held.seal(temporary).unwrap();
+        let mut published = held.create_file_exclusive("published").unwrap();
+        published.file_mut().write_all(b"old").unwrap();
+        assert!(held.rename_noreplace(temporary, "published").is_err());
         assert_eq!(std::fs::read(output.join("published")).unwrap(), b"old");
         let alias = temp.path().join("alias");
         if symlink_dir(&output, &alias).is_ok() {
@@ -785,5 +1169,27 @@ mod windows_tests {
         held.create_file_exclusive("proof").unwrap();
         assert!(moved.join("proof").is_file());
         assert!(!output.join("proof").exists());
+    }
+
+    #[test]
+    fn held_windows_artifact_rejects_link_and_same_byte_file_id_swap() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("output");
+        std::fs::create_dir(&output).unwrap();
+        crate::goal_scratch::set_private(&output).unwrap();
+        let held = HeldDirectoryAuthority::open_existing(&output).unwrap();
+        let mut artifact = held.create_file_exclusive("artifact").unwrap();
+        artifact.file_mut().write_all(b"same").unwrap();
+        let artifact = held.seal(artifact).unwrap();
+        std::fs::hard_link(output.join("artifact"), output.join("other-link")).unwrap();
+        assert!(held.rename_noreplace(artifact, "published").is_err());
+
+        let mut artifact = held.create_file_exclusive("swap").unwrap();
+        artifact.file_mut().write_all(b"same").unwrap();
+        let artifact = held.seal(artifact).unwrap();
+        std::fs::rename(output.join("swap"), output.join("moved-swap")).unwrap();
+        std::fs::write(output.join("swap"), b"same").unwrap();
+        crate::goal_scratch::set_private(&output.join("swap")).unwrap();
+        assert!(held.rename_noreplace(artifact, "published").is_err());
     }
 }

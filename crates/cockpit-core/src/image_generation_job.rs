@@ -18,6 +18,10 @@ use cockpit_db::db::sealed_scope::SealedActionGrantRow;
 use cockpit_db::image_spend::{AttemptMaximum, SpendReservation};
 use cockpit_db::media_attachments::AcquiredMediaComponentLease;
 
+pub use crate::private_fs::held_directory::{
+    HeldArtifactEvidence, HeldDirectoryEffectOutcome, HeldSealedArtifact, HeldTemporaryArtifact,
+};
+
 pub const MAX_IMAGE_GENERATION_TARGETS: usize = 16;
 pub const MAX_IMAGE_GENERATION_SLOTS: usize = 256;
 pub const MAX_IMAGE_GENERATION_ATTEMPTS_PER_SLOT: u32 = 8;
@@ -225,16 +229,24 @@ impl HeldImageGenerationOutputDirectory {
     pub fn path(&self) -> &Path {
         self.guard.diagnostic_path()
     }
-    pub fn create_temporary_exclusive(&self, name: &str) -> Result<std::fs::File> {
+    pub fn create_temporary_exclusive(&self, name: &str) -> Result<HeldTemporaryArtifact> {
         self.guard.create_file_exclusive(name)
     }
-    pub fn publish_temporary_noreplace(&self, temporary: &str, output: &str) -> Result<()> {
-        self.guard.rename_noreplace(temporary, output)?;
-        self.guard.sync()
+    pub fn seal_temporary(&self, temporary: HeldTemporaryArtifact) -> Result<HeldSealedArtifact> {
+        self.guard.seal(temporary)
     }
-    pub fn remove_temporary(&self, name: &str) -> Result<()> {
-        self.guard.unlink(name)?;
-        self.guard.sync()
+    pub fn publish_temporary_noreplace(
+        &self,
+        temporary: HeldSealedArtifact,
+        output: &str,
+    ) -> Result<HeldDirectoryEffectOutcome> {
+        self.guard.rename_noreplace(temporary, output)
+    }
+    pub fn remove_temporary(
+        &self,
+        temporary: HeldSealedArtifact,
+    ) -> Result<HeldDirectoryEffectOutcome> {
+        self.guard.unlink(temporary)
     }
 }
 pub fn open_image_generation_output_directory(

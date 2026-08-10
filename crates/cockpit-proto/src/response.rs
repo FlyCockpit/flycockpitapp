@@ -170,6 +170,11 @@ pub enum Response {
         goal: GoalSummary,
     },
 
+    /// Deterministic secret-free terminal projection for remote goal mutations.
+    RemoteGoalOutcome {
+        outcome: RemoteGoalOutcomeV1,
+    },
+
     GoalCleared {
         cleared: bool,
     },
@@ -504,6 +509,9 @@ pub enum Response {
     RunInvocationStatus {
         status: RunInvocationStatusV1,
     },
+    RemoteOperationStatus {
+        status: Option<RemoteOperationStatusV1>,
+    },
 
     /// Idempotent cancel result ([`Request::CancelRunInvocation`]).
     RunInvocationCancelResult {
@@ -532,6 +540,7 @@ pub enum ClientSubmissionReceiptStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunInvocationLifecycleState {
+    NotFound,
     Accepted,
     Queued,
     Dispatching,
@@ -550,6 +559,7 @@ pub enum RunInvocationLifecycleState {
 impl RunInvocationLifecycleState {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::NotFound => "not_found",
             Self::Accepted => "accepted",
             Self::Queued => "queued",
             Self::Dispatching => "dispatching",
@@ -662,6 +672,8 @@ pub enum RunInvocationCancelOutcome {
     CancellationRequested,
     AlreadyCancelled,
     AlreadyTerminal,
+    /// The authoritative lookup installed or observed a durable tombstone.
+    NotFound,
 }
 
 impl RunInvocationCancelOutcome {
@@ -670,8 +682,38 @@ impl RunInvocationCancelOutcome {
             Self::CancellationRequested => "cancellation_requested",
             Self::AlreadyCancelled => "already_cancelled",
             Self::AlreadyTerminal => "already_terminal",
+            Self::NotFound => "not_found",
         }
     }
+}
+
+/// Versioned, content-free response for a remote goal mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteGoalOutcomeV1 {
+    pub schema_version: u8,
+    pub session_id: Uuid,
+    pub goal_id: Uuid,
+    pub attempt_generation: i64,
+    pub disposition: GoalDisposition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteOperationStatusV1 {
+    pub schema_version: u8,
+    pub operation_id: Uuid,
+    pub state: RemoteOperationStateV1,
+    pub operation_seq: crate::remote_protocol_id::CanonicalU64DecimalStringV1,
+    pub safe_response: Option<Vec<u8>>,
+    pub event_high_water_mark: Option<crate::remote_protocol_id::CanonicalU64DecimalStringV1>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteOperationStateV1 {
+    Reserved,
+    Committed,
+    Rejected,
+    OutcomeUnknown,
 }
 
 /// Versioned, content-free cancel response for a run invocation.
@@ -712,6 +754,7 @@ macro_rules! response_variants {
             (Response::NoteRecorded { .. }, "note_recorded");
             (Response::GoalStatus { .. }, "goal_status");
             (Response::GoalUpdated { .. }, "goal_updated");
+            (Response::RemoteGoalOutcome { .. }, "remote_goal_outcome");
             (Response::GoalCleared { .. }, "goal_cleared");
             (Response::PinChanged { .. }, "pin_changed");
             (Response::PinToggled { .. }, "pin_toggled");
@@ -769,6 +812,7 @@ macro_rules! response_variants {
             (Response::CaffeinateState { .. }, "caffeinate_state");
             (Response::PausedWork { .. }, "paused_work");
             (Response::RunInvocationStatus { .. }, "run_invocation_status");
+            (Response::RemoteOperationStatus { .. }, "remote_operation_status");
             (Response::RunInvocationCancelResult { .. }, "run_invocation_cancel_result");
             (Response::Unknown, "__unknown");
         ] }

@@ -36,6 +36,7 @@ pub mod keys;
 pub mod projection;
 pub mod spool;
 
+use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
 use uuid::Uuid;
@@ -49,7 +50,11 @@ use cockpit_db::external_journal::{
     ExternalJournalAgeReport, ExternalJournalCapacity, ExternalJournalRecord, ExternalJournalState,
     ExternalPrepareOutcome, ExternalTransitionOutcome, PrepareExternalOperation,
 };
+use cockpit_db::remote_attachment_operations::RemoteFilesystemIdentityV1;
 
+pub(crate) use fsguard::DirGuard;
+#[cfg(unix)]
+pub(crate) use fsguard::{HeldEntryIdentity, HeldRenameEffect};
 pub use fsguard::{
     OpenStrictness, SPOOL_DIR_MODE, SPOOL_FILE_MODE, SPOOL_PERMISSION_POLICY, SpoolPermissionPolicy,
 };
@@ -384,6 +389,10 @@ pub struct ExternalJournal {
     integrity: Arc<Mutex<Option<String>>>,
     unresolved_facts: Arc<Mutex<Vec<UnresolvedFact>>>,
     db_faults: Arc<Mutex<DbFaults>>,
+    #[cfg(test)]
+    fail_remote_rename_cleanup_sync: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_remote_rename_cleanup_unlink: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for ExternalJournal {
@@ -398,6 +407,163 @@ impl std::fmt::Debug for ExternalJournal {
 }
 
 impl ExternalJournal {
+    #[cfg(test)]
+    pub(crate) fn for_test_at(db: Db, root: &std::path::Path) -> Self {
+        Self::new(
+            db,
+            Spool::open_at(root, SpoolAccess::Create).expect("open test external journal spool"),
+            SpoolKeyRing::for_test(&[(1, [0x51; 32])], 1).expect("test spool keys"),
+        )
+    }
+    /// Open the owner-private namespace used by remote operation recovery.
+    /// Callers receive a held no-follow directory authority, never its path.
+    pub(crate) fn remote_operation_artifact_dir(&self) -> Result<DirGuard, ExternalJournalError> {
+        if !cfg!(any(target_os = "linux", target_os = "macos")) {
+            return Err(ExternalJournalError::Containment(
+                "remote operation artifacts require Unix held-handle and owner-mode enforcement"
+                    .into(),
+            ));
+        }
+        let root = DirGuard::open_root(self.spool.root_path(), false)?;
+        root.verify_private()?;
+        let operations = root.open_child_dir("remote-operations", true)?;
+        operations.verify_private()?;
+        root.sync()?;
+        Ok(operations)
+    }
+
+    pub(crate) fn write_remote_rename_artifact(
+        &self,
+        artifact_id: Uuid,
+        record: &RemoteRenameArtifactV1,
+    ) -> Result<(), ExternalJournalError> {
+        let dir = self.remote_operation_artifact_dir()?;
+        let name = remote_rename_artifact_name(artifact_id, record.dispatch_generation);
+        let bytes = record.encode()?;
+        let mut file = dir.create_file_exclusive(&name)?;
+        file.write_all(&bytes).map_err(|error| {
+            ExternalJournalError::Spool(format!("write rename artifact: {error}"))
+        })?;
+        file.sync_all().map_err(|error| {
+            ExternalJournalError::Spool(format!("fsync rename artifact: {error}"))
+        })?;
+        dir.sync()?;
+        Ok(())
+    }
+
+    pub(crate) fn read_remote_rename_artifact(
+        &self,
+        artifact_id: Uuid,
+        dispatch_generation: u64,
+    ) -> Result<RemoteRenameArtifactV1, ExternalJournalError> {
+        let dir = self.remote_operation_artifact_dir()?;
+        let name = remote_rename_artifact_name(artifact_id, dispatch_generation);
+        let mut file = dir.open_file_verified(&name)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(|error| {
+            ExternalJournalError::Spool(format!("read rename artifact: {error}"))
+        })?;
+        RemoteRenameArtifactV1::decode(&bytes)
+    }
+
+    pub(crate) fn remove_all_remote_rename_artifacts(
+        &self,
+        artifact_id: Uuid,
+    ) -> Result<(), ExternalJournalError> {
+        let dir = self.remote_operation_artifact_dir()?;
+        let prefix = format!("{artifact_id}.");
+        for name in dir.list_file_names()? {
+            let Some(generation) = name
+                .strip_prefix(&prefix)
+                .and_then(|value| value.strip_suffix(".rr1"))
+            else {
+                continue;
+            };
+            if !generation.is_empty() && generation.bytes().all(|byte| byte.is_ascii_digit()) {
+                let held = dir.open_file_verified(&name)?;
+                #[cfg(test)]
+                if self
+                    .fail_remote_rename_cleanup_unlink
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(ExternalJournalError::Spool(
+                        "injected rename artifact unlink failure".into(),
+                    ));
+                }
+                dir.remove_file(&name)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt as _;
+                    if held
+                        .metadata()
+                        .map_err(|error| {
+                            ExternalJournalError::Spool(format!(
+                                "verify removed rename artifact: {error}"
+                            ))
+                        })?
+                        .nlink()
+                        != 0
+                    {
+                        return Err(ExternalJournalError::Containment(
+                            "rename artifact unlink identity proof failed".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        #[cfg(test)]
+        if self
+            .fail_remote_rename_cleanup_sync
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ExternalJournalError::Spool(
+                "injected rename artifact directory fsync failure".into(),
+            ));
+        }
+        dir.sync()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_remote_rename_cleanup_sync(&self) {
+        self.fail_remote_rename_cleanup_sync
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_remote_rename_cleanup_unlink(&self) {
+        self.fail_remote_rename_cleanup_unlink
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) async fn drain_remote_rename_artifact_cleanup(
+        &self,
+    ) -> Result<usize, ExternalJournalError> {
+        let intents = self
+            .db
+            .remote_rename_artifact_cleanup_intents()
+            .await
+            .map_err(db_error)?;
+        let mut completed = 0;
+        for intent in intents {
+            let artifact_id = Uuid::parse_str(&intent.artifact_id)
+                .map_err(|error| ExternalJournalError::Containment(error.to_string()))?;
+            self.remove_all_remote_rename_artifacts(artifact_id)?;
+            if self
+                .db
+                .complete_remote_rename_artifact_cleanup(
+                    &intent.logical_attachment_id,
+                    &intent.operation_id,
+                    &intent.artifact_id,
+                )
+                .await
+                .map_err(db_error)?
+            {
+                completed += 1;
+            }
+        }
+        Ok(completed)
+    }
+
     pub fn new(db: Db, spool: Spool, keys: SpoolKeyRing) -> Self {
         Self {
             db,
@@ -406,6 +572,10 @@ impl ExternalJournal {
             integrity: Arc::new(Mutex::new(None)),
             unresolved_facts: Arc::new(Mutex::new(Vec::new())),
             db_faults: Arc::new(Mutex::new(DbFaults::default())),
+            #[cfg(test)]
+            fail_remote_rename_cleanup_sync: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_remote_rename_cleanup_unlink: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -453,6 +623,7 @@ impl ExternalJournal {
 
         let journal = Self::new(db, spool, keys);
         let report = journal.recover(now_wall_ms).await?;
+        journal.drain_remote_rename_artifact_cleanup().await?;
         // Bounded housekeeping: session deletion writes a tombstone every time,
         // including ephemeral sweeps, so it needs a retention policy.
         journal
@@ -1592,6 +1763,142 @@ impl ExternalJournal {
             status.integrity_failure = Some(reason);
         }
         Ok(status)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteRenameArtifactV1 {
+    pub logical_attachment_id: Uuid,
+    pub operation_id: Uuid,
+    pub dispatch_generation: u64,
+    pub source_identity: RemoteFilesystemIdentityV1,
+    pub source_parent_identity: RemoteFilesystemIdentityV1,
+    pub target_parent_identity: RemoteFilesystemIdentityV1,
+    pub source_name: String,
+    pub target_name: String,
+}
+
+fn remote_rename_artifact_name(artifact_id: Uuid, generation: u64) -> String {
+    format!("{artifact_id}.{generation}.rr1")
+}
+
+impl RemoteRenameArtifactV1 {
+    const FIXED: usize = 4 + 16 + 16 + 8 + 57 * 3 + 2 + 2;
+
+    fn encode(&self) -> Result<Vec<u8>, ExternalJournalError> {
+        if self.logical_attachment_id.is_nil()
+            || self.operation_id.is_nil()
+            || self.operation_id.get_version_num() != 7
+            || self.dispatch_generation == 0
+        {
+            return Err(ExternalJournalError::Containment(
+                "rename artifact identity or generation is invalid".into(),
+            ));
+        }
+        let source = self.source_name.as_bytes();
+        let target = self.target_name.as_bytes();
+        let source_len = u16::try_from(source.len()).map_err(|_| {
+            ExternalJournalError::Containment("rename source name is too long".into())
+        })?;
+        let target_len = u16::try_from(target.len()).map_err(|_| {
+            ExternalJournalError::Containment("rename target name is too long".into())
+        })?;
+        if source.is_empty()
+            || target.is_empty()
+            || source.contains(&0)
+            || target.contains(&0)
+            || self.source_name.contains('/')
+            || self.source_name.contains('\\')
+            || self.target_name.contains('/')
+            || self.target_name.contains('\\')
+            || matches!(self.source_name.as_str(), "." | "..")
+            || matches!(self.target_name.as_str(), "." | "..")
+        {
+            return Err(ExternalJournalError::Containment(
+                "rename artifact names must be nonempty and NUL-free".into(),
+            ));
+        }
+        let mut out = Vec::with_capacity(Self::FIXED + source.len() + target.len());
+        out.extend_from_slice(b"RRA1");
+        out.extend_from_slice(self.logical_attachment_id.as_bytes());
+        out.extend_from_slice(self.operation_id.as_bytes());
+        out.extend_from_slice(&self.dispatch_generation.to_be_bytes());
+        for identity in [
+            self.source_identity,
+            self.source_parent_identity,
+            self.target_parent_identity,
+        ] {
+            out.extend_from_slice(
+                &identity
+                    .encode()
+                    .map_err(|error| ExternalJournalError::Containment(error.to_string()))?,
+            );
+        }
+        out.extend_from_slice(&source_len.to_be_bytes());
+        out.extend_from_slice(source);
+        out.extend_from_slice(&target_len.to_be_bytes());
+        out.extend_from_slice(target);
+        Ok(out)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, ExternalJournalError> {
+        if bytes.len() < Self::FIXED || &bytes[..4] != b"RRA1" {
+            return Err(ExternalJournalError::Containment(
+                "invalid rename artifact header".into(),
+            ));
+        }
+        let mut cursor = 4;
+        let take = |cursor: &mut usize, len: usize| -> Result<&[u8], ExternalJournalError> {
+            let end = cursor.checked_add(len).ok_or_else(|| {
+                ExternalJournalError::Containment("rename artifact length overflow".into())
+            })?;
+            let value = bytes.get(*cursor..end).ok_or_else(|| {
+                ExternalJournalError::Containment("truncated rename artifact".into())
+            })?;
+            *cursor = end;
+            Ok(value)
+        };
+        let logical_attachment_id = Uuid::from_slice(take(&mut cursor, 16)?)
+            .map_err(|error| ExternalJournalError::Containment(error.to_string()))?;
+        let operation_id = Uuid::from_slice(take(&mut cursor, 16)?)
+            .map_err(|error| ExternalJournalError::Containment(error.to_string()))?;
+        let dispatch_generation = u64::from_be_bytes(take(&mut cursor, 8)?.try_into().unwrap());
+        let decode_identity = |cursor: &mut usize| {
+            RemoteFilesystemIdentityV1::decode(take(cursor, 57)?)
+                .map_err(|error| ExternalJournalError::Containment(error.to_string()))
+        };
+        let source_identity = decode_identity(&mut cursor)?;
+        let source_parent_identity = decode_identity(&mut cursor)?;
+        let target_parent_identity = decode_identity(&mut cursor)?;
+        let source_len = u16::from_be_bytes(take(&mut cursor, 2)?.try_into().unwrap()) as usize;
+        let source_name = std::str::from_utf8(take(&mut cursor, source_len)?)
+            .map_err(|error| ExternalJournalError::Containment(error.to_string()))?
+            .to_owned();
+        let target_len = u16::from_be_bytes(take(&mut cursor, 2)?.try_into().unwrap()) as usize;
+        let target_name = std::str::from_utf8(take(&mut cursor, target_len)?)
+            .map_err(|error| ExternalJournalError::Containment(error.to_string()))?
+            .to_owned();
+        if cursor != bytes.len() {
+            return Err(ExternalJournalError::Containment(
+                "trailing rename artifact bytes".into(),
+            ));
+        }
+        let decoded = Self {
+            logical_attachment_id,
+            operation_id,
+            dispatch_generation,
+            source_identity,
+            source_parent_identity,
+            target_parent_identity,
+            source_name,
+            target_name,
+        };
+        if decoded.encode()? != bytes {
+            return Err(ExternalJournalError::Containment(
+                "noncanonical rename artifact".into(),
+            ));
+        }
+        Ok(decoded)
     }
 }
 

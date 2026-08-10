@@ -314,6 +314,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             }
         }
         proto::Response::GoalUpdated { goal } => scrub_goal_summary(goal, redact),
+        proto::Response::RemoteGoalOutcome { .. } => {}
         proto::Response::GoalCleared { cleared: _ } => {}
         proto::Response::Assistants { assistants } => {
             for assistant in assistants {
@@ -498,7 +499,8 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         | proto::Response::BulkTransferChunkAccepted { .. } => {}
         // Content-free run-invocation responses: safe fields only; nothing to scrub.
         proto::Response::RunInvocationStatus { .. }
-        | proto::Response::RunInvocationCancelResult { .. } => {}
+        | proto::Response::RunInvocationCancelResult { .. }
+        | proto::Response::RemoteOperationStatus { .. } => {}
         proto::Response::Unknown => {}
     }
 }
@@ -1715,6 +1717,11 @@ pub struct DaemonContext {
     pub media_admission_open: Arc<std::sync::atomic::AtomicBool>,
     pub registry: SessionRegistry,
     pub paths: DaemonPaths,
+    /// Canonical process cwd captured once at daemon construction. Remote
+    /// operation resources never trust a caller-supplied fallback cwd.
+    pub canonical_cwd: PathBuf,
+    #[cfg(test)]
+    pub(crate) fcor_resolver_calls: std::sync::atomic::AtomicUsize,
     pub started_at: Instant,
     /// Caffeination authority (`/caffeinate`, GOALS §1a chrome glyph).
     /// Holds the OS sleep assertion **in the daemon process** so it
@@ -1772,6 +1779,26 @@ pub struct DaemonContext {
     pub write_scope: Option<std::sync::Arc<crate::write_scope::WriteScopeCoordinator>>,
 }
 
+#[cfg(test)]
+pub(crate) fn test_context_for_daemon_modules() -> Arc<DaemonContext> {
+    let db = Db::open_in_memory().expect("in-memory test db");
+    let locks = Arc::new(crate::locks::LockManager::in_memory(db.clone()));
+    Arc::new(DaemonContext::new(
+        db,
+        locks,
+        DaemonPaths {
+            socket: PathBuf::from("/tmp/cockpit-module-test.sock"),
+            pid_file: PathBuf::from("/tmp/cockpit-module-test.pid"),
+            ephemeral: true,
+        },
+        crate::daemon::terminal::test_host_factory(),
+        crate::daemon::config_source::ConfigSource::fixed(
+            crate::config::providers::ProvidersConfig::default(),
+            crate::config::extended::ExtendedConfig::default(),
+        ),
+    ))
+}
+
 impl DaemonContext {
     fn caffeinate_state_event(&self) -> proto::Event {
         let snap = self.caffeinate.snapshot();
@@ -1798,6 +1825,8 @@ impl DaemonContext {
         terminal_factory: crate::daemon::terminal::TerminalHostFactory,
         config_source: crate::daemon::config_source::ConfigSource,
     ) -> Self {
+        let daemon_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let canonical_cwd = daemon_cwd.canonicalize().unwrap_or(daemon_cwd);
         // The daemon-wide graceful-shutdown gate
         // (`daemon-graceful-drain-shutdown.md`) — the central drain
         // authority. Built here and shared into the registry (which installs
@@ -1866,6 +1895,9 @@ impl DaemonContext {
             media_admission_open: Arc::new(std::sync::atomic::AtomicBool::new(cfg!(test))),
             registry,
             paths,
+            canonical_cwd,
+            #[cfg(test)]
+            fcor_resolver_calls: std::sync::atomic::AtomicUsize::new(0),
             started_at,
             caffeinate: Arc::new(crate::daemon::caffeinate::CaffeineController::new()),
             global_events,
@@ -3586,6 +3618,78 @@ async fn handle_client_frame(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RemoteOperationContext {
+    pub(super) request_id: Uuid,
+    pub(super) logical_attachment_id: Uuid,
+    pub(super) operation_id: Uuid,
+    pub(super) authenticated_device_id: Uuid,
+    pub(super) authenticated_device_generation: u64,
+}
+
+fn remote_operation_denied() -> ErrorPayload {
+    ErrorPayload {
+        code: ErrorCode::Authorization,
+        message: "remote operations require a valid server-authenticated actor binding and operation identity"
+            .to_string(),
+    }
+}
+
+fn admit_remote_operation(
+    principal: &ClientPrincipal,
+    request_id: Uuid,
+    operation: Option<proto::RemoteOperationIdentityV1>,
+    request: &Request,
+) -> std::result::Result<Option<RemoteOperationContext>, ErrorPayload> {
+    if principal.is_owner() {
+        return Ok(None);
+    }
+    let class = request
+        .remote_operation_class()
+        .map_err(|_| remote_operation_denied())?;
+    if class == proto::RemoteOperationClass::ReadOnly && operation.is_none() {
+        return Ok(None);
+    }
+    let ClientPrincipal::Remote(remote) = principal else {
+        unreachable!("owner principal returned above")
+    };
+    // A relay-authenticated principal without a device actor binding is not
+    // participating in cross-transport remote operations. It is admitted
+    // without an operation identity; the regular authorization layer
+    // enforces session/project/terminal grants independently.
+    if remote.actor_binding.is_none() {
+        return Ok(None);
+    }
+    let (Some(actor), Some(operation)) = (remote.actor_binding.as_ref(), operation) else {
+        return Err(remote_operation_denied());
+    };
+    let operation_valid = operation.schema_version == 1
+        && !operation.logical_attachment_id.is_nil()
+        && operation.logical_attachment_id.get_variant() == uuid::Variant::RFC4122
+        && !operation.operation_id.is_nil()
+        && operation.operation_id.get_variant() == uuid::Variant::RFC4122
+        && operation.operation_id.get_version_num() == 7;
+    let actor_valid = actor.schema_version == 1
+        && actor.device_generation > 0
+        && !actor.device_id.is_nil()
+        && actor.device_id.get_variant() == uuid::Variant::RFC4122
+        && !actor.logical_attachment_id.is_nil()
+        && actor.logical_attachment_id.get_variant() == uuid::Variant::RFC4122;
+    if !operation_valid
+        || !actor_valid
+        || actor.logical_attachment_id != operation.logical_attachment_id
+    {
+        return Err(remote_operation_denied());
+    }
+    Ok(Some(RemoteOperationContext {
+        request_id,
+        logical_attachment_id: operation.logical_attachment_id,
+        operation_id: operation.operation_id,
+        authenticated_device_id: actor.device_id,
+        authenticated_device_generation: actor.device_generation,
+    }))
+}
+
 async fn handle_envelope(
     env: Envelope,
     state: &mut MutableClientState,
@@ -3596,7 +3700,20 @@ async fn handle_envelope(
     concurrent: &mut ConcurrentRequestRuntime,
 ) -> Result<()> {
     match env.body {
-        Body::Request { id, request } => {
+        Body::Request {
+            id,
+            operation,
+            request,
+        } => {
+            let remote_operation =
+                match admit_remote_operation(&state.principal, id, operation, &request) {
+                    Ok(context) => context,
+                    Err(error) => {
+                        let envelope = Envelope::error(Some(id), error);
+                        let _ = send_writer_envelope(writer_tx, envelope).await;
+                        return Ok(());
+                    }
+                };
             if principal::request_ordering(&request) == principal::RequestOrdering::Concurrent {
                 let Ok(permit) = concurrent.permits.clone().acquire_owned().await else {
                     return Ok(());
@@ -3607,8 +3724,13 @@ async fn handle_envelope(
                 concurrent.tasks.spawn(async move {
                     let _permit = permit;
                     let response_shared = request_shared.clone();
-                    let result =
-                        run_concurrent_request_catching_panic(request, request_shared, ctx).await;
+                    let result = run_concurrent_request_catching_panic_with_remote_operation(
+                        request,
+                        request_shared,
+                        ctx,
+                        remote_operation,
+                    )
+                    .await;
                     let envelope = response_envelope_for_shared(id, result, &response_shared);
                     let _ = send_writer_envelope(&writer_tx, envelope).await;
                 });
@@ -3616,9 +3738,15 @@ async fn handle_envelope(
             }
             let is_attach = matches!(&request, Request::Attach { .. });
             let mut effects = ClientRequestEffects::default();
-            let result =
-                dispatch::handle_serialized_request(request, state, shared, ctx, &mut effects)
-                    .await;
+            let result = Box::pin(dispatch::handle_serialized_request_with_remote_operation(
+                request,
+                state,
+                shared,
+                ctx,
+                &mut effects,
+                remote_operation.as_ref(),
+            ))
+            .await;
             let attached = matches!(&result, Ok(Response::Attached { .. }));
             if (is_attach && attached) || state.attached.is_none() {
                 *shared = state.shared_snapshot();
@@ -3672,6 +3800,150 @@ async fn handle_envelope(
                 let _ = event_cmd_tx.send(ClientEventCommand::Detach).await;
             }
         }
+        Body::RemoteReplayRequest(proto::RemoteReplayRequestV2 {
+            id,
+            after_event_seq,
+            limit,
+        }) => {
+            let ClientPrincipal::Remote(remote) = &state.principal else {
+                let _ = send_writer_envelope(
+                    writer_tx,
+                    Envelope::error(
+                        Some(id),
+                        ErrorPayload {
+                            code: ErrorCode::Authorization,
+                            message: "remote replay requires an authenticated actor".into(),
+                        },
+                    ),
+                )
+                .await;
+                return Ok(());
+            };
+            let Some(actor) = remote.actor_binding.as_ref() else {
+                let _ = send_writer_envelope(
+                    writer_tx,
+                    Envelope::error(
+                        Some(id),
+                        ErrorPayload {
+                            code: ErrorCode::Authorization,
+                            message: "legacy actorless transport cannot replay mutations".into(),
+                        },
+                    ),
+                )
+                .await;
+                return Ok(());
+            };
+            let attachment = actor.logical_attachment_id.to_string();
+            let consumer = format!("t:{}:{}", actor.device_id.simple(), actor.device_generation);
+            let mut cursor = after_event_seq
+                .as_ref()
+                .map(|value| value.value())
+                .unwrap_or(0);
+            let mut events = Vec::with_capacity(limit.get() as usize);
+            for _ in 0..limit.get() {
+                let Some(lease) = ctx
+                    .db
+                    .claim_remote_outbox_delivery(
+                        &consumer,
+                        "*",
+                        Some(&attachment),
+                        Some(cursor),
+                        chrono::Utc::now().timestamp_millis(),
+                        30_000,
+                    )
+                    .await?
+                else {
+                    break;
+                };
+                cursor = lease.event_seq;
+                events.push(proto::RemoteOutboxDeliveryV1 {
+                    event_seq: proto::remote_protocol_id::CanonicalU64DecimalStringV1::from_u64(
+                        lease.event_seq,
+                    ),
+                    delivery_id: proto::CanonicalRfcUuidV1::new(Uuid::parse_str(
+                        &lease.delivery_id,
+                    )?)?,
+                    kind: lease.kind,
+                    canonical_payload: lease.canonical_payload,
+                    lease_token: proto::CanonicalRfcUuidV1::new(Uuid::parse_str(&lease.lease_id)?)?,
+                    lease_expires_at_ms: lease.lease_expires_at_ms,
+                });
+            }
+            let high_water = ctx.db.remote_outbox_high_water(&attachment).await?;
+            let envelope = Envelope {
+                v: proto::PROTOCOL_VERSION,
+                body: Body::RemoteReplayResponse(proto::RemoteReplayResponseV2 {
+                    id,
+                    events,
+                    high_water_mark:
+                        proto::remote_protocol_id::CanonicalU64DecimalStringV1::from_u64(high_water),
+                }),
+            };
+            let _ = send_writer_envelope(writer_tx, envelope).await;
+        }
+        Body::RemoteReplayAck(proto::RemoteReplayAckV2 {
+            id,
+            delivery_id,
+            lease_token,
+        }) => {
+            let ClientPrincipal::Remote(remote) = &state.principal else {
+                let _ = send_writer_envelope(
+                    writer_tx,
+                    Envelope::error(
+                        Some(id),
+                        ErrorPayload {
+                            code: ErrorCode::Authorization,
+                            message:
+                                "remote replay acknowledgement requires an authenticated actor"
+                                    .into(),
+                        },
+                    ),
+                )
+                .await;
+                return Ok(());
+            };
+            let Some(actor) = remote.actor_binding.as_ref() else {
+                let _ = send_writer_envelope(
+                    writer_tx,
+                    Envelope::error(
+                        Some(id),
+                        ErrorPayload {
+                            code: ErrorCode::Authorization,
+                            message: "legacy actorless transport cannot acknowledge replay".into(),
+                        },
+                    ),
+                )
+                .await;
+                return Ok(());
+            };
+            let attachment = actor.logical_attachment_id.to_string();
+            let consumer = format!("t:{}:{}", actor.device_id.simple(), actor.device_generation);
+            let acked = ctx
+                .db
+                .ack_remote_outbox_delivery(
+                    &attachment,
+                    &delivery_id.get().to_string(),
+                    &consumer,
+                    &lease_token.get().to_string(),
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await?;
+            let _ = send_writer_envelope(
+                writer_tx,
+                Envelope {
+                    v: proto::PROTOCOL_VERSION,
+                    body: Body::RemoteReplayAckResponse(proto::RemoteReplayAckResponseV2 {
+                        id,
+                        acked,
+                    }),
+                },
+            )
+            .await;
+        }
+        Body::RemoteReplayResponse(proto::RemoteReplayResponseV2 { id, .. })
+        | Body::RemoteReplayAckResponse(proto::RemoteReplayAckResponseV2 { id, .. }) => {
+            tracing::warn!(%id, "client sent a replay response; ignoring");
+        }
         Body::Response { id, .. } => {
             tracing::warn!(id = %id, "client sent a response envelope; ignoring");
         }
@@ -3693,9 +3965,23 @@ async fn run_concurrent_request_catching_panic(
     shared: Arc<SharedClientState>,
     ctx: Arc<DaemonContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
-    match AssertUnwindSafe(dispatch::handle_concurrent_request(request, shared, ctx))
-        .catch_unwind()
-        .await
+    run_concurrent_request_catching_panic_with_remote_operation(request, shared, ctx, None).await
+}
+
+async fn run_concurrent_request_catching_panic_with_remote_operation(
+    request: Request,
+    shared: Arc<SharedClientState>,
+    ctx: Arc<DaemonContext>,
+    remote_operation: Option<RemoteOperationContext>,
+) -> std::result::Result<Response, ErrorPayload> {
+    match AssertUnwindSafe(dispatch::handle_concurrent_request_with_remote_operation(
+        request,
+        shared,
+        ctx,
+        remote_operation,
+    ))
+    .catch_unwind()
+    .await
     {
         Ok(result) => result,
         Err(_) => Err(ErrorPayload {
@@ -3819,6 +4105,10 @@ fn envelope_kind(envelope: &Envelope) -> &'static str {
         Body::Error { .. } => "error",
         Body::Request { .. } => "request",
         Body::Event { .. } => "event",
+        Body::RemoteReplayRequest(_) => "replay_request",
+        Body::RemoteReplayResponse(_) => "replay_response",
+        Body::RemoteReplayAck(_) => "replay_ack",
+        Body::RemoteReplayAckResponse(_) => "replay_ack_response",
         Body::Unknown => "unknown",
     }
 }

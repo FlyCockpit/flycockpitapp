@@ -1419,14 +1419,14 @@ mod tests {
         );
         assert!(matches!(
             failed.state,
-            HealthState::Failed { cause: HealthCause::NonZeroExit { code: Some(8) } }
+            HealthState::Failed {
+                cause: HealthCause::NonZeroExit { code: Some(8) }
+            }
         ));
 
         let worker_contract = include_str!("../../../../apps/worker/src/lib/media-runtime.ts");
         assert!(worker_contract.contains(r#"execFileAsync(program, ["-version"]"#));
-        assert!(worker_contract.contains(
-            r#"/\b(?:ffmpeg|ffprobe) version\s+(\d+)(?:\.|\s)/i"#
-        ));
+        assert!(worker_contract.contains(r#"/\b(?:ffmpeg|ffprobe) version\s+(\d+)(?:\.|\s)/i"#));
     }
 
     #[test]

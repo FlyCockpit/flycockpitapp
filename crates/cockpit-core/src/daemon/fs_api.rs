@@ -240,6 +240,85 @@ pub async fn fs_write(
     .await
 }
 
+pub async fn fs_write_staged_remote(
+    ctx: Arc<DaemonContext>,
+    project_root: String,
+    path: String,
+    content: String,
+    base_hash: Option<String>,
+    operation_id: String,
+) -> Result<Response, ErrorPayload> {
+    join_fs_handler(
+        "fs_write",
+        tokio::task::spawn_blocking(move || {
+            fs_write_staged_sync(
+                &ctx,
+                &project_root,
+                &path,
+                &content,
+                base_hash,
+                &operation_id,
+            )
+        }),
+    )
+    .await
+}
+
+pub(crate) fn fs_write_staged_sync(
+    ctx: &DaemonContext,
+    project_root: &str,
+    path: &str,
+    content: &str,
+    base_hash: Option<String>,
+    operation_id: &str,
+) -> Result<Response, ErrorPayload> {
+    use std::io::Write as _;
+
+    let root = canonical_project_root(project_root)?;
+    let target = resolve_for_write(&root, path)?;
+    let locks = ctx.registry.locks();
+    let _guard = locks
+        .acquire_transient(&target, REMOTE_FILE_AGENT)
+        .map_err(lock_conflict)?;
+    let desired_hash = content_hash(content.as_bytes());
+    let current = match std::fs::read(&target) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => return Err(internal(err)),
+    };
+    let current_hash = content_hash(&current);
+    if current_hash == desired_hash {
+        return Ok(Response::FsWrite { hash: desired_hash });
+    }
+    if let Some(expected) = base_hash.as_deref()
+        && expected != current_hash
+    {
+        return Err(ErrorPayload {
+            code: ErrorCode::HashMismatch,
+            message: format!("file changed before write; current hash is {current_hash}"),
+        });
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| bad_request("write target has no parent"))?;
+    std::fs::create_dir_all(parent).map_err(internal)?;
+    let stage = parent.join(format!(".flycockpit-stage-{operation_id}"));
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&stage)
+        .map_err(internal)?;
+    file.write_all(content.as_bytes()).map_err(internal)?;
+    file.sync_all().map_err(internal)?;
+    drop(file);
+    std::fs::rename(&stage, &target).map_err(internal)?;
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(internal)?;
+    Ok(Response::FsWrite { hash: desired_hash })
+}
+
 pub(crate) fn fs_write_sync(
     ctx: &DaemonContext,
     project_root: &str,
@@ -281,6 +360,36 @@ pub async fn fs_create_dir(project_root: String, path: String) -> Result<Respons
     join_fs_handler(
         "fs_create_dir",
         tokio::task::spawn_blocking(move || fs_create_dir_blocking(&project_root, &path)),
+    )
+    .await
+}
+
+pub async fn fs_create_dir_reconciled_remote(
+    project_root: String,
+    path: String,
+) -> Result<Response, ErrorPayload> {
+    join_fs_handler(
+        "fs_create_dir",
+        tokio::task::spawn_blocking(move || {
+            let root = canonical_project_root(&project_root)?;
+            let target = resolve_for_write(&root, &path)?;
+            if target.try_exists().map_err(internal)? {
+                if target.is_dir() {
+                    return Ok(Response::Ack);
+                }
+                return Err(bad_request(format!(
+                    "`{path}` exists and is not a directory"
+                )));
+            }
+            std::fs::create_dir_all(&target).map_err(internal)?;
+            let parent = target
+                .parent()
+                .ok_or_else(|| bad_request("directory target has no parent"))?;
+            std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(internal)?;
+            Ok(Response::Ack)
+        }),
     )
     .await
 }
@@ -587,7 +696,7 @@ fn dotenv_pattern_matches(
     ))
 }
 
-fn canonical_project_root(project_root: &str) -> Result<PathBuf, ErrorPayload> {
+pub(crate) fn canonical_project_root(project_root: &str) -> Result<PathBuf, ErrorPayload> {
     let root = Path::new(project_root);
     match std::fs::canonicalize(root) {
         Ok(path) if path.is_dir() => Ok(path),
@@ -600,6 +709,41 @@ fn canonical_project_root(project_root: &str) -> Result<PathBuf, ErrorPayload> {
             message: format!("project root `{project_root}` is unavailable: {e}"),
         }),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthorizedCanonicalPathMode {
+    Existing,
+    WriteTarget,
+    RenameSource,
+}
+
+/// Resolve an already-authorized request path through the same symlink-aware
+/// containment rules used by production filesystem handlers.
+pub(crate) fn resolve_authorized_canonical_path(
+    project_root: &str,
+    path: &str,
+    mode: AuthorizedCanonicalPathMode,
+) -> Result<PathBuf, ErrorPayload> {
+    let root = canonical_project_root(project_root)?;
+    match mode {
+        AuthorizedCanonicalPathMode::Existing => resolve_existing_path(&root, path),
+        AuthorizedCanonicalPathMode::WriteTarget => resolve_existing_or_parent_path(&root, path),
+        AuthorizedCanonicalPathMode::RenameSource => resolve_rename_source(&root, path),
+    }
+}
+
+fn resolve_rename_source(root: &Path, path: &str) -> Result<PathBuf, ErrorPayload> {
+    let rel = clean_relative_path(path)?;
+    let name = rel
+        .file_name()
+        .ok_or_else(|| bad_request("rename source must name an entry"))?;
+    let parent_rel = rel.parent().unwrap_or_else(|| Path::new(""));
+    let parent = resolve_existing_path(root, parent_rel.to_str().unwrap_or(""))?;
+    if !parent.is_dir() {
+        return Err(bad_request("rename source parent is not a directory"));
+    }
+    Ok(parent.join(name))
 }
 
 fn resolve_existing_path(root: &Path, path: &str) -> Result<PathBuf, ErrorPayload> {
@@ -645,7 +789,10 @@ fn resolve_for_write(root: &Path, path: &str) -> Result<PathBuf, ErrorPayload> {
     if !canonical_ancestor.starts_with(root) {
         return Err(path_outside_root(path));
     }
-    Ok(root.join(rel))
+    let unresolved = joined
+        .strip_prefix(ancestor)
+        .map_err(|_| bad_request(format!("parent for `{path}` is unavailable")))?;
+    Ok(canonical_ancestor.join(unresolved))
 }
 
 fn clean_relative_path(path: &str) -> Result<PathBuf, ErrorPayload> {
@@ -746,6 +893,7 @@ mod tests {
     fn remote_project_files(root: &Path) -> ClientPrincipal {
         ClientPrincipal::Remote(RemotePrincipal {
             user_id: "user-1".into(),
+            actor_binding: None,
             grants: vec![PrincipalGrant {
                 scope: PrincipalScope::ProjectFiles,
                 project_root: Some(root.to_string_lossy().into_owned()),
@@ -776,6 +924,136 @@ mod tests {
         assert!(resolve_existing_path(&root.canonicalize().unwrap(), "ok.txt").is_ok());
     }
 
+    #[test]
+    fn authorized_resolver_distinguishes_existing_and_write_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("present.txt"), "ok").unwrap();
+        let root_text = root.to_str().unwrap();
+        let existing = resolve_authorized_canonical_path(
+            root_text,
+            "./present.txt",
+            AuthorizedCanonicalPathMode::Existing,
+        )
+        .unwrap();
+        assert_eq!(existing, root.canonicalize().unwrap().join("present.txt"));
+        assert!(
+            resolve_authorized_canonical_path(
+                root_text,
+                "missing.txt",
+                AuthorizedCanonicalPathMode::Existing,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            resolve_authorized_canonical_path(
+                root_text,
+                "missing.txt",
+                AuthorizedCanonicalPathMode::WriteTarget,
+            )
+            .unwrap(),
+            root.canonicalize().unwrap().join("missing.txt")
+        );
+    }
+
+    #[test]
+    fn rename_source_identity_is_stable_after_entry_disappears() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("nested/from.txt"), b"value").unwrap();
+        let root_text = root.to_str().unwrap();
+        let before = resolve_authorized_canonical_path(
+            root_text,
+            "nested/from.txt",
+            AuthorizedCanonicalPathMode::RenameSource,
+        )
+        .unwrap();
+        std::fs::rename(root.join("nested/from.txt"), root.join("nested/to.txt")).unwrap();
+        let after = resolve_authorized_canonical_path(
+            root_text,
+            "nested/from.txt",
+            AuthorizedCanonicalPathMode::RenameSource,
+        )
+        .unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn staged_write_reconciles_rename_before_ledger_commit_without_rewriting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        std::fs::create_dir_all(&root).unwrap();
+        let ctx = test_ctx(&root);
+        let root_text = root.to_str().unwrap();
+        let operation = "01890f3e-4c00-7000-8000-00000000009f";
+        let first = fs_write_staged_sync(
+            &ctx,
+            root_text,
+            "nested/value.txt",
+            "durable value",
+            None,
+            operation,
+        )
+        .unwrap();
+        let modified = std::fs::metadata(root.join("nested/value.txt"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let reconciled = fs_write_staged_sync(
+            &ctx,
+            root_text,
+            "nested/value.txt",
+            "durable value",
+            Some(content_hash(b"different base")),
+            operation,
+        )
+        .unwrap();
+        assert!(matches!(first, Response::Ack));
+        assert!(matches!(reconciled, Response::Ack));
+        assert_eq!(
+            std::fs::metadata(root.join("nested/value.txt"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            modified,
+            "reconciliation observes the desired target and does not rewrite"
+        );
+        assert!(
+            !root
+                .join("nested")
+                .join(format!(".flycockpit-stage-{operation}"))
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_directory_creation_reconciles_only_a_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        std::fs::create_dir_all(&root).unwrap();
+        let root_text = root.to_string_lossy().into_owned();
+        assert!(matches!(
+            fs_create_dir_reconciled_remote(root_text.clone(), "nested/dir".into())
+                .await
+                .unwrap(),
+            Response::Ack
+        ));
+        assert!(matches!(
+            fs_create_dir_reconciled_remote(root_text.clone(), "nested/dir".into())
+                .await
+                .unwrap(),
+            Response::Ack
+        ));
+        std::fs::write(root.join("not-a-dir"), b"file").unwrap();
+        assert!(
+            fs_create_dir_reconciled_remote(root_text, "not-a-dir".into())
+                .await
+                .is_err()
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn rejects_symlink_escape() {
@@ -803,6 +1081,30 @@ mod tests {
 
         let err = resolve_for_write(&root.canonicalize().unwrap(), "link.txt").unwrap_err();
         assert_eq!(err.code, ErrorCode::BadRequest);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_target_canonicalizes_symlink_alias_and_observes_retarget() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        symlink("first", root.join("alias")).unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+        assert_eq!(
+            resolve_for_write(&canonical_root, "alias/new.txt").unwrap(),
+            resolve_for_write(&canonical_root, "first/new.txt").unwrap()
+        );
+        std::fs::remove_file(root.join("alias")).unwrap();
+        symlink("second", root.join("alias")).unwrap();
+        assert_eq!(
+            resolve_for_write(&canonical_root, "alias/new.txt").unwrap(),
+            canonical_root.join("second/new.txt")
+        );
     }
 
     #[test]

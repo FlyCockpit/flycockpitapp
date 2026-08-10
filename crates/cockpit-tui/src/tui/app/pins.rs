@@ -1103,7 +1103,7 @@ mod tests {
                 RecvFrame::Unknown { .. } => panic!("unexpected unknown frame"),
                 RecvFrame::VersionMismatch { .. } => panic!("unexpected version mismatch"),
             };
-            let Body::Request { id, request } = env.body else {
+            let Body::Request { id, request, .. } = env.body else {
                 panic!("expected request envelope");
             };
             let parent_session_id = match &request {

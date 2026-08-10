@@ -917,63 +917,67 @@ impl Db {
         if receipts.is_empty() {
             return Ok(());
         }
-        self.write(move |conn| {
-            let tx = conn
-                .unchecked_transaction()
-                .context("begin terminal client submission receipt tx")?;
-            for receipt in receipts {
-                let id = receipt.client_submission_id.to_string();
-                let disposition = receipt.disposition.as_str();
-                let inserted = tx
-                    .execute(
-                        "INSERT OR IGNORE INTO client_submission_terminal_receipts
+        self.transaction(move |conn| {
+            Self::insert_client_submission_terminal_receipts_conn(conn, session_id, &receipts)
+        })
+        .await
+    }
+
+    pub fn insert_client_submission_terminal_receipts_conn(
+        conn: &Connection,
+        session_id: Uuid,
+        receipts: &[ClientSubmissionTerminalReceipt],
+    ) -> Result<()> {
+        for receipt in receipts {
+            let id = receipt.client_submission_id.to_string();
+            let disposition = receipt.disposition.as_str();
+            let inserted = conn
+                .execute(
+                    "INSERT OR IGNORE INTO client_submission_terminal_receipts
                          (session_id, client_submission_id, fingerprint, wire_fingerprint,
                           origin_principal, disposition, created_at_ms)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                        params![
-                            session_id.to_string(),
-                            id,
-                            receipt.fingerprint,
-                            receipt.wire_fingerprint,
-                            receipt.origin_principal,
-                            disposition,
-                            now_ms(),
-                        ],
-                    )
-                    .context("inserting terminal client submission receipt")?;
-                if inserted == 0 {
-                    let existing = tx
-                        .query_row(
-                            "SELECT fingerprint, wire_fingerprint, origin_principal, disposition
+                    params![
+                        session_id.to_string(),
+                        id,
+                        &receipt.fingerprint,
+                        &receipt.wire_fingerprint,
+                        receipt.origin_principal.as_deref(),
+                        disposition,
+                        now_ms(),
+                    ],
+                )
+                .context("inserting terminal client submission receipt")?;
+            if inserted == 0 {
+                let existing = conn
+                    .query_row(
+                        "SELECT fingerprint, wire_fingerprint, origin_principal, disposition
                                FROM client_submission_terminal_receipts
                               WHERE session_id = ?1 AND client_submission_id = ?2",
-                            params![session_id.to_string(), id],
-                            |row| {
-                                Ok((
-                                    row.get::<_, String>(0)?,
-                                    row.get::<_, String>(1)?,
-                                    row.get::<_, Option<String>>(2)?,
-                                    row.get::<_, String>(3)?,
-                                ))
-                            },
-                        )
-                        .context("reading existing terminal client submission receipt")?;
-                    if existing.0 != receipt.fingerprint
-                        || existing.1 != receipt.wire_fingerprint
-                        || existing.2 != receipt.origin_principal
-                        || existing.3 != disposition
-                    {
-                        bail!(
-                            "client submission {} already has a different terminal receipt",
-                            receipt.client_submission_id
-                        );
-                    }
+                        params![session_id.to_string(), id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                                row.get::<_, String>(3)?,
+                            ))
+                        },
+                    )
+                    .context("reading existing terminal client submission receipt")?;
+                if existing.0 != receipt.fingerprint
+                    || existing.1 != receipt.wire_fingerprint
+                    || existing.2.as_ref() != receipt.origin_principal.as_ref()
+                    || existing.3 != disposition
+                {
+                    bail!(
+                        "client submission {} already has a different terminal receipt",
+                        receipt.client_submission_id
+                    );
                 }
             }
-            tx.commit()
-                .context("commit terminal client submission receipt tx")
-        })
-        .await
+        }
+        Ok(())
     }
 
     pub async fn client_submission_terminal_receipt(

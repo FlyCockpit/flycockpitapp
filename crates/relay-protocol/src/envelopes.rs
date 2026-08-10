@@ -10,7 +10,7 @@ use serde_json::Value;
 /// window must keep parsing known data and ignoring unknown additive fields.
 /// Breaking changes such as removals, renames, or type changes bump
 /// `RELAY_MIN_SUPPORTED_ENVELOPE_VERSION`.
-pub const RELAY_ENVELOPE_VERSION: u32 = 1;
+pub const RELAY_ENVELOPE_VERSION: u32 = 2;
 pub const RELAY_MIN_SUPPORTED_ENVELOPE_VERSION: u32 = 1;
 
 pub fn is_relay_envelope_version_supported(version: u32) -> bool {
@@ -39,6 +39,73 @@ pub struct RelayPrincipal {
     #[serde(deserialize_with = "non_empty_string")]
     pub user_id: String,
     pub grants: Vec<RelayGrant>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_binding: Option<ClientActorBindingV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientActorBindingV1 {
+    #[serde(deserialize_with = "schema_version_one")]
+    pub schema_version: u8,
+    #[serde(deserialize_with = "canonical_nonnil_uuid")]
+    pub device_id: uuid::Uuid,
+    #[serde(with = "canonical_positive_u64")]
+    pub device_generation: u64,
+    #[serde(deserialize_with = "canonical_nonnil_uuid")]
+    pub logical_attachment_id: uuid::Uuid,
+}
+
+fn schema_version_one<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u8, D::Error> {
+    let value = u8::deserialize(deserializer)?;
+    if value != 1 {
+        return Err(serde::de::Error::custom(
+            "actor binding schemaVersion must be 1",
+        ));
+    }
+    Ok(value)
+}
+
+fn canonical_nonnil_uuid<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<uuid::Uuid, D::Error> {
+    let text = String::deserialize(deserializer)?;
+    let value = uuid::Uuid::parse_str(&text).map_err(serde::de::Error::custom)?;
+    if value.is_nil()
+        || value.get_variant() != uuid::Variant::RFC4122
+        || value.hyphenated().to_string() != text
+    {
+        return Err(serde::de::Error::custom(
+            "UUID must be canonical lowercase and nonnil",
+        ));
+    }
+    Ok(value)
+}
+
+mod canonical_positive_u64 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        if text.is_empty()
+            || (text.len() > 1 && text.starts_with('0'))
+            || !text.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(serde::de::Error::custom(
+                "generation must be canonical decimal u64",
+            ));
+        }
+        let value = text.parse::<u64>().map_err(serde::de::Error::custom)?;
+        if value == 0 {
+            return Err(serde::de::Error::custom("generation must be positive"));
+        }
+        Ok(value)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,7 +228,7 @@ pub struct ClientRelayFrame {
     pub payload: Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StampedClientRelayFrame {
     #[serde(deserialize_with = "relay_envelope_version")]
@@ -171,6 +238,35 @@ pub struct StampedClientRelayFrame {
     pub from: ClientFrameOrigin,
     pub principal: RelayPrincipal,
     pub payload: Value,
+}
+
+impl<'de> Deserialize<'de> for StampedClientRelayFrame {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Wire {
+            #[serde(deserialize_with = "relay_envelope_version")]
+            v: u32,
+            #[serde(deserialize_with = "non_empty_string")]
+            channel_id: String,
+            from: ClientFrameOrigin,
+            principal: RelayPrincipal,
+            payload: Value,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        if wire.v == 1 && wire.principal.actor_binding.is_some() {
+            return Err(serde::de::Error::custom(
+                "relay envelope v1 must be actorless",
+            ));
+        }
+        Ok(Self {
+            v: wire.v,
+            channel_id: wire.channel_id,
+            from: wire.from,
+            principal: wire.principal,
+            payload: wire.payload,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -394,6 +490,13 @@ pub fn parse_incoming(value: &str) -> serde_json::Result<IncomingRelayFrame> {
         let v = serde_json::from_value::<RelayEnvelopeVersionProbe>(parsed)?.v;
         return Ok(IncomingRelayFrame::Unknown { v, kind });
     }
+    let v = serde_json::from_value::<RelayEnvelopeVersionProbe>(parsed.clone())?.v;
+    if !is_relay_envelope_version_supported(v) {
+        return Ok(IncomingRelayFrame::Unknown {
+            v,
+            kind: "client".to_string(),
+        });
+    }
     serde_json::from_value::<StampedClientRelayFrame>(parsed).map(IncomingRelayFrame::Client)
 }
 
@@ -460,6 +563,32 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    #[test]
+    fn client_actor_binding_codec_is_strict_and_u64_complete() {
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packages/relay-protocol/fixtures/client-actor-binding-v1.json"
+        )))
+        .unwrap();
+        for vector in vectors["valid"].as_array().unwrap() {
+            let value = vector["value"].clone();
+            let binding: ClientActorBindingV1 = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(
+                serde_json::to_value(binding).unwrap(),
+                value,
+                "{}",
+                vector["name"]
+            );
+        }
+        for vector in vectors["invalid"].as_array().unwrap() {
+            assert!(
+                serde_json::from_value::<ClientActorBindingV1>(vector["value"].clone()).is_err(),
+                "{}",
+                vector["name"]
+            );
+        }
+    }
     use serde::Serialize;
     use serde::de::DeserializeOwned;
     use serde_json::{Map, json};
@@ -495,7 +624,7 @@ mod tests {
         let value = serde_json::to_value(frame).unwrap();
         assert_eq!(
             value,
-            json!({ "v": 1, "channelId": "ch-1", "payload": { "text": "world" } })
+            json!({ "v": 2, "channelId": "ch-1", "payload": { "text": "world" } })
         );
     }
 
@@ -512,8 +641,11 @@ mod tests {
             let raw = fs::read_to_string(&path).unwrap();
             match name.as_ref() {
                 "client-relay-frame.json" => assert_roundtrip::<ClientRelayFrame>(&raw),
-                "stamped-client-relay-frame.json" => {
+                "stamped-client-relay-frame.json" | "stamped-client-relay-frame-v1.json" => {
                     assert_roundtrip::<StampedClientRelayFrame>(&raw)
+                }
+                "client-actor-binding-v1.json" => {
+                    let _: serde_json::Value = serde_json::from_str(&raw).unwrap();
                 }
                 "daemon-client-relay-frame.json" => {
                     assert_roundtrip::<DaemonClientRelayFrame>(&raw)
@@ -560,7 +692,7 @@ mod tests {
 
         let frame = serde_json::from_str::<ClientRelayFrame>(&raw).unwrap();
 
-        assert_eq!(frame.v, RELAY_ENVELOPE_VERSION);
+        assert_eq!(frame.v, RELAY_MIN_SUPPORTED_ENVELOPE_VERSION);
         assert_eq!(frame.channel_id, "ch-forward");
         assert_eq!(frame.payload, json!({"kind": "req"}));
     }
@@ -601,7 +733,7 @@ mod tests {
         assert_eq!(
             frame,
             IncomingRelayFrame::Unknown {
-                v: RELAY_ENVELOPE_VERSION,
+                v: RELAY_MIN_SUPPORTED_ENVELOPE_VERSION,
                 kind: "mystery".to_string()
             }
         );
@@ -724,6 +856,15 @@ mod tests {
     }
 
     fn parses_any_schema(raw: &str) -> bool {
+        let Ok(value) = serde_json::from_str::<Value>(raw) else {
+            return false;
+        };
+        if value
+            .as_object()
+            .is_some_and(|object| object.contains_key("from") || object.contains_key("principal"))
+        {
+            return serde_json::from_value::<StampedClientRelayFrame>(value).is_ok();
+        }
         serde_json::from_str::<ClientRelayFrame>(raw).is_ok()
             || serde_json::from_str::<StampedClientRelayFrame>(raw).is_ok()
             || serde_json::from_str::<DaemonRelayFrame>(raw).is_ok()

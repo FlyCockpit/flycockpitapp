@@ -1,3 +1,4 @@
+import { RELAY_ENVELOPE_VERSION } from "@flycockpit/relay-protocol/envelopes";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import responsesFixture from "../fixtures/daemon-wire/responses.json" with { type: "json" };
 import { PROTOCOL_VERSION } from ".";
@@ -103,7 +104,7 @@ describe("RemoteSessionClient", () => {
     const relay = JSON.parse(socket.sent[0] ?? "{}");
 
     expect(relay).toMatchObject({
-      v: 1,
+      v: RELAY_ENVELOPE_VERSION,
       channelId: "sessions:i1",
       payload: {
         v: PROTOCOL_VERSION,

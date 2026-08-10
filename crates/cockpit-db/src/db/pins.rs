@@ -39,40 +39,52 @@ pub struct PinnedMessage {
 }
 
 impl Db {
+    pub fn pin_message_conn(
+        conn: &rusqlite::Connection,
+        session_id: Uuid,
+        seq: i64,
+        pinned_ms: i64,
+    ) -> Result<bool> {
+        let n = map_pin_insert(
+            conn.execute(
+                "INSERT OR IGNORE INTO pins (session_id, seq, pinned_ms) VALUES (?1, ?2, ?3)",
+                params![session_id.to_string(), seq, pinned_ms],
+            ),
+            session_id,
+            seq,
+        )?;
+        Ok(n == 1)
+    }
+
     /// Pin the message at `(session_id, seq)`. Idempotent: pinning an
     /// already-pinned message is a no-op (no error). Returns `true` when a
     /// new pin was created, `false` when it was already pinned.
     pub async fn pin_message(&self, session_id: Uuid, seq: i64) -> Result<bool> {
         let pinned_ms = now_ms();
-        self.write(move |conn| {
-            let n = map_pin_insert(
-                conn.execute(
-                    "INSERT OR IGNORE INTO pins (session_id, seq, pinned_ms)
-                     VALUES (?1, ?2, ?3)",
-                    params![session_id.to_string(), seq, pinned_ms],
-                ),
-                session_id,
-                seq,
-            )?;
-            Ok(n == 1)
-        })
-        .await
+        self.write(move |conn| Self::pin_message_conn(conn, session_id, seq, pinned_ms))
+            .await
     }
 
     /// Unpin the message at `(session_id, seq)`. Returns `true` when a pin
     /// was removed, `false` when there was none. The unpin path for both
     /// `d` (delete) and checking a checklist item in `/pins`.
+    pub fn unpin_message_conn(
+        conn: &rusqlite::Connection,
+        session_id: Uuid,
+        seq: i64,
+    ) -> Result<bool> {
+        let n = conn
+            .execute(
+                "DELETE FROM pins WHERE session_id = ?1 AND seq = ?2",
+                params![session_id.to_string(), seq],
+            )
+            .context("deleting pin")?;
+        Ok(n == 1)
+    }
+
     pub async fn unpin_message(&self, session_id: Uuid, seq: i64) -> Result<bool> {
-        self.write(move |conn| {
-            let n = conn
-                .execute(
-                    "DELETE FROM pins WHERE session_id = ?1 AND seq = ?2",
-                    params![session_id.to_string(), seq],
-                )
-                .context("deleting pin")?;
-            Ok(n == 1)
-        })
-        .await
+        self.write(move |conn| Self::unpin_message_conn(conn, session_id, seq))
+            .await
     }
 
     /// Whether the message at `(session_id, seq)` is currently pinned.
@@ -94,38 +106,33 @@ impl Db {
     /// Toggle the pin state of `(session_id, seq)`. Returns the NEW state
     /// (`true` = now pinned). The natural affordance for the mouse control
     /// and the message-pick mode.
+    pub fn toggle_pin_conn(
+        conn: &rusqlite::Connection,
+        session_id: Uuid,
+        seq: i64,
+        pinned_ms: i64,
+    ) -> Result<bool> {
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM pins WHERE session_id = ?1 AND seq = ?2",
+                params![session_id.to_string(), seq],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("querying pin")?;
+        if found.is_some() {
+            Self::unpin_message_conn(conn, session_id, seq)?;
+            Ok(false)
+        } else {
+            Self::pin_message_conn(conn, session_id, seq, pinned_ms)?;
+            Ok(true)
+        }
+    }
+
     pub async fn toggle_pin(&self, session_id: Uuid, seq: i64) -> Result<bool> {
         let pinned_ms = now_ms();
-        self.transaction(move |conn| {
-            let found: Option<i64> = conn
-                .query_row(
-                    "SELECT 1 FROM pins WHERE session_id = ?1 AND seq = ?2",
-                    params![session_id.to_string(), seq],
-                    |row| row.get(0),
-                )
-                .optional()
-                .context("querying pin")?;
-            if found.is_some() {
-                conn.execute(
-                    "DELETE FROM pins WHERE session_id = ?1 AND seq = ?2",
-                    params![session_id.to_string(), seq],
-                )
-                .context("deleting pin")?;
-                Ok(false)
-            } else {
-                map_pin_insert(
-                    conn.execute(
-                        "INSERT OR IGNORE INTO pins (session_id, seq, pinned_ms)
-                         VALUES (?1, ?2, ?3)",
-                        params![session_id.to_string(), seq, pinned_ms],
-                    ),
-                    session_id,
-                    seq,
-                )?;
-                Ok(true)
-            }
-        })
-        .await
+        self.transaction(move |conn| Self::toggle_pin_conn(conn, session_id, seq, pinned_ms))
+            .await
     }
 
     /// Count of pinned messages for one session. `0` when none — the

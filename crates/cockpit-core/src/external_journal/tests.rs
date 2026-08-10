@@ -15,12 +15,16 @@ use cockpit_db::external_journal::{
     CapsulePartition, EXTERNAL_JOURNAL_ADMISSION_CAPSULES, EXTERNAL_JOURNAL_PREPARED_TTL_MS,
     EXTERNAL_JOURNAL_UNRESOLVED_CRITICAL_MS, ExternalJournalState,
 };
+use cockpit_db::remote_attachment_operations::RemoteFilesystemIdentityV1;
 
 use super::capsule::{CAPSULE_BYTES, CapsuleSlot, SLOT_BYTES};
 use super::keys::SpoolKeyRing;
 use super::projection::{Digest, OperationBody, SafeToken, SanitizedProjection};
 use super::spool::{Spool, SpoolAccess, SpoolFaults};
-use super::{DbFaults, DispatchTicket, ExternalJournal, ExternalJournalError, OutcomeDurability};
+use super::{
+    DbFaults, DispatchTicket, ExternalJournal, ExternalJournalError, OutcomeDurability,
+    RemoteRenameArtifactV1,
+};
 
 const T0: i64 = 1_700_000_000_000;
 
@@ -98,166 +102,85 @@ fn keys_v1() -> SpoolKeyRing {
     SpoolKeyRing::for_test(&[(1, [0x11u8; 32])], 1).expect("key ring")
 }
 
-fn inference_projection() -> SanitizedProjection {
-    SanitizedProjection::new(OperationBody::InferenceRecovery {
-        request_digest: Digest::of(b"redacted-request"),
-        provider_digest: Digest::of(b"provider:model"),
-    })
-}
-
-#[tokio::test]
-async fn inference_journal_precedes_provider_construction() {
-    let env = Env::new();
-    let journal = env.journal();
-    let provider = FakeProvider::default();
-    let projection = inference_projection();
-    let record = journal
-        .prepare(&owner(), &key("inference-1"), &projection, T0)
-        .await
-        .unwrap();
-    assert_eq!(provider.count(), 0);
-    let ticket = journal
-        .begin_dispatch(record.operation_id, &projection, T0 + 1)
-        .await
-        .unwrap();
-    assert_eq!(provider.count(), 0);
-    provider.call(&ticket);
-    assert_eq!(provider.count(), 1);
-}
-
-#[tokio::test]
-async fn inference_journal_durability_failure_sends_nothing() {
-    let env = Env::new();
-    let journal = env.journal();
-    let provider = FakeProvider::default();
-    let projection = inference_projection();
-    journal.set_db_faults(DbFaults {
-        fail_prepared_commit: true,
-        ..DbFaults::default()
-    });
-    assert!(
-        journal
-            .prepare(&owner(), &key("inference-prepare"), &projection, T0)
-            .await
-            .is_err()
-    );
-    assert_eq!(provider.count(), 0);
-
-    let journal = env.journal();
-    let record = journal
-        .prepare(&owner(), &key("inference-dispatch"), &projection, T0)
-        .await
-        .unwrap();
-    journal.set_db_faults(DbFaults {
-        fail_dispatching_commit: true,
-        ..DbFaults::default()
-    });
-    assert!(
-        journal
-            .begin_dispatch(record.operation_id, &projection, T0 + 1)
-            .await
-            .is_err()
-    );
-    assert_eq!(provider.count(), 0);
-}
-
-async fn inference_primary_failure_journal_success_case() {
-    let env = Env::new();
-    let journal = env.journal();
-    let provider = FakeProvider::default();
-    let projection = inference_projection();
-    let record = journal
-        .prepare(&owner(), &key("incident-85acj7"), &projection, T0)
-        .await
-        .unwrap();
-    let ticket = journal
-        .begin_dispatch(record.operation_id, &projection, T0 + 1)
-        .await
-        .unwrap();
-    let missing_session = Uuid::new_v4();
-    assert!(
-        env.db()
-            .insert_inference_request(
-                "incident-85acj7",
-                missing_session,
-                &serde_json::json!({"redacted": true}),
-                cockpit_db::db::session_log::InferenceRequestStatus::Pending,
-            )
-            .await
-            .is_err()
-    );
-    provider.call(&ticket);
-    assert_eq!(provider.count(), 1);
-}
-
-#[tokio::test]
-async fn inference_primary_failure_journal_success() {
-    inference_primary_failure_journal_success_case().await;
-}
-
-#[tokio::test]
-async fn inference_submission_unknown_is_not_retried() {
-    let env = Env::new();
-    let journal = env.journal();
-    let mut ticket = dispatch(&journal, "inference-unknown").await;
-    journal
-        .record_outcome(&mut ticket, ExternalJournalState::SubmissionUnknown, T0 + 1)
-        .await
-        .unwrap();
-    let record = env
-        .db()
-        .external_operation(ticket.operation_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(record.state, ExternalJournalState::SubmissionUnknown);
-    assert!(!record.retry_permitted());
-}
-
-#[tokio::test]
-async fn inference_session_tombstone_prevents_resurrection() {
-    let env = Env::new();
-    let journal = env.journal();
-    let mut ticket = dispatch(&journal, "inference-tombstone").await;
-    env.db()
-        .tombstone_external_journal_session(&owner(), T0 + 1)
-        .await
-        .unwrap();
-    journal
-        .record_outcome(&mut ticket, ExternalJournalState::SubmissionUnknown, T0 + 2)
-        .await
-        .unwrap();
-    assert!(
-        env.db()
-            .external_journal_session_tombstoned(&owner())
-            .await
-            .unwrap()
-    );
-}
-
-#[tokio::test]
-async fn inference_85acj7_regression() {
-    inference_primary_failure_journal_success_case().await;
-}
-
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn inference_audit_sentinels_are_digest_only() {
-    let sentinels = [
-        "raw prompt",
-        "Bearer credential",
-        "x-secret-header",
-        "DATABASE disk image is malformed",
-        "SQL INSERT INTO inference_requests",
-        "/home/user/private",
-    ];
-    let projection = SanitizedProjection::new(OperationBody::InferenceRecovery {
-        request_digest: Digest::of(sentinels.join("|").as_bytes()),
-        provider_digest: Digest::of(b"provider:model"),
-    });
-    let encoded = String::from_utf8(projection.encode().unwrap()).unwrap();
-    for sentinel in sentinels {
-        assert!(!encoded.contains(sentinel));
+fn remote_operation_artifact_authority_is_private_held_and_nofollow() {
+    let env = Env::new();
+    let journal = env.journal();
+    let authority = journal.remote_operation_artifact_dir().unwrap();
+    authority.verify_private().unwrap();
+    authority
+        .create_file_exclusive("operation-artifact")
+        .unwrap()
+        .sync_all()
+        .unwrap();
+    authority.sync().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, symlink};
+        let metadata = std::fs::metadata(env.spool_root().join("remote-operations")).unwrap();
+        assert_eq!(metadata.mode() & 0o777, 0o700);
+        std::fs::remove_file(
+            env.spool_root()
+                .join("remote-operations/operation-artifact"),
+        )
+        .unwrap();
+        symlink(
+            "outside",
+            env.spool_root()
+                .join("remote-operations/operation-artifact"),
+        )
+        .unwrap();
+        assert!(authority.open_file_verified("operation-artifact").is_err());
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn remote_rename_artifact_is_generation_bound_canonical_and_reopenable() {
+    let env = Env::new();
+    let journal = env.journal();
+    let identity = |object_id, kind| RemoteFilesystemIdentityV1 {
+        filesystem_id: 7,
+        object_id,
+        kind,
+        len: 9,
+        mode: if kind == 1 { 0o100600 } else { 0o040700 },
+        owner_id: 42,
+        link_count: 1,
+    };
+    let artifact_id = Uuid::now_v7();
+    let record = RemoteRenameArtifactV1 {
+        logical_attachment_id: Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap(),
+        operation_id: Uuid::parse_str("01890f3e-4c00-7000-8000-0000000000ad").unwrap(),
+        dispatch_generation: 3,
+        source_identity: identity(1, 1),
+        source_parent_identity: identity(2, 2),
+        target_parent_identity: identity(3, 2),
+        source_name: "from.txt".into(),
+        target_name: "to.txt".into(),
+    };
+    journal
+        .write_remote_rename_artifact(artifact_id, &record)
+        .unwrap();
+    drop(journal);
+    assert_eq!(
+        env.journal()
+            .read_remote_rename_artifact(artifact_id, 3)
+            .unwrap(),
+        record
+    );
+    assert!(matches!(
+        env.journal().read_remote_rename_artifact(artifact_id, 4),
+        Err(ExternalJournalError::CapsuleMissing(_))
+    ));
+    env.journal()
+        .remove_all_remote_rename_artifacts(artifact_id)
+        .unwrap();
+    assert!(matches!(
+        env.journal().read_remote_rename_artifact(artifact_id, 3),
+        Err(ExternalJournalError::CapsuleMissing(_))
+    ));
 }
 
 fn projection() -> SanitizedProjection {

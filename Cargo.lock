@@ -1225,12 +1225,16 @@ dependencies = [
  "cockpit-config",
  "cockpit-db",
  "futures",
+ "quote",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "syn 2.0.119",
  "thiserror 2.0.19",
  "tokio",
  "tokio-util",
+ "unicode-normalization",
+ "url",
  "uuid",
 ]
 
@@ -2307,6 +2311,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]

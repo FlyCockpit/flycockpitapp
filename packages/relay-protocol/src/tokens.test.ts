@@ -25,6 +25,29 @@ async function signWrongAudienceToken() {
 }
 
 describe("relay token signing", () => {
+  const actorBinding = {
+    schemaVersion: 1 as const,
+    deviceId: "00000000-0000-4000-8000-000000000001",
+    deviceGeneration: "18446744073709551615",
+    logicalAttachmentId: "00000000-0000-4000-8000-000000000002",
+  };
+
+  it("stamps the exact authorized actor binding and rejects it on non-client tokens", async () => {
+    const signed = await signRelayToken(
+      { tokenType: "client", instanceId: "i1", userId: "u1", actorBinding },
+      { secret, issuer, audience: "relay-a" },
+    );
+    expect(signed.payload.actorBinding).toEqual(actorBinding);
+    for (const tokenType of ["connector", "user"] as const) {
+      expect(() =>
+        relayTokenPayloadSchema.parse({
+          ...signed.payload,
+          tokenType,
+          instanceId: tokenType === "connector" ? "i1" : undefined,
+        }),
+      ).toThrow();
+    }
+  });
   it("signs ES256 JWTs with a public JWKS-compatible key id", async () => {
     const result = await signRelayToken(
       { tokenType: "client", instanceId: "i1", userId: "u1" },

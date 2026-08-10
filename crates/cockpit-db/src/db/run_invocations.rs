@@ -326,46 +326,118 @@ impl Db {
         is_owner: bool,
     ) -> Result<LookupRunInvocationOutcome> {
         self.transaction(move |conn| {
-            delete_expired_run_invocation_rows(conn, now_wall_ms)?;
-
-            if let Some(row) = get_run_invocation_conn(conn, client_submission_id)? {
-                if is_owner || row.origin_principal_digest == claiming_principal_digest {
-                    return Ok(LookupRunInvocationOutcome::Found(Box::new(row)));
-                }
-                // Wrong principal: same content-free NotFound, no overwrite.
-                return Ok(LookupRunInvocationOutcome::NotFoundExistingTombstone);
-            }
-
-            if tombstone_exists_conn(conn, client_submission_id)? {
-                // Tombstones are never revealed, including to Owner.
-                return Ok(LookupRunInvocationOutcome::NotFoundExistingTombstone);
-            }
-
-            let accounted = accounted_bytes_for_tombstone(&claiming_principal_digest)?;
-            if !principal_quota_allows(conn, &claiming_principal_digest, accounted, true)? {
-                return Ok(LookupRunInvocationOutcome::LookupBusy);
-            }
-
-            let expires = now_wall_ms
-                .checked_add(RUN_INVOCATION_RETENTION_MS)
-                .context("tombstone expiry overflow")?;
-            conn.execute(
-                "INSERT INTO run_invocation_tombstones (
-                    client_submission_id, claiming_principal_digest,
-                    created_at_wall_ms, expires_at_wall_ms, accounted_bytes
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    client_submission_id.to_string(),
-                    claiming_principal_digest,
-                    now_wall_ms,
-                    expires,
-                    accounted as i64,
-                ],
+            Self::lookup_or_tombstone_run_invocation_conn(
+                conn,
+                client_submission_id,
+                &claiming_principal_digest,
+                now_wall_ms,
+                is_owner,
             )
-            .context("inserting run invocation tombstone")?;
-            Ok(LookupRunInvocationOutcome::NotFoundInstalledTombstone)
         })
         .await
+    }
+
+    pub fn lookup_or_tombstone_run_invocation_conn(
+        conn: &rusqlite::Connection,
+        client_submission_id: Uuid,
+        claiming_principal_digest: &str,
+        now_wall_ms: i64,
+        is_owner: bool,
+    ) -> Result<LookupRunInvocationOutcome> {
+        delete_expired_run_invocation_rows(conn, now_wall_ms)?;
+        if let Some(row) = get_run_invocation_conn(conn, client_submission_id)? {
+            if is_owner || row.origin_principal_digest == claiming_principal_digest {
+                return Ok(LookupRunInvocationOutcome::Found(Box::new(row)));
+            }
+            return Ok(LookupRunInvocationOutcome::NotFoundExistingTombstone);
+        }
+        if tombstone_exists_conn(conn, client_submission_id)? {
+            return Ok(LookupRunInvocationOutcome::NotFoundExistingTombstone);
+        }
+        let accounted = accounted_bytes_for_tombstone(claiming_principal_digest)?;
+        if !principal_quota_allows(conn, claiming_principal_digest, accounted, true)? {
+            return Ok(LookupRunInvocationOutcome::LookupBusy);
+        }
+        let expires = now_wall_ms
+            .checked_add(RUN_INVOCATION_RETENTION_MS)
+            .context("tombstone expiry overflow")?;
+        conn.execute(
+            "INSERT INTO run_invocation_tombstones (
+                client_submission_id, claiming_principal_digest,
+                created_at_wall_ms, expires_at_wall_ms, accounted_bytes
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                client_submission_id.to_string(),
+                claiming_principal_digest,
+                now_wall_ms,
+                expires,
+                accounted as i64
+            ],
+        )
+        .context("inserting run invocation tombstone")?;
+        Ok(LookupRunInvocationOutcome::NotFoundInstalledTombstone)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_run_invocation_state_conn(
+        conn: &rusqlite::Connection,
+        client_submission_id: Uuid,
+        expected_state_version: u64,
+        new_state: &str,
+        remaining_ms: Option<u64>,
+        cancel_requested: Option<bool>,
+        cancel_result: Option<&str>,
+        now_wall_ms: i64,
+    ) -> Result<Option<RunInvocationRow>> {
+        let Some(existing) = get_run_invocation_conn(conn, client_submission_id)? else {
+            return Ok(None);
+        };
+        if existing.state_version != expected_state_version {
+            return Ok(Some(existing));
+        }
+        if existing.terminal_at_wall_ms.is_some() {
+            if let Some(result) = cancel_result
+                && existing.cancel_result.is_none()
+            {
+                let new_version = existing
+                    .state_version
+                    .checked_add(1)
+                    .context("state_version overflow")?;
+                conn.execute(
+                    "UPDATE run_invocations SET state_version=?1, updated_at_wall_ms=?2,
+                     cancel_requested=1, cancel_result=?3 WHERE client_submission_id=?4",
+                    params![
+                        new_version as i64,
+                        now_wall_ms,
+                        result,
+                        client_submission_id.to_string()
+                    ],
+                )
+                .context("stamping cancel_result on terminal invocation")?;
+                return get_run_invocation_conn(conn, client_submission_id);
+            }
+            return Ok(Some(existing));
+        }
+        let new_version = existing
+            .state_version
+            .checked_add(1)
+            .context("state_version overflow")?;
+        conn.execute(
+            "UPDATE run_invocations SET state=?1, state_version=?2, updated_at_wall_ms=?3,
+             last_observed_wall_ms=?3, remaining_ms=?4, cancel_requested=?5,
+             cancel_result=?6 WHERE client_submission_id=?7",
+            params![
+                new_state,
+                new_version as i64,
+                now_wall_ms,
+                remaining_ms.or(existing.remaining_ms).map(|v| v as i64),
+                cancel_requested.unwrap_or(existing.cancel_requested) as i64,
+                cancel_result.or(existing.cancel_result.as_deref()),
+                client_submission_id.to_string()
+            ],
+        )
+        .context("updating run invocation cancellation state")?;
+        get_run_invocation_conn(conn, client_submission_id)
     }
 
     #[allow(clippy::too_many_arguments)]

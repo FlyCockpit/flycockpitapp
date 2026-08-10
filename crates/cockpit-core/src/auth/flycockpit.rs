@@ -528,6 +528,7 @@ fn store_credential_in_store(
     store: &mut CredentialStore,
     credential: &StoredFlycockpitCredential,
 ) -> Result<()> {
+    credential.validate()?;
     store.set(CREDENTIAL_KEY, serde_json::to_value(credential)?);
     store.save()?;
     register_credential_for_redaction(credential);
@@ -625,45 +626,13 @@ pub fn default_display_name() -> String {
 }
 
 pub fn normalize_server_url(raw: &str) -> Result<String> {
-    let trimmed = raw.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        anyhow::bail!("server URL cannot be empty");
-    }
-    let url = Url::parse(trimmed).context("server URL must be an absolute URL")?;
-    if url.username() != "" || url.password().is_some() {
-        anyhow::bail!("server URL must not include credentials");
-    }
-    if url.query().is_some() || url.fragment().is_some() {
-        anyhow::bail!("server URL must not include a query string or fragment");
-    }
-    if url.path() != "/" && !url.path().is_empty() {
-        anyhow::bail!("server URL must be an origin, not a path");
-    }
-    match url.scheme() {
-        "https" => {}
-        "http" if is_loopback_host(url.host_str()) => {}
-        "http" => anyhow::bail!("server URL must use HTTPS except for localhost development"),
-        scheme => anyhow::bail!("unsupported server URL scheme `{scheme}`"),
-    }
-    let mut origin = format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default());
-    if let Some(port) = url.port() {
-        origin.push(':');
-        origin.push_str(&port.to_string());
-    }
-    Ok(origin)
+    crate::daemon::proto::normalize_server_url(raw)
 }
 
 fn endpoint(server_url: &str, path: &str) -> Result<Url> {
     let base = Url::parse(server_url).context("parsing Flycockpit server URL")?;
     base.join(path.trim_start_matches('/'))
         .with_context(|| format!("building Flycockpit endpoint {path}"))
-}
-
-fn is_loopback_host(host: Option<&str>) -> bool {
-    matches!(
-        host,
-        Some("localhost") | Some("127.0.0.1") | Some("::1") | Some("[::1]")
-    )
 }
 
 fn parse_orpc_json<T: for<'de> Deserialize<'de>>(body: &str) -> Result<T> {

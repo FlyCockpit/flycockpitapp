@@ -5,6 +5,7 @@ import { z } from "zod";
 import {
   attentionEventTypeSchema,
   attentionNotificationPayloadSchema,
+  clientActorBindingSchema,
   clientRelayFrameSchema,
   daemonClientRelayFrameSchema,
   daemonControlRelayFrameSchema,
@@ -20,9 +21,16 @@ type Schema = z.ZodType<unknown>;
 
 const fixturesRoot = join(import.meta.dirname, "../fixtures");
 
+const actorBindingVectorsSchema = z.object({
+  valid: z.array(z.object({ name: z.string(), value: clientActorBindingSchema })),
+  invalid: z.array(z.object({ name: z.string(), value: z.unknown() })),
+});
+
 const validFixtures = {
+  "client-actor-binding-v1.json": actorBindingVectorsSchema,
   "client-relay-frame.json": clientRelayFrameSchema,
   "stamped-client-relay-frame.json": stampedClientRelayFrameSchema,
+  "stamped-client-relay-frame-v1.json": stampedClientRelayFrameSchema,
   "daemon-client-relay-frame.json": daemonClientRelayFrameSchema,
   "daemon-control-relay-frame.json": daemonControlRelayFrameSchema,
   "user-presence-relay-frame.json": userPresenceRelayFrameSchema,

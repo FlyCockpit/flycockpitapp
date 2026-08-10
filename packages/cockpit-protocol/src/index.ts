@@ -4,6 +4,7 @@ import { canonicalU64DecimalStringSchema, decodeProtocolIdBase64Url } from "./re
 export * from "./dependency-health";
 export * from "./remote-identity-protocol";
 export * from "./remote-wire-magic-registry";
+export * from "./send-user-message-v2";
 
 export const PROTOCOL_VERSION = 9 as const;
 
@@ -72,6 +73,70 @@ export const exportSessionDataSchema = z
   .passthrough();
 
 export const uuidSchema = z.string().uuid();
+const canonicalRfcUuidSchema = uuidSchema.refine(
+  (value) =>
+    value === value.toLowerCase() &&
+    value !== "00000000-0000-0000-0000-000000000000" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value),
+  "expected a canonical lowercase nonnil RFC UUID",
+);
+const uuidV7Schema = canonicalRfcUuidSchema.refine(
+  (value) => value[14] === "7",
+  "expected a UUIDv7 operation identity",
+);
+export const remoteOperationIdentityV1Schema = z
+  .object({
+    schemaVersion: z.literal(1),
+    logicalAttachmentId: canonicalRfcUuidSchema,
+    operationId: uuidV7Schema,
+  })
+  .strict();
+export type RemoteOperationIdentityV1 = z.infer<typeof remoteOperationIdentityV1Schema>;
+export const remoteReplayRequestV2Schema = z
+  .object({
+    v: z.literal(PROTOCOL_VERSION),
+    kind: z.literal("replay_req"),
+    id: canonicalRfcUuidSchema,
+    afterEventSeq: canonicalU64DecimalStringSchema.optional(),
+    limit: z.number().int().min(1).max(256),
+  })
+  .strict();
+export const remoteOutboxDeliveryV1Schema = z
+  .object({
+    eventSeq: canonicalU64DecimalStringSchema,
+    deliveryId: canonicalRfcUuidSchema,
+    kind: z.string().min(1).max(255),
+    canonicalPayload: z.array(z.number().int().min(0).max(255)).max(524288),
+    leaseToken: canonicalRfcUuidSchema,
+    leaseExpiresAtMs: safeI64NumberSchema,
+  })
+  .strict();
+export const remoteReplayResponseV2Schema = z
+  .object({
+    v: z.literal(PROTOCOL_VERSION),
+    kind: z.literal("replay_res"),
+    id: canonicalRfcUuidSchema,
+    events: z.array(remoteOutboxDeliveryV1Schema).max(256),
+    highWaterMark: canonicalU64DecimalStringSchema,
+  })
+  .strict();
+export const remoteReplayAckV2Schema = z
+  .object({
+    v: z.literal(PROTOCOL_VERSION),
+    kind: z.literal("replay_ack"),
+    id: canonicalRfcUuidSchema,
+    deliveryId: canonicalRfcUuidSchema,
+    leaseToken: canonicalRfcUuidSchema,
+  })
+  .strict();
+export const remoteReplayAckResponseV2Schema = z
+  .object({
+    v: z.literal(PROTOCOL_VERSION),
+    kind: z.literal("replay_ack_res"),
+    id: canonicalRfcUuidSchema,
+    acked: z.boolean(),
+  })
+  .strict();
 const clientSubmissionIdSchema = uuidSchema.refine(
   (value) => value !== "00000000-0000-0000-0000-000000000000",
   { message: "client_submission_id must not be nil" },
@@ -377,6 +442,7 @@ const requestParamSchemas = {
     })
     .strict(),
   get_run_invocation_status: z.object({ client_submission_id: clientSubmissionIdSchema }).strict(),
+  operation_status: z.object({ operation_id: uuidV7Schema }).strict(),
   cancel_run_invocation: z.object({ client_submission_id: clientSubmissionIdSchema }).strict(),
   session_live_status: z.object({ session_ids: z.array(uuidSchema) }).strict(),
   // `provider`/`model` are absent exactly when `clear` is set; the daemon
@@ -513,6 +579,7 @@ const clientRequestVariants = [
   requestVariant("resume_paused_work", requestParamSchemas.resume_paused_work),
   requestVariant("send_user_message", requestParamSchemas.send_user_message),
   requestVariant("get_run_invocation_status", requestParamSchemas.get_run_invocation_status),
+  requestVariant("operation_status", requestParamSchemas.operation_status),
   requestVariant("cancel_run_invocation", requestParamSchemas.cancel_run_invocation),
   requestVariant("session_live_status", requestParamSchemas.session_live_status),
   requestVariant("set_default_model", requestParamSchemas.set_default_model),
@@ -543,6 +610,7 @@ const clientEnvelopeVariants = clientRequestVariants.map((variant) =>
       v: z.literal(PROTOCOL_VERSION),
       kind: z.literal("req"),
       id: requestIdSchema,
+      operation: remoteOperationIdentityV1Schema.optional(),
       ...variant.shape,
     })
     .strict(),
@@ -560,6 +628,7 @@ export const clientEnvelopeSchema = z.discriminatedUnion(
 export type ClientEnvelope = z.infer<typeof clientEnvelopeSchema>;
 
 export const runInvocationLifecycleStateSchema = z.enum([
+  "not_found",
   "accepted",
   "queued",
   "dispatching",
@@ -606,7 +675,12 @@ export const runInvocationCancelResultV1Schema = z
   .object({
     schema_version: z.literal(1),
     client_submission_id: uuidSchema,
-    outcome: z.enum(["cancellation_requested", "already_cancelled", "already_terminal"]),
+    outcome: z.enum([
+      "cancellation_requested",
+      "already_cancelled",
+      "already_terminal",
+      "not_found",
+    ]),
     state: runInvocationLifecycleStateSchema,
     state_version: safeU64NumberSchema,
   })
@@ -632,6 +706,7 @@ export const responseNameSchema = z.enum([
   "models",
   "restart_decision",
   "run_invocation_status",
+  "remote_operation_status",
   "run_invocation_cancel_result",
   "session_messages",
   "session_live_status",
@@ -1176,6 +1251,24 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
     z.object({ status: runInvocationStatusV1Schema }).strict(),
   ),
   responseVariant(
+    "remote_operation_status",
+    z
+      .object({
+        status: z
+          .object({
+            schema_version: z.literal(1),
+            operation_id: uuidV7Schema,
+            state: z.enum(["reserved", "committed", "rejected", "outcome_unknown"]),
+            operation_seq: canonicalU64DecimalStringSchema,
+            safe_response: z.array(z.number().int().min(0).max(255)).max(524288).nullable(),
+            event_high_water_mark: canonicalU64DecimalStringSchema.nullable(),
+          })
+          .strict()
+          .nullable(),
+      })
+      .strict(),
+  ),
+  responseVariant(
     "run_invocation_cancel_result",
     z.object({ result: runInvocationCancelResultV1Schema }).strict(),
   ),
@@ -1663,6 +1756,7 @@ export function createEnvelope(id: string, request: ClientRequest): ClientEnvelo
 }
 
 export * from "./remote-admin-passkey";
+export * from "./remote-operation-fcor";
 export * from "./remote-protocol-id";
 export * from "./remote-signaling-attempt-store";
 export * from "./remote-signaling-payloads";

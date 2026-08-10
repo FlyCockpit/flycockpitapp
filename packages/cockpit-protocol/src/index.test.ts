@@ -5,6 +5,9 @@ import eventsFixture from "../fixtures/daemon-wire/events.json" with { type: "js
 import interruptsFixture from "../fixtures/daemon-wire/interrupts.json" with { type: "json" };
 import requestsFixture from "../fixtures/daemon-wire/requests.json" with { type: "json" };
 import responsesFixture from "../fixtures/daemon-wire/responses.json" with { type: "json" };
+import remoteOperationIdentityFixture from "../fixtures/remote-operation-identity-v1.json" with {
+  type: "json",
+};
 import {
   activeModelStateSchema,
   clientEnvelopeSchema,
@@ -20,6 +23,7 @@ import {
   modelSelectionResultDataSchema,
   PROTOCOL_VERSION,
   pausedWorkSummarySchema,
+  remoteOperationIdentityV1Schema,
   resolveResponseSchema,
   responseEnvelopeSchema,
   sandboxEscalationSchema,
@@ -36,6 +40,14 @@ const goldenFiles = [
 const interruptRaisedDataSchema = z.object({ question: interruptQuestionSchema });
 
 describe("cockpit-proto daemon wire schemas", () => {
+  it("enforces canonical UUIDv7 remote operation identities", () => {
+    const valid = remoteOperationIdentityFixture.valid;
+    expect(remoteOperationIdentityV1Schema.safeParse(valid).success).toBe(true);
+    for (const malformed of remoteOperationIdentityFixture.invalid) {
+      expect(remoteOperationIdentityV1Schema.safeParse(malformed).success).toBe(false);
+    }
+  });
+
   it("parses every golden request envelope", () => {
     for (const [name, frame] of Object.entries(requestsFixture)) {
       const parsed = clientEnvelopeSchema.safeParse(frame);

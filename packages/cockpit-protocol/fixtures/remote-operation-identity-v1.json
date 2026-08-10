@@ -1,0 +1,39 @@
+{
+  "valid": {
+    "schemaVersion": 1,
+    "logicalAttachmentId": "22222222-2222-4222-8222-222222222222",
+    "operationId": "018f3f24-7a10-7cc2-8f55-111111111111"
+  },
+  "invalid": [
+    {
+      "schemaVersion": 2,
+      "logicalAttachmentId": "22222222-2222-4222-8222-222222222222",
+      "operationId": "018f3f24-7a10-7cc2-8f55-111111111111"
+    },
+    {
+      "schemaVersion": 1,
+      "logicalAttachmentId": "22222222-2222-4222-8222-222222222222",
+      "operationId": "018F3F24-7A10-7CC2-8F55-111111111111"
+    },
+    {
+      "schemaVersion": 1,
+      "logicalAttachmentId": "22222222222242228222222222222222",
+      "operationId": "018f3f24-7a10-7cc2-8f55-111111111111"
+    },
+    {
+      "schemaVersion": 1,
+      "logicalAttachmentId": "00000000-0000-0000-0000-000000000000",
+      "operationId": "018f3f24-7a10-7cc2-8f55-111111111111"
+    },
+    {
+      "schemaVersion": 1,
+      "logicalAttachmentId": "22222222-2222-4222-8222-222222222222",
+      "operationId": "018f3f24-7a10-4cc2-8f55-111111111111"
+    },
+    {
+      "schemaVersion": 1,
+      "logicalAttachmentId": "22222222-2222-4222-8222-222222222222",
+      "operationId": "018f3f24-7a10-7cc2-7f55-111111111111"
+    }
+  ]
+}

@@ -545,6 +545,36 @@ pub struct HeldImageGenerationOutputDirectory {
     guard: crate::private_fs::held_directory::HeldDirectoryAuthority,
     authority: VerifiedOutputDirectoryAuthority,
 }
+
+#[derive(Debug)]
+pub struct HeldImageGenerationArtifactRoot {
+    guard: crate::private_fs::held_directory::HeldDirectoryAuthority,
+}
+
+impl HeldImageGenerationArtifactRoot {
+    pub fn create_component_temporary(&self,name:&str)->Result<HeldTemporaryArtifact>{
+        self.guard.create_file_exclusive(name)
+    }
+    pub fn seal_component(&self,temporary:HeldTemporaryArtifact)->Result<HeldSealedArtifact>{
+        self.guard.seal(temporary)
+    }
+    pub fn retain_component_noreplace(&self,temporary:HeldSealedArtifact,name:&str)->Result<HeldDirectoryEffectOutcome>{
+        self.guard.rename_noreplace(temporary,name)
+    }
+    pub fn open_verified_component(&self,name:&str,evidence:&HeldArtifactEvidence)->Result<HeldSealedArtifact>{
+        self.guard.open_verified(name,evidence)
+    }
+    pub fn remove_verified_component(&self,component:HeldSealedArtifact)->Result<HeldDirectoryEffectOutcome>{
+        self.guard.unlink(component)
+    }
+    pub fn reconcile_component(&self,recovery:&HeldDirectoryRecovery)->Result<HeldDirectoryEffectOutcome>{
+        self.guard.reconcile(recovery)
+    }
+}
+
+pub fn open_image_generation_artifact_root(path:&Path)->Result<HeldImageGenerationArtifactRoot>{
+    Ok(HeldImageGenerationArtifactRoot{guard:crate::private_fs::held_directory::HeldDirectoryAuthority::open_existing(path)?})
+}
 impl HeldImageGenerationOutputDirectory {
     pub fn authority(&self) -> &VerifiedOutputDirectoryAuthority {
         &self.authority

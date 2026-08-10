@@ -238,6 +238,15 @@ impl HeldDirectoryAuthority {
         self.imp.unlink(artifact)
     }
 
+    pub(crate) fn open_verified(
+        &self,
+        name: &str,
+        evidence: &HeldArtifactEvidence,
+    ) -> Result<HeldSealedArtifact> {
+        validate_leaf_name(name)?;
+        self.imp.open_verified(name, evidence)
+    }
+
     pub fn reconcile(
         &self,
         recovery: &HeldDirectoryRecovery,
@@ -675,6 +684,23 @@ mod imp {
                 ));
             }
             Ok(durable_evidence(None, artifact.evidence))
+        }
+
+        pub(super) fn open_verified(
+            &self,
+            name: &str,
+            evidence: &HeldArtifactEvidence,
+        ) -> Result<HeldSealedArtifact> {
+            self.verify_directory_security()?;
+            let mut file = open_named(&self.dir, name)?;
+            verify_expected_file(&file, evidence, true)?;
+            validate_contents(&mut file, evidence)?;
+            file.rewind()?;
+            Ok(HeldSealedArtifact {
+                file,
+                name: name.to_owned(),
+                evidence: evidence.clone(),
+            })
         }
 
         pub(super) fn reconcile(
@@ -1367,6 +1393,31 @@ mod imp {
             Ok(durable_evidence(None, artifact.evidence))
         }
 
+        pub(super) fn open_verified(
+            &self,
+            name: &str,
+            evidence: &HeldArtifactEvidence,
+        ) -> Result<HeldSealedArtifact> {
+            self.verify_directory_security()?;
+            let wide = std::ffi::OsStr::new(name).encode_wide().collect::<Vec<_>>();
+            let RelativeProbe::Present(mut file) = probe_relative(
+                &self.dir,
+                &wide,
+                GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            )?
+            else {
+                anyhow::bail!("held artifact is absent")
+            };
+            verify_expected_file(&file, evidence)?;
+            validate_contents(&mut file, evidence)?;
+            file.rewind()?;
+            Ok(HeldSealedArtifact {
+                file,
+                name: name.to_owned(),
+                evidence: evidence.clone(),
+            })
+        }
+
         pub(super) fn reconcile(
             &self,
             recovery: &HeldDirectoryRecovery,
@@ -1720,6 +1771,13 @@ mod imp {
             anyhow::bail!("held directory authority is unavailable")
         }
         pub(super) fn unlink(&self, _: HeldSealedArtifact) -> Result<HeldDirectoryEffectOutcome> {
+            anyhow::bail!("held directory authority is unavailable")
+        }
+        pub(super) fn open_verified(
+            &self,
+            _: &str,
+            _: &HeldArtifactEvidence,
+        ) -> Result<HeldSealedArtifact> {
             anyhow::bail!("held directory authority is unavailable")
         }
         pub(super) fn reconcile(

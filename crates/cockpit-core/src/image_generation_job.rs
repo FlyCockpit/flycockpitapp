@@ -4443,6 +4443,57 @@ mod tests {
         fixture.db.read(move|conn|{let row:(String,i64)=conn.query_row("SELECT state,(SELECT count(*) FROM image_generation_artifact_components WHERE artifact_id=i.artifact_id) FROM image_generation_response_publication_intents i WHERE job_id=?1",[fixture.job_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?)))?;assert_eq!(row,("applied".into(),1));Ok(())}).await.unwrap();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn accepted_semantic_failure_closes_publication_security_blocked() {
+        use std::os::unix::fs::PermissionsExt;
+        let (fixture, request) = setup_accepted_response_fixture("response-invalid").await;
+        let bytes = b"not-a-png".to_vec();
+        let fetcher = ScriptedAcceptedResponseFetcher::new(
+            vec![AcceptedImageResponseFetchOutcome::Fetched {
+                bytes: bytes.clone(),
+                evidence: b"invalid-fetch-proof".to_vec(),
+            }],
+            vec![],
+        );
+        fetch_accepted_image_response(
+            fixture.db.clone(),
+            &fetcher,
+            fixture.job_id,
+            fixture.slot_id,
+            1,
+            10,
+        )
+        .await
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let managed = temp.path().join("managed");
+        std::fs::create_dir(&managed).unwrap();
+        std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let root = std::sync::Arc::new(open_image_generation_artifact_root(&managed).unwrap());
+        assert!(coordinate_persisted_accepted_image_response(
+            fixture.db.clone(),
+            root,
+            CoordinateAcceptedImageResponse {
+                job_id: fixture.job_id,
+                slot_id: fixture.slot_id,
+                attempt_number: 1,
+                expected_job_version: 5,
+                expected_slot_version: 4,
+                expected_attempt_version: 5,
+                external_operation_id: request.external_operation_id,
+                expected_journal_version: 3,
+                component_id: Uuid::now_v7(),
+                release_operation_id: Uuid::now_v7(),
+                bytes,
+                now_unix_ms: 11
+            }
+        )
+        .await
+        .is_err());
+        fixture.db.read(move|conn|{let row:(String,i64)=conn.query_row("SELECT state,(SELECT count(*) FROM image_generation_artifacts WHERE job_id=i.job_id) FROM image_generation_response_publication_intents i WHERE job_id=?1",[fixture.job_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?)))?;assert_eq!(row,("security_blocked".into(),0));Ok(())}).await.unwrap();
+    }
+
     #[tokio::test]
     async fn handoff_evidence_finish_failure_rolls_back_every_projection() {
         let fixture = setup_real_ledger_scheduler_job(

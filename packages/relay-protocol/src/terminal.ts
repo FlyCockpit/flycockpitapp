@@ -134,35 +134,38 @@ export type FileLike = {
 export type TerminalPasteItem = { kind: "image"; file: FileLike; name: string };
 
 export type TerminalPasteInput = {
-  text?: string;
   files?: readonly FileLike[];
   maxImageBytes?: number;
 };
 
 export type TerminalPastePlan =
-  | { kind: "text"; text: string }
-  | { kind: "images"; images: TerminalPasteItem[] }
+  | { kind: "image"; image: TerminalPasteItem }
   | { kind: "empty" }
-  | { kind: "error"; code: "image_too_large" | "unsupported_file"; maxBytes: number };
+  | {
+      kind: "error";
+      code: "image_too_large" | "unsupported_file" | "too_many_files";
+      maxBytes: number;
+    };
 
 export function planTerminalPaste(input: TerminalPasteInput): TerminalPastePlan {
   const maxBytes = input.maxImageBytes ?? TERMINAL_IMAGE_MAX_BYTES;
   const files = [...(input.files ?? [])];
+  if (files.length > 1) return { kind: "error", code: "too_many_files", maxBytes };
   if (files.length > 0) {
-    const images: TerminalPasteItem[] = [];
-    for (const file of files) {
-      if (!isImageFile(file)) return { kind: "error", code: "unsupported_file", maxBytes };
-      if (file.size > maxBytes) return { kind: "error", code: "image_too_large", maxBytes };
-      images.push({
+    const file = files[0];
+    if (!file) return { kind: "empty" };
+    if (!isImageFile(file)) return { kind: "error", code: "unsupported_file", maxBytes };
+    if (file.size > maxBytes) return { kind: "error", code: "image_too_large", maxBytes };
+    return {
+      kind: "image",
+      image: {
         kind: "image",
         file,
         name: file.name?.trim() || "pasted-image.png",
-      });
-    }
-    return images.length > 0 ? { kind: "images", images } : { kind: "empty" };
+      },
+    };
   }
-  const text = input.text ?? "";
-  return text.length > 0 ? { kind: "text", text } : { kind: "empty" };
+  return { kind: "empty" };
 }
 
 function isImageFile(file: FileLike) {

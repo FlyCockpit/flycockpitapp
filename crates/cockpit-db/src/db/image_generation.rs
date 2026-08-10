@@ -2062,7 +2062,7 @@ mod tests {
                     (S::Discarded, true),
                     (S::Cancelled, false),
                 ],
-                Some(J::Cancelled),
+                Some(J::CompletedAfterCancel),
             ),
             (
                 vec![

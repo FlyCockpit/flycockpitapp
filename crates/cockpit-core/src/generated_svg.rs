@@ -34,7 +34,7 @@ pub const MAX_TEXT_SCALARS: usize = 8_192;
 
 pub fn sanitizer_provenance() -> VectorSanitizerProvenanceV1 {
     let policy = format!(
-        "generated-svg-v1:{MAX_RAW_BYTES}:{MAX_CANONICAL_BYTES}:{MAX_ELEMENTS}:{MAX_DEPTH}:{MAX_ATTRIBUTES}:{MAX_PATH_COMMANDS}:{MAX_IDS}:{MAX_REFERENCES}:{MAX_TEXT_BYTES}:{MAX_TEXT_SCALARS}"
+        "generated-svg-v2:canonical-v1:verifier-v1:{MAX_RAW_BYTES}:{MAX_CANONICAL_BYTES}:{MAX_ELEMENTS}:{MAX_DEPTH}:{MAX_ATTRIBUTES_PER_ELEMENT}:{MAX_ATTRIBUTES}:{MAX_ATTRIBUTE_BYTES}:{MAX_PATH_ATTRIBUTE_BYTES}:{MAX_PATH_BYTES}:{MAX_PATH_COMMANDS}:{MAX_IDS}:{MAX_REFERENCES}:{MAX_TEXT_BYTES}:{MAX_TEXT_SCALARS}"
     );
     VectorSanitizerProvenanceV1 {
         schema_version: 1,

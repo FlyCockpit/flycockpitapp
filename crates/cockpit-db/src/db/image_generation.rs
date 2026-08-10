@@ -11,9 +11,11 @@ use uuid::Uuid;
 
 use super::Db;
 use super::external_journal::{
-    ExternalJournalState, ExternalTransitionOutcome, transition_external_operation_conn,
+    ExternalJournalRecord, ExternalJournalState, ExternalTransitionOutcome,
+    PrepareExternalOperation, transition_external_operation_conn,
 };
 use super::image_generation_plan::ImageGenerationPlanV1;
+use super::image_spend::prepare_reserved_image_spend_dispatch_conn;
 
 const MAX_IMAGE_GENERATION_RECONCILIATION_EVIDENCE_BYTES: usize = 64 * 1024;
 
@@ -672,6 +674,57 @@ pub struct RequestImageGenerationCancellation<'a> {
     pub requested_at_unix_ms: i64,
 }
 
+pub struct PrepareImageGenerationDispatch<'a> {
+    pub job_id: Uuid,
+    pub slot_id: Uuid,
+    pub attempt_number: u32,
+    pub expected_job_version: u64,
+    pub expected_slot_version: u64,
+    pub expected_attempt_version: u64,
+    pub spend_reservation_id: &'a str,
+    pub spend_attempt_id: &'a str,
+    pub journal: &'a PrepareExternalOperation,
+    pub at_unix_ms: i64,
+    pub now_monotonic_ms: u64,
+}
+
+pub struct ImageGenerationQueueAuthority {
+    job_id: Uuid,
+    job_version: u64,
+}
+
+pub struct PreparedImageGenerationDispatch {
+    job_id: Uuid,
+    slot_id: Uuid,
+    attempt_number: u32,
+    operation: ExternalJournalRecord,
+    attempt_version: u64,
+    slot_version: u64,
+    job_version: u64,
+}
+
+pub struct DispatchingImageGenerationAttempt {
+    operation: ExternalJournalRecord,
+    job_id: Uuid,
+    slot_id: Uuid,
+    attempt_number: u32,
+    attempt_version: u64,
+}
+
+impl DispatchingImageGenerationAttempt {
+    pub fn operation(&self) -> &ExternalJournalRecord {
+        &self.operation
+    }
+    pub fn identity(&self) -> (Uuid, Uuid, u32, u64) {
+        (
+            self.job_id,
+            self.slot_id,
+            self.attempt_number,
+            self.attempt_version,
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageGenerationReconciliationOutcome {
     AuthoritativeNonacceptance,
@@ -738,6 +791,134 @@ impl SealedImageGenerationRecoveryAuthority {
 }
 
 impl Db {
+    pub fn image_generation_queue_authority_conn(
+        conn: &Connection,
+        job_id: Uuid,
+    ) -> Result<ImageGenerationQueueAuthority> {
+        let (canonical, digest, version, slots): (Vec<u8>, String, i64, i64) = conn.query_row("SELECT p.canonical_plan,p.plan_digest,j.version,(SELECT count(*) FROM image_generation_slots s WHERE s.job_id=j.job_id AND s.state='planned' AND s.version=1) FROM image_generation_jobs j JOIN image_generation_plans p ON p.job_id=j.job_id WHERE j.job_id=?1 AND j.state='created' AND j.version=1 AND NOT EXISTS(SELECT 1 FROM image_generation_cancellation_facts c WHERE c.job_id=j.job_id)",[job_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).context("image generation queue authority is unavailable")?;
+        let plan = ImageGenerationPlanV1::from_canonical(&canonical, &digest)?;
+        let sealed_slots = plan.targets.iter().try_fold(0_i64, |sum, target| {
+            sum.checked_add(i64::try_from(target.slots.len())?)
+                .context("image generation slot count overflow")
+        })?;
+        ensure!(
+            plan.job_id == job_id && slots == sealed_slots,
+            "image generation queue graph differs from sealed plan"
+        );
+        Ok(ImageGenerationQueueAuthority {
+            job_id,
+            job_version: u64::try_from(version)?,
+        })
+    }
+
+    pub fn queue_image_generation_job_conn(
+        conn: &Connection,
+        authority: ImageGenerationQueueAuthority,
+        at_unix_ms: i64,
+    ) -> Result<()> {
+        atomic_conn(conn, "image_generation_queue", || {
+            ensure!(conn.execute("UPDATE image_generation_jobs SET state='validating',version=version+1,updated_at_unix_ms=?1 WHERE job_id=?2 AND state='created' AND version=?3",params![at_unix_ms,authority.job_id.to_string(),i64::try_from(authority.job_version)?])?==1,"image generation queue authority is stale");
+            ensure!(conn.execute("UPDATE image_generation_jobs SET state='queued',version=version+1,updated_at_unix_ms=?1 WHERE job_id=?2 AND state='validating' AND version=?3",params![at_unix_ms,authority.job_id.to_string(),i64::try_from(authority.job_version+1)?])?==1,"image generation queue validation lost compare-and-set");
+            let changed=conn.execute("UPDATE image_generation_slots SET state='queued',version=version+1 WHERE job_id=?1 AND state='planned' AND version=1",[authority.job_id.to_string()])?;
+            let expected: i64 = conn.query_row(
+                "SELECT slot_count FROM image_generation_plans WHERE job_id=?1",
+                [authority.job_id.to_string()],
+                |row| row.get(0),
+            )?;
+            ensure!(
+                i64::try_from(changed)? == expected,
+                "image generation queue slot graph changed"
+            );
+            Ok(())
+        })
+    }
+
+    pub fn prepare_image_generation_dispatch_conn(
+        conn: &Connection,
+        input: &PrepareImageGenerationDispatch<'_>,
+    ) -> Result<PreparedImageGenerationDispatch> {
+        atomic_conn(conn, "image_generation_prepare_dispatch", || {
+            let projection = conn
+                .query_row(
+                    "SELECT j.state,s.state,a.state,p.plan_digest,p.operation_deadline_monotonic_ms,a.provider_idempotency_identity FROM image_generation_jobs j JOIN image_generation_slots s ON s.job_id=j.job_id JOIN image_generation_attempts a ON a.job_id=s.job_id AND a.slot_id=s.slot_id JOIN image_generation_plans p ON p.job_id=j.job_id WHERE j.job_id=?1 AND s.slot_id=?2 AND a.attempt_number=?3 AND j.version=?4 AND s.version=?5 AND a.version=?6 AND NOT EXISTS(SELECT 1 FROM image_generation_cancellation_facts c WHERE c.job_id=j.job_id)",
+                    params![input.job_id.to_string(), input.slot_id.to_string(), i64::from(input.attempt_number), i64::try_from(input.expected_job_version)?, i64::try_from(input.expected_slot_version)?, i64::try_from(input.expected_attempt_version)?],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, i64>(4)?, row.get::<_, String>(5)?)),
+                )
+                .optional()?
+                .context("image generation dispatch authority is unavailable")?;
+            ensure!(
+                projection.0 == "queued" && projection.1 == "queued" && projection.2 == "planned",
+                "image generation dispatch is not queued"
+            );
+            ensure!(
+                i64::try_from(input.now_monotonic_ms)? < projection.4,
+                "image generation operation deadline expired"
+            );
+            ensure!(
+                projection.5 == input.spend_attempt_id,
+                "image generation spend attempt identity differs"
+            );
+            let spend_plan: String = conn.query_row("SELECT plan_digest FROM image_spend_reservations WHERE reservation_id=?1 AND state='reserved'", [input.spend_reservation_id], |row| row.get(0)).context("image generation spend reservation is unavailable")?;
+            ensure!(
+                spend_plan == projection.3,
+                "image generation spend reservation plan differs"
+            );
+            let operation = prepare_reserved_image_spend_dispatch_conn(
+                conn,
+                input.spend_reservation_id,
+                input.spend_attempt_id,
+                input.journal,
+                input.at_unix_ms,
+            )?;
+            ensure!(conn.execute("UPDATE image_generation_attempts SET state='preparing',version=version+1,external_operation_id=?1,observed_journal_version=?2 WHERE job_id=?3 AND slot_id=?4 AND attempt_number=?5 AND state='planned' AND version=?6",params![operation.operation_id.to_string(),operation.version,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?])?==1,"image generation attempt preparation lost compare-and-set");
+            ensure!(conn.execute("UPDATE image_generation_attempts SET state='prepared',version=version+1 WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND state='preparing' AND version=?4",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version+1)?])?==1,"image generation attempt preparation lost compare-and-set");
+            ensure!(conn.execute("UPDATE image_generation_slots SET state='dispatching',version=version+1 WHERE job_id=?1 AND slot_id=?2 AND state='queued' AND version=?3",params![input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.expected_slot_version)?])?==1,"image generation slot dispatch lost compare-and-set");
+            ensure!(conn.execute("UPDATE image_generation_jobs SET state='dispatching',version=version+1,updated_at_unix_ms=?1 WHERE job_id=?2 AND state='queued' AND version=?3",params![input.at_unix_ms,input.job_id.to_string(),i64::try_from(input.expected_job_version)?])?==1,"image generation job dispatch lost compare-and-set");
+            Ok(PreparedImageGenerationDispatch {
+                job_id: input.job_id,
+                slot_id: input.slot_id,
+                attempt_number: input.attempt_number,
+                operation,
+                attempt_version: input.expected_attempt_version + 2,
+                slot_version: input.expected_slot_version + 1,
+                job_version: input.expected_job_version + 1,
+            })
+        })
+    }
+
+    pub fn begin_image_generation_handoff_conn(
+        conn: &Connection,
+        prepared: PreparedImageGenerationDispatch,
+        at_unix_ms: i64,
+        now_monotonic_ms: u64,
+    ) -> Result<DispatchingImageGenerationAttempt> {
+        atomic_conn(conn, "image_generation_begin_handoff", || {
+            let deadline: i64 = conn.query_row("SELECT p.operation_deadline_monotonic_ms FROM image_generation_plans p JOIN image_generation_jobs j ON j.job_id=p.job_id JOIN image_generation_slots s ON s.job_id=j.job_id WHERE j.job_id=?1 AND j.state='dispatching' AND j.version=?2 AND s.slot_id=?3 AND s.state='dispatching' AND s.version=?4 AND NOT EXISTS(SELECT 1 FROM image_generation_cancellation_facts c WHERE c.job_id=j.job_id)",params![prepared.job_id.to_string(),i64::try_from(prepared.job_version)?,prepared.slot_id.to_string(),i64::try_from(prepared.slot_version)?],|row|row.get(0)).context("image generation handoff authority is unavailable")?;
+            ensure!(
+                i64::try_from(now_monotonic_ms)? < deadline,
+                "image generation operation deadline expired"
+            );
+            let operation = match transition_external_operation_conn(
+                conn,
+                prepared.operation.operation_id,
+                prepared.operation.version,
+                ExternalJournalState::Dispatching,
+                at_unix_ms,
+            )? {
+                ExternalTransitionOutcome::Committed(record) => record,
+                _ => anyhow::bail!("image generation journal handoff lost compare-and-set"),
+            };
+            ensure!(conn.execute("UPDATE image_generation_attempts SET state='dispatching',version=version+1,observed_journal_version=observed_journal_version+1 WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND state='prepared' AND version=?4 AND external_operation_id=?5",params![prepared.job_id.to_string(),prepared.slot_id.to_string(),i64::from(prepared.attempt_number),i64::try_from(prepared.attempt_version)?,prepared.operation.operation_id.to_string()])?==1,"image generation attempt handoff lost compare-and-set");
+            Ok(DispatchingImageGenerationAttempt {
+                operation,
+                job_id: prepared.job_id,
+                slot_id: prepared.slot_id,
+                attempt_number: prepared.attempt_number,
+                attempt_version: prepared.attempt_version + 1,
+            })
+        })
+    }
+
     pub fn image_generation_recovery_authority_conn(
         conn: &Connection,
         job_id: Uuid,

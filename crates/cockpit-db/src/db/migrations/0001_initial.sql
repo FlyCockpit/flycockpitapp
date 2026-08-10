@@ -3261,7 +3261,10 @@ CREATE TRIGGER image_generation_job_transition_guard BEFORE UPDATE OF state,vers
 WHEN NEW.version != OLD.version+1 OR NOT EXISTS(SELECT 1 FROM image_generation_job_transitions WHERE from_state=OLD.state AND to_state=NEW.state)
 BEGIN SELECT RAISE(ABORT,'forbidden image generation job transition'); END;
 CREATE TRIGGER image_generation_slot_transition_guard BEFORE UPDATE OF state,version ON image_generation_slots
-WHEN NEW.version != OLD.version+1 OR NOT EXISTS(SELECT 1 FROM image_generation_slot_transitions WHERE from_state=OLD.state AND to_state=NEW.state)
+WHEN NEW.version != OLD.version+1 OR (
+ (NEW.state != OLD.state AND NOT EXISTS(SELECT 1 FROM image_generation_slot_transitions WHERE from_state=OLD.state AND to_state=NEW.state)) OR
+ (NEW.state = OLD.state AND NOT (OLD.state='validating' AND OLD.applied_cancellation_version IS NULL AND OLD.result_after_cancel=0 AND NEW.applied_cancellation_version IS NOT NULL AND NEW.result_after_cancel=1))
+)
 BEGIN SELECT RAISE(ABORT,'forbidden image generation slot transition'); END;
 CREATE TRIGGER image_generation_attempt_transition_guard BEFORE UPDATE OF state,version ON image_generation_attempts
 WHEN NEW.version != OLD.version+1 OR NOT EXISTS(SELECT 1 FROM image_generation_attempt_transitions WHERE from_state=OLD.state AND to_state=NEW.state)

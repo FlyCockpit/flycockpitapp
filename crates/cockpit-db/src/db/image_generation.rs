@@ -518,13 +518,6 @@ pub enum ImageGenerationCasOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ImageGenerationAttemptEvidence<'a> {
-    pub external_operation_id: &'a str,
-    pub journal_version: u64,
-    pub authoritative_nonacceptance_digest: Option<&'a str>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseAdoptionOrdering {
     Ordinary,
     ResponseAfterCancellation { cancellation_version: u64 },
@@ -555,20 +548,6 @@ pub struct CommitImageGenerationPublication {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CancelAdoptedImageGenerationResponse<'a> {
-    pub job_id: Uuid,
-    pub slot_id: Uuid,
-    pub attempt_number: u32,
-    pub expected_attempt_version: u64,
-    pub expected_slot_version: u64,
-    pub cancellation_version: u64,
-    pub request_operation_id: &'a str,
-    pub response_digest: &'a str,
-    pub journal_terminal_version: u64,
-    pub requested_at_unix_ms: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestImageGenerationCancellation<'a> {
     pub job_id: Uuid,
     pub cancellation_version: u64,
@@ -576,7 +555,100 @@ pub struct RequestImageGenerationCancellation<'a> {
     pub requested_at_unix_ms: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageGenerationReconciliationOutcome {
+    AuthoritativeNonacceptance,
+    AuthoritativeFailure,
+}
+pub struct ReconcileImageGenerationAttempt<'a> {
+    pub job_id: Uuid,
+    pub slot_id: Uuid,
+    pub attempt_number: u32,
+    pub expected_attempt_version: u64,
+    pub expected_slot_version: u64,
+    pub external_operation_id: Uuid,
+    pub expected_journal_version: u64,
+    pub evidence_digest: &'a str,
+    pub outcome: ImageGenerationReconciliationOutcome,
+    pub now_unix_ms: i64,
+}
+
 impl Db {
+    pub fn reconcile_image_generation_attempt_conn(
+        conn: &Connection,
+        input: &ReconcileImageGenerationAttempt<'_>,
+    ) -> Result<ImageGenerationCasOutcome> {
+        atomic_conn(conn, "image_generation_reconcile", || {
+            Self::reconcile_image_generation_attempt_inner(conn, input)
+        })
+    }
+    fn reconcile_image_generation_attempt_inner(
+        conn: &Connection,
+        input: &ReconcileImageGenerationAttempt<'_>,
+    ) -> Result<ImageGenerationCasOutcome> {
+        ensure!(
+            input.evidence_digest.len() == 64,
+            "reconciliation evidence digest is invalid"
+        );
+        let (journal_next, attempt_next, outcome) = match input.outcome {
+            ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance => (
+                ExternalJournalState::Rejected,
+                ImageGenerationAttemptState::RejectedNotAccepted,
+                "authoritative_nonacceptance",
+            ),
+            ImageGenerationReconciliationOutcome::AuthoritativeFailure => (
+                ExternalJournalState::Failed,
+                ImageGenerationAttemptState::FailedAfterAcceptance,
+                "authoritative_failure",
+            ),
+        };
+        match transition_external_operation_conn(
+            conn,
+            input.external_operation_id,
+            i64::try_from(input.expected_journal_version)?,
+            journal_next,
+            input.now_unix_ms,
+        )? {
+            ExternalTransitionOutcome::Committed(_) => {}
+            _ => anyhow::bail!("reconciliation lost journal compare-and-set"),
+        };
+        let journal_version = input
+            .expected_journal_version
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("journal version overflow"))?;
+        conn.execute("INSERT INTO image_generation_reconciliation_evidence(job_id,slot_id,attempt_number,journal_version,evidence_digest,outcome) VALUES(?1,?2,?3,?4,?5,?6)",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(journal_version)?,input.evidence_digest,outcome])?;
+        let attempt_changed=conn.execute("UPDATE image_generation_attempts SET state=?1,version=?2,observed_journal_version=?3,nonacceptance_evidence_digest=CASE WHEN ?4='authoritative_nonacceptance' THEN ?5 ELSE NULL END WHERE job_id=?6 AND slot_id=?7 AND attempt_number=?8 AND state='reconciling' AND version=?9 AND external_operation_id=?10",params![attempt_next.as_str(),i64::try_from(input.expected_attempt_version+1)?,i64::try_from(journal_version)?,outcome,input.evidence_digest,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?,input.external_operation_id.to_string()])?;
+        ensure!(
+            attempt_changed == 1,
+            "reconciliation lost attempt compare-and-set"
+        );
+        let slot_changed=conn.execute("UPDATE image_generation_slots SET state='failed',version=?1,failure_reason=?2 WHERE job_id=?3 AND slot_id=?4 AND state='submission_unknown' AND version=?5",params![i64::try_from(input.expected_slot_version+1)?,outcome,input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.expected_slot_version)?])?;
+        ensure!(
+            slot_changed == 1,
+            "reconciliation lost slot compare-and-set"
+        );
+        let mut projection_statement=conn.prepare("SELECT state,applied_cancellation_version,result_after_cancel FROM image_generation_slots WHERE job_id=?1 ORDER BY slot_index")?;
+        let projection = projection_statement
+            .query_map([input.job_id.to_string()], |row| {
+                let state: String = row.get(0)?;
+                let cancellation: Option<i64> = row.get(1)?;
+                let flag: i64 = row.get(2)?;
+                Ok(ImageGenerationSlotTerminalFact {
+                    state: ImageGenerationSlotState::parse(&state)
+                        .ok_or(rusqlite::Error::InvalidQuery)?,
+                    applied_cancellation_version: cancellation.map(|value| value as u64),
+                    result_after_cancel: flag == 1,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if let Some(terminal) = reduce_terminal_job_facts(&projection) {
+            let changed=conn.execute("UPDATE image_generation_jobs SET state=?1,version=version+1,updated_at_unix_ms=?2 WHERE job_id=?3 AND state='submission_unknown'",params![terminal.as_str(),input.now_unix_ms,input.job_id.to_string()])?;
+            ensure!(changed == 1, "reconciliation lost job compare-and-set");
+        }
+        Ok(ImageGenerationCasOutcome::Applied {
+            version: input.expected_slot_version + 1,
+        })
+    }
     /// Inserts the sealed plan and its initial projection in the caller's
     /// transaction. Composition with grants, resources, spend and journal
     /// rows therefore needs no second connection or async boundary.
@@ -754,7 +826,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn cas_image_generation_job_state_conn(
+    fn cas_image_generation_job_state_conn(
         conn: &Connection,
         job_id: Uuid,
         expected_state: ImageGenerationJobState,
@@ -784,7 +856,7 @@ impl Db {
         })
     }
 
-    pub fn cas_image_generation_slot_state_conn(
+    fn cas_image_generation_slot_state_conn(
         conn: &Connection,
         job_id: Uuid,
         slot_id: Uuid,
@@ -804,65 +876,6 @@ impl Db {
         let changed = conn.execute(
             "UPDATE image_generation_slots SET state=?1,version=?2 WHERE job_id=?3 AND slot_id=?4 AND state=?5 AND version=?6",
             params![next_state.as_str(), next_version_sql, job_id.to_string(), slot_id.to_string(), expected_state.as_str(), expected_version_sql],
-        )?;
-        Ok(if changed == 1 {
-            ImageGenerationCasOutcome::Applied {
-                version: next_version,
-            }
-        } else {
-            ImageGenerationCasOutcome::Conflict
-        })
-    }
-
-    pub fn cas_image_generation_attempt_state_conn(
-        conn: &Connection,
-        identity: (Uuid, Uuid, u32),
-        expected_state: ImageGenerationAttemptState,
-        expected_version: u64,
-        next_state: ImageGenerationAttemptState,
-        evidence: Option<ImageGenerationAttemptEvidence<'_>>,
-    ) -> Result<ImageGenerationCasOutcome> {
-        ensure!(
-            attempt_transition_allowed(expected_state, next_state),
-            "forbidden image generation attempt transition"
-        );
-        ensure!(
-            evidence.is_some()
-                || matches!(
-                    next_state,
-                    ImageGenerationAttemptState::Preparing
-                        | ImageGenerationAttemptState::Cancelled
-                        | ImageGenerationAttemptState::FailedNotSubmitted
-                ),
-            "attempt projection requires journal evidence"
-        );
-        let next_version = expected_version
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("image generation attempt version overflow"))?;
-        let expected_version_sql = i64::try_from(expected_version)?;
-        let next_version_sql = i64::try_from(next_version)?;
-        let attempt_number_sql = i64::from(identity.2);
-        if expected_state == ImageGenerationAttemptState::Dispatching
-            && next_state == ImageGenerationAttemptState::FailedNotSubmitted
-        {
-            ensure!(
-                evidence
-                    .and_then(|item| item.authoritative_nonacceptance_digest)
-                    .is_some(),
-                "dispatch failure requires authoritative zero-handoff evidence"
-            );
-        }
-        let (operation_id, journal_version, nonacceptance_digest) = match evidence {
-            Some(item) => (
-                Some(item.external_operation_id),
-                Some(i64::try_from(item.journal_version)?),
-                item.authoritative_nonacceptance_digest,
-            ),
-            None => (None, None, None),
-        };
-        let changed = conn.execute(
-            "UPDATE image_generation_attempts SET state=?1,version=?2,external_operation_id=COALESCE(external_operation_id,?3),observed_journal_version=?4,nonacceptance_evidence_digest=?5 WHERE job_id=?6 AND slot_id=?7 AND attempt_number=?8 AND state=?9 AND version=?10 AND (external_operation_id IS NULL OR external_operation_id=?3) AND (observed_journal_version IS NULL OR observed_journal_version<=?4)",
-            params![next_state.as_str(), next_version_sql, operation_id, journal_version, nonacceptance_digest, identity.0.to_string(), identity.1.to_string(), attempt_number_sql, expected_state.as_str(), expected_version_sql],
         )?;
         Ok(if changed == 1 {
             ImageGenerationCasOutcome::Applied {
@@ -995,15 +1008,6 @@ impl Db {
         );
         Ok(ImageGenerationCasOutcome::Applied {
             version: input.expected_slot_version + 1,
-        })
-    }
-
-    pub fn cancel_adopted_image_generation_response_conn(
-        conn: &Connection,
-        input: &CancelAdoptedImageGenerationResponse<'_>,
-    ) -> Result<ImageGenerationCasOutcome> {
-        atomic_conn(conn, "image_generation_cancel_adopted", || {
-            Self::cancel_adopted_image_generation_response_inner(conn, input)
         })
     }
 
@@ -1176,7 +1180,7 @@ impl Db {
             let current = ImageGenerationSlotState::parse(&slot_state)
                 .ok_or_else(|| anyhow::anyhow!("unknown slot state"))?;
             if response_adopted && slot_state == "validating" {
-                let changed=conn.execute("UPDATE image_generation_slots SET applied_cancellation_version=?1,result_after_cancel=1 WHERE job_id=?2 AND slot_id=?3 AND state='validating' AND version=?4 AND applied_cancellation_version IS NULL",params![cancellation_version,input.job_id.to_string(),&slot_id,slot_version])?;
+                let changed=conn.execute("UPDATE image_generation_slots SET version=?1,applied_cancellation_version=?2,result_after_cancel=1 WHERE job_id=?3 AND slot_id=?4 AND state='validating' AND version=?5 AND applied_cancellation_version IS NULL",params![slot_version+1,cancellation_version,input.job_id.to_string(),&slot_id,slot_version])?;
                 ensure!(
                     changed == 1,
                     "validating result lost cancellation compare-and-set"
@@ -1233,40 +1237,6 @@ impl Db {
         ensure!(changed == 1, "cancellation lost job compare-and-set");
         Ok(ImageGenerationCasOutcome::Applied {
             version: (job_version + 1) as u64,
-        })
-    }
-
-    fn cancel_adopted_image_generation_response_inner(
-        conn: &Connection,
-        input: &CancelAdoptedImageGenerationResponse<'_>,
-    ) -> Result<ImageGenerationCasOutcome> {
-        conn.execute(
-            "INSERT INTO image_generation_cancellation_facts(job_id,cancellation_version,requested_at_unix_ms,request_operation_id) VALUES(?1,?2,?3,?4)",
-            params![input.job_id.to_string(),i64::try_from(input.cancellation_version)?,input.requested_at_unix_ms,input.request_operation_id],
-        )?;
-        let fact_changed = conn.execute(
-            "INSERT INTO image_generation_cancelled_result_facts(job_id,slot_id,attempt_number,cancellation_version,response_digest,journal_terminal_version,ordering) SELECT ?1,?2,?3,?4,?5,?6,'response_adopted_before_cancellation' WHERE EXISTS(SELECT 1 FROM image_generation_attempts a JOIN external_journal_operations j ON j.operation_id=a.external_operation_id WHERE a.job_id=?1 AND a.slot_id=?2 AND a.attempt_number=?3 AND a.state='response_adopted' AND a.version=?7 AND a.response_digest=?5 AND a.observed_journal_version=?6 AND j.state='succeeded' AND j.version=?6) AND EXISTS(SELECT 1 FROM image_generation_slots s WHERE s.job_id=?1 AND s.slot_id=?2 AND s.state='ready_to_publish' AND s.version=?8 AND s.applied_cancellation_version IS NULL AND s.result_after_cancel=0) AND NOT EXISTS(SELECT 1 FROM image_generation_publication_right_facts p WHERE p.job_id=?1 AND p.slot_id=?2)",
-            params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.cancellation_version)?,input.response_digest,i64::try_from(input.journal_terminal_version)?,i64::try_from(input.expected_attempt_version)?,i64::try_from(input.expected_slot_version)?],
-        )?;
-        ensure!(
-            fact_changed == 1,
-            "cancellation lost response/publication compare-and-set"
-        );
-        let attempt_changed=conn.execute(
-            "UPDATE image_generation_attempts SET state='completed_after_cancel',version=?1,applied_cancellation_version=?2 WHERE job_id=?3 AND slot_id=?4 AND attempt_number=?5 AND state='response_adopted' AND version=?6",
-            params![i64::try_from(input.expected_attempt_version+1)?,i64::try_from(input.cancellation_version)?,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?],
-        )?;
-        ensure!(
-            attempt_changed == 1,
-            "cancellation lost attempt compare-and-set"
-        );
-        let slot_changed=conn.execute(
-            "UPDATE image_generation_slots SET state='late_quarantined',version=?1,applied_cancellation_version=?2,result_after_cancel=1 WHERE job_id=?3 AND slot_id=?4 AND state='ready_to_publish' AND version=?5",
-            params![i64::try_from(input.expected_slot_version+1)?,i64::try_from(input.cancellation_version)?,input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.expected_slot_version)?],
-        )?;
-        ensure!(slot_changed == 1, "cancellation lost slot compare-and-set");
-        Ok(ImageGenerationCasOutcome::Applied {
-            version: input.expected_slot_version + 1,
         })
     }
 }
@@ -1776,18 +1746,12 @@ mod tests {
                     },
                 )?;
                 assert!(
-                    Db::cancel_adopted_image_generation_response_conn(
+                    Db::request_image_generation_cancellation_conn(
                         conn,
-                        &CancelAdoptedImageGenerationResponse {
+                        &RequestImageGenerationCancellation {
                             job_id: fixture.job_id,
-                            slot_id: fixture.slot_id,
-                            attempt_number: 1,
-                            expected_attempt_version: 7,
-                            expected_slot_version: 7,
                             cancellation_version: 1,
                             request_operation_id: "cancel",
-                            response_digest: &"a".repeat(64),
-                            journal_terminal_version: 1,
                             requested_at_unix_ms: 11
                         }
                     )
@@ -1805,7 +1769,7 @@ mod tests {
         let cancel_first = Db::open_in_memory().unwrap();
         cancel_first.blocking_for_sync_cli(|conn|{
             let fixture=race_fixture(conn,true)?;
-            Db::cancel_adopted_image_generation_response_conn(conn,&CancelAdoptedImageGenerationResponse{job_id:fixture.job_id,slot_id:fixture.slot_id,attempt_number:1,expected_attempt_version:7,expected_slot_version:7,cancellation_version:1,request_operation_id:"cancel",response_digest:&"a".repeat(64),journal_terminal_version:1,requested_at_unix_ms:11})?;
+            Db::request_image_generation_cancellation_conn(conn,&RequestImageGenerationCancellation{job_id:fixture.job_id,cancellation_version:1,request_operation_id:"cancel",requested_at_unix_ms:11})?;
             assert!(Db::commit_image_generation_publication_conn(conn,&CommitImageGenerationPublication{job_id:fixture.job_id,slot_id:fixture.slot_id,attempt_number:1,expected_attempt_version:7,expected_slot_version:7,artifact_generation:1,now_unix_ms:12}).is_err());
             let fact:(String,String)=conn.query_row("SELECT ordering,response_digest FROM image_generation_cancelled_result_facts WHERE job_id=?1",[fixture.job_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?)))?; assert_eq!(fact,("response_adopted_before_cancellation".into(),"a".repeat(64)));
             Ok(())

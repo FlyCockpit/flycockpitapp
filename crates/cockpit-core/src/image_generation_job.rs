@@ -236,10 +236,8 @@ pub fn open_image_generation_output_directory(
         .map_err(anyhow::Error::new)?;
     guard.verify_private().map_err(anyhow::Error::new)?;
     let parent_identity_digest = guard.stable_identity_digest().map_err(anyhow::Error::new)?;
-    let canonical = std::fs::canonicalize(guard.path())?;
-    let canonical_destination_digest = digest_fields(&[canonical
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("output path is not UTF-8"))?]);
+    let canonical_destination_digest =
+        digest_fields(&["held-output-directory-v1", &parent_identity_digest]);
     let authority = VerifiedOutputDirectoryAuthority::from_held_directory(
         canonical_destination_digest,
         parent_identity_digest,
@@ -1155,12 +1153,12 @@ mod tests {
             MAX_IMAGE_GENERATION_DIMENSION,
         ] {
             let mut value = plan();
-            value.requested.width = dimension;
-            value.resolved.width = dimension;
+            value.targets[0].requested.width = dimension;
+            value.targets[0].resolved.width = dimension;
             assert!(value.validate().is_ok());
         }
         let mut above = plan();
-        above.requested.width = MAX_IMAGE_GENERATION_DIMENSION + 1;
+        above.targets[0].requested.width = MAX_IMAGE_GENERATION_DIMENSION + 1;
         assert!(above.validate().is_err());
     }
 

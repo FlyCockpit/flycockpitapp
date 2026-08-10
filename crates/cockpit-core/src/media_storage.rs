@@ -216,29 +216,44 @@ impl MediaStorageRecovery {
             if !claimed {
                 continue;
             }
-            let mut held = self
-                .owned_root
-                .open_file_verified(&storage)
-                .map_err(anyhow::Error::new)?;
-            ensure!(
-                stable_identity_digest(&held)? == identity,
-                "storage_security_violation"
-            );
-            let (actual_length, actual_checksum) = read_full_digest(&mut held)?;
-            ensure!(
-                actual_length == length.parse::<u64>()?
-                    && actual_checksum == checksum
-                    && stable_identity_digest(&held)? == identity,
-                "storage_security_violation"
-            );
-            let (container, mime) = probe_upload_container(&mut held, MediaKind::Image)?;
-            held.seek(SeekFrom::Start(0))?;
-            let mut bytes = Vec::new();
-            held.by_ref()
-                .take(10 * 1024 * 1024 + 1)
-                .read_to_end(&mut bytes)?;
-            ensure!(bytes.len() <= 10 * 1024 * 1024, "resource_limit");
-            let normalized = normalize_image(&bytes, container)?;
+            let prepared = (|| -> Result<_> {
+                let mut held = self
+                    .owned_root
+                    .open_file_verified(&storage)
+                    .map_err(anyhow::Error::new)?;
+                ensure!(
+                    stable_identity_digest(&held)? == identity,
+                    "storage_security_violation"
+                );
+                let (actual_length, actual_checksum) = read_full_digest(&mut held)?;
+                ensure!(
+                    actual_length == length.parse::<u64>()?
+                        && actual_checksum == checksum
+                        && stable_identity_digest(&held)? == identity,
+                    "storage_security_violation"
+                );
+                let (container, mime) = probe_upload_container(&mut held, MediaKind::Image)?;
+                held.seek(SeekFrom::Start(0))?;
+                let mut bytes = Vec::new();
+                held.by_ref()
+                    .take(10 * 1024 * 1024 + 1)
+                    .read_to_end(&mut bytes)?;
+                ensure!(bytes.len() <= 10 * 1024 * 1024, "resource_limit");
+                Ok((container, mime, normalize_image(&bytes, container)?))
+            })();
+            let (container, mime, normalized) = match prepared {
+                Ok(value) => value,
+                Err(error) => {
+                    if error.to_string().contains("storage_security_violation")
+                        || error.downcast_ref::<ExternalJournalError>().is_some()
+                    {
+                        self.db.transaction(move|conn|{let(component_id,component_generation):(String,String)=conn.query_row("SELECT component_id,component_generation FROM media_attachment_components WHERE attachment_id=?1 AND component_kind='quarantined_original'",[attachment_id.to_string()],|r|Ok((r.get(0)?,r.get(1)?)))?;let blocked_generation=expected_generation.checked_add(2).context("availability generation overflow")?;cockpit_db::Db::transition_media_attachment_conn(conn,attachment_id,expected_version,expected_generation+1,MediaAvailability::SecurityBlocked,now_unix_ms)?;conn.execute("UPDATE media_attachment_components SET lifecycle_state='security_blocked',component_generation=?1,updated_at_unix_ms=?2 WHERE component_id=?3 AND component_generation=?4",params![(component_generation.parse::<u64>()?+1).to_string(),now_unix_ms,component_id,component_generation])?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,'probing','security_blocked',?3,?4)",params![attachment_id.to_string(),blocked_generation.to_string(),job_id.to_string(),now_unix_ms])?;conn.execute("INSERT INTO media_attachment_processing_security_evidence(job_id,attachment_id,component_id,reason,recorded_at_unix_ms) VALUES(?1,?2,?3,'storage_security_violation',?4)",params![job_id.to_string(),attachment_id.to_string(),component_id,now_unix_ms])?;conn.execute("UPDATE media_attachment_processing_jobs SET state='completed',completed_at_unix_ms=?1 WHERE job_id=?2",params![now_unix_ms,job_id.to_string()])?;Ok(())}).await?;
+                        completed += 1;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
             let outputs = [
                 (
                     "image_model",
@@ -5837,6 +5852,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(counts, (0, 0, 1));
+    }
+
+    #[tokio::test]
+    async fn https_media_ingest_processing_proof_failure_blocks_with_evidence() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
+        let session_id = Uuid::now_v7();
+        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/redacted',1,1)",[session_id.to_string()])?;Ok(())}).await.unwrap();
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([1, 2, 3, 255]),
+        ))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+        let recovery = MediaStorageRecovery::open_or_create(db.clone(), &temp.path().join("media"))
+            .unwrap()
+            .with_https_fetcher(std::sync::Arc::new(ScriptedHttpsFetcher {
+                calls: AtomicUsize::new(0),
+                bytes: png.into_inner(),
+            }));
+        let request = RetainHttpsMediaV1 {
+            schema_version: 1,
+            kind: "retainHttpsMedia".into(),
+            local_operation_id: Uuid::now_v7(),
+            owner_principal_digest: "22".repeat(32),
+            session_id,
+            canonical_project_digest: "11".repeat(32),
+            client_draft_id: Uuid::now_v7(),
+            requested_media_kind: RequestedLocalPathMediaKind::Image,
+            url: "https://media.example.test/image.png".into(),
+        };
+        recovery
+            .retain_https_media(
+                request,
+                &cockpit_config::config::media_budget::MediaResourcePolicy::default(),
+                1,
+                10,
+            )
+            .await
+            .unwrap();
+        let storage=db.read(|conn|Ok(conn.query_row("SELECT storage_id FROM media_attachment_components WHERE component_kind='quarantined_original'",[],|r|r.get::<_,String>(0))?)).await.unwrap();
+        std::fs::write(
+            temp.path().join("media").join(storage),
+            b"tampered same path",
+        )
+        .unwrap();
+        assert_eq!(recovery.process_retained_https_jobs(11).await.unwrap(), 1);
+        let state=db.read(|conn|Ok((conn.query_row("SELECT availability FROM media_attachments",[],|r|r.get::<_,String>(0))?,conn.query_row("SELECT COUNT(*) FROM media_attachment_processing_security_evidence",[],|r|r.get::<_,i64>(0))?,conn.query_row("SELECT COUNT(*) FROM media_attachment_components WHERE component_kind IN ('image_model','browser_thumbnail')",[],|r|r.get::<_,i64>(0))?))).await.unwrap();
+        assert_eq!(state, ("security_blocked".into(), 1, 0));
     }
 
     #[tokio::test]

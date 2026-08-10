@@ -2256,7 +2256,7 @@ fn daemon_load_projects_provider_and_extended_values_from_one_layer_snapshot() {
         r#"{
             "active_model":{"provider":"snapshot-provider","model":"snapshot-model"},
             "response_metrics_tokenizer":"o200k_base",
-            "max_primary_rounds":37
+            "maxPrimaryRounds":37
         }"#,
     )
     .unwrap();

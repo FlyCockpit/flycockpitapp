@@ -1969,6 +1969,7 @@ impl Db {
     pub fn block_accepted_response_publication_conn(
         conn: &Connection,
         operation_id: Uuid,
+        recovery_evidence_json: &str,
         failure_evidence_digest: &str,
         at_unix_ms: i64,
     ) -> Result<()> {
@@ -1976,7 +1977,11 @@ impl Db {
             failure_evidence_digest,
             "response publication failure evidence",
         )?;
-        ensure!(conn.execute("UPDATE image_generation_response_publication_intents SET state='security_blocked',version=version+1,failure_evidence_digest=?1,decided_at_unix_ms=?2 WHERE publication_operation_id=?3 AND state='pending' AND version=1",params![failure_evidence_digest,at_unix_ms,operation_id.to_string()])?==1,"response publication intent compare-and-set lost");
+        ensure!(
+            !recovery_evidence_json.is_empty(),
+            "response publication recovery evidence is empty"
+        );
+        ensure!(conn.execute("UPDATE image_generation_response_publication_intents SET state='security_blocked',version=version+1,recovery_evidence_json=?1,failure_evidence_digest=?2,decided_at_unix_ms=?3 WHERE publication_operation_id=?4 AND state='pending' AND version=1",params![recovery_evidence_json,failure_evidence_digest,at_unix_ms,operation_id.to_string()])?==1,"response publication intent compare-and-set lost");
         Ok(())
     }
 

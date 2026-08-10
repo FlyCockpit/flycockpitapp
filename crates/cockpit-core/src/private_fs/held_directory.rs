@@ -52,6 +52,15 @@ impl HeldTemporaryArtifact {
     pub fn file_mut(&mut self) -> &mut File {
         &mut self.file
     }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn identity_digest(&self) -> &str {
+        &self.identity_digest
+    }
+    pub fn security_digest(&self) -> &str {
+        &self.security_digest
+    }
 }
 
 #[derive(Debug)]
@@ -66,6 +75,7 @@ pub enum HeldSealOutcome {
     Sealed(HeldSealedArtifact),
     Recoverable {
         artifact: HeldTemporaryArtifact,
+        evidence: Option<HeldArtifactEvidence>,
         error: anyhow::Error,
     },
 }
@@ -76,6 +86,9 @@ impl HeldSealedArtifact {
     }
     pub fn evidence(&self) -> &HeldArtifactEvidence {
         &self.evidence
+    }
+    pub fn name(&self) -> &str {
+        &self.name
     }
 }
 
@@ -210,7 +223,11 @@ impl HeldDirectoryAuthority {
                 name: artifact.name,
                 evidence,
             }),
-            Err(error) => HeldSealOutcome::Recoverable { artifact, error },
+            Err(error) => HeldSealOutcome::Recoverable {
+                artifact,
+                evidence: None,
+                error,
+            },
         }
     }
 

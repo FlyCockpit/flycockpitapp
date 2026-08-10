@@ -2174,6 +2174,10 @@ pub struct HeldImageGenerationArtifactRoot {
 }
 
 impl HeldImageGenerationArtifactRoot {
+    #[cfg(test)]
+    fn force_next_directory_sync_failure(&self) {
+        self.guard.force_next_directory_sync_failure();
+    }
     pub fn create_component_temporary(&self, name: &str) -> Result<HeldTemporaryArtifact> {
         self.guard.create_file_exclusive(name)
     }
@@ -2889,10 +2893,16 @@ pub async fn coordinate_persisted_accepted_image_response(
         }
         Err(error) => {
             let failure = crate::intel::hex_lower(&Sha256::digest(format!("{error:#}").as_bytes()));
+            let held_recovery = error
+                .downcast_ref::<RecoverableHeldArtifactPublication>()
+                .map(|error| error.evidence_json.clone());
             db.write(move |conn| {
+                let names:(String,String)=conn.query_row("SELECT temporary_name,destination_name FROM image_generation_response_publication_intents WHERE publication_operation_id=?1",[operation_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?)))?;
+                let recovery=held_recovery.unwrap_or(serde_json::to_string(&serde_json::json!({"destinationName":names.1,"kind":"held_publication_failure","temporaryName":names.0}))?);
                 cockpit_db::Db::block_accepted_response_publication_conn(
                     conn,
                     operation_id,
+                    &recovery,
                     &failure,
                     decided_at,
                 )
@@ -2940,9 +2950,11 @@ pub async fn reconcile_pending_accepted_response_publications(
                     b"accepted_response_publication_reconcile_failed",
                 ));
                 db.write(move |conn| {
+                    let recovery=serde_json::to_string(&serde_json::json!({"destinationName":name,"kind":"startup_reconcile_security_blocked"}))?;
                     cockpit_db::Db::block_accepted_response_publication_conn(
                         conn,
                         operation,
+                        &recovery,
                         &failure,
                         now_unix_ms,
                     )
@@ -2967,6 +2979,26 @@ pub struct RetainGeneratedImageArtifact<'a> {
     pub release_operation_id: Uuid,
     pub late_quarantined: bool,
     pub now_unix_ms: i64,
+}
+
+#[derive(Debug)]
+struct RecoverableHeldArtifactPublication {
+    evidence_json: String,
+    source: anyhow::Error,
+}
+impl std::fmt::Display for RecoverableHeldArtifactPublication {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "recoverable held artifact publication failure: {}",
+            self.source
+        )
+    }
+}
+impl std::error::Error for RecoverableHeldArtifactPublication {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
 }
 
 pub fn retain_generated_image_artifact(
@@ -3030,12 +3062,67 @@ pub fn retain_generated_image_artifact(
     )?;
     let mut temporary = root.create_component_temporary(&temporary_name)?;
     use std::io::Write as _;
-    temporary.file_mut().write_all(&canonical)?;
-    let sealed = root.seal_component(temporary)?;
-    let HeldDirectoryEffectOutcome::AppliedDurable(effect) =
-        root.retain_component_noreplace(sealed, &final_name)?
-    else {
-        anyhow::bail!("managed artifact publication requires reconciliation")
+    if let Err(write_error) = temporary.file_mut().write_all(&canonical) {
+        let evidence_json = serde_json::to_string(
+            &serde_json::json!({"identityDigest":temporary.identity_digest(),"kind":"held_partial_write","securityDigest":temporary.security_digest(),"sourceName":temporary.name()}),
+        )?;
+        return Err(RecoverableHeldArtifactPublication {
+            evidence_json,
+            source: write_error.into(),
+        }
+        .into());
+    }
+    let sealed = match root.seal_component_recoverable(temporary) {
+        HeldSealOutcome::Sealed(sealed) => sealed,
+        HeldSealOutcome::Recoverable {
+            artifact, error, ..
+        } => {
+            let evidence_json = match root.seal_component_recoverable(artifact) {
+                HeldSealOutcome::Sealed(sealed) => {
+                    let evidence = held_artifact_evidence_json(sealed.evidence())?;
+                    let cleanup = root.remove_verified_component(sealed)?;
+                    ensure!(
+                        matches!(cleanup, HeldDirectoryEffectOutcome::AppliedDurable(_)),
+                        "recoverable held temporary cleanup requires reconciliation"
+                    );
+                    serde_json::to_string(
+                        &serde_json::json!({"artifact":evidence,"cleanup":"applied_durable","kind":"held_temporary"}),
+                    )?
+                }
+                HeldSealOutcome::Recoverable { artifact, .. } => serde_json::to_string(
+                    &serde_json::json!({"identityDigest":artifact.identity_digest(),"kind":"held_temporary_security_blocked","securityDigest":artifact.security_digest(),"sourceName":artifact.name()}),
+                )?,
+            };
+            return Err(RecoverableHeldArtifactPublication {
+                evidence_json,
+                source: error,
+            }
+            .into());
+        }
+    };
+    let effect = match root.retain_component_noreplace(sealed, &final_name)? {
+        HeldDirectoryEffectOutcome::AppliedDurable(effect) => effect,
+        HeldDirectoryEffectOutcome::AppliedUnknown(recovery)
+        | HeldDirectoryEffectOutcome::SecurityAmbiguous(recovery) => {
+            let evidence_json = serde_json::to_string(
+                &serde_json::json!({"artifact":held_artifact_evidence_json(recovery.artifact())?,"destinationName":recovery.destination_name(),"kind":"held_effect_unknown","sourceCleanupRequired":recovery.source_cleanup_required(),"sourceName":recovery.source_name()}),
+            )?;
+            return Err(RecoverableHeldArtifactPublication {
+                evidence_json,
+                source: anyhow::anyhow!("managed artifact publication requires reconciliation"),
+            }
+            .into());
+        }
+        HeldDirectoryEffectOutcome::ProvenNotApplied(sealed) => {
+            let evidence_json = serde_json::to_string(
+                &serde_json::json!({"artifact":held_artifact_evidence_json(sealed.evidence())?,"kind":"held_proven_not_applied","sourceName":sealed.name()}),
+            )?;
+            return Err(RecoverableHeldArtifactPublication {
+                evidence_json,
+                source: anyhow::anyhow!("managed artifact publication was not applied"),
+            }
+            .into());
+        }
     };
     let evidence = effect.artifact().clone();
     let evidence_json = held_artifact_evidence_json(&evidence)?;
@@ -6046,6 +6133,22 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let held = open_image_generation_artifact_root(&root).unwrap();
+        let mut interrupted = held.create_component_temporary("interrupted.tmp").unwrap();
+        interrupted.file_mut().write_all(b"partial").unwrap();
+        held.force_next_directory_sync_failure();
+        let recovered = match held.seal_component_recoverable(interrupted) {
+            HeldSealOutcome::Recoverable { artifact, .. } => artifact,
+            _ => panic!("sync cut did not retain held authority"),
+        };
+        let sealed = match held.seal_component_recoverable(recovered) {
+            HeldSealOutcome::Sealed(sealed) => sealed,
+            _ => panic!("held retry did not seal"),
+        };
+        assert!(matches!(
+            held.remove_verified_component(sealed).unwrap(),
+            HeldDirectoryEffectOutcome::AppliedDurable(_)
+        ));
+        assert!(!root.join("interrupted.tmp").exists());
         let mut staged = held.create_component_temporary("component.tmp").unwrap();
         staged.file_mut().write_all(b"canonical-image").unwrap();
         let sealed = held.seal_component(staged).unwrap();

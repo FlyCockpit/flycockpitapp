@@ -3295,10 +3295,10 @@ CREATE TABLE image_generation_response_publication_intents (
  publication_operation_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, slot_id TEXT NOT NULL, attempt_number INTEGER NOT NULL,
  artifact_id TEXT NOT NULL UNIQUE, component_id TEXT NOT NULL UNIQUE, temporary_name TEXT NOT NULL, destination_name TEXT NOT NULL,
  response_digest TEXT NOT NULL CHECK(length(response_digest)=64), state TEXT NOT NULL CHECK(state IN ('pending','applied','security_blocked')),
- version INTEGER NOT NULL CHECK(version>=1), held_evidence_json TEXT, failure_evidence_digest TEXT,
+ version INTEGER NOT NULL CHECK(version>=1), held_evidence_json TEXT, recovery_evidence_json TEXT, failure_evidence_digest TEXT,
  created_at_unix_ms INTEGER NOT NULL, decided_at_unix_ms INTEGER,
  FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT,
- CHECK((state='pending' AND held_evidence_json IS NULL AND failure_evidence_digest IS NULL AND decided_at_unix_ms IS NULL) OR (state='applied' AND held_evidence_json IS NOT NULL AND failure_evidence_digest IS NULL AND decided_at_unix_ms IS NOT NULL) OR (state='security_blocked' AND failure_evidence_digest IS NOT NULL AND decided_at_unix_ms IS NOT NULL))
+ CHECK((state='pending' AND held_evidence_json IS NULL AND recovery_evidence_json IS NULL AND failure_evidence_digest IS NULL AND decided_at_unix_ms IS NULL) OR (state='applied' AND held_evidence_json IS NOT NULL AND recovery_evidence_json IS NULL AND failure_evidence_digest IS NULL AND decided_at_unix_ms IS NOT NULL) OR (state='security_blocked' AND recovery_evidence_json IS NOT NULL AND failure_evidence_digest IS NOT NULL AND decided_at_unix_ms IS NOT NULL))
 );
 CREATE TRIGGER image_generation_response_publication_intent_guard BEFORE INSERT ON image_generation_response_publication_intents
 WHEN NOT EXISTS(SELECT 1 FROM image_generation_response_fetches f JOIN image_generation_attempts a USING(job_id,slot_id,attempt_number) WHERE f.job_id=NEW.job_id AND f.slot_id=NEW.slot_id AND f.attempt_number=NEW.attempt_number AND f.response_digest=NEW.response_digest AND a.state IN ('accepted','downloading','cancellation_requested','response_adopted','completed_after_cancel'))

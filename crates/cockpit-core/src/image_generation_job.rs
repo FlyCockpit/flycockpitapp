@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 use std::io::{Read as _, Seek as _, SeekFrom, Write};
 use std::path::Path;
 
-use anyhow::{ensure, Context as _, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use anyhow::{Context as _, Result, ensure};
+use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
@@ -20,25 +20,25 @@ use cockpit_db::db::external_journal::{
     ExternalJournalDigest, ExternalJournalToken, PrepareExternalOperation, ProviderIdempotency,
 };
 use cockpit_db::db::image_generation::{
-    image_generation_component_set_binding, AcquireImageGenerationArtifactLease,
-    AcquiredImageGenerationArtifactLease, AdvanceImageGenerationLatePublication,
-    BlockVerifiedImageGenerationLatePublication, CreateImageGenerationArtifact,
-    CreateImageGenerationArtifactComponent, DispatchingImageGenerationAttempt,
-    ImageGenerationArtifactComponentKind, ImageGenerationArtifactComponentState,
-    ImageGenerationArtifactConsumerPurpose, ImageGenerationArtifactConsumerRoute,
-    ImageGenerationArtifactState, ImageGenerationDispatchCandidate,
-    ImageGenerationHandoffFinishDisposition, ImageGenerationLatePublicationEvidenceV1,
-    ImageGenerationLatePublicationState, PreparedImageGenerationDispatch,
-    ReserveImageGenerationLatePublication, TransitionImageGenerationArtifact,
-    TransitionImageGenerationArtifactComponent,
+    AcquireImageGenerationArtifactLease, AcquiredImageGenerationArtifactLease,
+    AdvanceImageGenerationLatePublication, BlockVerifiedImageGenerationLatePublication,
+    CreateImageGenerationArtifact, CreateImageGenerationArtifactComponent,
+    DispatchingImageGenerationAttempt, ImageGenerationArtifactComponentKind,
+    ImageGenerationArtifactComponentState, ImageGenerationArtifactConsumerPurpose,
+    ImageGenerationArtifactConsumerRoute, ImageGenerationArtifactState,
+    ImageGenerationDispatchCandidate, ImageGenerationHandoffFinishDisposition,
+    ImageGenerationLatePublicationEvidenceV1, ImageGenerationLatePublicationState,
+    PreparedImageGenerationDispatch, ReserveImageGenerationLatePublication,
+    TransitionImageGenerationArtifact, TransitionImageGenerationArtifactComponent,
+    image_generation_component_set_binding,
 };
 use cockpit_db::db::sealed_scope::SealedActionGrantRow;
 use cockpit_db::image_spend::{AttemptMaximum, ImageSpendDispatchEvidence, SpendReservation};
 use cockpit_db::media_attachments::AcquiredMediaComponentLease;
 
 use crate::media_reservation::{
-    definitive_rejection_retry_conn, finish_external_handoff_conn, handoff_external_conn,
     MediaExternalHandoffOutcome, ReservationReceipt, ReservationState,
+    definitive_rejection_retry_conn, finish_external_handoff_conn, handoff_external_conn,
 };
 
 pub use crate::private_fs::held_directory::{
@@ -47,11 +47,11 @@ pub use crate::private_fs::held_directory::{
 };
 pub use cockpit_db::image_generation_plan::{
     AttemptPlanV1, CapabilityProvenanceV1, GrantRequirementV1, ImageGenerationPlanV1,
-    OutputDirectoryAuthorityV1, OutputSlotPlanV1, ReferenceArtifactV1, RequestedOutputV1,
-    ResolvedOutputV1, ResourceReservationV1, SpendReservationPlanV1, TargetDestinationV1,
-    TargetPlanV1, TypedParameterV1, VectorSanitizerProvenanceV1,
     MAX_IMAGE_GENERATION_ATTEMPTS_PER_SLOT, MAX_IMAGE_GENERATION_DIMENSION,
-    MAX_IMAGE_GENERATION_SLOTS, MAX_IMAGE_GENERATION_TARGETS,
+    MAX_IMAGE_GENERATION_SLOTS, MAX_IMAGE_GENERATION_TARGETS, OutputDirectoryAuthorityV1,
+    OutputSlotPlanV1, ReferenceArtifactV1, RequestedOutputV1, ResolvedOutputV1,
+    ResourceReservationV1, SpendReservationPlanV1, TargetDestinationV1, TargetPlanV1,
+    TypedParameterV1, VectorSanitizerProvenanceV1,
 };
 
 const MAX_AUTHORITY_STRING_BYTES: usize = 1_024;
@@ -330,6 +330,165 @@ fn record_scheduler_error(
 impl ImageGenerationDispatcher {
     pub fn new(db: cockpit_db::Db) -> Self {
         Self { db }
+    }
+
+    pub async fn run_reconciliation_pass<A: ImageGenerationAdapter>(
+        &self,
+        adapter: &A,
+        worker_boot_id: Uuid,
+        now_unix_ms: i64,
+        limit: u32,
+    ) -> Result<u32> {
+        ensure!(
+            !worker_boot_id.is_nil() && (1..=64).contains(&limit),
+            "invalid reconciliation pass"
+        );
+        let candidates=self.db.read(move|conn|{
+            let mut statement=conn.prepare("SELECT a.job_id,a.slot_id,a.attempt_number,COALESCE((SELECT MAX(c.claim_generation)+1 FROM image_generation_reconciliation_claims c WHERE c.job_id=a.job_id AND c.slot_id=a.slot_id AND c.attempt_number=a.attempt_number),1) FROM image_generation_attempts a WHERE a.state IN ('submission_unknown','reconciling','cancellation_requested') AND EXISTS(SELECT 1 FROM image_generation_handoff_evidence h WHERE h.job_id=a.job_id AND h.slot_id=a.slot_id AND h.attempt_number=a.attempt_number AND h.outcome='submission_unknown') AND NOT EXISTS(SELECT 1 FROM image_generation_reconciliation_claims c LEFT JOIN image_generation_reconciliation_claim_completions d ON d.job_id=c.job_id AND d.slot_id=c.slot_id AND d.attempt_number=c.attempt_number AND d.claim_generation=c.claim_generation WHERE c.job_id=a.job_id AND c.slot_id=a.slot_id AND c.attempt_number=a.attempt_number AND d.claim_generation IS NULL AND c.expires_at_unix_ms>?1) ORDER BY a.job_id,a.slot_id,a.attempt_number LIMIT ?2")?;
+            Ok(statement.query_map(rusqlite::params![now_unix_ms,i64::from(limit)],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?)
+        }).await?;
+        let mut completed = 0;
+        for (job, slot, attempt, generation) in candidates {
+            let job_id = Uuid::parse_str(&job)?;
+            let slot_id = Uuid::parse_str(&slot)?;
+            let attempt_number = u32::try_from(attempt)?;
+            let claim_generation = u64::try_from(generation)?;
+            let authority = match self
+                .db
+                .transaction(move |conn| {
+                    cockpit_db::Db::claim_image_generation_reconciliation_conn(
+                        conn,
+                        &cockpit_db::db::image_generation::ClaimImageGenerationReconciliation {
+                            job_id,
+                            slot_id,
+                            attempt_number,
+                            worker_boot_id,
+                            claim_generation,
+                            now_unix_ms,
+                        },
+                    )
+                })
+                .await
+            {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let (
+                job_id,
+                slot_id,
+                attempt_number,
+                external_operation_id,
+                journal_version,
+                provider_request_ref,
+                provider_idempotency_ref,
+                payload_digest_ref,
+            ) = authority.adapter_identity();
+            let provider_request = provider_request_ref.to_owned();
+            let provider_idempotency = provider_idempotency_ref.to_owned();
+            let payload_digest = payload_digest_ref.to_owned();
+            let result = adapter
+                .reconcile(&ImageGenerationReconcileRequest {
+                    job_id,
+                    slot_id,
+                    attempt_number,
+                    external_operation_id,
+                    provider_request_identity: provider_request.clone(),
+                    provider_idempotency_identity: provider_idempotency.clone(),
+                })
+                .await;
+            let(outcome,prefix,evidence)=match result{ImageGenerationReconcileResult::AuthoritativeNonacceptance{evidence}=>(cockpit_db::db::image_generation::ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance,b"nonacceptance\0".as_slice(),evidence),ImageGenerationReconcileResult::AuthoritativeAccepted{evidence}=>(cockpit_db::db::image_generation::ImageGenerationReconciliationOutcome::AuthoritativeAccepted,b"accepted\0".as_slice(),evidence),ImageGenerationReconcileResult::AuthoritativeFailure{evidence}=>(cockpit_db::db::image_generation::ImageGenerationReconciliationOutcome::AuthoritativeFailure,b"postacceptance_failure\0".as_slice(),evidence),ImageGenerationReconcileResult::OutcomeUnknown{..}=>continue};
+            ensure!(
+                !evidence.is_empty() && evidence.len() <= MAX_PROVIDER_HANDOFF_EVIDENCE_BYTES,
+                "reconciliation evidence is outside its bound"
+            );
+            let mut bound = prefix.to_vec();
+            bound.extend_from_slice(&evidence);
+            let proof = authority.verify(
+                cockpit_db::db::image_generation::ImageGenerationReconciliationObservation {
+                    provider_request_identity: &provider_request,
+                    provider_idempotency_identity: &provider_idempotency,
+                    external_operation_id,
+                    journal_version,
+                    journal_payload_digest: &payload_digest,
+                    evidence_bytes: &bound,
+                    outcome,
+                    now_unix_ms,
+                },
+            )?;
+            self.db.transaction(move|conn|{
+                let disposition=cockpit_db::Db::reconcile_image_generation_attempt_conn(conn,&proof)?;
+                match disposition {
+                    cockpit_db::db::image_generation::ImageGenerationReconciliationDisposition::RetryQueued{external_operation_id,media_reservation_id,media_reservation_version,current_media_plan,current_media_plan_digest,next_media_plan,next_media_plan_digest}=>{
+                        let current=decode_media_plan_snapshot(&current_media_plan,&current_media_plan_digest)?;
+                        let next=decode_media_plan_snapshot(&next_media_plan,&next_media_plan_digest)?;
+                        definitive_rejection_retry_conn(conn,&media_reservation_id,media_reservation_version,&external_operation_id.to_string(),&[current],&[next],u64::try_from(now_unix_ms)?)?;
+                    }
+                    cockpit_db::db::image_generation::ImageGenerationReconciliationDisposition::Settled{external_operation_id,media_reservation_id,media_reservation_version,outcome:cockpit_db::db::image_generation::ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance}=>{
+                        finish_external_handoff_conn(conn,&media_reservation_id,media_reservation_version,&external_operation_id.to_string(),MediaExternalHandoffOutcome::DefinitivelyRejected)?;
+                    }
+                    cockpit_db::db::image_generation::ImageGenerationReconciliationDisposition::Settled{..}=>{}
+                }
+                conn.execute("INSERT INTO image_generation_reconciliation_claim_completions(job_id,slot_id,attempt_number,claim_generation,completed_at_unix_ms) VALUES(?1,?2,?3,?4,?5)",params![job_id.to_string(),slot_id.to_string(),i64::from(attempt_number),i64::try_from(claim_generation)?,now_unix_ms])?;Ok(())}).await?;
+            completed += 1;
+        }
+        Ok(completed)
+    }
+
+    pub async fn run_provider_cancel_pass<A: ImageGenerationAdapter>(
+        &self,
+        adapter: &A,
+        worker_boot_id: Uuid,
+        now_unix_ms: i64,
+        limit: u32,
+    ) -> Result<u32> {
+        ensure!(
+            !worker_boot_id.is_nil() && (1..=64).contains(&limit),
+            "invalid provider cancel pass"
+        );
+        let candidates=self.db.read(move|conn|{let mut statement=conn.prepare("SELECT a.job_id,a.slot_id,a.attempt_number,a.external_operation_id,a.provider_request_identity,COALESCE((SELECT MAX(c.claim_generation)+1 FROM image_generation_provider_cancel_claims c WHERE c.job_id=a.job_id AND c.slot_id=a.slot_id AND c.attempt_number=a.attempt_number),1) FROM image_generation_attempts a WHERE a.state='cancellation_requested' AND a.external_operation_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM image_generation_provider_cancel_evidence e WHERE e.job_id=a.job_id AND e.slot_id=a.slot_id AND e.attempt_number=a.attempt_number) AND NOT EXISTS(SELECT 1 FROM image_generation_provider_cancel_claims c WHERE c.job_id=a.job_id AND c.slot_id=a.slot_id AND c.attempt_number=a.attempt_number AND c.expires_at_unix_ms>?1) ORDER BY a.job_id,a.slot_id,a.attempt_number LIMIT ?2")?;Ok(statement.query_map(rusqlite::params![now_unix_ms,i64::from(limit)],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,i64>(5)?)))?.collect::<rusqlite::Result<Vec<_>>>()?)}).await?;
+        let mut recorded = 0;
+        for (job, slot, attempt, operation, provider, generation) in candidates {
+            let job_id = Uuid::parse_str(&job)?;
+            let slot_id = Uuid::parse_str(&slot)?;
+            let attempt_number = u32::try_from(attempt)?;
+            let claim_generation = u64::try_from(generation)?;
+            let external_operation_id = Uuid::parse_str(&operation)?;
+            let expires = now_unix_ms
+                .checked_add(60_000)
+                .context("provider cancel claim overflow")?;
+            let claimed=self.db.transaction(move|conn|Ok(conn.execute("INSERT INTO image_generation_provider_cancel_claims(job_id,slot_id,attempt_number,claim_generation,worker_boot_id,claimed_at_unix_ms,expires_at_unix_ms) SELECT ?1,?2,?3,?4,?5,?6,?7 WHERE EXISTS(SELECT 1 FROM image_generation_attempts a WHERE a.job_id=?1 AND a.slot_id=?2 AND a.attempt_number=?3 AND a.state='cancellation_requested' AND a.external_operation_id=?8) AND NOT EXISTS(SELECT 1 FROM image_generation_provider_cancel_evidence e WHERE e.job_id=?1 AND e.slot_id=?2 AND e.attempt_number=?3)",rusqlite::params![job_id.to_string(),slot_id.to_string(),i64::from(attempt_number),i64::try_from(claim_generation)?,worker_boot_id.to_string(),now_unix_ms,expires,external_operation_id.to_string()])?==1)).await?;
+            if !claimed {
+                continue;
+            }
+            let result = adapter
+                .cancel(&ImageGenerationCancelRequest {
+                    job_id,
+                    slot_id,
+                    attempt_number,
+                    external_operation_id,
+                    provider_request_identity: provider,
+                })
+                .await;
+            let (outcome, evidence) = match result {
+                ImageGenerationCancelResult::Cancelled { evidence } => ("cancelled", evidence),
+                ImageGenerationCancelResult::TooLateOrAccepted { evidence } => {
+                    ("too_late_or_accepted", evidence)
+                }
+                ImageGenerationCancelResult::OutcomeUnknown { evidence } => {
+                    ("outcome_unknown", evidence)
+                }
+            };
+            ensure!(
+                !evidence.is_empty() && evidence.len() <= MAX_PROVIDER_HANDOFF_EVIDENCE_BYTES,
+                "provider cancel evidence is outside its bound"
+            );
+            let digest = crate::intel::hex_lower(&Sha256::digest(&evidence));
+            let inserted=self.db.transaction(move|conn|Ok(conn.execute("INSERT INTO image_generation_provider_cancel_evidence(job_id,slot_id,attempt_number,external_operation_id,outcome,evidence_digest,recorded_at_unix_ms) SELECT ?1,?2,?3,?4,?5,?6,?7 WHERE EXISTS(SELECT 1 FROM image_generation_attempts a WHERE a.job_id=?1 AND a.slot_id=?2 AND a.attempt_number=?3 AND a.state='cancellation_requested' AND a.external_operation_id=?4) AND EXISTS(SELECT 1 FROM image_generation_provider_cancel_claims c WHERE c.job_id=?1 AND c.slot_id=?2 AND c.attempt_number=?3 AND c.claim_generation=?8 AND c.worker_boot_id=?9)",rusqlite::params![job_id.to_string(),slot_id.to_string(),i64::from(attempt_number),external_operation_id.to_string(),outcome,digest,now_unix_ms,i64::try_from(claim_generation)?,worker_boot_id.to_string()])?==1)).await?;
+            if inserted {
+                recorded += 1;
+            }
+        }
+        Ok(recorded)
     }
 
     pub async fn scan_dispatch_candidates(
@@ -4029,18 +4188,20 @@ mod tests {
             )?;
             assert_eq!(replay.outcome, ImageSpendDispatchEvidence::Accepted);
             assert_eq!(replay.bytes, b"accepted");
-            assert!(conn
-                .execute(
+            assert!(
+                conn.execute(
                     "UPDATE image_generation_handoff_evidence SET evidence=X'00' WHERE job_id=?1",
                     [job_id.to_string()]
                 )
-                .is_err());
-            assert!(conn
-                .execute(
+                .is_err()
+            );
+            assert!(
+                conn.execute(
                     "DELETE FROM image_generation_handoff_evidence WHERE job_id=?1",
                     [job_id.to_string()]
                 )
-                .is_err());
+                .is_err()
+            );
             Ok(())
         })
         .await
@@ -4956,6 +5117,50 @@ mod tests {
             .open_verified_component(&destination, &evidence)
             .unwrap();
         assert_eq!(std::fs::read_dir(&managed).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn authoritative_nonacceptance_requeues_exact_retry_and_reconciles_media_and_spend() {
+        let fixture = setup_real_ledger_scheduler_job_with_attempts(
+            cockpit_db::Db::open_in_memory().unwrap(),
+            "reconcile-retry",
+            2,
+        )
+        .await;
+        let job_id = fixture.job_id;
+        let slot_id = fixture.slot_id;
+        let media_id = fixture.media_reservation_id.clone();
+        let spend_id = fixture.spend_reservation_id.clone();
+        let handoff = DeterministicImageGenerationAdapter::new(vec![
+            ImageGenerationHandoffResult::SubmissionUnknown {
+                evidence: b"retry-unknown".to_vec(),
+            },
+        ]);
+        let dispatcher = ImageGenerationDispatcher::new(fixture.db.clone());
+        dispatcher
+            .run_scheduler_pass(&handoff, deadline_boot(), 100, 2, 2, 8)
+            .await
+            .unwrap();
+        let recovery = DeterministicImageGenerationAdapter::with_recovery(
+            vec![ImageGenerationReconcileResult::AuthoritativeNonacceptance {
+                evidence: b"authoritative-rejection".to_vec(),
+            }],
+            Vec::new(),
+        );
+        assert_eq!(
+            dispatcher
+                .run_reconciliation_pass(&recovery, Uuid::now_v7(), 10, 8)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(handoff.requests().len(), 1);
+        assert_eq!(recovery.reconciliation_requests().len(), 1);
+        fixture.db.read(move|conn|{
+            let row:(String,String,String,String,i64)=conn.query_row("SELECT a.state,s.state,m.state,b.state,(SELECT COUNT(*) FROM image_generation_attempt_activation_facts f WHERE f.job_id=a.job_id AND f.slot_id=a.slot_id AND f.attempt_number=2) FROM image_generation_attempts a JOIN image_generation_slots s USING(job_id,slot_id) JOIN media_reservations m ON m.reservation_id=?3 JOIN image_spend_reservations b ON b.reservation_id=?4 WHERE a.job_id=?1 AND a.slot_id=?2 AND a.attempt_number=1",rusqlite::params![job_id.to_string(),slot_id.to_string(),media_id,spend_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;
+            assert_eq!(row,("rejected_not_accepted".into(),"queued".into(),"executing_local".into(),"reserved".into(),1));
+            Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test]
@@ -6079,9 +6284,11 @@ mod tests {
         for count in [MAX_IMAGE_GENERATION_SLOTS - 1, MAX_IMAGE_GENERATION_SLOTS] {
             assert!(with_slots(count).validate().is_ok());
         }
-        assert!(with_slots(MAX_IMAGE_GENERATION_SLOTS + 1)
-            .validate()
-            .is_err());
+        assert!(
+            with_slots(MAX_IMAGE_GENERATION_SLOTS + 1)
+                .validate()
+                .is_err()
+        );
         for dimension in [
             MAX_IMAGE_GENERATION_DIMENSION - 1,
             MAX_IMAGE_GENERATION_DIMENSION,
@@ -6186,7 +6393,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn output_authority_is_held_private_and_nofollow() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::os::unix::fs::{PermissionsExt, symlink};
         let temporary = tempfile::TempDir::new().unwrap();
         let output = temporary.path().join("output");
         std::fs::create_dir(&output).unwrap();
@@ -6211,13 +6418,10 @@ mod tests {
         let widened = temporary.path().join("widened");
         std::fs::create_dir(&widened).unwrap();
         std::fs::set_permissions(&widened, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(open_image_generation_output_directory(
-            &widened,
-            1,
-            "generated".into(),
-            "png".into()
-        )
-        .is_err());
+        assert!(
+            open_image_generation_output_directory(&widened, 1, "generated".into(), "png".into())
+                .is_err()
+        );
         let link = temporary.path().join("link");
         symlink(&output, &link).unwrap();
         assert!(
@@ -6299,13 +6503,10 @@ mod tests {
                 Ok(())
             }
         }
-        assert!(write_verified_artifact_component(
-            &held,
-            &full,
-            evidence.sha256(),
-            &mut Disconnected,
-        )
-        .is_err());
+        assert!(
+            write_verified_artifact_component(&held, &full, evidence.sha256(), &mut Disconnected,)
+                .is_err()
+        );
         let mut reopened = held
             .open_verified_component("component.bin", &evidence)
             .unwrap();
@@ -6328,9 +6529,10 @@ mod tests {
             HeldDirectoryEffectOutcome::AppliedDurable(_)
         ));
         std::fs::write(root.join("mutated.bin"), b"changed").unwrap();
-        assert!(held
-            .open_verified_component("mutated.bin", &evidence)
-            .is_err());
+        assert!(
+            held.open_verified_component("mutated.bin", &evidence)
+                .is_err()
+        );
     }
 
     #[cfg(windows)]
@@ -6341,22 +6543,16 @@ mod tests {
         let output = temporary.path().join("output");
         std::fs::create_dir(&output).unwrap();
         crate::goal_scratch::set_private(&output).unwrap();
-        assert!(open_image_generation_output_directory(
-            &output,
-            1,
-            "generated".into(),
-            "png".into()
-        )
-        .is_ok());
+        assert!(
+            open_image_generation_output_directory(&output, 1, "generated".into(), "png".into())
+                .is_ok()
+        );
         let link = temporary.path().join("link");
         if symlink_dir(&output, &link).is_ok() {
-            assert!(open_image_generation_output_directory(
-                &link,
-                1,
-                "generated".into(),
-                "png".into()
-            )
-            .is_err());
+            assert!(
+                open_image_generation_output_directory(&link, 1, "generated".into(), "png".into())
+                    .is_err()
+            );
         }
     }
 }

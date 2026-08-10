@@ -124,6 +124,40 @@ pub(crate) fn finish_reserved_image_spend_dispatch_conn(
     Ok(outcome)
 }
 
+pub(crate) fn settle_reconciled_image_spend_dispatch_conn(
+    conn: &rusqlite::Connection,
+    operation_id: Uuid,
+    at_ms: i64,
+) -> Result<()> {
+    let reservation_id: String = conn.query_row(
+        "SELECT reservation_id FROM image_spend_attempt_dispatches WHERE external_operation_id=?1",
+        [operation_id.to_string()],
+        |row| row.get(0),
+    )?;
+    let journal_state: String = conn.query_row(
+        "SELECT state FROM external_journal_operations WHERE operation_id=?1",
+        [operation_id.to_string()],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        matches!(
+            journal_state.as_str(),
+            "accepted" | "rejected" | "cancelled" | "failed"
+        ),
+        "reconciled spend lacks a terminal provider outcome"
+    );
+    if matches!(journal_state.as_str(), "rejected" | "cancelled") {
+        let unresolved: i64 = conn.query_row("SELECT COUNT(*) FROM image_spend_attempts a LEFT JOIN image_spend_attempt_dispatches d USING(reservation_id,attempt_id) LEFT JOIN external_journal_operations o ON o.operation_id=d.external_operation_id WHERE a.reservation_id=?1 AND COALESCE(o.state,'') NOT IN ('rejected','cancelled')",[&reservation_id],|row|row.get(0))?;
+        if unresolved == 0 {
+            let changed=conn.execute("UPDATE image_spend_reservations SET state='released',release_proof_identity=?2,released_at_ms=?3 WHERE reservation_id=?1 AND state='reserved'",params![reservation_id,operation_id.to_string(),at_ms])?;
+            if changed != 0 {
+                conn.execute("UPDATE image_spend_scope_usage SET reserved_usd_micros=charged_usd_micros WHERE reservation_id=?1",[reservation_id])?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BudgetPolicy {

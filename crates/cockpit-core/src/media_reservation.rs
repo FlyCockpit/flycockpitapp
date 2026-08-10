@@ -1760,7 +1760,7 @@ pub(crate) fn finish_external_handoff_conn(
     outcome: MediaExternalHandoffOutcome,
 ) -> Result<ReservationReceipt> {
     let (sequence, deadline): (u64, u64) = conn.query_row(
-        "SELECT queue_sequence,deadline_monotonic_ms FROM media_reservations WHERE reservation_id=?1 AND state='dispatching_external' AND version=?2 AND external_operation_id=?3",
+        "SELECT queue_sequence,deadline_monotonic_ms FROM media_reservations WHERE reservation_id=?1 AND state IN ('dispatching_external','external_pending') AND version=?2 AND external_operation_id=?3",
         params![id, sqlite_i64(expected_version)?, journal_operation_id],
         |row| Ok((row_u64(row, 0)?, row_u64(row, 1)?)),
     )?;
@@ -1775,7 +1775,7 @@ pub(crate) fn finish_external_handoff_conn(
         .ok_or_else(|| anyhow!("accounting_overflow"))?;
     ensure!(
         conn.execute(
-            "UPDATE media_reservations SET state=?1,version=?2 WHERE reservation_id=?3 AND state='dispatching_external' AND version=?4 AND external_operation_id=?5",
+            "UPDATE media_reservations SET state=?1,version=?2 WHERE reservation_id=?3 AND state IN ('dispatching_external','external_pending') AND version=?4 AND external_operation_id=?5",
             params![next_state.as_str(), sqlite_i64(next_version)?, id, sqlite_i64(expected_version)?, journal_operation_id],
         )? == 1,
         "stale_version"
@@ -1799,7 +1799,7 @@ pub(crate) fn definitive_rejection_retry_conn(
     wall_ms: u64,
 ) -> Result<ReservationReceipt> {
     let (sequence, deadline, project, session): (u64, u64, String, String) = conn.query_row(
-        "SELECT queue_sequence,deadline_monotonic_ms,project_id,owner_session_key FROM media_reservations WHERE reservation_id=?1 AND state='dispatching_external' AND version=?2 AND external_operation_id=?3",
+        "SELECT queue_sequence,deadline_monotonic_ms,project_id,owner_session_key FROM media_reservations WHERE reservation_id=?1 AND state IN ('dispatching_external','external_pending') AND version=?2 AND external_operation_id=?3",
         params![id, sqlite_i64(expected_version)?, journal_operation_id],
         |row| Ok((row_u64(row,0)?,row_u64(row,1)?,row.get(2)?,row.get(3)?)),
     )?;
@@ -1835,7 +1835,7 @@ pub(crate) fn definitive_rejection_retry_conn(
     for plan in next_plans {
         acquire_plan(conn, id, &owner, plan, next_version, wall_ms)?;
     }
-    ensure!(conn.execute("UPDATE media_reservations SET state='executing_local',version=?1,external_operation_id=NULL WHERE reservation_id=?2 AND state='dispatching_external' AND version=?3 AND external_operation_id=?4",params![sqlite_i64(next_version)?,id,sqlite_i64(expected_version)?,journal_operation_id])?==1,"stale_version");
+    ensure!(conn.execute("UPDATE media_reservations SET state='executing_local',version=?1,external_operation_id=NULL WHERE reservation_id=?2 AND state IN ('dispatching_external','external_pending') AND version=?3 AND external_operation_id=?4",params![sqlite_i64(next_version)?,id,sqlite_i64(expected_version)?,journal_operation_id])?==1,"stale_version");
     Ok(ReservationReceipt {
         reservation_id: id.to_owned(),
         state: ReservationState::ExecutingLocal,

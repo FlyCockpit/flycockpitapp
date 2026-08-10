@@ -10,14 +10,14 @@ use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
 use cockpit_db::media_attachments::{
-    AcquiredMediaComponentLease, HttpsRedirectLocationClassV1, HttpsRetentionResultV1,
-    LocalMediaOwnerReceiptV1, LocalPathRegistrationReceiptV1, LocalPathRegistrationResultV1,
-    MediaAttachmentRecord, MediaAvailability, MediaComponentLeaseKind, MediaKind,
-    MediaSecurityRecoveryComponentTransitionV1, MediaSecurityRecoveryDisposition,
-    MediaSecurityRecoveryOutcome, MediaSourceKind, RecoverSecurityBlockedMediaV1,
-    RegisterLocalPathMediaV1, RequestedLocalPathMediaKind, RetainHttpsMediaV1,
-    RetainedHttpsMediaReceiptV1, SecurityRecoverySnapshot, SecurityRecoverySnapshotResult,
-    SelectedMediaStream,
+    AcquiredMediaComponentLease, HttpsRedirectLocationClassV1, HttpsRetentionRejectionReasonV1,
+    HttpsRetentionResultV1, LocalMediaOwnerReceiptV1, LocalPathRegistrationReceiptV1,
+    LocalPathRegistrationResultV1, MediaAttachmentRecord, MediaAvailability,
+    MediaComponentLeaseKind, MediaKind, MediaSecurityRecoveryComponentTransitionV1,
+    MediaSecurityRecoveryDisposition, MediaSecurityRecoveryOutcome, MediaSourceKind,
+    RecoverSecurityBlockedMediaV1, RegisterLocalPathMediaV1, RequestedLocalPathMediaKind,
+    RetainHttpsMediaV1, RetainedHttpsMediaReceiptV1, SecurityRecoverySnapshot,
+    SecurityRecoverySnapshotResult, SelectedMediaStream,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
@@ -210,18 +210,46 @@ impl MediaStorageRecovery {
             Err(error) => {
                 let _ = self.owned_root.remove_file(&storage_name);
                 let _ = self.owned_root.sync();
-                let cleanup_operation = request.local_operation_id.to_string();
-                let _ = self
-                    .db
-                    .transaction(move |conn| {
-                        conn.execute(
-                            "DELETE FROM media_retained_https_publication_intents WHERE local_operation_id=?1",
-                            [cleanup_operation],
-                        )?;
-                        Ok(())
-                    })
-                    .await;
-                return Err(error);
+                let text = error.to_string();
+                let reason = if text.contains("requires HTTPS")
+                    || text.contains("userinfo")
+                    || text.contains("fragment")
+                    || text.contains("forbidden destination")
+                    || text.contains("redirect")
+                {
+                    HttpsRetentionRejectionReasonV1::InvalidHttpsSource
+                } else if text.contains("byte limit") || text.contains("empty retained") {
+                    HttpsRetentionRejectionReasonV1::ResourceLimit
+                } else {
+                    HttpsRetentionRejectionReasonV1::SourceUnavailable
+                };
+                let rejected = RetainedHttpsMediaReceiptV1 {
+                    schema_version: 1,
+                    kind: "retainedHttpsMediaReceipt".into(),
+                    receipt_id: Uuid::now_v7(),
+                    local_operation_id: request.local_operation_id,
+                    owner_principal_digest: request.owner_principal_digest.clone(),
+                    session_id: request.session_id,
+                    canonical_project_digest: request.canonical_project_digest.clone(),
+                    client_draft_id: request.client_draft_id,
+                    operation_request_digest: binding.clone(),
+                    semantic_command_digest: semantic_digest.clone(),
+                    origin_scheme: "https".into(),
+                    redirect_location_classes: Vec::new(),
+                    path_segment_count: 0,
+                    safe_basename: None,
+                    fetched_at_unix_ms: now_unix_ms,
+                    result: HttpsRetentionResultV1::Rejected { reason },
+                    committed_at_unix_ms: now_unix_ms,
+                };
+                let rejected_json = serde_json::to_string(&rejected)?;
+                let rejected_request = request.clone();
+                return self.db.transaction(move |conn| {
+                    conn.execute("INSERT INTO media_retained_https_operations(local_operation_id,authoritative_operation_id,session_id,canonical_project_digest,client_draft_id,request_binding_digest,operation_request_digest,semantic_command_digest,receipt_json,committed_at_unix_ms,is_alias) VALUES(?1,?1,?2,?3,?4,?5,?5,?6,?7,?8,0)",params![rejected_request.local_operation_id.to_string(),rejected_request.session_id.to_string(),rejected_request.canonical_project_digest,rejected_request.client_draft_id.to_string(),binding,semantic_digest,rejected_json,now_unix_ms])?;
+                    conn.execute("INSERT INTO media_retained_https_audit(local_operation_id,outcome,committed_at_unix_ms) VALUES(?1,'rejected',?2)",params![rejected_request.local_operation_id.to_string(),now_unix_ms])?;
+                    conn.execute("DELETE FROM media_retained_https_publication_intents WHERE local_operation_id=?1",[rejected_request.local_operation_id.to_string()])?;
+                    Ok(rejected)
+                }).await;
             }
         };
         async_file.sync_all().await?;
@@ -4764,6 +4792,21 @@ mod tests {
         }
     }
 
+    struct RejectingHttpsFetcher(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl crate::media_https::HttpsMediaFetcher for RejectingHttpsFetcher {
+        async fn fetch(
+            &self,
+            _raw_url: &str,
+            _sink: &mut tokio::fs::File,
+            _limits: &crate::media_https::HttpsFetchLimits,
+        ) -> Result<crate::media_https::RetainedHttpsFetchEvidence> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("retained media exceeds byte limit")
+        }
+    }
+
     #[async_trait::async_trait]
     impl AvRuntimeRunner for ScriptedVideoRunner {
         async fn run(
@@ -5539,6 +5582,64 @@ mod tests {
             assert_eq!(counts, (0, 0, 0, 1), "{table}");
             assert_eq!(recovery.reconcile_media_uploads(11).await.unwrap(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn https_media_ingest_rejection_is_stable_and_replays_before_fetch() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
+        let session_id = Uuid::now_v7();
+        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'project','/redacted',1,1)",[session_id.to_string()])?;Ok(())}).await.unwrap();
+        let fetcher = std::sync::Arc::new(RejectingHttpsFetcher(AtomicUsize::new(0)));
+        let recovery = MediaStorageRecovery::open_or_create(db.clone(), &temp.path().join("media"))
+            .unwrap()
+            .with_https_fetcher(fetcher.clone());
+        let request = RetainHttpsMediaV1 {
+            schema_version: 1,
+            kind: "retainHttpsMedia".into(),
+            local_operation_id: Uuid::now_v7(),
+            owner_principal_digest: "22".repeat(32),
+            session_id,
+            canonical_project_digest: "11".repeat(32),
+            client_draft_id: Uuid::now_v7(),
+            requested_media_kind: RequestedLocalPathMediaKind::Image,
+            url: "https://media.example.test/large".into(),
+        };
+        let policy = cockpit_config::config::media_budget::MediaResourcePolicy::default();
+        let first = recovery
+            .retain_https_media(request.clone(), &policy, 1, 10)
+            .await
+            .unwrap();
+        assert!(matches!(
+            first.result,
+            HttpsRetentionResultV1::Rejected {
+                reason: HttpsRetentionRejectionReasonV1::ResourceLimit
+            }
+        ));
+        assert_eq!(
+            recovery
+                .retain_https_media(request, &policy, 2, 11)
+                .await
+                .unwrap(),
+            first
+        );
+        assert_eq!(fetcher.0.load(Ordering::SeqCst), 1);
+        let counts = db
+            .read(|conn| {
+                Ok((
+                    conn.query_row("SELECT COUNT(*) FROM media_attachments", [], |r| {
+                        r.get::<_, i64>(0)
+                    })?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM media_retained_https_publication_intents",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(counts, (0, 0));
     }
 
     #[tokio::test]

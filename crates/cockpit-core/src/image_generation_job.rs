@@ -716,7 +716,7 @@ impl ImageGenerationOwnerContextAuthority {
         );
         let mut identities = Vec::with_capacity(components.len());
         for component in components {
-            let (kind,generation,stable_identity,hi,lo,checksum,state):(String,i64,String,i64,i64,String,String)=tx.query_row("SELECT kind,generation,stable_identity_json,byte_length_hi,byte_length_lo,sha256,state FROM image_generation_artifact_components WHERE artifact_id=?1 AND component_id=?2",params![recorded.artifact_id.to_string(),component.component_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)))?;
+            let (kind,generation,stable_identity,hi,lo,checksum,state):(String,i64,String,i64,i64,String,String)=tx.query_row("SELECT component_kind,generation,stable_identity_json,byte_length_hi,byte_length_lo,sha256,state FROM image_generation_artifact_components WHERE artifact_id=?1 AND component_id=?2",params![recorded.artifact_id.to_string(),component.component_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)))?;
             let length = (u64::try_from(hi)? << 32) | u64::try_from(lo)?;
             let held = component.held.evidence();
             ensure!(

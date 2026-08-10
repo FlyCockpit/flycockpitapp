@@ -3457,7 +3457,7 @@ mod tests {
             let job_id=Uuid::now_v7(); let slot_id=Uuid::now_v7(); let artifact_id=Uuid::now_v7();
             let (plan,digest)=canonical_test_plan(job_id,slot_id,artifact_id,1,1,100);
             let verified=CreateImageGenerationJob::from_verified_canonical_plan(&plan,&digest,1)?;
-            Db::create_image_generation_graph_conn(conn,&verified,&[CreateImageGenerationSlot{slot_id,slot_index:0,sample_index:0,managed_artifact_id:artifact_id,attempts:vec![CreateImageGenerationAttempt{attempt_number:1,provider_request_identity:"claim-request".into(),provider_idempotency_identity:"claim-idempotency".into()}]}])?;
+            Db::create_image_generation_graph_conn(conn,&verified,&[CreateImageGenerationSlot{slot_id,slot_index:0,sample_index:0,managed_artifact_id:artifact_id,attempts:vec![CreateImageGenerationAttempt{attempt_number:1,provider_request_identity:"request:1".into(),provider_idempotency_identity:"idem:1".into()}]}])?;
             conn.execute("UPDATE image_generation_jobs SET state='validating',version=2 WHERE job_id=?1",[job_id.to_string()])?;
             conn.execute("UPDATE image_generation_jobs SET state='queued',version=3 WHERE job_id=?1",[job_id.to_string()])?;
             conn.execute("UPDATE image_generation_slots SET state='queued',version=2 WHERE job_id=?1 AND slot_id=?2",params![job_id.to_string(),slot_id.to_string()])?;

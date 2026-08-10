@@ -30,7 +30,8 @@ use cockpit_db::image_spend::{AttemptMaximum, ImageSpendDispatchEvidence, SpendR
 use cockpit_db::media_attachments::AcquiredMediaComponentLease;
 
 use crate::media_reservation::{
-    MediaExternalHandoffOutcome, finish_external_handoff_conn, handoff_external_conn,
+    MediaExternalHandoffOutcome, ReservationReceipt, ReservationState,
+    finish_external_handoff_conn, handoff_external_conn,
 };
 
 pub use crate::private_fs::held_directory::{
@@ -1220,6 +1221,7 @@ pub struct ImageGenerationResolutionProofs<'a> {
     pub runtime_snapshots: &'a [ImageHealthSnapshot],
     pub grants: &'a [SealedActionGrantRow],
     pub central_reservation: &'a MediaReservationPlan,
+    pub central_reservation_receipt: &'a ReservationReceipt,
     pub spend_reservation: &'a SpendReservation,
     pub spend_attempts: &'a [AttemptMaximum],
     pub reference_leases: &'a [AcquiredMediaComponentLease],
@@ -1242,6 +1244,14 @@ impl ImageGenerationResolutionAuthorityV1 {
         ensure!(
             proofs.operation_deadline_monotonic_ms > proofs.enqueue_started_monotonic_ms,
             "image generation deadline is invalid"
+        );
+        ensure!(
+            proofs.central_reservation_receipt.state == ReservationState::ExecutingLocal
+                && proofs.central_reservation_receipt.version > 0
+                && proofs.central_reservation_receipt.deadline_monotonic_ms
+                    >= proofs.operation_deadline_monotonic_ms
+                && !proofs.central_reservation_receipt.reservation_id.is_empty(),
+            "image generation media reservation receipt is not live"
         );
         let mut grants = proofs
             .grants
@@ -1335,11 +1345,7 @@ impl ImageGenerationResolutionAuthorityV1 {
             "central reservation cannot be allocated exactly"
         );
         let per_attempt_units = proofs.central_reservation.requested / total_attempts as u64;
-        let reservation_identity = digest_fields(&[
-            "image-generation-resource-v1",
-            &owner.project_identity_digest,
-            &serde_json::to_string(proofs.central_reservation)?,
-        ]);
+        let reservation_identity = proofs.central_reservation_receipt.reservation_id.clone();
         let per_attempt_resource = resource_reservation_from_media_reservation(
             &MediaReservationPlan {
                 requested: per_attempt_units,

@@ -3201,6 +3201,9 @@ CREATE TABLE image_generation_scheduler_claims (
 CREATE TRIGGER image_generation_scheduler_claim_immutable BEFORE UPDATE ON image_generation_scheduler_claims
 WHEN NEW.job_id!=OLD.job_id OR NEW.slot_id!=OLD.slot_id OR NEW.attempt_number!=OLD.attempt_number OR NEW.claim_generation!=OLD.claim_generation+1 OR NEW.claimed_at_unix_ms<OLD.claimed_at_unix_ms OR NEW.expires_at_unix_ms<=NEW.claimed_at_unix_ms OR NEW.expires_at_unix_ms>NEW.claimed_at_unix_ms+60000
 BEGIN SELECT RAISE(ABORT,'image generation scheduler claim is not monotonic'); END;
+CREATE TRIGGER image_generation_scheduler_claim_expiry_guard BEFORE UPDATE ON image_generation_scheduler_claims
+WHEN OLD.expires_at_unix_ms>CAST(unixepoch('subsec')*1000 AS INTEGER)
+BEGIN SELECT RAISE(ABORT,'image generation scheduler claim has not expired'); END;
 CREATE TRIGGER image_generation_scheduler_claim_delete_guard BEFORE DELETE ON image_generation_scheduler_claims
 WHEN EXISTS(SELECT 1 FROM image_generation_attempts a WHERE a.job_id=OLD.job_id AND a.slot_id=OLD.slot_id AND a.attempt_number=OLD.attempt_number AND a.state='planned')
 BEGIN SELECT RAISE(ABORT,'active image generation scheduler claim cannot be deleted'); END;

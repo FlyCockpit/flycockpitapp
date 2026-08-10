@@ -3775,6 +3775,20 @@ mod tests {
     }
 
     #[test]
+    fn raw_security_recovery_audit_mutations_fail_closed() {
+        let db = Db::open_in_memory().unwrap();
+        db.blocking_for_sync_cli(|conn| {
+            let operation = Uuid::now_v7().to_string();
+            conn.execute("INSERT INTO image_generation_artifact_security_recovery_attempts(recovery_operation_id,principal_digest,request_digest,state,created_at_unix_ms) VALUES(?1,?2,?3,'received',1)",params![operation,"a".repeat(64),"b".repeat(64)])?;
+            assert!(conn.execute("UPDATE image_generation_artifact_security_recovery_attempts SET request_digest=?1 WHERE recovery_operation_id=?2",params!["c".repeat(64),operation]).is_err());
+            assert!(conn.execute("UPDATE image_generation_artifact_security_recovery_attempts SET state='validated' WHERE recovery_operation_id=?1",[operation.clone()]).is_err());
+            assert!(conn.execute("DELETE FROM image_generation_artifact_security_recovery_attempts WHERE recovery_operation_id=?1",[operation.clone()]).is_err());
+            assert!(conn.execute("INSERT INTO image_generation_artifact_security_recovery_audits(recovery_operation_id,artifact_id,artifact_generation,job_id,slot_id,slot_generation,principal_digest,component_set_digest,component_identity_digest,disposition,state,created_at_unix_ms) VALUES(?1,?2,1,?3,?4,1,?5,?6,?7,'resume_verified_cleanup','recorded',1)",params![Uuid::now_v7().to_string(),Uuid::now_v7().to_string(),Uuid::now_v7().to_string(),Uuid::now_v7().to_string(),"a".repeat(64),"b".repeat(64),"c".repeat(64)]).is_err());
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
     fn artifact_graph_creation_is_atomic_and_exactly_bound_to_sealed_slot() {
         let db = Db::open_in_memory().unwrap();
         db.blocking_for_sync_cli(|conn| {

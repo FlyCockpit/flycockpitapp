@@ -1942,6 +1942,82 @@ mod tests {
     use super::*;
 
     #[test]
+    fn owner_recovery_authority_rejects_every_remote_write_mode() {
+        use crate::daemon::principal::{PrincipalGrant, PrincipalScope, RemotePrincipal};
+        for scope in [
+            PrincipalScope::Agent,
+            PrincipalScope::AgentReadonly,
+            PrincipalScope::ProjectFiles,
+            PrincipalScope::Terminal,
+        ] {
+            let remote = ClientPrincipal::Remote(RemotePrincipal {
+                user_id: format!("remote-{scope:?}"),
+                grants: vec![PrincipalGrant {
+                    scope,
+                    project_root: Some("/project".into()),
+                }],
+            });
+            assert!(DaemonLocalOwnerRecoveryAuthority::from_local_direct(&remote).is_err());
+        }
+        assert!(
+            DaemonLocalOwnerRecoveryAuthority::from_local_direct(&ClientPrincipal::Owner).is_ok()
+        );
+    }
+
+    #[test]
+    fn recovery_attempt_digest_binds_every_authority_identity() {
+        let component = RecoverImageArtifactComponentIdentity {
+            component_id: id(91),
+            kind: ImageGenerationArtifactComponentKind::Primary,
+            generation: 3,
+            stable_identity_digest: digest('a'),
+        };
+        let original = RecordImageArtifactSecurityRecovery {
+            operation_id: id(90),
+            artifact_id: id(92),
+            artifact_generation: 4,
+            job_id: id(93),
+            slot_id: id(94),
+            slot_generation: 5,
+            component_set_digest: digest('b'),
+            components: vec![component],
+            publication_operation_id: Some(id(95)),
+            publication_lease_version: Some(6),
+            output_identity_digest: Some(digest('c')),
+            disposition: ImageArtifactSecurityRecoveryDisposition::RemoveVerifiedExternalCopy,
+        };
+        let expected = security_recovery_request_digest(&original).unwrap();
+        let mutations: Vec<Box<dyn Fn(&mut RecordImageArtifactSecurityRecovery)>> = vec![
+            Box::new(|v| v.operation_id = id(190)),
+            Box::new(|v| v.artifact_id = id(191)),
+            Box::new(|v| v.artifact_generation += 1),
+            Box::new(|v| v.job_id = id(192)),
+            Box::new(|v| v.slot_id = id(193)),
+            Box::new(|v| v.slot_generation += 1),
+            Box::new(|v| v.component_set_digest = digest('d')),
+            Box::new(|v| v.components[0].component_id = id(194)),
+            Box::new(|v| v.components[0].kind = ImageGenerationArtifactComponentKind::Thumbnail),
+            Box::new(|v| v.components[0].generation += 1),
+            Box::new(|v| v.components[0].stable_identity_digest = digest('e')),
+            Box::new(|v| v.publication_operation_id = Some(id(195))),
+            Box::new(|v| v.publication_lease_version = Some(7)),
+            Box::new(|v| v.output_identity_digest = Some(digest('f'))),
+            Box::new(|v| {
+                v.disposition =
+                    ImageArtifactSecurityRecoveryDisposition::CompleteVerifiedLatePublication
+            }),
+        ];
+        for mutate in mutations {
+            let mut changed = original.clone();
+            mutate(&mut changed);
+            assert_ne!(
+                security_recovery_request_digest(&changed).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn artifact_route_authority_pairs_are_closed() {
         use ImageGenerationArtifactConsumerPurpose as P;
         use ImageGenerationArtifactConsumerRoute as R;

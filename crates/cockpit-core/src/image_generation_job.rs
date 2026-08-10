@@ -2716,6 +2716,14 @@ mod tests {
         db: cockpit_db::Db,
         suffix: &str,
     ) -> RealLedgerSchedulerFixture {
+        setup_real_ledger_scheduler_job_with_output(db, suffix, None).await
+    }
+
+    async fn setup_real_ledger_scheduler_job_with_output(
+        db: cockpit_db::Db,
+        suffix: &str,
+        output: Option<VerifiedOutputDirectoryAuthority>,
+    ) -> RealLedgerSchedulerFixture {
         use crate::media_reservation::{
             MediaOwner, MediaReservationLedger, ReservationState, ReserveRequest,
         };
@@ -2730,6 +2738,21 @@ mod tests {
             AttemptMaximum, BudgetPolicy, ImageSpendSettings, ProjectEpochPolicy, SpendScopeKeys,
         };
         let mut sealed = plan();
+        let project_id = format!("fixture-project-{suffix}");
+        let project_root = format!("/fixture-project-{suffix}");
+        let session = db
+            .create_session(&project_id, &project_root, "Image generation fixture")
+            .await
+            .unwrap();
+        sealed.owner_session_id = session.session_id;
+        sealed.owner_principal_digest = crate::intel::hex_lower(&Sha256::digest(
+            serde_json::to_vec(&ClientPrincipal::Owner).unwrap(),
+        ));
+        sealed.project_identity_digest =
+            crate::intel::hex_lower(&Sha256::digest(project_root.as_bytes()));
+        if let Some(output) = output {
+            sealed.output_authority = output.0;
+        }
         let suffix_id = suffix
             .bytes()
             .fold(0_u128, |sum, byte| sum.wrapping_add(u128::from(byte)));
@@ -2773,7 +2796,7 @@ mod tests {
                 reservation_id: sealed.central_resources[0].reservation_identity.clone(),
                 recovery_id: format!("scheduler-recovery-{suffix}"),
                 owner: MediaOwner {
-                    project_id: format!("fixture-project-{suffix}"),
+                    project_id: project_id.clone(),
                     session_id: sealed.owner_session_id.to_string(),
                 },
                 operation: "image_generation".into(),
@@ -2800,7 +2823,7 @@ mod tests {
             .unwrap();
         assert_eq!(executing.state, ReservationState::ExecutingLocal);
         db.save_image_spend_policy(
-            format!("fixture-project-{suffix}"),
+            project_id.clone(),
             ImageSpendSettings {
                 request: BudgetPolicy::Finite { usd_micros: 100 },
                 session: BudgetPolicy::Finite { usd_micros: 100 },
@@ -2819,7 +2842,7 @@ mod tests {
             SpendScopeKeys {
                 plan_digest: plan_digest.clone(),
                 session_id: sealed.owner_session_id.to_string(),
-                project_key: format!("fixture-project-{suffix}"),
+                project_key: project_id,
             },
             vec![AttemptMaximum {
                 attempt_id: provider_idempotency_identity.clone(),

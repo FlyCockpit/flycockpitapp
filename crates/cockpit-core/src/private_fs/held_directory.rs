@@ -67,11 +67,11 @@ impl HeldSealedArtifact {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum HeldDirectoryEffectOutcome {
     AppliedDurable(HeldDirectoryEffectEvidence),
     AppliedUnknown(HeldDirectoryRecovery),
-    ProvenNotApplied(HeldArtifactEvidence),
+    ProvenNotApplied(HeldSealedArtifact),
     SecurityAmbiguous(HeldDirectoryRecovery),
 }
 
@@ -307,6 +307,12 @@ thread_local! { static BEFORE_PUBLISH_HOOK: std::cell::RefCell<Option<Box<dyn Fn
 #[cfg(test)]
 thread_local! { static AFTER_PUBLISH_EFFECT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) }; }
 #[cfg(test)]
+thread_local! { static FORCE_PUBLISH_NONCOLLISION_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
+thread_local! { static FORCE_SOURCE_CLEANUP_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
+thread_local! { static FORCE_POST_CLEANUP_METADATA_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
 fn sync_failure_forced() -> bool {
     FORCE_DIRECTORY_SYNC_FAILURE.get()
 }
@@ -330,6 +336,34 @@ fn run_after_publish_effect_hook() {
 }
 #[cfg(not(test))]
 fn run_after_publish_effect_hook() {}
+#[cfg(test)]
+fn take_forced_failure(flag: &'static std::thread::LocalKey<std::cell::Cell<bool>>) -> bool {
+    flag.with(|value| value.replace(false))
+}
+#[cfg(not(test))]
+fn take_forced_publish_failure() -> bool {
+    false
+}
+#[cfg(test)]
+fn take_forced_publish_failure() -> bool {
+    take_forced_failure(&FORCE_PUBLISH_NONCOLLISION_FAILURE)
+}
+#[cfg(not(test))]
+fn take_forced_cleanup_failure() -> bool {
+    false
+}
+#[cfg(test)]
+fn take_forced_cleanup_failure() -> bool {
+    take_forced_failure(&FORCE_SOURCE_CLEANUP_FAILURE)
+}
+#[cfg(not(test))]
+fn take_forced_metadata_failure() -> bool {
+    false
+}
+#[cfg(test)]
+fn take_forced_metadata_failure() -> bool {
+    take_forced_failure(&FORCE_POST_CLEANUP_METADATA_FAILURE)
+}
 
 fn validate_component(value: &str) -> Result<()> {
     ensure!(
@@ -512,6 +546,14 @@ mod imp {
                     std::path::Path::new(proc_source.to_str()?).exists(),
                     "fd-bound procfs publication is unavailable"
                 );
+                if take_forced_publish_failure() {
+                    return Ok(unknown_recovery(
+                        Some(to.to_owned()),
+                        artifact.name,
+                        artifact.evidence,
+                        true,
+                    ));
+                }
                 let linked = unsafe {
                     libc::linkat(
                         libc::AT_FDCWD,
@@ -524,9 +566,7 @@ mod imp {
                 if linked != 0 {
                     let error = std::io::Error::last_os_error();
                     if error.kind() == std::io::ErrorKind::AlreadyExists {
-                        return Ok(HeldDirectoryEffectOutcome::ProvenNotApplied(
-                            artifact.evidence,
-                        ));
+                        return Ok(HeldDirectoryEffectOutcome::ProvenNotApplied(artifact));
                     }
                     return Ok(unknown_recovery(
                         Some(to.to_owned()),
@@ -546,7 +586,9 @@ mod imp {
                         ));
                     }
                 };
-                if unsafe { libc::unlinkat(self.dir.as_raw_fd(), source.as_ptr(), 0) } != 0 {
+                if take_forced_cleanup_failure()
+                    || unsafe { libc::unlinkat(self.dir.as_raw_fd(), source.as_ptr(), 0) } != 0
+                {
                     return Ok(unknown_recovery(
                         Some(to.to_owned()),
                         artifact.name.clone(),
@@ -592,9 +634,7 @@ mod imp {
                     && verify_expected_file(&source, &artifact.evidence, true).is_ok()
                     && validate_contents(&mut source, &artifact.evidence).is_ok()
                 {
-                    return Ok(HeldDirectoryEffectOutcome::ProvenNotApplied(
-                        artifact.evidence,
-                    ));
+                    return Ok(HeldDirectoryEffectOutcome::ProvenNotApplied(artifact));
                 }
                 return Ok(unknown_recovery(
                     None,
@@ -648,11 +688,24 @@ mod imp {
                     }
                 };
                 if absent {
-                    let mut source = open_named(&self.dir, &recovery.source_name)?;
-                    verify_expected_file(&source, &recovery.artifact, true)?;
-                    validate_contents(&mut source, &recovery.artifact)?;
+                    let Ok(mut source) = open_named(&self.dir, &recovery.source_name) else {
+                        return Ok(HeldDirectoryEffectOutcome::SecurityAmbiguous(
+                            recovery.clone(),
+                        ));
+                    };
+                    if verify_expected_file(&source, &recovery.artifact, true).is_err()
+                        || validate_contents(&mut source, &recovery.artifact).is_err()
+                    {
+                        return Ok(HeldDirectoryEffectOutcome::SecurityAmbiguous(
+                            recovery.clone(),
+                        ));
+                    }
                     return Ok(HeldDirectoryEffectOutcome::ProvenNotApplied(
-                        recovery.artifact.clone(),
+                        HeldSealedArtifact {
+                            file: source,
+                            name: recovery.source_name.clone(),
+                            evidence: recovery.artifact.clone(),
+                        },
                     ));
                 }
                 let mut destination_file = match open_named(&self.dir, destination) {
@@ -676,7 +729,14 @@ mod imp {
                             if verify_expected_file(&source, &recovery.artifact, false).is_ok()
                                 && validate_contents(&mut source, &recovery.artifact).is_ok() =>
                         {
-                            let name = CString::new(recovery.source_name.as_str())?;
+                            let name = match CString::new(recovery.source_name.as_str()) {
+                                Ok(name) => name,
+                                Err(_) => {
+                                    return Ok(HeldDirectoryEffectOutcome::SecurityAmbiguous(
+                                        recovery.clone(),
+                                    ));
+                                }
+                            };
                             if unsafe { libc::unlinkat(self.dir.as_raw_fd(), name.as_ptr(), 0) }
                                 != 0
                             {
@@ -698,7 +758,13 @@ mod imp {
                         }
                     }
                 }
-                if destination_file.metadata()?.nlink() != 1 {
+                if take_forced_metadata_failure() {
+                    return Ok(HeldDirectoryEffectOutcome::AppliedUnknown(recovery.clone()));
+                }
+                let Ok(destination_metadata) = destination_file.metadata() else {
+                    return Ok(HeldDirectoryEffectOutcome::AppliedUnknown(recovery.clone()));
+                };
+                if destination_metadata.nlink() != 1 {
                     return Ok(HeldDirectoryEffectOutcome::SecurityAmbiguous(
                         recovery.clone(),
                     ));
@@ -710,7 +776,11 @@ mod imp {
                             && validate_contents(&mut source, &recovery.artifact).is_ok() =>
                     {
                         return Ok(HeldDirectoryEffectOutcome::ProvenNotApplied(
-                            recovery.artifact.clone(),
+                            HeldSealedArtifact {
+                                file: source,
+                                name: recovery.source_name.clone(),
+                                evidence: recovery.artifact.clone(),
+                            },
                         ));
                     }
                     Ok(_) => {
@@ -1162,20 +1232,22 @@ mod imp {
                 status: 0,
                 information: 0,
             };
-            let status = unsafe {
-                NtSetInformationFile(
-                    artifact.file.as_raw_handle(),
-                    &mut io,
-                    buffer.as_ptr().cast(),
-                    buffer.len() as u32,
-                    10,
-                )
+            let status = if take_forced_publish_failure() {
+                -1
+            } else {
+                unsafe {
+                    NtSetInformationFile(
+                        artifact.file.as_raw_handle(),
+                        &mut io,
+                        buffer.as_ptr().cast(),
+                        buffer.len() as u32,
+                        10,
+                    )
+                }
             };
             if status < STATUS_SUCCESS_MIN {
                 if status == STATUS_OBJECT_NAME_COLLISION {
-                    return Ok(HeldDirectoryEffectOutcome::ProvenNotApplied(
-                        artifact.evidence,
-                    ));
+                    return Ok(HeldDirectoryEffectOutcome::ProvenNotApplied(artifact));
                 }
                 return Ok(unknown_recovery(
                     Some(target_name.to_owned()),
@@ -1243,14 +1315,18 @@ mod imp {
                 status: 0,
                 information: 0,
             };
-            let status = unsafe {
-                NtSetInformationFile(
-                    artifact.file.as_raw_handle(),
-                    &mut io,
-                    (&info as *const FileDispositionInformation).cast(),
-                    size_of::<FileDispositionInformation>() as u32,
-                    13,
-                )
+            let status = if take_forced_cleanup_failure() {
+                -1
+            } else {
+                unsafe {
+                    NtSetInformationFile(
+                        artifact.file.as_raw_handle(),
+                        &mut io,
+                        (&info as *const FileDispositionInformation).cast(),
+                        size_of::<FileDispositionInformation>() as u32,
+                        13,
+                    )
+                }
             };
             if status < STATUS_SUCCESS_MIN {
                 let source = std::ffi::OsStr::new(&artifact.name)
@@ -1263,9 +1339,7 @@ mod imp {
                 ) && verify_expected_file(&file, &artifact.evidence).is_ok()
                     && validate_contents(&mut file, &artifact.evidence).is_ok()
                 {
-                    return Ok(HeldDirectoryEffectOutcome::ProvenNotApplied(
-                        artifact.evidence,
-                    ));
+                    return Ok(HeldDirectoryEffectOutcome::ProvenNotApplied(artifact));
                 }
                 return Ok(unknown_recovery(
                     None,
@@ -1302,11 +1376,19 @@ mod imp {
                 let wide = std::ffi::OsStr::new(destination)
                     .encode_wide()
                     .collect::<Vec<_>>();
-                match probe_relative(
+                let destination_probe = match probe_relative(
                     &self.dir,
                     &wide,
                     GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-                )? {
+                ) {
+                    Ok(probe) => probe,
+                    Err(_) => {
+                        return Ok(HeldDirectoryEffectOutcome::SecurityAmbiguous(
+                            recovery.clone(),
+                        ));
+                    }
+                };
+                match destination_probe {
                     RelativeProbe::Present(mut file)
                         if verify_expected_file(&file, &recovery.artifact).is_ok()
                             && validate_contents(&mut file, &recovery.artifact).is_ok() => {}
@@ -1314,17 +1396,29 @@ mod imp {
                         let source = std::ffi::OsStr::new(&recovery.source_name)
                             .encode_wide()
                             .collect::<Vec<_>>();
-                        match probe_relative(
+                        let source_probe = match probe_relative(
                             &self.dir,
                             &source,
                             GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-                        )? {
+                        ) {
+                            Ok(probe) => probe,
+                            Err(_) => {
+                                return Ok(HeldDirectoryEffectOutcome::SecurityAmbiguous(
+                                    recovery.clone(),
+                                ));
+                            }
+                        };
+                        match source_probe {
                             RelativeProbe::Present(mut file)
                                 if verify_expected_file(&file, &recovery.artifact).is_ok()
                                     && validate_contents(&mut file, &recovery.artifact).is_ok() =>
                             {
                                 return Ok(HeldDirectoryEffectOutcome::ProvenNotApplied(
-                                    recovery.artifact.clone(),
+                                    HeldSealedArtifact {
+                                        file,
+                                        name: recovery.source_name.clone(),
+                                        evidence: recovery.artifact.clone(),
+                                    },
                                 ));
                             }
                             _ => {
@@ -1344,14 +1438,19 @@ mod imp {
                     let source = std::ffi::OsStr::new(&recovery.source_name)
                         .encode_wide()
                         .collect::<Vec<_>>();
-                    if !matches!(
-                        probe_relative(
-                            &self.dir,
-                            &source,
-                            GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE
-                        )?,
-                        RelativeProbe::Absent
+                    let source_probe = match probe_relative(
+                        &self.dir,
+                        &source,
+                        GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
                     ) {
+                        Ok(probe) => probe,
+                        Err(_) => {
+                            return Ok(HeldDirectoryEffectOutcome::SecurityAmbiguous(
+                                recovery.clone(),
+                            ));
+                        }
+                    };
+                    if !matches!(source_probe, RelativeProbe::Absent) {
                         return Ok(HeldDirectoryEffectOutcome::SecurityAmbiguous(
                             recovery.clone(),
                         ));
@@ -1361,18 +1460,30 @@ mod imp {
                 let wide = std::ffi::OsStr::new(&recovery.source_name)
                     .encode_wide()
                     .collect::<Vec<_>>();
-                match probe_relative(
+                let source_probe = match probe_relative(
                     &self.dir,
                     &wide,
                     GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-                )? {
+                ) {
+                    Ok(probe) => probe,
+                    Err(_) => {
+                        return Ok(HeldDirectoryEffectOutcome::SecurityAmbiguous(
+                            recovery.clone(),
+                        ));
+                    }
+                };
+                match source_probe {
                     RelativeProbe::Absent => {}
                     RelativeProbe::Present(mut file)
                         if verify_expected_file(&file, &recovery.artifact).is_ok()
                             && validate_contents(&mut file, &recovery.artifact).is_ok() =>
                     {
                         return Ok(HeldDirectoryEffectOutcome::ProvenNotApplied(
-                            recovery.artifact.clone(),
+                            HeldSealedArtifact {
+                                file,
+                                name: recovery.source_name.clone(),
+                                evidence: recovery.artifact.clone(),
+                            },
                         ));
                     }
                     _ => {
@@ -1670,12 +1781,18 @@ mod tests {
         let temp_file = held.seal(temp_file).unwrap();
         let mut output = held.create_file_exclusive("output").unwrap();
         output.file_mut().write_all(b"old").unwrap();
-        assert!(matches!(
-            held.rename_noreplace(temp_file, "output").unwrap(),
-            HeldDirectoryEffectOutcome::ProvenNotApplied(_)
-        ));
+        let HeldDirectoryEffectOutcome::ProvenNotApplied(retained) =
+            held.rename_noreplace(temp_file, "output").unwrap()
+        else {
+            panic!("collision must return retained source authority")
+        };
         assert!(temp.path().join("temp").exists());
         assert_eq!(std::fs::read(temp.path().join("output")).unwrap(), b"old");
+        assert!(matches!(
+            held.unlink(retained).unwrap(),
+            HeldDirectoryEffectOutcome::AppliedDurable(_)
+        ));
+        assert!(!temp.path().join("temp").exists());
     }
 
     #[test]
@@ -1748,6 +1865,80 @@ mod tests {
             std::fs::read(temp.path().join("published")).unwrap(),
             b"exact"
         );
+        assert!(matches!(
+            held.reconcile(&recovery).unwrap(),
+            HeldDirectoryEffectOutcome::AppliedDurable(_)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn noncollision_publish_failure_retains_source_authority_for_retry() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let held = HeldDirectoryAuthority::open_existing(temp.path()).unwrap();
+        let mut artifact = held.create_file_exclusive("temporary").unwrap();
+        artifact.file_mut().write_all(b"exact").unwrap();
+        let artifact = held.seal(artifact).unwrap();
+        FORCE_PUBLISH_NONCOLLISION_FAILURE.set(true);
+        let HeldDirectoryEffectOutcome::AppliedUnknown(recovery) =
+            held.rename_noreplace(artifact, "published").unwrap()
+        else {
+            panic!("noncollision syscall failure must retain recovery authority")
+        };
+        let HeldDirectoryEffectOutcome::ProvenNotApplied(retained) =
+            held.reconcile(&recovery).unwrap()
+        else {
+            panic!("exact absent destination and source must be retryable")
+        };
+        assert!(matches!(
+            held.rename_noreplace(retained, "published").unwrap(),
+            HeldDirectoryEffectOutcome::AppliedDurable(_)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_failure_and_metadata_after_cleanup_reconcile_without_generic_error() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let held = HeldDirectoryAuthority::open_existing(temp.path()).unwrap();
+        let mut artifact = held.create_file_exclusive("temporary").unwrap();
+        artifact.file_mut().write_all(b"exact").unwrap();
+        let artifact = held.seal(artifact).unwrap();
+        FORCE_SOURCE_CLEANUP_FAILURE.set(true);
+        let HeldDirectoryEffectOutcome::AppliedUnknown(recovery) =
+            held.rename_noreplace(artifact, "published").unwrap()
+        else {
+            panic!("source cleanup failure must retain recovery authority")
+        };
+        FORCE_POST_CLEANUP_METADATA_FAILURE.set(true);
+        assert!(matches!(
+            held.reconcile(&recovery).unwrap(),
+            HeldDirectoryEffectOutcome::AppliedUnknown(_)
+        ));
+        assert!(!temp.path().join("temporary").exists());
+        assert!(matches!(
+            held.reconcile(&recovery).unwrap(),
+            HeldDirectoryEffectOutcome::AppliedDurable(_)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn delete_sync_unknown_reconciles_exact_not_found_as_durable() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let held = HeldDirectoryAuthority::open_existing(temp.path()).unwrap();
+        let mut artifact = held.create_file_exclusive("temporary").unwrap();
+        artifact.file_mut().write_all(b"exact").unwrap();
+        let artifact = held.seal(artifact).unwrap();
+        FORCE_DIRECTORY_SYNC_FAILURE.set(true);
+        let HeldDirectoryEffectOutcome::AppliedUnknown(recovery) = held.unlink(artifact).unwrap()
+        else {
+            panic!("post-delete sync failure must retain recovery authority")
+        };
+        FORCE_DIRECTORY_SYNC_FAILURE.set(false);
         assert!(matches!(
             held.reconcile(&recovery).unwrap(),
             HeldDirectoryEffectOutcome::AppliedDurable(_)
@@ -1887,12 +2078,18 @@ mod windows_tests {
         let temporary = held.seal(temporary).unwrap();
         let mut published = held.create_file_exclusive("published").unwrap();
         published.file_mut().write_all(b"old").unwrap();
-        assert!(matches!(
-            held.rename_noreplace(temporary, "published").unwrap(),
-            HeldDirectoryEffectOutcome::ProvenNotApplied(_)
-        ));
+        let HeldDirectoryEffectOutcome::ProvenNotApplied(retained) =
+            held.rename_noreplace(temporary, "published").unwrap()
+        else {
+            panic!("collision must return retained source authority")
+        };
         assert!(output.join("temporary").exists());
         assert_eq!(std::fs::read(output.join("published")).unwrap(), b"old");
+        assert!(matches!(
+            held.unlink(retained).unwrap(),
+            HeldDirectoryEffectOutcome::AppliedDurable(_)
+        ));
+        assert!(!output.join("temporary").exists());
         let alias = temp.path().join("alias");
         if symlink_dir(&output, &alias).is_ok() {
             assert!(HeldDirectoryAuthority::open_existing(&alias).is_err());
@@ -2004,5 +2201,59 @@ mod windows_tests {
             HeldDirectoryEffectOutcome::SecurityAmbiguous(_)
         ));
         assert!(held.delete_recovered_destination(&recovery).is_err());
+    }
+
+    #[test]
+    fn held_windows_rename_and_delete_failures_retain_retry_authority() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("output");
+        std::fs::create_dir(&output).unwrap();
+        crate::goal_scratch::set_private(&output).unwrap();
+        let held = HeldDirectoryAuthority::open_existing(&output).unwrap();
+        let mut artifact = held.create_file_exclusive("temporary").unwrap();
+        artifact.file_mut().write_all(b"exact").unwrap();
+        let artifact = held.seal(artifact).unwrap();
+        FORCE_PUBLISH_NONCOLLISION_FAILURE.set(true);
+        let HeldDirectoryEffectOutcome::AppliedUnknown(recovery) =
+            held.rename_noreplace(artifact, "published").unwrap()
+        else {
+            panic!("rename failure must return recovery authority")
+        };
+        let HeldDirectoryEffectOutcome::ProvenNotApplied(retained) =
+            held.reconcile(&recovery).unwrap()
+        else {
+            panic!("absent destination must recover the source")
+        };
+        FORCE_SOURCE_CLEANUP_FAILURE.set(true);
+        let HeldDirectoryEffectOutcome::ProvenNotApplied(retained) = held.unlink(retained).unwrap()
+        else {
+            panic!("failed delete with exact source must retain it")
+        };
+        assert!(matches!(
+            held.unlink(retained).unwrap(),
+            HeldDirectoryEffectOutcome::AppliedDurable(_)
+        ));
+    }
+
+    #[test]
+    fn held_windows_delete_sync_unknown_reconciles_not_found() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("output");
+        std::fs::create_dir(&output).unwrap();
+        crate::goal_scratch::set_private(&output).unwrap();
+        let held = HeldDirectoryAuthority::open_existing(&output).unwrap();
+        let mut artifact = held.create_file_exclusive("temporary").unwrap();
+        artifact.file_mut().write_all(b"exact").unwrap();
+        let artifact = held.seal(artifact).unwrap();
+        FORCE_DIRECTORY_SYNC_FAILURE.set(true);
+        let HeldDirectoryEffectOutcome::AppliedUnknown(recovery) = held.unlink(artifact).unwrap()
+        else {
+            panic!("directory sync failure after delete must be recoverable")
+        };
+        FORCE_DIRECTORY_SYNC_FAILURE.set(false);
+        assert!(matches!(
+            held.reconcile(&recovery).unwrap(),
+            HeldDirectoryEffectOutcome::AppliedDurable(_)
+        ));
     }
 }

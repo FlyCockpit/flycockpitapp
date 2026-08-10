@@ -592,6 +592,15 @@ fn valid_path_component(value: &str) -> bool {
 mod tests {
     use super::*;
 
+    type ResolverCase = (
+        &'static str,
+        Box<dyn Fn(&mut ImageGenerationRequestV1, &mut ImageGenerationResolutionAuthorityV1)>,
+    );
+    type AuthorityCase = (
+        &'static str,
+        Box<dyn Fn(&mut ImageGenerationResolutionAuthorityV1)>,
+    );
+
     fn id(tail: u128) -> Uuid {
         Uuid::from_u128(0x018f3f247a107cc28000000000000000 | tail)
     }
@@ -685,6 +694,186 @@ mod tests {
                     }],
                 }],
             }],
+        }
+    }
+
+    fn resolver_fixture() -> (
+        ImageGenerationRequestV1,
+        ImageGenerationResolutionAuthorityV1,
+    ) {
+        let sealed = plan();
+        let target = &sealed.targets[0];
+        (
+            ImageGenerationRequestV1 {
+                width: target.requested.width,
+                height: target.requested.height,
+                format: target.requested.format.clone(),
+                samples_per_target: 1,
+                target_ids: vec![target.target_id.clone()],
+                parameters: target.typed_parameters.clone(),
+            },
+            ImageGenerationResolutionAuthorityV1 {
+                job_id: sealed.job_id,
+                owner_session_id: sealed.owner_session_id,
+                owner_principal_digest: sealed.owner_principal_digest,
+                project_identity_digest: sealed.project_identity_digest,
+                config_generation: sealed.config_generation,
+                enqueue_started_monotonic_ms: sealed.enqueue_started_monotonic_ms,
+                operation_deadline_monotonic_ms: sealed.operation_deadline_monotonic_ms,
+                required_grants: sealed.required_grants,
+                central_resources: sealed.central_resources,
+                spend: sealed.spend,
+                output_authority: VerifiedOutputDirectoryAuthority(sealed.output_authority),
+                targets: vec![ImageGenerationTargetResolutionAuthorityV1 {
+                    runtime: RuntimeTargetAuthorityV1 {
+                        target_id: target.target_id.clone(),
+                        target_config_generation: target.target_config_generation,
+                        normalized_config_digest: target.normalized_config_digest.clone(),
+                        capability_provenance: target.capability_provenance.clone(),
+                        destination: target.destination.clone(),
+                        supported_formats: BTreeMap::from([("png".into(), "image/png".into())]),
+                        maximum_width: 512,
+                        maximum_height: 512,
+                        allowed_parameters: vec!["quality".into()],
+                    },
+                    references: target.reference_artifacts.clone(),
+                    slot_artifact_ids: vec![(
+                        target.slots[0].slot_id,
+                        target.slots[0].managed_artifact_id,
+                    )],
+                    max_attempts: 1,
+                    attempt_resources: target.slots[0].attempts[0].resource_maximum.clone(),
+                    attempt_maximum_usd_micros: Some(10),
+                }],
+            },
+        )
+    }
+
+    fn image_row_count(db: &cockpit_db::Db) -> i64 {
+        db.blocking_for_sync_cli(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM image_generation_jobs", [], |row| {
+                row.get(0)
+            })
+            .map_err(Into::into)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn resolver_is_deterministic_pure_and_returns_structured_incompatibilities() {
+        let db = cockpit_db::Db::open_in_memory().unwrap();
+        let before = image_row_count(&db);
+        let (request, authority) = resolver_fixture();
+        let first = resolve_image_generation(request.clone(), authority.clone()).unwrap();
+        let second = resolve_image_generation(request.clone(), authority.clone()).unwrap();
+        let (ImageGenerationResolutionV1::Ready(first), ImageGenerationResolutionV1::Ready(second)) =
+            (first, second)
+        else {
+            panic!("compatible authority did not resolve")
+        };
+        assert_eq!(first, second);
+        assert_eq!(
+            first.canonical_bytes().unwrap(),
+            second.canonical_bytes().unwrap()
+        );
+        assert_eq!(image_row_count(&db), before);
+
+        let cases: Vec<ResolverCase> = vec![
+            (
+                "target",
+                Box::new(|request, _| request.target_ids[0] = "missing".into()),
+            ),
+            (
+                "format",
+                Box::new(|request, _| request.format = "webp".into()),
+            ),
+            ("width", Box::new(|request, _| request.width = 513)),
+            ("height", Box::new(|request, _| request.height = 513)),
+            (
+                "parameter",
+                Box::new(|request, _| {
+                    request
+                        .parameters
+                        .insert("unsealed".into(), TypedParameterV1::Boolean(true));
+                }),
+            ),
+            (
+                "samples",
+                Box::new(|request, _| request.samples_per_target = 2),
+            ),
+        ];
+        for (family, mutate) in cases {
+            let (mut request, mut authority) = resolver_fixture();
+            mutate(&mut request, &mut authority);
+            let ImageGenerationResolutionV1::Incompatible(alternatives) =
+                resolve_image_generation(request, authority).unwrap()
+            else {
+                panic!("{family} mismatch was accepted")
+            };
+            assert_eq!(alternatives.len(), 1, "{family}");
+            assert!(!alternatives[0].reason.is_empty(), "{family}");
+            assert_eq!(image_row_count(&db), before, "{family}");
+        }
+    }
+
+    #[test]
+    fn resolver_rejects_invalid_sealed_authority_before_persistence() {
+        let db = cockpit_db::Db::open_in_memory().unwrap();
+        let before = image_row_count(&db);
+        let mutations: Vec<AuthorityCase> = vec![
+            (
+                "reference",
+                Box::new(|a| {
+                    a.targets[0].references.push(ReferenceArtifactV1 {
+                        attachment_id: id(10),
+                        attachment_version: 0,
+                        component_id: id(11),
+                        component_generation: 1,
+                        media_kind: "image".into(),
+                        identity_digest: digest('b'),
+                        sha256: digest('c'),
+                        byte_length: 1,
+                    })
+                }),
+            ),
+            ("grant", Box::new(|a| a.required_grants[0].generation = 0)),
+            ("resource", Box::new(|a| a.central_resources[0].units += 1)),
+            ("spend", Box::new(|a| a.spend.maximum_usd_micros = Some(11))),
+            (
+                "slot identity",
+                Box::new(|a| a.targets[0].slot_artifact_ids[0].0 = Uuid::nil()),
+            ),
+        ];
+        for (family, mutate) in mutations {
+            let (request, mut authority) = resolver_fixture();
+            mutate(&mut authority);
+            assert!(
+                resolve_image_generation(request, authority).is_err(),
+                "{family}"
+            );
+            assert_eq!(image_row_count(&db), before, "{family}");
+        }
+    }
+
+    #[test]
+    fn resolver_source_has_no_adapter_or_network_contact_seam() {
+        let source = include_str!("image_generation_job.rs");
+        let start = source.find("pub fn resolve_image_generation(").unwrap();
+        let end = source[start..]
+            .find("\nimpl RuntimeTargetAuthorityV1")
+            .unwrap()
+            + start;
+        let body = &source[start..end];
+        for forbidden in [
+            "adapter.generate",
+            "reqwest",
+            "TcpStream",
+            "create_image_generation",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "resolver acquired side-effect seam: {forbidden}"
+            );
         }
     }
 

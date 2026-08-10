@@ -10,12 +10,12 @@ use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
 use cockpit_db::media_attachments::{
-    LocalMediaOwnerReceiptV1, LocalPathRegistrationReceiptV1, LocalPathRegistrationResultV1,
-    MediaAttachmentRecord, MediaAvailability, MediaKind,
-    MediaSecurityRecoveryComponentTransitionV1, MediaSecurityRecoveryDisposition,
-    MediaSecurityRecoveryOutcome, MediaSourceKind, RecoverSecurityBlockedMediaV1,
-    RegisterLocalPathMediaV1, RequestedLocalPathMediaKind, SecurityRecoverySnapshot,
-    SecurityRecoverySnapshotResult,
+    AcquiredMediaComponentLease, LocalMediaOwnerReceiptV1, LocalPathRegistrationReceiptV1,
+    LocalPathRegistrationResultV1, MediaAttachmentRecord, MediaAvailability,
+    MediaComponentLeaseKind, MediaKind, MediaSecurityRecoveryComponentTransitionV1,
+    MediaSecurityRecoveryDisposition, MediaSecurityRecoveryOutcome, MediaSourceKind,
+    RecoverSecurityBlockedMediaV1, RegisterLocalPathMediaV1, RequestedLocalPathMediaKind,
+    SecurityRecoverySnapshot, SecurityRecoverySnapshotResult,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
@@ -45,6 +45,54 @@ struct HeldHandleRecoveryProof {
     _handles: Vec<File>,
 }
 
+/// A DB-authorized component lease and the exact no-follow handle proven by
+/// that acquisition transaction. Consumers never receive a storage name.
+pub(crate) struct HeldMediaComponentLease {
+    db: cockpit_db::Db,
+    authority: AcquiredMediaComponentLease,
+    file: File,
+}
+
+impl HeldMediaComponentLease {
+    pub(crate) fn authority(&self) -> &AcquiredMediaComponentLease {
+        &self.authority
+    }
+
+    /// Complete-read verification is deliberately coupled to durable release.
+    /// A failed proof leaves the lease live, preventing cleanup until startup
+    /// reconciliation moves the attachment to `security_blocked`.
+    pub(crate) async fn read_verified(mut self, now_unix_ms: i64) -> Result<Vec<u8>> {
+        let before = stable_identity_digest(&self.file)?;
+        ensure!(
+            before == self.authority.component.stable_identity_digest,
+            "storage_security_violation"
+        );
+        self.file.seek(SeekFrom::Start(0))?;
+        let mut bytes = Vec::new();
+        self.file
+            .by_ref()
+            .take(self.authority.component.byte_length.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() as u64 == self.authority.component.byte_length
+                && crate::intel::hex_lower(&Sha256::digest(&bytes))
+                    == self.authority.component.sha256,
+            "storage_security_violation"
+        );
+        ensure!(
+            stable_identity_digest(&self.file)? == before,
+            "storage_security_violation"
+        );
+        let lease_id = self.authority.lease_id;
+        self.db
+            .transaction(move |conn| {
+                cockpit_db::Db::release_media_component_lease_conn(conn, lease_id, now_unix_ms)
+            })
+            .await?;
+        Ok(bytes)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct MediaStorageRecovery {
     db: cockpit_db::Db,
@@ -54,6 +102,52 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    pub(crate) async fn acquire_component_lease(
+        &self,
+        lease_id: Uuid,
+        attachment_id: Uuid,
+        attachment_version: u64,
+        availability_generation: u64,
+        capability_generation: u64,
+        kind: MediaComponentLeaseKind,
+        now_unix_ms: i64,
+    ) -> Result<HeldMediaComponentLease> {
+        let root = self.owned_root.clone();
+        let (authority, file) = self
+            .db
+            .transaction(move |conn| {
+                let authority = cockpit_db::Db::acquire_media_component_lease_conn(
+                    conn,
+                    lease_id,
+                    attachment_id,
+                    attachment_version,
+                    availability_generation,
+                    capability_generation,
+                    kind,
+                    now_unix_ms,
+                )?;
+                let name = authority.component.storage_id.to_string();
+                let mut file = root.open_file_verified(&name).map_err(anyhow::Error::new)?;
+                let before = stable_identity_digest(&file)?;
+                let (length, checksum) = read_full_digest(&mut file)?;
+                ensure!(
+                    before == authority.component.stable_identity_digest
+                        && length == authority.component.byte_length
+                        && checksum == authority.component.sha256
+                        && stable_identity_digest(&file)? == before,
+                    "storage_security_violation"
+                );
+                file.seek(SeekFrom::Start(0))?;
+                Ok((authority, file))
+            })
+            .await?;
+        Ok(HeldMediaComponentLease {
+            db: self.db.clone(),
+            authority,
+            file,
+        })
+    }
+
     /// Reconcile durable upload rows against the held storage root before the
     /// daemon accepts upload traffic. Appends may have reached the file but
     /// not SQLite, so a longer temporary is safely truncated to the durable
@@ -3076,6 +3170,46 @@ mod tests {
         session_id: Uuid,
         project_digest: String,
         borrowed_source: Option<BorrowedSourceHandle>,
+    }
+
+    #[tokio::test]
+    async fn component_lease_returns_only_fully_verified_held_bytes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root_path = temp.path().join("media");
+        let root = DirGuard::open_root(&root_path, true).unwrap();
+        let storage_id = Uuid::now_v7();
+        let mut file = root.create_file_exclusive(&storage_id.to_string()).unwrap();
+        file.write_all(b"safe preview").unwrap();
+        file.sync_all().unwrap();
+        let identity = stable_identity_digest(&file).unwrap();
+        let (length, checksum) = read_full_digest(&mut file).unwrap();
+        let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
+        let session_id = Uuid::now_v7();
+        let attachment_id = Uuid::now_v7();
+        let component_id = Uuid::now_v7();
+        db.transaction(move |conn| {
+            conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/redacted',1,1)",[session_id.to_string()])?;
+            cockpit_db::Db::insert_media_attachment_conn(conn,&MediaAttachmentRecord { attachment_id,session_id,canonical_project_digest:"11".repeat(32),media_kind:MediaKind::Image,source_kind:MediaSourceKind::RetainedHttps,canonical_container:"png".into(),canonical_mime:"image/png".into(),availability:MediaAvailability::Ready,attachment_version:1,availability_generation:5,reference_generation:1,captured_capability_generation:7,source_identity_digest:"22".repeat(32),source_byte_length:length,source_sha256:checksum.clone(),selected_video_stream:None,selected_audio_stream:None,created_at_unix_ms:1,updated_at_unix_ms:1,draft_expires_at_unix_ms:None,first_referenced_at_unix_ms:None})?;
+            cockpit_db::Db::insert_media_attachment_component_conn(conn,&MediaAttachmentComponent { component_id,attachment_id,attachment_version:1,component_kind:"browser_thumbnail".into(),storage_id,lifecycle_state:"ready".into(),component_generation:1,stable_identity_digest:identity,byte_length:length,sha256:checksum,reservation_id:"reservation".into(),created_at_unix_ms:1,updated_at_unix_ms:1 })?;
+            Ok(())
+        }).await.unwrap();
+        let storage = MediaStorageRecovery::open(db.clone(), &root_path).unwrap();
+        let lease = storage
+            .acquire_component_lease(
+                Uuid::now_v7(),
+                attachment_id,
+                1,
+                5,
+                7,
+                MediaComponentLeaseKind::Preview,
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(lease.authority().component.component_id, component_id);
+        assert_eq!(lease.read_verified(3).await.unwrap(), b"safe preview");
+        let live:i64=db.read(move|conn|Ok(conn.query_row("SELECT COUNT(*) FROM media_attachment_component_leases WHERE attachment_id=?1 AND released_at_unix_ms IS NULL",[attachment_id.to_string()],|row|row.get(0))?)).await.unwrap();
+        assert_eq!(live, 0);
     }
 
     async fn fixture() -> Fixture {

@@ -2913,7 +2913,7 @@ async fn remote_scheduler_mutation_is_local_only_before_ledger_or_domain_write()
     .unwrap();
     assert!(matches!(
         recv_writer_body(&mut writer_rx, "local-only scheduler rejection").await,
-        Body::Error { id: Some(id), error } if id == request_id && error.code == ErrorCode::Unauthorized
+        Body::Error { id: Some(id), error } if id == request_id && error.code == ErrorCode::Authorization
     ));
     assert!(
         ctx.db
@@ -3186,7 +3186,7 @@ async fn remote_outbox_replay_is_actor_bound_ordered_and_token_correlated() {
     assert_eq!(first_page.id, request_id);
     assert_eq!(first_page.events.len(), 1);
     let event = first_page.events[0].clone();
-    assert_eq!(event.event_seq.get(), 1);
+    assert_eq!(event.event_seq.value(), 1);
 
     handle_envelope(
         Envelope {
@@ -6072,20 +6072,20 @@ async fn staged_rename_executor_applies_commits_and_replays_without_second_effec
         authenticated_device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333336").unwrap(),
         authenticated_device_generation: 1,
     };
-    assert_eq!(
+    assert!(matches!(
         execute_remote_staged_rename(&request, &authorized, &operation, &ctx)
             .await
             .unwrap(),
         Response::Ack
-    );
+    ));
     assert!(!tmp.path().join("from.txt").exists());
     assert_eq!(std::fs::read(tmp.path().join("to.txt")).unwrap(), b"value");
-    assert_eq!(
+    assert!(matches!(
         execute_remote_staged_rename(&request, &authorized, &operation, &ctx)
             .await
             .unwrap(),
         Response::Ack
-    );
+    ));
     let events: i64 = ctx
         .db
         .read(|conn| {
@@ -6148,12 +6148,12 @@ async fn staged_rename_cleanup_intent_survives_unlink_fsync_failure_and_reopen()
         authenticated_device_id: Uuid::parse_str("33333333-3333-4333-8333-3333333333aa").unwrap(),
         authenticated_device_generation: 1,
     };
-    assert_eq!(
+    assert!(matches!(
         execute_remote_staged_rename(&request, &authorized, &operation, &ctx)
             .await
             .unwrap(),
         Response::Ack
-    );
+    ));
     assert_eq!(
         ctx.db
             .remote_rename_artifact_cleanup_intents()
@@ -6415,11 +6415,13 @@ async fn staged_rename_executor_recovers_every_durability_barrier_cut() {
             );
             continue;
         }
-        assert_eq!(
-            execute_remote_staged_rename(&request, &authorized, &operation, &ctx)
-                .await
-                .unwrap(),
-            Response::Ack,
+        assert!(
+            matches!(
+                execute_remote_staged_rename(&request, &authorized, &operation, &ctx)
+                    .await
+                    .unwrap(),
+                Response::Ack
+            ),
             "recovery failed after {cut}"
         );
         assert!(
@@ -7096,9 +7098,9 @@ fn mutating_dispatch_happy_cases() -> Vec<MutatingDispatchCase> {
     mutating_dispatch_case_list()
         .into_iter()
         .filter(|case| {
-            dispatch_matrix_rows().into_iter().any(|row| {
-                row.kind == case.kind && row.class == DispatchMatrixClass::Mutating
-            })
+            dispatch_matrix_rows()
+                .into_iter()
+                .any(|row| row.kind == case.kind && row.class == DispatchMatrixClass::Mutating)
         })
         .collect()
 }
@@ -9037,9 +9039,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             range: proto::StatsRange::Last7Days,
             by_role: false,
         },
-        "get_startup_disclosures" => Request::GetStartupDisclosures {
-            project_root: root,
-        },
+        "get_startup_disclosures" => Request::GetStartupDisclosures { project_root: root },
         "get_app_flag" => Request::GetAppFlag {
             key: proto::AppFlagKey::DaemonAutostartNotice,
         },
@@ -14094,6 +14094,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         SubagentTranscript,
         SendUserMessage,
         GetRunInvocationStatus,
+        OperationStatus,
         CancelRunInvocation,
         SteerDelegation,
         BeginAttachmentUpload,
@@ -17679,6 +17680,8 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         media_admission_open: base.media_admission_open.clone(),
         registry: base.registry.clone(),
         paths: base.paths.clone(),
+        canonical_cwd: base.canonical_cwd.clone(),
+        fcor_resolver_calls: std::sync::atomic::AtomicUsize::new(0),
         started_at: base.started_at,
         caffeinate: base.caffeinate.clone(),
         global_events,
@@ -17747,6 +17750,8 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         media_admission_open: base.media_admission_open.clone(),
         registry: base.registry.clone(),
         paths: base.paths.clone(),
+        canonical_cwd: base.canonical_cwd.clone(),
+        fcor_resolver_calls: std::sync::atomic::AtomicUsize::new(0),
         started_at: base.started_at,
         caffeinate: base.caffeinate.clone(),
         global_events,

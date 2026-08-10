@@ -134,7 +134,7 @@ mod tests {
 
     #[tokio::test]
     async fn committed_effect_is_drained_once_and_unknown_kind_is_untouched() {
-        let ctx = crate::daemon::server::tests::test_ctx();
+        let ctx = crate::daemon::server::test_context_for_daemon_modules();
         let attachment = "00000000-0000-4000-8000-000000000071";
         let operation = "01890f3e-4c00-7000-8000-000000000072";
         ctx.db

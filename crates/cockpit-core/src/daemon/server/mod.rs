@@ -1779,6 +1779,26 @@ pub struct DaemonContext {
     pub write_scope: Option<std::sync::Arc<crate::write_scope::WriteScopeCoordinator>>,
 }
 
+#[cfg(test)]
+pub(crate) fn test_context_for_daemon_modules() -> Arc<DaemonContext> {
+    let db = Db::open_in_memory().expect("in-memory test db");
+    let locks = Arc::new(crate::locks::LockManager::in_memory(db.clone()));
+    Arc::new(DaemonContext::new(
+        db,
+        locks,
+        DaemonPaths {
+            socket: PathBuf::from("/tmp/cockpit-module-test.sock"),
+            pid_file: PathBuf::from("/tmp/cockpit-module-test.pid"),
+            ephemeral: true,
+        },
+        crate::daemon::terminal::test_host_factory(),
+        crate::daemon::config_source::ConfigSource::fixed(
+            crate::config::providers::ProvidersConfig::default(),
+            crate::config::extended::ExtendedConfig::default(),
+        ),
+    ))
+}
+
 impl DaemonContext {
     fn caffeinate_state_event(&self) -> proto::Event {
         let snap = self.caffeinate.snapshot();
@@ -3809,7 +3829,7 @@ async fn handle_envelope(
             let consumer = format!("t:{}:{}", actor.device_id.simple(), actor.device_generation);
             let mut cursor = after_event_seq
                 .as_ref()
-                .map(|value| value.get())
+                .map(|value| value.value())
                 .unwrap_or(0);
             let mut events = Vec::with_capacity(limit.get() as usize);
             for _ in 0..limit.get() {

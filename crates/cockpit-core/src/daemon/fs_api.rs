@@ -1010,7 +1010,8 @@ mod tests {
             operation,
         )
         .unwrap();
-        assert_eq!(first, reconciled);
+        assert!(matches!(first, Response::Ack));
+        assert!(matches!(reconciled, Response::Ack));
         assert_eq!(
             std::fs::metadata(root.join("nested/value.txt"))
                 .unwrap()
@@ -1033,18 +1034,18 @@ mod tests {
         let root = tmp.path().join("app");
         std::fs::create_dir_all(&root).unwrap();
         let root_text = root.to_string_lossy().into_owned();
-        assert_eq!(
+        assert!(matches!(
             fs_create_dir_reconciled_remote(root_text.clone(), "nested/dir".into())
                 .await
                 .unwrap(),
             Response::Ack
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             fs_create_dir_reconciled_remote(root_text.clone(), "nested/dir".into())
                 .await
                 .unwrap(),
             Response::Ack
-        );
+        ));
         std::fs::write(root.join("not-a-dir"), b"file").unwrap();
         assert!(
             fs_create_dir_reconciled_remote(root_text, "not-a-dir".into())

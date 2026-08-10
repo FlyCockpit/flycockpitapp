@@ -347,7 +347,7 @@ async fn commit_staged_removal_after_receipts(
         .timestamp_millis()
         .try_into()
         .unwrap_or(0);
-    for receipt in &receipts {
+    for receipt in receipts {
         if let Err(error) = ledger
             .complete_downstream_invocation(&receipt.id.to_string(), wall_ms)
             .await
@@ -366,7 +366,7 @@ fn queue_removal_in_progress_error() -> proto::ErrorPayload {
     }
 }
 
-fn remote_queue_mutation_response(
+pub(super) fn remote_queue_mutation_response(
     receipt: RemoteQueueMutationReceiptV1,
 ) -> proto::RemoveQueuedUserMessageResult {
     proto::RemoveQueuedUserMessageResult {
@@ -1800,7 +1800,7 @@ pub(super) async fn run_worker(
                                 }
                                 receipt
                             }
-                            Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes)) => match serde_json::from_slice(&bytes) {
+                            Ok(crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes)) => match serde_json::from_slice::<RemoteQueueMutationReceiptV1>(&bytes) {
                                 Ok(receipt) => {
                                     if let Err(error) = receipt.validate() {
                                         let _ = respond_to.send(Err(proto::ErrorPayload { code: proto::ErrorCode::Internal, message: error.to_string() }));

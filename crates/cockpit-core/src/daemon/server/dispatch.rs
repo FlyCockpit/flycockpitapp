@@ -1,5 +1,6 @@
 use super::attachments::*;
 use super::authz::*;
+use super::run_invocation::{principal_digest, wall_ms_now};
 use super::sessions::*;
 use super::*;
 
@@ -273,7 +274,7 @@ async fn begin_remote_nonrepeatable(
     request: &Request,
     authorized: &AuthorizedRequestContext,
     operation: &super::RemoteOperationContext,
-    _ctx: &DaemonContext,
+    ctx: &DaemonContext,
 ) -> std::result::Result<Option<Response>, ErrorPayload> {
     let params = request
         .canonical_remote_operation_params_v1()
@@ -487,7 +488,7 @@ pub(crate) async fn execute_remote_staged_rename(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-async fn execute_remote_staged_rename_with_hook(
+pub(super) async fn execute_remote_staged_rename_with_hook(
     request: &Request,
     authorized: &AuthorizedRequestContext,
     operation: &super::RemoteOperationContext,
@@ -1349,13 +1350,6 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         Request::RemoveQueuedUserMessage { queue_item_id } => {
             let att = require_attached(state)?;
             let remote_queue_operation = if let Some(operation) = remote_operation {
-                if target_id.is_none() {
-                    return Err(ErrorPayload {
-                        code: ErrorCode::BadRequest,
-                        message: "remote newest queue removal requires an explicit target_id"
-                            .into(),
-                    });
-                }
                 let request = Request::RemoveQueuedUserMessage { queue_item_id };
                 let params = request
                     .canonical_remote_operation_params_v1()

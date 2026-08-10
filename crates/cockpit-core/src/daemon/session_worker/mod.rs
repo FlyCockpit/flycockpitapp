@@ -470,7 +470,7 @@ mod tests;
 use self::helpers::queue_target_to_proto;
 
 pub use handle::{
-    InteractiveClientGuard, ReplaceConfigSnapshotResult, SessionConfigHandle,
+    InteractiveClientGuard, RemoteQueueOperation, ReplaceConfigSnapshotResult, SessionConfigHandle,
     SessionConfigSnapshot, SessionWork, SessionWorkerHandle, TurnOutcome, UserMessageProbeResult,
     spawn,
 };
@@ -482,3 +482,5 @@ pub(crate) use helpers::{
     resolve_root_agent_conn,
 };
 pub(crate) use lifecycle::{initial_active_agent, initial_active_agent_for_llm_mode};
+#[cfg(test)]
+pub(super) use run::remote_queue_mutation_response;

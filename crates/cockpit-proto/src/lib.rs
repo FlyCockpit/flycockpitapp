@@ -1221,9 +1221,10 @@ impl DelegationSteerResult {
 
 mod response;
 pub use response::{
-    ActiveModelState, BtwForkInfo, ClientSubmissionReceiptStatus, RemoteOperationStateV1,
-    RemoteOperationStatusV1, Response, RunInvocationCancelOutcome, RunInvocationCancelResultV1,
-    RunInvocationLifecycleState, RunInvocationStatusV1, RunInvocationTerminalReason,
+    ActiveModelState, BtwForkInfo, ClientSubmissionReceiptStatus, RemoteGoalOutcomeV1,
+    RemoteOperationStateV1, RemoteOperationStatusV1, Response, RunInvocationCancelOutcome,
+    RunInvocationCancelResultV1, RunInvocationLifecycleState, RunInvocationStatusV1,
+    RunInvocationTerminalReason,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

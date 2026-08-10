@@ -5164,6 +5164,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconciliation_spend_and_media_faults_roll_back_reopen_and_reclaim_without_redispatch()
+    {
+        for (name, trigger) in [
+            (
+                "spend",
+                "CREATE TEMP TRIGGER reconciliation_cut BEFORE UPDATE ON image_spend_reservations BEGIN SELECT RAISE(ABORT,'cut'); END",
+            ),
+            (
+                "media",
+                "CREATE TEMP TRIGGER reconciliation_cut BEFORE UPDATE ON media_reservations BEGIN SELECT RAISE(ABORT,'cut'); END",
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join(format!("reconciliation-{name}.db"));
+            let fixture = setup_real_ledger_scheduler_job(
+                cockpit_db::Db::open(&path).unwrap(),
+                &format!("reconciliation-{name}"),
+            )
+            .await;
+            let job_id = fixture.job_id;
+            let slot_id = fixture.slot_id;
+            let media_id = fixture.media_reservation_id.clone();
+            let spend_id = fixture.spend_reservation_id.clone();
+            let reopen_media_id = media_id.clone();
+            let reopen_spend_id = spend_id.clone();
+            let handoff = DeterministicImageGenerationAdapter::new(vec![
+                ImageGenerationHandoffResult::SubmissionUnknown {
+                    evidence: b"fault-unknown".to_vec(),
+                },
+            ]);
+            ImageGenerationDispatcher::new(fixture.db.clone())
+                .run_scheduler_pass(&handoff, deadline_boot(), 100, 2, 2, 8)
+                .await
+                .unwrap();
+            fixture
+                .db
+                .write(move |conn| {
+                    conn.execute_batch(trigger)?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            let recovery = DeterministicImageGenerationAdapter::with_recovery(
+                vec![
+                    ImageGenerationReconcileResult::AuthoritativeNonacceptance {
+                        evidence: b"fault-first".to_vec(),
+                    },
+                    ImageGenerationReconcileResult::AuthoritativeNonacceptance {
+                        evidence: b"fault-reclaimed".to_vec(),
+                    },
+                ],
+                Vec::new(),
+            );
+            assert!(
+                ImageGenerationDispatcher::new(fixture.db.clone())
+                    .run_reconciliation_pass(&recovery, Uuid::now_v7(), 10, 8)
+                    .await
+                    .is_err(),
+                "{name} cut committed"
+            );
+            let after = fixture.db.read(move|conn|conn.query_row("SELECT o.state||':'||o.version||':'||a.state||':'||a.version||':'||s.state||':'||s.version||':'||j.state||':'||j.version||':'||m.state||':'||m.version||':'||b.state||':'||(SELECT COUNT(*) FROM image_generation_reconciliation_evidence e WHERE e.job_id=j.job_id)||':'||(SELECT COUNT(*) FROM image_generation_reconciliation_claim_completions c WHERE c.job_id=j.job_id) FROM image_generation_jobs j JOIN image_generation_slots s USING(job_id) JOIN image_generation_attempts a USING(job_id,slot_id) JOIN external_journal_operations o ON o.operation_id=a.external_operation_id JOIN media_reservations m ON m.reservation_id=?3 JOIN image_spend_reservations b ON b.reservation_id=?4 WHERE j.job_id=?1 AND s.slot_id=?2",rusqlite::params![job_id.to_string(),slot_id.to_string(),media_id,spend_id],|row|row.get::<_,String>(0)).map_err(Into::into)).await.unwrap();
+            assert!(after.contains(":reconciling:"), "{name}: {after}");
+            assert!(after.contains(":external_pending:"), "{name}: {after}");
+            assert!(after.contains(":reserved:0:0"), "{name}: {after}");
+            drop(fixture.db);
+            let reopened = cockpit_db::Db::open(&path).unwrap();
+            let reopened_snapshot = reopened.read(move|conn|conn.query_row("SELECT o.state||':'||o.version||':'||a.state||':'||a.version||':'||s.state||':'||s.version||':'||j.state||':'||j.version||':'||m.state||':'||m.version||':'||b.state||':'||(SELECT COUNT(*) FROM image_generation_reconciliation_evidence e WHERE e.job_id=j.job_id)||':'||(SELECT COUNT(*) FROM image_generation_reconciliation_claim_completions c WHERE c.job_id=j.job_id) FROM image_generation_jobs j JOIN image_generation_slots s USING(job_id) JOIN image_generation_attempts a USING(job_id,slot_id) JOIN external_journal_operations o ON o.operation_id=a.external_operation_id JOIN media_reservations m ON m.reservation_id=?3 JOIN image_spend_reservations b ON b.reservation_id=?4 WHERE j.job_id=?1 AND s.slot_id=?2",rusqlite::params![job_id.to_string(),slot_id.to_string(),reopen_media_id,reopen_spend_id],|row|row.get::<_,String>(0)).map_err(Into::into)).await.unwrap();
+            assert_eq!(reopened_snapshot, after, "{name}");
+            assert_eq!(
+                ImageGenerationDispatcher::new(reopened.clone())
+                    .run_reconciliation_pass(&recovery, Uuid::now_v7(), 60_010, 8)
+                    .await
+                    .unwrap(),
+                1,
+                "{name}"
+            );
+            assert_eq!(handoff.requests().len(), 1, "{name}");
+            assert_eq!(recovery.reconciliation_requests().len(), 2, "{name}");
+        }
+    }
+
+    #[tokio::test]
     async fn handoff_evidence_finish_failure_rolls_back_every_projection() {
         let fixture = setup_real_ledger_scheduler_job(
             cockpit_db::Db::open_in_memory().unwrap(),

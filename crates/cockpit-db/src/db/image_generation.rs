@@ -4667,6 +4667,8 @@ mod tests {
         let reopened = Db::open(&path).unwrap();
         reopened
             .blocking_for_sync_cli(move |conn| {
+                // Only the initially activated attempt is a dispatch candidate;
+                // attempt 2 remains planned+snapshotted until retry activation.
                 let rows = Db::scan_image_generation_dispatch_candidates_conn(
                     conn,
                     DeadlineObservationV1::new(
@@ -4675,22 +4677,33 @@ mod tests {
                     )?,
                     2,
                 )?;
-                assert_eq!(rows.len(), 2);
+                assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0].attempt_number, 1);
                 assert_eq!(rows[0].canonical_media_plan, first);
-                assert_eq!(rows[1].attempt_number, 2);
-                assert_eq!(rows[1].canonical_media_plan, second);
-                let handed_off = rows
+                let snapshots: Vec<(i64, Vec<u8>)> = {
+                    let mut statement = conn.prepare(
+                        "SELECT attempt_number,canonical_media_plan FROM image_generation_attempt_media_snapshots WHERE job_id=?1 ORDER BY attempt_number",
+                    )?;
+                    statement
+                        .query_map([job_id.to_string()], |row| {
+                            Ok((row.get(0)?, row.get(1)?))
+                        })?
+                        .collect::<rusqlite::Result<_>>()?
+                };
+                assert_eq!(
+                    snapshots,
+                    vec![(1, first.clone()), (2, second.clone())]
+                );
+                let maxima = snapshots
                     .iter()
-                    .map(|row| {
-                        serde_json::from_slice::<serde_json::Value>(&row.canonical_media_plan)
-                            .unwrap()["requested"]
+                    .map(|(_, plan)| {
+                        serde_json::from_slice::<serde_json::Value>(plan).unwrap()["requested"]
                             .as_u64()
                             .unwrap()
                     })
                     .collect::<Vec<_>>();
-                assert_eq!(handed_off, vec![1, 7]);
-                assert_eq!(handed_off.into_iter().sum::<u64>(), 8);
+                assert_eq!(maxima, vec![1, 7]);
+                assert_eq!(maxima.into_iter().sum::<u64>(), 8);
                 assert!(conn
                     .execute(
                         "UPDATE image_generation_attempt_media_snapshots SET canonical_media_plan=?1 WHERE job_id=?2 AND attempt_number=2",

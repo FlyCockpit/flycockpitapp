@@ -1242,23 +1242,17 @@ fn normalize_image(bytes: &[u8], container: &str) -> Result<NormalizedImageDeriv
     use image::{
         DynamicImage, GenericImageView as _, ImageDecoder as _, ImageFormat, ImageReader, Limits,
     };
-    let format = match container {
+    let (format, exif_orientation) = match container {
         "png" => {
             reject_png_color_metadata(bytes)?;
-            ImageFormat::Png
+            (ImageFormat::Png, None)
         }
-        "jpeg" => {
-            reject_jpeg_metadata(bytes)?;
-            ImageFormat::Jpeg
-        }
+        "jpeg" => (ImageFormat::Jpeg, reject_jpeg_metadata(bytes)?),
         "gif" => {
             reject_gif_structure(bytes)?;
-            ImageFormat::Gif
+            (ImageFormat::Gif, None)
         }
-        "webp" => {
-            reject_webp_metadata(bytes)?;
-            ImageFormat::WebP
-        }
+        "webp" => (ImageFormat::WebP, reject_webp_metadata(bytes)?),
         _ => anyhow::bail!("ambiguous_or_unsupported_container"),
     };
     let mut reader = ImageReader::with_format(std::io::Cursor::new(bytes), format);
@@ -1267,7 +1261,7 @@ fn normalize_image(bytes: &[u8], container: &str) -> Result<NormalizedImageDeriv
     limits.max_image_height = Some(8_192);
     limits.max_alloc = Some(160_000_000);
     reader.limits(limits);
-    let mut decoder = reader.into_decoder().context("invalid_media")?;
+    let decoder = reader.into_decoder().context("invalid_media")?;
     let (width, height) = decoder.dimensions();
     ensure!(
         width > 0 && height > 0 && width <= 8_192 && height <= 8_192,
@@ -1279,9 +1273,12 @@ fn normalize_image(bytes: &[u8], container: &str) -> Result<NormalizedImageDeriv
             .is_some_and(|p| p <= 40_000_000),
         "resource_limit"
     );
-    let orientation = decoder.orientation().context("invalid_media")?;
     let mut decoded = DynamicImage::from_decoder(decoder).context("decode_failed")?;
-    decoded.apply_orientation(orientation);
+    if let Some(value) = exif_orientation {
+        decoded.apply_orientation(
+            image::metadata::Orientation::from_exif(value).context("invalid_media")?,
+        );
+    }
     let mut rgba = decoded.into_rgba8();
     for pixel in rgba.pixels_mut() {
         if pixel[3] == 0 {
@@ -1316,10 +1313,10 @@ fn normalize_image(bytes: &[u8], container: &str) -> Result<NormalizedImageDeriv
     })
 }
 
-fn reject_jpeg_metadata(bytes: &[u8]) -> Result<()> {
+fn reject_jpeg_metadata(bytes: &[u8]) -> Result<Option<u8>> {
     ensure!(bytes.starts_with(b"\xff\xd8"), "invalid_media");
     let mut offset = 2usize;
-    let mut exif = 0usize;
+    let mut exif = None;
     while offset + 4 <= bytes.len() {
         ensure!(bytes[offset] == 0xff, "invalid_media");
         let marker = bytes[offset + 1];
@@ -1343,8 +1340,12 @@ fn reject_jpeg_metadata(bytes: &[u8]) -> Result<()> {
             anyhow::bail!("unsupported_color_profile");
         }
         if marker == 0xe1 && payload.starts_with(b"Exif\0\0") {
-            exif += 1;
-            ensure!(exif == 1, "unsupported_color_profile");
+            ensure!(exif.is_none(), "invalid_media");
+            let parsed = parse_tiff_exif(&payload[6..])?;
+            if let Some(color) = parsed.1 {
+                ensure!(color == 1, "unsupported_color_profile");
+            }
+            exif = parsed.0;
         }
         if matches!(
             marker,
@@ -1368,7 +1369,7 @@ fn reject_jpeg_metadata(bytes: &[u8]) -> Result<()> {
         }
         offset += length;
     }
-    Ok(())
+    Ok(exif)
 }
 
 fn reject_gif_structure(bytes: &[u8]) -> Result<()> {
@@ -1376,22 +1377,204 @@ fn reject_gif_structure(bytes: &[u8]) -> Result<()> {
         bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
         "invalid_media"
     );
-    ensure!(bytes.len() >= 13, "invalid_media");
-    Ok(())
+    ensure!(bytes.len() >= 14, "invalid_media");
+    let screen_width = u16::from_le_bytes(bytes[6..8].try_into()?) as u64;
+    let screen_height = u16::from_le_bytes(bytes[8..10].try_into()?) as u64;
+    ensure!(
+        screen_width > 0 && screen_height > 0 && screen_width * screen_height <= 40_000_000,
+        "resource_limit"
+    );
+    let packed = bytes[10];
+    let mut offset = 13usize;
+    if packed & 0x80 != 0 {
+        offset = offset
+            .checked_add(3usize << (usize::from(packed & 7) + 1))
+            .context("invalid_media")?;
+    }
+    ensure!(offset <= bytes.len(), "invalid_media");
+    let mut frames = 0u64;
+    let mut aggregate = 0u64;
+    while offset < bytes.len() {
+        match bytes[offset] {
+            0x3b => {
+                ensure!(frames > 0 && offset + 1 == bytes.len(), "invalid_media");
+                return Ok(());
+            }
+            0x21 => {
+                offset += 2;
+                ensure!(offset <= bytes.len(), "invalid_media");
+                skip_gif_sub_blocks(bytes, &mut offset)?;
+            }
+            0x2c => {
+                ensure!(offset + 10 <= bytes.len(), "invalid_media");
+                let left = u16::from_le_bytes(bytes[offset + 1..offset + 3].try_into()?) as u64;
+                let top = u16::from_le_bytes(bytes[offset + 3..offset + 5].try_into()?) as u64;
+                let width = u16::from_le_bytes(bytes[offset + 5..offset + 7].try_into()?) as u64;
+                let height = u16::from_le_bytes(bytes[offset + 7..offset + 9].try_into()?) as u64;
+                ensure!(
+                    width > 0
+                        && height > 0
+                        && left + width <= screen_width
+                        && top + height <= screen_height,
+                    "invalid_media"
+                );
+                frames = frames.checked_add(1).context("resource_limit")?;
+                aggregate = aggregate
+                    .checked_add(width.checked_mul(height).context("resource_limit")?)
+                    .context("resource_limit")?;
+                ensure!(
+                    frames <= 65_536 && aggregate <= 80_000_000,
+                    "resource_limit"
+                );
+                let local = bytes[offset + 9];
+                offset += 10;
+                if local & 0x80 != 0 {
+                    offset = offset
+                        .checked_add(3usize << (usize::from(local & 7) + 1))
+                        .context("invalid_media")?;
+                }
+                ensure!(
+                    offset < bytes.len() && bytes[offset] >= 2 && bytes[offset] <= 8,
+                    "invalid_media"
+                );
+                offset += 1;
+                skip_gif_sub_blocks(bytes, &mut offset)?;
+            }
+            _ => anyhow::bail!("invalid_media"),
+        }
+    }
+    anyhow::bail!("invalid_media")
 }
 
-fn reject_webp_metadata(bytes: &[u8]) -> Result<()> {
+fn skip_gif_sub_blocks(bytes: &[u8], offset: &mut usize) -> Result<()> {
+    loop {
+        ensure!(*offset < bytes.len(), "invalid_media");
+        let length = usize::from(bytes[*offset]);
+        *offset += 1;
+        if length == 0 {
+            return Ok(());
+        }
+        *offset = offset.checked_add(length).context("invalid_media")?;
+        ensure!(*offset <= bytes.len(), "invalid_media");
+    }
+}
+
+fn reject_webp_metadata(bytes: &[u8]) -> Result<Option<u8>> {
     ensure!(
         bytes.len() >= 16 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
         "invalid_media"
     );
-    if &bytes[12..16] == b"VP8X" {
-        ensure!(bytes.len() >= 21, "invalid_media");
-        let flags = bytes[20];
-        ensure!(flags & 0x28 == 0, "unsupported_color_profile");
-        ensure!(flags & 0x02 == 0, "invalid_media");
+    let declared = u32::from_le_bytes(bytes[4..8].try_into()?) as usize;
+    ensure!(
+        declared.checked_add(8) == Some(bytes.len()),
+        "invalid_media"
+    );
+    let mut offset = 12usize;
+    let mut orientation = None;
+    let mut exif_seen = false;
+    while offset + 8 <= bytes.len() {
+        let kind = &bytes[offset..offset + 4];
+        let length = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into()?) as usize;
+        let start = offset + 8;
+        let end = start.checked_add(length).context("invalid_media")?;
+        ensure!(end <= bytes.len(), "invalid_media");
+        if kind == b"ICCP" {
+            anyhow::bail!("unsupported_color_profile");
+        }
+        if kind == b"ANIM" || kind == b"ANMF" {
+            anyhow::bail!("invalid_media");
+        }
+        if kind == b"EXIF" {
+            ensure!(!exif_seen, "invalid_media");
+            exif_seen = true;
+            let payload = &bytes[start..end];
+            let tiff = payload.strip_prefix(b"Exif\0\0").unwrap_or(payload);
+            let parsed = parse_tiff_exif(tiff)?;
+            ensure!(parsed.1 == Some(1), "unsupported_color_profile");
+            orientation = parsed.0;
+        }
+        offset = end + (length & 1);
     }
-    Ok(())
+    ensure!(offset == bytes.len(), "invalid_media");
+    Ok(orientation)
+}
+
+fn parse_tiff_exif(bytes: &[u8]) -> Result<(Option<u8>, Option<u16>)> {
+    ensure!(bytes.len() >= 8, "invalid_media");
+    let little = match &bytes[..2] {
+        b"II" => true,
+        b"MM" => false,
+        _ => anyhow::bail!("invalid_media"),
+    };
+    let u16_at = |o: usize| -> Result<u16> {
+        let b: [u8; 2] = bytes.get(o..o + 2).context("invalid_media")?.try_into()?;
+        Ok(if little {
+            u16::from_le_bytes(b)
+        } else {
+            u16::from_be_bytes(b)
+        })
+    };
+    let u32_at = |o: usize| -> Result<u32> {
+        let b: [u8; 4] = bytes.get(o..o + 4).context("invalid_media")?.try_into()?;
+        Ok(if little {
+            u32::from_le_bytes(b)
+        } else {
+            u32::from_be_bytes(b)
+        })
+    };
+    ensure!(u16_at(2)? == 42, "invalid_media");
+    let ifd = usize::try_from(u32_at(4)?)?;
+    let count = usize::from(u16_at(ifd)?);
+    ensure!(count <= 256, "resource_limit");
+    let mut orientation = None;
+    let mut color = None;
+    let mut exif_ifd = None;
+    for index in 0..count {
+        let entry = ifd + 2 + index * 12;
+        let tag = u16_at(entry)?;
+        if tag == 0x8769 {
+            ensure!(
+                u16_at(entry + 2)? == 4 && u32_at(entry + 4)? == 1,
+                "invalid_media"
+            );
+            ensure!(
+                exif_ifd
+                    .replace(usize::try_from(u32_at(entry + 8)?)?)
+                    .is_none(),
+                "invalid_media"
+            );
+        }
+        if tag == 0x0112 || tag == 0xa001 {
+            ensure!(
+                u16_at(entry + 2)? == 3 && u32_at(entry + 4)? == 1,
+                "invalid_media"
+            );
+            let value = u16_at(entry + 8)?;
+            if tag == 0x0112 {
+                ensure!(
+                    orientation.replace(u8::try_from(value)?).is_none() && (1..=8).contains(&value),
+                    "invalid_media"
+                );
+            } else {
+                ensure!(color.replace(value).is_none(), "invalid_media");
+            }
+        }
+    }
+    if let Some(exif_ifd) = exif_ifd {
+        let count = usize::from(u16_at(exif_ifd)?);
+        ensure!(count <= 256, "resource_limit");
+        for index in 0..count {
+            let entry = exif_ifd + 2 + index * 12;
+            if u16_at(entry)? == 0xa001 {
+                ensure!(
+                    u16_at(entry + 2)? == 3 && u32_at(entry + 4)? == 1,
+                    "invalid_media"
+                );
+                ensure!(color.replace(u16_at(entry + 8)?).is_none(), "invalid_media");
+            }
+        }
+    }
+    Ok((orientation, color))
 }
 
 fn encode_canonical_png(image: &image::RgbaImage) -> Result<Vec<u8>> {
@@ -1950,6 +2133,64 @@ mod tests {
                 vec![*b"IHDR", *b"sRGB", *b"IDAT", *b"IEND"]
             );
         }
+    }
+
+    #[test]
+    fn exif_orientation_and_color_vectors_are_strict() {
+        fn tiff(entries: &[(u16, u16)]) -> Vec<u8> {
+            let mut out = b"II\x2a\0\x08\0\0\0".to_vec();
+            out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+            for (tag, value) in entries {
+                out.extend_from_slice(&tag.to_le_bytes());
+                out.extend_from_slice(&3u16.to_le_bytes());
+                out.extend_from_slice(&1u32.to_le_bytes());
+                out.extend_from_slice(&value.to_le_bytes());
+                out.extend_from_slice(&[0, 0]);
+            }
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out
+        }
+        for orientation in 1..=8 {
+            assert_eq!(
+                parse_tiff_exif(&tiff(&[(0x0112, orientation), (0xa001, 1)])).unwrap(),
+                (Some(orientation as u8), Some(1))
+            );
+        }
+        assert!(parse_tiff_exif(&tiff(&[(0x0112, 0)])).is_err());
+        assert!(parse_tiff_exif(&tiff(&[(0x0112, 1), (0x0112, 1)])).is_err());
+        assert!(parse_tiff_exif(&tiff(&[(0xa001, 2)])).is_ok());
+        let exif = tiff(&[(0x0112, 6), (0xa001, 1)]);
+        let mut webp = b"RIFF".to_vec();
+        let size = 4 + 8 + exif.len() + (exif.len() & 1);
+        webp.extend_from_slice(&(size as u32).to_le_bytes());
+        webp.extend_from_slice(b"WEBPEXIF");
+        webp.extend_from_slice(&(exif.len() as u32).to_le_bytes());
+        webp.extend_from_slice(&exif);
+        if exif.len() & 1 == 1 {
+            webp.push(0);
+        }
+        assert_eq!(reject_webp_metadata(&webp).unwrap(), Some(6));
+        let bad = tiff(&[(0xa001, 2)]);
+        let mut bad_webp = b"RIFF".to_vec();
+        let size = 4 + 8 + bad.len() + (bad.len() & 1);
+        bad_webp.extend_from_slice(&(size as u32).to_le_bytes());
+        bad_webp.extend_from_slice(b"WEBPEXIF");
+        bad_webp.extend_from_slice(&(bad.len() as u32).to_le_bytes());
+        bad_webp.extend_from_slice(&bad);
+        if bad.len() & 1 == 1 {
+            bad_webp.push(0);
+        }
+        assert!(reject_webp_metadata(&bad_webp).is_err());
+    }
+
+    #[test]
+    fn gif_walker_rejects_missing_trailer_and_out_of_canvas_frame() {
+        let mut missing = b"GIF89a\x01\0\x01\0\0\0\0".to_vec();
+        missing.extend_from_slice(&[0x2c, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 1, 0, 0]);
+        assert!(reject_gif_structure(&missing).is_err());
+        let mut outside = b"GIF89a\x01\0\x01\0\0\0\0".to_vec();
+        outside.extend_from_slice(&[0x2c, 1, 0, 0, 0, 1, 0, 1, 0, 0, 2, 1, 0, 0, 0x3b]);
+        assert!(reject_gif_structure(&outside).is_err());
     }
 
     fn png_chunk_names(bytes: &[u8]) -> Vec<[u8; 4]> {

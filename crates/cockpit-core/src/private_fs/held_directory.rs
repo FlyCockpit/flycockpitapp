@@ -876,11 +876,9 @@ mod imp {
                 libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             )
         };
-        ensure!(
-            fd >= 0,
-            "reopening held artifact failed: {}",
-            std::io::Error::last_os_error()
-        );
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error()).context("reopening held artifact");
+        }
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 

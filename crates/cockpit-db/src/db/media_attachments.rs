@@ -1011,6 +1011,18 @@ pub struct MediaCleanupIntent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaDiscardDecision {
+    pub attachment_id: Uuid,
+    pub attachment_version_before: u64,
+    pub availability_generation_before: u64,
+    pub availability_generation_after: u64,
+    pub reference_generation_before: u64,
+    pub reference_generation_after: u64,
+    pub outcome: MediaDiscardOutcomeV1,
+    pub reason: MediaDiscardReasonV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaAttachmentComponent {
     pub component_id: Uuid,
     pub attachment_id: Uuid,
@@ -1895,6 +1907,121 @@ impl super::Db {
             params![intent.intent_id.to_string(), intent.attachment_id.to_string(), decimal(intent.attachment_version)?, decimal(intent.expected_availability_generation)?, decimal(intent.expected_reference_generation)?, intent.component_set_digest, intent.reason, intent.created_at_unix_ms],
         ).context("inserting media cleanup intent")?;
         Ok(())
+    }
+
+    pub fn discard_unreferenced_media_attachment_conn(
+        conn: &Connection,
+        request: &DiscardUnreferencedMediaAttachmentV1,
+        now_unix_ms: i64,
+    ) -> Result<MediaDiscardDecision> {
+        ensure!(
+            request.schema_version == 1
+                && request.kind == "discardUnreferencedMediaAttachment"
+                && request.attachment_version > 0
+                && request.availability_generation > 0
+                && request.reference_generation > 0,
+            "invalid discard request"
+        );
+        let record = media_attachment_by_id(conn, request.attachment_id)?
+            .context("media_attachment_unavailable")?;
+        let expected_origin=conn.query_row("SELECT client_draft_id,upload_id,upload_generation FROM media_attachment_upload_origins WHERE attachment_id=?1",[request.attachment_id.to_string()],|row|Ok(MediaOriginUploadV1{client_draft_id:Uuid::parse_str(&row.get::<_,String>(0)?).map_err(|_|rusqlite::Error::InvalidQuery)?,upload_id:Uuid::parse_str(&row.get::<_,String>(1)?).map_err(|_|rusqlite::Error::InvalidQuery)?,upload_generation:row.get::<_,String>(2)?.parse().map_err(|_|rusqlite::Error::InvalidQuery)?})).optional()?;
+        ensure!(
+            request.origin_upload == expected_origin,
+            "discard origin conflict"
+        );
+        let reason = if request.attachment_version != record.attachment_version {
+            Some(MediaDiscardReasonV1::StaleAttachmentVersion)
+        } else if request.availability_generation != record.availability_generation {
+            Some(MediaDiscardReasonV1::StaleAvailabilityGeneration)
+        } else if request.reference_generation != record.reference_generation {
+            Some(MediaDiscardReasonV1::StaleReferenceGeneration)
+        } else if record.availability == MediaAvailability::SecurityBlocked {
+            Some(MediaDiscardReasonV1::SecurityRecoveryRequired)
+        } else if !matches!(
+            record.availability,
+            MediaAvailability::Registered
+                | MediaAvailability::Quarantined
+                | MediaAvailability::Probing
+                | MediaAvailability::Decoding
+                | MediaAvailability::Normalizing
+                | MediaAvailability::Ready
+                | MediaAvailability::ModelDerivativeUnavailable
+                | MediaAvailability::SourceChanged
+                | MediaAvailability::Failed
+        ) {
+            Some(MediaDiscardReasonV1::AvailabilityStateIneligible)
+        } else {
+            let live:i64=conn.query_row("SELECT (SELECT COUNT(*) FROM media_attachment_references WHERE attachment_id=?1 AND released_at_unix_ms IS NULL)+(SELECT COUNT(*) FROM media_attachment_component_leases WHERE attachment_id=?1 AND released_at_unix_ms IS NULL)",[request.attachment_id.to_string()],|row|row.get(0))?;
+            if live > 0 {
+                Some(MediaDiscardReasonV1::MediaAttachmentInUse)
+            } else if record.availability_generation == u64::MAX {
+                Some(MediaDiscardReasonV1::AvailabilityGenerationOverflow)
+            } else {
+                None
+            }
+        };
+        if let Some(reason) = reason {
+            return Ok(MediaDiscardDecision {
+                attachment_id: record.attachment_id,
+                attachment_version_before: record.attachment_version,
+                availability_generation_before: record.availability_generation,
+                availability_generation_after: record.availability_generation,
+                reference_generation_before: record.reference_generation,
+                reference_generation_after: record.reference_generation,
+                outcome: MediaDiscardOutcomeV1::Rejected,
+                reason,
+            });
+        }
+        let next = record
+            .availability_generation
+            .checked_add(1)
+            .context("availability generation overflow")?;
+        let pending = if record.source_kind.is_borrowed() {
+            MediaAvailability::BorrowedCleanupPending
+        } else {
+            MediaAvailability::OwnedCleanupPending
+        };
+        ensure!(conn.execute("UPDATE media_attachments SET availability=?1,availability_generation=?2,updated_at_unix_ms=?3 WHERE attachment_id=?4 AND availability_generation=?5 AND reference_generation=?6",params![pending.as_str(),decimal(next)?,now_unix_ms,record.attachment_id.to_string(),decimal(record.availability_generation)?,decimal(record.reference_generation)?])?==1,"discard lost compare-and-swap");
+        let components = {
+            let mut statement=conn.prepare("SELECT component_id,component_kind,component_generation FROM media_attachment_components WHERE attachment_id=?1 AND lifecycle_state<>'deleted' ORDER BY component_id")?;
+            statement
+                .query_map([record.attachment_id.to_string()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(b"media-cleanup-component-set-v1\0");
+        for (component_id, kind, generation) in &components {
+            hasher.update(component_id.as_bytes());
+            hasher.update([0]);
+            hasher.update(kind.as_bytes());
+            hasher.update([0]);
+            hasher.update(generation.as_bytes());
+            hasher.update([0]);
+            let next_component = generation
+                .parse::<u64>()?
+                .checked_add(1)
+                .context("component generation overflow")?;
+            ensure!(conn.execute("UPDATE media_attachment_components SET lifecycle_state='cleanup_pending',component_generation=?1,updated_at_unix_ms=?2 WHERE component_id=?3 AND component_generation=?4",params![decimal(next_component)?,now_unix_ms,component_id,generation])?==1,"discard component lost compare-and-swap");
+        }
+        let digest = hex_lower(&hasher.finalize());
+        conn.execute("INSERT INTO media_attachment_cleanup_intents(intent_id,attachment_id,attachment_version,expected_availability_generation,expected_reference_generation,component_set_digest,reason,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,'discard',?7)",params![Uuid::now_v7().to_string(),record.attachment_id.to_string(),decimal(record.attachment_version)?,decimal(next)?,decimal(record.reference_generation)?,digest,now_unix_ms])?;
+        conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![record.attachment_id.to_string(),decimal(next)?,record.availability.as_str(),pending.as_str(),Uuid::now_v7().to_string(),now_unix_ms])?;
+        Ok(MediaDiscardDecision {
+            attachment_id: record.attachment_id,
+            attachment_version_before: record.attachment_version,
+            availability_generation_before: record.availability_generation,
+            availability_generation_after: next,
+            reference_generation_before: record.reference_generation,
+            reference_generation_after: record.reference_generation,
+            outcome: MediaDiscardOutcomeV1::Applied,
+            reason: MediaDiscardReasonV1::DiscardStarted,
+        })
     }
 
     pub fn media_cleanup_intent_for_attachment_conn(

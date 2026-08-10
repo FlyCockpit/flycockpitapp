@@ -3622,9 +3622,15 @@ mod tests {
     async fn setup_accepted_response_fixture(
         suffix: &str,
     ) -> (RealLedgerSchedulerFixture, ImageGenerationHandoffRequest) {
-        let fixture =
-            setup_real_ledger_scheduler_job(cockpit_db::Db::open_in_memory().unwrap(), suffix)
-                .await;
+        setup_accepted_response_fixture_with_db(cockpit_db::Db::open_in_memory().unwrap(), suffix)
+            .await
+    }
+
+    async fn setup_accepted_response_fixture_with_db(
+        db: cockpit_db::Db,
+        suffix: &str,
+    ) -> (RealLedgerSchedulerFixture, ImageGenerationHandoffRequest) {
+        let fixture = setup_real_ledger_scheduler_job(db, suffix).await;
         let adapter = DeterministicImageGenerationAdapter::new(vec![
             ImageGenerationHandoffResult::Accepted {
                 evidence: b"accepted-response-fixture".to_vec(),
@@ -4631,7 +4637,13 @@ mod tests {
     #[tokio::test]
     async fn accepted_publication_finalize_crash_reopens_exact_applied_without_duplicate() {
         use std::os::unix::fs::PermissionsExt;
-        let (fixture, request) = setup_accepted_response_fixture("response-finalize-cut").await;
+        let database = tempfile::tempdir().unwrap();
+        let database_path = database.path().join("image.db");
+        let (fixture, request) = setup_accepted_response_fixture_with_db(
+            cockpit_db::Db::open(&database_path).unwrap(),
+            "response-finalize-cut",
+        )
+        .await;
         let mut cursor = std::io::Cursor::new(Vec::new());
         image::DynamicImage::new_rgba8(512, 512)
             .write_to(&mut cursor, image::ImageFormat::Png)
@@ -4688,13 +4700,69 @@ mod tests {
             })
             .await
             .unwrap();
+        let job_id = fixture.job_id;
+        drop(fixture);
+        let reopened = cockpit_db::Db::open(&database_path).unwrap();
         assert_eq!(
-            reconcile_pending_accepted_response_publications(fixture.db.clone(), root, 12)
+            reconcile_pending_accepted_response_publications(reopened.clone(), root, 12)
                 .await
                 .unwrap(),
             1
         );
-        fixture.db.read(move|conn|{let row:(String,i64)=conn.query_row("SELECT state,(SELECT count(*) FROM image_generation_artifact_components WHERE artifact_id=i.artifact_id) FROM image_generation_response_publication_intents i WHERE job_id=?1",[fixture.job_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?)))?;assert_eq!(row,("applied".into(),1));Ok(())}).await.unwrap();
+        reopened.read(move|conn|{let row:(String,i64)=conn.query_row("SELECT state,(SELECT count(*) FROM image_generation_artifact_components WHERE artifact_id=i.artifact_id) FROM image_generation_response_publication_intents i WHERE job_id=?1",[job_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?)))?;assert_eq!(row,("applied".into(),1));Ok(())}).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn accepted_publication_pre_intent_cut_has_no_state_or_filesystem_effect() {
+        use std::os::unix::fs::PermissionsExt;
+        let (fixture, request) = setup_accepted_response_fixture("response-pre-intent-cut").await;
+        let bytes = b"not-yet-touched".to_vec();
+        let fetcher = ScriptedAcceptedResponseFetcher::new(
+            vec![AcceptedImageResponseFetchOutcome::Fetched {
+                bytes: bytes.clone(),
+                evidence: b"pre-intent-proof".to_vec(),
+            }],
+            vec![],
+        );
+        fetch_accepted_image_response(
+            fixture.db.clone(),
+            &fetcher,
+            fixture.job_id,
+            fixture.slot_id,
+            1,
+            10,
+        )
+        .await
+        .unwrap();
+        fixture.db.write(|conn|{conn.execute_batch("CREATE TEMP TRIGGER cut_before_intent BEFORE INSERT ON image_generation_response_publication_intents BEGIN SELECT RAISE(ABORT,'cut'); END")?;Ok(())}).await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let managed = temp.path().join("managed");
+        std::fs::create_dir(&managed).unwrap();
+        std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let root = std::sync::Arc::new(open_image_generation_artifact_root(&managed).unwrap());
+        assert!(coordinate_persisted_accepted_image_response(
+            fixture.db.clone(),
+            root,
+            CoordinateAcceptedImageResponse {
+                job_id: fixture.job_id,
+                slot_id: fixture.slot_id,
+                attempt_number: 1,
+                expected_job_version: 5,
+                expected_slot_version: 4,
+                expected_attempt_version: 5,
+                external_operation_id: request.external_operation_id,
+                expected_journal_version: 3,
+                component_id: Uuid::now_v7(),
+                release_operation_id: Uuid::now_v7(),
+                bytes,
+                now_unix_ms: 11
+            }
+        )
+        .await
+        .is_err());
+        assert_eq!(std::fs::read_dir(&managed).unwrap().count(), 0);
+        fixture.db.read(move|conn|{let row:(i64,i64)=conn.query_row("SELECT (SELECT count(*) FROM image_generation_response_publication_intents),(SELECT count(*) FROM image_generation_artifacts WHERE job_id=?1)",[fixture.job_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?)))?;assert_eq!(row,(0,0));Ok(())}).await.unwrap();
     }
 
     #[tokio::test]

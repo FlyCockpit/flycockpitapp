@@ -211,6 +211,63 @@ impl DeterministicImageGenerationAdapter {
 }
 
 #[cfg(test)]
+struct ScriptedAcceptedResponseFetcher {
+    fetches: std::sync::Mutex<std::collections::VecDeque<AcceptedImageResponseFetchOutcome>>,
+    reconciliations:
+        std::sync::Mutex<std::collections::VecDeque<AcceptedImageResponseFetchOutcome>>,
+    fetch_count: std::sync::atomic::AtomicUsize,
+    reconcile_count: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl accepted_response_fetch_sealed::Sealed for ScriptedAcceptedResponseFetcher {}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl AcceptedImageResponseFetcher for ScriptedAcceptedResponseFetcher {
+    async fn fetch(
+        &self,
+        _: &AcceptedImageResponseFetchRequest,
+    ) -> AcceptedImageResponseFetchOutcome {
+        self.fetch_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.fetches
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("missing scripted fetch")
+    }
+    async fn reconcile(
+        &self,
+        _: &AcceptedImageResponseFetchRequest,
+        _: &[u8],
+    ) -> AcceptedImageResponseFetchOutcome {
+        self.reconcile_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.reconciliations
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("missing scripted reconciliation")
+    }
+}
+
+#[cfg(test)]
+impl ScriptedAcceptedResponseFetcher {
+    fn new(
+        fetches: Vec<AcceptedImageResponseFetchOutcome>,
+        reconciliations: Vec<AcceptedImageResponseFetchOutcome>,
+    ) -> Self {
+        Self {
+            fetches: std::sync::Mutex::new(fetches.into()),
+            reconciliations: std::sync::Mutex::new(reconciliations.into()),
+            fetch_count: std::sync::atomic::AtomicUsize::new(0),
+            reconcile_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+#[cfg(test)]
 impl image_generation_adapter_sealed::Sealed for DeterministicImageGenerationAdapter {}
 
 #[cfg(test)]
@@ -1368,7 +1425,7 @@ impl ImageGenerationOwnerContextAuthority {
         )?;
         let digest = crate::intel::hex_lower(&Sha256::digest(evidence));
         ensure!(
-            tx.execute(
+            conn.execute(
                 "UPDATE image_generation_artifact_security_recovery_attempts SET state=?1,outcome_digest=?2,decided_at_unix_ms=?3 WHERE recovery_operation_id=?4 AND principal_digest=?5 AND state='received'",
                 params![state, digest, now, operation_id.to_string(), self.principal_digest],
             )? == 1,
@@ -2449,7 +2506,7 @@ pub async fn fetch_accepted_image_response<F: AcceptedImageResponseFetcher>(
         })
         .await?;
     if let Some((outcome, safe_reason, evidence, bytes)) = existing {
-        let replay = match outcome.as_str() {
+        let replay: Result<AcceptedImageResponseFetchOutcome> = match outcome.as_str() {
             "fetched" => Ok(AcceptedImageResponseFetchOutcome::Fetched {
                 bytes: bytes.context("fetched response bytes are absent")?,
                 evidence,
@@ -3562,6 +3619,25 @@ mod tests {
         setup_real_ledger_scheduler_job_with_attempts(db, suffix, 1).await
     }
 
+    async fn setup_accepted_response_fixture(
+        suffix: &str,
+    ) -> (RealLedgerSchedulerFixture, ImageGenerationHandoffRequest) {
+        let fixture =
+            setup_real_ledger_scheduler_job(cockpit_db::Db::open_in_memory().unwrap(), suffix)
+                .await;
+        let adapter = DeterministicImageGenerationAdapter::new(vec![
+            ImageGenerationHandoffResult::Accepted {
+                evidence: b"accepted-response-fixture".to_vec(),
+            },
+        ]);
+        let pass = ImageGenerationDispatcher::new(fixture.db.clone())
+            .run_scheduler_pass(&adapter, deadline_boot(), 100, 2, 2, 8)
+            .await
+            .unwrap();
+        assert_eq!(pass.dispatched, 1);
+        (fixture, adapter.requests().into_iter().next().unwrap())
+    }
+
     async fn setup_real_ledger_scheduler_job_with_attempts(
         db: cockpit_db::Db,
         suffix: &str,
@@ -4154,6 +4230,217 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepted_response_fetch_replays_without_refetch() {
+        let (fixture, _) = setup_accepted_response_fixture("response-fetch-replay").await;
+        let fetcher = ScriptedAcceptedResponseFetcher::new(
+            vec![AcceptedImageResponseFetchOutcome::Fetched {
+                bytes: b"canonical-response".to_vec(),
+                evidence: b"fetch-proof".to_vec(),
+            }],
+            vec![],
+        );
+        let first = fetch_accepted_image_response(
+            fixture.db.clone(),
+            &fetcher,
+            fixture.job_id,
+            fixture.slot_id,
+            1,
+            10,
+        )
+        .await
+        .unwrap();
+        let replay = fetch_accepted_image_response(
+            fixture.db.clone(),
+            &fetcher,
+            fixture.job_id,
+            fixture.slot_id,
+            1,
+            11,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first, replay);
+        assert_eq!(
+            fetcher
+                .fetch_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        fixture
+            .db
+            .read(move |conn| {
+                let rows: i64 = conn.query_row(
+                    "SELECT count(*) FROM image_generation_response_fetch_outcomes WHERE job_id=?1",
+                    [fixture.job_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(rows, 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepted_response_unknown_reconciles_once_and_replays() {
+        let (fixture, _) = setup_accepted_response_fixture("response-unknown").await;
+        let fetcher = ScriptedAcceptedResponseFetcher::new(
+            vec![AcceptedImageResponseFetchOutcome::OutcomeUnknown {
+                evidence: b"unknown-proof".to_vec(),
+            }],
+            vec![AcceptedImageResponseFetchOutcome::Fetched {
+                bytes: b"reconciled-response".to_vec(),
+                evidence: b"reconcile-proof".to_vec(),
+            }],
+        );
+        assert!(matches!(
+            fetch_accepted_image_response(
+                fixture.db.clone(),
+                &fetcher,
+                fixture.job_id,
+                fixture.slot_id,
+                1,
+                10
+            )
+            .await
+            .unwrap(),
+            AcceptedImageResponseFetchOutcome::OutcomeUnknown { .. }
+        ));
+        let boot = Uuid::now_v7();
+        let resolved = reconcile_unknown_accepted_image_response(
+            fixture.db.clone(),
+            &fetcher,
+            fixture.job_id,
+            fixture.slot_id,
+            1,
+            boot,
+            11,
+        )
+        .await
+        .unwrap();
+        let replay = reconcile_unknown_accepted_image_response(
+            fixture.db.clone(),
+            &fetcher,
+            fixture.job_id,
+            fixture.slot_id,
+            1,
+            boot,
+            12,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved, replay);
+        assert_eq!(
+            fetcher
+                .fetch_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            fetcher
+                .reconcile_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_response_definitive_failure_terminalizes_and_replays() {
+        let (fixture, _) = setup_accepted_response_fixture("response-failed").await;
+        let fetcher = ScriptedAcceptedResponseFetcher::new(
+            vec![AcceptedImageResponseFetchOutcome::DefinitiveFailure {
+                safe_reason: "provider_response_invalid".into(),
+                evidence: b"failure-proof".to_vec(),
+            }],
+            vec![],
+        );
+        let first = fetch_accepted_image_response(
+            fixture.db.clone(),
+            &fetcher,
+            fixture.job_id,
+            fixture.slot_id,
+            1,
+            10,
+        )
+        .await
+        .unwrap();
+        let replay = fetch_accepted_image_response(
+            fixture.db.clone(),
+            &fetcher,
+            fixture.job_id,
+            fixture.slot_id,
+            1,
+            11,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first, replay);
+        fixture.db.read(move|conn|{let state:(String,String,String)=conn.query_row("SELECT a.state,s.state,j.state FROM image_generation_attempts a JOIN image_generation_slots s USING(job_id,slot_id) JOIN image_generation_jobs j USING(job_id) WHERE a.job_id=?1",[fixture.job_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;assert_eq!(state,("failed_after_acceptance".into(),"failed".into(),"failed".into()));Ok(())}).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn accepted_raster_uses_durable_intent_and_replays_startup() {
+        use std::os::unix::fs::PermissionsExt;
+        let (fixture, request) = setup_accepted_response_fixture("response-raster").await;
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(512, 512)
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .unwrap();
+        let bytes = cursor.into_inner();
+        let fetcher = ScriptedAcceptedResponseFetcher::new(
+            vec![AcceptedImageResponseFetchOutcome::Fetched {
+                bytes: bytes.clone(),
+                evidence: b"raster-fetch-proof".to_vec(),
+            }],
+            vec![],
+        );
+        fetch_accepted_image_response(
+            fixture.db.clone(),
+            &fetcher,
+            fixture.job_id,
+            fixture.slot_id,
+            1,
+            10,
+        )
+        .await
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let managed = temp.path().join("managed");
+        std::fs::create_dir(&managed).unwrap();
+        std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let root = std::sync::Arc::new(open_image_generation_artifact_root(&managed).unwrap());
+        let progress = coordinate_persisted_accepted_image_response(
+            fixture.db.clone(),
+            root.clone(),
+            CoordinateAcceptedImageResponse {
+                job_id: fixture.job_id,
+                slot_id: fixture.slot_id,
+                attempt_number: 1,
+                expected_job_version: 5,
+                expected_slot_version: 4,
+                expected_attempt_version: 5,
+                external_operation_id: request.external_operation_id,
+                expected_journal_version: 3,
+                component_id: Uuid::now_v7(),
+                release_operation_id: Uuid::now_v7(),
+                bytes,
+                now_unix_ms: 11,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(progress, AcceptedImageResponseProgress::Retained);
+        assert_eq!(
+            reconcile_pending_accepted_response_publications(fixture.db.clone(), root, 12)
+                .await
+                .unwrap(),
+            0
+        );
+        fixture.db.read(move|conn|{let row:(String,i64)=conn.query_row("SELECT state,(SELECT count(*) FROM image_generation_artifact_components WHERE artifact_id=i.artifact_id) FROM image_generation_response_publication_intents i WHERE job_id=?1",[fixture.job_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?)))?;assert_eq!(row,("applied".into(),1));Ok(())}).await.unwrap();
     }
 
     #[tokio::test]

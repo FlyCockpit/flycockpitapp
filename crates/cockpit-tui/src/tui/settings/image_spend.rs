@@ -39,6 +39,8 @@ pub(super) fn page(project_key: String) -> PageBox {
         cursor: 0,
         editing_time_zone: false,
         time_zone_before_edit: None,
+        editing_micros: None,
+        micros_buffer: String::new(),
         draft: ImageSpendSettings::default(),
         saved: ImageSpendSettings::default(),
         version: None,
@@ -53,6 +55,8 @@ pub(super) struct ImageSpendPage {
     cursor: usize,
     editing_time_zone: bool,
     time_zone_before_edit: Option<String>,
+    editing_micros: Option<usize>,
+    micros_buffer: String,
     draft: ImageSpendSettings,
     saved: ImageSpendSettings,
     version: Option<u64>,
@@ -62,6 +66,39 @@ pub(super) struct ImageSpendPage {
 }
 
 impl ImageSpendPage {
+    fn edit_micros(&mut self, code: KeyCode) {
+        let Some(scope) = self.editing_micros else {
+            return;
+        };
+        match code {
+            KeyCode::Esc => {
+                self.editing_micros = None;
+                self.micros_buffer.clear();
+            }
+            KeyCode::Backspace => {
+                self.micros_buffer.pop();
+            }
+            KeyCode::Char(character) if character.is_ascii_digit() => {
+                self.micros_buffer.push(character);
+            }
+            KeyCode::Enter => match self.micros_buffer.parse::<u64>() {
+                Ok(value) if value > 0 => {
+                    let policy = match scope {
+                        0 => &mut self.draft.request,
+                        1 => &mut self.draft.session,
+                        _ => &mut self.draft.project,
+                    };
+                    *policy = BudgetPolicy::Finite { usd_micros: value };
+                    self.editing_micros = None;
+                    self.micros_buffer.clear();
+                    self.status = "Finite micros updated; save to authorize.".into();
+                }
+                _ => self.status = "Enter a positive whole u64 micros value.".into(),
+            },
+            _ => {}
+        }
+    }
+
     fn edit_time_zone(&mut self, code: KeyCode) {
         let Some(ProjectEpochPolicy::CalendarMonth { time_zone }) = &mut self.draft.project_epoch
         else {
@@ -223,6 +260,10 @@ impl SettingsPage for ImageSpendPage {
 
     fn handle_key(&mut self, _cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         self.poll();
+        if self.editing_micros.is_some() {
+            self.edit_micros(key.code);
+            return Nav::Stay;
+        }
         if self.editing_time_zone {
             self.edit_time_zone(key.code);
             return Nav::Stay;
@@ -252,8 +293,10 @@ impl SettingsPage for ImageSpendPage {
                                 Some(ProjectEpochPolicy::Rolling {
                                     duration_seconds: 30 * 86_400,
                                     anchor: cockpit_config::config::image_spend::SavedInstant {
-                                        unix_ms: chrono::Utc::now().timestamp_millis(),
-                                        monotonic_sequence: 1,
+                                        // Placeholder only. The DB replaces it with its
+                                        // authoritative saved instant transactionally.
+                                        unix_ms: 0,
+                                        monotonic_sequence: 0,
                                     },
                                 })
                             }
@@ -271,6 +314,19 @@ impl SettingsPage for ImageSpendPage {
             }
             KeyCode::Char('-') => {
                 self.adjust_selected(false);
+                Nav::Stay
+            }
+            KeyCode::Char('e') if self.cursor < 3 => {
+                self.editing_micros = Some(self.cursor);
+                let policy = match self.cursor {
+                    0 => self.draft.request,
+                    1 => self.draft.session,
+                    _ => self.draft.project,
+                };
+                self.micros_buffer = match policy {
+                    BudgetPolicy::Finite { usd_micros } => usd_micros.to_string(),
+                    _ => String::new(),
+                };
                 Nav::Stay
             }
             KeyCode::Char('e')
@@ -326,6 +382,13 @@ impl SettingsPage for ImageSpendPage {
             Line::from(format!("{} Project window: {epoch}", marker(3))),
             Line::from(format!("{} Save reviewed choices", marker(4))),
             Line::from(format!("Status: {}", self.status)),
+            Line::from(if self.editing_micros.is_some() {
+                format!("Exact micros input: {}", self.micros_buffer)
+            } else if self.editing_time_zone {
+                "IANA timezone input active (Enter accepts, Esc restores).".into()
+            } else {
+                String::new()
+            }),
             Line::from(format!(
                 "Display suggestions: {}/{}/{} micros",
                 suggestions.request_usd_micros,
@@ -340,7 +403,7 @@ impl SettingsPage for ImageSpendPage {
         "Image spend budgets".into()
     }
     fn help_text(&self, _cx: &SettingsCx) -> &'static str {
-        "↑/↓: select  enter: choose/save  +/-: edit finite/rolling  e: enter IANA zone  esc: back"
+        "↑/↓: select  enter: choose/save  e: exact u64 micros/IANA zone  +/-: adjust  esc: back"
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -364,6 +427,8 @@ mod tests {
             cursor: 0,
             editing_time_zone: false,
             time_zone_before_edit: None,
+            editing_micros: None,
+            micros_buffer: String::new(),
             draft: ImageSpendSettings::default(),
             saved: ImageSpendSettings::default(),
             version: None,
@@ -449,6 +514,22 @@ mod tests {
         page.edit_time_zone(KeyCode::Esc);
         assert!(
             matches!(page.draft.project_epoch, Some(ProjectEpochPolicy::CalendarMonth { ref time_zone }) if time_zone == "America/Chicago")
+        );
+    }
+
+    #[test]
+    fn exact_micros_editor_accepts_full_positive_u64_without_float_conversion() {
+        let mut page = fixture();
+        page.editing_micros = Some(0);
+        for character in u64::MAX.to_string().chars() {
+            page.edit_micros(KeyCode::Char(character));
+        }
+        page.edit_micros(KeyCode::Enter);
+        assert_eq!(
+            page.draft.request,
+            BudgetPolicy::Finite {
+                usd_micros: u64::MAX
+            }
         );
     }
 }

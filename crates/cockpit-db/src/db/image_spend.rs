@@ -790,6 +790,68 @@ mod tests {
             .unwrap();
         assert_eq!(reserved.reserved_usd_micros, Some(u64::MAX));
     }
+
+    #[tokio::test]
+    async fn rolling_anchor_is_server_stamped_and_monotonic_per_policy_version() {
+        let db = Db::open_in_memory().unwrap();
+        let mut settings = finite(10);
+        settings.project_epoch = Some(ProjectEpochPolicy::Rolling {
+            duration_seconds: 86_400,
+            anchor: SavedInstant {
+                unix_ms: -1,
+                monotonic_sequence: u64::MAX,
+            },
+        });
+        db.save_image_spend_policy("project".into(), settings.clone(), None, 10)
+            .await
+            .unwrap();
+        let first = db
+            .current_image_spend_policy("project".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            first.settings.project_epoch,
+            Some(ProjectEpochPolicy::Rolling {
+                anchor: SavedInstant {
+                    unix_ms: 10,
+                    monotonic_sequence: 1
+                },
+                ..
+            })
+        ));
+        if let Some(ProjectEpochPolicy::Rolling {
+            duration_seconds,
+            anchor,
+        }) = &mut settings.project_epoch
+        {
+            *duration_seconds = 172_800;
+            *anchor = SavedInstant {
+                unix_ms: -2,
+                monotonic_sequence: u64::MAX,
+            };
+        }
+        db.save_image_spend_policy("project".into(), settings, Some(1), 20)
+            .await
+            .unwrap();
+        let second = db
+            .current_image_spend_policy("project".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.epoch_policy_version, 2);
+        assert!(matches!(
+            second.settings.project_epoch,
+            Some(ProjectEpochPolicy::Rolling {
+                anchor: SavedInstant {
+                    unix_ms: 20,
+                    monotonic_sequence: 2
+                },
+                ..
+            })
+        ));
+        assert_eq!(second.epoch_sequence, None);
+    }
 }
 
 impl Default for BudgetPolicy {
@@ -1100,43 +1162,34 @@ impl Db {
     pub async fn save_image_spend_policy(
         &self,
         project_key: String,
-        settings: ImageSpendSettings,
+        mut settings: ImageSpendSettings,
         expected_current_version: Option<u64>,
         saved_at_ms: i64,
     ) -> Result<u64> {
         settings.validate().map_err(anyhow::Error::new)?;
-        let resolved_epoch = if matches!(settings.project, BudgetPolicy::Finite { .. }) {
-            Some(
-                settings
-                    .project_epoch
-                    .as_ref()
-                    .ok_or(BudgetBlockReason::ProjectEpochUnconfigured)?
-                    .resolve_epoch(saved_at_ms)?,
-            )
-        } else {
-            None
-        };
-        let json = serde_json::to_string(&settings)?;
         self.transaction(move |conn| {
             let current: Option<(u64,String,u64)> = conn.query_row("SELECT version,settings_json,epoch_policy_version FROM image_spend_policy_versions WHERE project_key=?1 ORDER BY version DESC LIMIT 1", [&project_key], |r| Ok((read_u64(r.get(0)?)?,r.get(1)?,read_u64(r.get(2)?)?))).optional()?;
             if current.as_ref().map(|v|v.0) != expected_current_version { return Err(BudgetBlockReason::PolicyVersionChanged.into()); }
             let version = current.as_ref().map_or(Ok(1), |v| v.0.checked_add(1).ok_or(BudgetBlockReason::ArithmeticOverflow))?;
             let previous_epoch = current.as_ref().and_then(|v| serde_json::from_str::<ImageSpendSettings>(&v.1).ok()).and_then(|s|s.project_epoch);
-            let epoch_policy_version = current.as_ref().map_or(Ok(1), |v| if previous_epoch == settings.project_epoch { Ok(v.2) } else { v.2.checked_add(1).ok_or(BudgetBlockReason::ArithmeticOverflow) })?;
-            conn.execute("INSERT INTO image_spend_policy_versions(project_key,version,epoch_policy_version,settings_json,saved_at_ms) VALUES(?1,?2,?3,?4,?5)", params![project_key, sqlite_u64(version)?, sqlite_u64(epoch_policy_version)?, json, saved_at_ms])?;
-            if let Some(epoch) = resolved_epoch {
-                let epoch_policy_version_sql = sqlite_u64(epoch_policy_version)?;
-                let current: Option<(i64,String,i64)> = conn.query_row("SELECT epoch_sequence,membership_key,interval_start_ms FROM image_spend_epoch_heads WHERE project_key=?1 AND epoch_policy_version=?2",params![project_key,epoch_policy_version_sql],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-                if let Some((sequence,current_key,current_start)) = current {
-                    if current_key != epoch.membership_key {
-                        if epoch.interval_start_ms <= current_start { bail!("clock rollback cannot reopen an image spend epoch"); }
-                        let next=sequence.checked_add(1).ok_or(BudgetBlockReason::ArithmeticOverflow)?;
-                        conn.execute("UPDATE image_spend_epoch_heads SET epoch_sequence=?3,membership_key=?4,interval_start_ms=?5,resolved_at_ms=?6 WHERE project_key=?1 AND epoch_policy_version=?2 AND epoch_sequence=?7",params![project_key,epoch_policy_version_sql,next,epoch.membership_key,epoch.interval_start_ms,saved_at_ms,sequence])?;
-                    }
+            let same_epoch_policy = match (&previous_epoch, &settings.project_epoch) {
+                (Some(ProjectEpochPolicy::CalendarMonth { time_zone: left }), Some(ProjectEpochPolicy::CalendarMonth { time_zone: right })) => left == right,
+                (Some(ProjectEpochPolicy::Rolling { duration_seconds: left, .. }), Some(ProjectEpochPolicy::Rolling { duration_seconds: right, .. })) => left == right,
+                (None, None) => true,
+                _ => false,
+            };
+            let epoch_policy_version = current.as_ref().map_or(Ok(1), |v| if same_epoch_policy { Ok(v.2) } else { v.2.checked_add(1).ok_or(BudgetBlockReason::ArithmeticOverflow) })?;
+            if let Some(ProjectEpochPolicy::Rolling { duration_seconds, anchor }) = &mut settings.project_epoch {
+                if let Some(ProjectEpochPolicy::Rolling { duration_seconds: previous_duration, anchor: previous_anchor }) = &previous_epoch
+                    && previous_duration == duration_seconds
+                {
+                    *anchor = previous_anchor.clone();
                 } else {
-                    conn.execute("INSERT INTO image_spend_epoch_heads(project_key,epoch_policy_version,epoch_sequence,membership_key,interval_start_ms,resolved_at_ms) VALUES(?1,?2,1,?3,?4,?5)",params![project_key,epoch_policy_version_sql,epoch.membership_key,epoch.interval_start_ms,saved_at_ms])?;
+                    *anchor = SavedInstant { unix_ms: saved_at_ms, monotonic_sequence: epoch_policy_version };
                 }
             }
+            let json = serde_json::to_string(&settings)?;
+            conn.execute("INSERT INTO image_spend_policy_versions(project_key,version,epoch_policy_version,settings_json,saved_at_ms) VALUES(?1,?2,?3,?4,?5)", params![project_key, sqlite_u64(version)?, sqlite_u64(epoch_policy_version)?, json, saved_at_ms])?;
             Ok(version)
         }).await
     }

@@ -9,8 +9,8 @@ pub use cockpit_db::db::image_spend::{
 };
 
 /// Persist a user-reviewed file-backed policy into the immutable ledger and
-/// return the exact version tokens preflight must use. Epoch membership is
-/// derived here from the reviewed policy and authoritative bundled tzdb.
+/// return the exact version tokens preflight must use. This versions policy
+/// only; reservation derives epoch membership from the server-owned clock.
 pub async fn activate_saved_policy(
     db: &cockpit_db::Db,
     project_key: String,
@@ -32,13 +32,6 @@ pub async fn activate_saved_policy(
         .await?
         .ok_or_else(|| anyhow::anyhow!("saved image spend policy disappeared"))?;
     debug_assert_eq!(current.policy_version, version);
-    if matches!(current.settings.project, BudgetPolicy::Finite { .. })
-        && current.epoch_sequence.is_none()
-    {
-        return Err(anyhow::Error::new(
-            BudgetBlockReason::ProjectEpochUnconfigured,
-        ));
-    }
     Ok(current)
 }
 
@@ -113,5 +106,55 @@ mod tests {
             settings.validate(),
             Err(BudgetBlockReason::ProjectEpochUnconfigured)
         );
+    }
+
+    #[tokio::test]
+    async fn reviewed_policy_saves_and_reopens_without_creating_epoch_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spend.db");
+        let settings = ImageSpendSettings {
+            request: BudgetPolicy::Finite { usd_micros: 1 },
+            session: BudgetPolicy::Unlimited,
+            project: BudgetPolicy::Finite {
+                usd_micros: u64::MAX,
+            },
+            project_epoch: Some(ProjectEpochPolicy::Rolling {
+                duration_seconds: 86_400,
+                anchor: SavedInstant {
+                    unix_ms: -99,
+                    monotonic_sequence: u64::MAX,
+                },
+            }),
+        };
+        {
+            let db = cockpit_db::Db::open(&path).unwrap();
+            let saved = activate_saved_policy(&db, "project".into(), settings, None, 1_000)
+                .await
+                .unwrap();
+            assert_eq!(saved.epoch_sequence, None);
+            assert!(matches!(
+                saved.settings.project_epoch,
+                Some(ProjectEpochPolicy::Rolling {
+                    anchor: SavedInstant {
+                        unix_ms: 1_000,
+                        monotonic_sequence: 1
+                    },
+                    ..
+                })
+            ));
+        }
+        let reopened = cockpit_db::Db::open(&path).unwrap();
+        let current = reopened
+            .current_image_spend_policy("project".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            current.settings.project,
+            BudgetPolicy::Finite {
+                usd_micros: u64::MAX
+            }
+        );
+        assert_eq!(current.epoch_sequence, None);
     }
 }

@@ -295,6 +295,38 @@ fn component_recovery_identity_digest(
     )))
 }
 
+fn security_recovery_request_digest(input: &RecordImageArtifactSecurityRecovery) -> Result<String> {
+    let components = input
+        .components
+        .iter()
+        .map(|component| {
+            serde_json::json!({
+                "componentId": component.component_id,
+                "generation": component.generation,
+                "kind": component.kind.as_str(),
+                "stableIdentityDigest": component.stable_identity_digest,
+            })
+        })
+        .collect::<Vec<_>>();
+    let canonical = serde_json::json!({
+        "artifactGeneration": input.artifact_generation,
+        "artifactId": input.artifact_id,
+        "componentSetDigest": input.component_set_digest,
+        "components": components,
+        "disposition": input.disposition.as_str(),
+        "jobId": input.job_id,
+        "operationId": input.operation_id,
+        "outputIdentityDigest": input.output_identity_digest,
+        "publicationLeaseVersion": input.publication_lease_version,
+        "publicationOperationId": input.publication_operation_id,
+        "slotGeneration": input.slot_generation,
+        "slotId": input.slot_id,
+    });
+    Ok(crate::intel::hex_lower(&Sha256::digest(
+        serde_json::to_vec(&canonical)?,
+    )))
+}
+
 impl ImageGenerationOwnerContextAuthority {
     pub fn record_image_artifact_security_recovery(
         &self,
@@ -307,6 +339,58 @@ impl ImageGenerationOwnerContextAuthority {
             conn.is_autocommit(),
             "security recovery must begin outside a transaction"
         );
+        let request_digest = security_recovery_request_digest(input)?;
+        let now: i64 = conn.query_row(
+            "SELECT CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)",
+            [],
+            |row| row.get(0),
+        )?;
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO image_generation_artifact_security_recovery_attempts(recovery_operation_id,principal_digest,request_digest,state,created_at_unix_ms) VALUES(?1,?2,?3,'received',?4)",
+            params![input.operation_id.to_string(), self.principal_digest, request_digest, now],
+        )?;
+        if inserted == 0 {
+            let replay = conn
+                .query_row(
+                    "SELECT request_digest,state FROM image_generation_artifact_security_recovery_attempts WHERE recovery_operation_id=?1 AND principal_digest=?2",
+                    params![input.operation_id.to_string(), self.principal_digest],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?
+                .context("security recovery attempt is unavailable")?;
+            ensure!(
+                replay.0 == request_digest && replay.1 == "validated",
+                "security recovery replay differs"
+            );
+            return self.replay_recorded_security_recovery(conn, input);
+        }
+        match self.record_image_artifact_security_recovery_inner(conn, input) {
+            Ok(recorded) => {
+                self.close_security_recovery_attempt(
+                    conn,
+                    input.operation_id,
+                    "validated",
+                    recorded.component_identity_digest.as_bytes(),
+                )?;
+                Ok(recorded)
+            }
+            Err(error) => {
+                let _ = self.close_security_recovery_attempt(
+                    conn,
+                    input.operation_id,
+                    "denied",
+                    error.to_string().as_bytes(),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn record_image_artifact_security_recovery_inner(
+        &self,
+        conn: &Connection,
+        input: &RecordImageArtifactSecurityRecovery,
+    ) -> Result<RecordedImageArtifactSecurityRecovery> {
         let owner_digest = crate::intel::hex_lower(&Sha256::digest(serde_json::to_vec(
             &ClientPrincipal::Owner,
         )?));
@@ -314,7 +398,7 @@ impl ImageGenerationOwnerContextAuthority {
             self.principal_digest == owner_digest,
             "image artifact recovery is unavailable"
         );
-        let row=conn.query_row("SELECT a.state,a.component_set_digest,p.canonical_plan,p.plan_digest,COALESCE(lp.state,'') FROM image_generation_artifacts a JOIN image_generation_slots s ON s.job_id=a.job_id AND s.slot_id=a.slot_id JOIN image_generation_plans p ON p.job_id=a.job_id LEFT JOIN image_generation_late_publication_leases lp ON lp.publication_operation_id=?1 WHERE a.artifact_id=?2 AND a.generation=?3 AND a.job_id=?4 AND a.slot_id=?5 AND s.version=?6",params![input.publication_operation_id.map(|id|id.to_string()),input.artifact_id.to_string(),i64::try_from(input.artifact_generation)?,input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.slot_generation)?],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Vec<u8>>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?))).optional()?.ok_or_else(||anyhow::anyhow!("image artifact recovery is unavailable"))?;
+        let row=conn.query_row("SELECT a.state,a.component_set_digest,p.canonical_plan,p.plan_digest,COALESCE(lp.state,''),lp.version,lp.output_evidence_json FROM image_generation_artifacts a JOIN image_generation_slots s ON s.job_id=a.job_id AND s.slot_id=a.slot_id JOIN image_generation_plans p ON p.job_id=a.job_id LEFT JOIN image_generation_late_publication_leases lp ON lp.publication_operation_id=?1 WHERE a.artifact_id=?2 AND a.generation=?3 AND a.job_id=?4 AND a.slot_id=?5 AND s.version=?6",params![input.publication_operation_id.map(|id|id.to_string()),input.artifact_id.to_string(),i64::try_from(input.artifact_generation)?,input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.slot_generation)?],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Vec<u8>>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,Option<i64>>(5)?,row.get::<_,Option<String>>(6)?))).optional()?.ok_or_else(||anyhow::anyhow!("image artifact recovery is unavailable"))?;
         let plan = ImageGenerationPlanV1::from_canonical(&row.2, &row.3)?;
         ensure!(
             plan.owner_session_id == self.session_id
@@ -351,18 +435,40 @@ impl ImageGenerationOwnerContextAuthority {
         let component_identity_digest = component_recovery_identity_digest(&components)?;
         ensure!(
             matches!(
-                (input.disposition, input.publication_operation_id),
+                (
+                    input.disposition,
+                    input.publication_operation_id,
+                    input.publication_lease_version,
+                    input.output_identity_digest.as_deref()
+                ),
                 (
                     ImageArtifactSecurityRecoveryDisposition::CompleteVerifiedLatePublication,
+                    Some(_),
+                    Some(_),
                     Some(_)
                 ) | (
                     ImageArtifactSecurityRecoveryDisposition::RetainBlocked
                         | ImageArtifactSecurityRecoveryDisposition::ResumeVerifiedCleanup,
+                    None,
+                    None,
                     None
                 )
             ),
             "image artifact recovery disposition is unavailable"
         );
+        if let Some(expected_identity) = input.output_identity_digest.as_deref() {
+            ensure!(
+                row.5.map(u64::try_from).transpose()? == input.publication_lease_version,
+                "security recovery publication version differs"
+            );
+            let evidence = cockpit_db::db::image_generation::ImageGenerationLatePublicationEvidenceV1::from_canonical_json(
+                row.6.as_deref().context("security recovery output evidence is absent")?,
+            )?;
+            ensure!(
+                matches!(evidence, cockpit_db::db::image_generation::ImageGenerationLatePublicationEvidenceV1::OutputDurable { identity_digest, .. } if identity_digest == expected_identity),
+                "security recovery output identity differs"
+            );
+        }
         let now: i64 = conn.query_row(
             "SELECT CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)",
             [],
@@ -380,6 +486,63 @@ impl ImageGenerationOwnerContextAuthority {
             publication_lease_version: input.publication_lease_version,
             output_identity_digest: input.output_identity_digest.clone(),
         })
+    }
+
+    fn replay_recorded_security_recovery(
+        &self,
+        conn: &Connection,
+        input: &RecordImageArtifactSecurityRecovery,
+    ) -> Result<RecordedImageArtifactSecurityRecovery> {
+        let row = conn
+            .query_row(
+                "SELECT component_set_digest,component_identity_digest,publication_operation_id,publication_lease_version,output_identity_digest,disposition FROM image_generation_artifact_security_recovery_audits WHERE recovery_operation_id=?1 AND artifact_id=?2 AND artifact_generation=?3 AND job_id=?4 AND slot_id=?5 AND slot_generation=?6 AND principal_digest=?7",
+                params![input.operation_id.to_string(), input.artifact_id.to_string(), i64::try_from(input.artifact_generation)?, input.job_id.to_string(), input.slot_id.to_string(), i64::try_from(input.slot_generation)?, self.principal_digest],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<i64>>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, String>(5)?)),
+            )
+            .optional()?
+            .context("security recovery record is unavailable")?;
+        ensure!(
+            row.0 == input.component_set_digest
+                && row.2 == input.publication_operation_id.map(|id| id.to_string())
+                && row.3.map(u64::try_from).transpose()? == input.publication_lease_version
+                && row.4 == input.output_identity_digest
+                && row.5 == input.disposition.as_str(),
+            "security recovery replay differs"
+        );
+        Ok(RecordedImageArtifactSecurityRecovery {
+            operation_id: input.operation_id,
+            disposition: input.disposition,
+            artifact_id: input.artifact_id,
+            artifact_generation: input.artifact_generation,
+            component_set_digest: row.0,
+            component_identity_digest: row.1,
+            publication_operation_id: input.publication_operation_id,
+            publication_lease_version: input.publication_lease_version,
+            output_identity_digest: row.4,
+        })
+    }
+
+    fn close_security_recovery_attempt(
+        &self,
+        conn: &Connection,
+        operation_id: Uuid,
+        state: &str,
+        evidence: &[u8],
+    ) -> Result<()> {
+        let now: i64 = conn.query_row(
+            "SELECT CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)",
+            [],
+            |row| row.get(0),
+        )?;
+        let digest = crate::intel::hex_lower(&Sha256::digest(evidence));
+        ensure!(
+            conn.execute(
+                "UPDATE image_generation_artifact_security_recovery_attempts SET state=?1,outcome_digest=?2,decided_at_unix_ms=?3 WHERE recovery_operation_id=?4 AND principal_digest=?5 AND state='received'",
+                params![state, digest, now, operation_id.to_string(), self.principal_digest],
+            )? == 1,
+            "security recovery attempt is unavailable"
+        );
+        Ok(())
     }
 
     pub fn retain_image_artifact_security_block(

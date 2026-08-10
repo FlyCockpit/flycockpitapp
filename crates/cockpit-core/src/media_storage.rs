@@ -1593,99 +1593,14 @@ impl MediaStorageRecovery {
         }).await
     }
 
-    pub(crate) async fn finalize_media_upload(
+    async fn prepare_av_normalization(
         &self,
-        request: cockpit_db::media_attachments::FinalizeMediaUploadV1,
-        now_unix_ms: i64,
-    ) -> Result<cockpit_db::media_attachments::LocalMediaMutationReceiptV1> {
-        use cockpit_db::media_attachments::{
-            LocalMediaMutationOutcomeV1, LocalMediaMutationPayloadV1, LocalMediaMutationReceiptV1,
-            LocalMediaMutationTransitionV1, LocalMediaSubjectKindV1, MediaAttachmentComponent,
-            MediaAttachmentRecord, MediaAvailability, MediaKind, MediaSourceKind,
-            MediaUploadActionV1, MediaUploadLastTransitionV1, RemoteMediaOperationOutcomeV1,
-        };
-        cockpit_db::Db::validate_local_media_mutation_v1(&request)?;
-        let LocalMediaMutationPayloadV1::Finalize {
-            session_id,
-            canonical_project_digest,
-            client_draft_id,
-            upload_id,
-            upload_generation,
-            chunk_count,
-            total_bytes,
-            object_sha256,
-        } = &request.payload
-        else {
-            anyhow::bail!("local media action mismatch")
-        };
-        let session = *session_id;
-        let project = canonical_project_digest.clone();
-        let draft = *client_draft_id;
-        let upload = *upload_id;
-        let generation = *upload_generation;
-        let chunks = *chunk_count;
-        let total = *total_bytes;
-        let expected = object_sha256.clone();
-        let (request_digest, semantic_digest) =
-            cockpit_db::Db::local_media_mutation_digests(&request)?;
-        let domain = format!("finalize:{session}:{project}:{draft}:{upload}:{generation}");
-        let op = request.local_operation_id;
-        let pre_domain = domain.clone();
-        let pre_request = request_digest.clone();
-        let pre_semantic = semantic_digest.clone();
-        if let Some(receipt) = self
-            .db
-            .transaction(move |conn| {
-                preflight_local_operation(
-                    conn,
-                    op,
-                    "finalize",
-                    &pre_domain,
-                    &pre_request,
-                    &pre_semantic,
-                    now_unix_ms,
-                )
-            })
-            .await?
-        {
-            return Ok(receipt);
-        }
-        let query_project = project.clone();
-        let snapshot=self.db.read(move|conn|conn.query_row("SELECT temporary_storage_id,acknowledged_bytes,acknowledged_chunks,state,upload_generation,reservation_id,media_kind FROM media_uploads WHERE upload_id=?1 AND session_id=?2 AND canonical_project_digest=?3 AND client_draft_id=?4",params![upload.to_string(),session.to_string(),query_project,draft.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,u32>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?))).optional().map_err(Into::into)).await?.context("media_attachment_unavailable")?;
-        ensure!(
-            snapshot.3 == "open"
-                && snapshot.4.parse::<u64>()? == generation
-                && snapshot.2 == chunks
-                && snapshot.1.parse::<u64>()? == total,
-            "finalize count or length conflict"
-        );
-        let mut held = self
-            .owned_root
-            .open_file_verified(&snapshot.0)
-            .map_err(anyhow::Error::new)?;
-        let before = stable_identity_digest(&held)?;
-        let (actual_len, actual_sha) = read_full_digest(&mut held)?;
-        let after = stable_identity_digest(&held)?;
-        ensure!(
-            before == after && actual_len == total && actual_sha == expected,
-            "finalize object checksum mismatch"
-        );
-        let (container_signature, mime_signature) =
-            probe_upload_container(&mut held, media_kind_from_text(&snapshot.6)?)?;
-        let mut canonical_container = container_signature.to_owned();
-        let mut canonical_mime = mime_signature.to_owned();
-        let media_kind = media_kind_from_text(&snapshot.6)?;
-        let normalized = if media_kind == MediaKind::Image {
-            held.seek(SeekFrom::Start(0))?;
-            let mut bytes = Vec::new();
-            held.by_ref()
-                .take(10 * 1024 * 1024 + 1)
-                .read_to_end(&mut bytes)?;
-            ensure!(bytes.len() <= 10 * 1024 * 1024, "resource_limit");
-            Some(normalize_image(&bytes, &canonical_container)?)
-        } else {
-            None
-        };
+        input: AvNormalizationInput,
+    ) -> PreparedAvNormalization {
+        let mut canonical_container = input.initial_container;
+        let mut canonical_mime = input.initial_mime;
+        let media_kind = MediaKind::Audio;
+        let mut held = std::io::Cursor::new(input.bytes);
         let mut selected_video_stream = None;
         let mut selected_audio_stream = None;
         let mut av_terminal = None;
@@ -1905,6 +1820,153 @@ impl MediaStorageRecovery {
             }
         } else {
             None
+        };
+        PreparedAvNormalization {
+            canonical_container,
+            canonical_mime,
+            selected_video_stream,
+            selected_audio_stream,
+            derivatives: av_derivatives.unwrap_or_default(),
+            terminal_availability: av_terminal,
+            evidence: av_normalization_evidence,
+        }
+    }
+
+    pub(crate) async fn finalize_media_upload(
+        &self,
+        request: cockpit_db::media_attachments::FinalizeMediaUploadV1,
+        now_unix_ms: i64,
+    ) -> Result<cockpit_db::media_attachments::LocalMediaMutationReceiptV1> {
+        use cockpit_db::media_attachments::{
+            LocalMediaMutationOutcomeV1, LocalMediaMutationPayloadV1, LocalMediaMutationReceiptV1,
+            LocalMediaMutationTransitionV1, LocalMediaSubjectKindV1, MediaAttachmentComponent,
+            MediaAttachmentRecord, MediaAvailability, MediaKind, MediaSourceKind,
+            MediaUploadActionV1, MediaUploadLastTransitionV1, RemoteMediaOperationOutcomeV1,
+        };
+        cockpit_db::Db::validate_local_media_mutation_v1(&request)?;
+        let LocalMediaMutationPayloadV1::Finalize {
+            session_id,
+            canonical_project_digest,
+            client_draft_id,
+            upload_id,
+            upload_generation,
+            chunk_count,
+            total_bytes,
+            object_sha256,
+        } = &request.payload
+        else {
+            anyhow::bail!("local media action mismatch")
+        };
+        let session = *session_id;
+        let project = canonical_project_digest.clone();
+        let draft = *client_draft_id;
+        let upload = *upload_id;
+        let generation = *upload_generation;
+        let chunks = *chunk_count;
+        let total = *total_bytes;
+        let expected = object_sha256.clone();
+        let (request_digest, semantic_digest) =
+            cockpit_db::Db::local_media_mutation_digests(&request)?;
+        let domain = format!("finalize:{session}:{project}:{draft}:{upload}:{generation}");
+        let op = request.local_operation_id;
+        let pre_domain = domain.clone();
+        let pre_request = request_digest.clone();
+        let pre_semantic = semantic_digest.clone();
+        if let Some(receipt) = self
+            .db
+            .transaction(move |conn| {
+                preflight_local_operation(
+                    conn,
+                    op,
+                    "finalize",
+                    &pre_domain,
+                    &pre_request,
+                    &pre_semantic,
+                    now_unix_ms,
+                )
+            })
+            .await?
+        {
+            return Ok(receipt);
+        }
+        let query_project = project.clone();
+        let snapshot=self.db.read(move|conn|conn.query_row("SELECT temporary_storage_id,acknowledged_bytes,acknowledged_chunks,state,upload_generation,reservation_id,media_kind FROM media_uploads WHERE upload_id=?1 AND session_id=?2 AND canonical_project_digest=?3 AND client_draft_id=?4",params![upload.to_string(),session.to_string(),query_project,draft.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,u32>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?))).optional().map_err(Into::into)).await?.context("media_attachment_unavailable")?;
+        ensure!(
+            snapshot.3 == "open"
+                && snapshot.4.parse::<u64>()? == generation
+                && snapshot.2 == chunks
+                && snapshot.1.parse::<u64>()? == total,
+            "finalize count or length conflict"
+        );
+        let mut held = self
+            .owned_root
+            .open_file_verified(&snapshot.0)
+            .map_err(anyhow::Error::new)?;
+        let before = stable_identity_digest(&held)?;
+        let (actual_len, actual_sha) = read_full_digest(&mut held)?;
+        let after = stable_identity_digest(&held)?;
+        ensure!(
+            before == after && actual_len == total && actual_sha == expected,
+            "finalize object checksum mismatch"
+        );
+        let (container_signature, mime_signature) =
+            probe_upload_container(&mut held, media_kind_from_text(&snapshot.6)?)?;
+        let canonical_container = container_signature.to_owned();
+        let canonical_mime = mime_signature.to_owned();
+        let media_kind = media_kind_from_text(&snapshot.6)?;
+        let normalized = if media_kind == MediaKind::Image {
+            held.seek(SeekFrom::Start(0))?;
+            let mut bytes = Vec::new();
+            held.by_ref()
+                .take(10 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            ensure!(bytes.len() <= 10 * 1024 * 1024, "resource_limit");
+            Some(normalize_image(&bytes, &canonical_container)?)
+        } else {
+            None
+        };
+        let prepared_av = if media_kind != MediaKind::Image {
+            held.seek(SeekFrom::Start(0))?;
+            let mut bytes = Vec::new();
+            held.read_to_end(&mut bytes)?;
+            Some(
+                self.prepare_av_normalization(AvNormalizationInput {
+                    bytes,
+                    initial_container: canonical_container,
+                    initial_mime: canonical_mime,
+                })
+                .await,
+            )
+        } else {
+            None
+        };
+        let (
+            canonical_container,
+            canonical_mime,
+            selected_video_stream,
+            selected_audio_stream,
+            av_derivatives,
+            av_terminal,
+            av_normalization_evidence,
+        ) = match prepared_av {
+            Some(prepared) => (
+                prepared.canonical_container,
+                prepared.canonical_mime,
+                prepared.selected_video_stream,
+                prepared.selected_audio_stream,
+                Some(prepared.derivatives),
+                prepared.terminal_availability,
+                prepared.evidence,
+            ),
+            None => (
+                canonical_container,
+                canonical_mime,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
         };
         let storage_id = Uuid::now_v7();
         let target = storage_id.to_string();

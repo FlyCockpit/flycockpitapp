@@ -1686,4 +1686,30 @@ mod windows_tests {
         crate::goal_scratch::set_private(&output.join("swap")).unwrap();
         assert!(held.rename_noreplace(artifact, "published").is_err());
     }
+
+    #[test]
+    fn held_windows_post_effect_dacl_race_returns_recovery_authority() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("output");
+        std::fs::create_dir(&output).unwrap();
+        crate::goal_scratch::set_private(&output).unwrap();
+        let held = HeldDirectoryAuthority::open_existing(&output).unwrap();
+        let mut artifact = held.create_file_exclusive("temporary").unwrap();
+        artifact.file_mut().write_all(b"exact").unwrap();
+        let artifact = held.seal(artifact).unwrap();
+        let root = output.clone();
+        AFTER_PUBLISH_EFFECT_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                crate::goal_scratch::apply_test_windows_dacl(
+                    &root.join("published"),
+                    "D:(A;;FA;;;WD)",
+                )
+                .unwrap();
+            }))
+        });
+        assert!(matches!(
+            held.rename_noreplace(artifact, "published").unwrap(),
+            HeldDirectoryEffectOutcome::AppliedUnknown(_)
+        ));
+    }
 }

@@ -2696,6 +2696,16 @@ pub struct AcquireImageGenerationArtifactLease<'a> {
     pub committed_at_monotonic: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcquiredImageGenerationArtifactLease {
+    pub lease_id: Uuid,
+    pub relative_storage_key: String,
+    pub stable_identity_json: String,
+    pub byte_length: u64,
+    pub range_start: u64,
+    pub requested_length: u64,
+}
+
 #[derive(Debug)]
 struct LeaseComponentProjection {
     artifact_state: String,
@@ -2713,6 +2723,8 @@ struct LeaseComponentProjection {
     component_checksum: String,
     component_byte_length_hi: i64,
     component_byte_length_lo: i64,
+    relative_storage_key: String,
+    stable_identity_json: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3049,7 +3061,7 @@ impl Db {
     pub fn acquire_image_generation_artifact_lease_conn(
         conn: &Connection,
         input: &AcquireImageGenerationArtifactLease<'_>,
-    ) -> Result<()> {
+    ) -> Result<AcquiredImageGenerationArtifactLease> {
         ensure_digest(input.expected_component_checksum, "component checksum")?;
         ensure_digest(input.component_set_digest, "component set digest")?;
         ensure_digest(input.authorization_digest, "authorization digest")?;
@@ -3067,9 +3079,9 @@ impl Db {
             .context("lease deadline overflow")?;
         let tx = conn.unchecked_transaction()?;
         let projection=tx.query_row(
-            "SELECT a.state,a.generation,a.component_set_digest,j.version,s.state,s.version,s.result_after_cancel,s.published_disposition,s.published_disposition_generation,c.component_kind,c.state,c.generation,c.sha256,c.byte_length_hi,c.byte_length_lo FROM image_generation_artifacts a JOIN image_generation_jobs j ON j.job_id=a.job_id JOIN image_generation_slots s ON s.job_id=a.job_id AND s.slot_id=a.slot_id JOIN image_generation_artifact_components c ON c.artifact_id=a.artifact_id WHERE a.artifact_id=?1 AND a.job_id=?2 AND a.slot_id=?3 AND c.component_id=?4",
+            "SELECT a.state,a.generation,a.component_set_digest,j.version,s.state,s.version,s.result_after_cancel,s.published_disposition,s.published_disposition_generation,c.component_kind,c.state,c.generation,c.sha256,c.byte_length_hi,c.byte_length_lo,c.relative_storage_key,c.stable_identity_json FROM image_generation_artifacts a JOIN image_generation_jobs j ON j.job_id=a.job_id JOIN image_generation_slots s ON s.job_id=a.job_id AND s.slot_id=a.slot_id JOIN image_generation_artifact_components c ON c.artifact_id=a.artifact_id WHERE a.artifact_id=?1 AND a.job_id=?2 AND a.slot_id=?3 AND c.component_id=?4",
             params![input.artifact_id.to_string(),input.job_id.to_string(),input.slot_id.to_string(),input.component_id.to_string()],
-            |row| Ok(LeaseComponentProjection{artifact_state:row.get(0)?,artifact_generation:row.get(1)?,component_set_digest:row.get(2)?,job_generation:row.get(3)?,slot_state:row.get(4)?,slot_generation:row.get(5)?,result_after_cancel:row.get(6)?,published_disposition:row.get(7)?,published_disposition_generation:row.get(8)?,component_kind:row.get(9)?,component_state:row.get(10)?,component_generation:row.get(11)?,component_checksum:row.get(12)?,component_byte_length_hi:row.get(13)?,component_byte_length_lo:row.get(14)?}),
+            |row| Ok(LeaseComponentProjection{artifact_state:row.get(0)?,artifact_generation:row.get(1)?,component_set_digest:row.get(2)?,job_generation:row.get(3)?,slot_state:row.get(4)?,slot_generation:row.get(5)?,result_after_cancel:row.get(6)?,published_disposition:row.get(7)?,published_disposition_generation:row.get(8)?,component_kind:row.get(9)?,component_state:row.get(10)?,component_generation:row.get(11)?,component_checksum:row.get(12)?,component_byte_length_hi:row.get(13)?,component_byte_length_lo:row.get(14)?,relative_storage_key:row.get(15)?,stable_identity_json:row.get(16)?}),
         ).optional()?.context("artifact lease target is unavailable")?;
         ensure!(
             projection.artifact_state == "retained"
@@ -3118,6 +3130,10 @@ impl Db {
         );
         let component_length = (u64::try_from(projection.component_byte_length_hi)? << 32)
             | u64::try_from(projection.component_byte_length_lo)?;
+        let stable_identity_json = projection
+            .stable_identity_json
+            .clone()
+            .context("component held identity is absent")?;
         match input.read_kind {
             ImageGenerationArtifactReadKind::Full => ensure!(
                 input.range_start == 0 && input.requested_length == component_length,
@@ -3138,7 +3154,14 @@ impl Db {
         );
         tx.execute("INSERT INTO image_generation_artifact_leases(lease_id,artifact_id,artifact_generation,owning_job_id,owning_job_generation,owning_slot_id,owning_slot_generation,published_disposition,published_disposition_generation,component_id,component_kind,component_generation,component_checksum,consumer_purpose,consumer_route,read_kind,range_start_hi,range_start_lo,requested_length_hi,requested_length_lo,component_set_digest,authorization_digest,daemon_boot_id,committed_at_monotonic,deadline_monotonic) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",params![input.lease_id.to_string(),input.artifact_id.to_string(),i64::try_from(input.expected_artifact_generation)?,input.job_id.to_string(),i64::try_from(input.expected_job_generation)?,input.slot_id.to_string(),i64::try_from(input.expected_slot_generation)?,input.disposition.as_str(),i64::try_from(input.expected_disposition_generation)?,input.component_id.to_string(),input.expected_component_kind.as_str(),i64::try_from(input.expected_component_generation)?,input.expected_component_checksum,input.purpose.as_str(),input.route.as_str(),input.read_kind.as_str(),i64::from((input.range_start>>32) as u32),i64::from(input.range_start as u32),i64::from((input.requested_length>>32) as u32),i64::from(input.requested_length as u32),input.component_set_digest,input.authorization_digest,input.daemon_boot_id.to_string(),i64::try_from(input.committed_at_monotonic)?,i64::try_from(deadline)?])?;
         tx.commit()?;
-        Ok(())
+        Ok(AcquiredImageGenerationArtifactLease {
+            lease_id: input.lease_id,
+            relative_storage_key: projection.relative_storage_key,
+            stable_identity_json,
+            byte_length: component_length,
+            range_start: input.range_start,
+            requested_length: input.requested_length,
+        })
     }
 
     pub fn release_image_generation_artifact_lease_conn(

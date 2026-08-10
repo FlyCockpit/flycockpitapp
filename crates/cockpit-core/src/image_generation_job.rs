@@ -5,6 +5,7 @@
 //! provider-dispatch binding; no dispatcher may reinterpret caller input.
 
 use std::collections::BTreeMap;
+use std::io::{Read as _, Seek as _, SeekFrom, Write};
 use std::path::Path;
 
 use anyhow::{Context as _, Result, ensure};
@@ -19,6 +20,7 @@ use cockpit_db::db::external_journal::{
     ExternalJournalDigest, ExternalJournalToken, PrepareExternalOperation, ProviderIdempotency,
 };
 use cockpit_db::db::image_generation::{
+    image_generation_component_set_binding, AcquireImageGenerationArtifactLease,
     AdvanceImageGenerationLatePublication, BlockVerifiedImageGenerationLatePublication,
     CreateImageGenerationArtifact, CreateImageGenerationArtifactComponent,
     DispatchingImageGenerationAttempt, ImageGenerationArtifactComponentKind,
@@ -28,7 +30,6 @@ use cockpit_db::db::image_generation::{
     ImageGenerationLatePublicationEvidenceV1, ImageGenerationLatePublicationState,
     PreparedImageGenerationDispatch, ReserveImageGenerationLatePublication,
     TransitionImageGenerationArtifact, TransitionImageGenerationArtifactComponent,
-    image_generation_component_set_binding,
 };
 use cockpit_db::db::sealed_scope::SealedActionGrantRow;
 use cockpit_db::image_spend::{AttemptMaximum, ImageSpendDispatchEvidence, SpendReservation};
@@ -2112,6 +2113,86 @@ impl HeldImageGenerationArtifactRoot {
         recovery: &HeldDirectoryRecovery,
     ) -> Result<HeldDirectoryEffectOutcome> {
         self.guard.reconcile(recovery)
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PersistedHeldArtifactEvidence {
+    byte_length: String,
+    identity_digest: String,
+    security_digest: String,
+    sha256: String,
+}
+
+fn decode_held_artifact_evidence(value: &str) -> Result<HeldArtifactEvidence> {
+    let persisted: PersistedHeldArtifactEvidence = serde_json::from_str(value)?;
+    let byte_length = persisted.byte_length.parse::<u64>()?;
+    ensure!(
+        persisted.byte_length == byte_length.to_string()
+            && persisted.identity_digest.len() == 64
+            && persisted.security_digest.len() == 64
+            && persisted.sha256.len() == 64,
+        "component held evidence is invalid"
+    );
+    Ok(HeldArtifactEvidence {
+        identity_digest: persisted.identity_digest,
+        security_digest: persisted.security_digest,
+        byte_length,
+        sha256: persisted.sha256,
+    })
+}
+
+/// Acquires the durable route lease, proves and reads one no-follow held
+/// component, then releases the lease exactly once even when the consumer
+/// disconnects (`Write::write` returns an error).
+pub fn serve_image_generation_artifact_component<W: Write>(
+    conn: &Connection,
+    owner: &ImageGenerationOwnerContextAuthority,
+    root: &HeldImageGenerationArtifactRoot,
+    input: &AcquireImageGenerationArtifactLease<'_>,
+    released_at_monotonic: u64,
+    writer: &mut W,
+) -> Result<()> {
+    owner.revalidate_live_session(conn)?;
+    let authenticated: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM image_generation_artifact_authorization_facts WHERE authorization_digest=?1 AND principal_digest=?2 AND revoked_at_unix_ms IS NULL)",
+        params![input.authorization_digest, owner.principal_digest],
+        |row| row.get(0),
+    )?;
+    ensure!(authenticated, "image artifact route is unavailable");
+    let lease = cockpit_db::Db::acquire_image_generation_artifact_lease_conn(conn, input)?;
+    let served = (|| -> Result<()> {
+        let evidence = decode_held_artifact_evidence(&lease.stable_identity_json)?;
+        ensure!(
+            evidence.byte_length() == lease.byte_length
+                && evidence.sha256() == input.expected_component_checksum,
+            "component held evidence differs from lease"
+        );
+        let mut held = root.open_verified_component(&lease.relative_storage_key, &evidence)?;
+        ensure!(held.evidence() == &evidence, "component held proof differs");
+        held.file_mut().seek(SeekFrom::Start(lease.range_start))?;
+        let mut remaining = lease.requested_length;
+        let mut buffer = [0_u8; 64 * 1024];
+        while remaining != 0 {
+            let wanted = usize::try_from(remaining.min(buffer.len() as u64))?;
+            let count = held.file_mut().read(&mut buffer[..wanted])?;
+            ensure!(count != 0, "component ended before leased range");
+            writer.write_all(&buffer[..count])?;
+            remaining -= u64::try_from(count)?;
+        }
+        Ok(())
+    })();
+    let released = cockpit_db::Db::release_image_generation_artifact_lease_conn(
+        conn,
+        lease.lease_id,
+        released_at_monotonic,
+    );
+    match (served, released) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Ok(true)) => Ok(()),
+        (Ok(()), Ok(false)) => anyhow::bail!("artifact lease was not active at release"),
+        (Ok(()), Err(error)) => Err(error).context("releasing image artifact lease"),
     }
 }
 

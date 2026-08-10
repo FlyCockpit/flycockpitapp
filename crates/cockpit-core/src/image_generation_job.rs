@@ -23,7 +23,7 @@ pub use cockpit_db::image_generation_plan::{
     MAX_IMAGE_GENERATION_SLOTS, MAX_IMAGE_GENERATION_TARGETS, OutputDirectoryAuthorityV1,
     OutputSlotPlanV1, ReferenceArtifactV1, RequestedOutputV1, ResolvedOutputV1,
     ResourceReservationV1, SpendReservationPlanV1, TargetDestinationV1, TargetPlanV1,
-    TypedParameterV1,
+    TypedParameterV1, VectorSanitizerProvenanceV1,
 };
 
 const MAX_AUTHORITY_STRING_BYTES: usize = 1_024;
@@ -152,6 +152,8 @@ pub fn resolve_image_generation(
                 format: format.clone(),
                 mime: compatible.unwrap().clone(),
                 vector_sanitization_required: format == "svg",
+                vector_sanitizer: (format == "svg")
+                    .then(crate::generated_svg::sanitizer_provenance),
             },
             typed_parameters: request.parameters.clone(),
             slot_ids: target.slot_artifact_ids.clone(),
@@ -660,6 +662,7 @@ mod tests {
                     format: "png".into(),
                     mime: "image/png".into(),
                     vector_sanitization_required: false,
+                    vector_sanitizer: None,
                 },
                 typed_parameters: BTreeMap::from([(
                     "quality".into(),

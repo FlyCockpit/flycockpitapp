@@ -1525,6 +1525,7 @@ mod tests {
                     format: "png".into(),
                     mime: "image/png".into(),
                     vector_sanitization_required: false,
+                    vector_sanitizer: None,
                 },
                 typed_parameters: Default::default(),
                 sample_count: 1,

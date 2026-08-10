@@ -10,6 +10,9 @@ use std::io::{self, Write};
 
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
+use sha2::{Digest as _, Sha256};
+
+use cockpit_db::image_generation_plan::VectorSanitizerProvenanceV1;
 
 mod verify;
 
@@ -28,6 +31,17 @@ pub const MAX_IDS: usize = 16_384;
 pub const MAX_REFERENCES: usize = 65_536;
 pub const MAX_TEXT_BYTES: usize = 32_768;
 pub const MAX_TEXT_SCALARS: usize = 8_192;
+
+pub fn sanitizer_provenance() -> VectorSanitizerProvenanceV1 {
+    let policy = format!(
+        "generated-svg-v1:{MAX_RAW_BYTES}:{MAX_CANONICAL_BYTES}:{MAX_ELEMENTS}:{MAX_DEPTH}:{MAX_ATTRIBUTES}:{MAX_PATH_COMMANDS}:{MAX_IDS}:{MAX_REFERENCES}:{MAX_TEXT_BYTES}:{MAX_TEXT_SCALARS}"
+    );
+    VectorSanitizerProvenanceV1 {
+        schema_version: 1,
+        sanitizer_kind: "generated_svg_closed_policy".into(),
+        policy_digest: crate::intel::hex_lower(&Sha256::digest(policy.as_bytes())),
+    }
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct SanitizedSvgArtifact(Vec<u8>);

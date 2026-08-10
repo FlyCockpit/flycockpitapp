@@ -72,7 +72,13 @@ dto!(ResolvedOutputV1 {
     height: u32,
     format: String,
     mime: String,
-    vector_sanitization_required: bool
+    vector_sanitization_required: bool,
+    vector_sanitizer: Option<VectorSanitizerProvenanceV1>
+});
+dto!(VectorSanitizerProvenanceV1 {
+    schema_version: u8,
+    sanitizer_kind: String,
+    policy_digest: String
 });
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
@@ -308,6 +314,18 @@ impl TargetPlanV1 {
                 && self.resolved.vector_sanitization_required == contract.1,
             "invalid output contract"
         );
+        match (&self.resolved.vector_sanitizer, contract.1) {
+            (Some(provenance), true) => {
+                ensure!(
+                    provenance.schema_version == 1
+                        && provenance.sanitizer_kind == "generated_svg_closed_policy",
+                    "invalid vector sanitizer schema"
+                );
+                digest(&provenance.policy_digest)?;
+            }
+            (None, false) => {}
+            _ => anyhow::bail!("vector sanitizer provenance disagrees with output format"),
+        }
         ensure!(
             self.sample_count > 0
                 && self.sample_count as usize <= MAX_IMAGE_GENERATION_SLOTS

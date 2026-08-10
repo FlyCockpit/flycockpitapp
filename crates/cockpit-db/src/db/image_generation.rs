@@ -3,22 +3,22 @@
 //! Transition legality lives here so repository reducers and protocol
 //! projections cannot develop separate interpretations of persisted states.
 
-use anyhow::{Context as _, Result, ensure};
-use rusqlite::{Connection, OptionalExtension, params};
+use anyhow::{ensure, Context as _, Result};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
-use super::Db;
 use super::external_journal::{
-    ExternalJournalRecord, ExternalJournalState, ExternalTransitionOutcome,
-    PrepareExternalOperation, transition_external_operation_conn,
+    transition_external_operation_conn, ExternalJournalRecord, ExternalJournalState,
+    ExternalTransitionOutcome, PrepareExternalOperation,
 };
 use super::image_generation_plan::{AttemptPlanV1, ImageGenerationPlanV1};
 use super::image_spend::{
-    ImageSpendDispatchEvidence, finish_reserved_image_spend_dispatch_conn,
-    prepare_reserved_image_spend_dispatch_conn,
+    finish_reserved_image_spend_dispatch_conn, prepare_reserved_image_spend_dispatch_conn,
+    ImageSpendDispatchEvidence,
 };
+use super::Db;
 
 const MAX_IMAGE_GENERATION_RECONCILIATION_EVIDENCE_BYTES: usize = 64 * 1024;
 
@@ -817,6 +817,17 @@ pub struct BeginImageGenerationDownload {
     pub expected_job_version: u64,
     pub expected_slot_version: u64,
     pub expected_attempt_version: u64,
+    pub at_unix_ms: i64,
+}
+pub struct CommitAcceptedImageResponseFailure<'a> {
+    pub job_id: Uuid,
+    pub slot_id: Uuid,
+    pub attempt_number: u32,
+    pub expected_attempt_version: u64,
+    pub expected_slot_version: u64,
+    pub external_operation_id: Uuid,
+    pub expected_journal_version: u64,
+    pub safe_reason: &'a str,
     pub at_unix_ms: i64,
 }
 pub struct CommitImageGenerationValidation {
@@ -1888,6 +1899,30 @@ impl Db {
             ensure!(conn.execute("UPDATE image_generation_attempts SET state='downloading',version=version+1 WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND state='accepted' AND version=?4",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?])?==1,"image generation attempt download compare-and-set lost");
             ensure!(conn.execute("UPDATE image_generation_slots SET state='downloading',version=version+1 WHERE job_id=?1 AND slot_id=?2 AND state='running' AND version=?3",params![input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.expected_slot_version)?])?==1,"image generation slot download compare-and-set lost");
             ensure!(conn.execute("UPDATE image_generation_jobs SET state='downloading',version=version+1,updated_at_unix_ms=?1 WHERE job_id=?2 AND state='running' AND version=?3",params![input.at_unix_ms,input.job_id.to_string(),i64::try_from(input.expected_job_version)?])?==1,"image generation job download compare-and-set lost");
+            Ok(())
+        })
+    }
+
+    pub fn commit_accepted_image_response_failure_conn(
+        conn: &Connection,
+        input: &CommitAcceptedImageResponseFailure<'_>,
+    ) -> Result<()> {
+        atomic_conn(conn, "image_generation_accepted_response_failure", || {
+            let bound: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM image_generation_response_fetch_outcomes WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND outcome='definitive_failure' AND safe_reason=?4)",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),input.safe_reason],|row|row.get(0))?;
+            ensure!(bound, "accepted response failure evidence is absent");
+            match transition_external_operation_conn(
+                conn,
+                input.external_operation_id,
+                i64::try_from(input.expected_journal_version)?,
+                ExternalJournalState::Failed,
+                input.at_unix_ms,
+            )? {
+                ExternalTransitionOutcome::Committed(_) => {}
+                _ => anyhow::bail!("accepted response failure lost journal compare-and-set"),
+            }
+            ensure!(conn.execute("UPDATE image_generation_attempts SET state='failed_after_acceptance',version=version+1,observed_journal_version=?1 WHERE job_id=?2 AND slot_id=?3 AND attempt_number=?4 AND state IN ('accepted','downloading','cancellation_requested') AND version=?5 AND external_operation_id=?6",params![i64::try_from(input.expected_journal_version+1)?,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?,input.external_operation_id.to_string()])?==1,"accepted response failure lost attempt compare-and-set");
+            ensure!(conn.execute("UPDATE image_generation_slots SET state='failed',version=version+1,failure_reason=?1 WHERE job_id=?2 AND slot_id=?3 AND state IN ('running','downloading','cancellation_requested') AND version=?4",params![input.safe_reason,input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.expected_slot_version)?])?==1,"accepted response failure lost slot compare-and-set");
+            commit_terminal_job_projection_conn(conn, input.job_id, input.at_unix_ms)?;
             Ok(())
         })
     }
@@ -3782,29 +3817,23 @@ mod tests {
     #[test]
     fn reconciliation_evidence_has_exact_closed_bounds() {
         assert!(reconciliation_evidence_digest(&[]).is_err());
-        assert!(
-            reconciliation_evidence_digest(&vec![
-                0;
-                MAX_IMAGE_GENERATION_RECONCILIATION_EVIDENCE_BYTES
-                    - 1
-            ])
-            .is_ok()
-        );
-        assert!(
-            reconciliation_evidence_digest(&vec![
+        assert!(reconciliation_evidence_digest(&vec![
+            0;
+            MAX_IMAGE_GENERATION_RECONCILIATION_EVIDENCE_BYTES
+                - 1
+        ])
+        .is_ok());
+        assert!(reconciliation_evidence_digest(&vec![
                 0;
                 MAX_IMAGE_GENERATION_RECONCILIATION_EVIDENCE_BYTES
             ])
-            .is_ok()
-        );
-        assert!(
-            reconciliation_evidence_digest(&vec![
-                0;
-                MAX_IMAGE_GENERATION_RECONCILIATION_EVIDENCE_BYTES
-                    + 1
-            ])
-            .is_err()
-        );
+        .is_ok());
+        assert!(reconciliation_evidence_digest(&vec![
+            0;
+            MAX_IMAGE_GENERATION_RECONCILIATION_EVIDENCE_BYTES
+                + 1
+        ])
+        .is_err());
     }
 
     fn canonical_test_plan(
@@ -4149,30 +4178,22 @@ mod tests {
     fn deadline_observation_has_exact_boot_and_boundary_semantics() {
         let boot = Uuid::now_v7();
         let other_boot = Uuid::now_v7();
-        assert!(
-            DeadlineObservationV1::new(boot, 99)
-                .unwrap()
-                .is_before(boot, 100)
-                .unwrap()
-        );
-        assert!(
-            !DeadlineObservationV1::new(boot, 100)
-                .unwrap()
-                .is_before(boot, 100)
-                .unwrap()
-        );
-        assert!(
-            !DeadlineObservationV1::new(boot, 101)
-                .unwrap()
-                .is_before(boot, 100)
-                .unwrap()
-        );
-        assert!(
-            !DeadlineObservationV1::new(other_boot, 0)
-                .unwrap()
-                .is_before(boot, 100)
-                .unwrap()
-        );
+        assert!(DeadlineObservationV1::new(boot, 99)
+            .unwrap()
+            .is_before(boot, 100)
+            .unwrap());
+        assert!(!DeadlineObservationV1::new(boot, 100)
+            .unwrap()
+            .is_before(boot, 100)
+            .unwrap());
+        assert!(!DeadlineObservationV1::new(boot, 101)
+            .unwrap()
+            .is_before(boot, 100)
+            .unwrap());
+        assert!(!DeadlineObservationV1::new(other_boot, 0)
+            .unwrap()
+            .is_before(boot, 100)
+            .unwrap());
         assert!(DeadlineObservationV1::new(Uuid::nil(), 0).is_err());
     }
 
@@ -4324,15 +4345,13 @@ mod tests {
                         digest: &queued_first_digest,
                     },
                 ];
-                assert!(
-                    Db::queue_image_generation_job_conn(
-                        conn,
-                        Db::image_generation_queue_authority_conn(conn, job_id)?,
-                        &wrong,
-                        1,
-                    )
-                    .is_err()
-                );
+                assert!(Db::queue_image_generation_job_conn(
+                    conn,
+                    Db::image_generation_queue_authority_conn(conn, job_id)?,
+                    &wrong,
+                    1,
+                )
+                .is_err());
                 let exact = [
                     ImageGenerationMediaPlanSnapshot {
                         slot_id,
@@ -4990,28 +5009,24 @@ mod tests {
         let canonical = String::from_utf8(canonical).unwrap();
         let spaced = canonical.replacen("{", "{ ", 1);
         let spaced_digest = hex_lower(&Sha256::digest(spaced.as_bytes()));
-        assert!(
-            CreateImageGenerationJob::from_verified_canonical_plan(
-                spaced.as_bytes(),
-                &spaced_digest,
-                1
-            )
-            .is_err()
-        );
+        assert!(CreateImageGenerationJob::from_verified_canonical_plan(
+            spaced.as_bytes(),
+            &spaced_digest,
+            1
+        )
+        .is_err());
         let duplicate = canonical.replacen(
             "\"jobId\":",
             &format!("\"jobId\":\"{job_id}\",\"jobId\":"),
             1,
         );
         let duplicate_digest = hex_lower(&Sha256::digest(duplicate.as_bytes()));
-        assert!(
-            CreateImageGenerationJob::from_verified_canonical_plan(
-                duplicate.as_bytes(),
-                &duplicate_digest,
-                1
-            )
-            .is_err()
-        );
+        assert!(CreateImageGenerationJob::from_verified_canonical_plan(
+            duplicate.as_bytes(),
+            &duplicate_digest,
+            1
+        )
+        .is_err());
         let reordered = canonical.replacen(
             r#""schemaVersion":1,"kind":"imageGenerationPlan""#,
             r#""kind":"imageGenerationPlan","schemaVersion":1"#,
@@ -5019,14 +5034,12 @@ mod tests {
         );
         assert_ne!(reordered, canonical);
         let reordered_digest = hex_lower(&Sha256::digest(reordered.as_bytes()));
-        assert!(
-            CreateImageGenerationJob::from_verified_canonical_plan(
-                reordered.as_bytes(),
-                &reordered_digest,
-                1
-            )
-            .is_err()
-        );
+        assert!(CreateImageGenerationJob::from_verified_canonical_plan(
+            reordered.as_bytes(),
+            &reordered_digest,
+            1
+        )
+        .is_err());
     }
 
     #[test]
@@ -5102,18 +5115,16 @@ mod tests {
                         now_unix_ms: 10,
                     },
                 )?;
-                assert!(
-                    Db::request_image_generation_cancellation_conn(
-                        conn,
-                        &RequestImageGenerationCancellation {
-                            job_id: fixture.job_id,
-                            cancellation_version: 1,
-                            request_operation_id: "cancel",
-                            requested_at_unix_ms: 11
-                        }
-                    )
-                    .is_err()
-                );
+                assert!(Db::request_image_generation_cancellation_conn(
+                    conn,
+                    &RequestImageGenerationCancellation {
+                        job_id: fixture.job_id,
+                        cancellation_version: 1,
+                        request_operation_id: "cancel",
+                        requested_at_unix_ms: 11
+                    }
+                )
+                .is_err());
                 let facts: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM image_generation_cancellation_facts WHERE job_id=?1",
                     [fixture.job_id.to_string()],

@@ -2408,6 +2408,22 @@ pub enum GeneratedImageArtifactFormat {
     Svg,
 }
 
+async fn terminalize_accepted_response_failure(
+    db: &cockpit_db::Db,
+    job_id: Uuid,
+    slot_id: Uuid,
+    attempt_number: u32,
+    safe_reason: String,
+    now_unix_ms: i64,
+) -> Result<()> {
+    db.write(move |conn| {
+        let state:String=conn.query_row("SELECT state FROM image_generation_attempts WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3",params![job_id.to_string(),slot_id.to_string(),i64::from(attempt_number)],|row|row.get(0))?;
+        if state=="failed_after_acceptance" { return Ok(()); }
+        let (attempt_version,slot_version,operation,journal_version):(i64,i64,String,i64)=conn.query_row("SELECT a.version,s.version,a.external_operation_id,a.observed_journal_version FROM image_generation_attempts a JOIN image_generation_slots s ON s.job_id=a.job_id AND s.slot_id=a.slot_id WHERE a.job_id=?1 AND a.slot_id=?2 AND a.attempt_number=?3",params![job_id.to_string(),slot_id.to_string(),i64::from(attempt_number)],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
+        cockpit_db::Db::commit_accepted_image_response_failure_conn(conn,&cockpit_db::db::image_generation::CommitAcceptedImageResponseFailure{job_id,slot_id,attempt_number,expected_attempt_version:u64::try_from(attempt_version)?,expected_slot_version:u64::try_from(slot_version)?,external_operation_id:Uuid::parse_str(&operation)?,expected_journal_version:u64::try_from(journal_version)?,safe_reason:&safe_reason,at_unix_ms:now_unix_ms})
+    }).await
+}
+
 pub async fn fetch_accepted_image_response<F: AcceptedImageResponseFetcher>(
     db: cockpit_db::Db,
     fetcher: &F,
@@ -2428,7 +2444,7 @@ pub async fn fetch_accepted_image_response<F: AcceptedImageResponseFetcher>(
         })
         .await?;
     if let Some((outcome, safe_reason, evidence, bytes)) = existing {
-        return match outcome.as_str() {
+        let replay = match outcome.as_str() {
             "fetched" => Ok(AcceptedImageResponseFetchOutcome::Fetched {
                 bytes: bytes.context("fetched response bytes are absent")?,
                 evidence,
@@ -2439,7 +2455,19 @@ pub async fn fetch_accepted_image_response<F: AcceptedImageResponseFetcher>(
             }),
             "outcome_unknown" => Ok(AcceptedImageResponseFetchOutcome::OutcomeUnknown { evidence }),
             _ => anyhow::bail!("unknown accepted response fetch outcome"),
-        };
+        }?;
+        if let AcceptedImageResponseFetchOutcome::DefinitiveFailure { safe_reason, .. } = &replay {
+            terminalize_accepted_response_failure(
+                &db,
+                job_id,
+                slot_id,
+                attempt_number,
+                safe_reason.clone(),
+                now_unix_ms,
+            )
+            .await?;
+        }
+        return Ok(replay);
     }
     let provider_request_identity = db
         .read(move |conn| {
@@ -2509,6 +2537,17 @@ pub async fn fetch_accepted_image_response<F: AcceptedImageResponseFetcher>(
             }
             tx.commit()?; Ok(())
         }).await?;
+    if let AcceptedImageResponseFetchOutcome::DefinitiveFailure { safe_reason, .. } = &outcome {
+        terminalize_accepted_response_failure(
+            &db,
+            job_id,
+            slot_id,
+            attempt_number,
+            safe_reason.clone(),
+            now_unix_ms,
+        )
+        .await?;
+    }
     Ok(outcome)
 }
 

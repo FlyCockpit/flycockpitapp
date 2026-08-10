@@ -25,8 +25,9 @@ use cockpit_db::db::image_generation::{
     ImageGenerationArtifactConsumerPurpose, ImageGenerationArtifactConsumerRoute,
     ImageGenerationArtifactState, ImageGenerationDispatchCandidate,
     ImageGenerationLatePublicationEvidenceV1, ImageGenerationLatePublicationState,
-    PreparedImageGenerationDispatch, TransitionImageGenerationArtifact,
-    TransitionImageGenerationArtifactComponent, image_generation_component_set_binding,
+    PreparedImageGenerationDispatch, ReserveImageGenerationLatePublication,
+    TransitionImageGenerationArtifact, TransitionImageGenerationArtifactComponent,
+    image_generation_component_set_binding,
 };
 use cockpit_db::db::sealed_scope::SealedActionGrantRow;
 use cockpit_db::image_spend::{AttemptMaximum, ImageSpendDispatchEvidence, SpendReservation};
@@ -643,6 +644,155 @@ impl ImageGenerationOwnerContextAuthority {
         let changed=conn.execute("UPDATE image_generation_artifact_authorization_facts SET revoked_at_unix_ms=?1 WHERE authorization_digest=?2 AND principal_digest=?3 AND revoked_at_unix_ms IS NULL",params![revoked_at_unix_ms,authorization_digest,self.principal_digest])?;
         ensure!(changed == 1, "image artifact route is unavailable");
         Ok(())
+    }
+
+    pub fn authorize_late_publication(
+        &self,
+        conn: &Connection,
+        output: &HeldImageGenerationOutputDirectory,
+        artifact_id: Uuid,
+        destination_name: &str,
+        temporary_name: &str,
+        created_at_unix_ms: i64,
+    ) -> Result<ImageGenerationLatePublicationAuthority> {
+        self.revalidate_live_session(conn)?;
+        ensure!(
+            valid_path_component(destination_name)
+                && valid_path_component(temporary_name)
+                && temporary_name.starts_with('.'),
+            "late publication is unavailable"
+        );
+        let (job_id, slot_id, artifact_generation, slot_generation, component_set_digest, canonical, plan_digest): (String, String, i64, i64, String, Vec<u8>, String) = conn.query_row(
+            "SELECT a.job_id,a.slot_id,a.generation,s.version,a.component_set_digest,p.canonical_plan,p.plan_digest FROM image_generation_artifacts a JOIN image_generation_slots s ON s.job_id=a.job_id AND s.slot_id=a.slot_id JOIN image_generation_plans p ON p.job_id=a.job_id WHERE a.artifact_id=?1 AND a.state='late_quarantined' AND a.active_lease_count=0 AND s.state='late_quarantined' AND s.result_after_cancel=1 AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_cleanup_intents i WHERE i.artifact_id=a.artifact_id)",
+            [artifact_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+        ).optional()?.context("late publication is unavailable")?;
+        let plan = ImageGenerationPlanV1::from_canonical(&canonical, &plan_digest)?;
+        let output_authority = &output.authority.0;
+        ensure!(
+            plan.owner_session_id == self.session_id
+                && plan.owner_principal_digest == self.principal_digest
+                && plan.project_identity_digest == self.project_identity_digest
+                && plan.config_generation == self.config_generation
+                && plan.output_authority == *output_authority,
+            "late publication is unavailable"
+        );
+        let mut statement = conn.prepare("SELECT component_id,component_kind,relative_storage_key,byte_length_hi,byte_length_lo,sha256,resource_reservation_id,release_operation_id FROM image_generation_artifact_components WHERE artifact_id=?1 AND state='ready' ORDER BY component_id")?;
+        let components = statement
+            .query_map([artifact_id.to_string()], |row| {
+                let high = row.get::<_, i64>(3)?;
+                let low = row.get::<_, i64>(4)?;
+                Ok(CreateImageGenerationArtifactComponent {
+                    component_id: Uuid::parse_str(&row.get::<_, String>(0)?).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                    kind: ImageGenerationArtifactComponentKind::parse(&row.get::<_, String>(1)?)
+                        .ok_or(rusqlite::Error::InvalidQuery)?,
+                    relative_storage_key: row.get(2)?,
+                    byte_length: (u64::try_from(high).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Integer,
+                            Box::new(error),
+                        )
+                    })? << 32)
+                        | u64::try_from(low).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                4,
+                                rusqlite::types::Type::Integer,
+                                Box::new(error),
+                            )
+                        })?,
+                    sha256: row.get(5)?,
+                    resource_reservation_id: row.get(6)?,
+                    release_operation_id: Uuid::parse_str(&row.get::<_, String>(7)?).map_err(
+                        |error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                7,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        },
+                    )?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let (component_set_json, derived_digest) =
+            image_generation_component_set_binding(&components)?;
+        ensure!(
+            derived_digest == component_set_digest,
+            "late publication is unavailable"
+        );
+        let authorization_digest = digest_fields(&[
+            &artifact_id.to_string(),
+            &artifact_generation.to_string(),
+            &job_id,
+            &slot_id,
+            &slot_generation.to_string(),
+            &component_set_digest,
+            &output_authority.canonical_destination_digest,
+            &output_authority.authority_generation.to_string(),
+            destination_name,
+            temporary_name,
+            &self.principal_digest,
+        ]);
+        conn.execute("INSERT INTO image_generation_late_publication_authorization_facts(authorization_digest,artifact_id,artifact_generation,job_id,slot_id,slot_generation,component_set_digest,output_authority_digest,output_authority_generation,destination_name,temporary_name,principal_digest,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)", params![authorization_digest,artifact_id.to_string(),artifact_generation,job_id,slot_id,slot_generation,component_set_digest,output_authority.canonical_destination_digest, i64::try_from(output_authority.authority_generation)?,destination_name,temporary_name,self.principal_digest,created_at_unix_ms])?;
+        Ok(ImageGenerationLatePublicationAuthority {
+            artifact_id,
+            artifact_generation: u64::try_from(artifact_generation)?,
+            job_id: Uuid::parse_str(&job_id)?,
+            slot_id: Uuid::parse_str(&slot_id)?,
+            slot_generation: u64::try_from(slot_generation)?,
+            component_set_digest,
+            component_set_json,
+            authorization_digest,
+            output_authority_digest: output_authority.canonical_destination_digest.clone(),
+            output_authority_generation: output_authority.authority_generation,
+            destination_name: destination_name.into(),
+            temporary_name: temporary_name.into(),
+        })
+    }
+}
+
+pub struct ImageGenerationLatePublicationAuthority {
+    artifact_id: Uuid,
+    artifact_generation: u64,
+    job_id: Uuid,
+    slot_id: Uuid,
+    slot_generation: u64,
+    component_set_digest: String,
+    component_set_json: String,
+    authorization_digest: String,
+    output_authority_digest: String,
+    output_authority_generation: u64,
+    destination_name: String,
+    temporary_name: String,
+}
+
+impl ImageGenerationLatePublicationAuthority {
+    pub fn reserve(&self, conn: &Connection, publication_operation_id: Uuid) -> Result<bool> {
+        cockpit_db::Db::reserve_image_generation_late_publication_conn(
+            conn,
+            &ReserveImageGenerationLatePublication {
+                publication_operation_id,
+                artifact_id: self.artifact_id,
+                expected_artifact_generation: self.artifact_generation,
+                job_id: self.job_id,
+                slot_id: self.slot_id,
+                expected_slot_version: self.slot_generation,
+                component_set_digest: &self.component_set_digest,
+                component_set_json: &self.component_set_json,
+                authorization_digest: &self.authorization_digest,
+                output_authority_digest: &self.output_authority_digest,
+                output_authority_generation: self.output_authority_generation,
+                destination_name: &self.destination_name,
+                temporary_name: &self.temporary_name,
+            },
+        )
     }
 }
 

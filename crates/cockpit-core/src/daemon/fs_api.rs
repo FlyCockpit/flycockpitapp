@@ -364,6 +364,36 @@ pub async fn fs_create_dir(project_root: String, path: String) -> Result<Respons
     .await
 }
 
+pub async fn fs_create_dir_reconciled_remote(
+    project_root: String,
+    path: String,
+) -> Result<Response, ErrorPayload> {
+    join_fs_handler(
+        "fs_create_dir",
+        tokio::task::spawn_blocking(move || {
+            let root = canonical_project_root(&project_root)?;
+            let target = resolve_for_write(&root, &path)?;
+            if target.try_exists().map_err(internal)? {
+                if target.is_dir() {
+                    return Ok(Response::Ack);
+                }
+                return Err(bad_request(format!(
+                    "`{path}` exists and is not a directory"
+                )));
+            }
+            std::fs::create_dir_all(&target).map_err(internal)?;
+            let parent = target
+                .parent()
+                .ok_or_else(|| bad_request("directory target has no parent"))?;
+            std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(internal)?;
+            Ok(Response::Ack)
+        }),
+    )
+    .await
+}
+
 pub(crate) fn fs_create_dir_blocking(
     project_root: &str,
     path: &str,
@@ -956,6 +986,32 @@ mod tests {
                 .join("nested")
                 .join(format!(".flycockpit-stage-{operation}"))
                 .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_directory_creation_reconciles_only_a_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        std::fs::create_dir_all(&root).unwrap();
+        let root_text = root.to_string_lossy().into_owned();
+        assert_eq!(
+            fs_create_dir_reconciled_remote(root_text.clone(), "nested/dir".into())
+                .await
+                .unwrap(),
+            Response::Ack
+        );
+        assert_eq!(
+            fs_create_dir_reconciled_remote(root_text.clone(), "nested/dir".into())
+                .await
+                .unwrap(),
+            Response::Ack
+        );
+        std::fs::write(root.join("not-a-dir"), b"file").unwrap();
+        assert!(
+            fs_create_dir_reconciled_remote(root_text, "not-a-dir".into())
+                .await
+                .is_err()
         );
     }
 

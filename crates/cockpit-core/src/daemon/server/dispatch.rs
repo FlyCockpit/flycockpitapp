@@ -2243,6 +2243,23 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         }
 
         Request::FsCreateDir { project_root, path } => {
+            if let Some(operation) = remote_operation {
+                let request = Request::FsCreateDir {
+                    project_root: project_root.clone(),
+                    path: path.clone(),
+                };
+                if let Some(response) =
+                    begin_remote_idempotent_adapter(&request, &authorized_request, operation, ctx)
+                        .await?
+                {
+                    return Ok(response);
+                }
+                let response =
+                    crate::daemon::fs_api::fs_create_dir_reconciled_remote(project_root, path)
+                        .await?;
+                return commit_remote_idempotent_adapter(operation, ctx, "fs_create_dir", response)
+                    .await;
+            }
             crate::daemon::fs_api::fs_create_dir(project_root, path).await
         }
 

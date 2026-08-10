@@ -481,6 +481,14 @@ fn start_node(
         } else {
             MAX_ATTRIBUTE_BYTES
         };
+        if matches!(name, "fill" | "stroke" | "clip-path" | "mask")
+            && a.value.as_ref().contains(&b'&')
+        {
+            return Err(SvgSanitizeError::new(
+                SvgSanitizeCode::Attribute,
+                "url-escape",
+            ));
+        }
         let value = decode_attribute_bounded(a.value.as_ref(), limit)?;
         if name == "xmlns" {
             if kind != ElementKind::Svg || !stack.is_empty() || xmlns.is_some() || value != SVG_NS {

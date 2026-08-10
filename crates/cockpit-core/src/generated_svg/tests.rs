@@ -239,3 +239,53 @@ fn generated_svg_text_fragments_and_transform_separators() {
             .contains("transform=\"translate(1) scale(2)\"")
     );
 }
+
+#[test]
+fn generated_svg_incremental_writers_and_decoders_stop_at_exact_ceiling() {
+    let mut writer = BoundedBytes::new(4);
+    std::io::Write::write_all(&mut writer, b"1234").unwrap();
+    assert_eq!(writer.as_slice(), b"1234");
+    assert!(std::io::Write::write_all(&mut writer, b"5").is_err());
+    assert!(writer.overflowed);
+    assert_eq!(writer.as_slice(), b"1234");
+
+    assert_eq!(decode_attribute_bounded(b"&amp;&lt;", 2).unwrap(), "&<");
+    assert_eq!(
+        decode_attribute_bounded(b"&amp;&lt;", 1)
+            .unwrap_err()
+            .code(),
+        SvgSanitizeCode::AttributeBytes
+    );
+}
+
+#[test]
+fn generated_svg_namespace_and_active_content_matrix_is_closed() {
+    for raw in [
+        format!(r#"<svg xmlns="{SVG_NS}"><g xmlns="{SVG_NS}"/></svg>"#),
+        format!(r#"<svg xmlns="{SVG_NS}"><g xmlns=""/></svg>"#),
+        format!(r#"<svg xmlns="{SVG_NS}" xmlns:evil="urn:evil"/>"#),
+        format!(r#"<svg xmlns="{SVG_NS}"><evil:path/></svg>"#),
+        format!(r#"<svg xmlns="{SVG_NS}"><path onload="x"/></svg>"#),
+        format!(r#"<svg xmlns="{SVG_NS}"><path style="fill:red"/></svg>"#),
+        format!(r#"<svg xmlns="{SVG_NS}"><path filter="url(#x)"/></svg>"#),
+        format!(r#"<svg xmlns="{SVG_NS}"><path fill="url(&#35;x)"/></svg>"#),
+    ] {
+        assert!(sanitize_generated_svg(raw.as_bytes()).is_err(), "{raw}");
+    }
+}
+
+#[test]
+fn generated_svg_canonical_number_color_and_reference_fixtures_are_source_independent() {
+    let first = ok(
+        r##"<defs><linearGradient id="first"><stop offset="0.500000" stop-color="#AbC"/></linearGradient></defs><path id="shape-a" d="m 0 0 h 1 v 1 z" fill="url(#first)" transform="translate(1.000000,2)"/>"##,
+    );
+    let second = ok(
+        r##"<defs><linearGradient id="different"><stop offset="0.5" stop-color="#aabbcc"/></linearGradient></defs><path id="shape-b" d="M 0 0 L 1 0 L 1 1 Z" fill="url(#different)" transform="translate(1 2)"/>"##,
+    );
+    assert_eq!(first, second);
+    let canonical = std::str::from_utf8(first.as_bytes()).unwrap();
+    assert!(canonical.contains("id=\"svg_000001\""));
+    assert!(canonical.contains("id=\"svg_000002\""));
+    assert!(canonical.contains("fill=\"url(#svg_000001)\""));
+    assert!(canonical.contains("stop-color=\"#aabbcc\""));
+}

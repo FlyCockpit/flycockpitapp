@@ -190,11 +190,11 @@ impl MediaStorageRecovery {
             Ok(())
         }).await
     }
-    /// Claims and completes retained-HTTPS image work through the same strict
-    /// classifier/canonical image normalizer used by upload Finalize.
+    /// Claims and completes retained-HTTPS work through the same strict image
+    /// or A/V preparation pipeline used by upload Finalize.
     pub(crate) async fn process_retained_https_jobs(&self, now_unix_ms: i64) -> Result<usize> {
         let reclaim_before = now_unix_ms.saturating_sub(300_000);
-        let jobs=self.db.read(move|conn|{let mut statement=conn.prepare("SELECT j.job_id,j.attachment_id,j.expected_attachment_version,j.expected_availability_generation,j.source_evidence_digest,c.storage_id,c.stable_identity_digest,c.byte_length,c.sha256,c.reservation_id,j.state FROM media_attachment_processing_jobs j JOIN media_attachments a ON a.attachment_id=j.attachment_id JOIN media_attachment_components c ON c.attachment_id=a.attachment_id AND c.component_kind='quarantined_original' WHERE (j.state='pending' OR (j.state='claimed' AND j.claimed_at_unix_ms<=?1)) AND a.source_kind='retained_https' AND a.media_kind='image' ORDER BY j.created_at_unix_ms,j.job_id")?;statement.query_map([reclaim_before],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?,r.get::<_,String>(10)?)))?.collect::<std::result::Result<Vec<_>,_>>().map_err(Into::into)}).await?;
+        let jobs=self.db.read(move|conn|{let mut statement=conn.prepare("SELECT j.job_id,j.attachment_id,j.expected_attachment_version,j.expected_availability_generation,j.source_evidence_digest,c.storage_id,c.stable_identity_digest,c.byte_length,c.sha256,c.reservation_id,j.state,a.media_kind FROM media_attachment_processing_jobs j JOIN media_attachments a ON a.attachment_id=j.attachment_id JOIN media_attachment_components c ON c.attachment_id=a.attachment_id AND c.component_kind='quarantined_original' WHERE (j.state='pending' OR (j.state='claimed' AND j.claimed_at_unix_ms<=?1)) AND a.source_kind='retained_https' ORDER BY j.created_at_unix_ms,j.job_id")?;statement.query_map([reclaim_before],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?,r.get::<_,String>(10)?,r.get::<_,String>(11)?)))?.collect::<std::result::Result<Vec<_>,_>>().map_err(Into::into)}).await?;
         let mut completed = 0;
         for (
             job,
@@ -208,6 +208,7 @@ impl MediaStorageRecovery {
             checksum,
             reservation,
             prior_state,
+            media_kind,
         ) in jobs
         {
             let job_id = Uuid::parse_str(&job)?;
@@ -218,7 +219,8 @@ impl MediaStorageRecovery {
             if !claimed {
                 continue;
             }
-            let prepared = (|| -> Result<_> {
+            let requested_kind = media_kind_from_text(&media_kind)?;
+            let source = (|| -> Result<_> {
                 let mut held = self
                     .owned_root
                     .open_file_verified(&storage)
@@ -234,16 +236,13 @@ impl MediaStorageRecovery {
                         && stable_identity_digest(&held)? == identity,
                     "storage_security_violation"
                 );
-                let (container, mime) = probe_upload_container(&mut held, MediaKind::Image)?;
+                let (container, mime) = probe_upload_container(&mut held, requested_kind)?;
                 held.seek(SeekFrom::Start(0))?;
                 let mut bytes = Vec::new();
-                held.by_ref()
-                    .take(10 * 1024 * 1024 + 1)
-                    .read_to_end(&mut bytes)?;
-                ensure!(bytes.len() <= 10 * 1024 * 1024, "resource_limit");
-                Ok((container, mime, normalize_image(&bytes, container)?))
+                held.read_to_end(&mut bytes)?;
+                Ok((container.to_owned(), mime.to_owned(), bytes))
             })();
-            let (container, mime, normalized) = match prepared {
+            let (container, mime, bytes) = match source {
                 Ok(value) => value,
                 Err(error) => {
                     if error.to_string().contains("storage_security_violation")
@@ -254,31 +253,73 @@ impl MediaStorageRecovery {
                         continue;
                     }
                     self.db.transaction(move|conn|{let failed_generation=expected_generation.checked_add(2).context("availability generation overflow")?;cockpit_db::Db::transition_media_attachment_conn(conn,attachment_id,expected_version,expected_generation+1,MediaAvailability::Failed,now_unix_ms)?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,'probing','failed',?3,?4)",params![attachment_id.to_string(),failed_generation.to_string(),job_id.to_string(),now_unix_ms])?;conn.execute("INSERT INTO media_attachment_processing_failure_evidence(job_id,attachment_id,reason,recorded_at_unix_ms) VALUES(?1,?2,'processing_failed',?3)",params![job_id.to_string(),attachment_id.to_string(),now_unix_ms])?;conn.execute("UPDATE media_attachment_processing_jobs SET state='completed',completed_at_unix_ms=?1 WHERE job_id=?2 AND state='claimed'",params![now_unix_ms,job_id.to_string()])?;Ok(())}).await?;
-                    let _ = error;
                     completed += 1;
                     continue;
                 }
             };
-            let outputs = [
-                (
-                    "image_model",
-                    Uuid::now_v7(),
-                    normalized.model_png,
-                    normalized.width,
-                    normalized.height,
-                ),
-                (
-                    "browser_thumbnail",
-                    Uuid::now_v7(),
-                    normalized.thumbnail_png,
-                    normalized.thumbnail_width,
-                    normalized.thumbnail_height,
-                ),
-            ];
+            let (container, mime, outputs, av_evidence, terminal) =
+                if requested_kind == MediaKind::Image {
+                    let normalized = if bytes.len() <= 10 * 1024 * 1024 {
+                        normalize_image(&bytes, &container).ok()
+                    } else {
+                        None
+                    };
+                    if let Some(normalized) = normalized {
+                        (
+                            container,
+                            mime,
+                            vec![
+                                (
+                                    "image_model",
+                                    Uuid::now_v7(),
+                                    normalized.model_png,
+                                    Some((normalized.width, normalized.height)),
+                                ),
+                                (
+                                    "browser_thumbnail",
+                                    Uuid::now_v7(),
+                                    normalized.thumbnail_png,
+                                    Some((normalized.thumbnail_width, normalized.thumbnail_height)),
+                                ),
+                            ],
+                            None,
+                            None,
+                        )
+                    } else {
+                        (
+                            container,
+                            mime,
+                            Vec::new(),
+                            None,
+                            Some(MediaAvailability::Failed),
+                        )
+                    }
+                } else {
+                    let prepared = self
+                        .prepare_av_normalization(AvNormalizationInput {
+                            bytes,
+                            initial_container: container,
+                            initial_mime: mime,
+                        })
+                        .await;
+                    (
+                        prepared.canonical_container,
+                        prepared.canonical_mime,
+                        prepared.derivatives,
+                        prepared.evidence,
+                        prepared.terminal_availability,
+                    )
+                };
+            if let Some(terminal) = terminal {
+                let terminal_text = terminal.as_str().to_owned();
+                self.db.transaction(move|conn|{let terminal_generation=expected_generation.checked_add(2).context("availability generation overflow")?;cockpit_db::Db::transition_media_attachment_conn(conn,attachment_id,expected_version,expected_generation+1,terminal,now_unix_ms)?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,'probing',?3,?4,?5)",params![attachment_id.to_string(),terminal_generation.to_string(),terminal_text,job_id.to_string(),now_unix_ms])?;conn.execute("INSERT INTO media_attachment_processing_failure_evidence(job_id,attachment_id,reason,recorded_at_unix_ms) VALUES(?1,?2,?3,?4)",params![job_id.to_string(),attachment_id.to_string(),if terminal==MediaAvailability::ModelDerivativeUnavailable{"model_runtime_unavailable"}else{"processing_failed"},now_unix_ms])?;conn.execute("UPDATE media_attachment_processing_jobs SET state='completed',completed_at_unix_ms=?1 WHERE job_id=?2 AND state='claimed'",params![now_unix_ms,job_id.to_string()])?;Ok(())}).await?;
+                completed += 1;
+                continue;
+            }
             let intent_outputs = serde_json::to_string(
                 &outputs
                     .iter()
-                    .map(|(_, id, _, _, _)| id.to_string())
+                    .map(|(_, id, _, _)| id.to_string())
                     .collect::<Vec<_>>(),
             )?;
             let intent_job = job_id.to_string();
@@ -292,7 +333,7 @@ impl MediaStorageRecovery {
                     !self.fail_processing_output_proof,
                     "injected processing output proof failure"
                 );
-                for (kind, id, bytes, width, height) in outputs {
+                for (kind, id, bytes, dimensions) in outputs {
                     let name = id.to_string();
                     let mut file = self
                         .owned_root
@@ -315,8 +356,7 @@ impl MediaStorageRecovery {
                         output_identity,
                         output_length,
                         output_checksum,
-                        width,
-                        height,
+                        dimensions,
                     ));
                 }
                 self.owned_root.sync().map_err(anyhow::Error::new)?;
@@ -329,7 +369,7 @@ impl MediaStorageRecovery {
                 continue;
             }
             let names_on_error = names.clone();
-            let result=self.db.transaction(move|conn|{for(kind,id,identity,length,checksum,width,height)in components{let component=cockpit_db::media_attachments::MediaAttachmentComponent{component_id:id,attachment_id,attachment_version:expected_version,component_kind:kind.into(),storage_id:id,lifecycle_state:"ready".into(),component_generation:1,stable_identity_digest:identity,byte_length:length,sha256:checksum,reservation_id:reservation.clone(),created_at_unix_ms:now_unix_ms,updated_at_unix_ms:now_unix_ms};cockpit_db::Db::insert_media_attachment_component_conn(conn,&component)?;conn.execute("INSERT INTO media_image_component_dimensions(component_id,width,height) VALUES(?1,?2,?3)",params![id.to_string(),width,height])?;}conn.execute("UPDATE media_attachments SET canonical_container=?1,canonical_mime=?2 WHERE attachment_id=?3",params![container,mime,attachment_id.to_string()])?;let mut current=expected_generation+1;for next in[MediaAvailability::Decoding,MediaAvailability::Normalizing,MediaAvailability::Ready]{cockpit_db::Db::transition_media_attachment_conn(conn,attachment_id,expected_version,current,next,now_unix_ms)?;let after=current+1;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![attachment_id.to_string(),after.to_string(),if current==2{"probing"}else if current==3{"decoding"}else{"normalizing"},next.as_str(),job_id.to_string(),now_unix_ms])?;current=after;}conn.execute("UPDATE media_attachment_processing_jobs SET state='completed',completed_at_unix_ms=?1 WHERE job_id=?2 AND state='claimed' AND source_evidence_digest=?3",params![now_unix_ms,job_id.to_string(),source_evidence])?;conn.execute("DELETE FROM media_attachment_processing_publication_intents WHERE job_id=?1",[job_id.to_string()])?;Ok(())}).await;
+            let result=self.db.transaction(move|conn|{for(kind,id,identity,length,checksum,dimensions)in components{let component=cockpit_db::media_attachments::MediaAttachmentComponent{component_id:id,attachment_id,attachment_version:expected_version,component_kind:kind.into(),storage_id:id,lifecycle_state:"ready".into(),component_generation:1,stable_identity_digest:identity,byte_length:length,sha256:checksum,reservation_id:reservation.clone(),created_at_unix_ms:now_unix_ms,updated_at_unix_ms:now_unix_ms};cockpit_db::Db::insert_media_attachment_component_conn(conn,&component)?;if let Some((width,height))=dimensions{conn.execute("INSERT INTO media_image_component_dimensions(component_id,width,height) VALUES(?1,?2,?3)",params![id.to_string(),width,height])?;}}if let Some(evidence)=av_evidence{conn.execute("INSERT INTO media_av_normalization_evidence(attachment_id,runtime_fingerprint,probe_digest,decode_digest,plan_digest,derivative_checksum) VALUES(?1,?2,?3,?4,?5,?6)",params![attachment_id.to_string(),evidence.runtime_fingerprint,evidence.probe_digest,evidence.decode_digest,evidence.plan_digest,evidence.derivative_checksum])?;}conn.execute("UPDATE media_attachments SET canonical_container=?1,canonical_mime=?2 WHERE attachment_id=?3",params![container,mime,attachment_id.to_string()])?;let mut current=expected_generation+1;for next in[MediaAvailability::Decoding,MediaAvailability::Normalizing,MediaAvailability::Ready]{cockpit_db::Db::transition_media_attachment_conn(conn,attachment_id,expected_version,current,next,now_unix_ms)?;let after=current+1;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![attachment_id.to_string(),after.to_string(),if current==2{"probing"}else if current==3{"decoding"}else{"normalizing"},next.as_str(),job_id.to_string(),now_unix_ms])?;current=after;}conn.execute("UPDATE media_attachment_processing_jobs SET state='completed',completed_at_unix_ms=?1 WHERE job_id=?2 AND state='claimed' AND source_evidence_digest=?3",params![now_unix_ms,job_id.to_string(),source_evidence])?;conn.execute("DELETE FROM media_attachment_processing_publication_intents WHERE job_id=?1",[job_id.to_string()])?;Ok(())}).await;
             if let Err(error) = result {
                 for name in names_on_error {
                     let _ = self.owned_root.remove_file(&name);
@@ -6176,6 +6216,67 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state, ("failed".into(), 1));
+    }
+
+    #[tokio::test]
+    async fn retained_audio_runtime_unavailable_is_terminal_and_not_reclaimed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
+        let session_id = Uuid::now_v7();
+        db.transaction(move |conn| {
+            conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/redacted',1,1)",[session_id.to_string()])?;
+            Ok(())
+        }).await.unwrap();
+        let mut wav = b"RIFF".to_vec();
+        wav.extend_from_slice(&36u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&[1, 0, 1, 0]);
+        wav.extend_from_slice(&48_000u32.to_le_bytes());
+        wav.extend_from_slice(&96_000u32.to_le_bytes());
+        wav.extend_from_slice(&[2, 0, 16, 0]);
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&0u32.to_le_bytes());
+        let recovery = MediaStorageRecovery::open_or_create(db.clone(), &temp.path().join("media"))
+            .unwrap()
+            .with_https_fetcher(std::sync::Arc::new(ScriptedHttpsFetcher {
+                calls: AtomicUsize::new(0),
+                bytes: wav,
+            }))
+            .with_av_runtime(ApprovedAvRuntime {
+                ffmpeg: "/definitely-missing/ffmpeg".into(),
+                ffprobe: "/definitely-missing/ffprobe".into(),
+                fingerprint: "ab".repeat(32),
+            });
+        recovery
+            .retain_https_media(
+                RetainHttpsMediaV1 {
+                    schema_version: 1,
+                    kind: "retainHttpsMedia".into(),
+                    local_operation_id: Uuid::now_v7(),
+                    owner_principal_digest: "22".repeat(32),
+                    session_id,
+                    canonical_project_digest: "11".repeat(32),
+                    client_draft_id: Uuid::now_v7(),
+                    requested_media_kind: RequestedLocalPathMediaKind::Audio,
+                    url: "https://media.example.test/audio.wav".into(),
+                },
+                &cockpit_config::config::media_budget::MediaResourcePolicy::default(),
+                1,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovery.process_retained_https_jobs(11).await.unwrap(), 1);
+        assert_eq!(
+            recovery
+                .process_retained_https_jobs(1_000_000)
+                .await
+                .unwrap(),
+            0
+        );
+        let state = db.read(|conn| Ok((conn.query_row("SELECT availability FROM media_attachments", [], |r| r.get::<_, String>(0))?, conn.query_row("SELECT COUNT(*) FROM media_attachment_processing_failure_evidence WHERE reason='model_runtime_unavailable'", [], |r| r.get::<_, i64>(0))?))).await.unwrap();
+        assert_eq!(state, ("model_derivative_unavailable".into(), 1));
     }
 
     #[tokio::test]

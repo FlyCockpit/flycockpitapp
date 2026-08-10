@@ -15,7 +15,10 @@ use super::external_journal::{
     PrepareExternalOperation, transition_external_operation_conn,
 };
 use super::image_generation_plan::ImageGenerationPlanV1;
-use super::image_spend::prepare_reserved_image_spend_dispatch_conn;
+use super::image_spend::{
+    ImageSpendDispatchEvidence, finish_reserved_image_spend_dispatch_conn,
+    prepare_reserved_image_spend_dispatch_conn,
+};
 
 const MAX_IMAGE_GENERATION_RECONCILIATION_EVIDENCE_BYTES: usize = 64 * 1024;
 
@@ -683,6 +686,8 @@ pub struct PrepareImageGenerationDispatch<'a> {
     pub expected_attempt_version: u64,
     pub spend_reservation_id: &'a str,
     pub spend_attempt_id: &'a str,
+    pub media_reservation_id: &'a str,
+    pub expected_media_reservation_version: u64,
     pub journal: &'a PrepareExternalOperation,
     pub at_unix_ms: i64,
     pub now_monotonic_ms: u64,
@@ -691,6 +696,10 @@ pub struct PrepareImageGenerationDispatch<'a> {
 pub struct ImageGenerationQueueAuthority {
     job_id: Uuid,
     job_version: u64,
+    spend_reservation_id: String,
+    spend_attempt_id: String,
+    media_reservation_id: String,
+    media_reservation_version: u64,
 }
 
 pub struct PreparedImageGenerationDispatch {
@@ -699,6 +708,10 @@ pub struct PreparedImageGenerationDispatch {
     attempt_number: u32,
     operation: ExternalJournalRecord,
     attempt_version: u64,
+    spend_reservation_id: String,
+    spend_attempt_id: String,
+    media_reservation_id: String,
+    media_reservation_version: u64,
     slot_version: u64,
     job_version: u64,
 }
@@ -870,6 +883,19 @@ impl Db {
                 input.journal,
                 input.at_unix_ms,
             )?;
+            let canonical: Vec<u8> = conn.query_row(
+                "SELECT canonical_plan FROM image_generation_plans WHERE job_id=?1",
+                [input.job_id.to_string()],
+                |row| row.get(0),
+            )?;
+            let plan = ImageGenerationPlanV1::from_canonical(&canonical, &projection.3)?;
+            ensure!(
+                plan.central_resources.iter().any(|resource| {
+                    resource.reservation_identity == input.media_reservation_id
+                }),
+                "image generation media reservation differs from sealed plan"
+            );
+            ensure!(conn.execute("UPDATE media_reservations SET state='dispatching_external',version=version+1,external_operation_id=?1 WHERE reservation_id=?2 AND state='executing_local' AND version=?3 AND owner_session_key=?4 AND deadline_monotonic_ms>?5 AND cancellation_requested=0 AND external_operation_id IS NULL",params![operation.operation_id.to_string(),input.media_reservation_id,i64::try_from(input.expected_media_reservation_version)?,input.journal.owner_session_id.as_str(),i64::try_from(input.now_monotonic_ms)?])?==1,"image generation media reservation lost dispatch authority");
             ensure!(conn.execute("UPDATE image_generation_attempts SET state='preparing',version=version+1,external_operation_id=?1,observed_journal_version=?2 WHERE job_id=?3 AND slot_id=?4 AND attempt_number=?5 AND state='planned' AND version=?6",params![operation.operation_id.to_string(),operation.version,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?])?==1,"image generation attempt preparation lost compare-and-set");
             ensure!(conn.execute("UPDATE image_generation_attempts SET state='prepared',version=version+1 WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND state='preparing' AND version=?4",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version+1)?])?==1,"image generation attempt preparation lost compare-and-set");
             ensure!(conn.execute("UPDATE image_generation_slots SET state='dispatching',version=version+1 WHERE job_id=?1 AND slot_id=?2 AND state='queued' AND version=?3",params![input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.expected_slot_version)?])?==1,"image generation slot dispatch lost compare-and-set");
@@ -882,6 +908,10 @@ impl Db {
                 attempt_version: input.expected_attempt_version + 2,
                 slot_version: input.expected_slot_version + 1,
                 job_version: input.expected_job_version + 1,
+                spend_reservation_id: input.spend_reservation_id.into(),
+                spend_attempt_id: input.spend_attempt_id.into(),
+                media_reservation_id: input.media_reservation_id.into(),
+                media_reservation_version: input.expected_media_reservation_version + 1,
             })
         })
     }
@@ -915,7 +945,58 @@ impl Db {
                 slot_id: prepared.slot_id,
                 attempt_number: prepared.attempt_number,
                 attempt_version: prepared.attempt_version + 1,
+                spend_reservation_id: prepared.spend_reservation_id,
+                spend_attempt_id: prepared.spend_attempt_id,
+                media_reservation_id: prepared.media_reservation_id,
+                media_reservation_version: prepared.media_reservation_version,
             })
+        })
+    }
+
+    pub fn finish_image_generation_handoff_conn(
+        conn: &Connection,
+        dispatching: DispatchingImageGenerationAttempt,
+        evidence: ImageSpendDispatchEvidence,
+        at_unix_ms: i64,
+    ) -> Result<()> {
+        atomic_conn(conn, "image_generation_finish_handoff", || {
+            let outcome = finish_reserved_image_spend_dispatch_conn(
+                conn,
+                &dispatching.spend_reservation_id,
+                &dispatching.spend_attempt_id,
+                dispatching.operation.operation_id,
+                dispatching.operation.version,
+                evidence,
+                at_unix_ms,
+            )?;
+            let (attempt, slot, job, media) = match evidence {
+                ImageSpendDispatchEvidence::Accepted => {
+                    ("accepted", "running", "running", "external_pending")
+                }
+                ImageSpendDispatchEvidence::DefinitivelyRejected => {
+                    ("rejected_not_accepted", "failed", "failed", "settling")
+                }
+                ImageSpendDispatchEvidence::SubmissionUnknown => (
+                    "submission_unknown",
+                    "submission_unknown",
+                    "submission_unknown",
+                    "external_pending",
+                ),
+            };
+            ensure!(
+                outcome.record().state.as_str()
+                    == match evidence {
+                        ImageSpendDispatchEvidence::Accepted => "accepted",
+                        ImageSpendDispatchEvidence::DefinitivelyRejected => "rejected",
+                        ImageSpendDispatchEvidence::SubmissionUnknown => "submission_unknown",
+                    },
+                "image generation handoff evidence differs"
+            );
+            ensure!(conn.execute("UPDATE image_generation_attempts SET state=?1,version=version+1,observed_journal_version=?2 WHERE job_id=?3 AND slot_id=?4 AND attempt_number=?5 AND state='dispatching' AND version=?6 AND external_operation_id=?7",params![attempt,outcome.record().version,dispatching.job_id.to_string(),dispatching.slot_id.to_string(),i64::from(dispatching.attempt_number),i64::try_from(dispatching.attempt_version)?,dispatching.operation.operation_id.to_string()])?==1,"image generation handoff attempt compare-and-set lost");
+            ensure!(conn.execute("UPDATE image_generation_slots SET state=?1,version=version+1,failure_reason=CASE WHEN ?1='failed' THEN 'definitively_rejected' ELSE NULL END WHERE job_id=?2 AND slot_id=?3 AND state='dispatching'",params![slot,dispatching.job_id.to_string(),dispatching.slot_id.to_string()])?==1,"image generation handoff slot compare-and-set lost");
+            ensure!(conn.execute("UPDATE image_generation_jobs SET state=?1,version=version+1,updated_at_unix_ms=?2 WHERE job_id=?3 AND state='dispatching'",params![job,at_unix_ms,dispatching.job_id.to_string()])?==1,"image generation handoff job compare-and-set lost");
+            ensure!(conn.execute("UPDATE media_reservations SET state=?1,version=version+1 WHERE reservation_id=?2 AND state='dispatching_external' AND version=?3 AND external_operation_id=?4",params![media,dispatching.media_reservation_id,i64::try_from(dispatching.media_reservation_version)?,dispatching.operation.operation_id.to_string()])?==1,"image generation media handoff compare-and-set lost");
+            Ok(())
         })
     }
 

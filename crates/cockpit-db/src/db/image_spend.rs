@@ -92,6 +92,38 @@ pub(crate) fn prepare_reserved_image_spend_dispatch_conn(
     Ok(record.clone())
 }
 
+pub(crate) fn finish_reserved_image_spend_dispatch_conn(
+    conn: &rusqlite::Connection,
+    reservation_id: &str,
+    attempt_id: &str,
+    operation_id: Uuid,
+    expected_version: i64,
+    evidence: ImageSpendDispatchEvidence,
+    at_ms: i64,
+) -> Result<ExternalTransitionOutcome> {
+    let bound: Option<i64> = conn.query_row("SELECT 1 FROM image_spend_attempt_dispatches WHERE reservation_id=?1 AND attempt_id=?2 AND external_operation_id=?3",params![reservation_id,attempt_id,operation_id.to_string()],|row|row.get(0)).optional()?;
+    if bound.is_none() {
+        bail!("external operation is not bound to the image spend attempt");
+    }
+    let next = match evidence {
+        ImageSpendDispatchEvidence::Accepted => ExternalJournalState::Accepted,
+        ImageSpendDispatchEvidence::DefinitivelyRejected => ExternalJournalState::Rejected,
+        ImageSpendDispatchEvidence::SubmissionUnknown => ExternalJournalState::SubmissionUnknown,
+    };
+    let outcome =
+        transition_external_operation_conn(conn, operation_id, expected_version, next, at_ms)?;
+    if outcome.record().state == ExternalJournalState::Rejected {
+        let unrejected:i64=conn.query_row("SELECT COUNT(*) FROM image_spend_attempts a LEFT JOIN image_spend_attempt_dispatches d USING(reservation_id,attempt_id) LEFT JOIN external_journal_operations o ON o.operation_id=d.external_operation_id WHERE a.reservation_id=?1 AND COALESCE(o.state,'')<>'rejected'",[reservation_id],|row|row.get(0))?;
+        if unrejected == 0 {
+            let changed=conn.execute("UPDATE image_spend_reservations SET state='released',release_proof_identity=?2,released_at_ms=?3 WHERE reservation_id=?1 AND state='reserved'",params![reservation_id,operation_id.to_string(),at_ms])?;
+            if changed != 0 {
+                conn.execute("UPDATE image_spend_scope_usage SET reserved_usd_micros=charged_usd_micros WHERE reservation_id=?1",[reservation_id])?;
+            }
+        }
+    }
+    Ok(outcome)
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BudgetPolicy {
@@ -1462,34 +1494,17 @@ impl Db {
         at_ms: i64,
     ) -> Result<ExternalTransitionOutcome> {
         self.transaction(move |conn| {
-            let bound: Option<i64> = conn.query_row(
-                "SELECT 1 FROM image_spend_attempt_dispatches WHERE reservation_id=?1 AND attempt_id=?2 AND external_operation_id=?3",
-                params![reservation_id, attempt_id, operation_id.to_string()], |row| row.get(0),
-            ).optional()?;
-            if bound.is_none() { bail!("external operation is not bound to the image spend attempt"); }
-            let next = match evidence {
-                ImageSpendDispatchEvidence::Accepted => ExternalJournalState::Accepted,
-                ImageSpendDispatchEvidence::DefinitivelyRejected => ExternalJournalState::Rejected,
-                ImageSpendDispatchEvidence::SubmissionUnknown => ExternalJournalState::SubmissionUnknown,
-            };
-            let outcome = transition_external_operation_conn(conn, operation_id, expected_version, next, at_ms)?;
-            if outcome.record().state == ExternalJournalState::Rejected {
-                let unrejected: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM image_spend_attempts a LEFT JOIN image_spend_attempt_dispatches d USING(reservation_id,attempt_id) LEFT JOIN external_journal_operations o ON o.operation_id=d.external_operation_id WHERE a.reservation_id=?1 AND COALESCE(o.state,'')<>'rejected'",
-                    [&reservation_id], |row| row.get(0),
-                )?;
-                if unrejected == 0 {
-                    let changed = conn.execute(
-                        "UPDATE image_spend_reservations SET state='released',release_proof_identity=?2,released_at_ms=?3 WHERE reservation_id=?1 AND state='reserved'",
-                        params![reservation_id, operation_id.to_string(), at_ms],
-                    )?;
-                    if changed != 0 {
-                        conn.execute("UPDATE image_spend_scope_usage SET reserved_usd_micros=charged_usd_micros WHERE reservation_id=?1", [&reservation_id])?;
-                    }
-                }
-            }
-            Ok(outcome)
-        }).await
+            finish_reserved_image_spend_dispatch_conn(
+                conn,
+                &reservation_id,
+                &attempt_id,
+                operation_id,
+                expected_version,
+                evidence,
+                at_ms,
+            )
+        })
+        .await
     }
 
     /// Apply one authoritative billing identity exactly once. Actual cost is

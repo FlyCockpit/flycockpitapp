@@ -1575,6 +1575,139 @@ mod tests {
         operation_id: Uuid,
     }
 
+    struct MixedFixture {
+        job_id: Uuid,
+        slots: Vec<Uuid>,
+        operations: Vec<Uuid>,
+    }
+
+    fn mixed_fixture(conn: &Connection) -> Result<MixedFixture> {
+        let job_id = Uuid::now_v7();
+        let slots = (0..4).map(|_| Uuid::now_v7()).collect::<Vec<_>>();
+        let artifacts = (0..4).map(|_| Uuid::now_v7()).collect::<Vec<_>>();
+        let (bytes, _) = canonical_test_plan(job_id, slots[0], artifacts[0], 1, 1, 100);
+        let mut plan: ImageGenerationPlanV1 = serde_json::from_slice(&bytes)?;
+        let template = plan.targets[0].slots[0].clone();
+        plan.targets[0].slots = slots
+            .iter()
+            .zip(&artifacts)
+            .enumerate()
+            .map(|(index, (slot_id, artifact_id))| {
+                let mut slot = template.clone();
+                slot.slot_id = *slot_id;
+                slot.managed_artifact_id = *artifact_id;
+                slot.slot_index = index as u32;
+                slot.sample_index = index as u32;
+                slot.publication_name = format!("generated-{index}.png");
+                slot.attempts[0].provider_request_identity = format!("request:{index}");
+                slot.attempts[0].provider_idempotency_identity = format!("idem:{index}");
+                slot
+            })
+            .collect();
+        plan.targets[0].sample_count = 4;
+        plan.central_resources[0].units = 4;
+        plan.spend.maximum_usd_micros = Some(4);
+        let bytes = plan.canonical_bytes()?;
+        let digest = plan.digest()?;
+        let verified = CreateImageGenerationJob::from_verified_canonical_plan(&bytes, &digest, 1)?;
+        let graph = plan.targets[0]
+            .slots
+            .iter()
+            .map(|slot| CreateImageGenerationSlot {
+                slot_id: slot.slot_id,
+                slot_index: slot.slot_index,
+                sample_index: slot.sample_index,
+                managed_artifact_id: slot.managed_artifact_id,
+                attempts: vec![CreateImageGenerationAttempt {
+                    attempt_number: 1,
+                    provider_request_identity: slot.attempts[0].provider_request_identity.clone(),
+                    provider_idempotency_identity: slot.attempts[0]
+                        .provider_idempotency_identity
+                        .clone(),
+                }],
+            })
+            .collect::<Vec<_>>();
+        Db::create_image_generation_graph_conn(conn, &verified, &graph)?;
+        for (state, version) in [("validating", 2), ("queued", 3), ("dispatching", 4)] {
+            conn.execute(
+                "UPDATE image_generation_jobs SET state=?1,version=?2 WHERE job_id=?3",
+                params![state, version, job_id.to_string()],
+            )?;
+        }
+        let operations = (0..3).map(|_| Uuid::now_v7()).collect::<Vec<_>>();
+        for (index, slot_id) in slots.iter().take(2).enumerate() {
+            conn.execute("INSERT INTO external_journal_operations(operation_id,operation_kind,owner_session_id,idempotency_key,payload_digest,payload_len,state,version,created_at_wall_ms,updated_at_wall_ms,terminal_at_wall_ms) VALUES(?1,'image_generation','owner',?2,?3,1,'succeeded',1,1,1,1)",params![operations[index].to_string(),format!("idem:{index}"),"1".repeat(64)])?;
+            for (state, version) in [
+                ("preparing", 2),
+                ("prepared", 3),
+                ("dispatching", 4),
+                ("accepted", 5),
+                ("downloading", 6),
+                ("response_adopted", 7),
+            ] {
+                conn.execute("UPDATE image_generation_attempts SET state=?1,version=?2,external_operation_id=?3,observed_journal_version=1,response_digest=CASE WHEN ?1='response_adopted' THEN ?4 ELSE response_digest END WHERE job_id=?5 AND slot_id=?6",params![state,version,operations[index].to_string(),"a".repeat(64),job_id.to_string(),slot_id.to_string()])?;
+            }
+            for (state, version) in [
+                ("queued", 2),
+                ("dispatching", 3),
+                ("running", 4),
+                ("downloading", 5),
+                ("validating", 6),
+            ] {
+                conn.execute("UPDATE image_generation_slots SET state=?1,version=?2 WHERE job_id=?3 AND slot_id=?4",params![state,version,job_id.to_string(),slot_id.to_string()])?;
+            }
+        }
+        conn.execute("UPDATE image_generation_slots SET state='ready_to_publish',version=7 WHERE job_id=?1 AND slot_id=?2",params![job_id.to_string(),slots[0].to_string()])?;
+        Db::commit_image_generation_publication_conn(
+            conn,
+            &CommitImageGenerationPublication {
+                job_id,
+                slot_id: slots[0],
+                attempt_number: 1,
+                expected_attempt_version: 7,
+                expected_slot_version: 7,
+                artifact_generation: 1,
+                now_unix_ms: 2,
+            },
+        )?;
+        conn.execute("INSERT INTO external_journal_operations(operation_id,operation_kind,owner_session_id,idempotency_key,payload_digest,payload_len,state,version,created_at_wall_ms,updated_at_wall_ms) VALUES(?1,'image_generation','owner','idem:3',?2,1,'reconciling',2,1,1)",params![operations[2].to_string(),"3".repeat(64)])?;
+        for (state, version) in [
+            ("preparing", 2),
+            ("prepared", 3),
+            ("dispatching", 4),
+            ("submission_unknown", 5),
+            ("reconciling", 6),
+        ] {
+            conn.execute("UPDATE image_generation_attempts SET state=?1,version=?2,external_operation_id=?3,observed_journal_version=2 WHERE job_id=?4 AND slot_id=?5",params![state,version,operations[2].to_string(),job_id.to_string(),slots[3].to_string()])?;
+        }
+        for (state, version) in [("queued", 2), ("dispatching", 3), ("submission_unknown", 4)] {
+            conn.execute("UPDATE image_generation_slots SET state=?1,version=?2 WHERE job_id=?3 AND slot_id=?4",params![state,version,job_id.to_string(),slots[3].to_string()])?;
+        }
+        Ok(MixedFixture {
+            job_id,
+            slots,
+            operations,
+        })
+    }
+
+    fn mixed_snapshot(conn: &Connection, job_id: Uuid) -> Result<String> {
+        let queries = [
+            "SELECT COALESCE(group_concat(job_id||':'||state||':'||version,'|'),'') FROM image_generation_jobs",
+            "SELECT COALESCE(group_concat(slot_id||':'||state||':'||version||':'||COALESCE(applied_cancellation_version,'')||':'||result_after_cancel,'|'),'') FROM image_generation_slots",
+            "SELECT COALESCE(group_concat(slot_id||':'||state||':'||version||':'||COALESCE(applied_cancellation_version,'')||':'||COALESCE(observed_journal_version,''),'|'),'') FROM image_generation_attempts",
+            "SELECT COALESCE(group_concat(job_id||':'||cancellation_version||':'||request_operation_id,'|'),'') FROM image_generation_cancellation_facts",
+            "SELECT COALESCE(group_concat(slot_id||':'||attempt_number||':'||cancellation_version||':'||response_digest,'|'),'') FROM image_generation_cancelled_result_facts",
+            "SELECT COALESCE(group_concat(slot_id||':'||attempt_number||':'||journal_version||':'||evidence_digest,'|'),'') FROM image_generation_reconciliation_evidence",
+            "SELECT COALESCE(group_concat(operation_id||':'||state||':'||version,'|'),'') FROM external_journal_operations",
+        ];
+        let mut snapshot = job_id.to_string();
+        for query in queries {
+            let value: String = conn.query_row(query, [], |row| row.get(0))?;
+            snapshot.push_str(&value);
+        }
+        Ok(snapshot)
+    }
+
     fn race_fixture(conn: &Connection, adopted: bool) -> Result<RaceFixture> {
         let job_id = Uuid::now_v7();
         let slot_id = Uuid::now_v7();
@@ -1779,6 +1912,96 @@ mod tests {
                 assert!(Db::reconcile_image_generation_attempt_conn(conn,&ReconcileImageGenerationAttempt{job_id:fixture.job_id,slot_id:fixture.slot_id,attempt_number:1,expected_attempt_version:6,expected_slot_version:4,external_operation_id:fixture.operation_id,expected_journal_version:2,evidence_bytes:b"authoritative provider evidence",outcome,now_unix_ms:20}).is_err());
                 Ok(())
             }).unwrap();
+        }
+    }
+
+    fn cancel_mixed(
+        conn: &Connection,
+        fixture: &MixedFixture,
+    ) -> Result<ImageGenerationCasOutcome> {
+        Db::request_image_generation_cancellation_conn(
+            conn,
+            &RequestImageGenerationCancellation {
+                job_id: fixture.job_id,
+                cancellation_version: 1,
+                request_operation_id: "cancel:mixed",
+                requested_at_unix_ms: 10,
+            },
+        )
+    }
+
+    #[test]
+    fn mixed_four_slot_cancellation_is_atomic_and_replay_exact() {
+        let db = Db::open_in_memory().unwrap();
+        db.blocking_for_sync_cli(|conn|{
+            let fixture=mixed_fixture(conn)?; let outcome=cancel_mixed(conn,&fixture)?; assert_eq!(outcome,ImageGenerationCasOutcome::Applied{version:5});
+            let states=conn.prepare("SELECT state,version,applied_cancellation_version,result_after_cancel FROM image_generation_slots WHERE job_id=?1 ORDER BY slot_index")?.query_map([fixture.job_id.to_string()],|row|Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,Option<i64>>(2)?,row.get::<_,i64>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            assert_eq!(states,vec![("published".into(),8,None,0),("validating".into(),7,Some(1),1),("cancelled".into(),2,Some(1),0),("cancellation_requested".into(),5,Some(1),0)]);
+            let attempts=conn.prepare("SELECT state,version,applied_cancellation_version FROM image_generation_attempts WHERE job_id=?1 ORDER BY slot_id")?.query_map([fixture.job_id.to_string()],|row|Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,Option<i64>>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            assert_eq!(attempts.iter().filter(|row|row.0=="completed_after_cancel"&&row.2==Some(1)).count(),1);
+            assert_eq!(attempts.iter().filter(|row|row.0=="cancelled"&&row.2==Some(1)).count(),1);
+            assert_eq!(attempts.iter().filter(|row|row.0=="cancellation_requested"&&row.2==Some(1)).count(),1);
+            let facts:i64=conn.query_row("SELECT COUNT(*) FROM image_generation_cancelled_result_facts WHERE job_id=?1 AND cancellation_version=1 AND ordering='response_adopted_before_cancellation'",[fixture.job_id.to_string()],|row|row.get(0))?; assert_eq!(facts,1);
+            let journal:(String,i64)=conn.query_row("SELECT state,version FROM external_journal_operations WHERE operation_id=?1",[fixture.operations[2].to_string()],|row|Ok((row.get(0)?,row.get(1)?)))?;
+            assert_eq!(journal,("cancellation_requested".into(),3));
+            let before=mixed_snapshot(conn,fixture.job_id)?; assert_eq!(cancel_mixed(conn,&fixture)?,ImageGenerationCasOutcome::Applied{version:5}); assert_eq!(mixed_snapshot(conn,fixture.job_id)?,before);
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
+    fn mixed_cancellation_rolls_back_at_every_write_boundary() {
+        for (cut, trigger) in [
+            (
+                "fact",
+                "CREATE TEMP TRIGGER cut BEFORE INSERT ON image_generation_cancellation_facts BEGIN SELECT RAISE(ABORT,'cut'); END",
+            ),
+            (
+                "journal",
+                "CREATE TEMP TRIGGER cut BEFORE UPDATE ON external_journal_operations BEGIN SELECT RAISE(ABORT,'cut'); END",
+            ),
+            (
+                "result",
+                "CREATE TEMP TRIGGER cut BEFORE INSERT ON image_generation_cancelled_result_facts BEGIN SELECT RAISE(ABORT,'cut'); END",
+            ),
+            (
+                "attempt",
+                "CREATE TEMP TRIGGER cut BEFORE UPDATE ON image_generation_attempts BEGIN SELECT RAISE(ABORT,'cut'); END",
+            ),
+            (
+                "slot",
+                "CREATE TEMP TRIGGER cut BEFORE UPDATE ON image_generation_slots BEGIN SELECT RAISE(ABORT,'cut'); END",
+            ),
+            (
+                "job",
+                "CREATE TEMP TRIGGER cut BEFORE UPDATE ON image_generation_jobs BEGIN SELECT RAISE(ABORT,'cut'); END",
+            ),
+        ] {
+            let db = Db::open_in_memory().unwrap();
+            db.blocking_for_sync_cli(move |conn| {
+                let fixture = mixed_fixture(conn)?;
+                let before = mixed_snapshot(conn, fixture.job_id)?;
+                conn.execute_batch(trigger)?;
+                ensure!(cancel_mixed(conn, &fixture).is_err(), "{cut}");
+                conn.execute_batch("DROP TRIGGER cut")?;
+                ensure!(
+                    mixed_snapshot(conn, fixture.job_id)? == before,
+                    "{cut} left partial state"
+                );
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn cancelled_reconciling_slot_accepts_both_authoritative_outcomes() {
+        for outcome in [
+            ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance,
+            ImageGenerationReconciliationOutcome::AuthoritativeFailure,
+        ] {
+            let db = Db::open_in_memory().unwrap();
+            db.blocking_for_sync_cli(move|conn|{let fixture=mixed_fixture(conn)?;cancel_mixed(conn,&fixture)?;Db::reconcile_image_generation_attempt_conn(conn,&ReconcileImageGenerationAttempt{job_id:fixture.job_id,slot_id:fixture.slots[3],attempt_number:1,expected_attempt_version:7,expected_slot_version:5,external_operation_id:fixture.operations[2],expected_journal_version:3,evidence_bytes:b"mixed reconciliation",outcome,now_unix_ms:11})?;let row:(String,String,Option<i64>)=conn.query_row("SELECT a.state,s.state,a.applied_cancellation_version FROM image_generation_attempts a JOIN image_generation_slots s ON s.job_id=a.job_id AND s.slot_id=a.slot_id WHERE a.job_id=?1 AND a.slot_id=?2",params![fixture.job_id.to_string(),fixture.slots[3].to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;let expected=match outcome{ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance=>("cancelled","cancelled"),ImageGenerationReconciliationOutcome::AuthoritativeFailure=>("failed_after_acceptance","failed")};assert_eq!((row.0.as_str(),row.1.as_str(),row.2),(expected.0,expected.1,Some(1)));Ok(())}).unwrap();
         }
     }
 

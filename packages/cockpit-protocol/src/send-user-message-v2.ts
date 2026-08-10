@@ -158,10 +158,10 @@ function validate(v: CanonicalSendUserMessageV2) {
   uuid(v.request.client_submission_id);
   if (v.model_config_generation < 0n || v.model_config_generation > 0xffffffffffffffffn)
     throw new Error("model config generation exceeds u64");
-  if (v.canonical_project_digest.length !== 32 || !v.canonical_project_digest.some(Boolean))
-    throw new Error("invalid project digest");
-  if (v.canonical_model_digest.length !== 32 || !v.canonical_model_digest.some(Boolean))
-    throw new Error("invalid model digest");
+  if (v.canonical_project_digest.length !== 32) throw new Error("invalid project digest");
+  if (!v.canonical_project_digest.some(Boolean)) throw new Error("zero project digest");
+  if (v.canonical_model_digest.length !== 32) throw new Error("invalid model digest");
+  if (!v.canonical_model_digest.some(Boolean)) throw new Error("zero model digest");
   const text = bytes(v.request.text, 1048576, "text");
   if (scalars(v.request.text) > 262144) throw new Error("text exceeds scalar limit");
   if (v.request.display_text !== null) {
@@ -309,8 +309,9 @@ class Reader {
     return v;
   }
   text(n: number) {
+    const value = this.raw(n);
     try {
-      return decoder.decode(this.raw(n));
+      return decoder.decode(value);
     } catch {
       throw new Error("invalid UTF-8");
     }

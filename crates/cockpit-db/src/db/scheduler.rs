@@ -66,13 +66,8 @@ impl Db {
 
     pub async fn delete_scheduled_job(&self, id: &str) -> Result<bool> {
         let id = id.to_string();
-        self.write(move |conn| {
-            let changed = conn
-                .execute("DELETE FROM scheduled_jobs WHERE id = ?1", [id])
-                .context("deleting scheduled job")?;
-            Ok(changed > 0)
-        })
-        .await
+        self.write(move |conn| delete_scheduled_job_conn(conn, &id))
+            .await
     }
 
     pub async fn set_scheduled_job_enabled(
@@ -205,6 +200,13 @@ impl Db {
         })
         .await
     }
+}
+
+pub fn delete_scheduled_job_conn(conn: &rusqlite::Connection, id: &str) -> Result<bool> {
+    let changed = conn
+        .execute("DELETE FROM scheduled_jobs WHERE id = ?1", [id])
+        .context("deleting scheduled job")?;
+    Ok(changed > 0)
 }
 
 fn insert_scheduled_job_conn(

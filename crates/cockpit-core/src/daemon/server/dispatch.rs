@@ -2461,6 +2461,49 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         }
         Request::DeleteScheduledJob { id } => {
             let scheduler = require_scheduler(ctx)?;
+            if let Some(operation) = remote_operation {
+                let request = Request::DeleteScheduledJob { id: id.clone() };
+                let params = request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&request, &params)?;
+                let request_hash =
+                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let logical_attachment_id = operation.logical_attachment_id.to_string();
+                let operation_id = operation.operation_id.to_string();
+                let device_id = operation.authenticated_device_id.to_string();
+                let response_id = id.clone();
+                let outcome = ctx.db.execute_transactional_remote_operation(
+                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                        logical_attachment_id: &logical_attachment_id,
+                        operation_id: &operation_id,
+                        authenticated_device_id: &device_id,
+                        authenticated_device_generation: operation.authenticated_device_generation,
+                        operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::TransactionalMutation,
+                        request_hash,
+                        now_ms: chrono::Utc::now().timestamp_millis(),
+                    },
+                    move |conn| {
+                        let deleted = crate::db::scheduler::delete_scheduled_job_conn(conn, &id)?;
+                        let response = Response::ScheduledJobDeleted { id: response_id, deleted };
+                        let bytes = serde_json::to_vec(&response)?;
+                        Ok(crate::db::remote_attachment_operations::TransactionalRemoteMutation {
+                            value: response,
+                            safe_response: bytes.clone(),
+                            outbox_kind: "delete_scheduled_job".into(),
+                            outbox_payload: bytes,
+                        })
+                    },
+                ).await.map_err(internal)?;
+                let response = match outcome {
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Applied(response) => response,
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::Replay(bytes) => serde_json::from_slice(&bytes).map_err(internal)?,
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationConflict | crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::OperationActorConflict => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+                    crate::db::remote_attachment_operations::TransactionalRemoteOperationOutcome::AttachmentLedgerCapacity => return Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+                };
+                scheduler.refresh_timeline().await.map_err(internal)?;
+                return Ok(response);
+            }
             let deleted = scheduler.delete_job(&id).await.map_err(internal)?;
             Ok(Response::ScheduledJobDeleted { id, deleted })
         }

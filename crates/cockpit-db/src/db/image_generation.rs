@@ -1088,6 +1088,15 @@ impl Db {
                 version: u64::try_from(job_version)?,
             });
         }
+        let cancellable_slots: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM image_generation_slots WHERE job_id=?1 AND state NOT IN ('published','failed','cancelled','discarded','late_quarantined')",
+            [input.job_id.to_string()],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            cancellable_slots > 0,
+            "image generation job has no cancellable slots"
+        );
         conn.execute(
             "INSERT INTO image_generation_cancellation_facts(job_id,cancellation_version,requested_at_unix_ms,request_operation_id) VALUES(?1,?2,?3,?4)",
             params![input.job_id.to_string(),cancellation_version,input.requested_at_unix_ms,input.request_operation_id],
@@ -1797,10 +1806,11 @@ mod tests {
             .is_err()
         );
         let reordered = canonical.replacen(
-            &format!(r#""jobId":"{job_id}","enqueueStartedMonotonicMs":1"#),
-            &format!(r#""enqueueStartedMonotonicMs":1,"jobId":"{job_id}""#),
+            r#""schemaVersion":1,"kind":"imageGenerationPlan""#,
+            r#""kind":"imageGenerationPlan","schemaVersion":1"#,
             1,
         );
+        assert_ne!(reordered, canonical);
         let reordered_digest = hex_lower(&Sha256::digest(reordered.as_bytes()));
         assert!(
             CreateImageGenerationJob::from_verified_canonical_plan(

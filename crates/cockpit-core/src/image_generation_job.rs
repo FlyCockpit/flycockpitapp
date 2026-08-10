@@ -8,13 +8,16 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Result, ensure};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use crate::daemon::principal::ClientPrincipal;
 use crate::image_generation_runtime::ImageHealthSnapshot;
 use cockpit_config::config::media_budget::MediaReservationPlan;
+use cockpit_db::db::image_generation::{
+    ImageGenerationArtifactConsumerPurpose, ImageGenerationArtifactConsumerRoute,
+};
 use cockpit_db::db::sealed_scope::SealedActionGrantRow;
 use cockpit_db::image_spend::{AttemptMaximum, SpendReservation};
 use cockpit_db::media_attachments::AcquiredMediaComponentLease;
@@ -120,6 +123,88 @@ impl ImageGenerationOwnerContextAuthority {
             config_generation,
         })
     }
+
+    pub fn authorize_artifact_route(
+        &self,
+        conn: &Connection,
+        request: &AuthorizeImageGenerationArtifactRoute,
+    ) -> Result<String> {
+        ensure!(
+            route_authority_pair_valid(request.purpose, request.route),
+            "image artifact route is unavailable"
+        );
+        let row=conn.query_row("SELECT a.generation,j.version,s.version,p.canonical_plan,p.plan_digest FROM image_generation_artifacts a JOIN image_generation_jobs j ON j.job_id=a.job_id JOIN image_generation_slots s ON s.job_id=a.job_id AND s.slot_id=a.slot_id JOIN image_generation_plans p ON p.job_id=a.job_id WHERE a.artifact_id=?1 AND a.job_id=?2 AND a.slot_id=?3 AND a.state='retained' AND s.state='published'",params![request.artifact_id.to_string(),request.job_id.to_string(),request.slot_id.to_string()],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,Vec<u8>>(3)?,row.get::<_,String>(4)?))).optional()?.ok_or_else(||anyhow::anyhow!("image artifact route is unavailable"))?;
+        let plan = ImageGenerationPlanV1::from_canonical(&row.3, &row.4)?;
+        ensure!(
+            plan.owner_session_id == self.session_id
+                && plan.owner_principal_digest == self.principal_digest
+                && plan.project_identity_digest == self.project_identity_digest
+                && plan.config_generation == self.config_generation,
+            "image artifact route is unavailable"
+        );
+        ensure!(
+            row.0 == i64::try_from(request.artifact_generation)?
+                && row.1 == i64::try_from(request.job_generation)?
+                && row.2 == i64::try_from(request.slot_generation)?,
+            "image artifact route is unavailable"
+        );
+        let canonical = serde_json::to_vec(
+            &serde_json::json!({"artifactId":request.artifact_id,"artifactGeneration":request.artifact_generation,"configGeneration":self.config_generation,"jobGeneration":request.job_generation,"jobId":request.job_id,"principalDigest":self.principal_digest,"projectId":self.project_id,"projectIdentityDigest":self.project_identity_digest,"purpose":request.purpose.as_str(),"route":request.route.as_str(),"sessionId":self.session_id,"slotGeneration":request.slot_generation,"slotId":request.slot_id}),
+        )?;
+        let digest = crate::intel::hex_lower(&Sha256::digest(canonical));
+        conn.execute("INSERT INTO image_generation_artifact_authorization_facts(authorization_digest,artifact_id,artifact_generation,job_id,job_generation,slot_id,slot_generation,consumer_purpose,consumer_route,principal_digest,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![digest,request.artifact_id.to_string(),i64::try_from(request.artifact_generation)?,request.job_id.to_string(),i64::try_from(request.job_generation)?,request.slot_id.to_string(),i64::try_from(request.slot_generation)?,request.purpose.as_str(),request.route.as_str(),self.principal_digest,request.created_at_unix_ms])?;
+        Ok(digest)
+    }
+
+    pub fn revoke_artifact_route(
+        &self,
+        conn: &Connection,
+        authorization_digest: &str,
+        revoked_at_unix_ms: i64,
+    ) -> Result<()> {
+        let stored=conn.query_row("SELECT p.canonical_plan,p.plan_digest FROM image_generation_artifact_authorization_facts f JOIN image_generation_artifacts a ON a.artifact_id=f.artifact_id JOIN image_generation_plans p ON p.job_id=a.job_id WHERE f.authorization_digest=?1 AND f.principal_digest=?2 AND f.revoked_at_unix_ms IS NULL",params![authorization_digest,self.principal_digest],|row|Ok((row.get::<_,Vec<u8>>(0)?,row.get::<_,String>(1)?))).optional()?.ok_or_else(||anyhow::anyhow!("image artifact route is unavailable"))?;
+        let plan = ImageGenerationPlanV1::from_canonical(&stored.0, &stored.1)?;
+        ensure!(
+            plan.owner_session_id == self.session_id
+                && plan.owner_principal_digest == self.principal_digest
+                && plan.project_identity_digest == self.project_identity_digest
+                && plan.config_generation == self.config_generation,
+            "image artifact route is unavailable"
+        );
+        let changed=conn.execute("UPDATE image_generation_artifact_authorization_facts SET revoked_at_unix_ms=?1 WHERE authorization_digest=?2 AND principal_digest=?3 AND revoked_at_unix_ms IS NULL",params![revoked_at_unix_ms,authorization_digest,self.principal_digest])?;
+        ensure!(changed == 1, "image artifact route is unavailable");
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizeImageGenerationArtifactRoute {
+    pub artifact_id: Uuid,
+    pub artifact_generation: u64,
+    pub job_id: Uuid,
+    pub job_generation: u64,
+    pub slot_id: Uuid,
+    pub slot_generation: u64,
+    pub purpose: ImageGenerationArtifactConsumerPurpose,
+    pub route: ImageGenerationArtifactConsumerRoute,
+    pub created_at_unix_ms: i64,
+}
+
+const fn route_authority_pair_valid(
+    purpose: ImageGenerationArtifactConsumerPurpose,
+    route: ImageGenerationArtifactConsumerRoute,
+) -> bool {
+    use ImageGenerationArtifactConsumerPurpose as P;
+    use ImageGenerationArtifactConsumerRoute as R;
+    matches!(
+        (purpose, route),
+        (P::ServeArtifact, R::ArtifactFull | R::ArtifactRange)
+            | (P::ServeThumbnail, R::Thumbnail)
+            | (P::ToolInput, R::Tool)
+            | (P::ModelInput, R::ModelPayload)
+            | (P::InternalVerification, R::Verification)
+            | (P::InternalCleanup, R::Cleanup)
+    )
 }
 
 pub struct ImageGenerationResolutionProofs<'a> {
@@ -917,6 +1002,29 @@ fn valid_path_component(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn artifact_route_authority_pairs_are_closed() {
+        use ImageGenerationArtifactConsumerPurpose as P;
+        use ImageGenerationArtifactConsumerRoute as R;
+        let allowed = [
+            (P::ServeArtifact, R::ArtifactFull),
+            (P::ServeArtifact, R::ArtifactRange),
+            (P::ServeThumbnail, R::Thumbnail),
+            (P::ToolInput, R::Tool),
+            (P::ModelInput, R::ModelPayload),
+            (P::InternalVerification, R::Verification),
+            (P::InternalCleanup, R::Cleanup),
+        ];
+        for &purpose in P::ALL {
+            for &route in R::ALL {
+                assert_eq!(
+                    route_authority_pair_valid(purpose, route),
+                    allowed.contains(&(purpose, route))
+                );
+            }
+        }
+    }
 
     type ResolverCase = (
         &'static str,

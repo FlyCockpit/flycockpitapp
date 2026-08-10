@@ -2661,6 +2661,7 @@ CREATE TABLE remote_attachment_operations (
     operation_class                TEXT    NOT NULL CHECK (operation_class IN (
         'transactional_mutation', 'idempotent_adapter_mutation', 'nonrepeatable_mutation'
     )),
+    operation_kind                 TEXT    NOT NULL DEFAULT 'generic' CHECK (operation_kind IN ('generic','staged_rename')),
     state                          TEXT    NOT NULL CHECK (state IN (
         'reserved', 'dispatched', 'committed', 'rejected', 'outcome_unknown'
     )),
@@ -2717,9 +2718,9 @@ CREATE TABLE remote_rename_journal (
       AND replace(artifact_id,'-','') NOT GLOB '*[^0-9a-f]*'
       AND replace(artifact_id,'-','')<>'00000000000000000000000000000000'
     ),
-    source_identity BLOB NOT NULL CHECK(length(source_identity) = 57 AND substr(source_identity,1,4)=X'52464931' AND substr(source_identity,29,1) IN (X'01',X'02') AND substr(source_identity,50,8)<>zeroblob(8)),
-    source_parent_identity BLOB NOT NULL CHECK(length(source_parent_identity) = 57 AND substr(source_parent_identity,1,4)=X'52464931' AND substr(source_parent_identity,29,1) IN (X'01',X'02') AND substr(source_parent_identity,50,8)<>zeroblob(8)),
-    target_parent_identity BLOB NOT NULL CHECK(length(target_parent_identity) = 57 AND substr(target_parent_identity,1,4)=X'52464931' AND substr(target_parent_identity,29,1) IN (X'01',X'02') AND substr(target_parent_identity,50,8)<>zeroblob(8)),
+    source_identity BLOB NOT NULL CHECK(length(source_identity) = 57 AND substr(source_identity,1,4)=X'52464931' AND ((substr(source_identity,29,1)=X'01' AND substr(hex(source_identity),79,1)='8') OR (substr(source_identity,29,1)=X'02' AND substr(hex(source_identity),79,1)='4')) AND substr(source_identity,50,8)<>zeroblob(8)),
+    source_parent_identity BLOB NOT NULL CHECK(length(source_parent_identity) = 57 AND substr(source_parent_identity,1,4)=X'52464931' AND substr(source_parent_identity,29,1)=X'02' AND substr(hex(source_parent_identity),79,1)='4' AND substr(source_parent_identity,50,8)<>zeroblob(8)),
+    target_parent_identity BLOB NOT NULL CHECK(length(target_parent_identity) = 57 AND substr(target_parent_identity,1,4)=X'52464931' AND substr(target_parent_identity,29,1)=X'02' AND substr(hex(target_parent_identity),79,1)='4' AND substr(target_parent_identity,50,8)<>zeroblob(8)),
     dispatch_generation INTEGER NOT NULL CHECK(dispatch_generation > 0),
     state TEXT NOT NULL CHECK(state IN ('prepared','artifact_synced','renamed','source_parent_synced','target_parent_synced','applied','ledger_committed')),
     created_at_ms INTEGER NOT NULL,
@@ -2789,6 +2790,9 @@ WHEN NEW.logical_attachment_id IS NOT OLD.logical_attachment_id
   OR NEW.authenticated_device_generation IS NOT OLD.authenticated_device_generation
   OR NEW.operation_seq IS NOT OLD.operation_seq
   OR NEW.operation_class IS NOT OLD.operation_class
+  OR (NEW.operation_kind IS NOT OLD.operation_kind AND NOT (
+      OLD.operation_kind='generic' AND NEW.operation_kind='staged_rename' AND OLD.state='reserved'
+  ))
   OR NEW.request_hash IS NOT OLD.request_hash
   OR NEW.created_at_ms IS NOT OLD.created_at_ms
 BEGIN

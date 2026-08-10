@@ -164,14 +164,7 @@ pub struct RemoteFilesystemIdentityV1 {
 impl RemoteFilesystemIdentityV1 {
     pub const ENCODED_LEN: usize = 57;
     pub fn encode(self) -> Result<[u8; Self::ENCODED_LEN]> {
-        ensure!(
-            matches!(self.kind, 1 | 2),
-            "invalid remote filesystem identity kind"
-        );
-        ensure!(
-            self.link_count > 0,
-            "remote filesystem identity has no links"
-        );
+        self.validate()?;
         let mut out = [0; Self::ENCODED_LEN];
         out[..4].copy_from_slice(b"RFI1");
         out[4..12].copy_from_slice(&self.filesystem_id.to_be_bytes());
@@ -182,6 +175,22 @@ impl RemoteFilesystemIdentityV1 {
         out[41..49].copy_from_slice(&self.owner_id.to_be_bytes());
         out[49..57].copy_from_slice(&self.link_count.to_be_bytes());
         Ok(out)
+    }
+    fn validate(self) -> Result<()> {
+        ensure!(
+            matches!(self.kind, 1 | 2),
+            "invalid remote filesystem identity kind"
+        );
+        ensure!(
+            self.link_count > 0,
+            "remote filesystem identity has no links"
+        );
+        let mode_kind = self.mode & 0o170000;
+        ensure!(
+            (self.kind == 1 && mode_kind == 0o100000) || (self.kind == 2 && mode_kind == 0o040000),
+            "remote filesystem identity kind and mode disagree"
+        );
+        Ok(())
     }
     pub fn decode(value: &[u8]) -> Result<Self> {
         ensure!(
@@ -199,14 +208,7 @@ impl RemoteFilesystemIdentityV1 {
             owner_id: u64::from_be_bytes(array(41..49)?),
             link_count: u64::from_be_bytes(array(49..57)?),
         };
-        ensure!(
-            matches!(decoded.kind, 1 | 2),
-            "invalid remote filesystem identity kind"
-        );
-        ensure!(
-            decoded.link_count > 0,
-            "remote filesystem identity has no links"
-        );
+        decoded.validate()?;
         Ok(decoded)
     }
 }
@@ -243,6 +245,15 @@ impl Db {
             request.operation_class == RemoteOperationClass::IdempotentAdapterMutation,
             "remote rename requires adapter class"
         );
+        for parent in [source_parent_identity, target_parent_identity]
+            .into_iter()
+            .flatten()
+        {
+            ensure!(
+                parent.kind == 2,
+                "remote rename parent identity must be a directory"
+            );
+        }
         let owned = OwnedReserveRemoteOperation {
             logical_attachment_id: request.logical_attachment_id.into(),
             operation_id: request.operation_id.into(),
@@ -268,7 +279,7 @@ impl Db {
                 let target_parent=target_parent.context("new rename lacks target parent identity")?;
                 let artifact=Uuid::now_v7().to_string();
                 conn.execute("INSERT INTO remote_rename_journal(logical_attachment_id,operation_id,artifact_id,source_identity,source_parent_identity,target_parent_identity,dispatch_generation,state,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,1,'prepared',?7,?7)",params![owned.logical_attachment_id,owned.operation_id,artifact,source,source_parent,target_parent,owned.now_ms])?;
-                conn.execute("UPDATE remote_attachment_operations SET state='dispatched',dispatch_generation=1 WHERE logical_attachment_id=?1 AND operation_id=?2 AND state='reserved'",params![owned.logical_attachment_id,owned.operation_id])?;
+                conn.execute("UPDATE remote_attachment_operations SET state='dispatched',operation_kind='staged_rename',dispatch_generation=1 WHERE logical_attachment_id=?1 AND operation_id=?2 AND state='reserved'",params![owned.logical_attachment_id,owned.operation_id])?;
                 Ok(PrepareRemoteRenameOutcome::Prepared(load_remote_rename_evidence(conn,&owned.logical_attachment_id,&owned.operation_id)?))
             }
             ReserveRemoteOperationOutcome::Replay(replay) if replay.state=="committed" => Ok(PrepareRemoteRenameOutcome::Replay(replay.safe_response.context("committed rename lacks response")?)),
@@ -1156,7 +1167,7 @@ fn commit_conn_with_policy(
     validate_uuid("outbox delivery id", &request.outbox_delivery_id)?;
     if !allow_remote_rename {
         let has_rename: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM remote_rename_journal WHERE logical_attachment_id=?1 AND operation_id=?2)",
+            "SELECT operation_kind='staged_rename' FROM remote_attachment_operations WHERE logical_attachment_id=?1 AND operation_id=?2",
             params![request.logical_attachment_id, request.operation_id],
             |row| row.get(0),
         )?;
@@ -1455,7 +1466,7 @@ mod tests {
             object_id: u128::from(seed),
             kind,
             len: seed,
-            mode: 0o700,
+            mode: if kind == 1 { 0o100700 } else { 0o040700 },
             owner_id: 42,
             link_count: 1,
         }
@@ -2433,6 +2444,42 @@ mod tests {
                 .unwrap(),
             CommitRemoteOperationOutcome::Committed { .. }
         ));
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        let (journal_state, outbox_count): (String, i64) = db
+            .transaction(move |conn| {
+                Ok((
+                    conn.query_row(
+                        "SELECT state FROM remote_rename_journal WHERE logical_attachment_id=?1 AND operation_id=?2",
+                        params![ATTACHMENT, operation],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM remote_attachment_outbox WHERE logical_attachment_id=?1 AND operation_seq=(SELECT operation_seq FROM remote_attachment_operations WHERE logical_attachment_id=?1 AND operation_id=?2)",
+                        params![ATTACHMENT, operation],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(journal_state, "ledger_committed");
+        assert_eq!(outbox_count, 1);
+        assert!(db
+            .commit_remote_rename_operation(commit(), 2)
+            .await
+            .is_err());
+        let outbox_after_second: i64 = db
+            .transaction(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM remote_attachment_outbox WHERE logical_attachment_id=?1 AND operation_seq=(SELECT operation_seq FROM remote_attachment_operations WHERE logical_attachment_id=?1 AND operation_id=?2)",
+                    params![ATTACHMENT, operation],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(outbox_after_second, 1);
         assert_eq!(
             db.prepare_remote_rename_operation(request(), None, None, None)
                 .await
@@ -2456,6 +2503,70 @@ mod tests {
         bad_kind[28] = 3;
         assert!(RemoteFilesystemIdentityV1::decode(&bad_kind).is_err());
         assert!(RemoteFilesystemIdentityV1::decode(&encoded[..56]).is_err());
+        let mut mismatched = identity;
+        mismatched.mode = 0o040700;
+        assert!(mismatched.encode().is_err());
+    }
+
+    #[tokio::test]
+    async fn rename_discriminator_survives_journal_deletion_and_parent_roles_are_strict() {
+        let db = Db::open_in_memory().unwrap();
+        let operation = "01890f3e-4c00-7000-8000-0000000000a6";
+        let request = || ReserveRemoteOperation {
+            operation_class: RemoteOperationClass::IdempotentAdapterMutation,
+            ..reserve(operation, [16; 32])
+        };
+        assert!(db
+            .prepare_remote_rename_operation(
+                request(),
+                Some(filesystem_identity(1, 1)),
+                Some(filesystem_identity(2, 1)),
+                Some(filesystem_identity(3, 2)),
+            )
+            .await
+            .is_err());
+        assert!(db
+            .prepare_remote_rename_operation(
+                request(),
+                Some(filesystem_identity(1, 1)),
+                Some(filesystem_identity(2, 2)),
+                Some(filesystem_identity(3, 1)),
+            )
+            .await
+            .is_err());
+        let PrepareRemoteRenameOutcome::Prepared(_) = db
+            .prepare_remote_rename_operation(
+                request(),
+                Some(filesystem_identity(1, 1)),
+                Some(filesystem_identity(2, 2)),
+                Some(filesystem_identity(3, 2)),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("prepared")
+        };
+        db.transaction(move |conn| {
+            conn.execute(
+                "DELETE FROM remote_rename_journal WHERE logical_attachment_id=?1 AND operation_id=?2",
+                params![ATTACHMENT, operation],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(db
+            .commit_remote_attachment_operation(CommitRemoteOperation {
+                logical_attachment_id: ATTACHMENT,
+                operation_id: operation,
+                safe_response: b"forbidden",
+                outbox_delivery_id: "00000000-0000-4000-8000-0000000000a7",
+                outbox_kind: "filesystem_changed",
+                outbox_payload: b"rename",
+                now_ms: 30,
+            })
+            .await
+            .is_err());
     }
 
     #[tokio::test]

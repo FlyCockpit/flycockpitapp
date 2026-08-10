@@ -61,6 +61,15 @@ pub struct HeldSealedArtifact {
     evidence: HeldArtifactEvidence,
 }
 
+#[derive(Debug)]
+pub enum HeldSealOutcome {
+    Sealed(HeldSealedArtifact),
+    Recoverable {
+        artifact: HeldTemporaryArtifact,
+        error: anyhow::Error,
+    },
+}
+
 impl HeldSealedArtifact {
     pub fn file_mut(&mut self) -> &mut File {
         &mut self.file
@@ -151,45 +160,58 @@ impl HeldDirectoryAuthority {
         })
     }
 
-    pub fn seal(&self, mut artifact: HeldTemporaryArtifact) -> Result<HeldSealedArtifact> {
-        self.imp.revalidate_named(
-            &artifact.name,
-            &artifact.file,
-            &artifact.identity_digest,
-            &artifact.security_digest,
-        )?;
-        artifact.file.flush()?;
-        artifact.file.sync_all()?;
-        artifact.file.seek(SeekFrom::Start(0))?;
-        let mut hash = Sha256::new();
-        let mut length = 0_u64;
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let count = artifact.file.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            length = length
-                .checked_add(count as u64)
-                .context("artifact length overflow")?;
-            hash.update(&buffer[..count]);
+    pub fn seal(&self, artifact: HeldTemporaryArtifact) -> Result<HeldSealedArtifact> {
+        match self.seal_recoverable(artifact) {
+            HeldSealOutcome::Sealed(sealed) => Ok(sealed),
+            HeldSealOutcome::Recoverable { error, .. } => Err(error),
         }
-        self.imp.revalidate_named(
-            &artifact.name,
-            &artifact.file,
-            &artifact.identity_digest,
-            &artifact.security_digest,
-        )?;
-        Ok(HeldSealedArtifact {
-            file: artifact.file,
-            name: artifact.name,
-            evidence: HeldArtifactEvidence {
-                identity_digest: artifact.identity_digest,
-                security_digest: artifact.security_digest,
+    }
+
+    pub fn seal_recoverable(&self, mut artifact: HeldTemporaryArtifact) -> HeldSealOutcome {
+        let result = (|| -> Result<HeldArtifactEvidence> {
+            self.imp.revalidate_named(
+                &artifact.name,
+                &artifact.file,
+                &artifact.identity_digest,
+                &artifact.security_digest,
+            )?;
+            artifact.file.flush()?;
+            artifact.file.sync_all()?;
+            artifact.file.seek(SeekFrom::Start(0))?;
+            let mut hash = Sha256::new();
+            let mut length = 0_u64;
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let count = artifact.file.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                length = length
+                    .checked_add(count as u64)
+                    .context("artifact length overflow")?;
+                hash.update(&buffer[..count]);
+            }
+            self.imp.revalidate_named(
+                &artifact.name,
+                &artifact.file,
+                &artifact.identity_digest,
+                &artifact.security_digest,
+            )?;
+            Ok(HeldArtifactEvidence {
+                identity_digest: artifact.identity_digest.clone(),
+                security_digest: artifact.security_digest.clone(),
                 byte_length: length,
                 sha256: crate::intel::hex_lower(&hash.finalize()),
-            },
-        })
+            })
+        })();
+        match result {
+            Ok(evidence) => HeldSealOutcome::Sealed(HeldSealedArtifact {
+                file: artifact.file,
+                name: artifact.name,
+                evidence,
+            }),
+            Err(error) => HeldSealOutcome::Recoverable { artifact, error },
+        }
     }
 
     pub fn rename_noreplace(

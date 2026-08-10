@@ -43,7 +43,7 @@ use crate::media_reservation::{
 
 pub use crate::private_fs::held_directory::{
     HeldArtifactEvidence, HeldDirectoryEffectEvidence, HeldDirectoryEffectOutcome,
-    HeldDirectoryRecovery, HeldSealedArtifact, HeldTemporaryArtifact,
+    HeldDirectoryRecovery, HeldSealOutcome, HeldSealedArtifact, HeldTemporaryArtifact,
 };
 pub use cockpit_db::image_generation_plan::{
     AttemptPlanV1, CapabilityProvenanceV1, GrantRequirementV1, ImageGenerationPlanV1,
@@ -2179,6 +2179,9 @@ impl HeldImageGenerationArtifactRoot {
     }
     pub fn seal_component(&self, temporary: HeldTemporaryArtifact) -> Result<HeldSealedArtifact> {
         self.guard.seal(temporary)
+    }
+    pub fn seal_component_recoverable(&self, temporary: HeldTemporaryArtifact) -> HeldSealOutcome {
+        self.guard.seal_recoverable(temporary)
     }
     pub fn retain_component_noreplace(
         &self,

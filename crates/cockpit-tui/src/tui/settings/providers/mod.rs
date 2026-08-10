@@ -1408,7 +1408,8 @@ impl SettingsCx {
                         s.id_field.set("");
                     }
                     s.url_field.set(t.url);
-                    *s.headers = HeaderEditor::new(
+                    *s.headers = HeaderEditor::new_for_provider(
+                        s.id_field.text(),
                         templates::default_headers_for(t),
                         /* show_continue */ true,
                     );
@@ -1435,6 +1436,7 @@ impl SettingsCx {
                         s.error = Some(format!("a provider with id `{id}` already exists"));
                     } else {
                         s.error = None;
+                        s.headers.set_provider_id(&id);
                         if let Err(error) = s.run.submit(WizardAnswer::Text(id)) {
                             s.error = Some(error);
                         }
@@ -1924,8 +1926,11 @@ impl SettingsCx {
                 // Hand off to the Headers sub-page. We move
                 // the EditState out via `mem::replace` so the
                 // Headers page can return it intact on back.
-                let editor =
-                    HeaderEditor::new(s.entry.headers.clone(), /* show_continue */ false);
+                let editor = HeaderEditor::new_for_provider(
+                    &s.provider_id,
+                    s.entry.headers.clone(),
+                    /* show_continue */ false,
+                );
                 let owned =
                     std::mem::replace(s, EditState::new(String::new(), ProviderEntry::default()));
                 return Nav::Replace(super::providers_page(ProvidersPage::Headers {
@@ -2090,6 +2095,13 @@ impl SettingsCx {
         parent: &mut Box<EditState>,
     ) -> Nav {
         if matches!(editor.mode, HeaderMode::Browse) && matches!(key.code, KeyCode::Char('q')) {
+            if let Err(error) = cockpit_config::config::providers::validate_provider_headers(
+                &parent.provider_id,
+                &editor.rows,
+            ) {
+                editor.status = Some(error.to_string());
+                return Nav::Stay;
+            }
             parent.entry.headers = editor.rows.clone();
             let _ = self.commit_edit_entry(parent);
             return Nav::Close;
@@ -2097,6 +2109,13 @@ impl SettingsCx {
         match editor.handle_key(key) {
             HeaderResult::Stay | HeaderResult::Continue => Nav::Stay,
             HeaderResult::Save => {
+                if let Err(error) = cockpit_config::config::providers::validate_provider_headers(
+                    &parent.provider_id,
+                    &editor.rows,
+                ) {
+                    editor.status = Some(error.to_string());
+                    return Nav::Stay;
+                }
                 // `[save changes]` / `s`: fold the live header rows into the
                 // parent entry, commit to disk, and STAY on the sub-page.
                 parent.entry.headers = editor.rows.clone();
@@ -2104,6 +2123,13 @@ impl SettingsCx {
                 Nav::Stay
             }
             HeaderResult::Back => {
+                if let Err(error) = cockpit_config::config::providers::validate_provider_headers(
+                    &parent.provider_id,
+                    &editor.rows,
+                ) {
+                    editor.status = Some(error.to_string());
+                    return Nav::Stay;
+                }
                 // Move both the editor's rows and the parent state
                 // out by swapping with placeholders, then build the
                 // restored Edit page. Leaving auto-commits so the header
@@ -4439,6 +4465,10 @@ fn render_header_editor(
     if let Some(save_idx) = h.save_idx() {
         bindings.push((lines.len(), SettingsControlId(save_idx as u64)));
         lines.push(save_button_line("[save changes]", h.cursor == save_idx));
+    }
+    if let Some(status) = &h.status {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(status.clone(), yellow)));
     }
     bindings
 }

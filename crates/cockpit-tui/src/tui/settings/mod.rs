@@ -1894,6 +1894,13 @@ impl SettingsDialog {
         let mut doc = ConfigDoc::load(&self.config_path).map_err(|e| e.to_string())?;
         let mut merged = doc.providers();
         merge_dialog_provider_config(&mut merged, &self.original_config, &self.config);
+        for (provider_id, entry) in &merged.providers {
+            cockpit_config::config::providers::validate_provider_headers(
+                provider_id,
+                &entry.headers,
+            )
+            .map_err(|error| error.to_string())?;
+        }
         let notice = cockpit_core::secret_ref::protect_literal_headers(
             &mut merged.providers,
             self.credential_store_path.as_deref(),

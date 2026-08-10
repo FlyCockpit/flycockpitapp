@@ -54,10 +54,9 @@ pub const COPILOT_MODEL_MODE_DEFAULTS: &[(&str, LlmMode)] = &[
 /// so the defaults are correct there; the same id served through an
 /// aggregator such as OpenRouter is left alone. GitHub Copilot has its own
 /// template-scoped mode table ([`COPILOT_MODEL_MODE_DEFAULTS`]). Matched
-/// against a provider's persisted [`ProviderEntry::template`] identity (with a
-/// map-key fallback via [`ProviderEntry::effective_template`]), **not** its
-/// config-map key — so a renamed connection like `anthropic-work` still gets
-/// the defaults.
+/// against a provider's persisted [`ProviderEntry::template`] identity as
+/// exposed by [`ProviderEntry::effective_template`], **not** its config-map
+/// key — so a renamed connection like `anthropic-work` still gets the defaults.
 pub const FRONTIER_DEFAULT_PROVIDER_IDS: &[&str] =
     &["anthropic", "codex-oauth", "grok-oauth", "openai", "z-ai"];
 

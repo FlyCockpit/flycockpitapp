@@ -23,12 +23,12 @@ pub(super) type AnthropicCompletionModel =
 #[derive(Clone)]
 pub struct UsageAliasHttpClient {
     client: reqwest::Client,
-    extra_headers: Vec<(String, String)>,
+    extra_headers: reqwest::header::HeaderMap,
 }
 
 impl Default for UsageAliasHttpClient {
     fn default() -> Self {
-        Self::new(Vec::new())
+        Self::new(Vec::new()).expect("the canonical User-Agent is a valid header")
     }
 }
 
@@ -41,16 +41,23 @@ impl fmt::Debug for UsageAliasHttpClient {
 }
 
 impl UsageAliasHttpClient {
-    pub(super) fn new(extra_headers: Vec<(String, String)>) -> Self {
+    pub(super) fn new(extra_headers: Vec<(String, String)>) -> anyhow::Result<Self> {
         let extra_headers = with_canonical_user_agent(extra_headers);
+        let mut validated = reqwest::header::HeaderMap::new();
+        for (name, value) in extra_headers {
+            validated.insert(
+                reqwest::header::HeaderName::from_bytes(name.as_bytes())?,
+                reqwest::header::HeaderValue::from_str(&value)?,
+            );
+        }
         let client = reqwest::Client::builder()
             .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self {
+        Ok(Self {
             client,
-            extra_headers,
-        }
+            extra_headers: validated,
+        })
     }
 }
 
@@ -69,16 +76,11 @@ fn with_canonical_user_agent(mut headers: Vec<(String, String)>) -> Vec<(String,
 
 fn apply_extra_headers<T>(
     req: rig::http_client::Request<T>,
-    headers: &[(String, String)],
+    headers: &reqwest::header::HeaderMap,
 ) -> rig::http_client::Request<T> {
     let (mut parts, body) = req.into_parts();
     for (name, value) in headers {
-        if let (Ok(name), Ok(value)) = (
-            reqwest::header::HeaderName::from_bytes(name.as_bytes()),
-            reqwest::header::HeaderValue::from_str(value),
-        ) {
-            parts.headers.insert(name, value);
-        }
+        parts.headers.insert(name.clone(), value.clone());
     }
     rig::http_client::Request::from_parts(parts, body)
 }

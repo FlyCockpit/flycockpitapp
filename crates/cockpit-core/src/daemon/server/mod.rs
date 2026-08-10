@@ -3254,17 +3254,18 @@ where
         writer_tx,
     ));
 
-    tokio::pin!(reader_task);
-    tokio::pin!(writer_task);
-    tokio::pin!(event_task);
-    tokio::pin!(executor_task);
+    let mut reader_task = reader_task;
+    let mut writer_task = writer_task;
+    let mut event_task = event_task;
+    let mut executor_task = executor_task;
 
-    let completed = tokio::select! {
-        result = &mut reader_task => flatten_client_task(result, "client reader task"),
-        result = &mut writer_task => flatten_client_task(result, "client writer task"),
-        result = &mut event_task => flatten_client_task(result, "client event task"),
-        result = &mut executor_task => flatten_client_task(result, "client executor task"),
-    };
+    let completed = select_client_task(
+        &mut reader_task,
+        &mut writer_task,
+        &mut event_task,
+        &mut executor_task,
+    )
+    .await;
 
     reader_task.abort();
     writer_task.abort();
@@ -3272,6 +3273,21 @@ where
     executor_task.abort();
     completed?;
     Ok(())
+}
+
+async fn select_client_task(
+    reader: &mut tokio::task::JoinHandle<Result<()>>,
+    writer: &mut tokio::task::JoinHandle<Result<()>>,
+    event: &mut tokio::task::JoinHandle<Result<()>>,
+    executor: &mut tokio::task::JoinHandle<Result<()>>,
+) -> Result<()> {
+    tokio::select! {
+        biased;
+        result = executor => flatten_client_task(result, "client executor task"),
+        result = reader => flatten_client_task(result, "client reader task"),
+        result = writer => flatten_client_task(result, "client writer task"),
+        result = event => flatten_client_task(result, "client event task"),
+    }
 }
 
 fn flatten_client_task(

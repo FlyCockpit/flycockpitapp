@@ -14283,7 +14283,7 @@ async fn serialized_requests_apply_in_receipt_order() {
     assert!(saw_set_ack);
     assert!(saw_message);
     drop(executor_tx);
-    executor.await.unwrap();
+    executor.await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -14342,7 +14342,7 @@ async fn concurrent_requests_may_complete_out_of_order() {
         other => panic!("expected slow response, got {other:?}"),
     }
     drop(executor_tx);
-    executor.await.unwrap();
+    executor.await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -14408,7 +14408,7 @@ async fn slow_request_does_not_block_event_forwarding() {
     }
     event_task.abort();
     drop(executor_tx);
-    executor.await.unwrap();
+    executor.await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -14461,7 +14461,7 @@ async fn concurrent_request_panic_yields_internal_error_and_keeps_connection() {
     assert!(saw_panic_error);
     assert!(saw_status);
     drop(executor_tx);
-    executor.await.unwrap();
+    executor.await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -14517,7 +14517,7 @@ async fn blocking_fs_handler_panic_keeps_client_connection() {
     assert!(saw_fs_error);
     assert!(saw_status);
     drop(executor_tx);
-    executor.await.unwrap();
+    executor.await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -16335,6 +16335,33 @@ async fn client_transport_task_flattener_preserves_inner_error_and_task_context(
     assert_eq!(
         format!("{error:#}"),
         "client fixture task failed: forced child failure"
+    );
+}
+
+#[tokio::test]
+async fn client_transport_executor_error_wins_over_dependent_clean_writer_exit() {
+    let (writer_lifetime, writer_closed) = tokio::sync::oneshot::channel::<()>();
+    let mut executor = tokio::spawn(async move {
+        drop(writer_lifetime);
+        Err::<(), _>(anyhow::anyhow!("forced executor failure"))
+    });
+    let mut writer = tokio::spawn(async move {
+        let _ = writer_closed.await;
+        Ok::<(), anyhow::Error>(())
+    });
+    let mut reader = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
+    let mut event = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
+
+    let error = super::select_client_task(&mut reader, &mut writer, &mut event, &mut executor)
+        .await
+        .unwrap_err();
+    reader.abort();
+    writer.abort();
+    event.abort();
+    executor.abort();
+    assert_eq!(
+        format!("{error:#}"),
+        "client executor task failed: forced executor failure"
     );
 }
 

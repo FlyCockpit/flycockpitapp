@@ -12,6 +12,216 @@ fn bad(svg: &str) -> SvgSanitizeCode {
 
 #[test]
 fn generated_svg_allowlist() {
+    use ElementKind::*;
+    let kinds = [
+        Svg,
+        G,
+        Defs,
+        Title,
+        Desc,
+        Path,
+        Rect,
+        Circle,
+        Ellipse,
+        Line,
+        Polyline,
+        Polygon,
+        ClipPath,
+        Mask,
+        LinearGradient,
+        RadialGradient,
+        Stop,
+    ];
+    for parent in kinds {
+        for child in kinds {
+            let expected = match parent {
+                Svg => matches!(
+                    child,
+                    Title
+                        | Desc
+                        | Defs
+                        | G
+                        | Path
+                        | Rect
+                        | Circle
+                        | Ellipse
+                        | Line
+                        | Polyline
+                        | Polygon
+                ),
+                G | ClipPath | Mask => matches!(
+                    child,
+                    Title | Desc | G | Path | Rect | Circle | Ellipse | Line | Polyline | Polygon
+                ),
+                Defs => matches!(child, ClipPath | Mask | LinearGradient | RadialGradient),
+                LinearGradient | RadialGradient => child == Stop,
+                _ => false,
+            };
+            assert_eq!(
+                allowed_child(parent, child),
+                expected,
+                "{} -> {}",
+                parent.name(),
+                child.name()
+            );
+        }
+    }
+    let attribute_universe = [
+        "id",
+        "width",
+        "height",
+        "viewBox",
+        "preserveAspectRatio",
+        "transform",
+        "xml:space",
+        "d",
+        "pathLength",
+        "x",
+        "y",
+        "rx",
+        "ry",
+        "cx",
+        "cy",
+        "r",
+        "x1",
+        "y1",
+        "x2",
+        "y2",
+        "points",
+        "clipPathUnits",
+        "maskUnits",
+        "maskContentUnits",
+        "gradientUnits",
+        "spreadMethod",
+        "gradientTransform",
+        "fx",
+        "fy",
+        "fr",
+        "offset",
+        "stop-color",
+        "stop-opacity",
+        "fill",
+        "fill-opacity",
+        "stroke",
+        "stroke-width",
+        "stroke-linecap",
+        "stroke-linejoin",
+        "stroke-miterlimit",
+        "stroke-dasharray",
+        "stroke-dashoffset",
+        "stroke-opacity",
+        "opacity",
+        "color",
+        "display",
+        "visibility",
+        "clip-path",
+        "mask",
+    ];
+    for kind in kinds {
+        for attribute in attribute_universe {
+            let common = matches!(
+                attribute,
+                "fill"
+                    | "fill-opacity"
+                    | "stroke"
+                    | "stroke-width"
+                    | "stroke-linecap"
+                    | "stroke-linejoin"
+                    | "stroke-miterlimit"
+                    | "stroke-dasharray"
+                    | "stroke-dashoffset"
+                    | "stroke-opacity"
+                    | "opacity"
+                    | "color"
+                    | "display"
+                    | "visibility"
+                    | "clip-path"
+                    | "mask"
+            ) && matches!(
+                kind,
+                G | Path | Rect | Circle | Ellipse | Line | Polyline | Polygon
+            );
+            let owned = match kind {
+                Svg => matches!(
+                    attribute,
+                    "id" | "width" | "height" | "viewBox" | "preserveAspectRatio"
+                ),
+                G => matches!(attribute, "id" | "transform"),
+                Defs => false,
+                Title | Desc => attribute == "xml:space",
+                Path => matches!(attribute, "id" | "d" | "pathLength" | "transform"),
+                Rect => matches!(
+                    attribute,
+                    "id" | "x"
+                        | "y"
+                        | "width"
+                        | "height"
+                        | "rx"
+                        | "ry"
+                        | "pathLength"
+                        | "transform"
+                ),
+                Circle => matches!(
+                    attribute,
+                    "id" | "cx" | "cy" | "r" | "pathLength" | "transform"
+                ),
+                Ellipse => matches!(
+                    attribute,
+                    "id" | "cx" | "cy" | "rx" | "ry" | "pathLength" | "transform"
+                ),
+                Line => matches!(
+                    attribute,
+                    "id" | "x1" | "y1" | "x2" | "y2" | "pathLength" | "transform"
+                ),
+                Polyline | Polygon => {
+                    matches!(attribute, "id" | "points" | "pathLength" | "transform")
+                }
+                ClipPath => matches!(attribute, "id" | "clipPathUnits" | "transform"),
+                Mask => matches!(
+                    attribute,
+                    "id" | "x"
+                        | "y"
+                        | "width"
+                        | "height"
+                        | "maskUnits"
+                        | "maskContentUnits"
+                        | "transform"
+                ),
+                LinearGradient => matches!(
+                    attribute,
+                    "id" | "x1"
+                        | "y1"
+                        | "x2"
+                        | "y2"
+                        | "gradientUnits"
+                        | "spreadMethod"
+                        | "gradientTransform"
+                ),
+                RadialGradient => matches!(
+                    attribute,
+                    "id" | "cx"
+                        | "cy"
+                        | "r"
+                        | "fx"
+                        | "fy"
+                        | "fr"
+                        | "gradientUnits"
+                        | "spreadMethod"
+                        | "gradientTransform"
+                ),
+                Stop => matches!(attribute, "offset" | "stop-color" | "stop-opacity"),
+            };
+            assert_eq!(
+                allowed_attr(kind, attribute),
+                owned || common,
+                "{} {attribute}",
+                kind.name()
+            );
+        }
+        assert!(!allowed_attr(kind, "style"));
+        assert!(!allowed_attr(kind, "onclick"));
+        assert!(!allowed_attr(kind, "href"));
+    }
     let artifact = ok(
         r##"<title>safe</title><desc>description</desc><defs><linearGradient id="paint"><stop offset="0" stop-color="red"/><stop offset="100%" stop-color="#ABC"/></linearGradient><clipPath id="clip"><rect width="1" height="1"/></clipPath><mask id="mask"><path d="M 0 0 L 1 1 Z"/></mask></defs><g fill="url(#paint)" clip-path="url(#clip)" mask="url(#mask)" transform="translate(1,2)"><rect id="shape" x="0" y="0" width="10" height="10" rx="1" fill-opacity="0.5"/></g>"##,
     );

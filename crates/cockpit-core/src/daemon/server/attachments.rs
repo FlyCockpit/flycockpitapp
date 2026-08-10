@@ -675,10 +675,9 @@ pub(super) async fn finish_attachment_upload_admitted(
                     .to_owned()
             };
             let project_digest = crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes()));
-            let policy = upload
-                .media_resources_policy
-                .take()
-                .ok_or_else(|| internal("attachment upload is missing its evaluated media policy"))?;
+            let policy = upload.media_resources_policy.take().ok_or_else(|| {
+                internal("attachment upload is missing its evaluated media policy")
+            })?;
             let storage = ctx
                 .media_storage_recovery
                 .as_ref()

@@ -19,7 +19,8 @@ use cockpit_db::image_spend::{AttemptMaximum, SpendReservation};
 use cockpit_db::media_attachments::AcquiredMediaComponentLease;
 
 pub use crate::private_fs::held_directory::{
-    HeldArtifactEvidence, HeldDirectoryEffectOutcome, HeldSealedArtifact, HeldTemporaryArtifact,
+    HeldArtifactEvidence, HeldDirectoryEffectEvidence, HeldDirectoryEffectOutcome,
+    HeldDirectoryRecovery, HeldSealedArtifact, HeldTemporaryArtifact,
 };
 
 pub const MAX_IMAGE_GENERATION_TARGETS: usize = 16;
@@ -247,6 +248,18 @@ impl HeldImageGenerationOutputDirectory {
         temporary: HeldSealedArtifact,
     ) -> Result<HeldDirectoryEffectOutcome> {
         self.guard.unlink(temporary)
+    }
+    pub fn reconcile_publication(
+        &self,
+        recovery: &HeldDirectoryRecovery,
+    ) -> Result<HeldDirectoryEffectOutcome> {
+        self.guard.reconcile(recovery)
+    }
+    pub fn delete_recovered_publication(
+        &self,
+        recovery: &HeldDirectoryRecovery,
+    ) -> Result<HeldDirectoryEffectOutcome> {
+        self.guard.delete_recovered_destination(recovery)
     }
 }
 pub fn open_image_generation_output_directory(

@@ -138,6 +138,88 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    pub(crate) async fn acquire_message_image(
+        &self,
+        attachment_id: Uuid,
+        session_id: Uuid,
+        project_digest: String,
+        consumer_id: String,
+        now_unix_ms: i64,
+    ) -> Result<Vec<u8>> {
+        use cockpit_db::media_attachments::{
+            MediaComponentLeaseKind, MediaKind, MediaReferenceConsumerKind,
+        };
+        let lease_id = Uuid::now_v7();
+        let reference_id = Uuid::now_v7();
+        let authority = self
+            .db
+            .transaction(move |conn| {
+                let record = cockpit_db::Db::media_attachment_for_owner_conn(
+                    conn,
+                    attachment_id,
+                    session_id,
+                    &project_digest,
+                )?
+                .context("media_attachment_unavailable")?;
+                ensure!(
+                    record.media_kind == MediaKind::Image && record.availability.is_ready(),
+                    "media_attachment_unavailable"
+                );
+                cockpit_db::Db::acquire_media_reference_conn(
+                    conn,
+                    reference_id,
+                    attachment_id,
+                    record.attachment_version,
+                    session_id,
+                    &project_digest,
+                    MediaReferenceConsumerKind::Message,
+                    &consumer_id,
+                    now_unix_ms,
+                )?;
+                cockpit_db::Db::acquire_media_component_lease_conn(
+                    conn,
+                    lease_id,
+                    attachment_id,
+                    record.attachment_version,
+                    record.availability_generation,
+                    record.captured_capability_generation,
+                    MediaComponentLeaseKind::Model,
+                    now_unix_ms,
+                )
+            })
+            .await?;
+        let opened = (|| -> Result<File> {
+            let mut file = self
+                .owned_root
+                .open_file_verified(&authority.component.storage_id.to_string())
+                .map_err(anyhow::Error::new)?;
+            let before = stable_identity_digest(&file)?;
+            let (length, checksum) = read_full_digest(&mut file)?;
+            ensure!(
+                before == authority.component.stable_identity_digest
+                    && length == authority.component.byte_length
+                    && checksum == authority.component.sha256
+                    && stable_identity_digest(&file)? == before,
+                "storage_security_violation"
+            );
+            file.seek(SeekFrom::Start(0))?;
+            Ok(file)
+        })();
+        let file = match opened {
+            Ok(file) => file,
+            Err(error) => {
+                block_component_lease_after_failed_proof(&self.db, authority, now_unix_ms).await?;
+                return Err(error);
+            }
+        };
+        HeldMediaComponentLease {
+            db: self.db.clone(),
+            authority,
+            file,
+        }
+        .read_verified(now_unix_ms)
+        .await
+    }
     async fn block_cleanup_security_ambiguity(
         &self,
         attachment_id: String,

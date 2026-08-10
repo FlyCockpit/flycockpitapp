@@ -3823,6 +3823,17 @@ CREATE TRIGGER image_generation_job_transition_guard BEFORE UPDATE OF state,vers
 WHEN NEW.version != OLD.version+1 OR (
  NOT EXISTS(SELECT 1 FROM image_generation_job_transitions WHERE from_state=OLD.state AND to_state=NEW.state)
  AND NOT (
+   OLD.state='dispatching' AND NEW.state='queued' AND EXISTS(
+     SELECT 1 FROM image_generation_slots s
+     JOIN image_generation_attempt_activation_facts f ON f.job_id=s.job_id AND f.slot_id=s.slot_id AND f.activation_reason='authoritative_retry'
+     JOIN image_generation_attempts prior ON prior.job_id=f.job_id AND prior.slot_id=f.slot_id AND prior.attempt_number=f.prior_attempt_number AND prior.state='rejected_not_accepted'
+     JOIN external_journal_operations j ON j.operation_id=prior.external_operation_id AND j.state='rejected'
+     JOIN image_generation_handoff_evidence e ON e.job_id=prior.job_id AND e.slot_id=prior.slot_id AND e.attempt_number=prior.attempt_number AND e.external_operation_id=j.operation_id AND e.outcome='definitively_rejected'
+     JOIN image_generation_attempt_media_snapshots m ON m.job_id=f.job_id AND m.slot_id=f.slot_id AND m.attempt_number=f.attempt_number
+     WHERE s.job_id=OLD.job_id AND s.state='queued'
+   )
+ )
+ AND NOT (
    OLD.terminal_event_version IS NULL
    AND NEW.terminal_event_version=NEW.version
    AND EXISTS(
@@ -3836,7 +3847,15 @@ WHEN NEW.version != OLD.version+1 OR (
 BEGIN SELECT RAISE(ABORT,'forbidden image generation job transition'); END;
 CREATE TRIGGER image_generation_slot_transition_guard BEFORE UPDATE OF state,version ON image_generation_slots
 WHEN NEW.version != OLD.version+1 OR (
- (NEW.state != OLD.state AND NOT EXISTS(SELECT 1 FROM image_generation_slot_transitions WHERE from_state=OLD.state AND to_state=NEW.state)) OR
+ (NEW.state != OLD.state AND NOT EXISTS(SELECT 1 FROM image_generation_slot_transitions WHERE from_state=OLD.state AND to_state=NEW.state)
+  AND NOT (OLD.state='dispatching' AND NEW.state='queued' AND EXISTS(
+    SELECT 1 FROM image_generation_attempt_activation_facts f
+    JOIN image_generation_attempts prior ON prior.job_id=f.job_id AND prior.slot_id=f.slot_id AND prior.attempt_number=f.prior_attempt_number AND prior.state='rejected_not_accepted'
+    JOIN external_journal_operations j ON j.operation_id=prior.external_operation_id AND j.state='rejected'
+    JOIN image_generation_handoff_evidence e ON e.job_id=prior.job_id AND e.slot_id=prior.slot_id AND e.attempt_number=prior.attempt_number AND e.external_operation_id=j.operation_id AND e.outcome='definitively_rejected'
+    JOIN image_generation_attempt_media_snapshots m ON m.job_id=f.job_id AND m.slot_id=f.slot_id AND m.attempt_number=f.attempt_number
+    WHERE f.job_id=OLD.job_id AND f.slot_id=OLD.slot_id AND f.attempt_number=f.prior_attempt_number+1
+  ))) OR
  (NEW.state = OLD.state AND NOT (OLD.state='validating' AND OLD.applied_cancellation_version IS NULL AND OLD.result_after_cancel=0 AND NEW.applied_cancellation_version IS NOT NULL AND NEW.result_after_cancel=1))
 )
 BEGIN SELECT RAISE(ABORT,'forbidden image generation slot transition'); END;

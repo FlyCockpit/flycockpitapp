@@ -3187,6 +3187,19 @@ CREATE TABLE image_generation_attempts (
     FOREIGN KEY(external_operation_id) REFERENCES external_journal_operations(operation_id) ON DELETE RESTRICT,
     CHECK((external_operation_id IS NULL AND observed_journal_version IS NULL) OR (external_operation_id IS NOT NULL AND observed_journal_version >= 1))
 );
+CREATE TABLE image_generation_handoff_evidence (
+ job_id TEXT NOT NULL, slot_id TEXT NOT NULL, attempt_number INTEGER NOT NULL,
+ external_operation_id TEXT NOT NULL UNIQUE,
+ outcome TEXT NOT NULL CHECK(outcome IN ('accepted','definitively_rejected','submission_unknown')),
+ evidence BLOB NOT NULL CHECK(length(evidence) BETWEEN 1 AND 65536),
+ evidence_digest TEXT NOT NULL CHECK(length(evidence_digest)=64),
+ recorded_at_unix_ms INTEGER NOT NULL,
+ PRIMARY KEY(job_id,slot_id,attempt_number),
+ FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT,
+ FOREIGN KEY(external_operation_id) REFERENCES external_journal_operations(operation_id) ON DELETE RESTRICT
+);
+CREATE TRIGGER image_generation_handoff_evidence_immutable BEFORE UPDATE ON image_generation_handoff_evidence BEGIN SELECT RAISE(ABORT,'image generation handoff evidence is immutable'); END;
+CREATE TRIGGER image_generation_handoff_evidence_no_delete BEFORE DELETE ON image_generation_handoff_evidence BEGIN SELECT RAISE(ABORT,'image generation handoff evidence is immutable'); END;
 
 CREATE TABLE image_generation_scheduler_claims (
  job_id TEXT NOT NULL,

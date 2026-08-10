@@ -873,6 +873,19 @@ pub struct DispatchingImageGenerationAttempt {
     media_reservation_version: u64,
 }
 
+pub struct ImageGenerationProviderHandoffEvidence<'a> {
+    pub outcome: ImageSpendDispatchEvidence,
+    pub bytes: &'a [u8],
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredImageGenerationProviderHandoffEvidence {
+    pub external_operation_id: Uuid,
+    pub outcome: ImageSpendDispatchEvidence,
+    pub bytes: Vec<u8>,
+    pub digest: String,
+    pub recorded_at_unix_ms: i64,
+}
+
 impl DispatchingImageGenerationAttempt {
     pub fn operation(&self) -> &ExternalJournalRecord {
         &self.operation
@@ -959,6 +972,33 @@ impl SealedImageGenerationRecoveryAuthority {
 }
 
 impl Db {
+    pub fn replay_image_generation_handoff_evidence_conn(
+        conn: &Connection,
+        job_id: Uuid,
+        slot_id: Uuid,
+        attempt_number: u32,
+    ) -> Result<StoredImageGenerationProviderHandoffEvidence> {
+        let(operation,outcome,bytes,digest,recorded):(String,String,Vec<u8>,String,i64)=conn.query_row("SELECT external_operation_id,outcome,evidence,evidence_digest,recorded_at_unix_ms FROM image_generation_handoff_evidence WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3",params![job_id.to_string(),slot_id.to_string(),i64::from(attempt_number)],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;
+        ensure!(
+            !bytes.is_empty()
+                && bytes.len() <= 65_536
+                && hex_lower(&Sha256::digest(&bytes)) == digest,
+            "stored image generation handoff evidence is invalid"
+        );
+        let outcome = match outcome.as_str() {
+            "accepted" => ImageSpendDispatchEvidence::Accepted,
+            "definitively_rejected" => ImageSpendDispatchEvidence::DefinitivelyRejected,
+            "submission_unknown" => ImageSpendDispatchEvidence::SubmissionUnknown,
+            _ => anyhow::bail!("stored image generation handoff outcome is invalid"),
+        };
+        Ok(StoredImageGenerationProviderHandoffEvidence {
+            external_operation_id: Uuid::parse_str(&operation)?,
+            outcome,
+            bytes,
+            digest,
+            recorded_at_unix_ms: recorded,
+        })
+    }
     pub fn image_generation_queue_authority_conn(
         conn: &Connection,
         job_id: Uuid,
@@ -1150,7 +1190,7 @@ impl Db {
     pub fn finish_image_generation_handoff_conn(
         conn: &Connection,
         dispatching: DispatchingImageGenerationAttempt,
-        evidence: ImageSpendDispatchEvidence,
+        evidence: ImageGenerationProviderHandoffEvidence<'_>,
         at_unix_ms: i64,
     ) -> Result<()> {
         atomic_conn(conn, "image_generation_finish_handoff", || {
@@ -1160,10 +1200,21 @@ impl Db {
                 &dispatching.spend_attempt_id,
                 dispatching.operation.operation_id,
                 dispatching.operation.version,
-                evidence,
+                evidence.outcome,
                 at_unix_ms,
             )?;
-            let (attempt, slot, job) = match evidence {
+            ensure!(
+                !evidence.bytes.is_empty() && evidence.bytes.len() <= 65_536,
+                "image generation handoff evidence is outside its bound"
+            );
+            let evidence_digest = hex_lower(&Sha256::digest(evidence.bytes));
+            let outcome_name = match evidence.outcome {
+                ImageSpendDispatchEvidence::Accepted => "accepted",
+                ImageSpendDispatchEvidence::DefinitivelyRejected => "definitively_rejected",
+                ImageSpendDispatchEvidence::SubmissionUnknown => "submission_unknown",
+            };
+            ensure!(conn.execute("INSERT INTO image_generation_handoff_evidence(job_id,slot_id,attempt_number,external_operation_id,outcome,evidence,evidence_digest,recorded_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![dispatching.job_id.to_string(),dispatching.slot_id.to_string(),i64::from(dispatching.attempt_number),dispatching.operation.operation_id.to_string(),outcome_name,evidence.bytes,evidence_digest,at_unix_ms])?==1,"image generation handoff evidence was not recorded");
+            let (attempt, slot, job) = match evidence.outcome {
                 ImageSpendDispatchEvidence::Accepted => ("accepted", "running", "running"),
                 ImageSpendDispatchEvidence::DefinitivelyRejected => {
                     ("rejected_not_accepted", "failed", "failed")
@@ -1176,7 +1227,7 @@ impl Db {
             };
             ensure!(
                 outcome.record().state.as_str()
-                    == match evidence {
+                    == match evidence.outcome {
                         ImageSpendDispatchEvidence::Accepted => "accepted",
                         ImageSpendDispatchEvidence::DefinitivelyRejected => "rejected",
                         ImageSpendDispatchEvidence::SubmissionUnknown => "submission_unknown",

@@ -421,6 +421,7 @@ impl ImageGenerationDispatcher {
         &self,
         dispatching: DispatchingImageGenerationAttempt,
         evidence: ImageSpendDispatchEvidence,
+        evidence_bytes: Vec<u8>,
         at_unix_ms: i64,
     ) -> Result<()> {
         let operation_id = dispatching.operation().operation_id.to_string();
@@ -440,7 +441,10 @@ impl ImageGenerationDispatcher {
                 cockpit_db::Db::finish_image_generation_handoff_conn(
                     conn,
                     dispatching,
-                    evidence,
+                    cockpit_db::db::image_generation::ImageGenerationProviderHandoffEvidence {
+                        outcome: evidence,
+                        bytes: &evidence_bytes,
+                    },
                     at_unix_ms,
                 )?;
                 finish_external_handoff_conn(
@@ -488,8 +492,18 @@ impl ImageGenerationDispatcher {
         };
         let result = adapter.handoff(&request).await;
         result.validate()?;
-        self.finish_external_handoff(dispatching, result.spend_evidence(), at_unix_ms)
-            .await?;
+        let evidence_bytes = match &result {
+            ImageGenerationHandoffResult::Accepted { evidence }
+            | ImageGenerationHandoffResult::DefinitivelyRejected { evidence }
+            | ImageGenerationHandoffResult::SubmissionUnknown { evidence } => evidence.clone(),
+        };
+        self.finish_external_handoff(
+            dispatching,
+            result.spend_evidence(),
+            evidence_bytes,
+            at_unix_ms,
+        )
+        .await?;
         Ok(result)
     }
 }
@@ -2969,6 +2983,8 @@ mod tests {
         let fixture =
             setup_real_ledger_scheduler_job(cockpit_db::Db::open_in_memory().unwrap(), suffix)
                 .await;
+        let job_id = fixture.job_id;
+        let slot_id = fixture.slot_id;
         let db = fixture.db;
         let dispatcher = ImageGenerationDispatcher::new(db.clone());
         let adapter = DeterministicImageGenerationAdapter::new(vec![
@@ -2982,6 +2998,29 @@ mod tests {
             .unwrap();
         assert_eq!(first.dispatched, 1, "{first:#?}");
         assert_eq!(adapter.requests().len(), 1);
+        db.blocking_for_sync_cli(move |conn| {
+            let replay = cockpit_db::Db::replay_image_generation_handoff_evidence_conn(
+                conn, job_id, slot_id, 1,
+            )?;
+            assert_eq!(replay.outcome, ImageSpendDispatchEvidence::Accepted);
+            assert_eq!(replay.bytes, b"accepted");
+            assert!(
+                conn.execute(
+                    "UPDATE image_generation_handoff_evidence SET evidence=X'00' WHERE job_id=?1",
+                    [job_id.to_string()]
+                )
+                .is_err()
+            );
+            assert!(
+                conn.execute(
+                    "DELETE FROM image_generation_handoff_evidence WHERE job_id=?1",
+                    [job_id.to_string()]
+                )
+                .is_err()
+            );
+            Ok(())
+        })
+        .unwrap();
         let second = dispatcher
             .run_scheduler_pass(&adapter, Uuid::now_v7(), 100, 3, 3, 8)
             .await
@@ -2993,6 +3032,66 @@ mod tests {
     #[tokio::test]
     async fn scheduler_dispatches_one_real_ledger_job_once() {
         run_real_ledger_scheduler_fixture("once").await;
+    }
+
+    #[tokio::test]
+    async fn handoff_evidence_survives_file_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("image.db");
+        let fixture = setup_real_ledger_scheduler_job(
+            cockpit_db::Db::open(&path).unwrap(),
+            "evidence-reopen",
+        )
+        .await;
+        let job = fixture.job_id;
+        let slot = fixture.slot_id;
+        let adapter = DeterministicImageGenerationAdapter::new(vec![
+            ImageGenerationHandoffResult::SubmissionUnknown {
+                evidence: b"ambiguous".to_vec(),
+            },
+        ]);
+        ImageGenerationDispatcher::new(fixture.db)
+            .run_scheduler_pass(&adapter, Uuid::now_v7(), 100, 2, 2, 8)
+            .await
+            .unwrap();
+        let reopened = cockpit_db::Db::open(&path).unwrap();
+        reopened
+            .blocking_for_sync_cli(move |conn| {
+                let replay = cockpit_db::Db::replay_image_generation_handoff_evidence_conn(
+                    conn, job, slot, 1,
+                )?;
+                assert_eq!(
+                    replay.outcome,
+                    ImageSpendDispatchEvidence::SubmissionUnknown
+                );
+                assert_eq!(replay.bytes, b"ambiguous");
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn handoff_evidence_finish_failure_rolls_back_every_projection() {
+        let fixture = setup_real_ledger_scheduler_job(
+            cockpit_db::Db::open_in_memory().unwrap(),
+            "evidence-cut",
+        )
+        .await;
+        let job = fixture.job_id;
+        let slot = fixture.slot_id;
+        fixture.db.blocking_for_sync_cli(|conn|{conn.execute_batch("CREATE TEMP TRIGGER cut_handoff_evidence AFTER INSERT ON image_generation_handoff_evidence BEGIN SELECT RAISE(ABORT,'cut'); END")?;Ok(())}).unwrap();
+        let adapter = DeterministicImageGenerationAdapter::new(vec![
+            ImageGenerationHandoffResult::Accepted {
+                evidence: b"accepted-cut".to_vec(),
+            },
+        ]);
+        let pass = ImageGenerationDispatcher::new(fixture.db.clone())
+            .run_scheduler_pass(&adapter, Uuid::now_v7(), 100, 2, 2, 8)
+            .await
+            .unwrap();
+        assert_eq!(pass.dispatched, 0);
+        assert_eq!(adapter.requests().len(), 1);
+        fixture.db.blocking_for_sync_cli(move|conn|{let row:(String,String,i64)=conn.query_row("SELECT a.state,o.state,(SELECT count(*) FROM image_generation_handoff_evidence e WHERE e.job_id=a.job_id AND e.slot_id=a.slot_id) FROM image_generation_attempts a JOIN external_journal_operations o ON o.operation_id=a.external_operation_id WHERE a.job_id=?1 AND a.slot_id=?2",rusqlite::params![job.to_string(),slot.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;assert_eq!(row,("dispatching".into(),"dispatching".into(),0));Ok(())}).unwrap();
     }
 
     struct LatePublicationRecoveryFixture {

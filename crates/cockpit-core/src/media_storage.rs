@@ -6039,6 +6039,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_discard_replays_aliases_reopens_and_rolls_back_faults() {
+        use cockpit_db::media_attachments::{
+            LocalMediaActorRoleV1, LocalMediaMutationPayloadV1, LocalMediaMutationV1,
+        };
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("db.sqlite");
+        let db = cockpit_db::Db::open(&path).unwrap();
+        let session = Uuid::now_v7();
+        let attachment = Uuid::now_v7();
+        let fault_attachment = Uuid::now_v7();
+        let project = "11".repeat(32);
+        let record = |id| MediaAttachmentRecord {
+            attachment_id: id,
+            session_id: session,
+            canonical_project_digest: project.clone(),
+            media_kind: MediaKind::Image,
+            source_kind: MediaSourceKind::LocalPath,
+            canonical_container: "png".into(),
+            canonical_mime: "image/png".into(),
+            availability: MediaAvailability::Registered,
+            attachment_version: 1,
+            availability_generation: 1,
+            reference_generation: 1,
+            captured_capability_generation: 1,
+            source_identity_digest: "22".repeat(32),
+            source_byte_length: 1,
+            source_sha256: "33".repeat(32),
+            selected_video_stream: None,
+            selected_audio_stream: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+            draft_expires_at_unix_ms: None,
+            first_referenced_at_unix_ms: None,
+        };
+        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at)VALUES(?1,'p','/redacted',1,1)",[session.to_string()])?;cockpit_db::Db::insert_media_attachment_conn(conn,&record(attachment))?;cockpit_db::Db::insert_media_attachment_conn(conn,&record(fault_attachment))?;Ok(())}).await.unwrap();
+        let storage =
+            MediaStorageRecovery::open_or_create(db.clone(), &temp.path().join("media")).unwrap();
+        let request = LocalMediaMutationV1 {
+            schema_version: 1,
+            kind: "localMediaMutation".into(),
+            local_operation_id: Uuid::now_v7(),
+            actor_principal_digest: "44".repeat(32),
+            actor_role: LocalMediaActorRoleV1::Owner,
+            payload: LocalMediaMutationPayloadV1::Discard {
+                session_id: session,
+                canonical_project_digest: project.clone(),
+                attachment_id: attachment,
+                attachment_version: 1,
+                availability_generation: 1,
+                reference_generation: 1,
+                origin_upload: None,
+            },
+        };
+        let receipt = storage
+            .discard_media_attachment(request.clone(), 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            receipt.outcome,
+            cockpit_db::media_attachments::LocalMediaMutationOutcomeV1::Applied
+        );
+        assert_eq!(
+            storage
+                .discard_media_attachment(request.clone(), 3)
+                .await
+                .unwrap(),
+            receipt
+        );
+        let mut alias = request.clone();
+        alias.local_operation_id = Uuid::now_v7();
+        assert_eq!(
+            storage
+                .discard_media_attachment(alias.clone(), 4)
+                .await
+                .unwrap(),
+            receipt
+        );
+        drop(storage);
+        drop(db);
+        let reopened_db = cockpit_db::Db::open(&path).unwrap();
+        let reopened =
+            MediaStorageRecovery::open(reopened_db.clone(), &temp.path().join("media")).unwrap();
+        assert_eq!(
+            reopened.discard_media_attachment(alias, 5).await.unwrap(),
+            receipt
+        );
+        reopened_db.transaction(|conn|{conn.execute_batch("CREATE TRIGGER fail_discard_operation BEFORE INSERT ON local_media_operations BEGIN SELECT RAISE(ABORT,'injected discard operation failure'); END;")?;Ok(())}).await.unwrap();
+        let fault = LocalMediaMutationV1 {
+            schema_version: 1,
+            kind: "localMediaMutation".into(),
+            local_operation_id: Uuid::now_v7(),
+            actor_principal_digest: "44".repeat(32),
+            actor_role: LocalMediaActorRoleV1::Owner,
+            payload: LocalMediaMutationPayloadV1::Discard {
+                session_id: session,
+                canonical_project_digest: project,
+                attachment_id: fault_attachment,
+                attachment_version: 1,
+                availability_generation: 1,
+                reference_generation: 1,
+                origin_upload: None,
+            },
+        };
+        assert!(reopened.discard_media_attachment(fault, 6).await.is_err());
+        let state=reopened_db.read(move|conn|Ok((conn.query_row("SELECT availability FROM media_attachments WHERE attachment_id=?1",[fault_attachment.to_string()],|row|row.get::<_,String>(0))?,conn.query_row("SELECT COUNT(*) FROM media_attachment_cleanup_intents WHERE attachment_id=?1",[fault_attachment.to_string()],|row|row.get::<_,i64>(0))?))).await.unwrap();
+        assert_eq!(state, ("registered".into(), 0));
+    }
+
+    #[tokio::test]
     #[ignore = "manual system-runtime conformance; required tests use the injected runner"]
     async fn executable_ffmpeg_vectors_cover_named_dimensions_and_frame_rates() {
         fn executable(name: &str) -> Option<std::path::PathBuf> {

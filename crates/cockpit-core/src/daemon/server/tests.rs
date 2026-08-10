@@ -3575,6 +3575,7 @@ fn dispatch_matrix_class_for_command(
 ) -> DispatchMatrixClass {
     match (kind, authz, mutating) {
         ("unknown", "owner_only", false) => DispatchMatrixClass::NonDispatchable,
+        (_, "owner_only", _) => DispatchMatrixClass::AccessControlled,
         ("fs_list", "project_files", false)
         | ("fs_stat", "project_files", false)
         | ("fs_read", "project_files", false)
@@ -3594,15 +3595,7 @@ fn dispatch_matrix_class_for_command(
         ("attach_terminal", "terminal", false)
         | ("terminal_input", "terminal", false)
         | ("terminal_resize", "terminal", false)
-        | ("subagent_transcript", "custom", false)
-        | ("resource_snapshot", "owner_only", false)
-        | ("list_scheduled_jobs", "owner_only", false)
-        | ("list_assistants", "owner_only", false)
-        | ("list_sealed_values", "owner_only", false)
-        | ("export_session_data", "owner_only", false)
-        | ("read_bulk_transfer_chunk", "owner_only", false)
-        | ("get_usage_counts", "owner_only", false)
-        | ("stats_rollup", "owner_only", false) => DispatchMatrixClass::AccessControlled,
+        | ("subagent_transcript", "custom", false) => DispatchMatrixClass::AccessControlled,
         ("count_pinned_messages", "session_row_reader", false)
         | ("list_pinned_message_seqs", "session_row_reader", false)
         | ("list_pinned_messages_with_text", "session_row_reader", false)
@@ -3733,10 +3726,17 @@ struct MutatingDispatchCase {
 
 fn mutating_dispatch_happy_cases() -> Vec<MutatingDispatchCase> {
     mutating_dispatch_case_list()
+        .into_iter()
+        .filter(|case| {
+            dispatch_matrix_rows().into_iter().any(|row| {
+                row.kind == case.kind && row.class == DispatchMatrixClass::Mutating
+            })
+        })
+        .collect()
 }
 
 fn mutating_dispatch_malformed_cases() -> Vec<MutatingDispatchCase> {
-    mutating_dispatch_case_list()
+    mutating_dispatch_happy_cases()
 }
 
 fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
@@ -3811,6 +3811,11 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             kind: "repair_resume",
             effect_class: DriverForwarded,
             observation: "SessionWork::RepairResume delivered to attached worker",
+        },
+        MutatingDispatchCase {
+            kind: "create_goal",
+            effect_class: Durable,
+            observation: "session goal and planner control job are persisted atomically",
         },
         MutatingDispatchCase {
             kind: "set_goal_status",
@@ -4339,6 +4344,11 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "record_usage"
         | "get_usage_counts"
         | "stats_rollup"
+        | "create_goal"
+        | "get_startup_disclosures"
+        | "get_app_flag"
+        | "mark_app_flag_seen"
+        | "set_workspace_trust"
         | "guidance_estimate"
         | "restart_if_idle"
         | "stop_daemon" => AuthzAllowedOutcome::Response,
@@ -4374,6 +4384,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "run_scheduled_job"
         | "auto_title"
         | "create_assistant_session"
+        | "resolve_assistant_session"
         | "store_flycockpit_credential"
         | "clear_flycockpit_credential"
         | "set_goal_status"
@@ -4436,6 +4447,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_writer("cancel_paused_work"),
         authz_session_writer("repair_resume"),
         authz_session_reader("goal_status"),
+        authz_session_writer("create_goal"),
         authz_session_writer("set_goal_status"),
         authz_session_writer("clear_goal"),
         authz_session_writer("pin_message"),
@@ -4454,6 +4466,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("delete_project_note"),
         authz_owner_only("list_assistants"),
         authz_owner_only("upsert_assistant"),
+        authz_owner_only("resolve_assistant_session"),
         authz_owner_only("create_assistant_session"),
         authz_session_writer("auto_title"),
         authz_owner_only("export_session_data"),
@@ -4528,6 +4541,10 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("record_usage"),
         authz_owner_only("get_usage_counts"),
         authz_owner_only("stats_rollup"),
+        authz_owner_only("get_startup_disclosures"),
+        authz_owner_only("get_app_flag"),
+        authz_owner_only("mark_app_flag_seen"),
+        authz_owner_only("set_workspace_trust"),
         authz_project_read("guidance_estimate"),
         authz_owner_only("stop_daemon"),
         authz_owner_only("restart_if_idle"),
@@ -5306,6 +5323,11 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "cancel_paused_work" => Request::CancelPausedWork { session_id },
         "repair_resume" => Request::RepairResume { session_id },
         "goal_status" => Request::GoalStatus { session_id },
+        "create_goal" => Request::CreateGoal {
+            session_id,
+            objective: "ship goal rpc".into(),
+            token_budget: Some(100),
+        },
         "set_goal_status" => Request::SetGoalStatus {
             session_id,
             status: proto::GoalDisposition::UserPaused,
@@ -5350,6 +5372,11 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             home_dir: root,
             config_json: "{}".into(),
             content_hash: "h".into(),
+        },
+        "resolve_assistant_session" => Request::ResolveAssistantSession {
+            assistant_id: "missing-assistant".into(),
+            project_root: root,
+            mode: proto::AssistantSessionResolutionMode::MostRecentOrCreate,
         },
         "create_assistant_session" => Request::CreateAssistantSession {
             name: "missing-assistant".into(),
@@ -5638,6 +5665,21 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             project_id: None,
             range: proto::StatsRange::Last7Days,
             by_role: false,
+        },
+        "get_startup_disclosures" => Request::GetStartupDisclosures {
+            project_root: root,
+        },
+        "get_app_flag" => Request::GetAppFlag {
+            key: proto::AppFlagKey::DaemonAutostartNotice,
+        },
+        "mark_app_flag_seen" => Request::MarkAppFlagSeen {
+            key: proto::AppFlagKey::DaemonAutostartNotice,
+            expected_version: 0,
+        },
+        "set_workspace_trust" => Request::SetWorkspaceTrust {
+            project_root: root,
+            mode: proto::WorkspaceTrustMode::Trust,
+            expected_config_generation: 0,
         },
         "guidance_estimate" => Request::GuidanceEstimate {
             project_root: root,
@@ -6451,7 +6493,9 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         "resume_paused_work" | "cancel_paused_work" => {
             assert_paused_work_mutating_happy(case.kind).await;
         }
-        "set_goal_status" | "clear_goal" => assert_goal_mutating_happy(case.kind).await,
+        "create_goal" | "set_goal_status" | "clear_goal" => {
+            assert_goal_mutating_happy(case.kind).await
+        }
         "pin_message"
         | "unpin_message"
         | "toggle_pinned_message"
@@ -6620,7 +6664,9 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
             assert!(matches!(response, Response::Ack));
             assert!(ctx.db.paused_session_work_all().await.unwrap().is_empty());
         }
-        "set_goal_status" | "clear_goal" => assert_goal_mutating_malformed(case.kind).await,
+        "create_goal" | "set_goal_status" | "clear_goal" => {
+            assert_goal_mutating_malformed(case.kind).await
+        }
         "pin_message"
         | "unpin_message"
         | "toggle_pinned_message"
@@ -7933,19 +7979,26 @@ async fn assert_paused_work_mutating_happy(kind: &str) {
 async fn assert_goal_mutating_happy(kind: &str) {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
-    ctx.db
-        .create_session_goal(
-            session.session_id,
-            &session.project_id,
-            "ship goal rpc",
-            None,
-            Some(100),
-        )
-        .await
-        .unwrap();
+    if kind != "create_goal" {
+        ctx.db
+            .create_session_goal(
+                session.session_id,
+                &session.project_id,
+                "ship goal rpc",
+                None,
+                Some(100),
+            )
+            .await
+            .unwrap();
+    }
     let response = dispatch_matrix_request(
         &ctx,
         match kind {
+            "create_goal" => Request::CreateGoal {
+                session_id: session.session_id,
+                objective: "ship goal rpc".into(),
+                token_budget: Some(100),
+            },
             "set_goal_status" => Request::SetGoalStatus {
                 session_id: session.session_id,
                 status: proto::GoalDisposition::UserPaused,
@@ -7959,6 +8012,10 @@ async fn assert_goal_mutating_happy(kind: &str) {
     .await
     .expect("goal mutation");
     match (kind, response) {
+        ("create_goal", Response::GoalUpdated { goal }) => {
+            assert_eq!(goal.session_id, session.session_id);
+            assert_eq!(goal.objective, "ship goal rpc");
+        }
         ("set_goal_status", Response::GoalUpdated { goal }) => {
             assert_eq!(goal.session_id, session.session_id);
             assert_eq!(goal.disposition, proto::GoalDisposition::UserPaused);
@@ -7982,6 +8039,29 @@ async fn assert_goal_mutating_malformed(kind: &str) {
     let ctx = test_ctx();
     let session = ctx.db.create_session("p", "/repo", "Build").await.unwrap();
     match kind {
+        "create_goal" => {
+            ctx.db
+                .create_session_goal(
+                    session.session_id,
+                    &session.project_id,
+                    "existing goal",
+                    None,
+                    Some(100),
+                )
+                .await
+                .unwrap();
+            let err = dispatch_matrix_request(
+                &ctx,
+                Request::CreateGoal {
+                    session_id: session.session_id,
+                    objective: "second goal".into(),
+                    token_budget: Some(100),
+                },
+            )
+            .await
+            .expect_err("second open goal rejects creation");
+            assert_eq!(err.code, ErrorCode::BadRequest);
+        }
         "set_goal_status" => {
             let err = dispatch_matrix_request(
                 &ctx,

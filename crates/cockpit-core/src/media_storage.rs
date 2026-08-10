@@ -153,11 +153,28 @@ impl MediaStorageRecovery {
             "media_attachment_unavailable"
         );
         let binding = digest_json(b"retained-https-binding-v1", &request)?;
+        let semantic_digest = digest_json(
+            b"retained-https-semantic-v1",
+            &(
+                &request.owner_principal_digest,
+                request.session_id,
+                &request.canonical_project_digest,
+                request.client_draft_id,
+                request.requested_media_kind,
+                &request.url,
+            ),
+        )?;
         let operation_id = request.local_operation_id.to_string();
         let binding_preflight = binding.clone();
         if let Some(receipt) = self.db.read(move |conn| {
             let row: Option<(String,String)> = conn.query_row("SELECT request_binding_digest,receipt_json FROM media_retained_https_operations WHERE local_operation_id=?1",[operation_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
             match row { Some((stored,json)) => { ensure!(stored == binding_preflight,"idempotency_conflict"); Ok(Some(serde_json::from_str(&json)?)) }, None => Ok(None) }
+        }).await? { return Ok(receipt); }
+        let alias_request = request.clone();
+        let alias_binding = binding.clone();
+        let alias_semantic = semantic_digest.clone();
+        if let Some(receipt)=self.db.transaction(move|conn|{
+            if let Some((authoritative,stored_semantic,json))=conn.query_row("SELECT authoritative_operation_id,semantic_command_digest,receipt_json FROM media_retained_https_operations WHERE session_id=?1 AND canonical_project_digest=?2 AND client_draft_id=?3 AND is_alias=0",params![alias_request.session_id.to_string(),alias_request.canonical_project_digest,alias_request.client_draft_id.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()? { ensure!(stored_semantic==alias_semantic,"idempotency_conflict"); conn.execute("INSERT INTO media_retained_https_operations(local_operation_id,authoritative_operation_id,session_id,canonical_project_digest,client_draft_id,request_binding_digest,operation_request_digest,semantic_command_digest,receipt_json,committed_at_unix_ms,is_alias) VALUES(?1,?2,?3,?4,?5,?6,?6,?7,?8,?9,1)",params![alias_request.local_operation_id.to_string(),authoritative,alias_request.session_id.to_string(),alias_request.canonical_project_digest,alias_request.client_draft_id.to_string(),alias_binding,alias_semantic,json,now_unix_ms])?; return Ok(Some(serde_json::from_str(&json)?)); } Ok(None)
         }).await? { return Ok(receipt); }
 
         let storage_id = Uuid::now_v7();
@@ -232,17 +249,6 @@ impl MediaStorageRecovery {
         // Operation identity is request-only; fetched bytes belong exclusively
         // to source evidence and cannot alter replay classification.
         let request_digest = binding.clone();
-        let semantic_digest = digest_json(
-            b"retained-https-semantic-v1",
-            &(
-                &request.owner_principal_digest,
-                request.session_id,
-                &request.canonical_project_digest,
-                request.client_draft_id,
-                request.requested_media_kind,
-                &request.url,
-            ),
-        )?;
         let source_evidence_digest = digest_json(
             b"retained-https-source-evidence-v1",
             &(
@@ -4730,6 +4736,34 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    struct ScriptedHttpsFetcher {
+        calls: AtomicUsize,
+        bytes: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::media_https::HttpsMediaFetcher for ScriptedHttpsFetcher {
+        async fn fetch(
+            &self,
+            _raw_url: &str,
+            sink: &mut tokio::fs::File,
+            _limits: &crate::media_https::HttpsFetchLimits,
+        ) -> Result<crate::media_https::RetainedHttpsFetchEvidence> {
+            use tokio::io::AsyncWriteExt as _;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            sink.write_all(&self.bytes).await?;
+            Ok(crate::media_https::RetainedHttpsFetchEvidence {
+                byte_length: self.bytes.len() as u64,
+                sha256: crate::intel::hex_lower(&Sha256::digest(&self.bytes)),
+                provenance: crate::media_https::RedactedHttpsProvenance {
+                    redirect_classes: vec![crate::media_https::RedirectLocationClass::CrossOrigin],
+                    path_segment_count: 2,
+                    safe_basename: Some("media.png".into()),
+                },
+            })
+        }
+    }
+
     #[async_trait::async_trait]
     impl AvRuntimeRunner for ScriptedVideoRunner {
         async fn run(
@@ -5357,6 +5391,79 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(counts, (1, 1));
+    }
+
+    #[tokio::test]
+    async fn https_media_ingest_production_publication_replays_conflicts_and_reopens() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
+        let session_id = Uuid::now_v7();
+        db.transaction(move |conn| { conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'project','/redacted',1,1)",[session_id.to_string()])?; Ok(()) }).await.unwrap();
+        let fetcher = std::sync::Arc::new(ScriptedHttpsFetcher {
+            calls: AtomicUsize::new(0),
+            bytes: b"retained https fixture".to_vec(),
+        });
+        let recovery = MediaStorageRecovery::open_or_create(db.clone(), &temp.path().join("media"))
+            .unwrap()
+            .with_https_fetcher(fetcher.clone());
+        let request = RetainHttpsMediaV1 {
+            schema_version: 1,
+            kind: "retainHttpsMedia".into(),
+            local_operation_id: Uuid::now_v7(),
+            owner_principal_digest: "22".repeat(32),
+            session_id,
+            canonical_project_digest: "11".repeat(32),
+            client_draft_id: Uuid::now_v7(),
+            requested_media_kind: RequestedLocalPathMediaKind::Image,
+            url: "https://media.example.test/private/media.png?token=secret".into(),
+        };
+        let policy = cockpit_config::config::media_budget::MediaResourcePolicy::default();
+        let first = recovery
+            .retain_https_media(request.clone(), &policy, 1, 10)
+            .await
+            .unwrap();
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            recovery
+                .retain_https_media(request.clone(), &policy, 2, 11)
+                .await
+                .unwrap(),
+            first
+        );
+        let mut alias = request.clone();
+        alias.local_operation_id = Uuid::now_v7();
+        assert_eq!(
+            recovery
+                .retain_https_media(alias, &policy, 3, 12)
+                .await
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            fetcher.calls.load(Ordering::SeqCst),
+            1,
+            "replays and aliases must precede DNS/fetch"
+        );
+        let mut conflict = request.clone();
+        conflict.url = "https://other.example.test/changed".into();
+        assert!(
+            recovery
+                .retain_https_media(conflict, &policy, 4, 13)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("conflict")
+        );
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+        drop(recovery);
+        let reopened = MediaStorageRecovery::open(db, &temp.path().join("media")).unwrap();
+        assert_eq!(
+            reopened
+                .retain_https_media(request, &policy, 5, 14)
+                .await
+                .unwrap(),
+            first
+        );
     }
 
     #[tokio::test]

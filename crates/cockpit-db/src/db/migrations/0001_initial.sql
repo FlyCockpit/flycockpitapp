@@ -3209,12 +3209,8 @@ CREATE TABLE image_generation_scheduler_claims (
  claim_generation INTEGER NOT NULL CHECK(claim_generation>=1),
  claimed_at_unix_ms INTEGER NOT NULL,
  expires_at_unix_ms INTEGER NOT NULL CHECK(expires_at_unix_ms>claimed_at_unix_ms AND expires_at_unix_ms<=claimed_at_unix_ms+60000),
- PRIMARY KEY(job_id,slot_id),
+ PRIMARY KEY(job_id,slot_id,claim_generation),
  FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT
-);
-CREATE TABLE image_generation_scheduler_claim_mutation_authority (
- job_id TEXT NOT NULL, slot_id TEXT NOT NULL, from_generation INTEGER NOT NULL, to_generation INTEGER NOT NULL,
- PRIMARY KEY(job_id,slot_id), CHECK(to_generation=from_generation+1)
 );
 CREATE TABLE image_generation_attempt_media_snapshots (
  job_id TEXT NOT NULL,
@@ -3229,15 +3225,11 @@ CREATE TABLE image_generation_attempt_media_snapshots (
 );
 CREATE TRIGGER image_generation_attempt_media_snapshot_immutable BEFORE UPDATE ON image_generation_attempt_media_snapshots BEGIN SELECT RAISE(ABORT,'image generation media snapshot is immutable'); END;
 CREATE TRIGGER image_generation_attempt_media_snapshot_no_delete BEFORE DELETE ON image_generation_attempt_media_snapshots BEGIN SELECT RAISE(ABORT,'image generation media snapshot is immutable'); END;
-CREATE TRIGGER image_generation_scheduler_claim_immutable BEFORE UPDATE ON image_generation_scheduler_claims
-WHEN NEW.job_id!=OLD.job_id OR NEW.slot_id!=OLD.slot_id OR NEW.attempt_number!=OLD.attempt_number OR NEW.claim_generation!=OLD.claim_generation+1 OR NEW.claimed_at_unix_ms<OLD.claimed_at_unix_ms OR NEW.expires_at_unix_ms<=NEW.claimed_at_unix_ms OR NEW.expires_at_unix_ms>NEW.claimed_at_unix_ms+60000
-BEGIN SELECT RAISE(ABORT,'image generation scheduler claim is not monotonic'); END;
-CREATE TRIGGER image_generation_scheduler_claim_expiry_guard BEFORE UPDATE ON image_generation_scheduler_claims
-WHEN OLD.expires_at_unix_ms>CAST(unixepoch('subsec')*1000 AS INTEGER) OR NOT EXISTS(SELECT 1 FROM image_generation_scheduler_claim_mutation_authority x WHERE x.job_id=OLD.job_id AND x.slot_id=OLD.slot_id AND x.from_generation=OLD.claim_generation AND x.to_generation=NEW.claim_generation)
-BEGIN SELECT RAISE(ABORT,'image generation scheduler claim has not expired'); END;
-CREATE TRIGGER image_generation_scheduler_claim_delete_guard BEFORE DELETE ON image_generation_scheduler_claims
-WHEN EXISTS(SELECT 1 FROM image_generation_attempts a WHERE a.job_id=OLD.job_id AND a.slot_id=OLD.slot_id AND a.attempt_number=OLD.attempt_number AND a.state='planned')
-BEGIN SELECT RAISE(ABORT,'active image generation scheduler claim cannot be deleted'); END;
+CREATE TRIGGER image_generation_scheduler_claim_immutable BEFORE UPDATE ON image_generation_scheduler_claims BEGIN SELECT RAISE(ABORT,'image generation scheduler claim is immutable'); END;
+CREATE TRIGGER image_generation_scheduler_claim_no_delete BEFORE DELETE ON image_generation_scheduler_claims BEGIN SELECT RAISE(ABORT,'image generation scheduler claim is immutable'); END;
+CREATE TRIGGER image_generation_scheduler_claim_insert_guard BEFORE INSERT ON image_generation_scheduler_claims
+WHEN (NEW.claim_generation=1 AND EXISTS(SELECT 1 FROM image_generation_scheduler_claims c WHERE c.job_id=NEW.job_id AND c.slot_id=NEW.slot_id)) OR (NEW.claim_generation>1 AND NOT EXISTS(SELECT 1 FROM image_generation_scheduler_claims c WHERE c.job_id=NEW.job_id AND c.slot_id=NEW.slot_id AND c.claim_generation=NEW.claim_generation-1 AND c.expires_at_unix_ms<=CAST(unixepoch('subsec')*1000 AS INTEGER) AND c.claim_generation=(SELECT MAX(m.claim_generation) FROM image_generation_scheduler_claims m WHERE m.job_id=NEW.job_id AND m.slot_id=NEW.slot_id)))
+BEGIN SELECT RAISE(ABORT,'image generation scheduler claim generation is not available'); END;
 
 CREATE TABLE image_generation_cancellation_facts (
     job_id TEXT PRIMARY KEY REFERENCES image_generation_jobs(job_id) ON DELETE RESTRICT,

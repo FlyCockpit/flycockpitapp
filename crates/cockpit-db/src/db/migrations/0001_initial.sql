@@ -3386,7 +3386,12 @@ CREATE TABLE image_generation_late_publication_leases (
  decided_at_unix_ms INTEGER,
  FOREIGN KEY(job_id,slot_id) REFERENCES image_generation_slots(job_id,slot_id) ON DELETE RESTRICT,
  CHECK(deadline_unix_ms=created_at_unix_ms+300000),
- CHECK((worker_boot_id IS NULL)=(claim_generation IS NULL))
+ CHECK((worker_boot_id IS NULL)=(claim_generation IS NULL)),
+ CHECK((state='reserved' AND temporary_evidence_json IS NULL AND output_evidence_json IS NULL AND decided_at_unix_ms IS NULL) OR
+       (state='copy_authorized' AND temporary_evidence_json IS NOT NULL AND output_evidence_json IS NULL AND recovery_evidence_json IS NULL AND decided_at_unix_ms IS NULL) OR
+       (state='copy_committed' AND temporary_evidence_json IS NOT NULL AND output_evidence_json IS NOT NULL AND recovery_evidence_json IS NULL AND decided_at_unix_ms IS NULL) OR
+       (state='published' AND output_evidence_json IS NOT NULL AND decided_at_unix_ms IS NOT NULL) OR
+       (state IN ('aborted','expired','security_blocked') AND recovery_evidence_json IS NOT NULL AND decided_at_unix_ms IS NOT NULL))
 );
 CREATE TABLE image_generation_late_publication_authorization_facts (
  authorization_digest TEXT PRIMARY KEY CHECK(length(authorization_digest)=64 AND authorization_digest NOT GLOB '*[^0-9a-f]*'),
@@ -3566,6 +3571,15 @@ WHEN OLD.revoked_at_unix_ms IS NOT NULL OR NEW.revoked_at_unix_ms IS NULL OR NEW
 BEGIN SELECT RAISE(ABORT,'artifact authorization revocation is not monotonic'); END;
 CREATE TRIGGER image_generation_late_publication_identity_immutable BEFORE UPDATE OF publication_operation_id,artifact_id,artifact_generation,job_id,slot_id,expected_slot_version,component_set_digest,component_set_json,authorization_digest,output_authority_digest,output_authority_generation,destination_name,temporary_name,created_at_unix_ms,deadline_unix_ms ON image_generation_late_publication_leases BEGIN SELECT RAISE(ABORT,'late publication identity is immutable'); END;
 CREATE TRIGGER image_generation_late_publication_delete_forbidden BEFORE DELETE ON image_generation_late_publication_leases BEGIN SELECT RAISE(ABORT,'late publication lease is durable'); END;
+CREATE TRIGGER image_generation_late_publication_claim_guard BEFORE UPDATE OF worker_boot_id,claim_generation ON image_generation_late_publication_leases
+WHEN OLD.state!='reserved' OR NEW.state!='reserved' OR NEW.worker_boot_id IS NULL OR NEW.claim_generation IS NULL OR NEW.claim_generation<=COALESCE(OLD.claim_generation,0) OR (OLD.claim_generation IS NOT NULL AND NEW.recovery_evidence_json IS NULL) OR CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)>=OLD.deadline_unix_ms
+BEGIN SELECT RAISE(ABORT,'late publication claim lacks fresh fenced authority'); END;
+CREATE TRIGGER image_generation_late_publication_evidence_immutable BEFORE UPDATE OF temporary_evidence_json,output_evidence_json,recovery_evidence_json ON image_generation_late_publication_leases
+WHEN (OLD.temporary_evidence_json IS NOT NULL AND NEW.temporary_evidence_json!=OLD.temporary_evidence_json) OR (OLD.output_evidence_json IS NOT NULL AND NEW.output_evidence_json!=OLD.output_evidence_json) OR (OLD.recovery_evidence_json IS NOT NULL AND NEW.recovery_evidence_json!=OLD.recovery_evidence_json)
+BEGIN SELECT RAISE(ABORT,'late publication evidence is immutable'); END;
+CREATE TRIGGER image_generation_late_publication_decision_immutable BEFORE UPDATE OF decided_at_unix_ms ON image_generation_late_publication_leases
+WHEN OLD.decided_at_unix_ms IS NOT NULL OR NEW.decided_at_unix_ms IS NULL
+BEGIN SELECT RAISE(ABORT,'late publication decision is immutable'); END;
 CREATE TRIGGER image_generation_user_published_output_immutable BEFORE UPDATE ON image_generation_user_published_outputs BEGIN SELECT RAISE(ABORT,'published output evidence is immutable'); END;
 CREATE TRIGGER image_generation_user_published_output_delete_forbidden BEFORE DELETE ON image_generation_user_published_outputs BEGIN SELECT RAISE(ABORT,'published output evidence is durable'); END;
 CREATE TRIGGER image_generation_security_recovery_audit_identity_immutable BEFORE UPDATE OF recovery_operation_id,artifact_id,artifact_generation,job_id,slot_id,slot_generation,principal_digest,component_set_digest,publication_operation_id,disposition,created_at_unix_ms ON image_generation_artifact_security_recovery_audits BEGIN SELECT RAISE(ABORT,'security recovery audit identity is immutable'); END;
@@ -3573,6 +3587,10 @@ CREATE TRIGGER image_generation_security_recovery_audit_transition_guard BEFORE 
 CREATE TRIGGER image_generation_security_recovery_audit_delete_forbidden BEFORE DELETE ON image_generation_artifact_security_recovery_audits BEGIN SELECT RAISE(ABORT,'security recovery audit is durable'); END;
 CREATE TRIGGER image_generation_late_publication_authorization_immutable BEFORE UPDATE OF authorization_digest,artifact_id,artifact_generation,job_id,slot_id,slot_generation,component_set_digest,output_authority_digest,output_authority_generation,destination_name,temporary_name,principal_digest,created_at_unix_ms ON image_generation_late_publication_authorization_facts BEGIN SELECT RAISE(ABORT,'late publication authorization identity is immutable'); END;
 CREATE TRIGGER image_generation_late_publication_authorization_delete_forbidden BEFORE DELETE ON image_generation_late_publication_authorization_facts BEGIN SELECT RAISE(ABORT,'late publication authorization fact is durable'); END;
+CREATE TRIGGER image_generation_late_publication_authorization_revoke_guard BEFORE UPDATE OF revoked_at_unix_ms ON image_generation_late_publication_authorization_facts WHEN OLD.revoked_at_unix_ms IS NOT NULL OR NEW.revoked_at_unix_ms IS NULL OR NEW.revoked_at_unix_ms<OLD.created_at_unix_ms BEGIN SELECT RAISE(ABORT,'late publication authorization revocation is not monotonic'); END;
+CREATE TRIGGER image_generation_user_published_output_insert_guard BEFORE INSERT ON image_generation_user_published_outputs
+WHEN NOT EXISTS(SELECT 1 FROM image_generation_late_publication_leases p WHERE p.publication_operation_id=NEW.publication_operation_id AND p.artifact_id=NEW.artifact_id AND p.artifact_generation=NEW.artifact_generation AND p.state IN ('copy_committed','security_blocked') AND p.output_authority_digest=NEW.output_authority_digest AND p.output_authority_generation=NEW.output_authority_generation AND p.destination_name=NEW.destination_name AND p.output_evidence_json=NEW.output_evidence_json)
+BEGIN SELECT RAISE(ABORT,'published output fact lacks exact durable lease evidence'); END;
 CREATE TRIGGER image_generation_artifact_transition_registry_sealed BEFORE INSERT ON image_generation_artifact_transitions BEGIN SELECT RAISE(ABORT,'image artifact transition registry is sealed'); END;
 CREATE TRIGGER image_generation_artifact_transition_registry_update_sealed BEFORE UPDATE ON image_generation_artifact_transitions BEGIN SELECT RAISE(ABORT,'image artifact transition registry is sealed'); END;
 CREATE TRIGGER image_generation_artifact_transition_registry_delete_sealed BEFORE DELETE ON image_generation_artifact_transitions BEGIN SELECT RAISE(ABORT,'image artifact transition registry is sealed'); END;

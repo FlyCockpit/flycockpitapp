@@ -13,6 +13,20 @@ pub enum Response {
     /// `CancelTurn`, `ResolveInterrupt`, …).
     Ack,
 
+    MediaOwnerRecovery(cockpit_db::media_attachments::LocalMediaOwnerReceiptV1),
+
+    LocalPathMediaRegistration(cockpit_db::media_attachments::LocalPathRegistrationReceiptV1),
+
+    RetainedHttpsMedia(cockpit_db::media_attachments::RetainedHttpsMediaReceiptV1),
+
+    MediaAttachmentStatus(cockpit_db::media_attachments::MediaAttachmentStatusV1),
+
+    MediaAttachmentPreview(cockpit_db::media_attachments::MediaAttachmentPreviewV1),
+
+    LocalMediaMutation(cockpit_db::media_attachments::LocalMediaMutationReceiptV1),
+
+    MediaUploadStatus(cockpit_db::media_attachments::MediaUploadStatusV1),
+
     /// Terminal proof that an explicit config refresh was adopted.
     ConfigRefreshed {
         applied_generation: u64,
@@ -735,6 +749,13 @@ macro_rules! response_variants {
     ($with_variants:ident $(, $context:ident)*) => {
         $with_variants! { ($($context),*) [
             (Response::Ack, "ack");
+            (Response::MediaOwnerRecovery(..), "media_owner_recovery");
+            (Response::LocalPathMediaRegistration(..), "local_path_media_registration");
+            (Response::RetainedHttpsMedia(..), "retained_https_media");
+            (Response::MediaAttachmentStatus(..), "media_attachment_status");
+            (Response::MediaAttachmentPreview(..), "media_attachment_preview");
+            (Response::LocalMediaMutation(..), "local_media_mutation");
+            (Response::MediaUploadStatus(..), "media_upload_status");
             (Response::ConfigRefreshed { .. }, "config_refreshed");
             (Response::RestartDecision { .. }, "restart_decision");
             (Response::UserMessageQueued { .. }, "user_message_queued");

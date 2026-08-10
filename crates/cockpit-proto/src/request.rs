@@ -1072,6 +1072,31 @@ pub enum Request {
         model: Option<String>,
     },
 
+    /// Owner-only, daemon-local disposition of a security-blocked aggregate.
+    RecoverSecurityBlockedMedia(cockpit_db::media_attachments::RecoverSecurityBlockedMediaV1),
+
+    /// Register a project-contained local file while retaining its verified handle.
+    RegisterLocalPathMedia(cockpit_db::media_attachments::RegisterLocalPathMediaV1),
+
+    /// Owner-only daemon-local retained HTTPS ingress.
+    RetainHttpsMedia(cockpit_db::media_attachments::RetainHttpsMediaV1),
+
+    GetMediaAttachmentStatus(cockpit_db::media_attachments::GetMediaAttachmentStatusV1),
+
+    GetMediaAttachmentPreview(cockpit_db::media_attachments::GetMediaAttachmentPreviewV1),
+
+    BeginMediaUpload(cockpit_db::media_attachments::BeginMediaUploadV1),
+
+    AppendMediaUploadChunk(cockpit_db::media_attachments::AppendMediaUploadChunkV1),
+
+    CancelMediaUpload(cockpit_db::media_attachments::CancelMediaUploadV1),
+
+    GetMediaUploadStatus(cockpit_db::media_attachments::GetMediaUploadStatusV1),
+
+    FinalizeMediaUpload(cockpit_db::media_attachments::FinalizeMediaUploadV1),
+
+    DiscardUnreferencedMediaAttachment(cockpit_db::media_attachments::LocalMediaMutationV1),
+
     /// Request orderly shutdown. The daemon flushes in-flight writes
     /// (session DB, lock state) before exiting.
     StopDaemon {
@@ -1356,6 +1381,17 @@ macro_rules! request_variants {
             (Request::GetUsageCounts { .. }, "get_usage_counts");
             (Request::StatsRollup { .. }, "stats_rollup");
             (Request::GuidanceEstimate { .. }, "guidance_estimate");
+            (Request::RecoverSecurityBlockedMedia(..), "recover_security_blocked_media");
+            (Request::RegisterLocalPathMedia(..), "register_local_path_media");
+            (Request::RetainHttpsMedia(..), "retain_https_media");
+            (Request::GetMediaAttachmentStatus(..), "get_media_attachment_status");
+            (Request::GetMediaAttachmentPreview(..), "get_media_attachment_preview");
+            (Request::BeginMediaUpload(..), "begin_media_upload");
+            (Request::AppendMediaUploadChunk(..), "append_media_upload_chunk");
+            (Request::CancelMediaUpload(..), "cancel_media_upload");
+            (Request::DiscardUnreferencedMediaAttachment(..), "discard_unreferenced_media_attachment");
+            (Request::GetMediaUploadStatus(..), "get_media_upload_status");
+            (Request::FinalizeMediaUpload(..), "finalize_media_upload");
             (Request::StopDaemon { .. }, "stop_daemon");
             (Request::RestartIfIdle, "restart_if_idle");
             (Request::Unknown, "__unknown");
@@ -1522,6 +1558,17 @@ macro_rules! command {
             (Request::GetUsageCounts { project_id }, "get_usage_counts", owner_only, none, false, local_only, none, concurrent, none, "project_id:Option<String>", [project_id: Option<String> => project]);
             (Request::StatsRollup { project_id, range, by_role }, "stats_rollup", owner_only, none, false, local_only, none, concurrent, none, "project_id:Option<String>|range:StatsRange|by_role:bool", [project_id: Option<String> => project, range: StatsRange => param, by_role: bool => param]);
             (Request::GuidanceEstimate { project_root, provider, model }, "guidance_estimate", project_read(project_root), none, false, read_only, none, concurrent, none, "project_root:String|provider:Option<String>|model:Option<String>", [project_root: String => project_root, provider: Option<String> => provider_model_left(model), model: Option<String> => provider_model_right(provider)]);
+            (Request::RecoverSecurityBlockedMedia(..), "recover_security_blocked_media", owner_only, none, true, local_only, none, serialized, none, "-", []);
+            (Request::RegisterLocalPathMedia(..), "register_local_path_media", owner_only, none, true, local_only, none, serialized, none, "-", []);
+            (Request::RetainHttpsMedia(..), "retain_https_media", owner_only, none, true, local_only, none, serialized, none, "-", []);
+            (Request::GetMediaAttachmentStatus(..), "get_media_attachment_status", public_read, none, false, read_only, none, serialized, none, "-", []);
+            (Request::GetMediaAttachmentPreview(..), "get_media_attachment_preview", public_read, none, false, read_only, none, serialized, none, "-", []);
+            (Request::BeginMediaUpload(..), "begin_media_upload", public_read, none, true, idempotent_adapter_mutation, none, serialized, none, "-", []);
+            (Request::AppendMediaUploadChunk(..), "append_media_upload_chunk", public_read, none, true, idempotent_adapter_mutation, none, serialized, none, "-", []);
+            (Request::CancelMediaUpload(..), "cancel_media_upload", public_read, none, true, idempotent_adapter_mutation, none, serialized, none, "-", []);
+            (Request::DiscardUnreferencedMediaAttachment(..), "discard_unreferenced_media_attachment", public_read, none, true, idempotent_adapter_mutation, none, serialized, none, "-", []);
+            (Request::GetMediaUploadStatus(..), "get_media_upload_status", public_read, none, false, read_only, none, serialized, none, "-", []);
+            (Request::FinalizeMediaUpload(..), "finalize_media_upload", public_read, none, true, idempotent_adapter_mutation, none, serialized, none, "-", []);
             (Request::StopDaemon { grace_secs }, "stop_daemon", owner_only, none, true, local_only, none, serialized, none, "grace_secs:Option<u64>", [grace_secs: Option<u64> => param]);
             (Request::RestartIfIdle, "restart_if_idle", owner_only, none, true, local_only, none, serialized, none, "-", []);
             (Request::Unknown, "unknown", owner_only, none, false, rejected, rejected_before_dispatch, serialized, none, "-", []);
@@ -2641,6 +2688,30 @@ mod tests {
             run_invocation_options: None,
         };
         assert!(invalid.validate_semantics().is_err());
+    }
+
+    #[test]
+    fn retained_https_wire_accepts_production_uuid_v4_session_authority() {
+        use cockpit_db::media_attachments::{RequestedLocalPathMediaKind, RetainHttpsMediaV1};
+
+        let session_id = Uuid::new_v4();
+        let request = Request::RetainHttpsMedia(RetainHttpsMediaV1 {
+            schema_version: 1,
+            kind: "retainHttpsMedia".into(),
+            local_operation_id: Uuid::now_v7(),
+            owner_principal_digest: "11".repeat(32),
+            session_id,
+            canonical_project_digest: "22".repeat(32),
+            client_draft_id: Uuid::now_v7(),
+            requested_media_kind: RequestedLocalPathMediaKind::Image,
+            url: "https://media.example.test/image.png".into(),
+        });
+        let encoded = serde_json::to_string(&request).unwrap();
+        let decoded: Request = serde_json::from_str(&encoded).unwrap();
+        let Request::RetainHttpsMedia(decoded) = decoded else {
+            panic!("wrong typed-media wire variant")
+        };
+        assert_eq!(decoded.session_id, session_id);
     }
 }
 

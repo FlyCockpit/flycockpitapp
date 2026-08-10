@@ -785,6 +785,21 @@ fn btw_info_for_row_conn(conn: &Connection, row: &SessionRow) -> Result<BtwForkI
 /// without recreating session content. It is written in the caller's
 /// transaction, so a session can never be removed without one.
 pub fn delete_session_conn(conn: &Connection, session_id: Uuid) -> Result<()> {
+    // Media metadata may cascade only after owned bytes have independently
+    // reached a deletion-evidenced terminal. Starting cleanup is owned by the
+    // media storage orchestrator; this DB boundary is the final fail-closed
+    // guard for every current and future session-deletion caller.
+    let unsafe_media: i64 = conn
+        .query_row(
+            "WITH RECURSIVE subtree(session_id) AS (SELECT ?1 UNION ALL SELECT s.session_id FROM sessions s JOIN subtree p ON s.parent_session_id=p.session_id) SELECT COUNT(*) FROM media_attachments a JOIN subtree t ON t.session_id=a.session_id WHERE a.availability NOT IN ('retained_copy_deleted','borrowed_derivatives_deleted','metadata_deleted') OR EXISTS(SELECT 1 FROM media_attachment_components c WHERE c.attachment_id=a.attachment_id AND c.lifecycle_state<>'deleted')",
+            [session_id.to_string()],
+            |row| row.get(0),
+        )
+        .context("checking session media deletion barrier")?;
+    anyhow::ensure!(
+        unsafe_media == 0,
+        "session media cleanup must complete before session deletion"
+    );
     // The delete cascades to descendant forks and `/btw` rows, so every member
     // of the cascade set needs a tombstone — not just the requested root. A
     // descendant deleted without one loses the owner-visible marker for its

@@ -1,14 +1,21 @@
 {
   "get_app_flag": {
-    "params": { "key": "daemon_autostart_notice" },
+    "params": {
+      "key": "daemon_autostart_notice"
+    },
     "request": "get_app_flag"
   },
   "get_startup_disclosures": {
-    "params": { "project_root": "/tmp/project" },
+    "params": {
+      "project_root": "/tmp/project"
+    },
     "request": "get_startup_disclosures"
   },
   "mark_app_flag_seen": {
-    "params": { "expected_version": 7, "key": "daemon_autostart_notice" },
+    "params": {
+      "expected_version": 7,
+      "key": "daemon_autostart_notice"
+    },
     "request": "mark_app_flag_seen"
   },
   "resolve_assistant_session": {
@@ -982,5 +989,184 @@
       "name": "helper-bot"
     },
     "request": "upsert_assistant"
+  },
+  "recover_security_blocked_media": {
+    "params": {
+      "schemaVersion": 1,
+      "kind": "recoverSecurityBlockedMedia",
+      "localRequestId": "01890f3e-7bcd-7abc-8abc-000000000001",
+      "ownerPrincipalDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "attachmentId": "01890f3e-7bcd-7abc-8abc-000000000002",
+      "attachmentVersion": 1,
+      "expectedAvailabilityGeneration": 1,
+      "affectedComponents": [],
+      "disposition": "retain_blocked"
+    },
+    "request": "recover_security_blocked_media"
+  },
+  "register_local_path_media": {
+    "params": {
+      "schemaVersion": 1,
+      "kind": "registerLocalPathMedia",
+      "localOperationId": "01890f3e-7bcd-7abc-8abc-000000000001",
+      "ownerPrincipalDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "sessionId": "01890f3e-7bcd-7abc-8abc-000000000002",
+      "canonicalProjectDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+      "clientDraftId": "01890f3e-7bcd-7abc-8abc-000000000003",
+      "requestedMediaKind": "image",
+      "path": "/tmp/project/file.png"
+    },
+    "request": "register_local_path_media"
+  },
+  "retain_https_media": {
+    "params": {
+      "schemaVersion": 1,
+      "kind": "retainHttpsMedia",
+      "localOperationId": "01890f3e-7bcd-7abc-8abc-000000000001",
+      "ownerPrincipalDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "sessionId": "01890f3e-7bcd-7abc-8abc-000000000002",
+      "canonicalProjectDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+      "clientDraftId": "01890f3e-7bcd-7abc-8abc-000000000003",
+      "requestedMediaKind": "image",
+      "url": "https://example.com/image.png"
+    },
+    "request": "retain_https_media"
+  },
+  "get_media_attachment_status": {
+    "params": {
+      "schemaVersion": 1,
+      "kind": "getMediaAttachmentStatus",
+      "sessionId": "01890f3e-7bcd-7abc-8abc-000000000001",
+      "canonicalProjectDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+      "attachmentId": "01890f3e-7bcd-7abc-8abc-000000000002"
+    },
+    "request": "get_media_attachment_status"
+  },
+  "get_media_attachment_preview": {
+    "params": {
+      "schemaVersion": 1,
+      "kind": "getMediaAttachmentPreview",
+      "sessionId": "01890f3e-7bcd-7abc-8abc-000000000001",
+      "canonicalProjectDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+      "attachmentId": "01890f3e-7bcd-7abc-8abc-000000000002",
+      "attachmentVersion": 1,
+      "availabilityGeneration": 1,
+      "previewGeneration": 1,
+      "previewChecksum": "3333333333333333333333333333333333333333333333333333333333333333"
+    },
+    "request": "get_media_attachment_preview"
+  },
+  "begin_media_upload": {
+    "params": {
+      "schemaVersion": 1,
+      "kind": "localMediaMutation",
+      "localOperationId": "01890f3e-7bcd-7abc-8abc-000000000001",
+      "actorPrincipalDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "actorRole": "owner",
+      "payload": {
+        "action": "begin",
+        "sessionId": "01890f3e-7bcd-7abc-8abc-000000000002",
+        "canonicalProjectDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+        "clientDraftId": "01890f3e-7bcd-7abc-8abc-000000000003",
+        "mediaKind": "image",
+        "declaredTotalBytes": 1,
+        "reservationDigest": "3333333333333333333333333333333333333333333333333333333333333333"
+      }
+    },
+    "request": "begin_media_upload"
+  },
+  "append_media_upload_chunk": {
+    "params": {
+      "mutation": {
+        "schemaVersion": 1,
+        "kind": "localMediaMutation",
+        "localOperationId": "01890f3e-7bcd-7abc-8abc-000000000001",
+        "actorPrincipalDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+        "actorRole": "owner",
+        "payload": {
+          "action": "append",
+          "sessionId": "01890f3e-7bcd-7abc-8abc-000000000002",
+          "canonicalProjectDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+          "clientDraftId": "01890f3e-7bcd-7abc-8abc-000000000003",
+          "uploadId": "01890f3e-7bcd-7abc-8abc-000000000004",
+          "uploadGeneration": 1,
+          "chunkIndex": 0,
+          "chunkLength": 1,
+          "chunkSha256": "3333333333333333333333333333333333333333333333333333333333333333"
+        }
+      },
+      "dataBase64": "AA=="
+    },
+    "request": "append_media_upload_chunk"
+  },
+  "cancel_media_upload": {
+    "params": {
+      "schemaVersion": 1,
+      "kind": "localMediaMutation",
+      "localOperationId": "01890f3e-7bcd-7abc-8abc-000000000001",
+      "actorPrincipalDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "actorRole": "owner",
+      "payload": {
+        "action": "cancel",
+        "sessionId": "01890f3e-7bcd-7abc-8abc-000000000002",
+        "canonicalProjectDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+        "clientDraftId": "01890f3e-7bcd-7abc-8abc-000000000003",
+        "uploadId": "01890f3e-7bcd-7abc-8abc-000000000004",
+        "uploadGeneration": 1
+      }
+    },
+    "request": "cancel_media_upload"
+  },
+  "discard_unreferenced_media_attachment": {
+    "params": {
+      "schemaVersion": 1,
+      "kind": "localMediaMutation",
+      "localOperationId": "01890f3e-7bcd-7abc-8abc-000000000001",
+      "actorPrincipalDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "actorRole": "owner",
+      "payload": {
+        "action": "discard",
+        "sessionId": "01890f3e-7bcd-7abc-8abc-000000000002",
+        "canonicalProjectDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+        "attachmentId": "01890f3e-7bcd-7abc-8abc-000000000003",
+        "attachmentVersion": 1,
+        "availabilityGeneration": 1,
+        "referenceGeneration": 1
+      }
+    },
+    "request": "discard_unreferenced_media_attachment"
+  },
+  "get_media_upload_status": {
+    "params": {
+      "schemaVersion": 1,
+      "kind": "getMediaUploadStatus",
+      "sessionId": "01890f3e-7bcd-7abc-8abc-000000000001",
+      "canonicalProjectDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+      "clientDraftId": "01890f3e-7bcd-7abc-8abc-000000000002",
+      "uploadId": "01890f3e-7bcd-7abc-8abc-000000000003",
+      "uploadGeneration": 1
+    },
+    "request": "get_media_upload_status"
+  },
+  "finalize_media_upload": {
+    "params": {
+      "schemaVersion": 1,
+      "kind": "localMediaMutation",
+      "localOperationId": "01890f3e-7bcd-7abc-8abc-000000000001",
+      "actorPrincipalDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "actorRole": "owner",
+      "payload": {
+        "action": "finalize",
+        "sessionId": "01890f3e-7bcd-7abc-8abc-000000000002",
+        "canonicalProjectDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+        "clientDraftId": "01890f3e-7bcd-7abc-8abc-000000000003",
+        "uploadId": "01890f3e-7bcd-7abc-8abc-000000000004",
+        "uploadGeneration": 1,
+        "chunkCount": 1,
+        "totalBytes": 1,
+        "objectSha256": "3333333333333333333333333333333333333333333333333333333333333333"
+      }
+    },
+    "request": "finalize_media_upload"
   }
 }

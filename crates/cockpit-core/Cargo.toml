@@ -87,6 +87,10 @@ tree-sitter-cpp = { workspace = true }
 rayon = { workspace = true }
 firecrawl = "2"
 jsonc-parser = { workspace = true }
+# Generated SVG trust boundary. Exact direct pins; both run without optional
+# default features so parser/sanitizer behavior cannot drift through features.
+quick-xml = { version = "=0.39.4", default-features = false }
+svg-hush = { version = "=0.9.6", default-features = false }
 
 # Native secure key store: keyring-core on every target; exactly one native
 # store per supported OS; Unsupported adapter elsewhere. Never the all-in-one

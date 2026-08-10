@@ -786,12 +786,19 @@ impl MediaStorageRecovery {
                         .map(parse_positive_ratio)
                         .transpose()?
                         .unwrap_or((1, 1));
-                    let (width, height) = select_video_dimensions(
-                        probe.width.context("invalid_media")?,
-                        probe.height.context("invalid_media")?,
-                        sar_num,
-                        sar_den,
-                    )?;
+                    let (oriented_width, oriented_height) = oriented_video_dimensions(probe)?;
+                    let rotated = (oriented_width, oriented_height)
+                        != (
+                            probe.width.context("invalid_media")?,
+                            probe.height.context("invalid_media")?,
+                        );
+                    let (sar_num, sar_den) = if rotated {
+                        (sar_den, sar_num)
+                    } else {
+                        (sar_num, sar_den)
+                    };
+                    let (width, height) =
+                        select_video_dimensions(oriented_width, oriented_height, sar_num, sar_den)?;
                     let timestamps = selected_video_timestamps(&document, probe)?;
                     let source_frame_count = timestamps.len();
                     let (fps_num, fps_den, gop, min_keyint) = select_video_rate(&timestamps)?;
@@ -2070,6 +2077,13 @@ struct FfprobeStream {
     time_base: Option<String>,
     profile: Option<String>,
     pix_fmt: Option<String>,
+    #[serde(default)]
+    side_data_list: Vec<FfprobeSideData>,
+}
+#[derive(Debug, serde::Deserialize)]
+struct FfprobeSideData {
+    #[serde(default)]
+    rotation: Option<i32>,
 }
 #[derive(Debug, serde::Deserialize)]
 struct FfprobeFrame {
@@ -2226,6 +2240,24 @@ fn selected_video_timestamps(
         "invalid_media"
     );
     Ok(timestamps)
+}
+
+fn oriented_video_dimensions(stream: &FfprobeStream) -> Result<(u32, u32)> {
+    let width = stream.width.context("invalid_media")?;
+    let height = stream.height.context("invalid_media")?;
+    let rotations = stream
+        .side_data_list
+        .iter()
+        .filter_map(|data| data.rotation)
+        .collect::<Vec<_>>();
+    ensure!(rotations.len() <= 1, "invalid_media");
+    let rotation = rotations.first().copied().unwrap_or(0).rem_euclid(360);
+    ensure!(matches!(rotation, 0 | 90 | 180 | 270), "invalid_media");
+    Ok(if matches!(rotation, 90 | 270) {
+        (height, width)
+    } else {
+        (width, height)
+    })
 }
 
 fn verify_encoded_video_provenance(

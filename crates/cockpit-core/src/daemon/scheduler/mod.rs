@@ -190,7 +190,9 @@ impl DaemonSchedulerHandle {
     }
 
     pub(crate) async fn refresh_timeline(&self) -> Result<()> {
-        self.rebuild_timeline().await
+        self.scheduler.rebuild_timeline().await?;
+        self.wake();
+        Ok(())
     }
 
     pub async fn set_enabled(

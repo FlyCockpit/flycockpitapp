@@ -1247,6 +1247,10 @@ pub struct AcquiredMediaComponentLease {
     pub attachment_version: u64,
     pub availability_generation: u64,
     pub captured_capability_generation: u64,
+    pub owner_session_id: Uuid,
+    pub canonical_project_digest: String,
+    pub lease_purpose: String,
+    pub lease_expires_at_unix_ms: i64,
     pub component: MediaAttachmentComponent,
 }
 
@@ -2450,9 +2454,17 @@ impl super::Db {
             )
             .optional()?
             .context("media attachment unavailable")?;
+        let lease_purpose = if matches!(kind, MediaComponentLeaseKind::Model) {
+            "model_input"
+        } else {
+            "preview"
+        };
+        let lease_expires_at_unix_ms = now_unix_ms
+            .checked_add(15 * 60 * 1_000)
+            .context("media lease deadline overflow")?;
         conn.execute(
-            "INSERT INTO media_attachment_component_leases(lease_id,attachment_id,attachment_version,component_id,lease_kind,expected_availability_generation,captured_capability_generation,acquired_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![lease_id.to_string(), attachment_id.to_string(), decimal(expected_version)?, component.component_id.to_string(), kind.as_str(), decimal(expected_availability_generation)?, decimal(expected_capability_generation)?, now_unix_ms],
+            "INSERT INTO media_attachment_component_leases(lease_id,attachment_id,attachment_version,component_id,lease_kind,expected_availability_generation,captured_capability_generation,owner_session_id,canonical_project_digest,lease_purpose,lease_expires_at_unix_ms,acquired_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            params![lease_id.to_string(), attachment_id.to_string(), decimal(expected_version)?, component.component_id.to_string(), kind.as_str(), decimal(expected_availability_generation)?, decimal(expected_capability_generation)?,attachment.session_id.to_string(),&attachment.canonical_project_digest,lease_purpose,lease_expires_at_unix_ms, now_unix_ms],
         ).context("acquiring media component lease")?;
         Ok(AcquiredMediaComponentLease {
             lease_id,
@@ -2460,6 +2472,10 @@ impl super::Db {
             attachment_version: expected_version,
             availability_generation: expected_availability_generation,
             captured_capability_generation: expected_capability_generation,
+            owner_session_id: attachment.session_id,
+            canonical_project_digest: attachment.canonical_project_digest,
+            lease_purpose: lease_purpose.into(),
+            lease_expires_at_unix_ms,
             component,
         })
     }

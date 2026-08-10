@@ -114,11 +114,9 @@ impl ImageGenerationOwnerContextAuthority {
             session_id,
             project_id: session.project_id.clone(),
             principal_digest: crate::intel::hex_lower(&Sha256::digest(principal_json)),
-            project_identity_digest: digest_fields(&[
-                "image-generation-project-v1",
-                &session.project_id,
-                &session.project_root,
-            ]),
+            project_identity_digest: crate::intel::hex_lower(&Sha256::digest(
+                session.project_root.as_bytes(),
+            )),
             config_generation,
         })
     }
@@ -147,6 +145,10 @@ impl ImageGenerationResolutionAuthorityV1 {
             !request.target_ids.is_empty() && request.samples_per_target > 0,
             "image generation request has no outputs"
         );
+        ensure!(
+            proofs.operation_deadline_monotonic_ms > proofs.enqueue_started_monotonic_ms,
+            "image generation deadline is invalid"
+        );
         let mut grants = proofs
             .grants
             .iter()
@@ -163,7 +165,24 @@ impl ImageGenerationResolutionAuthorityV1 {
         let references = proofs
             .reference_leases
             .iter()
-            .map(reference_artifact_from_acquired_media_lease)
+            .map(|lease| {
+                let required_lease_deadline = proofs
+                    .now_unix_ms
+                    .checked_add(i64::try_from(
+                        proofs.operation_deadline_monotonic_ms
+                            - proofs.enqueue_started_monotonic_ms,
+                    )?)
+                    .ok_or_else(|| anyhow::anyhow!("model input lease deadline overflow"))?;
+                ensure!(
+                    lease.owner_session_id == owner.session_id
+                        && lease.canonical_project_digest == owner.project_identity_digest
+                        && lease.lease_purpose == "model_input"
+                        && lease.lease_expires_at_unix_ms >= required_lease_deadline
+                        && lease.captured_capability_generation > 0,
+                    "retained media lease does not belong to image generation authority"
+                );
+                reference_artifact_from_acquired_media_lease(lease)
+            })
             .collect::<Result<Vec<_>>>()?;
         ensure!(
             references

@@ -2520,7 +2520,7 @@ mod tests {
         assert_eq!(evidence.dispatch_generation, 2);
         assert_eq!(evidence.state, "artifact_synced");
         assert_eq!(
-            db.read(|conn| Ok(conn.query_row(
+            db.read(move |conn| Ok(conn.query_row(
                 "SELECT updated_at_ms FROM remote_rename_journal WHERE logical_attachment_id=?1 AND operation_id=?2",
                 params![ATTACHMENT, operation],
                 |row| row.get::<_, i64>(0),

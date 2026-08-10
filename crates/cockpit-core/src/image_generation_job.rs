@@ -3093,7 +3093,7 @@ mod tests {
         .unwrap();
         let output = fixture
             .db
-            .blocking_for_sync_cli(move |conn| {
+            .write(move |conn| {
                 let owner = ImageGenerationOwnerContextAuthority::from_attached_session(
                     conn,
                     owner_session_id,
@@ -3132,6 +3132,7 @@ mod tests {
                 )?;
                 Ok(output)
             })
+            .await
             .unwrap();
         output.force_next_directory_sync_failure();
         let HeldDirectoryEffectOutcome::AppliedUnknown(recovery) = output
@@ -3140,7 +3141,7 @@ mod tests {
         else {
             panic!("post-effect sync cut did not yield restart recovery")
         };
-        fixture.db.blocking_for_sync_cli(move |conn| {
+        fixture.db.write(move |conn| {
             let owner = ImageGenerationOwnerContextAuthority::from_attached_session(
                 conn,
                 owner_session_id,
@@ -3171,7 +3172,7 @@ mod tests {
             )?;
             assert_eq!(states, ("published".into(), "retained".into(), "published".into()));
             Ok(())
-        }).unwrap();
+        }).await.unwrap();
         assert_eq!(
             std::fs::read(output_path.join("generated-late.png")).unwrap(),
             b"late publication bytes"

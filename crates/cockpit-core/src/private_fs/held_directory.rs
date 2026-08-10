@@ -398,6 +398,10 @@ mod imp {
     }
 
     impl HeldDirectory {
+        #[cfg(test)]
+        pub(super) fn test_dir(&self) -> &File {
+            &self.dir
+        }
         pub(super) fn open_existing(path: &Path) -> Result<Self> {
             ensure!(path.is_absolute(), "held directory path must be absolute");
             let mut names = Vec::new();
@@ -865,7 +869,7 @@ mod imp {
         Ok(())
     }
 
-    fn open_named(dir: &File, name: &str) -> Result<File> {
+    pub(super) fn open_named(dir: &File, name: &str) -> Result<File> {
         let name = CString::new(name)?;
         let fd = unsafe {
             libc::openat(
@@ -882,7 +886,7 @@ mod imp {
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 
-    fn entry_absent(dir: &File, name: &str) -> Result<bool> {
+    pub(super) fn entry_absent(dir: &File, name: &str) -> Result<bool> {
         let name = CString::new(name)?;
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
         let result = unsafe {
@@ -2028,7 +2032,7 @@ mod tests {
         assert_eq!(applied.destination_name(), Some("published"));
         assert_eq!(applied.artifact(), &expected);
 
-        let file = open_named(&held.imp.dir, "published").unwrap();
+        let file = imp::open_named(held.imp.test_dir(), "published").unwrap();
         let sealed = HeldSealedArtifact {
             file,
             name: "published".into(),
@@ -2048,14 +2052,14 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let held = HeldDirectoryAuthority::open_existing(temp.path()).unwrap();
-        assert!(entry_absent(&held.imp.dir, "missing").unwrap());
+        assert!(imp::entry_absent(held.imp.test_dir(), "missing").unwrap());
         symlink(
             temp.path().join("missing-target"),
             temp.path().join("ambiguous"),
         )
         .unwrap();
-        assert!(!entry_absent(&held.imp.dir, "ambiguous").unwrap());
-        assert!(open_named(&held.imp.dir, "ambiguous").is_err());
+        assert!(!imp::entry_absent(held.imp.test_dir(), "ambiguous").unwrap());
+        assert!(imp::open_named(held.imp.test_dir(), "ambiguous").is_err());
     }
 }
 

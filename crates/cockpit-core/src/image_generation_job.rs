@@ -402,7 +402,8 @@ pub fn resolve_image_generation(
             slot_ids: target.slot_artifact_ids.clone(),
             max_attempts: target.max_attempts,
             attempt_resource_maximum: target.attempt_resources.clone(),
-            attempt_maximum_usd_micros: target.attempt_maximum_usd_micros,
+            attempt_maximum_usd_micros: target.attempt_maximum_usd_micros.clone(),
+            spend_attempt_identities: target.spend_attempt_identities.clone(),
         });
     }
     if !alternatives.is_empty() {
@@ -530,7 +531,8 @@ pub(crate) struct ImageGenerationPreflightTargetV1 {
     pub slot_ids: Vec<(Uuid, Uuid)>,
     pub max_attempts: u32,
     pub attempt_resource_maximum: Vec<ResourceReservationV1>,
-    pub attempt_maximum_usd_micros: Option<u64>,
+    pub attempt_maximum_usd_micros: Vec<Option<u64>>,
+    pub spend_attempt_identities: Vec<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ImageGenerationPreflightInputV1 {
@@ -564,6 +566,12 @@ pub(crate) fn plan_image_generation(
         ensure!(
             !target.slot_ids.is_empty(),
             "target has no resolved output slots"
+        );
+        let sealed_attempt_count = target.slot_ids.len() * target.max_attempts as usize;
+        ensure!(
+            target.attempt_maximum_usd_micros.len() == sealed_attempt_count
+                && target.spend_attempt_identities.len() == sealed_attempt_count,
+            "target spend attempt graph is incomplete"
         );
         let mut slots = Vec::with_capacity(target.slot_ids.len());
         for (sample_index, (slot_id, artifact_id)) in target.slot_ids.into_iter().enumerate() {

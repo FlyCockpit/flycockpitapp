@@ -1675,6 +1675,41 @@ fn select_av_streams(
     }
 }
 
+fn select_video_dimensions(
+    width: u32,
+    height: u32,
+    sar_num: u32,
+    sar_den: u32,
+) -> Result<(u32, u32)> {
+    ensure!(
+        width > 0 && height > 0 && sar_num > 0 && sar_den > 0,
+        "invalid_media"
+    );
+    let max_w = width.min(1280);
+    let max_h = height.min(720);
+    ensure!(max_w >= 2 && max_h >= 2, "video_dimensions_too_small");
+    let mut best: Option<(u32, u32, u128)> = None;
+    for w in (2..=max_w).step_by(2) {
+        for h in (2..=max_h).step_by(2) {
+            let left = u128::from(w) * u128::from(height) * u128::from(sar_den);
+            let right = u128::from(h) * u128::from(width) * u128::from(sar_num);
+            let error = left.abs_diff(right);
+            let replace = best.is_none_or(|(best_w, best_h, best_error)| {
+                let order = (error * u128::from(best_h)).cmp(&(best_error * u128::from(h)));
+                let area = u64::from(w) * u64::from(h);
+                let best_area = u64::from(best_w) * u64::from(best_h);
+                order.is_lt()
+                    || (order.is_eq() && (area > best_area || (area == best_area && w > best_w)))
+            });
+            if replace {
+                best = Some((w, h, error));
+            }
+        }
+    }
+    best.map(|(w, h, _)| (w, h))
+        .context("video_dimensions_too_small")
+}
+
 struct NormalizedImageDerivatives {
     model_png: Vec<u8>,
     thumbnail_png: Vec<u8>,
@@ -2608,6 +2643,28 @@ mod tests {
                 ]
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn video_dimension_rational_search_matches_exact_vectors() {
+        for (input, sar, output) in [
+            ((1920, 1080), (1, 1), (1280, 720)),
+            ((640, 360), (1, 1), (640, 360)),
+            ((1440, 1080), (4, 3), (1280, 720)),
+            ((720, 480), (8, 9), (640, 480)),
+            ((3, 3), (1, 1), (2, 2)),
+        ] {
+            assert_eq!(
+                select_video_dimensions(input.0, input.1, sar.0, sar.1).unwrap(),
+                output
+            );
+        }
+        assert!(
+            select_video_dimensions(1, 1080, 1, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("video_dimensions_too_small")
         );
     }
 

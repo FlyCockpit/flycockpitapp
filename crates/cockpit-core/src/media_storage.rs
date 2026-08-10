@@ -4469,6 +4469,13 @@ mod tests {
 
     use super::*;
 
+    struct FixedMediaClock;
+    impl crate::media_reservation::MonotonicClock for FixedMediaClock {
+        fn now_ms(&self) -> u64 {
+            1
+        }
+    }
+
     struct ScriptedVideoRunner {
         fail_encode: AtomicBool,
         calls: AtomicUsize,
@@ -5937,6 +5944,98 @@ mod tests {
             reopened.finalize_media_upload(request, 23).await.unwrap(),
             receipt
         );
+    }
+
+    #[tokio::test]
+    async fn message_image_batch_proof_failure_has_zero_egress_and_live_authority() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = cockpit_db::Db::open(&temp.path().join("db.sqlite")).unwrap();
+        let session = Uuid::now_v7();
+        let project = "22".repeat(32);
+        let root = temp.path().join("media");
+        let storage = MediaStorageRecovery::open_or_create(db.clone(), &root).unwrap();
+        let mut fixtures = Vec::new();
+        for (index, bytes) in [b"first".as_slice(), b"second".as_slice()]
+            .into_iter()
+            .enumerate()
+        {
+            let attachment = Uuid::now_v7();
+            let component = Uuid::now_v7();
+            let storage_id = Uuid::now_v7();
+            let reservation = format!("batch-reservation-{index}");
+            std::fs::write(root.join(storage_id.to_string()), bytes).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(
+                    root.join(storage_id.to_string()),
+                    std::fs::Permissions::from_mode(0o600),
+                )
+                .unwrap();
+            }
+            let file = File::open(root.join(storage_id.to_string())).unwrap();
+            let identity = stable_identity_digest(&file).unwrap();
+            let checksum = crate::intel::hex_lower(&Sha256::digest(bytes));
+            let record = MediaAttachmentRecord {
+                attachment_id: attachment,
+                session_id: session,
+                canonical_project_digest: project.clone(),
+                media_kind: MediaKind::Image,
+                source_kind: MediaSourceKind::AuthenticatedSessionUpload,
+                canonical_container: "png".into(),
+                canonical_mime: "image/png".into(),
+                availability: MediaAvailability::Quarantined,
+                attachment_version: 1,
+                availability_generation: 1,
+                reference_generation: 1,
+                captured_capability_generation: 1,
+                source_identity_digest: "11".repeat(32),
+                source_byte_length: bytes.len() as u64,
+                source_sha256: checksum.clone(),
+                selected_video_stream: None,
+                selected_audio_stream: None,
+                created_at_unix_ms: 1,
+                updated_at_unix_ms: 1,
+                draft_expires_at_unix_ms: None,
+                first_referenced_at_unix_ms: None,
+            };
+            let component_record = MediaAttachmentComponent {
+                component_id: component,
+                attachment_id: attachment,
+                attachment_version: 1,
+                component_kind: "image_model".into(),
+                storage_id,
+                lifecycle_state: "ready".into(),
+                component_generation: 1,
+                stable_identity_digest: identity,
+                byte_length: bytes.len() as u64,
+                sha256: checksum,
+                reservation_id: reservation.clone(),
+                created_at_unix_ms: 1,
+                updated_at_unix_ms: 1,
+            };
+            db.transaction(move|conn|{conn.execute("INSERT OR IGNORE INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/redacted',1,1)",[session.to_string()])?;conn.execute("INSERT INTO media_reservations(reservation_id,policy_version,project_id,owner_session_key,operation,purpose,recovery_id,state,version,queue_sequence,deadline_monotonic_ms,created_wall_ms,published) VALUES(?1,1,'p',?2,'upload','image',?1,'settling',1,?3,100,1,1)",params![reservation,session.to_string(),index as i64+1])?;cockpit_db::Db::insert_media_attachment_conn(conn,&record)?;cockpit_db::Db::insert_media_attachment_component_conn(conn,&component_record)?;for generation in 1..5{let next=[MediaAvailability::Probing,MediaAvailability::Decoding,MediaAvailability::Normalizing,MediaAvailability::Ready][generation-1];cockpit_db::Db::transition_media_attachment_conn(conn,attachment,1,generation as u64,next,1)?;}Ok(())}).await.unwrap();
+            fixtures.push((attachment, storage_id));
+        }
+        std::fs::write(root.join(fixtures[1].1.to_string()), b"tampered").unwrap();
+        let ledger = crate::media_reservation::MediaReservationLedger::new(
+            db.clone(),
+            std::sync::Arc::new(FixedMediaClock),
+        );
+        let result = storage
+            .acquire_message_images_bound(
+                fixtures.iter().map(|value| value.0).collect(),
+                session,
+                project,
+                "submission".into(),
+                &ledger,
+                1024,
+                5,
+            )
+            .await;
+        assert!(result.is_err());
+        let counts=db.read(|conn|Ok((conn.query_row("SELECT COUNT(*) FROM media_attachment_component_leases WHERE released_at_unix_ms IS NULL",[],|row|row.get::<_,i64>(0))?,conn.query_row("SELECT COUNT(*) FROM media_attachment_references WHERE released_at_unix_ms IS NULL",[],|row|row.get::<_,i64>(0))?,conn.query_row("SELECT COUNT(*) FROM media_downstream_ownership WHERE released_wall_ms IS NULL",[],|row|row.get::<_,i64>(0))?))).await.unwrap();
+        assert_eq!(counts, (0, 0, 0));
     }
 
     #[tokio::test]

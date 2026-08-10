@@ -245,7 +245,10 @@ pub fn open_image_generation_output_directory(
 ) -> Result<HeldImageGenerationOutputDirectory> {
     let guard = crate::private_fs::held_directory::HeldDirectoryAuthority::open_existing(path)?;
     let parent_identity_digest = guard.identity().stable_digest.clone();
-    let canonical_destination_digest = guard.identity().canonical_binding_digest.clone();
+    let canonical_destination_digest = digest_fields(&[
+        guard.identity().platform,
+        &guard.identity().canonical_binding_digest,
+    ]);
     let authority = VerifiedOutputDirectoryAuthority::from_held_directory(
         canonical_destination_digest,
         parent_identity_digest,

@@ -2283,11 +2283,34 @@ fn verify_encoded_video_provenance(
         "invalid_media"
     );
     let timestamps = selected_video_timestamps(document, video)?;
-    let actual_rate = select_video_rate(&timestamps)?;
-    ensure!(
-        (actual_rate.0, actual_rate.1) == expected_rate,
-        "invalid_media"
-    );
+    if timestamps.len() > 1 {
+        let first_num = u128::from(timestamps[1].0)
+            .checked_mul(u128::from(timestamps[0].1))
+            .context("invalid_media")?
+            .checked_sub(
+                u128::from(timestamps[0].0)
+                    .checked_mul(u128::from(timestamps[1].1))
+                    .context("invalid_media")?,
+            )
+            .context("invalid_media")?;
+        let first_den = u128::from(timestamps[0].1)
+            .checked_mul(u128::from(timestamps[1].1))
+            .context("invalid_media")?;
+        ensure!(first_num > 0, "invalid_media");
+        for pair in timestamps.windows(2) {
+            let num = u128::from(pair[1].0) * u128::from(pair[0].1)
+                - u128::from(pair[0].0) * u128::from(pair[1].1);
+            let den = u128::from(pair[0].1) * u128::from(pair[1].1);
+            ensure!(num * first_den == first_num * den, "invalid_media");
+        }
+        ensure!(
+            first_den * u128::from(expected_rate.1) == first_num * u128::from(expected_rate.0),
+            "invalid_media"
+        );
+    } else {
+        ensure!(expected_rate == (1, 1), "invalid_media");
+    }
+    ensure!(frames[0].key_frame == 1, "invalid_media");
     let mut last_keyframe = None;
     for (index, frame) in frames.iter().enumerate() {
         if frame.key_frame == 1 {

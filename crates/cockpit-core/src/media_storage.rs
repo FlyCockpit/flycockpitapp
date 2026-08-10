@@ -1971,8 +1971,8 @@ impl MediaStorageRecovery {
             Some(
                 self.prepare_av_normalization(AvNormalizationInput {
                     bytes,
-                    initial_container: canonical_container,
-                    initial_mime: canonical_mime,
+                    initial_container: canonical_container.clone(),
+                    initial_mime: canonical_mime.clone(),
                 })
                 .await,
             )

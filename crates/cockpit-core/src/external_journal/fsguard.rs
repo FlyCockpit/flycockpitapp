@@ -445,13 +445,14 @@ mod imp {
             Ok(())
         }
 
-        /// Move an entry into another held directory, refusing to replace an
-        /// existing entry. Native atomic APIs support files and directories.
+        /// Move a file into another held directory, refusing to replace an
+        /// existing entry.
         ///
         /// A check-then-rename would let a same-user process create the target
         /// between the check and the rename and have its evidence silently
-        /// overwritten. Linux gets `renameat2(RENAME_NOREPLACE)` and Apple
-        /// gets `renameatx_np(RENAME_EXCL)`.
+        /// overwritten. Linux gets `renameat2(RENAME_NOREPLACE)`; every other
+        /// Unix gets `linkat` (which fails `EEXIST` on its own) followed by
+        /// `unlinkat`, which is the same guarantee in two steps.
         pub fn rename_into_noreplace(
             &self,
             name: &str,
@@ -496,32 +497,6 @@ mod imp {
                 }
             }
 
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            {
-                // SAFETY: both held directory descriptors and both component
-                // names stay live for this one atomic no-replace operation.
-                let result = unsafe {
-                    libc::renameatx_np(
-                        self.dir.as_raw_fd(),
-                        from.as_ptr(),
-                        target.dir.as_raw_fd(),
-                        to.as_ptr(),
-                        libc::RENAME_EXCL,
-                    )
-                };
-                if result == 0 {
-                    return Ok(());
-                }
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    return Err(ExternalJournalError::QuarantineNameTaken(
-                        target_name.to_string(),
-                    ));
-                }
-                return Err(io("atomically renaming guarded entry", error));
-            }
-
-            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             // SAFETY: both dirfds and both names stay live for the call.
             // `linkat` never replaces: it fails with EEXIST.
             let linked = unsafe {
@@ -533,7 +508,6 @@ mod imp {
                     0,
                 )
             };
-            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             if linked != 0 {
                 let error = std::io::Error::last_os_error();
                 if error.kind() == std::io::ErrorKind::AlreadyExists {
@@ -543,17 +517,14 @@ mod imp {
                 }
                 return Err(io("linking capsule into quarantine", error));
             }
-            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             // SAFETY: the directory descriptor and name are live for the call.
             let unlinked = unsafe { libc::unlinkat(self.dir.as_raw_fd(), from.as_ptr(), 0) };
-            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             if unlinked != 0 {
                 return Err(io(
                     "unlinking capsule after quarantine link",
                     std::io::Error::last_os_error(),
                 ));
             }
-            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             Ok(())
         }
 
@@ -777,34 +748,6 @@ mod imp {
             let from = self.path.join(name);
             reject_reparse(&from)?;
             let to = target.path.join(target_name);
-            #[cfg(windows)]
-            {
-                use std::os::windows::ffi::OsStrExt as _;
-                use windows::Win32::Storage::FileSystem::{MOVE_FILE_FLAGS, MoveFileExW};
-                use windows::core::PCWSTR;
-                let from_wide: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
-                let to_wide: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
-                // No REPLACE_EXISTING flag: the kernel performs the absence
-                // check and move atomically for both files and directories.
-                unsafe {
-                    MoveFileExW(
-                        PCWSTR(from_wide.as_ptr()),
-                        PCWSTR(to_wide.as_ptr()),
-                        MOVE_FILE_FLAGS(0),
-                    )
-                }
-                .map_err(|error| {
-                    if to.exists() {
-                        ExternalJournalError::QuarantineNameTaken(target_name.to_string())
-                    } else {
-                        ExternalJournalError::Spool(format!(
-                            "atomically renaming guarded entry: {error}"
-                        ))
-                    }
-                })?;
-                return Ok(());
-            }
-            #[cfg(not(windows))]
             std::fs::hard_link(&from, &to).map_err(|error| {
                 if error.kind() == std::io::ErrorKind::AlreadyExists {
                     ExternalJournalError::QuarantineNameTaken(target_name.to_string())
@@ -812,13 +755,8 @@ mod imp {
                     io("linking capsule into quarantine", error)
                 }
             })?;
-            #[cfg(not(windows))]
             std::fs::remove_file(&from)
-                .map_err(|error| io("unlinking capsule after quarantine link", error))?;
-            #[cfg(not(windows))]
-            return Ok(());
-            #[allow(unreachable_code)]
-            Ok(())
+                .map_err(|error| io("unlinking capsule after quarantine link", error))
         }
 
         /// Documented no-op: Windows has no directory fsync. See the module
@@ -1003,24 +941,5 @@ mod tests {
         from.rename_into_noreplace("a.v1", &to, "a.v1.1").unwrap();
         assert!(std::fs::symlink_metadata(from.path().join("a.v1")).is_err());
         assert!(std::fs::symlink_metadata(to.path().join("a.v1.1")).is_ok());
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
-    #[test]
-    fn guarded_atomic_noreplace_rename_supports_directories_and_rejects_planting() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = DirGuard::open_root(&tmp.path().join("root"), true).unwrap();
-        let from = root.open_child_dir("from", true).unwrap();
-        let to = root.open_child_dir("to", true).unwrap();
-        from.open_child_dir("tree", true).unwrap();
-        to.open_child_dir("planted", true).unwrap();
-        assert!(matches!(
-            from.rename_into_noreplace("tree", &to, "planted"),
-            Err(ExternalJournalError::QuarantineNameTaken(_))
-        ));
-        assert!(from.path().join("tree").is_dir());
-        from.rename_into_noreplace("tree", &to, "moved").unwrap();
-        assert!(!from.path().join("tree").exists());
-        assert!(to.path().join("moved").is_dir());
     }
 }

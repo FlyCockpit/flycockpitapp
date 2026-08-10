@@ -5465,6 +5465,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "manual system-runtime conformance; required tests use the injected runner"]
     async fn executable_ffmpeg_vectors_cover_named_dimensions_and_frame_rates() {
         fn executable(name: &str) -> Option<std::path::PathBuf> {
             std::env::var_os("PATH")

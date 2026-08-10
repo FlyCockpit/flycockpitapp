@@ -138,6 +138,134 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    pub(crate) async fn acquire_message_images_bound(
+        &self,
+        attachment_ids: Vec<Uuid>,
+        session_id: Uuid,
+        project_digest: String,
+        consumer_id: String,
+        ledger: &crate::media_reservation::MediaReservationLedger,
+        max_total_bytes: u64,
+        now_unix_ms: i64,
+    ) -> Result<Vec<Vec<u8>>> {
+        use cockpit_db::media_attachments::{
+            AcquiredMediaReference, MediaComponentLeaseKind, MediaKind, MediaReferenceConsumerKind,
+        };
+        ensure!(!attachment_ids.is_empty(), "media_attachment_unavailable");
+        let acquired = self
+            .db
+            .transaction(move |conn| {
+                let mut rows = Vec::with_capacity(attachment_ids.len());
+                let mut total_bytes = 0u64;
+                for attachment_id in attachment_ids {
+                    let record = cockpit_db::Db::media_attachment_for_owner_conn(
+                        conn,
+                        attachment_id,
+                        session_id,
+                        &project_digest,
+                    )?
+                    .context("media_attachment_unavailable")?;
+                    ensure!(
+                        record.media_kind == MediaKind::Image && record.availability.is_ready(),
+                        "media_attachment_unavailable"
+                    );
+                    let reference = cockpit_db::Db::acquire_media_reference_conn(
+                        conn,
+                        Uuid::now_v7(),
+                        attachment_id,
+                        record.attachment_version,
+                        session_id,
+                        &project_digest,
+                        MediaReferenceConsumerKind::Message,
+                        &consumer_id,
+                        now_unix_ms,
+                    )?;
+                    let authority = cockpit_db::Db::acquire_media_component_lease_conn(
+                        conn,
+                        Uuid::now_v7(),
+                        attachment_id,
+                        record.attachment_version,
+                        record.availability_generation,
+                        record.captured_capability_generation,
+                        MediaComponentLeaseKind::Model,
+                        now_unix_ms,
+                    )?;
+                    total_bytes = total_bytes
+                        .checked_add(authority.component.byte_length)
+                        .context("media_attachment_unavailable")?;
+                    ensure!(
+                        total_bytes <= max_total_bytes,
+                        "media_attachment_unavailable"
+                    );
+                    rows.push((reference, authority));
+                }
+                Ok(rows)
+            })
+            .await?;
+        let reservations = acquired
+            .iter()
+            .map(|(_, authority)| authority.component.reservation_id.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if let Err(error) = ledger
+            .bind_downstream_ownership(reservations, &consumer_id, u64::try_from(now_unix_ms)?)
+            .await
+        {
+            let compensation = acquired
+                .iter()
+                .map(|(reference, authority)| (reference.clone(), authority.lease_id))
+                .collect::<Vec<(AcquiredMediaReference, Uuid)>>();
+            self.db.transaction(move |conn| {
+                for (reference, lease_id) in compensation {
+                    conn.execute("UPDATE media_attachment_component_leases SET released_at_unix_ms=?1 WHERE lease_id=?2 AND released_at_unix_ms IS NULL", params![now_unix_ms, lease_id.to_string()])?;
+                    if reference.inserted {
+                        conn.execute("DELETE FROM media_attachment_references WHERE reference_id=?1 AND released_at_unix_ms IS NULL", [reference.reference_id.to_string()])?;
+                    }
+                }
+                Ok(())
+            }).await?;
+            return Err(anyhow::anyhow!(error.to_string()).context("media_attachment_unavailable"));
+        }
+        let mut images = Vec::with_capacity(acquired.len());
+        for (_, authority) in acquired {
+            let opened = (|| -> Result<File> {
+                let mut file = self
+                    .owned_root
+                    .open_file_verified(&authority.component.storage_id.to_string())
+                    .map_err(anyhow::Error::new)?;
+                let before = stable_identity_digest(&file)?;
+                let (length, checksum) = read_full_digest(&mut file)?;
+                ensure!(
+                    before == authority.component.stable_identity_digest
+                        && length == authority.component.byte_length
+                        && checksum == authority.component.sha256
+                        && stable_identity_digest(&file)? == before,
+                    "storage_security_violation"
+                );
+                file.seek(SeekFrom::Start(0))?;
+                Ok(file)
+            })();
+            let file = match opened {
+                Ok(file) => file,
+                Err(error) => {
+                    block_component_lease_after_failed_proof(&self.db, authority, now_unix_ms)
+                        .await?;
+                    return Err(error);
+                }
+            };
+            images.push(
+                HeldMediaComponentLease {
+                    db: self.db.clone(),
+                    authority,
+                    file,
+                }
+                .read_verified(now_unix_ms)
+                .await?,
+            );
+        }
+        Ok(images)
+    }
     pub(crate) async fn ingest_message_image(
         &self,
         actor_principal_digest: String,

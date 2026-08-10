@@ -787,27 +787,18 @@ pub(super) async fn claim_message_image_refs_admitted(
         .as_ref()
         .ok_or_else(|| bad_request("media attachment unavailable"))?;
     let now = chrono::Utc::now().timestamp_millis();
-    let mut images = Vec::with_capacity(refs.len());
-    let mut total = 0usize;
-    for image_ref in refs {
-        let bytes = storage
-            .acquire_message_image(
-                image_ref.id,
-                session_id,
-                project_digest.clone(),
-                client_submission_id.to_string(),
-                now,
-            )
-            .await
-            .map_err(|_| bad_request("media attachment unavailable"))?;
-        total = total
-            .checked_add(bytes.len())
-            .ok_or_else(|| bad_request("media attachment unavailable"))?;
-        if total > proto::MAX_TOTAL_IMAGE_BYTES {
-            return Err(bad_request("media attachment unavailable"));
-        }
-        images.push(bytes);
-    }
+    let images = storage
+        .acquire_message_images_bound(
+            refs.iter().map(|image_ref| image_ref.id).collect(),
+            session_id,
+            project_digest,
+            client_submission_id.to_string(),
+            &ctx.media_ledger,
+            proto::MAX_TOTAL_IMAGE_BYTES as u64,
+            now,
+        )
+        .await
+        .map_err(|_| bad_request("media attachment unavailable"))?;
     Ok(images)
 }
 

@@ -528,6 +528,24 @@ CREATE TABLE media_attachment_processing_security_evidence (
     FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE,
     FOREIGN KEY (component_id) REFERENCES media_attachment_components(component_id) ON DELETE CASCADE
 );
+CREATE TABLE media_attachment_processing_publication_intents (
+    job_id          TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE,
+    output_ids_json TEXT NOT NULL,
+    created_at_unix_ms INTEGER NOT NULL
+);
+CREATE TABLE media_attachment_processing_cleanup_evidence (
+    job_id          TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE,
+    evidence_digest TEXT NOT NULL,
+    completed_at_unix_ms INTEGER NOT NULL,
+    CHECK (length(evidence_digest)=64 AND evidence_digest NOT GLOB '*[^0-9a-f]*')
+);
+CREATE TABLE media_attachment_processing_failure_evidence (
+    job_id TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE,
+    attachment_id TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK(reason='processing_failed'),
+    recorded_at_unix_ms INTEGER NOT NULL,
+    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE
+);
 
 CREATE TABLE media_uploads (
     upload_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, canonical_project_digest TEXT NOT NULL,

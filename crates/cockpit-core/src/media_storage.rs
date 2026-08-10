@@ -5467,6 +5467,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn https_media_ingest_publication_fault_cuts_roll_back_and_reconcile_orphan() {
+        for table in [
+            "media_attachment_components",
+            "media_retained_https_evidence",
+            "media_retained_https_operations",
+            "media_retained_https_audit",
+        ] {
+            let temp = tempfile::TempDir::new().unwrap();
+            let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
+            let session_id = Uuid::now_v7();
+            let trigger = format!(
+                "CREATE TRIGGER fail_https_cut BEFORE INSERT ON {table} BEGIN SELECT RAISE(ABORT,'injected retained HTTPS fault'); END;"
+            );
+            db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'project','/redacted',1,1)",[session_id.to_string()])?;conn.execute_batch(&trigger)?;Ok(())}).await.unwrap();
+            let recovery =
+                MediaStorageRecovery::open_or_create(db.clone(), &temp.path().join("media"))
+                    .unwrap()
+                    .with_https_fetcher(std::sync::Arc::new(ScriptedHttpsFetcher {
+                        calls: AtomicUsize::new(0),
+                        bytes: b"fault fixture".to_vec(),
+                    }));
+            let request = RetainHttpsMediaV1 {
+                schema_version: 1,
+                kind: "retainHttpsMedia".into(),
+                local_operation_id: Uuid::now_v7(),
+                owner_principal_digest: "22".repeat(32),
+                session_id,
+                canonical_project_digest: "11".repeat(32),
+                client_draft_id: Uuid::now_v7(),
+                requested_media_kind: RequestedLocalPathMediaKind::Image,
+                url: "https://media.example.test/fault.bin".into(),
+            };
+            assert!(
+                recovery
+                    .retain_https_media(
+                        request,
+                        &cockpit_config::config::media_budget::MediaResourcePolicy::default(),
+                        1,
+                        10
+                    )
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("injected retained HTTPS fault"),
+                "{table}"
+            );
+            let counts = db
+                .read(|conn| {
+                    Ok((
+                        conn.query_row("SELECT COUNT(*) FROM media_attachments", [], |r| {
+                            r.get::<_, i64>(0)
+                        })?,
+                        conn.query_row("SELECT COUNT(*) FROM media_reservations", [], |r| {
+                            r.get::<_, i64>(0)
+                        })?,
+                        conn.query_row(
+                            "SELECT COUNT(*) FROM media_retained_https_operations",
+                            [],
+                            |r| r.get::<_, i64>(0),
+                        )?,
+                        conn.query_row(
+                            "SELECT COUNT(*) FROM media_retained_https_publication_intents",
+                            [],
+                            |r| r.get::<_, i64>(0),
+                        )?,
+                    ))
+                })
+                .await
+                .unwrap();
+            assert_eq!(counts, (0, 0, 0, 1), "{table}");
+            assert_eq!(recovery.reconcile_media_uploads(11).await.unwrap(), 1);
+        }
+    }
+
+    #[tokio::test]
     async fn local_path_registration_fault_rolls_back_reservation_and_attachment() {
         let temp = tempfile::TempDir::new().unwrap();
         let project = temp.path().join("project");

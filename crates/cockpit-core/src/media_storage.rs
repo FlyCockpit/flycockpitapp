@@ -15,7 +15,7 @@ use cockpit_db::media_attachments::{
     MediaComponentLeaseKind, MediaKind, MediaSecurityRecoveryComponentTransitionV1,
     MediaSecurityRecoveryDisposition, MediaSecurityRecoveryOutcome, MediaSourceKind,
     RecoverSecurityBlockedMediaV1, RegisterLocalPathMediaV1, RequestedLocalPathMediaKind,
-    SecurityRecoverySnapshot, SecurityRecoverySnapshotResult,
+    SecurityRecoverySnapshot, SecurityRecoverySnapshotResult, SelectedMediaStream,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
@@ -694,7 +694,8 @@ impl MediaStorageRecovery {
         );
         let (canonical_container, canonical_mime) =
             probe_upload_container(&mut held, media_kind_from_text(&snapshot.6)?)?;
-        let normalized = if media_kind_from_text(&snapshot.6)? == MediaKind::Image {
+        let media_kind = media_kind_from_text(&snapshot.6)?;
+        let normalized = if media_kind == MediaKind::Image {
             held.seek(SeekFrom::Start(0))?;
             let mut bytes = Vec::new();
             held.by_ref()
@@ -702,6 +703,74 @@ impl MediaStorageRecovery {
                 .read_to_end(&mut bytes)?;
             ensure!(bytes.len() <= 10 * 1024 * 1024, "resource_limit");
             Some(normalize_image(&bytes, canonical_container)?)
+        } else {
+            None
+        };
+        let selected_video_stream = None;
+        let mut selected_audio_stream = None;
+        let av_derivatives = if media_kind == MediaKind::Audio {
+            held.seek(SeekFrom::Start(0))?;
+            let mut bytes = Vec::new();
+            held.read_to_end(&mut bytes)?;
+            let health = crate::external_runtime::global_health_store()
+                .current()
+                .context("model_runtime_unavailable")?;
+            let runtime = approved_av_runtime(&health)?;
+            let (document, _) = run_bounded_ffprobe(&runtime, bytes.clone()).await?;
+            let streams = document
+                .streams
+                .iter()
+                .map(|stream| AvProbeStream {
+                    index: stream.index,
+                    kind: if stream.codec_type == "audio" {
+                        "audio"
+                    } else if stream.codec_type == "video" {
+                        "video"
+                    } else {
+                        "other"
+                    },
+                    codec: stream.codec_name.clone(),
+                    default_disposition: stream
+                        .disposition
+                        .as_ref()
+                        .is_some_and(|value| value.default == 1),
+                })
+                .collect::<Vec<_>>();
+            let (video, audio) = select_av_streams(canonical_container, &streams)?;
+            let audio = audio.context("invalid_media")?;
+            decode_selected_streams(
+                &runtime,
+                bytes.clone(),
+                video.as_ref().map(|value| value.index),
+                Some(audio.index),
+            )
+            .await?;
+            let probe = document
+                .streams
+                .iter()
+                .find(|stream| stream.index == audio.index)
+                .context("invalid_media")?;
+            let rate = probe
+                .sample_rate
+                .as_deref()
+                .context("invalid_media")?
+                .parse::<u32>()?;
+            let channels = probe.channels.context("invalid_media")?;
+            let argv = audio_normalization_argv(audio.index, rate, channels)?;
+            let output = run_bounded_runtime(
+                &runtime.ffmpeg,
+                &argv,
+                bytes,
+                100 * 1024 * 1024,
+                std::time::Duration::from_secs(120),
+            )
+            .await?;
+            let wav = canonicalize_pcm_wav(&output.stdout)?;
+            selected_audio_stream = Some(SelectedMediaStream {
+                index: audio.index,
+                codec: audio.codec,
+            });
+            Some(vec![("audio_model", Uuid::now_v7(), wav, None)])
         } else {
             None
         };
@@ -724,7 +793,7 @@ impl MediaStorageRecovery {
                     ),
                 ]
             })
-            .unwrap_or_default();
+            .map_or_else(|| av_derivatives.unwrap_or_default(), |value| value);
         let intent_upload = upload.to_string();
         let intent_temporary = snapshot.0.clone();
         let intent_target = target.clone();
@@ -814,7 +883,6 @@ impl MediaStorageRecovery {
         }
         let attachment = Uuid::now_v7();
         let component = Uuid::now_v7();
-        let media_kind = media_kind_from_text(&snapshot.6)?;
         let next = generation
             .checked_add(1)
             .context("upload generation overflow")?;
@@ -843,8 +911,8 @@ impl MediaStorageRecovery {
             source_identity_digest: before.clone(),
             source_byte_length: total,
             source_sha256: actual_sha.clone(),
-            selected_video_stream: None,
-            selected_audio_stream: None,
+            selected_video_stream,
+            selected_audio_stream,
             created_at_unix_ms: now_unix_ms,
             updated_at_unix_ms: now_unix_ms,
             draft_expires_at_unix_ms: Some(expires),
@@ -1871,12 +1939,8 @@ struct FfprobeStream {
     codec_name: String,
     #[serde(default)]
     disposition: Option<FfprobeDisposition>,
-    width: Option<u32>,
-    height: Option<u32>,
     sample_rate: Option<String>,
     channels: Option<u32>,
-    sample_aspect_ratio: Option<String>,
-    time_base: Option<String>,
 }
 #[derive(Debug, serde::Deserialize)]
 struct FfprobeDocument {

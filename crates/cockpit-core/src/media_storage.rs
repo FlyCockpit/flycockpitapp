@@ -1619,6 +1619,62 @@ fn valid_mpeg_audio_prefix(bytes: &[u8]) -> bool {
         && frame[2] & 0x0c != 0x0c
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AvProbeStream {
+    index: u32,
+    kind: &'static str,
+    codec: String,
+    default_disposition: bool,
+}
+
+fn select_av_streams(
+    container: &str,
+    streams: &[AvProbeStream],
+) -> Result<(Option<AvProbeStream>, Option<AvProbeStream>)> {
+    ensure!(!streams.is_empty() && streams.len() <= 64, "invalid_media");
+    let allowed_audio = |codec: &str| match container {
+        "wav" => matches!(codec, "pcm_s16le" | "pcm_s24le" | "pcm_s32le" | "pcm_f32le"),
+        "mp3" => codec == "mp3",
+        "m4a" => matches!(codec, "aac" | "alac"),
+        "flac" => codec == "flac",
+        "ogg" => matches!(codec, "vorbis" | "opus" | "flac"),
+        "mp4" => matches!(codec, "aac" | "alac" | "mp3"),
+        "webm" => matches!(codec, "opus" | "vorbis"),
+        "mov" => matches!(
+            codec,
+            "aac" | "alac" | "pcm_s16le" | "pcm_s24le" | "pcm_s32le"
+        ),
+        _ => false,
+    };
+    let allowed_video = |codec: &str| match container {
+        "mp4" => matches!(codec, "h264" | "hevc" | "av1"),
+        "webm" => matches!(codec, "vp8" | "vp9" | "av1"),
+        "mov" => matches!(codec, "h264" | "hevc" | "prores"),
+        _ => false,
+    };
+    let choose = |kind: &str, allowed: &dyn Fn(&str) -> bool| {
+        streams
+            .iter()
+            .filter(|stream| stream.kind == kind && allowed(&stream.codec))
+            .min_by_key(|stream| (!stream.default_disposition, stream.index))
+            .cloned()
+    };
+    let audio = choose("audio", &allowed_audio);
+    let video = choose("video", &allowed_video);
+    if matches!(container, "wav" | "mp3" | "m4a" | "flac" | "ogg") {
+        ensure!(
+            audio.is_some() && streams.iter().all(|stream| stream.kind != "video"),
+            "ambiguous_or_unsupported_container"
+        );
+        Ok((None, audio))
+    } else if matches!(container, "mp4" | "webm" | "mov") {
+        ensure!(video.is_some(), "ambiguous_or_unsupported_container");
+        Ok((video, audio))
+    } else {
+        anyhow::bail!("ambiguous_or_unsupported_container")
+    }
+}
+
 struct NormalizedImageDerivatives {
     model_png: Vec<u8>,
     thumbnail_png: Vec<u8>,
@@ -2477,6 +2533,82 @@ mod tests {
                 container
             );
         }
+    }
+
+    #[test]
+    fn av_stream_selection_is_independent_default_then_index() {
+        let streams = vec![
+            AvProbeStream {
+                index: 4,
+                kind: "video",
+                codec: "vp9".into(),
+                default_disposition: false,
+            },
+            AvProbeStream {
+                index: 2,
+                kind: "video",
+                codec: "vp8".into(),
+                default_disposition: true,
+            },
+            AvProbeStream {
+                index: 9,
+                kind: "audio",
+                codec: "opus".into(),
+                default_disposition: true,
+            },
+            AvProbeStream {
+                index: 1,
+                kind: "audio",
+                codec: "vorbis".into(),
+                default_disposition: false,
+            },
+        ];
+        let (video, audio) = select_av_streams("webm", &streams).unwrap();
+        assert_eq!(video.unwrap().index, 2);
+        assert_eq!(audio.unwrap().index, 9);
+        let unsupported_default = vec![
+            AvProbeStream {
+                index: 0,
+                kind: "audio",
+                codec: "ac3".into(),
+                default_disposition: true,
+            },
+            AvProbeStream {
+                index: 3,
+                kind: "audio",
+                codec: "aac".into(),
+                default_disposition: false,
+            },
+        ];
+        assert_eq!(
+            select_av_streams("m4a", &unsupported_default)
+                .unwrap()
+                .1
+                .unwrap()
+                .index,
+            3
+        );
+        assert!(select_av_streams("mp4", &unsupported_default).is_err());
+        assert!(
+            select_av_streams(
+                "wav",
+                &[
+                    AvProbeStream {
+                        index: 0,
+                        kind: "audio",
+                        codec: "pcm_s16le".into(),
+                        default_disposition: false
+                    },
+                    AvProbeStream {
+                        index: 1,
+                        kind: "video",
+                        codec: "h264".into(),
+                        default_disposition: false
+                    }
+                ]
+            )
+            .is_err()
+        );
     }
 
     #[test]

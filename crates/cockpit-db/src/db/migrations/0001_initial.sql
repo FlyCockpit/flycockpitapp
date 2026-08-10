@@ -3240,6 +3240,27 @@ CREATE TABLE image_generation_cancellation_facts (
     UNIQUE(job_id,cancellation_version)
 );
 
+CREATE TABLE image_generation_deadline_expiry_facts (
+    job_id TEXT PRIMARY KEY REFERENCES image_generation_jobs(job_id) ON DELETE RESTRICT,
+    schema_version INTEGER NOT NULL CHECK(schema_version=1),
+    state TEXT NOT NULL CHECK(state IN ('cleanup_required','cancellation_requested')),
+    deadline_boot_id TEXT NOT NULL,
+    deadline_monotonic_ms INTEGER NOT NULL CHECK(deadline_monotonic_ms>=0),
+    observed_boot_id TEXT NOT NULL,
+    observed_monotonic_ms INTEGER NOT NULL CHECK(observed_monotonic_ms>=0),
+    cancellation_version INTEGER NOT NULL CHECK(cancellation_version>=1),
+    cancellation_operation_id TEXT NOT NULL UNIQUE,
+    cleanup_operation_id TEXT NOT NULL UNIQUE,
+    media_reservation_id TEXT NOT NULL,
+    media_reservation_version INTEGER NOT NULL CHECK(media_reservation_version>=1),
+    spend_reservation_id TEXT NOT NULL,
+    spend_reservation_version INTEGER NOT NULL CHECK(spend_reservation_version>=1),
+    recorded_at_unix_ms INTEGER NOT NULL,
+    FOREIGN KEY(job_id,cancellation_version) REFERENCES image_generation_cancellation_facts(job_id,cancellation_version) ON DELETE RESTRICT
+);
+CREATE TRIGGER image_generation_deadline_expiry_immutable BEFORE UPDATE ON image_generation_deadline_expiry_facts BEGIN SELECT RAISE(ABORT,'image generation deadline expiry evidence is immutable'); END;
+CREATE TRIGGER image_generation_deadline_expiry_no_delete BEFORE DELETE ON image_generation_deadline_expiry_facts BEGIN SELECT RAISE(ABORT,'image generation deadline expiry evidence is immutable'); END;
+
 CREATE TABLE image_generation_cancelled_result_facts (
     job_id TEXT NOT NULL,
     slot_id TEXT NOT NULL,

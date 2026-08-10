@@ -3135,6 +3135,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deadline_expiry_fact_replays_and_survives_reopen_without_releasing() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("deadline.db");
+        let fixture = setup_real_ledger_scheduler_job(
+            cockpit_db::Db::open(&path).unwrap(),
+            "deadline-intent",
+        )
+        .await;
+        let job_id = fixture.job_id;
+        let media_id = fixture.media_reservation_id.clone();
+        let spend_id = fixture.spend_reservation_id.clone();
+        let fact = fixture.db.write(move |conn| {
+            assert!(cockpit_db::Db::record_image_generation_deadline_expiry_conn(
+                conn,
+                job_id,
+                cockpit_db::db::image_generation::DeadlineObservationV1::new(
+                    deadline_boot(),
+                    399,
+                )?,
+                8,
+            )
+            .is_err());
+            let observation = cockpit_db::db::image_generation::DeadlineObservationV1::new(
+                deadline_boot(),
+                400,
+            )?;
+            let first = cockpit_db::Db::record_image_generation_deadline_expiry_conn(
+                conn, job_id, observation, 9,
+            )?;
+            let replay = cockpit_db::Db::record_image_generation_deadline_expiry_conn(
+                conn, job_id, observation, 99,
+            )?;
+            assert_eq!(first, replay);
+            assert!(conn.execute(
+                "UPDATE image_generation_deadline_expiry_facts SET state='cancellation_requested' WHERE job_id=?1",
+                [job_id.to_string()],
+            ).is_err());
+            Ok(first)
+        }).await.unwrap();
+        assert_eq!(
+            fact.disposition,
+            cockpit_db::db::image_generation::ImageGenerationDeadlineExpiryDisposition::CleanupRequired
+        );
+        drop(fixture.db);
+        cockpit_db::Db::open(&path).unwrap().read(move |conn| {
+            let stored:(String,String,String)=conn.query_row(
+                "SELECT d.state,m.state,s.state FROM image_generation_deadline_expiry_facts d JOIN media_reservations m ON m.reservation_id=d.media_reservation_id JOIN image_spend_reservations s ON s.reservation_id=d.spend_reservation_id WHERE d.job_id=?1",
+                [job_id.to_string()],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            )?;
+            assert_eq!(stored.0,"cleanup_required");
+            assert_eq!(stored.1,"executing_local");
+            assert_eq!(stored.2,"reserved");
+            assert_eq!(fact.media_reservation_id,media_id);
+            assert_eq!(fact.spend_reservation_id,spend_id);
+            Ok(())
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn handoff_evidence_survives_file_reopen() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("image.db");

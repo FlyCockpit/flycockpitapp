@@ -744,6 +744,25 @@ impl DeadlineObservationV1 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageGenerationDeadlineExpiryDisposition {
+    CleanupRequired,
+    CancellationRequested,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageGenerationDeadlineExpiryFact {
+    pub job_id: Uuid,
+    pub disposition: ImageGenerationDeadlineExpiryDisposition,
+    pub cancellation_version: u64,
+    pub cancellation_operation_id: String,
+    pub cleanup_operation_id: String,
+    pub media_reservation_id: String,
+    pub media_reservation_version: u64,
+    pub spend_reservation_id: String,
+    pub spend_reservation_version: u64,
+}
+
 pub struct ClaimImageGenerationDispatch {
     pub job_id: Uuid,
     pub slot_id: Uuid,
@@ -1769,6 +1788,101 @@ impl Db {
         })
     }
 
+    pub fn record_image_generation_deadline_expiry_conn(
+        conn: &Connection,
+        job_id: Uuid,
+        observation: DeadlineObservationV1,
+        recorded_at_unix_ms: i64,
+    ) -> Result<ImageGenerationDeadlineExpiryFact> {
+        atomic_conn(conn, "image_generation_deadline_expiry", || {
+            if let Some(existing) = load_deadline_expiry_fact(conn, job_id)? {
+                return Ok(existing);
+            }
+            let (canonical, plan_digest, deadline_boot, deadline): (Vec<u8>, String, String, i64) = conn.query_row(
+                "SELECT canonical_plan,plan_digest,deadline_boot_id,operation_deadline_monotonic_ms FROM image_generation_plans WHERE job_id=?1",
+                [job_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+            let deadline_boot = Uuid::parse_str(&deadline_boot)?;
+            ensure!(
+                !observation.is_before(deadline_boot, deadline)?,
+                "image generation operation deadline has not expired"
+            );
+            let plan = ImageGenerationPlanV1::from_canonical(&canonical, &plan_digest)?;
+            let media_reservation_id = plan
+                .central_resources
+                .first()
+                .context("image generation central reservation is absent")?
+                .reservation_identity
+                .clone();
+            let media_reservation_version: i64 = conn.query_row(
+                "SELECT version FROM media_reservations WHERE reservation_id=?1",
+                [&media_reservation_id],
+                |row| row.get(0),
+            )?;
+            let spend_reservation_version: i64 = conn.query_row(
+                "SELECT policy_version FROM image_spend_reservations WHERE reservation_id=?1",
+                [&plan.spend.reservation_id],
+                |row| row.get(0),
+            )?;
+            let identity_digest = hex_lower(&Sha256::digest(
+                format!("{job_id}:{plan_digest}").as_bytes(),
+            ));
+            let cancellation_operation_id = format!("deadline:{identity_digest}");
+            let cleanup_operation_id = format!("deadline-cleanup:{identity_digest}");
+            let handoff_possible: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM image_generation_attempts a JOIN external_journal_operations o ON o.operation_id=a.external_operation_id WHERE a.job_id=?1 AND o.state IN ('dispatching','accepted','submission_unknown','cancellation_requested','reconciling','succeeded','failed'))",
+                [job_id.to_string()],
+                |row| row.get(0),
+            )?;
+            if !handoff_possible {
+                let mut prepared = conn.prepare(
+                    "SELECT a.external_operation_id,a.observed_journal_version FROM image_generation_attempts a JOIN external_journal_operations o ON o.operation_id=a.external_operation_id WHERE a.job_id=?1 AND o.state='prepared' ORDER BY a.slot_id,a.attempt_number",
+                )?;
+                let operations = prepared
+                    .query_map([job_id.to_string()], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                drop(prepared);
+                for (operation_id, version) in operations {
+                    let operation_id = Uuid::parse_str(&operation_id)?;
+                    let record = match transition_external_operation_conn(
+                        conn,
+                        operation_id,
+                        version,
+                        ExternalJournalState::Expired,
+                        recorded_at_unix_ms,
+                    )? {
+                        ExternalTransitionOutcome::Committed(record)
+                        | ExternalTransitionOutcome::Duplicate(record) => record,
+                        ExternalTransitionOutcome::Conflict(_) => {
+                            anyhow::bail!("deadline expiry lost journal compare-and-set")
+                        }
+                    };
+                    ensure!(conn.execute("UPDATE image_generation_attempts SET observed_journal_version=?1 WHERE job_id=?2 AND external_operation_id=?3 AND observed_journal_version=?4",params![record.version,job_id.to_string(),operation_id.to_string(),version])?==1,"deadline expiry lost attempt journal binding");
+                }
+            }
+            let cancellation_version = 1_u64;
+            Self::request_image_generation_cancellation_inner(
+                conn,
+                &RequestImageGenerationCancellation {
+                    job_id,
+                    cancellation_version,
+                    request_operation_id: &cancellation_operation_id,
+                    requested_at_unix_ms: recorded_at_unix_ms,
+                },
+            )?;
+            let state = if handoff_possible {
+                "cancellation_requested"
+            } else {
+                "cleanup_required"
+            };
+            conn.execute("INSERT INTO image_generation_deadline_expiry_facts(job_id,schema_version,state,deadline_boot_id,deadline_monotonic_ms,observed_boot_id,observed_monotonic_ms,cancellation_version,cancellation_operation_id,cleanup_operation_id,media_reservation_id,media_reservation_version,spend_reservation_id,spend_reservation_version,recorded_at_unix_ms) VALUES(?1,1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",params![job_id.to_string(),state,deadline_boot.to_string(),deadline,observation.daemon_boot_id.to_string(),i64::try_from(observation.now_monotonic_ms)?,i64::try_from(cancellation_version)?,cancellation_operation_id,cleanup_operation_id,media_reservation_id,media_reservation_version,plan.spend.reservation_id,spend_reservation_version,recorded_at_unix_ms])?;
+            load_deadline_expiry_fact(conn, job_id)?.context("deadline expiry fact was not stored")
+        })
+    }
+
     fn request_image_generation_cancellation_inner(
         conn: &Connection,
         input: &RequestImageGenerationCancellation<'_>,
@@ -1897,22 +2011,31 @@ impl Db {
                     (&operation_id, journal_version)
                 {
                     let operation_id = Uuid::parse_str(operation_id)?;
-                    let next = if attempt_handoff_possible {
-                        ExternalJournalState::CancellationRequested
+                    let journal_state: String = conn.query_row(
+                        "SELECT state FROM external_journal_operations WHERE operation_id=?1 AND version=?2",
+                        params![operation_id.to_string(), journal_version],
+                        |row| row.get(0),
+                    )?;
+                    if journal_state == "expired" && !attempt_handoff_possible {
+                        // Deadline expiry owns the prepared -> expired edge.
                     } else {
-                        ExternalJournalState::Cancelled
-                    };
-                    match transition_external_operation_conn(
-                        conn,
-                        operation_id,
-                        journal_version,
-                        next,
-                        input.requested_at_unix_ms,
-                    )? {
-                        ExternalTransitionOutcome::Committed(_)
-                        | ExternalTransitionOutcome::Duplicate(_) => {}
-                        ExternalTransitionOutcome::Conflict(_) => {
-                            anyhow::bail!("cancellation lost journal compare-and-set")
+                        let next = if attempt_handoff_possible {
+                            ExternalJournalState::CancellationRequested
+                        } else {
+                            ExternalJournalState::Cancelled
+                        };
+                        match transition_external_operation_conn(
+                            conn,
+                            operation_id,
+                            journal_version,
+                            next,
+                            input.requested_at_unix_ms,
+                        )? {
+                            ExternalTransitionOutcome::Committed(_)
+                            | ExternalTransitionOutcome::Duplicate(_) => {}
+                            ExternalTransitionOutcome::Conflict(_) => {
+                                anyhow::bail!("cancellation lost journal compare-and-set")
+                            }
                         }
                     }
                 }
@@ -2022,6 +2145,37 @@ fn atomic_conn<T>(
             Err(error)
         }
     }
+}
+
+fn load_deadline_expiry_fact(
+    conn: &Connection,
+    job_id: Uuid,
+) -> Result<Option<ImageGenerationDeadlineExpiryFact>> {
+    conn.query_row(
+        "SELECT state,cancellation_version,cancellation_operation_id,cleanup_operation_id,media_reservation_id,media_reservation_version,spend_reservation_id,spend_reservation_version FROM image_generation_deadline_expiry_facts WHERE job_id=?1",
+        [job_id.to_string()],
+        |row| {
+            let state: String = row.get(0)?;
+            let disposition = match state.as_str() {
+                "cleanup_required" => ImageGenerationDeadlineExpiryDisposition::CleanupRequired,
+                "cancellation_requested" => ImageGenerationDeadlineExpiryDisposition::CancellationRequested,
+                _ => return Err(rusqlite::Error::InvalidQuery),
+            };
+            Ok(ImageGenerationDeadlineExpiryFact {
+                job_id,
+                disposition,
+                cancellation_version: row.get::<_, i64>(1)? as u64,
+                cancellation_operation_id: row.get(2)?,
+                cleanup_operation_id: row.get(3)?,
+                media_reservation_id: row.get(4)?,
+                media_reservation_version: row.get::<_, i64>(5)? as u64,
+                spend_reservation_id: row.get(6)?,
+                spend_reservation_version: row.get::<_, i64>(7)? as u64,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 fn hex_lower(bytes: &[u8]) -> String {

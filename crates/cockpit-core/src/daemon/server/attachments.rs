@@ -737,6 +737,7 @@ pub(super) fn consume_image_refs(
 /// Attachment ownership remains with the session. Submission UUID
 /// idempotency belongs to the worker receipt, while the durable media layer
 /// records a distinct reference per committed consumer.
+#[cfg(test)]
 pub(super) fn claim_message_image_refs(
     state: &mut MutableClientState,
     session_id: Uuid,
@@ -839,6 +840,7 @@ fn validate_image_ref_shape(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_message_attachment(
     attachment: &ReadyAttachment,
     session_id: Uuid,

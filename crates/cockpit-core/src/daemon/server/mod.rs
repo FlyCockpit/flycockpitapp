@@ -2626,6 +2626,7 @@ struct MutableClientState {
     attached: Option<AttachedSession>,
     pending_replay: Vec<proto::Event>,
     pending_uploads: HashMap<Uuid, PendingAttachmentUpload>,
+    #[cfg(test)]
     ready_attachments: HashMap<Uuid, ReadyAttachment>,
     upload_accounting: Arc<StdMutex<UploadAccounting>>,
     upload_limits: AttachmentUploadLimits,
@@ -2709,6 +2710,7 @@ impl MutableClientState {
             attached: None,
             pending_replay: Vec::new(),
             pending_uploads: HashMap::new(),
+            #[cfg(test)]
             ready_attachments: HashMap::new(),
             upload_accounting,
             upload_limits: AttachmentUploadLimits,
@@ -2863,6 +2865,7 @@ struct PendingAttachmentUpload {
     created_at: Instant,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct ReadyAttachment {
     media_reservation: Option<crate::media_reservation::ReservationReceipt>,

@@ -5109,6 +5109,26 @@ pub(crate) fn test_ctx() -> Arc<DaemonContext> {
     test_ctx_with_config_source(stub_config_source())
 }
 
+fn disk_test_ctx(db_path: &Path, spool_path: &Path) -> Arc<DaemonContext> {
+    let db = Db::open(db_path).expect("file-backed test db");
+    let locks = Arc::new(LockManager::in_memory(db.clone()));
+    let mut context = DaemonContext::new(
+        db.clone(),
+        locks,
+        DaemonPaths {
+            socket: db_path.with_extension("sock"),
+            pid_file: db_path.with_extension("pid"),
+            ephemeral: false,
+        },
+        crate::daemon::terminal::test_host_factory(),
+        stub_config_source(),
+    );
+    context.external_journal = Some(Arc::new(
+        crate::external_journal::ExternalJournal::for_test_at(db, spool_path),
+    ));
+    Arc::new(context)
+}
+
 fn test_ctx_with_config_source(
     config_source: crate::daemon::config_source::ConfigSource,
 ) -> Arc<DaemonContext> {
@@ -5914,6 +5934,93 @@ async fn staged_rename_executor_applies_commits_and_replays_without_second_effec
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
+async fn staged_rename_cleanup_intent_survives_unlink_fsync_failure_and_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let durable = tempfile::tempdir().unwrap();
+    let db_path = durable.path().join("daemon.db");
+    let spool_path = durable.path().join("spool");
+    std::fs::write(root.path().join("from.txt"), b"value").unwrap();
+    let ctx = disk_test_ctx(&db_path, &spool_path);
+    let journal = ctx.external_journal.as_ref().unwrap();
+    journal.fail_next_remote_rename_cleanup_sync();
+    let request = Request::FsRename {
+        project_root: root.path().to_string_lossy().into_owned(),
+        from_path: "from.txt".into(),
+        to_path: "to.txt".into(),
+    };
+    let canonical_root = root.path().canonicalize().unwrap();
+    let authorized = AuthorizedRequestContext {
+        fcor_resources: vec![
+            AuthorizedFcorResource {
+                kind: proto::remote_operation_fcor::RemoteOperationResourceKind::ProjectRoot,
+                value: canonical_root.to_string_lossy().as_bytes().to_vec(),
+            },
+            AuthorizedFcorResource {
+                kind: proto::remote_operation_fcor::RemoteOperationResourceKind::FilePath,
+                value: canonical_root
+                    .join("from.txt")
+                    .to_string_lossy()
+                    .as_bytes()
+                    .to_vec(),
+            },
+            AuthorizedFcorResource {
+                kind: proto::remote_operation_fcor::RemoteOperationResourceKind::FilePath,
+                value: canonical_root
+                    .join("to.txt")
+                    .to_string_lossy()
+                    .as_bytes()
+                    .to_vec(),
+            },
+        ],
+    };
+    let operation = RemoteOperationContext {
+        request_id: Uuid::new_v4(),
+        logical_attachment_id: Uuid::parse_str("22222222-2222-4222-8222-2222222222aa").unwrap(),
+        operation_id: Uuid::parse_str("018f3f24-7a10-7cc2-8f55-1111111111aa").unwrap(),
+        authenticated_device_id: Uuid::parse_str("33333333-3333-4333-8333-3333333333aa").unwrap(),
+        authenticated_device_generation: 1,
+    };
+    assert_eq!(
+        execute_remote_staged_rename(&request, &authorized, &operation, &ctx)
+            .await
+            .unwrap(),
+        Response::Ack
+    );
+    assert_eq!(
+        ctx.db
+            .remote_rename_artifact_cleanup_intents()
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(ctx);
+    let reopened = disk_test_ctx(&db_path, &spool_path);
+    reopened
+        .external_journal
+        .as_ref()
+        .unwrap()
+        .drain_remote_rename_artifact_cleanup()
+        .await
+        .unwrap();
+    assert!(
+        reopened
+            .db
+            .remote_rename_artifact_cleanup_intents()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        std::fs::read_dir(spool_path.join("remote-operations"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
 async fn staged_rename_executor_recovers_every_durability_barrier_cut() {
     for (index, cut) in [
         "artifact_durable",
@@ -5923,22 +6030,18 @@ async fn staged_rename_executor_recovers_every_durability_barrier_cut() {
         "applied_journal",
         "ledger_committed",
         "source_identity_swap",
+        "target_after_artifact_prepared",
+        "target_after_artifact_synced",
     ]
     .into_iter()
     .enumerate()
     {
         let tmp = tempfile::tempdir().unwrap();
-        let spool = tempfile::tempdir().unwrap();
+        let durable = tempfile::tempdir().unwrap();
+        let spool_path = durable.path().join("spool");
+        let db_path = durable.path().join("daemon.db");
         std::fs::write(tmp.path().join("from.txt"), format!("value-{index}")).unwrap();
-        let base = test_ctx();
-        let mut owned = match Arc::try_unwrap(base) {
-            Ok(value) => value,
-            Err(_) => panic!("test context unexpectedly shared"),
-        };
-        owned.external_journal = Some(Arc::new(
-            crate::external_journal::ExternalJournal::for_test_at(owned.db.clone(), spool.path()),
-        ));
-        let ctx = Arc::new(owned);
+        let ctx = disk_test_ctx(&db_path, &spool_path);
         let request = Request::FsRename {
             project_root: tmp.path().to_string_lossy().into_owned(),
             from_path: "from.txt".into(),
@@ -5995,6 +6098,18 @@ async fn staged_rename_executor_recovers_every_durability_barrier_cut() {
                         std::fs::write(tmp.path().join("from.txt"), b"replacement").unwrap();
                         return Ok(());
                     }
+                    if cut == "target_after_artifact_prepared" && barrier == "artifact_durable" {
+                        fired = true;
+                        std::fs::write(tmp.path().join("to.txt"), b"planted").unwrap();
+                        return Ok(());
+                    }
+                    if cut == "target_after_artifact_synced" && barrier == "artifact_journal_synced"
+                    {
+                        fired = true;
+                        #[cfg(unix)]
+                        std::os::unix::fs::symlink("from.txt", tmp.path().join("to.txt")).unwrap();
+                        return Ok(());
+                    }
                     if !fired && barrier == cut {
                         fired = true;
                         return Err(ErrorPayload {
@@ -6009,7 +6124,20 @@ async fn staged_rename_executor_recovers_every_durability_barrier_cut() {
             .is_err()
         );
         assert!(fired, "cut {cut} was not reached");
-        if cut == "source_identity_swap" {
+        drop(ctx);
+        let ctx = disk_test_ctx(&db_path, &spool_path);
+        ctx.external_journal
+            .as_ref()
+            .unwrap()
+            .drain_remote_rename_artifact_cleanup()
+            .await
+            .unwrap();
+        if matches!(
+            cut,
+            "source_identity_swap"
+                | "target_after_artifact_prepared"
+                | "target_after_artifact_synced"
+        ) {
             assert!(
                 execute_remote_staged_rename(&request, &authorized, &operation, &ctx)
                     .await
@@ -6025,13 +6153,21 @@ async fn staged_rename_executor_recovers_every_durability_barrier_cut() {
                 .unwrap()
                 .unwrap();
             assert_eq!(status.state, "outcome_unknown");
-            assert_eq!(
-                std::fs::read(tmp.path().join("from.txt")).unwrap(),
-                b"replacement"
-            );
-            assert!(!tmp.path().join("to.txt").exists());
+            if cut == "source_identity_swap" {
+                assert_eq!(
+                    std::fs::read(tmp.path().join("from.txt")).unwrap(),
+                    b"replacement"
+                );
+                assert!(!tmp.path().join("to.txt").exists());
+            } else {
+                assert_eq!(
+                    std::fs::read_to_string(tmp.path().join("from.txt")).unwrap(),
+                    format!("value-{index}")
+                );
+                assert!(std::fs::symlink_metadata(tmp.path().join("to.txt")).is_ok());
+            }
             assert!(
-                std::fs::read_dir(spool.path().join("remote-operations"))
+                std::fs::read_dir(spool_path.join("remote-operations"))
                     .unwrap()
                     .next()
                     .is_none()
@@ -6044,6 +6180,13 @@ async fn staged_rename_executor_recovers_every_durability_barrier_cut() {
                 .unwrap(),
             Response::Ack,
             "recovery failed after {cut}"
+        );
+        assert!(
+            std::fs::read_dir(spool_path.join("remote-operations"))
+                .unwrap()
+                .next()
+                .is_none(),
+            "artifact cleanup did not survive reopen after {cut}"
         );
         assert!(!tmp.path().join("from.txt").exists());
         assert_eq!(

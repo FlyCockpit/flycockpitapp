@@ -273,7 +273,7 @@ async fn begin_remote_nonrepeatable(
     request: &Request,
     authorized: &AuthorizedRequestContext,
     operation: &super::RemoteOperationContext,
-    ctx: &DaemonContext,
+    _ctx: &DaemonContext,
 ) -> std::result::Result<Option<Response>, ErrorPayload> {
     let params = request
         .canonical_remote_operation_params_v1()
@@ -442,19 +442,38 @@ fn db_filesystem_identity(
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn cleanup_remote_rename_artifacts(
+    _ctx: &DaemonContext,
+    journal: &crate::external_journal::ExternalJournal,
+    _attachment: &str,
+    _operation_id: &str,
+) {
+    let _ = journal.drain_remote_rename_artifact_cleanup().await;
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn close_remote_rename_effect_unknown(
     ctx: &DaemonContext,
     journal: &crate::external_journal::ExternalJournal,
     attachment: &str,
     operation_id: &str,
-) {
-    if let Ok(stored) = ctx
-        .db
-        .remote_rename_evidence(attachment, operation_id)
+    dispatch_generation: u64,
+    message: &'static str,
+) -> std::result::Result<Response, ErrorPayload> {
+    ctx.db
+        .record_remote_rename_effect_unknown(
+            attachment,
+            operation_id,
+            dispatch_generation,
+            b"{\"outcome\":\"unknown\"}",
+            chrono::Utc::now().timestamp_millis(),
+        )
         .await
-        && let Ok(artifact_id) = Uuid::parse_str(&stored.artifact_id)
-    {
-        let _ = journal.remove_all_remote_rename_artifacts(artifact_id);
-    }
+        .map_err(internal)?;
+    cleanup_remote_rename_artifacts(ctx, journal, attachment, operation_id).await;
+    Err(ErrorPayload {
+        code: ErrorCode::Conflict,
+        message: message.into(),
+    })
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -692,9 +711,17 @@ async fn execute_remote_staged_rename_with_hook(
                     .into(),
             });
         }
-        target_parent
-            .require_entry_absent(&target_name)
-            .map_err(internal)?;
+        if target_parent.require_entry_absent(&target_name).is_err() {
+            return close_remote_rename_effect_unknown(
+                ctx,
+                journal,
+                &attachment,
+                &operation_id,
+                evidence.dispatch_generation,
+                "rename target appeared after artifact durability; outcome is closed as unknown",
+            )
+            .await;
+        }
         if !ctx
             .db
             .advance_remote_rename_operation(
@@ -712,6 +739,7 @@ async fn execute_remote_staged_rename_with_hook(
                 "rename artifact barrier generation lost"
             )));
         }
+        after_barrier("artifact_journal_synced")?;
     }
     let mut state = if evidence.state == "prepared" {
         "artifact_synced"
@@ -724,9 +752,17 @@ async fn execute_remote_staged_rename_with_hook(
             target_parent.open_entry_identity(&target_name),
         ) {
             (Ok(source), Err(_)) if db_filesystem_identity(source) == evidence.source_identity => {
-                target_parent
-                    .require_entry_absent(&target_name)
-                    .map_err(internal)?;
+                if target_parent.require_entry_absent(&target_name).is_err() {
+                    return close_remote_rename_effect_unknown(
+                        ctx,
+                        journal,
+                        &attachment,
+                        &operation_id,
+                        evidence.dispatch_generation,
+                        "rename target appeared before dispatch; outcome is closed as unknown",
+                    )
+                    .await;
+                }
                 let rename_effect = match source_parent.rename_entry_noreplace_atomic(
                     &source_name,
                     &target_parent,
@@ -877,7 +913,7 @@ async fn execute_remote_staged_rename_with_hook(
     {
         CommitRemoteOperationOutcome::Committed { .. } => {
             after_barrier("ledger_committed")?;
-            let _ = journal.remove_all_remote_rename_artifacts(artifact_id);
+            cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id).await;
             Ok(response)
         }
         _ => Err(ErrorPayload {

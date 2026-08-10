@@ -142,6 +142,13 @@ pub struct RemoteRenameEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteRenameArtifactCleanupIntent {
+    pub logical_attachment_id: String,
+    pub operation_id: String,
+    pub artifact_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrepareRemoteRenameOutcome {
     Prepared(RemoteRenameEvidence),
     Reconcile(RemoteRenameEvidence),
@@ -235,6 +242,39 @@ pub struct RemoteOutboxDeliveryLease {
 }
 
 impl Db {
+    pub async fn remote_rename_artifact_cleanup_intents(
+        &self,
+    ) -> Result<Vec<RemoteRenameArtifactCleanupIntent>> {
+        self.read(|conn| {
+            let mut statement = conn.prepare("SELECT logical_attachment_id,operation_id,artifact_id FROM remote_rename_artifact_cleanup_intents ORDER BY created_at_ms,operation_id")?;
+            Ok(statement
+                .query_map([], |row| Ok(RemoteRenameArtifactCleanupIntent {
+                    logical_attachment_id: row.get(0)?,
+                    operation_id: row.get(1)?,
+                    artifact_id: row.get(2)?,
+                }))?
+                .collect::<std::result::Result<Vec<_>, _>>()?)
+        }).await
+    }
+
+    pub async fn complete_remote_rename_artifact_cleanup(
+        &self,
+        logical_attachment_id: &str,
+        operation_id: &str,
+        artifact_id: &str,
+    ) -> Result<bool> {
+        validate_uuid("logical attachment id", logical_attachment_id)?;
+        validate_operation_id(operation_id)?;
+        validate_uuid("rename artifact id", artifact_id)?;
+        let attachment = logical_attachment_id.to_owned();
+        let operation = operation_id.to_owned();
+        let artifact = artifact_id.to_owned();
+        self.transaction(move |conn| Ok(conn.execute(
+            "DELETE FROM remote_rename_artifact_cleanup_intents WHERE logical_attachment_id=?1 AND operation_id=?2 AND artifact_id=?3",
+            params![attachment,operation,artifact],
+        )? == 1)).await
+    }
+
     pub async fn remote_rename_evidence(
         &self,
         logical_attachment_id: &str,
@@ -374,6 +414,7 @@ impl Db {
                 params![attachment, operation, generation, response, now_ms],
             )?;
             ensure!(operation_changed == 1, "rename mismatch lost operation generation authority");
+            conn.execute("INSERT OR IGNORE INTO remote_rename_artifact_cleanup_intents(logical_attachment_id,operation_id,artifact_id,created_at_ms) SELECT logical_attachment_id,operation_id,artifact_id,?3 FROM remote_rename_journal WHERE logical_attachment_id=?1 AND operation_id=?2",params![attachment,operation,now_ms])?;
             Ok(true)
         }).await
     }
@@ -407,6 +448,7 @@ impl Db {
                 params![attachment, operation, generation, response, now_ms],
             )?;
             ensure!(operation_changed == 1, "rename unknown lost operation generation authority");
+            conn.execute("INSERT OR IGNORE INTO remote_rename_artifact_cleanup_intents(logical_attachment_id,operation_id,artifact_id,created_at_ms) SELECT logical_attachment_id,operation_id,artifact_id,?3 FROM remote_rename_journal WHERE logical_attachment_id=?1 AND operation_id=?2",params![attachment,operation,now_ms])?;
             Ok(true)
         }).await
     }
@@ -1071,6 +1113,7 @@ impl Db {
                 params![owned.logical_attachment_id, owned.operation_id, generation, owned.now_ms],
             )?;
             ensure!(changed == 1, "rename commit requires one applied row at the expected generation");
+            conn.execute("INSERT OR IGNORE INTO remote_rename_artifact_cleanup_intents(logical_attachment_id,operation_id,artifact_id,created_at_ms) SELECT logical_attachment_id,operation_id,artifact_id,?3 FROM remote_rename_journal WHERE logical_attachment_id=?1 AND operation_id=?2",params![owned.logical_attachment_id,owned.operation_id,owned.now_ms])?;
             Ok(outcome)
         })
         .await

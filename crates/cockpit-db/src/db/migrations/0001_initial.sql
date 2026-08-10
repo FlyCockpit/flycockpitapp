@@ -2773,6 +2773,33 @@ BEGIN
     SELECT RAISE(ABORT, 'remote rename journal is immutable, monotonic, and generation bound');
 END;
 
+CREATE TABLE remote_rename_artifact_cleanup_intents (
+    logical_attachment_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    PRIMARY KEY(logical_attachment_id,operation_id),
+    FOREIGN KEY(logical_attachment_id,operation_id)
+      REFERENCES remote_rename_journal(logical_attachment_id,operation_id) ON DELETE CASCADE
+);
+
+CREATE TRIGGER remote_rename_artifact_cleanup_intents_immutable
+BEFORE UPDATE ON remote_rename_artifact_cleanup_intents
+BEGIN
+    SELECT RAISE(ABORT, 'remote rename artifact cleanup intent is immutable');
+END;
+
+CREATE TRIGGER remote_rename_journal_cleanup_obligation
+BEFORE DELETE ON remote_rename_journal
+WHEN EXISTS (
+    SELECT 1 FROM remote_rename_artifact_cleanup_intents
+    WHERE logical_attachment_id=OLD.logical_attachment_id
+      AND operation_id=OLD.operation_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'remote rename artifact cleanup remains outstanding');
+END;
+
 CREATE TRIGGER remote_attachment_operation_reservation_insert
 BEFORE INSERT ON remote_attachment_operations
 WHEN NEW.state <> 'reserved' OR NEW.safe_response IS NOT NULL OR NEW.event_high_water_mark IS NOT NULL

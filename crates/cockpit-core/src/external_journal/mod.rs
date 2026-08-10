@@ -388,6 +388,8 @@ pub struct ExternalJournal {
     integrity: Arc<Mutex<Option<String>>>,
     unresolved_facts: Arc<Mutex<Vec<UnresolvedFact>>>,
     db_faults: Arc<Mutex<DbFaults>>,
+    #[cfg(test)]
+    fail_remote_rename_cleanup_sync: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for ExternalJournal {
@@ -497,7 +499,51 @@ impl ExternalJournal {
                 }
             }
         }
+        #[cfg(test)]
+        if self
+            .fail_remote_rename_cleanup_sync
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ExternalJournalError::Spool(
+                "injected rename artifact directory fsync failure".into(),
+            ));
+        }
         dir.sync()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_remote_rename_cleanup_sync(&self) {
+        self.fail_remote_rename_cleanup_sync
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) async fn drain_remote_rename_artifact_cleanup(
+        &self,
+    ) -> Result<usize, ExternalJournalError> {
+        let intents = self
+            .db
+            .remote_rename_artifact_cleanup_intents()
+            .await
+            .map_err(db_error)?;
+        let mut completed = 0;
+        for intent in intents {
+            let artifact_id = Uuid::parse_str(&intent.artifact_id)
+                .map_err(|error| ExternalJournalError::Containment(error.to_string()))?;
+            self.remove_all_remote_rename_artifacts(artifact_id)?;
+            if self
+                .db
+                .complete_remote_rename_artifact_cleanup(
+                    &intent.logical_attachment_id,
+                    &intent.operation_id,
+                    &intent.artifact_id,
+                )
+                .await
+                .map_err(db_error)?
+            {
+                completed += 1;
+            }
+        }
+        Ok(completed)
     }
 
     pub fn new(db: Db, spool: Spool, keys: SpoolKeyRing) -> Self {
@@ -508,6 +554,8 @@ impl ExternalJournal {
             integrity: Arc::new(Mutex::new(None)),
             unresolved_facts: Arc::new(Mutex::new(Vec::new())),
             db_faults: Arc::new(Mutex::new(DbFaults::default())),
+            #[cfg(test)]
+            fail_remote_rename_cleanup_sync: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -555,6 +603,7 @@ impl ExternalJournal {
 
         let journal = Self::new(db, spool, keys);
         let report = journal.recover(now_wall_ms).await?;
+        journal.drain_remote_rename_artifact_cleanup().await?;
         // Bounded housekeeping: session deletion writes a tombstone every time,
         // including ephemeral sweeps, so it needs a retention policy.
         journal

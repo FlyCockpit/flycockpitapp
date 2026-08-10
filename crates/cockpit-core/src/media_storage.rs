@@ -3419,6 +3419,63 @@ mod tests {
         borrowed_source: Option<BorrowedSourceHandle>,
     }
 
+    async fn cleanup_fixture() -> (
+        tempfile::TempDir,
+        MediaStorageRecovery,
+        cockpit_db::Db,
+        Uuid,
+        Uuid,
+        Uuid,
+    ) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root_path = temp.path().join("media");
+        let root = DirGuard::open_root(&root_path, true).unwrap();
+        let storage_id = Uuid::now_v7();
+        let mut file = root.create_file_exclusive(&storage_id.to_string()).unwrap();
+        file.write_all(b"cleanup bytes").unwrap();
+        file.sync_all().unwrap();
+        let identity = stable_identity_digest(&file).unwrap();
+        let (length, checksum) = read_full_digest(&mut file).unwrap();
+        let db = cockpit_db::Db::open_in_memory_async().await.unwrap();
+        let session = Uuid::now_v7();
+        let attachment = Uuid::now_v7();
+        let component = Uuid::now_v7();
+        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/redacted',1,1)",[session.to_string()])?;conn.execute("INSERT INTO media_reservations(reservation_id,policy_version,project_id,owner_session_key,operation,purpose,recovery_id,state,version,queue_sequence,deadline_monotonic_ms,created_wall_ms) VALUES('cleanup-reservation',1,'p',?1,'cleanup','retention','cleanup-recovery','settling',1,1,1,1)",[session.to_string()])?;cockpit_db::Db::insert_media_attachment_conn(conn,&MediaAttachmentRecord{attachment_id:attachment,session_id:session,canonical_project_digest:"11".repeat(32),media_kind:MediaKind::Image,source_kind:MediaSourceKind::RetainedHttps,canonical_container:"png".into(),canonical_mime:"image/png".into(),availability:MediaAvailability::OwnedCleanupPending,attachment_version:1,availability_generation:2,reference_generation:1,captured_capability_generation:1,source_identity_digest:"22".repeat(32),source_byte_length:length,source_sha256:checksum.clone(),selected_video_stream:None,selected_audio_stream:None,created_at_unix_ms:1,updated_at_unix_ms:1,draft_expires_at_unix_ms:None,first_referenced_at_unix_ms:Some(1)})?;cockpit_db::Db::insert_media_attachment_component_conn(conn,&MediaAttachmentComponent{component_id:component,attachment_id:attachment,attachment_version:1,component_kind:"image_model".into(),storage_id,lifecycle_state:"cleanup_pending".into(),component_generation:2,stable_identity_digest:identity,byte_length:length,sha256:checksum,reservation_id:"cleanup-reservation".into(),created_at_unix_ms:1,updated_at_unix_ms:1})?;conn.execute("INSERT INTO media_attachment_cleanup_intents(intent_id,attachment_id,attachment_version,expected_availability_generation,expected_reference_generation,component_set_digest,reason,created_at_unix_ms) VALUES(?1,?2,'1','2','1',?3,'session_retention',1)",params![Uuid::now_v7().to_string(),attachment.to_string(),"33".repeat(32)])?;Ok(())}).await.unwrap();
+        let storage = MediaStorageRecovery::open(db.clone(), &root_path).unwrap();
+        (temp, storage, db, attachment, component, storage_id)
+    }
+
+    #[tokio::test]
+    async fn cleanup_reconciles_restart_once_and_releases_only_after_evidence() {
+        let (_temp, storage, db, attachment, component, _) = cleanup_fixture().await;
+        assert_eq!(
+            storage.reconcile_media_cleanup_intents(10).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            storage.reconcile_media_cleanup_intents(11).await.unwrap(),
+            0
+        );
+        let state:(String,String,i64,i64)=db.read(move|conn|Ok(conn.query_row("SELECT a.availability,r.state,(SELECT COUNT(*) FROM media_component_deletion_evidence WHERE component_id=?1),(SELECT COUNT(*) FROM media_attachment_cleanup_intents WHERE attachment_id=?2 AND completed_at_unix_ms IS NOT NULL) FROM media_attachments a JOIN media_reservations r ON r.reservation_id='cleanup-reservation' WHERE a.attachment_id=?2",params![component.to_string(),attachment.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?)).await.unwrap();
+        assert_eq!(
+            state,
+            ("retained_copy_deleted".into(), "released".into(), 1, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_tamper_blocks_and_preserves_intent_without_release() {
+        let (temp, storage, db, attachment, component, storage_id) = cleanup_fixture().await;
+        std::fs::write(
+            temp.path().join("media").join(storage_id.to_string()),
+            b"tampered bytes",
+        )
+        .unwrap();
+        assert!(storage.reconcile_media_cleanup_intents(10).await.is_err());
+        let state:(String,String,i64,i64)=db.read(move|conn|Ok(conn.query_row("SELECT a.availability,r.state,(SELECT COUNT(*) FROM media_cleanup_security_evidence WHERE component_id=?1),(SELECT COUNT(*) FROM media_attachment_cleanup_intents WHERE attachment_id=?2 AND completed_at_unix_ms IS NULL) FROM media_attachments a JOIN media_reservations r ON r.reservation_id='cleanup-reservation' WHERE a.attachment_id=?2",params![component.to_string(),attachment.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?)).await.unwrap();
+        assert_eq!(state, ("security_blocked".into(), "settling".into(), 1, 1));
+    }
+
     #[tokio::test]
     async fn component_lease_returns_only_fully_verified_held_bytes() {
         let temp = tempfile::TempDir::new().unwrap();

@@ -11,6 +11,8 @@ use std::io::{self, Write};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 
+mod verify;
+
 const SVG_NS: &str = "http://www.w3.org/2000/svg";
 pub const MAX_RAW_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_CANONICAL_BYTES: usize = 16 * 1024 * 1024;
@@ -268,6 +270,7 @@ pub fn sanitize_generated_svg(raw: &[u8]) -> Result<SanitizedSvgArtifact> {
         .filter(canonical.as_slice(), &mut hush)
         .map_err(|_| SvgSanitizeError::new(SvgSanitizeCode::DefenseMismatch, "svg-hush"))?;
     verify_defense_output(&canonical, hush.as_slice())?;
+    verify::verify_canonical_svg(&canonical)?;
     let verified = canonicalize(
         parse_validate(&canonical, true, false)
             .map_err(|_| SvgSanitizeError::new(SvgSanitizeCode::StructuralVerify, "canonical"))?,

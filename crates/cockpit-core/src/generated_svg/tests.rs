@@ -153,6 +153,17 @@ fn generated_svg_structural_verify() {
             .code(),
         SvgSanitizeCode::DefenseMismatch
     );
+    for mutation in [
+        format!(r#"<svg xmlns="{SVG_NS}"><script/></svg>"#),
+        format!(r#"<svg xmlns="{SVG_NS}" width="javascript:alert(1)"/>"#),
+        format!(
+            r#"<svg xmlns="{SVG_NS}"><defs><clipPath id="svg_000001"/></defs><path fill="url(#svg_000001)"/></svg>"#
+        ),
+        format!(r#"<svg xmlns="{SVG_NS}"><path d="M 0 0 H 1"/></svg>"#),
+        format!(r#"<svg xmlns="{SVG_NS}" width="1" width="1"/>"#),
+    ] {
+        assert!(super::verify::verify_canonical_svg(mutation.as_bytes()).is_err());
+    }
 }
 
 #[test]

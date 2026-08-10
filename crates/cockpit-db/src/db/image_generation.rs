@@ -259,45 +259,146 @@ pub const fn slot_is_job_settled(state: ImageGenerationSlotState) -> bool {
 pub fn reduce_terminal_job(
     slots: &[(ImageGenerationSlotState, bool)],
 ) -> Option<ImageGenerationJobState> {
+    let facts = slots
+        .iter()
+        .map(|(state, result)| ImageGenerationSlotTerminalFact {
+            state: *state,
+            applied_cancellation_version: (*result
+                || *state == ImageGenerationSlotState::Cancelled)
+                .then_some(1),
+            result_after_cancel: *result,
+        })
+        .collect::<Vec<_>>();
+    reduce_terminal_job_facts(&facts)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageGenerationSlotTerminalFact {
+    pub state: ImageGenerationSlotState,
+    pub applied_cancellation_version: Option<u64>,
+    pub result_after_cancel: bool,
+}
+
+pub fn reduce_terminal_job_facts(
+    slots: &[ImageGenerationSlotTerminalFact],
+) -> Option<ImageGenerationJobState> {
     use ImageGenerationJobState as J;
     use ImageGenerationSlotState as S;
     if slots.is_empty()
-        || slots.iter().any(|(state, result_after_cancel)| {
-            !slot_is_job_settled(*state)
-                || (matches!(
-                    state,
-                    ImageGenerationSlotState::LateQuarantined | ImageGenerationSlotState::Discarded
-                ) && !result_after_cancel)
-        })
+        || slots
+            .iter()
+            .any(|slot| !slot_is_job_settled(slot.state) || !terminal_slot_vector_valid(*slot))
     {
         return None;
     }
-    if slots
-        .iter()
-        .any(|(_, result_after_cancel)| *result_after_cancel)
-    {
+    if slots.iter().any(|slot| slot.result_after_cancel) {
         Some(J::CompletedAfterCancel)
-    } else if slots.iter().all(|(state, _)| *state == S::Published) {
+    } else if slots.iter().all(|slot| slot.state == S::Published) {
         Some(J::Completed)
-    } else if slots.iter().any(|(state, _)| *state == S::Published) {
+    } else if slots.iter().any(|slot| slot.state == S::Published) {
         Some(J::PartiallyFailed)
-    } else if slots.iter().any(|(state, _)| *state == S::Failed) {
+    } else if slots.iter().any(|slot| slot.state == S::Failed) {
         Some(J::Failed)
     } else {
         Some(J::Cancelled)
     }
 }
 
+fn terminal_slot_vector_valid(slot: ImageGenerationSlotTerminalFact) -> bool {
+    use ImageGenerationSlotState as S;
+    match slot.state {
+        S::Published => {
+            (!slot.result_after_cancel && slot.applied_cancellation_version.is_none())
+                || (slot.result_after_cancel && slot.applied_cancellation_version.is_some())
+        }
+        S::LateQuarantined | S::Discarded => {
+            slot.result_after_cancel && slot.applied_cancellation_version.is_some()
+        }
+        S::Cancelled => !slot.result_after_cancel && slot.applied_cancellation_version.is_some(),
+        S::Failed => !slot.result_after_cancel || slot.applied_cancellation_version.is_some(),
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateImageGenerationJob<'a> {
-    pub job_id: Uuid,
-    pub plan_digest: &'a str,
-    pub canonical_plan: &'a [u8],
-    pub slot_count: u32,
-    pub max_attempt_count: u32,
-    pub enqueue_started_monotonic_ms: u64,
-    pub operation_deadline_monotonic_ms: u64,
-    pub created_at_unix_ms: i64,
+    job_id: Uuid,
+    plan_digest: &'a str,
+    canonical_plan: &'a [u8],
+    slot_count: u32,
+    max_attempt_count: u32,
+    enqueue_started_monotonic_ms: u64,
+    operation_deadline_monotonic_ms: u64,
+    created_at_unix_ms: i64,
+}
+
+impl<'a> CreateImageGenerationJob<'a> {
+    pub fn from_verified_canonical_plan(
+        canonical_plan: &'a [u8],
+        plan_digest: &'a str,
+        created_at_unix_ms: i64,
+    ) -> Result<Self> {
+        ensure!(
+            canonical_plan.first() == Some(&b'{')
+                && canonical_plan.last() == Some(&b'}')
+                && !json_has_unquoted_whitespace(canonical_plan),
+            "plan JSON is not canonical"
+        );
+        reject_duplicate_json_keys(canonical_plan)?;
+        let computed = hex_lower(&Sha256::digest(canonical_plan));
+        ensure!(computed == plan_digest, "sealed plan digest mismatch");
+        let plan: serde_json::Value = serde_json::from_slice(canonical_plan)?;
+        let job_id = Uuid::parse_str(
+            plan.get("jobId")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("sealed plan job identity missing"))?,
+        )?;
+        let targets = plan
+            .get("targets")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("sealed plan targets missing"))?;
+        let mut slot_count = 0_u32;
+        let mut max_attempt_count = None;
+        for target in targets {
+            let attempts = u32::try_from(
+                target
+                    .get("maxAttempts")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| anyhow::anyhow!("sealed retry bound missing"))?,
+            )?;
+            ensure!(
+                max_attempt_count.is_none_or(|value| value == attempts),
+                "target retry bounds disagree"
+            );
+            max_attempt_count = Some(attempts);
+            slot_count = slot_count
+                .checked_add(u32::try_from(
+                    target
+                        .get("slots")
+                        .and_then(serde_json::Value::as_array)
+                        .ok_or_else(|| anyhow::anyhow!("sealed slots missing"))?
+                        .len(),
+                )?)
+                .ok_or_else(|| anyhow::anyhow!("slot count overflow"))?;
+        }
+        Ok(Self {
+            job_id,
+            plan_digest,
+            canonical_plan,
+            slot_count,
+            max_attempt_count: max_attempt_count
+                .ok_or_else(|| anyhow::anyhow!("sealed attempts missing"))?,
+            enqueue_started_monotonic_ms: plan
+                .get("enqueueStartedMonotonicMs")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| anyhow::anyhow!("enqueue start missing"))?,
+            operation_deadline_monotonic_ms: plan
+                .get("operationDeadlineMonotonicMs")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| anyhow::anyhow!("deadline missing"))?,
+            created_at_unix_ms,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -980,19 +1081,21 @@ impl Db {
         )?;
         let current = ImageGenerationJobState::parse(&job_state)
             .ok_or_else(|| anyhow::anyhow!("unknown job state"))?;
-        let mut projection_statement=conn.prepare("SELECT state,result_after_cancel FROM image_generation_slots WHERE job_id=?1 ORDER BY slot_index")?;
+        let mut projection_statement=conn.prepare("SELECT state,applied_cancellation_version,result_after_cancel FROM image_generation_slots WHERE job_id=?1 ORDER BY slot_index")?;
         let projection = projection_statement
             .query_map([input.job_id.to_string()], |row| {
                 let state: String = row.get(0)?;
-                let flag: i64 = row.get(1)?;
-                Ok((
-                    ImageGenerationSlotState::parse(&state)
+                let cancellation: Option<i64> = row.get(1)?;
+                let flag: i64 = row.get(2)?;
+                Ok(ImageGenerationSlotTerminalFact {
+                    state: ImageGenerationSlotState::parse(&state)
                         .ok_or_else(|| rusqlite::Error::InvalidQuery)?,
-                    flag == 1,
-                ))
+                    applied_cancellation_version: cancellation.map(|value| value as u64),
+                    result_after_cancel: flag == 1,
+                })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let reduced = reduce_terminal_job(&projection);
+        let reduced = reduce_terminal_job_facts(&projection);
         let next = reduced
             .filter(|terminal| job_transition_allowed(current, *terminal))
             .unwrap_or(ImageGenerationJobState::CancellationRequested);
@@ -1075,6 +1178,99 @@ fn hex_lower(bytes: &[u8]) -> String {
         output.push(HEX[(byte & 0x0f) as usize] as char);
     }
     output
+}
+
+fn json_has_unquoted_whitespace(bytes: &[u8]) -> bool {
+    let mut quoted = false;
+    let mut escaped = false;
+    for byte in bytes {
+        if quoted {
+            if escaped {
+                escaped = false
+            } else if *byte == b'\\' {
+                escaped = true
+            } else if *byte == b'"' {
+                quoted = false
+            }
+        } else if *byte == b'"' {
+            quoted = true
+        } else if byte.is_ascii_whitespace() {
+            return true;
+        }
+    }
+    quoted || escaped
+}
+
+fn reject_duplicate_json_keys(bytes: &[u8]) -> Result<()> {
+    struct Checked;
+    impl<'de> serde::Deserialize<'de> for Checked {
+        fn deserialize<D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> std::result::Result<Self, D::Error> {
+            deserializer.deserialize_any(CheckedVisitor)
+        }
+    }
+    struct CheckedVisitor;
+    impl<'de> serde::de::Visitor<'de> for CheckedVisitor {
+        type Value = Checked;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("JSON without duplicate keys")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<Checked, A::Error> {
+            let mut keys = std::collections::BTreeSet::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if !keys.insert(key) {
+                    return Err(serde::de::Error::custom("duplicate JSON key"));
+                }
+                map.next_value::<Checked>()?;
+            }
+            Ok(Checked)
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<Checked, A::Error> {
+            while seq.next_element::<Checked>()?.is_some() {}
+            Ok(Checked)
+        }
+        fn visit_bool<E: serde::de::Error>(self, _: bool) -> std::result::Result<Checked, E> {
+            Ok(Checked)
+        }
+        fn visit_i64<E: serde::de::Error>(self, _: i64) -> std::result::Result<Checked, E> {
+            Ok(Checked)
+        }
+        fn visit_u64<E: serde::de::Error>(self, _: u64) -> std::result::Result<Checked, E> {
+            Ok(Checked)
+        }
+        fn visit_f64<E: serde::de::Error>(self, _: f64) -> std::result::Result<Checked, E> {
+            Ok(Checked)
+        }
+        fn visit_str<E: serde::de::Error>(self, _: &str) -> std::result::Result<Checked, E> {
+            Ok(Checked)
+        }
+        fn visit_string<E: serde::de::Error>(self, _: String) -> std::result::Result<Checked, E> {
+            Ok(Checked)
+        }
+        fn visit_none<E: serde::de::Error>(self) -> std::result::Result<Checked, E> {
+            Ok(Checked)
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Checked, E> {
+            Ok(Checked)
+        }
+        fn visit_some<D: serde::Deserializer<'de>>(
+            self,
+            d: D,
+        ) -> std::result::Result<Checked, D::Error> {
+            Checked::deserialize(d)
+        }
+    }
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let _ = Checked::deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1183,6 +1379,47 @@ mod tests {
     }
 
     #[test]
+    fn terminal_reducer_rejects_every_invalid_cancellation_vector() {
+        use ImageGenerationSlotState as S;
+        for state in [
+            S::Published,
+            S::LateQuarantined,
+            S::Failed,
+            S::Cancelled,
+            S::Discarded,
+        ] {
+            for cancellation in [None, Some(1)] {
+                for result_after_cancel in [false, true] {
+                    let fact = ImageGenerationSlotTerminalFact {
+                        state,
+                        applied_cancellation_version: cancellation,
+                        result_after_cancel,
+                    };
+                    assert_eq!(
+                        reduce_terminal_job_facts(&[fact]).is_some(),
+                        terminal_slot_vector_valid(fact),
+                        "{fact:?}"
+                    );
+                }
+            }
+        }
+        for state in ImageGenerationSlotState::ALL
+            .iter()
+            .copied()
+            .filter(|state| !slot_is_job_settled(*state))
+        {
+            assert_eq!(
+                reduce_terminal_job_facts(&[ImageGenerationSlotTerminalFact {
+                    state,
+                    applied_cancellation_version: None,
+                    result_after_cancel: false
+                }]),
+                None
+            );
+        }
+    }
+
+    #[test]
     fn transition_tables_reject_self_and_terminal_edges() {
         for state in ImageGenerationJobState::ALL {
             assert!(!job_transition_allowed(*state, *state));
@@ -1261,6 +1498,47 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn sealed_plan_token_rejects_duplicate_and_noncanonical_json() {
+        let job_id = Uuid::now_v7();
+        let canonical = format!(
+            r#"{{"jobId":"{job_id}","enqueueStartedMonotonicMs":1,"operationDeadlineMonotonicMs":2,"targets":[{{"maxAttempts":1,"slots":[{{"attempts":[{{}}]}}]}}]}}"#
+        );
+        let digest = hex_lower(&Sha256::digest(canonical.as_bytes()));
+        assert!(
+            CreateImageGenerationJob::from_verified_canonical_plan(
+                canonical.as_bytes(),
+                &digest,
+                1
+            )
+            .is_ok()
+        );
+        let spaced = canonical.replacen("{", "{ ", 1);
+        let spaced_digest = hex_lower(&Sha256::digest(spaced.as_bytes()));
+        assert!(
+            CreateImageGenerationJob::from_verified_canonical_plan(
+                spaced.as_bytes(),
+                &spaced_digest,
+                1
+            )
+            .is_err()
+        );
+        let duplicate = canonical.replacen(
+            "\"jobId\":",
+            &format!("\"jobId\":\"{job_id}\",\"jobId\":"),
+            1,
+        );
+        let duplicate_digest = hex_lower(&Sha256::digest(duplicate.as_bytes()));
+        assert!(
+            CreateImageGenerationJob::from_verified_canonical_plan(
+                duplicate.as_bytes(),
+                &duplicate_digest,
+                1
+            )
+            .is_err()
+        );
     }
 
     #[test]

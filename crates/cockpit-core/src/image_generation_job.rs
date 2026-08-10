@@ -12,6 +12,8 @@ use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use crate::image_generation_runtime::ImageHealthSnapshot;
+use cockpit_config::config::media_budget::MediaReservationPlan;
+use cockpit_db::db::sealed_scope::SealedActionGrantRow;
 use cockpit_db::image_spend::{AttemptMaximum, SpendReservation};
 use cockpit_db::media_attachments::AcquiredMediaComponentLease;
 
@@ -20,6 +22,7 @@ pub const MAX_IMAGE_GENERATION_SLOTS: usize = 256;
 pub const MAX_IMAGE_GENERATION_ATTEMPTS_PER_SLOT: u32 = 8;
 pub const MAX_IMAGE_GENERATION_DIMENSION: u32 = 16_384;
 const MAX_PLAN_STRING_BYTES: usize = 1_024;
+const MAX_PLAN_LIST_ITEMS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -261,6 +264,48 @@ impl ReferenceArtifactV1 {
     }
 }
 
+impl GrantRequirementV1 {
+    pub fn from_sealed_grant(grant: &SealedActionGrantRow, now_ms: i64) -> Result<Self> {
+        ensure!(
+            grant.revoked_at_ms.is_none()
+                && grant.expires_at_ms.is_none_or(|expiry| expiry >= now_ms),
+            "sealed grant is not current"
+        );
+        let generation = u64::try_from(grant.use_epoch)?;
+        Ok(Self {
+            grant_kind: grant.action_id.clone(),
+            authority_digest: digest_fields(&[
+                &grant.grant_id,
+                &grant.record_id,
+                &grant.project_key,
+                &grant.session_id,
+                &grant.action_id,
+            ]),
+            generation,
+        })
+    }
+}
+
+impl ResourceReservationV1 {
+    pub fn from_media_reservation(
+        plan: &MediaReservationPlan,
+        reservation_identity: String,
+    ) -> Result<Self> {
+        ensure!(
+            plan.requested > 0 && valid_string(&reservation_identity),
+            "media reservation is invalid"
+        );
+        Ok(Self {
+            resource_kind: serde_json::to_value(plan.dimension)?
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("media dimension is not a string"))?
+                .to_owned(),
+            units: plan.requested,
+            reservation_identity,
+        })
+    }
+}
+
 impl SpendReservationPlanV1 {
     pub fn from_spend_reservation(
         reservation: &SpendReservation,
@@ -331,7 +376,9 @@ impl ImageGenerationPlanV1 {
             "operation deadline must follow enqueue start"
         );
         ensure!(
-            !self.required_grants.is_empty() && strictly_sorted(&self.required_grants),
+            !self.required_grants.is_empty()
+                && self.required_grants.len() <= MAX_PLAN_LIST_ITEMS
+                && strictly_sorted(&self.required_grants),
             "grants must be nonempty, unique, and sorted"
         );
         for grant in &self.required_grants {
@@ -342,7 +389,9 @@ impl ImageGenerationPlanV1 {
             validate_digest(&grant.authority_digest)?;
         }
         ensure!(
-            !self.central_resources.is_empty() && strictly_sorted(&self.central_resources),
+            !self.central_resources.is_empty()
+                && self.central_resources.len() <= MAX_PLAN_LIST_ITEMS
+                && strictly_sorted(&self.central_resources),
             "resources must be nonempty, unique, and sorted"
         );
         validate_resources(&self.central_resources)?;
@@ -366,17 +415,31 @@ impl ImageGenerationPlanV1 {
         validate_digest(&self.output_authority.parent_identity_digest)?;
         validate_digest(&self.spend.plan_digest)?;
         ensure!(
-            self.spend.policy_version > 0 && !self.spend.reservation_id.is_empty(),
+            self.spend.policy_version > 0 && valid_string(&self.spend.reservation_id),
             "spend authority is incomplete"
         );
         let mut total_maximum = Some(0_u64);
         let mut slot_ids = std::collections::BTreeSet::new();
         let mut artifact_ids = std::collections::BTreeSet::new();
         let mut publication_names = std::collections::BTreeSet::new();
+        let mut provider_requests = std::collections::BTreeSet::new();
+        let mut provider_idempotencies = std::collections::BTreeSet::new();
+        let mut reference_identities = std::collections::BTreeSet::new();
         let mut resource_totals = BTreeMap::<(String, String), u64>::new();
         let mut total_slots = 0_usize;
         for target in &self.targets {
             target.validate(self.operation_deadline_monotonic_ms)?;
+            for reference in &target.reference_artifacts {
+                ensure!(
+                    reference_identities.insert((
+                        reference.attachment_id,
+                        reference.attachment_version,
+                        reference.component_id,
+                        reference.component_generation
+                    )),
+                    "references must be globally unique"
+                );
+            }
             ensure!(
                 target.resolved.format == self.output_authority.extension
                     || (target.resolved.format == "jpeg"
@@ -406,6 +469,12 @@ impl ImageGenerationPlanV1 {
                     "publication name is outside the sealed output naming contract"
                 );
                 for attempt in &slot.attempts {
+                    ensure!(
+                        provider_requests.insert(attempt.provider_request_identity.clone())
+                            && provider_idempotencies
+                                .insert(attempt.provider_idempotency_identity.clone()),
+                        "provider attempt identities must be globally unique"
+                    );
                     for resource in &attempt.resource_maximum {
                         let total = resource_totals
                             .entry((
@@ -514,9 +583,9 @@ impl TargetPlanV1 {
             "dimensions must be positive"
         );
         ensure!(
-            !self.requested.format.is_empty()
-                && !self.resolved.format.is_empty()
-                && !self.resolved.mime.is_empty(),
+            valid_string(&self.requested.format)
+                && valid_string(&self.resolved.format)
+                && valid_string(&self.resolved.mime),
             "format resolution is incomplete"
         );
         let (expected_mime, requires_vector_sanitizer) = match self.resolved.format.as_str() {
@@ -533,6 +602,7 @@ impl TargetPlanV1 {
         );
         ensure!(
             self.sample_count > 0
+                && self.sample_count as usize <= MAX_IMAGE_GENERATION_SLOTS
                 && self.max_attempts > 0
                 && self.max_attempts <= MAX_IMAGE_GENERATION_ATTEMPTS_PER_SLOT,
             "sample and attempt counts must be positive"
@@ -542,8 +612,21 @@ impl TargetPlanV1 {
             "sample count must equal slot count"
         );
         ensure!(
-            strictly_sorted(&self.reference_artifacts),
+            self.reference_artifacts.len() <= MAX_PLAN_LIST_ITEMS
+                && strictly_sorted(&self.reference_artifacts),
             "references must be unique and sorted"
+        );
+        ensure!(
+            self.typed_parameters.len() <= MAX_PLAN_LIST_ITEMS
+                && self
+                    .typed_parameters
+                    .iter()
+                    .all(|(key, value)| valid_string(key)
+                        && match value {
+                            TypedParameterV1::Text(text) => valid_string(text),
+                            _ => true,
+                        }),
+            "typed parameters exceed plan bounds"
         );
         for reference in &self.reference_artifacts {
             ensure!(
@@ -629,6 +712,10 @@ fn valid_path_component(value: &str) -> bool {
 }
 
 fn validate_resources(resources: &[ResourceReservationV1]) -> Result<()> {
+    ensure!(
+        resources.len() <= MAX_PLAN_LIST_ITEMS,
+        "resource list exceeds plan bound"
+    );
     for resource in resources {
         ensure!(
             valid_string(&resource.resource_kind)

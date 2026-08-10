@@ -3206,6 +3206,14 @@ CREATE TABLE image_generation_publication_right_facts (
     PRIMARY KEY(job_id,slot_id),
     FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT
 );
+CREATE TABLE image_generation_reconciliation_evidence (
+ job_id TEXT NOT NULL, slot_id TEXT NOT NULL, attempt_number INTEGER NOT NULL,
+ journal_version INTEGER NOT NULL CHECK(journal_version>=1),
+ evidence_digest TEXT NOT NULL CHECK(length(evidence_digest)=64),
+ outcome TEXT NOT NULL CHECK(outcome IN ('authoritative_nonacceptance','authoritative_failure')),
+ PRIMARY KEY(job_id,slot_id,attempt_number,journal_version),
+ FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT
+);
 
 CREATE TABLE image_generation_job_transitions (from_state TEXT NOT NULL,to_state TEXT NOT NULL,PRIMARY KEY(from_state,to_state));
 INSERT INTO image_generation_job_transitions VALUES
@@ -3272,6 +3280,19 @@ WHEN NEW.state='response_adopted' AND (
   AND j.state='succeeded' AND j.version=NEW.observed_journal_version)
  OR EXISTS(SELECT 1 FROM image_generation_cancellation_facts c WHERE c.job_id=NEW.job_id))
 BEGIN SELECT RAISE(ABORT,'response-adopted attempt lacks exact uncancelled journal evidence'); END;
+CREATE TRIGGER image_generation_attempt_reconciliation_failure_guard BEFORE UPDATE OF state ON image_generation_attempts
+WHEN OLD.state IN ('submission_unknown','reconciling') AND NEW.state IN ('rejected_not_accepted','failed_after_acceptance') AND NOT EXISTS(
+ SELECT 1 FROM image_generation_reconciliation_evidence e WHERE e.job_id=NEW.job_id AND e.slot_id=NEW.slot_id AND e.attempt_number=NEW.attempt_number AND e.journal_version=NEW.observed_journal_version)
+BEGIN SELECT RAISE(ABORT,'attempt failure lacks authoritative reconciliation evidence'); END;
+CREATE TRIGGER image_generation_slot_reconciliation_failure_guard BEFORE UPDATE OF state ON image_generation_slots
+WHEN OLD.state='submission_unknown' AND NEW.state='failed' AND NOT EXISTS(
+ SELECT 1 FROM image_generation_attempts a JOIN image_generation_reconciliation_evidence e ON e.job_id=a.job_id AND e.slot_id=a.slot_id AND e.attempt_number=a.attempt_number AND e.journal_version=a.observed_journal_version
+ WHERE a.job_id=NEW.job_id AND a.slot_id=NEW.slot_id)
+BEGIN SELECT RAISE(ABORT,'slot failure lacks authoritative reconciliation evidence'); END;
+CREATE TRIGGER image_generation_job_reconciliation_failure_guard BEFORE UPDATE OF state ON image_generation_jobs
+WHEN OLD.state='submission_unknown' AND NEW.state='failed' AND NOT EXISTS(
+ SELECT 1 FROM image_generation_reconciliation_evidence e WHERE e.job_id=NEW.job_id)
+BEGIN SELECT RAISE(ABORT,'job failure lacks authoritative reconciliation evidence'); END;
 CREATE TRIGGER image_generation_failed_not_submitted_guard BEFORE UPDATE OF state ON image_generation_attempts
 WHEN OLD.state='dispatching' AND NEW.state='failed_not_submitted' AND NEW.nonacceptance_evidence_digest IS NULL
 BEGIN SELECT RAISE(ABORT,'dispatch failure lacks zero-handoff evidence'); END;

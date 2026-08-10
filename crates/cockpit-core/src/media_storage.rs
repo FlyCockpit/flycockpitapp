@@ -1795,6 +1795,189 @@ fn ebml_doctype_is_webm(bytes: &[u8]) -> Result<bool> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct BoundedRuntimeOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+async fn run_bounded_runtime(
+    program: &Path,
+    args: &[String],
+    input: Vec<u8>,
+    stdout_limit: u64,
+    deadline: std::time::Duration,
+) -> Result<BoundedRuntimeOutput> {
+    use std::process::Stdio;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    ensure!(
+        program.is_absolute() && stdout_limit > 0,
+        "model_runtime_unavailable"
+    );
+    let end = tokio::time::Instant::now() + deadline;
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(args)
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().context("model_runtime_unavailable")?;
+    let mut stdin = child.stdin.take().context("model_runtime_unavailable")?;
+    let mut stdout = child.stdout.take().context("model_runtime_unavailable")?;
+    let mut stderr = child.stderr.take().context("model_runtime_unavailable")?;
+    let work = async move {
+        let writer = async move {
+            stdin.write_all(&input).await?;
+            stdin.shutdown().await
+        };
+        let reader = async move {
+            let mut bytes = Vec::new();
+            stdout
+                .take(stdout_limit + 1)
+                .read_to_end(&mut bytes)
+                .await?;
+            Ok::<_, std::io::Error>(bytes)
+        };
+        let error_reader = async move {
+            let mut bytes = Vec::new();
+            stderr.take(65_537).read_to_end(&mut bytes).await?;
+            Ok::<_, std::io::Error>(bytes)
+        };
+        let (write, stdout, stderr) = tokio::join!(writer, reader, error_reader);
+        write?;
+        Ok::<_, anyhow::Error>((stdout?, stderr?))
+    };
+    let (stdout, stderr) = tokio::time::timeout_at(end, work)
+        .await
+        .context("model_runtime_timeout")??;
+    let status = tokio::time::timeout_at(end, child.wait())
+        .await
+        .context("model_runtime_timeout")??;
+    ensure!(
+        stdout.len() as u64 <= stdout_limit && stderr.len() <= 65_536,
+        "resource_limit"
+    );
+    ensure!(status.success(), "invalid_media");
+    Ok(BoundedRuntimeOutput { stdout, stderr })
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct FfprobeDisposition {
+    #[serde(default)]
+    default: i32,
+}
+#[derive(Debug, serde::Deserialize)]
+struct FfprobeStream {
+    index: u32,
+    codec_type: String,
+    codec_name: String,
+    #[serde(default)]
+    disposition: Option<FfprobeDisposition>,
+    width: Option<u32>,
+    height: Option<u32>,
+    sample_rate: Option<String>,
+    channels: Option<u32>,
+    sample_aspect_ratio: Option<String>,
+    time_base: Option<String>,
+}
+#[derive(Debug, serde::Deserialize)]
+struct FfprobeDocument {
+    streams: Vec<FfprobeStream>,
+}
+
+async fn run_bounded_ffprobe(
+    runtime: &ApprovedAvRuntime,
+    input: Vec<u8>,
+) -> Result<(FfprobeDocument, String)> {
+    let argv = [
+        "-v",
+        "error",
+        "-nostdin",
+        "-print_format",
+        "json",
+        "-show_streams",
+        "-show_format",
+        "pipe:0",
+    ]
+    .map(str::to_owned);
+    let output = run_bounded_runtime(
+        &runtime.ffprobe,
+        &argv,
+        input,
+        1_048_576,
+        std::time::Duration::from_secs(30),
+    )
+    .await?;
+    ensure!(output.stderr.is_empty(), "invalid_media");
+    let digest = crate::intel::hex_lower(&Sha256::digest(&output.stdout));
+    let document: FfprobeDocument =
+        serde_json::from_slice(&output.stdout).context("invalid_media")?;
+    ensure!(
+        !document.streams.is_empty() && document.streams.len() <= 64,
+        "invalid_media"
+    );
+    Ok((document, digest))
+}
+
+fn decode_to_null_argv(video: Option<u32>, audio: Option<u32>) -> Result<Vec<String>> {
+    ensure!(video.is_some() || audio.is_some(), "invalid_media");
+    let mut argv = [
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-threads",
+        "1",
+        "-i",
+        "pipe:0",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    for index in [video, audio].into_iter().flatten() {
+        argv.extend(["-map".into(), format!("0:{index}")]);
+    }
+    argv.extend(
+        [
+            "-map_metadata",
+            "-1",
+            "-map_chapters",
+            "-1",
+            "-f",
+            "null",
+            "-",
+        ]
+        .map(str::to_owned),
+    );
+    Ok(argv)
+}
+
+async fn decode_selected_streams(
+    runtime: &ApprovedAvRuntime,
+    input: Vec<u8>,
+    video: Option<u32>,
+    audio: Option<u32>,
+) -> Result<String> {
+    let argv = decode_to_null_argv(video, audio)?;
+    let output = run_bounded_runtime(
+        &runtime.ffmpeg,
+        &argv,
+        input,
+        1,
+        std::time::Duration::from_secs(120),
+    )
+    .await?;
+    ensure!(output.stdout.is_empty(), "invalid_media");
+    let mut hasher = Sha256::new();
+    hasher.update(b"media-full-decode-v1\0");
+    hasher.update(runtime.fingerprint.as_bytes());
+    for arg in argv {
+        hasher.update(arg.as_bytes());
+        hasher.update([0]);
+    }
+    Ok(crate::intel::hex_lower(&hasher.finalize()))
+}
+
 struct ApprovedAvRuntime {
     ffmpeg: std::path::PathBuf,
     ffprobe: std::path::PathBuf,

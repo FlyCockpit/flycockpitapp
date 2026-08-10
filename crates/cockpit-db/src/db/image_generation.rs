@@ -1636,7 +1636,7 @@ mod tests {
         }
         let operations = (0..3).map(|_| Uuid::now_v7()).collect::<Vec<_>>();
         for (index, slot_id) in slots.iter().take(2).enumerate() {
-            conn.execute("INSERT INTO external_journal_operations(operation_id,operation_kind,owner_session_id,idempotency_key,payload_digest,payload_len,state,version,created_at_wall_ms,updated_at_wall_ms,terminal_at_wall_ms) VALUES(?1,'image_generation','owner',?2,?3,1,'succeeded',1,1,1,1)",params![operations[index].to_string(),format!("idem:{index}"),"1".repeat(64)])?;
+            conn.execute("INSERT INTO external_journal_operations(operation_id,operation_kind,owner_session_id,idempotency_key,payload_digest,payload_len,state,version,created_at_wall_ms,updated_at_wall_ms,terminal_at_wall_ms) VALUES(?1,'image_generation','owner',?2,?3,1,'succeeded',1,1,1,1)",params![operations[index].to_string(),format!("idem_{index}"),"1".repeat(64)])?;
             for (state, version) in [
                 ("preparing", 2),
                 ("prepared", 3),
@@ -1670,7 +1670,7 @@ mod tests {
                 now_unix_ms: 2,
             },
         )?;
-        conn.execute("INSERT INTO external_journal_operations(operation_id,operation_kind,owner_session_id,idempotency_key,payload_digest,payload_len,state,version,created_at_wall_ms,updated_at_wall_ms) VALUES(?1,'image_generation','owner','idem:3',?2,1,'reconciling',2,1,1)",params![operations[2].to_string(),"3".repeat(64)])?;
+        conn.execute("INSERT INTO external_journal_operations(operation_id,operation_kind,owner_session_id,idempotency_key,payload_digest,payload_len,state,version,created_at_wall_ms,updated_at_wall_ms) VALUES(?1,'image_generation','owner','idem_3',?2,1,'reconciling',2,1,1)",params![operations[2].to_string(),"3".repeat(64)])?;
         for (state, version) in [
             ("preparing", 2),
             ("prepared", 3),

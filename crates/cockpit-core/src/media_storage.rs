@@ -711,11 +711,13 @@ impl MediaStorageRecovery {
         let mut selected_video_stream = None;
         let mut selected_audio_stream = None;
         let mut av_terminal = None;
+        let mut av_normalization_evidence = None;
         let av_derivatives = if media_kind != MediaKind::Image {
             let prepared: Result<(
                 Vec<(&'static str, Uuid, Vec<u8>, Option<(u32, u32)>)>,
                 Option<SelectedMediaStream>,
                 Option<SelectedMediaStream>,
+                AvNormalizationEvidence,
             )> = async {
                 held.seek(SeekFrom::Start(0))?;
                 let mut bytes = Vec::new();
@@ -724,7 +726,7 @@ impl MediaStorageRecovery {
                     .current()
                     .context("model_runtime_unavailable")?;
                 let runtime = approved_av_runtime(&health)?;
-                let (document, _) = run_bounded_ffprobe(&runtime, bytes.clone()).await?;
+                let (document, probe_digest) = run_bounded_ffprobe(&runtime, bytes.clone()).await?;
                 let streams = document
                     .streams
                     .iter()
@@ -759,7 +761,7 @@ impl MediaStorageRecovery {
                     .into();
                 }
                 let (video, audio) = select_av_streams(&canonical_container, &streams)?;
-                decode_selected_streams(
+                let decode_digest = decode_selected_streams(
                     &runtime,
                     bytes.clone(),
                     video.as_ref().map(|value| value.index),
@@ -832,6 +834,7 @@ impl MediaStorageRecovery {
                         gop,
                         min_keyint,
                     )?;
+                    let plan_digest = av_plan_digest(&runtime.fingerprint, &argv);
                     let mp4 = run_video_normalization(&runtime, argv, bytes).await?;
                     verify_canonical_video_mp4(&mp4)?;
                     let (encoded, _) = run_bounded_ffprobe(&runtime, mp4.clone()).await?;
@@ -844,10 +847,18 @@ impl MediaStorageRecovery {
                         gop,
                         audio.is_some(),
                     )?;
+                    let derivative_checksum = crate::intel::hex_lower(&Sha256::digest(&mp4));
                     Ok((
                         vec![("video_model", Uuid::now_v7(), mp4, Some((width, height)))],
                         selected_video,
                         selected_audio,
+                        AvNormalizationEvidence {
+                            runtime_fingerprint: runtime.fingerprint,
+                            probe_digest,
+                            decode_digest,
+                            plan_digest,
+                            derivative_checksum,
+                        },
                     ))
                 } else {
                     let audio = audio.context("invalid_media")?;
@@ -863,6 +874,7 @@ impl MediaStorageRecovery {
                         .parse::<u32>()?;
                     let channels = probe.channels.context("invalid_media")?;
                     let argv = audio_normalization_argv(audio.index, rate, channels)?;
+                    let plan_digest = av_plan_digest(&runtime.fingerprint, &argv);
                     let output = run_bounded_runtime(
                         &runtime.ffmpeg,
                         &argv,
@@ -872,18 +884,27 @@ impl MediaStorageRecovery {
                     )
                     .await?;
                     let wav = canonicalize_pcm_wav(&output.stdout)?;
+                    let derivative_checksum = crate::intel::hex_lower(&Sha256::digest(&wav));
                     Ok((
                         vec![("audio_model", Uuid::now_v7(), wav, None)],
                         None,
                         selected_audio,
+                        AvNormalizationEvidence {
+                            runtime_fingerprint: runtime.fingerprint,
+                            probe_digest,
+                            decode_digest,
+                            plan_digest,
+                            derivative_checksum,
+                        },
                     ))
                 }
             }
             .await;
             match prepared {
-                Ok((derivatives, video, audio)) => {
+                Ok((derivatives, video, audio, evidence)) => {
                     selected_video_stream = video;
                     selected_audio_stream = audio;
+                    av_normalization_evidence = Some(evidence);
                     Some(derivatives)
                 }
                 Err(error) => {
@@ -1062,7 +1083,7 @@ impl MediaStorageRecovery {
         let final_availability = av_terminal.unwrap_or(MediaAvailability::Ready);
         let reservation_id = snapshot.5.clone();
         let transition_operation_id = mutation.local_operation_id;
-        let result=self.db.transaction(move|conn|{if let Some(receipt)=preflight_local_operation(conn,mutation.local_operation_id,"finalize",&domain,&request_digest,&semantic_digest,now_unix_ms)?{return Ok((receipt,false))}cockpit_db::Db::insert_media_attachment_conn(conn,&record)?;cockpit_db::Db::insert_media_attachment_component_conn(conn,&component_record)?;if ready {for (kind,storage,identity,length,checksum,dimensions) in derivative_components {let id=Uuid::now_v7();let component=MediaAttachmentComponent{component_id:id,attachment_id:attachment,attachment_version:1,component_kind:kind,storage_id:storage,lifecycle_state:"ready".into(),component_generation:1,stable_identity_digest:identity,byte_length:length,sha256:checksum,reservation_id:reservation_id.clone(),created_at_unix_ms:now_unix_ms,updated_at_unix_ms:now_unix_ms};cockpit_db::Db::insert_media_attachment_component_conn(conn,&component)?;if let Some((width,height))=dimensions{conn.execute("INSERT INTO media_image_component_dimensions(component_id,width,height) VALUES(?1,?2,?3)",params![id.to_string(),width,height])?;}}}if processed{let mut availability=MediaAvailability::Quarantined;let mut available_generation=1;for next_state in [MediaAvailability::Probing,MediaAvailability::Decoding,MediaAvailability::Normalizing,final_availability]{cockpit_db::Db::transition_media_attachment_conn(conn,attachment,1,available_generation,next_state,now_unix_ms)?;let next_generation=available_generation.checked_add(1).context("availability generation overflow")?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![attachment.to_string(),next_generation.to_string(),availability.as_str(),next_state.as_str(),transition_operation_id.to_string(),now_unix_ms])?;availability=next_state;available_generation=next_generation;}ensure!(availability==final_availability,"media terminal transition failed");}conn.execute("INSERT INTO media_attachment_upload_origins(attachment_id,client_draft_id,upload_id,upload_generation) VALUES(?1,?2,?3,?4)",params![attachment.to_string(),draft.to_string(),upload.to_string(),next.to_string()])?;let changed=conn.execute("UPDATE media_uploads SET state='materialized',upload_generation=?1,next_chunk_index=NULL,attachment_id=?2,attachment_version='1',last_transition_json=?3,updated_at_unix_ms=?4 WHERE upload_id=?5 AND upload_generation=?6 AND state='open'",params![next.to_string(),attachment.to_string(),serde_json::to_string(&transition)?,now_unix_ms,upload.to_string(),generation.to_string()])?;ensure!(changed==1,"upload finalize lost compare-and-swap");let receipt=LocalMediaMutationReceiptV1{schema_version:1,kind:"localMediaMutationReceipt".into(),receipt_id:Uuid::now_v7(),local_operation_id:mutation.local_operation_id,actor_principal_digest:mutation.actor_principal_digest,action:"finalize".into(),subject_kind:LocalMediaSubjectKindV1::Upload,subject_id:upload,operation_request_digest:request_digest.clone(),semantic_command_digest:semantic_digest.clone(),outcome:LocalMediaMutationOutcomeV1::Applied,transition:LocalMediaMutationTransitionV1::UploadToAttachment{upload_generation_before:generation,upload_generation_after:next,attachment_version:1,availability_generation:if processed{5}else{1},reference_generation:1},discard_result:None,discard_result_digest:None,committed_at_unix_ms:now_unix_ms};commit_local_operation(conn,&receipt,"finalize",&domain,&request_digest,&semantic_digest,now_unix_ms)?;Ok((receipt,true))}).await;
+        let result=self.db.transaction(move|conn|{if let Some(receipt)=preflight_local_operation(conn,mutation.local_operation_id,"finalize",&domain,&request_digest,&semantic_digest,now_unix_ms)?{return Ok((receipt,false))}cockpit_db::Db::insert_media_attachment_conn(conn,&record)?;cockpit_db::Db::insert_media_attachment_component_conn(conn,&component_record)?;if ready {for (kind,storage,identity,length,checksum,dimensions) in derivative_components {let id=Uuid::now_v7();let component=MediaAttachmentComponent{component_id:id,attachment_id:attachment,attachment_version:1,component_kind:kind,storage_id:storage,lifecycle_state:"ready".into(),component_generation:1,stable_identity_digest:identity,byte_length:length,sha256:checksum,reservation_id:reservation_id.clone(),created_at_unix_ms:now_unix_ms,updated_at_unix_ms:now_unix_ms};cockpit_db::Db::insert_media_attachment_component_conn(conn,&component)?;if let Some((width,height))=dimensions{conn.execute("INSERT INTO media_image_component_dimensions(component_id,width,height) VALUES(?1,?2,?3)",params![id.to_string(),width,height])?;}}}if let Some(evidence)=av_normalization_evidence{conn.execute("INSERT INTO media_av_normalization_evidence(attachment_id,runtime_fingerprint,probe_digest,decode_digest,plan_digest,derivative_checksum) VALUES(?1,?2,?3,?4,?5,?6)",params![attachment.to_string(),evidence.runtime_fingerprint,evidence.probe_digest,evidence.decode_digest,evidence.plan_digest,evidence.derivative_checksum])?;}if processed{let mut availability=MediaAvailability::Quarantined;let mut available_generation=1;for next_state in [MediaAvailability::Probing,MediaAvailability::Decoding,MediaAvailability::Normalizing,final_availability]{cockpit_db::Db::transition_media_attachment_conn(conn,attachment,1,available_generation,next_state,now_unix_ms)?;let next_generation=available_generation.checked_add(1).context("availability generation overflow")?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![attachment.to_string(),next_generation.to_string(),availability.as_str(),next_state.as_str(),transition_operation_id.to_string(),now_unix_ms])?;availability=next_state;available_generation=next_generation;}ensure!(availability==final_availability,"media terminal transition failed");}conn.execute("INSERT INTO media_attachment_upload_origins(attachment_id,client_draft_id,upload_id,upload_generation) VALUES(?1,?2,?3,?4)",params![attachment.to_string(),draft.to_string(),upload.to_string(),next.to_string()])?;let changed=conn.execute("UPDATE media_uploads SET state='materialized',upload_generation=?1,next_chunk_index=NULL,attachment_id=?2,attachment_version='1',last_transition_json=?3,updated_at_unix_ms=?4 WHERE upload_id=?5 AND upload_generation=?6 AND state='open'",params![next.to_string(),attachment.to_string(),serde_json::to_string(&transition)?,now_unix_ms,upload.to_string(),generation.to_string()])?;ensure!(changed==1,"upload finalize lost compare-and-swap");let receipt=LocalMediaMutationReceiptV1{schema_version:1,kind:"localMediaMutationReceipt".into(),receipt_id:Uuid::now_v7(),local_operation_id:mutation.local_operation_id,actor_principal_digest:mutation.actor_principal_digest,action:"finalize".into(),subject_kind:LocalMediaSubjectKindV1::Upload,subject_id:upload,operation_request_digest:request_digest.clone(),semantic_command_digest:semantic_digest.clone(),outcome:LocalMediaMutationOutcomeV1::Applied,transition:LocalMediaMutationTransitionV1::UploadToAttachment{upload_generation_before:generation,upload_generation_after:next,attachment_version:1,availability_generation:if processed{5}else{1},reference_generation:1},discard_result:None,discard_result_digest:None,committed_at_unix_ms:now_unix_ms};commit_local_operation(conn,&receipt,"finalize",&domain,&request_digest,&semantic_digest,now_unix_ms)?;Ok((receipt,true))}).await;
         if result.as_ref().is_err() || result.as_ref().is_ok_and(|(_, applied)| !*applied) {
             self.owned_root
                 .rename_into_noreplace(&target, &self.owned_root, &snapshot.0)
@@ -1995,6 +2016,26 @@ struct BoundedRuntimeOutput {
     stderr: Vec<u8>,
 }
 
+struct AvNormalizationEvidence {
+    runtime_fingerprint: String,
+    probe_digest: String,
+    decode_digest: String,
+    plan_digest: String,
+    derivative_checksum: String,
+}
+
+fn av_plan_digest(runtime_fingerprint: &str, argv: &[String]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"media-av-derivative-plan-v1\0");
+    hasher.update(runtime_fingerprint.as_bytes());
+    hasher.update([0]);
+    for argument in argv {
+        hasher.update(argument.as_bytes());
+        hasher.update([0]);
+    }
+    crate::intel::hex_lower(&hasher.finalize())
+}
+
 async fn run_bounded_runtime(
     program: &Path,
     args: &[String],
@@ -2084,6 +2125,8 @@ struct FfprobeStream {
 struct FfprobeSideData {
     #[serde(default)]
     rotation: Option<i32>,
+    #[serde(default)]
+    displaymatrix: Option<String>,
 }
 #[derive(Debug, serde::Deserialize)]
 struct FfprobeFrame {
@@ -2245,19 +2288,63 @@ fn selected_video_timestamps(
 fn oriented_video_dimensions(stream: &FfprobeStream) -> Result<(u32, u32)> {
     let width = stream.width.context("invalid_media")?;
     let height = stream.height.context("invalid_media")?;
-    let rotations = stream
+    let transforms = stream
         .side_data_list
         .iter()
-        .filter_map(|data| data.rotation)
+        .filter(|data| data.rotation.is_some() || data.displaymatrix.is_some())
         .collect::<Vec<_>>();
-    ensure!(rotations.len() <= 1, "invalid_media");
-    let rotation = rotations.first().copied().unwrap_or(0).rem_euclid(360);
+    ensure!(transforms.len() <= 1, "invalid_media");
+    let Some(transform) = transforms.first() else {
+        return Ok((width, height));
+    };
+    let rotation = transform.rotation.unwrap_or(0).rem_euclid(360);
     ensure!(matches!(rotation, 0 | 90 | 180 | 270), "invalid_media");
-    Ok(if matches!(rotation, 90 | 270) {
+    let matrix = transform
+        .displaymatrix
+        .as_deref()
+        .map(parse_display_matrix)
+        .transpose()?
+        .context("invalid_media")?;
+    let [a, b, _, c, d, _, x, y, scale] = matrix;
+    ensure!(
+        [a, b, c, d]
+            .iter()
+            .all(|value| matches!(*value, -65_536 | 0 | 65_536))
+            && [a, b].iter().filter(|value| **value != 0).count() == 1
+            && [c, d].iter().filter(|value| **value != 0).count() == 1
+            && [a, c].iter().filter(|value| **value != 0).count() == 1
+            && [b, d].iter().filter(|value| **value != 0).count() == 1
+            && x == 0
+            && y == 0
+            && scale == 1_073_741_824,
+        "invalid_media"
+    );
+    let matrix_rotation = match (a, b, c, d) {
+        (65_536, 0, 0, 65_536) | (-65_536, 0, 0, 65_536) => 0,
+        (0, -65_536, 65_536, 0) | (0, 65_536, 65_536, 0) => 90,
+        (-65_536, 0, 0, -65_536) | (65_536, 0, 0, -65_536) => 180,
+        (0, 65_536, -65_536, 0) | (0, -65_536, -65_536, 0) => 270,
+        _ => anyhow::bail!("invalid_media"),
+    };
+    ensure!(rotation == matrix_rotation, "invalid_media");
+    Ok(if a == 0 {
         (height, width)
     } else {
         (width, height)
     })
+}
+
+fn parse_display_matrix(value: &str) -> Result<[i64; 9]> {
+    let values = value
+        .lines()
+        .flat_map(|line| line.split_once(':').map(|(_, values)| values).into_iter())
+        .flat_map(str::split_ascii_whitespace)
+        .map(|value| value.parse::<i64>().context("invalid_media"))
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(values.len() == 9, "invalid_media");
+    values
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid_media"))
 }
 
 fn verify_encoded_video_provenance(
@@ -2289,7 +2376,11 @@ fn verify_encoded_video_provenance(
             && video.profile.as_deref() == Some("High")
             && video.pix_fmt.as_deref() == Some("yuv420p")
             && video.width == Some(width)
-            && video.height == Some(height),
+            && video.height == Some(height)
+            && video
+                .side_data_list
+                .iter()
+                .all(|data| { data.rotation.is_none() && data.displaymatrix.is_none() }),
         "invalid_media"
     );
     if let Some(audio) = audio.first() {

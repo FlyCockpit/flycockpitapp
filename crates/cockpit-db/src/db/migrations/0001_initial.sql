@@ -234,6 +234,22 @@ CREATE TABLE media_attachment_transition_evidence (
     PRIMARY KEY(attachment_id, availability_generation)
 );
 
+CREATE TABLE media_av_normalization_evidence (
+    attachment_id TEXT PRIMARY KEY REFERENCES media_attachments(attachment_id) ON DELETE CASCADE,
+    runtime_fingerprint TEXT NOT NULL,
+    probe_digest TEXT NOT NULL,
+    decode_digest TEXT NOT NULL,
+    plan_digest TEXT NOT NULL,
+    derivative_version TEXT GENERATED ALWAYS AS (plan_digest) STORED,
+    derivative_checksum TEXT NOT NULL,
+    CHECK (length(runtime_fingerprint) = 64 AND runtime_fingerprint NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(probe_digest) = 64 AND probe_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(decode_digest) = 64 AND decode_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(plan_digest) = 64 AND plan_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(derivative_version) = 64 AND derivative_version NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(derivative_checksum) = 64 AND derivative_checksum NOT GLOB '*[^0-9a-f]*')
+);
+
 CREATE TABLE media_storage_publication_intents (
     upload_id TEXT PRIMARY KEY REFERENCES media_uploads(upload_id) ON DELETE CASCADE,
     temporary_storage_id TEXT NOT NULL,

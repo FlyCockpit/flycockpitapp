@@ -1155,6 +1155,7 @@ impl DispatchingImageGenerationAttempt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageGenerationReconciliationOutcome {
     AuthoritativeNonacceptance,
+    AuthoritativeAccepted,
     AuthoritativeFailure,
 }
 pub struct ImageGenerationReconciliationObservation<'a> {
@@ -1185,6 +1186,28 @@ pub struct VerifiedImageGenerationReconciliationProof {
     outcome: ImageGenerationReconciliationOutcome,
     now_unix_ms: i64,
 }
+pub struct ClaimImageGenerationReconciliation {
+    pub job_id: Uuid,
+    pub slot_id: Uuid,
+    pub attempt_number: u32,
+    pub worker_boot_id: Uuid,
+    pub claim_generation: u64,
+    pub now_unix_ms: i64,
+}
+impl SealedImageGenerationRecoveryAuthority {
+    pub fn adapter_identity(&self) -> (Uuid, Uuid, u32, Uuid, u64, &str, &str, &str) {
+        (
+            self.job_id,
+            self.slot_id,
+            self.attempt_number,
+            self.external_operation_id,
+            self.journal_version,
+            &self.provider_request_identity,
+            &self.provider_idempotency_identity,
+            &self.journal_payload_digest,
+        )
+    }
+}
 impl SealedImageGenerationRecoveryAuthority {
     pub fn verify(
         self,
@@ -1200,6 +1223,7 @@ impl SealedImageGenerationRecoveryAuthority {
         );
         let outcome_prefix: &[u8] = match observation.outcome {
             ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance => b"nonacceptance\0",
+            ImageGenerationReconciliationOutcome::AuthoritativeAccepted => b"accepted\0",
             ImageGenerationReconciliationOutcome::AuthoritativeFailure => {
                 b"postacceptance_failure\0"
             }
@@ -1565,6 +1589,53 @@ impl Db {
     ) -> Result<SealedImageGenerationRecoveryAuthority> {
         conn.query_row("SELECT a.version,s.version,a.external_operation_id,j.version,a.provider_request_identity,a.provider_idempotency_identity,j.payload_digest FROM image_generation_attempts a JOIN image_generation_slots s ON s.job_id=a.job_id AND s.slot_id=a.slot_id JOIN external_journal_operations j ON j.operation_id=a.external_operation_id WHERE a.job_id=?1 AND a.slot_id=?2 AND a.attempt_number=?3 AND a.state IN ('reconciling','cancellation_requested') AND s.state IN ('submission_unknown','cancellation_requested') AND j.state IN ('reconciling','cancellation_requested')",params![job_id.to_string(),slot_id.to_string(),i64::from(attempt_number)],|row|Ok(SealedImageGenerationRecoveryAuthority{job_id,slot_id,attempt_number,attempt_version:u64::try_from(row.get::<_,i64>(0)?).map_err(|_|rusqlite::Error::InvalidQuery)?,slot_version:u64::try_from(row.get::<_,i64>(1)?).map_err(|_|rusqlite::Error::InvalidQuery)?,external_operation_id:Uuid::parse_str(&row.get::<_,String>(2)?).map_err(|_|rusqlite::Error::InvalidQuery)?,journal_version:u64::try_from(row.get::<_,i64>(3)?).map_err(|_|rusqlite::Error::InvalidQuery)?,provider_request_identity:row.get(4)?,provider_idempotency_identity:row.get(5)?,journal_payload_digest:row.get(6)?})).context("image generation recovery authority unavailable")
     }
+    pub fn claim_image_generation_reconciliation_conn(
+        conn: &Connection,
+        input: &ClaimImageGenerationReconciliation,
+    ) -> Result<SealedImageGenerationRecoveryAuthority> {
+        atomic_conn(conn, "image_generation_reconciliation_claim", || {
+            ensure!(
+                !input.worker_boot_id.is_nil() && input.claim_generation > 0,
+                "invalid reconciliation claim"
+            );
+            let expires = input
+                .now_unix_ms
+                .checked_add(60_000)
+                .context("reconciliation claim overflow")?;
+            let prior:Option<(i64,i64)>=conn.query_row("SELECT claim_generation,expires_at_unix_ms FROM image_generation_reconciliation_claims WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 ORDER BY claim_generation DESC LIMIT 1",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number)],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+            ensure!(
+                match prior {
+                    None => input.claim_generation == 1,
+                    Some((generation, expiry)) =>
+                        i64::try_from(input.claim_generation)? == generation + 1
+                            && expiry <= input.now_unix_ms,
+                },
+                "reconciliation claim generation is unavailable"
+            );
+            conn.execute("INSERT INTO image_generation_reconciliation_claims(job_id,slot_id,attempt_number,claim_generation,worker_boot_id,claimed_at_unix_ms,expires_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.claim_generation)?,input.worker_boot_id.to_string(),input.now_unix_ms,expires])?;
+            let (operation,version,attempt_version,state):(String,i64,i64,String)=conn.query_row("SELECT external_operation_id,observed_journal_version,version,state FROM image_generation_attempts WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND state IN ('submission_unknown','reconciling','cancellation_requested') AND EXISTS(SELECT 1 FROM image_generation_handoff_evidence h WHERE h.job_id=image_generation_attempts.job_id AND h.slot_id=image_generation_attempts.slot_id AND h.attempt_number=image_generation_attempts.attempt_number AND h.outcome='submission_unknown')",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number)],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).context("reconcilable attempt is unavailable")?;
+            if state == "submission_unknown" {
+                let operation_id = Uuid::parse_str(&operation)?;
+                let record = match transition_external_operation_conn(
+                    conn,
+                    operation_id,
+                    version,
+                    ExternalJournalState::Reconciling,
+                    input.now_unix_ms,
+                )? {
+                    ExternalTransitionOutcome::Committed(record) => record,
+                    _ => anyhow::bail!("reconciliation claim lost journal compare-and-set"),
+                };
+                ensure!(conn.execute("UPDATE image_generation_attempts SET state='reconciling',version=version+1,observed_journal_version=?1 WHERE job_id=?2 AND slot_id=?3 AND attempt_number=?4 AND state='submission_unknown' AND version=?5",params![record.version,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),attempt_version])?==1,"reconciliation claim lost attempt compare-and-set");
+            }
+            Self::image_generation_recovery_authority_conn(
+                conn,
+                input.job_id,
+                input.slot_id,
+                input.attempt_number,
+            )
+        })
+    }
     pub fn reconcile_image_generation_attempt_conn(
         conn: &Connection,
         proof: &VerifiedImageGenerationReconciliationProof,
@@ -1594,6 +1665,11 @@ impl Db {
                 ExternalJournalState::Rejected,
                 ImageGenerationAttemptState::RejectedNotAccepted,
                 "authoritative_nonacceptance",
+            ),
+            (ImageGenerationReconciliationOutcome::AuthoritativeAccepted, _) => (
+                ExternalJournalState::Accepted,
+                ImageGenerationAttemptState::Accepted,
+                "authoritative_accepted",
             ),
             (ImageGenerationReconciliationOutcome::AuthoritativeFailure, _) => (
                 ExternalJournalState::Failed,
@@ -1625,20 +1701,49 @@ impl Db {
             attempt_changed == 1,
             "reconciliation lost attempt compare-and-set"
         );
-        let slot_next = if cancellation.is_some()
+        let slot_next = if matches!(
+            proof.outcome,
+            ImageGenerationReconciliationOutcome::AuthoritativeAccepted
+        ) {
+            if cancellation.is_some() {
+                "cancellation_requested"
+            } else {
+                "running"
+            }
+        } else if cancellation.is_some()
             && matches!(
                 proof.outcome,
                 ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance
-            ) {
+            )
+        {
             "cancelled"
         } else {
             "failed"
         };
-        let slot_changed=conn.execute("UPDATE image_generation_slots SET state=?1,version=?2,failure_reason=CASE WHEN ?1='failed' THEN ?3 ELSE NULL END WHERE job_id=?4 AND slot_id=?5 AND state IN ('submission_unknown','cancellation_requested') AND version=?6",params![slot_next,i64::try_from(input.slot_version+1)?,outcome,input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.slot_version)?])?;
+        let slot_changed = if matches!(
+            proof.outcome,
+            ImageGenerationReconciliationOutcome::AuthoritativeAccepted
+        ) && cancellation.is_some()
+        {
+            1
+        } else {
+            conn.execute("UPDATE image_generation_slots SET state=?1,version=?2,failure_reason=CASE WHEN ?1='failed' THEN ?3 ELSE NULL END WHERE job_id=?4 AND slot_id=?5 AND state IN ('submission_unknown','cancellation_requested') AND version=?6",params![slot_next,i64::try_from(input.slot_version+1)?,outcome,input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.slot_version)?])?
+        };
         ensure!(
             slot_changed == 1,
             "reconciliation lost slot compare-and-set"
         );
+        if matches!(
+            proof.outcome,
+            ImageGenerationReconciliationOutcome::AuthoritativeAccepted
+        ) {
+            if cancellation.is_none() {
+                ensure!(conn.execute("UPDATE image_generation_jobs SET state='running',version=version+1,updated_at_unix_ms=?1 WHERE job_id=?2 AND state='submission_unknown'",params![proof.now_unix_ms,input.job_id.to_string()])?==1,"accepted reconciliation lost job compare-and-set");
+            }
+            return Ok(ImageGenerationCasOutcome::Applied {
+                version: input.slot_version + 1,
+            });
+        }
         let mut projection_statement=conn.prepare("SELECT state,applied_cancellation_version,result_after_cancel FROM image_generation_slots WHERE job_id=?1 ORDER BY slot_index")?;
         let projection = projection_statement
             .query_map([input.job_id.to_string()], |row| {
@@ -4550,6 +4655,7 @@ mod tests {
         let payload = authority.journal_payload_digest.clone();
         let prefix: &[u8] = match outcome {
             ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance => b"nonacceptance\0",
+            ImageGenerationReconciliationOutcome::AuthoritativeAccepted => b"accepted\0",
             ImageGenerationReconciliationOutcome::AuthoritativeFailure => {
                 b"postacceptance_failure\0"
             }
@@ -4702,13 +4808,13 @@ mod tests {
                 let result=Db::reconcile_image_generation_attempt_conn(conn,&proof)?;
                 assert_eq!(result,ImageGenerationCasOutcome::Applied{version:5});
                 let row:(String,String,String,String,String,i64)=conn.query_row("SELECT e.evidence_digest,e.provider_request_identity,e.provider_idempotency_identity,e.journal_payload_digest,a.state,COUNT(*) FROM image_generation_reconciliation_evidence e JOIN image_generation_attempts a ON a.job_id=e.job_id AND a.slot_id=e.slot_id AND a.attempt_number=e.attempt_number WHERE e.job_id=?1",[fixture.job_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)))?;
-                let prefix:&[u8]=match outcome{ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance=>b"nonacceptance\0",ImageGenerationReconciliationOutcome::AuthoritativeFailure=>b"postacceptance_failure\0"};let mut expected_evidence=prefix.to_vec();expected_evidence.extend_from_slice(b"authoritative provider evidence");
+                let prefix:&[u8]=match outcome{ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance=>b"nonacceptance\0",ImageGenerationReconciliationOutcome::AuthoritativeAccepted=>b"accepted\0",ImageGenerationReconciliationOutcome::AuthoritativeFailure=>b"postacceptance_failure\0"};let mut expected_evidence=prefix.to_vec();expected_evidence.extend_from_slice(b"authoritative provider evidence");
                 assert_eq!(row.0,hex_lower(&Sha256::digest(expected_evidence)));
                 assert_eq!(row.1,"request:1");
                 assert_eq!(row.2,"idem:1");
                 assert_eq!(row.3,"1".repeat(64));
                 assert_eq!(row.5,1);
-                let expected=match outcome{ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance=>"rejected_not_accepted",ImageGenerationReconciliationOutcome::AuthoritativeFailure=>"failed_after_acceptance"};
+                let expected=match outcome{ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance=>"rejected_not_accepted",ImageGenerationReconciliationOutcome::AuthoritativeAccepted=>"accepted",ImageGenerationReconciliationOutcome::AuthoritativeFailure=>"failed_after_acceptance"};
                 assert_eq!(row.4,expected);
                 let event=Db::replay_image_generation_terminal_event_conn(conn,fixture.job_id)?.context("terminal event missing")?;
                 assert_eq!(event.job_id,fixture.job_id);
@@ -4845,7 +4951,7 @@ mod tests {
             ImageGenerationReconciliationOutcome::AuthoritativeFailure,
         ] {
             let db = Db::open_in_memory().unwrap();
-            db.blocking_for_sync_cli(move|conn|{let fixture=mixed_fixture(conn)?;cancel_mixed(conn,&fixture)?;let proof=verified_reconciliation(conn,fixture.job_id,fixture.slots[3],1,outcome,b"mixed reconciliation",11)?;Db::reconcile_image_generation_attempt_conn(conn,&proof)?;let row:(String,String,Option<i64>)=conn.query_row("SELECT a.state,s.state,a.applied_cancellation_version FROM image_generation_attempts a JOIN image_generation_slots s ON s.job_id=a.job_id AND s.slot_id=a.slot_id WHERE a.job_id=?1 AND a.slot_id=?2",params![fixture.job_id.to_string(),fixture.slots[3].to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;let expected=match outcome{ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance=>("cancelled","cancelled"),ImageGenerationReconciliationOutcome::AuthoritativeFailure=>("failed_after_acceptance","failed")};assert_eq!((row.0.as_str(),row.1.as_str(),row.2),(expected.0,expected.1,Some(1)));Ok(())}).unwrap();
+            db.blocking_for_sync_cli(move|conn|{let fixture=mixed_fixture(conn)?;cancel_mixed(conn,&fixture)?;let proof=verified_reconciliation(conn,fixture.job_id,fixture.slots[3],1,outcome,b"mixed reconciliation",11)?;Db::reconcile_image_generation_attempt_conn(conn,&proof)?;let row:(String,String,Option<i64>)=conn.query_row("SELECT a.state,s.state,a.applied_cancellation_version FROM image_generation_attempts a JOIN image_generation_slots s ON s.job_id=a.job_id AND s.slot_id=a.slot_id WHERE a.job_id=?1 AND a.slot_id=?2",params![fixture.job_id.to_string(),fixture.slots[3].to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;let expected=match outcome{ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance=>("cancelled","cancelled"),ImageGenerationReconciliationOutcome::AuthoritativeAccepted=>("accepted","cancellation_requested"),ImageGenerationReconciliationOutcome::AuthoritativeFailure=>("failed_after_acceptance","failed")};assert_eq!((row.0.as_str(),row.1.as_str(),row.2),(expected.0,expected.1,Some(1)));Ok(())}).unwrap();
         }
     }
 

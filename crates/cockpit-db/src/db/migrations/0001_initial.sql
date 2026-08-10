@@ -3336,6 +3336,41 @@ CREATE TABLE image_generation_attempt_activation_facts (
  FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT,
  CHECK((activation_reason='initial' AND attempt_number=1 AND prior_attempt_number IS NULL) OR (activation_reason='authoritative_retry' AND attempt_number>1 AND prior_attempt_number=attempt_number-1))
 );
+CREATE TABLE image_generation_reconciliation_claims (
+ job_id TEXT NOT NULL, slot_id TEXT NOT NULL, attempt_number INTEGER NOT NULL, claim_generation INTEGER NOT NULL CHECK(claim_generation>=1),
+ worker_boot_id TEXT NOT NULL, claimed_at_unix_ms INTEGER NOT NULL, expires_at_unix_ms INTEGER NOT NULL CHECK(expires_at_unix_ms>claimed_at_unix_ms AND expires_at_unix_ms<=claimed_at_unix_ms+60000),
+ PRIMARY KEY(job_id,slot_id,attempt_number,claim_generation),
+ FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT
+);
+CREATE TABLE image_generation_reconciliation_claim_completions (
+ job_id TEXT NOT NULL, slot_id TEXT NOT NULL, attempt_number INTEGER NOT NULL, claim_generation INTEGER NOT NULL,
+ completed_at_unix_ms INTEGER NOT NULL,
+ PRIMARY KEY(job_id,slot_id,attempt_number,claim_generation),
+ FOREIGN KEY(job_id,slot_id,attempt_number,claim_generation) REFERENCES image_generation_reconciliation_claims(job_id,slot_id,attempt_number,claim_generation) ON DELETE RESTRICT
+);
+CREATE TABLE image_generation_provider_cancel_evidence (
+ job_id TEXT NOT NULL,slot_id TEXT NOT NULL,attempt_number INTEGER NOT NULL,
+ external_operation_id TEXT NOT NULL UNIQUE,outcome TEXT NOT NULL CHECK(outcome IN ('cancelled','too_late_or_accepted','outcome_unknown')),
+ evidence_digest TEXT NOT NULL CHECK(length(evidence_digest)=64),recorded_at_unix_ms INTEGER NOT NULL,
+ PRIMARY KEY(job_id,slot_id,attempt_number),
+ FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT
+);
+CREATE TABLE image_generation_provider_cancel_claims (
+ job_id TEXT NOT NULL,slot_id TEXT NOT NULL,attempt_number INTEGER NOT NULL,
+ claim_generation INTEGER NOT NULL CHECK(claim_generation>=1),worker_boot_id TEXT NOT NULL,
+ claimed_at_unix_ms INTEGER NOT NULL,expires_at_unix_ms INTEGER NOT NULL
+   CHECK(expires_at_unix_ms>claimed_at_unix_ms AND expires_at_unix_ms<=claimed_at_unix_ms+60000),
+ PRIMARY KEY(job_id,slot_id,attempt_number,claim_generation),
+ FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT
+);
+CREATE TRIGGER image_generation_provider_cancel_evidence_immutable BEFORE UPDATE ON image_generation_provider_cancel_evidence BEGIN SELECT RAISE(ABORT,'image provider cancel evidence is immutable'); END;
+CREATE TRIGGER image_generation_provider_cancel_evidence_no_delete BEFORE DELETE ON image_generation_provider_cancel_evidence BEGIN SELECT RAISE(ABORT,'image provider cancel evidence is immutable'); END;
+CREATE TRIGGER image_generation_provider_cancel_claim_immutable BEFORE UPDATE ON image_generation_provider_cancel_claims BEGIN SELECT RAISE(ABORT,'image provider cancel claim is immutable'); END;
+CREATE TRIGGER image_generation_provider_cancel_claim_no_delete BEFORE DELETE ON image_generation_provider_cancel_claims BEGIN SELECT RAISE(ABORT,'image provider cancel claim is immutable'); END;
+CREATE TRIGGER image_generation_reconciliation_claim_immutable BEFORE UPDATE ON image_generation_reconciliation_claims BEGIN SELECT RAISE(ABORT,'image reconciliation claim is immutable'); END;
+CREATE TRIGGER image_generation_reconciliation_claim_no_delete BEFORE DELETE ON image_generation_reconciliation_claims BEGIN SELECT RAISE(ABORT,'image reconciliation claim is immutable'); END;
+CREATE TRIGGER image_generation_reconciliation_completion_immutable BEFORE UPDATE ON image_generation_reconciliation_claim_completions BEGIN SELECT RAISE(ABORT,'image reconciliation completion is immutable'); END;
+CREATE TRIGGER image_generation_reconciliation_completion_no_delete BEFORE DELETE ON image_generation_reconciliation_claim_completions BEGIN SELECT RAISE(ABORT,'image reconciliation completion is immutable'); END;
 CREATE TRIGGER image_generation_attempt_activation_immutable BEFORE UPDATE ON image_generation_attempt_activation_facts BEGIN SELECT RAISE(ABORT,'image generation attempt activation is immutable'); END;
 CREATE TRIGGER image_generation_attempt_activation_no_delete BEFORE DELETE ON image_generation_attempt_activation_facts BEGIN SELECT RAISE(ABORT,'image generation attempt activation is immutable'); END;
 CREATE TABLE image_generation_attempt_media_snapshots (

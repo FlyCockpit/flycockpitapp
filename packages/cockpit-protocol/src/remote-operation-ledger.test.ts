@@ -31,29 +31,31 @@ describe("remote operation classification fixture", () => {
       fixture.rows.every((row) => row.fcorRoles.every((entry) => allowedRoles.has(entry.role))),
     ).toBe(true);
     const byTag = new Map(fixture.rows.map((row) => [row.tag, row]));
-    for (const tag of [
-      "cancel_run_invocation",
-      "create_goal",
-      "mark_app_flag_seen",
-      "resolve_assistant_session",
-    ]) {
+    for (const tag of ["cancel_run_invocation", "create_goal"]) {
       expect(byTag.get(tag)).toMatchObject({
         class: "transactional_mutation",
         strategy: "sql_transaction",
         evidence: null,
       });
     }
-    expect(byTag.get("write_bulk_transfer_chunk")).toMatchObject({
+    for (const tag of ["mark_app_flag_seen", "resolve_assistant_session", "set_workspace_trust"]) {
+      expect(byTag.get(tag)).toMatchObject({
+        class: "local_only",
+        strategy: "none",
+        evidence: null,
+      });
+    }
+    expect(byTag.get("steer_delegation")).toMatchObject({
       class: "nonrepeatable_mutation",
       strategy: "nonrepeatable_dispatch",
       evidence: null,
     });
-    expect(byTag.get("set_default_model")).toMatchObject({
+    expect(byTag.get("fs_write")).toMatchObject({
       class: "idempotent_adapter_mutation",
       strategy: "staged_filesystem_commit",
       evidence: "staged_artifact_fingerprints_and_fsync_barriers",
     });
-    expect(byTag.get("set_workspace_trust")).toMatchObject({
+    expect(byTag.get("set_active_model")).toMatchObject({
       class: "idempotent_adapter_mutation",
       strategy: "durable_desired_state",
       evidence: "desired_state_generation_and_observed_digest",

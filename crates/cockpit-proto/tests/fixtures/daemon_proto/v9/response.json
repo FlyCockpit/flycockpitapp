@@ -537,6 +537,19 @@
     },
     "response": "remote_goal_outcome"
   },
+  "remote_operation_status": {
+    "data": {
+      "status": {
+        "schema_version": 1,
+        "operation_id": "018f3f24-7a10-7cc2-8f55-666666666666",
+        "state": "committed",
+        "operation_seq": "42",
+        "safe_response": [72, 101, 108, 108, 111],
+        "event_high_water_mark": "100"
+      }
+    },
+    "response": "remote_operation_status"
+  },
   "guidance_estimate": {
     "data": {
       "file": "file-fixture",

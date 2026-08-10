@@ -4,8 +4,10 @@ import errorsFixture from "../fixtures/daemon-wire/errors.json" with { type: "js
 import eventsFixture from "../fixtures/daemon-wire/events.json" with { type: "json" };
 import interruptsFixture from "../fixtures/daemon-wire/interrupts.json" with { type: "json" };
 import requestsFixture from "../fixtures/daemon-wire/requests.json" with { type: "json" };
-import remoteOperationIdentityFixture from "../fixtures/remote-operation-identity-v1.json" with { type: "json" };
 import responsesFixture from "../fixtures/daemon-wire/responses.json" with { type: "json" };
+import remoteOperationIdentityFixture from "../fixtures/remote-operation-identity-v1.json" with {
+  type: "json",
+};
 import {
   activeModelStateSchema,
   clientEnvelopeSchema,

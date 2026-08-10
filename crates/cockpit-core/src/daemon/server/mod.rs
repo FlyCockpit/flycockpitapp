@@ -3652,6 +3652,13 @@ fn admit_remote_operation(
     let ClientPrincipal::Remote(remote) = principal else {
         unreachable!("owner principal returned above")
     };
+    // A relay-authenticated principal without a device actor binding is not
+    // participating in cross-transport remote operations. It is admitted
+    // without an operation identity; the regular authorization layer
+    // enforces session/project/terminal grants independently.
+    if remote.actor_binding.is_none() {
+        return Ok(None);
+    }
     let (Some(actor), Some(operation)) = (remote.actor_binding.as_ref(), operation) else {
         return Err(remote_operation_denied());
     };
@@ -3730,14 +3737,14 @@ async fn handle_envelope(
             }
             let is_attach = matches!(&request, Request::Attach { .. });
             let mut effects = ClientRequestEffects::default();
-            let result = dispatch::handle_serialized_request_with_remote_operation(
+            let result = Box::pin(dispatch::handle_serialized_request_with_remote_operation(
                 request,
                 state,
                 shared,
                 ctx,
                 &mut effects,
                 remote_operation.as_ref(),
-            )
+            ))
             .await;
             let attached = matches!(&result, Ok(Response::Attached { .. }));
             if (is_attach && attached) || state.attached.is_none() {

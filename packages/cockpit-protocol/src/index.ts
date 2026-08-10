@@ -675,7 +675,12 @@ export const runInvocationCancelResultV1Schema = z
   .object({
     schema_version: z.literal(1),
     client_submission_id: uuidSchema,
-    outcome: z.enum(["cancellation_requested", "already_cancelled", "already_terminal", "not_found"]),
+    outcome: z.enum([
+      "cancellation_requested",
+      "already_cancelled",
+      "already_terminal",
+      "not_found",
+    ]),
     state: runInvocationLifecycleStateSchema,
     state_version: safeU64NumberSchema,
   })
@@ -1247,14 +1252,21 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
   ),
   responseVariant(
     "remote_operation_status",
-    z.object({
-      status: z.object({
-        schema_version: z.literal(1), operation_id: uuidV7Schema, state: z.enum(["reserved", "committed", "rejected", "outcome_unknown"]),
-        operation_seq: canonicalU64DecimalStringSchema,
-        safe_response: z.array(z.number().int().min(0).max(255)).max(524288).nullable(),
-        event_high_water_mark: canonicalU64DecimalStringSchema.nullable(),
-      }).strict().nullable(),
-    }).strict(),
+    z
+      .object({
+        status: z
+          .object({
+            schema_version: z.literal(1),
+            operation_id: uuidV7Schema,
+            state: z.enum(["reserved", "committed", "rejected", "outcome_unknown"]),
+            operation_seq: canonicalU64DecimalStringSchema,
+            safe_response: z.array(z.number().int().min(0).max(255)).max(524288).nullable(),
+            event_high_water_mark: canonicalU64DecimalStringSchema.nullable(),
+          })
+          .strict()
+          .nullable(),
+      })
+      .strict(),
   ),
   responseVariant(
     "run_invocation_cancel_result",

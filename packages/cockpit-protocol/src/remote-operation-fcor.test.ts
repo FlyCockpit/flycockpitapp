@@ -1,16 +1,16 @@
 import { describe, expect, it } from "vitest";
-import vector from "../fixtures/remote-operation-fcor-v1.json" with { type: "json" };
 import providerModelVector from "../fixtures/provider-model-resource-v1.json" with { type: "json" };
+import vector from "../fixtures/remote-operation-fcor-v1.json" with { type: "json" };
 import {
-  CanonicalParamsV1,
   CanonicalParamError,
+  CanonicalParamsV1,
   checkedFcorV1Size,
   encodeFcorV1,
   encodeProviderModelResourceV1,
   hashFcorV1,
-  validateRegisteredSendUserMessageV2,
   validateFcorV1,
   validateProviderModelResourceV1,
+  validateRegisteredSendUserMessageV2,
 } from "./remote-operation-fcor";
 
 describe("FCOR v1", () => {
@@ -53,10 +53,13 @@ describe("FCOR v1", () => {
     ).toThrow();
     for (const malformed of vector.malformed) {
       let candidate = Uint8Array.from(bytes);
-      if ("replaceByte" in malformed)
-        candidate[malformed.replaceByte[0]] = malformed.replaceByte[1];
-      if ("truncateBy" in malformed) candidate = candidate.subarray(0, -malformed.truncateBy);
-      if ("appendHex" in malformed)
+      if ("replaceByte" in malformed && malformed.replaceByte) {
+        const [offset, byte] = malformed.replaceByte;
+        if (offset !== undefined && byte !== undefined) candidate[offset] = byte;
+      }
+      if ("truncateBy" in malformed && malformed.truncateBy !== undefined)
+        candidate = candidate.subarray(0, -malformed.truncateBy);
+      if ("appendHex" in malformed && malformed.appendHex !== undefined)
         candidate = Uint8Array.from([...candidate, ...Buffer.from(malformed.appendHex, "hex")]);
       expect(() => validateFcorV1(candidate), malformed.name).toThrow();
     }
@@ -109,12 +112,18 @@ describe("FCOR v1", () => {
     for (const invalid of vector.invalidCanonicalCases) {
       const call = () => {
         const params = new CanonicalParamsV1();
-        if (invalid.kind === "string" && "value" in invalid) params.pushString(invalid.value);
+        if (invalid.kind === "string" && "value" in invalid && invalid.value !== undefined)
+          params.pushString(invalid.value);
         else if (invalid.kind === "utf16_string") {
           params.pushString(
-            String.fromCharCode(...("codeUnits" in invalid ? invalid.codeUnits : [])),
+            String.fromCharCode(
+              ...("codeUnits" in invalid && invalid.codeUnits ? invalid.codeUnits : []),
+            ),
           );
-        } else if ("entries" in invalid) params.pushStringMap(invalid.entries);
+        } else if ("entries" in invalid && invalid.entries !== undefined)
+          params.pushStringMap(
+            invalid.entries as unknown as ReadonlyArray<readonly [string, string]>,
+          );
       };
       try {
         call();

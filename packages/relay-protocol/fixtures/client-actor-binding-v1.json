@@ -20,14 +20,87 @@
     }
   ],
   "invalid": [
-    { "name": "number", "value": { "schemaVersion": 1, "deviceId": "00000000-0000-4000-8000-000000000001", "deviceGeneration": 9007199254740992, "logicalAttachmentId": "00000000-0000-4000-8000-000000000002" } },
-    { "name": "zero", "value": { "schemaVersion": 1, "deviceId": "00000000-0000-4000-8000-000000000001", "deviceGeneration": "0", "logicalAttachmentId": "00000000-0000-4000-8000-000000000002" } },
-    { "name": "leading_zero", "value": { "schemaVersion": 1, "deviceId": "00000000-0000-4000-8000-000000000001", "deviceGeneration": "01", "logicalAttachmentId": "00000000-0000-4000-8000-000000000002" } },
-    { "name": "overflow", "value": { "schemaVersion": 1, "deviceId": "00000000-0000-4000-8000-000000000001", "deviceGeneration": "18446744073709551616", "logicalAttachmentId": "00000000-0000-4000-8000-000000000002" } },
-    { "name": "nil", "value": { "schemaVersion": 1, "deviceId": "00000000-0000-0000-0000-000000000000", "deviceGeneration": "1", "logicalAttachmentId": "00000000-0000-4000-8000-000000000002" } },
-    { "name": "uppercase", "value": { "schemaVersion": 1, "deviceId": "00000000-0000-4000-8000-00000000000A", "deviceGeneration": "1", "logicalAttachmentId": "00000000-0000-4000-8000-000000000002" } },
-    { "name": "wrong_variant", "value": { "schemaVersion": 1, "deviceId": "00000000-0000-4000-7000-000000000001", "deviceGeneration": "1", "logicalAttachmentId": "00000000-0000-4000-8000-000000000002" } },
-    { "name": "wrong_schema", "value": { "schemaVersion": 2, "deviceId": "00000000-0000-4000-8000-000000000001", "deviceGeneration": "1", "logicalAttachmentId": "00000000-0000-4000-8000-000000000002" } },
-    { "name": "unknown", "value": { "schemaVersion": 1, "deviceId": "00000000-0000-4000-8000-000000000001", "deviceGeneration": "1", "logicalAttachmentId": "00000000-0000-4000-8000-000000000002", "unknown": true } }
+    {
+      "name": "number",
+      "value": {
+        "schemaVersion": 1,
+        "deviceId": "00000000-0000-4000-8000-000000000001",
+        "deviceGeneration": 9007199254740992,
+        "logicalAttachmentId": "00000000-0000-4000-8000-000000000002"
+      }
+    },
+    {
+      "name": "zero",
+      "value": {
+        "schemaVersion": 1,
+        "deviceId": "00000000-0000-4000-8000-000000000001",
+        "deviceGeneration": "0",
+        "logicalAttachmentId": "00000000-0000-4000-8000-000000000002"
+      }
+    },
+    {
+      "name": "leading_zero",
+      "value": {
+        "schemaVersion": 1,
+        "deviceId": "00000000-0000-4000-8000-000000000001",
+        "deviceGeneration": "01",
+        "logicalAttachmentId": "00000000-0000-4000-8000-000000000002"
+      }
+    },
+    {
+      "name": "overflow",
+      "value": {
+        "schemaVersion": 1,
+        "deviceId": "00000000-0000-4000-8000-000000000001",
+        "deviceGeneration": "18446744073709551616",
+        "logicalAttachmentId": "00000000-0000-4000-8000-000000000002"
+      }
+    },
+    {
+      "name": "nil",
+      "value": {
+        "schemaVersion": 1,
+        "deviceId": "00000000-0000-0000-0000-000000000000",
+        "deviceGeneration": "1",
+        "logicalAttachmentId": "00000000-0000-4000-8000-000000000002"
+      }
+    },
+    {
+      "name": "uppercase",
+      "value": {
+        "schemaVersion": 1,
+        "deviceId": "00000000-0000-4000-8000-00000000000A",
+        "deviceGeneration": "1",
+        "logicalAttachmentId": "00000000-0000-4000-8000-000000000002"
+      }
+    },
+    {
+      "name": "wrong_variant",
+      "value": {
+        "schemaVersion": 1,
+        "deviceId": "00000000-0000-4000-7000-000000000001",
+        "deviceGeneration": "1",
+        "logicalAttachmentId": "00000000-0000-4000-8000-000000000002"
+      }
+    },
+    {
+      "name": "wrong_schema",
+      "value": {
+        "schemaVersion": 2,
+        "deviceId": "00000000-0000-4000-8000-000000000001",
+        "deviceGeneration": "1",
+        "logicalAttachmentId": "00000000-0000-4000-8000-000000000002"
+      }
+    },
+    {
+      "name": "unknown",
+      "value": {
+        "schemaVersion": 1,
+        "deviceId": "00000000-0000-4000-8000-000000000001",
+        "deviceGeneration": "1",
+        "logicalAttachmentId": "00000000-0000-4000-8000-000000000002",
+        "unknown": true
+      }
+    }
   ]
 }

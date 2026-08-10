@@ -1344,6 +1344,21 @@ impl Request {
         }
         request_variants!(wire_tag)
     }
+    /// Returns the tag used by the `command!` metadata table. This differs
+    /// from `wire_tag()` for a small number of variants whose serde rename
+    /// does not match the command-table tag (e.g. `create_btw_fork` vs
+    /// `btw_create`).
+    pub fn command_tag(&self) -> &'static str {
+        macro_rules! command_tag {
+            (($($context:ident),*) [$(($pattern:pat, $tag:literal, $($rest:tt)*);)+]) => {
+                #[allow(unused_variables)]
+                match self {
+                    $($pattern => $tag,)+
+                }
+            };
+        }
+        crate::command!(command_tag)
+    }
 }
 
 // Keep daemon command metadata centralized. Callers provide a local callback
@@ -1721,7 +1736,7 @@ impl Request {
     pub fn remote_operation_class(
         &self,
     ) -> std::result::Result<RemoteOperationClass, UnknownRemoteOperationClass> {
-        remote_operation_class_for_tag(self.wire_tag()).ok_or(UnknownRemoteOperationClass)
+        remote_operation_class_for_tag(self.command_tag()).ok_or(UnknownRemoteOperationClass)
     }
 
     /// Ordered, type-checked FCOR fields for this concrete request variant.
@@ -2095,8 +2110,9 @@ mod tests {
             );
             let variant = pattern
                 .strip_prefix("Request :: ")
+                .or_else(|| pattern.strip_prefix("Request::"))
                 .unwrap_or(pattern)
-                .split([' ', '{'])
+                .split([' ', '\t', '\n', '\r', '{'])
                 .next()
                 .unwrap();
             assert!(
@@ -2114,7 +2130,9 @@ mod tests {
             } else {
                 typed_fields
                     .iter()
-                    .map(|(name, ty, _)| format!("{name}:{}", ty.replace(' ', "")))
+                    .map(|(name, ty, _)| {
+                        format!("{name}:{}", ty.replace(' ', "").replace("$crate", "crate"))
+                    })
                     .collect::<Vec<_>>()
                     .join("|")
             };
@@ -2124,18 +2142,19 @@ mod tests {
                 .map(|(name, _, _)| *name)
                 .collect::<std::collections::BTreeSet<_>>();
             for (name, ty, role) in &typed_fields {
+                let ty = ty.replace(' ', "");
                 let valid = match role.split_once('(').map(|(head, _)| head).unwrap_or(role) {
                     "param" | "legacy_message" => true,
-                    "session" => matches!(*ty, "Uuid" | "Option<Uuid>"),
-                    "project" => *ty == "Option<String>",
-                    "project_root" => *ty == "String",
-                    "project_root_effective" => *ty == "Option<String>",
-                    "file_existing" | "file_write_target" | "rename_source" => *ty == "String",
-                    "terminal" | "upload" | "interrupt" | "queue" => *ty == "Uuid",
+                    "session" => ty == "Uuid" || ty == "Option<Uuid>",
+                    "project" => ty == "Option<String>",
+                    "project_root" => ty == "String",
+                    "project_root_effective" => ty == "Option<String>",
+                    "file_existing" | "file_write_target" | "rename_source" => ty == "String",
+                    "terminal" | "upload" | "interrupt" | "queue" => ty == "Uuid",
                     "provider_model_left" | "provider_model_right" => {
-                        matches!(*ty, "String" | "Option<String>")
+                        ty == "String" || ty == "Option<String>"
                     }
-                    "scheduled" => *ty == "ScheduledJobCreate",
+                    "scheduled" => ty == "ScheduledJobCreate",
                     _ => false,
                 };
                 assert!(valid, "invalid FCOR role {role} for {tag}.{name}:{ty}");
@@ -2190,7 +2209,7 @@ mod tests {
                     .expect("registered canonical FCOR schema"),
                 "fcorRoles": [$({
                     "field": stringify!($fcor_field),
-                    "type": stringify!($fcor_type).replace(' ', ""),
+                    "type": stringify!($fcor_type).replace(' ', "").replace("$crate", "crate"),
                     "role": concat!(stringify!($fcor_role), $("(", stringify!($($fcor_role_arg),*), ")")?),
                 }),*],
             })),+]

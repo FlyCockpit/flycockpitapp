@@ -2,8 +2,8 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
-  remoteReplayAckV2Schema,
   remoteReplayAckResponseV2Schema,
+  remoteReplayAckV2Schema,
   remoteReplayRequestV2Schema,
   remoteReplayResponseV2Schema,
 } from "./index";

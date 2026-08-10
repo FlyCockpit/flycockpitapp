@@ -266,8 +266,10 @@ pub(super) async fn handle_serialized_request(
     ctx: &Arc<DaemonContext>,
     effects: &mut ClientRequestEffects,
 ) -> std::result::Result<Response, ErrorPayload> {
-    handle_serialized_request_with_remote_operation(request, state, shared, ctx, effects, None)
-        .await
+    Box::pin(handle_serialized_request_with_remote_operation(
+        request, state, shared, ctx, effects, None,
+    ))
+    .await
 }
 
 async fn begin_remote_nonrepeatable(

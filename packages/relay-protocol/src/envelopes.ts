@@ -34,7 +34,10 @@ export const clientActorBindingSchema = z
   .object({
     schemaVersion: z.literal(1),
     deviceId: canonicalUuidSchema,
-    deviceGeneration: canonicalU64Schema.refine((value) => value !== "0", "generation must be positive"),
+    deviceGeneration: canonicalU64Schema.refine(
+      (value) => value !== "0",
+      "generation must be positive",
+    ),
     logicalAttachmentId: canonicalUuidSchema,
   })
   .strict();

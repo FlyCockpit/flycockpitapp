@@ -146,7 +146,9 @@ export class CanonicalParamsV1 {
     });
     encoded.sort((left, right) => compareBytes(left.key, right.key));
     for (let index = 1; index < encoded.length; index += 1) {
-      if (encoded[index - 1].normalizedKey === encoded[index].normalizedKey)
+      const prev = encoded[index - 1];
+      const curr = encoded[index];
+      if (prev !== undefined && curr !== undefined && prev.normalizedKey === curr.normalizedKey)
         throw new CanonicalParamError("duplicate_nfc_key", "duplicate NFC map key");
     }
     this.pushU32(encoded.length);
@@ -184,7 +186,9 @@ export function validateProviderModelResourceV1(bytes: Uint8Array): void {
     if (offset + length > bytes.length) throw new Error("truncated provider_model value");
     let value: string;
     try {
-      value = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(offset, offset + length));
+      value = new TextDecoder("utf-8", { fatal: true }).decode(
+        bytes.subarray(offset, offset + length),
+      );
     } catch {
       throw new Error("invalid provider_model UTF-8");
     }
@@ -209,7 +213,9 @@ function hasUnpairedSurrogate(value: string): boolean {
 function compareBytes(left: Uint8Array, right: Uint8Array): number {
   const length = Math.min(left.length, right.length);
   for (let index = 0; index < length; index += 1) {
-    if (left[index] !== right[index]) return left[index] - right[index];
+    const l = left[index];
+    const r = right[index];
+    if (l !== undefined && r !== undefined && l !== r) return l - r;
   }
   return left.length - right.length;
 }
@@ -309,7 +315,7 @@ export function validateFcorV1(bytes: Uint8Array): ValidatedFcorV1 {
   if (bytes[4] !== FCOR_SCHEMA_VERSION) throw new Error("unsupported FCOR schema");
   let offset = 5;
   const kindLength = bytes[offset++];
-  if (kindLength === 0 || offset + kindLength + 2 > bytes.length) {
+  if (kindLength === undefined || kindLength === 0 || offset + kindLength + 2 > bytes.length) {
     throw new Error("invalid FCOR request kind length");
   }
   const kind = new TextDecoder("utf-8", { fatal: true }).decode(
@@ -323,7 +329,8 @@ export function validateFcorV1(bytes: Uint8Array): ValidatedFcorV1 {
   for (let index = 0; index < count; index += 1) {
     if (offset + 5 > bytes.length) throw new Error("truncated FCOR resource");
     const resourceKind = bytes[offset++];
-    if (resourceKind < 1 || resourceKind > 11) throw new Error("unknown FCOR resource kind");
+    if (resourceKind === undefined || resourceKind < 1 || resourceKind > 11)
+      throw new Error("unknown FCOR resource kind");
     const length = view.getUint32(offset, false);
     offset += 4;
     if (offset + length > bytes.length) throw new Error("truncated FCOR resource value");
@@ -339,5 +346,6 @@ export function validateFcorV1(bytes: Uint8Array): ValidatedFcorV1 {
 
 export async function hashFcorV1(bytes: Uint8Array): Promise<Uint8Array> {
   const validated = validateFcorV1(bytes);
-  return new Uint8Array(await crypto.subtle.digest("SHA-256", validated));
+  const copy = new Uint8Array(validated);
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", copy));
 }

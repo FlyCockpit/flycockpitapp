@@ -2,14 +2,15 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   attachmentSetDigest,
+  type CanonicalSendUserMessageV2,
   decodeCanonicalSendUserMessageV2,
   encodeCanonicalSendUserMessageV2,
+  FCM2_MAX_BYTES,
   hasMessageText,
   messageRequestDigest,
-  FCM2_MAX_BYTES,
+  validateAuthenticatedRemoteMessageV2,
   validateFcm2Length,
   validateLocalOwnerDirectMessageV2,
-  validateAuthenticatedRemoteMessageV2,
 } from "./send-user-message-v2";
 
 const fixture = JSON.parse(
@@ -152,13 +153,13 @@ describe("send_user_message_v2_canonical_vectors", () => {
     const base = decodeCanonicalSendUserMessageV2(fromHex(fixture.vectors[1].fcm2_hex));
     for (const testCase of fixture.semantic_error_cases) {
       const value = structuredClone(base);
-      if (testCase.mutation === "empty_tool") value.request.tag_expansions[0].tool = "";
-      else if (testCase.mutation === "detail_one_over")
-        value.request.tag_expansions[0].detail = "d".repeat(4097);
+      const firstTag = value.request.tag_expansions[0];
+      if (testCase.mutation === "empty_tool" && firstTag) firstTag.tool = "";
+      else if (testCase.mutation === "detail_one_over" && firstTag)
+        firstTag.detail = "d".repeat(4097);
       else if (testCase.mutation === "empty_skill") value.request.forced_skill = "";
       else if (testCase.mutation === "invalid_skill") value.request.forced_skill = "bad/skill";
-      else if (testCase.mutation === "multibyte_tool")
-        value.request.tag_expansions[0].tool = "é".repeat(65);
+      else if (testCase.mutation === "multibyte_tool" && firstTag) firstTag.tool = "é".repeat(65);
       expect(
         exactError(() => encodeCanonicalSendUserMessageV2(value)),
         testCase.name,
@@ -190,10 +191,11 @@ describe("send_user_message_v2_canonical_vectors", () => {
 
   it("rejects noncanonical UUIDs and out-of-range u64 values", () => {
     const decoded = decodeCanonicalSendUserMessageV2(fromHex(fixture.vectors[0].fcm2_hex));
+    const noncanonicalSessionId = "abcdefab-cdef-4abc-8abc-abcdefabcdef".toUpperCase();
     expect(() =>
       encodeCanonicalSendUserMessageV2({
         ...decoded,
-        session_id: decoded.session_id.toUpperCase(),
+        session_id: noncanonicalSessionId,
       }),
     ).toThrow(/canonical/);
     expect(() =>
@@ -204,7 +206,7 @@ describe("send_user_message_v2_canonical_vectors", () => {
   it("encodes the exact maximum and rejects cap plus one before allocation", () => {
     const scalarMax = "😀".repeat(262_144);
     const decoded = decodeCanonicalSendUserMessageV2(fromHex(fixture.vectors[0].fcm2_hex));
-    const maximum = {
+    const maximum: CanonicalSendUserMessageV2 = {
       ...decoded,
       model_config_generation: 0xffffffffffffffffn,
       request: {

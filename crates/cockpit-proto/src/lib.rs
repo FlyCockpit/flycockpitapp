@@ -888,7 +888,7 @@ pub enum Body {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct RemoteReplayRequestV2 {
     pub id: Uuid,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -897,7 +897,7 @@ pub struct RemoteReplayRequestV2 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct RemoteReplayResponseV2 {
     pub id: Uuid,
     pub events: Vec<RemoteOutboxDeliveryV1>,
@@ -905,7 +905,7 @@ pub struct RemoteReplayResponseV2 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct RemoteReplayAckV2 {
     pub id: Uuid,
     pub delivery_id: CanonicalRfcUuidV1,
@@ -913,14 +913,14 @@ pub struct RemoteReplayAckV2 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct RemoteReplayAckResponseV2 {
     pub id: Uuid,
     pub acked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct RemoteOutboxDeliveryV1 {
     pub event_seq: crate::remote_protocol_id::CanonicalU64DecimalStringV1,
     pub delivery_id: CanonicalRfcUuidV1,
@@ -1028,7 +1028,7 @@ impl<'de> Deserialize<'de> for RemoteOperationIdentityV1 {
         D: serde::Deserializer<'de>,
     {
         #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        #[serde(rename_all = "camelCase")]
         struct Wire {
             schema_version: u8,
             logical_attachment_id: String,

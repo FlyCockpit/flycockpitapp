@@ -689,7 +689,6 @@ impl RunInvocationCancelOutcome {
 
 /// Versioned, content-free response for a remote goal mutation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RemoteGoalOutcomeV1 {
     pub schema_version: u8,
     pub session_id: Uuid,
@@ -699,7 +698,6 @@ pub struct RemoteGoalOutcomeV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RemoteOperationStatusV1 {
     pub schema_version: u8,
     pub operation_id: Uuid,
@@ -720,7 +718,6 @@ pub enum RemoteOperationStateV1 {
 
 /// Versioned, content-free cancel response for a run invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RunInvocationCancelResultV1 {
     pub schema_version: u32,
     pub client_submission_id: Uuid,

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { clientActorBindingSchema } from "./envelopes";
 import vectors from "../fixtures/client-actor-binding-v1.json" with { type: "json" };
+import { clientActorBindingSchema } from "./envelopes";
 
 describe("client actor binding v1", () => {
   it("preserves the full u64 range as canonical decimal text", () => {

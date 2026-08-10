@@ -339,7 +339,10 @@ fn bubblewrap_notice_is_conditional_read_only_and_infallible() {
 fn powershell_notice_returns_to_installer_and_wrapper_swallows_failures() {
     use std::{fs, path::PathBuf, process::Command};
     let shell = ["pwsh", "powershell"].into_iter().find(|name| {
-        Command::new(name).args(["-NoProfile", "-Command", "exit 0"]).status().is_ok()
+        Command::new(name)
+            .args(["-NoProfile", "-Command", "exit 0"])
+            .status()
+            .is_ok()
     });
     let Some(shell) = shell else { return };
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -349,10 +352,15 @@ fn powershell_notice_returns_to_installer_and_wrapper_swallows_failures() {
     fs::create_dir_all(&root).unwrap();
     let notice = root.join("notice.ps1");
     let sentinel = root.join("continued");
-    fs::write(&notice, include_str!("../scripts/runtime-prerequisite-notice.ps1")).unwrap();
+    fs::write(
+        &notice,
+        include_str!("../scripts/runtime-prerequisite-notice.ps1"),
+    )
+    .unwrap();
     let command = format!(
         "& '{}'; [IO.File]::WriteAllText('{}', 'returned')",
-        notice.display(), sentinel.display()
+        notice.display(),
+        sentinel.display()
     );
     let output = Command::new(shell)
         .args(["-NoProfile", "-Command", &command])
@@ -365,9 +373,13 @@ fn powershell_notice_returns_to_installer_and_wrapper_swallows_failures() {
     fs::write(&notice, "throw 'fixture notice failure'").unwrap();
     let command = format!(
         "try {{ & '{}' }} catch {{}}; [IO.File]::WriteAllText('{}', 'swallowed')",
-        notice.display(), sentinel.display()
+        notice.display(),
+        sentinel.display()
     );
-    let output = Command::new(shell).args(["-NoProfile", "-Command", &command]).output().unwrap();
+    let output = Command::new(shell)
+        .args(["-NoProfile", "-Command", &command])
+        .output()
+        .unwrap();
     assert!(output.status.success());
     assert_eq!(fs::read_to_string(&sentinel).unwrap(), "swallowed");
     fs::remove_dir_all(root).unwrap();

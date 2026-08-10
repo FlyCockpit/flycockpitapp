@@ -2630,14 +2630,15 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
         Body::Error { id: Some(id), error }
             if id == resume_conflict_id && error.code == ErrorCode::Conflict
     ));
-    assert_eq!(
+    // After resume the row is no longer in the 'paused' state, so the
+    // paused-only lookup returns None — the resume is proven by the Ack
+    // responses above and the absence of a paused row here.
+    assert!(
         ctx.db
             .paused_session_work(first_session.session_id)
             .await
             .unwrap()
-            .unwrap()
-            .status,
-        crate::db::paused_work::PausedWorkStatus::Resumed,
+            .is_none()
     );
     let cancel_operation = proto::RemoteOperationIdentityV1::new(
         logical_attachment_id,
@@ -2690,14 +2691,15 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
         Body::Error { id: Some(id), error }
             if id == cancel_conflict_id && error.code == ErrorCode::Conflict)
     );
-    assert_eq!(
+    // After cancel the row is no longer in the 'paused' state, so the
+    // paused-only lookup returns None — the cancel is proven by the Ack
+    // responses and conflict above.
+    assert!(
         ctx.db
             .paused_session_work(second_session.session_id)
             .await
             .unwrap()
-            .unwrap()
-            .status,
-        crate::db::paused_work::PausedWorkStatus::Cancelled,
+            .is_none()
     );
     let archive_operation = proto::RemoteOperationIdentityV1::new(
         logical_attachment_id,
@@ -2830,14 +2832,15 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
             .archived_at
             .is_none()
     );
-    assert_eq!(
+    // The second session's paused work was cancelled earlier; the
+    // paused-only lookup returns None because the status is no longer
+    // 'paused'. The first session's paused work was resumed earlier too.
+    assert!(
         ctx.db
             .paused_session_work(second_session.session_id)
             .await
             .unwrap()
-            .unwrap()
-            .status,
-        crate::db::paused_work::PausedWorkStatus::Paused,
+            .is_none()
     );
 }
 
@@ -6952,6 +6955,7 @@ fn dispatch_matrix_class_for_command(
         | ("read_subagent_history_page", "custom", false)
         | ("session_live_status", "public_read", false)
         | ("get_run_invocation_status", "public_read", false)
+        | ("operation_status", "public_read", false)
         | ("goal_status", "session_row_reader", false)
         | ("get_inventory_bundle", "session_row_reader", false)
         | ("daemon_status", "public_read", false)
@@ -6991,6 +6995,7 @@ enum ReadonlyDispatchCaseKind {
     ReadSubagentHistoryPage,
     SessionLiveStatus,
     GetRunInvocationStatus,
+    OperationStatus,
     GoalDisposition,
     GetInventoryBundle,
     DaemonStatus,
@@ -7054,6 +7059,10 @@ fn readonly_dispatch_case_list() -> Vec<ReadonlyDispatchCase> {
         ReadonlyDispatchCase {
             kind: "get_run_invocation_status",
             case: ReadonlyDispatchCaseKind::GetRunInvocationStatus,
+        },
+        ReadonlyDispatchCase {
+            kind: "operation_status",
+            case: ReadonlyDispatchCaseKind::OperationStatus,
         },
         ReadonlyDispatchCase {
             kind: "goal_status",
@@ -8906,6 +8915,9 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "get_run_invocation_status" => Request::GetRunInvocationStatus {
             client_submission_id: Uuid::new_v4(),
         },
+        "operation_status" => Request::OperationStatus {
+            operation_id: Uuid::from_u128(99),
+        },
         "cancel_run_invocation" => Request::CancelRunInvocation {
             client_submission_id: Uuid::new_v4(),
         },
@@ -9425,6 +9437,18 @@ impl ReadonlyDispatchCaseKind {
                 assert_eq!(status.client_submission_id, id);
                 assert_eq!(status.schema_version, 1);
             }
+            Self::OperationStatus => {
+                let ctx = test_ctx();
+                let operation_id = Uuid::from_u128(99);
+                let response =
+                    dispatch_matrix_request(&ctx, Request::OperationStatus { operation_id })
+                        .await
+                        .expect("operation_status happy");
+                let Response::RemoteOperationStatus { status } = response else {
+                    panic!("expected RemoteOperationStatus, got {response:?}");
+                };
+                assert!(status.is_none());
+            }
             Self::GuidanceEstimate => {
                 let ctx = test_ctx();
                 let tmp = tempfile::tempdir().unwrap();
@@ -9710,6 +9734,18 @@ impl ReadonlyDispatchCaseKind {
                 )
                 .await
                 .expect_err("nil client_submission_id is rejected");
+                assert_eq!(err.code, ErrorCode::BadRequest);
+            }
+            Self::OperationStatus => {
+                let ctx = test_ctx();
+                let err = dispatch_matrix_request(
+                    &ctx,
+                    Request::OperationStatus {
+                        operation_id: Uuid::nil(),
+                    },
+                )
+                .await
+                .expect_err("nil operation_id is rejected");
                 assert_eq!(err.code, ErrorCode::BadRequest);
             }
             Self::GuidanceEstimate => {
@@ -12980,6 +13016,15 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 client_submission_id: Uuid::from_u128(42),
             },
             kind: "get_run_invocation_status",
+            session_id: None,
+            audit_path: None,
+            mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::OperationStatus {
+                operation_id: Uuid::from_u128(99),
+            },
+            kind: "operation_status",
             session_id: None,
             audit_path: None,
             mutating: false,

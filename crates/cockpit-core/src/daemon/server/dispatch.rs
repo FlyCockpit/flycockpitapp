@@ -2267,7 +2267,121 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             project_root,
             from_path,
             to_path,
-        } => crate::daemon::fs_api::fs_rename(ctx.clone(), project_root, from_path, to_path).await,
+        } => {
+            if let Some(operation) = remote_operation {
+                let request = Request::FsRename {
+                    project_root: project_root.clone(),
+                    from_path: from_path.clone(),
+                    to_path: to_path.clone(),
+                };
+                let params = request
+                    .canonical_remote_operation_params_v1()
+                    .map_err(internal)?;
+                let canonical = authorized_request.encode_fcor(&request, &params)?;
+                let request_hash =
+                    proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+                let precondition = crate::daemon::fs_api::fs_rename_precondition_digest(
+                    &project_root,
+                    &from_path,
+                )?;
+                let attachment = operation.logical_attachment_id.to_string();
+                let operation_id = operation.operation_id.to_string();
+                let device = operation.authenticated_device_id.to_string();
+                let prepared=ctx.db.prepare_staged_filesystem_remote_operation(
+                    crate::db::remote_attachment_operations::ReserveRemoteOperation {
+                        logical_attachment_id:&attachment,operation_id:&operation_id,
+                        authenticated_device_id:&device,
+                        authenticated_device_generation:operation.authenticated_device_generation,
+                        operation_class:crate::db::remote_attachment_operations::RemoteOperationClass::IdempotentAdapterMutation,
+                        request_hash,now_ms:chrono::Utc::now().timestamp_millis(),
+                    },"fs_rename",precondition,request_hash,
+                ).await.map_err(internal)?;
+                let evidence=match prepared {
+                    crate::db::remote_attachment_operations::PrepareStagedFilesystemOperationOutcome::Prepared(value)
+                    | crate::db::remote_attachment_operations::PrepareStagedFilesystemOperationOutcome::Reconcile(value)=>value,
+                    crate::db::remote_attachment_operations::PrepareStagedFilesystemOperationOutcome::Replay(bytes)=>return serde_json::from_slice(&bytes).map_err(internal),
+                    crate::db::remote_attachment_operations::PrepareStagedFilesystemOperationOutcome::OperationConflict
+                    | crate::db::remote_attachment_operations::PrepareStagedFilesystemOperationOutcome::OperationActorConflict=>return Err(ErrorPayload{code:ErrorCode::Conflict,message:"remote operation conflict".into()}),
+                    crate::db::remote_attachment_operations::PrepareStagedFilesystemOperationOutcome::AttachmentLedgerCapacity=>return Err(ErrorPayload{code:ErrorCode::Conflict,message:"remote operation capacity reached".into()}),
+                };
+                if evidence.state == "prepared" {
+                    let root = project_root.clone();
+                    let to = to_path.clone();
+                    let artifact = evidence.artifact_id.clone();
+                    let pre = evidence.precondition_digest;
+                    let result = evidence.result_digest;
+                    tokio::task::spawn_blocking(move || {
+                        crate::daemon::fs_api::stage_remote_rename_sync(
+                            &root, &to, &artifact, pre, result,
+                        )
+                    })
+                    .await
+                    .map_err(internal)??;
+                    let advanced = ctx
+                        .db
+                        .advance_staged_filesystem_remote_operation(
+                            &attachment,
+                            &operation_id,
+                            &evidence.artifact_id,
+                            "prepared",
+                            "artifact_synced",
+                            chrono::Utc::now().timestamp_millis(),
+                        )
+                        .await
+                        .map_err(internal)?;
+                    if !advanced {
+                        return Err(internal(anyhow::anyhow!("staged rename barrier raced")));
+                    }
+                }
+                let root = project_root.clone();
+                let from = from_path.clone();
+                let to = to_path.clone();
+                let artifact = evidence.artifact_id.clone();
+                let pre = evidence.precondition_digest;
+                let result = evidence.result_digest;
+                let fs_ctx = ctx.clone();
+                let (response, sidecar) = tokio::task::spawn_blocking(move || {
+                    crate::daemon::fs_api::apply_or_reconcile_remote_rename_sync(
+                        &fs_ctx, &root, &from, &to, &artifact, pre, result,
+                    )
+                })
+                .await
+                .map_err(internal)??;
+                if evidence.state != "applied" && evidence.state != "ledger_committed" {
+                    let from_state = if evidence.state == "prepared" {
+                        "artifact_synced"
+                    } else {
+                        evidence.state.as_str()
+                    };
+                    let advanced = ctx
+                        .db
+                        .advance_staged_filesystem_remote_operation(
+                            &attachment,
+                            &operation_id,
+                            &evidence.artifact_id,
+                            from_state,
+                            "applied",
+                            chrono::Utc::now().timestamp_millis(),
+                        )
+                        .await
+                        .map_err(internal)?;
+                    if !advanced {
+                        return Err(internal(anyhow::anyhow!(
+                            "staged rename apply barrier raced"
+                        )));
+                    }
+                }
+                let committed =
+                    commit_remote_idempotent_adapter(operation, ctx, "fs_rename", response).await?;
+                if std::fs::remove_file(&sidecar).is_ok()
+                    && let Some(parent) = sidecar.parent()
+                {
+                    let _ = std::fs::File::open(parent).and_then(|dir| dir.sync_all());
+                }
+                return Ok(committed);
+            }
+            crate::daemon::fs_api::fs_rename(ctx.clone(), project_root, from_path, to_path).await
+        }
 
         Request::FsDelete { project_root, path } => {
             crate::daemon::fs_api::fs_delete(ctx.clone(), project_root, path).await

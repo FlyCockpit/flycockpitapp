@@ -2705,6 +2705,49 @@ BEGIN
     SELECT RAISE(ABORT, 'remote attachment close authority is immutable');
 END;
 
+CREATE TABLE remote_staged_filesystem_operations (
+    logical_attachment_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    adapter_kind TEXT NOT NULL CHECK(adapter_kind IN ('fs_write','fs_create_dir','fs_rename')),
+    artifact_id TEXT NOT NULL UNIQUE CHECK (
+        length(artifact_id)=36 AND artifact_id=lower(artifact_id)
+        AND substr(artifact_id,9,1)='-' AND substr(artifact_id,14,1)='-'
+        AND substr(artifact_id,19,1)='-' AND substr(artifact_id,24,1)='-'
+        AND substr(artifact_id,20,1) GLOB '[89ab]'
+        AND length(replace(artifact_id,'-',''))=32
+        AND replace(artifact_id,'-','') NOT GLOB '*[^0-9a-f]*'
+        AND replace(artifact_id,'-','') <> '00000000000000000000000000000000'
+    ),
+    precondition_digest BLOB NOT NULL CHECK(length(precondition_digest)=32),
+    result_digest BLOB NOT NULL CHECK(length(result_digest)=32),
+    state TEXT NOT NULL CHECK(state IN ('prepared','artifact_synced','applied','ledger_committed')),
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    PRIMARY KEY(logical_attachment_id,operation_id),
+    FOREIGN KEY(logical_attachment_id,operation_id)
+      REFERENCES remote_attachment_operations(logical_attachment_id,operation_id) ON DELETE CASCADE
+);
+
+CREATE TRIGGER remote_staged_filesystem_binding_immutable
+BEFORE UPDATE ON remote_staged_filesystem_operations
+WHEN NEW.logical_attachment_id IS NOT OLD.logical_attachment_id
+  OR NEW.operation_id IS NOT OLD.operation_id
+  OR NEW.adapter_kind IS NOT OLD.adapter_kind
+  OR NEW.artifact_id IS NOT OLD.artifact_id
+  OR NEW.precondition_digest IS NOT OLD.precondition_digest
+  OR NEW.result_digest IS NOT OLD.result_digest
+  OR NEW.created_at_ms IS NOT OLD.created_at_ms
+  OR NEW.updated_at_ms < OLD.updated_at_ms
+  OR CASE OLD.state
+       WHEN 'prepared' THEN NEW.state NOT IN ('prepared','artifact_synced','applied')
+       WHEN 'artifact_synced' THEN NEW.state NOT IN ('artifact_synced','applied')
+       WHEN 'applied' THEN NEW.state NOT IN ('applied','ledger_committed')
+       ELSE NEW.state <> OLD.state
+     END
+BEGIN
+    SELECT RAISE(ABORT, 'remote staged filesystem evidence is immutable and monotonic');
+END;
+
 CREATE TRIGGER remote_attachment_operation_reservation_insert
 BEFORE INSERT ON remote_attachment_operations
 WHEN NEW.state <> 'reserved' OR NEW.safe_response IS NOT NULL OR NEW.event_high_water_mark IS NOT NULL

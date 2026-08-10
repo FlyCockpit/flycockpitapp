@@ -2540,6 +2540,8 @@ mod tests {
         db: cockpit_db::Db,
         job_id: Uuid,
         slot_id: Uuid,
+        spend_reservation_id: String,
+        media_reservation_id: String,
     }
 
     async fn setup_real_ledger_scheduler_job(
@@ -2650,6 +2652,8 @@ mod tests {
         .unwrap();
         let fixture_job_id = sealed.job_id;
         let fixture_slot_id = sealed.targets[0].slots[0].slot_id;
+        let fixture_spend = sealed.spend.reservation_id.clone();
+        let fixture_media = sealed.central_resources[0].reservation_identity.clone();
         db.transaction(move |conn| {
             let verified = CreateImageGenerationJob::from_verified_canonical_plan(
                 &canonical,
@@ -2691,6 +2695,8 @@ mod tests {
             db,
             job_id: fixture_job_id,
             slot_id: fixture_slot_id,
+            spend_reservation_id: fixture_spend,
+            media_reservation_id: fixture_media,
         }
     }
 
@@ -2722,6 +2728,49 @@ mod tests {
     #[tokio::test]
     async fn scheduler_dispatches_one_real_ledger_job_once() {
         run_real_ledger_scheduler_fixture("once").await;
+    }
+
+    #[tokio::test]
+    async fn accepted_result_cancelled_during_validation_is_late_quarantined() {
+        use cockpit_db::db::image_generation::{
+            AdoptImageGenerationResponse, BeginImageGenerationDownload,
+            CommitImageGenerationValidation, RequestImageGenerationCancellation,
+        };
+        let fixture = setup_real_ledger_scheduler_job(
+            cockpit_db::Db::open_in_memory().unwrap(),
+            "late-result",
+        )
+        .await;
+        assert!(
+            !fixture.spend_reservation_id.is_empty() && !fixture.media_reservation_id.is_empty()
+        );
+        let dispatcher = ImageGenerationDispatcher::new(fixture.db.clone());
+        let adapter = DeterministicImageGenerationAdapter::new(vec![
+            ImageGenerationHandoffResult::Accepted {
+                evidence: b"accepted-late".to_vec(),
+            },
+        ]);
+        assert_eq!(
+            dispatcher
+                .run_scheduler_pass(&adapter, Uuid::now_v7(), 100, 2, 2, 8)
+                .await
+                .unwrap()
+                .dispatched,
+            1
+        );
+        let request = adapter.requests().into_iter().next().unwrap();
+        let job_id = fixture.job_id;
+        let slot_id = fixture.slot_id;
+        fixture.db.transaction(move|conn|{
+            cockpit_db::Db::begin_image_generation_download_conn(conn,&BeginImageGenerationDownload{job_id,slot_id,attempt_number:1,expected_job_version:5,expected_slot_version:4,expected_attempt_version:5,at_unix_ms:3})?;
+            cockpit_db::Db::adopt_image_generation_response_conn(conn,&AdoptImageGenerationResponse{job_id,slot_id,attempt_number:1,expected_attempt_version:6,expected_slot_version:5,external_operation_id:request.external_operation_id,expected_journal_version:3,response_digest:&"a".repeat(64),now_unix_ms:4})?;
+            cockpit_db::Db::request_image_generation_cancellation_conn(conn,&RequestImageGenerationCancellation{job_id,cancellation_version:1,request_operation_id:"cancel:late",requested_at_unix_ms:5})?;
+            let state=cockpit_db::Db::commit_image_generation_validation_conn(conn,&CommitImageGenerationValidation{job_id,slot_id,expected_slot_version:7,at_unix_ms:6})?;
+            assert_eq!(state,cockpit_db::db::image_generation::ImageGenerationSlotState::LateQuarantined);
+            let persisted:(String,String)=conn.query_row("SELECT s.state,j.state FROM image_generation_slots s JOIN image_generation_jobs j USING(job_id) WHERE s.job_id=?1 AND s.slot_id=?2",rusqlite::params![job_id.to_string(),slot_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?)))?;
+            assert_eq!(persisted,("late_quarantined".into(),"completed_after_cancel".into()));
+            Ok(())
+        }).await.unwrap();
     }
 
     #[tokio::test]

@@ -161,10 +161,22 @@ impl MediaStorageRecovery {
 
         let storage_id = Uuid::now_v7();
         let storage_name = storage_id.to_string();
+        let intent_operation = request.local_operation_id.to_string();
+        let intent_storage = storage_name.clone();
+        self.db
+            .transaction(move |conn| {
+                conn.execute(
+                    "INSERT INTO media_retained_https_publication_intents(local_operation_id,storage_id,created_at_unix_ms) VALUES(?1,?2,?3)",
+                    params![intent_operation, intent_storage, now_unix_ms],
+                )?;
+                Ok(())
+            })
+            .await?;
         let mut held = self
             .owned_root
             .create_file_exclusive(&storage_name)
             .map_err(anyhow::Error::new)?;
+        self.owned_root.sync().map_err(anyhow::Error::new)?;
         let async_file = tokio::fs::File::from_std(held.try_clone()?);
         let mut async_file = async_file;
         let fetch = crate::media_https::fetch_retained_https(
@@ -178,6 +190,18 @@ impl MediaStorageRecovery {
             Ok(fetch) => fetch,
             Err(error) => {
                 let _ = self.owned_root.remove_file(&storage_name);
+                let _ = self.owned_root.sync();
+                let cleanup_operation = request.local_operation_id.to_string();
+                let _ = self
+                    .db
+                    .transaction(move |conn| {
+                        conn.execute(
+                            "DELETE FROM media_retained_https_publication_intents WHERE local_operation_id=?1",
+                            [cleanup_operation],
+                        )?;
+                        Ok(())
+                    })
+                    .await;
                 return Err(error);
             }
         };
@@ -315,15 +339,16 @@ impl MediaStorageRecovery {
         let receipt_json = serde_json::to_string(&receipt)?;
         let request_for_tx = request.clone();
         let result=self.db.transaction(move|conn|{
-            if let Some((authoritative,stored_semantic,json))=conn.query_row("SELECT authoritative_operation_id,semantic_command_digest,receipt_json FROM media_retained_https_operations WHERE session_id=?1 AND canonical_project_digest=?2 AND client_draft_id=?3 AND is_alias=0",params![request_for_tx.session_id.to_string(),request_for_tx.canonical_project_digest,request_for_tx.client_draft_id.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()? { ensure!(stored_semantic==semantic_digest,"idempotency_conflict"); conn.execute("INSERT INTO media_retained_https_operations(local_operation_id,authoritative_operation_id,session_id,canonical_project_digest,client_draft_id,request_binding_digest,operation_request_digest,semantic_command_digest,receipt_json,committed_at_unix_ms,is_alias) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1)",params![request_for_tx.local_operation_id.to_string(),authoritative,request_for_tx.session_id.to_string(),request_for_tx.canonical_project_digest,request_for_tx.client_draft_id.to_string(),binding,request_digest,semantic_digest,json,now_unix_ms])?; return Ok(serde_json::from_str(&json)?); }
+            if let Some((authoritative,stored_semantic,json))=conn.query_row("SELECT authoritative_operation_id,semantic_command_digest,receipt_json FROM media_retained_https_operations WHERE session_id=?1 AND canonical_project_digest=?2 AND client_draft_id=?3 AND is_alias=0",params![request_for_tx.session_id.to_string(),request_for_tx.canonical_project_digest,request_for_tx.client_draft_id.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()? { ensure!(stored_semantic==semantic_digest,"idempotency_conflict"); conn.execute("INSERT INTO media_retained_https_operations(local_operation_id,authoritative_operation_id,session_id,canonical_project_digest,client_draft_id,request_binding_digest,operation_request_digest,semantic_command_digest,receipt_json,committed_at_unix_ms,is_alias) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1)",params![request_for_tx.local_operation_id.to_string(),authoritative,request_for_tx.session_id.to_string(),request_for_tx.canonical_project_digest,request_for_tx.client_draft_id.to_string(),binding,request_digest,semantic_digest,json,now_unix_ms])?; conn.execute("DELETE FROM media_retained_https_publication_intents WHERE local_operation_id=?1",[request_for_tx.local_operation_id.to_string()])?; return Ok(serde_json::from_str(&json)?); }
             crate::media_reservation::reserve_conn(conn,crate::media_reservation::ReserveRequest{reservation_id:reservation_id.clone(),recovery_id:reservation_id.clone(),owner:crate::media_reservation::MediaOwner{project_id:request_for_tx.canonical_project_digest.clone(),session_id:request_for_tx.session_id.to_string()},operation:"retained_https_ingest".into(),purpose:"retained_media".into(),plans,wall_ms:u64::try_from(now_unix_ms)?},monotonic_now_ms)?;
             cockpit_db::Db::insert_media_attachment_conn(conn,&record)?; cockpit_db::Db::insert_media_attachment_component_conn(conn,&component)?;
             conn.execute("INSERT INTO media_retained_https_evidence(attachment_id,source_evidence_digest,redirect_classes_json,path_segment_count,safe_basename,fetched_at_unix_ms,reservation_id,reservation_digest) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![attachment_id.to_string(),source_evidence_digest,serde_json::to_string(&redirect_classes)?,path_segment_count,safe_basename,now_unix_ms,reservation_id,reservation_digest])?;
             conn.execute("INSERT INTO media_retained_https_operations(local_operation_id,authoritative_operation_id,session_id,canonical_project_digest,client_draft_id,request_binding_digest,operation_request_digest,semantic_command_digest,receipt_json,committed_at_unix_ms,is_alias) VALUES(?1,?1,?2,?3,?4,?5,?6,?7,?8,?9,0)",params![request_for_tx.local_operation_id.to_string(),request_for_tx.session_id.to_string(),request_for_tx.canonical_project_digest,request_for_tx.client_draft_id.to_string(),binding,request_digest,semantic_digest,receipt_json,now_unix_ms])?;
-            conn.execute("INSERT INTO media_retained_https_audit(local_operation_id,outcome,committed_at_unix_ms) VALUES(?1,'retained',?2)",params![request_for_tx.local_operation_id.to_string(),now_unix_ms])?; Ok(receipt)
+            conn.execute("INSERT INTO media_retained_https_audit(local_operation_id,outcome,committed_at_unix_ms) VALUES(?1,'retained',?2)",params![request_for_tx.local_operation_id.to_string(),now_unix_ms])?; conn.execute("DELETE FROM media_retained_https_publication_intents WHERE local_operation_id=?1",[request_for_tx.local_operation_id.to_string()])?; Ok(receipt)
         }).await;
         if result.as_ref().is_err() || result.as_ref().is_ok_and(|r| r.receipt_id != receipt_id) {
             let _ = self.owned_root.remove_file(&storage_name);
+            let _ = self.owned_root.sync();
         }
         result
     }
@@ -1079,8 +1104,30 @@ impl MediaStorageRecovery {
         use cockpit_db::media_attachments::{
             MediaUploadLastTransitionV1, MediaUploadSystemActionV1, RemoteMediaOperationOutcomeV1,
         };
-        let publication_intents=self.db.read(|conn|{let mut statement=conn.prepare("SELECT upload_id,temporary_storage_id,quarantine_storage_id,derivative_storage_ids_json FROM media_storage_publication_intents ORDER BY created_at_unix_ms,upload_id")?;let rows=statement.query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?)))?;rows.collect::<std::result::Result<Vec<_>,_>>().map_err(Into::into)}).await?;
         let mut repaired = 0usize;
+        let https_intents = self.db.read(|conn| {
+            let mut statement=conn.prepare("SELECT local_operation_id,storage_id FROM media_retained_https_publication_intents ORDER BY created_at_unix_ms,local_operation_id")?;
+            statement.query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))?.collect::<std::result::Result<Vec<_>,_>>().map_err(Into::into)
+        }).await?;
+        for (operation_id, storage_id) in https_intents {
+            if let Some(file) = open_optional_verified(&self.owned_root, &storage_id)? {
+                self.owned_root
+                    .remove_file(&storage_id)
+                    .map_err(anyhow::Error::new)?;
+                self.owned_root.sync().map_err(anyhow::Error::new)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt as _;
+                    ensure!(
+                        file.metadata()?.nlink() == 0,
+                        "retained HTTPS orphan was not deleted"
+                    );
+                }
+            }
+            self.db.transaction(move|conn|{conn.execute("DELETE FROM media_retained_https_publication_intents WHERE local_operation_id=?1",[operation_id])?;Ok(())}).await?;
+            repaired += 1;
+        }
+        let publication_intents=self.db.read(|conn|{let mut statement=conn.prepare("SELECT upload_id,temporary_storage_id,quarantine_storage_id,derivative_storage_ids_json FROM media_storage_publication_intents ORDER BY created_at_unix_ms,upload_id")?;let rows=statement.query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?)))?;rows.collect::<std::result::Result<Vec<_>,_>>().map_err(Into::into)}).await?;
         for (upload_id, temporary, quarantine, derivative_json) in publication_intents {
             let derivatives: Vec<String> = serde_json::from_str(&derivative_json)?;
             for derivative in derivatives {
@@ -5472,12 +5519,27 @@ mod tests {
         let intent_quarantine = quarantine.clone();
         let intent_derivatives = serde_json::to_string(&vec![orphan.clone()]).unwrap();
         db.transaction(move|conn|{conn.execute("INSERT INTO media_storage_publication_intents(upload_id,temporary_storage_id,quarantine_storage_id,derivative_storage_ids_json,created_at_unix_ms) VALUES(?1,?2,?3,?4,14)",params![intent_upload,intent_temporary,intent_quarantine,intent_derivatives])?;Ok(())}).await.unwrap();
+        let https_operation = Uuid::now_v7().to_string();
+        let https_orphan = Uuid::now_v7().to_string();
+        std::fs::write(
+            temp.path().join("media").join(&https_orphan),
+            b"https-orphan",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            temp.path().join("media").join(&https_orphan),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let https_orphan_for_db = https_orphan.clone();
+        db.transaction(move|conn|{conn.execute("INSERT INTO media_retained_https_publication_intents(local_operation_id,storage_id,created_at_unix_ms) VALUES(?1,?2,14)",params![https_operation,https_orphan_for_db])?;Ok(())}).await.unwrap();
         drop(recovery);
         let recovery = MediaStorageRecovery::open(db.clone(), &temp.path().join("media")).unwrap();
-        assert_eq!(recovery.reconcile_media_uploads(15).await.unwrap(), 1);
+        assert_eq!(recovery.reconcile_media_uploads(15).await.unwrap(), 2);
         assert!(temp.path().join("media").join(&temporary).exists());
         assert!(!temp.path().join("media").join(&quarantine).exists());
         assert!(!temp.path().join("media").join(&orphan).exists());
+        assert!(!temp.path().join("media").join(&https_orphan).exists());
         let insecure = Uuid::now_v7().to_string();
         std::fs::write(temp.path().join("media").join(&insecure), b"insecure").unwrap();
         std::fs::set_permissions(

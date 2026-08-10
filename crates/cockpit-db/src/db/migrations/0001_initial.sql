@@ -491,6 +491,12 @@ CREATE TABLE media_retained_https_audit (
     committed_at_unix_ms INTEGER NOT NULL
 );
 
+CREATE TABLE media_retained_https_publication_intents (
+    local_operation_id TEXT PRIMARY KEY,
+    storage_id         TEXT NOT NULL UNIQUE,
+    created_at_unix_ms INTEGER NOT NULL
+);
+
 CREATE TABLE media_uploads (
     upload_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, canonical_project_digest TEXT NOT NULL,
     client_draft_id TEXT NOT NULL, media_kind TEXT NOT NULL CHECK(media_kind IN ('image','audio','video')),

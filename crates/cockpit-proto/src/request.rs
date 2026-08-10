@@ -1049,6 +1049,8 @@ pub enum Request {
 
     GetMediaAttachmentStatus(cockpit_db::media_attachments::GetMediaAttachmentStatusV1),
 
+    GetMediaAttachmentPreview(cockpit_db::media_attachments::GetMediaAttachmentPreviewV1),
+
     BeginMediaUpload(cockpit_db::media_attachments::BeginMediaUploadV1),
 
     AppendMediaUploadChunk(cockpit_db::media_attachments::AppendMediaUploadChunkV1),
@@ -1328,6 +1330,7 @@ macro_rules! request_variants {
             (Request::RecoverSecurityBlockedMedia(..), "recover_security_blocked_media");
             (Request::RegisterLocalPathMedia(..), "register_local_path_media");
             (Request::GetMediaAttachmentStatus(..), "get_media_attachment_status");
+            (Request::GetMediaAttachmentPreview(..), "get_media_attachment_preview");
             (Request::BeginMediaUpload(..), "begin_media_upload");
             (Request::AppendMediaUploadChunk(..), "append_media_upload_chunk");
             (Request::CancelMediaUpload(..), "cancel_media_upload");
@@ -1482,6 +1485,7 @@ macro_rules! command {
             (Request::RecoverSecurityBlockedMedia(..), "recover_security_blocked_media", owner_only, none, true, serialized, none);
             (Request::RegisterLocalPathMedia(..), "register_local_path_media", owner_only, none, true, serialized, none);
             (Request::GetMediaAttachmentStatus(..), "get_media_attachment_status", public_read, none, false, serialized, none);
+            (Request::GetMediaAttachmentPreview(..), "get_media_attachment_preview", public_read, none, false, serialized, none);
             (Request::BeginMediaUpload(..), "begin_media_upload", public_read, none, true, serialized, none);
             (Request::AppendMediaUploadChunk(..), "append_media_upload_chunk", public_read, none, true, serialized, none);
             (Request::CancelMediaUpload(..), "cancel_media_upload", public_read, none, true, serialized, none);

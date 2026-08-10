@@ -2317,6 +2317,116 @@ pub(super) async fn handle_serialized_request(
                 .ok_or_else(unavailable)?;
             Ok(Response::MediaAttachmentStatus(status))
         }
+        Request::GetMediaAttachmentPreview(request) => {
+            use cockpit_db::media_attachments::{
+                GetMediaAttachmentStatusV1, MediaAttachmentPreviewV1,
+                MediaAttachmentStatusDetailV1, MediaComponentLeaseKind,
+            };
+            use sha2::{Digest as _, Sha256};
+            let unavailable = || ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: "media_attachment_unavailable".into(),
+            };
+            if request.schema_version != 1
+                || request.kind != "getMediaAttachmentPreview"
+                || request.attachment_version == 0
+                || request.availability_generation == 0
+                || request.preview_generation == 0
+            {
+                return Err(unavailable());
+            }
+            authorize_session_row_reader(&state.principal, ctx, request.session_id)
+                .await
+                .map_err(|_| unavailable())?;
+            let attached = require_attached(state).map_err(|_| unavailable())?;
+            let project_text = attached
+                .handle
+                .project_root
+                .to_str()
+                .ok_or_else(unavailable)?;
+            let project_digest = crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes()));
+            if request.session_id != attached.handle.session_id
+                || request.canonical_project_digest != project_digest
+                || request.preview_checksum.len() != 64
+                || request
+                    .preview_checksum
+                    .bytes()
+                    .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+            {
+                return Err(unavailable());
+            }
+            let status_request = GetMediaAttachmentStatusV1 {
+                schema_version: 1,
+                kind: "getMediaAttachmentStatus".into(),
+                session_id: request.session_id,
+                canonical_project_digest: request.canonical_project_digest.clone(),
+                attachment_id: request.attachment_id,
+            };
+            let (status, capability) = ctx
+                .db
+                .read(move |conn| {
+                    let status = cockpit_db::Db::media_attachment_status_for_owner_conn(
+                        conn,
+                        &status_request,
+                    )?
+                    .context("media_attachment_unavailable")?;
+                    let record = cockpit_db::Db::media_attachment_for_owner_conn(
+                        conn,
+                        status_request.attachment_id,
+                        status_request.session_id,
+                        &status_request.canonical_project_digest,
+                    )?
+                    .context("media_attachment_unavailable")?;
+                    Ok((status, record.captured_capability_generation))
+                })
+                .await
+                .map_err(|_| unavailable())?;
+            let MediaAttachmentStatusDetailV1::Ready {
+                preview: Some(preview),
+                ..
+            } = status.detail
+            else {
+                return Err(unavailable());
+            };
+            if status.attachment_version != request.attachment_version
+                || status.availability_generation != request.availability_generation
+                || preview.generation != request.preview_generation
+                || preview.checksum != request.preview_checksum
+                || preview.byte_length > 524_288
+            {
+                return Err(unavailable());
+            }
+            let storage = ctx
+                .media_storage_recovery
+                .as_ref()
+                .ok_or_else(unavailable)?;
+            let now = chrono::Utc::now().timestamp_millis();
+            let lease = storage
+                .acquire_component_lease(
+                    Uuid::now_v7(),
+                    request.attachment_id,
+                    request.attachment_version,
+                    request.availability_generation,
+                    capability,
+                    MediaComponentLeaseKind::Preview,
+                    now,
+                )
+                .await
+                .map_err(|_| unavailable())?;
+            let body = lease.read_verified(now).await.map_err(|_| unavailable())?;
+            if body.len() as u64 != preview.byte_length || !body.starts_with(b"\x89PNG\r\n\x1a\n") {
+                return Err(unavailable());
+            }
+            Ok(Response::MediaAttachmentPreview(MediaAttachmentPreviewV1 {
+                schema_version: 1,
+                kind: "mediaAttachmentPreview".into(),
+                content_type: "image/png".into(),
+                cache_control: "no-store, private".into(),
+                x_content_type_options: "nosniff".into(),
+                content_length: body.len() as u64,
+                body,
+            }))
+        }
         Request::BeginMediaUpload(request) => {
             use cockpit_db::media_attachments::{
                 LocalMediaActorRoleV1, LocalMediaMutationPayloadV1,

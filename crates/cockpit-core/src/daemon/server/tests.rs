@@ -1708,7 +1708,7 @@ async fn media_upload_production_dispatch_cancel_finalize_and_status() {
             schema_version: 1,
             kind: "getMediaUploadStatus".into(),
             session_id,
-            canonical_project_digest: project_digest,
+            canonical_project_digest: project_digest.clone(),
             client_draft_id: draft,
             upload_id: upload,
             upload_generation: generation + 1,
@@ -1721,12 +1721,70 @@ async fn media_upload_production_dispatch_cancel_finalize_and_status() {
         panic!("unexpected upload status")
     };
     assert!(matches!(
-        status.detail,
+        &status.detail,
         MediaUploadStateDetailV1::Materialized {
             attachment_version: 1,
             ..
         }
     ));
+    let cockpit_db::media_attachments::MediaUploadStateDetailV1::Materialized {
+        attachment_id,
+        attachment_version,
+        ..
+    } = status.detail
+    else {
+        unreachable!()
+    };
+    let Response::MediaAttachmentStatus(attachment_status) = handle_request(
+        Request::GetMediaAttachmentStatus(
+            cockpit_db::media_attachments::GetMediaAttachmentStatusV1 {
+                schema_version: 1,
+                kind: "getMediaAttachmentStatus".into(),
+                session_id,
+                canonical_project_digest: project_digest.clone(),
+                attachment_id,
+            },
+        ),
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap() else {
+        panic!("unexpected attachment status")
+    };
+    let cockpit_db::media_attachments::MediaAttachmentStatusDetailV1::Ready {
+        preview: Some(summary),
+        ..
+    } = attachment_status.detail
+    else {
+        panic!("ready image preview missing")
+    };
+    let Response::MediaAttachmentPreview(preview) = handle_request(
+        Request::GetMediaAttachmentPreview(
+            cockpit_db::media_attachments::GetMediaAttachmentPreviewV1 {
+                schema_version: 1,
+                kind: "getMediaAttachmentPreview".into(),
+                session_id,
+                canonical_project_digest: project_digest,
+                attachment_id,
+                attachment_version,
+                availability_generation: attachment_status.availability_generation,
+                preview_generation: summary.generation,
+                preview_checksum: summary.checksum,
+            },
+        ),
+        &mut state,
+        &ctx,
+    )
+    .await
+    .unwrap() else {
+        panic!("unexpected preview response")
+    };
+    assert_eq!(preview.content_type, "image/png");
+    assert_eq!(preview.cache_control, "no-store, private");
+    assert_eq!(preview.x_content_type_options, "nosniff");
+    assert_eq!(preview.content_length, preview.body.len() as u64);
+    assert!(preview.body.starts_with(b"\x89PNG\r\n\x1a\n"));
 }
 
 #[cfg(unix)]

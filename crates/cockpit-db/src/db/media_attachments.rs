@@ -406,6 +406,34 @@ pub struct GetMediaAttachmentStatusV1 {
     pub attachment_id: Uuid,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GetMediaAttachmentPreviewV1 {
+    pub schema_version: u8,
+    pub kind: String,
+    #[serde(with = "strict_uuid_v7")]
+    pub session_id: Uuid,
+    pub canonical_project_digest: String,
+    #[serde(with = "strict_uuid_v7")]
+    pub attachment_id: Uuid,
+    pub attachment_version: u64,
+    pub availability_generation: u64,
+    pub preview_generation: u64,
+    pub preview_checksum: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MediaAttachmentPreviewV1 {
+    pub schema_version: u8,
+    pub kind: String,
+    pub content_type: String,
+    pub cache_control: String,
+    pub x_content_type_options: String,
+    pub content_length: u64,
+    pub body: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaAttachmentReasonV1 {

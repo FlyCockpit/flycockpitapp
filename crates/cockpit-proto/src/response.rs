@@ -19,6 +19,8 @@ pub enum Response {
 
     MediaAttachmentStatus(cockpit_db::media_attachments::MediaAttachmentStatusV1),
 
+    MediaAttachmentPreview(cockpit_db::media_attachments::MediaAttachmentPreviewV1),
+
     LocalMediaMutation(cockpit_db::media_attachments::LocalMediaMutationReceiptV1),
 
     MediaUploadStatus(cockpit_db::media_attachments::MediaUploadStatusV1),

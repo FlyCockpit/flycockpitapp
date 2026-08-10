@@ -2074,7 +2074,9 @@ fn approved_av_runtime(
     use crate::external_runtime::{
         HealthState, ID_MEDIA_FFMPEG, ID_MEDIA_FFPROBE, select_media_runtime_pair,
     };
-    let (ffmpeg, ffprobe) = select_media_runtime_pair(snapshot).map_err(anyhow::Error::msg)?;
+    let (ffmpeg, ffprobe) = select_media_runtime_pair(snapshot)
+        .map_err(anyhow::Error::msg)
+        .context("model_runtime_unavailable")?;
     let evidence = |id| match &snapshot.get(id).context("model_runtime_unavailable")?.state {
         HealthState::Available {
             version_evidence: Some(value),

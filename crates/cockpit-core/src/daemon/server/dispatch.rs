@@ -269,6 +269,89 @@ pub(super) async fn handle_serialized_request(
         .await
 }
 
+async fn begin_remote_nonrepeatable(
+    request: &Request,
+    authorized: &AuthorizedRequestContext,
+    operation: &super::RemoteOperationContext,
+    ctx: &DaemonContext,
+) -> std::result::Result<Option<Response>, ErrorPayload> {
+    let params = request
+        .canonical_remote_operation_params_v1()
+        .map_err(internal)?;
+    let canonical = authorized.encode_fcor(request, &params)?;
+    let request_hash = proto::remote_operation_fcor::hash_fcor_v1(&canonical).map_err(internal)?;
+    let attachment = operation.logical_attachment_id.to_string();
+    let operation_id = operation.operation_id.to_string();
+    let device = operation.authenticated_device_id.to_string();
+    match ctx.db.begin_nonrepeatable_remote_operation(
+        crate::db::remote_attachment_operations::ReserveRemoteOperation {
+            logical_attachment_id: &attachment, operation_id: &operation_id,
+            authenticated_device_id: &device,
+            authenticated_device_generation: operation.authenticated_device_generation,
+            operation_class: crate::db::remote_attachment_operations::RemoteOperationClass::NonrepeatableMutation,
+            request_hash, now_ms: chrono::Utc::now().timestamp_millis(),
+        },
+    ).await.map_err(internal)? {
+        crate::db::remote_attachment_operations::BeginNonrepeatableRemoteOperationOutcome::Dispatch { .. } => Ok(None),
+        crate::db::remote_attachment_operations::BeginNonrepeatableRemoteOperationOutcome::Replay(bytes) =>
+            serde_json::from_slice(&bytes).map(Some).map_err(internal),
+        crate::db::remote_attachment_operations::BeginNonrepeatableRemoteOperationOutcome::OutcomeUnknown(_) =>
+            Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation outcome is unknown; it will not be retried".into() }),
+        crate::db::remote_attachment_operations::BeginNonrepeatableRemoteOperationOutcome::OperationConflict
+        | crate::db::remote_attachment_operations::BeginNonrepeatableRemoteOperationOutcome::OperationActorConflict =>
+            Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation conflict".into() }),
+        crate::db::remote_attachment_operations::BeginNonrepeatableRemoteOperationOutcome::AttachmentLedgerCapacity =>
+            Err(ErrorPayload { code: ErrorCode::Conflict, message: "remote operation capacity reached".into() }),
+    }
+}
+
+async fn commit_remote_nonrepeatable(
+    operation: &super::RemoteOperationContext,
+    ctx: &DaemonContext,
+    kind: &str,
+    response: Response,
+) -> std::result::Result<Response, ErrorPayload> {
+    let attachment = operation.logical_attachment_id.to_string();
+    let operation_id = operation.operation_id.to_string();
+    let bytes = serde_json::to_vec(&response).map_err(internal)?;
+    let delivery = Uuid::now_v7().to_string();
+    match ctx
+        .db
+        .commit_remote_attachment_operation(
+            crate::db::remote_attachment_operations::CommitRemoteOperation {
+                logical_attachment_id: &attachment,
+                operation_id: &operation_id,
+                safe_response: &bytes,
+                outbox_delivery_id: &delivery,
+                outbox_kind: kind,
+                outbox_payload: &bytes,
+                now_ms: chrono::Utc::now().timestamp_millis(),
+            },
+        )
+        .await
+        .map_err(internal)?
+    {
+        crate::db::remote_attachment_operations::CommitRemoteOperationOutcome::Committed {
+            ..
+        } => Ok(response),
+        _ => {
+            ctx.db
+                .mark_nonrepeatable_remote_operation_outcome_unknown(
+                    &attachment,
+                    &operation_id,
+                    br#"{"outcome":"unknown"}"#,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                .map_err(internal)?;
+            Err(ErrorPayload {
+                code: ErrorCode::Conflict,
+                message: "remote operation outcome is unknown; it will not be retried".into(),
+            })
+        }
+    }
+}
+
 pub(super) async fn handle_serialized_request_with_remote_operation(
     request: Request,
     state: &mut MutableClientState,
@@ -594,14 +677,35 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             label,
             message,
         } => {
+            if let Some(operation) = remote_operation {
+                let request = Request::SteerDelegation {
+                    session_id,
+                    task_call_id: task_call_id.clone(),
+                    label: label.clone(),
+                    message: message.clone(),
+                };
+                if let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+                {
+                    return Ok(response);
+                }
+            }
             let Some(handle) = ctx.registry.live_handle(session_id) else {
-                return Ok(Response::DelegationSteer {
+                let response = Response::DelegationSteer {
                     result: proto::DelegationSteerResult::not_steerable(
                         task_call_id,
                         Some(label),
                         "session is not live".to_string(),
                     ),
-                });
+                };
+                return match remote_operation {
+                    Some(operation) => {
+                        commit_remote_nonrepeatable(operation, ctx, "steer_delegation", response)
+                            .await
+                    }
+                    None => Ok(response),
+                };
             };
             let (respond_to, response_rx) = tokio::sync::oneshot::channel();
             handle
@@ -615,7 +719,13 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 .await
                 .map_err(internal)?;
             let result = response_rx.await.map_err(internal)?;
-            Ok(Response::DelegationSteer { result })
+            let response = Response::DelegationSteer { result };
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "steer_delegation", response).await
+                }
+                None => Ok(response),
+            }
         }
 
         Request::BeginAttachmentUpload {
@@ -927,13 +1037,28 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     message: "repair_resume session_id does not match the attached session".into(),
                 });
             }
+            if let Some(operation) = remote_operation {
+                let request = Request::RepairResume { session_id };
+                if let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+                {
+                    return Ok(response);
+                }
+            }
             let (respond_to, response_rx) = tokio::sync::oneshot::channel();
             att.handle
                 .send_work(SessionWork::RepairResume { respond_to })
                 .await
                 .map_err(internal)?;
             match response_rx.await.map_err(internal)? {
-                Ok(()) => Ok(Response::Ack),
+                Ok(()) => match remote_operation {
+                    Some(operation) => {
+                        commit_remote_nonrepeatable(operation, ctx, "repair_resume", Response::Ack)
+                            .await
+                    }
+                    None => Ok(Response::Ack),
+                },
                 Err(message) => Err(ErrorPayload {
                     code: ErrorCode::BadRequest,
                     message,
@@ -2066,6 +2191,21 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         }
 
         Request::TerminalInput { terminal_id, bytes } => {
+            if let Some(operation) = remote_operation {
+                let request = Request::TerminalInput {
+                    terminal_id,
+                    bytes: bytes.clone(),
+                };
+                if let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+                {
+                    return Ok(response);
+                }
+                let response = state.terminal_host.input(terminal_id, bytes)?;
+                return commit_remote_nonrepeatable(operation, ctx, "terminal_input", response)
+                    .await;
+            }
             state.terminal_host.input(terminal_id, bytes)
         }
 
@@ -2073,7 +2213,25 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             terminal_id,
             cols,
             rows,
-        } => state.terminal_host.resize(terminal_id, cols, rows),
+        } => {
+            if let Some(operation) = remote_operation {
+                let request = Request::TerminalResize {
+                    terminal_id,
+                    cols,
+                    rows,
+                };
+                if let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+                {
+                    return Ok(response);
+                }
+                let response = state.terminal_host.resize(terminal_id, cols, rows)?;
+                return commit_remote_nonrepeatable(operation, ctx, "terminal_resize", response)
+                    .await;
+            }
+            state.terminal_host.resize(terminal_id, cols, rows)
+        }
 
         Request::CloseTerminal { terminal_id } => {
             state.terminal_views.remove(&terminal_id);
@@ -2936,29 +3094,71 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
 
         Request::Prune => {
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation
+                && let Some(response) =
+                    begin_remote_nonrepeatable(&Request::Prune, &authorized_request, operation, ctx)
+                        .await?
+            {
+                return Ok(response);
+            }
             att.handle
                 .send_work(SessionWork::Prune)
                 .await
                 .map_err(internal)?;
-            Ok(Response::Ack)
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "prune", Response::Ack).await
+                }
+                None => Ok(Response::Ack),
+            }
         }
 
         Request::Compact => {
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation
+                && let Some(response) = begin_remote_nonrepeatable(
+                    &Request::Compact,
+                    &authorized_request,
+                    operation,
+                    ctx,
+                )
+                .await?
+            {
+                return Ok(response);
+            }
             att.handle
                 .send_work(SessionWork::Compact)
                 .await
                 .map_err(internal)?;
-            Ok(Response::Ack)
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "compact", Response::Ack).await
+                }
+                None => Ok(Response::Ack),
+            }
         }
 
         Request::Pin { text } => {
             let att = require_attached(state)?;
+            if let Some(operation) = remote_operation {
+                let request = Request::Pin { text: text.clone() };
+                if let Some(response) =
+                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                        .await?
+                {
+                    return Ok(response);
+                }
+            }
             att.handle
                 .send_work(SessionWork::Pin { text })
                 .await
                 .map_err(internal)?;
-            Ok(Response::Ack)
+            match remote_operation {
+                Some(operation) => {
+                    commit_remote_nonrepeatable(operation, ctx, "pin", Response::Ack).await
+                }
+                None => Ok(Response::Ack),
+            }
         }
 
         Request::StoreFlycockpitCredential { credential } => {

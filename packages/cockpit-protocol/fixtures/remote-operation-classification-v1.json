@@ -374,8 +374,8 @@
       "tag": "repair_resume",
       "fcorSchema": "session_id:Uuid",
       "fcorCanonicalSchema": "session_id:uuid",
-      "class": "transactional_mutation",
-      "strategy": "sql_transaction",
+      "class": "nonrepeatable_mutation",
+      "strategy": "nonrepeatable_dispatch",
       "evidence": null,
       "fcorRoles": [
         {

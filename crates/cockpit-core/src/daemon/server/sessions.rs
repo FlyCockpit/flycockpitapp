@@ -451,6 +451,16 @@ pub(super) async fn delete_session(
         .terminalize_session_run_invocations(session_id, now_wall_ms)
         .await
         .map_err(internal)?;
+    if let Some(storage) = &ctx.media_storage_recovery {
+        storage
+            .begin_session_deletion_cleanup(session_id, now_wall_ms)
+            .await
+            .map_err(internal)?;
+        storage
+            .reconcile_media_cleanup_intents(now_wall_ms)
+            .await
+            .map_err(internal)?;
+    }
     ctx.db.delete_session(session_id).await.map_err(internal)?;
     Ok(Response::Ack)
 }

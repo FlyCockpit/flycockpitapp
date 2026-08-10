@@ -398,7 +398,7 @@ impl Db {
         let response = safe_response.to_vec();
         self.transaction(move |conn| {
             let journal = conn.execute(
-                "UPDATE remote_rename_journal SET state='effect_unknown',updated_at_ms=?4 WHERE logical_attachment_id=?1 AND operation_id=?2 AND dispatch_generation=?3 AND state IN ('artifact_synced','renamed','source_parent_synced','target_parent_synced')",
+                "UPDATE remote_rename_journal SET state='effect_unknown',updated_at_ms=?4 WHERE logical_attachment_id=?1 AND operation_id=?2 AND dispatch_generation=?3 AND state IN ('prepared','artifact_synced','renamed','source_parent_synced','target_parent_synced')",
                 params![attachment, operation, generation, now_ms],
             )?;
             ensure!(journal == 1, "rename unknown requires artifact-synced expected generation");
@@ -2815,6 +2815,70 @@ mod tests {
             )
             .await
             .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_rename_can_close_unknown_atomically_and_never_redispatch() {
+        let db = Db::open_in_memory().unwrap();
+        let operation = "01890f3e-4c00-7000-8000-0000000000ae";
+        let request = || ReserveRemoteOperation {
+            operation_class: RemoteOperationClass::IdempotentAdapterMutation,
+            ..reserve(operation, [19; 32])
+        };
+        assert!(matches!(
+            db.prepare_remote_rename_operation(
+                request(),
+                Some(filesystem_identity(1, 1)),
+                Some(filesystem_identity(2, 2)),
+                Some(filesystem_identity(3, 2)),
+            )
+            .await
+            .unwrap(),
+            PrepareRemoteRenameOutcome::Prepared(_)
+        ));
+        assert!(
+            db.record_remote_rename_effect_unknown(
+                ATTACHMENT,
+                operation,
+                1,
+                b"{\"outcome\":\"unknown\"}",
+                11,
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            db.prepare_remote_rename_operation(request(), None, None, None)
+                .await
+                .unwrap(),
+            PrepareRemoteRenameOutcome::OutcomeUnknown(b"{\"outcome\":\"unknown\"}".to_vec())
+        );
+        let (journal, operation_state, outbox): (String, String, i64) = db
+            .read(move |conn| {
+                Ok((
+                    conn.query_row(
+                        "SELECT state FROM remote_rename_journal WHERE logical_attachment_id=?1 AND operation_id=?2",
+                        params![ATTACHMENT, operation],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT state FROM remote_attachment_operations WHERE logical_attachment_id=?1 AND operation_id=?2",
+                        params![ATTACHMENT, operation],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM remote_attachment_outbox WHERE logical_attachment_id=?1",
+                        [ATTACHMENT],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            (journal.as_str(), operation_state.as_str(), outbox),
+            ("effect_unknown", "outcome_unknown", 0)
         );
     }
 

@@ -5922,6 +5922,7 @@ async fn staged_rename_executor_recovers_every_durability_barrier_cut() {
         "target_parent_fsync",
         "applied_journal",
         "ledger_committed",
+        "source_identity_swap",
     ]
     .into_iter()
     .enumerate()
@@ -5984,6 +5985,16 @@ async fn staged_rename_executor_recovers_every_durability_barrier_cut() {
                 &operation,
                 &ctx,
                 |barrier| {
+                    if cut == "source_identity_swap" && barrier == "artifact_durable" {
+                        fired = true;
+                        std::fs::rename(
+                            tmp.path().join("from.txt"),
+                            tmp.path().join("original.txt"),
+                        )
+                        .unwrap();
+                        std::fs::write(tmp.path().join("from.txt"), b"replacement").unwrap();
+                        return Ok(());
+                    }
                     if !fired && barrier == cut {
                         fired = true;
                         return Err(ErrorPayload {
@@ -5998,6 +6009,35 @@ async fn staged_rename_executor_recovers_every_durability_barrier_cut() {
             .is_err()
         );
         assert!(fired, "cut {cut} was not reached");
+        if cut == "source_identity_swap" {
+            assert!(
+                execute_remote_staged_rename(&request, &authorized, &operation, &ctx)
+                    .await
+                    .is_err()
+            );
+            let status = ctx
+                .db
+                .remote_operation_status(
+                    &operation.logical_attachment_id.to_string(),
+                    &operation.operation_id.to_string(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(status.state, "outcome_unknown");
+            assert_eq!(
+                std::fs::read(tmp.path().join("from.txt")).unwrap(),
+                b"replacement"
+            );
+            assert!(!tmp.path().join("to.txt").exists());
+            assert!(
+                std::fs::read_dir(spool.path().join("remote-operations"))
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+            continue;
+        }
         assert_eq!(
             execute_remote_staged_rename(&request, &authorized, &operation, &ctx)
                 .await

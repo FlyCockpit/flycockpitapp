@@ -475,7 +475,26 @@ impl ExternalJournal {
                 continue;
             };
             if !generation.is_empty() && generation.bytes().all(|byte| byte.is_ascii_digit()) {
+                let held = dir.open_file_verified(&name)?;
                 dir.remove_file(&name)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt as _;
+                    if held
+                        .metadata()
+                        .map_err(|error| {
+                            ExternalJournalError::Spool(format!(
+                                "verify removed rename artifact: {error}"
+                            ))
+                        })?
+                        .nlink()
+                        != 0
+                    {
+                        return Err(ExternalJournalError::Containment(
+                            "rename artifact unlink identity proof failed".into(),
+                        ));
+                    }
+                }
             }
         }
         dir.sync()

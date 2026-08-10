@@ -2759,7 +2759,7 @@ WHEN NEW.logical_attachment_id IS NOT OLD.logical_attachment_id
   OR NEW.dispatch_generation < OLD.dispatch_generation
   OR NEW.updated_at_ms < OLD.updated_at_ms
   OR CASE OLD.state
-       WHEN 'prepared' THEN NEW.state NOT IN ('prepared','artifact_synced')
+       WHEN 'prepared' THEN NEW.state NOT IN ('prepared','artifact_synced','effect_unknown')
        WHEN 'artifact_synced' THEN NEW.state NOT IN ('artifact_synced','renamed','applied_mismatch','effect_unknown')
        WHEN 'renamed' THEN NEW.state NOT IN ('renamed','source_parent_synced','effect_unknown')
        WHEN 'source_parent_synced' THEN NEW.state NOT IN ('source_parent_synced','target_parent_synced','effect_unknown')

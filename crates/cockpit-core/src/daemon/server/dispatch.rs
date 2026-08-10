@@ -441,6 +441,23 @@ fn db_filesystem_identity(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn cleanup_remote_rename_artifacts(
+    ctx: &DaemonContext,
+    journal: &crate::external_journal::ExternalJournal,
+    attachment: &str,
+    operation_id: &str,
+) {
+    if let Ok(stored) = ctx
+        .db
+        .remote_rename_evidence(attachment, operation_id)
+        .await
+        && let Ok(artifact_id) = Uuid::parse_str(&stored.artifact_id)
+    {
+        let _ = journal.remove_all_remote_rename_artifacts(artifact_id);
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) async fn execute_remote_staged_rename(
     request: &Request,
     authorized: &AuthorizedRequestContext,
@@ -550,17 +567,11 @@ async fn execute_remote_staged_rename_with_hook(
         PrepareRemoteRenameOutcome::Prepared(value)
         | PrepareRemoteRenameOutcome::Reconcile(value) => value,
         PrepareRemoteRenameOutcome::Replay(bytes) => {
-            if let Ok(stored) = ctx
-                .db
-                .remote_rename_evidence(&attachment, &operation_id)
-                .await
-                && let Ok(artifact_id) = Uuid::parse_str(&stored.artifact_id)
-            {
-                let _ = journal.remove_all_remote_rename_artifacts(artifact_id);
-            }
+            cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id).await;
             return serde_json::from_slice(&bytes).map_err(internal);
         }
         PrepareRemoteRenameOutcome::OutcomeUnknown(_) => {
+            cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id).await;
             return Err(ErrorPayload {
                 code: ErrorCode::Conflict,
                 message: "remote rename outcome is unknown and will not be redispatched".into(),
@@ -594,6 +605,7 @@ async fn execute_remote_staged_rename_with_hook(
             )
             .await
             .map_err(internal)?;
+        cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id).await;
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,
             message: "rename authority changed during recovery".into(),
@@ -623,14 +635,28 @@ async fn execute_remote_staged_rename_with_hook(
                 )
                 .await
                 .map_err(internal)?;
+            cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id).await;
             return Err(ErrorPayload {
                 code: ErrorCode::Conflict,
                 message: "rename artifact binding mismatch; outcome is unknown".into(),
             });
         }
-        Err(crate::external_journal::ExternalJournalError::CapsuleMissing(_)) => journal
-            .write_remote_rename_artifact(artifact_id, &artifact)
-            .map_err(internal)?,
+        Err(crate::external_journal::ExternalJournalError::CapsuleMissing(_)) => {
+            if let Err(error) = journal.write_remote_rename_artifact(artifact_id, &artifact) {
+                ctx.db
+                    .record_remote_rename_effect_unknown(
+                        &attachment,
+                        &operation_id,
+                        evidence.dispatch_generation,
+                        b"{\"outcome\":\"unknown\"}",
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await
+                    .map_err(internal)?;
+                cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id).await;
+                return Err(internal(error));
+            }
+        }
         Err(error) => {
             ctx.db
                 .record_remote_rename_effect_unknown(
@@ -642,15 +668,28 @@ async fn execute_remote_staged_rename_with_hook(
                 )
                 .await
                 .map_err(internal)?;
+            cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id).await;
             return Err(internal(error));
         }
     }
     after_barrier("artifact_durable")?;
     if evidence.state == "prepared" {
         if source_observed.map(db_filesystem_identity) != Some(evidence.source_identity) {
+            ctx.db
+                .record_remote_rename_effect_unknown(
+                    &attachment,
+                    &operation_id,
+                    evidence.dispatch_generation,
+                    b"{\"outcome\":\"unknown\"}",
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                .map_err(internal)?;
+            cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id).await;
             return Err(ErrorPayload {
                 code: ErrorCode::Conflict,
-                message: "rename source changed before artifact durability".into(),
+                message: "rename source changed after reservation; outcome is closed as unknown"
+                    .into(),
             });
         }
         target_parent
@@ -706,6 +745,8 @@ async fn execute_remote_staged_rename_with_hook(
                             )
                             .await
                             .map_err(internal)?;
+                        cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id)
+                            .await;
                         return Err(ErrorPayload { code: ErrorCode::Conflict, message: "rename target appeared during dispatch; outcome is closed as unknown".into() });
                     }
                     Err(error) => return Err(internal(error)),
@@ -724,6 +765,8 @@ async fn execute_remote_staged_rename_with_hook(
                             )
                             .await
                             .map_err(internal)?;
+                        cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id)
+                            .await;
                         return Err(ErrorPayload {
                             code: ErrorCode::Conflict,
                             message:
@@ -746,6 +789,7 @@ async fn execute_remote_staged_rename_with_hook(
                     )
                     .await
                     .map_err(internal)?;
+                cleanup_remote_rename_artifacts(ctx, journal, &attachment, &operation_id).await;
                 return Err(ErrorPayload {
                     code: ErrorCode::Conflict,
                     message: "rename filesystem evidence is ambiguous; outcome is unknown".into(),

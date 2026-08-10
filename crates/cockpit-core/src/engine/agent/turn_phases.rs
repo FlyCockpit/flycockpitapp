@@ -1687,6 +1687,7 @@ pub(crate) async fn run_turn(
         }
 
         let text_recovery_marker = recovered_markers.remove(&tc.id);
+        let config_snapshot = ctx.config.snapshot();
         let env = super::tool_dispatch::DispatchEnv {
             agent,
             session: &session,
@@ -1697,6 +1698,7 @@ pub(crate) async fn run_turn(
             hint_corrections,
             loop_guard_threshold,
             cwd: &cwd,
+            hooks: config_snapshot.hooks(),
         };
         super::tool_dispatch::execute_ordinary_call(
             &env,

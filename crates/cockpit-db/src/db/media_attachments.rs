@@ -876,8 +876,8 @@ pub enum MediaAttachmentStatusDetailV1 {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MediaAttachmentStatusV1 {
     pub schema_version: u8,
     pub kind: String,
@@ -893,6 +893,51 @@ pub struct MediaAttachmentStatusV1 {
     pub draft_expires_at_unix_ms: Option<i64>,
     #[serde(flatten)]
     pub detail: MediaAttachmentStatusDetailV1,
+}
+
+impl<'de> Deserialize<'de> for MediaAttachmentStatusV1 {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Wire {
+            schema_version: u8,
+            kind: String,
+            #[serde(with = "strict_uuid_v7")]
+            attachment_id: Uuid,
+            attachment_version: u64,
+            media_kind: RequestedLocalPathMediaKind,
+            availability_generation: u64,
+            reference_generation: u64,
+            can_discard: bool,
+            preview_available: bool,
+            #[serde(default)]
+            draft_expires_at_unix_ms: Option<i64>,
+            #[serde(flatten)]
+            detail: MediaAttachmentStatusDetailV1,
+            #[serde(flatten)]
+            unknown: std::collections::BTreeMap<String, serde_json::Value>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        if let Some(field) = wire.unknown.keys().next() {
+            return Err(serde::de::Error::custom(format!("unknown field `{field}`")));
+        }
+        Ok(Self {
+            schema_version: wire.schema_version,
+            kind: wire.kind,
+            attachment_id: wire.attachment_id,
+            attachment_version: wire.attachment_version,
+            media_kind: wire.media_kind,
+            availability_generation: wire.availability_generation,
+            reference_generation: wire.reference_generation,
+            can_discard: wire.can_discard,
+            preview_available: wire.preview_available,
+            draft_expires_at_unix_ms: wire.draft_expires_at_unix_ms,
+            detail: wire.detail,
+        })
+    }
 }
 
 impl MediaSourceKind {
@@ -2933,8 +2978,9 @@ mod tests {
         let storage_id = Uuid::now_v7();
         db.transaction(move |conn| {
             conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/redacted',1,1)",[session_id.to_string()])?;
-            let record = MediaAttachmentRecord { attachment_id, session_id, canonical_project_digest:"11".repeat(32), media_kind:MediaKind::Image, source_kind:MediaSourceKind::RetainedHttps, canonical_container:"png".into(), canonical_mime:"image/png".into(), availability:MediaAvailability::Ready, attachment_version:1, availability_generation:5, reference_generation:1, captured_capability_generation:9, source_identity_digest:"22".repeat(32), source_byte_length:3, source_sha256:"33".repeat(32), selected_video_stream:None, selected_audio_stream:None, created_at_unix_ms:1, updated_at_unix_ms:1, draft_expires_at_unix_ms:None, first_referenced_at_unix_ms:None };
+            let record = MediaAttachmentRecord { attachment_id, session_id, canonical_project_digest:"11".repeat(32), media_kind:MediaKind::Image, source_kind:MediaSourceKind::RetainedHttps, canonical_container:"png".into(), canonical_mime:"image/png".into(), availability:MediaAvailability::Quarantined, attachment_version:1, availability_generation:1, reference_generation:1, captured_capability_generation:9, source_identity_digest:"22".repeat(32), source_byte_length:3, source_sha256:"33".repeat(32), selected_video_stream:None, selected_audio_stream:None, created_at_unix_ms:1, updated_at_unix_ms:1, draft_expires_at_unix_ms:None, first_referenced_at_unix_ms:None };
             super::super::Db::insert_media_attachment_conn(conn,&record)?;
+            for (generation,state) in [MediaAvailability::Probing,MediaAvailability::Decoding,MediaAvailability::Normalizing,MediaAvailability::Ready].into_iter().enumerate(){super::super::Db::transition_media_attachment_conn(conn,attachment_id,1,u64::try_from(generation)?+1,state,2)?;}
             conn.execute("INSERT INTO media_attachment_components(component_id,attachment_id,attachment_version,component_kind,storage_id,lifecycle_state,component_generation,stable_identity_digest,byte_length,sha256,reservation_id,created_at_unix_ms,updated_at_unix_ms) VALUES(?1,?2,'1','browser_thumbnail',?3,'ready','1',?4,'3',?5,'reservation',1,1)",params![component_id.to_string(),attachment_id.to_string(),storage_id.to_string(),"44".repeat(32),"55".repeat(32)])?;
             assert!(super::super::Db::acquire_media_component_lease_conn(conn,AcquireMediaComponentLeaseInput { lease_id:Uuid::now_v7(),attachment_id,expected_version:1,expected_availability_generation:5,expected_capability_generation:8,kind:MediaComponentLeaseKind::Preview,now_unix_ms:2 }).is_err());
             let lease_id=Uuid::now_v7();
@@ -3103,7 +3149,7 @@ mod tests {
         let in_use = Uuid::now_v7();
         let overflow = Uuid::now_v7();
         let reference_id = Uuid::now_v7();
-        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at)VALUES(?1,'p','/redacted',1,1)",[session.to_string()])?;for id in [applied,in_use,overflow]{super::super::Db::insert_media_attachment_conn(conn,&make(id))?;}let project_digest="11".repeat(32);super::super::Db::acquire_media_reference_conn(conn,AcquireMediaReferenceInput { reference_id,attachment_id:in_use,expected_version:1,session_id:session,project_digest:&project_digest,consumer_kind:MediaReferenceConsumerKind::Message,consumer_id:"message",now_unix_ms:2 })?;conn.execute("UPDATE media_attachments SET availability_generation=?1 WHERE attachment_id=?2",params![u64::MAX.to_string(),overflow.to_string()])?;Ok(())}).await.unwrap();
+        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at)VALUES(?1,'p','/redacted',1,1)",[session.to_string()])?;for id in [applied,in_use,overflow]{super::super::Db::insert_media_attachment_conn(conn,&make(id))?;}for (generation,state) in [MediaAvailability::Probing,MediaAvailability::Decoding,MediaAvailability::Normalizing,MediaAvailability::Ready].into_iter().enumerate(){super::super::Db::transition_media_attachment_conn(conn,in_use,1,u64::try_from(generation)?+1,state,2)?;}let project_digest="11".repeat(32);super::super::Db::acquire_media_reference_conn(conn,AcquireMediaReferenceInput { reference_id,attachment_id:in_use,expected_version:1,session_id:session,project_digest:&project_digest,consumer_kind:MediaReferenceConsumerKind::Message,consumer_id:"message",now_unix_ms:2 })?;conn.execute("UPDATE media_attachments SET availability_generation=?1 WHERE attachment_id=?2",params![u64::MAX.to_string(),overflow.to_string()])?;Ok(())}).await.unwrap();
         let request = |id, availability, reference| DiscardUnreferencedMediaAttachmentV1 {
             schema_version: 1,
             kind: "discardUnreferencedMediaAttachment".into(),
@@ -3118,7 +3164,7 @@ mod tests {
                 Ok((
                     super::super::Db::discard_unreferenced_media_attachment_conn(
                         conn,
-                        &request(in_use, 1, 2),
+                        &request(in_use, 5, 2),
                         3,
                     )?,
                     super::super::Db::discard_unreferenced_media_attachment_conn(
@@ -3160,7 +3206,7 @@ mod tests {
                         kind: "discardUnreferencedMediaAttachment".into(),
                         attachment_id: in_use,
                         attachment_version: 1,
-                        availability_generation: 1,
+                        availability_generation: 5,
                         reference_generation: 3,
                         origin_upload: None,
                     },

@@ -132,6 +132,7 @@ pub(crate) struct MediaStorageRecovery {
     owned_root: std::sync::Arc<DirGuard>,
     borrowed_sources:
         std::sync::Arc<std::sync::Mutex<std::collections::HashMap<Uuid, BorrowedSourceHandle>>>,
+    av_runner: std::sync::Arc<dyn AvRuntimeRunner>,
 }
 
 impl MediaStorageRecovery {
@@ -726,7 +727,8 @@ impl MediaStorageRecovery {
                     .current()
                     .context("model_runtime_unavailable")?;
                 let runtime = approved_av_runtime(&health)?;
-                let (document, probe_digest) = run_bounded_ffprobe(&runtime, bytes.clone()).await?;
+                let (document, probe_digest) =
+                    run_bounded_ffprobe(&runtime, self.av_runner.as_ref(), bytes.clone()).await?;
                 let streams = document
                     .streams
                     .iter()
@@ -763,6 +765,7 @@ impl MediaStorageRecovery {
                 let (video, audio) = select_av_streams(&canonical_container, &streams)?;
                 let decode_digest = decode_selected_streams(
                     &runtime,
+                    self.av_runner.as_ref(),
                     bytes.clone(),
                     video.as_ref().map(|value| value.index),
                     audio.as_ref().map(|value| value.index),
@@ -822,7 +825,12 @@ impl MediaStorageRecovery {
                             ))
                         })
                         .transpose()?;
-                    verify_required_video_encoders(&runtime, audio.is_some()).await?;
+                    verify_required_video_encoders(
+                        &runtime,
+                        self.av_runner.as_ref(),
+                        audio.is_some(),
+                    )
+                    .await?;
                     let argv = video_normalization_argv(
                         video.index,
                         audio.as_ref().map(|value| value.index),
@@ -835,9 +843,12 @@ impl MediaStorageRecovery {
                         min_keyint,
                     )?;
                     let plan_digest = av_plan_digest(&runtime.fingerprint, &argv);
-                    let mp4 = run_video_normalization(&runtime, argv, bytes).await?;
+                    let mp4 =
+                        run_video_normalization(&runtime, self.av_runner.as_ref(), argv, bytes)
+                            .await?;
                     verify_canonical_video_mp4(&mp4)?;
-                    let (encoded, _) = run_bounded_ffprobe(&runtime, mp4.clone()).await?;
+                    let (encoded, _) =
+                        run_bounded_ffprobe(&runtime, self.av_runner.as_ref(), mp4.clone()).await?;
                     verify_encoded_video_provenance(
                         &encoded,
                         width,
@@ -875,14 +886,16 @@ impl MediaStorageRecovery {
                     let channels = probe.channels.context("invalid_media")?;
                     let argv = audio_normalization_argv(audio.index, rate, channels)?;
                     let plan_digest = av_plan_digest(&runtime.fingerprint, &argv);
-                    let output = run_bounded_runtime(
-                        &runtime.ffmpeg,
-                        &argv,
-                        bytes,
-                        100 * 1024 * 1024,
-                        std::time::Duration::from_secs(120),
-                    )
-                    .await?;
+                    let output = self
+                        .av_runner
+                        .run(
+                            &runtime.ffmpeg,
+                            &argv,
+                            bytes,
+                            100 * 1024 * 1024,
+                            std::time::Duration::from_secs(120),
+                        )
+                        .await?;
                     let wav = canonicalize_pcm_wav(&output.stdout)?;
                     let derivative_checksum = crate::intel::hex_lower(&Sha256::digest(&wav));
                     Ok((
@@ -1528,6 +1541,7 @@ impl MediaStorageRecovery {
             db,
             owned_root: std::sync::Arc::new(root),
             borrowed_sources: Default::default(),
+            av_runner: std::sync::Arc::new(SystemAvRuntimeRunner),
         })
     }
 
@@ -1542,7 +1556,14 @@ impl MediaStorageRecovery {
             db,
             owned_root: std::sync::Arc::new(root),
             borrowed_sources: Default::default(),
+            av_runner: std::sync::Arc::new(SystemAvRuntimeRunner),
         })
+    }
+
+    #[cfg(test)]
+    fn with_av_runner(mut self, runner: std::sync::Arc<dyn AvRuntimeRunner>) -> Self {
+        self.av_runner = runner;
+        self
     }
 
     /// Transfer the already-open no-delete local-path handle from registration
@@ -2016,6 +2037,34 @@ struct BoundedRuntimeOutput {
     stderr: Vec<u8>,
 }
 
+#[async_trait::async_trait]
+trait AvRuntimeRunner: Send + Sync {
+    async fn run(
+        &self,
+        program: &Path,
+        args: &[String],
+        input: Vec<u8>,
+        stdout_limit: u64,
+        deadline: std::time::Duration,
+    ) -> Result<BoundedRuntimeOutput>;
+}
+
+struct SystemAvRuntimeRunner;
+
+#[async_trait::async_trait]
+impl AvRuntimeRunner for SystemAvRuntimeRunner {
+    async fn run(
+        &self,
+        program: &Path,
+        args: &[String],
+        input: Vec<u8>,
+        stdout_limit: u64,
+        deadline: std::time::Duration,
+    ) -> Result<BoundedRuntimeOutput> {
+        run_bounded_runtime(program, args, input, stdout_limit, deadline).await
+    }
+}
+
 struct AvNormalizationEvidence {
     runtime_fingerprint: String,
     probe_digest: String,
@@ -2146,6 +2195,7 @@ struct FfprobeDocument {
 
 async fn run_bounded_ffprobe(
     runtime: &ApprovedAvRuntime,
+    runner: &dyn AvRuntimeRunner,
     input: Vec<u8>,
 ) -> Result<(FfprobeDocument, String)> {
     let argv = [
@@ -2160,14 +2210,15 @@ async fn run_bounded_ffprobe(
         "pipe:0",
     ]
     .map(str::to_owned);
-    let output = run_bounded_runtime(
-        &runtime.ffprobe,
-        &argv,
-        input,
-        16 * 1_048_576,
-        std::time::Duration::from_secs(30),
-    )
-    .await?;
+    let output = runner
+        .run(
+            &runtime.ffprobe,
+            &argv,
+            input,
+            16 * 1_048_576,
+            std::time::Duration::from_secs(30),
+        )
+        .await?;
     ensure!(output.stderr.is_empty(), "invalid_media");
     let digest = crate::intel::hex_lower(&Sha256::digest(&output.stdout));
     let document: FfprobeDocument =
@@ -2215,19 +2266,21 @@ fn decode_to_null_argv(video: Option<u32>, audio: Option<u32>) -> Result<Vec<Str
 
 async fn decode_selected_streams(
     runtime: &ApprovedAvRuntime,
+    runner: &dyn AvRuntimeRunner,
     input: Vec<u8>,
     video: Option<u32>,
     audio: Option<u32>,
 ) -> Result<String> {
     let argv = decode_to_null_argv(video, audio)?;
-    let output = run_bounded_runtime(
-        &runtime.ffmpeg,
-        &argv,
-        input,
-        1,
-        std::time::Duration::from_secs(120),
-    )
-    .await?;
+    let output = runner
+        .run(
+            &runtime.ffmpeg,
+            &argv,
+            input,
+            1,
+            std::time::Duration::from_secs(120),
+        )
+        .await?;
     ensure!(output.stdout.is_empty(), "invalid_media");
     let mut hasher = Sha256::new();
     hasher.update(b"media-full-decode-v1\0");
@@ -2449,6 +2502,7 @@ fn verify_encoded_video_provenance(
 
 async fn run_video_normalization(
     runtime: &ApprovedAvRuntime,
+    runner: &dyn AvRuntimeRunner,
     mut argv: Vec<String>,
     input: Vec<u8>,
 ) -> Result<Vec<u8>> {
@@ -2466,14 +2520,15 @@ async fn run_video_normalization(
     ensure!(destination == "pipe:1", "invalid_media");
     *destination = output_path;
     argv.insert(1, "-y".into());
-    let result = run_bounded_runtime(
-        &runtime.ffmpeg,
-        &argv,
-        input,
-        1,
-        std::time::Duration::from_secs(300),
-    )
-    .await?;
+    let result = runner
+        .run(
+            &runtime.ffmpeg,
+            &argv,
+            input,
+            1,
+            std::time::Duration::from_secs(300),
+        )
+        .await?;
     ensure!(result.stdout.is_empty(), "invalid_media");
     ensure!(
         before == stable_identity_digest(output.as_file())?,
@@ -2492,6 +2547,7 @@ async fn run_video_normalization(
 
 async fn verify_required_video_encoders(
     runtime: &ApprovedAvRuntime,
+    runner: &dyn AvRuntimeRunner,
     require_aac: bool,
 ) -> Result<()> {
     let argv = [
@@ -2499,15 +2555,16 @@ async fn verify_required_video_encoders(
         "-hide_banner".to_owned(),
         "-encoders".to_owned(),
     ];
-    let output = run_bounded_runtime(
-        &runtime.ffmpeg,
-        &argv,
-        Vec::new(),
-        2 * 1_048_576,
-        std::time::Duration::from_secs(10),
-    )
-    .await
-    .context("model_runtime_unavailable")?;
+    let output = runner
+        .run(
+            &runtime.ffmpeg,
+            &argv,
+            Vec::new(),
+            2 * 1_048_576,
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .context("model_runtime_unavailable")?;
     let encoders = std::str::from_utf8(&output.stdout).context("model_runtime_unavailable")?;
     let has = |name: &str| {
         encoders.lines().any(|line| {

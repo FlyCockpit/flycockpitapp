@@ -2730,6 +2730,21 @@ CREATE TABLE remote_rename_journal (
       REFERENCES remote_attachment_operations(logical_attachment_id,operation_id) ON DELETE CASCADE
 );
 
+CREATE TRIGGER remote_rename_journal_insert_authority
+BEFORE INSERT ON remote_rename_journal
+WHEN NOT EXISTS (
+  SELECT 1 FROM remote_attachment_operations
+  WHERE logical_attachment_id=NEW.logical_attachment_id
+    AND operation_id=NEW.operation_id
+    AND operation_kind='staged_rename'
+    AND operation_class='idempotent_adapter_mutation'
+    AND state='dispatched'
+    AND dispatch_generation=NEW.dispatch_generation
+)
+BEGIN
+    SELECT RAISE(ABORT, 'remote rename journal requires staged rename authority');
+END;
+
 CREATE TRIGGER remote_rename_journal_guard
 BEFORE UPDATE ON remote_rename_journal
 WHEN NEW.logical_attachment_id IS NOT OLD.logical_attachment_id

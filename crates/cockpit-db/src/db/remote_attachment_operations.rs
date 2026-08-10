@@ -278,8 +278,8 @@ impl Db {
                 let source_parent=source_parent.context("new rename lacks source parent identity")?;
                 let target_parent=target_parent.context("new rename lacks target parent identity")?;
                 let artifact=Uuid::now_v7().to_string();
-                conn.execute("INSERT INTO remote_rename_journal(logical_attachment_id,operation_id,artifact_id,source_identity,source_parent_identity,target_parent_identity,dispatch_generation,state,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,1,'prepared',?7,?7)",params![owned.logical_attachment_id,owned.operation_id,artifact,source,source_parent,target_parent,owned.now_ms])?;
                 conn.execute("UPDATE remote_attachment_operations SET state='dispatched',operation_kind='staged_rename',dispatch_generation=1 WHERE logical_attachment_id=?1 AND operation_id=?2 AND state='reserved'",params![owned.logical_attachment_id,owned.operation_id])?;
+                conn.execute("INSERT INTO remote_rename_journal(logical_attachment_id,operation_id,artifact_id,source_identity,source_parent_identity,target_parent_identity,dispatch_generation,state,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,1,'prepared',?7,?7)",params![owned.logical_attachment_id,owned.operation_id,artifact,source,source_parent,target_parent,owned.now_ms])?;
                 Ok(PrepareRemoteRenameOutcome::Prepared(load_remote_rename_evidence(conn,&owned.logical_attachment_id,&owned.operation_id)?))
             }
             ReserveRemoteOperationOutcome::Replay(replay) if replay.state=="committed" => Ok(PrepareRemoteRenameOutcome::Replay(replay.safe_response.context("committed rename lacks response")?)),
@@ -982,7 +982,8 @@ impl Db {
                  WHERE logical_attachment_id=?1 AND operation_id=?2 AND state='applied'
                    AND dispatch_generation=?3
                    AND dispatch_generation=(SELECT dispatch_generation FROM remote_attachment_operations
-                     WHERE logical_attachment_id=?1 AND operation_id=?2)",
+                     WHERE logical_attachment_id=?1 AND operation_id=?2
+                       AND operation_kind='staged_rename')",
                 params![owned.logical_attachment_id, owned.operation_id, generation, owned.now_ms],
             )?;
             ensure!(changed == 1, "rename commit requires one applied row at the expected generation");
@@ -2567,6 +2568,54 @@ mod tests {
             })
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn specialized_rename_commit_rejects_a_forged_generic_applied_journal() {
+        let db = Db::open_in_memory().unwrap();
+        let operation = "01890f3e-4c00-7000-8000-0000000000a8";
+        let generic = ReserveRemoteOperation {
+            operation_class: RemoteOperationClass::IdempotentAdapterMutation,
+            ..reserve(operation, [17; 32])
+        };
+        db.reserve_remote_attachment_operation(generic)
+            .await
+            .unwrap();
+        let source = filesystem_identity(1, 1).encode().unwrap().to_vec();
+        let parent = filesystem_identity(2, 2).encode().unwrap().to_vec();
+        db.transaction(move |conn| {
+            assert!(conn.execute(
+                "INSERT INTO remote_rename_journal(logical_attachment_id,operation_id,artifact_id,source_identity,source_parent_identity,target_parent_identity,dispatch_generation,state,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?5,1,'applied',10,10)",
+                params![ATTACHMENT,operation,"00000000-0000-4000-8000-0000000000a9",source,parent],
+            ).is_err(), "schema must reject a journal without staged authority");
+            conn.execute("DROP TRIGGER remote_rename_journal_insert_authority", [])?;
+            conn.execute(
+                "INSERT INTO remote_rename_journal(logical_attachment_id,operation_id,artifact_id,source_identity,source_parent_identity,target_parent_identity,dispatch_generation,state,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?5,1,'applied',10,10)",
+                params![ATTACHMENT,operation,"00000000-0000-4000-8000-0000000000a9",source,parent],
+            )?;
+            Ok(())
+        }).await.unwrap();
+        assert!(db
+            .commit_remote_rename_operation(
+                CommitRemoteOperation {
+                    logical_attachment_id: ATTACHMENT,
+                    operation_id: operation,
+                    safe_response: b"forbidden",
+                    outbox_delivery_id: "00000000-0000-4000-8000-0000000000aa",
+                    outbox_kind: "filesystem_changed",
+                    outbox_payload: b"rename",
+                    now_ms: 30,
+                },
+                1
+            )
+            .await
+            .is_err());
+        let (state, outbox): (String, i64) = db.transaction(move |conn| Ok((
+            conn.query_row("SELECT state FROM remote_attachment_operations WHERE logical_attachment_id=?1 AND operation_id=?2", params![ATTACHMENT,operation], |row| row.get(0))?,
+            conn.query_row("SELECT COUNT(*) FROM remote_attachment_outbox WHERE logical_attachment_id=?1", [ATTACHMENT], |row| row.get(0))?,
+        ))).await.unwrap();
+        assert_eq!(state, "reserved");
+        assert_eq!(outbox, 0);
     }
 
     #[tokio::test]

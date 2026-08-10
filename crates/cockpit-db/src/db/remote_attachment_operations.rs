@@ -401,6 +401,7 @@ impl Db {
                 [&attachment],
                 |row| row.get(0),
             ).context("remote attachment must be authoritatively closed before compaction")?;
+            validate_snapshot_high_water(conn, &attachment, high_water)?;
             conn.execute(
                 "INSERT INTO remote_attachment_outbox_snapshots
                  (logical_attachment_id, compacted_through_event_seq, snapshot_high_water_mark, updated_at_ms)
@@ -425,6 +426,52 @@ impl Db {
                    AND state IN ('committed','rejected','outcome_unknown')
                    AND (event_high_water_mark IS NULL OR event_high_water_mark<=?3)",
                 params![attachment, now_ms, cursor],
+            )?;
+            Ok(deleted as u64)
+        })
+        .await
+    }
+
+    /// Compacts replay events for an active attachment only behind a snapshot
+    /// high-water mark observed in this same writer transaction. Operation
+    /// outcomes remain queryable for the full active lifetime.
+    pub async fn compact_active_remote_attachment_outbox(
+        &self,
+        logical_attachment_id: &str,
+        compacted_through_event_seq: u64,
+        snapshot_high_water_mark: u64,
+        now_ms: i64,
+    ) -> Result<u64> {
+        validate_uuid("logical attachment id", logical_attachment_id)?;
+        ensure!(
+            snapshot_high_water_mark >= compacted_through_event_seq,
+            "snapshot high-water mark precedes compacted cursor"
+        );
+        let cursor = i64::try_from(compacted_through_event_seq)?;
+        let high_water = i64::try_from(snapshot_high_water_mark)?;
+        let attachment = logical_attachment_id.to_owned();
+        self.transaction(move |conn| {
+            let closed: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM remote_attachment_lifecycle WHERE logical_attachment_id=?1)",
+                [&attachment],
+                |row| row.get(0),
+            )?;
+            ensure!(!closed, "closed attachment requires closed-ledger compaction");
+            validate_snapshot_high_water(conn, &attachment, high_water)?;
+            conn.execute(
+                "INSERT INTO remote_attachment_outbox_snapshots
+                 (logical_attachment_id, compacted_through_event_seq, snapshot_high_water_mark, updated_at_ms)
+                 VALUES (?1,?2,?3,?4)
+                 ON CONFLICT(logical_attachment_id) DO UPDATE SET
+                   compacted_through_event_seq=excluded.compacted_through_event_seq,
+                   snapshot_high_water_mark=excluded.snapshot_high_water_mark,
+                   updated_at_ms=excluded.updated_at_ms",
+                params![attachment, cursor, high_water, now_ms],
+            )?;
+            let deleted = conn.execute(
+                "DELETE FROM remote_attachment_outbox
+                 WHERE logical_attachment_id=?1 AND event_seq<=?2",
+                params![attachment, cursor],
             )?;
             Ok(deleted as u64)
         })
@@ -839,6 +886,28 @@ fn reserve_conn(
         None,
         None,
     )?))
+}
+
+fn validate_snapshot_high_water(
+    conn: &Connection,
+    logical_attachment_id: &str,
+    supplied_high_water: i64,
+) -> Result<()> {
+    let observed: i64 = conn.query_row(
+        "SELECT MAX(
+             COALESCE((SELECT MAX(event_seq) FROM remote_attachment_outbox
+                       WHERE logical_attachment_id=?1), 0),
+             COALESCE((SELECT snapshot_high_water_mark FROM remote_attachment_outbox_snapshots
+                       WHERE logical_attachment_id=?1), 0)
+         )",
+        [logical_attachment_id],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        supplied_high_water == observed,
+        "snapshot high-water mark does not match the authoritative outbox boundary"
+    );
+    Ok(())
 }
 
 fn commit_conn(
@@ -2100,6 +2169,52 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn active_snapshot_compacts_events_but_preserves_queryable_operation_outcomes() {
+        let db = Db::open_in_memory().unwrap();
+        let operation = "01890f3e-4c00-7000-8000-0000000000a0";
+        db.reserve_remote_attachment_operation(reserve(operation, [12; 32]))
+            .await
+            .unwrap();
+        db.commit_remote_attachment_operation(CommitRemoteOperation {
+            logical_attachment_id: ATTACHMENT,
+            operation_id: operation,
+            safe_response: b"active-safe",
+            outbox_delivery_id: "00000000-0000-4000-8000-0000000000a1",
+            outbox_kind: "active_snapshot_test",
+            outbox_payload: b"active-event",
+            now_ms: 11,
+        })
+        .await
+        .unwrap();
+        assert!(
+            db.compact_active_remote_attachment_outbox(ATTACHMENT, 1, 2, 12)
+                .await
+                .is_err(),
+            "a caller cannot invent a snapshot high-water mark"
+        );
+        assert_eq!(
+            db.compact_active_remote_attachment_outbox(ATTACHMENT, 1, 1, 12)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            db.remote_operation_status(ATTACHMENT, operation)
+                .await
+                .unwrap()
+                .is_some(),
+            "active snapshot compaction never deletes a queryable outcome"
+        );
+        assert_eq!(
+            db.compact_active_remote_attachment_outbox(ATTACHMENT, 1, 1, 13)
+                .await
+                .unwrap(),
+            0,
+            "the recorded historical high-water makes compaction idempotent"
         );
     }
 }

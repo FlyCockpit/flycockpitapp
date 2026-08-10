@@ -468,9 +468,11 @@ mod tests {
 
     impl ImageSpendPersistence for FilePersistence {
         fn load(&self, project_key: String) -> LoadResult {
-            let db = cockpit_db::Db::open(&self.path).map_err(|error| error.to_string())?;
+            let store =
+                cockpit_config::config::image_spend::ImageSpendPolicyStore::open(&self.path)
+                    .map_err(|error| error.to_string())?;
             image_spend_runtime()?
-                .block_on(db.current_image_spend_policy(project_key))
+                .block_on(store.current(project_key))
                 .map_err(|error| error.to_string())
         }
 
@@ -480,15 +482,11 @@ mod tests {
             settings: ImageSpendSettings,
             expected_version: Option<u64>,
         ) -> Result<CurrentImageSpendPolicy, String> {
-            let db = cockpit_db::Db::open(&self.path).map_err(|error| error.to_string())?;
+            let store =
+                cockpit_config::config::image_spend::ImageSpendPolicyStore::open(&self.path)
+                    .map_err(|error| error.to_string())?;
             image_spend_runtime()?
-                .block_on(cockpit_config::config::image_spend::activate_saved_policy(
-                    &db,
-                    project_key,
-                    settings,
-                    expected_version,
-                    self.saved_at_ms,
-                ))
+                .block_on(store.activate(project_key, settings, expected_version, self.saved_at_ms))
                 .map_err(|error| error.to_string())
         }
     }
@@ -683,10 +681,11 @@ mod tests {
         reopened.draft.session = BudgetPolicy::Unconfigured;
         reopened.save();
         assert!(reopened.save.lock().unwrap().is_none());
-        let db = cockpit_db::Db::open(&path).unwrap();
+        let store =
+            cockpit_config::config::image_spend::ImageSpendPolicyStore::open(&path).unwrap();
         let persisted = image_spend_runtime()
             .unwrap()
-            .block_on(db.current_image_spend_policy("project".into()))
+            .block_on(store.current("project".into()))
             .unwrap()
             .unwrap();
         assert_eq!(persisted.policy_version, 1);

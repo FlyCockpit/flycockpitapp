@@ -62,6 +62,45 @@ pub async fn current_saved_policy_default(
         .await
 }
 
+/// Application-layer image spend policy persistence with the database
+/// implementation kept behind the config crate boundary.
+#[derive(Clone)]
+pub struct ImageSpendPolicyStore {
+    db: cockpit_db::Db,
+}
+
+impl ImageSpendPolicyStore {
+    pub fn open(path: &std::path::Path) -> anyhow::Result<Self> {
+        Ok(Self {
+            db: cockpit_db::Db::open(path)?,
+        })
+    }
+
+    pub async fn current(
+        &self,
+        project_key: String,
+    ) -> anyhow::Result<Option<CurrentImageSpendPolicy>> {
+        self.db.current_image_spend_policy(project_key).await
+    }
+
+    pub async fn activate(
+        &self,
+        project_key: String,
+        saved: ImageSpendSettings,
+        expected_current_version: Option<u64>,
+        saved_at_ms: i64,
+    ) -> anyhow::Result<CurrentImageSpendPolicy> {
+        activate_saved_policy(
+            &self.db,
+            project_key,
+            saved,
+            expected_current_version,
+            saved_at_ms,
+        )
+        .await
+    }
+}
+
 /// Editable UI suggestions. These values are not a default and must never be
 /// merged into [`ImageSpendSettings`] by a loader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

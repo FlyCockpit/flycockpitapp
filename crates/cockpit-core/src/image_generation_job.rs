@@ -57,6 +57,10 @@ pub use cockpit_db::image_generation_plan::{
 const MAX_AUTHORITY_STRING_BYTES: usize = 1_024;
 const MAX_PROVIDER_HANDOFF_EVIDENCE_BYTES: usize = 64 * 1024;
 const MAX_IMAGE_MEDIA_PLAN_SNAPSHOT_BYTES: usize = 64 * 1024;
+#[cfg(test)]
+static FORCE_ACCEPTED_RESPONSE_POST_RENAME_CUT: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::BTreeSet<Uuid>>,
+> = std::sync::LazyLock::new(Default::default);
 
 pub fn canonical_media_plan_snapshot(plan: &MediaReservationPlan) -> Result<(Vec<u8>, String)> {
     let bytes = serde_json::to_vec(plan)?;
@@ -2178,6 +2182,13 @@ impl HeldImageGenerationArtifactRoot {
     fn force_next_directory_sync_failure(&self) {
         self.guard.force_next_directory_sync_failure();
     }
+    #[cfg(test)]
+    fn force_accepted_response_post_rename_cut(&self, component_id: Uuid) {
+        FORCE_ACCEPTED_RESPONSE_POST_RENAME_CUT
+            .lock()
+            .unwrap()
+            .insert(component_id);
+    }
     pub fn create_component_temporary(&self, name: &str) -> Result<HeldTemporaryArtifact> {
         self.guard.create_file_exclusive(name)
     }
@@ -3126,6 +3137,21 @@ pub fn retain_generated_image_artifact(
     };
     let evidence = effect.artifact().clone();
     let evidence_json = held_artifact_evidence_json(&evidence)?;
+    #[cfg(test)]
+    if FORCE_ACCEPTED_RESPONSE_POST_RENAME_CUT
+        .lock()
+        .unwrap()
+        .remove(&input.component_id)
+    {
+        let recovery = serde_json::to_string(
+            &serde_json::json!({"artifact":evidence_json,"destinationName":final_name,"kind":"held_applied_durable"}),
+        )?;
+        return Err(RecoverableHeldArtifactPublication {
+            evidence_json: recovery,
+            source: anyhow::anyhow!("injected post-rename cut"),
+        }
+        .into());
+    }
     cockpit_db::Db::transition_image_generation_artifact_component_conn(
         conn,
         &TransitionImageGenerationArtifactComponent {
@@ -4853,6 +4879,82 @@ mod tests {
         .is_err());
         assert_eq!(std::fs::read_dir(&managed).unwrap().count(), 0);
         fixture.db.read(move|conn|{let row:(i64,i64)=conn.query_row("SELECT (SELECT count(*) FROM image_generation_response_publication_intents),(SELECT count(*) FROM image_generation_artifacts WHERE job_id=?1)",[fixture.job_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?)))?;assert_eq!(row,(0,0));Ok(())}).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn accepted_post_rename_cut_reopens_exact_security_blocked_destination() {
+        use std::os::unix::fs::PermissionsExt;
+        let database = tempfile::tempdir().unwrap();
+        let database_path = database.path().join("image.db");
+        let (fixture, request) = setup_accepted_response_fixture_with_db(
+            cockpit_db::Db::open(&database_path).unwrap(),
+            "response-rename-cut",
+        )
+        .await;
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(512, 512)
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .unwrap();
+        let bytes = cursor.into_inner();
+        let fetcher = ScriptedAcceptedResponseFetcher::new(
+            vec![AcceptedImageResponseFetchOutcome::Fetched {
+                bytes: bytes.clone(),
+                evidence: b"rename-cut-proof".to_vec(),
+            }],
+            vec![],
+        );
+        fetch_accepted_image_response(
+            fixture.db.clone(),
+            &fetcher,
+            fixture.job_id,
+            fixture.slot_id,
+            1,
+            10,
+        )
+        .await
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let managed = temp.path().join("managed");
+        std::fs::create_dir(&managed).unwrap();
+        std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let root = std::sync::Arc::new(open_image_generation_artifact_root(&managed).unwrap());
+        let component_id = Uuid::now_v7();
+        root.force_accepted_response_post_rename_cut(component_id);
+        assert!(coordinate_persisted_accepted_image_response(
+            fixture.db.clone(),
+            root,
+            CoordinateAcceptedImageResponse {
+                job_id: fixture.job_id,
+                slot_id: fixture.slot_id,
+                attempt_number: 1,
+                expected_job_version: 5,
+                expected_slot_version: 4,
+                expected_attempt_version: 5,
+                external_operation_id: request.external_operation_id,
+                expected_journal_version: 3,
+                component_id,
+                release_operation_id: Uuid::now_v7(),
+                bytes,
+                now_unix_ms: 11
+            }
+        )
+        .await
+        .is_err());
+        let job_id = fixture.job_id;
+        let artifact_id = fixture.artifact_id;
+        drop(fixture);
+        let reopened = cockpit_db::Db::open(&database_path).unwrap();
+        let recovery:String=reopened.read(move|conn|{let row:(String,String,i64,i64,i64)=conn.query_row("SELECT state,recovery_evidence_json,(SELECT count(*) FROM image_generation_artifacts WHERE job_id=i.job_id),(SELECT count(*) FROM image_generation_artifact_components WHERE artifact_id=i.artifact_id),(SELECT count(*) FROM image_generation_response_fetches WHERE job_id=i.job_id) FROM image_generation_response_publication_intents i WHERE job_id=?1",[job_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;assert_eq!(row.0,"security_blocked");assert_eq!((row.2,row.3,row.4),(0,0,1));Ok(row.1)}).await.unwrap();
+        let value: serde_json::Value = serde_json::from_str(&recovery).unwrap();
+        assert_eq!(value["kind"], "held_applied_durable");
+        let evidence = decode_held_artifact_evidence(value["artifact"].as_str().unwrap()).unwrap();
+        let destination = format!("{artifact_id}-{component_id}.artifact");
+        let reopened_root = open_image_generation_artifact_root(&managed).unwrap();
+        let _held = reopened_root
+            .open_verified_component(&destination, &evidence)
+            .unwrap();
+        assert_eq!(std::fs::read_dir(&managed).unwrap().count(), 1);
     }
 
     #[tokio::test]

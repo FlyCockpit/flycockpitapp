@@ -696,10 +696,6 @@ pub struct PrepareImageGenerationDispatch<'a> {
 pub struct ImageGenerationQueueAuthority {
     job_id: Uuid,
     job_version: u64,
-    spend_reservation_id: String,
-    spend_attempt_id: String,
-    media_reservation_id: String,
-    media_reservation_version: u64,
 }
 
 pub struct PreparedImageGenerationDispatch {
@@ -722,6 +718,10 @@ pub struct DispatchingImageGenerationAttempt {
     slot_id: Uuid,
     attempt_number: u32,
     attempt_version: u64,
+    spend_reservation_id: String,
+    spend_attempt_id: String,
+    media_reservation_id: String,
+    media_reservation_version: u64,
 }
 
 impl DispatchingImageGenerationAttempt {

@@ -2536,8 +2536,7 @@ mod tests {
         assert_eq!(adapter.requests(), vec![request]);
     }
 
-    #[tokio::test]
-    async fn scheduler_dispatches_one_real_ledger_job_once() {
+    async fn run_real_ledger_scheduler_fixture(suffix: &str) {
         use crate::media_reservation::{
             MediaOwner, MediaReservationLedger, ReservationState, ReserveRequest,
         };
@@ -2577,13 +2576,13 @@ mod tests {
         let receipt = ledger
             .reserve(ReserveRequest {
                 reservation_id: sealed.central_resources[0].reservation_identity.clone(),
-                recovery_id: "scheduler-recovery".into(),
+                recovery_id: format!("scheduler-recovery-{suffix}"),
                 owner: MediaOwner {
-                    project_id: "fixture-project".into(),
+                    project_id: format!("fixture-project-{suffix}"),
                     session_id: sealed.owner_session_id.to_string(),
                 },
                 operation: "image_generation".into(),
-                purpose: "scheduler_fixture".into(),
+                purpose: format!("scheduler_fixture_{suffix}"),
                 plans: vec![deadline, queued_global, queued_session, local.clone()],
                 wall_ms: 1,
             })
@@ -2600,7 +2599,7 @@ mod tests {
             .unwrap();
         assert_eq!(executing.state, ReservationState::ExecutingLocal);
         db.save_image_spend_policy(
-            "fixture-project".into(),
+            format!("fixture-project-{suffix}"),
             ImageSpendSettings {
                 request: BudgetPolicy::Finite { usd_micros: 100 },
                 session: BudgetPolicy::Finite { usd_micros: 100 },
@@ -2619,7 +2618,7 @@ mod tests {
             SpendScopeKeys {
                 plan_digest: plan_digest.clone(),
                 session_id: sealed.owner_session_id.to_string(),
-                project_key: "fixture-project".into(),
+                project_key: format!("fixture-project-{suffix}"),
             },
             vec![AttemptMaximum {
                 attempt_id: "idem:1".into(),
@@ -2685,6 +2684,11 @@ mod tests {
             .unwrap();
         assert_eq!(second.dispatched, 0);
         assert_eq!(adapter.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn scheduler_dispatches_one_real_ledger_job_once() {
+        run_real_ledger_scheduler_fixture("once").await;
     }
 
     #[test]

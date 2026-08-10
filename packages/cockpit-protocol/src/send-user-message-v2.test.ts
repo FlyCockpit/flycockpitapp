@@ -1,8 +1,8 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import type { CanonicalSendUserMessageV2 } from "./send-user-message-v2";
 import {
   attachmentSetDigest,
-  type CanonicalSendUserMessageV2,
   decodeCanonicalSendUserMessageV2,
   encodeCanonicalSendUserMessageV2,
   FCM2_MAX_BYTES,
@@ -153,13 +153,13 @@ describe("send_user_message_v2_canonical_vectors", () => {
     const base = decodeCanonicalSendUserMessageV2(fromHex(fixture.vectors[1].fcm2_hex));
     for (const testCase of fixture.semantic_error_cases) {
       const value = structuredClone(base);
-      const firstTag = value.request.tag_expansions[0];
-      if (testCase.mutation === "empty_tool" && firstTag) firstTag.tool = "";
-      else if (testCase.mutation === "detail_one_over" && firstTag)
-        firstTag.detail = "d".repeat(4097);
+      const tag = value.request.tag_expansions[0];
+      if (!tag) throw new Error("semantic fixture requires one tag expansion");
+      if (testCase.mutation === "empty_tool") tag.tool = "";
+      else if (testCase.mutation === "detail_one_over") tag.detail = "d".repeat(4097);
       else if (testCase.mutation === "empty_skill") value.request.forced_skill = "";
       else if (testCase.mutation === "invalid_skill") value.request.forced_skill = "bad/skill";
-      else if (testCase.mutation === "multibyte_tool" && firstTag) firstTag.tool = "é".repeat(65);
+      else if (testCase.mutation === "multibyte_tool") tag.tool = "é".repeat(65);
       expect(
         exactError(() => encodeCanonicalSendUserMessageV2(value)),
         testCase.name,
@@ -191,11 +191,10 @@ describe("send_user_message_v2_canonical_vectors", () => {
 
   it("rejects noncanonical UUIDs and out-of-range u64 values", () => {
     const decoded = decodeCanonicalSendUserMessageV2(fromHex(fixture.vectors[0].fcm2_hex));
-    const noncanonicalSessionId = "abcdefab-cdef-4abc-8abc-abcdefabcdef".toUpperCase();
     expect(() =>
       encodeCanonicalSendUserMessageV2({
         ...decoded,
-        session_id: noncanonicalSessionId,
+        session_id: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
       }),
     ).toThrow(/canonical/);
     expect(() =>

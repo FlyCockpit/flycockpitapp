@@ -309,9 +309,9 @@ class Reader {
     return v;
   }
   text(n: number) {
-    const raw = this.raw(n);
+    const value = this.raw(n);
     try {
-      return decoder.decode(raw);
+      return decoder.decode(value);
     } catch {
       throw new Error("invalid UTF-8");
     }

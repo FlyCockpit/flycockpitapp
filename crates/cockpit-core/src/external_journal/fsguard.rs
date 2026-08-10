@@ -296,6 +296,14 @@ mod imp {
         /// Open the spool root: canonicalize the existing part once, then
         /// walk any remaining components no-follow.
         pub fn open_root(path: &Path, create: bool) -> Result<Self, ExternalJournalError> {
+            Self::open_root_with_snapshot_hook(path, create, |_| {})
+        }
+
+        pub(crate) fn open_root_with_snapshot_hook(
+            path: &Path,
+            create: bool,
+            after_snapshot: impl FnOnce(&Path),
+        ) -> Result<Self, ExternalJournalError> {
             let (base, pending) = resolve_existing_base(path)?;
             if !create && !pending.is_empty() {
                 return Err(ExternalJournalError::Spool(format!(
@@ -303,6 +311,18 @@ mod imp {
                     path.display()
                 )));
             }
+            let mut snapshots = Vec::new();
+            let mut snapshot_path = PathBuf::from("/");
+            for component in base.components() {
+                let std::path::Component::Normal(name) = component else {
+                    continue;
+                };
+                snapshot_path.push(name);
+                let metadata = std::fs::metadata(&snapshot_path)
+                    .map_err(|error| io("snapshot canonical root component", error))?;
+                snapshots.push((name.to_owned(), metadata.dev(), metadata.ino()));
+            }
+            after_snapshot(&base);
             // Hold `/` first and walk every canonical component with openat
             // and O_NOFOLLOW. Opening the canonical absolute path in one call
             // would still follow an ancestor swapped after canonicalization.
@@ -317,16 +337,21 @@ mod imp {
             }
             let mut dir = unsafe { File::from_raw_fd(fd) };
             let mut walked = PathBuf::from("/");
-            for component in base.components() {
-                let std::path::Component::Normal(name) = component else {
-                    continue;
-                };
+            for (name, expected_dev, expected_ino) in snapshots {
                 let name = name.to_str().ok_or_else(|| {
                     ExternalJournalError::Containment(
                         "spool root component is not valid UTF-8".into(),
                     )
                 })?;
                 let (next, _) = open_dir_at(Some(&dir), &cstring(name)?, false)?;
+                let metadata = next
+                    .metadata()
+                    .map_err(|error| io("revalidate canonical root component", error))?;
+                if metadata.dev() != expected_dev || metadata.ino() != expected_ino {
+                    return Err(ExternalJournalError::Containment(
+                        "canonical root component changed while acquiring authority".into(),
+                    ));
+                }
                 dir = next;
                 walked.push(name);
             }
@@ -410,12 +435,19 @@ mod imp {
             name: &str,
             target: &DirGuard,
             target_name: &str,
-        ) -> Result<(), ExternalJournalError> {
+            expected_source: HeldEntryIdentity,
+        ) -> Result<HeldEntryIdentity, ExternalJournalError> {
             self.require_same_filesystem(target)?;
             check_component(name)?;
             check_component(target_name)?;
             let from = cstring(name)?;
             let to = cstring(target_name)?;
+            let observed_source = self.open_entry_identity(name)?;
+            if observed_source != expected_source {
+                return Err(ExternalJournalError::Containment(
+                    "rename source identity changed before dispatch".into(),
+                ));
+            }
             #[cfg(target_os = "linux")]
             let result = unsafe {
                 libc::syscall(
@@ -438,11 +470,17 @@ mod imp {
                 )
             };
             #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            return Err(ExternalJournalError::Containment(
+            let result: libc::c_int = return Err(ExternalJournalError::Containment(
                 "held atomic no-replace rename is unsupported on this platform".into(),
             ));
             if result == 0 {
-                return Ok(());
+                let observed_target = target.open_entry_identity(target_name)?;
+                if observed_target != expected_source {
+                    return Err(ExternalJournalError::Containment(
+                        "rename destination identity does not match dispatched source".into(),
+                    ));
+                }
+                return Ok(observed_target);
             }
             let error = std::io::Error::last_os_error();
             if error.kind() == std::io::ErrorKind::AlreadyExists {
@@ -1094,10 +1132,10 @@ mod tests {
         );
         std::fs::write(to.path().join("occupied"), b"other").unwrap();
         assert!(matches!(
-            from.rename_entry_noreplace_atomic("entry", &to, "occupied"),
+            from.rename_entry_noreplace_atomic("entry", &to, "occupied", before),
             Err(ExternalJournalError::QuarantineNameTaken(_))
         ));
-        from.rename_entry_noreplace_atomic("entry", &to, "moved")
+        from.rename_entry_noreplace_atomic("entry", &to, "moved", before)
             .unwrap();
         assert_eq!(to.open_entry_identity("moved").unwrap(), before);
         assert!(from.open_entry_identity("entry").is_err());
@@ -1107,5 +1145,37 @@ mod tests {
             std::os::unix::fs::symlink("moved", to.path().join("alias")).unwrap();
             assert!(to.open_entry_identity("alias").is_err());
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn held_atomic_rename_rejects_source_identity_swap() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = DirGuard::open_root(&tmp.path().join("root"), true).unwrap();
+        let from = root.open_child_dir("from", true).unwrap();
+        let to = root.open_child_dir("to", true).unwrap();
+        std::fs::write(from.path().join("entry"), b"first").unwrap();
+        let expected = from.open_entry_identity("entry").unwrap();
+        std::fs::rename(from.path().join("entry"), from.path().join("old")).unwrap();
+        std::fs::write(from.path().join("entry"), b"first").unwrap();
+        assert!(matches!(
+            from.rename_entry_noreplace_atomic("entry", &to, "moved", expected),
+            Err(ExternalJournalError::Containment(_))
+        ));
+        assert!(!to.path().join("moved").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn held_root_rejects_component_replacement_after_canonical_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let moved = tmp.path().join("moved");
+        let result = DirGuard::open_root_with_snapshot_hook(&root, false, |_| {
+            std::fs::rename(&root, &moved).unwrap();
+            std::fs::create_dir(&root).unwrap();
+        });
+        assert!(matches!(result, Err(ExternalJournalError::Containment(_))));
     }
 }

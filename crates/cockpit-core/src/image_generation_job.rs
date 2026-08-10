@@ -2524,7 +2524,7 @@ pub async fn fetch_accepted_image_response<F: AcceptedImageResponseFetcher>(
         })
         .await?;
     if let Some((outcome, safe_reason, evidence, bytes)) = existing {
-        let replay: Result<AcceptedImageResponseFetchOutcome> = match outcome.as_str() {
+        let replay_result: Result<AcceptedImageResponseFetchOutcome> = match outcome.as_str() {
             "fetched" => Ok(AcceptedImageResponseFetchOutcome::Fetched {
                 bytes: bytes.context("fetched response bytes are absent")?,
                 evidence,
@@ -2535,7 +2535,8 @@ pub async fn fetch_accepted_image_response<F: AcceptedImageResponseFetcher>(
             }),
             "outcome_unknown" => Ok(AcceptedImageResponseFetchOutcome::OutcomeUnknown { evidence }),
             _ => anyhow::bail!("unknown accepted response fetch outcome"),
-        }?;
+        };
+        let replay = replay_result?;
         if let AcceptedImageResponseFetchOutcome::DefinitiveFailure { safe_reason, .. } = &replay {
             terminalize_accepted_response_failure(
                 &db,

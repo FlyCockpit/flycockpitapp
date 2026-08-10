@@ -102,6 +102,38 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    /// Process-local handles cannot survive daemon restart. Boot records that
+    /// fact before releasing every leftover durable lease, and must call this
+    /// before exposing any media request handler.
+    pub(crate) async fn reconcile_abandoned_component_leases(
+        &self,
+        now_unix_ms: i64,
+    ) -> Result<usize> {
+        self.db
+            .transaction(move |conn| {
+                let lease_ids = {
+                    let mut statement = conn.prepare(
+                        "SELECT lease_id FROM media_attachment_component_leases WHERE released_at_unix_ms IS NULL ORDER BY lease_id",
+                    )?;
+                    statement
+                        .query_map([], |row| row.get::<_, String>(0))?
+                        .collect::<std::result::Result<Vec<_>, _>>()?
+                };
+                for lease_id in &lease_ids {
+                    conn.execute(
+                        "INSERT INTO media_component_lease_reconciliation_evidence(lease_id,reason,released_at_unix_ms) VALUES(?1,'daemon_restart',?2)",
+                        params![lease_id, now_unix_ms],
+                    )?;
+                    conn.execute(
+                        "UPDATE media_attachment_component_leases SET released_at_unix_ms=?1 WHERE lease_id=?2 AND released_at_unix_ms IS NULL",
+                        params![now_unix_ms, lease_id],
+                    )?;
+                }
+                Ok(lease_ids.len())
+            })
+            .await
+    }
+
     pub(crate) async fn acquire_component_lease(
         &self,
         lease_id: Uuid,
@@ -3210,6 +3242,37 @@ mod tests {
         assert_eq!(lease.read_verified(3).await.unwrap(), b"safe preview");
         let live:i64=db.read(move|conn|Ok(conn.query_row("SELECT COUNT(*) FROM media_attachment_component_leases WHERE attachment_id=?1 AND released_at_unix_ms IS NULL",[attachment_id.to_string()],|row|row.get(0))?)).await.unwrap();
         assert_eq!(live, 0);
+        let abandoned_id = Uuid::now_v7();
+        let abandoned = storage
+            .acquire_component_lease(
+                abandoned_id,
+                attachment_id,
+                1,
+                5,
+                7,
+                MediaComponentLeaseKind::Preview,
+                4,
+            )
+            .await
+            .unwrap();
+        drop(abandoned);
+        let reopened = MediaStorageRecovery::open(db.clone(), &root_path).unwrap();
+        assert_eq!(
+            reopened
+                .reconcile_abandoned_component_leases(5)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            reopened
+                .reconcile_abandoned_component_leases(6)
+                .await
+                .unwrap(),
+            0
+        );
+        let evidence:i64=db.read(move|conn|Ok(conn.query_row("SELECT COUNT(*) FROM media_component_lease_reconciliation_evidence WHERE lease_id=?1 AND reason='daemon_restart'",[abandoned_id.to_string()],|row|row.get(0))?)).await.unwrap();
+        assert_eq!(evidence, 1);
     }
 
     async fn fixture() -> Fixture {

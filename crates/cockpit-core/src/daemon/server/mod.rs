@@ -2100,6 +2100,10 @@ pub(crate) async fn boot_with_db(
     );
     if let Some(storage) = &ctx.media_storage_recovery {
         storage
+            .reconcile_abandoned_component_leases(chrono::Utc::now().timestamp_millis())
+            .await
+            .context("reconciling abandoned media component leases")?;
+        storage
             .reconcile_media_uploads(chrono::Utc::now().timestamp_millis())
             .await
             .context("reconciling authenticated media uploads")?;

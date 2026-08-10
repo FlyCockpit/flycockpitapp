@@ -321,6 +321,12 @@ CREATE UNIQUE INDEX idx_media_attachment_component_leases_live_id
 CREATE INDEX idx_media_attachment_component_leases_live_attachment
     ON media_attachment_component_leases(attachment_id, attachment_version, released_at_unix_ms);
 
+CREATE TABLE media_component_lease_reconciliation_evidence (
+    lease_id TEXT PRIMARY KEY REFERENCES media_attachment_component_leases(lease_id) ON DELETE CASCADE,
+    reason TEXT NOT NULL CHECK(reason = 'daemon_restart'),
+    released_at_unix_ms INTEGER NOT NULL
+);
+
 CREATE TABLE media_attachment_cleanup_intents (
     intent_id                         TEXT PRIMARY KEY,
     attachment_id                    TEXT NOT NULL UNIQUE,

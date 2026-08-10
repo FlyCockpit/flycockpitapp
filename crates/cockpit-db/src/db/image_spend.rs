@@ -64,6 +64,18 @@ pub enum ImageSpendDispatchEvidence {
     SubmissionUnknown,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreDispatchCancellationEvidence(ExternalJournalToken);
+
+impl PreDispatchCancellationEvidence {
+    pub fn parse(identity: &str) -> Result<Self> {
+        Ok(Self(ExternalJournalToken::parse(identity)?))
+    }
+    fn identity(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,7 +96,6 @@ mod tests {
             plan_digest: plan.into(),
             session_id: "session".into(),
             project_key: "project".into(),
-            project_epoch_sequence: 1,
         }
     }
 
@@ -248,6 +259,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reservation_and_journal_prepare_commit_or_rollback_together() {
+        let db = Db::open_in_memory().unwrap();
+        db.save_image_spend_policy("project".into(), finite(10), None, 0)
+            .await
+            .unwrap();
+        let result = db
+            .reserve_and_prepare_image_spend(ReserveAndPrepareImageSpend {
+                reservation_id: "atomic".into(),
+                keys: keys("plan"),
+                attempts: vec![AttemptMaximum {
+                    attempt_id: "attempt".into(),
+                    usd_micros: Some(1),
+                }],
+                expected_policy_version: 1,
+                attempt_id: "attempt".into(),
+                journal: PrepareExternalOperation {
+                    operation_kind: ExternalJournalToken::parse("image_generation").unwrap(),
+                    owner_session_id: ExternalJournalToken::parse("wrong-session").unwrap(),
+                    idempotency_key: ExternalJournalToken::parse("atomic-key").unwrap(),
+                    payload_digest: ExternalJournalDigest::of(b"projection"),
+                    payload_len: 10,
+                    provider_idempotency: None,
+                },
+                created_at_ms: 0,
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(
+            db.image_spend_diagnostic("atomic".into())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.external_operation_by_identity(
+                &ExternalJournalToken::parse("image_generation").unwrap(),
+                &ExternalJournalToken::parse("wrong-session").unwrap(),
+                &ExternalJournalToken::parse("atomic-key").unwrap(),
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn unknown_requires_all_unlimited_and_late_cost_charges_once() {
         let db = Db::open_in_memory().unwrap();
         db.save_image_spend_policy("project".into(), finite(10), None, 0)
@@ -291,9 +348,13 @@ mod tests {
             .unwrap();
         assert!(reservation.cost_unknown);
         assert!(
-            db.cancel_image_spend_before_dispatch("unknown".into(), "proof".into(), 2)
-                .await
-                .unwrap()
+            db.cancel_image_spend_before_dispatch(
+                "unknown".into(),
+                PreDispatchCancellationEvidence::parse("proof").unwrap(),
+                2,
+            )
+            .await
+            .unwrap()
         );
         assert!(
             db.reconcile_image_spend(
@@ -458,9 +519,13 @@ mod tests {
         )
         .await
         .unwrap();
-        db.cancel_image_spend_before_dispatch("released".into(), "not-accepted".into(), 5)
-            .await
-            .unwrap();
+        db.cancel_image_spend_before_dispatch(
+            "released".into(),
+            PreDispatchCancellationEvidence::parse("not-accepted").unwrap(),
+            5,
+        )
+        .await
+        .unwrap();
         db.reconcile_image_spend(
             "released".into(),
             "c".into(),
@@ -542,9 +607,13 @@ mod tests {
             )
             .await
             .unwrap();
-            db.cancel_image_spend_before_dispatch("cancelled".into(), "cancel".into(), 1)
-                .await
-                .unwrap();
+            db.cancel_image_spend_before_dispatch(
+                "cancelled".into(),
+                PreDispatchCancellationEvidence::parse("cancel").unwrap(),
+                1,
+            )
+            .await
+            .unwrap();
         }
         let reopened = Db::open(&path).unwrap();
         let policy = reopened
@@ -796,7 +865,6 @@ pub struct SpendScopeKeys {
     pub plan_digest: String,
     pub session_id: String,
     pub project_key: String,
-    pub project_epoch_sequence: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -811,6 +879,16 @@ pub struct SpendReservation {
     pub reserved_usd_micros: Option<u64>,
     pub cost_unknown: bool,
     pub policy_version: u64,
+}
+
+pub struct ReserveAndPrepareImageSpend {
+    pub reservation_id: String,
+    pub keys: SpendScopeKeys,
+    pub attempts: Vec<AttemptMaximum>,
+    pub expected_policy_version: u64,
+    pub attempt_id: String,
+    pub journal: PrepareExternalOperation,
+    pub created_at_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -938,6 +1016,56 @@ impl Db {
         expected_policy_version: u64,
         created_at_ms: i64,
     ) -> Result<SpendReservation> {
+        self.reserve_image_spend_impl(
+            reservation_id,
+            keys,
+            attempts,
+            expected_policy_version,
+            created_at_ms,
+            None,
+        )
+        .await
+        .map(|(reservation, _)| reservation)
+    }
+
+    pub async fn reserve_and_prepare_image_spend(
+        &self,
+        request: ReserveAndPrepareImageSpend,
+    ) -> Result<(SpendReservation, ExternalJournalRecord)> {
+        let ReserveAndPrepareImageSpend {
+            reservation_id,
+            keys,
+            attempts,
+            expected_policy_version,
+            attempt_id,
+            journal,
+            created_at_ms,
+        } = request;
+        let (reservation, prepared) = self
+            .reserve_image_spend_impl(
+                reservation_id,
+                keys,
+                attempts,
+                expected_policy_version,
+                created_at_ms,
+                Some((attempt_id, journal)),
+            )
+            .await?;
+        Ok((
+            reservation,
+            prepared.context("atomic journal preparation was absent")?,
+        ))
+    }
+
+    async fn reserve_image_spend_impl(
+        &self,
+        reservation_id: String,
+        keys: SpendScopeKeys,
+        attempts: Vec<AttemptMaximum>,
+        expected_policy_version: u64,
+        created_at_ms: i64,
+        journal: Option<(String, PrepareExternalOperation)>,
+    ) -> Result<(SpendReservation, Option<ExternalJournalRecord>)> {
         self.transaction(move |conn| {
             if let Some((existing,state,plan,session,project)) = conn.query_row("SELECT reserved_usd_micros,cost_unknown,policy_version,state,plan_digest,session_id,project_key FROM image_spend_reservations WHERE reservation_id=?1", [&reservation_id], |r| Ok((SpendReservation { reservation_id: reservation_id.clone(), reserved_usd_micros: r.get::<_,Option<Vec<u8>>>(0)?.map(read_money).transpose()?, cost_unknown: r.get::<_,i64>(1)? != 0, policy_version: read_u64(r.get(2)?)? },r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?))).optional()? {
                 if state != "reserved" { return Err(BudgetBlockReason::ReservationTerminal.into()); }
@@ -946,7 +1074,15 @@ impl Db {
                 let mut requested: Vec<_> = attempts.iter().map(|a|(a.attempt_id.clone(),a.usd_micros)).collect(); requested.sort();
                 let stored: Vec<_> = stored.into_iter().map(|(id,v)| Ok((id,v.map(read_money).transpose()?))).collect::<rusqlite::Result<_>>()?;
                 if stored != requested { bail!("reservation replay attempts do not match immutable plan"); }
-                return Ok(existing);
+                if let Some((attempt_id,journal)) = journal {
+                    let prepared=prepare_external_operation_conn(conn,&journal,created_at_ms)?;
+                    let record=prepared.record().clone();
+                    let bound: Option<String> = conn.query_row("SELECT external_operation_id FROM image_spend_attempt_dispatches WHERE reservation_id=?1 AND attempt_id=?2",params![reservation_id,attempt_id],|row|row.get(0)).optional()?;
+                    let operation_id = record.operation_id.to_string();
+                    if bound.as_deref() != Some(operation_id.as_str()) { bail!("reservation replay journal binding does not match"); }
+                    return Ok((existing, Some(record)));
+                }
+                return Ok((existing, None));
             }
             let current: Option<(u64,String,u64)> = conn.query_row("SELECT version,settings_json,epoch_policy_version FROM image_spend_policy_versions WHERE project_key=?1 ORDER BY version DESC LIMIT 1", [&keys.project_key], |r| Ok((read_u64(r.get(0)?)?,r.get(1)?,read_u64(r.get(2)?)?))).optional()?;
             let (current_version,json,epoch_policy_version)=current.ok_or(BudgetBlockReason::ProjectUnconfigured)?;
@@ -964,15 +1100,29 @@ impl Db {
             let total_sql = money_blob(total);
             let expected_policy_version_sql = sqlite_u64(expected_policy_version)?;
             let epoch_policy_version_sql = sqlite_u64(epoch_policy_version)?;
-            let epoch_sequence_sql = sqlite_u64(keys.project_epoch_sequence)?;
-            if matches!(settings.project, BudgetPolicy::Finite { .. }) {
-                let head: Option<i64> = conn.query_row("SELECT epoch_sequence FROM image_spend_epoch_heads WHERE project_key=?1 AND epoch_policy_version=?2",params![keys.project_key,epoch_policy_version_sql],|r|r.get(0)).optional()?;
-                if head != Some(epoch_sequence_sql) { return Err(BudgetBlockReason::InvalidProjectEpoch.into()); }
-            }
+            let epoch_sequence = if matches!(settings.project, BudgetPolicy::Finite { .. }) {
+                let resolved = settings.project_epoch.as_ref().ok_or(BudgetBlockReason::ProjectEpochUnconfigured)?.resolve_epoch(created_at_ms)?;
+                let head: Option<(i64,String,i64)> = conn.query_row("SELECT epoch_sequence,membership_key,interval_start_ms FROM image_spend_epoch_heads WHERE project_key=?1 AND epoch_policy_version=?2",params![keys.project_key,epoch_policy_version_sql],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+                match head {
+                    Some((sequence,key,_)) if key == resolved.membership_key => read_u64(sequence)?,
+                    Some((sequence,_,start)) if resolved.interval_start_ms > start => {
+                        let next=sequence.checked_add(1).ok_or(BudgetBlockReason::ArithmeticOverflow)?;
+                        let changed=conn.execute("UPDATE image_spend_epoch_heads SET epoch_sequence=?3,membership_key=?4,interval_start_ms=?5,resolved_at_ms=?6 WHERE project_key=?1 AND epoch_policy_version=?2 AND epoch_sequence=?7",params![keys.project_key,epoch_policy_version_sql,next,resolved.membership_key,resolved.interval_start_ms,created_at_ms,sequence])?;
+                        if changed != 1 { return Err(BudgetBlockReason::PolicyVersionChanged.into()); }
+                        read_u64(next)?
+                    }
+                    Some(_) => return Err(BudgetBlockReason::InvalidProjectEpoch.into()),
+                    None => {
+                        conn.execute("INSERT INTO image_spend_epoch_heads(project_key,epoch_policy_version,epoch_sequence,membership_key,interval_start_ms,resolved_at_ms) VALUES(?1,?2,1,?3,?4,?5)",params![keys.project_key,epoch_policy_version_sql,resolved.membership_key,resolved.interval_start_ms,created_at_ms])?;
+                        1
+                    }
+                }
+            } else { 0 };
+            let epoch_sequence_sql = sqlite_u64(epoch_sequence)?;
             conn.execute("INSERT INTO image_spend_reservations(reservation_id,plan_digest,session_id,project_key,policy_version,epoch_policy_version,epoch_sequence,reserved_usd_micros,cost_unknown,state,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'reserved',?10)", params![reservation_id,keys.plan_digest,keys.session_id,keys.project_key,expected_policy_version_sql,epoch_policy_version_sql,epoch_sequence_sql,if unknown { None } else { Some(total_sql.clone()) },unknown,created_at_ms])?;
             for (kind, scope_key, policy) in [("request", keys.plan_digest.as_str(), settings.request), ("session", keys.session_id.as_str(), settings.session), ("project", keys.project_key.as_str(), settings.project)] {
                 if let BudgetPolicy::Finite { usd_micros: limit } = policy {
-                    let epoch = if kind == "project" { keys.project_epoch_sequence } else { 0 };
+                    let epoch = if kind == "project" { epoch_sequence } else { 0 };
                     let epoch_policy = if kind == "project" { epoch_policy_version } else { 0 };
                     let used = { let mut statement=conn.prepare("SELECT reserved_usd_micros FROM image_spend_scope_usage WHERE scope_kind=?1 AND scope_key=?2 AND (?3!='project' OR (epoch_policy_version=?4 AND epoch_sequence=?5))")?; let values=statement.query_map(params![kind,scope_key,kind,sqlite_u64(epoch_policy)?,sqlite_u64(epoch)?],|r|r.get::<_,Vec<u8>>(0))?.collect::<rusqlite::Result<Vec<_>>>()?; values.into_iter().try_fold(0u64,|sum,value|sum.checked_add(read_money(value)?).ok_or_else(||anyhow::Error::new(BudgetBlockReason::ArithmeticOverflow)))? };
                     let debt = { let mut statement=conn.prepare("SELECT debt_usd_micros FROM image_spend_scope_usage WHERE scope_kind=?1 AND scope_key=?2")?; let values=statement.query_map(params![kind,scope_key],|r|r.get::<_,Vec<u8>>(0))?.collect::<rusqlite::Result<Vec<_>>>()?; values.into_iter().try_fold(0u64,|sum,value|sum.checked_add(read_money(value)?).ok_or_else(||anyhow::Error::new(BudgetBlockReason::ArithmeticOverflow)))? };
@@ -983,7 +1133,16 @@ impl Db {
                 }
             }
             for attempt in attempts { conn.execute("INSERT INTO image_spend_attempts(reservation_id,attempt_id,maximum_usd_micros) VALUES(?1,?2,?3)",params![reservation_id,attempt.attempt_id,attempt.usd_micros.map(money_blob)])?; }
-            Ok(SpendReservation { reservation_id, reserved_usd_micros: (!unknown).then_some(total), cost_unknown: unknown, policy_version: expected_policy_version })
+            let reservation = SpendReservation { reservation_id: reservation_id.clone(), reserved_usd_micros: (!unknown).then_some(total), cost_unknown: unknown, policy_version: expected_policy_version };
+            let prepared = if let Some((attempt_id,journal)) = journal {
+                if journal.operation_kind.as_str() != "image_generation" || journal.owner_session_id.as_str() != keys.session_id { bail!("atomic image dispatch journal identity is invalid"); }
+                let prepared=prepare_external_operation_conn(conn,&journal,created_at_ms)?;
+                if matches!(&prepared, ExternalPrepareOutcome::Existing(_)) { bail!("external operation already exists outside this reservation"); }
+                let record=prepared.record().clone();
+                conn.execute("INSERT INTO image_spend_attempt_dispatches(reservation_id,attempt_id,external_operation_id) VALUES(?1,?2,?3)",params![reservation_id,attempt_id,record.operation_id.to_string()])?;
+                Some(record)
+            } else { None };
+            Ok((reservation, prepared))
         }).await
     }
 
@@ -1126,7 +1285,7 @@ impl Db {
     pub async fn cancel_image_spend_before_dispatch(
         &self,
         reservation_id: String,
-        proof_identity: String,
+        evidence: PreDispatchCancellationEvidence,
         at_ms: i64,
     ) -> Result<bool> {
         self.transaction(move |conn| {
@@ -1137,7 +1296,7 @@ impl Db {
             if possibly_accepted != 0 {
                 bail!("provider acceptance is possible; retain the image spend reservation");
             }
-            let changed=conn.execute("UPDATE image_spend_reservations SET state='released',release_proof_identity=?2,released_at_ms=?3 WHERE reservation_id=?1 AND state='reserved'",params![reservation_id,proof_identity,at_ms])?;
+            let changed=conn.execute("UPDATE image_spend_reservations SET state='released',release_proof_identity=?2,released_at_ms=?3 WHERE reservation_id=?1 AND state='reserved'",params![reservation_id,evidence.identity(),at_ms])?;
             if changed != 0 { conn.execute("UPDATE image_spend_scope_usage SET reserved_usd_micros=charged_usd_micros WHERE reservation_id=?1",[reservation_id])?; }
             Ok(changed != 0)
         }).await

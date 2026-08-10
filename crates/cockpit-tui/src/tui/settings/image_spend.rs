@@ -37,6 +37,7 @@ pub(super) fn page(project_key: String) -> PageBox {
     Box::new(ImageSpendPage {
         project_key,
         cursor: 0,
+        editing_time_zone: false,
         draft: ImageSpendSettings::default(),
         saved: ImageSpendSettings::default(),
         version: None,
@@ -49,6 +50,7 @@ pub(super) fn page(project_key: String) -> PageBox {
 pub(super) struct ImageSpendPage {
     project_key: String,
     cursor: usize,
+    editing_time_zone: bool,
     draft: ImageSpendSettings,
     saved: ImageSpendSettings,
     version: Option<u64>,
@@ -58,6 +60,31 @@ pub(super) struct ImageSpendPage {
 }
 
 impl ImageSpendPage {
+    fn edit_time_zone(&mut self, code: KeyCode) {
+        let Some(ProjectEpochPolicy::CalendarMonth { time_zone }) = &mut self.draft.project_epoch
+        else {
+            self.editing_time_zone = false;
+            return;
+        };
+        match code {
+            KeyCode::Enter => self.editing_time_zone = false,
+            KeyCode::Esc => {
+                time_zone.clear();
+                self.editing_time_zone = false;
+            }
+            KeyCode::Backspace => {
+                time_zone.pop();
+            }
+            KeyCode::Char(character)
+                if character.is_ascii_alphanumeric()
+                    || matches!(character, '/' | '_' | '-' | '+') =>
+            {
+                time_zone.push(character);
+            }
+            _ => {}
+        }
+    }
+
     pub(super) fn poll(&mut self) {
         if let Some(result) = self
             .load
@@ -189,6 +216,10 @@ impl SettingsPage for ImageSpendPage {
 
     fn handle_key(&mut self, _cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         self.poll();
+        if self.editing_time_zone {
+            self.edit_time_zone(key.code);
+            return Nav::Stay;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left | KeyCode::Char('h') => Nav::Back,
             KeyCode::Up | KeyCode::Char('k') => {
@@ -208,7 +239,7 @@ impl SettingsPage for ImageSpendPage {
                     3 => {
                         self.draft.project_epoch = match self.draft.project_epoch {
                             None => Some(ProjectEpochPolicy::CalendarMonth {
-                                time_zone: "UTC".into(),
+                                time_zone: String::new(),
                             }),
                             Some(ProjectEpochPolicy::CalendarMonth { .. }) => {
                                 Some(ProjectEpochPolicy::Rolling {
@@ -235,16 +266,14 @@ impl SettingsPage for ImageSpendPage {
                 self.adjust_selected(false);
                 Nav::Stay
             }
-            KeyCode::Char('t') if self.cursor == 3 => {
-                if let Some(ProjectEpochPolicy::CalendarMonth { time_zone }) =
-                    &mut self.draft.project_epoch
-                {
-                    *time_zone = if time_zone == "UTC" {
-                        "America/Chicago".into()
-                    } else {
-                        "UTC".into()
-                    };
-                }
+            KeyCode::Char('e')
+                if self.cursor == 3
+                    && matches!(
+                        self.draft.project_epoch,
+                        Some(ProjectEpochPolicy::CalendarMonth { .. })
+                    ) =>
+            {
+                self.editing_time_zone = true;
                 Nav::Stay
             }
             _ => Nav::Stay,
@@ -298,7 +327,7 @@ impl SettingsPage for ImageSpendPage {
         "Image spend budgets".into()
     }
     fn help_text(&self, _cx: &SettingsCx) -> &'static str {
-        "↑/↓: select  enter: choose/save  +/-: edit finite/rolling  t: timezone  esc: back"
+        "↑/↓: select  enter: choose/save  +/-: edit finite/rolling  e: enter IANA zone  esc: back"
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -320,6 +349,7 @@ mod tests {
         ImageSpendPage {
             project_key: "project".into(),
             cursor: 0,
+            editing_time_zone: false,
             draft: ImageSpendSettings::default(),
             saved: ImageSpendSettings::default(),
             version: None,
@@ -374,5 +404,22 @@ mod tests {
         assert_eq!(page.draft, settings);
         assert_eq!(page.saved, settings);
         assert_eq!(page.version, Some(4));
+    }
+
+    #[test]
+    fn calendar_epoch_starts_empty_and_accepts_arbitrary_explicit_iana_zone() {
+        let mut page = fixture();
+        page.cursor = 3;
+        page.draft.project_epoch = Some(ProjectEpochPolicy::CalendarMonth {
+            time_zone: String::new(),
+        });
+        page.editing_time_zone = true;
+        for character in "Pacific/Auckland".chars() {
+            page.edit_time_zone(KeyCode::Char(character));
+        }
+        assert!(matches!(
+            page.draft.project_epoch,
+            Some(ProjectEpochPolicy::CalendarMonth { ref time_zone }) if time_zone == "Pacific/Auckland"
+        ));
     }
 }

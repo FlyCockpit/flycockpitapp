@@ -104,6 +104,19 @@ pub enum TransactionalRemoteOperationOutcome<T> {
     AttachmentLedgerCapacity,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BeginNonrepeatableRemoteOperationOutcome {
+    Dispatch {
+        operation_seq: u64,
+        dispatch_generation: u64,
+    },
+    Replay(Vec<u8>),
+    OutcomeUnknown(Vec<u8>),
+    OperationConflict,
+    OperationActorConflict,
+    AttachmentLedgerCapacity,
+}
+
 pub struct TransactionalRemoteMutation<T> {
     pub value: T,
     pub safe_response: Vec<u8>,
@@ -124,6 +137,80 @@ pub struct RemoteOutboxDeliveryLease {
 }
 
 impl Db {
+    /// Reserve and durably mark a nonrepeatable operation dispatched in one
+    /// writer transaction. The caller may perform the external/in-memory
+    /// effect only after receiving `Dispatch`.
+    pub async fn begin_nonrepeatable_remote_operation(
+        &self,
+        request: ReserveRemoteOperation<'_>,
+    ) -> Result<BeginNonrepeatableRemoteOperationOutcome> {
+        ensure!(
+            request.operation_class == RemoteOperationClass::NonrepeatableMutation,
+            "nonrepeatable executor requires nonrepeatable_mutation class"
+        );
+        let owned = OwnedReserveRemoteOperation {
+            logical_attachment_id: request.logical_attachment_id.to_owned(),
+            operation_id: request.operation_id.to_owned(),
+            authenticated_device_id: request.authenticated_device_id.to_owned(),
+            authenticated_device_generation: request.authenticated_device_generation,
+            operation_class: request.operation_class,
+            request_hash: request.request_hash,
+            now_ms: request.now_ms,
+        };
+        self.transaction(move |conn| match reserve_conn(conn, &owned)? {
+            ReserveRemoteOperationOutcome::Reserved(reservation) => {
+                conn.execute(
+                    "UPDATE remote_attachment_operations
+                     SET state='dispatched', dispatch_generation=dispatch_generation+1, updated_at_ms=?3
+                     WHERE logical_attachment_id=?1 AND operation_id=?2 AND state='reserved'",
+                    params![owned.logical_attachment_id, owned.operation_id, owned.now_ms],
+                )?;
+                Ok(BeginNonrepeatableRemoteOperationOutcome::Dispatch {
+                    operation_seq: reservation.operation_seq,
+                    dispatch_generation: 1,
+                })
+            }
+            ReserveRemoteOperationOutcome::Replay(replay) if replay.state == "committed" =>
+                Ok(BeginNonrepeatableRemoteOperationOutcome::Replay(
+                    replay.safe_response.context("committed operation missing safe response")?)),
+            ReserveRemoteOperationOutcome::Replay(replay)
+                if matches!(replay.state.as_str(), "dispatched" | "outcome_unknown") =>
+                Ok(BeginNonrepeatableRemoteOperationOutcome::OutcomeUnknown(
+                    replay.safe_response.unwrap_or_else(|| b"{\"outcome\":\"unknown\"}".to_vec()))),
+            ReserveRemoteOperationOutcome::Replay(_) => bail!("invalid nonrepeatable replay state"),
+            ReserveRemoteOperationOutcome::OperationConflict => Ok(BeginNonrepeatableRemoteOperationOutcome::OperationConflict),
+            ReserveRemoteOperationOutcome::OperationActorConflict => Ok(BeginNonrepeatableRemoteOperationOutcome::OperationActorConflict),
+            ReserveRemoteOperationOutcome::AttachmentLedgerCapacity => Ok(BeginNonrepeatableRemoteOperationOutcome::AttachmentLedgerCapacity),
+        }).await
+    }
+
+    /// Recovery closes a dispatched operation without retrying its effect.
+    pub async fn mark_nonrepeatable_remote_operation_outcome_unknown(
+        &self,
+        logical_attachment_id: &str,
+        operation_id: &str,
+        safe_response: &[u8],
+        now_ms: i64,
+    ) -> Result<bool> {
+        ensure!(
+            !safe_response.is_empty() && safe_response.len() <= MAX_SAFE_RESPONSE_BYTES,
+            "outcome-unknown response must be bounded and nonempty"
+        );
+        validate_uuid("logical attachment id", logical_attachment_id)?;
+        validate_operation_id(operation_id)?;
+        let attachment = logical_attachment_id.to_owned();
+        let operation = operation_id.to_owned();
+        let response = safe_response.to_vec();
+        self.transaction(move |conn| {
+            let changed = conn.execute(
+                "UPDATE remote_attachment_operations SET state='outcome_unknown', safe_response=?3, updated_at_ms=?4
+                 WHERE logical_attachment_id=?1 AND operation_id=?2 AND state='dispatched' AND operation_class='nonrepeatable_mutation'",
+                params![attachment, operation, response, now_ms],
+            )?;
+            Ok(changed == 1)
+        }).await
+    }
+
     pub async fn remote_operation_status(
         &self,
         logical_attachment_id: &str,
@@ -511,7 +598,7 @@ fn commit_conn(
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .context("loading reserved remote operation")?;
-    if state != "reserved" {
+    if !matches!(state.as_str(), "reserved" | "dispatched") {
         bail!("remote operation is already terminal");
     }
     let response_bytes: i64 = conn.query_row(
@@ -556,7 +643,7 @@ fn commit_conn(
         "UPDATE remote_attachment_operations
          SET state = 'committed', safe_response = ?3, event_high_water_mark = ?4,
              updated_at_ms = ?5
-         WHERE logical_attachment_id = ?1 AND operation_id = ?2 AND state = 'reserved'",
+         WHERE logical_attachment_id = ?1 AND operation_id = ?2 AND state IN ('reserved','dispatched')",
         params![
             request.logical_attachment_id,
             request.operation_id,
@@ -1549,5 +1636,52 @@ mod tests {
                 "delivery ack must not become compaction authority after reopen"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn nonrepeatable_dispatch_is_durable_and_replay_never_redispatches() {
+        let db = Db::open_in_memory().unwrap();
+        let request = || ReserveRemoteOperation {
+            logical_attachment_id: "00000000-0000-4000-8000-000000000001",
+            operation_id: "01890f3e-4c00-7000-8000-000000000097",
+            authenticated_device_id: "00000000-0000-4000-8000-000000000002",
+            authenticated_device_generation: 1,
+            operation_class: RemoteOperationClass::NonrepeatableMutation,
+            request_hash: [6; 32],
+            now_ms: 1,
+        };
+        assert!(matches!(
+            db.begin_nonrepeatable_remote_operation(request())
+                .await
+                .unwrap(),
+            BeginNonrepeatableRemoteOperationOutcome::Dispatch {
+                dispatch_generation: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            db.begin_nonrepeatable_remote_operation(request())
+                .await
+                .unwrap(),
+            BeginNonrepeatableRemoteOperationOutcome::OutcomeUnknown(_)
+        ));
+        assert!(
+            db.mark_nonrepeatable_remote_operation_outcome_unknown(
+                request().logical_attachment_id,
+                request().operation_id,
+                br#"{"outcome":"unknown"}"#,
+                2,
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            db.begin_nonrepeatable_remote_operation(request())
+                .await
+                .unwrap(),
+            BeginNonrepeatableRemoteOperationOutcome::OutcomeUnknown(
+                br#"{"outcome":"unknown"}"#.to_vec()
+            )
+        );
     }
 }

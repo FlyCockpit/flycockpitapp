@@ -2662,7 +2662,7 @@ CREATE TABLE remote_attachment_operations (
         'transactional_mutation', 'idempotent_adapter_mutation', 'nonrepeatable_mutation'
     )),
     state                          TEXT    NOT NULL CHECK (state IN (
-        'reserved', 'committed', 'rejected', 'outcome_unknown'
+        'reserved', 'dispatched', 'committed', 'rejected', 'outcome_unknown'
     )),
     dispatch_generation            INTEGER NOT NULL DEFAULT 0 CHECK (dispatch_generation >= 0),
     request_hash                   BLOB    NOT NULL CHECK (length(request_hash) = 32),
@@ -2672,7 +2672,7 @@ CREATE TABLE remote_attachment_operations (
     updated_at_ms                  INTEGER NOT NULL,
     retire_at_ms                   INTEGER,
     CHECK (
-        (state = 'reserved' AND safe_response IS NULL AND event_high_water_mark IS NULL)
+        (state IN ('reserved', 'dispatched') AND safe_response IS NULL AND event_high_water_mark IS NULL)
         OR (state IN ('committed', 'rejected') AND safe_response IS NOT NULL AND event_high_water_mark IS NOT NULL)
         OR (state = 'outcome_unknown' AND safe_response IS NOT NULL)
     ),
@@ -2729,8 +2729,9 @@ END;
 
 CREATE TRIGGER remote_attachment_operation_transition_guard
 BEFORE UPDATE ON remote_attachment_operations
-WHEN (OLD.state <> 'reserved' AND NEW.state <> OLD.state)
-  OR (OLD.state = 'reserved' AND NEW.state NOT IN ('reserved', 'committed', 'rejected', 'outcome_unknown'))
+WHEN (OLD.state NOT IN ('reserved', 'dispatched') AND NEW.state <> OLD.state)
+  OR (OLD.state = 'reserved' AND NEW.state NOT IN ('reserved', 'dispatched', 'committed', 'rejected', 'outcome_unknown'))
+  OR (OLD.state = 'dispatched' AND NEW.state NOT IN ('dispatched', 'committed', 'rejected', 'outcome_unknown'))
   OR NEW.dispatch_generation < OLD.dispatch_generation
   OR NEW.updated_at_ms < OLD.updated_at_ms
   OR (OLD.safe_response IS NOT NULL AND NEW.safe_response IS NOT OLD.safe_response)

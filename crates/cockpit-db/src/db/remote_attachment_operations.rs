@@ -138,6 +138,7 @@ pub struct RemoteRenameEvidence {
     pub source_identity: RemoteFilesystemIdentityV1,
     pub source_parent_identity: RemoteFilesystemIdentityV1,
     pub target_parent_identity: RemoteFilesystemIdentityV1,
+    pub observed_target_identity: Option<RemoteFilesystemIdentityV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +146,7 @@ pub enum PrepareRemoteRenameOutcome {
     Prepared(RemoteRenameEvidence),
     Reconcile(RemoteRenameEvidence),
     Replay(Vec<u8>),
+    OutcomeUnknown(Vec<u8>),
     OperationConflict,
     OperationActorConflict,
     AttachmentLedgerCapacity,
@@ -290,6 +292,7 @@ impl Db {
                 ensure!(changed==1,"rename journal generation CAS lost");
                 Ok(PrepareRemoteRenameOutcome::Reconcile(load_remote_rename_evidence(conn,&owned.logical_attachment_id,&owned.operation_id)?))
             }
+            ReserveRemoteOperationOutcome::Replay(replay) if replay.state=="outcome_unknown" => Ok(PrepareRemoteRenameOutcome::OutcomeUnknown(replay.safe_response.context("outcome-unknown rename lacks response")?)),
             ReserveRemoteOperationOutcome::Replay(_)=>bail!("invalid remote rename state"),
             ReserveRemoteOperationOutcome::OperationConflict=>Ok(PrepareRemoteRenameOutcome::OperationConflict),
             ReserveRemoteOperationOutcome::OperationActorConflict=>Ok(PrepareRemoteRenameOutcome::OperationActorConflict),
@@ -325,6 +328,41 @@ impl Db {
         let to = to.to_owned();
         let generation = i64::try_from(dispatch_generation)?;
         self.transaction(move|conn|Ok(conn.execute("UPDATE remote_rename_journal SET state=?5,updated_at_ms=?6 WHERE logical_attachment_id=?1 AND operation_id=?2 AND dispatch_generation=?3 AND state=?4",params![attachment,operation,generation,from,to,now_ms])?==1)).await
+    }
+
+    pub async fn record_remote_rename_applied_mismatch(
+        &self,
+        logical_attachment_id: &str,
+        operation_id: &str,
+        dispatch_generation: u64,
+        observed_target_identity: RemoteFilesystemIdentityV1,
+        safe_response: &[u8],
+        now_ms: i64,
+    ) -> Result<bool> {
+        validate_uuid("logical attachment id", logical_attachment_id)?;
+        validate_operation_id(operation_id)?;
+        ensure!(
+            !safe_response.is_empty() && safe_response.len() <= MAX_SAFE_RESPONSE_BYTES,
+            "rename mismatch response must be bounded and nonempty"
+        );
+        let attachment = logical_attachment_id.to_owned();
+        let operation = operation_id.to_owned();
+        let generation = i64::try_from(dispatch_generation)?;
+        let observed = observed_target_identity.encode()?.to_vec();
+        let response = safe_response.to_vec();
+        self.transaction(move |conn| {
+            let journal = conn.execute(
+                "UPDATE remote_rename_journal SET state='applied_mismatch',observed_target_identity=?4,updated_at_ms=?5 WHERE logical_attachment_id=?1 AND operation_id=?2 AND dispatch_generation=?3 AND state='artifact_synced'",
+                params![attachment, operation, generation, observed, now_ms],
+            )?;
+            ensure!(journal == 1, "rename mismatch requires artifact-synced expected generation");
+            let operation_changed = conn.execute(
+                "UPDATE remote_attachment_operations SET state='outcome_unknown',safe_response=?4,updated_at_ms=?5 WHERE logical_attachment_id=?1 AND operation_id=?2 AND dispatch_generation=?3 AND operation_kind='staged_rename' AND state='dispatched'",
+                params![attachment, operation, generation, response, now_ms],
+            )?;
+            ensure!(operation_changed == 1, "rename mismatch lost operation generation authority");
+            Ok(true)
+        }).await
     }
     /// Reserves an adapter effect before dispatch. A process restart may claim
     /// the same immutable request again with a higher dispatch generation;
@@ -1111,14 +1149,15 @@ fn load_remote_rename_evidence(
     attachment: &str,
     operation: &str,
 ) -> Result<RemoteRenameEvidence> {
-    let (artifact_id, generation, state, source, source_parent, target_parent): (
+    let (artifact_id, generation, state, source, source_parent, target_parent, observed): (
         String,
         i64,
         String,
         Vec<u8>,
         Vec<u8>,
         Vec<u8>,
-    ) = conn.query_row("SELECT artifact_id,dispatch_generation,state,source_identity,source_parent_identity,target_parent_identity FROM remote_rename_journal WHERE logical_attachment_id=?1 AND operation_id=?2",params![attachment,operation],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))).context("loading remote rename evidence")?;
+        Option<Vec<u8>>,
+    ) = conn.query_row("SELECT artifact_id,dispatch_generation,state,source_identity,source_parent_identity,target_parent_identity,observed_target_identity FROM remote_rename_journal WHERE logical_attachment_id=?1 AND operation_id=?2",params![attachment,operation],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?))).context("loading remote rename evidence")?;
     Ok(RemoteRenameEvidence {
         artifact_id,
         dispatch_generation: generation.try_into()?,
@@ -1126,6 +1165,9 @@ fn load_remote_rename_evidence(
         source_identity: RemoteFilesystemIdentityV1::decode(&source)?,
         source_parent_identity: RemoteFilesystemIdentityV1::decode(&source_parent)?,
         target_parent_identity: RemoteFilesystemIdentityV1::decode(&target_parent)?,
+        observed_target_identity: observed
+            .map(|value| RemoteFilesystemIdentityV1::decode(&value))
+            .transpose()?,
     })
 }
 
@@ -2616,6 +2658,82 @@ mod tests {
         ))).await.unwrap();
         assert_eq!(state, "reserved");
         assert_eq!(outbox, 0);
+    }
+
+    #[tokio::test]
+    async fn rename_applied_identity_mismatch_is_durable_and_never_redispatched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rename-mismatch.db");
+        let operation = "01890f3e-4c00-7000-8000-0000000000ab";
+        let request = || ReserveRemoteOperation {
+            operation_class: RemoteOperationClass::IdempotentAdapterMutation,
+            ..reserve(operation, [18; 32])
+        };
+        let observed = filesystem_identity(99, 1);
+        {
+            let db = Db::open(&path).unwrap();
+            assert!(matches!(
+                db.prepare_remote_rename_operation(
+                    request(),
+                    Some(filesystem_identity(1, 1)),
+                    Some(filesystem_identity(2, 2)),
+                    Some(filesystem_identity(3, 2)),
+                )
+                .await
+                .unwrap(),
+                PrepareRemoteRenameOutcome::Prepared(_)
+            ));
+            assert!(db
+                .advance_remote_rename_operation(
+                    ATTACHMENT,
+                    operation,
+                    1,
+                    "prepared",
+                    "artifact_synced",
+                    11,
+                )
+                .await
+                .unwrap());
+            assert!(db
+                .record_remote_rename_applied_mismatch(
+                    ATTACHMENT,
+                    operation,
+                    1,
+                    observed,
+                    b"{\"outcome\":\"unknown\"}",
+                    12,
+                )
+                .await
+                .unwrap());
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(
+            db.prepare_remote_rename_operation(request(), None, None, None)
+                .await
+                .unwrap(),
+            PrepareRemoteRenameOutcome::OutcomeUnknown(b"{\"outcome\":\"unknown\"}".to_vec())
+        );
+        let evidence = db
+            .transaction(move |conn| load_remote_rename_evidence(conn, ATTACHMENT, operation))
+            .await
+            .unwrap();
+        assert_eq!(evidence.state, "applied_mismatch");
+        assert_eq!(evidence.observed_target_identity, Some(observed));
+        assert!(db
+            .commit_remote_rename_operation(
+                CommitRemoteOperation {
+                    logical_attachment_id: ATTACHMENT,
+                    operation_id: operation,
+                    safe_response: b"forbidden",
+                    outbox_delivery_id: "00000000-0000-4000-8000-0000000000ac",
+                    outbox_kind: "filesystem_changed",
+                    outbox_payload: b"rename",
+                    now_ms: 13,
+                },
+                1,
+            )
+            .await
+            .is_err());
     }
 
     #[tokio::test]

@@ -2267,7 +2267,21 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             project_root,
             from_path,
             to_path,
-        } => crate::daemon::fs_api::fs_rename(ctx.clone(), project_root, from_path, to_path).await,
+        } => {
+            if remote_operation.is_some() {
+                return Err(ErrorPayload {
+                    code: ErrorCode::Unavailable,
+                    message: if cfg!(any(target_os = "linux", target_os = "macos")) {
+                        "remote staged rename is unavailable until held-handle recovery is initialized"
+                            .into()
+                    } else {
+                        "remote staged rename is unavailable on this platform; Windows handle security is deferred"
+                            .into()
+                    },
+                });
+            }
+            crate::daemon::fs_api::fs_rename(ctx.clone(), project_root, from_path, to_path).await
+        }
 
         Request::FsDelete { project_root, path } => {
             crate::daemon::fs_api::fs_delete(ctx.clone(), project_root, path).await

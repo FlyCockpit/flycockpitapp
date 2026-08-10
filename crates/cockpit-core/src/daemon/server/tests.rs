@@ -5777,6 +5777,62 @@ async fn remote_fs_write_real_ingress_applies_once_replays_and_conflicts_on_chan
 }
 
 #[tokio::test]
+async fn remote_fs_rename_fails_closed_before_reservation_until_held_recovery_is_available() {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("from.txt"), b"value").unwrap();
+    let attachment = Uuid::parse_str("22222222-2222-4222-8222-222222222225").unwrap();
+    let operation_id = Uuid::parse_str("018f3f24-7a10-7cc2-8f55-111111111115").unwrap();
+    let mut state = remote_state_with_grants(vec![project_files_grant(tmp.path())]);
+    let ClientPrincipal::Remote(principal) = &mut state.principal else {
+        panic!("remote")
+    };
+    principal.actor_binding = Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+        schema_version: 1,
+        device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333335").unwrap(),
+        device_generation: 1,
+        logical_attachment_id: attachment,
+    });
+    let mut shared = state.shared_snapshot();
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_tx, _) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let mut concurrent = ConcurrentRequestRuntime::new();
+    let request_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::remote_request(
+            request_id,
+            proto::RemoteOperationIdentityV1::new(attachment, operation_id).unwrap(),
+            Request::FsRename {
+                project_root: tmp.path().to_string_lossy().into_owned(),
+                from_path: "from.txt".into(),
+                to_path: "to.txt".into(),
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(recv_writer_body(&mut writer_rx,"rename unavailable").await,
+        Body::Error{id:Some(id),error} if id==request_id && error.code==ErrorCode::Unavailable)
+    );
+    assert!(tmp.path().join("from.txt").exists());
+    assert!(!tmp.path().join("to.txt").exists());
+    assert!(
+        ctx.db
+            .remote_operation_status(&attachment.to_string(), &operation_id.to_string())
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn resource_scheduler_is_shared_only_for_persistent_daemons() {
     let persistent_db = Db::open_in_memory().expect("in-memory db");
     let persistent_locks = Arc::new(LockManager::in_memory(persistent_db.clone()));

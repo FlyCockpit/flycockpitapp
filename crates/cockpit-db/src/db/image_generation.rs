@@ -1854,6 +1854,17 @@ pub enum ImageGenerationLatePublicationReplay {
 }
 
 impl ImageGenerationLatePublicationEvidenceV1 {
+    pub fn from_canonical_json(encoded: &str) -> Result<Self> {
+        let parsed: Self =
+            serde_json::from_str(encoded).context("decoding publication evidence")?;
+        parsed.validate()?;
+        ensure!(
+            serde_json::to_string(&parsed)? == encoded,
+            "publication evidence is not canonical"
+        );
+        Ok(parsed)
+    }
+
     pub fn canonical_json(&self) -> Result<String> {
         self.validate()?;
         Ok(serde_json::to_string(self)?)

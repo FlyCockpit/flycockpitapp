@@ -3432,7 +3432,10 @@ CREATE TABLE image_generation_artifact_security_recovery_audits (
  slot_generation INTEGER NOT NULL CHECK(slot_generation>=1),
  principal_digest TEXT NOT NULL CHECK(length(principal_digest)=64 AND principal_digest NOT GLOB '*[^0-9a-f]*'),
  component_set_digest TEXT NOT NULL CHECK(length(component_set_digest)=64 AND component_set_digest NOT GLOB '*[^0-9a-f]*'),
+ component_identity_digest TEXT NOT NULL CHECK(length(component_identity_digest)=64 AND component_identity_digest NOT GLOB '*[^0-9a-f]*'),
  publication_operation_id TEXT,
+ publication_lease_version INTEGER CHECK(publication_lease_version IS NULL OR publication_lease_version>=1),
+ output_identity_digest TEXT CHECK(output_identity_digest IS NULL OR (length(output_identity_digest)=64 AND output_identity_digest NOT GLOB '*[^0-9a-f]*')),
  disposition TEXT NOT NULL CHECK(disposition IN ('retain_blocked','resume_verified_cleanup','complete_verified_late_publication')),
  state TEXT NOT NULL CHECK(state IN ('recorded','applied','denied','proof_failed','stale')),
  outcome_digest TEXT CHECK(outcome_digest IS NULL OR (length(outcome_digest)=64 AND outcome_digest NOT GLOB '*[^0-9a-f]*')),
@@ -3440,7 +3443,8 @@ CREATE TABLE image_generation_artifact_security_recovery_audits (
  decided_at_unix_ms INTEGER,
  FOREIGN KEY(job_id,slot_id) REFERENCES image_generation_slots(job_id,slot_id) ON DELETE RESTRICT,
  FOREIGN KEY(publication_operation_id) REFERENCES image_generation_late_publication_leases(publication_operation_id) ON DELETE RESTRICT,
- CHECK((state='recorded' AND decided_at_unix_ms IS NULL AND outcome_digest IS NULL) OR (state!='recorded' AND decided_at_unix_ms IS NOT NULL AND outcome_digest IS NOT NULL))
+ CHECK((state='recorded' AND decided_at_unix_ms IS NULL AND outcome_digest IS NULL) OR (state!='recorded' AND decided_at_unix_ms IS NOT NULL AND outcome_digest IS NOT NULL)),
+ CHECK((publication_operation_id IS NULL AND publication_lease_version IS NULL AND output_identity_digest IS NULL) OR (publication_operation_id IS NOT NULL AND publication_lease_version IS NOT NULL AND output_identity_digest IS NOT NULL))
 );
 
 CREATE TABLE image_generation_artifact_transitions(from_state TEXT NOT NULL,to_state TEXT NOT NULL,PRIMARY KEY(from_state,to_state));
@@ -3582,7 +3586,7 @@ WHEN OLD.decided_at_unix_ms IS NOT NULL OR NEW.decided_at_unix_ms IS NULL
 BEGIN SELECT RAISE(ABORT,'late publication decision is immutable'); END;
 CREATE TRIGGER image_generation_user_published_output_immutable BEFORE UPDATE ON image_generation_user_published_outputs BEGIN SELECT RAISE(ABORT,'published output evidence is immutable'); END;
 CREATE TRIGGER image_generation_user_published_output_delete_forbidden BEFORE DELETE ON image_generation_user_published_outputs BEGIN SELECT RAISE(ABORT,'published output evidence is durable'); END;
-CREATE TRIGGER image_generation_security_recovery_audit_identity_immutable BEFORE UPDATE OF recovery_operation_id,artifact_id,artifact_generation,job_id,slot_id,slot_generation,principal_digest,component_set_digest,publication_operation_id,disposition,created_at_unix_ms ON image_generation_artifact_security_recovery_audits BEGIN SELECT RAISE(ABORT,'security recovery audit identity is immutable'); END;
+CREATE TRIGGER image_generation_security_recovery_audit_identity_immutable BEFORE UPDATE OF recovery_operation_id,artifact_id,artifact_generation,job_id,slot_id,slot_generation,principal_digest,component_set_digest,component_identity_digest,publication_operation_id,publication_lease_version,output_identity_digest,disposition,created_at_unix_ms ON image_generation_artifact_security_recovery_audits BEGIN SELECT RAISE(ABORT,'security recovery audit identity is immutable'); END;
 CREATE TRIGGER image_generation_security_recovery_audit_transition_guard BEFORE UPDATE OF state ON image_generation_artifact_security_recovery_audits WHEN OLD.state!='recorded' OR NEW.state NOT IN ('applied','denied','proof_failed','stale') BEGIN SELECT RAISE(ABORT,'security recovery audit outcome is immutable'); END;
 CREATE TRIGGER image_generation_security_recovery_audit_delete_forbidden BEFORE DELETE ON image_generation_artifact_security_recovery_audits BEGIN SELECT RAISE(ABORT,'security recovery audit is durable'); END;
 CREATE TRIGGER image_generation_late_publication_authorization_immutable BEFORE UPDATE OF authorization_digest,artifact_id,artifact_generation,job_id,slot_id,slot_generation,component_set_digest,output_authority_digest,output_authority_generation,destination_name,temporary_name,principal_digest,created_at_unix_ms ON image_generation_late_publication_authorization_facts BEGIN SELECT RAISE(ABORT,'late publication authorization identity is immutable'); END;

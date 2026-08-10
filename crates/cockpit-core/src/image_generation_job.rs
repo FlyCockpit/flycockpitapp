@@ -248,8 +248,19 @@ pub struct RecordImageArtifactSecurityRecovery {
     pub slot_id: Uuid,
     pub slot_generation: u64,
     pub component_set_digest: String,
+    pub components: Vec<RecoverImageArtifactComponentIdentity>,
     pub publication_operation_id: Option<Uuid>,
+    pub publication_lease_version: Option<u64>,
+    pub output_identity_digest: Option<String>,
     pub disposition: ImageArtifactSecurityRecoveryDisposition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RecoverImageArtifactComponentIdentity {
+    pub component_id: Uuid,
+    pub kind: ImageGenerationArtifactComponentKind,
+    pub generation: u64,
+    pub stable_identity_digest: String,
 }
 
 #[derive(Debug)]
@@ -259,16 +270,39 @@ pub struct RecordedImageArtifactSecurityRecovery {
     artifact_id: Uuid,
     artifact_generation: u64,
     component_set_digest: String,
+    component_identity_digest: String,
     publication_operation_id: Option<Uuid>,
+    publication_lease_version: Option<u64>,
+    output_identity_digest: Option<String>,
+}
+
+fn component_recovery_identity_digest(
+    components: &[RecoverImageArtifactComponentIdentity],
+) -> Result<String> {
+    let canonical = components
+        .iter()
+        .map(|component| {
+            serde_json::json!({
+                "componentId": component.component_id,
+                "generation": component.generation,
+                "kind": component.kind.as_str(),
+                "stableIdentityDigest": component.stable_identity_digest,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(crate::intel::hex_lower(&Sha256::digest(
+        serde_json::to_vec(&canonical)?,
+    )))
 }
 
 impl ImageGenerationOwnerContextAuthority {
     pub fn record_image_artifact_security_recovery(
         &self,
         conn: &Connection,
-        _local_owner: &DaemonLocalOwnerRecoveryAuthority,
+        principal: &ClientPrincipal,
         input: &RecordImageArtifactSecurityRecovery,
     ) -> Result<RecordedImageArtifactSecurityRecovery> {
+        let _local_owner = DaemonLocalOwnerRecoveryAuthority::from_local_direct(principal)?;
         ensure!(
             conn.is_autocommit(),
             "security recovery must begin outside a transaction"
@@ -294,6 +328,27 @@ impl ImageGenerationOwnerContextAuthority {
             row.0 == "security_blocked" || row.4 == "security_blocked",
             "image artifact recovery is unavailable"
         );
+        let mut components = input.components.clone();
+        components.sort();
+        ensure!(
+            components == input.components,
+            "security recovery components are not canonical"
+        );
+        ensure!(
+            components
+                .windows(2)
+                .all(|pair| pair[0].component_id != pair[1].component_id)
+                && components.iter().all(|component| {
+                    component.generation > 0
+                        && component.stable_identity_digest.len() == 64
+                        && component
+                            .stable_identity_digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                }),
+            "security recovery component identity is invalid"
+        );
+        let component_identity_digest = component_recovery_identity_digest(&components)?;
         ensure!(
             matches!(
                 (input.disposition, input.publication_operation_id),
@@ -313,14 +368,17 @@ impl ImageGenerationOwnerContextAuthority {
             [],
             |row| row.get(0),
         )?;
-        conn.execute("INSERT INTO image_generation_artifact_security_recovery_audits(recovery_operation_id,artifact_id,artifact_generation,job_id,slot_id,slot_generation,principal_digest,component_set_digest,publication_operation_id,disposition,state,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'recorded',?11)",params![input.operation_id.to_string(),input.artifact_id.to_string(),i64::try_from(input.artifact_generation)?,input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.slot_generation)?,self.principal_digest,input.component_set_digest,input.publication_operation_id.map(|id|id.to_string()),input.disposition.as_str(),now])?;
+        conn.execute("INSERT INTO image_generation_artifact_security_recovery_audits(recovery_operation_id,artifact_id,artifact_generation,job_id,slot_id,slot_generation,principal_digest,component_set_digest,component_identity_digest,publication_operation_id,publication_lease_version,output_identity_digest,disposition,state,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'recorded',?14)",params![input.operation_id.to_string(),input.artifact_id.to_string(),i64::try_from(input.artifact_generation)?,input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.slot_generation)?,self.principal_digest,input.component_set_digest,component_identity_digest,input.publication_operation_id.map(|id|id.to_string()),input.publication_lease_version.map(i64::try_from).transpose()?,input.output_identity_digest.as_deref(),input.disposition.as_str(),now])?;
         Ok(RecordedImageArtifactSecurityRecovery {
             operation_id: input.operation_id,
             disposition: input.disposition,
             artifact_id: input.artifact_id,
             artifact_generation: input.artifact_generation,
             component_set_digest: input.component_set_digest.clone(),
+            component_identity_digest,
             publication_operation_id: input.publication_operation_id,
+            publication_lease_version: input.publication_lease_version,
+            output_identity_digest: input.output_identity_digest.clone(),
         })
     }
 
@@ -383,27 +441,38 @@ impl ImageGenerationOwnerContextAuthority {
             recorded.disposition == ImageArtifactSecurityRecoveryDisposition::ResumeVerifiedCleanup,
             "security recovery disposition differs"
         );
-        let expected:i64=conn.query_row("SELECT expected_component_count FROM image_generation_artifacts WHERE artifact_id=?1 AND generation=?2 AND state='security_blocked' AND component_set_digest=?3 AND active_lease_count=0 AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_references r WHERE r.artifact_id=image_generation_artifacts.artifact_id AND r.released_at_unix_ms IS NULL) AND NOT EXISTS(SELECT 1 FROM image_generation_late_publication_leases p WHERE p.artifact_id=image_generation_artifacts.artifact_id AND p.state IN ('reserved','copy_authorized','copy_committed'))",params![recorded.artifact_id.to_string(),i64::try_from(recorded.artifact_generation)?,recorded.component_set_digest],|row|row.get(0))?;
+        let tx = conn.unchecked_transaction()?;
+        let expected:i64=tx.query_row("SELECT expected_component_count FROM image_generation_artifacts WHERE artifact_id=?1 AND generation=?2 AND state='security_blocked' AND component_set_digest=?3 AND active_lease_count=0 AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_references r WHERE r.artifact_id=image_generation_artifacts.artifact_id AND r.released_at_unix_ms IS NULL) AND NOT EXISTS(SELECT 1 FROM image_generation_late_publication_leases p WHERE p.artifact_id=image_generation_artifacts.artifact_id AND p.state IN ('reserved','copy_authorized','copy_committed','security_blocked'))",params![recorded.artifact_id.to_string(),i64::try_from(recorded.artifact_generation)?,recorded.component_set_digest],|row|row.get(0))?;
         ensure!(
             usize::try_from(expected)? == components.len(),
             "security recovery component set differs"
         );
-        let mut ids = std::collections::BTreeSet::new();
+        let mut identities = Vec::with_capacity(components.len());
         for component in components {
-            ensure!(
-                ids.insert(component.component_id),
-                "security recovery component is duplicated"
-            );
-            let (hi,lo,checksum,state):(i64,i64,String,String)=conn.query_row("SELECT byte_length_hi,byte_length_lo,sha256,state FROM image_generation_artifact_components WHERE artifact_id=?1 AND component_id=?2",params![recorded.artifact_id.to_string(),component.component_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
+            let (kind,generation,stable_identity,hi,lo,checksum,state):(String,i64,String,i64,i64,String,String)=tx.query_row("SELECT kind,generation,stable_identity_json,byte_length_hi,byte_length_lo,sha256,state FROM image_generation_artifact_components WHERE artifact_id=?1 AND component_id=?2",params![recorded.artifact_id.to_string(),component.component_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)))?;
             let length = (u64::try_from(hi)? << 32) | u64::try_from(lo)?;
+            let held = component.held.evidence();
             ensure!(
                 matches!(state.as_str(), "ready" | "security_blocked")
-                    && component.held.evidence().byte_length() == length
-                    && component.held.evidence().sha256() == checksum,
+                    && component.kind.as_str() == kind
+                    && component.generation == u64::try_from(generation)?
+                    && held.byte_length() == length
+                    && held.sha256() == checksum
+                    && held_artifact_evidence_json(held)? == stable_identity,
                 "security recovery held component differs"
             );
+            identities.push(RecoverImageArtifactComponentIdentity {
+                component_id: component.component_id,
+                kind: component.kind,
+                generation: component.generation,
+                stable_identity_digest: held.identity_digest().to_owned(),
+            });
         }
-        let tx = conn.unchecked_transaction()?;
+        identities.sort();
+        ensure!(
+            component_recovery_identity_digest(&identities)? == recorded.component_identity_digest,
+            "security recovery component identity set differs"
+        );
         let now: i64 = tx.query_row(
             "SELECT CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)",
             [],
@@ -464,6 +533,13 @@ impl ImageGenerationOwnerContextAuthority {
         let publication_operation_id = recorded
             .publication_operation_id
             .context("security recovery publication identity is absent")?;
+        let expected_lease_version = recorded
+            .publication_lease_version
+            .context("security recovery publication version is absent")?;
+        let expected_output_identity = recorded
+            .output_identity_digest
+            .as_deref()
+            .context("security recovery output identity is absent")?;
         let effect = output.reconcile_publication(recovery)?;
         let HeldDirectoryEffectOutcome::AppliedDurable(effect) = effect else {
             anyhow::bail!("late publication held outcome is not durably applied")
@@ -473,9 +549,17 @@ impl ImageGenerationOwnerContextAuthority {
             .context("late publication destination evidence is absent")?;
         let authority = &output.authority.0;
         let evidence=cockpit_db::db::image_generation::ImageGenerationLatePublicationEvidenceV1::OutputDurable{schema_version:1,identity_digest:effect.artifact().identity_digest().to_owned(),security_digest:effect.artifact().security_digest().to_owned(),byte_length:effect.artifact().byte_length().to_string(),sha256:effect.artifact().sha256().to_owned(),parent_sync_digest:authority.parent_identity_digest.clone()}.canonical_json()?;
-        let row=conn.query_row("SELECT p.version,p.destination_name,p.output_authority_digest,p.output_authority_generation,p.expected_slot_version,a.state FROM image_generation_late_publication_leases p JOIN image_generation_artifacts a ON a.artifact_id=p.artifact_id WHERE p.publication_operation_id=?1 AND p.artifact_id=?2 AND p.artifact_generation=?3 AND p.state='security_blocked'",params![publication_operation_id.to_string(),recorded.artifact_id.to_string(),i64::try_from(recorded.artifact_generation)?],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,i64>(3)?,row.get::<_,i64>(4)?,row.get::<_,String>(5)?))).optional()?.context("security-blocked publication is unavailable")?;
+        let row=conn.query_row("SELECT p.version,p.destination_name,p.output_authority_digest,p.output_authority_generation,p.expected_slot_version,a.state,p.output_evidence_json FROM image_generation_late_publication_leases p JOIN image_generation_artifacts a ON a.artifact_id=p.artifact_id WHERE p.publication_operation_id=?1 AND p.artifact_id=?2 AND p.artifact_generation=?3 AND p.state='security_blocked'",params![publication_operation_id.to_string(),recorded.artifact_id.to_string(),i64::try_from(recorded.artifact_generation)?],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,i64>(3)?,row.get::<_,i64>(4)?,row.get::<_,String>(5)?,row.get::<_,String>(6)?))).optional()?.context("security-blocked publication is unavailable")?;
+        let prior = cockpit_db::db::image_generation::ImageGenerationLatePublicationEvidenceV1::from_canonical_json(&row.6)?;
+        let prior_identity = match prior {
+            cockpit_db::db::image_generation::ImageGenerationLatePublicationEvidenceV1::OutputDurable { identity_digest, .. } => identity_digest,
+            _ => anyhow::bail!("security-blocked publication has no durable output identity"),
+        };
         ensure!(
-            row.1 == destination
+            u64::try_from(row.0)? == expected_lease_version
+                && prior_identity == expected_output_identity
+                && effect.artifact().identity_digest() == expected_output_identity
+                && row.1 == destination
                 && row.2 == authority.canonical_destination_digest
                 && row.3 == i64::try_from(authority.authority_generation)?
                 && matches!(row.5.as_str(), "late_quarantined" | "security_blocked"),
@@ -885,11 +969,16 @@ impl HeldImageGenerationArtifactRoot {
     pub fn open_component_for_owner_recovery(
         &self,
         component_id: Uuid,
+        kind: ImageGenerationArtifactComponentKind,
+        generation: u64,
         name: &str,
         evidence: &HeldArtifactEvidence,
     ) -> Result<VerifiedManagedComponentForRecovery> {
+        ensure!(generation > 0, "component recovery generation is invalid");
         Ok(VerifiedManagedComponentForRecovery {
             component_id,
+            kind,
+            generation,
             held: self.guard.open_verified(name, evidence)?,
         })
     }
@@ -910,7 +999,18 @@ impl HeldImageGenerationArtifactRoot {
 #[derive(Debug)]
 pub struct VerifiedManagedComponentForRecovery {
     component_id: Uuid,
+    kind: ImageGenerationArtifactComponentKind,
+    generation: u64,
     held: HeldSealedArtifact,
+}
+
+fn held_artifact_evidence_json(evidence: &HeldArtifactEvidence) -> Result<String> {
+    Ok(serde_json::to_string(&serde_json::json!({
+        "byteLength": evidence.byte_length().to_string(),
+        "identityDigest": evidence.identity_digest(),
+        "securityDigest": evidence.security_digest(),
+        "sha256": evidence.sha256(),
+    }))?)
 }
 
 pub fn open_image_generation_artifact_root(path: &Path) -> Result<HeldImageGenerationArtifactRoot> {
@@ -1011,9 +1111,7 @@ pub fn retain_generated_image_artifact(
         anyhow::bail!("managed artifact publication requires reconciliation")
     };
     let evidence = effect.artifact().clone();
-    let evidence_json = serde_json::to_string(
-        &serde_json::json!({"byteLength":evidence.byte_length().to_string(),"identityDigest":evidence.identity_digest(),"securityDigest":evidence.security_digest(),"sha256":evidence.sha256()}),
-    )?;
+    let evidence_json = held_artifact_evidence_json(&evidence)?;
     cockpit_db::Db::transition_image_generation_artifact_component_conn(
         conn,
         &TransitionImageGenerationArtifactComponent {

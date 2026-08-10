@@ -450,6 +450,47 @@ CREATE TABLE media_local_path_registration_audit (
     committed_at_unix_ms INTEGER NOT NULL
 );
 
+CREATE TABLE media_retained_https_operations (
+    local_operation_id         TEXT PRIMARY KEY,
+    authoritative_operation_id TEXT NOT NULL,
+    session_id                 TEXT NOT NULL,
+    canonical_project_digest   TEXT NOT NULL,
+    client_draft_id            TEXT NOT NULL,
+    request_binding_digest     TEXT NOT NULL,
+    operation_request_digest   TEXT NOT NULL,
+    semantic_command_digest    TEXT NOT NULL,
+    receipt_json               TEXT NOT NULL,
+    committed_at_unix_ms       INTEGER NOT NULL,
+    is_alias                   INTEGER NOT NULL CHECK (is_alias IN (0,1)),
+    CHECK (length(canonical_project_digest) = 64 AND canonical_project_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(request_binding_digest) = 64 AND request_binding_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(operation_request_digest) = 64 AND operation_request_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(semantic_command_digest) = 64 AND semantic_command_digest NOT GLOB '*[^0-9a-f]*')
+);
+CREATE UNIQUE INDEX uq_media_retained_https_domain
+ON media_retained_https_operations(session_id, canonical_project_digest, client_draft_id)
+WHERE is_alias = 0;
+
+CREATE TABLE media_retained_https_evidence (
+    attachment_id             TEXT PRIMARY KEY,
+    source_evidence_digest    TEXT NOT NULL,
+    redirect_classes_json     TEXT NOT NULL,
+    path_segment_count        INTEGER NOT NULL CHECK(path_segment_count >= 0),
+    safe_basename             TEXT,
+    fetched_at_unix_ms        INTEGER NOT NULL,
+    reservation_id           TEXT NOT NULL,
+    reservation_digest       TEXT NOT NULL,
+    CHECK (length(source_evidence_digest) = 64 AND source_evidence_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(reservation_digest) = 64 AND reservation_digest NOT GLOB '*[^0-9a-f]*'),
+    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE
+);
+
+CREATE TABLE media_retained_https_audit (
+    local_operation_id   TEXT PRIMARY KEY,
+    outcome              TEXT NOT NULL CHECK(outcome IN ('retained','rejected')),
+    committed_at_unix_ms INTEGER NOT NULL
+);
+
 CREATE TABLE media_uploads (
     upload_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, canonical_project_digest TEXT NOT NULL,
     client_draft_id TEXT NOT NULL, media_kind TEXT NOT NULL CHECK(media_kind IN ('image','audio','video')),

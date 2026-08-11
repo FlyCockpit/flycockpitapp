@@ -397,7 +397,12 @@ pub fn validate_digest_hex(s: &str) -> Result<(), IcePolicyError> {
 
 /// Validate a nonzero decimal generation string.
 pub fn validate_generation(s: &str) -> Result<u64, IcePolicyError> {
-    parse_canonical_u64_decimal_string(s).map_err(|_| IcePolicyError::BadGeneration(s.to_string()))
+    let v = parse_canonical_u64_decimal_string(s)
+        .map_err(|_| IcePolicyError::BadGeneration(s.to_string()))?;
+    if v == 0 {
+        return Err(IcePolicyError::BadGeneration("generation must be nonzero".into()));
+    }
+    Ok(v)
 }
 
 /// Validate that a sorted unique list of strings is sorted ascending and unique.
@@ -1451,7 +1456,7 @@ mod tests {
         let random_id = [0xABu8; 16];
         let username = coturn_username(1_000_000_000, &random_id);
         assert_eq!(username, format!("1000000000:{}", B64URL.encode(&random_id)));
-        assert_eq!(B64URL.encode(&random_id).len(), CREDENTIAL_RANDOM_ID_BYTES * 4 / 3);
+        assert_eq!(B64URL.encode(&random_id).len(), ID_B64URL_LEN);
         // 16-byte randomness check.
         assert_eq!(random_id.len(), 16);
         // HMAC-SHA1/base64 coturn vector: known test vector.

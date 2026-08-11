@@ -1388,3 +1388,836 @@ fn render_resize_blocker(frame: &mut Frame, area: Rect) {
         area,
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        }
+    }
+
+    fn test_dialog() -> super::SettingsDialog {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::mem::forget(tmp);
+        super::SettingsDialog::open(path)
+    }
+
+    fn render_page_lines(
+        page: &dyn SettingsPage,
+        dialog: &super::SettingsDialog,
+        width: u16,
+        height: u16,
+    ) -> Vec<String> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let cx: &SettingsCx = &**dialog;
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                page.render(cx, frame, area);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        buffer
+            .content()
+            .iter()
+            .collect::<Vec<_>>()
+            .chunks(width as usize)
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    // AC 1: viewport breakpoints
+    #[test]
+    fn image_generation_settings_viewport_breakpoints() {
+        assert_eq!(
+            generation_viewport_mode(100, 30),
+            GenerationViewportMode::Full
+        );
+        assert_eq!(
+            generation_viewport_mode(120, 40),
+            GenerationViewportMode::Full
+        );
+        assert_eq!(
+            generation_viewport_mode(80, 24),
+            GenerationViewportMode::Compact
+        );
+        assert_eq!(
+            generation_viewport_mode(99, 29),
+            GenerationViewportMode::Compact
+        );
+        assert_eq!(
+            generation_viewport_mode(60, 16),
+            GenerationViewportMode::Reduced
+        );
+        assert_eq!(
+            generation_viewport_mode(79, 23),
+            GenerationViewportMode::Reduced
+        );
+        assert_eq!(
+            generation_viewport_mode(59, 30),
+            GenerationViewportMode::Blocked
+        );
+        assert_eq!(
+            generation_viewport_mode(100, 15),
+            GenerationViewportMode::Blocked
+        );
+        assert_eq!(
+            generation_viewport_mode(59, 15),
+            GenerationViewportMode::Blocked
+        );
+        assert_eq!(
+            generation_viewport_mode(0, 0),
+            GenerationViewportMode::Blocked
+        );
+        assert_eq!(
+            generation_viewport_mode(99, 30),
+            GenerationViewportMode::Compact
+        );
+        assert_eq!(
+            generation_viewport_mode(100, 29),
+            GenerationViewportMode::Compact
+        );
+    }
+
+    #[test]
+    fn image_generation_settings_viewport_blocked_renders_blocker() {
+        let page = GenerationListPage {
+            cursor: 0,
+            principal: GenerationPrincipal::local_owner(),
+            viewport: GenerationViewportMode::Blocked,
+        };
+        let dialog = test_dialog();
+        let lines = render_page_lines(&page, &dialog, 40, 10);
+        assert!(lines.iter().any(|l| l.contains("too small")));
+        assert!(lines.iter().any(|l| l.contains("q: quit")));
+    }
+
+    // AC 2: keyboard focus matrix
+    #[test]
+    fn image_generation_settings_keyboard_focus_matrix() {
+        let principal = GenerationPrincipal::local_owner();
+        let mut dialog = test_dialog();
+        let mut page = GenerationListPage {
+            cursor: 0,
+            principal,
+            viewport: GenerationViewportMode::Full,
+        };
+        let nav = page.handle_key(&mut dialog, press(KeyCode::Down));
+        assert!(matches!(nav, Nav::Stay));
+        assert_eq!(page.cursor, 1);
+        page.handle_key(&mut dialog, press(KeyCode::Up));
+        assert_eq!(page.cursor, 0);
+        let nav = page.handle_key(&mut dialog, press(KeyCode::Esc));
+        assert!(matches!(nav, Nav::Back));
+        let nav = page.handle_key(&mut dialog, press(KeyCode::Enter));
+        assert!(matches!(nav, Nav::Push(_)));
+        let mut compact = GenerationListPage {
+            cursor: 0,
+            principal,
+            viewport: GenerationViewportMode::Compact,
+        };
+        compact.handle_key(&mut dialog, press(KeyCode::Down));
+        assert_eq!(compact.cursor, 1);
+        let mut reduced = GenerationListPage {
+            cursor: 0,
+            principal,
+            viewport: GenerationViewportMode::Reduced,
+        };
+        reduced.handle_key(&mut dialog, press(KeyCode::Down));
+        assert_eq!(reduced.cursor, 1);
+        let mut blocked = GenerationListPage {
+            cursor: 0,
+            principal,
+            viewport: GenerationViewportMode::Blocked,
+        };
+        let _ = blocked.handle_key(&mut dialog, press(KeyCode::Down));
+        assert_eq!(blocked.cursor, 0);
+        let nav = blocked.handle_key(&mut dialog, press(KeyCode::Esc));
+        assert!(matches!(nav, Nav::Back));
+    }
+
+    // AC 3: authorization visibility
+    #[test]
+    fn image_generation_settings_authorization_visibility() {
+        let owner = GenerationPrincipal::local_owner();
+        assert!(owner.config_section_reason().is_none());
+        assert!(owner.targets_section_reason().is_none());
+        assert!(owner.jobs_section_reason().is_none());
+        assert!(owner.can_mutate_config());
+        assert!(owner.can_cancel_job());
+
+        let admin = GenerationPrincipal {
+            exact_project_admin: true,
+            admin_exact_project: true,
+            project_read: true,
+            session_read: true,
+            session_write: true,
+            ..Default::default()
+        };
+        assert!(admin.config_section_reason().is_none());
+        assert!(admin.can_mutate_config());
+
+        let wrong_admin = GenerationPrincipal {
+            exact_project_admin: true,
+            admin_exact_project: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            wrong_admin.config_section_reason(),
+            Some(REASON_FORBIDDEN_IMAGE_ADMIN)
+        );
+        assert!(!wrong_admin.can_mutate_config());
+
+        let proj_read = GenerationPrincipal {
+            project_read: true,
+            ..Default::default()
+        };
+        assert!(proj_read.targets_section_reason().is_none());
+        assert_eq!(
+            proj_read.config_section_reason(),
+            Some(REASON_FORBIDDEN_IMAGE_ADMIN)
+        );
+        assert_eq!(
+            proj_read.jobs_section_reason(),
+            Some(REASON_FORBIDDEN_SESSION_MEMBERSHIP)
+        );
+
+        let sess_read = GenerationPrincipal {
+            session_read: true,
+            ..Default::default()
+        };
+        assert!(sess_read.jobs_section_reason().is_none());
+        assert_eq!(
+            sess_read.targets_section_reason(),
+            Some(REASON_FORBIDDEN_PROJECT_READ)
+        );
+        assert_eq!(
+            sess_read.config_section_reason(),
+            Some(REASON_FORBIDDEN_IMAGE_ADMIN)
+        );
+
+        let sess_write = GenerationPrincipal {
+            session_write: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            sess_write.targets_section_reason(),
+            Some(REASON_FORBIDDEN_PROJECT_READ)
+        );
+        assert!(sess_write.can_cancel_job());
+
+        let sess_both = GenerationPrincipal {
+            session_read: true,
+            session_write: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            sess_both.targets_section_reason(),
+            Some(REASON_FORBIDDEN_PROJECT_READ)
+        );
+
+        let proj_sess = GenerationPrincipal {
+            project_read: true,
+            session_read: true,
+            ..Default::default()
+        };
+        assert!(proj_sess.targets_section_reason().is_none());
+        assert!(proj_sess.jobs_section_reason().is_none());
+        assert_eq!(
+            proj_sess.config_section_reason(),
+            Some(REASON_FORBIDDEN_IMAGE_ADMIN)
+        );
+
+        let none = GenerationPrincipal::default();
+        assert_eq!(
+            none.config_section_reason(),
+            Some(REASON_FORBIDDEN_IMAGE_ADMIN)
+        );
+        assert_eq!(
+            none.targets_section_reason(),
+            Some(REASON_FORBIDDEN_PROJECT_READ)
+        );
+        assert_eq!(
+            none.jobs_section_reason(),
+            Some(REASON_FORBIDDEN_SESSION_MEMBERSHIP)
+        );
+
+        let all_reasons: std::collections::HashSet<&str> =
+            SECTION_REASON_CODES.iter().copied().collect();
+        assert_eq!(all_reasons.len(), 3);
+    }
+
+    #[test]
+    fn image_generation_settings_no_global_grant_option() {
+        let page = GrantListPage {
+            cursor: 0,
+            principal: GenerationPrincipal::local_owner(),
+            grants: Vec::new(),
+            confirm: None,
+            viewport: GenerationViewportMode::Full,
+        };
+        let dialog = test_dialog();
+        let lines = render_page_lines(&page, &dialog, 80, 24);
+        assert!(!lines.iter().any(|l| l.to_lowercase().contains("global")));
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.to_lowercase().contains("create grant")
+                    || l.to_lowercase().contains("add grant"))
+        );
+    }
+
+    // AC 4: budget editor
+    #[test]
+    fn image_generation_settings_budget_editor() {
+        let mut state = BudgetEditorState::unconfigured();
+        assert!(state.blocks_paid_generation);
+        assert!(!state.request_scope_editable());
+        state.plan_context = Some(PlanContext {
+            plan_id: "p1".into(),
+            plan_digest: "d1".into(),
+            owning_session: "s1".into(),
+        });
+        assert!(state.request_scope_editable());
+        state.plan_context = Some(PlanContext {
+            plan_id: "".into(),
+            plan_digest: "d1".into(),
+            owning_session: "s1".into(),
+        });
+        assert!(!state.request_scope_editable());
+
+        let mut state = BudgetEditorState::unconfigured();
+        state.set_finite(BudgetScopeKind::Session, 10_000_000);
+        assert_eq!(
+            state.session.policy,
+            cockpit_core::image_generation_control_plane::BudgetPolicy::Finite
+        );
+        assert!(!state.blocks_paid_generation);
+        state.set_unlimited(BudgetScopeKind::Project);
+        assert_eq!(
+            state.project.policy,
+            cockpit_core::image_generation_control_plane::BudgetPolicy::Unlimited
+        );
+
+        assert_eq!(
+            BudgetEditorState::suggestion_for(BudgetScopeKind::Request),
+            1_000_000
+        );
+        assert_eq!(
+            BudgetEditorState::suggestion_for(BudgetScopeKind::Session),
+            10_000_000
+        );
+        assert_eq!(
+            BudgetEditorState::suggestion_for(BudgetScopeKind::Project),
+            100_000_000
+        );
+
+        let state = BudgetEditorState::unconfigured();
+        assert!(state.session.generation.is_none());
+        assert!(state.project.generation.is_none());
+        assert!(state.request.generation.is_none());
+
+        let page = BudgetEditorPage {
+            cursor: 0,
+            principal: GenerationPrincipal::local_owner(),
+            state: BudgetEditorState::unconfigured(),
+            viewport: GenerationViewportMode::Full,
+        };
+        let dialog = test_dialog();
+        let lines = render_page_lines(&page, &dialog, 80, 24);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(REASON_REQUEST_SCOPE_REQUIRES_PLAN))
+        );
+    }
+
+    // AC 5: authorization review overlay (not a settings surface)
+    #[test]
+    fn image_generation_authorization_review_not_settings_surface() {
+        let surfaces: std::collections::HashSet<SettingsPointerSurfaceKind> =
+            SettingsPointerSurfaceKind::ALL.into_iter().collect();
+        assert!(surfaces.contains(&SettingsPointerSurfaceKind::GenerationList));
+        assert!(surfaces.contains(&SettingsPointerSurfaceKind::EndpointEditor));
+        assert!(surfaces.contains(&SettingsPointerSurfaceKind::TargetEditor));
+        assert!(surfaces.contains(&SettingsPointerSurfaceKind::WorkflowEditor));
+        assert!(surfaces.contains(&SettingsPointerSurfaceKind::BudgetEditor));
+        assert!(surfaces.contains(&SettingsPointerSurfaceKind::GrantList));
+        assert!(surfaces.contains(&SettingsPointerSurfaceKind::JobList));
+        assert!(surfaces.contains(&SettingsPointerSurfaceKind::JobDetail));
+        assert!(surfaces.contains(&SettingsPointerSurfaceKind::LateResultAction));
+    }
+
+    // AC 6: job reducer matrix
+    #[test]
+    fn image_generation_job_reducer_matrix() {
+        let mut reducer = JobReducer::new("d1".into(), "p1".into(), "s1".into());
+        let job = JobCard {
+            job_id: "j1".into(),
+            version: 1,
+            state: ImageJobState::Pending,
+            slots: Vec::new(),
+            quarantined_late_result_count: 0,
+            stale: false,
+        };
+        assert!(reducer.apply_job_event("d1", "p1", "s1", job, "c1", 1));
+        assert_eq!(reducer.jobs.len(), 1);
+
+        let job = JobCard {
+            job_id: "j1".into(),
+            version: 2,
+            state: ImageJobState::Running,
+            slots: vec![JobSlot {
+                target_id: "t1".into(),
+                state: ImageJobState::Running,
+                published_artifacts: 0,
+                quarantined_late_results: 0,
+            }],
+            quarantined_late_result_count: 0,
+            stale: false,
+        };
+        assert!(reducer.apply_job_event("d1", "p1", "s1", job, "c1", 2));
+
+        let job = JobCard {
+            job_id: "j2".into(),
+            version: 1,
+            state: ImageJobState::PartialFailure,
+            slots: vec![
+                JobSlot {
+                    target_id: "ta".into(),
+                    state: ImageJobState::Succeeded,
+                    published_artifacts: 1,
+                    quarantined_late_results: 0,
+                },
+                JobSlot {
+                    target_id: "tb".into(),
+                    state: ImageJobState::Failed,
+                    published_artifacts: 0,
+                    quarantined_late_results: 0,
+                },
+            ],
+            quarantined_late_result_count: 0,
+            stale: false,
+        };
+        assert!(reducer.apply_job_event("d1", "p1", "s1", job, "c1", 3));
+        assert_eq!(reducer.jobs.len(), 2);
+
+        let job = JobCard {
+            job_id: "j3".into(),
+            version: 1,
+            state: ImageJobState::Pending,
+            slots: Vec::new(),
+            quarantined_late_result_count: 0,
+            stale: false,
+        };
+        assert!(!reducer.apply_job_event("d2", "p1", "s1", job, "c1", 4));
+        assert!(!reducer.apply_job_event("d1", "p2", "s1", job, "c1", 4));
+        assert!(!reducer.apply_job_event("d1", "p1", "s2", job, "c1", 4));
+
+        let job = JobCard {
+            job_id: "j1".into(),
+            version: 1,
+            state: ImageJobState::Pending,
+            slots: Vec::new(),
+            quarantined_late_result_count: 0,
+            stale: false,
+        };
+        assert!(!reducer.apply_job_event("d1", "p1", "s1", job, "c1", 1));
+
+        let job = JobCard {
+            job_id: "j4".into(),
+            version: 1,
+            state: ImageJobState::Pending,
+            slots: Vec::new(),
+            quarantined_late_result_count: 0,
+            stale: false,
+        };
+        assert!(!reducer.apply_job_event("d1", "p1", "s1", job, "c1", 10));
+
+        let job = JobCard {
+            job_id: "j5".into(),
+            version: 1,
+            state: ImageJobState::Running,
+            slots: Vec::new(),
+            quarantined_late_result_count: 0,
+            stale: false,
+        };
+        assert!(reducer.apply_job_event("d1", "p1", "s1", job, "c1", 4));
+        assert!(reducer.request_cancel("j5"));
+        let j = reducer.jobs.iter().find(|j| j.job_id == "j5").unwrap();
+        assert_eq!(j.state, ImageJobState::Cancelling);
+        assert_eq!(j.state.label(), "Cancellation requested");
+        assert!(reducer.apply_cancelled("j5"));
+        let j = reducer.jobs.iter().find(|j| j.job_id == "j5").unwrap();
+        assert_eq!(j.state, ImageJobState::Cancelled);
+        assert_eq!(j.state.label(), "Cancelled");
+
+        reducer.mark_stale();
+        assert!(reducer.jobs.iter().all(|j| j.stale));
+        reducer.rehydrate(Vec::new());
+        assert!(reducer.jobs.is_empty());
+    }
+
+    // AC 7: late result actions
+    #[test]
+    fn image_generation_late_result_actions() {
+        assert_eq!(LateResultAction::Publish.label(), "Publish late result?");
+        assert_eq!(LateResultAction::Publish.confirm_label(), "Publish");
+        assert_eq!(LateResultAction::Discard.label(), "Discard late result?");
+        assert_eq!(LateResultAction::Discard.confirm_label(), "Discard");
+
+        let page = LateResultActionPage {
+            cursor: 0,
+            principal: GenerationPrincipal::local_owner(),
+            late_result_id: "lr1".into(),
+            action: LateResultAction::Publish,
+            confirm: None,
+            viewport: GenerationViewportMode::Full,
+        };
+        let dialog = test_dialog();
+        let lines = render_page_lines(&page, &dialog, 80, 24);
+        assert!(lines.iter().any(|l| l.contains("bytes are never exposed")));
+        assert!(lines.iter().any(|l| l.contains("opaque handles")));
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("/tmp/") || l.contains("host_path"))
+        );
+    }
+
+    // AC 8: redaction and conflict
+    #[test]
+    fn image_generation_settings_redaction_and_conflict() {
+        let sentinels = cockpit_core::image_generation_control_plane::FORBIDDEN_SENTINELS;
+        assert!(sentinels.contains(&"api_key"));
+        assert!(sentinels.contains(&"secret"));
+        assert!(sentinels.contains(&"raw_workflow_json"));
+        assert!(sentinels.contains(&"host_path"));
+        assert!(sentinels.contains(&"provider_body"));
+        assert!(sentinels.contains(&"quarantine"));
+
+        let dialog = test_dialog();
+        let page = EndpointEditorPage {
+            cursor: 0,
+            principal: GenerationPrincipal::local_owner(),
+            endpoint_id: None,
+            viewport: GenerationViewportMode::Full,
+        };
+        let lines = render_page_lines(&page, &dialog, 80, 24);
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("api_key") || l.contains("secret"))
+        );
+
+        let page = EndpointEditorPage {
+            cursor: 0,
+            principal: GenerationPrincipal::default(),
+            endpoint_id: None,
+            viewport: GenerationViewportMode::Full,
+        };
+        let lines = render_page_lines(&page, &dialog, 80, 24);
+        assert!(lines.iter().any(|l| l.contains("No endpoint data visible")));
+
+        let mut reducer = JobReducer::new("d".into(), "p".into(), "s".into());
+        reducer.apply_job_event(
+            "d",
+            "p",
+            "s",
+            JobCard {
+                job_id: "j".into(),
+                version: 1,
+                state: ImageJobState::Running,
+                slots: Vec::new(),
+                quarantined_late_result_count: 0,
+                stale: false,
+            },
+            "c",
+            1,
+        );
+        reducer.mark_stale();
+        assert!(reducer.jobs[0].stale);
+        reducer.rehydrate(vec![JobCard {
+            job_id: "j".into(),
+            version: 2,
+            state: ImageJobState::Succeeded,
+            slots: Vec::new(),
+            quarantined_late_result_count: 0,
+            stale: false,
+        }]);
+        assert_eq!(reducer.jobs[0].version, 2);
+        assert!(!reducer.jobs[0].stale);
+    }
+
+    // AC 9: pointer surface
+    #[test]
+    fn image_generation_settings_pointer_surface() {
+        let list = GenerationListPage {
+            cursor: 0,
+            principal: GenerationPrincipal::local_owner(),
+            viewport: GenerationViewportMode::Full,
+        };
+        assert_eq!(
+            list.pointer_surface_kind(),
+            SettingsPointerSurfaceKind::GenerationList
+        );
+        let endpoint = EndpointEditorPage {
+            cursor: 0,
+            principal: GenerationPrincipal::local_owner(),
+            endpoint_id: None,
+            viewport: GenerationViewportMode::Full,
+        };
+        assert_eq!(
+            endpoint.pointer_surface_kind(),
+            SettingsPointerSurfaceKind::EndpointEditor
+        );
+        let target = TargetEditorPage {
+            cursor: 0,
+            principal: GenerationPrincipal::local_owner(),
+            target_id: None,
+            viewport: GenerationViewportMode::Full,
+        };
+        assert_eq!(
+            target.pointer_surface_kind(),
+            SettingsPointerSurfaceKind::TargetEditor
+        );
+        let workflow = WorkflowEditorPage {
+            cursor: 0,
+            principal: GenerationPrincipal::local_owner(),
+            workflow_id: None,
+            viewport: GenerationViewportMode::Full,
+        };
+        assert_eq!(
+            workflow.pointer_surface_kind(),
+            SettingsPointerSurfaceKind::WorkflowEditor
+        );
+        let budget = BudgetEditorPage {
+            cursor: 0,
+            principal: GenerationPrincipal::local_owner(),
+            state: BudgetEditorState::unconfigured(),
+            viewport: GenerationViewportMode::Full,
+        };
+        assert_eq!(
+            budget.pointer_surface_kind(),
+            SettingsPointerSurfaceKind::BudgetEditor
+        );
+        let grants = GrantListPage {
+            cursor: 0,
+            principal: GenerationPrincipal::local_owner(),
+            grants: Vec::new(),
+            confirm: None,
+            viewport: GenerationViewportMode::Full,
+        };
+        assert_eq!(
+            grants.pointer_surface_kind(),
+            SettingsPointerSurfaceKind::GrantList
+        );
+        let jobs = JobListPage {
+            cursor: 0,
+            principal: GenerationPrincipal::local_owner(),
+            reducer: JobReducer::new("d".into(), "p".into(), "s".into()),
+            viewport: GenerationViewportMode::Full,
+        };
+        assert_eq!(
+            jobs.pointer_surface_kind(),
+            SettingsPointerSurfaceKind::JobList
+        );
+        let detail = JobDetailPage {
+            cursor: 0,
+            principal: GenerationPrincipal::local_owner(),
+            job_id: "j".into(),
+            reducer: JobReducer::new("d".into(), "p".into(), "s".into()),
+            confirm: None,
+            viewport: GenerationViewportMode::Full,
+        };
+        assert_eq!(
+            detail.pointer_surface_kind(),
+            SettingsPointerSurfaceKind::JobDetail
+        );
+        let late = LateResultActionPage {
+            cursor: 0,
+            principal: GenerationPrincipal::local_owner(),
+            late_result_id: "lr".into(),
+            action: LateResultAction::Publish,
+            confirm: None,
+            viewport: GenerationViewportMode::Full,
+        };
+        assert_eq!(
+            late.pointer_surface_kind(),
+            SettingsPointerSurfaceKind::LateResultAction
+        );
+
+        let surfaces: std::collections::HashSet<SettingsPointerSurfaceKind> =
+            SettingsPointerSurfaceKind::ALL.into_iter().collect();
+        assert_eq!(surfaces.len(), SettingsPointerSurfaceKind::ALL.len());
+    }
+
+    // AC 10: state action registry
+    #[test]
+    fn image_generation_settings_state_action_registry() {
+        assert_eq!(
+            confirmation_text(GenerationAction::CancelJob(ImageJobId("j".into()))),
+            Some("Cancel job?")
+        );
+        let (c, x) =
+            confirmation_buttons(GenerationAction::CancelJob(ImageJobId("j".into()))).unwrap();
+        assert_eq!(c, "Cancel job");
+        assert_eq!(x, "Cancel");
+
+        assert_eq!(
+            confirmation_text(GenerationAction::RevokeGrant(LateResultId("g".into()))),
+            Some("Revoke grant?")
+        );
+        let (c, x) =
+            confirmation_buttons(GenerationAction::RevokeGrant(LateResultId("g".into()))).unwrap();
+        assert_eq!(c, "Revoke grant");
+        assert_eq!(x, "Cancel");
+
+        assert_eq!(
+            confirmation_text(GenerationAction::PublishLateResult(LateResultId(
+                "lr".into()
+            ))),
+            Some("Publish late result?")
+        );
+        let (c, x) = confirmation_buttons(GenerationAction::PublishLateResult(LateResultId(
+            "lr".into(),
+        )))
+        .unwrap();
+        assert_eq!(c, "Publish");
+        assert_eq!(x, "Cancel");
+
+        assert_eq!(
+            confirmation_text(GenerationAction::DiscardLateResult(LateResultId(
+                "lr".into()
+            ))),
+            Some("Discard late result?")
+        );
+        let (c, x) = confirmation_buttons(GenerationAction::DiscardLateResult(LateResultId(
+            "lr".into(),
+        )))
+        .unwrap();
+        assert_eq!(c, "Discard");
+        assert_eq!(x, "Cancel");
+
+        assert!(confirmation_text(GenerationAction::RefreshHealth).is_none());
+        assert!(confirmation_text(GenerationAction::CreateEndpoint).is_none());
+        assert!(confirmation_text(GenerationAction::SaveBudget).is_none());
+
+        let mut dialog = test_dialog();
+        let mut detail = JobDetailPage {
+            cursor: 0,
+            principal: GenerationPrincipal::local_owner(),
+            job_id: "j1".into(),
+            reducer: JobReducer::new("d".into(), "p".into(), "s".into()),
+            confirm: None,
+            viewport: GenerationViewportMode::Full,
+        };
+        detail.handle_key(&mut dialog, press(KeyCode::Char('c')));
+        assert!(detail.confirm.is_none());
+
+        detail.reducer.jobs.push(JobCard {
+            job_id: "j1".into(),
+            version: 1,
+            state: ImageJobState::Running,
+            slots: Vec::new(),
+            quarantined_late_result_count: 0,
+            stale: false,
+        });
+        detail.handle_key(&mut dialog, press(KeyCode::Char('c')));
+        assert!(detail.confirm.is_some());
+        let lines = render_page_lines(&detail, &dialog, 80, 24);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Cancel job? [Cancel job] [Cancel]"))
+        );
+
+        let mut detail2 = JobDetailPage {
+            cursor: 0,
+            principal: GenerationPrincipal::local_owner(),
+            job_id: "j2".into(),
+            reducer: JobReducer::new("d".into(), "p".into(), "s".into()),
+            confirm: None,
+            viewport: GenerationViewportMode::Full,
+        };
+        detail2.reducer.jobs.push(JobCard {
+            job_id: "j2".into(),
+            version: 1,
+            state: ImageJobState::Succeeded,
+            slots: Vec::new(),
+            quarantined_late_result_count: 0,
+            stale: false,
+        });
+        detail2.handle_key(&mut dialog, press(KeyCode::Char('c')));
+        assert!(detail2.confirm.is_none());
+
+        let mut detail3 = JobDetailPage {
+            cursor: 0,
+            principal: GenerationPrincipal::default(),
+            job_id: "j3".into(),
+            reducer: JobReducer::new("d".into(), "p".into(), "s".into()),
+            confirm: None,
+            viewport: GenerationViewportMode::Full,
+        };
+        detail3.reducer.jobs.push(JobCard {
+            job_id: "j3".into(),
+            version: 1,
+            state: ImageJobState::Running,
+            slots: Vec::new(),
+            quarantined_late_result_count: 0,
+            stale: false,
+        });
+        detail3.handle_key(&mut dialog, press(KeyCode::Char('c')));
+        assert!(detail3.confirm.is_none());
+
+        let pub_page = LateResultActionPage {
+            cursor: 0,
+            principal: GenerationPrincipal::local_owner(),
+            late_result_id: "lr".into(),
+            action: LateResultAction::Publish,
+            confirm: None,
+            viewport: GenerationViewportMode::Full,
+        };
+        let lines = render_page_lines(&pub_page, &dialog, 80, 24);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Publish late result? [Publish] [Cancel]"))
+        );
+
+        let disc_page = LateResultActionPage {
+            cursor: 0,
+            principal: GenerationPrincipal::local_owner(),
+            late_result_id: "lr".into(),
+            action: LateResultAction::Discard,
+            confirm: None,
+            viewport: GenerationViewportMode::Full,
+        };
+        let lines = render_page_lines(&disc_page, &dialog, 80, 24);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("Discard late result? [Discard] [Cancel]"))
+        );
+    }
+}

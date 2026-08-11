@@ -466,6 +466,8 @@ fn history_entry_render_fingerprint(entry: &HistoryEntry) -> u64 {
             reasoning_offset,
             think_duration,
             seq,
+            performance,
+            performance_expanded,
         } => {
             hash_len(&mut hasher, name);
             hash_len(&mut hasher, text);
@@ -475,6 +477,8 @@ fn history_entry_render_fingerprint(entry: &HistoryEntry) -> u64 {
             reasoning_offset.hash(&mut hasher);
             think_duration.hash(&mut hasher);
             seq.hash(&mut hasher);
+            performance.hash(&mut hasher);
+            performance_expanded.hash(&mut hasher);
         }
         HistoryEntry::Diff {
             tool,

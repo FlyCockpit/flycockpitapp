@@ -6,7 +6,7 @@ use tiktoken_rs::{
     r50k_base_singleton,
 };
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TiktokenEncoding {
     #[serde(rename = "r50k_base")]

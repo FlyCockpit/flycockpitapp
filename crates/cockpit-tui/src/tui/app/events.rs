@@ -708,6 +708,7 @@ impl App {
                 text,
                 reasoning,
                 seq,
+                response_performance,
                 ..
             } => {
                 if let Some(p) = &mut self.pending {
@@ -719,6 +720,11 @@ impl App {
                     // Stamp the message's stable id (`session_events.seq`)
                     // so the finalized row can be pinned (`pinned-messages`).
                     p.seq = seq;
+                    // Stamp the durable response-performance snapshot from
+                    // the foundation (`response-performance-display-
+                    // telemetry-foundation`). `None` for empty/think-only/
+                    // no-visible-body/zero-duration responses.
+                    p.response_performance = response_performance;
                     // The engine's finalizing text is the authoritative
                     // user-facing form and is ALREADY clean: inline `<think>`
                     // blocks were stripped by the single shared parser before
@@ -2301,6 +2307,8 @@ impl App {
                 reasoning_offset: 0,
                 think_duration,
                 seq: p.seq,
+                performance: p.response_performance,
+                performance_expanded: false,
             });
         }
     }
@@ -2594,6 +2602,8 @@ pub(super) fn wire_history_to_entries(
                     // "thought for X" sub-line.
                     think_duration: None,
                     seq: (seq != 0).then_some(seq),
+                    performance: None,
+                    performance_expanded: false,
                 });
             }
             Wire::ToolCall {
@@ -2916,6 +2926,7 @@ pub(super) fn new_pending(name: String, strip_think: bool) -> PendingMsg {
         tag_partial: String::new(),
         seq: None,
         strip_think,
+        response_performance: None,
     }
 }
 

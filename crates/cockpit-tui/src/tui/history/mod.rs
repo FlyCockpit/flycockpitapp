@@ -30,7 +30,11 @@ use crate::tui::theme::{
     SUCCESS_TEXT, TOOL_OUTPUT, TOOL_SIDEBAR, WARNING_TEXT,
 };
 use cockpit_config::extended::ThinkingDisplay;
-use cockpit_core::engine::{ToolProgress, tool::ToolPresentation};
+use cockpit_core::engine::{
+    ToolProgress,
+    response_performance::ResponsePerformance,
+    tool::ToolPresentation,
+};
 
 mod pending;
 mod scroll;
@@ -192,6 +196,18 @@ pub enum HistoryEntry {
         /// references — `pinned-messages`). `None` only when the timeline
         /// write failed for this turn.
         seq: Option<i64>,
+        /// Optional durable response-performance snapshot (TTFT,
+        /// generation, displayed tokens, encoding). `None` for
+        /// empty/think-only/no-visible-body/zero-duration responses —
+        /// the foundation omits the snapshot in those cases. When
+        /// present, the renderer draws a clickable `<ttft>/<tps>` chip
+        /// immediately left of fork/pin/timestamp.
+        performance: Option<ResponsePerformance>,
+        /// Whether the performance chip is expanded to show the detail
+        /// line (`TTFT: <value> / TPS: <value>`). TUI-local; defaults
+        /// closed on live/replay and is never persisted. Toggled
+        /// independently of the reasoning `expanded` field.
+        performance_expanded: bool,
     },
     /// Completed `edit` tool call. Rendered as a diff per `tui.diff_style`
     /// (side-by-side / inline / hidden). Stored instead of a `Plain` line so
@@ -608,6 +624,14 @@ pub struct Rendered {
     /// too narrow to fit any control. Carries the seq + exact row/column
     /// ranges so hit-tests route only visible glyphs.
     pub pin_region: Option<PinRegion>,
+    /// Where the clickable response-performance metric chip landed, when
+    /// drawn. `None` when the entry has no performance snapshot, the chip
+    /// was hidden (mouse mode off), or the terminal is below the minimum
+    /// supported width (24 columns) and the header is replaced by the
+    /// `↔` resize state. Carries exact row/column ranges so hit-tests
+    /// route only visible glyphs; clicking toggles
+    /// `performance_expanded` only.
+    pub metric_region: Option<MetricRegion>,
 }
 
 #[derive(Clone)]
@@ -703,6 +727,28 @@ pub struct PinRegion {
     pub col_end: u16,
     pub fork_col_start: Option<u16>,
     pub fork_col_end: Option<u16>,
+}
+
+/// Where the clickable response-performance metric chip landed: the
+/// half-open `[col_start, col_end)` column range on each row that
+/// belongs to the chip. The chip may span multiple rows when the
+/// metric is split across dedicated metadata rows on narrow terminals.
+/// The chrome offsets each `row` by the entry's position in the scroll
+/// buffer and hit-tests only the recorded ranges. Clicking toggles
+/// only `performance_expanded` — never the reasoning `expanded` field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricRegion {
+    /// The row ranges (within an entry's `lines`) and their column
+    /// ranges that form the union hit target of the metric chip.
+    pub rows: Vec<MetricRow>,
+}
+
+/// One row of the metric chip's hit target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetricRow {
+    pub row: usize,
+    pub col_start: u16,
+    pub col_end: u16,
 }
 
 #[cfg(test)]
@@ -804,6 +850,7 @@ pub fn render_entry(
                 tool_result_scroll_regions: Vec::new(),
                 reasoning_scroll_region: None,
                 pin_region,
+                metric_region: None,
             }
         }
         HistoryEntry::Plain { line } => Rendered {
@@ -818,6 +865,7 @@ pub fn render_entry(
             reasoning_scroll_region: None,
             copy_body_start: None,
             pin_region: None,
+            metric_region: None,
         },
         HistoryEntry::CommandError { line } => Rendered {
             lines: vec![Line::from(vec![
@@ -831,6 +879,7 @@ pub fn render_entry(
             reasoning_scroll_region: None,
             copy_body_start: None,
             pin_region: None,
+            metric_region: None,
         },
         HistoryEntry::Maintenance { line } => Rendered {
             lines: vec![Line::from(vec![
@@ -844,6 +893,7 @@ pub fn render_entry(
             reasoning_scroll_region: None,
             copy_body_start: None,
             pin_region: None,
+            metric_region: None,
         },
         HistoryEntry::InterruptDecision { decision } => {
             let lines = render_interrupt_decision(decision);
@@ -857,6 +907,7 @@ pub fn render_entry(
                 reasoning_scroll_region: None,
                 copy_body_start: None,
                 pin_region: None,
+                metric_region: None,
             }
         }
         HistoryEntry::UserNote {
@@ -873,6 +924,7 @@ pub fn render_entry(
                 reasoning_scroll_region: None,
                 copy_body_start: None,
                 pin_region: None,
+                metric_region: None,
             }
         }
         HistoryEntry::SkillAutoInjected { name, reason } => {
@@ -886,6 +938,7 @@ pub fn render_entry(
                 reasoning_scroll_region: None,
                 copy_body_start: None,
                 pin_region: None,
+                metric_region: None,
             }
         }
         HistoryEntry::InferenceError {
@@ -928,6 +981,7 @@ pub fn render_entry(
                 reasoning_scroll_region: None,
                 copy_body_start: None,
                 pin_region: None,
+                metric_region: None,
             }
         }
         HistoryEntry::BackupWarning { line } | HistoryEntry::InferenceWarning { line } => {
@@ -945,6 +999,7 @@ pub fn render_entry(
                 reasoning_scroll_region: None,
                 copy_body_start: None,
                 pin_region: None,
+                metric_region: None,
             }
         }
         HistoryEntry::Diff {
@@ -965,6 +1020,7 @@ pub fn render_entry(
                 reasoning_scroll_region: None,
                 copy_body_start: None,
                 pin_region: None,
+                metric_region: None,
             }
         }
         HistoryEntry::ToolBox {
@@ -997,6 +1053,7 @@ pub fn render_entry(
                 reasoning_scroll_region: None,
                 copy_body_start: None,
                 pin_region: None,
+                metric_region: None,
             }
         }
         HistoryEntry::LocalCommand {
@@ -1028,6 +1085,7 @@ pub fn render_entry(
                 reasoning_scroll_region: None,
                 copy_body_start: None,
                 pin_region: None,
+                metric_region: None,
             }
         }
         HistoryEntry::Subagent {
@@ -1095,6 +1153,8 @@ pub fn render_entry(
             expanded,
             reasoning_offset,
             think_duration,
+            performance,
+            performance_expanded,
             ..
         } => {
             let effective_reasoning: &str = match thinking {
@@ -1117,6 +1177,8 @@ pub fn render_entry(
                 width,
                 md.agent,
                 pin,
+                *performance,
+                *performance_expanded,
             )
         }
     }
@@ -1857,6 +1919,83 @@ fn render_skill_auto_injected(
     (lines, continuations)
 }
 
+/// Minimum terminal width for response-header controls (metric chip,
+/// detail, timestamp, fork, pin, overflow menu). Below this the complete
+/// header is replaced by a noninteractive one-cell `↔` resize state.
+const RESPONSE_HEADER_MIN_WIDTH: u16 = 24;
+
+/// Format TTFT (time-to-first-token) for the compact chip per the spec:
+/// seconds rounded half-up to one decimal below 10; a carry to 10.0+
+/// renders integer seconds half-up. Examples: 3000ms->`3`, 9949ms->`9.9`,
+/// 9950ms->`10`, 10500ms->`11`.
+fn format_ttft(ttft_ms: u64) -> String {
+    let secs = ttft_ms as f64 / 1000.0;
+    if secs < 10.0 {
+        // One decimal, rounded half-up.
+        let rounded = (secs * 10.0 + 0.5).floor() / 10.0;
+        // If rounding carried to 10.0+, render as integer.
+        if rounded >= 10.0 {
+            format!("{}", (secs + 0.5).floor() as u64)
+        } else if rounded == rounded.floor() {
+            // 3000ms -> 3.0 -> "3" (spec example: integer when decimal is .0).
+            format!("{}", rounded as u64)
+        } else {
+            format!("{:.1}", rounded)
+        }
+    } else {
+        // Integer seconds, rounded half-up.
+        format!("{}", (secs + 0.5).floor() as u64)
+    }
+}
+
+/// Format TPS (tokens-per-second) for the compact chip per the spec:
+/// `displayed_tokens * 1_000 / generation_ms`, rounded half-up to an
+/// integer (53.5->`54`). Returns `None` when `generation_ms` is zero
+/// (no TPS snapshot).
+fn format_tps(perf: &ResponsePerformance) -> Option<String> {
+    if perf.generation_ms == 0 {
+        return None;
+    }
+    let tps = perf.displayed_tokens * 1000 / perf.generation_ms;
+    // Round half-up: check the remainder.
+    let remainder = (perf.displayed_tokens * 1000) % perf.generation_ms;
+    let rounded = if remainder * 2 >= perf.generation_ms {
+        tps + 1
+    } else {
+        tps
+    };
+    Some(format!("{rounded}"))
+}
+
+/// The compact `<ttft>/<tps>` chip text, or `None` when the snapshot has
+/// no TPS (zero `generation_ms`).
+fn metric_chip_text(perf: &ResponsePerformance) -> Option<String> {
+    let tps = format_tps(perf)?;
+    Some(format!("{}/{}", format_ttft(perf.ttft_ms), tps))
+}
+
+/// The expanded detail line text: `TTFT: <value>s / TPS: <value>`,
+/// using the same rounded values as the chip. TPS is `-` when absent
+/// (zero generation).
+fn metric_detail_text(perf: &ResponsePerformance) -> String {
+    let ttft = format_ttft(perf.ttft_ms);
+    let tps = format_tps(perf).unwrap_or_else(|| "-".to_string());
+    format!("TTFT: {ttft}s / TPS: {tps}")
+}
+
+/// Style for the metric chip text -- a muted cyan accent, distinct from
+/// the timestamp's grey and the fork/pin yellow/grey.
+fn metric_chip_style() -> Style {
+    Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::DIM | Modifier::UNDERLINED)
+}
+
+/// Style for the expanded metric detail line.
+fn metric_detail_style() -> Style {
+    Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)
+}
+
 /// Agent reply: `• text...` with timestamp right-aligned, optional
 /// indented reasoning trailing when expanded. The agent name is *not*
 /// rendered per-line — the active-agent indicator in the chrome is the
@@ -1876,6 +2015,8 @@ fn render_agent(
     width: u16,
     markdown: bool,
     pin: Option<PinControl>,
+    performance: Option<ResponsePerformance>,
+    performance_expanded: bool,
 ) -> Rendered {
     let _ = name;
     let bullet_width: usize = AGENT_INDENT
@@ -1896,6 +2037,7 @@ fn render_agent(
     // control (mouse mode on and it fit). The `▶` pick-arrow alone is not
     // clickable, so it leaves this `None`.
     let mut pin_region: Option<PinRegion> = None;
+    let mut metric_region: Option<MetricRegion> = None;
     let mut copy_body_start: Option<RenderedCopy> = None;
 
     let mut out: Vec<Line<'static>> = Vec::new();
@@ -1907,6 +2049,181 @@ fn render_agent(
     let mut chip_row = None;
     let mut reasoning_scroll_region: Option<ReasoningScrollRegion> = None;
 
+    // Compute the compact metric chip text (if any). The chip is absent
+    // for None or invalid/zero-duration snapshots (no TPS).
+    let metric_text: Option<String> = performance.as_ref().and_then(metric_chip_text);
+
+    // Below the minimum supported width for response-header controls,
+    // replace all header chrome (metric, detail, timestamp, fork, pin,
+    // overflow menu) with a noninteractive one-cell `↔` resize state.
+    // It has no hit target, never clips horizontally, and retains no
+    // hidden mouse action; the complete accessible header returns only
+    // after resize to 24 columns or wider.
+    if width < RESPONSE_HEADER_MIN_WIDTH {
+        let mut out: Vec<Line<'static>> = Vec::new();
+        let mut conts: Vec<bool> = Vec::new();
+        let mut copy_body_start: Option<RenderedCopy> = None;
+
+        // The resize indicator on its own row.
+        let resize_style = Style::default()
+            .fg(Color::Indexed(MUTED_COLOR_INDEX))
+            .add_modifier(Modifier::DIM);
+        out.push(Line::from(vec![
+            Span::raw(" ".repeat(AGENT_INDENT)),
+            Span::styled("↔", resize_style),
+        ]));
+        conts.push(false);
+
+        // Body content still renders below the resize indicator, just
+        // without any header chrome.
+        let body_content_w = (width as usize).saturating_sub(2 * AGENT_INDENT).max(1);
+        if markdown {
+            let body = render_markdown_message_block(
+                text,
+                body_content_w,
+                0,
+                AGENT_INDENT,
+                Style::default(),
+            );
+            copy_body_start = Some(RenderedCopy::from_block(1, &body));
+            out.extend(body.lines);
+            conts.extend(body.continuations);
+        } else if !text.trim().is_empty() {
+            let wrapped = wrap_with_reserved_first_line(text, body_content_w, 0);
+            let indent = " ".repeat(AGENT_INDENT);
+            for (i, chunk) in wrapped.iter().enumerate() {
+                out.push(Line::from(vec![
+                    Span::raw(indent.clone()),
+                    Span::raw(chunk.clone()),
+                ]));
+                conts.push(i > 0);
+            }
+        }
+
+        // Reasoning chip still renders (it's content, not header chrome).
+        if has_reasoning {
+            let arrow = if expanded { "▼" } else { "▶" };
+            let action_hint = if expanded {
+                "ctrl+t to collapse"
+            } else {
+                "ctrl+t to expand"
+            };
+            let label = match think_duration {
+                Some(d) => format!(
+                    "{arrow} thought for {} ({action_hint})",
+                    format_think_duration(d)
+                ),
+                None => format!("{arrow} thinking ({action_hint})"),
+            };
+            chip_row = Some(0);
+            // Insert the reasoning chip as the first row, pushing the
+            // resize indicator + body down.
+            let chip_line = Line::from(vec![
+                Span::raw(" ".repeat(bullet_width)),
+                Span::styled(
+                    label,
+                    Style::default()
+                        .fg(THINKING_FG)
+                        .add_modifier(Modifier::DIM | Modifier::UNDERLINED),
+                ),
+            ]);
+            out.insert(0, chip_line);
+            conts.insert(0, false);
+            if let Some(mut copy) = copy_body_start {
+                copy.start += 1;
+                copy_body_start = Some(copy);
+            }
+            // Expanded reasoning renders below the chip.
+            if expanded {
+                let reasoning_indent = AGENT_INDENT + 2;
+                let reasoning_w =
+                    (width as usize).saturating_sub(reasoning_indent).max(1);
+                let mut reasoning_rows: Vec<(Line<'static>, bool)> = Vec::new();
+                for raw_line in reasoning.lines() {
+                    let chunks = if raw_line.is_empty() {
+                        vec![String::new()]
+                    } else {
+                        wrap_with_reserved_first_line_and_prefix(
+                            raw_line,
+                            reasoning_w,
+                            0,
+                            0,
+                        )
+                    };
+                    for (i, chunk) in chunks.into_iter().enumerate() {
+                        reasoning_rows.push((
+                            Line::from(vec![
+                                Span::raw(" ".repeat(reasoning_indent)),
+                                Span::styled(chunk, Style::default().fg(REASONING_FG)),
+                            ]),
+                            i > 0,
+                        ));
+                    }
+                }
+                let window = inner_scroll_window(
+                    reasoning_rows.len(),
+                    THINKING_VISIBLE,
+                    reasoning_offset,
+                );
+                let insert_at = 1; // after the chip row
+                if window.more_above > 0 {
+                    out.insert(
+                        insert_at,
+                        Line::from(vec![
+                            Span::raw(" ".repeat(reasoning_indent)),
+                            Span::styled(
+                                format!("{} more above", window.more_above),
+                                Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                            ),
+                        ]),
+                    );
+                    conts.insert(insert_at, false);
+                }
+                let region_start = insert_at + usize::from(window.more_above > 0);
+                for (line, continuation) in reasoning_rows
+                    .iter()
+                    .skip(window.offset)
+                    .take(window.end.saturating_sub(window.offset))
+                {
+                    out.push(line.clone());
+                    conts.push(*continuation);
+                }
+                if window.more_below > 0 {
+                    out.push(Line::from(vec![
+                        Span::raw(" ".repeat(reasoning_indent)),
+                        Span::styled(
+                            format!("{} more below", window.more_below),
+                            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                        ),
+                    ]));
+                    conts.push(false);
+                }
+                let region_end = out.len().saturating_sub(1);
+                if window.max_offset > 0 && region_start <= region_end {
+                    reasoning_scroll_region = Some(ReasoningScrollRegion {
+                        row_start: region_start,
+                        row_end: region_end,
+                        offset: window.offset,
+                        max_offset: window.max_offset,
+                    });
+                }
+            }
+        }
+
+        return Rendered {
+            lines: out,
+            copy_body_start,
+            chip_row,
+            continuations: conts,
+            tool_call_rows: Vec::new(),
+            tool_result_scroll_regions: Vec::new(),
+            reasoning_scroll_region,
+            pin_region: None,
+            metric_region: None,
+        };
+    }
+
+    // width >= RESPONSE_HEADER_MIN_WIDTH: render the full header chrome.
     // When the agent produced reasoning, the *first* row of this entry
     // is the bullet + chip line — replacing the "Thinking…" placeholder
     // that lived there during streaming.  The timestamp lands on the
@@ -1992,9 +2309,12 @@ fn render_agent(
             // lines wrap explicitly so the continuation keeps the same
             // left indent — otherwise ratatui's auto-wrap drops them
             // to column 0 and the block looks ragged.
-            let (line, region) =
-                render_first_line_with_pin_and_timestamp(chip_spans, timestamp, width, pin);
+            let (line, region, metric_row) =
+                render_first_line_with_pin_and_timestamp_metric(chip_spans, timestamp, width, pin, metric_text.as_deref());
             pin_region = region;
+                if let Some(mr) = metric_row {
+                    metric_region = Some(MetricRegion { rows: vec![mr] });
+                }
             out.push(line);
             conts.push(false);
             let reasoning_indent = AGENT_INDENT + 2;
@@ -2067,9 +2387,12 @@ fn render_agent(
             // Collapsed + markdown: chip on its own row (folding
             // markdown spans onto the chip line is more visual jank than
             // it's worth), body markdown lines follow.
-            let (line, region) =
-                render_first_line_with_pin_and_timestamp(chip_spans, timestamp, width, pin);
+            let (line, region, metric_row) =
+                render_first_line_with_pin_and_timestamp_metric(chip_spans, timestamp, width, pin, metric_text.as_deref());
             pin_region = region;
+                if let Some(mr) = metric_row {
+                    metric_region = Some(MetricRegion { rows: vec![mr] });
+                }
             out.push(line);
             conts.push(false);
             if let Some(mut copy) = body_copy {
@@ -2094,9 +2417,12 @@ fn render_agent(
                 first_line_spans.push(Span::raw(" "));
                 first_line_spans.push(Span::raw(collapsed_wrapped[0].clone()));
             }
-            let (line, region) =
-                render_first_line_with_pin_and_timestamp(first_line_spans, timestamp, width, pin);
+            let (line, region, metric_row) =
+                render_first_line_with_pin_and_timestamp_metric(first_line_spans, timestamp, width, pin, metric_text.as_deref());
             pin_region = region;
+                if let Some(mr) = metric_row {
+                    metric_region = Some(MetricRegion { rows: vec![mr] });
+                }
             out.push(line);
             conts.push(false);
             for chunk in collapsed_wrapped.iter().skip(1) {
@@ -2129,9 +2455,12 @@ fn render_agent(
         );
         copy_body_start = Some(RenderedCopy::from_block(0, &body));
         if body.lines.is_empty() {
-            let (line, region) =
-                render_first_line_with_pin_and_timestamp(vec![], timestamp, width, pin);
+            let (line, region, metric_row) =
+                render_first_line_with_pin_and_timestamp_metric(vec![], timestamp, width, pin, metric_text.as_deref());
             pin_region = region;
+                if let Some(mr) = metric_row {
+                    metric_region = Some(MetricRegion { rows: vec![mr] });
+                }
             out.push(line);
             conts.push(false);
         } else {
@@ -2142,9 +2471,12 @@ fn render_agent(
             // continuation (copy rejoins with a space, not a newline).
             let mut iter = body.lines.into_iter().zip(body.continuations);
             let (first, first_cont) = iter.next().expect("body non-empty");
-            let (line, region) =
-                render_first_line_with_pin_and_timestamp(first.spans, timestamp, width, pin);
+            let (line, region, metric_row) =
+                render_first_line_with_pin_and_timestamp_metric(first.spans, timestamp, width, pin, metric_text.as_deref());
             pin_region = region;
+                if let Some(mr) = metric_row {
+                    metric_region = Some(MetricRegion { rows: vec![mr] });
+                }
             out.push(line);
             conts.push(first_cont);
             for (line, cont) in iter {
@@ -2167,9 +2499,12 @@ fn render_agent(
             0,
         );
         if chunks.is_empty() {
-            let (line, region) =
-                render_first_line_with_pin_and_timestamp(vec![], timestamp, width, pin);
+            let (line, region, metric_row) =
+                render_first_line_with_pin_and_timestamp_metric(vec![], timestamp, width, pin, metric_text.as_deref());
             pin_region = region;
+                if let Some(mr) = metric_row {
+                    metric_region = Some(MetricRegion { rows: vec![mr] });
+                }
             out.push(line);
             conts.push(false);
         } else {
@@ -2183,9 +2518,12 @@ fn render_agent(
                         ));
                     }
                     spans.push(Span::raw(chunk.clone()));
-                    let (line, region) =
-                        render_first_line_with_pin_and_timestamp(spans, timestamp, width, pin);
+                    let (line, region, metric_row) =
+                render_first_line_with_pin_and_timestamp_metric(spans, timestamp, width, pin, metric_text.as_deref());
                     pin_region = region;
+                if let Some(mr) = metric_row {
+                    metric_region = Some(MetricRegion { rows: vec![mr] });
+                }
                     out.push(line);
                     conts.push(false);
                 } else {
@@ -2194,6 +2532,175 @@ fn render_agent(
                     conts.push(true);
                 }
             }
+        }
+    }
+
+    // If the metric chip didn't fit inline, emit a dedicated metadata row
+    // (or rows) for it. This row is inserted after the first row (which
+    // carries the timestamp/pin) so the timestamp and controls are
+    // preserved. The dedicated row is clickable.
+    if metric_text.is_some() && metric_region.is_none() {
+        let chip_text = metric_text.as_ref().unwrap();
+        let chip_w = chip_text.width();
+        let avail = (width as usize).saturating_sub(2 * AGENT_INDENT).max(1);
+        let mut metric_rows: Vec<MetricRow> = Vec::new();
+
+        if chip_w + AGENT_INDENT <= avail + AGENT_INDENT {
+            // The chip fits on one row.
+            let (row_line, mr) = render_metric_metadata_row(chip_text, false, width);
+            let insert_at = 1.min(out.len());
+            out.insert(insert_at, row_line);
+            conts.insert(insert_at, false);
+            // Adjust chip_row if it was set.
+            if let Some(cr) = chip_row.as_mut() {
+                if *cr >= insert_at {
+                    *cr += 1;
+                }
+            }
+            // Adjust copy_body_start if it was set.
+            if let Some(copy) = copy_body_start.as_mut() {
+                copy.start += 1;
+            }
+            // Adjust reasoning_scroll_region if set.
+            if let Some(region) = reasoning_scroll_region.as_mut() {
+                region.row_start += 1;
+                region.row_end += 1;
+            }
+            metric_rows.push(MetricRow {
+                row: insert_at,
+                col_start: mr.col_start,
+                col_end: mr.col_end,
+            });
+        } else {
+            // Long metric: split TTFT and TPS onto separate rows.
+            let perf = performance.as_ref().unwrap();
+            let ttft_label = format!("TTFT: {}", format_ttft(perf.ttft_ms));
+            let tps_label = match format_tps(perf) {
+                Some(tps) => format!("TPS: {tps}"),
+                None => "TPS: -".to_string(),
+            };
+            let insert_at = 1.min(out.len());
+            let mut current_row = insert_at;
+            for label in [&ttft_label, &tps_label] {
+                let label_w = label.width();
+                if label_w + AGENT_INDENT <= width as usize {
+                    let (row_line, mr) = render_metric_metadata_row(label, false, width);
+                    out.insert(current_row, row_line);
+                    conts.insert(current_row, false);
+                    metric_rows.push(MetricRow {
+                        row: current_row,
+                        col_start: mr.col_start,
+                        col_end: mr.col_end,
+                    });
+                    current_row += 1;
+                } else {
+                    // Label on one row, value on the next.
+                    let parts: Vec<&str> = label.splitn(2, ' ').collect();
+                    if parts.len() == 2 {
+                        let (l1, _) = render_metric_metadata_row(parts[0], false, width);
+                        out.insert(current_row, l1);
+                        conts.insert(current_row, false);
+                        current_row += 1;
+                        let (l2, mr2) = render_metric_metadata_row(parts[1], false, width);
+                        out.insert(current_row, l2);
+                        conts.insert(current_row, false);
+                        metric_rows.push(MetricRow {
+                            row: current_row,
+                            col_start: mr2.col_start,
+                            col_end: mr2.col_end,
+                        });
+                        current_row += 1;
+                    } else {
+                        let (row_line, mr) = render_metric_metadata_row(label, false, width);
+                        out.insert(current_row, row_line);
+                        conts.insert(current_row, false);
+                        metric_rows.push(MetricRow {
+                            row: current_row,
+                            col_start: mr.col_start,
+                            col_end: mr.col_end,
+                        });
+                        current_row += 1;
+                    }
+                }
+            }
+            // Adjust chip_row and copy_body_start for inserted rows.
+            let inserted = current_row - insert_at;
+            if let Some(cr) = chip_row.as_mut() {
+                if *cr >= insert_at {
+                    *cr += inserted;
+                }
+            }
+            if let Some(copy) = copy_body_start.as_mut() {
+                copy.start += inserted;
+            }
+            if let Some(region) = reasoning_scroll_region.as_mut() {
+                region.row_start += inserted;
+                region.row_end += inserted;
+            }
+        }
+
+        // Expanded detail line (if the metric is expanded).
+        if performance_expanded {
+            let perf = performance.as_ref().unwrap();
+            let detail = metric_detail_text(perf);
+            let detail_w = detail.width();
+            let detail_rows = if detail_w + AGENT_INDENT <= width as usize {
+                vec![detail]
+            } else {
+                // Split detail across rows per the wrapping rule.
+                let ttft_part = format!("TTFT: {}s", format_ttft(perf.ttft_ms));
+                let tps_part = match format_tps(perf) {
+                    Some(tps) => format!("TPS: {tps}"),
+                    None => "TPS: -".to_string(),
+                };
+                vec![ttft_part, tps_part]
+            };
+            for d in &detail_rows {
+                let (row_line, _) = render_metric_metadata_row(d, true, width);
+                out.push(row_line);
+                conts.push(false);
+            }
+        }
+
+        if !metric_rows.is_empty() {
+            metric_region = Some(MetricRegion {
+                rows: metric_rows,
+            });
+        }
+    } else if metric_region.is_some() && performance_expanded {
+        // Inline metric was placed; add expanded detail rows after the
+        // first row.
+        let perf = performance.as_ref().unwrap();
+        let detail = metric_detail_text(perf);
+        let detail_w = detail.width();
+        let detail_rows = if detail_w + AGENT_INDENT <= width as usize {
+            vec![detail]
+        } else {
+            let ttft_part = format!("TTFT: {}s", format_ttft(perf.ttft_ms));
+            let tps_part = match format_tps(perf) {
+                Some(tps) => format!("TPS: {tps}"),
+                None => "TPS: -".to_string(),
+            };
+            vec![ttft_part, tps_part]
+        };
+        let insert_at = 1.min(out.len());
+        for (i, d) in detail_rows.iter().enumerate() {
+            let (row_line, _) = render_metric_metadata_row(d, true, width);
+            out.insert(insert_at + i, row_line);
+            conts.insert(insert_at + i, false);
+        }
+        let inserted = detail_rows.len();
+        if let Some(cr) = chip_row.as_mut() {
+            if *cr >= insert_at {
+                *cr += inserted;
+            }
+        }
+        if let Some(copy) = copy_body_start.as_mut() {
+            copy.start += inserted;
+        }
+        if let Some(region) = reasoning_scroll_region.as_mut() {
+            region.row_start += inserted;
+            region.row_end += inserted;
         }
     }
 
@@ -2206,6 +2713,7 @@ fn render_agent(
         tool_result_scroll_regions: Vec::new(),
         reasoning_scroll_region,
         pin_region,
+        metric_region,
     }
 }
 
@@ -2317,6 +2825,7 @@ fn render_subagent(input: SubagentRenderInput<'_>) -> Rendered {
             reasoning_scroll_region: None,
             copy_body_start: None,
             pin_region: None,
+            metric_region: None,
         };
     };
 
@@ -2370,6 +2879,7 @@ fn render_subagent(input: SubagentRenderInput<'_>) -> Rendered {
             reasoning_scroll_region: None,
             copy_body_start: None,
             pin_region: None,
+            metric_region: None,
         };
     }
 
@@ -2444,6 +2954,7 @@ fn render_subagent(input: SubagentRenderInput<'_>) -> Rendered {
         reasoning_scroll_region: None,
         copy_body_start: None,
         pin_region: None,
+        metric_region: None,
     }
 }
 
@@ -3157,6 +3668,7 @@ fn render_toolbox(
         reasoning_scroll_region: None,
         copy_body_start: None,
         pin_region: None,
+        metric_region: None,
     }
 }
 
@@ -3263,6 +3775,182 @@ fn render_first_line_with_pin_and_timestamp(
     width: u16,
     pin: Option<PinControl>,
 ) -> (Line<'static>, Option<PinRegion>) {
+    let (line, region, _) = render_first_line_with_pin_and_timestamp_metric(spans, timestamp, width, pin, None);
+    (line, region)
+}
+
+/// Like [`render_first_line_with_pin_and_timestamp`] but also places an
+/// optional metric chip immediately left of the pin block. Returns the
+/// line, the pin region, and the metric hit row (if the chip was placed
+/// inline on this row). When the metric doesn't fit inline, the metric
+/// hit row is `None` — the caller must emit a dedicated metadata row.
+fn render_first_line_with_pin_and_timestamp_metric(
+    mut spans: Vec<Span<'static>>,
+    timestamp: DateTime<Local>,
+    width: u16,
+    pin: Option<PinControl>,
+    metric_text: Option<&str>,
+) -> (Line<'static>, Option<PinRegion>, Option<MetricRow>) {
+    let area = width as usize;
+    let ts = format_timestamp(timestamp);
+    let used: usize = spans.iter().map(|s| s.content.width()).sum();
+    let metric_w = metric_text.map(|t| t.width()).unwrap_or(0);
+
+    let Some(p) = pin else {
+        // No pin: try to place metric + timestamp.
+        let right_margin = TIMESTAMP_RIGHT_MARGIN.min(area.saturating_sub(used + TIMESTAMP_WIDTH + 1));
+        let metric_fits = metric_w > 0
+            && used + metric_w + 1 + TIMESTAMP_WIDTH + 1 + right_margin <= area;
+        if metric_fits {
+            let total_right = metric_w + 1 + TIMESTAMP_WIDTH + 1 + right_margin;
+            let pad = area.saturating_sub(used + total_right);
+            spans.push(Span::raw(" ".repeat(pad + 1)));
+            let metric_start = (used + pad + 1) as u16;
+            spans.push(Span::styled(metric_text.unwrap().to_string(), metric_chip_style()));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(ts, Style::default().fg(TIMESTAMP_FG)));
+            spans.push(Span::raw(" ".repeat(right_margin)));
+            return (
+                Line::from(spans),
+                None,
+                Some(MetricRow {
+                    row: 0,
+                    col_start: metric_start,
+                    col_end: metric_start + metric_w as u16,
+                }),
+            );
+        }
+        return (
+            render_first_line_timestamped(spans, timestamp, width, true),
+            None,
+            None,
+        );
+    };
+
+    let arrow_w = if p.is_pick {
+        crate::tui::pins_overlay::PICK_ARROW.width() + 1
+    } else {
+        0
+    };
+    let pin_w = p.pin_control_width();
+    let full_ctrl = p.control_width(true);
+    let pin_only_ctrl = p.control_width(false);
+    let right_margin = TIMESTAMP_RIGHT_MARGIN.min(area.saturating_sub(used + TIMESTAMP_WIDTH + 1));
+    let timestamp_reserve = TIMESTAMP_WIDTH + 1 + right_margin;
+    let (control_w, include_fork) =
+        if full_ctrl > 0 && used + arrow_w + full_ctrl + timestamp_reserve < area {
+            (full_ctrl, true)
+        } else if pin_only_ctrl > 0 && used + arrow_w + pin_only_ctrl + timestamp_reserve < area {
+            (pin_only_ctrl, false)
+        } else if arrow_w > 0 && used + arrow_w + TIMESTAMP_WIDTH + right_margin < area {
+            (0, false)
+        } else {
+            // No pin block fits. Try metric + timestamp only.
+            let metric_fits = metric_w > 0
+                && used + metric_w + 1 + TIMESTAMP_WIDTH + 1 + right_margin <= area;
+            if metric_fits {
+                let total_right = metric_w + 1 + TIMESTAMP_WIDTH + 1 + right_margin;
+                let pad = area.saturating_sub(used + total_right);
+                spans.push(Span::raw(" ".repeat(pad + 1)));
+                let metric_start = (used + pad + 1) as u16;
+                spans.push(Span::styled(metric_text.unwrap().to_string(), metric_chip_style()));
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(ts, Style::default().fg(TIMESTAMP_FG)));
+                spans.push(Span::raw(" ".repeat(right_margin)));
+                return (
+                    Line::from(spans),
+                    None,
+                    Some(MetricRow {
+                        row: 0,
+                        col_start: metric_start,
+                        col_end: metric_start + metric_w as u16,
+                    }),
+                );
+            }
+            return (
+                render_first_line_timestamped(spans, timestamp, width, true),
+                None,
+                None,
+            );
+        };
+    let pin_block = arrow_w + control_w + usize::from(control_w > 0);
+
+    // Check if metric fits inline: metric + space + pin_block + space + ts + margin.
+    let metric_fits_inline = metric_w > 0
+        && used + metric_w + 1 + pin_block + TIMESTAMP_WIDTH + 1 + right_margin <= area;
+
+    if metric_fits_inline {
+        // Layout: ...content... [pad] [metric] [space] [pin_block] [space] [ts] [margin]
+        let total_right = metric_w + 1 + pin_block + TIMESTAMP_WIDTH + 1 + right_margin;
+        let pad = area.saturating_sub(used + total_right);
+        spans.push(Span::raw(" ".repeat(pad + 1)));
+        let metric_start = (used + pad + 1) as u16;
+        spans.push(Span::styled(metric_text.unwrap().to_string(), metric_chip_style()));
+        spans.push(Span::raw(" "));
+        // Pin block.
+        if p.is_pick {
+            spans.push(Span::styled(
+                format!("{} ", crate::tui::pins_overlay::PICK_ARROW),
+                Style::default()
+                    .fg(crate::tui::pins_overlay::PIN_YELLOW)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        let mut region = None;
+        if control_w > 0 {
+            let pin_end = area - right_margin - TIMESTAMP_WIDTH - 1;
+            let pin_start = pin_end - pin_w;
+            let fork_range = if include_fork {
+                let fork_end = pin_start - 1;
+                let fork_start = fork_end - p.fork_control_width();
+                spans.extend(crate::tui::pins_overlay::fork_control_spans());
+                spans.push(Span::raw(" "));
+                Some((fork_start as u16, fork_end as u16))
+            } else {
+                None
+            };
+            let col_start = pin_start as u16;
+            region = Some(PinRegion {
+                seq: p.seq,
+                row: 0,
+                col_start,
+                col_end: col_start + pin_w as u16,
+                fork_col_start: fork_range.map(|(start, _)| start),
+                fork_col_end: fork_range.map(|(_, end)| end),
+            });
+            spans.extend(crate::tui::pins_overlay::pin_control_spans(p.pinned));
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(ts, Style::default().fg(TIMESTAMP_FG)));
+        spans.push(Span::raw(" ".repeat(right_margin)));
+        return (
+            Line::from(spans),
+            region,
+            Some(MetricRow {
+                row: 0,
+                col_start: metric_start,
+                col_end: metric_start + metric_w as u16,
+            }),
+        );
+    }
+
+    // Metric doesn't fit inline — use the original pin-only layout.
+    // Rebuild spans without the metric (it goes on a dedicated row).
+    let (line, region) = render_first_line_with_pin_and_timestamp_inner(
+        spans, timestamp, width, Some(p),
+    );
+    (line, region, None)
+}
+
+/// The inner pin+timestamp layout (no metric). This is the original
+/// `render_first_line_with_pin_and_timestamp` body, factored out so the
+/// metric-aware wrapper can fall back to it.
+fn render_first_line_with_pin_and_timestamp_inner(
+    mut spans: Vec<Span<'static>>,
+    timestamp: DateTime<Local>,
+    width: u16,
+    pin: Option<PinControl>,
+) -> (Line<'static>, Option<PinRegion>) {
     let area = width as usize;
     let ts = format_timestamp(timestamp);
     let used: usize = spans.iter().map(|s| s.content.width()).sum();
@@ -3296,11 +3984,8 @@ fn render_first_line_with_pin_and_timestamp(
             );
         };
     let pin_block = arrow_w + control_w + usize::from(control_w > 0);
-    // Slack pushes the controls + timestamp to the right edge.
     let pad = area.saturating_sub(used + pin_block + TIMESTAMP_WIDTH + 1 + right_margin);
     spans.push(Span::raw(" ".repeat(pad + 1)));
-    // `▶ ` first (immediately left of the controls), then optional `[fork]`,
-    // then the `[pin]`/`[unpin]` control.
     if p.is_pick {
         spans.push(Span::styled(
             format!("{} ", crate::tui::pins_overlay::PICK_ARROW),
@@ -3341,6 +4026,37 @@ fn render_first_line_with_pin_and_timestamp(
 
 fn format_timestamp(t: DateTime<Local>) -> String {
     t.format("%H:%M").to_string()
+}
+
+/// Render a dedicated metric metadata row: the compact chip (or expanded
+/// detail) left-aligned at `AGENT_INDENT`. Returns the line and the
+/// metric hit row (column range covering the chip text).
+fn render_metric_metadata_row(
+    metric_text: &str,
+    detail: bool,
+    width: u16,
+) -> (Line<'static>, MetricRow) {
+    let indent = " ".repeat(AGENT_INDENT);
+    let text_w = metric_text.width();
+    let col_start = AGENT_INDENT as u16;
+    let style = if detail {
+        metric_detail_style()
+    } else {
+        metric_chip_style()
+    };
+    let line = Line::from(vec![
+        Span::raw(indent),
+        Span::styled(metric_text.to_string(), style),
+    ]);
+    let _ = width;
+    (
+        line,
+        MetricRow {
+            row: 0,
+            col_start,
+            col_end: col_start + text_w as u16,
+        },
+    )
 }
 
 /// Split `text` into chunks that fit within `area_width`, reserving

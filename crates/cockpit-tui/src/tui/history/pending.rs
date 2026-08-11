@@ -1,5 +1,7 @@
 use chrono::{DateTime, Local};
 
+use cockpit_core::engine::response_performance::ResponsePerformance;
+
 /// In-flight assistant turn. Lives in `App.pending` from
 /// `ThinkingStarted` to `AssistantText`; once finalized it gets pushed
 /// to `App.history` as [`HistoryEntry::Agent`].
@@ -46,4 +48,9 @@ pub struct PendingMsg {
     /// verbatim as body and reasoning rides only the provider's
     /// `reasoning_content` channel — no partial-tag buffering is initialized.
     pub strip_think: bool,
+    /// The durable response-performance snapshot, set from the
+    /// finalizing `AssistantText` event and stamped onto the frozen
+    /// [`HistoryEntry::Agent`]. `None` for empty/think-only/no-visible-
+    /// body/zero-duration responses.
+    pub response_performance: Option<ResponsePerformance>,
 }

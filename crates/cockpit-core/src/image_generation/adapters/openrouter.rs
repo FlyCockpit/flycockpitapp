@@ -369,7 +369,11 @@ pub enum SizeValue {
     Tier(&'static str),
     /// Canonical explicit pixels `WxH` where each dimension parses into `u32`
     /// and the product fits `u64`.
-    Pixels { width: u32, height: u32, product: u64 },
+    Pixels {
+        width: u32,
+        height: u32,
+        product: u64,
+    },
 }
 
 impl SizeValue {
@@ -403,9 +407,7 @@ impl SizeValue {
     pub fn as_str(&self) -> String {
         match self {
             Self::Tier(t) => (*t).to_string(),
-            Self::Pixels {
-                width, height, ..
-            } => format!("{width}x{height}"),
+            Self::Pixels { width, height, .. } => format!("{width}x{height}"),
         }
     }
 }
@@ -489,10 +491,7 @@ pub fn validate_routing_policy(
     let mut valid_tags: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for tag in endpoint_tags {
         if let Some(t) = tag {
-            if t.is_empty()
-                || t != t.trim()
-                || t.bytes().any(|b| b.is_ascii_control())
-            {
+            if t.is_empty() || t != t.trim() || t.bytes().any(|b| b.is_ascii_control()) {
                 return Err(RoutingError::InvalidDiscoveredTag);
             }
             valid_tags.insert(t.clone());
@@ -1061,15 +1060,16 @@ pub fn preflight(
                     return PreflightOutcome::Reject(PreflightReason::ExplicitPixelsPlusResolution);
                 }
             }
-            SizeValue::Pixels {
-                width, height, ..
-            } => {
+            SizeValue::Pixels { width, height, .. } => {
                 // Explicit-pixel size is authorized only when every possible
                 // endpoint advertises that exact canonical pixel string in a
                 // size enum descriptor. The current live records advertise no
                 // such descriptor.
                 let intersection = parameter_intersection(endpoints, |e| {
-                    e.size.iter().map(|d| d.canonical.clone()).collect::<Vec<_>>()
+                    e.size
+                        .iter()
+                        .map(|d| d.canonical.clone())
+                        .collect::<Vec<_>>()
                 });
                 let canonical = format!("{width}x{height}");
                 if !intersection.iter().any(|s| *s == canonical) {
@@ -1086,7 +1086,9 @@ pub fn preflight(
                 // via exact-rational cross multiplication.
                 if let Some(aspect) = &request.aspect_ratio {
                     if aspect == "auto" {
-                        return PreflightOutcome::Reject(PreflightReason::AspectInconsistentWithPixels);
+                        return PreflightOutcome::Reject(
+                            PreflightReason::AspectInconsistentWithPixels,
+                        );
                     }
                     let ratio = match ExactRatio::parse(aspect) {
                         Some(r) => r,
@@ -1157,7 +1159,9 @@ pub fn preflight(
                 let bytes = decode_data_url_bytes(&reference.image_url.url);
                 let bytes = match bytes {
                     Some(b) => b,
-                    None => return PreflightOutcome::Reject(PreflightReason::ReferencesUnavailable),
+                    None => {
+                        return PreflightOutcome::Reject(PreflightReason::ReferencesUnavailable);
+                    }
                 };
                 if bytes.len() > max_per.min(MAX_PER_REFERENCE_BYTES) {
                     return PreflightOutcome::Reject(PreflightReason::ReferenceOversized);
@@ -1180,7 +1184,9 @@ pub fn decode_data_url_bytes(url: &str) -> Option<Vec<u8>> {
     let payload = url.strip_prefix("data:")?;
     let payload = payload.split_once(';')?.1;
     let payload = payload.strip_prefix("base64,")?;
-    base64::engine::general_purpose::STANDARD.decode(payload).ok()
+    base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -1353,8 +1359,8 @@ pub fn parse_response(body: &[u8]) -> Result<ParsedImageResponse, ResponseParseE
             .decode(b64)
             .map_err(|_| ResponseParseError::InvalidB64Json)?;
         // Canonically detect bytes first.
-        let detected = canonical_detect_media_type(&bytes)
-            .ok_or(ResponseParseError::UndetectableBytes)?;
+        let detected =
+            canonical_detect_media_type(&bytes).ok_or(ResponseParseError::UndetectableBytes)?;
         // A present media_type must match detection.
         if let Some(media) = item.get("media_type").and_then(|v| v.as_str()) {
             if media != detected {
@@ -1450,7 +1456,9 @@ impl fmt::Display for ResponseParseError {
             Self::MissingB64Json => write!(f, "output missing b64_json"),
             Self::InvalidB64Json => write!(f, "output b64_json is invalid"),
             Self::OversizedOutput => write!(f, "output exceeds bounded size"),
-            Self::UndetectableBytes => write!(f, "output bytes undetectable with absent media type"),
+            Self::UndetectableBytes => {
+                write!(f, "output bytes undetectable with absent media type")
+            }
             Self::MediaTypeConflict => write!(f, "present media type conflicts with detection"),
             Self::SvgSanitizationFailed => write!(f, "SVG sanitization failed"),
             Self::InvalidUsageCost => write!(f, "usage cost is invalid"),
@@ -1480,7 +1488,10 @@ pub fn attribution_headers() -> Vec<(&'static str, &'static str)> {
 /// `openrouter-attribution-headers` contract.
 pub fn merge_attribution(headers: &mut Vec<(String, String)>) {
     for (name, default) in attribution_headers() {
-        match headers.iter().position(|(n, _)| n.eq_ignore_ascii_case(name)) {
+        match headers
+            .iter()
+            .position(|(n, _)| n.eq_ignore_ascii_case(name))
+        {
             Some(index) if headers[index].1.is_empty() => {
                 headers.remove(index);
             }
@@ -1610,7 +1621,9 @@ pub fn redact_provider_error(payload: &str) -> String {
     let mut redacted = payload.to_string();
     // Redact bearer tokens.
     let bearer = regex::Regex::new(r"(?i)bearer\s+[A-Za-z0-9._\-]+").unwrap();
-    redacted = bearer.replace_all(&redacted, "Bearer [redacted]").to_string();
+    redacted = bearer
+        .replace_all(&redacted, "Bearer [redacted]")
+        .to_string();
     // Redact API-key-like patterns.
     let key = regex::Regex::new(r"(?i)(sk-[A-Za-z0-9]{20,})").unwrap();
     redacted = key.replace_all(&redacted, "[redacted]").to_string();
@@ -2053,7 +2066,11 @@ mod tests {
         let model = ModelId::parse("qwen/qwen-image-3-pro").unwrap();
         let endpoint_req = build_endpoint_request("https://openrouter.ai", &model).unwrap();
         assert_eq!(endpoint_req.method, "GET");
-        assert!(endpoint_req.url.ends_with("/api/v1/images/models/qwen/qwen-image-3-pro/endpoints"));
+        assert!(
+            endpoint_req
+                .url
+                .ends_with("/api/v1/images/models/qwen/qwen-image-3-pro/endpoints")
+        );
 
         // two-segment model grammar.
         assert!(ModelId::parse("qwen/qwen-image-3-pro").is_some());
@@ -2068,7 +2085,11 @@ mod tests {
         assert!(validate_endpoint_link(&link, &model).is_ok());
         // absolute URL rejected.
         assert_eq!(
-            validate_endpoint_link("https://evil.com/api/v1/images/models/qwen/qwen-image-3-pro/endpoints", &model).unwrap_err(),
+            validate_endpoint_link(
+                "https://evil.com/api/v1/images/models/qwen/qwen-image-3-pro/endpoints",
+                &model
+            )
+            .unwrap_err(),
             EndpointLinkError::AbsoluteOrProtocolRelative
         );
         // protocol-relative rejected.
@@ -2078,7 +2099,8 @@ mod tests {
         );
         // foreign-authority / non-canonical rejected.
         assert_eq!(
-            validate_endpoint_link("/api/v1/images/models/other/model/endpoints", &model).unwrap_err(),
+            validate_endpoint_link("/api/v1/images/models/other/model/endpoints", &model)
+                .unwrap_err(),
             EndpointLinkError::NotCanonical
         );
         // query/fragment rejected.
@@ -2092,12 +2114,20 @@ mod tests {
         );
         // traversal rejected.
         assert_eq!(
-            validate_endpoint_link("/api/v1/images/models/../qwen/qwen-image-3-pro/endpoints", &model).unwrap_err(),
+            validate_endpoint_link(
+                "/api/v1/images/models/../qwen/qwen-image-3-pro/endpoints",
+                &model
+            )
+            .unwrap_err(),
             EndpointLinkError::Traversal
         );
         // encoded separator rejected.
         assert_eq!(
-            validate_endpoint_link("/api/v1/images/models/qwen%2Fqwen-image-3-pro/endpoints", &model).unwrap_err(),
+            validate_endpoint_link(
+                "/api/v1/images/models/qwen%2Fqwen-image-3-pro/endpoints",
+                &model
+            )
+            .unwrap_err(),
             EndpointLinkError::EncodedSeparator
         );
 
@@ -2117,7 +2147,13 @@ mod tests {
                 output: vec!["image".into()],
             }),
         };
-        assert!(model_record.modalities.unwrap().input.contains(&"image".to_string()));
+        assert!(
+            model_record
+                .modalities
+                .unwrap()
+                .input
+                .contains(&"image".to_string())
+        );
 
         // nullable routing tags versus provider-slug evidence.
         let ep_null_tag = endpoint_with_tag(None);
@@ -2764,27 +2800,27 @@ mod tests {
     fn image_generation_openrouter_attempt_safety() {
         // canonical attribution.
         let headers = attribution_headers();
-        assert!(headers
-            .iter()
-            .any(|(n, _)| *n == "HTTP-Referer"));
-        assert!(headers
-            .iter()
-            .any(|(n, _)| *n == "X-OpenRouter-Title"));
+        assert!(headers.iter().any(|(n, _)| *n == "HTTP-Referer"));
+        assert!(headers.iter().any(|(n, _)| *n == "X-OpenRouter-Title"));
 
         // attribution merge: collision-safe.
         let mut merged = vec![("HTTP-Referer".to_string(), "".to_string())];
         merge_attribution(&mut merged);
         // empty value removed, then default added.
-        assert!(merged
-            .iter()
-            .any(|(n, v)| n == "HTTP-Referer" && v == "https://flycockpit.dev"));
+        assert!(
+            merged
+                .iter()
+                .any(|(n, v)| n == "HTTP-Referer" && v == "https://flycockpit.dev")
+        );
 
         let mut merged = vec![("HTTP-Referer".to_string(), "https://custom.dev".to_string())];
         merge_attribution(&mut merged);
         // non-empty configured value preserved.
-        assert!(merged
-            .iter()
-            .any(|(n, v)| n == "HTTP-Referer" && v == "https://custom.dev"));
+        assert!(
+            merged
+                .iter()
+                .any(|(n, v)| n == "HTTP-Referer" && v == "https://custom.dev")
+        );
 
         // secret redaction.
         let redacted = redact_provider_error("Bearer sk-abcdef1234567890abcdef1234567890 error");

@@ -911,8 +911,8 @@
     },
     {
       "tag": "export_session_data",
-      "fcorSchema": "session_id:Uuid|kind:ExportSessionKind|include_generated_artifacts:bool|include_sensitive:bool",
-      "fcorCanonicalSchema": "session_id:uuid|kind:enum16:ExportSessionKind|include_generated_artifacts:bool|include_sensitive:bool",
+      "fcorSchema": "session_id:Uuid|kind:ExportSessionKind|include_generated_artifacts:bool",
+      "fcorCanonicalSchema": "session_id:uuid|kind:enum16:ExportSessionKind|include_generated_artifacts:bool",
       "class": "local_only",
       "strategy": "none",
       "evidence": null,
@@ -929,11 +929,6 @@
         },
         {
           "field": "include_generated_artifacts",
-          "type": "bool",
-          "role": "param"
-        },
-        {
-          "field": "include_sensitive",
           "type": "bool",
           "role": "param"
         }

@@ -1050,11 +1050,6 @@ pub struct ExportArgs {
     /// Include generated/cache/prior-export artifacts from raw config layer copies.
     #[arg(long)]
     pub include_generated: bool,
-
-    /// Include exact captured model/tool payloads. By default export scrubs
-    /// sensitive strings through the configured redaction table.
-    #[arg(long)]
-    pub include_sensitive: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -1447,20 +1442,17 @@ mod tests {
             Some(Command::Export(args)) => {
                 assert_eq!(args.session_id.as_deref(), Some("abc123"));
                 assert!(args.include_generated);
-                assert!(!args.include_sensitive);
             }
             other => panic!("expected export command, got {other:?}"),
         }
+    }
 
-        let cli =
-            Cli::try_parse_from(["cockpit", "export", "abc123", "--include-sensitive"]).unwrap();
-        match cli.command {
-            Some(Command::Export(args)) => {
-                assert_eq!(args.session_id.as_deref(), Some("abc123"));
-                assert!(args.include_sensitive);
-            }
-            other => panic!("expected export command, got {other:?}"),
-        }
+    #[test]
+    fn export_has_no_include_sensitive_flag() {
+        // `--include-sensitive` was removed: every export is a permanently
+        // redacted, portable artifact. The flag must not parse.
+        let result = Cli::try_parse_from(["cockpit", "export", "abc123", "--include-sensitive"]);
+        assert!(result.is_err(), "--include-sensitive must not be accepted");
     }
 
     #[test]

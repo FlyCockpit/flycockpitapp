@@ -125,7 +125,7 @@ fn entry_names(bytes: &[u8]) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn export_redaction_helper_scrubs_by_default_and_preserves_with_opt_in() {
+async fn export_redaction_helper_scrubs_with_no_bypass() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = crate::config::extended::RedactConfig {
         denylist: vec!["exact-secret-value".to_string()],
@@ -140,13 +140,15 @@ async fn export_redaction_helper_scrubs_by_default_and_preserves_with_opt_in() {
             "nested": ["exact-secret-value"],
         }
     });
-    redact_value_for_export(&mut safe, &redactor, false);
+    redact_value_for_export(&mut safe, &redactor);
     assert!(!safe.to_string().contains("exact-secret-value"));
     assert!(safe.to_string().contains("REDACTED"));
 
-    let mut sensitive = json!({"prompt": "send exact-secret-value"});
-    redact_value_for_export(&mut sensitive, &redactor, true);
-    assert!(sensitive.to_string().contains("exact-secret-value"));
+    // There is no bypass: scrubbing a second value through the same
+    // redactor still redacts — the helper has no opt-out path.
+    let mut also_redacted = json!({"prompt": "send exact-secret-value"});
+    redact_value_for_export(&mut also_redacted, &redactor);
+    assert!(!also_redacted.to_string().contains("exact-secret-value"));
 }
 
 async fn responses_session_with_intro() -> Session {
@@ -775,7 +777,7 @@ async fn export_bundles_main_and_subagent_requests() {
 }
 
 #[tokio::test]
-async fn export_request_payloads_redacted_by_default_and_sensitive_opt_in_preserves() {
+async fn export_request_payloads_are_redacted_with_no_bypass() {
     let tmp = tempfile::tempdir().unwrap();
     let config_dir = tmp.path().join(".cockpit");
     std::fs::create_dir_all(&config_dir).unwrap();
@@ -830,30 +832,6 @@ async fn export_request_payloads_redacted_by_default_and_sensitive_opt_in_preser
     assert!(!safe_body.contains("trusted-secret-value"));
     assert!(
         !read_zip_entry(&safe, "events.json")
-            .unwrap()
-            .contains("trusted-secret-value")
-    );
-
-    let sensitive = trusted_build_zip_with_options(
-        &db,
-        &target,
-        &bundle,
-        ExportBundleOptions {
-            include_sensitive: true,
-            ..ExportBundleOptions::default()
-        },
-        &test_export_env(),
-    )
-    .await
-    .unwrap();
-    let sensitive_body = entry_names(&sensitive)
-        .into_iter()
-        .find(|name| name.starts_with("inference_requests/"))
-        .and_then(|name| read_zip_entry(&sensitive, &name))
-        .expect("request file exists");
-    assert!(sensitive_body.contains("trusted-secret-value"));
-    assert!(
-        read_zip_entry(&sensitive, "events.json")
             .unwrap()
             .contains("trusted-secret-value")
     );
@@ -2726,7 +2704,7 @@ async fn bundle_export_reloads_a_stale_caller_target_inside_its_snapshot() {
     let after = manifest_active_model("provider-after", "model-after");
     set_test_session_active_model(&db, session.session_id, &after).await;
 
-    let bundle = build_bundle_zip_bytes(&db, &stale_target, false, true)
+    let bundle = build_bundle_zip_bytes(&db, &stale_target, false)
         .await
         .expect("export reloads its target by session id");
     let manifest: Value =
@@ -2823,7 +2801,6 @@ async fn bundle_export_is_one_wal_snapshot_across_all_query_phases() {
                 session_id,
                 ExportBundleOptions {
                     include_generated_artifacts: false,
-                    include_sensitive: true,
                 },
                 &test_export_env(),
                 move || {
@@ -2930,7 +2907,7 @@ async fn write_bundle_zip_overwrite_mode_vs_clobber_guard() {
     assert!(!out.parent().unwrap().exists());
 
     // First write succeeds and creates the directory.
-    let summary = write_bundle_zip(&db, &target, &out, false, false, false)
+    let summary = write_bundle_zip(&db, &target, &out, false, false)
         .await
         .unwrap();
     assert_eq!(summary.session_count, 1);
@@ -2938,13 +2915,13 @@ async fn write_bundle_zip_overwrite_mode_vs_clobber_guard() {
     assert!(out.exists());
 
     // Clobber guard: a second write with `overwrite = false` is refused.
-    let err = write_bundle_zip(&db, &target, &out, false, false, false)
+    let err = write_bundle_zip(&db, &target, &out, false, false)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("already exists"));
 
     // Overwrite mode replaces the file unconditionally (TUI path).
-    let again = write_bundle_zip(&db, &target, &out, true, false, false)
+    let again = write_bundle_zip(&db, &target, &out, true, false)
         .await
         .unwrap();
     assert_eq!(again.session_count, 1);
@@ -2968,7 +2945,7 @@ async fn archive_is_private() {
     let target = get_test_session(&db, session.session_id).await;
     let out = tmp.path().join("export.zip");
 
-    write_bundle_zip(&db, &target, &out, false, false, false)
+    write_bundle_zip(&db, &target, &out, false, false)
         .await
         .expect("export succeeds");
 
@@ -3013,57 +2990,6 @@ async fn redaction_failure_aborts_export() {
             .to_string()
             .contains("synthetic redaction-table failure"),
         "error must preserve the redaction failure cause: {error:#}"
-    );
-}
-
-#[tokio::test]
-async fn include_sensitive_still_works() {
-    let db = Db::open_in_memory().unwrap();
-    let session = create_test_session(&db, "p", "/proj", "builder").await;
-    let secret = "include-sensitive-secret";
-    let call = Uuid::new_v4();
-    db.insert_inference_request(
-        &call.to_string(),
-        session.session_id,
-        &json!({
-            "model": "m",
-            "system": secret,
-            "tools": [],
-            "history": [],
-        }),
-        crate::db::session_log::InferenceRequestStatus::Completed,
-    )
-    .await
-    .unwrap();
-    db.insert_session_event(
-        session.session_id,
-        SessionEventKind::InferenceRequest,
-        Some("builder"),
-        Some(&call.to_string()),
-        &json!({"secret": secret}),
-    )
-    .await
-    .unwrap();
-    let target = get_test_session(&db, session.session_id).await;
-
-    let bundle = build_bundle_zip_bytes(&db, &target, false, true)
-        .await
-        .expect("--include-sensitive is the explicit export escape hatch");
-
-    assert!(
-        read_zip_entry(&bundle.bytes, "events.json")
-            .expect("events are exported")
-            .contains(secret),
-        "--include-sensitive must retain event payloads"
-    );
-    let request = entry_names(&bundle.bytes)
-        .into_iter()
-        .find(|name| name.starts_with("inference_requests/"))
-        .and_then(|name| read_zip_entry(&bundle.bytes, &name))
-        .expect("request payload is exported");
-    assert!(
-        request.contains(secret),
-        "--include-sensitive must retain inference payloads"
     );
 }
 
@@ -3512,7 +3438,6 @@ async fn manifest_has_version_and_session_date() {
         &bundle,
         ExportBundleOptions {
             include_generated_artifacts: true,
-            include_sensitive: false,
         },
         &test_export_env(),
     )
@@ -4115,4 +4040,78 @@ async fn portable_export_stays_redacted_across_every_trust_mode_combination() {
              secret-bearing material never reached the export, so the matrix proved nothing"
         );
     }
+}
+
+/// Acceptance criterion 1: no Rust source surface accepts, serializes,
+/// defaults, or honors `include_sensitive`, `--include-sensitive`, or an
+/// equivalent bypass. This is a structural grep over the crate sources so a
+/// future reintroduction (a new field, flag, or branching on a boolean
+/// bypass) is caught at test time rather than becoming a secret-delivery
+/// channel.
+#[test]
+fn export_has_no_include_sensitive_escape_hatch() {
+    use std::path::Path;
+
+    // The crate root for `cockpit-core`.
+    let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    // The repository root (parent of the crate directory).
+    let repo_root = crate_root.parent().unwrap().parent().unwrap();
+
+    // Source roots scanned for a bypass surface. The protocol, core, CLI, and
+    // TUI are the Rust surfaces that previously carried the field.
+    let scan_roots = [
+        crate_root.join("src"),
+        repo_root.join("crates/cockpit-proto/src"),
+        repo_root.join("apps/cli/src"),
+        repo_root.join("crates/cockpit-tui/src"),
+    ];
+
+    // Substrings that indicate a bypass surface. The doc-comment phrase
+    // "there is no `include_sensitive` bypass" is permitted (it documents the
+    // invariant); an actual field, flag, struct member, or argument is not.
+    let forbidden = [
+        "include_sensitive: bool",
+        "include_sensitive: false",
+        "include_sensitive: true",
+        "--include-sensitive",
+        "include_sensitive,",
+        "include_sensitive)",
+        ".include_sensitive",
+    ];
+
+    let allow_phrase = "there is no `include_sensitive` bypass";
+
+    let mut hits = Vec::new();
+    for root in &scan_roots {
+        let walker = walkdir::WalkDir::new(root);
+        for entry in walker {
+            let entry = entry.unwrap();
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if ext != "rs" {
+                continue;
+            }
+            let source = std::fs::read_to_string(path).unwrap();
+            for (lineno, line) in source.lines().enumerate() {
+                let trimmed = line.trim();
+                // Permit the documenting comment.
+                if trimmed.contains(allow_phrase) {
+                    continue;
+                }
+                for needle in forbidden {
+                    if line.contains(needle) {
+                        hits.push(format!("{}:{}: {}", path.display(), lineno + 1, line.trim_end()));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "found `include_sensitive` bypass surface(s) that must be removed:\n{}",
+        hits.join("\n")
+    );
 }

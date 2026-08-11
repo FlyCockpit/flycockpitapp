@@ -24,27 +24,15 @@ pub async fn run(args: ExportArgs) -> Result<()> {
     // successor sessions, then assemble the archive. The walk is cheap
     // point-lookups per session; the read is bounded by the session's
     // history, which is acceptable to do on the current task for a
-    // one-shot CLI export.
+    // one-shot CLI export. Every export is a permanently redacted,
+    // portable artifact; there is no unredacted escape hatch.
     let out_path = args
         .output
         .clone()
         .unwrap_or_else(|| default_output_path(&target));
 
-    if args.include_sensitive {
-        eprintln!(
-            "warning: --include-sensitive exports exact captured payloads and may include secrets sent to trusted models"
-        );
-    }
-
-    let summary = write_bundle_zip(
-        &db,
-        &target,
-        &out_path,
-        args.force,
-        args.include_generated,
-        args.include_sensitive,
-    )
-    .await?;
+    let summary =
+        write_bundle_zip(&db, &target, &out_path, args.force, args.include_generated).await?;
 
     println!(
         "Exported session `{}` ({} session{}, {} bytes) → {}",
@@ -87,7 +75,6 @@ mod tests {
                 output: None,
                 force: false,
                 include_generated: false,
-                include_sensitive: false,
             },
         )
         .await
@@ -111,7 +98,6 @@ mod tests {
                 output: None,
                 force: false,
                 include_generated: false,
-                include_sensitive: false,
             },
         )
         .await
@@ -150,7 +136,6 @@ mod tests {
                 output: None,
                 force: false,
                 include_generated: false,
-                include_sensitive: false,
             },
         )
         .await

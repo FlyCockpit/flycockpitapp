@@ -1865,3 +1865,400 @@ fn sealed_bindings_and_noninference_process_egress_are_absent_env_scrub() {
     assert!(crate::redact::env_scrub_patterns("SEALED_DBURL_PROD"));
     assert!(!crate::redact::env_scrub_patterns("PATH"));
 }
+
+// ---------------------------------------------------------------------------
+// sealed-value-untrusted-inference-marker: typed replacement architecture
+// ---------------------------------------------------------------------------
+
+use crate::redact::{Replacement, sealed_untrusted_inference_marker};
+
+#[test]
+fn sealed_untrusted_inference_marker_renders_exact_protocol_string() {
+    // The marker is a protocol-level instruction with exact spelling:
+    // Unicode em dash, lowercase, backtick-delimited value id.
+    let marker = sealed_untrusted_inference_marker("prod_token");
+    assert_eq!(
+        marker,
+        "**redacted by cockpit — to use this value, reference sealed value `prod_token`**"
+    );
+    // The value id is data, not assembled Markdown: it cannot inject headings,
+    // links, or code-fence syntax because the sealed-value contract constrains
+    // it to lowercase letters, digits, `-`, `_`.
+    let marker2 = sealed_untrusted_inference_marker("db-prod-1");
+    assert!(marker2.contains("`db-prod-1`"));
+    assert!(!marker2.contains("]"));
+}
+
+#[test]
+fn sealed_untrusted_inference_marker_generic_for_ordinary_secrets() {
+    // The persisted table uses Generic replacement for every entry, including
+    // sealed entries. Active authorization is never persisted in a redaction
+    // entry — it is resolved at egress time.
+    let cfg = enabled_cfg();
+    let dir = TempDir::new().unwrap();
+    let table = build_with_session_env(&cfg, dir.path(), &HashMap::new());
+    let sealed_literal = "high-entropy-sealed-token-xyz";
+    let table = table
+        .with_forced_literal(sealed_literal.to_string(), "sealed:prod_token".to_string())
+        .unwrap();
+    // Without sealed replacements activated, the sealed entry renders the
+    // generic placeholder — same as an ordinary secret.
+    let scrubbed = table.scrub(&format!("use {sealed_literal} now"));
+    assert!(scrubbed.contains("***REDACT***"));
+    assert!(!scrubbed.contains(sealed_literal));
+    assert!(!scrubbed.contains("reference sealed value"));
+}
+
+#[test]
+fn sealed_untrusted_inference_marker_exact_for_active_grant() {
+    // At egress time, with_sealed_replacements activates the actionable marker
+    // for sealed entries whose canonical value id has an active exact grant.
+    let cfg = enabled_cfg();
+    let dir = TempDir::new().unwrap();
+    let table = build_with_session_env(&cfg, dir.path(), &HashMap::new());
+    let sealed_literal = "high-entropy-sealed-token-xyz";
+    let table = table
+        .with_forced_literal(sealed_literal.to_string(), "sealed:prod_token".to_string())
+        .unwrap();
+    let mut active = std::collections::HashSet::new();
+    active.insert("prod_token".to_string());
+    let egress = table.with_sealed_replacements(&active);
+    let scrubbed = egress.scrub(&format!("use {sealed_literal} now"));
+    assert!(scrubbed.contains("reference sealed value `prod_token`"));
+    assert!(!scrubbed.contains(sealed_literal));
+}
+
+#[test]
+fn sealed_untrusted_inference_marker_inactive_grant_falls_back_generic() {
+    // A sealed entry without an active exact grant (revoked, expired, ungranted)
+    // receives the generic placeholder, never a stale actionable handle.
+    let cfg = enabled_cfg();
+    let dir = TempDir::new().unwrap();
+    let table = build_with_session_env(&cfg, dir.path(), &HashMap::new());
+    let sealed_literal = "high-entropy-sealed-token-xyz";
+    let table = table
+        .with_forced_literal(sealed_literal.to_string(), "sealed:prod_token".to_string())
+        .unwrap();
+    // No active grants — empty set.
+    let active = std::collections::HashSet::<String>::new();
+    let egress = table.with_sealed_replacements(&active);
+    let scrubbed = egress.scrub(&format!("use {sealed_literal} now"));
+    assert!(scrubbed.contains("***REDACT***"));
+    assert!(!scrubbed.contains(sealed_literal));
+    assert!(!scrubbed.contains("reference sealed value"));
+}
+
+#[test]
+fn sealed_untrusted_inference_marker_mixed_sealed_and_ordinary() {
+    // A request containing a sealed literal beside an ordinary secret preserves
+    // text order and replaces each occurrence with the entry's own renderer.
+    // An ordinary secret must never acquire a sealed ID, and a sealed literal
+    // must never fall back to the ordinary marker (when its grant is active).
+    let cfg = enabled_cfg();
+    let dir = TempDir::new().unwrap();
+    let table = build_with_session_env(&cfg, dir.path(), &HashMap::new());
+    let sealed_literal = "high-entropy-sealed-token-xyz";
+    let ordinary_secret = "ordinary-api-key-12345678";
+    let table = table
+        .with_forced_literal(sealed_literal.to_string(), "sealed:prod_token".to_string())
+        .unwrap()
+        .with_forced_literal(ordinary_secret.to_string(), "$SECRET".to_string())
+        .unwrap();
+    let mut active = std::collections::HashSet::new();
+    active.insert("prod_token".to_string());
+    let egress = table.with_sealed_replacements(&active);
+    let input = format!("sealed={sealed_literal} ordinary={ordinary_secret} done");
+    let scrubbed = egress.scrub(&input);
+    // The sealed literal gets the actionable marker.
+    assert!(scrubbed.contains("reference sealed value `prod_token`"));
+    // The ordinary secret gets the generic placeholder.
+    assert!(scrubbed.contains("***REDACT***"));
+    // No literal leaks.
+    assert!(!scrubbed.contains(sealed_literal));
+    assert!(!scrubbed.contains(ordinary_secret));
+    // Text order is preserved: sealed marker appears before ordinary marker.
+    let sealed_pos = scrubbed.find("reference sealed value").unwrap();
+    let ordinary_pos = scrubbed.rfind("***REDACT***").unwrap();
+    assert!(sealed_pos < ordinary_pos, "text order must be preserved");
+}
+
+#[test]
+fn sealed_untrusted_inference_marker_multiple_occurrences_same_marker() {
+    // Multiple occurrences of the same sealed literal each receive the same
+    // complete marker. A marker produced on an earlier pass is idempotent.
+    let cfg = enabled_cfg();
+    let dir = TempDir::new().unwrap();
+    let table = build_with_session_env(&cfg, dir.path(), &HashMap::new());
+    let sealed_literal = "high-entropy-sealed-token-xyz";
+    let table = table
+        .with_forced_literal(sealed_literal.to_string(), "sealed:prod_token".to_string())
+        .unwrap();
+    let mut active = std::collections::HashSet::new();
+    active.insert("prod_token".to_string());
+    let egress = table.with_sealed_replacements(&active);
+    let input = format!("{sealed_literal} and {sealed_literal} again");
+    let scrubbed = egress.scrub(&input);
+    let marker = sealed_untrusted_inference_marker("prod_token");
+    let count = scrubbed.matches(&marker).count();
+    assert_eq!(count, 2, "each occurrence gets the complete marker");
+    // Idempotency: re-scrubbing the already-scrubbed text does not nest,
+    // truncate, or change the marker.
+    let re_scrubbed = egress.scrub(&scrubbed);
+    assert_eq!(re_scrubbed, scrubbed, "marker is idempotent under re-scrub");
+}
+
+#[test]
+fn sealed_untrusted_inference_marker_per_entry_independent_rendering() {
+    // AC4: in a mixed multi-sealed untrusted turn, each entry is independently
+    // rendered. Only literals with an active exact grant receive the marker;
+    // revoked/ungranted literals receive generic replacement.
+    let cfg = enabled_cfg();
+    let dir = TempDir::new().unwrap();
+    let table = build_with_session_env(&cfg, dir.path(), &HashMap::new());
+    let granted_literal = "granted-sealed-token-aaaa";
+    let revoked_literal = "revoked-sealed-token-bbbb";
+    let table = table
+        .with_forced_literal(granted_literal.to_string(), "sealed:granted".to_string())
+        .unwrap()
+        .with_forced_literal(revoked_literal.to_string(), "sealed:revoked".to_string())
+        .unwrap();
+    // Only "granted" has an active exact grant; "revoked" does not.
+    let mut active = std::collections::HashSet::new();
+    active.insert("granted".to_string());
+    let egress = table.with_sealed_replacements(&active);
+    let input = format!("granted={granted_literal} revoked={revoked_literal}");
+    let scrubbed = egress.scrub(&input);
+    // Granted: actionable marker.
+    assert!(scrubbed.contains("reference sealed value `granted`"));
+    assert!(!scrubbed.contains(granted_literal));
+    // Revoked: generic placeholder, no actionable handle.
+    assert!(scrubbed.contains("***REDACT***"));
+    assert!(!scrubbed.contains("reference sealed value `revoked`"));
+    assert!(!scrubbed.contains(revoked_literal));
+}
+
+#[test]
+fn sealed_untrusted_inference_marker_scoped_origin_resolves_by_record_id() {
+    // Scoped sealed values carry the richer typed origin grammar
+    // `sealed:1:<scope>:<record_id>:<version>:<name>`. The renderer must use
+    // the canonical record_id as the value id, not the name.
+    use crate::sealed::{SealedName, SealedRecordId, sealed_redaction_origin};
+    use cockpit_db::db::sealed_scope::SealedScopeKind;
+
+    let cfg = enabled_cfg();
+    let dir = TempDir::new().unwrap();
+    let table = build_with_session_env(&cfg, dir.path(), &HashMap::new());
+    let sealed_literal = "scoped-sealed-token-cccc";
+    let record_id = SealedRecordId::generate();
+    let name = SealedName::canonical("deploy_key").unwrap();
+    let origin = sealed_redaction_origin(SealedScopeKind::Project, record_id, 1, &name);
+    let table = table
+        .with_forced_literal(sealed_literal.to_string(), origin)
+        .unwrap();
+    // The active set is keyed by the canonical record_id (UUID string).
+    let mut active = std::collections::HashSet::new();
+    active.insert(record_id.to_string());
+    let egress = table.with_sealed_replacements(&active);
+    let scrubbed = egress.scrub(&format!("use {sealed_literal}"));
+    assert!(scrubbed.contains(&format!("reference sealed value `{record_id}`")));
+    assert!(!scrubbed.contains(sealed_literal));
+    // The name must not appear as the value id in the marker.
+    assert!(!scrubbed.contains("reference sealed value `deploy_key`"));
+}
+
+#[test]
+fn redaction_destination_renderer_is_explicit() {
+    // AC13: the typed replacement selection is explicit and closed.
+    // Generic/local: no sealed replacements → ordinary placeholder.
+    let cfg = enabled_cfg();
+    let dir = TempDir::new().unwrap();
+    let table = build_with_session_env(&cfg, dir.path(), &HashMap::new());
+    let sealed_literal = "destination-test-sealed-token";
+    let table = table
+        .with_forced_literal(sealed_literal.to_string(), "sealed:dest".to_string())
+        .unwrap();
+
+    // Generic/local rendering: no active grants → generic placeholder.
+    let generic = table.with_sealed_replacements(&std::collections::HashSet::new());
+    let generic_out = generic.scrub(sealed_literal);
+    assert!(generic_out.contains("***REDACT***"));
+    assert!(!generic_out.contains("reference sealed value"));
+
+    // Interactive-with-exact-connector-capability: active grant → marker.
+    let mut active = std::collections::HashSet::new();
+    active.insert("dest".to_string());
+    let interactive = table.with_sealed_replacements(&active);
+    let interactive_out = interactive.scrub(sealed_literal);
+    assert!(interactive_out.contains("reference sealed value `dest`"));
+
+    // Interactive-without-capability: no active grant → generic (same as above).
+    // (Already covered by `generic`.)
+
+    // Trusted-raw: an empty table is the raw-custody token; it scrubs nothing.
+    let trusted = crate::redact::RedactionTable::empty();
+    assert_eq!(trusted.scrub(sealed_literal), sealed_literal);
+
+    // The Replacement descriptor types are exhaustive: Generic and Sealed.
+    let generic_repl = Replacement::Generic;
+    assert!(!generic_repl.is_sealed());
+    let sealed_repl = Replacement::Sealed {
+        value_id: "dest".to_string(),
+    };
+    assert!(sealed_repl.is_sealed());
+    assert_eq!(
+        sealed_repl.render("***REDACT***"),
+        sealed_untrusted_inference_marker("dest")
+    );
+    assert_eq!(generic_repl.render("***REDACT***"), "***REDACT***");
+}
+
+#[test]
+fn sealed_registration_paths_use_typed_entries() {
+    // AC10/AC2: every sealed-literal registration route uses typed
+    // registration (canonical origin) before persistence/use, with no
+    // origin-string parsing of a spoofable convention.
+    //
+    // The three production registration sites are:
+    //   1. Session::set_sealed_value (session/sealed_values.rs)
+    //   2. InterruptHub::seal_redaction_at_origin (engine/interrupt.rs)
+    //   3. SealedRuntime via SessionRedactionSink (sealed/runtime.rs)
+    //
+    // All three ultimately call RedactionTable::with_forced_literal with a
+    // canonical origin. This test verifies the table accepts and preserves
+    // the typed origin and that historical_redaction_inventory parses it back.
+    use crate::sealed::{historical_redaction_inventory, parse_sealed_redaction_origin};
+    use crate::sealed::{sealed_redaction_origin, SealedName, SealedRecordId};
+    use cockpit_db::db::sealed_scope::SealedScopeKind;
+
+    let cfg = enabled_cfg();
+    let dir = TempDir::new().unwrap();
+    let table = build_with_session_env(&cfg, dir.path(), &HashMap::new());
+    let literal = "typed-registration-test-token";
+    let record_id = SealedRecordId::generate();
+    let name = SealedName::canonical("prod_db").unwrap();
+    let origin = sealed_redaction_origin(SealedScopeKind::Project, record_id, 1, &name);
+    let table = table
+        .with_forced_literal(literal.to_string(), origin.clone())
+        .unwrap();
+
+    // The origin is in the table and parses back to canonical identity.
+    assert!(table.has_origin(&origin));
+    let parsed = parse_sealed_redaction_origin(&origin).unwrap();
+    assert_eq!(parsed.record_id, Some(record_id));
+    assert_eq!(parsed.name.as_str(), "prod_db");
+    assert_eq!(parsed.version, 1);
+
+    // The historical inventory includes this typed entry.
+    let inventory = historical_redaction_inventory(&table);
+    assert!(inventory.iter().any(|id| id.record_id == Some(record_id)));
+
+    // No spoofable bare-string convention: an origin that does not parse
+    // as sealed (e.g. "$SECRET") is not treated as sealed.
+    let ordinary = "$SECRET".to_string();
+    assert!(parse_sealed_redaction_origin(&ordinary).is_none());
+}
+
+#[test]
+fn sealed_marker_requires_exact_action_grant() {
+    // AC14: the sealed marker requires an active exact (value, version, action)
+    // grant. A missing, wrong, or revoked grant falls back to generic.
+    let cfg = enabled_cfg();
+    let dir = TempDir::new().unwrap();
+    let table = build_with_session_env(&cfg, dir.path(), &HashMap::new());
+    let literal = "exact-grant-test-sealed-token";
+    let table = table
+        .with_forced_literal(literal.to_string(), "sealed:exact".to_string())
+        .unwrap();
+
+    // Missing grant (empty set) → generic.
+    let egress_none = table.with_sealed_replacements(&std::collections::HashSet::new());
+    assert!(egress_none.scrub(literal).contains("***REDACT***"));
+
+    // Wrong value id (different from "exact") → generic.
+    let mut wrong = std::collections::HashSet::new();
+    wrong.insert("other_value".to_string());
+    let egress_wrong = table.with_sealed_replacements(&wrong);
+    assert!(egress_wrong.scrub(literal).contains("***REDACT***"));
+    assert!(!egress_wrong.scrub(literal).contains("reference sealed value `exact`"));
+
+    // Exact grant → marker.
+    let mut exact = std::collections::HashSet::new();
+    exact.insert("exact".to_string());
+    let egress_exact = table.with_sealed_replacements(&exact);
+    assert!(egress_exact
+        .scrub(literal)
+        .contains("reference sealed value `exact`"));
+}
+
+#[test]
+fn noninteractive_sealed_value_stays_generic() {
+    // AC12: embeddings, utilities, and tandem/observer egress are generic-only.
+    // The interactive marker is selected only for actual untrusted interactive
+    // wire requests with an active exact grant. Noninteractive paths never call
+    // with_sealed_replacements, so they always see the generic placeholder.
+    let cfg = enabled_cfg();
+    let dir = TempDir::new().unwrap();
+    let table = build_with_session_env(&cfg, dir.path(), &HashMap::new());
+    let sealed_literal = "noninteractive-test-sealed-token";
+    let table = table
+        .with_forced_literal(sealed_literal.to_string(), "sealed:noninteractive".to_string())
+        .unwrap();
+    // A noninteractive path holds the table as-is (no with_sealed_replacements
+    // call), so it renders the generic placeholder even though a grant could
+    // be active for an interactive target.
+    let scrubbed = table.scrub(sealed_literal);
+    assert!(scrubbed.contains("***REDACT***"));
+    assert!(!scrubbed.contains("reference sealed value"));
+}
+
+#[test]
+fn untrusted_embedding_sealed_value_stays_generic() {
+    // AC12: embeddings are generic-only. The embedding send boundary resolves
+    // provider/model trust independently and uses OutboundGuard::scrub_many,
+    // which calls the generic RedactionTable::scrub — never the interactive
+    // marker path. This test verifies that the generic scrub path does not
+    // produce the sealed marker even when the table has a sealed entry.
+    let cfg = enabled_cfg();
+    let dir = TempDir::new().unwrap();
+    let table = build_with_session_env(&cfg, dir.path(), &HashMap::new());
+    let sealed_literal = "embedding-test-sealed-token";
+    let table = table
+        .with_forced_literal(sealed_literal.to_string(), "sealed:embedding".to_string())
+        .unwrap();
+    // The embedding path uses OutboundGuard::scrub_many, which delegates to
+    // RedactionTable::scrub — the generic path, not with_sealed_replacements.
+    let guard = crate::engine::model::OutboundGuard::new(std::sync::Arc::new(table));
+    let redacted = guard.scrub_many(&[sealed_literal, "clean text"]);
+    assert!(redacted[0].contains("***REDACT***"));
+    assert!(!redacted[0].contains("reference sealed value"));
+    assert_eq!(redacted[1], "clean text");
+}
+
+#[test]
+fn untrusted_inference_keeps_mandatory_sensitive_baseline_when_redaction_is_disabled() {
+    // AC15: when discretionary redaction is disabled (redact.enabled = false),
+    // environment, credential-store, and sealed sentinels remain absent from
+    // every untrusted wire/capture field. The `enforced` view ignores the
+    // config-level opt-out so untrusted egress still scrubs.
+    let mut cfg = enabled_cfg();
+    cfg.enabled = false; // discretionary redaction disabled
+    let dir = TempDir::new().unwrap();
+    let table = build_with_session_env(&cfg, dir.path(), &HashMap::new());
+    let sealed_literal = "disabled-redaction-sealed-token";
+    let ordinary_secret = "disabled-redaction-ordinary-key";
+    let table = table
+        .with_forced_literal(sealed_literal.to_string(), "sealed:disabled".to_string())
+        .unwrap()
+        .with_forced_literal(ordinary_secret.to_string(), "$SECRET".to_string())
+        .unwrap();
+    // The table is built with disabled=true, so the raw table passes through.
+    assert_eq!(table.scrub(sealed_literal), sealed_literal);
+    // But the enforced view (untrusted egress) ignores the opt-out.
+    let enforced = table.enforced();
+    let scrubbed_sealed = enforced.scrub(sealed_literal);
+    let scrubbed_ordinary = enforced.scrub(ordinary_secret);
+    assert!(!scrubbed_sealed.contains(sealed_literal));
+    assert!(!scrubbed_ordinary.contains(ordinary_secret));
+    assert!(scrubbed_sealed.contains("***REDACT***"));
+    assert!(scrubbed_ordinary.contains("***REDACT***"));
+}

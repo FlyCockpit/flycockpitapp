@@ -1027,6 +1027,9 @@ importers:
 
   packages/db:
     dependencies:
+      '@flycockpit/cockpit-protocol':
+        specifier: workspace:*
+        version: link:../cockpit-protocol
       '@flycockpit/env':
         specifier: workspace:*
         version: link:../env
@@ -1058,6 +1061,9 @@ importers:
       typescript:
         specifier: 'catalog:'
         version: 6.0.3
+      vitest:
+        specifier: 'catalog:'
+        version: 4.1.9(@opentelemetry/api@1.9.1)(@types/node@25.9.3)(@vitest/browser-playwright@4.1.9)(vite@8.0.16(@types/node@25.9.3)(esbuild@0.28.0)(jiti@2.7.0)(terser@5.48.0)(tsx@4.22.4)(yaml@2.9.0))
 
   packages/env:
     dependencies:

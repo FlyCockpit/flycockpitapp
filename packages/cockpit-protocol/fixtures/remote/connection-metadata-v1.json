@@ -1,0 +1,261 @@
+{
+  "schemaVersion": 1,
+  "enums": {
+    "serviceTier": {
+      "public_saas": 1,
+      "enterprise": 2
+    },
+    "transport": {
+      "webrtc": 1,
+      "websocket_data": 2
+    },
+    "routeClass": {
+      "direct": 1,
+      "turn": 2,
+      "websocket_gateway": 3
+    },
+    "outcome": {
+      "connected": 1,
+      "rejected": 2,
+      "cancelled": 3,
+      "superseded": 4,
+      "failed": 5,
+      "revoked": 6,
+      "expired": 7
+    },
+    "reason": {
+      "none": 0,
+      "policy": 1,
+      "authentication": 2,
+      "authorization": 3,
+      "dependency": 4,
+      "network": 5,
+      "quota": 6,
+      "protocol": 7,
+      "user": 8,
+      "revocation": 9,
+      "timeout": 10,
+      "internal": 11
+    },
+    "custodyClass": {
+      "origin_protected": 1,
+      "os_protected": 2,
+      "hardware_or_external": 3
+    },
+    "region": {
+      "unknown": 0,
+      "local": 1,
+      "north_america": 2,
+      "south_america": 3,
+      "europe": 4,
+      "africa": 5,
+      "middle_east": 6,
+      "asia_pacific": 7,
+      "oceania": 8
+    },
+    "durationBucket": {
+      "lt_5s": 1,
+      "5s_lt_30s": 2,
+      "30s_lt_2m": 3,
+      "2m_lt_10m": 4,
+      "10m_lt_1h": 5,
+      "gte_1h": 6
+    },
+    "bytesBucket": {
+      "zero": 0,
+      "1b_lt_64kib": 1,
+      "64kib_lt_1mib": 2,
+      "1mib_lt_16mib": 3,
+      "16mib_lt_256mib": 4,
+      "256kib_lt_1gib": 5,
+      "gte_1gib": 6
+    }
+  },
+  "timeBucket": {
+    "examples": [
+      {
+        "epochSeconds": 1722736800,
+        "timeBucket": 1722736800,
+        "comment": "exact UTC hour boundary"
+      },
+      {
+        "epochSeconds": 1722736801,
+        "timeBucket": 1722736800,
+        "comment": "floors to the hour"
+      },
+      {
+        "epochSeconds": 1722740399,
+        "timeBucket": 1722736800,
+        "comment": "last second of the hour"
+      },
+      {
+        "epochSeconds": 0,
+        "timeBucket": 0,
+        "comment": "epoch zero"
+      }
+    ]
+  },
+  "durationBuckets": [
+    { "seconds": 0, "bucket": 1 },
+    { "seconds": 4, "bucket": 1 },
+    { "seconds": 5, "bucket": 2 },
+    { "seconds": 29, "bucket": 2 },
+    { "seconds": 30, "bucket": 3 },
+    { "seconds": 119, "bucket": 3 },
+    { "seconds": 120, "bucket": 4 },
+    { "seconds": 599, "bucket": 4 },
+    { "seconds": 600, "bucket": 5 },
+    { "seconds": 3599, "bucket": 5 },
+    { "seconds": 3600, "bucket": 6 },
+    { "seconds": 99999, "bucket": 6 }
+  ],
+  "bytesBuckets": [
+    { "bytes": 0, "bucket": 0 },
+    { "bytes": 1, "bucket": 1 },
+    { "bytes": 65535, "bucket": 1 },
+    { "bytes": 65536, "bucket": 2 },
+    { "bytes": 1048575, "bucket": 2 },
+    { "bytes": 1048576, "bucket": 3 },
+    { "bytes": 16777215, "bucket": 3 },
+    { "bytes": 16777216, "bucket": 4 },
+    { "bytes": 268435455, "bucket": 4 },
+    { "bytes": 268435456, "bucket": 5 },
+    { "bytes": 1073741823, "bucket": 5 },
+    { "bytes": 1073741824, "bucket": 6 }
+  ],
+  "retention": {
+    "defaultDays": 30,
+    "minDays": 0,
+    "maxDays": 365
+  },
+  "pseudonymSchemas": [
+    {
+      "domain": "flycockpit.remote.metadata.tenant.v1",
+      "components": [{ "kind": 1, "name": "tenant_id" }]
+    },
+    {
+      "domain": "flycockpit.remote.metadata.account.v1",
+      "components": [{ "kind": 2, "name": "account_id" }]
+    },
+    {
+      "domain": "flycockpit.remote.metadata.device.v1",
+      "components": [{ "kind": 3, "name": "device_id" }]
+    },
+    {
+      "domain": "flycockpit.remote.metadata.instance.v1",
+      "components": [{ "kind": 4, "name": "instance_id" }]
+    },
+    {
+      "domain": "flycockpit.remote.metadata.attempt.v1",
+      "components": [{ "kind": 5, "name": "attempt_id" }]
+    }
+  ],
+  "hkdfSaltDomain": "flycockpit.remote.metadata.hkdf.salt.v1",
+  "tenantKeyInfoDomain": "flycockpit.remote.metadata.tenant-key.v1",
+  "cardinalityDomain": "flycockpit.remote.metadata.cardinality.v1",
+  "aggregateCellTuple": [
+    "tier",
+    "region",
+    "routeClass",
+    "outcome",
+    "ingressBytesBucket",
+    "egressBytesBucket",
+    "durationBucket"
+  ],
+  "smallCellThreshold": 20,
+  "correctionHorizonDays": 7,
+  "forbiddenFields": [
+    "content",
+    "decryptedFrames",
+    "keyBody",
+    "certificateBody",
+    "grantBody",
+    "proofBody",
+    "rawIp",
+    "address",
+    "candidate",
+    "interface",
+    "turnPassword",
+    "turnUsername",
+    "path",
+    "prompt",
+    "completeWebSocketPayload",
+    "sdp",
+    "ticket",
+    "credential",
+    "transcript"
+  ],
+  "allowedRowFields": [
+    "schemaVersion",
+    "rowId",
+    "createdAt",
+    "timeBucket",
+    "keyVersion",
+    "tenantPseudonym",
+    "accountPseudonym",
+    "devicePseudonym",
+    "instancePseudonym",
+    "attemptPseudonym",
+    "serviceTier",
+    "transport",
+    "routeClass",
+    "region",
+    "outcome",
+    "reason",
+    "policyEpoch",
+    "custodyClass",
+    "durationBucket",
+    "ingressBytesBucket",
+    "egressBytesBucket",
+    "policyRetentionDaysAtCreation",
+    "expiresAt"
+  ],
+  "positiveVectors": [
+    {
+      "name": "tenant_pseudonym_v1",
+      "domain": "flycockpit.remote.metadata.tenant.v1",
+      "aliasHex": "0102030405060708090a0b0c0d0e0f10",
+      "componentKind": 1,
+      "messageHex": "666c79636f636b7069742e72656d6f74652e6d657461646174612e74656e616e742e763100010100100102030405060708090a0b0c0d0e0f10"
+    },
+    {
+      "name": "account_pseudonym_v1",
+      "domain": "flycockpit.remote.metadata.account.v1",
+      "aliasHex": "1112131415161718191a1b1c1d1e1f20",
+      "componentKind": 2,
+      "messageHex": "666c79636f636b7069742e72656d6f74652e6d657461646174612e6163636f756e742e76310001020010101112131415161718191a1b1c1d1e1f20"
+    }
+  ],
+  "malformedVectors": [
+    {
+      "name": "wrong_domain_type_pairing",
+      "domain": "flycockpit.remote.metadata.tenant.v1",
+      "componentKind": 2,
+      "rejection": "domain_component_mismatch"
+    },
+    {
+      "name": "zero_components",
+      "domain": "flycockpit.remote.metadata.tenant.v1",
+      "componentKind": 0,
+      "rejection": "zero_components"
+    },
+    {
+      "name": "multiple_components",
+      "domain": "flycockpit.remote.metadata.tenant.v1",
+      "componentKind": 1,
+      "rejection": "multiple_components"
+    },
+    {
+      "name": "unknown_domain",
+      "domain": "flycockpit.remote.metadata.unknown.v1",
+      "componentKind": 1,
+      "rejection": "unknown_domain"
+    },
+    {
+      "name": "trailing_byte",
+      "domain": "flycockpit.remote.metadata.tenant.v1",
+      "componentKind": 1,
+      "rejection": "trailing_byte"
+    }
+  ]
+}

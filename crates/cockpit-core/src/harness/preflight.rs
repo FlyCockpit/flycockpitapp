@@ -1,20 +1,24 @@
 //! Preflight checks before invoking an external harness: the command is
 //! on `PATH`, and the harness is authenticated.
 //!
-//! Auth resolves in two steps (implementation note §5):
-//! 1. If `auth_env_vars` is non-empty, any one being set (non-empty)
-//!    counts as authenticated — cheap, no subprocess.
-//! 2. Otherwise, if `auth_probe_args` is non-empty, run
+//! Auth resolves in one step (implementation note §5, post
+//! external-harness-trust-custody-policy):
+//! 1. If `auth_probe_args` is non-empty, run
 //!    `command auth_probe_args` and treat exit 0 as authenticated.
-//! 3. If neither is configured, assume authenticated (let a real run
+//! 2. If no probe is configured, assume authenticated (let a real run
 //!    surface the failure) — we never block a harness the user wired up
 //!    without an auth hint.
+//!
+//! The former `auth_env_vars` path is retired: external harnesses receive no
+//! Cockpit-provided secret environment value, including a dedicated harness
+//! authentication token. A harness must authenticate independently without a
+//! Cockpit-provided secret.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::config::extended::HarnessConfig;
-use crate::harness::env::{harness_auth_env_present, harness_child_env};
+use crate::harness::env::harness_child_env;
 
 /// A preflight failure, with the harness name + command baked into the
 /// message per cockpit error conventions (backticked identifiers).
@@ -48,7 +52,8 @@ impl std::fmt::Display for PreflightError {
             PreflightError::NotAuthenticated { harness, command } => write!(
                 f,
                 "harness `{harness}` is not authenticated: `{command}` has no credentials. \
-                 Set its auth env var or run its login flow, then retry.",
+                 Run its login flow or configure an `auth_probe_args` probe, then retry. \
+                 Cockpit does not provide secret environment values to external harnesses.",
             ),
         }
     }
@@ -172,15 +177,12 @@ fn is_spawnable_file(path: &Path) -> bool {
     path.is_file()
 }
 
-/// Whether the harness is authenticated, per the two-step policy.
+/// Whether the harness is authenticated, per the probe-only policy.
 async fn is_authenticated(
     cfg: &HarnessConfig,
     cwd: &Path,
     session_overlay: Option<&std::collections::HashMap<String, String>>,
 ) -> bool {
-    if !cfg.auth_env_vars.is_empty() {
-        return harness_auth_env_present(cfg, session_overlay);
-    }
     if !cfg.auth_probe_args.is_empty() {
         return run_auth_probe(cfg, cwd, session_overlay).await;
     }
@@ -243,7 +245,7 @@ mod tests {
             supports_agent_file: false,
             agent_file_args: vec![],
             agent_file_env: None,
-            auth_env_vars: vec![],
+            trust: crate::config::extended::HarnessTrust::Untrusted,
             auth_probe_args: vec![],
             always_allow: false,
             timeout_secs: 60,
@@ -325,16 +327,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_env_var_unset_is_unauthenticated() {
-        let mut cfg = base("sh");
-        cfg.auth_env_vars = vec!["COCKPIT_TEST_AUTH_VAR_UNSET_XYZ".to_string()];
-        let err = preflight_with_env("x", &cfg, std::env::temp_dir().as_path(), None)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, PreflightError::NotAuthenticated { .. }));
-    }
-
-    #[tokio::test]
     async fn auth_probe_exit_zero_authenticates() {
         let mut cfg = base("sh");
         cfg.auth_probe_args = vec!["-c".to_string(), "exit 0".to_string()];
@@ -349,15 +341,14 @@ mod tests {
     async fn auth_probe_uses_curated_env() {
         let env = crate::test_env::lock_async().await;
         let mut cfg = base("sh");
-        cfg.auth_env_vars.clear();
         cfg.auth_probe_args = vec![
             "-c".to_string(),
-            "test \"${SECRET_API_KEY-unset}\" = unset && test \"$ALLOWED_AUTH_TOKEN\" = visible"
+            "test \"${SECRET_API_KEY-unset}\" = unset && test \"$ALLOWED_NONSECRET\" = visible"
                 .to_string(),
         ];
         env.set_var("SECRET_API_KEY", "hidden");
         let mut overlay = std::collections::HashMap::new();
-        overlay.insert("ALLOWED_AUTH_TOKEN".to_string(), "visible".to_string());
+        overlay.insert("ALLOWED_NONSECRET".to_string(), "visible".to_string());
 
         assert!(
             preflight_with_env("x", &cfg, std::env::temp_dir().as_path(), Some(&overlay))

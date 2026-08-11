@@ -799,6 +799,17 @@ allowlist and denylist. Automatic candidates default to an eight-character
 minimum; every redaction entry has a hard four-byte minimum. Treat it as a
 safeguard, not a guarantee that every secret is removed.
 
+External harnesses (claude, codex, opencode, copilot, goose, grok, and custom
+harnesses) are OS processes, not trusted inference providers. They are
+untrusted by default: an explicit per-harness `trust` field opts into raw
+prompt delivery only, never inferred from model name, locality, command, or
+mode. An untrusted harness receives a redacted prompt (the mandatory sensitive
+baseline, unaffected by `redact.enabled = false`); a trusted harness receives
+its raw prompt only after explicit configuration. No harness, trusted or
+untrusted, receives Cockpit-provided secret environment values — the former
+`auth_env_vars` field is retired. Harness custody is separate from
+provider/model `ModelTrust` and from `LlmMode` posture.
+
 The shell sandbox is filesystem-only and does not restrict network access. It
 has no native Windows backend: Windows shell commands are unconfined and require
 explicit approval unless a matching session, project, or global grant exists.

@@ -115,7 +115,7 @@ mod tests {
             supports_agent_file: false,
             agent_file_args: vec![],
             agent_file_env: None,
-            auth_env_vars: vec![],
+            trust: crate::config::extended::HarnessTrust::Untrusted,
             auth_probe_args: vec![],
             always_allow: false,
             timeout_secs: 60,

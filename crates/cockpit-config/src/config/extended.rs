@@ -48,8 +48,8 @@ pub use guards::{
 };
 #[allow(unused_imports)]
 pub use harness::{
-    ArgvOverflowBehavior, DEFAULT_HARNESS_TIMEOUT_SECS, HarnessConfig, PromptInputMode,
-    SystemPromptConfig, builtin_harness_presets, resolve_harnesses,
+    ArgvOverflowBehavior, DEFAULT_HARNESS_TIMEOUT_SECS, HarnessConfig, HarnessTrust,
+    PromptInputMode, SystemPromptConfig, builtin_harness_presets, resolve_harnesses,
 };
 pub use hooks::{
     HookApplicability, HookConfigSource, HookEvent, HookEventPolicy, HookGate, HookMatcherPolicy,

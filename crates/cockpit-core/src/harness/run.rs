@@ -26,7 +26,8 @@ use std::time::Duration;
 use anyhow::Result;
 
 use crate::config::extended::HarnessConfig;
-use crate::config::providers::{HarnessCustodyTrust, ProvidersConfig};
+use crate::config::extended::HarnessTrust;
+use crate::config::providers::ProvidersConfig;
 use crate::harness::env::harness_child_env;
 use crate::harness::parse::{HarnessMetadata, parse_harness_json};
 use crate::harness::preflight::preflight_with_env;
@@ -198,46 +199,60 @@ pub struct RunContext<'a> {
     pub env_overlay: Option<&'a std::collections::HashMap<String, String>>,
 }
 
-/// The custody posture every external OS harness runs at.
+/// The custody posture every external OS harness runs at, resolved from its
+/// explicit `trust` configuration field.
 ///
-/// [`HarnessCustodyTrust`] carries the same meaning as a model's custody class
+/// [`HarnessTrust`] carries the same meaning as a model's custody class
 /// — trusted may hold raw content, untrusted must be handed a redacted
 /// rendering — but it is a deliberately separate type: an external harness is
 /// not a provider/model route, so this value must never reach model routing.
-/// External harnesses are handed the redacted rendering today, and there is no
-/// configuration that changes that.
-pub const HARNESS_CUSTODY: HarnessCustodyTrust = HarnessCustodyTrust::Untrusted;
-
-/// Render the outbound harness prompt for the harness custody posture.
+/// It is never inferred from model, locality, command, or `LlmMode`; it is
+/// an explicitly configured harness-local policy that defaults to untrusted.
 ///
-/// Both arms scrub: the untrusted posture requires it, and no external harness
-/// arrives with a host-authorized trusted contract, so a future trusted posture
-/// must bring its own contract rather than silently skipping the chokepoint.
-///
-/// Both scrub against the table's *enforced* view, so the config opt-out
-/// `redact.enabled = false` cannot hand raw content to an external harness —
-/// those shell out to third-party cloud CLIs. That opt-out is a trusted-route
-/// opt-out, and no external harness is a trusted route: there is no
-/// host-authorized raw contract for one, so neither posture may skip the
-/// chokepoint by way of a disabled table.
+/// An untrusted harness receives the mandatory sensitive-redaction baseline
+/// (the enforced redaction table) — this holds even when discretionary
+/// redaction is disabled, because the enforced view ignores that opt-out.
+/// A trusted harness receives its raw prompt, including sensitive/sealed
+/// literals, only after the user explicitly configures it as trusted. Both
+/// classes receive no Cockpit-provided secret environment value.
 fn render_for_harness_custody(
-    custody: HarnessCustodyTrust,
+    custody: HarnessTrust,
     redact: &RedactionTable,
     prompt: &str,
 ) -> String {
-    let enforced = redact.enforced();
     match custody {
-        HarnessCustodyTrust::Untrusted => enforced.scrub(prompt),
-        HarnessCustodyTrust::Trusted => enforced.scrub(prompt),
+        HarnessTrust::Untrusted => {
+            // The mandatory sensitive baseline: the enforced view of the
+            // session redaction table. This scrubs environment, credential-
+            // store, and sealed sentinels regardless of the config opt-out
+            // `redact.enabled = false`, because the enforced view ignores
+            // that opt-out. A disabled discretionary table cannot deliver
+            // any sensitive sentinel to an untrusted subprocess.
+            redact.enforced().scrub(prompt)
+        }
+        HarnessTrust::Trusted => {
+            // A trusted harness receives its raw prompt, including
+            // sensitive/sealed literals. This is the explicit opt-in: only
+            // an explicit `trust: "trusted"` field reaches here. The raw
+            // prompt is never persisted (invocation records, child output,
+            // process records, histories, diagnostics, and /export debug
+            // receive only generic-redacted representations before write).
+            prompt.to_string()
+        }
     }
 }
 
 /// Run one harness invocation synchronously, end to end.
 pub async fn run_harness(ctx: RunContext<'_>) -> Result<HarnessRunResult, String> {
-    // 1. Render the outbound prompt for the harness custody posture —
-    //    non-bypassable (GOALS §7). From here on, only the rendered text exists
-    //    in argv / stdin / tempfile.
-    let scrubbed = render_for_harness_custody(HARNESS_CUSTODY, &ctx.redact, ctx.prompt);
+    // 1. Resolve the harness custody posture from its explicit `trust`
+    //    field — never inferred from model, locality, command, or `LlmMode`.
+    //    Then render the outbound prompt for that custody posture. For an
+    //    untrusted harness, this constructs the mandatory sensitive baseline
+    //    (the enforced redaction table); a construction failure fails before
+    //    process spawn and never receives a raw fallback prompt. From here
+    //    on, only the rendered text exists in argv / stdin / tempfile.
+    let custody = ctx.cfg.trust;
+    let scrubbed = render_for_harness_custody(custody, &ctx.redact, ctx.prompt);
 
     // 2. Preflight: PATH + auth.
     if let Err(e) = preflight_with_env(ctx.harness_name, ctx.cfg, ctx.cwd, ctx.env_overlay).await {
@@ -513,34 +528,58 @@ mod tests {
     use super::*;
 
     /// The external-harness custody posture is expressed with
-    /// [`HarnessCustodyTrust`] — a separate type from the model custody class,
-    /// because a harness is not a provider/model route. Behavior is unchanged:
-    /// every posture renders through the session redaction table.
+    /// [`HarnessTrust`] — a separate type from the model custody class,
+    /// because a harness is not a provider/model route. An untrusted harness
+    /// renders through the enforced session redaction table; a trusted
+    /// harness receives its raw prompt (the explicit opt-in).
     #[test]
-    fn harness_custody_posture_always_renders_redacted() {
-        assert_eq!(HARNESS_CUSTODY, HarnessCustodyTrust::Untrusted);
-        assert!(!HARNESS_CUSTODY.is_trusted());
-        assert_eq!(HARNESS_CUSTODY.as_str(), "untrusted");
-
+    fn harness_custody_untrusted_renders_redacted_trusted_renders_raw() {
         let table = RedactionTable::empty()
             .with_forced_literal("sk-live-harness-secret".to_string(), "TEST".to_string())
             .expect("forced literal");
         let prompt = "call the api with sk-live-harness-secret please";
 
-        let rendered = render_for_harness_custody(HARNESS_CUSTODY, &table, prompt);
-        assert!(!rendered.contains("sk-live-harness-secret"), "{rendered}");
-        // The enforced view, not the table as given: `table` here is built on
-        // `RedactionTable::empty()`, which carries the config opt-out flag, and
-        // that opt-out must not follow content out to an external harness.
-        assert_eq!(rendered, table.enforced().scrub(prompt));
+        // Untrusted: the enforced view scrubs the sentinel. The enforced
+        // view, not the table as given: `table` here is built on
+        // `RedactionTable::empty()`, which carries the config opt-out flag,
+        // and that opt-out must not follow content out to an untrusted
+        // external harness.
+        let untrusted = render_for_harness_custody(HarnessTrust::Untrusted, &table, prompt);
+        assert!(!untrusted.contains("sk-live-harness-secret"), "{untrusted}");
+        assert_eq!(untrusted, table.enforced().scrub(prompt));
 
-        // Even the trusted-equivalent posture renders redacted: no external
-        // harness has a host-authorized raw contract, so there is no bypass.
-        let as_trusted = render_for_harness_custody(HarnessCustodyTrust::Trusted, &table, prompt);
+        // Trusted: the raw prompt is delivered (the explicit opt-in). The
+        // sentinel survives because the user explicitly configured this
+        // harness as trusted.
+        let trusted = render_for_harness_custody(HarnessTrust::Trusted, &table, prompt);
+        assert_eq!(trusted, prompt);
+        assert!(trusted.contains("sk-live-harness-secret"), "{trusted}");
+    }
+
+    /// Disabling discretionary redaction does not disable the mandatory
+    /// sensitive baseline for an untrusted harness prompt: the enforced
+    /// view ignores the `redact.enabled = false` opt-out.
+    #[test]
+    fn untrusted_harness_keeps_sensitive_baseline_when_redaction_disabled() {
+        // A table built with `enabled: false` carries the disabled flag, but
+        // `enforced()` ignores it. An untrusted harness scrubs against the
+        // enforced view, so the sentinel is still redacted.
+        let table = RedactionTable::empty()
+            .with_forced_literal("sk-live-disabled-baseline".to_string(), "TEST".to_string())
+            .expect("forced literal");
+        // Simulate the disabled flag by building an enforced view directly:
+        // the enforced view always scrubs regardless of the disabled flag.
+        let enforced = table.enforced();
+        let prompt = "use sk-live-disabled-baseline now";
+        let untrusted = render_for_harness_custody(HarnessTrust::Untrusted, &enforced, prompt);
         assert!(
-            !as_trusted.contains("sk-live-harness-secret"),
-            "{as_trusted}"
+            !untrusted.contains("sk-live-disabled-baseline"),
+            "{untrusted}"
         );
+
+        // A trusted harness still receives the raw prompt.
+        let trusted = render_for_harness_custody(HarnessTrust::Trusted, &enforced, prompt);
+        assert_eq!(trusted, prompt);
     }
 
     #[test]
@@ -803,7 +842,7 @@ mod tests {
     /// A `sh -c <script>` harness: prompt rides stdin (ignored by the
     /// script), so the script body fully controls the behavior.
     fn sh_harness(script: &str) -> HarnessConfig {
-        use crate::config::extended::{ArgvOverflowBehavior, PromptInputMode};
+        use crate::config::extended::{ArgvOverflowBehavior, HarnessTrust, PromptInputMode};
         HarnessConfig {
             command: "sh".to_string(),
             args: vec!["-c".to_string(), script.to_string()],
@@ -818,7 +857,7 @@ mod tests {
             supports_agent_file: false,
             agent_file_args: vec![],
             agent_file_env: None,
-            auth_env_vars: vec![],
+            trust: HarnessTrust::Untrusted,
             auth_probe_args: vec![],
             always_allow: false,
             timeout_secs: 30,

@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::daemon::proto::{self, Request};
-use crate::daemon::relay_envelope::{RelayGrantScope, RelayPrincipal};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientPrincipal {
@@ -46,15 +45,26 @@ impl ClientPrincipal {
         Self::Owner
     }
 
-    pub fn from_relay(principal: RelayPrincipal) -> Self {
+    /// Construct a daemon-verified remote principal from transport-neutral
+    /// fields.
+    ///
+    /// This is the only sanctioned remote principal constructor after the
+    /// standalone relay cutover. The legacy `ClientPrincipal::from_relay`
+    /// constructor that trusted a `RelayPrincipal` wire shape has been
+    /// deleted: the daemon is now the final verifier and principal
+    /// constructor, building `RemotePrincipal` from claims it verified itself
+    /// rather than from a relay-stamped envelope. The optional
+    /// `actor_binding` is the device-bound verification artifact carried
+    /// alongside the verified grants.
+    pub fn from_verified_remote(
+        user_id: String,
+        grants: Vec<PrincipalGrant>,
+        actor_binding: Option<crate::daemon::relay_envelope::ClientActorBindingV1>,
+    ) -> Self {
         Self::Remote(RemotePrincipal {
-            user_id: principal.user_id,
-            actor_binding: principal.actor_binding,
-            grants: principal
-                .grants
-                .into_iter()
-                .map(PrincipalGrant::from)
-                .collect(),
+            user_id,
+            grants,
+            actor_binding,
         })
     }
 
@@ -116,21 +126,6 @@ impl PrincipalGrant {
         match self.project_root.as_deref() {
             None => true,
             Some(grant_root) => roots_equal(grant_root, project_root),
-        }
-    }
-}
-
-impl From<crate::daemon::relay_envelope::RelayGrant> for PrincipalGrant {
-    fn from(grant: crate::daemon::relay_envelope::RelayGrant) -> Self {
-        let scope = match grant.scope {
-            RelayGrantScope::Terminal => PrincipalScope::Terminal,
-            RelayGrantScope::Agent => PrincipalScope::Agent,
-            RelayGrantScope::AgentReadonly => PrincipalScope::AgentReadonly,
-            RelayGrantScope::ProjectFiles => PrincipalScope::ProjectFiles,
-        };
-        Self {
-            scope,
-            project_root: grant.project_root,
         }
     }
 }
@@ -219,7 +214,6 @@ pub fn request_ordering(request: &Request) -> RequestOrdering {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::relay_envelope::{RelayGrant, RelayGrantScope, RelayPrincipal};
 
     macro_rules! request_ordering_rows_from_command_table {
         (($($context:ident),*) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
@@ -248,20 +242,17 @@ mod tests {
         }};
     }
 
-    fn remote(scope: RelayGrantScope, project_root: Option<String>) -> ClientPrincipal {
-        ClientPrincipal::from_relay(RelayPrincipal {
-            user_id: "user-1".to_string(),
-            grants: vec![RelayGrant {
-                scope,
-                project_root,
-            }],
-            actor_binding: None,
-        })
+    fn remote(scope: PrincipalScope, project_root: Option<String>) -> ClientPrincipal {
+        ClientPrincipal::from_verified_remote(
+            "user-1".to_string(),
+            vec![PrincipalGrant { scope, project_root }],
+            None,
+        )
     }
 
     #[test]
     fn agent_scope_allows_write_and_read_for_matching_project() {
-        let principal = remote(RelayGrantScope::Agent, Some("/workspace/app".to_string()));
+        let principal = remote(PrincipalScope::Agent, Some("/workspace/app".to_string()));
         assert!(principal.can_agent_write_project("/workspace/app"));
         assert!(principal.can_agent_read_project("/workspace/app"));
         assert!(!principal.can_agent_write_project("/workspace/other"));
@@ -270,7 +261,7 @@ mod tests {
     #[test]
     fn readonly_scope_allows_read_but_not_write() {
         let principal = remote(
-            RelayGrantScope::AgentReadonly,
+            PrincipalScope::AgentReadonly,
             Some("/workspace/app".to_string()),
         );
         assert!(!principal.can_agent_write_project("/workspace/app"));
@@ -279,9 +270,22 @@ mod tests {
 
     #[test]
     fn instance_wide_grant_matches_any_project() {
-        let principal = remote(RelayGrantScope::ProjectFiles, None);
+        let principal = remote(PrincipalScope::ProjectFiles, None);
         assert!(principal.has_project_files("/workspace/app"));
         assert!(principal.has_project_files("/elsewhere"));
+    }
+
+    #[test]
+    fn from_verified_remote_is_the_only_remote_constructor() {
+        // After the standalone relay cutover, the legacy
+        // `ClientPrincipal::from_relay` constructor is gone. The daemon
+        // builds remote principals only from transport-neutral verified
+        // fields, never from a relay-stamped `RelayPrincipal`.
+        let principal = remote(PrincipalScope::Agent, Some("/workspace/app".to_string()));
+        let tag = principal.tag().expect("remote principal has a tag");
+        assert_eq!(tag, "flycockpit:user-1");
+        assert!(!principal.is_owner());
+        assert!(principal.can_agent_write_project("/workspace/app"));
     }
 
     #[test]

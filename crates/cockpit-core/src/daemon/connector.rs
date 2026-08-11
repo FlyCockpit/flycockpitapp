@@ -16,11 +16,11 @@ use crate::auth::flycockpit::{
     FlycockpitClient, RelayCandidate, RelayChoice, StoredFlycockpitCredential, clear_credential,
     maybe_load_credential, store_relay_choice,
 };
-use crate::daemon::principal::ClientPrincipal;
+use crate::daemon::principal::{ClientPrincipal, PrincipalGrant, PrincipalScope};
 use crate::daemon::proto::{self, Body, Envelope, Event, InterruptQuestion};
 use crate::daemon::relay_envelope::{
-    AttentionEventType, AttentionNotificationPayload, IncomingRelayFrame, RelayPrincipal,
-    daemon_client_frame, daemon_control_frame, parse_incoming,
+    AttentionEventType, AttentionNotificationPayload, IncomingRelayFrame, RelayGrantScope,
+    RelayPrincipal, daemon_client_frame, daemon_control_frame, parse_incoming,
 };
 use crate::daemon::server::DaemonContext;
 use crate::db::connector::ConnectorStatusUpdate;
@@ -712,7 +712,7 @@ async fn run_socket(
                         ) {
                             continue;
                         }
-                        let principal = frame.principal.clone();
+                        let principal = principal_from_relay_wire(frame.principal.clone());
                         let handle = channels.entry(frame.channel_id.clone()).or_insert_with(|| {
                             spawn_channel(
                                 frame.channel_id.clone(),
@@ -744,9 +744,37 @@ async fn run_socket(
     result
 }
 
+/// Convert a legacy relay wire `RelayPrincipal` into a daemon-verified,
+/// transport-neutral `ClientPrincipal` at the legacy relay channel
+/// boundary.
+///
+/// This is the only place that still touches `RelayPrincipal`: the
+/// standalone relay cutover deleted `ClientPrincipal::from_relay`, so the
+/// daemon no longer trusts a relay-stamped principal envelope. The
+/// connector decomposes the wire shape into verified `PrincipalGrant`s
+/// and constructs the principal via `ClientPrincipal::from_verified_remote`.
+/// This adapter lives only on the legacy relay channel path, which is
+/// itself removed when the standalone relay service is deleted.
+fn principal_from_relay_wire(principal: RelayPrincipal) -> ClientPrincipal {
+    let grants = principal
+        .grants
+        .into_iter()
+        .map(|grant| PrincipalGrant {
+            scope: match grant.scope {
+                RelayGrantScope::Terminal => PrincipalScope::Terminal,
+                RelayGrantScope::Agent => PrincipalScope::Agent,
+                RelayGrantScope::AgentReadonly => PrincipalScope::AgentReadonly,
+                RelayGrantScope::ProjectFiles => PrincipalScope::ProjectFiles,
+            },
+            project_root: grant.project_root,
+        })
+        .collect();
+    ClientPrincipal::from_verified_remote(principal.user_id, grants, principal.actor_binding)
+}
+
 fn spawn_channel(
     channel_id: String,
-    principal: RelayPrincipal,
+    principal: ClientPrincipal,
     ctx: Arc<DaemonContext>,
     relay_url: String,
     outbound: mpsc::Sender<OutboundFrame>,
@@ -764,7 +792,7 @@ fn spawn_channel(
 
 async fn channel_task(
     channel_id: String,
-    principal: RelayPrincipal,
+    principal: ClientPrincipal,
     ctx: Arc<DaemonContext>,
     relay_url: String,
     mut input_rx: mpsc::Receiver<Value>,
@@ -776,7 +804,7 @@ async fn channel_task(
         crate::daemon::server::handle_relay_channel_as_with_instance(
             daemon_side,
             ctx.clone(),
-            ClientPrincipal::from_relay(principal),
+            principal,
             client_instance_id,
         ),
     );

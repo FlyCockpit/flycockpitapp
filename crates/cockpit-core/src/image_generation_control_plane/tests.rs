@@ -11,8 +11,8 @@
 //! - `image_generation_admin_grant_resolution`: active authority key and lifecycle
 
 use super::*;
-use crate::daemon::principal::{ClientPrincipal, PrincipalGrant, PrincipalScope, RemotePrincipal};
-use crate::daemon::relay_envelope::{RelayGrant, RelayGrantScope, RelayPrincipal};
+use crate::daemon::principal::{ClientPrincipal, PrincipalGrant, PrincipalScope};
+use crate::daemon::relay_envelope::RelayGrantScope;
 use cockpit_proto::remote_public_service_policy::{
     RemoteAttachmentCapabilityV1, RemotePermissionCeilingV1, RemoteProjectCapabilityV1,
     permission_ceiling_digest,
@@ -23,14 +23,24 @@ use cockpit_proto::remote_public_service_policy::{
 // ---------------------------------------------------------------------------
 
 fn remote_principal(scope: RelayGrantScope, project_root: Option<String>) -> ClientPrincipal {
-    ClientPrincipal::from_relay(RelayPrincipal {
-        user_id: "user-1".to_string(),
-        grants: vec![RelayGrant {
-            scope,
+    // After the standalone relay cutover, `ClientPrincipal::from_relay` is
+    // gone. The daemon constructs remote principals only from
+    // transport-neutral verified fields. The legacy `RelayGrantScope` is
+    // mapped to `PrincipalScope` here at the test boundary.
+    let principal_scope = match scope {
+        RelayGrantScope::Terminal => PrincipalScope::Terminal,
+        RelayGrantScope::Agent => PrincipalScope::Agent,
+        RelayGrantScope::AgentReadonly => PrincipalScope::AgentReadonly,
+        RelayGrantScope::ProjectFiles => PrincipalScope::ProjectFiles,
+    };
+    ClientPrincipal::from_verified_remote(
+        "user-1".to_string(),
+        vec![PrincipalGrant {
+            scope: principal_scope,
             project_root,
         }],
-        actor_binding: None,
-    })
+        None,
+    )
 }
 
 fn nonzero_project_id() -> [u8; 16] {

@@ -14,6 +14,7 @@
 pub mod audit;
 pub mod coordinator;
 pub mod frame;
+pub mod guidance;
 pub mod host_identity;
 pub mod observation;
 pub mod platform;

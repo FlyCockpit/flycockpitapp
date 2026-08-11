@@ -295,10 +295,10 @@ impl RemotePermissionCeilingV1 {
             if pid.iter().all(|&b| b == 0) {
                 return ceiling_err("project id must be nonzero");
             }
-            if let Some(prev) = prev_id {
-                if &prev >= pid {
-                    return ceiling_err("project ids must be strictly ascending");
-                }
+            if let Some(prev) = prev_id
+                && prev >= *pid
+            {
+                return ceiling_err("project ids must be strictly ascending");
             }
             prev_id = Some(*pid);
             if caps.is_empty() || caps.len() > 16 {
@@ -404,10 +404,10 @@ impl RemotePermissionCeilingV1 {
             if pid.iter().all(|&b| b == 0) {
                 return ceiling_err("project id must be nonzero");
             }
-            if let Some(prev) = prev_pid {
-                if prev >= pid {
-                    return ceiling_err("project ids must be strictly ascending");
-                }
+            if let Some(prev) = prev_pid
+                && prev >= pid
+            {
+                return ceiling_err("project ids must be strictly ascending");
             }
             prev_pid = Some(pid);
             if pos >= bytes.len() {
@@ -918,8 +918,8 @@ impl RemotePublicServicePolicyV1 {
     pub fn canonical_json(&self) -> Result<String> {
         // Serialize to a Value, then canonicalize. We use serde_json::to_value
         // then the canonical_json helper to guarantee RFC 8785 ordering.
-        let value =
-            serde_json::to_value(self).map_err(|e| RemotePublicPolicyError::Invalid(e.to_string()))?;
+        let value = serde_json::to_value(self)
+            .map_err(|e| RemotePublicPolicyError::Invalid(e.to_string()))?;
         canonical_json_value(&value)
     }
 
@@ -985,9 +985,8 @@ pub fn validate_digest_hex(hex: &str) -> Result<()> {
 pub fn canonical_json_value(value: &Value) -> Result<String> {
     match value {
         Value::Null => Ok("null".into()),
-        Value::Bool(_) | Value::Number(_) | Value::String(_) => {
-            serde_json::to_string(value).map_err(|e| RemotePublicPolicyError::Invalid(e.to_string()))
-        }
+        Value::Bool(_) | Value::Number(_) | Value::String(_) => serde_json::to_string(value)
+            .map_err(|e| RemotePublicPolicyError::Invalid(e.to_string())),
         Value::Array(values) => Ok(format!(
             "[{}]",
             values
@@ -1681,14 +1680,8 @@ mod tests {
     fn daemon_custody_meet_table() {
         use DaemonCustodyPolicy::*;
         assert_eq!(OsProtected.meet(OsProtected), OsProtected);
-        assert_eq!(
-            OsProtected.meet(HardwareOrExternal),
-            HardwareOrExternal
-        );
-        assert_eq!(
-            HardwareOrExternal.meet(OsProtected),
-            HardwareOrExternal
-        );
+        assert_eq!(OsProtected.meet(HardwareOrExternal), HardwareOrExternal);
+        assert_eq!(HardwareOrExternal.meet(OsProtected), HardwareOrExternal);
         assert_eq!(
             HardwareOrExternal.meet(HardwareOrExternal),
             HardwareOrExternal
@@ -1759,11 +1752,21 @@ mod tests {
         // Names are disjoint: no variant name appears in both enums.
         let proj_names: Vec<String> = RemoteProjectCapabilityV1::all()
             .iter()
-            .map(|c| serde_json::to_string(c).unwrap().trim_matches('"').to_string())
+            .map(|c| {
+                serde_json::to_string(c)
+                    .unwrap()
+                    .trim_matches('"')
+                    .to_string()
+            })
             .collect();
         let att_names: Vec<String> = RemoteAttachmentCapabilityV1::all()
             .iter()
-            .map(|c| serde_json::to_string(c).unwrap().trim_matches('"').to_string())
+            .map(|c| {
+                serde_json::to_string(c)
+                    .unwrap()
+                    .trim_matches('"')
+                    .to_string()
+            })
             .collect();
         for pn in &proj_names {
             assert!(!att_names.contains(pn), "name {pn} not disjoint");
@@ -1810,8 +1813,7 @@ mod tests {
         for i in 1..=16u8 {
             let mut pid = [0u8; 16];
             pid[15] = i;
-            let caps: Vec<RemoteProjectCapabilityV1> =
-                RemoteProjectCapabilityV1::all().to_vec();
+            let caps: Vec<RemoteProjectCapabilityV1> = RemoteProjectCapabilityV1::all().to_vec();
             projects.push((pid, caps));
         }
         let c = RemotePermissionCeilingV1 {

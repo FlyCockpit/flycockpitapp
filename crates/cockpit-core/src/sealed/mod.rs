@@ -38,11 +38,14 @@
 //! its own coordinator prompt.
 
 pub mod action;
+pub mod action_admin;
 pub mod compartment;
 pub mod custody;
 pub mod grant;
 pub mod identity;
 pub mod marker;
+pub mod owner;
+pub mod owner_commands;
 pub mod runtime;
 pub mod store;
 
@@ -53,6 +56,12 @@ pub use action::{
     OwnerAuthority, SealedActionDescriptor, SealedActionId, SealedActionRegistry,
     SealedActionRegistryBuilder, SealedActionResult, SealedActionRevision, SealedCompletion,
     SealedHostAction, SealedParamSpec, SealedParamValue, SealedParams, SealedSafeValue,
+};
+pub use action_admin::{
+    CreateSealedAction, HTTPS_MAX_ORIGIN_BYTES, HTTPS_MAX_ORIGINS, HTTPS_MAX_RESPONSE_BYTES,
+    HTTPS_TIMEOUT_MS, HttpsCredentialPlacement, HttpsOrigin, HttpsOriginAllowlist,
+    ReviseSealedAction, SealedActionDirectory, SealedActionInstanceSummary, SealedActionKind,
+    SealedActionSnapshot, SealedParamSpecJson, SealedProjectionId,
 };
 pub use compartment::{
     SealedCompartment, SealedCompartmentKey, SealedLiteral, SealedLiteralHandle,
@@ -71,6 +80,11 @@ pub use identity::{
 pub use marker::{
     SealedCapabilityState, SealedMarkerIdentity, SealedMarkerPredicate,
     historical_redaction_inventory,
+};
+pub use owner::{
+    BeginResult, BeginSensitiveOwnerOperation, CAPABILITY_TTL, MAX_SENSITIVE_FRAME_BYTES,
+    OneUseCapability, SensitiveFrameKind, SensitiveFrameOutcome, SensitiveOwnerFrame,
+    SensitiveOwnerOperation,
 };
 pub use runtime::{SealedRedactionSink, SealedRuntime, SessionRedactionSink};
 pub use store::{

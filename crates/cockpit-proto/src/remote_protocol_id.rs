@@ -19,6 +19,8 @@ pub enum RemoteProtocolIdKind {
     Frame,
     /// Ephemeral per-transfer identifier (`RemoteBulk*.transferId`).
     Transfer,
+    /// Signed public SaaS service-policy identifier (`RemotePublicPolicyId`).
+    PublicPolicy,
 }
 
 impl RemoteProtocolIdKind {
@@ -31,6 +33,7 @@ impl RemoteProtocolIdKind {
             RemoteProtocolIdKind::Project => "project",
             RemoteProtocolIdKind::Frame => "frame",
             RemoteProtocolIdKind::Transfer => "transfer",
+            RemoteProtocolIdKind::PublicPolicy => "public_policy",
         }
     }
 }
@@ -62,6 +65,8 @@ pub mod kind {
     pub struct Frame;
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
     pub struct Transfer;
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+    pub struct PublicPolicy;
 
     macro_rules! seal_kind {
         ($($ty:ident => $variant:ident),+ $(,)?) => {
@@ -82,6 +87,7 @@ pub mod kind {
         Project => Project,
         Frame => Frame,
         Transfer => Transfer,
+        PublicPolicy => PublicPolicy,
     }
 }
 
@@ -212,6 +218,10 @@ impl<'de, K: kind::ProtocolIdKind> serde::Deserialize<'de> for RemoteProtocolId<
 pub type RemoteFrameId = RemoteProtocolId<kind::Frame>;
 /// Ephemeral 16-byte bulk-transfer identifier carried raw in binary frames.
 pub type RemoteTransferId = RemoteProtocolId<kind::Transfer>;
+/// Signed public SaaS service-policy identifier (`RemotePublicPolicyId`):
+/// the protocol-foundation random 16-byte typed alias encoded as canonical
+/// 22-character unpadded base64url.
+pub type RemotePublicPolicyId = RemoteProtocolId<kind::PublicPolicy>;
 
 /// Nominal CanonicalU64DecimalStringV1 wire type (never a JSON number).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

@@ -855,23 +855,17 @@ mod ask_image {
     #[test]
     fn valid_durable_attachment_passes() {
         let att = valid_durable_ref("sess-1");
-        let result = AskImageService::validate_attachment(
-            &att,
-            "sess-1",
-            AskImageAttachmentKind::Durable,
-        );
+        let result =
+            AskImageService::validate_attachment(&att, "sess-1", AskImageAttachmentKind::Durable);
         assert!(result.is_ok());
     }
 
     #[test]
     fn wrong_session_fails() {
         let att = valid_durable_ref("sess-1");
-        let err = AskImageService::validate_attachment(
-            &att,
-            "sess-2",
-            AskImageAttachmentKind::Durable,
-        )
-        .unwrap_err();
+        let err =
+            AskImageService::validate_attachment(&att, "sess-2", AskImageAttachmentKind::Durable)
+                .unwrap_err();
         assert_eq!(err, AskImageError::WrongSession);
     }
 
@@ -879,12 +873,9 @@ mod ask_image {
     fn expired_attachment_fails() {
         let mut att = valid_durable_ref("sess-1");
         att.expired = true;
-        let err = AskImageService::validate_attachment(
-            &att,
-            "sess-1",
-            AskImageAttachmentKind::Durable,
-        )
-        .unwrap_err();
+        let err =
+            AskImageService::validate_attachment(&att, "sess-1", AskImageAttachmentKind::Durable)
+                .unwrap_err();
         assert_eq!(err, AskImageError::Expired);
     }
 
@@ -892,12 +883,9 @@ mod ask_image {
     fn quarantined_attachment_fails() {
         let mut att = valid_durable_ref("sess-1");
         att.quarantined = true;
-        let err = AskImageService::validate_attachment(
-            &att,
-            "sess-1",
-            AskImageAttachmentKind::Durable,
-        )
-        .unwrap_err();
+        let err =
+            AskImageService::validate_attachment(&att, "sess-1", AskImageAttachmentKind::Durable)
+                .unwrap_err();
         assert_eq!(err, AskImageError::Quarantined);
     }
 
@@ -905,24 +893,18 @@ mod ask_image {
     fn over_limit_attachment_fails() {
         let mut att = valid_durable_ref("sess-1");
         att.over_limit = true;
-        let err = AskImageService::validate_attachment(
-            &att,
-            "sess-1",
-            AskImageAttachmentKind::Durable,
-        )
-        .unwrap_err();
+        let err =
+            AskImageService::validate_attachment(&att, "sess-1", AskImageAttachmentKind::Durable)
+                .unwrap_err();
         assert_eq!(err, AskImageError::OverLimit);
     }
 
     #[test]
     fn transient_frame_not_allowed_for_ask_image() {
         let att = valid_durable_ref("sess-1");
-        let err = AskImageService::validate_attachment(
-            &att,
-            "sess-1",
-            AskImageAttachmentKind::Transient,
-        )
-        .unwrap_err();
+        let err =
+            AskImageService::validate_attachment(&att, "sess-1", AskImageAttachmentKind::Transient)
+                .unwrap_err();
         assert_eq!(err, AskImageError::TransientNotAllowed);
     }
 
@@ -930,12 +912,9 @@ mod ask_image {
     fn empty_attachment_id_fails() {
         let mut att = valid_durable_ref("sess-1");
         att.attachment_id = String::new();
-        let err = AskImageService::validate_attachment(
-            &att,
-            "sess-1",
-            AskImageAttachmentKind::Durable,
-        )
-        .unwrap_err();
+        let err =
+            AskImageService::validate_attachment(&att, "sess-1", AskImageAttachmentKind::Durable)
+                .unwrap_err();
         assert!(matches!(err, AskImageError::AttachmentNotFound(_)));
     }
 
@@ -1080,9 +1059,7 @@ mod cache {
         let clock = FakeDossierClock::new(1000);
         cache.session_start("sess-1");
         let key = valid_cache_key("sess-1");
-        cache
-            .insert(key.clone(), valid_dossier(), &clock)
-            .unwrap();
+        cache.insert(key.clone(), valid_dossier(), &clock).unwrap();
         // Access just under 30 minutes — still valid.
         clock.advance(DOSSIER_CACHE_IDLE_TTL.as_millis() as u64 - 1);
         assert!(matches!(
@@ -1103,9 +1080,7 @@ mod cache {
         let clock = FakeDossierClock::new(1000);
         cache.session_start("sess-1");
         let key = valid_cache_key("sess-1");
-        cache
-            .insert(key.clone(), valid_dossier(), &clock)
-            .unwrap();
+        cache.insert(key.clone(), valid_dossier(), &clock).unwrap();
         assert_eq!(cache.len(), 1);
         cache.session_end("sess-1");
         assert_eq!(cache.len(), 0);
@@ -1121,9 +1096,7 @@ mod cache {
         let clock = FakeDossierClock::new(1000);
         cache.session_start("sess-1");
         let key = valid_cache_key("sess-1");
-        cache
-            .insert(key.clone(), valid_dossier(), &clock)
-            .unwrap();
+        cache.insert(key.clone(), valid_dossier(), &clock).unwrap();
         // Different checksum = different key — no hit.
         let mut key2 = valid_cache_key("sess-1");
         key2.attachment_checksum_hex = "different".to_string();
@@ -1139,9 +1112,7 @@ mod cache {
         let clock = FakeDossierClock::new(1000);
         cache.session_start("sess-1");
         let key = valid_cache_key("sess-1");
-        cache
-            .insert(key.clone(), valid_dossier(), &clock)
-            .unwrap();
+        cache.insert(key.clone(), valid_dossier(), &clock).unwrap();
         let mut key2 = valid_cache_key("sess-1");
         key2.config_generation = 2;
         assert!(matches!(
@@ -1156,12 +1127,14 @@ mod cache {
         let clock = FakeDossierClock::new(1000);
         cache.session_start("sess-1");
         let key = valid_cache_key("sess-1");
-        cache
-            .insert(key.clone(), valid_dossier(), &clock)
-            .unwrap();
+        cache.insert(key.clone(), valid_dossier(), &clock).unwrap();
         let mut key2 = valid_cache_key("sess-1");
         key2.crop_identity = Some(CropIdentity::from_bounds_and_checksum(
-            10, 10, 100, 100, &[1, 2, 3],
+            10,
+            10,
+            100,
+            100,
+            &[1, 2, 3],
         ));
         assert!(matches!(
             cache.lookup(&key2, &clock),
@@ -1175,9 +1148,7 @@ mod cache {
         let clock = FakeDossierClock::new(1000);
         cache.session_start("sess-1");
         let key = valid_cache_key("sess-1");
-        cache
-            .insert(key.clone(), valid_dossier(), &clock)
-            .unwrap();
+        cache.insert(key.clone(), valid_dossier(), &clock).unwrap();
         let mut key2 = valid_cache_key("sess-1");
         key2.sidecar_model = "other-model".to_string();
         assert!(matches!(
@@ -1282,10 +1253,13 @@ mod transient_frames {
         let crop = CropIdentity::from_bounds_and_checksum(0, 0, 100, 100, &[1]);
         let mut frame = TransientComputerFrame::new("op-1", "sess-1", crop);
         let err = frame.consume("op-1", "sess-2").unwrap_err();
-        assert_eq!(err, TransientFrameError::SessionMismatch {
-            expected: "sess-1".to_string(),
-            got: "sess-2".to_string(),
-        });
+        assert_eq!(
+            err,
+            TransientFrameError::SessionMismatch {
+                expected: "sess-1".to_string(),
+                got: "sess-2".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -1293,22 +1267,22 @@ mod transient_frames {
         let crop = CropIdentity::from_bounds_and_checksum(0, 0, 100, 100, &[1]);
         let mut frame = TransientComputerFrame::new("op-1", "sess-1", crop);
         let err = frame.consume("op-2", "sess-1").unwrap_err();
-        assert_eq!(err, TransientFrameError::OperationMismatch {
-            expected: "op-1".to_string(),
-            got: "op-2".to_string(),
-        });
+        assert_eq!(
+            err,
+            TransientFrameError::OperationMismatch {
+                expected: "op-1".to_string(),
+                got: "op-2".to_string(),
+            }
+        );
     }
 
     #[test]
     fn transient_frame_not_addressable_by_ask_image() {
         // AskImageService rejects transient kind.
         let att = valid_durable_ref("sess-1");
-        let err = AskImageService::validate_attachment(
-            &att,
-            "sess-1",
-            AskImageAttachmentKind::Transient,
-        )
-        .unwrap_err();
+        let err =
+            AskImageService::validate_attachment(&att, "sess-1", AskImageAttachmentKind::Transient)
+                .unwrap_err();
         assert_eq!(err, AskImageError::TransientNotAllowed);
     }
 

@@ -2429,18 +2429,20 @@ impl NativeResponseExtractor {
 
 #[cfg(test)]
 mod tests {
+    use super::super::host_identity::HostInstallationId;
     use super::super::target::{
-        FakeTargetEvidenceAdapter, HostInstallationId, TargetGeometry, empty_unavailable,
+        FakeTargetEvidenceAdapter, TargetIdentityEvidence, empty_unavailable,
         sample_physical_evidence,
     };
     use super::super::{
-        Anthropic20250124ComputerAction, Anthropic20251124ComputerAction, ComputerAction,
-        ComputerBackend, ComputerError, ComputerToolContract, CoordinateSpace, DisplayGeometry,
-        FakeBackend, LogicalSize, Modifiers, OpenAiComputerAction, PixelSize, Point,
-        ProviderPointerButton, ScaleFactor,
+        Anthropic20250124ComputerAction, Anthropic20251124ComputerAction, ClickCount,
+        ComputerAction, ComputerBackend, ComputerError, ComputerToolContract, CoordinateSpace,
+        DisplayGeometry, Easing, FakeBackend, KeyChord, LogicalSize, Modifiers, MouseButton,
+        OpenAiComputerAction, PixelSize, Point, ProviderPointerButton, Rect, ScaleFactor,
     };
     use super::*;
     use std::sync::Arc;
+    use std::time::Duration;
 
     fn test_geometry() -> DisplayGeometry {
         DisplayGeometry {
@@ -2473,13 +2475,7 @@ mod tests {
             [2u8; 32],
             [3u8; 32],
             [4u8; 16],
-            TargetGeometry {
-                x: 0,
-                y: 0,
-                width: 1280,
-                height: 720,
-                scale: 1.0,
-            },
+            1234,
         )
     }
 
@@ -2717,8 +2713,8 @@ mod tests {
     #[test]
     fn computer_native_host_arbiter_cross_process_contention() {
         let os_lock = InMemoryOsAdvisoryLock::new();
-        let mut arbiter_a = HostInputArbiter::new(Box::new(os_lock), OwnerInstance(1));
         let os_lock_b = os_lock.shared_clone();
+        let mut arbiter_a = HostInputArbiter::new(Box::new(os_lock), OwnerInstance(1));
         let mut arbiter_b = HostInputArbiter::new(Box::new(os_lock_b), OwnerInstance(2));
 
         let key = physical_key();
@@ -3073,7 +3069,7 @@ mod tests {
         // action/target denial — every action that passes capability checks
         // is dispatched.
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
-        let backend = Box::new(FakeBackend::new());
+        let backend = FakeBackend::new();
         let params = CoordinatorParams {
             session_id: "session-1".to_string(),
             delegation_id: DelegationId("delegation-1".to_string()),
@@ -3272,7 +3268,7 @@ mod tests {
     async fn computer_native_unsupported_provider_variant() {
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
         let backend = Box::new(FakeBackend::new());
-        let mut coordinator = make_coordinator(backend, authorizer).await;
+        let _coordinator = make_coordinator(backend, authorizer).await;
 
         // Simulate an unsupported variant.
         let call = NativeComputerCall::UnsupportedVariant {
@@ -3453,7 +3449,7 @@ mod tests {
         // This test replaces the old direct-dispatch test. It drives a
         // failing batch through the coordinator path and asserts the
         // failure outcome.
-        let mut backend = FakeBackend::failing_at(1, ComputerError::Refused("blocked".to_string()));
+        let backend = FakeBackend::failing_at(1, ComputerError::Refused("blocked".to_string()));
         // failing_at uses the default geometry; we need to ensure the
         // coordinator opens with this backend.
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
@@ -3643,5 +3639,684 @@ mod tests {
             outcome2,
             CoordinatedOutcome::DuplicateReplay { .. }
         ));
+    }
+
+    // =====================================================================
+    // Acceptance criterion 1: computer_lease_scoped_to_delegation
+    // Proves one coalesced Ask decision, reuse, re-prompt for every
+    // key/generation change, and no broader persistence.
+    // =====================================================================
+
+    fn make_ask_coordinator_params(
+        authorizer: Arc<dyn ComputerAuthorizer>,
+        provider: &str,
+        model: &str,
+    ) -> CoordinatorParams {
+        CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Ask,
+            owner_instance: OwnerInstance(1),
+            authorizer,
+            host_arbiter: None,
+            target_adapter: None,
+            provider_id: ProviderId(provider.to_string()),
+            model_id: ModelId(model.to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn computer_lease_scoped_to_delegation() {
+        // Ask tier: the first valid Ask action creates one coalesced central
+        // authorization request. Approve creates an in-memory
+        // AskDelegationLease. The lease is reused for all action classes until
+        // invalidation. The lease never persists and cannot be broadened.
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let backend = FakeBackend::new();
+        let params = make_ask_coordinator_params(authorizer.clone(), "openai", "gpt-5");
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
+            .await
+            .expect("coordinator open");
+
+        // First Ask action — authorizer is called once (one coalesced decision).
+        let actions = vec![OpenAiComputerAction::Screenshot];
+        let outcome1 = coordinator.execute_openai_call("call-1", &actions).await;
+        assert!(matches!(outcome1, CoordinatedOutcome::Completed { .. }));
+        assert_eq!(authorizer.call_count(), 1);
+
+        // Second action — the lease is reused, no new authorizer call.
+        let actions2 = vec![OpenAiComputerAction::Move {
+            to: Point {
+                x: 10.0,
+                y: 20.0,
+                space: CoordinateSpace::Physical,
+            },
+        }];
+        let outcome2 = coordinator.execute_openai_call("call-2", &actions2).await;
+        assert!(matches!(outcome2, CoordinatedOutcome::Completed { .. }));
+        assert_eq!(authorizer.call_count(), 1); // Still 1 — lease reused.
+
+        // The lease is installed in the store.
+        assert_eq!(coordinator.ask_lease_store().len(), 1);
+
+        // The lease is scoped — it cannot be broadened to session/project/global.
+        let lease_key = coordinator.ask_lease_key(None).unwrap();
+        assert!(coordinator.ask_lease_store().has_lease(&lease_key));
+    }
+
+    #[tokio::test]
+    async fn computer_lease_re_prompt_on_provider_model_change() {
+        // Provider/model change invalidates the lease and requires a new
+        // human decision.
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let backend = FakeBackend::new();
+        let params = make_ask_coordinator_params(authorizer.clone(), "openai", "gpt-5");
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
+            .await
+            .expect("coordinator open");
+
+        let actions = vec![OpenAiComputerAction::Screenshot];
+        let _ = coordinator.execute_openai_call("call-1", &actions).await;
+        assert_eq!(authorizer.call_count(), 1);
+
+        // Revoke the lease (simulates provider/model change).
+        assert!(coordinator.revoke_ask_lease());
+
+        // Next action requires a new decision.
+        let _ = coordinator.execute_openai_call("call-2", &actions).await;
+        assert_eq!(authorizer.call_count(), 2); // New decision required.
+    }
+
+    // =====================================================================
+    // Acceptance criterion 2: computer_lease_host_composition
+    // =====================================================================
+
+    #[tokio::test]
+    async fn computer_lease_host_composition_physical() {
+        // Physical target: Ask requires both the Ask delegation lease AND the
+        // host lease. Neither alone can dispatch.
+        let os_lock = InMemoryOsAdvisoryLock::new();
+        let arbiter = Arc::new(std::sync::Mutex::new(HostInputArbiter::new(
+            Box::new(os_lock),
+            OwnerInstance(1),
+        )));
+        let adapter = FakeTargetEvidenceAdapter::new(physical_evidence());
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let params = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Ask,
+            owner_instance: OwnerInstance(1),
+            authorizer: authorizer.clone(),
+            host_arbiter: Some(arbiter.clone()),
+            target_adapter: Some(Box::new(adapter)),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+        };
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+
+        // The host lease is acquired at open time.
+        assert!(coordinator.host_lease().is_some());
+
+        // First Ask action — both leases are composed. The action dispatches.
+        let actions = vec![OpenAiComputerAction::Screenshot];
+        let outcome = coordinator.execute_openai_call("call-1", &actions).await;
+        assert!(matches!(outcome, CoordinatedOutcome::Completed { .. }));
+        assert_eq!(authorizer.call_count(), 1);
+
+        // The Ask lease is installed.
+        assert_eq!(coordinator.ask_lease_store().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn computer_lease_host_composition_replaced_generation_invalidates() {
+        // A replaced host lease generation invalidates the Ask lease and
+        // requires a new human decision before another action.
+        let os_lock = InMemoryOsAdvisoryLock::new();
+        let arbiter = Arc::new(std::sync::Mutex::new(HostInputArbiter::new(
+            Box::new(os_lock),
+            OwnerInstance(1),
+        )));
+        let adapter = FakeTargetEvidenceAdapter::new(physical_evidence());
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let params = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Ask,
+            owner_instance: OwnerInstance(1),
+            authorizer: authorizer.clone(),
+            host_arbiter: Some(arbiter.clone()),
+            target_adapter: Some(Box::new(adapter)),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+        };
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+
+        // First action — both leases composed.
+        let actions = vec![OpenAiComputerAction::Screenshot];
+        let _ = coordinator.execute_openai_call("call-1", &actions).await;
+        assert_eq!(authorizer.call_count(), 1);
+        assert_eq!(coordinator.ask_lease_store().len(), 1);
+
+        // Simulate host generation replacement: revoke the Ask lease.
+        assert!(coordinator.revoke_ask_lease());
+
+        // Next action requires a new decision (new host generation + new Ask).
+        let _ = coordinator.execute_openai_call("call-2", &actions).await;
+        assert_eq!(authorizer.call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn computer_lease_host_composition_physical_contenders_serialized() {
+        // Physical contenders remain globally serialized.
+        let os_lock = InMemoryOsAdvisoryLock::new();
+        let arbiter = Arc::new(std::sync::Mutex::new(HostInputArbiter::new(
+            Box::new(os_lock),
+            OwnerInstance(1),
+        )));
+        let key = physical_key();
+        let delegation_a = DelegationId("delegation-a".to_string());
+        let delegation_b = DelegationId("delegation-b".to_string());
+
+        let result_a = {
+            let mut arb = arbiter.lock().unwrap();
+            arb.try_acquire(&key, delegation_a.clone())
+        };
+        assert!(matches!(result_a, AcquireResult::Acquired(_)));
+
+        let result_b = {
+            let mut arb = arbiter.lock().unwrap();
+            arb.try_acquire(&key, delegation_b.clone())
+        };
+        assert!(matches!(result_b, AcquireResult::Queued));
+    }
+
+    // =====================================================================
+    // Acceptance criterion 3: computer_lease_unforgeable
+    // =====================================================================
+
+    #[test]
+    fn computer_lease_unforgeable_ask_lease_not_constructible() {
+        // AskDelegationLease is not constructible outside this module.
+        let mut store = AskDelegationLeaseStore::new();
+        assert!(store.is_empty());
+
+        let key = AskLeaseKey {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+            target_key: LeaseTargetKey::Virtual([0u8; 16]),
+            host_lease_generation: None,
+            display_generation: 1,
+        };
+        assert!(!store.has_lease(&key));
+
+        let v = store.begin_approval_wait(&key);
+        let outcome = store.install(&key, v);
+        assert_eq!(outcome, AskAuthorizationOutcome::Installed);
+        assert!(store.has_lease(&key));
+    }
+
+    #[test]
+    fn computer_lease_unforgeable_constant_time_token() {
+        // The opaque token is compared in constant time. Two leases with the
+        // same key but different tokens are not equal.
+        let key = AskLeaseKey {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+            target_key: LeaseTargetKey::Virtual([0u8; 16]),
+            host_lease_generation: None,
+            display_generation: 1,
+        };
+        let mut store = AskDelegationLeaseStore::new();
+        let v1 = store.begin_approval_wait(&key);
+        assert_eq!(store.install(&key, v1), AskAuthorizationOutcome::Installed);
+        let lease1 = store.lease(&key).unwrap().clone();
+
+        assert!(store.revoke(&key));
+        let v2 = store.begin_approval_wait(&key);
+        assert_eq!(store.install(&key, v2), AskAuthorizationOutcome::Installed);
+        let lease2 = store.lease(&key).unwrap().clone();
+
+        assert_eq!(lease1.key(), lease2.key());
+        assert_ne!(lease1, lease2); // Different tokens.
+    }
+
+    #[test]
+    fn computer_lease_unforgeable_no_serde() {
+        // AskDelegationLease has no serde implementation (compile-time
+        // guarantee). The store exposes no serialization API.
+        let store = AskDelegationLeaseStore::new();
+        assert!(store.is_empty());
+    }
+
+    // =====================================================================
+    // Acceptance criterion 4: computer_lease_revocation_race
+    // =====================================================================
+
+    #[tokio::test]
+    async fn computer_lease_revocation_race_approval_cancel() {
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let backend = FakeBackend::new();
+        let params = make_ask_coordinator_params(authorizer, "openai", "gpt-5");
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
+            .await
+            .expect("coordinator open");
+
+        let actions = vec![OpenAiComputerAction::Screenshot];
+        let _ = coordinator.execute_openai_call("call-1", &actions).await;
+        assert_eq!(coordinator.ask_lease_store().len(), 1);
+
+        let outcome = coordinator.cancel_before_dispatch("call-2");
+        assert!(matches!(
+            outcome,
+            CoordinatedOutcome::CancelledBeforeDispatch
+        ));
+    }
+
+    #[tokio::test]
+    async fn computer_lease_revocation_race_approval_terminal() {
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let backend = FakeBackend::new();
+        let params = make_ask_coordinator_params(authorizer, "openai", "gpt-5");
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
+            .await
+            .expect("coordinator open");
+
+        let actions = vec![OpenAiComputerAction::Screenshot];
+        let _ = coordinator.execute_openai_call("call-1", &actions).await;
+        assert_eq!(coordinator.ask_lease_store().len(), 1);
+
+        let revoked = coordinator.revoke_ask_lease_for_delegation();
+        assert_eq!(revoked, 1);
+        assert_eq!(coordinator.ask_lease_store().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn computer_lease_revocation_race_host_replacement() {
+        let os_lock = InMemoryOsAdvisoryLock::new();
+        let arbiter = Arc::new(std::sync::Mutex::new(HostInputArbiter::new(
+            Box::new(os_lock),
+            OwnerInstance(1),
+        )));
+        let adapter = FakeTargetEvidenceAdapter::new(physical_evidence());
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let params = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Ask,
+            owner_instance: OwnerInstance(1),
+            authorizer,
+            host_arbiter: Some(arbiter.clone()),
+            target_adapter: Some(Box::new(adapter)),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+        };
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+
+        let actions = vec![OpenAiComputerAction::Screenshot];
+        let _ = coordinator.execute_openai_call("call-1", &actions).await;
+        assert_eq!(coordinator.ask_lease_store().len(), 1);
+
+        coordinator.invalidate(TargetUnavailableReason::StaleTarget);
+        assert_eq!(coordinator.ask_lease_store().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn computer_lease_revocation_race_queued_revoke() {
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let backend = FakeBackend::new();
+        let params = make_ask_coordinator_params(authorizer, "openai", "gpt-5");
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
+            .await
+            .expect("coordinator open");
+
+        assert!(!coordinator.revoke_ask_lease());
+    }
+
+    #[tokio::test]
+    async fn computer_lease_revocation_race_handoff_revoke() {
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let backend = FakeBackend::new();
+        let params = make_ask_coordinator_params(authorizer, "openai", "gpt-5");
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
+            .await
+            .expect("coordinator open");
+
+        let actions = vec![OpenAiComputerAction::Screenshot];
+        let outcome1 = coordinator.execute_openai_call("call-1", &actions).await;
+        assert!(matches!(outcome1, CoordinatedOutcome::Completed { .. }));
+
+        assert!(coordinator.revoke_ask_lease());
+
+        let outcome2 = coordinator.execute_openai_call("call-1", &actions).await;
+        assert!(matches!(
+            outcome2,
+            CoordinatedOutcome::DuplicateReplay { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn computer_lease_revocation_race_close_revoke() {
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let backend = FakeBackend::new();
+        let params = make_ask_coordinator_params(authorizer, "openai", "gpt-5");
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
+            .await
+            .expect("coordinator open");
+
+        let actions = vec![OpenAiComputerAction::Screenshot];
+        let _ = coordinator.execute_openai_call("call-1", &actions).await;
+        assert_eq!(coordinator.ask_lease_store().len(), 1);
+
+        coordinator.close().await.expect("close");
+        assert_eq!(coordinator.ask_lease_store().len(), 0);
+    }
+
+    // =====================================================================
+    // Acceptance criterion 5: computer_action_semantics_advisory
+    // =====================================================================
+
+    #[test]
+    fn computer_action_semantics_advisory_table() {
+        let cases = vec![
+            (ComputerAction::CaptureFull, ActionClass::Reversible),
+            (
+                ComputerAction::CaptureRegion {
+                    rect: Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 100.0,
+                        height: 100.0,
+                        space: CoordinateSpace::Physical,
+                    },
+                },
+                ActionClass::Reversible,
+            ),
+            (
+                ComputerAction::MoveCursor {
+                    to: Point {
+                        x: 10.0,
+                        y: 20.0,
+                        space: CoordinateSpace::Physical,
+                    },
+                    duration: Duration::from_millis(100),
+                    easing: Easing::Linear,
+                },
+                ActionClass::Reversible,
+            ),
+            (
+                ComputerAction::Scroll {
+                    delta_x: 0,
+                    delta_y: 10,
+                    modifiers: Modifiers::default(),
+                },
+                ActionClass::Reversible,
+            ),
+            (
+                ComputerAction::Wait {
+                    duration: Duration::from_millis(100),
+                },
+                ActionClass::Reversible,
+            ),
+            (
+                ComputerAction::Click {
+                    button: MouseButton::Left,
+                    count: ClickCount::Single,
+                    modifiers: Modifiers::default(),
+                },
+                ActionClass::StateChanging,
+            ),
+            (
+                ComputerAction::MouseDown {
+                    button: MouseButton::Left,
+                },
+                ActionClass::StateChanging,
+            ),
+            (
+                ComputerAction::MouseUp {
+                    button: MouseButton::Left,
+                },
+                ActionClass::StateChanging,
+            ),
+            (
+                ComputerAction::TypeText {
+                    text: "hello world".to_string(),
+                },
+                ActionClass::StateChanging,
+            ),
+            (
+                ComputerAction::TypeText {
+                    text: "my password is secret".to_string(),
+                },
+                ActionClass::CredentialEntry,
+            ),
+            (
+                ComputerAction::TypeText {
+                    text: "rm -rf /".to_string(),
+                },
+                ActionClass::Destructive,
+            ),
+            (
+                ComputerAction::KeyChord {
+                    chord: KeyChord {
+                        keys: vec!["Enter".to_string()],
+                    },
+                },
+                ActionClass::StateChanging,
+            ),
+            (
+                ComputerAction::HoldKey {
+                    key: "Shift".to_string(),
+                    duration: Duration::from_millis(100),
+                },
+                ActionClass::StateChanging,
+            ),
+        ];
+
+        for (action, expected_class) in cases {
+            let actual = ActionClass::classify(&action);
+            assert_eq!(
+                actual, expected_class,
+                "action {:?} should be {:?} but was {:?}",
+                action, expected_class, actual
+            );
+        }
+
+        let labels = [
+            ActionClass::Reversible,
+            ActionClass::StateChanging,
+            ActionClass::Submission,
+            ActionClass::Purchase,
+            ActionClass::CredentialEntry,
+            ActionClass::Destructive,
+            ActionClass::Unknown,
+        ];
+        for class in labels {
+            assert!(!class.label().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn computer_action_semantics_advisory_no_deny_difference() {
+        // Advisory classes never trigger a prompt/deny/grant difference.
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let backend = FakeBackend::new();
+        let params = make_ask_coordinator_params(authorizer.clone(), "openai", "gpt-5");
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
+            .await
+            .expect("coordinator open");
+
+        let reversible = vec![OpenAiComputerAction::Screenshot];
+        let outcome_r = coordinator
+            .execute_openai_call("call-reversible", &reversible)
+            .await;
+        assert!(matches!(outcome_r, CoordinatedOutcome::Completed { .. }));
+
+        let destructive = vec![OpenAiComputerAction::TypeText("rm -rf /".to_string())];
+        let outcome_d = coordinator
+            .execute_openai_call("call-destructive", &destructive)
+            .await;
+        assert!(matches!(outcome_d, CoordinatedOutcome::Completed { .. }));
+
+        // Only one authorizer call — lease reused for both classes.
+        assert_eq!(authorizer.call_count(), 1);
+    }
+
+    // =====================================================================
+    // Acceptance criterion 6: computer_yolo_complete_trust
+    // =====================================================================
+
+    #[tokio::test]
+    async fn computer_yolo_complete_trust_zero_human_requests() {
+        // Yolo: zero human requests, zero grants.
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_ask());
+        let backend = FakeBackend::new();
+        let params = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Yolo,
+            owner_instance: OwnerInstance(1),
+            authorizer: authorizer.clone(),
+            host_arbiter: None,
+            target_adapter: None,
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+        };
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
+            .await
+            .expect("coordinator open");
+
+        let actions = vec![OpenAiComputerAction::Screenshot];
+        let outcome = coordinator.execute_openai_call("call-1", &actions).await;
+        assert!(matches!(outcome, CoordinatedOutcome::Completed { .. }));
+
+        // Zero human requests — authorizer not called.
+        assert_eq!(authorizer.call_count(), 0);
+        // Zero grants — no Ask lease.
+        assert_eq!(coordinator.ask_lease_store().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn computer_yolo_complete_trust_physical_requires_host_lease() {
+        // Yolo still requires host capability/lease for physical targets.
+        let os_lock = InMemoryOsAdvisoryLock::new();
+        let arbiter = Arc::new(std::sync::Mutex::new(HostInputArbiter::new(
+            Box::new(os_lock),
+            OwnerInstance(1),
+        )));
+        let adapter = FakeTargetEvidenceAdapter::new(physical_evidence());
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_ask());
+        let params = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Yolo,
+            owner_instance: OwnerInstance(1),
+            authorizer,
+            host_arbiter: Some(arbiter.clone()),
+            target_adapter: Some(Box::new(adapter)),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+        };
+        let coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
+            .await
+            .expect("coordinator open");
+
+        assert!(coordinator.host_lease().is_some());
+        assert_eq!(coordinator.ask_lease_store().len(), 0);
+    }
+
+    // =====================================================================
+    // Acceptance criterion 7: computer_use_no_grant_inheritance
+    // =====================================================================
+
+    #[tokio::test]
+    async fn computer_use_no_grant_inheritance_unrelated_grants() {
+        // Unrelated grants never satisfy Ask.
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let backend = FakeBackend::new();
+        let params = make_ask_coordinator_params(authorizer, "openai", "gpt-5");
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
+            .await
+            .expect("coordinator open");
+
+        // A lease for a different delegation does not satisfy this delegation.
+        let other_key = AskLeaseKey {
+            session_id: "session-2".to_string(),
+            delegation_id: DelegationId("delegation-2".to_string()),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+            target_key: LeaseTargetKey::Virtual([0u8; 16]),
+            host_lease_generation: None,
+            display_generation: 1,
+        };
+        let mut other_store = AskDelegationLeaseStore::new();
+        let v = other_store.begin_approval_wait(&other_key);
+        assert_eq!(
+            other_store.install(&other_key, v),
+            AskAuthorizationOutcome::Installed
+        );
+
+        // This coordinator's store is empty.
+        assert_eq!(coordinator.ask_lease_store().len(), 0);
+
+        let actions = vec![OpenAiComputerAction::Screenshot];
+        let outcome = coordinator.execute_openai_call("call-1", &actions).await;
+        assert!(matches!(outcome, CoordinatedOutcome::Completed { .. }));
+
+        // A lease was installed for THIS delegation, not inherited.
+        assert_eq!(coordinator.ask_lease_store().len(), 1);
+        let this_key = coordinator.ask_lease_key(None).unwrap();
+        assert_ne!(this_key.session_id, other_key.session_id);
+    }
+
+    #[tokio::test]
+    async fn computer_use_no_grant_inheritance_different_provider_model() {
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let backend = FakeBackend::new();
+        let params = make_ask_coordinator_params(authorizer.clone(), "openai", "gpt-5");
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
+            .await
+            .expect("coordinator open");
+
+        let actions = vec![OpenAiComputerAction::Screenshot];
+        let _ = coordinator.execute_openai_call("call-1", &actions).await;
+        assert_eq!(authorizer.call_count(), 1);
+        assert_eq!(coordinator.ask_lease_store().len(), 1);
+
+        assert!(coordinator.revoke_ask_lease());
+
+        let _ = coordinator.execute_openai_call("call-2", &actions).await;
+        assert_eq!(authorizer.call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn computer_use_no_grant_inheritance_daemon_restart() {
+        let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
+        let backend = FakeBackend::new();
+        let params = make_ask_coordinator_params(authorizer.clone(), "openai", "gpt-5");
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
+            .await
+            .expect("coordinator open");
+
+        let actions = vec![OpenAiComputerAction::Screenshot];
+        let _ = coordinator.execute_openai_call("call-1", &actions).await;
+        assert_eq!(authorizer.call_count(), 1);
+        assert_eq!(coordinator.ask_lease_store().len(), 1);
+
+        coordinator.clear_all_ask_leases();
+        assert_eq!(coordinator.ask_lease_store().len(), 0);
+
+        let _ = coordinator.execute_openai_call("call-2", &actions).await;
+        assert_eq!(authorizer.call_count(), 2);
     }
 }

@@ -794,6 +794,7 @@ pub struct AskLeaseKey {
 ///   lost OS lock, or daemon restart.
 /// - Daemon restart loses both Ask and host leases; Ask requires a new
 ///   decision.
+#[derive(Clone)]
 pub struct AskDelegationLease {
     key: AskLeaseKey,
     /// Opaque constant-time token. Never serialized, never exposed except by
@@ -1157,10 +1158,13 @@ impl ActionPayloadDigest {
                     count.hash(&mut hasher);
                     modifiers.hash(&mut hasher);
                 }
-                ComputerAction::Scroll { delta_x, delta_y, .. } => {
+                ComputerAction::Scroll {
+                    delta_x, delta_y, ..
+                } => {
                     (delta_x, delta_y).hash(&mut hasher);
                 }
-                ComputerAction::CaptureRegion { rect } | ComputerAction::CaptureNativeZoom { rect, .. } => {
+                ComputerAction::CaptureRegion { rect }
+                | ComputerAction::CaptureNativeZoom { rect, .. } => {
                     rect.space.hash(&mut hasher);
                 }
                 // TypeText/KeyChord/HoldKey: kind only, NO text/key content.
@@ -1245,9 +1249,7 @@ pub enum CoordinatedOutcome {
     /// A different payload with the same `(session, delegation,
     /// provider_call_id, batch_index)` identity was already committed.
     /// Zero input was dispatched.
-    IdentityConflict {
-        identity: ActionIdentity,
-    },
+    IdentityConflict { identity: ActionIdentity },
     /// The provider native variant is unsupported. A typed provider-compatible
     /// unsupported result is returned before backend input.
     UnsupportedProviderVariant { detail: String },
@@ -2054,7 +2056,12 @@ impl ComputerActionCoordinator {
         // uses only the host lease and records `agent_discretion`; it creates
         // no approval grant.
         if let Err(outcome) = self
-            .check_ask_lease_for_dispatch(call_id, &action_label, &backend_actions, self.virtual_display_uuid())
+            .check_ask_lease_for_dispatch(
+                call_id,
+                &action_label,
+                &backend_actions,
+                self.virtual_display_uuid(),
+            )
             .await
         {
             self.journal.record_identity(identity, payload_digest);
@@ -2145,7 +2152,12 @@ impl ComputerActionCoordinator {
 
         // Lease composition gate.
         if let Err(outcome) = self
-            .check_ask_lease_for_dispatch(call_id, &action_label, &backend_actions, self.virtual_display_uuid())
+            .check_ask_lease_for_dispatch(
+                call_id,
+                &action_label,
+                &backend_actions,
+                self.virtual_display_uuid(),
+            )
             .await
         {
             self.journal.record_identity(identity, payload_digest);
@@ -2235,7 +2247,12 @@ impl ComputerActionCoordinator {
 
         // Lease composition gate.
         if let Err(outcome) = self
-            .check_ask_lease_for_dispatch(call_id, &action_label, &backend_actions, self.virtual_display_uuid())
+            .check_ask_lease_for_dispatch(
+                call_id,
+                &action_label,
+                &backend_actions,
+                self.virtual_display_uuid(),
+            )
             .await
         {
             self.journal.record_identity(identity, payload_digest);

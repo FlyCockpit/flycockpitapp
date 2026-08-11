@@ -1167,8 +1167,7 @@ mod remote_attempt_authz_tests {
         assert_eq!(kinds.len(), rows.len(), "duplicate request kinds in table");
 
         // All three categories have at least one request.
-        let categories: std::collections::BTreeSet<&str> =
-            rows.iter().map(|(_, c)| *c).collect();
+        let categories: std::collections::BTreeSet<&str> = rows.iter().map(|(_, c)| *c).collect();
         for expected in &valid_categories {
             assert!(
                 categories.contains(expected),
@@ -1177,7 +1176,11 @@ mod remote_attempt_authz_tests {
         }
 
         // Spot-check: read-only requests are classified as read_only_without_project.
-        let read_only_kinds = ["daemon_status", "get_run_invocation_status", "operation_status"];
+        let read_only_kinds = [
+            "daemon_status",
+            "get_run_invocation_status",
+            "operation_status",
+        ];
         for kind in &read_only_kinds {
             let (_, category) = rows
                 .iter()

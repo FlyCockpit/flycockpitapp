@@ -406,7 +406,11 @@ pub enum ImageArtifactDaemonRequestV1 {
         session_id: String,
         #[serde(rename = "artifactId")]
         artifact_id: String,
-        #[serde(rename = "rangeHeader", default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "rangeHeader",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
         range_header: Option<String>,
     },
     ImageArtifactThumbnail {
@@ -419,7 +423,11 @@ pub enum ImageArtifactDaemonRequestV1 {
         #[serde(rename = "artifactId")]
         artifact_id: String,
         box_size: u32,
-        #[serde(rename = "rangeHeader", default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "rangeHeader",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
         range_header: Option<String>,
     },
     ImageArtifactTransferCancel {
@@ -514,9 +522,7 @@ pub fn validate_daemon_request(request: &ImageArtifactDaemonRequestV1) -> bool {
             request_id,
             transfer_id,
             ..
-        } => {
-            validate_base64url_id_22(request_id) && validate_base64url_id_22(transfer_id)
-        }
+        } => validate_base64url_id_22(request_id) && validate_base64url_id_22(transfer_id),
     }
 }
 
@@ -583,9 +589,7 @@ pub struct ImageArtifactDaemonErrorV1 {
 impl ImageArtifactDaemonErrorV1 {
     /// Create an error with null `authorizedLength` (every non-range code, or
     /// thumbnail range).
-    pub fn null_length(
-        code: ImageArtifactDaemonErrorCode,
-    ) -> Self {
+    pub fn null_length(code: ImageArtifactDaemonErrorCode) -> Self {
         Self {
             schema_version: IMAGE_ARTIFACT_ROUTE_SCHEMA_VERSION,
             code,
@@ -690,7 +694,8 @@ impl ImageArtifactMetadataV1 {
         {
             return false;
         }
-        if self.published_disposition != "ordinary" && self.published_disposition != "late_authorized"
+        if self.published_disposition != "ordinary"
+            && self.published_disposition != "late_authorized"
         {
             return false;
         }
@@ -786,7 +791,10 @@ pub struct ImageArtifactReadHeadV1 {
     #[serde(rename = "cacheControl")]
     pub cache_control: String,
     pub nosniff: String,
-    #[serde(rename = "contentSecurityPolicy", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "contentSecurityPolicy",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub content_security_policy: Option<String>,
     #[serde(rename = "contentLength")]
     pub content_length: String,
@@ -809,7 +817,8 @@ impl ImageArtifactReadHeadV1 {
         if self.schema_version != IMAGE_ARTIFACT_ROUTE_SCHEMA_VERSION {
             return false;
         }
-        if !validate_base64url_id_22(&self.request_id) || !validate_base64url_id_22(&self.transfer_id)
+        if !validate_base64url_id_22(&self.request_id)
+            || !validate_base64url_id_22(&self.transfer_id)
         {
             return false;
         }
@@ -835,10 +844,7 @@ impl ImageArtifactReadHeadV1 {
             return false;
         }
         // ETag is the quoted lowercase full SHA-256.
-        if !self.etag.starts_with('"')
-            || !self.etag.ends_with('"')
-            || self.etag.len() != 66
-        {
+        if !self.etag.starts_with('"') || !self.etag.ends_with('"') || self.etag.len() != 66 {
             return false;
         }
         let inner = &self.etag[1..self.etag.len() - 1];
@@ -871,11 +877,21 @@ impl ImageArtifactReadHeadV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ImageArtifactDaemonOutcomeV1 {
-    Metadata { value: ImageArtifactMetadataV1 },
-    Read { head: ImageArtifactReadHeadV1 },
-    ThumbnailPending { value: ImageThumbnailPendingV1 },
-    Cancelled { value: ImageArtifactTransferCancelResultV1 },
-    Error { error: ImageArtifactDaemonErrorV1 },
+    Metadata {
+        value: ImageArtifactMetadataV1,
+    },
+    Read {
+        head: ImageArtifactReadHeadV1,
+    },
+    ThumbnailPending {
+        value: ImageThumbnailPendingV1,
+    },
+    Cancelled {
+        value: ImageArtifactTransferCancelResultV1,
+    },
+    Error {
+        error: ImageArtifactDaemonErrorV1,
+    },
 }
 
 /// The daemon reply envelope.
@@ -988,8 +1004,7 @@ pub fn raster_download_disposition(media_kind: &str) -> Option<&'static str> {
 /// The exact `Content-Disposition` attachment header for a validated raster
 /// download.
 pub fn raster_download_content_disposition(media_kind: &str) -> Option<String> {
-    raster_download_disposition(media_kind)
-        .map(|name| format!("attachment; filename=\"{name}\""))
+    raster_download_disposition(media_kind).map(|name| format!("attachment; filename=\"{name}\""))
 }
 
 /// The exact `Content-Disposition` inline header for a raster thumbnail.
@@ -1062,11 +1077,7 @@ pub fn thumbnail_output_dimensions(width: u32, height: u32, box_size: u32) -> Op
 /// Compute the fixed-point source coordinate for destination coordinate `x`.
 /// `sx=floor(((2*x+1)*source_width*65536)/(2*out_width))-32768`, clamped to
 /// `[0,(source_width-1)*65536]`.
-pub fn bilinear_source_coordinate(
-    x: u32,
-    source_width: u32,
-    out_width: u32,
-) -> Option<(u32, u32)> {
+pub fn bilinear_source_coordinate(x: u32, source_width: u32, out_width: u32) -> Option<(u32, u32)> {
     if out_width == 0 || source_width == 0 {
         return None;
     }
@@ -1075,7 +1086,7 @@ pub fn bilinear_source_coordinate(
         .checked_add(1u64)?
         .checked_mul(u64::from(source_width))?
         .checked_mul(65536u64)?)
-        .checked_div(u64::from(2u32).checked_mul(u64::from(out_width))?)?;
+    .checked_div(u64::from(2u32).checked_mul(u64::from(out_width))?)?;
     let sx_raw = numerator.saturating_sub(32768u64);
     let max_sx = u64::from(source_width.saturating_sub(1)).saturating_mul(65536u64);
     let sx = sx_raw.clamp(0, max_sx);

@@ -4103,7 +4103,12 @@ fn export_has_no_include_sensitive_escape_hatch() {
                 }
                 for needle in forbidden {
                     if line.contains(needle) {
-                        hits.push(format!("{}:{}: {}", path.display(), lineno + 1, line.trim_end()));
+                        hits.push(format!(
+                            "{}:{}: {}",
+                            path.display(),
+                            lineno + 1,
+                            line.trim_end()
+                        ));
                     }
                 }
             }

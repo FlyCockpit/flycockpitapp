@@ -399,9 +399,7 @@ pub fn meet_policies(
     // but if the transport meet excluded websocket_data, the fallback must
     // be false (you cannot fall back to a transport that is not allowed).
     let websocket_fallback = meet_bool(a.websocket_fallback, b.websocket_fallback)
-        && allowed_transports
-            .iter()
-            .any(|t| t == "websocket_data");
+        && allowed_transports.iter().any(|t| t == "websocket_data");
 
     let result = RemoteConnectionPolicyV1 {
         allowed_transports,

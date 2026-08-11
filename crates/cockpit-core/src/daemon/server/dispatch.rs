@@ -2540,15 +2540,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             session_id,
             kind,
             include_generated_artifacts,
-        } => {
-            export_session_data(
-                ctx,
-                session_id,
-                kind,
-                include_generated_artifacts,
-            )
-            .await
-        }
+        } => export_session_data(ctx, session_id, kind, include_generated_artifacts).await,
         Request::OperationStatus { operation_id } => {
             let ClientPrincipal::Remote(remote) = &shared.principal else {
                 return Err(ErrorPayload {
@@ -5581,15 +5573,7 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
             session_id,
             kind,
             include_generated_artifacts,
-        } => {
-            export_session_data(
-                &ctx,
-                session_id,
-                kind,
-                include_generated_artifacts,
-            )
-            .await
-        }
+        } => export_session_data(&ctx, session_id, kind, include_generated_artifacts).await,
 
         Request::ImportSessionArchive { transfer, as_new } => {
             import_session_archive(&ctx, &transfer, as_new).await
@@ -7043,9 +7027,7 @@ pub(super) async fn export_session_data(
             let export_redactor = db
                 .read(move |conn| {
                     let env = crate::session::export::process_env_map_for_conn();
-                    crate::session::export::redaction_table_for_session_conn(
-                        conn, &target, &env,
-                    )
+                    crate::session::export::redaction_table_for_session_conn(conn, &target, &env)
                 })
                 .await
                 .map_err(internal)?;

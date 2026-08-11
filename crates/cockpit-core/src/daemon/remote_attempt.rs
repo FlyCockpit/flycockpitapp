@@ -34,12 +34,12 @@ use sha2::{Digest, Sha256};
 
 use crate::daemon::principal::ClientPrincipal;
 use cockpit_proto::remote_public_service_policy::{
-    permission_ceiling_digest, RemoteAttachmentCapabilityV1, RemoteAuthorizedTupleSetV1,
-    RemotePermissionCeilingV1, RemoteProjectCapabilityV1, TRANSPORT_BITS_VALID,
+    RemoteAttachmentCapabilityV1, RemoteAuthorizedTupleSetV1, RemotePermissionCeilingV1,
+    RemoteProjectCapabilityV1, TRANSPORT_BITS_VALID, permission_ceiling_digest,
 };
 use cockpit_proto::remote_signaling_attempt_store::{
-    daemon_admission_offer_digest, final_proof_set_digest, validate_fcdo, validate_fccp,
-    RemoteEndpointFinalProofV1, SignalingCodecError,
+    RemoteEndpointFinalProofV1, SignalingCodecError, daemon_admission_offer_digest,
+    final_proof_set_digest, validate_fccp, validate_fcdo,
 };
 
 // ---------------------------------------------------------------------------
@@ -262,7 +262,9 @@ pub struct VerifiedDaemonAdmissionOffer {
 /// defined complete `bodyLength:u16be | body | signature:[64]` FCDO
 /// envelope; body-only, signature-omitting, decoded-field, or re-encoded
 /// hashes fail.
-pub fn verify_daemon_admission_offer(fcdo_bytes: &[u8]) -> Result<VerifiedDaemonAdmissionOffer, AttemptGrantError> {
+pub fn verify_daemon_admission_offer(
+    fcdo_bytes: &[u8],
+) -> Result<VerifiedDaemonAdmissionOffer, AttemptGrantError> {
     let child_attempt_id = validate_fcdo(fcdo_bytes)
         .map_err(|e| AttemptGrantError::Offer(format!("FCDO structural validation: {e}")))?;
     let offer_digest = daemon_admission_offer_digest(fcdo_bytes)
@@ -286,7 +288,9 @@ pub struct VerifiedClientAdmissionProof {
 /// the enrolled client P-256 key. The FCCP signature domain is
 /// `P1363(SHA-256(UTF8("flycockpit.remote.client-admission-proof.v1\0")
 /// || sharedCodecBody))`.
-pub fn verify_client_admission_proof(fccp_bytes: &[u8]) -> Result<VerifiedClientAdmissionProof, AttemptGrantError> {
+pub fn verify_client_admission_proof(
+    fccp_bytes: &[u8],
+) -> Result<VerifiedClientAdmissionProof, AttemptGrantError> {
     let child_attempt_id = validate_fccp(fccp_bytes)
         .map_err(|e| AttemptGrantError::Proof(format!("FCCP structural validation: {e}")))?;
     Ok(VerifiedClientAdmissionProof {
@@ -410,9 +414,7 @@ impl EndpointProofGate {
     /// The transport epoch shared by both proofs.
     pub fn transport_epoch(&self) -> &[u8; 16] {
         // transportEpoch starts at offset 1 + 16 = 17 in agreement
-        let epoch: [u8; 16] = self.client_proof.agreement[17..33]
-            .try_into()
-            .unwrap();
+        let epoch: [u8; 16] = self.client_proof.agreement[17..33].try_into().unwrap();
         epoch.as_ref()
     }
 }
@@ -541,7 +543,11 @@ mod tests {
                         ],
                     )],
                 };
-                permission_ceiling_digest(&ceiling).unwrap().as_bytes().copied().collect::<Vec<_>>()
+                permission_ceiling_digest(&ceiling)
+                    .unwrap()
+                    .as_bytes()
+                    .copied()
+                    .collect::<Vec<_>>()
                     .try_into()
                     .unwrap()
             },
@@ -641,7 +647,10 @@ mod tests {
         for cap in RemoteAttachmentCapabilityV1::all() {
             let ord = cap.ordinal();
             assert!(ord >= 1 && ord <= 13);
-            assert_eq!(RemoteAttachmentCapabilityV1::from_ordinal(ord).unwrap(), *cap);
+            assert_eq!(
+                RemoteAttachmentCapabilityV1::from_ordinal(ord).unwrap(),
+                *cap
+            );
         }
 
         // Transport-bit values 0x01/0x02/0x03.
@@ -790,9 +799,15 @@ mod tests {
         assert!(verify_daemon_admission_offer(&tampered).is_err());
 
         // FCDO domain separator is exact.
-        assert_eq!(FCDO_DOMAIN, b"flycockpit.remote.daemon-admission-offer.v1\0");
+        assert_eq!(
+            FCDO_DOMAIN,
+            b"flycockpit.remote.daemon-admission-offer.v1\0"
+        );
         // FCCP domain separator is exact and distinct.
-        assert_eq!(FCCP_DOMAIN, b"flycockpit.remote.client-admission-proof.v1\0");
+        assert_eq!(
+            FCCP_DOMAIN,
+            b"flycockpit.remote.client-admission-proof.v1\0"
+        );
         assert_ne!(FCDO_DOMAIN, FCCP_DOMAIN);
     }
 
@@ -909,8 +924,8 @@ mod tests {
         assert!(EndpointProofGate::consume(&tampered, &daemon_proof, &grant_digest).is_err());
 
         // Same-byte replay returns the same set digest.
-        let gate2 = EndpointProofGate::consume(&client_proof, &daemon_proof, &grant_digest)
-            .unwrap();
+        let gate2 =
+            EndpointProofGate::consume(&client_proof, &daemon_proof, &grant_digest).unwrap();
         assert_eq!(gate.set_digest, gate2.set_digest);
     }
 
@@ -1110,8 +1125,8 @@ mod tests {
         let gate = EndpointProofGate::consume(&client_proof, &daemon_proof, &grant_digest)
             .expect("admission must succeed");
         // Exact retry returns the same set digest.
-        let gate2 = EndpointProofGate::consume(&client_proof, &daemon_proof, &grant_digest)
-            .unwrap();
+        let gate2 =
+            EndpointProofGate::consume(&client_proof, &daemon_proof, &grant_digest).unwrap();
         assert_eq!(gate.set_digest, gate2.set_digest);
 
         // Conflict: different grant digest fails.

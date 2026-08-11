@@ -3,7 +3,7 @@
 //! Consumes `packages/cockpit-protocol/fixtures/remote/attempt-grants-v1.json`
 //! and asserts nonzero valid and malformed cases before structural comparison.
 use cockpit_proto::remote_public_service_policy::{
-    permission_ceiling_digest, RemotePermissionCeilingV1, TRANSPORT_BITS_VALID,
+    RemotePermissionCeilingV1, TRANSPORT_BITS_VALID, permission_ceiling_digest,
 };
 use serde::Deserialize;
 
@@ -107,12 +107,8 @@ const REQUIRED_PAYLOAD_MEMBERS: &[&str] = &[
 ];
 
 /// The exact member set for the `client`/`daemon` identity sub-objects.
-const REQUIRED_IDENTITY_MEMBERS: &[&str] = &[
-    "deviceId",
-    "certificateId",
-    "generation",
-    "p256Thumbprint",
-];
+const REQUIRED_IDENTITY_MEMBERS: &[&str] =
+    &["deviceId", "certificateId", "generation", "p256Thumbprint"];
 
 fn object_keys(value: &serde_json::Value) -> Vec<String> {
     value
@@ -184,7 +180,8 @@ fn assert_digest_hex_64(value: &serde_json::Value, field: &str) {
                 s.len()
             );
             assert!(
-                s.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+                s.bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
                 "{field} digest must be lowercase hex"
             );
         }
@@ -196,11 +193,16 @@ fn assert_capability_ords(value: &serde_json::Value, max: u8, field: &str) {
     let arr = value
         .as_array()
         .unwrap_or_else(|| panic!("{field} must be an array of ordinals"));
-    assert!(!arr.is_empty() || field.contains("attachment"), "{field} may be empty only for attachment");
+    assert!(
+        !arr.is_empty() || field.contains("attachment"),
+        "{field} may be empty only for attachment"
+    );
     assert!(arr.len() <= 16, "{field} exceeds 16 cap");
     let mut prev: u8 = 0;
     for (i, v) in arr.iter().enumerate() {
-        let ord = v.as_u64().unwrap_or_else(|| panic!("{field} ordinal must be u8")) as u8;
+        let ord = v
+            .as_u64()
+            .unwrap_or_else(|| panic!("{field} ordinal must be u8")) as u8;
         assert!(ord >= 1 && ord <= max, "{field} ordinal {ord} out of range");
         if i > 0 {
             assert!(ord > prev, "{field} must be strictly ascending");
@@ -233,7 +235,11 @@ fn validate_grant_payload(payload: &serde_json::Value, fixture: &Fixture) {
     // Identity sub-objects.
     for side in ["client", "daemon"] {
         let id_obj = &payload[side];
-        assert_exact_keys(id_obj, REQUIRED_IDENTITY_MEMBERS, &format!("{side} identity"));
+        assert_exact_keys(
+            id_obj,
+            REQUIRED_IDENTITY_MEMBERS,
+            &format!("{side} identity"),
+        );
         assert_alias_22(&id_obj["deviceId"], &format!("{side}.deviceId"));
         assert_alias_22(&id_obj["certificateId"], &format!("{side}.certificateId"));
         assert_decimal_string(&id_obj["generation"], &format!("{side}.generation"));
@@ -241,7 +247,14 @@ fn validate_grant_payload(payload: &serde_json::Value, fixture: &Fixture) {
     }
 
     // Top-level aliases.
-    for field in ["tenantId", "accountId", "instanceId", "logicalAttachmentId", "childAttemptId", "jti"] {
+    for field in [
+        "tenantId",
+        "accountId",
+        "instanceId",
+        "logicalAttachmentId",
+        "childAttemptId",
+        "jti",
+    ] {
         assert_alias_22(&payload[field], field);
     }
 
@@ -251,7 +264,14 @@ fn validate_grant_payload(payload: &serde_json::Value, fixture: &Fixture) {
     }
 
     // Decimal-string integers/times.
-    for field in ["serviceVersion", "policyEpoch", "authorityEpoch", "iat", "nbf", "exp"] {
+    for field in [
+        "serviceVersion",
+        "policyEpoch",
+        "authorityEpoch",
+        "iat",
+        "nbf",
+        "exp",
+    ] {
         assert_decimal_string(&payload[field], field);
     }
 
@@ -315,18 +335,28 @@ fn validate_grant_payload(payload: &serde_json::Value, fixture: &Fixture) {
     for proj in projects {
         let keys = object_keys(proj);
         let expected: Vec<String> = vec!["capabilities".to_string(), "projectId".to_string()];
-        assert_eq!(keys, expected, "project entry must have exactly projectId and capabilities");
-        let pid = proj["projectId"].as_str().expect("projectId must be string");
+        assert_eq!(
+            keys, expected,
+            "project entry must have exactly projectId and capabilities"
+        );
+        let pid = proj["projectId"]
+            .as_str()
+            .expect("projectId must be string");
         // Canonical 16-byte base64url (22 chars) or 32-char hex.
         assert!(
             pid.len() == 22 || pid.len() == 32,
             "projectId must be 22-char base64url or 32-char hex"
         );
         if let Some(prev_id) = &prev_pid {
-            assert!(pid > prev_id.as_str(), "projectIds must be sorted ascending");
+            assert!(
+                pid > prev_id.as_str(),
+                "projectIds must be sorted ascending"
+            );
         }
         prev_pid = Some(pid.to_string());
-        let caps = proj["capabilities"].as_array().expect("capabilities must be array");
+        let caps = proj["capabilities"]
+            .as_array()
+            .expect("capabilities must be array");
         assert!(
             !caps.is_empty() && caps.len() <= fixture.limits.project_capability_count_max,
             "project capability count must be 1..={}",
@@ -335,16 +365,25 @@ fn validate_grant_payload(payload: &serde_json::Value, fixture: &Fixture) {
         let mut prev_cap: u8 = 0;
         for (i, v) in caps.iter().enumerate() {
             let ord = v.as_u64().unwrap() as u8;
-            assert!(ord >= 1 && ord <= 15, "project capability ordinal out of range");
+            assert!(
+                ord >= 1 && ord <= 15,
+                "project capability ordinal out of range"
+            );
             if i > 0 {
-                assert!(ord > prev_cap, "project capabilities must be strictly ascending");
+                assert!(
+                    ord > prev_cap,
+                    "project capabilities must be strictly ascending"
+                );
             }
             prev_cap = ord;
         }
     }
 
     // permissionCeilingDigest: 64-char lowercase hex, present.
-    assert_digest_hex_64(&payload["permissionCeilingDigest"], "permissionCeilingDigest");
+    assert_digest_hex_64(
+        &payload["permissionCeilingDigest"],
+        "permissionCeilingDigest",
+    );
 
     // tenantAuthorizationDigest: null for control-plane, or 64-char hex for enterprise.
     match &payload["tenantAuthorizationDigest"] {

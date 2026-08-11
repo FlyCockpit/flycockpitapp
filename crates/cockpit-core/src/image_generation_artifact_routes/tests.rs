@@ -125,7 +125,8 @@ fn image_artifact_route_protocol_v1_rejects_bad_path_shape() {
         "api/cockpit/v1/instances/{VALID_INSTANCE_ID}/sessions/{VALID_SESSION_ID}/image-artifacts/{VALID_ARTIFACT_ID}/thumbnails/256/extra",
     ];
     for bad in cases {
-        let bad = bad.replace("{VALID_INSTANCE_ID}", VALID_INSTANCE_ID)
+        let bad = bad
+            .replace("{VALID_INSTANCE_ID}", VALID_INSTANCE_ID)
             .replace("{VALID_SESSION_ID}", VALID_SESSION_ID)
             .replace("{VALID_ARTIFACT_ID}", VALID_ARTIFACT_ID);
         assert_eq!(
@@ -247,8 +248,7 @@ fn image_artifact_route_protocol_v1_daemon_reply_roundtrip() {
         },
     };
     let json = serde_json::to_string(&reply).expect("serialize");
-    let back: ImageArtifactDaemonReplyV1 =
-        serde_json::from_str(&json).expect("deserialize");
+    let back: ImageArtifactDaemonReplyV1 = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(reply, back);
     assert_eq!(back.request_id, VALID_REQUEST_ID);
 }
@@ -292,8 +292,14 @@ fn image_artifact_route_protocol_v1_authorized_length_nullability() {
         ImageArtifactDaemonErrorCode::Internal,
     ] {
         let err = ImageArtifactDaemonErrorV1::null_length(code);
-        assert!(err.validate_nullability(false), "{code:?} null length valid on content");
-        assert!(err.validate_nullability(true), "{code:?} null length valid on thumbnail");
+        assert!(
+            err.validate_nullability(false),
+            "{code:?} null length valid on content"
+        );
+        assert!(
+            err.validate_nullability(true),
+            "{code:?} null length valid on thumbnail"
+        );
     }
 }
 
@@ -358,7 +364,10 @@ fn image_artifact_route_precedence_range_full_when_absent() {
 #[test]
 fn image_artifact_route_precedence_range_valid_start_end() {
     let r = parse_range_header(Some("bytes=0-99"), 1000);
-    assert_eq!(r, ParsedRange::Satisfiable(SatisfiableRange { start: 0, end: 99 }));
+    assert_eq!(
+        r,
+        ParsedRange::Satisfiable(SatisfiableRange { start: 0, end: 99 })
+    );
 }
 
 #[test]
@@ -366,7 +375,10 @@ fn image_artifact_route_precedence_range_valid_start_open() {
     let r = parse_range_header(Some("bytes=500-"), 1000);
     assert_eq!(
         r,
-        ParsedRange::Satisfiable(SatisfiableRange { start: 500, end: 999 })
+        ParsedRange::Satisfiable(SatisfiableRange {
+            start: 500,
+            end: 999
+        })
     );
 }
 
@@ -375,7 +387,10 @@ fn image_artifact_route_precedence_range_valid_suffix() {
     let r = parse_range_header(Some("bytes=-200"), 1000);
     assert_eq!(
         r,
-        ParsedRange::Satisfiable(SatisfiableRange { start: 800, end: 999 })
+        ParsedRange::Satisfiable(SatisfiableRange {
+            start: 800,
+            end: 999
+        })
     );
 }
 
@@ -394,15 +409,27 @@ fn image_artifact_route_precedence_range_end_clamps_to_last_byte() {
     let r = parse_range_header(Some("bytes=900-5000"), 1000);
     assert_eq!(
         r,
-        ParsedRange::Satisfiable(SatisfiableRange { start: 900, end: 999 })
+        ParsedRange::Satisfiable(SatisfiableRange {
+            start: 900,
+            end: 999
+        })
     );
 }
 
 #[test]
 fn image_artifact_route_precedence_range_zero_length_unsatisfiable() {
-    assert_eq!(parse_range_header(Some("bytes=0-0"), 0), ParsedRange::NotSatisfiable);
-    assert_eq!(parse_range_header(Some("bytes=0-"), 0), ParsedRange::NotSatisfiable);
-    assert_eq!(parse_range_header(Some("bytes=-1"), 0), ParsedRange::NotSatisfiable);
+    assert_eq!(
+        parse_range_header(Some("bytes=0-0"), 0),
+        ParsedRange::NotSatisfiable
+    );
+    assert_eq!(
+        parse_range_header(Some("bytes=0-"), 0),
+        ParsedRange::NotSatisfiable
+    );
+    assert_eq!(
+        parse_range_header(Some("bytes=-1"), 0),
+        ParsedRange::NotSatisfiable
+    );
 }
 
 #[test]
@@ -419,7 +446,10 @@ fn image_artifact_route_precedence_range_start_at_length_unsatisfiable() {
 
 #[test]
 fn image_artifact_route_precedence_range_zero_suffix_unsatisfiable() {
-    assert_eq!(parse_range_header(Some("bytes=-0"), 1000), ParsedRange::NotSatisfiable);
+    assert_eq!(
+        parse_range_header(Some("bytes=-0"), 1000),
+        ParsedRange::NotSatisfiable
+    );
 }
 
 #[test]
@@ -486,7 +516,10 @@ fn image_artifact_route_precedence_http_error_mapping() {
     assert!(r.has_body);
 
     // thumbnail_unavailable_for_format -> 409 body
-    let r = http_error_response(ImageArtifactDaemonErrorCode::ThumbnailUnavailableForFormat, true);
+    let r = http_error_response(
+        ImageArtifactDaemonErrorCode::ThumbnailUnavailableForFormat,
+        true,
+    );
     assert_eq!(r.status, 409);
     assert!(r.has_body);
 
@@ -539,7 +572,10 @@ fn image_artifact_route_svg_is_sanitized_svg_detection() {
 
 #[test]
 fn image_artifact_route_svg_content_type_constant() {
-    assert_eq!(content_type_for_media_kind("image/svg+xml"), Some(CONTENT_TYPE_SVG));
+    assert_eq!(
+        content_type_for_media_kind("image/svg+xml"),
+        Some(CONTENT_TYPE_SVG)
+    );
     assert_eq!(content_type_for_media_kind("svg"), Some(CONTENT_TYPE_SVG));
 }
 
@@ -560,7 +596,10 @@ fn image_artifact_route_svg_csp_constant() {
 #[test]
 fn image_artifact_route_svg_thumbnail_409_before_range() {
     // The 409 for SVG thumbnail is emitted before any Range parsing.
-    let r = http_error_response(ImageArtifactDaemonErrorCode::ThumbnailUnavailableForFormat, true);
+    let r = http_error_response(
+        ImageArtifactDaemonErrorCode::ThumbnailUnavailableForFormat,
+        true,
+    );
     assert_eq!(r.status, 409);
     // No Range parser is invoked: the error code itself signals format
     // unavailability.
@@ -597,14 +636,8 @@ fn image_artifact_route_svg_no_raster_fallback_for_thumbnail() {
 #[test]
 fn image_thumbnail_pipeline_no_upscale_when_both_fit() {
     // Source smaller than box in both dims: out = (w, h).
-    assert_eq!(
-        thumbnail_output_dimensions(100, 50, 256),
-        Some((100, 50))
-    );
-    assert_eq!(
-        thumbnail_output_dimensions(256, 256, 256),
-        Some((256, 256))
-    );
+    assert_eq!(thumbnail_output_dimensions(100, 50, 256), Some((100, 50)));
+    assert_eq!(thumbnail_output_dimensions(256, 256, 256), Some((256, 256)));
 }
 
 #[test]
@@ -615,10 +648,7 @@ fn image_thumbnail_pipeline_downscale_w_ge_h() {
         Some((256, 192))
     );
     // Exact division.
-    assert_eq!(
-        thumbnail_output_dimensions(512, 256, 256),
-        Some((256, 128))
-    );
+    assert_eq!(thumbnail_output_dimensions(512, 256, 256), Some((256, 128)));
 }
 
 #[test]
@@ -749,10 +779,22 @@ fn image_artifact_route_byte_headers_thumbnail_disposition() {
 
 #[test]
 fn image_artifact_route_byte_headers_content_type_map() {
-    assert_eq!(content_type_for_media_kind("image/png"), Some(CONTENT_TYPE_PNG));
-    assert_eq!(content_type_for_media_kind("image/jpeg"), Some(CONTENT_TYPE_JPEG));
-    assert_eq!(content_type_for_media_kind("image/webp"), Some(CONTENT_TYPE_WEBP));
-    assert_eq!(content_type_for_media_kind("image/svg+xml"), Some(CONTENT_TYPE_SVG));
+    assert_eq!(
+        content_type_for_media_kind("image/png"),
+        Some(CONTENT_TYPE_PNG)
+    );
+    assert_eq!(
+        content_type_for_media_kind("image/jpeg"),
+        Some(CONTENT_TYPE_JPEG)
+    );
+    assert_eq!(
+        content_type_for_media_kind("image/webp"),
+        Some(CONTENT_TYPE_WEBP)
+    );
+    assert_eq!(
+        content_type_for_media_kind("image/svg+xml"),
+        Some(CONTENT_TYPE_SVG)
+    );
     assert_eq!(content_type_for_media_kind("unknown"), None);
 }
 

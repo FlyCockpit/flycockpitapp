@@ -40,6 +40,7 @@ pub mod gitignore;
 pub mod goal_scratch;
 pub mod harness;
 pub mod image_generation;
+pub mod image_generation_agent_tools;
 pub mod image_generation_comfyui;
 pub mod image_generation_job;
 pub mod image_generation_runtime;

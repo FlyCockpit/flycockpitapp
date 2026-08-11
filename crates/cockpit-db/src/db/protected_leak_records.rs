@@ -290,6 +290,11 @@ pub enum InsertLeakResult {
     },
 }
 
+#[allow(dead_code)]
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
 impl Db {
     /// List all protected leak records for a session (full rows, including
     /// the `history_id` link). Owner-sensitive read only.

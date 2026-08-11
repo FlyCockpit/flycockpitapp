@@ -295,10 +295,10 @@ impl RemotePermissionCeilingV1 {
             if pid.iter().all(|&b| b == 0) {
                 return ceiling_err("project id must be nonzero");
             }
-            if let Some(prev) = prev_id {
-                if &prev >= pid {
-                    return ceiling_err("project ids must be strictly ascending");
-                }
+            if let Some(prev) = prev_id
+                && &prev >= pid
+            {
+                return ceiling_err("project ids must be strictly ascending");
             }
             prev_id = Some(*pid);
             if caps.is_empty() || caps.len() > 16 {
@@ -404,10 +404,10 @@ impl RemotePermissionCeilingV1 {
             if pid.iter().all(|&b| b == 0) {
                 return ceiling_err("project id must be nonzero");
             }
-            if let Some(prev) = prev_pid {
-                if prev >= pid {
-                    return ceiling_err("project ids must be strictly ascending");
-                }
+            if let Some(prev) = prev_pid
+                && prev >= pid
+            {
+                return ceiling_err("project ids must be strictly ascending");
             }
             prev_pid = Some(pid);
             if pos >= bytes.len() {

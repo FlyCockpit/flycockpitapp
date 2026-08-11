@@ -307,7 +307,9 @@ impl RemoteDeviceRelationshipV1 {
         off += 4;
         let version = bytes[off];
         if version != RELATIONSHIP_VERSION {
-            return codec_err(format!("relationship version must be {RELATIONSHIP_VERSION}, got {version}"));
+            return codec_err(format!(
+                "relationship version must be {RELATIONSHIP_VERSION}, got {version}"
+            ));
         }
         off += 1;
         let tenant_id = bytes[off..off + 16].try_into().unwrap();
@@ -462,7 +464,8 @@ impl IpDisclosureRegistry {
 
     /// Build a registry from entries, computing the digest.
     pub fn build(registry_version: u64, entries: Vec<IpDisclosureVersion>) -> Self {
-        let digest = Self::compute_registry_digest(Self::SCHEMA_VERSION, registry_version, &entries);
+        let digest =
+            Self::compute_registry_digest(Self::SCHEMA_VERSION, registry_version, &entries);
         Self {
             schema_version: Self::SCHEMA_VERSION,
             registry_version,
@@ -480,10 +483,10 @@ impl IpDisclosureRegistry {
     /// digests, and no duplicate versions.
     pub fn is_ready(&self) -> bool {
         !self.entries.is_empty()
-            && self.entries.iter().all(|e| {
-                !e.localization_key.is_empty()
-                    && e.semantic_digest != [0u8; 32]
-            })
+            && self
+                .entries
+                .iter()
+                .all(|e| !e.localization_key.is_empty() && e.semantic_digest != [0u8; 32])
             && {
                 let mut versions: Vec<u16> = self.entries.iter().map(|e| e.version).collect();
                 versions.sort_unstable();
@@ -594,7 +597,9 @@ impl RemoteIpConsentReceiptBody {
         off += 4;
         let version = bytes[off];
         if version != RECEIPT_VERSION {
-            return codec_err(format!("receipt version must be {RECEIPT_VERSION}, got {version}"));
+            return codec_err(format!(
+                "receipt version must be {RECEIPT_VERSION}, got {version}"
+            ));
         }
         off += 1;
         let action = ConsentAction::try_from_discriminant(bytes[off])?;
@@ -608,7 +613,8 @@ impl RemoteIpConsentReceiptBody {
             ));
         }
         off += 2;
-        let relationship = RemoteDeviceRelationshipV1::decode(&bytes[off..off + RELATIONSHIP_BODY_LEN])?;
+        let relationship =
+            RemoteDeviceRelationshipV1::decode(&bytes[off..off + RELATIONSHIP_BODY_LEN])?;
         off += RELATIONSHIP_BODY_LEN;
         let disclosure_version = u16::from_be_bytes(bytes[off..off + 2].try_into().unwrap());
         off += 2;
@@ -807,7 +813,9 @@ impl RemoteIpConsentStatusBody {
         off += 4;
         let version = bytes[off];
         if version != STATUS_VERSION {
-            return codec_err(format!("status version must be {STATUS_VERSION}, got {version}"));
+            return codec_err(format!(
+                "status version must be {STATUS_VERSION}, got {version}"
+            ));
         }
         off += 1;
         let rel_len = u16::from_be_bytes(bytes[off..off + 2].try_into().unwrap()) as usize;
@@ -817,7 +825,8 @@ impl RemoteIpConsentStatusBody {
             ));
         }
         off += 2;
-        let relationship = RemoteDeviceRelationshipV1::decode(&bytes[off..off + RELATIONSHIP_BODY_LEN])?;
+        let relationship =
+            RemoteDeviceRelationshipV1::decode(&bytes[off..off + RELATIONSHIP_BODY_LEN])?;
         off += RELATIONSHIP_BODY_LEN;
         let disclosure_version = u16::from_be_bytes(bytes[off..off + 2].try_into().unwrap());
         off += 2;
@@ -833,7 +842,9 @@ impl RemoteIpConsentStatusBody {
         off += 8;
         let kid_len = bytes[off] as usize;
         if !(1..=ISSUER_KID_MAX_LEN).contains(&kid_len) {
-            return codec_err(format!("issuer kid length must be 1..={ISSUER_KID_MAX_LEN}, got {kid_len}"));
+            return codec_err(format!(
+                "issuer kid length must be 1..={ISSUER_KID_MAX_LEN}, got {kid_len}"
+            ));
         }
         off += 1;
         let kid_end = off + kid_len;
@@ -914,7 +925,9 @@ impl RemoteIpConsentStatusEnvelope {
 
     /// Decode from the canonical envelope (≤362 bytes).
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < 2 + Self::MIN_BODY_LEN + SIGNATURE_LEN || bytes.len() > STATUS_ENVELOPE_MAX_LEN {
+        if bytes.len() < 2 + Self::MIN_BODY_LEN + SIGNATURE_LEN
+            || bytes.len() > STATUS_ENVELOPE_MAX_LEN
+        {
             return codec_err(format!(
                 "status envelope must be <= {STATUS_ENVELOPE_MAX_LEN} bytes, got {}",
                 bytes.len()
@@ -1030,7 +1043,8 @@ impl RemoteIpConsentChallenge {
     /// relationship's role-selected certificate.
     pub fn certificate_matches_relationship(&self) -> bool {
         self.certificate_generation == self.relationship.generation_for_role(self.endpoint_role)
-            && self.certificate_thumbprint == self.relationship.thumbprint_for_role(self.endpoint_role)
+            && self.certificate_thumbprint
+                == self.relationship.thumbprint_for_role(self.endpoint_role)
     }
 }
 
@@ -1117,13 +1131,19 @@ impl RelationshipConsentState {
     /// receipt does not match the current state.
     pub fn append_receipt(&mut self, receipt: &StoredConsentReceipt) -> Result<u64> {
         if receipt.relationship_hash != self.relationship_hash {
-            return Err(ConsentError::Linearization("receipt relationship hash mismatch".into()));
+            return Err(ConsentError::Linearization(
+                "receipt relationship hash mismatch".into(),
+            ));
         }
         if receipt.disclosure_version != self.disclosure_version {
-            return Err(ConsentError::Linearization("receipt disclosure version mismatch".into()));
+            return Err(ConsentError::Linearization(
+                "receipt disclosure version mismatch".into(),
+            ));
         }
         if receipt.semantic_digest != self.semantic_digest {
-            return Err(ConsentError::Linearization("receipt semantic digest mismatch".into()));
+            return Err(ConsentError::Linearization(
+                "receipt semantic digest mismatch".into(),
+            ));
         }
         if receipt.server_sequence != self.server_sequence + 1 {
             return Err(ConsentError::Linearization(format!(
@@ -1133,7 +1153,9 @@ impl RelationshipConsentState {
             )));
         }
         if receipt.registry_digest != self.registry_digest {
-            return Err(ConsentError::Linearization("receipt registry digest mismatch".into()));
+            return Err(ConsentError::Linearization(
+                "receipt registry digest mismatch".into(),
+            ));
         }
         // Apply the action.
         match (receipt.action, receipt.endpoint_role) {
@@ -1179,10 +1201,7 @@ impl RelationshipConsentState {
     /// True if the consent is materially invalidated by the given
     /// invalidator. Every named material invalidator requires new mutual
     /// consent.
-    pub fn is_materially_invalidated_by(
-        &self,
-        invalidator: &ConsentInvalidator,
-    ) -> bool {
+    pub fn is_materially_invalidated_by(&self, invalidator: &ConsentInvalidator) -> bool {
         match invalidator {
             ConsentInvalidator::DeviceRevoke { device_id } => {
                 // Device/instance revoke invalidates consent.
@@ -1252,7 +1271,12 @@ pub enum GatherAuthorizationState {
 }
 
 impl GatherAuthorizationState {
-    pub const ALL: [Self; 4] = [Self::Unused, Self::Started, Self::Completed, Self::Cancelled];
+    pub const ALL: [Self; 4] = [
+        Self::Unused,
+        Self::Started,
+        Self::Completed,
+        Self::Cancelled,
+    ];
     pub fn discriminant(self) -> u8 {
         self as u8
     }
@@ -1335,24 +1359,34 @@ impl ConsentLinearization {
         }
         // Verify nonexpired status.
         if !status.is_valid_at(now) {
-            return Err(ConsentError::Linearization("status is expired or not yet valid".into()));
+            return Err(ConsentError::Linearization(
+                "status is expired or not yet valid".into(),
+            ));
         }
         // Verify exact relationship binding.
         let rel_hash = status.relationship.hash();
         if rel_hash != self.state.relationship_hash {
-            return Err(ConsentError::Linearization("status relationship does not match".into()));
+            return Err(ConsentError::Linearization(
+                "status relationship does not match".into(),
+            ));
         }
         // Verify disclosure version.
         if status.disclosure_version != self.state.disclosure_version {
-            return Err(ConsentError::Linearization("status disclosure version mismatch".into()));
+            return Err(ConsentError::Linearization(
+                "status disclosure version mismatch".into(),
+            ));
         }
         // Verify policy epoch.
         if status.policy_epoch != self.state.policy_epoch {
-            return Err(ConsentError::Linearization("status policy epoch mismatch".into()));
+            return Err(ConsentError::Linearization(
+                "status policy epoch mismatch".into(),
+            ));
         }
         // Verify authority epoch.
         if status.authority_epoch != self.state.authority_epoch {
-            return Err(ConsentError::Linearization("status authority epoch mismatch".into()));
+            return Err(ConsentError::Linearization(
+                "status authority epoch mismatch".into(),
+            ));
         }
         // Verify the status sequence matches the current server sequence.
         if status.server_sequence != self.state.server_sequence {
@@ -1378,10 +1412,7 @@ impl ConsentLinearization {
     }
 
     /// Mark an authorization as started (gathering has begun).
-    pub fn start_gather(
-        &mut self,
-        authorization_id: &[u8; 16],
-    ) -> Result<()> {
+    pub fn start_gather(&mut self, authorization_id: &[u8; 16]) -> Result<()> {
         let auth = self
             .authorizations
             .iter_mut()
@@ -1394,7 +1425,8 @@ impl ConsentLinearization {
             )));
         }
         auth.state = GatherAuthorizationState::Started;
-        self.started.push((auth.child_attempt_id, auth.server_sequence));
+        self.started
+            .push((auth.child_attempt_id, auth.server_sequence));
         Ok(())
     }
 
@@ -1431,15 +1463,14 @@ impl ConsentLinearization {
     /// cancelled, and appends the signed-cancellation outbox event. Active
     /// started authorizations are torn down (marked cancelled) but bytes
     /// already disclosed cannot be revoked.
-    pub fn revoke(
-        &mut self,
-        now: i64,
-    ) -> Result<u64> {
+    pub fn revoke(&mut self, now: i64) -> Result<u64> {
         let _ = now;
         // Increment server sequence.
-        self.state.server_sequence = self.state.server_sequence.checked_add(1).ok_or_else(|| {
-            ConsentError::Linearization("server sequence overflow".into())
-        })?;
+        self.state.server_sequence = self
+            .state
+            .server_sequence
+            .checked_add(1)
+            .ok_or_else(|| ConsentError::Linearization("server sequence overflow".into()))?;
         // Mark all non-completed authorizations cancelled.
         for auth in &mut self.authorizations {
             if auth.state == GatherAuthorizationState::Unused
@@ -1638,7 +1669,11 @@ impl InstrumentedCandidateFactory {
 
     /// Emit a candidate of the given type. Returns true if the candidate was
     /// emitted (only relay candidates in relay_only mode).
-    pub fn emit_candidate(&mut self, candidate_type: CandidateType, capability: &VerifiedDirectCapability) -> bool {
+    pub fn emit_candidate(
+        &mut self,
+        candidate_type: CandidateType,
+        capability: &VerifiedDirectCapability,
+    ) -> bool {
         match capability.capability {
             ConsentCapability::DirectAllowed => {
                 match candidate_type {
@@ -1657,7 +1692,11 @@ impl InstrumentedCandidateFactory {
     }
 
     /// Accept a candidate. Returns true if the candidate was accepted.
-    pub fn accept_candidate(&mut self, candidate_type: CandidateType, capability: &VerifiedDirectCapability) -> bool {
+    pub fn accept_candidate(
+        &mut self,
+        candidate_type: CandidateType,
+        capability: &VerifiedDirectCapability,
+    ) -> bool {
         match capability.capability {
             ConsentCapability::DirectAllowed => {
                 if !matches!(candidate_type, CandidateType::Relay) {
@@ -1674,7 +1713,11 @@ impl InstrumentedCandidateFactory {
     }
 
     /// Nominate a candidate pair. Returns true if the pair was nominated.
-    pub fn nominate_pair(&mut self, pair_type: CandidatePairType, capability: &VerifiedDirectCapability) -> bool {
+    pub fn nominate_pair(
+        &mut self,
+        pair_type: CandidatePairType,
+        capability: &VerifiedDirectCapability,
+    ) -> bool {
         match capability.capability {
             ConsentCapability::DirectAllowed => {
                 if !matches!(pair_type, CandidatePairType::RelayRelay) {
@@ -1703,12 +1746,30 @@ impl InstrumentedCandidateFactory {
 
     /// Assert no direct work was performed (for relay_only/unavailable).
     pub fn assert_no_direct_work(&self) {
-        assert!(!self.direct_mode_configured, "direct mode must not be configured");
-        assert!(!self.stun_server_configured, "STUN server must not be configured");
-        assert_eq!(self.host_candidates_emitted, 0, "no host candidates emitted");
-        assert_eq!(self.srflx_candidates_emitted, 0, "no srflx candidates emitted");
-        assert_eq!(self.non_relay_candidates_accepted, 0, "no non-relay candidates accepted");
-        assert_eq!(self.non_relay_pairs_nominated, 0, "no non-relay pairs nominated");
+        assert!(
+            !self.direct_mode_configured,
+            "direct mode must not be configured"
+        );
+        assert!(
+            !self.stun_server_configured,
+            "STUN server must not be configured"
+        );
+        assert_eq!(
+            self.host_candidates_emitted, 0,
+            "no host candidates emitted"
+        );
+        assert_eq!(
+            self.srflx_candidates_emitted, 0,
+            "no srflx candidates emitted"
+        );
+        assert_eq!(
+            self.non_relay_candidates_accepted, 0,
+            "no non-relay candidates accepted"
+        );
+        assert_eq!(
+            self.non_relay_pairs_nominated, 0,
+            "no non-relay pairs nominated"
+        );
         assert_eq!(self.daemon_direct_sockets, 0, "no daemon direct sockets");
     }
 }
@@ -1844,9 +1905,7 @@ mod tests {
         }
     }
 
-    fn make_relationship_variant(
-        field: &str,
-    ) -> RemoteDeviceRelationshipV1 {
+    fn make_relationship_variant(field: &str) -> RemoteDeviceRelationshipV1 {
         let mut r = make_relationship();
         match field {
             "tenant_id" => r.tenant_id[0] ^= 1,
@@ -1974,10 +2033,22 @@ mod tests {
         }
 
         // Role-selected certificate accessors.
-        assert_eq!(rel.thumbprint_for_role(EndpointRole::Daemon), rel.daemon_thumbprint);
-        assert_eq!(rel.thumbprint_for_role(EndpointRole::Client), rel.client_thumbprint);
-        assert_eq!(rel.generation_for_role(EndpointRole::Daemon), rel.daemon_generation);
-        assert_eq!(rel.generation_for_role(EndpointRole::Client), rel.client_generation);
+        assert_eq!(
+            rel.thumbprint_for_role(EndpointRole::Daemon),
+            rel.daemon_thumbprint
+        );
+        assert_eq!(
+            rel.thumbprint_for_role(EndpointRole::Client),
+            rel.client_thumbprint
+        );
+        assert_eq!(
+            rel.generation_for_role(EndpointRole::Daemon),
+            rel.daemon_generation
+        );
+        assert_eq!(
+            rel.generation_for_role(EndpointRole::Client),
+            rel.client_generation
+        );
 
         // contains_device.
         assert!(rel.contains_device(&rel.daemon_device_id));
@@ -2098,7 +2169,10 @@ mod tests {
         // re-append at the same sequence is rejected because the sequence
         // already advanced).
         let result = state.append_receipt(&receipt2);
-        assert!(result.is_err(), "exact retry after sequence advance must fail");
+        assert!(
+            result.is_err(),
+            "exact retry after sequence advance must fail"
+        );
 
         // Conflicting replay: a receipt with a wrong sequence fails.
         let mut bad_receipt = receipt1.clone();
@@ -2139,11 +2213,21 @@ mod tests {
         let registry = make_registry();
 
         // No receipts, no relay → unavailable.
-        let s1 = RelationshipConsentState::new(&rel, 1, sem, registry.registry_digest, 1, true, false, 1);
+        let s1 = RelationshipConsentState::new(
+            &rel,
+            1,
+            sem,
+            registry.registry_digest,
+            1,
+            true,
+            false,
+            1,
+        );
         assert_eq!(s1.evaluate_capability(), ConsentCapability::Unavailable);
 
         // No receipts, relay authorized → relay_only.
-        let s2 = RelationshipConsentState::new(&rel, 1, sem, registry.registry_digest, 1, true, true, 1);
+        let s2 =
+            RelationshipConsentState::new(&rel, 1, sem, registry.registry_digest, 1, true, true, 1);
         assert_eq!(s2.evaluate_capability(), ConsentCapability::RelayOnly);
 
         // One-sided acceptance (daemon only), relay authorized → relay_only.
@@ -2168,13 +2252,31 @@ mod tests {
         assert_eq!(s6.evaluate_capability(), ConsentCapability::DirectAllowed);
 
         // Mutual acceptance, policy denies direct, relay authorized → relay_only.
-        let mut s7 = RelationshipConsentState::new(&rel, 1, sem, registry.registry_digest, 1, false, true, 1);
+        let mut s7 = RelationshipConsentState::new(
+            &rel,
+            1,
+            sem,
+            registry.registry_digest,
+            1,
+            false,
+            true,
+            1,
+        );
         s7.daemon_accepted = true;
         s7.client_accepted = true;
         assert_eq!(s7.evaluate_capability(), ConsentCapability::RelayOnly);
 
         // Mutual acceptance, policy denies direct, no relay → unavailable.
-        let mut s8 = RelationshipConsentState::new(&rel, 1, sem, registry.registry_digest, 1, false, false, 1);
+        let mut s8 = RelationshipConsentState::new(
+            &rel,
+            1,
+            sem,
+            registry.registry_digest,
+            1,
+            false,
+            false,
+            1,
+        );
         s8.daemon_accepted = true;
         s8.client_accepted = true;
         assert_eq!(s8.evaluate_capability(), ConsentCapability::Unavailable);
@@ -2207,7 +2309,8 @@ mod tests {
         let registry = make_registry();
 
         // Build a status body with a 1-byte kid (minimum body = 233).
-        let mut state = RelationshipConsentState::new(&rel, 1, sem, registry.registry_digest, 1, true, true, 1);
+        let mut state =
+            RelationshipConsentState::new(&rel, 1, sem, registry.registry_digest, 1, true, true, 1);
         state.daemon_accepted = true;
         state.client_accepted = true;
         state.server_sequence = 5;
@@ -2231,7 +2334,10 @@ mod tests {
         assert_eq!(body_bytes[4], STATUS_VERSION);
 
         // 232-byte fixed portion + 2-byte kid = 234 bytes.
-        assert_eq!(body_bytes.len(), RemoteIpConsentStatusBody::FIXED_PORTION_LEN + 2);
+        assert_eq!(
+            body_bytes.len(),
+            RemoteIpConsentStatusBody::FIXED_PORTION_LEN + 2
+        );
 
         // Round-trip.
         let decoded = RemoteIpConsentStatusBody::decode(&body_bytes).unwrap();
@@ -2291,27 +2397,13 @@ mod tests {
         assert!(result.is_ok());
 
         // Wrong relationship hash fails.
-        let result = envelope.verify_binding(
-            &[0xFF; 32],
-            1,
-            &sem,
-            1,
-            1,
-            3_000_030,
-            |_digest, _sig| true,
-        );
+        let result =
+            envelope.verify_binding(&[0xFF; 32], 1, &sem, 1, 1, 3_000_030, |_digest, _sig| true);
         assert!(result.is_err());
 
         // Wrong disclosure version fails.
-        let result = envelope.verify_binding(
-            &rel_hash,
-            2,
-            &sem,
-            1,
-            1,
-            3_000_030,
-            |_digest, _sig| true,
-        );
+        let result =
+            envelope.verify_binding(&rel_hash, 2, &sem, 1, 1, 3_000_030, |_digest, _sig| true);
         assert!(result.is_err());
 
         // Wrong semantic digest fails.
@@ -2327,51 +2419,23 @@ mod tests {
         assert!(result.is_err());
 
         // Wrong policy epoch fails.
-        let result = envelope.verify_binding(
-            &rel_hash,
-            1,
-            &sem,
-            2,
-            1,
-            3_000_030,
-            |_digest, _sig| true,
-        );
+        let result =
+            envelope.verify_binding(&rel_hash, 1, &sem, 2, 1, 3_000_030, |_digest, _sig| true);
         assert!(result.is_err());
 
         // Wrong authority epoch fails.
-        let result = envelope.verify_binding(
-            &rel_hash,
-            1,
-            &sem,
-            1,
-            2,
-            3_000_030,
-            |_digest, _sig| true,
-        );
+        let result =
+            envelope.verify_binding(&rel_hash, 1, &sem, 1, 2, 3_000_030, |_digest, _sig| true);
         assert!(result.is_err());
 
         // Expired status fails.
-        let result = envelope.verify_binding(
-            &rel_hash,
-            1,
-            &sem,
-            1,
-            1,
-            3_000_100,
-            |_digest, _sig| true,
-        );
+        let result =
+            envelope.verify_binding(&rel_hash, 1, &sem, 1, 1, 3_000_100, |_digest, _sig| true);
         assert!(result.is_err());
 
         // Signature verification failure fails.
-        let result = envelope.verify_binding(
-            &rel_hash,
-            1,
-            &sem,
-            1,
-            1,
-            3_000_030,
-            |_digest, _sig| false,
-        );
+        let result =
+            envelope.verify_binding(&rel_hash, 1, &sem, 1, 1, 3_000_030, |_digest, _sig| false);
         assert!(result.is_err());
 
         // No boolean bypass: the capability is a typed enum, not a boolean.
@@ -2418,7 +2482,8 @@ mod tests {
         let registry = make_registry();
 
         // Before committed begin: no direct work.
-        let state = RelationshipConsentState::new(&rel, 1, sem, registry.registry_digest, 1, true, true, 1);
+        let state =
+            RelationshipConsentState::new(&rel, 1, sem, registry.registry_digest, 1, true, true, 1);
         let _lin = ConsentLinearization::new(state);
         let cap = VerifiedDirectCapability::unavailable(rel.hash(), 1, 1, 1);
         let mut factory = InstrumentedCandidateFactory::default();
@@ -2434,7 +2499,8 @@ mod tests {
         assert!(!factory.open_daemon_direct_socket(&cap));
 
         // After committed begin with direct_allowed: direct work is permitted.
-        let mut state2 = RelationshipConsentState::new(&rel, 1, sem, registry.registry_digest, 1, true, true, 1);
+        let mut state2 =
+            RelationshipConsentState::new(&rel, 1, sem, registry.registry_digest, 1, true, true, 1);
         state2.daemon_accepted = true;
         state2.client_accepted = true;
         state2.server_sequence = 3;
@@ -2455,7 +2521,9 @@ mod tests {
 
         let auth_id = [0x07; 16];
         let attempt_id = [0x08; 16];
-        let seq = lin2.begin_direct_gather(auth_id, attempt_id, &status, 3_000_030).unwrap();
+        let seq = lin2
+            .begin_direct_gather(auth_id, attempt_id, &status, 3_000_030)
+            .unwrap();
         assert_eq!(seq, 3);
 
         let auth = &lin2.authorizations()[0];
@@ -2519,15 +2587,32 @@ mod tests {
         let sem = make_semantic_digest();
         let registry = make_registry();
 
-        fn make_lin(rel: &RemoteDeviceRelationshipV1, sem: [u8; 32], registry: &IpDisclosureRegistry) -> ConsentLinearization {
-            let mut state = RelationshipConsentState::new(rel, 1, sem, registry.registry_digest, 1, true, true, 1);
+        fn make_lin(
+            rel: &RemoteDeviceRelationshipV1,
+            sem: [u8; 32],
+            registry: &IpDisclosureRegistry,
+        ) -> ConsentLinearization {
+            let mut state = RelationshipConsentState::new(
+                rel,
+                1,
+                sem,
+                registry.registry_digest,
+                1,
+                true,
+                true,
+                1,
+            );
             state.daemon_accepted = true;
             state.client_accepted = true;
             state.server_sequence = 3;
             ConsentLinearization::new(state)
         }
 
-        fn make_status(rel: &RemoteDeviceRelationshipV1, sem: [u8; 32], seq: u64) -> RemoteIpConsentStatusBody {
+        fn make_status(
+            rel: &RemoteDeviceRelationshipV1,
+            sem: [u8; 32],
+            seq: u64,
+        ) -> RemoteIpConsentStatusBody {
             RemoteIpConsentStatusBody {
                 relationship: rel.clone(),
                 disclosure_version: 1,
@@ -2557,17 +2642,25 @@ mod tests {
         let status = make_status(&rel, sem, 3);
         let auth_id = [0x09; 16];
         let attempt_id = [0x0A; 16];
-        let seq = lin.begin_direct_gather(auth_id, attempt_id, &status, 3_000_020).unwrap();
+        let seq = lin
+            .begin_direct_gather(auth_id, attempt_id, &status, 3_000_020)
+            .unwrap();
         assert_eq!(seq, 3);
 
         // Start gathering.
         lin.start_gather(&auth_id).unwrap();
-        assert_eq!(lin.authorizations()[0].state, GatherAuthorizationState::Started);
+        assert_eq!(
+            lin.authorizations()[0].state,
+            GatherAuthorizationState::Started
+        );
 
         // Revoke after begin: increments sequence, cancels the authorization.
         let new_seq = lin.revoke(3_000_030).unwrap();
         assert_eq!(new_seq, 4);
-        assert_eq!(lin.authorizations()[0].state, GatherAuthorizationState::Cancelled);
+        assert_eq!(
+            lin.authorizations()[0].state,
+            GatherAuthorizationState::Cancelled
+        );
 
         // Cancelled unstarted work: create a new begin, then revoke without
         // starting.
@@ -2575,10 +2668,14 @@ mod tests {
         let status = make_status(&rel, sem, 3);
         let auth_id = [0x0B; 16];
         let attempt_id = [0x0C; 16];
-        lin.begin_direct_gather(auth_id, attempt_id, &status, 3_000_020).unwrap();
+        lin.begin_direct_gather(auth_id, attempt_id, &status, 3_000_020)
+            .unwrap();
         // Revoke without starting.
         lin.revoke(3_000_030).unwrap();
-        assert_eq!(lin.authorizations()[0].state, GatherAuthorizationState::Cancelled);
+        assert_eq!(
+            lin.authorizations()[0].state,
+            GatherAuthorizationState::Cancelled
+        );
 
         // Active teardown: started authorization is cancelled on revoke.
         // (Already tested above: the started authorization becomes Cancelled.)
@@ -2587,7 +2684,8 @@ mod tests {
         // sequence fails.
         let mut lin = make_lin(&rel, sem, &registry);
         let status_old = make_status(&rel, sem, 3);
-        lin.begin_direct_gather([0x0D; 16], [0x0E; 16], &status_old, 3_000_020).unwrap();
+        lin.begin_direct_gather([0x0D; 16], [0x0E; 16], &status_old, 3_000_020)
+            .unwrap();
         lin.revoke(3_000_030).unwrap();
         // New begin with old sequence (3) fails because current is 4 and
         // capability is relay_only.
@@ -2605,10 +2703,14 @@ mod tests {
         let status = make_status(&rel, sem, 3);
         let auth_id = [0x11; 16];
         let attempt_id = [0x12; 16];
-        lin.begin_direct_gather(auth_id, attempt_id, &status, 3_000_020).unwrap();
+        lin.begin_direct_gather(auth_id, attempt_id, &status, 3_000_020)
+            .unwrap();
         lin.start_gather(&auth_id).unwrap();
         lin.revoke(3_000_030).unwrap();
-        assert_eq!(lin.authorizations()[0].state, GatherAuthorizationState::Cancelled);
+        assert_eq!(
+            lin.authorizations()[0].state,
+            GatherAuthorizationState::Cancelled
+        );
         // No later old-sequence accept/begin can reactivate.
         let result = lin.begin_direct_gather([0x13; 16], [0x14; 16], &status, 3_000_040);
         assert!(result.is_err());
@@ -2622,7 +2724,8 @@ mod tests {
         let sem = make_semantic_digest();
         let registry = make_registry();
 
-        let mut state = RelationshipConsentState::new(&rel, 1, sem, registry.registry_digest, 1, true, true, 1);
+        let mut state =
+            RelationshipConsentState::new(&rel, 1, sem, registry.registry_digest, 1, true, true, 1);
         state.daemon_accepted = true;
         state.client_accepted = true;
         state.server_sequence = 3;
@@ -2643,7 +2746,8 @@ mod tests {
 
         let auth_id = [0x15; 16];
         let attempt_id = [0x16; 16];
-        lin.begin_direct_gather(auth_id, attempt_id, &status, 3_000_020).unwrap();
+        lin.begin_direct_gather(auth_id, attempt_id, &status, 3_000_020)
+            .unwrap();
         lin.start_gather(&auth_id).unwrap();
 
         // Revoke: sequence advances to 4.
@@ -2652,7 +2756,10 @@ mod tests {
 
         // Stale UI completion with old sequence (3) must be rejected.
         let result = lin.complete_gather(&auth_id, 3);
-        assert!(result.is_err(), "stale sequence completion must be rejected");
+        assert!(
+            result.is_err(),
+            "stale sequence completion must be rejected"
+        );
 
         // Stale UI completion with new version: if the disclosure version
         // changed, the old authorization is for the old version and must be
@@ -2677,7 +2784,8 @@ mod tests {
         let sem = make_semantic_digest();
         let registry = make_registry();
 
-        let mut state = RelationshipConsentState::new(&rel, 1, sem, registry.registry_digest, 1, true, true, 1);
+        let mut state =
+            RelationshipConsentState::new(&rel, 1, sem, registry.registry_digest, 1, true, true, 1);
 
         // Mutual consent at time T1.
         let r1 = StoredConsentReceipt {
@@ -2706,31 +2814,35 @@ mod tests {
             registry_digest: registry.registry_digest,
         };
         state.append_receipt(&r2).unwrap();
-        assert_eq!(state.evaluate_capability(), ConsentCapability::DirectAllowed);
+        assert_eq!(
+            state.evaluate_capability(),
+            ConsentCapability::DirectAllowed
+        );
 
         // Advance time significantly: consent persists (no time expiry).
         let far_future = 10_000_000_000;
         // The state does not check time; consent is still direct_allowed.
-        assert_eq!(state.evaluate_capability(), ConsentCapability::DirectAllowed);
+        assert_eq!(
+            state.evaluate_capability(),
+            ConsentCapability::DirectAllowed
+        );
 
         // Renew short status leases: issue a new status at the far future.
-        let status = issue_status(
-            &state,
-            &rel,
-            "k1",
-            far_future,
-            60,
-            [0xFF; 64],
-        )
-        .unwrap();
+        let status = issue_status(&state, &rel, "k1", far_future, 60, [0xFF; 64]).unwrap();
         assert!(status.body.is_valid_at(far_future + 30));
         assert!(!status.body.is_valid_at(far_future + 61));
 
         // Every named material invalidator requires new mutual consent.
         let invalidators = vec![
-            ConsentInvalidator::DeviceRevoke { device_id: rel.daemon_device_id },
-            ConsentInvalidator::Unenroll { device_id: rel.client_device_id },
-            ConsentInvalidator::GenerationReplacement { device_id: rel.daemon_device_id },
+            ConsentInvalidator::DeviceRevoke {
+                device_id: rel.daemon_device_id,
+            },
+            ConsentInvalidator::Unenroll {
+                device_id: rel.client_device_id,
+            },
+            ConsentInvalidator::GenerationReplacement {
+                device_id: rel.daemon_device_id,
+            },
             ConsentInvalidator::RelationshipDeletion,
             ConsentInvalidator::PolicyRelayOnly,
             ConsentInvalidator::MaterialVersionChange { new_version: 2 },
@@ -2748,12 +2860,18 @@ mod tests {
         let mut revoked_state = state.clone();
         revoked_state.daemon_accepted = false;
         revoked_state.daemon_revoked = true;
-        assert_eq!(revoked_state.evaluate_capability(), ConsentCapability::RelayOnly);
+        assert_eq!(
+            revoked_state.evaluate_capability(),
+            ConsentCapability::RelayOnly
+        );
 
         // Policy relay-only invalidation.
         let mut policy_state = state.clone();
         policy_state.policy_allows_direct = false;
-        assert_eq!(policy_state.evaluate_capability(), ConsentCapability::RelayOnly);
+        assert_eq!(
+            policy_state.evaluate_capability(),
+            ConsentCapability::RelayOnly
+        );
         assert!(policy_state.is_materially_invalidated_by(&ConsentInvalidator::PolicyRelayOnly));
 
         // Material version change: new version requires new consent.
@@ -2761,7 +2879,10 @@ mod tests {
         version_state.disclosure_version = 2;
         version_state.daemon_accepted = false;
         version_state.client_accepted = false;
-        assert_eq!(version_state.evaluate_capability(), ConsentCapability::RelayOnly);
+        assert_eq!(
+            version_state.evaluate_capability(),
+            ConsentCapability::RelayOnly
+        );
     }
 
     // ── AC10: Shared-leg, accessibility, redaction, fixture gates ──
@@ -2783,15 +2904,24 @@ mod tests {
     #[test]
     fn enums_are_closed_and_consistent() {
         assert_eq!(
-            EndpointRole::ALL.iter().map(|r| r.name()).collect::<Vec<_>>(),
+            EndpointRole::ALL
+                .iter()
+                .map(|r| r.name())
+                .collect::<Vec<_>>(),
             vec!["daemon", "client"]
         );
         assert_eq!(
-            ConsentAction::ALL.iter().map(|a| a.name()).collect::<Vec<_>>(),
+            ConsentAction::ALL
+                .iter()
+                .map(|a| a.name())
+                .collect::<Vec<_>>(),
             vec!["accept", "revoke"]
         );
         assert_eq!(
-            ConsentCapability::ALL.iter().map(|c| c.name()).collect::<Vec<_>>(),
+            ConsentCapability::ALL
+                .iter()
+                .map(|c| c.name())
+                .collect::<Vec<_>>(),
             vec!["direct_allowed", "relay_only", "unavailable"]
         );
         assert_eq!(GatherAuthorizationState::Unused.discriminant(), 1);
@@ -2843,8 +2973,17 @@ mod tests {
     #[test]
     fn receipt_envelope_rejects_wrong_length() {
         let rel = make_relationship();
-        let body = make_receipt_body(ConsentAction::Accept, EndpointRole::Daemon, &rel, [0x05; 16], 0);
-        let env = RemoteIpConsentReceiptEnvelope { body, signature: [0xEE; 64] };
+        let body = make_receipt_body(
+            ConsentAction::Accept,
+            EndpointRole::Daemon,
+            &rel,
+            [0x05; 16],
+            0,
+        );
+        let env = RemoteIpConsentReceiptEnvelope {
+            body,
+            signature: [0xEE; 64],
+        };
         let bytes = env.encode();
         assert_eq!(bytes.len(), RECEIPT_ENVELOPE_LEN);
         // Too short.
@@ -2862,39 +3001,90 @@ mod tests {
     #[test]
     fn receipt_binding_rejects_wrong_role() {
         let rel = make_relationship();
-        let body = make_receipt_body(ConsentAction::Accept, EndpointRole::Daemon, &rel, [0x05; 16], 0);
-        let env = RemoteIpConsentReceiptEnvelope { body, signature: [0xEE; 64] };
+        let body = make_receipt_body(
+            ConsentAction::Accept,
+            EndpointRole::Daemon,
+            &rel,
+            [0x05; 16],
+            0,
+        );
+        let env = RemoteIpConsentReceiptEnvelope {
+            body,
+            signature: [0xEE; 64],
+        };
         let rel_hash = rel.hash();
 
         // Correct role + thumbprint + generation → ok.
-        assert!(env
-            .verify_binding(&rel_hash, EndpointRole::Daemon, rel.daemon_generation, &rel.daemon_thumbprint, |_, _| true)
-            .is_ok());
+        assert!(
+            env.verify_binding(
+                &rel_hash,
+                EndpointRole::Daemon,
+                rel.daemon_generation,
+                &rel.daemon_thumbprint,
+                |_, _| true
+            )
+            .is_ok()
+        );
 
         // Wrong role → fail.
-        assert!(env
-            .verify_binding(&rel_hash, EndpointRole::Client, rel.client_generation, &rel.client_thumbprint, |_, _| true)
-            .is_err());
+        assert!(
+            env.verify_binding(
+                &rel_hash,
+                EndpointRole::Client,
+                rel.client_generation,
+                &rel.client_thumbprint,
+                |_, _| true
+            )
+            .is_err()
+        );
 
         // Wrong generation → fail.
-        assert!(env
-            .verify_binding(&rel_hash, EndpointRole::Daemon, 999, &rel.daemon_thumbprint, |_, _| true)
-            .is_err());
+        assert!(
+            env.verify_binding(
+                &rel_hash,
+                EndpointRole::Daemon,
+                999,
+                &rel.daemon_thumbprint,
+                |_, _| true
+            )
+            .is_err()
+        );
 
         // Wrong thumbprint → fail.
-        assert!(env
-            .verify_binding(&rel_hash, EndpointRole::Daemon, rel.daemon_generation, &[0xFF; 32], |_, _| true)
-            .is_err());
+        assert!(
+            env.verify_binding(
+                &rel_hash,
+                EndpointRole::Daemon,
+                rel.daemon_generation,
+                &[0xFF; 32],
+                |_, _| true
+            )
+            .is_err()
+        );
 
         // Signature failure → fail.
-        assert!(env
-            .verify_binding(&rel_hash, EndpointRole::Daemon, rel.daemon_generation, &rel.daemon_thumbprint, |_, _| false)
-            .is_err());
+        assert!(
+            env.verify_binding(
+                &rel_hash,
+                EndpointRole::Daemon,
+                rel.daemon_generation,
+                &rel.daemon_thumbprint,
+                |_, _| false
+            )
+            .is_err()
+        );
 
         // Wrong relationship hash → fail.
-        assert!(env
-            .verify_binding(&[0xFF; 32], EndpointRole::Daemon, rel.daemon_generation, &rel.daemon_thumbprint, |_, _| true)
-            .is_err());
+        assert!(
+            env.verify_binding(
+                &[0xFF; 32],
+                EndpointRole::Daemon,
+                rel.daemon_generation,
+                &rel.daemon_thumbprint,
+                |_, _| true
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2913,39 +3103,45 @@ mod tests {
             effective_at: 200,
             material_change: true,
         };
-        let d1 = IpDisclosureRegistry::compute_registry_digest(1, 1, &[entry1.clone(), entry2.clone()]);
+        let d1 =
+            IpDisclosureRegistry::compute_registry_digest(1, 1, &[entry1.clone(), entry2.clone()]);
         let d2 = IpDisclosureRegistry::compute_registry_digest(1, 1, &[entry1, entry2]);
         assert_eq!(d1, d2);
 
         // Different registry version → different digest.
-        let d3 = IpDisclosureRegistry::compute_registry_digest(1, 2, &[
-            IpDisclosureVersion {
-                version: 1,
-                localization_key: "key1".to_string(),
-                semantic_digest: [0x11; 32],
-                effective_at: 100,
-                material_change: false,
-            },
-            IpDisclosureVersion {
-                version: 2,
-                localization_key: "key2".to_string(),
-                semantic_digest: [0x22; 32],
-                effective_at: 200,
-                material_change: true,
-            },
-        ]);
+        let d3 = IpDisclosureRegistry::compute_registry_digest(
+            1,
+            2,
+            &[
+                IpDisclosureVersion {
+                    version: 1,
+                    localization_key: "key1".to_string(),
+                    semantic_digest: [0x11; 32],
+                    effective_at: 100,
+                    material_change: false,
+                },
+                IpDisclosureVersion {
+                    version: 2,
+                    localization_key: "key2".to_string(),
+                    semantic_digest: [0x22; 32],
+                    effective_at: 200,
+                    material_change: true,
+                },
+            ],
+        );
         assert_ne!(d1, d3);
 
         // Registry readiness.
-        let reg = IpDisclosureRegistry::build(1, vec![
-            IpDisclosureVersion {
+        let reg = IpDisclosureRegistry::build(
+            1,
+            vec![IpDisclosureVersion {
                 version: 1,
                 localization_key: "k".to_string(),
                 semantic_digest: [0x11; 32],
                 effective_at: 100,
                 material_change: false,
-            },
-        ]);
+            }],
+        );
         assert!(reg.is_ready());
 
         // Empty registry is not ready.
@@ -2953,22 +3149,25 @@ mod tests {
         assert!(!empty.is_ready());
 
         // Duplicate versions are not ready.
-        let dup = IpDisclosureRegistry::build(1, vec![
-            IpDisclosureVersion {
-                version: 1,
-                localization_key: "k1".to_string(),
-                semantic_digest: [0x11; 32],
-                effective_at: 100,
-                material_change: false,
-            },
-            IpDisclosureVersion {
-                version: 1,
-                localization_key: "k2".to_string(),
-                semantic_digest: [0x22; 32],
-                effective_at: 200,
-                material_change: true,
-            },
-        ]);
+        let dup = IpDisclosureRegistry::build(
+            1,
+            vec![
+                IpDisclosureVersion {
+                    version: 1,
+                    localization_key: "k1".to_string(),
+                    semantic_digest: [0x11; 32],
+                    effective_at: 100,
+                    material_change: false,
+                },
+                IpDisclosureVersion {
+                    version: 1,
+                    localization_key: "k2".to_string(),
+                    semantic_digest: [0x22; 32],
+                    effective_at: 200,
+                    material_change: true,
+                },
+            ],
+        );
         assert!(!dup.is_ready());
     }
 
@@ -2977,7 +3176,8 @@ mod tests {
         let rel = make_relationship();
         let sem = make_semantic_digest();
         let registry = make_registry();
-        let state = RelationshipConsentState::new(&rel, 1, sem, registry.registry_digest, 1, true, true, 1);
+        let state =
+            RelationshipConsentState::new(&rel, 1, sem, registry.registry_digest, 1, true, true, 1);
 
         // Valid 60-second window.
         let status = issue_status(&state, &rel, "k1", 3_000_000, 60, [0xFF; 64]).unwrap();
@@ -3059,8 +3259,26 @@ mod tests {
 
         let sem = make_semantic_digest();
         let registry = make_registry();
-        let s1 = RelationshipConsentState::new(&rel1, 1, sem, registry.registry_digest, 1, true, true, 1);
-        let s2 = RelationshipConsentState::new(&rel2, 1, sem, registry.registry_digest, 1, true, true, 1);
+        let s1 = RelationshipConsentState::new(
+            &rel1,
+            1,
+            sem,
+            registry.registry_digest,
+            1,
+            true,
+            true,
+            1,
+        );
+        let s2 = RelationshipConsentState::new(
+            &rel2,
+            1,
+            sem,
+            registry.registry_digest,
+            1,
+            true,
+            true,
+            1,
+        );
         assert_ne!(s1.relationship_hash, s2.relationship_hash);
     }
 
@@ -3091,9 +3309,23 @@ mod tests {
         assert!(!std::str::from_utf8(&bytes).unwrap().contains("srflx"));
         assert!(!std::str::from_utf8(&bytes).unwrap().contains("host"));
 
-        let receipt_body = make_receipt_body(ConsentAction::Accept, EndpointRole::Daemon, &make_relationship(), [0x05; 16], 0);
+        let receipt_body = make_receipt_body(
+            ConsentAction::Accept,
+            EndpointRole::Daemon,
+            &make_relationship(),
+            [0x05; 16],
+            0,
+        );
         let receipt_bytes = receipt_body.encode();
-        assert!(!std::str::from_utf8(&receipt_bytes).unwrap().contains("192.168"));
-        assert!(!std::str::from_utf8(&receipt_bytes).unwrap().contains("candidate:"));
+        assert!(
+            !std::str::from_utf8(&receipt_bytes)
+                .unwrap()
+                .contains("192.168")
+        );
+        assert!(
+            !std::str::from_utf8(&receipt_bytes)
+                .unwrap()
+                .contains("candidate:")
+        );
     }
 }

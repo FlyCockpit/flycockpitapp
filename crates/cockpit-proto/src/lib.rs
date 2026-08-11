@@ -25,6 +25,7 @@
 //! refuse envelopes whose `v` is outside the supported range.
 
 pub mod remote_device_identity_enrollment;
+pub mod remote_enterprise_connection_policy;
 pub mod remote_identity_protocol;
 pub mod remote_ip_consent;
 pub mod remote_operation_fcor;

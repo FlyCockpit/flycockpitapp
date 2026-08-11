@@ -727,6 +727,25 @@ pub enum DirectIpMode {
     MutualConsent,
 }
 
+/// `directIpMode` ordering: `forbid < mutual_consent` by permissiveness.
+/// The meet of two values chooses the stricter (forbid).
+impl DirectIpMode {
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Forbid => 0,
+            Self::MutualConsent => 1,
+        }
+    }
+    /// Total meet table: `forbid×forbid=forbid; forbid×mutual=forbid;
+    /// mutual×forbid=forbid; mutual×mutual=mutual`.
+    pub fn meet(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Forbid, _) | (_, Self::Forbid) => Self::Forbid,
+            (Self::MutualConsent, Self::MutualConsent) => Self::MutualConsent,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SharedSessionRoute {
@@ -734,11 +753,52 @@ pub enum SharedSessionRoute {
     PerLegPolicy,
 }
 
+/// `sharedSessionRoute` ordering: `relay_only < per_leg_policy` by
+/// permissiveness. The meet chooses the stricter (relay_only).
+impl SharedSessionRoute {
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::RelayOnly => 0,
+            Self::PerLegPolicy => 1,
+        }
+    }
+    /// Total meet table: `relay_only×relay_only=relay_only;
+    /// relay_only×per_leg=relay_only; per_leg×relay_only=relay_only;
+    /// per_leg×per_leg=per_leg`.
+    pub fn meet(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::RelayOnly, _) | (_, Self::RelayOnly) => Self::RelayOnly,
+            (Self::PerLegPolicy, Self::PerLegPolicy) => Self::PerLegPolicy,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TenantAuthorization {
     ControlPlane,
     TenantSignerRequired,
+}
+
+/// `tenantAuthorization` ordering: `tenant_signer_required < control_plane`
+/// by permissiveness. The meet chooses the stricter signer requirement.
+impl TenantAuthorization {
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::TenantSignerRequired => 0,
+            Self::ControlPlane => 1,
+        }
+    }
+    /// Total meet table: `signer×signer=signer; signer×control=signer;
+    /// control×signer=signer; control×control=control`.
+    pub fn meet(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::TenantSignerRequired, _) | (_, Self::TenantSignerRequired) => {
+                Self::TenantSignerRequired
+            }
+            (Self::ControlPlane, Self::ControlPlane) => Self::ControlPlane,
+        }
+    }
 }
 
 /// Positive-width resource limits.
@@ -850,10 +910,12 @@ impl RemoteConnectionPolicyV1 {
         //    tenant signer/governance epoch — enforced by the enterprise
         //    connection policy module which checks the signer flow.
 
-        if self.websocket_fallback && !self.allowed_transports.contains(&"websocket_data".to_string()) {
-            return invalid(
-                "websocketFallback=true requires websocket_data in allowedTransports",
-            );
+        if self.websocket_fallback
+            && !self
+                .allowed_transports
+                .contains(&"websocket_data".to_string())
+        {
+            return invalid("websocketFallback=true requires websocket_data in allowedTransports");
         }
 
         if self.shared_session_route == SharedSessionRoute::RelayOnly {
@@ -871,7 +933,8 @@ impl RemoteConnectionPolicyV1 {
 
     /// Whether `websocket_data` is in the allowed transports set.
     pub fn allows_websocket_data(&self) -> bool {
-        self.allowed_transports.contains(&"websocket_data".to_string())
+        self.allowed_transports
+            .contains(&"websocket_data".to_string())
     }
 
     /// Whether `webrtc` is in the allowed transports set.

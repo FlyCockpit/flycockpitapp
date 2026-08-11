@@ -24,16 +24,16 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD as BASE64_STD, URL_SAFE_NO_PAD as B64URL};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use crate::remote_protocol_id::{
     CanonicalU64DecimalStringV1, parse_canonical_u64_decimal_string,
 };
-use crate::remote_public_service_policy::canonical_json_value;
+use crate::remote_public_service_policy::{RemotePublicPolicyError, canonical_json_value};
 
 pub use crate::remote_protocol_id::REMOTE_PROTOCOL_ID_B64URL_LEN as ID_B64URL_LEN;
 
@@ -151,6 +151,12 @@ pub enum IcePolicyError {
     BadResponse(String),
     #[error("HMAC derivation failed: {0}")]
     Hmac(String),
+}
+
+impl From<RemotePublicPolicyError> for IcePolicyError {
+    fn from(e: RemotePublicPolicyError) -> Self {
+        IcePolicyError::BadDigest(e.to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -578,7 +584,7 @@ fn parse_host_port(authority: &str) -> Result<(String, Option<u16>), IcePolicyEr
         let port = if rest.is_empty() {
             None
         } else if let Some(p) = rest.strip_prefix(':') {
-            parse_port(p)?
+            Some(parse_port(p)?)
         } else {
             return Err(IcePolicyError::BadUrl("trailing delimiter after IPv6".into()));
         };
@@ -1076,17 +1082,17 @@ pub fn coturn_password(
     let mut mac = HmacSha1::new_from_slice(secret)
         .map_err(|e| IcePolicyError::Hmac(e.to_string()))?;
     mac.update(username.as_bytes());
-    let result = mac.finalize().map_err(|e| IcePolicyError::Hmac(e.to_string()))?;
+    let result = mac.finalize();
     Ok(BASE64_STD.encode(result.into_bytes()))
 }
 
-/// A derived coturn REST credential pair (username, password). The secret is
-/// not retained.
-#[derive(Debug, Clone, PartialEq, Eq, Zeroize)]
+/// A derived coturn REST credential pair (username, password). The password
+/// is wrapped in `Zeroizing` so it is cleared on drop; the secret input is
+/// never retained.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoturnCredential {
     pub username: String,
-    #[zeroize(drop)]
-    pub password: String,
+    pub password: Zeroizing<String>,
 }
 
 /// Derive a coturn REST credential from the given expiry, random ID, and
@@ -1098,7 +1104,10 @@ pub fn derive_coturn_credential(
 ) -> Result<CoturnCredential, IcePolicyError> {
     let username = coturn_username(unix_expiry, random_id);
     let password = coturn_password(&username, secret)?;
-    Ok(CoturnCredential { username, password })
+    Ok(CoturnCredential {
+        username,
+        password: Zeroizing::new(password),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1222,10 +1231,10 @@ mod tests {
         }
     }
 
-    fn valid_pool(id: &str, gen: &str, lifecycle: PoolLifecycle) -> PoolV1 {
+    fn valid_pool(id: &str, generation: &str, lifecycle: PoolLifecycle) -> PoolV1 {
         PoolV1 {
             id: id.into(),
-            generation: gen.into(),
+            generation: generation.into(),
             turn_urls: vec!["turn:turn.example.com:3478?transport=tcp".into()],
             stun_urls: vec![],
             realm: "flycockpit.example".into(),
@@ -1453,7 +1462,7 @@ mod tests {
         // Verify against known coturn REST vector: HMAC-SHA1("secret", "100:testuser")
         let mut mac = HmacSha1::new_from_slice(secret).unwrap();
         mac.update(username.as_bytes());
-        let expected = BASE64_STD.encode(mac.finalize().unwrap().into_bytes());
+        let expected = BASE64_STD.encode(mac.finalize().into_bytes());
         assert_eq!(password, expected);
         assert_eq!(password.len(), 28); // base64 of 20 bytes
         // No identity fields in username (only expiry:randomId).
@@ -1498,7 +1507,7 @@ mod tests {
         let text = serde_json::to_string(&resp).unwrap();
         assert!(!text.contains("stun:"));
         // Exact keys.
-        let keys: Vec<&str> = resp.as_object().unwrap().keys().collect();
+        let keys: Vec<String> = resp.as_object().unwrap().keys().cloned().collect();
         let mut sorted = keys.clone();
         sorted.sort();
         assert_eq!(sorted, vec!["authorization", "expiresAt", "iceServers", "iceTransportPolicy", "routeClass"]);

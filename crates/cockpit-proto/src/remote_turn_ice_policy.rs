@@ -30,7 +30,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use crate::remote_protocol_id::{CanonicalU64DecimalStringV1, parse_canonical_u64_decimal_string};
+use crate::remote_protocol_id::parse_canonical_u64_decimal_string;
 use crate::remote_public_service_policy::{RemotePublicPolicyError, canonical_json_value};
 
 pub use crate::remote_protocol_id::REMOTE_PROTOCOL_ID_B64URL_LEN as ID_B64URL_LEN;
@@ -1237,6 +1237,7 @@ mod hex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote_protocol_id::CanonicalU64DecimalStringV1;
 
     fn valid_provider() -> ProviderPin {
         ProviderPin {
@@ -1290,7 +1291,7 @@ mod tests {
             secrets: vec![SecretEntry {
                 secret_ref: "secret1".into(),
                 secret_version: "1".into(),
-                secret_base64url: B64URL.encode(&secret_bytes),
+                secret_base64url: B64URL.encode(secret_bytes),
                 state: SecretLifecycle::Current,
             }],
         }
@@ -1357,7 +1358,7 @@ mod tests {
         assert!(valid_secrets_file().validate().is_ok());
         // Secret too short.
         let mut sf = valid_secrets_file();
-        sf.secrets[0].secret_base64url = B64URL.encode(&[0u8; 16]);
+        sf.secrets[0].secret_base64url = B64URL.encode([0u8; 16]);
         assert!(sf.validate().is_err());
         // Duplicate secret material.
         let mut sf = valid_secrets_file();
@@ -1365,7 +1366,7 @@ mod tests {
         sf.secrets.push(SecretEntry {
             secret_ref: "secret2".into(),
             secret_version: "1".into(),
-            secret_base64url: B64URL.encode(&bytes),
+            secret_base64url: B64URL.encode(bytes),
             state: SecretLifecycle::Current,
         });
         assert!(sf.validate().is_err());
@@ -1480,11 +1481,8 @@ mod tests {
         // Username format: <unix-expiry>:<base64url-16-byte-random-id>
         let random_id = [0xABu8; 16];
         let username = coturn_username(1_000_000_000, &random_id);
-        assert_eq!(
-            username,
-            format!("1000000000:{}", B64URL.encode(&random_id))
-        );
-        assert_eq!(B64URL.encode(&random_id).len(), ID_B64URL_LEN);
+        assert_eq!(username, format!("1000000000:{}", B64URL.encode(random_id)));
+        assert_eq!(B64URL.encode(random_id).len(), ID_B64URL_LEN);
         // 16-byte randomness check.
         assert_eq!(random_id.len(), 16);
         // HMAC-SHA1/base64 coturn vector: known test vector.

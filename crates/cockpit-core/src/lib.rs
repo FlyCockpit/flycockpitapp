@@ -52,6 +52,7 @@ mod media_https;
 pub mod media_reservation;
 mod media_storage;
 pub mod model_system_prompt;
+pub mod openai_images_adapter;
 pub mod packages;
 pub mod path_containment;
 pub mod private_fs;

@@ -53,16 +53,6 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use cockpit_proto::remote_transport_selection::{
-    ChildState, DRAINING_TIMEOUT_SECS, DurableLifecycle, HealthTier,
-    ICE_DISCONNECTED_FALLBACK_MISSES, INITIAL_DEADLINE_SECS, MAX_ORDINARY_PENDING_CHILDREN,
-    MAX_PENDING_PER_KIND, MAX_PHYSICAL_CHILDREN_TURN_EXCEPTION, MAX_RESERVATIONS_PER_TRAIN,
-    MAX_ROUTED_CURRENT_CHILDREN, MAX_SAME_KIND_RETRIES, ParentState, RENEWAL_LEAD_SECS,
-    RETRY_DELAY_SECS, ROLLING_WINDOW_SECS, ReachabilityClass, RemoteTransportRetryReservation,
-    RemoteTransportRetryReservationKey, ReservationOutcome, RoutingClass, SecondChildReason,
-    TRAIN_ID_BYTES, TransportDenial, TransportKind, UserTransportPreference,
-    WEBRTC_DEGRADED_BUFFER_BYTES, WEBRTC_DEGRADED_MISSES, WEBRTC_FAILED_MISSES,
-    WEBRTC_HEALTHY_CONSECUTIVE_SUCCESSES, WEBSOCKET_DEGRADED_BUFFER_BYTES,
-    WEBSOCKET_DEGRADED_UNACKED_AGE_SECS, WEBSOCKET_FAILED_RETRANSMISSIONS,
     ChildState, DurableLifecycle, HealthTier, ICE_DISCONNECTED_FALLBACK_MISSES,
     INITIAL_DEADLINE_SECS, MAX_ORDINARY_PENDING_CHILDREN, MAX_PENDING_PER_KIND,
     MAX_PHYSICAL_CHILDREN_TURN_EXCEPTION, MAX_RESERVATIONS_PER_TRAIN, MAX_ROUTED_CURRENT_CHILDREN,
@@ -362,10 +352,6 @@ impl TransportSelectionState {
             turn_replacement: None,
             delivery_assignments: HashMap::new(),
             cancelled: false,
-        }
-    }
-
-    /// Count children by kind in a given state filter.
             kind_retries_used: HashMap::new(),
         }
     }
@@ -583,7 +569,6 @@ pub enum TransportSelectionAction {
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Compute the authorized child plan from the authorization inputs and user
-/// preference. This is the entry point for `remote_transport_authorized_plan_matrix`.
 /// preference. This is the entry point for
 /// `remote_transport_authorized_plan_matrix`.
 pub fn compute_authorized_plan(
@@ -593,7 +578,6 @@ pub fn compute_authorized_plan(
     let mut allowed = Vec::new();
     let mut denials = Vec::new();
 
-    // Check WebRTC authorization.
     let webrtc_available = auth.webrtc_authorized && auth.client_supports_webrtc;
     if !auth.webrtc_authorized {
         denials.push(TransportDenial::KindNotAuthorized);
@@ -601,7 +585,6 @@ pub fn compute_authorized_plan(
         denials.push(TransportDenial::ClientCapabilityMissing);
     }
 
-    // Check WebSocket authorization.
     let websocket_available = auth.websocket_authorized && auth.client_supports_websocket;
     if !auth.websocket_authorized {
         denials.push(TransportDenial::KindNotAuthorized);
@@ -609,31 +592,10 @@ pub fn compute_authorized_plan(
         denials.push(TransportDenial::ClientCapabilityMissing);
     }
 
-    // IP consent / privacy checks for WebRTC.
-    if webrtc_available
-        && auth.privacy_relay_only
-        && matches!(auth.ip_consent_direct, IpConsentTriState::Granted)
-    {
-        // Privacy relay-only overrides direct consent: WebRTC is still
-        // allowed but only via TURN. This doesn't deny WebRTC entirely.
-    }
-    if webrtc_available
-        && matches!(auth.ip_consent_direct, IpConsentTriState::Denied)
-        && !auth.privacy_relay_only
-    {
-        // If IP consent is denied and privacy doesn't require relay,
-        // WebRTC direct is denied but TURN is still possible.
-        // We don't deny WebRTC entirely here — the adapter handles
-        // candidate filtering. But if neither direct nor TURN is available,
-        // it's a denial.
-    }
-
-    // Quota check.
     if !auth.quota_available {
         denials.push(TransportDenial::QuotaExhausted);
     }
 
-    // Apply user preference narrowing.
     match preference {
         UserTransportPreference::Auto => {
             if webrtc_available {
@@ -649,7 +611,6 @@ pub fn compute_authorized_plan(
             } else {
                 denials.push(TransportDenial::PreferenceDisallowed);
             }
-            // Forced WebRTC never starts fallback — do not add WebSocket.
         }
         UserTransportPreference::Websocket => {
             if websocket_available {
@@ -657,11 +618,6 @@ pub fn compute_authorized_plan(
             } else {
                 denials.push(TransportDenial::PreferenceDisallowed);
             }
-            // Forced WebSocket starts only authorized fallback.
-        }
-    }
-
-    // If quota is exhausted, no kinds are allowed.
         }
     }
 
@@ -669,7 +625,6 @@ pub fn compute_authorized_plan(
         allowed.clear();
     }
 
-    // If nothing is allowed and we have no denials yet, add a policy denial.
     if allowed.is_empty() && denials.is_empty() {
         denials.push(TransportDenial::PolicyDenied);
     }
@@ -692,7 +647,6 @@ pub fn reduce(
     input: &TransportSelectionInput,
 ) -> Vec<TransportSelectionAction> {
     if state.cancelled {
-        // After cancellation, only supersede is processed.
         if matches!(input, TransportSelectionInput::Supersede) {
             state.parent_state = ParentState::Superseded;
             return vec![TransportSelectionAction::ParentTransition {
@@ -788,16 +742,6 @@ fn reduce_start_plan(state: &mut TransportSelectionState) -> Vec<TransportSelect
         new_state: ParentState::Establishing,
     }];
 
-    // For auto preference: start WebRTC first, arm deadline.
-    // For webrtc preference: start WebRTC only.
-    // For websocket preference: start WebSocket only.
-    match state.preference {
-        UserTransportPreference::Auto => {
-            if plan.allowed_kinds.contains(&TransportKind::Webrtc) {
-                let id = state.next_child_attempt;
-                let epoch = state.next_epoch;
-                state.next_child_attempt = state.next_child_attempt.next();
-                state.next_epoch = TransportEpoch(state.next_epoch.0 + 1);
     match state.preference {
         UserTransportPreference::Auto => {
             if plan.allowed_kinds.contains(&TransportKind::Webrtc) {
@@ -816,11 +760,6 @@ fn reduce_start_plan(state: &mut TransportSelectionState) -> Vec<TransportSelect
                     secs: state.deadline_secs,
                 });
             } else if plan.allowed_kinds.contains(&TransportKind::Websocket) {
-                // No WebRTC available, start WebSocket directly.
-                let id = state.next_child_attempt;
-                let epoch = state.next_epoch;
-                state.next_child_attempt = state.next_child_attempt.next();
-                state.next_epoch = TransportEpoch(state.next_epoch.0 + 1);
                 let id = state.alloc_child_attempt();
                 let epoch = state.alloc_epoch();
                 state.children.push(ChildRecord::new_pending(
@@ -837,10 +776,6 @@ fn reduce_start_plan(state: &mut TransportSelectionState) -> Vec<TransportSelect
         }
         UserTransportPreference::Webrtc => {
             if plan.allowed_kinds.contains(&TransportKind::Webrtc) {
-                let id = state.next_child_attempt;
-                let epoch = state.next_epoch;
-                state.next_child_attempt = state.next_child_attempt.next();
-                state.next_epoch = TransportEpoch(state.next_epoch.0 + 1);
                 let id = state.alloc_child_attempt();
                 let epoch = state.alloc_epoch();
                 state
@@ -851,15 +786,10 @@ fn reduce_start_plan(state: &mut TransportSelectionState) -> Vec<TransportSelect
                     kind: TransportKind::Webrtc,
                     epoch,
                 });
-                // No deadline timer — forced WebRTC never falls back.
             }
         }
         UserTransportPreference::Websocket => {
             if plan.allowed_kinds.contains(&TransportKind::Websocket) {
-                let id = state.next_child_attempt;
-                let epoch = state.next_epoch;
-                state.next_child_attempt = state.next_child_attempt.next();
-                state.next_epoch = TransportEpoch(state.next_epoch.0 + 1);
                 let id = state.alloc_child_attempt();
                 let epoch = state.alloc_epoch();
                 state.children.push(ChildRecord::new_pending(
@@ -883,7 +813,6 @@ fn reduce_child_active(
     state: &mut TransportSelectionState,
     child_attempt: ChildAttemptId,
 ) -> Vec<TransportSelectionAction> {
-    // Late cancelled results cannot activate.
     let Some(child) = state.find_child_mut(child_attempt) else {
         return vec![TransportSelectionAction::Inert];
     };
@@ -895,7 +824,6 @@ fn reduce_child_active(
     child.consecutive_healthy = child.consecutive_healthy.saturating_add(1);
     child.recompute_health();
 
-    // If any child is active, parent is active.
     if state.children.iter().any(|c| c.state == ChildState::Active) {
         let old_state = state.parent_state;
         state.parent_state = ParentState::Active;
@@ -921,7 +849,6 @@ fn reduce_child_reachability(
         return vec![TransportSelectionAction::Inert];
     }
 
-    // Security failures are handled separately and are terminal.
     match class {
         ReachabilityClass::IceDisconnected => {
             child.ice_disconnected_misses = child.ice_disconnected_misses.saturating_add(1);
@@ -929,7 +856,6 @@ fn reduce_child_reachability(
             child.recompute_health();
 
             if child.ice_disconnected_misses >= ICE_DISCONNECTED_FALLBACK_MISSES {
-                // Maps to network_unreachable — trigger fallback.
                 return maybe_start_websocket_fallback(state);
             }
             vec![]
@@ -938,10 +864,6 @@ fn reduce_child_reachability(
         | ReachabilityClass::IceTimeout
         | ReachabilityClass::NetworkUnreachable
         | ReachabilityClass::TurnUnreachable => {
-            // Closed reachability class — close this child and maybe fallback.
-            child.state = ChildState::Closed;
-            child.recompute_health();
-
             child.state = ChildState::Closed;
             child.recompute_health();
             maybe_start_websocket_fallback(state)
@@ -952,18 +874,12 @@ fn reduce_child_reachability(
 fn maybe_start_websocket_fallback(
     state: &mut TransportSelectionState,
 ) -> Vec<TransportSelectionAction> {
-    // Only for auto preference. Forced webrtc never falls back.
     if !matches!(state.preference, UserTransportPreference::Auto) {
         return vec![];
     }
     if state.websocket_fallback_started {
         return vec![];
     }
-    // Check WebSocket is authorized and available.
-    if !state.authorization.websocket_authorized || !state.authorization.client_supports_websocket {
-        return vec![];
-    }
-    // Check cap: one pending per kind, two ordinary pending total.
     if !state.authorization.websocket_authorized || !state.authorization.client_supports_websocket {
         return vec![];
     }
@@ -977,10 +893,6 @@ fn maybe_start_websocket_fallback(
     state.websocket_fallback_started = true;
     state.deadline_timer_armed = false;
 
-    let id = state.next_child_attempt;
-    let epoch = state.next_epoch;
-    state.next_child_attempt = state.next_child_attempt.next();
-    state.next_epoch = TransportEpoch(state.next_epoch.0 + 1);
     let id = state.alloc_child_attempt();
     let epoch = state.alloc_epoch();
     state.children.push(ChildRecord::new_pending(
@@ -1029,12 +941,10 @@ fn reduce_webrtc_probe(
 
     child.recompute_health();
 
-    // State transitions based on health.
     let mut actions = Vec::new();
     match child.health_tier {
         HealthTier::Failed => {
             child.state = ChildState::Closed;
-            // WebRTC failed — try fallback for auto preference.
             if matches!(state.preference, UserTransportPreference::Auto) {
                 actions.extend(maybe_start_websocket_fallback(state));
             }
@@ -1046,8 +956,6 @@ fn reduce_webrtc_probe(
         }
         HealthTier::Healthy => {
             if child.state == ChildState::Degraded
-                && child.consecutive_healthy
-                    >= cockpit_proto::remote_transport_selection::RECOVERY_CONSECUTIVE_HEALTHY
                 && child.consecutive_healthy >= RECOVERY_CONSECUTIVE_HEALTHY
             {
                 child.state = ChildState::Active;
@@ -1084,12 +992,6 @@ fn reduce_websocket_ack(
 
     child.recompute_health();
 
-    let mut actions = Vec::new();
-    match child.health_tier {
-        HealthTier::Failed => {
-            child.state = ChildState::Closed;
-            // WebSocket failed — no further fallback (no same-kind retry
-            // beyond the one allowed, and no other transport to fall to).
     match child.health_tier {
         HealthTier::Failed => {
             child.state = ChildState::Closed;
@@ -1101,8 +1003,6 @@ fn reduce_websocket_ack(
         }
         HealthTier::Healthy => {
             if child.state == ChildState::Degraded
-                && child.consecutive_healthy
-                    >= cockpit_proto::remote_transport_selection::RECOVERY_CONSECUTIVE_HEALTHY
                 && child.consecutive_healthy >= RECOVERY_CONSECUTIVE_HEALTHY
             {
                 child.state = ChildState::Active;
@@ -1110,10 +1010,6 @@ fn reduce_websocket_ack(
         }
     }
 
-    if actions.is_empty() {
-        actions.push(TransportSelectionAction::Inert);
-    }
-    actions
     vec![TransportSelectionAction::Inert]
 }
 
@@ -1123,7 +1019,6 @@ fn reduce_deadline_fired(
 ) -> Vec<TransportSelectionAction> {
     state.deadline_timer_armed = false;
 
-    // Only start fallback if no WebRTC child is active yet.
     let webrtc_active = state
         .children
         .iter()
@@ -1146,7 +1041,6 @@ fn reduce_retry_delay_fired(
         return vec![TransportSelectionAction::Inert];
     };
 
-    // Check caps before starting the retry.
     if state.count_ordinary_pending_kind(pending.kind) >= MAX_PENDING_PER_KIND {
         return vec![TransportSelectionAction::Inert];
     }
@@ -1180,14 +1074,6 @@ fn reduce_child_closed(
     child.recompute_health();
 
     if security_failure {
-        // Security failure is terminal and never falls back.
-        // Do not start any fallback.
-        return vec![];
-    }
-
-    // Closing one child cannot clear the other, durable retry budget,
-    // operation outcome, event cursor, or presence.
-    // But if no children are active and none are pending, parent may fail.
         return vec![];
     }
 
@@ -1201,15 +1087,6 @@ fn reduce_child_closed(
         .any(|c| matches!(c.state, ChildState::Pending | ChildState::Authenticating));
 
     if !any_active && !any_pending {
-        // Try same-kind retry if budget allows.
-        let kind = child.kind;
-        let retries_used = child.retries_used;
-        if retries_used < MAX_SAME_KIND_RETRIES && !state.cancelled {
-            // Schedule a retry with 1-second delay.
-            let id = state.next_child_attempt;
-            let epoch = state.next_epoch;
-            state.next_child_attempt = state.next_child_attempt.next();
-            state.next_epoch = TransportEpoch(state.next_epoch.0 + 1);
         let kind = child.kind;
         if state.kind_retries(kind) < MAX_SAME_KIND_RETRIES && !state.cancelled {
             state.increment_kind_retry(kind);
@@ -1225,7 +1102,6 @@ fn reduce_child_closed(
                 secs: RETRY_DELAY_SECS,
             }];
         }
-        // No retry budget left — parent fails.
         state.parent_state = ParentState::Failed;
         return vec![TransportSelectionAction::ParentTransition {
             new_state: ParentState::Failed,
@@ -1240,7 +1116,6 @@ fn reduce_request_second_child(
     reason: SecondChildReason,
     _now_ms: i64,
 ) -> Vec<TransportSelectionAction> {
-    // Only if at least one child is active.
     let has_active = state.children.iter().any(|c| c.state == ChildState::Active);
     if !has_active {
         return vec![TransportSelectionAction::Deny {
@@ -1248,7 +1123,6 @@ fn reduce_request_second_child(
         }];
     }
 
-    // Determine which kind to start as the second child.
     let existing_kinds: Vec<TransportKind> = state
         .children
         .iter()
@@ -1272,7 +1146,6 @@ fn reduce_request_second_child(
         }];
     };
 
-    // Check caps.
     if state.count_ordinary_pending_kind(target_kind) >= MAX_PENDING_PER_KIND {
         return vec![TransportSelectionAction::Deny {
             denial: TransportDenial::ChildCapExceeded,
@@ -1289,13 +1162,6 @@ fn reduce_request_second_child(
         }];
     }
 
-    let id = state.next_child_attempt;
-    let epoch = state.next_epoch;
-    state.next_child_attempt = state.next_child_attempt.next();
-    state.next_epoch = TransportEpoch(state.next_epoch.0 + 1);
-
-    let mut child = ChildRecord::new_pending(id, target_kind, epoch);
-    // credential_rotation creates a replacement_pending TURN child.
     let id = state.alloc_child_attempt();
     let epoch = state.alloc_epoch();
 
@@ -1324,7 +1190,6 @@ fn reduce_credential_rotation(
     state: &mut TransportSelectionState,
     _now_ms: i64,
 ) -> Vec<TransportSelectionAction> {
-    // Find the current WebRTC child and create a replacement_pending pair.
     let current_webrtc = state
         .children
         .iter()
@@ -1339,22 +1204,16 @@ fn reduce_credential_rotation(
         return vec![TransportSelectionAction::Inert];
     };
 
-    // Check if a replacement is already pending.
     if state.turn_replacement.is_some() {
         return vec![TransportSelectionAction::Inert];
     }
 
-    // Check physical child cap (three only during TURN replacement).
     if state.count_physical_children() >= MAX_PHYSICAL_CHILDREN_TURN_EXCEPTION {
         return vec![TransportSelectionAction::Deny {
             denial: TransportDenial::ChildCapExceeded,
         }];
     }
 
-    let id = state.next_child_attempt;
-    let epoch = state.next_epoch;
-    state.next_child_attempt = state.next_child_attempt.next();
-    state.next_epoch = TransportEpoch(state.next_epoch.0 + 1);
     let id = state.alloc_child_attempt();
     let epoch = state.alloc_epoch();
 
@@ -1363,8 +1222,6 @@ fn reduce_credential_rotation(
     replacement.replacement_peer = Some(current_id);
     state.children.push(replacement);
 
-    // Set the replacement pair.
-    let lease_id = [0xAB; 16]; // In practice generated deterministically.
     let lease_id = [0xAB; 16];
     state.turn_replacement = Some(TurnReplacementPair {
         current: current_id,
@@ -1373,7 +1230,6 @@ fn reduce_credential_rotation(
         lease_id,
     });
 
-    // Link the current child to its replacement peer.
     if let Some(current) = state.find_child_mut(current_id) {
         current.replacement_peer = Some(id);
     }
@@ -1398,7 +1254,6 @@ fn reduce_supervisor_cutover_ack(
         return vec![TransportSelectionAction::Inert];
     }
 
-    // Cutover: new becomes current, old becomes draining.
     if let Some(new_child) = state.find_child_mut(new) {
         new_child.durable_lifecycle = DurableLifecycle::Current;
         new_child.state = ChildState::Active;
@@ -1427,10 +1282,6 @@ fn reduce_second_lease(
     };
 
     if replacement.current != old && replacement.replacement != old {
-        // The old draining child should match.
-    }
-
-    // Remove the old draining child.
         // The old draining child should match the current field (the old
         // current became draining after cutover).
     }
@@ -1455,7 +1306,6 @@ fn reduce_close_child(
     };
 
     child.state = ChildState::Closing;
-    // Closing one child cannot clear the other.
 
     vec![TransportSelectionAction::CloseChild { child_attempt }]
 }
@@ -1491,7 +1341,6 @@ fn reduce_supersede(state: &mut TransportSelectionState) -> Vec<TransportSelecti
     state.pending_retry = None;
 
     let mut actions = Vec::new();
-    for child in &mut state.children.iter() {
     for child in &state.children {
         if !matches!(child.state, ChildState::Closed) {
             actions.push(TransportSelectionAction::CancelChild {
@@ -1512,8 +1361,6 @@ fn reduce_route_request(
     delivery_id: &str,
     routing_class: RoutingClass,
 ) -> Vec<TransportSelectionAction> {
-    // If already assigned, keep the assignment (one stable delivery ID → one
-    // current child; failover may resend exact bytes).
     if let Some(&assigned) = state.delivery_assignments.get(delivery_id) {
         if let Some(child) = state.find_child(assigned) {
             if child.is_routed_current() {
@@ -1582,7 +1429,6 @@ fn select_route(
             if let Some(c) = healthy_websocket {
                 return Some(c.child_attempt);
             }
-            // Degraded by lower epoch.
             current_children
                 .iter()
                 .min_by_key(|c| c.epoch)
@@ -1602,8 +1448,6 @@ fn select_route(
                         a.writable_bytes()
                             .cmp(&b.writable_bytes())
                             .then_with(|| {
-                                // Tie: WebRTC first (webrtc < websocket in
-                                // ordering, so reverse for priority).
                                 let a_prio = matches!(a.kind, TransportKind::Webrtc);
                                 let b_prio = matches!(b.kind, TransportKind::Webrtc);
                                 b_prio.cmp(&a_prio)
@@ -1612,7 +1456,6 @@ fn select_route(
                     })
                     .map(|c| c.child_attempt);
             }
-            // No healthy — degraded by lower epoch.
             current_children
                 .iter()
                 .min_by_key(|c| c.epoch)
@@ -1627,14 +1470,6 @@ fn reduce_reservation_result(
     result: &Result<RemoteTransportRetryReservation, TransportDenial>,
 ) -> Vec<TransportSelectionAction> {
     match result {
-        Ok(_reservation) => {
-            // Reservation succeeded — the child can proceed.
-            // The child was already started; this is a confirmation.
-            vec![TransportSelectionAction::Inert]
-        }
-        Err(denial) => {
-            // Reservation failed — cancel the corresponding child.
-            // Find the child by transport kind and child attempt.
         Ok(_reservation) => vec![TransportSelectionAction::Inert],
         Err(denial) => {
             let child_attempt = ChildAttemptId(key.child_attempt);
@@ -1660,14 +1495,10 @@ fn reduce_child_security_failure(
         return vec![TransportSelectionAction::Inert];
     };
 
-    // Security failure is terminal and never falls back.
     child.state = ChildState::Closed;
     child.cancelled = true;
     child.recompute_health();
 
-    // Do NOT start any fallback.
-
-    // If this was the only child and it failed terminally, parent fails.
     let any_active = state
         .children
         .iter()
@@ -1707,7 +1538,6 @@ pub fn validate_retry_budget(
     new_key: &RemoteTransportRetryReservationKey,
     now_ms: i64,
 ) -> Result<(), TransportDenial> {
-    // Reject more than four reservations per train.
     let train_count = existing_in_train
         .iter()
         .filter(|r| r.key.train_id == new_key.train_id)
@@ -1716,8 +1546,6 @@ pub fn validate_retry_budget(
         return Err(TransportDenial::RetryBudgetExhausted);
     }
 
-    // Reject more than twelve committed reservations in the preceding rolling
-    // 3,600 seconds.
     let rolling_start = now_ms - (ROLLING_WINDOW_SECS as i64) * 1000;
     let rolling_count = committed_in_rolling_window
         .iter()
@@ -1727,14 +1555,12 @@ pub fn validate_retry_budget(
         return Err(TransportDenial::RetryBudgetExhausted);
     }
 
-    // Check for exact duplicates — exact duplicates do not count.
     let is_duplicate = existing_in_train.iter().any(|r| {
         r.key.transport_kind == new_key.transport_kind
             && r.key.child_attempt == new_key.child_attempt
             && r.key.train_id == new_key.train_id
     });
     if is_duplicate {
-        // Idempotent — return Ok (the duplicate does not count).
         return Ok(());
     }
 
@@ -1803,18 +1629,11 @@ pub fn record_golden_trace(
     trace
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Duration helper
-// ─────────────────────────────────────────────────────────────────────────
-
 /// Convert the deadline seconds to a Duration.
 pub fn deadline_duration(secs: u64) -> Duration {
     Duration::from_secs(secs)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 // Re-export key constants for consumers.
 pub use cockpit_proto::remote_transport_selection::{
     DRAINING_TIMEOUT_SECS as PUB_DRAINING_TIMEOUT_SECS,
@@ -1862,12 +1681,6 @@ mod tests {
 
     #[test]
     fn remote_transport_authorized_plan_matrix() {
-        // Both authorized → both allowed for auto.
-        let plan = compute_authorized_plan(&full_auth(), UserTransportPreference::Auto);
-        assert!(plan.allowed_kinds.contains(&TransportKind::Webrtc));
-        assert!(plan.allowed_kinks_granted_if_both_available());
-
-        // WebRTC not authorized → not in allowed for auto.
         let plan = compute_authorized_plan(&full_auth(), UserTransportPreference::Auto);
         assert!(plan.allowed_kinds.contains(&TransportKind::Webrtc));
         assert!(plan.allowed_kinds.contains(&TransportKind::Websocket));
@@ -1879,13 +1692,11 @@ mod tests {
         assert!(!plan.allowed_kinds.contains(&TransportKind::Webrtc));
         assert!(plan.denials.contains(&TransportDenial::KindNotAuthorized));
 
-        // WebSocket not authorized.
         let mut auth = full_auth();
         auth.websocket_authorized = false;
         let plan = compute_authorized_plan(&auth, UserTransportPreference::Auto);
         assert!(!plan.allowed_kinds.contains(&TransportKind::Websocket));
 
-        // Client doesn't support WebRTC.
         let mut auth = full_auth();
         auth.client_supports_webrtc = false;
         let plan = compute_authorized_plan(&auth, UserTransportPreference::Auto);
@@ -1895,39 +1706,23 @@ mod tests {
                 .contains(&TransportDenial::ClientCapabilityMissing)
         );
 
-        // Quota exhausted → nothing allowed.
         let mut auth = full_auth();
         auth.quota_available = false;
         let plan = compute_authorized_plan(&auth, UserTransportPreference::Auto);
         assert!(plan.allowed_kinds.is_empty());
         assert!(plan.denials.contains(&TransportDenial::QuotaExhausted));
 
-        // Both not available → denied with policy.
         let mut auth = full_auth();
         auth.webrtc_authorized = false;
         auth.websocket_authorized = false;
         let plan = compute_authorized_plan(&auth, UserTransportPreference::Auto);
         assert!(plan.allowed_kinds.is_empty());
-        assert_eq!(plan.parent_state_if_plan_used(), ParentState::Denied);
     }
 
     // ── AC 2: user_preference_matrix ──
 
     #[test]
     fn remote_transport_user_preference_matrix() {
-        // Auto: both allowed.
-        let plan = compute_authorized_plan(&full_auth(), UserTransportPreference::Auto);
-        assert_eq!(plan.allowed_kinds.len(), 2);
-
-        // Webrtc forced: only webrtc, no websocket (no silent fallback).
-        let plan = compute_authorized_plan(&full_auth(), UserTransportPreference::Webrtc);
-        assert_eq!(plan.allowed_kinds, vec![TransportKind::Webrtc]);
-
-        // Websocket forced: only websocket.
-        let plan = compute_authorized_plan(&full_auth(), UserTransportPreference::Websocket);
-        assert_eq!(plan.allowed_kinds, vec![TransportKind::Websocket]);
-
-        // Webrtc forced but not available → typed denial, no silent override.
         let plan = compute_authorized_plan(&full_auth(), UserTransportPreference::Auto);
         assert_eq!(plan.allowed_kinds.len(), 2);
 
@@ -1946,7 +1741,6 @@ mod tests {
                 .contains(&TransportDenial::PreferenceDisallowed)
         );
 
-        // Websocket forced but not available → typed denial.
         let mut auth = full_auth();
         auth.websocket_authorized = false;
         let plan = compute_authorized_plan(&auth, UserTransportPreference::Websocket);
@@ -1961,7 +1755,6 @@ mod tests {
 
     #[test]
     fn remote_transport_only_reachability_falls_back() {
-        // Start plan with auto → WebRTC child started + deadline armed.
         let mut state = new_auto_state();
         let actions = reduce(&mut state, &TransportSelectionInput::StartPlan);
         assert!(actions.iter().any(|a| matches!(
@@ -1980,8 +1773,6 @@ mod tests {
         assert_eq!(state.children[0].kind, TransportKind::Webrtc);
 
         let webrtc_id = state.children[0].child_attempt;
-
-        // Closed reachability → fallback to WebSocket.
         let actions = reduce(
             &mut state,
             &TransportSelectionInput::ChildReachability {
@@ -1998,7 +1789,6 @@ mod tests {
         )));
         assert!(state.websocket_fallback_started);
 
-        // Forced webrtc: closed reachability does NOT fallback.
         let mut state = TransportSelectionState::new(
             full_auth(),
             UserTransportPreference::Webrtc,
@@ -2022,7 +1812,6 @@ mod tests {
             }
         )));
 
-        // Security failure never falls back.
         let mut state = new_auto_state();
         reduce(&mut state, &TransportSelectionInput::StartPlan);
         let webrtc_id = state.children[0].child_attempt;
@@ -2047,11 +1836,6 @@ mod tests {
 
     #[test]
     fn remote_transport_deadline_validation() {
-        assert!(cockpit_proto::remote_transport_selection::validate_deadline_secs(10).is_ok());
-        assert!(cockpit_proto::remote_transport_selection::validate_deadline_secs(3).is_ok());
-        assert!(cockpit_proto::remote_transport_selection::validate_deadline_secs(30).is_ok());
-        assert!(cockpit_proto::remote_transport_selection::validate_deadline_secs(2).is_err());
-        assert!(cockpit_proto::remote_transport_selection::validate_deadline_secs(31).is_err());
         assert!(validate_deadline_secs(10).is_ok());
         assert!(validate_deadline_secs(3).is_ok());
         assert!(validate_deadline_secs(30).is_ok());
@@ -2063,7 +1847,6 @@ mod tests {
     fn remote_transport_deadline_fires_fallback() {
         let mut state = new_auto_state();
         reduce(&mut state, &TransportSelectionInput::StartPlan);
-        // Deadline fires without active WebRTC → fallback.
         let actions = reduce(
             &mut state,
             &TransportSelectionInput::DeadlineFired { now_ms: 10_000 },
@@ -2081,10 +1864,6 @@ mod tests {
 
     #[test]
     fn remote_transport_child_caps_and_reasons() {
-        // Two routed-current cap: one per kind.
-        let mut state = new_auto_state();
-        reduce(&mut state, &TransportSelectionInput::StartPlan);
-        // Activate WebRTC.
         let mut state = new_auto_state();
         reduce(&mut state, &TransportSelectionInput::StartPlan);
         let webrtc_id = state.children[0].child_attempt;
@@ -2095,7 +1874,6 @@ mod tests {
                 now_ms: 1000,
             },
         );
-        // Start WebSocket via deadline.
         reduce(
             &mut state,
             &TransportSelectionInput::DeadlineFired { now_ms: 10_000 },
@@ -2110,7 +1888,6 @@ mod tests {
         );
         assert_eq!(state.count_routed_current(), 2);
 
-        // Request a third child → denied (cap exceeded).
         let actions = reduce(
             &mut state,
             &TransportSelectionInput::RequestSecondChild {
@@ -2125,7 +1902,6 @@ mod tests {
             }
         )));
 
-        // Named second-child reasons are accepted when under cap.
         let mut state = new_auto_state();
         reduce(&mut state, &TransportSelectionInput::StartPlan);
         let webrtc_id = state.children[0].child_attempt;
@@ -2136,7 +1912,6 @@ mod tests {
                 now_ms: 1000,
             },
         );
-        // Only one active child; request second for network_handoff.
         let actions = reduce(
             &mut state,
             &TransportSelectionInput::RequestSecondChild {
@@ -2153,7 +1928,6 @@ mod tests {
 
     #[test]
     fn remote_transport_turn_replacement_three_physical() {
-        // TURN replacement creates a third physical child (the exception).
         let mut state = new_auto_state();
         reduce(&mut state, &TransportSelectionInput::StartPlan);
         let webrtc_id = state.children[0].child_attempt;
@@ -2164,7 +1938,6 @@ mod tests {
                 now_ms: 1000,
             },
         );
-        // Start WebSocket too.
         reduce(
             &mut state,
             &TransportSelectionInput::DeadlineFired { now_ms: 10_000 },
@@ -2178,7 +1951,6 @@ mod tests {
             },
         );
 
-        // Credential rotation → replacement_pending TURN child.
         let actions = reduce(
             &mut state,
             &TransportSelectionInput::CredentialRotationLead { now_ms: 20_000 },
@@ -2188,11 +1960,6 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, TransportSelectionAction::StartReplacementPending { .. }))
         );
-        // Now three physical children: current WebRTC + replacement_pending
-        // + current WebSocket.
-        assert_eq!(state.count_physical_children(), 3);
-
-        // The replacement is replacement_pending, not current.
         assert_eq!(state.count_physical_children(), 3);
 
         let replacement = state
@@ -2202,7 +1969,6 @@ mod tests {
             .unwrap();
         assert!(!replacement.is_routed_current());
 
-        // Supervisor ACK → cutover: new becomes current, old becomes draining.
         let new_id = replacement.child_attempt;
         let actions = reduce(
             &mut state,
@@ -2221,7 +1987,6 @@ mod tests {
         let old_child = state.find_child(webrtc_id).unwrap();
         assert_eq!(old_child.durable_lifecycle, DurableLifecycle::Draining);
 
-        // Second lease removes old draining.
         let actions = reduce(
             &mut state,
             &TransportSelectionInput::SecondLease { old: webrtc_id },
@@ -2255,13 +2020,6 @@ mod tests {
             TransportKind::Webrtc,
             ChildAttemptId(1),
         );
-
-        // No existing → Ok.
-        assert!(validate_retry_budget(&[], &[], &key1, 0).is_ok());
-
-        // Four reservations per train → exhausted on fifth.
-        let mut existing: Vec<RemoteTransportRetryReservation> = Vec::new();
-        for i in 1..=4 {
         assert!(validate_retry_budget(&[], &[], &key1, 0).is_ok());
 
         let mut existing: Vec<RemoteTransportRetryReservation> = Vec::new();
@@ -2297,7 +2055,6 @@ mod tests {
             Err(TransportDenial::RetryBudgetExhausted)
         ));
 
-        // Exact duplicate → idempotent Ok.
         let dup_key = build_reservation_key(
             tenant,
             account,
@@ -2309,10 +2066,6 @@ mod tests {
         );
         assert!(validate_retry_budget(&existing, &[], &dup_key, 0).is_ok());
 
-        // Twelve committed in rolling window → exhausted on thirteenth.
-        let mut committed: Vec<RemoteTransportRetryReservation> = Vec::new();
-        let other_train = TrainId([0x99; TRAIN_ID_BYTES]);
-        for i in 1..=12 {
         let other_train = TrainId([0x99; TRAIN_ID_BYTES]);
         let mut committed: Vec<RemoteTransportRetryReservation> = Vec::new();
         for i in 1..=12u64 {
@@ -2347,7 +2100,6 @@ mod tests {
             Err(TransportDenial::RetryBudgetExhausted)
         ));
 
-        // Outside rolling window → Ok.
         let old_committed: Vec<RemoteTransportRetryReservation> = committed
             .iter()
             .map(|r| {
@@ -2363,12 +2115,10 @@ mod tests {
 
     #[test]
     fn remote_transport_retry_initial_plus_one() {
-        // Initial establishment plus one fresh retry per kind.
         let mut state = new_auto_state();
         reduce(&mut state, &TransportSelectionInput::StartPlan);
         let webrtc_id = state.children[0].child_attempt;
 
-        // Child closes without security failure → retry scheduled.
         let actions = reduce(
             &mut state,
             &TransportSelectionInput::ChildClosed {
@@ -2383,7 +2133,6 @@ mod tests {
         );
         assert!(state.pending_retry.is_some());
 
-        // Retry delay fires → retry child started.
         let actions = reduce(
             &mut state,
             &TransportSelectionInput::RetryDelayFired { now_ms: 2000 },
@@ -2395,15 +2144,6 @@ mod tests {
         );
         assert!(state.pending_retry.is_none());
 
-        // Second close → no more retries (retries_used is 0 on the new child,
-        // but the kind has already used its one retry in this train).
-        // The retry child also has retries_used=0, so it will try again.
-        // But per spec: "initial establishment plus one fresh retry is
-        // allowed within the train" — so after the retry also fails, no
-        // further same-kind retry.
-        let retry_id = state.children[1].child_attempt;
-        let retry_child = state.find_child_mut(retry_id).unwrap();
-        retry_child.retries_used = 1; // Simulate that this was the retry.
         let retry_id = state.children[1].child_attempt;
         let actions = reduce(
             &mut state,
@@ -2424,7 +2164,6 @@ mod tests {
 
     #[test]
     fn remote_transport_health_thresholds() {
-        // WebRTC: healthy after 2 consecutive successes.
         let mut state = new_auto_state();
         reduce(&mut state, &TransportSelectionInput::StartPlan);
         let webrtc_id = state.children[0].child_attempt;
@@ -2436,7 +2175,6 @@ mod tests {
             },
         );
 
-        // Two consecutive successful probes → healthy.
         reduce(
             &mut state,
             &TransportSelectionInput::WebrtcProbe {
@@ -2455,9 +2193,6 @@ mod tests {
         );
         let child = state.find_child(webrtc_id).unwrap();
         assert_eq!(child.health_tier, HealthTier::Healthy);
-        assert_eq!(child.consecutive_healthy, 3); // 1 from active + 2 probes
-
-        // Three misses → degraded.
 
         for _ in 0..3 {
             reduce(
@@ -2472,7 +2207,6 @@ mod tests {
         let child = state.find_child(webrtc_id).unwrap();
         assert_eq!(child.health_tier, HealthTier::Degraded);
 
-        // Six misses → failed.
         for _ in 0..3 {
             reduce(
                 &mut state,
@@ -2486,7 +2220,6 @@ mod tests {
         let child = state.find_child(webrtc_id).unwrap();
         assert_eq!(child.health_tier, HealthTier::Failed);
 
-        // Buffer >= 4 MiB for two probes → degraded.
         let mut state = new_auto_state();
         reduce(&mut state, &TransportSelectionInput::StartPlan);
         let webrtc_id = state.children[0].child_attempt;
@@ -2530,7 +2263,6 @@ mod tests {
             },
         );
 
-        // Degraded when oldest unacked age >= 3 seconds.
         reduce(
             &mut state,
             &TransportSelectionInput::WebsocketAckProgress {
@@ -2543,7 +2275,6 @@ mod tests {
         let child = state.find_child(ws_id).unwrap();
         assert_eq!(child.health_tier, HealthTier::Degraded);
 
-        // Degraded when buffered >= 4 MiB.
         reduce(
             &mut state,
             &TransportSelectionInput::WebsocketAckProgress {
@@ -2556,7 +2287,6 @@ mod tests {
         let child = state.find_child(ws_id).unwrap();
         assert_eq!(child.health_tier, HealthTier::Degraded);
 
-        // Failed at third retransmission.
         reduce(
             &mut state,
             &TransportSelectionInput::WebsocketAckProgress {
@@ -2584,7 +2314,6 @@ mod tests {
                 now_ms: 1000,
             },
         );
-        // Start WebSocket via deadline.
         reduce(
             &mut state,
             &TransportSelectionInput::DeadlineFired { now_ms: 10_000 },
@@ -2598,8 +2327,6 @@ mod tests {
             },
         );
 
-        // Both healthy. Interactive: healthy WebRTC first.
-        // Make both healthy.
         for _ in 0..2 {
             reduce(
                 &mut state,
@@ -2644,8 +2371,6 @@ mod tests {
             } if delivery_id == "d1" && *child_attempt == webrtc_id
         )));
 
-        // Control: healthy over degraded, then lower epoch.
-        // WebRTC has lower epoch (1) than WebSocket (2), both healthy.
         let actions = reduce(
             &mut state,
             &TransportSelectionInput::RouteRequest {
@@ -2655,14 +2380,6 @@ mod tests {
         );
         assert!(actions.iter().any(|a| matches!(
             a,
-            TransportSelectionAction::RouteDelivery {
-                child_attempt,
-                ..
-            } if *child_attempt == webrtc_id
-        )));
-
-        // Bulk: healthy child with more writable bytes.
-        // Both have 0 buffered, so writable_bytes is equal; tie → WebRTC.
             TransportSelectionAction::RouteDelivery { child_attempt, .. } if *child_attempt
                 == webrtc_id
         )));
@@ -2676,14 +2393,6 @@ mod tests {
         );
         assert!(actions.iter().any(|a| matches!(
             a,
-            TransportSelectionAction::RouteDelivery {
-                child_attempt,
-                ..
-            } if *child_attempt == webrtc_id
-        )));
-
-        // One stable delivery ID → one current child; same delivery gets
-        // same assignment.
             TransportSelectionAction::RouteDelivery { child_attempt, .. } if *child_attempt
                 == webrtc_id
         )));
@@ -2695,7 +2404,6 @@ mod tests {
                 routing_class: RoutingClass::Bulk,
             },
         );
-        // Should still route to the original webrtc assignment.
         assert!(actions.iter().any(|a| matches!(
             a,
             TransportSelectionAction::RouteDelivery {
@@ -2717,14 +2425,12 @@ mod tests {
                 now_ms: 1000,
             },
         );
-        // Credential rotation → replacement_pending.
         reduce(
             &mut state,
             &TransportSelectionInput::CredentialRotationLead { now_ms: 2000 },
         );
         let replacement_id = state.children[1].child_attempt;
 
-        // The replacement_pending child should never be selected for routing.
         let actions = reduce(
             &mut state,
             &TransportSelectionInput::RouteRequest {
@@ -2745,12 +2451,10 @@ mod tests {
 
     #[test]
     fn remote_transport_deadline_late_success_race() {
-        // Deadline fires, WebSocket starts, then WebRTC activates late.
         let mut state = new_auto_state();
         reduce(&mut state, &TransportSelectionInput::StartPlan);
         let webrtc_id = state.children[0].child_attempt;
 
-        // Deadline fires → WebSocket starts.
         let actions = reduce(
             &mut state,
             &TransportSelectionInput::DeadlineFired { now_ms: 10_000 },
@@ -2764,9 +2468,6 @@ mod tests {
         )));
         let ws_id = state.children[1].child_attempt;
 
-        // Late WebRTC success — still activates (separately authorized kinds
-        // may coexist).
-        let actions = reduce(
         reduce(
             &mut state,
             &TransportSelectionInput::ChildActive {
@@ -2774,11 +2475,6 @@ mod tests {
                 now_ms: 10_001,
             },
         );
-        // WebRTC should be active.
-        let webrtc_child = state.find_child(webrtc_id).unwrap();
-        assert_eq!(webrtc_child.state, ChildState::Active);
-
-        // WebSocket also activates.
         let webrtc_child = state.find_child(webrtc_id).unwrap();
         assert_eq!(webrtc_child.state, ChildState::Active);
 
@@ -2792,7 +2488,6 @@ mod tests {
         let ws_child = state.find_child(ws_id).unwrap();
         assert_eq!(ws_child.state, ChildState::Active);
 
-        // Both coexist.
         assert_eq!(state.count_routed_current(), 2);
     }
 
@@ -2802,12 +2497,10 @@ mod tests {
         reduce(&mut state, &TransportSelectionInput::StartPlan);
         let webrtc_id = state.children[0].child_attempt;
 
-        // Cancel the attachment.
         reduce(&mut state, &TransportSelectionInput::Cancel);
         let child = state.find_child(webrtc_id).unwrap();
         assert!(child.cancelled);
 
-        // Late active event → inert.
         let actions = reduce(
             &mut state,
             &TransportSelectionInput::ChildActive {
@@ -2821,12 +2514,6 @@ mod tests {
                 .all(|a| matches!(a, TransportSelectionAction::Inert))
         );
         let child = state.find_child(webrtc_id).unwrap();
-        // State unchanged (still closing, not active).
-        assert_ne!(child.state, ChildState::Active);
-    }
-
-    // ── AC: closing one child does not clear the other ──
-
         assert_ne!(child.state, ChildState::Active);
     }
 
@@ -2855,7 +2542,6 @@ mod tests {
             },
         );
 
-        // Close WebRTC — WebSocket should remain active.
         reduce(
             &mut state,
             &TransportSelectionInput::ChildClosed {
@@ -2866,8 +2552,6 @@ mod tests {
         let ws_child = state.find_child(ws_id).unwrap();
         assert_eq!(ws_child.state, ChildState::Active);
     }
-
-    // ── AC: golden trace ──
 
     #[test]
     fn remote_transport_golden_trace() {
@@ -2882,8 +2566,6 @@ mod tests {
         assert_eq!(trace[0].parent_state_after, "Establishing");
     }
 
-    // ── AC: ice_disconnected degraded not fallback ──
-
     #[test]
     fn remote_transport_ice_disconnected_degraded_not_fallback() {
         let mut state = new_auto_state();
@@ -2897,7 +2579,6 @@ mod tests {
             },
         );
 
-        // First ice_disconnected → degraded, no fallback.
         let actions = reduce(
             &mut state,
             &TransportSelectionInput::ChildReachability {
@@ -2916,7 +2597,6 @@ mod tests {
         assert_eq!(child.state, ChildState::Degraded);
         assert_eq!(child.ice_disconnected_misses, 1);
 
-        // Second ice_disconnected → still degraded, no fallback.
         reduce(
             &mut state,
             &TransportSelectionInput::ChildReachability {
@@ -2926,7 +2606,6 @@ mod tests {
         );
         assert!(!state.websocket_fallback_started);
 
-        // Third ice_disconnected → maps to network_unreachable, fallback.
         let actions = reduce(
             &mut state,
             &TransportSelectionInput::ChildReachability {
@@ -2943,19 +2622,6 @@ mod tests {
         )));
     }
 
-    // ── Helper trait for tests ──
-
-    impl AuthorizedPlan {
-        fn allowed_kinks_granted_if_both_available(&self) -> bool {
-            self.allowed_kinds.len() == 2
-        }
-
-        fn parent_state_if_plan_used(&self) -> ParentState {
-            if self.allowed_kinds.is_empty() {
-                ParentState::Denied
-            } else {
-                ParentState::Planning
-            }
     #[test]
     fn remote_transport_cancel_aborts_timers() {
         let mut state = new_auto_state();

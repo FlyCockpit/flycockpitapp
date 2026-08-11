@@ -46,7 +46,8 @@ pub(super) const REASON_FORBIDDEN_IMAGE_ADMIN: &str = "forbidden_requires_image_
 /// Targets/health projections need exact-project `project_read=1`.
 pub(super) const REASON_FORBIDDEN_PROJECT_READ: &str = "forbidden_requires_project_read";
 /// Job/plan sections need current-session `session_read=7`.
-pub(super) const REASON_FORBIDDEN_SESSION_MEMBERSHIP: &str = "forbidden_requires_session_membership";
+pub(super) const REASON_FORBIDDEN_SESSION_MEMBERSHIP: &str =
+    "forbidden_requires_session_membership";
 /// Request-scope budget row is editable only with a live plan context.
 pub(super) const REASON_REQUEST_SCOPE_REQUIRES_PLAN: &str = "request_scope_requires_plan";
 
@@ -257,7 +258,10 @@ impl BudgetEditorState {
 
     /// The request-scope row is editable only with a live plan context.
     pub(crate) fn request_scope_editable(&self) -> bool {
-        self.plan_context.as_ref().map(|c| c.is_live()).unwrap_or(false)
+        self.plan_context
+            .as_ref()
+            .map(|c| c.is_live())
+            .unwrap_or(false)
     }
 
     /// Apply explicit finite USD micros to a scope (non-authoritative until
@@ -291,9 +295,9 @@ impl BudgetEditorState {
     /// confirmation.
     pub(crate) fn suggestion_for(scope: BudgetScopeKind) -> u64 {
         match scope {
-            BudgetScopeKind::Request => 1_000_000,        // USD 1 in micros
-            BudgetScopeKind::Session => 10_000_000,       // USD 10
-            BudgetScopeKind::Project => 100_000_000,      // USD 100
+            BudgetScopeKind::Request => 1_000_000,   // USD 1 in micros
+            BudgetScopeKind::Session => 10_000_000,  // USD 10
+            BudgetScopeKind::Project => 100_000_000, // USD 100
         }
     }
 }
@@ -361,10 +365,7 @@ impl JobCard {
 
     /// Cancellation is requestable only for non-terminal jobs.
     pub(crate) fn cancellable(&self) -> bool {
-        matches!(
-            self.state,
-            ImageJobState::Pending | ImageJobState::Running
-        )
+        matches!(self.state, ImageJobState::Pending | ImageJobState::Running)
     }
 }
 
@@ -563,7 +564,9 @@ pub(crate) fn confirmation_text(action: GenerationAction) -> Option<&'static str
 }
 
 /// The confirmation button labels `[confirm] [Cancel]`.
-pub(crate) fn confirmation_buttons(action: GenerationAction) -> Option<(&'static str, &'static str)> {
+pub(crate) fn confirmation_buttons(
+    action: GenerationAction,
+) -> Option<(&'static str, &'static str)> {
     match action {
         GenerationAction::CancelJob(_) => Some(("Cancel job", "Cancel")),
         GenerationAction::RevokeGrant(_) => Some(("Revoke grant", "Cancel")),
@@ -1226,8 +1229,10 @@ impl SettingsPage for JobDetailPage {
             KeyCode::Char('c') => {
                 if let Some(job) = self.reducer.jobs.iter().find(|j| j.job_id == self.job_id) {
                     if job.cancellable() && self.principal.can_cancel_job() {
-                        self.confirm =
-                            Some((GenerationAction::CancelJob(ImageJobId(self.job_id.clone())), ConfirmationChoice::Confirm));
+                        self.confirm = Some((
+                            GenerationAction::CancelJob(ImageJobId(self.job_id.clone())),
+                            ConfirmationChoice::Confirm,
+                        ));
                     }
                 }
                 Nav::Stay
@@ -1280,9 +1285,7 @@ impl SettingsPage for JobDetailPage {
             if let Some(text) = confirmation_text(*action) {
                 let (confirm_label, _) = confirmation_buttons(*action).unwrap();
                 lines.push(Line::from(""));
-                lines.push(Line::from(format!(
-                    "{text} [{confirm_label}] [Cancel]"
-                )));
+                lines.push(Line::from(format!("{text} [{confirm_label}] [Cancel]")));
                 let _ = choice;
             }
         }

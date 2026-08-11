@@ -1800,19 +1800,34 @@ impl SettingsDialog {
         if let Some(p) = self.page.downcast_ref::<LspPage>() {
             return TestPageRef::Lsp(p);
         }
-        if let Some(p) = self.page.downcast_ref::<image_generation::GenerationListPage>() {
+        if let Some(p) = self
+            .page
+            .downcast_ref::<image_generation::GenerationListPage>()
+        {
             return TestPageRef::GenerationList(p);
         }
-        if let Some(p) = self.page.downcast_ref::<image_generation::EndpointEditorPage>() {
+        if let Some(p) = self
+            .page
+            .downcast_ref::<image_generation::EndpointEditorPage>()
+        {
             return TestPageRef::EndpointEditor(p);
         }
-        if let Some(p) = self.page.downcast_ref::<image_generation::TargetEditorPage>() {
+        if let Some(p) = self
+            .page
+            .downcast_ref::<image_generation::TargetEditorPage>()
+        {
             return TestPageRef::TargetEditor(p);
         }
-        if let Some(p) = self.page.downcast_ref::<image_generation::WorkflowEditorPage>() {
+        if let Some(p) = self
+            .page
+            .downcast_ref::<image_generation::WorkflowEditorPage>()
+        {
             return TestPageRef::WorkflowEditor(p);
         }
-        if let Some(p) = self.page.downcast_ref::<image_generation::BudgetEditorPage>() {
+        if let Some(p) = self
+            .page
+            .downcast_ref::<image_generation::BudgetEditorPage>()
+        {
             return TestPageRef::BudgetEditor(p);
         }
         if let Some(p) = self.page.downcast_ref::<image_generation::GrantListPage>() {
@@ -1824,7 +1839,10 @@ impl SettingsDialog {
         if let Some(p) = self.page.downcast_ref::<image_generation::JobDetailPage>() {
             return TestPageRef::JobDetail(p);
         }
-        if let Some(p) = self.page.downcast_ref::<image_generation::LateResultActionPage>() {
+        if let Some(p) = self
+            .page
+            .downcast_ref::<image_generation::LateResultActionPage>()
+        {
             return TestPageRef::LateResultAction(p);
         }
         unreachable!("unknown settings page")
@@ -1882,35 +1900,55 @@ impl SettingsDialog {
         if self.page.as_any().is::<LspPage>() {
             return TestPageMut::Lsp(self.page.downcast_mut::<LspPage>().unwrap());
         }
-        if self.page.as_any().is::<image_generation::GenerationListPage>() {
+        if self
+            .page
+            .as_any()
+            .is::<image_generation::GenerationListPage>()
+        {
             return TestPageMut::GenerationList(
                 self.page
                     .downcast_mut::<image_generation::GenerationListPage>()
                     .unwrap(),
             );
         }
-        if self.page.as_any().is::<image_generation::EndpointEditorPage>() {
+        if self
+            .page
+            .as_any()
+            .is::<image_generation::EndpointEditorPage>()
+        {
             return TestPageMut::EndpointEditor(
                 self.page
                     .downcast_mut::<image_generation::EndpointEditorPage>()
                     .unwrap(),
             );
         }
-        if self.page.as_any().is::<image_generation::TargetEditorPage>() {
+        if self
+            .page
+            .as_any()
+            .is::<image_generation::TargetEditorPage>()
+        {
             return TestPageMut::TargetEditor(
                 self.page
                     .downcast_mut::<image_generation::TargetEditorPage>()
                     .unwrap(),
             );
         }
-        if self.page.as_any().is::<image_generation::WorkflowEditorPage>() {
+        if self
+            .page
+            .as_any()
+            .is::<image_generation::WorkflowEditorPage>()
+        {
             return TestPageMut::WorkflowEditor(
                 self.page
                     .downcast_mut::<image_generation::WorkflowEditorPage>()
                     .unwrap(),
             );
         }
-        if self.page.as_any().is::<image_generation::BudgetEditorPage>() {
+        if self
+            .page
+            .as_any()
+            .is::<image_generation::BudgetEditorPage>()
+        {
             return TestPageMut::BudgetEditor(
                 self.page
                     .downcast_mut::<image_generation::BudgetEditorPage>()
@@ -1938,7 +1976,11 @@ impl SettingsDialog {
                     .unwrap(),
             );
         }
-        if self.page.as_any().is::<image_generation::LateResultActionPage>() {
+        if self
+            .page
+            .as_any()
+            .is::<image_generation::LateResultActionPage>()
+        {
             return TestPageMut::LateResultAction(
                 self.page
                     .downcast_mut::<image_generation::LateResultActionPage>()

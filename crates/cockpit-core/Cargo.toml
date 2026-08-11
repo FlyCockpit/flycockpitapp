@@ -73,6 +73,7 @@ tracing-subscriber = { workspace = true }
 tempfile = { workspace = true }
 regex = { workspace = true }
 unicode-width = { workspace = true }
+unicode-normalization = { workspace = true }
 csv = { workspace = true }
 similar = { workspace = true }
 tree-sitter = { workspace = true }

@@ -10,6 +10,9 @@ use std::io::{self, Write};
 
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
+use sha2::{Digest as _, Sha256};
+
+use cockpit_db::image_generation_plan::VectorSanitizerProvenanceV1;
 
 mod verify;
 
@@ -28,6 +31,73 @@ pub const MAX_IDS: usize = 16_384;
 pub const MAX_REFERENCES: usize = 65_536;
 pub const MAX_TEXT_BYTES: usize = 32_768;
 pub const MAX_TEXT_SCALARS: usize = 8_192;
+
+pub fn sanitizer_provenance() -> VectorSanitizerProvenanceV1 {
+    let limits = [
+        MAX_RAW_BYTES,
+        MAX_CANONICAL_BYTES,
+        MAX_ELEMENTS,
+        MAX_DEPTH,
+        MAX_ATTRIBUTES_PER_ELEMENT,
+        MAX_ATTRIBUTES,
+        MAX_ATTRIBUTE_BYTES,
+        MAX_PATH_ATTRIBUTE_BYTES,
+        MAX_PATH_BYTES,
+        MAX_PATH_COMMANDS,
+        MAX_IDS,
+        MAX_REFERENCES,
+        MAX_TEXT_BYTES,
+        MAX_TEXT_SCALARS,
+    ];
+    VectorSanitizerProvenanceV1 {
+        schema_version: 1,
+        sanitizer_kind: "generated_svg_closed_policy".into(),
+        policy_digest: sanitizer_policy_digest(&limits),
+    }
+}
+
+fn sanitizer_policy_digest(limits: &[usize; 14]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"generated-svg-v2\0canonical-v1\0verifier-v1\0");
+    for limit in limits {
+        digest.update((*limit as u64).to_be_bytes());
+    }
+    crate::intel::hex_lower(&digest.finalize())
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+    #[test]
+    fn every_closed_policy_limit_changes_provenance() {
+        let baseline = [
+            MAX_RAW_BYTES,
+            MAX_CANONICAL_BYTES,
+            MAX_ELEMENTS,
+            MAX_DEPTH,
+            MAX_ATTRIBUTES_PER_ELEMENT,
+            MAX_ATTRIBUTES,
+            MAX_ATTRIBUTE_BYTES,
+            MAX_PATH_ATTRIBUTE_BYTES,
+            MAX_PATH_BYTES,
+            MAX_PATH_COMMANDS,
+            MAX_IDS,
+            MAX_REFERENCES,
+            MAX_TEXT_BYTES,
+            MAX_TEXT_SCALARS,
+        ];
+        let expected = sanitizer_policy_digest(&baseline);
+        for index in 0..baseline.len() {
+            let mut changed = baseline;
+            changed[index] = changed[index].checked_add(1).unwrap();
+            assert_ne!(
+                sanitizer_policy_digest(&changed),
+                expected,
+                "policy limit {index}"
+            );
+        }
+    }
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct SanitizedSvgArtifact(Vec<u8>);

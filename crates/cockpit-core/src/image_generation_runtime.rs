@@ -27,6 +27,10 @@ impl CredentialIdentityDigest {
     pub const fn from_sha256(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
+
+    pub(crate) fn plan_identity_hex(&self) -> String {
+        crate::intel::hex_lower(&self.0)
+    }
 }
 
 impl fmt::Debug for CredentialIdentityDigest {
@@ -728,6 +732,7 @@ impl CapabilitySnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageHealthSnapshot {
     pub endpoint_id: String,
+    pub adapter_kind: ImageAdapterKind,
     pub target_id: String,
     pub target_immutable_identity: String,
     pub config_generation: u64,
@@ -1682,6 +1687,7 @@ impl ImageRuntimeRegistry {
         }
         let snapshot = ImageHealthSnapshot {
             endpoint_id: endpoint.id.clone(),
+            adapter_kind: endpoint.adapter,
             target_id,
             target_immutable_identity: target_current.immutable,
             config_generation: generation,
@@ -1773,6 +1779,7 @@ impl ImageRuntimeRegistry {
             endpoint.id.clone(),
             ImageHealthSnapshot {
                 endpoint_id: endpoint.id.clone(),
+                adapter_kind: endpoint.adapter,
                 target_id: target_id.to_owned(),
                 target_immutable_identity: self
                     .inner

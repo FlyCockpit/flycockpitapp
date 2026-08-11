@@ -1,7 +1,7 @@
 #![allow(clippy::items_after_test_module)]
 //! Durable, exactly-once image-generation monetary reservations.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
@@ -45,6 +45,117 @@ fn read_money(value: Vec<u8>) -> rusqlite::Result<u64> {
         )
     })?;
     Ok(u64::from_be_bytes(bytes))
+}
+
+pub(crate) fn prepare_reserved_image_spend_dispatch_conn(
+    conn: &rusqlite::Connection,
+    reservation_id: &str,
+    attempt_id: &str,
+    journal: &PrepareExternalOperation,
+    at_ms: i64,
+) -> Result<ExternalJournalRecord> {
+    if journal.operation_kind.as_str() != "image_generation" {
+        bail!("image spend dispatch requires image_generation journal kind");
+    }
+    let session_id: String = conn
+        .query_row(
+            "SELECT r.session_id FROM image_spend_attempts a JOIN image_spend_reservations r USING(reservation_id) WHERE a.reservation_id=?1 AND a.attempt_id=?2 AND r.state='reserved'",
+            params![reservation_id, attempt_id],
+            |row| row.get(0),
+        )
+        .context("image spend attempt is absent or no longer reserved")?;
+    if journal.owner_session_id.as_str() != session_id {
+        bail!("journal owner does not match the reserved image session");
+    }
+    let prepared = prepare_external_operation_conn(conn, journal, at_ms)?;
+    let record = prepared.record();
+    if let Some(existing_id) = conn
+        .query_row(
+            "SELECT external_operation_id FROM image_spend_attempt_dispatches WHERE reservation_id=?1 AND attempt_id=?2",
+            params![reservation_id, attempt_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        if existing_id != record.operation_id.to_string() {
+            bail!("image spend attempt is already bound to another external operation");
+        }
+        return Ok(record.clone());
+    }
+    if matches!(&prepared, ExternalPrepareOutcome::Existing(_)) {
+        bail!("existing external operation is not bound to this image spend attempt");
+    }
+    conn.execute(
+        "INSERT INTO image_spend_attempt_dispatches(reservation_id,attempt_id,external_operation_id) VALUES(?1,?2,?3)",
+        params![reservation_id, attempt_id, record.operation_id.to_string()],
+    )?;
+    Ok(record.clone())
+}
+
+pub(crate) fn finish_reserved_image_spend_dispatch_conn(
+    conn: &rusqlite::Connection,
+    reservation_id: &str,
+    attempt_id: &str,
+    operation_id: Uuid,
+    expected_version: i64,
+    evidence: ImageSpendDispatchEvidence,
+    at_ms: i64,
+) -> Result<ExternalTransitionOutcome> {
+    let bound: Option<i64> = conn.query_row("SELECT 1 FROM image_spend_attempt_dispatches WHERE reservation_id=?1 AND attempt_id=?2 AND external_operation_id=?3",params![reservation_id,attempt_id,operation_id.to_string()],|row|row.get(0)).optional()?;
+    if bound.is_none() {
+        bail!("external operation is not bound to the image spend attempt");
+    }
+    let next = match evidence {
+        ImageSpendDispatchEvidence::Accepted => ExternalJournalState::Accepted,
+        ImageSpendDispatchEvidence::DefinitivelyRejected => ExternalJournalState::Rejected,
+        ImageSpendDispatchEvidence::SubmissionUnknown => ExternalJournalState::SubmissionUnknown,
+    };
+    let outcome =
+        transition_external_operation_conn(conn, operation_id, expected_version, next, at_ms)?;
+    if outcome.record().state == ExternalJournalState::Rejected {
+        let unrejected:i64=conn.query_row("SELECT COUNT(*) FROM image_spend_attempts a LEFT JOIN image_spend_attempt_dispatches d USING(reservation_id,attempt_id) LEFT JOIN external_journal_operations o ON o.operation_id=d.external_operation_id WHERE a.reservation_id=?1 AND COALESCE(o.state,'')<>'rejected'",[reservation_id],|row|row.get(0))?;
+        if unrejected == 0 {
+            let changed=conn.execute("UPDATE image_spend_reservations SET state='released',release_proof_identity=?2,released_at_ms=?3 WHERE reservation_id=?1 AND state='reserved'",params![reservation_id,operation_id.to_string(),at_ms])?;
+            if changed != 0 {
+                conn.execute("UPDATE image_spend_scope_usage SET reserved_usd_micros=charged_usd_micros WHERE reservation_id=?1",[reservation_id])?;
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+pub(crate) fn settle_reconciled_image_spend_dispatch_conn(
+    conn: &rusqlite::Connection,
+    operation_id: Uuid,
+    at_ms: i64,
+) -> Result<()> {
+    let reservation_id: String = conn.query_row(
+        "SELECT reservation_id FROM image_spend_attempt_dispatches WHERE external_operation_id=?1",
+        [operation_id.to_string()],
+        |row| row.get(0),
+    )?;
+    let journal_state: String = conn.query_row(
+        "SELECT state FROM external_journal_operations WHERE operation_id=?1",
+        [operation_id.to_string()],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        matches!(
+            journal_state.as_str(),
+            "accepted" | "rejected" | "cancelled" | "failed"
+        ),
+        "reconciled spend lacks a terminal provider outcome"
+    );
+    if matches!(journal_state.as_str(), "rejected" | "cancelled") {
+        let unresolved: i64 = conn.query_row("SELECT COUNT(*) FROM image_spend_attempts a LEFT JOIN image_spend_attempt_dispatches d USING(reservation_id,attempt_id) LEFT JOIN external_journal_operations o ON o.operation_id=d.external_operation_id WHERE a.reservation_id=?1 AND COALESCE(o.state,'') NOT IN ('rejected','cancelled')",[&reservation_id],|row|row.get(0))?;
+        if unresolved == 0 {
+            let changed=conn.execute("UPDATE image_spend_reservations SET state='released',release_proof_identity=?2,released_at_ms=?3 WHERE reservation_id=?1 AND state='reserved'",params![reservation_id,operation_id.to_string(),at_ms])?;
+            if changed != 0 {
+                conn.execute("UPDATE image_spend_scope_usage SET reserved_usd_micros=charged_usd_micros WHERE reservation_id=?1",[reservation_id])?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -1373,33 +1484,15 @@ impl Db {
             bail!("image spend dispatch requires image_generation journal kind");
         }
         self.transaction(move |conn| {
-            let session_id: String = conn.query_row(
-                "SELECT r.session_id FROM image_spend_attempts a JOIN image_spend_reservations r USING(reservation_id) WHERE a.reservation_id=?1 AND a.attempt_id=?2 AND r.state='reserved'",
-                params![reservation_id, attempt_id], |row| row.get(0),
-            ).context("image spend attempt is absent or no longer reserved")?;
-            if journal.owner_session_id.as_str() != session_id {
-                bail!("journal owner does not match the reserved image session");
-            }
-            let prepared = prepare_external_operation_conn(conn, &journal, at_ms)?;
-            let record = prepared.record();
-            if let Some(existing_id) = conn.query_row(
-                "SELECT external_operation_id FROM image_spend_attempt_dispatches WHERE reservation_id=?1 AND attempt_id=?2",
-                params![reservation_id, attempt_id], |row| row.get::<_, String>(0),
-            ).optional()? {
-                if existing_id != record.operation_id.to_string() {
-                    bail!("image spend attempt is already bound to another external operation");
-                }
-                return Ok(record.clone());
-            }
-            if matches!(&prepared, ExternalPrepareOutcome::Existing(_)) {
-                bail!("existing external operation is not bound to this image spend attempt");
-            }
-            conn.execute(
-                "INSERT INTO image_spend_attempt_dispatches(reservation_id,attempt_id,external_operation_id) VALUES(?1,?2,?3)",
-                params![reservation_id, attempt_id, record.operation_id.to_string()],
-            )?;
-            Ok(record.clone())
-        }).await
+            prepare_reserved_image_spend_dispatch_conn(
+                conn,
+                &reservation_id,
+                &attempt_id,
+                &journal,
+                at_ms,
+            )
+        })
+        .await
     }
 
     /// Commit the durable `dispatching` proof immediately before provider
@@ -1435,34 +1528,17 @@ impl Db {
         at_ms: i64,
     ) -> Result<ExternalTransitionOutcome> {
         self.transaction(move |conn| {
-            let bound: Option<i64> = conn.query_row(
-                "SELECT 1 FROM image_spend_attempt_dispatches WHERE reservation_id=?1 AND attempt_id=?2 AND external_operation_id=?3",
-                params![reservation_id, attempt_id, operation_id.to_string()], |row| row.get(0),
-            ).optional()?;
-            if bound.is_none() { bail!("external operation is not bound to the image spend attempt"); }
-            let next = match evidence {
-                ImageSpendDispatchEvidence::Accepted => ExternalJournalState::Accepted,
-                ImageSpendDispatchEvidence::DefinitivelyRejected => ExternalJournalState::Rejected,
-                ImageSpendDispatchEvidence::SubmissionUnknown => ExternalJournalState::SubmissionUnknown,
-            };
-            let outcome = transition_external_operation_conn(conn, operation_id, expected_version, next, at_ms)?;
-            if outcome.record().state == ExternalJournalState::Rejected {
-                let unrejected: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM image_spend_attempts a LEFT JOIN image_spend_attempt_dispatches d USING(reservation_id,attempt_id) LEFT JOIN external_journal_operations o ON o.operation_id=d.external_operation_id WHERE a.reservation_id=?1 AND COALESCE(o.state,'')<>'rejected'",
-                    [&reservation_id], |row| row.get(0),
-                )?;
-                if unrejected == 0 {
-                    let changed = conn.execute(
-                        "UPDATE image_spend_reservations SET state='released',release_proof_identity=?2,released_at_ms=?3 WHERE reservation_id=?1 AND state='reserved'",
-                        params![reservation_id, operation_id.to_string(), at_ms],
-                    )?;
-                    if changed != 0 {
-                        conn.execute("UPDATE image_spend_scope_usage SET reserved_usd_micros=charged_usd_micros WHERE reservation_id=?1", [&reservation_id])?;
-                    }
-                }
-            }
-            Ok(outcome)
-        }).await
+            finish_reserved_image_spend_dispatch_conn(
+                conn,
+                &reservation_id,
+                &attempt_id,
+                operation_id,
+                expected_version,
+                evidence,
+                at_ms,
+            )
+        })
+        .await
     }
 
     /// Apply one authoritative billing identity exactly once. Actual cost is

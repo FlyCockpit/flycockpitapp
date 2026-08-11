@@ -4,6 +4,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+pub(crate) mod held_directory;
+
 #[cfg(all(unix, not(test)))]
 struct UmaskGuard(libc::mode_t);
 

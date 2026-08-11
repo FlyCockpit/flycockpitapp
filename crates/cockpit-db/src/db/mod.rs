@@ -44,6 +44,8 @@ pub mod execution_containments;
 pub mod external_journal;
 mod files;
 pub mod guidance;
+pub mod image_generation;
+pub mod image_generation_plan;
 pub mod image_spend;
 pub mod inference_calls;
 pub mod installation_identity;

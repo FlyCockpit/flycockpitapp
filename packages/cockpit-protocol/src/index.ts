@@ -7,6 +7,7 @@ export * from "./remote-identity-protocol";
 export * from "./remote-identity-protocol";
 export * from "./remote-noise-binding";
 export * from "./remote-tenant-authority-protocol";
+export * from "./remote-transport-selection";
 export * from "./remote-websocket-fallback";
 export * from "./remote-wire-magic-registry";
 export * from "./remote-wire-magic-registry";

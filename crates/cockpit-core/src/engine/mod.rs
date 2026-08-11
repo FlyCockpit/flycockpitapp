@@ -45,6 +45,7 @@ pub mod prune;
 pub mod rehydrate;
 pub mod repair;
 pub mod resource_scheduler;
+pub mod response_performance;
 pub mod retry;
 pub mod safety_gate;
 pub mod schedule;
@@ -60,6 +61,11 @@ pub use agent::{
     TurnEvent,
 };
 pub use driver::Driver;
+pub use response_performance::{
+    AssistantAttemptId, AssistantTextPayload, DisplayAttemptReset, DisplayClassifierConfig,
+    DisplayComplete, DisplayError, DisplayEvent, DisplayReasoningDelta, DisplayStreamClassifier,
+    DisplayTextDelta, InjectedDisplayClock, Instant, RealDisplayClock, ResponsePerformance,
+};
 
 /// Whether the conversation is at a point where context-reduction
 /// (`/prune` auto-fire, auto-`/compact`) may run without corrupting the

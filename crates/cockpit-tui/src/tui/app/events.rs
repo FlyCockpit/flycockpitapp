@@ -2580,6 +2580,7 @@ pub(super) fn wire_history_to_entries(
                 reasoning,
                 ts_ms,
                 seq,
+                ..
             } => {
                 out.push(HistoryEntry::Agent {
                     name: agent,

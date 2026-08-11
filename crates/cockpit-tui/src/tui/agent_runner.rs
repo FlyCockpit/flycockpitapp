@@ -3355,14 +3355,20 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         AssistantText {
             agent,
             text,
+            presentation_text,
             reasoning,
             seq,
+            response_performance,
             ..
         } => TurnEvent::AssistantText {
             agent,
             text,
+            presentation_text,
             reasoning,
             seq,
+            response_performance: response_performance.as_ref().and_then(
+                cockpit_core::engine::response_performance::ResponsePerformance::from_proto,
+            ),
         },
         UserMessageRecorded {
             seq,
@@ -5248,8 +5254,10 @@ mod tests {
             session_id,
             agent: "Build".to_string(),
             text: "still draining".to_string(),
+            presentation_text: None,
             reasoning: String::new(),
             seq: Some(1),
+            response_performance: None,
         });
         let drained = drain_turn_events(&events);
         assert!(matches!(
@@ -5410,7 +5418,9 @@ mod tests {
                                         vec![proto::HistoryEntry::Assistant {
                                             agent: "Build".to_string(),
                                             text: "replayed".to_string(),
+                                            presentation_text: None,
                                             reasoning: String::new(),
+                                            response_performance: None,
                                             ts_ms: 0,
                                             seq: 5,
                                         }],
@@ -5532,7 +5542,9 @@ mod tests {
                                 vec![proto::HistoryEntry::Assistant {
                                     agent: "Build".to_string(),
                                     text: "replayed".to_string(),
+                                    presentation_text: None,
                                     reasoning: String::new(),
+                                    response_performance: None,
                                     ts_ms: 0,
                                     seq: 2,
                                 }],
@@ -5672,7 +5684,9 @@ mod tests {
         let history = vec![proto::HistoryEntry::Assistant {
             agent: "Plan".to_string(),
             text: "restored".to_string(),
+            presentation_text: None,
             reasoning: String::new(),
+            response_performance: None,
             ts_ms: 0,
             seq: 7,
         }];
@@ -6101,8 +6115,10 @@ mod tests {
                 session_id: sid,
                 agent: "Build".to_string(),
                 text: "duplicate".to_string(),
+                presentation_text: None,
                 reasoning: String::new(),
                 seq: Some(5),
+                response_performance: None,
             },
             &incoming,
         );
@@ -6136,7 +6152,9 @@ mod tests {
                     proto::HistoryEntry::Assistant {
                         agent: "Build".to_string(),
                         text: "replayed".to_string(),
+                        presentation_text: None,
                         reasoning: String::new(),
+                        response_performance: None,
                         ts_ms: 0,
                         seq: 7,
                     },

@@ -1295,7 +1295,7 @@ fn default_client_protocol_version() -> u32 {
 mod event;
 pub use event::{
     AuthFailureKind, DefaultModelStandaloneOutcome, DefaultModelUpdateOutcome, Event,
-    InferenceErrorClass, ModelSelectionActiveState, ModelSelectionOutcome,
+    InferenceErrorClass, ModelSelectionActiveState, ModelSelectionOutcome, ResponsePerformance,
     UserMessageTerminalDisposition,
 };
 
@@ -1549,12 +1549,23 @@ pub enum HistoryEntry {
         /// Body text with inline `<think>` blocks stripped (the clean,
         /// stored form). Never carries reasoning tags.
         text: String,
+        /// The exact final text shown to users when it differs from `text`
+        /// (translation success). `None` for legacy/fallback/identical —
+        /// consumers display `presentation_text.unwrap_or(text)`. Model
+        /// context continues to use `text` only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        presentation_text: Option<String>,
         /// The turn's (channel + inline) reasoning, repopulating the
         /// thinking chip on resume (implementation note).
         /// Empty when the turn had none. UI/DB-only — never re-enters the
         /// model's context.
         #[serde(default)]
         reasoning: String,
+        /// Optional durable response-performance snapshot. Absent for
+        /// empty/think-only/no-visible-body/zero-duration responses and
+        /// legacy rows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_performance: Option<ResponsePerformance>,
         /// `session_events.ts_ms` of this turn (epoch millis).
         #[serde(default)]
         ts_ms: i64,

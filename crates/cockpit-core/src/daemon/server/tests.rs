@@ -4906,8 +4906,10 @@ async fn boundary_owner_gets_raw_non_owner_gets_scrubbed_from_same_envelope() {
         session_id: Uuid::new_v4(),
         agent: "Build".to_string(),
         text: "visible client-boundary-secret".to_string(),
+        presentation_text: None,
         reasoning: String::new(),
         seq: None,
+        response_performance: None,
     };
     let envelope = EventEnvelope {
         event: event.clone(),

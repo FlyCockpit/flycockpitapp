@@ -180,9 +180,17 @@ pub enum TurnEvent {
     /// write failed. UI/DB-only — never enters the model's context.
     AssistantText {
         agent: String,
+        /// Model-context/wire body.
         text: String,
+        /// The exact final text shown to users when it differs from `text`
+        /// (translation success). `None` for legacy/fallback/identical —
+        /// consumers display `presentation_text.unwrap_or(text)`.
+        presentation_text: Option<String>,
         reasoning: String,
         seq: Option<i64>,
+        /// Optional durable response-performance snapshot. Absent for
+        /// empty/think-only/no-visible-body/zero-duration responses.
+        response_performance: Option<crate::engine::response_performance::ResponsePerformance>,
     },
     /// A user/injected message was recorded to the timeline; carries the
     /// assigned `session_events` `seq` so the TUI can stamp it onto the

@@ -463,10 +463,20 @@ fn history_snapshot_from_events_conn(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                let presentation_text = ev
+                    .data
+                    .get("presentation_text")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let response_performance = ev.data.get("response_performance").and_then(|v| {
+                    serde_json::from_value::<proto::ResponsePerformance>(v.clone()).ok()
+                });
                 snapshot.push(proto::HistoryEntry::Assistant {
                     agent,
                     text,
+                    presentation_text,
                     reasoning,
+                    response_performance,
                     ts_ms: ev.ts_ms,
                     seq: ev.seq,
                 });
@@ -808,10 +818,20 @@ fn subagent_history_entries_from_events(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                let presentation_text = ev
+                    .data
+                    .get("presentation_text")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let response_performance = ev.data.get("response_performance").and_then(|v| {
+                    serde_json::from_value::<proto::ResponsePerformance>(v.clone()).ok()
+                });
                 snapshot.push(proto::HistoryEntry::Assistant {
                     agent,
                     text,
+                    presentation_text,
                     reasoning,
+                    response_performance,
                     ts_ms: ev.ts_ms,
                     seq: ev.seq,
                 });

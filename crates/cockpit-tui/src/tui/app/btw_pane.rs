@@ -1125,8 +1125,10 @@ mod tests {
             TurnEvent::AssistantText {
                 agent: "Btw".to_string(),
                 text: "hello from side".to_string(),
+                presentation_text: None,
                 reasoning: String::new(),
                 seq: Some(1),
+                response_performance: None,
             },
             true,
         );

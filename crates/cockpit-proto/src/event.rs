@@ -103,6 +103,35 @@ impl From<cockpit_db::db::session_log::ClientSubmissionTerminalDisposition>
     }
 }
 
+/// Durable per-assistant-message response performance snapshot carried on
+/// the wire protocol. Persists durations (not wall-clock instants):
+/// `ttft_ms` is time-to-first-token, `generation_ms` is the post-first-
+/// visible-token duration, `displayed_tokens` is the shared-tokenizer count
+/// of the displayed body, and `encoding` is the frozen tiktoken encoding
+/// name. The snapshot is immutable: later tokenizer changes never recompute
+/// history.
+///
+/// This is the wire form; the engine layer (`cockpit-core`) owns the
+/// canonical [`ResponsePerformance`](cockpit_core::engine::ResponsePerformance)
+/// with the typed encoding enum and the classifier that produces it. The
+/// `encoding` field here is the serde string name of the
+/// `TiktokenEncoding` variant.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResponsePerformance {
+    /// Time-to-first-token in milliseconds (dispatch → first non-whitespace
+    /// presentation emission).
+    pub ttft_ms: u64,
+    /// Generation duration in milliseconds (first non-whitespace
+    /// presentation emission → finish).
+    pub generation_ms: u64,
+    /// Token count of the final canonical displayed body as counted by the
+    /// shared tokenizer.
+    pub displayed_tokens: u64,
+    /// The tiktoken encoding name used to count `displayed_tokens` (e.g.
+    /// `"cl100k_base"`). Frozen at snapshot time.
+    pub encoding: String,
+}
+
 /// Why a turn's inference failed.
 ///
 /// The flat string produced by [`Self::as_str`] remains the stable display
@@ -717,10 +746,21 @@ pub enum Event {
         session_id: Uuid,
         agent: String,
         text: String,
+        /// The exact final text shown to users when it differs from `text`
+        /// (translation success). `None` for legacy/fallback/identical —
+        /// consumers display `presentation_text.unwrap_or(text)`. Model
+        /// context continues to use `text` only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        presentation_text: Option<String>,
         #[serde(default)]
         reasoning: String,
         #[serde(default)]
         seq: Option<i64>,
+        /// Optional durable response-performance snapshot. Absent for
+        /// empty/think-only/no-visible-body/zero-duration responses and
+        /// legacy rows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_performance: Option<ResponsePerformance>,
     },
 
     /// A user/injected message was recorded to the timeline. Carries the

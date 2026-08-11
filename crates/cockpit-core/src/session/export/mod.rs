@@ -232,18 +232,27 @@ fn transcript_json_from_history(history: &[proto::HistoryEntry]) -> Value {
             proto::HistoryEntry::Assistant {
                 agent,
                 text,
+                presentation_text,
                 reasoning,
+                response_performance,
                 ts_ms,
                 ..
             } => {
                 flush_tool_calls(&mut turns, &mut pending_tool_calls);
+                let display_text = presentation_text.as_deref().unwrap_or(text);
                 turns.push(json!({
                     "type": "assistant",
                     "agent": agent,
-                    "text": text,
+                    "text": display_text,
                     "reasoning": reasoning,
                     "timestamp": timestamp_json(*ts_ms),
                     "think_ms": Option::<u64>::None,
+                    "response_performance": response_performance.as_ref().map(|p| json!({
+                        "ttft_ms": p.ttft_ms,
+                        "generation_ms": p.generation_ms,
+                        "displayed_tokens": p.displayed_tokens,
+                        "encoding": p.encoding,
+                    })),
                 }));
             }
             proto::HistoryEntry::InferenceError {

@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "files": [
+    "packages/api/src/enterprise/tenant-remote-authority.test.ts",
+    "apps/web/src/routes/$lang/_auth/settings/tenant-remote-authority.test.tsx"
+  ],
+  "requiredTestNames": [
+    "tenant_authority_customer_signer_enrollment",
+    "tenant_authority_submit_credential_cannot_sign",
+    "tenant_authority_role_passkey_matrix",
+    "tenant_authority_dual_control_matrix",
+    "tenant_authority_recovery_timeline",
+    "tenant_authority_generation_race",
+    "tenant_authority_rotation_convergence",
+    "tenant_authority_outage_no_profile_downgrade",
+    "tenant_authority_identity_revocation_governance",
+    "tenant_authority_enrollment_authorizer_trust",
+    "tenant_authority_governance_ui_accessibility_redaction"
+  ]
+}

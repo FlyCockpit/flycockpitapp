@@ -1,0 +1,269 @@
+{
+  "schemaVersion": 1,
+  "package": "@flycockpit/cockpit-protocol",
+  "owningModule": "remote-tenant-authority-protocol",
+  "wireMagics": {
+    "FCTA": "RemoteTenantAuthorityAuthorizationV1",
+    "FCTO": "RemoteTenantAuthorityResultV1",
+    "FCTV": "RemoteTenantAuthorityRevocationEvidenceV1",
+    "FCIR": "RemoteIdentityRevocationRequestV1"
+  },
+  "operations": [
+    { "discriminant": 1, "name": "authority_activation" },
+    { "discriminant": 2, "name": "device_enrollment" },
+    { "discriminant": 3, "name": "policy_revision" },
+    { "discriminant": 4, "name": "attempt_grant" },
+    { "discriminant": 5, "name": "authority_rotation" },
+    { "discriminant": 6, "name": "credential_registry_revision" },
+    { "discriminant": 7, "name": "recovery_lifecycle" },
+    { "discriminant": 8, "name": "recovery_execution" },
+    { "discriminant": 9, "name": "tenant_authority_status" },
+    { "discriminant": 10, "name": "tenant_identity_revocation_status" },
+    { "discriminant": 11, "name": "identity_revocation" }
+  ],
+  "deviceEnrollmentActions": [
+    { "discriminant": 1, "name": "enroll" },
+    { "discriminant": 2, "name": "renew" },
+    { "discriminant": 3, "name": "rotate" }
+  ],
+  "credentialRegistryActions": [
+    { "discriminant": 1, "name": "add_credential" },
+    { "discriminant": 2, "name": "revoke_credential" },
+    { "discriminant": 3, "name": "assign_security_role" },
+    { "discriminant": 4, "name": "remove_security_role" }
+  ],
+  "recoveryLifecycleActions": [
+    { "discriminant": 1, "name": "propose" },
+    { "discriminant": 2, "name": "reconfirm" },
+    { "discriminant": 3, "name": "cancel" },
+    { "discriminant": 4, "name": "expire" }
+  ],
+  "identityRevocationActions": [
+    { "discriminant": 1, "name": "self_client" },
+    { "discriminant": 2, "name": "security_admin" }
+  ],
+  "evidenceTypes": [
+    {
+      "discriminant": 1,
+      "name": "authority_ring",
+      "category": "compact_jws",
+      "typ": "flycockpit-tenant-authority-ring+jws",
+      "cap": 32768
+    },
+    {
+      "discriminant": 2,
+      "name": "authority_status",
+      "category": "compact_jws",
+      "typ": "flycockpit-tenant-authority-status+jws",
+      "cap": 16384
+    },
+    {
+      "discriminant": 3,
+      "name": "mtls_identity",
+      "category": "binary",
+      "magic": "FCMI",
+      "cap": 8192
+    },
+    {
+      "discriminant": 4,
+      "name": "credential_registry",
+      "category": "binary",
+      "magic": "FCWR",
+      "cap": 131072
+    },
+    {
+      "discriminant": 5,
+      "name": "admin_approval",
+      "category": "binary",
+      "magic": "FCWA",
+      "cap": 16384
+    },
+    {
+      "discriminant": 6,
+      "name": "identity_certificate",
+      "category": "compact_jws",
+      "typ": "flycockpit-remote-identity-certificate+jws",
+      "cap": 4096
+    },
+    {
+      "discriminant": 7,
+      "name": "possession_proof",
+      "category": "binary",
+      "magic": "FCPP",
+      "cap": 4096
+    },
+    {
+      "discriminant": 8,
+      "name": "custody_evidence",
+      "category": "binary",
+      "magic": "FCCE",
+      "cap": 65536
+    },
+    {
+      "discriminant": 9,
+      "name": "public_service_policy",
+      "category": "compact_jws",
+      "typ": "flycockpit-public-remote-policy+jws",
+      "cap": 16384
+    },
+    {
+      "discriminant": 10,
+      "name": "tenant_policy",
+      "category": "compact_jws",
+      "typ": "flycockpit-tenant-remote-policy+jws",
+      "cap": 16384
+    },
+    {
+      "discriminant": 11,
+      "name": "revocation_status",
+      "category": "binary",
+      "magic": "FCTV",
+      "cap": 16384
+    },
+    {
+      "discriminant": 12,
+      "name": "attempt_request",
+      "category": "binary",
+      "magic": "FCAR",
+      "cap": 16384
+    },
+    {
+      "discriminant": 13,
+      "name": "quota_request",
+      "category": "binary",
+      "magic": "FCQR",
+      "cap": 4096
+    },
+    {
+      "discriminant": 14,
+      "name": "recovery_history",
+      "category": "binary",
+      "magic": "FCRH",
+      "cap": 65536
+    },
+    {
+      "discriminant": 15,
+      "name": "identity_proposal",
+      "category": "binary",
+      "magic": "FCIP",
+      "cap": 4096
+    },
+    {
+      "discriminant": 16,
+      "name": "enrollment_transcript",
+      "category": "binary",
+      "magic": "FCEN",
+      "cap": 1024
+    },
+    {
+      "discriminant": 17,
+      "name": "enrollment_confirmation",
+      "category": "binary",
+      "magic": "FCCF",
+      "cap": 168
+    },
+    {
+      "discriminant": 18,
+      "name": "identity_revocation_request",
+      "category": "binary",
+      "magic": "FCIR",
+      "cap": 4096
+    },
+    {
+      "discriminant": 19,
+      "name": "control_plane_authority_ring",
+      "category": "canonical_json",
+      "cap": 32768
+    },
+    {
+      "discriminant": 20,
+      "name": "control_plane_authority_status",
+      "category": "compact_jws",
+      "typ": "flycockpit-remote-authority-status+jws",
+      "cap": 16384
+    }
+  ],
+  "resultKinds": [
+    { "discriminant": 1, "name": "authorized" },
+    { "discriminant": 2, "name": "denied" },
+    { "discriminant": 3, "name": "authority_status" },
+    { "discriminant": 4, "name": "identity_revocation_status" },
+    { "discriminant": 5, "name": "error" }
+  ],
+  "reasonCodes": [
+    { "discriminant": 0, "name": "none" },
+    { "discriminant": 1, "name": "malformed" },
+    { "discriminant": 2, "name": "unsupported_version" },
+    { "discriminant": 3, "name": "unknown_operation" },
+    { "discriminant": 4, "name": "request_too_large" },
+    { "discriminant": 5, "name": "unauthenticated" },
+    { "discriminant": 6, "name": "tenant_or_authority_not_found" },
+    { "discriminant": 7, "name": "request_conflict" },
+    { "discriminant": 8, "name": "stale_epoch" },
+    { "discriminant": 9, "name": "invalid_evidence" },
+    { "discriminant": 10, "name": "invalid_approval" },
+    { "discriminant": 11, "name": "revoked" },
+    { "discriminant": 12, "name": "quota_exceeded" },
+    { "discriminant": 13, "name": "policy_denied" },
+    { "discriminant": 14, "name": "provider_unavailable" },
+    { "discriminant": 15, "name": "indeterminate" },
+    { "discriminant": 16, "name": "deadline_exceeded" },
+    { "discriminant": 17, "name": "not_ready" },
+    { "discriminant": 18, "name": "internal" }
+  ],
+  "jwsKinds": [
+    { "name": "TenantAuthorityRingV1", "typ": "flycockpit-tenant-authority-ring+jws" },
+    { "name": "TenantRemotePolicyV1", "typ": "flycockpit-tenant-remote-policy+jws" },
+    { "name": "TenantAuthorityStatusV1", "typ": "flycockpit-tenant-authority-status+jws" },
+    {
+      "name": "TenantIdentityRevocationStatusV1",
+      "typ": "flycockpit-tenant-identity-revocation-status+jws"
+    },
+    {
+      "name": "TenantAuthorizationStatementV1",
+      "typ": "flycockpit-tenant-authorization-statement+jws"
+    }
+  ],
+  "signingDomains": [
+    "TenantAuthorityRingV1",
+    "TenantRemotePolicyV1",
+    "TenantAuthorityStatusV1",
+    "TenantIdentityRevocationStatusV1",
+    "TenantAuthorizationStatementV1",
+    "RemoteTenantAuthorityWatermarkV1"
+  ],
+  "envelope": {
+    "magic": "FCTA",
+    "version": 1,
+    "maxBodyBytes": 261760,
+    "maxRequestBytes": 262144,
+    "maxResultBytes": 16384,
+    "maxStatementJwsBytes": 16000,
+    "maxArtifactBytes": 16000,
+    "maxFctvBytes": 16057,
+    "validitySeconds": 60,
+    "futureIssuedToleranceSeconds": 60,
+    "networkDeadlineSeconds": 10,
+    "idempotencyRetentionHours": 24
+  },
+  "fctirReasons": [
+    { "discriminant": 1, "name": "user_requested" },
+    { "discriminant": 2, "name": "device_lost" },
+    { "discriminant": 3, "name": "key_compromised" },
+    { "discriminant": 4, "name": "admin_policy" },
+    { "discriminant": 5, "name": "instance_retired" }
+  ],
+  "statementLifetimes": {
+    "attempt": 300,
+    "activation": 900,
+    "denial": 60,
+    "status": 60,
+    "verifierCacheSeconds": 30,
+    "verifierSkewSeconds": 60,
+    "retentionFloorSeconds": 990
+  },
+  "crossProtocolMagics": {
+    "turn": "FCTR",
+    "relationshipConsent": "FCRS"
+  }
+}

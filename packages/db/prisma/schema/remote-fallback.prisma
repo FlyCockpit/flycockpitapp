@@ -1,0 +1,9 @@
+model RemoteFallbackRouteKeyWatermark {
+  deploymentId      String   @id
+  highestRevision   Decimal  @db.Decimal(20, 0)
+  currentGeneration Decimal  @db.Decimal(20, 0)
+  fileDigest        String
+  updatedAt         DateTime @updatedAt
+
+  @@map("remote_fallback_route_key_watermarks")
+}

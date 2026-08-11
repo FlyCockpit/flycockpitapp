@@ -1,0 +1,10 @@
+{
+  "name": "@flycockpit/cockpit-noise-wasm",
+  "version": "0.0.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "files": [
+    "generated"
+  ]
+}

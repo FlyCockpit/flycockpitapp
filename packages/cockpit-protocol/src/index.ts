@@ -1,6 +1,11 @@
 import { z } from "zod";
 import { canonicalU64DecimalStringSchema, decodeProtocolIdBase64Url } from "./remote-protocol-id";
 
+export * from "./remote-identity-protocol";
+export * from "./remote-noise-binding";
+export * from "./remote-websocket-fallback";
+export * from "./remote-wire-magic-registry";
+
 export * from "./dependency-health";
 export * from "./remote-connection-metadata";
 export * from "./remote-identity-protocol";

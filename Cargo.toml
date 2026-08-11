@@ -5,6 +5,7 @@ members = [
     "crates/cockpit-config",
     "crates/cockpit-core",
     "crates/cockpit-db",
+    "crates/cockpit-noise",
     "crates/cockpit-proto",
     "crates/cockpit-test-support",
     "crates/cockpit-tokenizer",

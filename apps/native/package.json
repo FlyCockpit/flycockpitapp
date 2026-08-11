@@ -11,10 +11,12 @@
     "ios": "expo start --ios",
     "web": "expo start --web",
     "check-types": "tsc --noEmit",
-    "test": "vitest run --passWithNoTests"
+    "test": "vitest run --passWithNoTests",
+    "cng:verify": "tsx scripts/cng-verify.ts"
   },
   "dependencies": {
     "@better-auth/expo": "catalog:",
+    "@config-plugins/react-native-webrtc": "15.0.1",
     "@expo/metro-runtime": "catalog:",
     "@expo/vector-icons": "catalog:",
     "@gorhom/bottom-sheet": "catalog:",
@@ -54,6 +56,7 @@
     "react-native-screens": "catalog:",
     "react-native-svg": "catalog:",
     "react-native-web": "catalog:",
+    "react-native-webrtc": "124.0.8",
     "react-native-worklets": "catalog:",
     "tailwind-merge": "catalog:",
     "tailwind-variants": "catalog:",
@@ -63,6 +66,7 @@
   },
   "devDependencies": {
     "@types/react": "catalog:",
+    "tsx": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:"
   }

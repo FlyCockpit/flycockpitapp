@@ -29,7 +29,8 @@
         {
           "photosPermission": "Allow Flycockpit to attach images to remote sessions."
         }
-      ]
+      ],
+      "@config-plugins/react-native-webrtc"
     ],
     "experiments": {
       "typedRoutes": true,

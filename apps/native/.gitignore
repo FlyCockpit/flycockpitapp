@@ -19,3 +19,8 @@ web-build/
 # UniWind generated types
 uniwind-types.d.ts
 
+# CNG verification outputs — repo-owned ignored root only.
+# Generated native projects live exclusively under this directory, never at
+# top-level ios/ or android/, and never under /tmp.
+.cng-verify/
+

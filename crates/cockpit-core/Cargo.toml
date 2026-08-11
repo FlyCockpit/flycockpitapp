@@ -102,6 +102,20 @@ zeroize = { workspace = true }
 # native-secure-sealed-state-store requires exactly 0.13.0 + zeroize feature.
 hmac = { version = "=0.13.0", default-features = false, features = ["zeroize"] }
 
+# TURN relay socket provider (`remote-rust-turn-socket-provider`).
+# Exact pins per prompt gates. `turn-client-proto` is the sans-I/O TURN
+# protocol state machine (RFC 5766/8656); `turn-client-rustls` adds TLS
+# transport. Both are MIT OR Apache-2.0, MSRV 1.80.0, edition 2021.
+# `default-features = false` + `std` only: disables the optional `openssl`
+# feature on turn-client-proto (OpenSSL/native-TLS is forbidden) and avoids
+# pulling any server/default features not required by the audited client path.
+# `turn-client-rustls` deliberately selects no crypto provider; the provider
+# installs `aws_lc_rs` explicitly once at process startup instead.
+turn-client-proto = { version = "=0.7.1", default-features = false, features = ["std"] }
+turn-client-rustls = { version = "=0.1.0", default-features = false, features = ["std"] }
+# System roots for TLS-to-TURN-server verification (rustls-native-certs).
+rustls-native-certs = { version = "0.8", default-features = false }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { workspace = true }
 zbus-secret-service-keyring-store = { version = "=1.0.0", default-features = false, features = ["rt-tokio-crypto-rust"] }

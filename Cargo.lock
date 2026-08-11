@@ -1229,6 +1229,7 @@ dependencies = [
  "cockpit-config",
  "cockpit-db",
  "futures",
+ "hmac 0.13.0",
  "quote",
  "serde",
  "serde_json",

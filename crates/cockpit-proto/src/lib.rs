@@ -36,6 +36,7 @@ pub mod remote_signaling_attempt_store;
 pub mod remote_tenant_authority_protocol;
 pub mod remote_signaling_attempt_store;
 pub mod remote_transport;
+pub mod remote_turn_ice_policy;
 pub mod remote_version;
 pub mod remote_wire_magic_registry;
 pub mod send_user_message_v2;

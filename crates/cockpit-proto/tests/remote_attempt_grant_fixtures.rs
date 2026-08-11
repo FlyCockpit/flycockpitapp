@@ -3,19 +3,14 @@
 //! Consumes `packages/cockpit-protocol/fixtures/remote/attempt-grants-v1.json`
 //! and asserts nonzero valid and malformed cases before structural comparison.
 use cockpit_proto::remote_public_service_policy::{
-    permission_ceiling_digest, RemoteAttachmentCapabilityV1, RemotePermissionCeilingV1,
-    RemoteProjectCapabilityV1, TRANSPORT_BITS_VALID,
-};
-use cockpit_proto::remote_signaling_attempt_store::{
-    daemon_admission_offer_digest, final_proof_set_digest, validate_fcdo, validate_fccp,
-    RemoteEndpointFinalProofV1,
+    permission_ceiling_digest, RemotePermissionCeilingV1, TRANSPORT_BITS_VALID,
 };
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Fixture {
+    #[allow(dead_code)]
     version: u64,
     limits: Limits,
     valid_grants: Vec<GrantEntry>,
@@ -51,6 +46,7 @@ struct GrantEntry {
 #[serde(rename_all = "camelCase")]
 struct MalformedEntry {
     id: String,
+    #[allow(dead_code)]
     field: String,
     #[allow(dead_code)]
     value: serde_json::Value,
@@ -131,7 +127,8 @@ fn object_keys(value: &serde_json::Value) -> Vec<String> {
 
 fn assert_exact_keys(value: &serde_json::Value, required: &[&str], context: &str) {
     let keys = object_keys(value);
-    let expected: Vec<String> = required.iter().map(|s| s.to_string()).collect();
+    let mut expected: Vec<String> = required.iter().map(|s| s.to_string()).collect();
+    expected.sort();
     assert_eq!(keys, expected, "key mismatch in {context}");
 }
 
@@ -158,6 +155,22 @@ fn assert_alias_22(value: &serde_json::Value, field: &str) {
             );
         }
         _ => panic!("{field} must be a string alias, got {value}"),
+    }
+}
+
+/// RFC 7638 P-256 thumbprint: 43-char base64url without padding (SHA-256
+/// of the canonical JWK). This is NOT a hex digest.
+fn assert_p256_thumbprint(value: &serde_json::Value, field: &str) {
+    match value {
+        serde_json::Value::String(s) => {
+            assert_eq!(
+                s.len(),
+                43,
+                "{field} P-256 thumbprint must be 43-char base64url, got {} chars",
+                s.len()
+            );
+        }
+        _ => panic!("{field} must be a string thumbprint, got {value}"),
     }
 }
 
@@ -224,7 +237,7 @@ fn validate_grant_payload(payload: &serde_json::Value, fixture: &Fixture) {
         assert_alias_22(&id_obj["deviceId"], &format!("{side}.deviceId"));
         assert_alias_22(&id_obj["certificateId"], &format!("{side}.certificateId"));
         assert_decimal_string(&id_obj["generation"], &format!("{side}.generation"));
-        assert_digest_hex_64(&id_obj["p256Thumbprint"], &format!("{side}.p256Thumbprint"));
+        assert_p256_thumbprint(&id_obj["p256Thumbprint"], &format!("{side}.p256Thumbprint"));
     }
 
     // Top-level aliases.
@@ -310,7 +323,7 @@ fn validate_grant_payload(payload: &serde_json::Value, fixture: &Fixture) {
             "projectId must be 22-char base64url or 32-char hex"
         );
         if let Some(prev_id) = &prev_pid {
-            assert!(pid > prev_id, "projectIds must be sorted ascending");
+            assert!(pid > prev_id.as_str(), "projectIds must be sorted ascending");
         }
         prev_pid = Some(pid.to_string());
         let caps = proj["capabilities"].as_array().expect("capabilities must be array");

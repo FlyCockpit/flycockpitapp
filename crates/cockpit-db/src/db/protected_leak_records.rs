@@ -344,6 +344,63 @@ impl Db {
         self.read(move |conn| get_leak_record_conn(conn, &report_id))
             .await
     }
+
+    /// Machine-wide Owner list of safe leak-record refs, newest-first, with
+    /// stable paging. Optional `session_filter` narrows to one session
+    /// without changing ownership scope; `None` means all Owner-visible
+    /// machine records. The cursor is the opaque `(last_seen_ms, report_id)`
+    /// pair from the prior page's last row; `None` starts a new traversal.
+    /// Only `contained`/`rotated`/`superseded` rows are listable.
+    pub async fn protected_leak_records_machine_refs(
+        &self,
+        session_filter: Option<&str>,
+        cursor: Option<LeakListCursor>,
+        limit: i64,
+    ) -> Result<Vec<ProtectedLeakRecordRef>> {
+        let session_filter = session_filter.map(str::to_owned);
+        let cursor = cursor.map(|c| (c.last_seen_ms, c.report_id));
+        self.read(move |conn| {
+            list_machine_refs_conn(conn, session_filter.as_deref(), cursor.as_ref(), limit)
+        })
+        .await
+    }
+
+    /// Update the rotation disposition of a leak record. Metadata-only,
+    /// reversible, and owner-scoped. A fresh re-report clears it to `none`.
+    pub async fn protected_leak_record_set_rotation(
+        &self,
+        report_id: &str,
+        rotation: LeakRotation,
+    ) -> Result<()> {
+        let report_id = report_id.to_owned();
+        self.write(move |conn| set_rotation_conn(conn, &report_id, rotation))
+            .await
+    }
+
+    /// Delete the protected plaintext/ciphertext for a leak record while
+    /// retaining safe historical report metadata. Sets status to `deleted`,
+    /// stamps `retired_at_ms`, and retires the protected-redaction-history
+    /// row so future recovery fails closed. The safe report metadata
+    /// (source, category, provenance, timestamps, rotation) is retained.
+    pub async fn protected_leak_record_delete_protected_value(
+        &self,
+        report_id: &str,
+        now_ms: i64,
+    ) -> Result<()> {
+        let report_id = report_id.to_owned();
+        self.write(move |conn| delete_protected_value_conn(conn, &report_id, now_ms))
+            .await
+    }
+}
+
+/// Opaque paging cursor for the machine-wide leak list. Binds the
+/// `(last_seen_ms, report_id)` ordering key from the last row of the prior
+/// page. The leaks-page layer wraps this with owner/scope/filter/high-watermark
+/// bindings before handing it to the daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeakListCursor {
+    pub last_seen_ms: i64,
+    pub report_id: String,
 }
 
 // ---- Connection-scoped writers (compose inside one transaction) ------------
@@ -454,6 +511,46 @@ pub fn retire_leak_record_conn(conn: &Connection, report_id: &str, now_ms: i64) 
     Ok(())
 }
 
+/// Update the rotation disposition of a leak record. Metadata-only and
+/// reversible; a fresh re-report clears it to `none`. Connection-scoped so
+/// callers compose it inside one transaction if needed.
+pub fn set_rotation_conn(conn: &Connection, report_id: &str, rotation: LeakRotation) -> Result<()> {
+    let n = conn
+        .execute(
+            "UPDATE protected_leak_records SET rotation = ?1 WHERE report_id = ?2",
+            params![rotation.as_str(), report_id],
+        )
+        .context("updating protected leak record rotation")?;
+    if n == 0 {
+        bail!("protected leak record not found: {report_id}");
+    }
+    Ok(())
+}
+
+/// Delete the protected plaintext/ciphertext for a leak record while
+/// retaining safe historical report metadata. Sets status to `deleted`,
+/// stamps `retired_at_ms`, and retires the protected-redaction-history row so
+/// future recovery fails closed. The safe report metadata is retained.
+/// Connection-scoped so callers compose it inside one transaction with the
+/// history retirement.
+pub fn delete_protected_value_conn(conn: &Connection, report_id: &str, now_ms: i64) -> Result<()> {
+    let row = get_leak_record_conn(conn, report_id)?
+        .ok_or_else(|| anyhow::anyhow!("protected leak record not found: {report_id}"))?;
+    crate::db::protected_redaction_history::retire_history_conn(conn, &row.history_id)?;
+    let n = conn
+        .execute(
+            "UPDATE protected_leak_records
+             SET status = 'deleted', retired_at_ms = ?1
+             WHERE report_id = ?2",
+            params![now_ms, report_id],
+        )
+        .context("deleting protected leak record value")?;
+    if n == 0 {
+        bail!("protected leak record not found: {report_id}");
+    }
+    Ok(())
+}
+
 // ---- Connection-scoped readers --------------------------------------------
 
 /// Load one leak record by report id (full row).
@@ -546,6 +643,63 @@ pub fn count_recent_conn(conn: &Connection, session_id: &str, since_ms: i64) -> 
         |row| row.get(0),
     )
     .context("counting recent protected leak records")
+}
+
+/// Machine-wide Owner list of safe leak-record refs, newest-first, with
+/// stable paging. Optional `session_filter` narrows to one session without
+/// changing ownership scope. The cursor is the opaque
+/// `(last_seen_ms, report_id)` pair from the prior page's last row; `None`
+/// starts a new traversal. Only `contained`/`rotated`/`superseded` rows are
+/// listable. `limit` is clamped to 1..=100 by the caller; this function
+/// trusts the caller's bound.
+pub fn list_machine_refs_conn(
+    conn: &Connection,
+    session_filter: Option<&str>,
+    cursor: Option<&(i64, String)>,
+    limit: i64,
+) -> Result<Vec<ProtectedLeakRecordRef>> {
+    let mut sql = String::from(
+        "SELECT report_id, session_id, history_id, leak_fingerprint, source, category,
+                provider_id, model_id, generation, connector_id, status, seen_count,
+                rotation, first_reported_ms, last_reported_ms, contained_at_ms, retired_at_ms
+         FROM protected_leak_records
+         WHERE status IN ('contained', 'rotated', 'superseded')",
+    );
+    let mut param_index = 1;
+    let mut params_vec: Vec<rusqlite::types::Value> = Vec::new();
+
+    if let Some(sid) = session_filter {
+        sql.push_str(&format!(" AND session_id = ?{param_index}"));
+        params_vec.push(rusqlite::types::Value::from(sid.to_owned()));
+        param_index += 1;
+    }
+    if let Some((last_seen_ms, report_id)) = cursor {
+        sql.push_str(&format!(
+            " AND (last_reported_ms < ?{param_index} OR (last_reported_ms = ?{param_index} AND report_id < ?{}))",
+            param_index + 1
+        ));
+        params_vec.push(rusqlite::types::Value::from(*last_seen_ms));
+        params_vec.push(rusqlite::types::Value::from(report_id.to_owned()));
+        param_index += 2;
+    }
+    sql.push_str(&format!(
+        " ORDER BY last_reported_ms DESC, report_id DESC LIMIT ?{param_index}"
+    ));
+    params_vec.push(rusqlite::types::Value::from(limit));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::ToSql> = params_vec
+        .iter()
+        .map(|v| v as &dyn rusqlite::ToSql)
+        .collect();
+    let rows = stmt.query_map(params.as_slice(), map_leak_row)?;
+    let records: Vec<ProtectedLeakRecord> = rows
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("listing machine-wide protected leak records")?;
+    Ok(records
+        .iter()
+        .map(ProtectedLeakRecordRef::from_row)
+        .collect())
 }
 
 // ---- Row mappers -----------------------------------------------------------

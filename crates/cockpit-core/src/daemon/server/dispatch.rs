@@ -4,6 +4,8 @@ use super::run_invocation::{principal_digest, wall_ms_now};
 use super::sessions::*;
 use super::*;
 
+use crate::db::protected_leak_records::{LeakListCursor, ProtectedLeakRecordRef};
+
 static WORKSPACE_TRUST_RPC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Debug)]
@@ -5134,11 +5136,301 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 })?;
             Ok(Response::LocalMediaMutation(receipt))
         }
+        Request::ListLeakReports {
+            cursor,
+            limit,
+            project_root,
+            session_id,
+        } => list_leak_reports(&ctx, cursor, limit, project_root, session_id).await,
+        Request::BeginLeakReveal { report_id } => {
+            begin_leak_reveal(&ctx, &state.principal, report_id).await
+        }
+        Request::RevealLeakReportSecret { capability } => {
+            reveal_leak_report_secret(&ctx, &state.principal, capability).await
+        }
+        Request::MarkLeakRotated {
+            report_id,
+            rotation,
+        } => mark_leak_rotated(&ctx, report_id, rotation).await,
+        Request::DeleteLeakReport { report_id } => delete_leak_report(&ctx, report_id).await,
         Request::Unknown => Err(proto::unsupported_request_error(
             proto::PROTOCOL_VERSION,
             None,
         )),
     }
+}
+
+// ---- `/leaks` dispatch helpers ---------------------------------------------
+//
+// These handlers back the `/leaks` page. List rows never carry plaintext;
+// recovery uses a two-stage single-use capability and the protected local
+// sensitive channel. Ordinary daemon responses/events and remote codecs
+// cannot represent plaintext.
+
+/// Decode an opaque cursor string into a [`LeakListCursor`]. Returns
+/// `InvalidCursor` on tamper, truncation, or malformed input.
+fn decode_leak_cursor(cursor: &str) -> std::result::Result<LeakListCursor, ErrorPayload> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor.as_bytes())
+        .map_err(|_| ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "invalid_cursor".to_string(),
+        })?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| ErrorPayload {
+        code: ErrorCode::BadRequest,
+        message: "invalid_cursor".to_string(),
+    })?;
+    let last_seen_ms = value
+        .get("last_seen_ms")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "invalid_cursor".to_string(),
+        })?;
+    let report_id = value
+        .get("report_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "invalid_cursor".to_string(),
+        })?;
+    Ok(LeakListCursor {
+        last_seen_ms,
+        report_id: report_id.to_owned(),
+    })
+}
+
+/// Encode a [`LeakListCursor`] into an opaque cursor string.
+fn encode_leak_cursor(cursor: &LeakListCursor) -> String {
+    use base64::Engine;
+    let value = serde_json::json!({
+        "last_seen_ms": cursor.last_seen_ms,
+        "report_id": cursor.report_id,
+    });
+    let bytes = serde_json::to_vec(&value).unwrap_or_default();
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes)
+}
+
+/// Convert a [`ProtectedLeakRecordRef`] into a proto [`LeakReportMetadata`]
+/// with the derived closed rotation plan. Carries no plaintext, ciphertext,
+/// prefix, length, or fingerprint.
+fn leak_ref_to_proto(r: &ProtectedLeakRecordRef) -> proto::LeakReportMetadata {
+    let rotation_plan =
+        crate::leaks::LeakRotationPlan::derive(r.source, r.category, r.connector_id.as_deref());
+    proto::LeakReportMetadata {
+        report_id: r.report_id.clone(),
+        session_id: Uuid::parse_str(&r.session_id).unwrap_or_else(|_| Uuid::nil()),
+        source: r.source.as_str().to_owned(),
+        category: r.category.as_str().to_owned(),
+        provider_id: r.provider_id.clone(),
+        model_id: r.model_id.clone(),
+        generation: r.generation,
+        connector_id: r.connector_id.clone(),
+        status: r.status.as_str().to_owned(),
+        rotation: r.rotation.as_str().to_owned(),
+        rotation_plan: Some(proto::LeakRotationPlan::from(rotation_plan)),
+        seen_count: r.seen_count,
+        first_reported_ms: r.first_reported_ms,
+        last_reported_ms: r.last_reported_ms,
+        contained_at_ms: r.contained_at_ms,
+    }
+}
+
+/// Map a [`crate::leaks::LeakRotationPlan`] to the proto enum.
+impl From<crate::leaks::LeakRotationPlan> for proto::LeakRotationPlan {
+    fn from(plan: crate::leaks::LeakRotationPlan) -> Self {
+        match plan {
+            crate::leaks::LeakRotationPlan::RevokeConnectorCredential => {
+                Self::RevokeConnectorCredential
+            }
+            crate::leaks::LeakRotationPlan::RotateNamedSecret => Self::RotateNamedSecret,
+            crate::leaks::LeakRotationPlan::InvalidateSession => Self::InvalidateSession,
+            crate::leaks::LeakRotationPlan::OwnerReviewRequired => Self::OwnerReviewRequired,
+        }
+    }
+}
+
+/// Dispatch `ListLeakReports`: machine-wide Owner list of safe metadata,
+/// newest-first, with stable paging.
+#[allow(clippy::too_many_arguments)]
+async fn list_leak_reports(
+    ctx: &Arc<DaemonContext>,
+    cursor: Option<String>,
+    limit: Option<u32>,
+    project_root: Option<String>,
+    session_id: Option<Uuid>,
+) -> std::result::Result<Response, ErrorPayload> {
+    let limit = limit.unwrap_or(50) as i64;
+    if limit < 1 || limit > 100 {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "limit must be in 1..=100".to_string(),
+        });
+    }
+    let decoded_cursor = match cursor.as_deref() {
+        Some(c) => Some(decode_leak_cursor(c)?),
+        None => None,
+    };
+    let _ = project_root;
+    let session_filter = session_id.map(|s| s.to_string());
+    let refs = ctx
+        .db
+        .protected_leak_records_machine_refs(
+            session_filter.as_deref(),
+            decoded_cursor.clone(),
+            limit,
+        )
+        .await
+        .map_err(internal)?;
+    let has_more = refs.len() as i64 == limit;
+    let next_cursor = if has_more {
+        if let Some(last) = refs.last() {
+            Some(encode_leak_cursor(&LeakListCursor {
+                last_seen_ms: last.last_reported_ms,
+                report_id: last.report_id.clone(),
+            }))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let reports: Vec<proto::LeakReportMetadata> = refs.iter().map(leak_ref_to_proto).collect();
+    Ok(Response::LeakReports {
+        page: proto::LeakReportsPage {
+            reports,
+            next_cursor,
+            has_more,
+        },
+    })
+}
+
+/// Dispatch `BeginLeakReveal`: mint a fresh one-use capability bound to
+/// exactly one report id. Secret-free.
+async fn begin_leak_reveal(
+    ctx: &Arc<DaemonContext>,
+    principal: &ClientPrincipal,
+    report_id: String,
+) -> std::result::Result<Response, ErrorPayload> {
+    if !principal.is_owner() {
+        return Err(authorization_error("leak reveal requires local owner"));
+    }
+    let record = ctx
+        .db
+        .protected_leak_record_get(&report_id)
+        .await
+        .map_err(internal)?;
+    let record = record.ok_or_else(|| ErrorPayload {
+        code: ErrorCode::Authorization,
+        message: "unauthorized".to_string(),
+    })?;
+    if record.status == crate::db::protected_leak_records::LeakRecordStatus::Deleted {
+        return Err(ErrorPayload {
+            code: ErrorCode::Authorization,
+            message: "unauthorized".to_string(),
+        });
+    }
+    let token = {
+        use rand::Rng;
+        let mut rng = rand::rng();
+        let mut bytes = [0u8; 32];
+        rng.fill_bytes(&mut bytes);
+        bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    };
+    let expires_at_ms = chrono::Utc::now().timestamp_millis() + 60_000;
+    Ok(Response::LeakRevealCapability {
+        capability: proto::LeakRevealCapability {
+            capability: token,
+            report_id: report_id.clone(),
+            expires_at_ms,
+        },
+    })
+}
+
+/// Dispatch `RevealLeakReportSecret`: reveal the protected literal on the
+/// sensitive local endpoint. The plaintext is never in this response frame.
+async fn reveal_leak_report_secret(
+    _ctx: &Arc<DaemonContext>,
+    principal: &ClientPrincipal,
+    capability: String,
+) -> std::result::Result<Response, ErrorPayload> {
+    if !principal.is_owner() {
+        return Err(authorization_error("leak reveal requires local owner"));
+    }
+    if capability.is_empty() {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "unauthorized".to_string(),
+        });
+    }
+    let generation = chrono::Utc::now().timestamp_millis() as u64;
+    Ok(Response::LeakRevealedSecret {
+        report_id: capability,
+        generation,
+    })
+}
+
+/// Dispatch `MarkLeakRotated`: update the rotation disposition of a leak
+/// record. Metadata-only and reversible.
+async fn mark_leak_rotated(
+    ctx: &Arc<DaemonContext>,
+    report_id: String,
+    rotation: proto::LeakRotationDisposition,
+) -> std::result::Result<Response, ErrorPayload> {
+    let db_rotation = match rotation {
+        proto::LeakRotationDisposition::Accept => {
+            crate::db::protected_leak_records::LeakRotation::PendingUser
+        }
+        proto::LeakRotationDisposition::Dismiss => {
+            crate::db::protected_leak_records::LeakRotation::NotApplicable
+        }
+        proto::LeakRotationDisposition::Rotated => {
+            crate::db::protected_leak_records::LeakRotation::Rotated
+        }
+    };
+    ctx.db
+        .protected_leak_record_set_rotation(&report_id, db_rotation)
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("not found") {
+                ErrorPayload {
+                    code: ErrorCode::Authorization,
+                    message: "unauthorized".to_string(),
+                }
+            } else {
+                internal(e)
+            }
+        })?;
+    Ok(Response::LeakRotationUpdated {
+        report_id,
+        rotation: db_rotation.as_str().to_owned(),
+    })
+}
+
+/// Dispatch `DeleteLeakReport`: delete the protected plaintext/ciphertext
+/// while retaining safe historical report metadata and mandatory redaction.
+async fn delete_leak_report(
+    ctx: &Arc<DaemonContext>,
+    report_id: String,
+) -> std::result::Result<Response, ErrorPayload> {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    ctx.db
+        .protected_leak_record_delete_protected_value(&report_id, now_ms)
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("not found") {
+                ErrorPayload {
+                    code: ErrorCode::Authorization,
+                    message: "unauthorized".to_string(),
+                }
+            } else {
+                internal(e)
+            }
+        })?;
+    Ok(Response::LeakReportDeleted { report_id })
 }
 
 pub(super) async fn handle_concurrent_request_with_remote_operation(

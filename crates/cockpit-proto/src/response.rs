@@ -214,6 +214,34 @@ pub enum Response {
         values: Vec<SealedValueMetadata>,
     },
 
+    /// `/leaks` list response: a page of safe leak-report metadata. Never
+    /// carries plaintext, ciphertext, prefix, length, or fingerprint.
+    LeakReports {
+        page: LeakReportsPage,
+    },
+    /// BeginLeakReveal response: a fresh one-use capability bound to exactly
+    /// one report id. Secret-free.
+    LeakRevealCapability {
+        capability: LeakRevealCapability,
+    },
+    /// RevealLeakReportSecret response: an acknowledgement with a generation
+    /// id the TUI uses to invalidate stale buffers. The plaintext is never in
+    /// this frame; it travels only on the protected local sensitive channel.
+    LeakRevealedSecret {
+        report_id: String,
+        generation: u64,
+    },
+    /// MarkLeakRotated response: the updated rotation disposition.
+    LeakRotationUpdated {
+        report_id: String,
+        rotation: String,
+    },
+    /// DeleteLeakReport response: the protected value was deleted; safe
+    /// historical metadata is retained.
+    LeakReportDeleted {
+        report_id: String,
+    },
+
     ProjectNotes {
         notes: Vec<ProjectNote>,
     },
@@ -785,6 +813,11 @@ macro_rules! response_variants {
             (Response::PinsWithText { .. }, "pins_with_text");
             (Response::PinState { .. }, "pin_state");
             (Response::SealedValues { .. }, "sealed_values");
+            (Response::LeakReports { .. }, "leak_reports");
+            (Response::LeakRevealCapability { .. }, "leak_reveal_capability");
+            (Response::LeakRevealedSecret { .. }, "leak_revealed_secret");
+            (Response::LeakRotationUpdated { .. }, "leak_rotation_updated");
+            (Response::LeakReportDeleted { .. }, "leak_report_deleted");
             (Response::ProjectNotes { .. }, "project_notes");
             (Response::ProjectNoteCreated { .. }, "project_note_created");
             (Response::ProjectNoteRenamed { .. }, "project_note_renamed");
@@ -940,6 +973,55 @@ mod tests {
         assert_eq!(
             Response::SealedValues { values: Vec::new() }.wire_tag(),
             "sealed_values"
+        );
+    }
+
+    #[test]
+    fn leak_response_variants_are_registered() {
+        assert_eq!(
+            Response::LeakReports {
+                page: LeakReportsPage {
+                    reports: Vec::new(),
+                    next_cursor: None,
+                    has_more: false,
+                }
+            }
+            .wire_tag(),
+            "leak_reports"
+        );
+        assert_eq!(
+            Response::LeakRevealCapability {
+                capability: LeakRevealCapability {
+                    capability: String::new(),
+                    report_id: String::new(),
+                    expires_at_ms: 0,
+                }
+            }
+            .wire_tag(),
+            "leak_reveal_capability"
+        );
+        assert_eq!(
+            Response::LeakRevealedSecret {
+                report_id: String::new(),
+                generation: 0,
+            }
+            .wire_tag(),
+            "leak_revealed_secret"
+        );
+        assert_eq!(
+            Response::LeakRotationUpdated {
+                report_id: String::new(),
+                rotation: String::new(),
+            }
+            .wire_tag(),
+            "leak_rotation_updated"
+        );
+        assert_eq!(
+            Response::LeakReportDeleted {
+                report_id: String::new(),
+            }
+            .wire_tag(),
+            "leak_report_deleted"
         );
     }
 

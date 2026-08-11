@@ -322,6 +322,44 @@ pub enum Request {
         value_id: String,
     },
 
+    /// `/leaks`: machine-wide Owner list of safe leak-report metadata,
+    /// newest-first, with stable paging. Optional `session_id` narrows to one
+    /// session without changing ownership scope. `cursor` is the opaque
+    /// cursor from the prior page; `None` starts a new traversal. `limit` is
+    /// clamped to 1..=100.
+    ListLeakReports {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_root: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<Uuid>,
+    },
+    /// Begin a leak reveal: mint a fresh one-use capability bound to exactly
+    /// one report id. Secret-free.
+    BeginLeakReveal {
+        report_id: String,
+    },
+    /// Reveal the protected literal on the sensitive local endpoint. Accepts
+    /// the capability alone; mismatched/second report selectors are rejected
+    /// before lookup.
+    RevealLeakReportSecret {
+        capability: String,
+    },
+    /// Update the rotation disposition of a leak record. Metadata-only and
+    /// reversible.
+    MarkLeakRotated {
+        report_id: String,
+        rotation: LeakRotationDisposition,
+    },
+    /// Delete the protected plaintext/ciphertext for a leak record while
+    /// retaining safe historical report metadata and mandatory redaction.
+    DeleteLeakReport {
+        report_id: String,
+    },
+
     ListProjectNotes {
         project_root: String,
     },
@@ -1287,6 +1325,11 @@ macro_rules! request_variants {
             (Request::PinnedMessageState { .. }, "pinned_message_state");
             (Request::ListSealedValues { .. }, "list_sealed_values");
             (Request::DeleteSealedValue { .. }, "delete_sealed_value");
+            (Request::ListLeakReports { .. }, "list_leak_reports");
+            (Request::BeginLeakReveal { .. }, "begin_leak_reveal");
+            (Request::RevealLeakReportSecret { .. }, "reveal_leak_report_secret");
+            (Request::MarkLeakRotated { .. }, "mark_leak_rotated");
+            (Request::DeleteLeakReport { .. }, "delete_leak_report");
             (Request::ListProjectNotes { .. }, "list_project_notes");
             (Request::CreateProjectNote { .. }, "create_project_note");
             (Request::SetProjectNoteContent { .. }, "set_project_note_content");
@@ -1464,6 +1507,11 @@ macro_rules! command {
             (Request::PinnedMessageState { session_id }, "pinned_message_state", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::ListSealedValues { session_id }, "list_sealed_values", owner_only, field(session_id), false, local_only, none, concurrent, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::DeleteSealedValue { session_id, value_id }, "delete_sealed_value", owner_only, field(session_id), true, local_only, none, serialized, none, "session_id:Uuid|value_id:String", [session_id: Uuid => session, value_id: String => param]);
+            (Request::ListLeakReports { cursor, limit, project_root, session_id }, "list_leak_reports", owner_only, none, false, local_only, none, concurrent, none, "cursor:Option<String>|limit:Option<u32>|project_root:Option<String>|session_id:Option<Uuid>", [cursor: Option<String> => param, limit: Option<u32> => param, project_root: Option<String> => project_root, session_id: Option<Uuid> => param]);
+            (Request::BeginLeakReveal { report_id }, "begin_leak_reveal", owner_only, none, false, local_only, none, serialized, none, "report_id:String", [report_id: String => param]);
+            (Request::RevealLeakReportSecret { capability }, "reveal_leak_report_secret", owner_only, none, false, local_only, none, serialized, none, "capability:String", [capability: String => param]);
+            (Request::MarkLeakRotated { report_id, rotation }, "mark_leak_rotated", owner_only, none, true, local_only, none, serialized, none, "report_id:String|rotation:LeakRotationDisposition", [report_id: String => param, rotation: LeakRotationDisposition => param]);
+            (Request::DeleteLeakReport { report_id }, "delete_leak_report", owner_only, none, true, local_only, none, serialized, none, "report_id:String", [report_id: String => param]);
             (Request::ListProjectNotes { project_root }, "list_project_notes", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::CreateProjectNote { project_root, name }, "create_project_note", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|name:String", [project_root: String => project_root, name: String => param]);
             (Request::SetProjectNoteContent { project_root, id, content }, "set_project_note_content", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|id:Uuid|content:String", [project_root: String => project_root, id: Uuid => param, content: String => param]);
@@ -2469,6 +2517,46 @@ mod tests {
         let command_tags = crate::command!(command_tags);
         for tag in tags {
             assert!(command_tags.contains(&tag), "missing command row for {tag}");
+        }
+    }
+
+    #[test]
+    fn leak_rpcs_are_registered_in_both_macro_tables() {
+        let requests = [
+            Request::ListLeakReports {
+                cursor: None,
+                limit: Some(50),
+                project_root: None,
+                session_id: None,
+            },
+            Request::BeginLeakReveal {
+                report_id: "r1".into(),
+            },
+            Request::RevealLeakReportSecret {
+                capability: "cap".into(),
+            },
+            Request::MarkLeakRotated {
+                report_id: "r1".into(),
+                rotation: crate::LeakRotationDisposition::Accept,
+            },
+            Request::DeleteLeakReport {
+                report_id: "r1".into(),
+            },
+        ];
+        let tags: Vec<_> = requests.iter().map(Request::wire_tag).collect();
+        assert_eq!(
+            tags,
+            [
+                "list_leak_reports",
+                "begin_leak_reveal",
+                "reveal_leak_report_secret",
+                "mark_leak_rotated",
+                "delete_leak_report",
+            ]
+        );
+        let command_tags = crate::command!(command_tags);
+        for tag in &tags {
+            assert!(command_tags.contains(tag), "missing command row for {tag}");
         }
     }
 

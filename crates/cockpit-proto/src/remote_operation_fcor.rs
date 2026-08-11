@@ -316,6 +316,11 @@ canonical_unit_enum16!(cockpit_db::db::session_goals::GoalDisposition, {
     Complete = 7,
     Cleared = 8,
 });
+canonical_unit_enum16!(crate::LeakRotationDisposition, {
+    Accept = 1,
+    Dismiss = 2,
+    Rotated = 3,
+});
 
 macro_rules! canonical_struct {
     ($ty:ty, $value:ident, $out:ident, [$($field:ident),+ $(,)?]) => {

@@ -2380,6 +2380,53 @@ impl App {
         );
     }
 
+    /// Handle the `/leaks` command: list, rotate, or delete contained leak
+    /// reports machine-wide. Uses metadata-only Owner RPCs; recovery uses
+    /// the protected local sensitive channel.
+    pub(super) fn handle_leaks_command(&mut self, args: &str) {
+        let Some(request) = leaks_request(args) else {
+            self.push_plain(
+                "/leaks: usage `/leaks`, `/leaks list`, `/leaks rotate <id> <accept|dismiss|rotated>`, `/leaks delete <id>`"
+                    .to_string(),
+            );
+            return;
+        };
+        let label = match &request {
+            cockpit_core::daemon::proto::Request::ListLeakReports { .. } => "leaks-list",
+            cockpit_core::daemon::proto::Request::MarkLeakRotated { .. } => "leaks-rotate",
+            cockpit_core::daemon::proto::Request::DeleteLeakReport { .. } => "leaks-delete",
+            _ => "leaks",
+        };
+        self.async_actions.start_blocking(
+            AsyncActionKind::DaemonRpc(label),
+            AsyncActionPolicy::AllowConcurrent,
+            move || match agent_runner::daemon_request_blocking(request) {
+                Ok(cockpit_core::daemon::proto::Response::LeakReports { page }) => {
+                    let text = format_leak_reports(&page);
+                    Ok(AsyncActionPayload::Text(text))
+                }
+                Ok(cockpit_core::daemon::proto::Response::LeakRotationUpdated {
+                    report_id,
+                    rotation,
+                }) => Ok(AsyncActionPayload::Text(format!(
+                    "/leaks: rotated {report_id} -> {rotation}"
+                ))),
+                Ok(cockpit_core::daemon::proto::Response::LeakReportDeleted { report_id }) => {
+                    Ok(AsyncActionPayload::Text(format!(
+                        "/leaks: deleted protected value for {report_id}; safe metadata retained"
+                    )))
+                }
+                Ok(cockpit_core::daemon::proto::Response::Error(err)) => {
+                    Ok(AsyncActionPayload::Text(format!("/leaks: {}", err.message)))
+                }
+                Ok(other) => Ok(AsyncActionPayload::Text(format!(
+                    "/leaks: unexpected response: {other:?}"
+                ))),
+                Err(e) => Ok(AsyncActionPayload::Text(format!("/leaks: {e:#}"))),
+            },
+        );
+    }
+
     pub(super) fn handle_sealed_command(&mut self, args: &str) {
         if !self.daemon_connected {
             self.push_plain("/sealed: a running session is required".to_string());

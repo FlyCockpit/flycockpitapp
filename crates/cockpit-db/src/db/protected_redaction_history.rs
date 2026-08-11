@@ -255,6 +255,18 @@ impl Db {
         self.write(move |conn| retire_zero_ref_conn(conn, &session_id))
             .await
     }
+
+    /// Load one protected redaction-history row by id (full row, including
+    /// encrypted material). Owner-sensitive read only; used by the leaks-page
+    /// reveal path to rehydrate the literal on the protected local channel.
+    pub async fn protected_redaction_history_get(
+        &self,
+        history_id: &str,
+    ) -> Result<Option<ProtectedRedactionHistoryRow>> {
+        let history_id = history_id.to_owned();
+        self.read(move |conn| get_history_conn(conn, &history_id))
+            .await
+    }
 }
 
 // ---- Connection-scoped writers (compose inside one transaction) ------------

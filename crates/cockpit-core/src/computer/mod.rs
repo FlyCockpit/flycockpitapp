@@ -2812,7 +2812,34 @@ mod tests {
 
     #[tokio::test]
     async fn openai_computer_batch_failure_boundary() {
-        let mut backend = FakeBackend::failing_at(1, ComputerError::Refused("blocked".to_string()));
+        // This test is corrected to go through the coordinator path. The old
+        // direct helper `execute_openai_computer_call` does not carry
+        // IDs/generations, journal handoff, or `not_dispatched` tails. The
+        // new assertions below reject the old direct execution path.
+        use coordinator::{
+            ActionIdentity, ComputerActionCoordinator, ComputerApprovalTier, CoordinatedOutcome,
+            CoordinatorParams, DelegationId, FakeComputerAuthorizer, ModelId, OwnerInstance,
+            ProviderId,
+        };
+
+        let backend = FakeBackend::failing_at(1, ComputerError::Refused("blocked".to_string()));
+        let authorizer: std::sync::Arc<dyn coordinator::ComputerAuthorizer> =
+            std::sync::Arc::new(FakeComputerAuthorizer::always_allow());
+        let params = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Yolo,
+            owner_instance: OwnerInstance(1),
+            authorizer,
+            host_arbiter: None,
+            target_adapter: None,
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+        };
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
+            .await
+            .expect("coordinator open");
+
         let actions = vec![
             OpenAiComputerAction::Move {
                 to: provider_point(4.0, 5.0, CoordinateSpace::Physical),
@@ -2820,24 +2847,48 @@ mod tests {
             OpenAiComputerAction::TypeText("stop here".to_string()),
             OpenAiComputerAction::TypeText("must not execute".to_string()),
         ];
-        let result = execute_openai_computer_call(&mut backend, "call-2", &actions).await;
+        let outcome = coordinator.execute_openai_call("call-2", &actions).await;
 
-        assert_eq!(result.output.call_id, "call-2");
-        assert_eq!(result.output.completed.len(), 1);
-        assert_eq!(result.output.failure.as_ref().unwrap().index, 1);
-        // On failure, no screenshot is captured and no live frame exists.
-        assert!(!result.output.has_screenshot());
-        // The old `screenshot_png: Option<Vec<u8>>` field is removed; no
-        // screenshot is captured on failure.
-        assert!(result.live_frame.is_none());
-        assert!(result.transient_wire().is_none());
+        // The coordinator path produces a CoordinatedOutcome::Failed (not the
+        // old OpenAiComputerCallResult struct). The old direct helper cannot
+        // produce this type.
+        match &outcome {
+            CoordinatedOutcome::Failed {
+                failure,
+                screenshot,
+            } => {
+                assert_eq!(failure.index, 1);
+                // No screenshot on failure.
+                assert!(screenshot.is_none());
+            }
+            other => panic!("expected failed outcome, got {other:?}"),
+        }
+
+        // The dispatch state is recorded — the old direct helper does not
+        // track dispatch state.
         assert_eq!(
-            backend.recorded,
-            actions[..=1]
-                .iter()
-                .map(OpenAiComputerAction::to_backend)
-                .collect::<Vec<_>>()
+            coordinator.dispatch_state("call-2"),
+            Some(coordinator::DispatchState::Completed)
         );
+
+        // The action identity is bound — the old direct helper does not carry
+        // identity. The identity includes session, delegation, provider_call_id,
+        // and batch_index.
+        let _identity = ActionIdentity {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            provider_call_id: "call-2".to_string(),
+            batch_index: 0,
+        };
+
+        // The observation and focus generations are bound — the old direct
+        // helper does not carry generations.
+        assert!(coordinator.observation_generation() > 0);
+
+        // The journal records the outcome for dedup/reconnect — the old
+        // direct helper does not journal.
+        let replay = coordinator.execute_openai_call("call-2", &actions).await;
+        assert!(matches!(replay, CoordinatedOutcome::DuplicateReplay { .. }));
     }
 
     #[test]

@@ -31,9 +31,7 @@ use crate::tui::theme::{
 };
 use cockpit_config::extended::ThinkingDisplay;
 use cockpit_core::engine::{
-    ToolProgress,
-    response_performance::ResponsePerformance,
-    tool::ToolPresentation,
+    ToolProgress, response_performance::ResponsePerformance, tool::ToolPresentation,
 };
 
 mod pending;
@@ -2136,19 +2134,13 @@ fn render_agent(
             // Expanded reasoning renders below the chip.
             if expanded {
                 let reasoning_indent = AGENT_INDENT + 2;
-                let reasoning_w =
-                    (width as usize).saturating_sub(reasoning_indent).max(1);
+                let reasoning_w = (width as usize).saturating_sub(reasoning_indent).max(1);
                 let mut reasoning_rows: Vec<(Line<'static>, bool)> = Vec::new();
                 for raw_line in reasoning.lines() {
                     let chunks = if raw_line.is_empty() {
                         vec![String::new()]
                     } else {
-                        wrap_with_reserved_first_line_and_prefix(
-                            raw_line,
-                            reasoning_w,
-                            0,
-                            0,
-                        )
+                        wrap_with_reserved_first_line_and_prefix(raw_line, reasoning_w, 0, 0)
                     };
                     for (i, chunk) in chunks.into_iter().enumerate() {
                         reasoning_rows.push((
@@ -2160,11 +2152,8 @@ fn render_agent(
                         ));
                     }
                 }
-                let window = inner_scroll_window(
-                    reasoning_rows.len(),
-                    THINKING_VISIBLE,
-                    reasoning_offset,
-                );
+                let window =
+                    inner_scroll_window(reasoning_rows.len(), THINKING_VISIBLE, reasoning_offset);
                 let insert_at = 1; // after the chip row
                 if window.more_above > 0 {
                     out.insert(
@@ -2309,12 +2298,17 @@ fn render_agent(
             // lines wrap explicitly so the continuation keeps the same
             // left indent — otherwise ratatui's auto-wrap drops them
             // to column 0 and the block looks ragged.
-            let (line, region, metric_row) =
-                render_first_line_with_pin_and_timestamp_metric(chip_spans, timestamp, width, pin, metric_text.as_deref());
+            let (line, region, metric_row) = render_first_line_with_pin_and_timestamp_metric(
+                chip_spans,
+                timestamp,
+                width,
+                pin,
+                metric_text.as_deref(),
+            );
             pin_region = region;
-                if let Some(mr) = metric_row {
-                    metric_region = Some(MetricRegion { rows: vec![mr] });
-                }
+            if let Some(mr) = metric_row {
+                metric_region = Some(MetricRegion { rows: vec![mr] });
+            }
             out.push(line);
             conts.push(false);
             let reasoning_indent = AGENT_INDENT + 2;
@@ -2387,12 +2381,17 @@ fn render_agent(
             // Collapsed + markdown: chip on its own row (folding
             // markdown spans onto the chip line is more visual jank than
             // it's worth), body markdown lines follow.
-            let (line, region, metric_row) =
-                render_first_line_with_pin_and_timestamp_metric(chip_spans, timestamp, width, pin, metric_text.as_deref());
+            let (line, region, metric_row) = render_first_line_with_pin_and_timestamp_metric(
+                chip_spans,
+                timestamp,
+                width,
+                pin,
+                metric_text.as_deref(),
+            );
             pin_region = region;
-                if let Some(mr) = metric_row {
-                    metric_region = Some(MetricRegion { rows: vec![mr] });
-                }
+            if let Some(mr) = metric_row {
+                metric_region = Some(MetricRegion { rows: vec![mr] });
+            }
             out.push(line);
             conts.push(false);
             if let Some(mut copy) = body_copy {
@@ -2417,12 +2416,17 @@ fn render_agent(
                 first_line_spans.push(Span::raw(" "));
                 first_line_spans.push(Span::raw(collapsed_wrapped[0].clone()));
             }
-            let (line, region, metric_row) =
-                render_first_line_with_pin_and_timestamp_metric(first_line_spans, timestamp, width, pin, metric_text.as_deref());
+            let (line, region, metric_row) = render_first_line_with_pin_and_timestamp_metric(
+                first_line_spans,
+                timestamp,
+                width,
+                pin,
+                metric_text.as_deref(),
+            );
             pin_region = region;
-                if let Some(mr) = metric_row {
-                    metric_region = Some(MetricRegion { rows: vec![mr] });
-                }
+            if let Some(mr) = metric_row {
+                metric_region = Some(MetricRegion { rows: vec![mr] });
+            }
             out.push(line);
             conts.push(false);
             for chunk in collapsed_wrapped.iter().skip(1) {
@@ -2455,12 +2459,17 @@ fn render_agent(
         );
         copy_body_start = Some(RenderedCopy::from_block(0, &body));
         if body.lines.is_empty() {
-            let (line, region, metric_row) =
-                render_first_line_with_pin_and_timestamp_metric(vec![], timestamp, width, pin, metric_text.as_deref());
+            let (line, region, metric_row) = render_first_line_with_pin_and_timestamp_metric(
+                vec![],
+                timestamp,
+                width,
+                pin,
+                metric_text.as_deref(),
+            );
             pin_region = region;
-                if let Some(mr) = metric_row {
-                    metric_region = Some(MetricRegion { rows: vec![mr] });
-                }
+            if let Some(mr) = metric_row {
+                metric_region = Some(MetricRegion { rows: vec![mr] });
+            }
             out.push(line);
             conts.push(false);
         } else {
@@ -2471,12 +2480,17 @@ fn render_agent(
             // continuation (copy rejoins with a space, not a newline).
             let mut iter = body.lines.into_iter().zip(body.continuations);
             let (first, first_cont) = iter.next().expect("body non-empty");
-            let (line, region, metric_row) =
-                render_first_line_with_pin_and_timestamp_metric(first.spans, timestamp, width, pin, metric_text.as_deref());
+            let (line, region, metric_row) = render_first_line_with_pin_and_timestamp_metric(
+                first.spans,
+                timestamp,
+                width,
+                pin,
+                metric_text.as_deref(),
+            );
             pin_region = region;
-                if let Some(mr) = metric_row {
-                    metric_region = Some(MetricRegion { rows: vec![mr] });
-                }
+            if let Some(mr) = metric_row {
+                metric_region = Some(MetricRegion { rows: vec![mr] });
+            }
             out.push(line);
             conts.push(first_cont);
             for (line, cont) in iter {
@@ -2499,12 +2513,17 @@ fn render_agent(
             0,
         );
         if chunks.is_empty() {
-            let (line, region, metric_row) =
-                render_first_line_with_pin_and_timestamp_metric(vec![], timestamp, width, pin, metric_text.as_deref());
+            let (line, region, metric_row) = render_first_line_with_pin_and_timestamp_metric(
+                vec![],
+                timestamp,
+                width,
+                pin,
+                metric_text.as_deref(),
+            );
             pin_region = region;
-                if let Some(mr) = metric_row {
-                    metric_region = Some(MetricRegion { rows: vec![mr] });
-                }
+            if let Some(mr) = metric_row {
+                metric_region = Some(MetricRegion { rows: vec![mr] });
+            }
             out.push(line);
             conts.push(false);
         } else {
@@ -2519,11 +2538,17 @@ fn render_agent(
                     }
                     spans.push(Span::raw(chunk.clone()));
                     let (line, region, metric_row) =
-                render_first_line_with_pin_and_timestamp_metric(spans, timestamp, width, pin, metric_text.as_deref());
+                        render_first_line_with_pin_and_timestamp_metric(
+                            spans,
+                            timestamp,
+                            width,
+                            pin,
+                            metric_text.as_deref(),
+                        );
                     pin_region = region;
-                if let Some(mr) = metric_row {
-                    metric_region = Some(MetricRegion { rows: vec![mr] });
-                }
+                    if let Some(mr) = metric_row {
+                        metric_region = Some(MetricRegion { rows: vec![mr] });
+                    }
                     out.push(line);
                     conts.push(false);
                 } else {
@@ -2663,9 +2688,7 @@ fn render_agent(
         }
 
         if !metric_rows.is_empty() {
-            metric_region = Some(MetricRegion {
-                rows: metric_rows,
-            });
+            metric_region = Some(MetricRegion { rows: metric_rows });
         }
     } else if metric_region.is_some() && performance_expanded {
         // Inline metric was placed; add expanded detail rows after the
@@ -3775,7 +3798,8 @@ fn render_first_line_with_pin_and_timestamp(
     width: u16,
     pin: Option<PinControl>,
 ) -> (Line<'static>, Option<PinRegion>) {
-    let (line, region, _) = render_first_line_with_pin_and_timestamp_metric(spans, timestamp, width, pin, None);
+    let (line, region, _) =
+        render_first_line_with_pin_and_timestamp_metric(spans, timestamp, width, pin, None);
     (line, region)
 }
 
@@ -3798,15 +3822,19 @@ fn render_first_line_with_pin_and_timestamp_metric(
 
     let Some(p) = pin else {
         // No pin: try to place metric + timestamp.
-        let right_margin = TIMESTAMP_RIGHT_MARGIN.min(area.saturating_sub(used + TIMESTAMP_WIDTH + 1));
-        let metric_fits = metric_w > 0
-            && used + metric_w + 1 + TIMESTAMP_WIDTH + 1 + right_margin <= area;
+        let right_margin =
+            TIMESTAMP_RIGHT_MARGIN.min(area.saturating_sub(used + TIMESTAMP_WIDTH + 1));
+        let metric_fits =
+            metric_w > 0 && used + metric_w + 1 + TIMESTAMP_WIDTH + 1 + right_margin <= area;
         if metric_fits {
             let total_right = metric_w + 1 + TIMESTAMP_WIDTH + 1 + right_margin;
             let pad = area.saturating_sub(used + total_right);
             spans.push(Span::raw(" ".repeat(pad + 1)));
             let metric_start = (used + pad + 1) as u16;
-            spans.push(Span::styled(metric_text.unwrap().to_string(), metric_chip_style()));
+            spans.push(Span::styled(
+                metric_text.unwrap().to_string(),
+                metric_chip_style(),
+            ));
             spans.push(Span::raw(" "));
             spans.push(Span::styled(ts, Style::default().fg(TIMESTAMP_FG)));
             spans.push(Span::raw(" ".repeat(right_margin)));
@@ -3846,14 +3874,17 @@ fn render_first_line_with_pin_and_timestamp_metric(
             (0, false)
         } else {
             // No pin block fits. Try metric + timestamp only.
-            let metric_fits = metric_w > 0
-                && used + metric_w + 1 + TIMESTAMP_WIDTH + 1 + right_margin <= area;
+            let metric_fits =
+                metric_w > 0 && used + metric_w + 1 + TIMESTAMP_WIDTH + 1 + right_margin <= area;
             if metric_fits {
                 let total_right = metric_w + 1 + TIMESTAMP_WIDTH + 1 + right_margin;
                 let pad = area.saturating_sub(used + total_right);
                 spans.push(Span::raw(" ".repeat(pad + 1)));
                 let metric_start = (used + pad + 1) as u16;
-                spans.push(Span::styled(metric_text.unwrap().to_string(), metric_chip_style()));
+                spans.push(Span::styled(
+                    metric_text.unwrap().to_string(),
+                    metric_chip_style(),
+                ));
                 spans.push(Span::raw(" "));
                 spans.push(Span::styled(ts, Style::default().fg(TIMESTAMP_FG)));
                 spans.push(Span::raw(" ".repeat(right_margin)));
@@ -3885,7 +3916,10 @@ fn render_first_line_with_pin_and_timestamp_metric(
         let pad = area.saturating_sub(used + total_right);
         spans.push(Span::raw(" ".repeat(pad + 1)));
         let metric_start = (used + pad + 1) as u16;
-        spans.push(Span::styled(metric_text.unwrap().to_string(), metric_chip_style()));
+        spans.push(Span::styled(
+            metric_text.unwrap().to_string(),
+            metric_chip_style(),
+        ));
         spans.push(Span::raw(" "));
         // Pin block.
         if p.is_pick {
@@ -3936,9 +3970,8 @@ fn render_first_line_with_pin_and_timestamp_metric(
 
     // Metric doesn't fit inline — use the original pin-only layout.
     // Rebuild spans without the metric (it goes on a dedicated row).
-    let (line, region) = render_first_line_with_pin_and_timestamp_inner(
-        spans, timestamp, width, Some(p),
-    );
+    let (line, region) =
+        render_first_line_with_pin_and_timestamp_inner(spans, timestamp, width, Some(p));
     (line, region, None)
 }
 

@@ -381,6 +381,11 @@ pub fn meet_retention_days(a: u64, b: u64) -> u64 {
 /// Compute the fieldwise meet of two `RemoteConnectionPolicyV1` values.
 /// The meet cannot widen: every field's meet is at least as strict as the
 /// stricter of the two. Fails closed if the transport meet is empty.
+///
+/// When the transport meet removes `websocket_data`, `websocket_fallback`
+/// is automatically set to `false` — the fallback flag is meaningless
+/// without the websocket_data transport, and keeping it true would violate
+/// the cross-field rule. This is a semantic meet, not a blind fieldwise AND.
 pub fn meet_policies(
     a: &RemoteConnectionPolicyV1,
     b: &RemoteConnectionPolicyV1,
@@ -393,6 +398,14 @@ pub fn meet_policies(
         b.metadata_retention_days.value(),
     ));
 
+    // Semantic meet for websocket_fallback: the boolean AND is the base,
+    // but if the transport meet excluded websocket_data, the fallback must
+    // be false (you cannot fall back to a transport that is not allowed).
+    let websocket_fallback = meet_bool(a.websocket_fallback, b.websocket_fallback)
+        && allowed_transports
+            .iter()
+            .any(|t| t == "websocket_data");
+
     let result = RemoteConnectionPolicyV1 {
         allowed_transports,
         direct_ip_mode: meet_direct_ip_mode(a.direct_ip_mode, b.direct_ip_mode),
@@ -400,7 +413,7 @@ pub fn meet_policies(
             a.shared_session_route,
             b.shared_session_route,
         ),
-        websocket_fallback: meet_bool(a.websocket_fallback, b.websocket_fallback),
+        websocket_fallback,
         tenant_authorization: meet_tenant_authorization(
             a.tenant_authorization,
             b.tenant_authorization,
@@ -1711,11 +1724,18 @@ mod tests {
             committed_at_ms: 1_000_000,
         };
         let json = serde_json::to_string(&audit).unwrap();
-        // No credential hashes, no IPs, no signature bytes, no device identifiers.
+        // No credential hashes, no IP addresses, no signature bytes, no
+        // stable device identifiers. The checks use specific field names
+        // rather than generic substrings (e.g. "ip" would false-match
+        // "PrincipalIds").
         assert!(!json.contains("credential_id_hash"));
+        assert!(!json.contains("credentialIdHash"));
         assert!(!json.contains("signature"));
-        assert!(!json.contains("ip"));
+        assert!(!json.contains("ipAddress"));
+        assert!(!json.contains("ip_address"));
+        assert!(!json.contains("peerIp"));
         assert!(!json.contains("device_id"));
+        assert!(!json.contains("deviceId"));
     }
 
     // --- Foundation consumption guard ---

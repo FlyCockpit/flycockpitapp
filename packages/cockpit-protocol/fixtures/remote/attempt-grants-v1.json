@@ -1,0 +1,289 @@
+{
+  "version": 1,
+  "limits": {
+    "compactJwsMaxBytes": 8192,
+    "permissionCeilingMaxBytes": 512,
+    "tupleSetMin": 1,
+    "tupleSetMax": 16,
+    "projectCountMax": 16,
+    "projectCapabilityCountMax": 16,
+    "attachmentCapabilityCountMax": 16,
+    "grantLifetimeSeconds": 300,
+    "verificationSkewSeconds": 60
+  },
+  "domainSeparators": {
+    "daemonAdmissionOffer": "flycockpit.remote.daemon-admission-offer.v1\u0000",
+    "clientAdmissionProof": "flycockpit.remote.client-admission-proof.v1\u0000",
+    "endpointFinalProofSet": "flycockpit.remote.endpoint-final-proof-set.v1\u0000"
+  },
+  "transportBits": {
+    "webrtc": 1,
+    "websocketData": 2,
+    "both": 3
+  },
+  "validGrants": [
+    {
+      "id": "minimal-saas",
+      "protectedHeader": {
+        "alg": "ES256",
+        "kid": "k1",
+        "typ": "flycockpit-remote-attempt+jwt"
+      },
+      "payload": {
+        "schemaVersion": 1,
+        "iss": "issuer-1",
+        "aud": "audience-1",
+        "tenantId": "AAAAAAAAAAAAAAAAAAAAAA",
+        "accountId": "BBBBBBBBBBBBBBBBBBBBBB",
+        "instanceId": "CCCCCCCCCCCCCCCCCCCCCC",
+        "logicalAttachmentId": "DDDDDDDDDDDDDDDDDDDDDD",
+        "childAttemptId": "EEEEEEEEEEEEEEEEEEEEEE",
+        "jti": "FFFFFFFFFFFFFFFFFFFFFF",
+        "client": {
+          "deviceId": "GGGGGGGGGGGGGGGGGGGGGG",
+          "certificateId": "HHHHHHHHHHHHHHHHHHHHHH",
+          "generation": "1",
+          "p256Thumbprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "daemon": {
+          "deviceId": "IIIIIIIIIIIIIIIIIIIIII",
+          "certificateId": "JJJJJJJJJJJJJJJJJJJJJJ",
+          "generation": "1",
+          "p256Thumbprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        "serverNonce": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "serviceVersion": "1",
+        "servicePolicyDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "policyEpoch": "1",
+        "policyDigest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "authorityEpoch": "1",
+        "attachmentCapabilities": [1, 3],
+        "projectCapabilities": [
+          { "projectId": "0102030405060708090a0b0c0d0e0f10", "capabilities": [1, 3] }
+        ],
+        "permissionCeilingDigest": "f1d2d1f3925868d84351cafc6c9e5e5b5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e",
+        "authorizedTransports": 3,
+        "compatibleTupleIds": [1, 2],
+        "tenantAuthorizationDigest": null,
+        "iat": "1700000000",
+        "nbf": "1700000000",
+        "exp": "1700000300"
+      },
+      "compactJws": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImsxIiwidHlwIjoiZmx5Y29ja3BpdC1yZW1vdGUtYXR0ZW1wdCtqd3QifQ.eyJzY2hlbWFWZXJzaW9uIjoxLCJpc3MiOiJpc3N1ZXItMSIsImF1ZCI6ImF1ZGllbmNlLTEiLCJ0ZW5hbnRJZCI6IkFBQUFBQUFBQUFBQUFBQUFBQUFBQSIsImFjY291bnRJZCI6IkJCQkJCQkJCQkJCQkJCQkJCQkJCQiIsImluc3RhbmNlSWQiOiJDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDIiwibG9naWNhbEF0dGFjaG1lbnRJZCI6IkRERERERERERERERERERERERERERCIsImNoaWxkQXR0ZW1wdElkIjoiRUVFRUVFRUVFRUVFRUVFRUVFRUVFIiwianRpIjoiRkZGRkZGRkZGRkZGRkZGRkZGRkZGIiwiY2xpZW50Ijp7ImRldmljZUlkIjoiR0dHR0dHR0dHR0dHR0dHR0dHR0dHIiwiY2VydGlmaWNhdGVJZCI6IkhISEhISEhISEhISEhISEhISEhISCIsImdlbmVyYXRpb24iOiIxIiwicDI1NlRodW1icHJpbnQiOiJhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSJ9LCJkYWVtb24iOnsiZGV2aWNlSWQiOiJJSUlJSUlJSUlJSUlJSUlJSUlJSUkiLCJjZXJ0aWZpY2F0ZUlkIjoiSkpKSkpKSkpKSkpKSkpKSkpKSkpKIiwiZ2VuZXJhdGlvbiI6IjEiLCJwMjU2VGh1bWJwcmludCI6ImJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiIn0sInNlcnZlck5vbmNlIjoiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjIiwic2VydmljZVZlcnNpb24iOiIxIiwic2VydmljZVBvbGljeURpZ2VzdCI6ImRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGQiLCJwb2xpY3lFcG9jaCI6IjEiLCJwb2xpY3lEaWdlc3QiOiJlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWUiIsImF1dGhvcml0eUVwb2NoIjoiMSIsImF0dGFjaG1lbnRDYXBhYmlsaXRpZXMiOlsxLDNdLCJwcm9qZWN0Q2FwYWJpbGl0aWVzIjpbeyJwcm9qZWN0SWQiOiIwMTAyMDMwNDA1MDYwNzA4MDkwYTBiMGMwZDBlMGYxMCIsImNhcGFiaWxpdGllcyI6WzEsM119XSwicGVybWlzc2lvbkNlaWxpbmdEaWdlc3QiOiJmMWQyZDFmMzkyNTg2OGQ4NDM1MWNhZmM2YzllNWU1YjVlNWU1ZTVlNWU1ZTVlNWU1ZTVlNWU1ZTVlNWU1ZTVlNWUiLCJhdXRob3JpemVkVHJhbnNwb3J0cyI6MywiY29tcGF0aWJsZVR1cGxlSWRzIjpbMSwyXSwidGVuYW50QXV0aG9yaXphdGlvbkRpZ2VzdCI6bnVsbCwiaWF0IjoiMTcwMDAwMDAwMCIsIm5iZiI6IjE3MDAwMDAwMDAiLCJleHAiOiIxNzAwMDAwMzAwIn0.signature"
+    },
+    {
+      "id": "enterprise-tenant",
+      "protectedHeader": {
+        "alg": "ES256",
+        "kid": "k2",
+        "typ": "flycockpit-remote-attempt+jwt"
+      },
+      "payload": {
+        "schemaVersion": 1,
+        "iss": "issuer-2",
+        "aud": "audience-2",
+        "tenantId": "KKKKKKKKKKKKKKKKKKKKKK",
+        "accountId": "LLLLLLLLLLLLLLLLLLLLLL",
+        "instanceId": "MMMMMMMMMMMMMMMMMMMMMM",
+        "logicalAttachmentId": "NNNNNNNNNNNNNNNNNNNNNN",
+        "childAttemptId": "OOOOOOOOOOOOOOOOOOOOOO",
+        "jti": "PPPPPPPPPPPPPPPPPPPPPP",
+        "client": {
+          "deviceId": "QQQQQQQQQQQQQQQQQQQQQQ",
+          "certificateId": "RRRRRRRRRRRRRRRRRRRRRR",
+          "generation": "2",
+          "p256Thumbprint": "111111111111111111111111111111111111111111111"
+        },
+        "daemon": {
+          "deviceId": "SSSSSSSSSSSSSSSSSSSSSS",
+          "certificateId": "TTTTTTTTTTTTTTTTTTTTTT",
+          "generation": "3",
+          "p256Thumbprint": "222222222222222222222222222222222222222222222"
+        },
+        "serverNonce": "3333333333333333333333333333333333333333333333333333333333333333",
+        "serviceVersion": "2",
+        "servicePolicyDigest": "4444444444444444444444444444444444444444444444444444444444444444",
+        "policyEpoch": "5",
+        "policyDigest": "5555555555555555555555555555555555555555555555555555555555555555",
+        "authorityEpoch": "7",
+        "attachmentCapabilities": [1, 2, 3, 13],
+        "projectCapabilities": [
+          { "projectId": "0a0b0c0d0e0f10111213141516171819", "capabilities": [1, 2, 3, 14] },
+          { "projectId": "1a1b1c1d1e1f20212223242526272829", "capabilities": [7, 8, 15] }
+        ],
+        "permissionCeilingDigest": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2",
+        "authorizedTransports": 1,
+        "compatibleTupleIds": [3, 5, 7],
+        "tenantAuthorizationDigest": "f0e1d2c3b4a5968778695a4b3c2d1e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7",
+        "iat": "1700000100",
+        "nbf": "1700000100",
+        "exp": "1700000400"
+      },
+      "compactJws": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImsyIiwidHlwIjoiZmx5Y29ja3BpdC1yZW1vdGUtYXR0ZW1wdCtqd3QifQ.eyJzY2hlbWFWZXJzaW9uIjoxLCJpc3MiOiJpc3N1ZXItMiIsImF1ZCI6ImF1ZGllbmNlLTIiLCJ0ZW5hbnRJZCI6IktLS0tLS0tLS0tLS0tLS0tLS0tLS0siLCJhY2NvdW50SWQiOiJMTExMTExMTExMTExMTExMTExMTExMSIsImluc3RhbmNlSWQiOiJNTU1NTU1NTU1NTU1NTU1NTU1NTU1NIiwibG9naWNhbEF0dGFjaG1lbnRJZCI6Ik5OTk5OTk5OTk5OTk5OTk5OTk5OTk4iLCJjaGlsZEF0dGVtcHRJZCI6Ik9PT09PT09PT09PT09PT09PT09PT08iLCJqdGkiOiJQUFBQUFBQUFBQUFBQUFBQUFBQUFQIiwiY2xpZW50Ijp7ImRldmljZUlkIjoiUVFQUVBQUVBQUVBQUVBQUFBQUFBQUEiLCJjZXJ0aWZpY2F0ZUlkIjoiUlJSUlJSUlJSUlJSUlJSUlJSUlJSUiIsImdlbmVyYXRpb24iOiIyIiwicDI1NlRodW1icHJpbnQiOiIxMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMSJ9LCJkYWVtb24iOnsiZGV2aWNlSWQiOiJTU1NTU1NTU1NTU1NTU1NTU1NTU1NTIiwiY2VydGlmaWNhdGVJZCI6IlRU VFRUVFRUVFRUVFRUVFRUVFRUVFQiLCJnZW5lcmF0aW9uIjoiMyIsInAyNTZUaHVtYnByaW50IjoiMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMiJ9LCJzZXJ2ZXJOb25jZSI6IjMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzIiwic2VydmljZVZlcnNpb24iOiIyIiwic2VydmljZVBvbGljeURpZ2VzdCI6IjQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQiLCJwb2xpY3lFcG9jaCI6IjUiLCJwb2xpY3lEaWdlc3QiOiI1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NSIsImF1dGhvcml0eUVwb2NoIjoiNyIsImF0dGFjaG1lbnRDYXBhYmlsaXRpZXMiOlsxLDIsMywxM10sInByb2plY3RDYXBhYmlsaXRpZXMiOlt7InByb2plY3RJZCI6IjBhMGIwYzBkMGUwZjEwMTExMjEzMTQxNTE2MTcxODE5IiwiY2FwYWJpbGl0aWVzIjpbMSwyLDMsMTRdfSx7InByb2plY3RJZCI6IjFhMWIxYzFkMWUxZjIwMjEyMjIzMjQyNTI2MjcyODI5IiwiY2FwYWJpbGl0aWVzIjpbNyw4LDE1XX1dLCJwZXJtaXNzaW9uQ2VpbGluZ0RpZ2VzdCI6ImExYjJjM2Q0ZTVmNmE3YjhjOWQwZTFmMmEzYjRjNWQ2ZTdmOGE5YjBjMWQyZTNmNGE1YjZjN2Q4ZTlmMGExYjIiLCJhdXRob3JpemVkVHJhbnNwb3J0cyI6MSwiY29tcGF0aWJsZVR1cGxlSWRzIjpbMyw1LDddLCJ0ZW5hbnRBdXRob3JpemF0aW9uRGlnZXN0IjoiZjBlMWQyYzNiNGE1OTY4Nzc4Njk1YTRiM2MyZDFlMGYxYTJiM2M0ZDVlNmY3YThiOWMwZDFlMmYzYTRiNWM2ZDciLCJpYXQiOiIxNzAwMDAwMTAwIiwibmJmIjoiMTcwMDAwMDEwMCIsImV4cCI6IjE3MDAwMDA0MDAifQ.signature"
+    }
+  ],
+  "malformedGrants": [
+    { "id": "wrong-alg", "field": "protectedHeader.alg", "value": "RS256", "rejection": "header" },
+    { "id": "wrong-typ", "field": "protectedHeader.typ", "value": "JWT", "rejection": "header" },
+    { "id": "missing-kid", "field": "protectedHeader.kid", "value": null, "rejection": "header" },
+    {
+      "id": "extra-header",
+      "field": "protectedHeader.cty",
+      "value": "json",
+      "rejection": "header"
+    },
+    {
+      "id": "redundant-role",
+      "field": "payload.role",
+      "value": "client",
+      "rejection": "unknown_claim"
+    },
+    {
+      "id": "noise-thumbprint",
+      "field": "payload.daemon.noiseThumbprint",
+      "value": "xxxx",
+      "rejection": "unknown_claim"
+    },
+    {
+      "id": "wrong-schema-version",
+      "field": "payload.schemaVersion",
+      "value": 2,
+      "rejection": "schema_version"
+    },
+    {
+      "id": "integer-not-string",
+      "field": "payload.client.generation",
+      "value": 1,
+      "rejection": "decimal_string"
+    },
+    { "id": "oversize-jws", "field": "compactJws", "value": "oversize", "rejection": "size" },
+    {
+      "id": "transport-bits-zero",
+      "field": "payload.authorizedTransports",
+      "value": 0,
+      "rejection": "transport_bits"
+    },
+    {
+      "id": "transport-bits-four",
+      "field": "payload.authorizedTransports",
+      "value": 4,
+      "rejection": "transport_bits"
+    },
+    {
+      "id": "empty-tuple-ids",
+      "field": "payload.compatibleTupleIds",
+      "value": [],
+      "rejection": "tuple_set"
+    },
+    {
+      "id": "too-many-tuple-ids",
+      "field": "payload.compatibleTupleIds",
+      "value": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
+      "rejection": "tuple_set"
+    },
+    {
+      "id": "unsorted-tuple-ids",
+      "field": "payload.compatibleTupleIds",
+      "value": [2, 1],
+      "rejection": "tuple_set"
+    },
+    {
+      "id": "too-many-projects",
+      "field": "payload.projectCapabilities",
+      "value": "too_many",
+      "rejection": "project_count"
+    },
+    {
+      "id": "empty-project-caps",
+      "field": "payload.projectCapabilities",
+      "value": "empty_caps",
+      "rejection": "project_capability_count"
+    },
+    {
+      "id": "alias-too-short",
+      "field": "payload.tenantId",
+      "value": "short",
+      "rejection": "alias"
+    },
+    {
+      "id": "digest-wrong-length",
+      "field": "payload.serverNonce",
+      "value": "tooshort",
+      "rejection": "digest_width"
+    },
+    {
+      "id": "exp-before-iat",
+      "field": "payload.exp",
+      "value": "1699999999",
+      "rejection": "time_order"
+    },
+    {
+      "id": "tenant-digest-when-control-plane",
+      "field": "payload.tenantAuthorizationDigest",
+      "value": "non_null_control_plane",
+      "rejection": "tenant_digest"
+    },
+    {
+      "id": "flat-permission-capabilities",
+      "field": "payload.permissionCapabilities",
+      "value": [1, 2],
+      "rejection": "unknown_claim"
+    },
+    {
+      "id": "wildcard-project",
+      "field": "payload.projectCapabilities",
+      "value": "wildcard",
+      "rejection": "wildcard_project"
+    },
+    {
+      "id": "duplicate-project",
+      "field": "payload.projectCapabilities",
+      "value": "duplicate",
+      "rejection": "duplicate_project"
+    },
+    {
+      "id": "unsorted-project-caps",
+      "field": "payload.projectCapabilities",
+      "value": "unsorted_caps",
+      "rejection": "project_cap_order"
+    },
+    {
+      "id": "unsorted-attachment-caps",
+      "field": "payload.attachmentCapabilities",
+      "value": [3, 1],
+      "rejection": "attachment_cap_order"
+    },
+    {
+      "id": "missing-permission-ceiling-digest",
+      "field": "payload.permissionCeilingDigest",
+      "value": null,
+      "rejection": "ceiling_digest_missing"
+    },
+    {
+      "id": "wrong-permission-ceiling-digest",
+      "field": "payload.permissionCeilingDigest",
+      "value": "0000000000000000000000000000000000000000000000000000000000000000",
+      "rejection": "ceiling_digest_mismatch"
+    }
+  ],
+  "daemonOfferDigestVectors": [
+    {
+      "id": "complete-envelope",
+      "description": "SHA-256 of the complete length-prefixed signed FCDO envelope",
+      "fcdoHex": "015b4643444f010102030405060708090a0b0c0d0e0f1000000000000000010102030405060708090a0b0c0d0e0f100000000000000001030405060708090a0b0c0d0e0f1000000000000000010405060708090a0b0c0d0e0f10000000000000000105060708090a0b0c0d0e0f1000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000102030405060708090a0b0c0d0e0f100102030405060708090a0b0c0d0e0f100102030405060708090a0b0c0d0e0f100102030405060708090a0b0c0d0e0f100000102030405060708090a0b0c0d0e0f10000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000301000102030405060708090a0b0c0d0e0f1000000000d6279a6d5b0e00000000d6279a6d5b1e",
+      "expectedDigestHex": "computed_at_runtime"
+    }
+  ],
+  "permissionCeilingVectors": [
+    {
+      "id": "minimal-ceiling",
+      "ceilingHex": "01000102030405060708090a0b0c0d0e0f10030102",
+      "expectedDigestHex": "computed_at_runtime"
+    },
+    {
+      "id": "empty-attachment-ceiling",
+      "ceilingHex": "01000102030405060708090a0b0c0d0e0f1002",
+      "expectedDigestHex": "computed_at_runtime"
+    }
+  ]
+}

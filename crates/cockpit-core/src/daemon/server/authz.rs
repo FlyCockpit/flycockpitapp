@@ -1082,3 +1082,137 @@ pub(super) async fn authorize_request_shared(
         principal
     )
 }
+
+#[cfg(test)]
+mod remote_attempt_authz_tests {
+    use super::*;
+
+    /// Classify each authz tag into one of the three remote-attempt
+    /// request-authorization categories:
+    /// - `read_only_without_project`: requests that don't require a
+    ///   project-scoped capability (public_read, owner_only, session-scoped).
+    /// - `attachment_capability`: requests that require an attachment-wide
+    ///   capability (terminal, session_writer, session_row_*).
+    /// - `project_capability`: requests that require a project-scoped
+    ///   capability (project_files, project_read, custom with project_root).
+    macro_rules! remote_attempt_authz_class {
+        (owner_only) => {
+            "read_only_without_project"
+        };
+        (public_read) => {
+            "read_only_without_project"
+        };
+        (terminal) => {
+            "attachment_capability"
+        };
+        (session_writer) => {
+            "attachment_capability"
+        };
+        (session_row_writer) => {
+            "attachment_capability"
+        };
+        (session_row_reader) => {
+            "attachment_capability"
+        };
+        (project_files) => {
+            "project_capability"
+        };
+        (project_read) => {
+            "project_capability"
+        };
+        (custom) => {
+            "project_capability"
+        };
+    }
+
+    macro_rules! remote_attempt_authz_rows {
+        (($($context:ident),*) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+            vec![$(($kind, remote_attempt_authz_class!($authz))),+]
+        }};
+    }
+
+    macro_rules! remote_attempt_authz_row_count {
+        (($($context:ident),*) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+            0usize $(+ { let _ = stringify!($pattern); 1usize })+
+        }};
+    }
+
+    #[test]
+    fn remote_attempt_request_authz_table_exhaustive() {
+        let rows = proto::command!(remote_attempt_authz_rows);
+        let row_count = proto::command!(remote_attempt_authz_row_count);
+
+        // Every request kind is assigned to exactly one category.
+        assert_eq!(rows.len(), row_count);
+        assert!(
+            rows.len() > 80,
+            "command table should enumerate all Request rows"
+        );
+
+        // Every assigned category is one of the three valid values.
+        let valid_categories = [
+            "read_only_without_project",
+            "attachment_capability",
+            "project_capability",
+        ];
+        for (kind, category) in &rows {
+            assert!(
+                valid_categories.contains(category),
+                "request {kind} has invalid authz category {category}"
+            );
+        }
+
+        // No request kind is missing (no wildcard arm).
+        let kinds: std::collections::BTreeSet<&str> = rows.iter().map(|(k, _)| *k).collect();
+        assert_eq!(kinds.len(), rows.len(), "duplicate request kinds in table");
+
+        // All three categories have at least one request.
+        let categories: std::collections::BTreeSet<&str> =
+            rows.iter().map(|(_, c)| *c).collect();
+        for expected in &valid_categories {
+            assert!(
+                categories.contains(expected),
+                "category {expected} has zero requests"
+            );
+        }
+
+        // Spot-check: read-only requests are classified as read_only_without_project.
+        let read_only_kinds = ["daemon_status", "get_run_invocation_status", "operation_status"];
+        for kind in &read_only_kinds {
+            let (_, category) = rows
+                .iter()
+                .find(|(k, _)| k == kind)
+                .unwrap_or_else(|| panic!("missing request kind {kind}"));
+            assert_eq!(
+                *category, "read_only_without_project",
+                "{kind} should be read_only_without_project"
+            );
+        }
+
+        // Spot-check: project-scoped requests are classified as project_capability.
+        let project_kinds = ["fs_list", "fs_read", "fs_stat"];
+        for kind in &project_kinds {
+            let (_, category) = rows
+                .iter()
+                .find(|(k, _)| k == kind)
+                .unwrap_or_else(|| panic!("missing request kind {kind}"));
+            assert_eq!(
+                *category, "project_capability",
+                "{kind} should be project_capability"
+            );
+        }
+
+        // Spot-check: attachment-scoped requests are classified as attachment_capability.
+        let attachment_kinds = ["send_user_message", "cancel_turn"];
+        for kind in &attachment_kinds {
+            let (_, category) = rows
+                .iter()
+                .find(|(k, _)| k == kind)
+                .unwrap_or_else(|| panic!("missing request kind {kind}"));
+            assert_eq!(
+                *category, "attachment_capability",
+                "{kind} should be attachment_capability"
+            );
+        }
+    }
+}

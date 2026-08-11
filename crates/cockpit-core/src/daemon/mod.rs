@@ -41,6 +41,7 @@ pub mod proto;
 pub mod registry;
 pub mod relay_envelope;
 pub mod remote_audit_upload;
+pub mod remote_attempt;
 pub(crate) mod remote_outbox_worker;
 pub mod scheduler;
 pub mod server;

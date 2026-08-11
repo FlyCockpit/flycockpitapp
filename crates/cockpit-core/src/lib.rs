@@ -69,6 +69,8 @@ pub mod process_containment;
 pub mod providers;
 pub mod redact;
 pub mod remote_daemon_identity_custody;
+pub mod remote_native_identity_custody;
+pub mod remote_browser_identity_custody;
 pub mod sealed;
 pub mod secret_paths;
 pub mod secret_ref;

@@ -290,10 +290,6 @@ pub enum InsertLeakResult {
     },
 }
 
-fn now_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
-}
-
 impl Db {
     /// List all protected leak records for a session (full rows, including
     /// the `history_id` link). Owner-sensitive read only.
@@ -782,14 +778,16 @@ mod tests {
             .await
             .unwrap();
 
+        let report_id_clone = report_id.clone();
         db.write(move |conn| {
-            transition_leak_status_conn(conn, &report_id, LeakRecordStatus::Contained, 2000)
+            transition_leak_status_conn(conn, &report_id, LeakRecordStatus::Contained, 2000)?;
+            Ok::<_, anyhow::Error>(())
         })
         .await
         .unwrap();
 
         let row = db
-            .protected_leak_record_get(&report_id)
+            .protected_leak_record_get(&report_id_clone)
             .await
             .unwrap()
             .unwrap();

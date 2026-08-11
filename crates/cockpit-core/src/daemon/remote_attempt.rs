@@ -39,7 +39,7 @@ use cockpit_proto::remote_public_service_policy::{
 };
 use cockpit_proto::remote_signaling_attempt_store::{
     RemoteEndpointFinalProofV1, SignalingCodecError, daemon_admission_offer_digest,
-    final_proof_set_digest, validate_fcdo, validate_fccp,
+    final_proof_set_digest, validate_fccp, validate_fcdo,
 };
 
 // ---------------------------------------------------------------------------

@@ -51,6 +51,7 @@ pub mod skew_restart;
 pub mod terminal;
 #[cfg(test)]
 pub(crate) mod test_harness;
+pub mod transport_selection;
 pub mod turn_socket_provider;
 
 #[cfg(unix)]

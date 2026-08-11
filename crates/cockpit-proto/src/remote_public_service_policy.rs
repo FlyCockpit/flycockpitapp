@@ -810,7 +810,8 @@ pub struct RemoteConnectionPolicyV1 {
 
 impl RemoteConnectionPolicyV1 {
     /// Validate the full policy: sorted nonempty transports, sorted unique
-    /// regions, positive limits, retention in 0..365, all field constraints.
+    /// regions, positive limits, retention in 0..365, all field constraints,
+    /// and exact cross-field rules.
     pub fn validate(&self) -> Result<()> {
         // allowedTransports: sorted nonempty subset of webrtc|websocket_data
         if self.allowed_transports.is_empty() {
@@ -836,7 +837,51 @@ impl RemoteConnectionPolicyV1 {
         // limits positive-width
         self.limits.validate()?;
 
+        // Cross-field rules (exact, closed):
+        //
+        // 1. websocketFallback=true requires websocket_data in allowedTransports.
+        // 2. sharedSessionRoute=relay_only requires either WebRTC with at
+        //    least one TURN region, or WebSocket fallback enabled.
+        // 3. directIpMode=forbid prevents direct routes (enforced by the
+        //    evaluator: no direct IP route is ever selected when forbid).
+        //    The schema-level rule is that forbid is a valid closed value;
+        //    the route-selection ceiling is enforced at evaluation time.
+        // 4. tenantAuthorization=tenant_signer_required requires an active
+        //    tenant signer/governance epoch — enforced by the enterprise
+        //    connection policy module which checks the signer flow.
+
+        if self.websocket_fallback && !self.allowed_transports.contains(&"websocket_data".to_string()) {
+            return invalid(
+                "websocketFallback=true requires websocket_data in allowedTransports",
+            );
+        }
+
+        if self.shared_session_route == SharedSessionRoute::RelayOnly {
+            let has_webrtc = self.allowed_transports.contains(&"webrtc".to_string());
+            let has_region = !self.allowed_turn_regions.is_empty();
+            if !(has_webrtc && has_region) && !self.websocket_fallback {
+                return invalid(
+                    "sharedSessionRoute=relay_only requires either WebRTC with at least one region or WebSocket fallback",
+                );
+            }
+        }
+
         Ok(())
+    }
+
+    /// Whether `websocket_data` is in the allowed transports set.
+    pub fn allows_websocket_data(&self) -> bool {
+        self.allowed_transports.contains(&"websocket_data".to_string())
+    }
+
+    /// Whether `webrtc` is in the allowed transports set.
+    pub fn allows_webrtc(&self) -> bool {
+        self.allowed_transports.contains(&"webrtc".to_string())
+    }
+
+    /// Whether direct IP routes are permitted (mutual_consent) or forbidden.
+    pub fn direct_ip_permitted(&self) -> bool {
+        self.direct_ip_mode == DirectIpMode::MutualConsent
     }
 }
 

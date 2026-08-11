@@ -45,6 +45,7 @@ pub mod remote_audit_upload;
 pub(crate) mod remote_outbox_worker;
 pub mod scheduler;
 pub mod server;
+pub mod session_continuity;
 pub mod session_worker;
 pub mod shutdown;
 pub mod skew_restart;

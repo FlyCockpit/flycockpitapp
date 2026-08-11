@@ -1854,6 +1854,78 @@ pub struct SealedValueMetadata {
     pub origin_session_id: Uuid,
 }
 
+/// The closed rotation plan proposed for a leak record. Derived from the
+/// closed report `source`, `category`, and connector ID enums only; the Owner
+/// never enters arbitrary plan text.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum LeakRotationPlan {
+    RevokeConnectorCredential,
+    RotateNamedSecret,
+    InvalidateSession,
+    OwnerReviewRequired,
+}
+
+/// The rotation disposition the Owner may set on a leak record. Metadata-only
+/// and reversible; a fresh re-report clears it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum LeakRotationDisposition {
+    Accept,
+    Dismiss,
+    Rotated,
+}
+
+/// One safe metadata-only leak report row. Contains no plaintext, ciphertext,
+/// masked prefix, length-derived identity, or keyed fingerprint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LeakReportMetadata {
+    pub report_id: String,
+    pub session_id: Uuid,
+    pub source: String,
+    pub category: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector_id: Option<String>,
+    pub status: String,
+    pub rotation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation_plan: Option<LeakRotationPlan>,
+    pub seen_count: i64,
+    pub first_reported_ms: i64,
+    pub last_reported_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contained_at_ms: Option<i64>,
+}
+
+/// A page of leak report metadata. Never carries plaintext.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LeakReportsPage {
+    pub reports: Vec<LeakReportMetadata>,
+    /// Opaque cursor for the next page; `None` if this was the last page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
+
+/// A fresh one-use capability minted by BeginLeakReveal and bound to exactly
+/// one report id. Secret-free.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LeakRevealCapability {
+    /// The opaque capability token; never derived from the secret.
+    pub capability: String,
+    /// The single report id this capability is bound to.
+    pub report_id: String,
+    /// When this capability expires (unix ms). A reveal after this is
+    /// rejected.
+    pub expires_at_ms: i64,
+}
+
 #[cfg(test)]
 mod sealed_value_tests {
     use super::*;

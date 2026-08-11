@@ -511,6 +511,24 @@ impl<'a> ProtectedRedactionHistory<'a> {
         Ok(frame)
     }
 
+    /// Rehydrate one history row by its opaque history id. Used by the
+    /// leaks-page reveal path to recover the literal on the protected local
+    /// channel. Fails closed on any key-store failure, integrity mismatch,
+    /// missing row, or retired row. The returned literal lives only inside
+    /// the zeroizing [`RehydratedLiteral`] frame.
+    pub async fn rehydrate_by_history_id(&self, history_id: &str) -> Result<RehydratedLiteral> {
+        let history_id = history_id.to_owned();
+        let row = self
+            .db
+            .read(move |conn| {
+                crate::db::protected_redaction_history::get_history_conn(conn, &history_id)
+            })
+            .await?;
+        let row =
+            row.ok_or_else(|| anyhow::anyhow!("protected redaction history row not found"))?;
+        self.rehydrate_row(&row)
+    }
+
     /// Rehydrate one history row into a literal. Fails closed on any error.
     fn rehydrate_row(&self, row: &ProtectedRedactionHistoryRow) -> Result<RehydratedLiteral> {
         if row.retired_at_ms.is_some() {

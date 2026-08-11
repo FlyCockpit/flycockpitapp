@@ -113,7 +113,11 @@ pub struct PixelBounds {
 impl PixelBounds {
     /// Validate that width/height are positive and the bounds are wholly
     /// inside the decoded source of the given dimensions.
-    pub fn validate(&self, source_width_px: u32, source_height_px: u32) -> Result<(), DossierError> {
+    pub fn validate(
+        &self,
+        source_width_px: u32,
+        source_height_px: u32,
+    ) -> Result<(), DossierError> {
         if self.width_px == 0 {
             return Err(DossierError::ZeroWidth);
         }
@@ -339,15 +343,21 @@ pub enum DossierError {
     AnswerScalarBound { actual: usize, max_scalars: usize },
     #[error("ask_image answer exceeds {max_bytes} UTF-8 bytes (actual {actual})")]
     AnswerByteBound { actual: usize, max_bytes: usize },
-    #[error("ask_image answer provenance exceeds {max_scalars} Unicode scalar values (actual {actual})")]
+    #[error(
+        "ask_image answer provenance exceeds {max_scalars} Unicode scalar values (actual {actual})"
+    )]
     AnswerProvenanceScalarBound { actual: usize, max_scalars: usize },
     #[error("ask_image answer provenance exceeds {max_bytes} UTF-8 bytes (actual {actual})")]
     AnswerProvenanceByteBound { actual: usize, max_bytes: usize },
     #[error("ask_image answer uncertainty exceeds {max_entries} entries (actual {actual})")]
     AnswerUncertaintyEntriesBound { actual: usize, max_entries: usize },
-    #[error("ask_image answer uncertainty statement exceeds {max_scalars} Unicode scalar values (actual {actual})")]
+    #[error(
+        "ask_image answer uncertainty statement exceeds {max_scalars} Unicode scalar values (actual {actual})"
+    )]
     AnswerUncertaintyScalarBound { actual: usize, max_scalars: usize },
-    #[error("ask_image answer uncertainty statement exceeds {max_bytes} UTF-8 bytes (actual {actual})")]
+    #[error(
+        "ask_image answer uncertainty statement exceeds {max_bytes} UTF-8 bytes (actual {actual})"
+    )]
     AnswerUncertaintyByteBound { actual: usize, max_bytes: usize },
 }
 
@@ -357,11 +367,7 @@ pub enum DossierError {
 
 /// Check that a string satisfies both a Unicode-scalar-value count limit and
 /// a UTF-8-byte limit. Returns the scalar count and byte count on success.
-fn check_text_limits(
-    s: &str,
-    max_scalars: usize,
-    max_bytes: usize,
-) -> Result<(usize, usize), ()> {
+fn check_text_limits(s: &str, max_scalars: usize, max_bytes: usize) -> Result<(usize, usize), ()> {
     let scalars = s.chars().count();
     if scalars > max_scalars {
         return Err(());
@@ -416,9 +422,7 @@ impl DossierValidator {
         if let serde_json::Value::Object(map) = value {
             for key in map.keys() {
                 if !known_fields.contains(&key.as_str()) {
-                    return Err(DossierError::UnknownField {
-                        field: key.clone(),
-                    });
+                    return Err(DossierError::UnknownField { field: key.clone() });
                 }
             }
         }
@@ -455,21 +459,24 @@ impl ImageSidecarDossier {
         let src_h = self.provenance.source_height_px;
 
         // summary
-        let (s_scalars, s_bytes) =
-            check_text_limits(&self.summary, SUMMARY_MAX_UNICODE_SCALARS, SUMMARY_MAX_UTF8_BYTES)
-                .map_err(|()| {
-                    if self.summary.chars().count() > SUMMARY_MAX_UNICODE_SCALARS {
-                        DossierError::SummaryScalarBound {
-                            actual: self.summary.chars().count(),
-                            max_scalars: SUMMARY_MAX_UNICODE_SCALARS,
-                        }
-                    } else {
-                        DossierError::SummaryByteBound {
-                            actual: self.summary.len(),
-                            max_bytes: SUMMARY_MAX_UTF8_BYTES,
-                        }
-                    }
-                })?;
+        let (s_scalars, s_bytes) = check_text_limits(
+            &self.summary,
+            SUMMARY_MAX_UNICODE_SCALARS,
+            SUMMARY_MAX_UTF8_BYTES,
+        )
+        .map_err(|()| {
+            if self.summary.chars().count() > SUMMARY_MAX_UNICODE_SCALARS {
+                DossierError::SummaryScalarBound {
+                    actual: self.summary.chars().count(),
+                    max_scalars: SUMMARY_MAX_UNICODE_SCALARS,
+                }
+            } else {
+                DossierError::SummaryByteBound {
+                    actual: self.summary.len(),
+                    max_bytes: SUMMARY_MAX_UTF8_BYTES,
+                }
+            }
+        })?;
         let _ = (s_scalars, s_bytes);
 
         // ocr_regions
@@ -552,20 +559,24 @@ impl ImageSidecarDossier {
             if let Some(c) = &fact.confidence_bps {
                 c.validate()?;
             }
-            check_text_limits(&fact.key, FACT_KEY_MAX_UNICODE_SCALARS, FACT_KEY_MAX_UTF8_BYTES)
-                .map_err(|()| {
-                    if fact.key.chars().count() > FACT_KEY_MAX_UNICODE_SCALARS {
-                        DossierError::FactKeyScalarBound {
-                            actual: fact.key.chars().count(),
-                            max_scalars: FACT_KEY_MAX_UNICODE_SCALARS,
-                        }
-                    } else {
-                        DossierError::FactKeyByteBound {
-                            actual: fact.key.len(),
-                            max_bytes: FACT_KEY_MAX_UTF8_BYTES,
-                        }
+            check_text_limits(
+                &fact.key,
+                FACT_KEY_MAX_UNICODE_SCALARS,
+                FACT_KEY_MAX_UTF8_BYTES,
+            )
+            .map_err(|()| {
+                if fact.key.chars().count() > FACT_KEY_MAX_UNICODE_SCALARS {
+                    DossierError::FactKeyScalarBound {
+                        actual: fact.key.chars().count(),
+                        max_scalars: FACT_KEY_MAX_UNICODE_SCALARS,
                     }
-                })?;
+                } else {
+                    DossierError::FactKeyByteBound {
+                        actual: fact.key.len(),
+                        max_bytes: FACT_KEY_MAX_UTF8_BYTES,
+                    }
+                }
+            })?;
             check_text_limits(
                 &fact.value,
                 FACT_VALUE_MAX_UNICODE_SCALARS,
@@ -624,9 +635,7 @@ impl ImageSidecarDossier {
             RECREATION_GUIDANCE_MAX_UTF8_BYTES,
         )
         .map_err(|()| {
-            if self.recreation_guidance.chars().count()
-                > RECREATION_GUIDANCE_MAX_UNICODE_SCALARS
-            {
+            if self.recreation_guidance.chars().count() > RECREATION_GUIDANCE_MAX_UNICODE_SCALARS {
                 DossierError::RecreationGuidanceScalarBound {
                     actual: self.recreation_guidance.chars().count(),
                     max_scalars: RECREATION_GUIDANCE_MAX_UNICODE_SCALARS,
@@ -974,7 +983,10 @@ impl DossierCache {
 
     /// Register a session as active. Entries for this session can be cached.
     pub fn session_start(&self, session_id: &str) {
-        self.active_sessions.lock().unwrap().insert(session_id.to_string());
+        self.active_sessions
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string());
     }
 
     /// End a session. All entries for this session are evicted immediately.
@@ -1026,14 +1038,18 @@ impl DossierCache {
         // Check for expiry.
         let expired = entries
             .get(key)
-            .map(|e| now.saturating_sub(e.last_accessed_ms) >= DOSSIER_CACHE_IDLE_TTL.as_millis() as u64)
+            .map(|e| {
+                now.saturating_sub(e.last_accessed_ms) >= DOSSIER_CACHE_IDLE_TTL.as_millis() as u64
+            })
             .unwrap_or(false);
         if expired {
             entries.remove(key);
             return CacheLookupOutcome::Miss;
         }
         // Proactively evict all expired entries.
-        entries.retain(|_, e| now.saturating_sub(e.last_accessed_ms) < DOSSIER_CACHE_IDLE_TTL.as_millis() as u64);
+        entries.retain(|_, e| {
+            now.saturating_sub(e.last_accessed_ms) < DOSSIER_CACHE_IDLE_TTL.as_millis() as u64
+        });
         if let Some(entry) = entries.get_mut(key) {
             entry.last_accessed_ms = now;
             CacheLookupOutcome::Hit {
@@ -1049,7 +1065,9 @@ impl DossierCache {
     pub fn evict_expired(&self, clock: &dyn DossierClock) {
         let now = clock.now_ms();
         let mut entries = self.entries.lock().unwrap();
-        entries.retain(|_, e| now.saturating_sub(e.last_accessed_ms) < DOSSIER_CACHE_IDLE_TTL.as_millis() as u64);
+        entries.retain(|_, e| {
+            now.saturating_sub(e.last_accessed_ms) < DOSSIER_CACHE_IDLE_TTL.as_millis() as u64
+        });
     }
 
     /// Invalidate a single entry (e.g. attachment/checksum/crop/sidecar/config
@@ -1060,7 +1078,10 @@ impl DossierCache {
 
     /// Clear all entries for a session.
     pub fn clear_session(&self, session_id: &str) {
-        self.entries.lock().unwrap().retain(|key, _| key.session_id != session_id);
+        self.entries
+            .lock()
+            .unwrap()
+            .retain(|key, _| key.session_id != session_id);
     }
 
     /// Number of cached entries (for inspection/testing).

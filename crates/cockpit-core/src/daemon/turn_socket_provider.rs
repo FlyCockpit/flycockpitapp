@@ -30,7 +30,7 @@
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use zeroize::Zeroizing;
@@ -317,7 +317,11 @@ impl TurnServerUrl {
             (TurnScheme::Turns, rest)
         } else if let Some(rest) = url.strip_prefix("turn://") {
             (TurnScheme::Turn, rest)
-        } else if url.starts_with("stun:") || url.starts_with("stuns:") || url.starts_with("stun://") || url.starts_with("stuns://") {
+        } else if url.starts_with("stun:")
+            || url.starts_with("stuns:")
+            || url.starts_with("stun://")
+            || url.starts_with("stuns://")
+        {
             return Err(TurnUrlError::StunRejected);
         } else {
             return Err(TurnUrlError::UnsupportedScheme);
@@ -431,9 +435,7 @@ pub enum TurnUrlError {
 fn split_host_port(s: &str) -> Result<(&str, Option<u16>), TurnUrlError> {
     if let Some(rest) = s.strip_prefix('[') {
         // IPv6 literal [addr]:port
-        let close = rest
-            .find(']')
-            .ok_or(TurnUrlError::InvalidHost)?;
+        let close = rest.find(']').ok_or(TurnUrlError::InvalidHost)?;
         let host = &rest[..close];
         let after = &rest[close + 1..];
         let port = if let Some(p) = after.strip_prefix(':') {
@@ -524,7 +526,10 @@ pub enum LifecycleEvent {
     /// An allocation is draining.
     Draining { generation: u64 },
     /// An allocation has closed.
-    Closed { generation: u64, reason: CloseReason },
+    Closed {
+        generation: u64,
+        reason: CloseReason,
+    },
 }
 
 /// Safe reason codes — TURN error text is mapped to these and never
@@ -881,14 +886,12 @@ impl TurnAllocation {
         }
         let remaining = effective_expiry - now_secs;
         let half_lifetime = self.allocation_lifetime.as_secs() / 2;
-        let lead = remaining.saturating_sub(half_lifetime).min(remaining.saturating_sub(REFRESH_LEAD_FIXED.as_secs()));
+        let lead = remaining
+            .saturating_sub(half_lifetime)
+            .min(remaining.saturating_sub(REFRESH_LEAD_FIXED.as_secs()));
         // Take the earlier (smaller) lead.
         let lead = lead.min(remaining.saturating_sub(half_lifetime));
-        if lead == 0 {
-            Some(0)
-        } else {
-            Some(lead)
-        }
+        if lead == 0 { Some(0) } else { Some(lead) }
     }
 }
 
@@ -1112,11 +1115,10 @@ impl TurnSocketProvider {
         if lease.old_allocation_generation != current_gen {
             return Err(CutoverError::LeaseMismatch);
         }
-        self.events
-            .push_back(LifecycleEvent::CutoverReady {
-                old_generation: current_gen,
-                new_generation: pending_gen,
-            });
+        self.events.push_back(LifecycleEvent::CutoverReady {
+            old_generation: current_gen,
+            new_generation: pending_gen,
+        });
         Ok(())
     }
 
@@ -1152,8 +1154,9 @@ impl TurnSocketProvider {
         old_draining.demote_to_draining();
         self.current = Some(new_current);
         self.noncurrent = Some(old_draining);
-        self.events
-            .push_back(LifecycleEvent::Draining { generation: old_gen });
+        self.events.push_back(LifecycleEvent::Draining {
+            generation: old_gen,
+        });
         Ok(())
     }
 
@@ -1162,12 +1165,11 @@ impl TurnSocketProvider {
     pub fn remove_draining(&mut self) -> Result<(), CutoverError> {
         if let Some(draining) = self.noncurrent.take() {
             if draining.is_draining() {
-                let gen = draining.generation;
-                self.events
-                    .push_back(LifecycleEvent::Closed {
-                        generation: gen,
-                        reason: CloseReason::Deallocated,
-                    });
+                let alloc_gen = draining.generation;
+                self.events.push_back(LifecycleEvent::Closed {
+                    generation: alloc_gen,
+                    reason: CloseReason::Deallocated,
+                });
                 return Ok(());
             }
             // Not draining — put it back.
@@ -1183,12 +1185,11 @@ impl TurnSocketProvider {
         if let Some(ref mut current) = self.current {
             if current.generation == generation {
                 current.close(CloseReason::Cancelled);
-                let gen = current.generation;
-                self.events
-                    .push_back(LifecycleEvent::Closed {
-                        generation: gen,
-                        reason: CloseReason::Cancelled,
-                    });
+                let alloc_gen = current.generation;
+                self.events.push_back(LifecycleEvent::Closed {
+                    generation: alloc_gen,
+                    reason: CloseReason::Cancelled,
+                });
                 return;
             }
         }
@@ -1197,12 +1198,11 @@ impl TurnSocketProvider {
                 // Stale pending success or draining deallocate cannot affect
                 // current allocation/route/lease/budget.
                 nc.close(CloseReason::Cancelled);
-                let gen = nc.generation;
-                self.events
-                    .push_back(LifecycleEvent::Closed {
-                        generation: gen,
-                        reason: CloseReason::Cancelled,
-                    });
+                let alloc_gen = nc.generation;
+                self.events.push_back(LifecycleEvent::Closed {
+                    generation: alloc_gen,
+                    reason: CloseReason::Cancelled,
+                });
             }
         }
     }
@@ -1213,21 +1213,19 @@ impl TurnSocketProvider {
     pub fn shutdown(&mut self) {
         if let Some(ref mut current) = self.current {
             current.close(CloseReason::Shutdown);
-            let gen = current.generation;
-            self.events
-                .push_back(LifecycleEvent::Closed {
-                    generation: gen,
-                    reason: CloseReason::Shutdown,
-                });
+            let alloc_gen = current.generation;
+            self.events.push_back(LifecycleEvent::Closed {
+                generation: alloc_gen,
+                reason: CloseReason::Shutdown,
+            });
         }
         if let Some(ref mut nc) = self.noncurrent {
             nc.close(CloseReason::Shutdown);
-            let gen = nc.generation;
-            self.events
-                .push_back(LifecycleEvent::Closed {
-                    generation: gen,
-                    reason: CloseReason::Shutdown,
-                });
+            let alloc_gen = nc.generation;
+            self.events.push_back(LifecycleEvent::Closed {
+                generation: alloc_gen,
+                reason: CloseReason::Shutdown,
+            });
         }
         // Zeroizing credential buffers are dropped when allocations drop.
     }
@@ -1236,21 +1234,19 @@ impl TurnSocketProvider {
     pub fn revoke(&mut self) {
         if let Some(ref mut current) = self.current {
             current.close(CloseReason::Revoked);
-            let gen = current.generation;
-            self.events
-                .push_back(LifecycleEvent::Closed {
-                    generation: gen,
-                    reason: CloseReason::Revoked,
-                });
+            let alloc_gen = current.generation;
+            self.events.push_back(LifecycleEvent::Closed {
+                generation: alloc_gen,
+                reason: CloseReason::Revoked,
+            });
         }
         if let Some(ref mut nc) = self.noncurrent {
             nc.close(CloseReason::Revoked);
-            let gen = nc.generation;
-            self.events
-                .push_back(LifecycleEvent::Closed {
-                    generation: gen,
-                    reason: CloseReason::Revoked,
-                });
+            let alloc_gen = nc.generation;
+            self.events.push_back(LifecycleEvent::Closed {
+                generation: alloc_gen,
+                reason: CloseReason::Revoked,
+            });
         }
     }
 
@@ -1258,21 +1254,19 @@ impl TurnSocketProvider {
     pub fn interface_change(&mut self) {
         if let Some(ref mut current) = self.current {
             current.close(CloseReason::InterfaceChange);
-            let gen = current.generation;
-            self.events
-                .push_back(LifecycleEvent::Closed {
-                    generation: gen,
-                    reason: CloseReason::InterfaceChange,
-                });
+            let alloc_gen = current.generation;
+            self.events.push_back(LifecycleEvent::Closed {
+                generation: alloc_gen,
+                reason: CloseReason::InterfaceChange,
+            });
         }
         if let Some(ref mut nc) = self.noncurrent {
             nc.close(CloseReason::InterfaceChange);
-            let gen = nc.generation;
-            self.events
-                .push_back(LifecycleEvent::Closed {
-                    generation: gen,
-                    reason: CloseReason::InterfaceChange,
-                });
+            let alloc_gen = nc.generation;
+            self.events.push_back(LifecycleEvent::Closed {
+                generation: alloc_gen,
+                reason: CloseReason::InterfaceChange,
+            });
         }
     }
 
@@ -1282,24 +1276,22 @@ impl TurnSocketProvider {
         let now = self.clock.now_secs();
         if let Some(ref mut current) = self.current {
             if current.credential_expiry <= now && !current.is_closed() {
-                let gen = current.generation;
+                let alloc_gen = current.generation;
                 current.close(CloseReason::CredentialExpired);
-                self.events
-                    .push_back(LifecycleEvent::Closed {
-                        generation: gen,
-                        reason: CloseReason::CredentialExpired,
-                    });
+                self.events.push_back(LifecycleEvent::Closed {
+                    generation: alloc_gen,
+                    reason: CloseReason::CredentialExpired,
+                });
             }
         }
         if let Some(ref mut nc) = self.noncurrent {
             if nc.credential_expiry <= now && !nc.is_closed() {
-                let gen = nc.generation;
+                let alloc_gen = nc.generation;
                 nc.close(CloseReason::CredentialExpired);
-                self.events
-                    .push_back(LifecycleEvent::Closed {
-                        generation: gen,
-                        reason: CloseReason::CredentialExpired,
-                    });
+                self.events.push_back(LifecycleEvent::Closed {
+                    generation: alloc_gen,
+                    reason: CloseReason::CredentialExpired,
+                });
             }
         }
     }
@@ -1337,10 +1329,7 @@ impl TurnSocketProvider {
     /// Send a datagram through the current allocation.
     pub fn send(&mut self, data: Vec<u8>) -> Result<(), SendError> {
         // Relay-only: no direct socket path exists. This is the only send.
-        let current = self
-            .current
-            .as_mut()
-            .ok_or(SendError::Closed)?;
+        let current = self.current.as_mut().ok_or(SendError::Closed)?;
         current.send(data)
     }
 
@@ -1370,11 +1359,10 @@ impl TurnSocketProvider {
         if let Some(ref mut nc) = self.noncurrent {
             if nc.generation == generation {
                 nc.close(CloseReason::StaleGeneration);
-                self.events
-                    .push_back(LifecycleEvent::Closed {
-                        generation,
-                        reason: CloseReason::StaleGeneration,
-                    });
+                self.events.push_back(LifecycleEvent::Closed {
+                    generation,
+                    reason: CloseReason::StaleGeneration,
+                });
             }
         }
     }
@@ -1498,11 +1486,7 @@ impl DnsResolver for FakeDnsResolver {
         if self.fail {
             return Err(DnsError::LookupFailed);
         }
-        let addrs = self
-            .records
-            .get(hostname)
-            .cloned()
-            .unwrap_or_default();
+        let addrs = self.records.get(hostname).cloned().unwrap_or_default();
         if addrs.len() > max_addresses {
             return Err(DnsError::TooManyAddresses);
         }

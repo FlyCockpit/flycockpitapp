@@ -1674,10 +1674,7 @@ mod tests {
                 str0m::channel::Reliability::Reliable
             ));
             // Negotiated with exact channel ID (u16 stream ID).
-            assert_eq!(
-                config.negotiated,
-                Some(REMOTE_LANE_CHANNELS[i].channel_id)
-            );
+            assert_eq!(config.negotiated, Some(REMOTE_LANE_CHANNELS[i].channel_id));
         }
     }
 

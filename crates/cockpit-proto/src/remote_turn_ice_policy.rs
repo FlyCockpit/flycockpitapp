@@ -30,9 +30,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use crate::remote_protocol_id::{
-    CanonicalU64DecimalStringV1, parse_canonical_u64_decimal_string,
-};
+use crate::remote_protocol_id::{CanonicalU64DecimalStringV1, parse_canonical_u64_decimal_string};
 use crate::remote_public_service_policy::{RemotePublicPolicyError, canonical_json_value};
 
 pub use crate::remote_protocol_id::REMOTE_PROTOCOL_ID_B64URL_LEN as ID_B64URL_LEN;
@@ -390,7 +388,9 @@ pub fn validate_digest_hex(s: &str) -> Result<(), IcePolicyError> {
         .bytes()
         .all(|b| (b'a'..=b'f').contains(&b) || b.is_ascii_digit())
     {
-        return Err(IcePolicyError::BadDigest("digest must be lowercase hex".into()));
+        return Err(IcePolicyError::BadDigest(
+            "digest must be lowercase hex".into(),
+        ));
     }
     Ok(())
 }
@@ -400,7 +400,9 @@ pub fn validate_generation(s: &str) -> Result<u64, IcePolicyError> {
     let v = parse_canonical_u64_decimal_string(s)
         .map_err(|_| IcePolicyError::BadGeneration(s.to_string()))?;
     if v == 0 {
-        return Err(IcePolicyError::BadGeneration("generation must be nonzero".into()));
+        return Err(IcePolicyError::BadGeneration(
+            "generation must be nonzero".into(),
+        ));
     }
     Ok(v)
 }
@@ -435,7 +437,9 @@ pub fn validate_turn_url(url: &str, allow_ip_literals: bool) -> Result<TurnUrl, 
     }
     // Reject userinfo, path, fragment.
     if rest.contains('@') || rest.contains('/') || rest.contains('#') {
-        return Err(IcePolicyError::BadUrl("userinfo/path/fragment forbidden".into()));
+        return Err(IcePolicyError::BadUrl(
+            "userinfo/path/fragment forbidden".into(),
+        ));
     }
     let (authority, query) = match rest.split_once('?') {
         Some((a, q)) => (a, Some(q)),
@@ -462,7 +466,9 @@ pub fn validate_turn_url(url: &str, allow_ip_literals: bool) -> Result<TurnUrl, 
             }
             let val = &q["transport=".len()..];
             if val != "tcp" {
-                return Err(IcePolicyError::BadUrl("turns requires transport=tcp".into()));
+                return Err(IcePolicyError::BadUrl(
+                    "turns requires transport=tcp".into(),
+                ));
             }
             TurnTransport::Tcp
         }
@@ -470,14 +476,10 @@ pub fn validate_turn_url(url: &str, allow_ip_literals: bool) -> Result<TurnUrl, 
     // Scheme-default must omit query.
     match (scheme, query, transport) {
         (TurnScheme::Turn, Some(_), TurnTransport::Udp) => {
-            return Err(IcePolicyError::BadUrl(
-                "turn udp must omit query".into(),
-            ));
+            return Err(IcePolicyError::BadUrl("turn udp must omit query".into()));
         }
         (TurnScheme::Turns, Some(_), TurnTransport::Tcp) => {
-            return Err(IcePolicyError::BadUrl(
-                "turns tcp must omit query".into(),
-            ));
+            return Err(IcePolicyError::BadUrl("turns tcp must omit query".into()));
         }
         _ => {}
     }
@@ -515,10 +517,15 @@ pub fn validate_stun_url(url: &str) -> Result<StunUrl, IcePolicyError> {
     if scheme != "stun" {
         return Err(IcePolicyError::BadUrl(format!("bad scheme: {scheme}")));
     }
-    if rest.is_empty() || rest.contains('?') || rest.contains('@') || rest.contains('/')
+    if rest.is_empty()
+        || rest.contains('?')
+        || rest.contains('@')
+        || rest.contains('/')
         || rest.contains('#')
     {
-        return Err(IcePolicyError::BadUrl("stun must be stun:host[:port]".into()));
+        return Err(IcePolicyError::BadUrl(
+            "stun must be stun:host[:port]".into(),
+        ));
     }
     let (host, port) = parse_host_port(rest)?;
     let normalized_host = normalize_host(&host)?;
@@ -591,7 +598,9 @@ fn parse_host_port(authority: &str) -> Result<(String, Option<u16>), IcePolicyEr
         } else if let Some(p) = rest.strip_prefix(':') {
             Some(parse_port(p)?)
         } else {
-            return Err(IcePolicyError::BadUrl("trailing delimiter after IPv6".into()));
+            return Err(IcePolicyError::BadUrl(
+                "trailing delimiter after IPv6".into(),
+            ));
         };
         return Ok((format!("[{host}]"), port));
     }
@@ -641,8 +650,7 @@ fn is_ip_literal(host: &str) -> bool {
         return true;
     }
     // IPv4 dotted quad.
-    host.parse::<std::net::IpAddr>().is_ok()
-        || host.parse::<std::net::Ipv4Addr>().is_ok()
+    host.parse::<std::net::IpAddr>().is_ok() || host.parse::<std::net::Ipv4Addr>().is_ok()
 }
 
 /// Reconstruct the canonical URL string from a parsed TurnUrl (for digest
@@ -693,7 +701,9 @@ impl PoolsFile {
         }
         validate_generation(&self.revision)?;
         if self.pools.is_empty() {
-            return Err(IcePolicyError::BadLifecycle("pools must be nonempty".into()));
+            return Err(IcePolicyError::BadLifecycle(
+                "pools must be nonempty".into(),
+            ));
         }
         // Sorted by raw UTF-8 id then generation.
         for w in self.pools.windows(2) {
@@ -756,7 +766,10 @@ impl PoolV1 {
         }
         // region.
         if !ALLOWED_REGIONS.contains(&self.region.as_str()) {
-            return Err(IcePolicyError::BadUrl(format!("bad region: {}", self.region)));
+            return Err(IcePolicyError::BadUrl(format!(
+                "bad region: {}",
+                self.region
+            )));
         }
         // transports (subset of allowed, sorted unique).
         if self.transports.is_empty() || self.transports.len() > ALLOWED_TURN_TRANSPORTS.len() {
@@ -804,10 +817,14 @@ impl ProviderPin {
             return Err(IcePolicyError::BadProvider("baseUrl empty origin".into()));
         }
         if without.contains('?') || without.contains('#') || without.contains('@') {
-            return Err(IcePolicyError::BadProvider("baseUrl has query/frag/userinfo".into()));
+            return Err(IcePolicyError::BadProvider(
+                "baseUrl has query/frag/userinfo".into(),
+            ));
         }
         if !without.ends_with("/v1") {
-            return Err(IcePolicyError::BadProvider("baseUrl must end with /v1".into()));
+            return Err(IcePolicyError::BadProvider(
+                "baseUrl must end with /v1".into(),
+            ));
         }
         // mTLS digests.
         validate_digest_hex(&self.mtls_ca_sha256)?;
@@ -815,12 +832,11 @@ impl ProviderPin {
         // event JWKS: 1..=3 keys, exactly one current, unique kids.
         let jwks = &self.event_jwks.keys;
         if jwks.is_empty() || jwks.len() > 3 {
-            return Err(IcePolicyError::BadProvider("eventJwks must be 1..=3 keys".into()));
+            return Err(IcePolicyError::BadProvider(
+                "eventJwks must be 1..=3 keys".into(),
+            ));
         }
-        let current = jwks
-            .iter()
-            .filter(|k| k.state == JwkState::Current)
-            .count();
+        let current = jwks.iter().filter(|k| k.state == JwkState::Current).count();
         if current != 1 {
             return Err(IcePolicyError::BadProvider(
                 "exactly one current JWKS key".into(),
@@ -829,7 +845,9 @@ impl ProviderPin {
         let mut kids = std::collections::HashSet::new();
         for k in jwks {
             if k.kty != "EC" || k.crv != "P-256" {
-                return Err(IcePolicyError::BadProvider("JWKS must be ES256/P-256".into()));
+                return Err(IcePolicyError::BadProvider(
+                    "JWKS must be ES256/P-256".into(),
+                ));
             }
             if !kids.insert(k.kid.as_str()) {
                 return Err(IcePolicyError::BadProvider("duplicate JWKS kid".into()));
@@ -849,7 +867,9 @@ impl ProviderPin {
 /// one current + one lower draining.
 fn validate_lifecycle_pair(gens: &[&PoolV1]) -> Result<(), IcePolicyError> {
     if gens.is_empty() || gens.len() > 2 {
-        return Err(IcePolicyError::BadLifecycle("1..=2 generations per id".into()));
+        return Err(IcePolicyError::BadLifecycle(
+            "1..=2 generations per id".into(),
+        ));
     }
     let current_count = gens
         .iter()
@@ -937,7 +957,9 @@ impl SecretsFile {
                 )));
             }
             if !material.insert(bytes) {
-                return Err(IcePolicyError::BadSecret("duplicate secret material".into()));
+                return Err(IcePolicyError::BadSecret(
+                    "duplicate secret material".into(),
+                ));
             }
         }
         Ok(())
@@ -1031,7 +1053,9 @@ pub fn remote_ice_policy_digest_v1(
     validate_digest_hex(&input.provider_binding_digest)?;
     // Validate childAttemptId is base64url-16.
     if input.child_attempt_id.len() != ID_B64URL_LEN {
-        return Err(IcePolicyError::BadDigest("childAttemptId must be 22 chars".into()));
+        return Err(IcePolicyError::BadDigest(
+            "childAttemptId must be 22 chars".into(),
+        ));
     }
     let canonical = canonical_json_value(&json!({
         "version": input.version,
@@ -1080,12 +1104,9 @@ pub fn coturn_username(unix_expiry: u64, random_id: &[u8; CREDENTIAL_RANDOM_ID_B
 
 /// Coturn REST credential password: base64 of HMAC-SHA1 over UTF-8 username
 /// using the selected coturn REST shared secret.
-pub fn coturn_password(
-    username: &str,
-    secret: &[u8],
-) -> Result<String, IcePolicyError> {
-    let mut mac = HmacSha1::new_from_slice(secret)
-        .map_err(|e| IcePolicyError::Hmac(e.to_string()))?;
+pub fn coturn_password(username: &str, secret: &[u8]) -> Result<String, IcePolicyError> {
+    let mut mac =
+        HmacSha1::new_from_slice(secret).map_err(|e| IcePolicyError::Hmac(e.to_string()))?;
     mac.update(username.as_bytes());
     let result = mac.finalize();
     Ok(BASE64_STD.encode(result.into_bytes()))
@@ -1187,8 +1208,8 @@ pub fn serialize_ice_policy_response(
         "routeClass": input.route_class.as_str(),
     });
     // Verify no secretRef leak in the serialized output.
-    let text = serde_json::to_string(&response)
-        .map_err(|e| IcePolicyError::BadResponse(e.to_string()))?;
+    let text =
+        serde_json::to_string(&response).map_err(|e| IcePolicyError::BadResponse(e.to_string()))?;
     if text.contains("secretRef") {
         return Err(IcePolicyError::SecretRefLeak);
     }
@@ -1292,13 +1313,15 @@ mod tests {
         assert!(IceEnvConfig::from_values(None, None, Some("enterprise".into()), None).is_ok());
         // Secure paths.
         assert!(IceEnvConfig::from_values(Some("relative".into()), None, None, None).is_err());
-        assert!(IceEnvConfig::from_values(
-            Some("/etc/pools.json".into()),
-            Some("/etc/secrets.json".into()),
-            None,
-            None
-        )
-        .is_ok());
+        assert!(
+            IceEnvConfig::from_values(
+                Some("/etc/pools.json".into()),
+                Some("/etc/secrets.json".into()),
+                None,
+                None
+            )
+            .is_ok()
+        );
         // Pools file valid.
         assert!(valid_pools_file().validate().is_ok());
         // Bad schema version.
@@ -1307,11 +1330,13 @@ mod tests {
         assert_eq!(pf.validate(), Err(IcePolicyError::BadSchemaVersion));
         // Bad lifecycle: two current.
         let mut pf = valid_pools_file();
-        pf.pools.push(valid_pool("pool1", "2", PoolLifecycle::Current));
+        pf.pools
+            .push(valid_pool("pool1", "2", PoolLifecycle::Current));
         assert!(pf.validate().is_err());
         // Bad lifecycle: pending lower than current.
         let mut pf = valid_pools_file();
-        pf.pools.push(valid_pool("pool1", "0", PoolLifecycle::Draining));
+        pf.pools
+            .push(valid_pool("pool1", "0", PoolLifecycle::Draining));
         // generation 0 is invalid.
         assert!(pf.validate().is_err());
         // Good: current + higher replacement_pending.
@@ -1455,7 +1480,10 @@ mod tests {
         // Username format: <unix-expiry>:<base64url-16-byte-random-id>
         let random_id = [0xABu8; 16];
         let username = coturn_username(1_000_000_000, &random_id);
-        assert_eq!(username, format!("1000000000:{}", B64URL.encode(&random_id)));
+        assert_eq!(
+            username,
+            format!("1000000000:{}", B64URL.encode(&random_id))
+        );
         assert_eq!(B64URL.encode(&random_id).len(), ID_B64URL_LEN);
         // 16-byte randomness check.
         assert_eq!(random_id.len(), 16);
@@ -1515,7 +1543,16 @@ mod tests {
         let keys: Vec<String> = resp.as_object().unwrap().keys().cloned().collect();
         let mut sorted = keys.clone();
         sorted.sort();
-        assert_eq!(sorted, vec!["authorization", "expiresAt", "iceServers", "iceTransportPolicy", "routeClass"]);
+        assert_eq!(
+            sorted,
+            vec![
+                "authorization",
+                "expiresAt",
+                "iceServers",
+                "iceTransportPolicy",
+                "routeClass"
+            ]
+        );
         // Relay-only with stun URLs provided should still not include STUN.
         let stun = vec!["stun:stun.example.com:3478".into()];
         let resp = serialize_ice_policy_response(&IcePolicyResponseInput {
@@ -1606,7 +1643,10 @@ mod tests {
         assert_eq!(u.host, "turn.example.com");
         // Round-trip URL string.
         let u = validate_turn_url("turn:turn.example.com:3478?transport=tcp", false).unwrap();
-        assert_eq!(u.to_url_string(), "turn:turn.example.com:3478?transport=tcp");
+        assert_eq!(
+            u.to_url_string(),
+            "turn:turn.example.com:3478?transport=tcp"
+        );
         let u = validate_turn_url("turn:turn.example.com:3478", false).unwrap();
         assert_eq!(u.to_url_string(), "turn:turn.example.com:3478");
     }

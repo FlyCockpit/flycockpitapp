@@ -49,9 +49,9 @@ pub mod session_worker;
 pub mod shutdown;
 pub mod skew_restart;
 pub mod terminal;
-pub mod turn_socket_provider;
 #[cfg(test)]
 pub(crate) mod test_harness;
+pub mod turn_socket_provider;
 
 #[cfg(unix)]
 use std::io::{BufRead, BufReader};

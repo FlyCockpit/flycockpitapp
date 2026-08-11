@@ -44,9 +44,9 @@ use crate::remote_identity_protocol as identity;
 
 /// Wire/constants reused from the foundation identity protocol.
 pub use crate::remote_identity_protocol::{
-    CustodyClass as RemoteIdentityCustodyClassV1, CustodyEvidence as RemoteIdentityCustodyEvidenceV1,
-    EnrollmentRole as RemoteEnrollmentRoleV1, PresenceMode as RemoteIdentityPresenceModeV1,
-    SubjectKind as RemoteSubjectKindV1,
+    CustodyClass as RemoteIdentityCustodyClassV1,
+    CustodyEvidence as RemoteIdentityCustodyEvidenceV1, EnrollmentRole as RemoteEnrollmentRoleV1,
+    PresenceMode as RemoteIdentityPresenceModeV1, SubjectKind as RemoteSubjectKindV1,
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -357,9 +357,9 @@ impl EnrollmentDiscoveryLink {
 /// Validate a normalized HTTPS public origin (lowercase, no trailing slash, no
 /// path/query/fragment, no `:443`). Mirrors the foundation origin rules.
 fn validate_link_origin(origin: &str) -> Result<(), EnrollmentLinkError> {
-    let authority = origin.strip_prefix("https://").ok_or_else(|| {
-        EnrollmentLinkError::Origin("origin must use HTTPS".into())
-    })?;
+    let authority = origin
+        .strip_prefix("https://")
+        .ok_or_else(|| EnrollmentLinkError::Origin("origin must use HTTPS".into()))?;
     if !(1..=255).contains(&origin.len())
         || authority.is_empty()
         || authority
@@ -395,7 +395,9 @@ fn validate_link_origin(origin: &str) -> Result<(), EnrollmentLinkError> {
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         })
     {
-        return Err(EnrollmentLinkError::Origin("origin host is noncanonical".into()));
+        return Err(EnrollmentLinkError::Origin(
+            "origin host is noncanonical".into(),
+        ));
     }
     Ok(())
 }
@@ -409,7 +411,9 @@ pub fn build_discovery_link(
 ) -> Result<EnrollmentDiscoveryLink, EnrollmentLinkError> {
     validate_link_origin(public_origin)?;
     if enrollment_id.iter().all(|&b| b == 0) {
-        return Err(EnrollmentLinkError::Malformed("enrollmentId is zero".into()));
+        return Err(EnrollmentLinkError::Malformed(
+            "enrollmentId is zero".into(),
+        ));
     }
     if discovery_capability.iter().all(|&b| b == 0) {
         return Err(EnrollmentLinkError::Malformed(
@@ -429,10 +433,12 @@ pub fn build_discovery_link(
 /// path `/remote/enroll`, query keys `v=1`, `id=<base64url-16>`,
 /// `cap=<base64url-32>` in that order, and no extra parameters, fragments, or
 /// padding. Malformed/extra/padded variants are rejected.
-pub fn parse_https_enrollment_link(url: &str) -> Result<EnrollmentDiscoveryLink, EnrollmentLinkError> {
-    let (origin, query) = url
-        .split_once(ENROLLMENT_LINK_PATH)
-        .ok_or_else(|| EnrollmentLinkError::Malformed("missing lowercase /remote/enroll path".into()))?;
+pub fn parse_https_enrollment_link(
+    url: &str,
+) -> Result<EnrollmentDiscoveryLink, EnrollmentLinkError> {
+    let (origin, query) = url.split_once(ENROLLMENT_LINK_PATH).ok_or_else(|| {
+        EnrollmentLinkError::Malformed("missing lowercase /remote/enroll path".into())
+    })?;
     let origin = origin
         .strip_prefix("https://")
         .ok_or_else(|| EnrollmentLinkError::Malformed("link must use https".into()))?;
@@ -468,12 +474,16 @@ pub fn parse_https_enrollment_link(url: &str) -> Result<EnrollmentDiscoveryLink,
         .strip_prefix("cap=")
         .ok_or_else(|| EnrollmentLinkError::Malformed("cap parameter malformed".into()))?;
     if parts.next().is_some() {
-        return Err(EnrollmentLinkError::Malformed("extra query parameters rejected".into()));
+        return Err(EnrollmentLinkError::Malformed(
+            "extra query parameters rejected".into(),
+        ));
     }
     let enrollment_id = decode_b64url_fixed::<16>(id_value, "enrollmentId")?;
     let discovery_capability = decode_b64url_fixed::<32>(cap_value, "capability")?;
     if enrollment_id.iter().all(|&b| b == 0) {
-        return Err(EnrollmentLinkError::Malformed("enrollmentId is zero".into()));
+        return Err(EnrollmentLinkError::Malformed(
+            "enrollmentId is zero".into(),
+        ));
     }
     if discovery_capability.iter().all(|&b| b == 0) {
         return Err(EnrollmentLinkError::Malformed("capability is zero".into()));
@@ -486,10 +496,16 @@ pub fn parse_https_enrollment_link(url: &str) -> Result<EnrollmentDiscoveryLink,
 }
 
 /// Strictly parse a typed deep link `flycockpit://remote/enroll?v=1&id=...&cap=...`.
-pub fn parse_deep_enrollment_link(url: &str) -> Result<EnrollmentDiscoveryLink, EnrollmentLinkError> {
+pub fn parse_deep_enrollment_link(
+    url: &str,
+) -> Result<EnrollmentDiscoveryLink, EnrollmentLinkError> {
     let rest = url
         .strip_prefix("flycockpit://remote/enroll")
-        .ok_or_else(|| EnrollmentLinkError::Malformed("deep link must start with flycockpit://remote/enroll".into()))?;
+        .ok_or_else(|| {
+            EnrollmentLinkError::Malformed(
+                "deep link must start with flycockpit://remote/enroll".into(),
+            )
+        })?;
     let query = rest.strip_prefix('?').ok_or_else(|| {
         EnrollmentLinkError::Malformed("deep link query must begin with '?'".into())
     })?;
@@ -509,12 +525,16 @@ pub fn parse_deep_enrollment_link(url: &str) -> Result<EnrollmentDiscoveryLink, 
         .and_then(|p| p.strip_prefix("cap="))
         .ok_or_else(|| EnrollmentLinkError::Malformed("cap parameter malformed".into()))?;
     if parts.next().is_some() {
-        return Err(EnrollmentLinkError::Malformed("extra query parameters rejected".into()));
+        return Err(EnrollmentLinkError::Malformed(
+            "extra query parameters rejected".into(),
+        ));
     }
     let enrollment_id = decode_b64url_fixed::<16>(id_value, "enrollmentId")?;
     let discovery_capability = decode_b64url_fixed::<32>(cap_value, "capability")?;
     if enrollment_id.iter().all(|&b| b == 0) {
-        return Err(EnrollmentLinkError::Malformed("enrollmentId is zero".into()));
+        return Err(EnrollmentLinkError::Malformed(
+            "enrollmentId is zero".into(),
+        ));
     }
     if discovery_capability.iter().all(|&b| b == 0) {
         return Err(EnrollmentLinkError::Malformed("capability is zero".into()));
@@ -650,10 +670,7 @@ pub trait RemoteIdentityCustodyProvider {
         handle: RemoteIdentityCustodyHandleId,
         provider_evidence: &[u8],
     ) -> Result<
-        (
-            RemoteIdentityP256PublicKey,
-            RemoteIdentityCustodyEvidenceV1,
-        ),
+        (RemoteIdentityP256PublicKey, RemoteIdentityCustodyEvidenceV1),
         RemoteIdentityCustodyError,
     >;
 
@@ -1215,7 +1232,8 @@ mod tests {
     fn sas_v1_salt_and_info_preimages_match_committed_vectors() {
         // Committed salt preimage hex:
         // 666c79636f636b7069742d72656d6f74652d656e726f6c6c6d656e742d7361732d76310073616c74
-        let expected_salt_hex = "666c79636f636b7069742d72656d6f74652d656e726f6c6c6d656e742d7361732d76310073616c74";
+        let expected_salt_hex =
+            "666c79636f636b7069742d72656d6f74652d656e726f6c6c6d656e742d7361732d76310073616c74";
         let expected_salt_preimage: Vec<u8> = expected_salt_hex
             .as_bytes()
             .chunks_exact(2)
@@ -1397,9 +1415,12 @@ mod tests {
         let bad_scheme = good.replacen("https://", "http://", 1);
         assert!(parse_https_enrollment_link(&bad_scheme).is_err());
 
-        // Padded base64url rejected.
-        let padded = good.replace("id=", "id=");
-        let padded = format!("{padded}=");
+        // Padded base64url rejected (an `=` in any value is noncanonical).
+        let padded_id = format!("{}=", URL_SAFE_NO_PAD.encode(enrollment_id));
+        let padded = format!(
+            "https://enroll.flycockpit.example/remote/enroll?v=1&id={padded_id}&cap={}",
+            URL_SAFE_NO_PAD.encode(capability),
+        );
         assert!(parse_https_enrollment_link(&padded).is_err());
 
         // Fragment rejected.
@@ -1415,12 +1436,30 @@ mod tests {
         assert!(parse_https_enrollment_link(&swapped).is_err());
 
         // Noncanonical origin rejected.
-        assert!(build_discovery_link("https://Enroll.flycockpit.example", enrollment_id, capability)
-            .is_err());
-        assert!(build_discovery_link("https://enroll.flycockpit.example:443", enrollment_id, capability)
-            .is_err());
-        assert!(build_discovery_link("http://enroll.flycockpit.example", enrollment_id, capability)
-            .is_err());
+        assert!(
+            build_discovery_link(
+                "https://Enroll.flycockpit.example",
+                enrollment_id,
+                capability
+            )
+            .is_err()
+        );
+        assert!(
+            build_discovery_link(
+                "https://enroll.flycockpit.example:443",
+                enrollment_id,
+                capability
+            )
+            .is_err()
+        );
+        assert!(
+            build_discovery_link(
+                "http://enroll.flycockpit.example",
+                enrollment_id,
+                capability
+            )
+            .is_err()
+        );
 
         // Zero IDs rejected.
         assert!(build_discovery_link(origin, [0; 16], capability).is_err());
@@ -1437,72 +1476,109 @@ mod tests {
     fn enrollment_state_terminal_reason_pairs_validate() {
         // Issued and all non-terminal states have null terminal reason.
         for state in EnrollmentState::ALL {
-            assert_eq!(state.null_terminal_reason(), !state.requires_terminal_reason());
+            assert_eq!(
+                state.null_terminal_reason(),
+                !state.requires_terminal_reason()
+            );
         }
         // Legal pairs.
-        assert!(EnrollmentTerminalReason::ExplicitReject
-            .validate_pair(EnrollmentState::Rejected)
-            .is_ok());
-        assert!(EnrollmentTerminalReason::Expired
-            .validate_pair(EnrollmentState::Expired)
-            .is_ok());
-        assert!(EnrollmentTerminalReason::Cancelled
-            .validate_pair(EnrollmentState::Cancelled)
-            .is_ok());
-        assert!(EnrollmentTerminalReason::Superseded
-            .validate_pair(EnrollmentState::Superseded)
-            .is_ok());
+        assert!(
+            EnrollmentTerminalReason::ExplicitReject
+                .validate_pair(EnrollmentState::Rejected)
+                .is_ok()
+        );
+        assert!(
+            EnrollmentTerminalReason::Expired
+                .validate_pair(EnrollmentState::Expired)
+                .is_ok()
+        );
+        assert!(
+            EnrollmentTerminalReason::Cancelled
+                .validate_pair(EnrollmentState::Cancelled)
+                .is_ok()
+        );
+        assert!(
+            EnrollmentTerminalReason::Superseded
+                .validate_pair(EnrollmentState::Superseded)
+                .is_ok()
+        );
         // Illegal pairs.
-        assert!(EnrollmentTerminalReason::Expired
-            .validate_pair(EnrollmentState::Rejected)
-            .is_err());
-        assert!(EnrollmentTerminalReason::ExplicitReject
-            .validate_pair(EnrollmentState::Issued)
-            .is_err());
-        assert!(EnrollmentTerminalReason::MismatchLimit
-            .validate_pair(EnrollmentState::Expired)
-            .is_err());
+        assert!(
+            EnrollmentTerminalReason::Expired
+                .validate_pair(EnrollmentState::Rejected)
+                .is_err()
+        );
+        assert!(
+            EnrollmentTerminalReason::ExplicitReject
+                .validate_pair(EnrollmentState::Issued)
+                .is_err()
+        );
+        assert!(
+            EnrollmentTerminalReason::MismatchLimit
+                .validate_pair(EnrollmentState::Expired)
+                .is_err()
+        );
     }
 
     #[test]
     fn certificate_operation_state_terminal_reason_pairs_validate() {
-        assert!(CertificateOperationTerminalReason::InvalidCurrent
-            .validate_pair(CertificateOperationState::Denied)
-            .is_ok());
-        assert!(CertificateOperationTerminalReason::SignerUnavailable
-            .validate_pair(CertificateOperationState::Denied)
-            .is_ok());
-        assert!(CertificateOperationTerminalReason::Expired
-            .validate_pair(CertificateOperationState::Expired)
-            .is_ok());
-        assert!(CertificateOperationTerminalReason::Cancelled
-            .validate_pair(CertificateOperationState::Cancelled)
-            .is_ok());
+        assert!(
+            CertificateOperationTerminalReason::InvalidCurrent
+                .validate_pair(CertificateOperationState::Denied)
+                .is_ok()
+        );
+        assert!(
+            CertificateOperationTerminalReason::SignerUnavailable
+                .validate_pair(CertificateOperationState::Denied)
+                .is_ok()
+        );
+        assert!(
+            CertificateOperationTerminalReason::Expired
+                .validate_pair(CertificateOperationState::Expired)
+                .is_ok()
+        );
+        assert!(
+            CertificateOperationTerminalReason::Cancelled
+                .validate_pair(CertificateOperationState::Cancelled)
+                .is_ok()
+        );
         // Illegal: denied reason on issued state.
-        assert!(CertificateOperationTerminalReason::InvalidCurrent
-            .validate_pair(CertificateOperationState::Issued)
-            .is_err());
+        assert!(
+            CertificateOperationTerminalReason::InvalidCurrent
+                .validate_pair(CertificateOperationState::Issued)
+                .is_err()
+        );
         // Illegal: expired reason on cancelled state.
-        assert!(CertificateOperationTerminalReason::Expired
-            .validate_pair(CertificateOperationState::Cancelled)
-            .is_err());
+        assert!(
+            CertificateOperationTerminalReason::Expired
+                .validate_pair(CertificateOperationState::Cancelled)
+                .is_err()
+        );
     }
 
     #[test]
     fn revocation_state_terminal_reason_pairs_validate() {
-        assert!(RevocationTerminalReason::InvalidApproval
-            .validate_pair(RevocationState::Denied)
-            .is_ok());
-        assert!(RevocationTerminalReason::Expired
-            .validate_pair(RevocationState::Expired)
-            .is_ok());
-        assert!(RevocationTerminalReason::Cancelled
-            .validate_pair(RevocationState::Cancelled)
-            .is_ok());
+        assert!(
+            RevocationTerminalReason::InvalidApproval
+                .validate_pair(RevocationState::Denied)
+                .is_ok()
+        );
+        assert!(
+            RevocationTerminalReason::Expired
+                .validate_pair(RevocationState::Expired)
+                .is_ok()
+        );
+        assert!(
+            RevocationTerminalReason::Cancelled
+                .validate_pair(RevocationState::Cancelled)
+                .is_ok()
+        );
         // Illegal: denied reason on revoked state (revoked has null reason).
-        assert!(RevocationTerminalReason::InvalidCurrent
-            .validate_pair(RevocationState::Revoked)
-            .is_err());
+        assert!(
+            RevocationTerminalReason::InvalidCurrent
+                .validate_pair(RevocationState::Revoked)
+                .is_err()
+        );
     }
 
     #[test]

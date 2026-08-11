@@ -10,6 +10,7 @@ import remoteOperationIdentityFixture from "../fixtures/remote-operation-identit
 };
 import {
   activeModelStateSchema,
+  canonicalToolResultContentSchema,
   clientEnvelopeSchema,
   commandDetailSchema,
   defaultModelUpdateOutcomeSchema,
@@ -26,6 +27,7 @@ import {
   remoteOperationIdentityV1Schema,
   resolveResponseSchema,
   responseEnvelopeSchema,
+  safeMediaMetadataSchema,
   sandboxEscalationSchema,
   serverMessageSchema,
 } from ".";
@@ -597,5 +599,152 @@ describe("cockpit-proto daemon wire schemas", () => {
         pending_tool_count: Number.MIN_SAFE_INTEGER - 1,
       }).success,
     ).toBe(false);
+  });
+
+  describe("typed media tool-result transport", () => {
+    it("round-trips text content", () => {
+      const text = { kind: "text", text: "hello world" };
+      expect(canonicalToolResultContentSchema.safeParse(text).success).toBe(true);
+    });
+
+    it("round-trips json content", () => {
+      const json = { kind: "json", value: { key: "value", num: 42 } };
+      expect(canonicalToolResultContentSchema.safeParse(json).success).toBe(true);
+    });
+
+    it("round-trips media reference content", () => {
+      const mediaRef = {
+        kind: "media_reference",
+        attachmentId: "00000000-0000-7000-8000-000000000001",
+        attachmentVersion: 1,
+        mediaKind: "image",
+        mimeType: "image/png",
+        ordinal: 0,
+        purpose: "primary",
+        checksum: "a".repeat(64),
+        byteCount: 1024,
+        dimensions: { width: 1920, height: 1080 },
+        availability: "ready",
+        provenance: { toolName: "screenshot", sourceLabel: "screen" },
+      };
+      expect(canonicalToolResultContentSchema.safeParse(mediaRef).success).toBe(true);
+    });
+
+    it("round-trips media reference with duration", () => {
+      const mediaRef = {
+        kind: "media_reference",
+        attachmentId: "00000000-0000-7000-8000-000000000002",
+        attachmentVersion: 1,
+        mediaKind: "audio",
+        mimeType: "audio/wav",
+        ordinal: 1,
+        purpose: "primary",
+        checksum: "b".repeat(64),
+        byteCount: 2048,
+        durationMs: { durationMs: 5000 },
+        availability: "ready",
+        provenance: { toolName: "recorder" },
+      };
+      expect(canonicalToolResultContentSchema.safeParse(mediaRef).success).toBe(true);
+    });
+
+    it("rejects unknown kind variant", () => {
+      expect(
+        canonicalToolResultContentSchema.safeParse({
+          kind: "unknown",
+          text: "hello",
+        }).success,
+      ).toBe(false);
+    });
+
+    it("rejects unknown fields in media reference", () => {
+      const mediaRef = {
+        kind: "media_reference",
+        attachmentId: "00000000-0000-7000-8000-000000000001",
+        attachmentVersion: 1,
+        mediaKind: "image",
+        mimeType: "image/png",
+        ordinal: 0,
+        purpose: "primary",
+        checksum: "a".repeat(64),
+        byteCount: 1024,
+        availability: "ready",
+        provenance: { toolName: "screenshot" },
+        evilField: "malicious",
+      };
+      expect(canonicalToolResultContentSchema.safeParse(mediaRef).success).toBe(false);
+    });
+
+    it("rejects invalid checksum (non-hex)", () => {
+      const mediaRef = {
+        kind: "media_reference",
+        attachmentId: "00000000-0000-7000-8000-000000000001",
+        attachmentVersion: 1,
+        mediaKind: "image",
+        mimeType: "image/png",
+        ordinal: 0,
+        purpose: "primary",
+        checksum: "XYZ".repeat(22),
+        byteCount: 1024,
+        availability: "ready",
+        provenance: { toolName: "screenshot" },
+      };
+      expect(canonicalToolResultContentSchema.safeParse(mediaRef).success).toBe(false);
+    });
+
+    it("rejects invalid attachment version (zero)", () => {
+      const mediaRef = {
+        kind: "media_reference",
+        attachmentId: "00000000-0000-7000-8000-000000000001",
+        attachmentVersion: 0,
+        mediaKind: "image",
+        mimeType: "image/png",
+        ordinal: 0,
+        purpose: "primary",
+        checksum: "a".repeat(64),
+        byteCount: 1024,
+        availability: "ready",
+        provenance: { toolName: "screenshot" },
+      };
+      expect(canonicalToolResultContentSchema.safeParse(mediaRef).success).toBe(false);
+    });
+
+    it("projects safe metadata without bytes", () => {
+      const metadata = {
+        attachmentId: "00000000-0000-7000-8000-000000000001",
+        mediaKind: "video",
+        mimeType: "video/mp4",
+        byteCount: 4096,
+        ordinal: 3,
+        purpose: "primary",
+        durationMs: { durationMs: 10000 },
+        provenance: { toolName: "capture" },
+        artifactHandle: "handle-abc-123",
+      };
+      const parsed = safeMediaMetadataSchema.safeParse(metadata);
+      expect(parsed.success).toBe(true);
+      if (parsed.success) {
+        const json = JSON.stringify(parsed.data);
+        expect(json).not.toContain("bytes");
+        expect(json).not.toContain("base64");
+      }
+    });
+
+    it("rejects unknown media kind", () => {
+      const mediaRef = {
+        kind: "media_reference",
+        attachmentId: "00000000-0000-7000-8000-000000000001",
+        attachmentVersion: 1,
+        mediaKind: "document",
+        mimeType: "application/pdf",
+        ordinal: 0,
+        purpose: "primary",
+        checksum: "a".repeat(64),
+        byteCount: 1024,
+        availability: "ready",
+        provenance: { toolName: "scanner" },
+      };
+      expect(canonicalToolResultContentSchema.safeParse(mediaRef).success).toBe(false);
+    });
   });
 });

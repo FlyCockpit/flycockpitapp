@@ -73,6 +73,7 @@ pub mod test_env;
 pub mod text;
 pub mod tokens;
 pub mod tools;
+pub mod typed_media_result;
 pub mod user_agent;
 pub mod welcome;
 pub mod wizard;

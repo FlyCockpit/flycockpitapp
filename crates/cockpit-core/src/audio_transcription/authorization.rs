@@ -118,7 +118,11 @@ pub fn transcription_request_digest(req: &MediaEgressTranscriptionRequest) -> St
     hasher.update(timestamps_str(req.timestamps).as_bytes());
     hasher.update(b"\n");
     hasher.update(b"diarization:");
-    hasher.update(if req.diarization { b"true" } else { b"false" });
+    hasher.update(if req.diarization {
+        &b"true"[..]
+    } else {
+        &b"false"[..]
+    });
     hasher.update(b"\n");
     hasher.update(b"purpose:");
     hasher.update(req.purpose.as_str().as_bytes());

@@ -644,22 +644,20 @@ pub fn encode_multipart(plan: &PlannedMultipart, audio: &[u8]) -> Result<Vec<u8>
         .map_err(|_| anyhow::anyhow!("encoded_length too large for usize"))?;
     let mut buf = Vec::with_capacity(capacity);
     for part in &plan.parts {
-        write!(buf, "--{}\r\n", plan.boundary).ok();
+        buf.extend_from_slice(format!("--{}\r\n", plan.boundary).as_bytes());
         if part.is_file {
-            write!(
-                buf,
-                "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
-                part.name, AUDIO_PART_FILENAME
-            )
-            .ok();
-            write!(buf, "Content-Type: {}\r\n", AUDIO_PART_CONTENT_TYPE).ok();
+            buf.extend_from_slice(
+                format!(
+                    "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
+                    part.name, AUDIO_PART_FILENAME
+                )
+                .as_bytes(),
+            );
+            buf.extend_from_slice(format!("Content-Type: {}\r\n", AUDIO_PART_CONTENT_TYPE).as_bytes());
         } else {
-            write!(
-                buf,
-                "Content-Disposition: form-data; name=\"{}\"\r\n",
-                part.name
-            )
-            .ok();
+            buf.extend_from_slice(
+                format!("Content-Disposition: form-data; name=\"{}\"\r\n", part.name).as_bytes(),
+            );
         }
         buf.extend_from_slice(b"\r\n");
         if part.is_file {
@@ -669,7 +667,7 @@ pub fn encode_multipart(plan: &PlannedMultipart, audio: &[u8]) -> Result<Vec<u8>
         }
         buf.extend_from_slice(b"\r\n");
     }
-    write!(buf, "--{}--\r\n", plan.boundary).ok();
+    buf.extend_from_slice(format!("--{}--\r\n", plan.boundary).as_bytes());
     // Verify transmitted length equals precomputed length
     if buf.len() as u64 != plan.encoded_length {
         bail!(

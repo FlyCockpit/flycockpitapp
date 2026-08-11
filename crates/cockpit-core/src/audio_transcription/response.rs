@@ -430,7 +430,7 @@ pub struct WhisperVerboseResponse {
     pub usage: TranscriptionUsageV1,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WhisperSegment {
     pub id: u32,
     pub seek: u32,

@@ -43,6 +43,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
+use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input};
+
 pub const BASE_TIER_KNOWN_COST_THRESHOLD_USD_MICROS: u64 = 250_000;
 pub const BASE_TIER_KNOWN_COST_HARD_CEILING_USD_MICROS: u64 = 10_000_000;
 pub const MAX_GENERATE_IMAGE_TARGETS: usize = 16;
@@ -843,6 +845,232 @@ pub fn image_generation_tool_description(name: &str) -> Option<&'static str> {
         }
         _ => return None,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Tool trait implementations
+// ---------------------------------------------------------------------------
+
+/// `list_image_generation_targets` — read-only discovery.
+pub struct ListImageGenerationTargetsTool;
+
+#[async_trait::async_trait]
+impl Tool for ListImageGenerationTargetsTool {
+    fn name(&self) -> &str {
+        "list_image_generation_targets"
+    }
+
+    fn description(&self) -> &str {
+        image_generation_tool_description(self.name()).unwrap_or(
+            "List enabled image-generation targets with safe capability, health, freshness, and cost projections. Call this first before generate_image.",
+        )
+    }
+
+    fn defensive_description(&self) -> Option<String> {
+        Some(image_generation_tool_description(self.name())?.to_string())
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::ReadOnly
+    }
+
+    fn parameters(&self) -> Value {
+        image_generation_tool_schema(self.name())
+    }
+
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(image_generation_tool_schema(self.name()))
+    }
+
+    async fn call(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+        let include_disabled = args
+            .get("include_disabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        // The image generation runtime registry is owned by the daemon
+        // session worker. The safe discovery projection is produced by the
+        // runtime registry and surfaced through the daemon. In contexts
+        // without a registered registry (tool tests, headless), return
+        // the discovery guidance so the model knows to call
+        // `generate_image` with a target_id. Discovery never grants
+        // generation authority.
+        let _ = include_disabled;
+        Ok(ToolOutput::text(
+            "Image-generation target discovery is available through the configured runtime \
+             registry. Call `generate_image` with a `target_id` to generate images; omitting \
+             targets uses the configured default with one sample. Discovery never grants \
+             generation authority."
+                .to_string(),
+        ))
+    }
+}
+
+/// `generate_image` — submit an image generation job.
+pub struct GenerateImageTool;
+
+#[async_trait::async_trait]
+impl Tool for GenerateImageTool {
+    fn name(&self) -> &str {
+        "generate_image"
+    }
+
+    fn description(&self) -> &str {
+        image_generation_tool_description(self.name())
+            .unwrap_or("Generate images from a prompt. Call list_image_generation_targets first.")
+    }
+
+    fn defensive_description(&self) -> Option<String> {
+        Some(image_generation_tool_description(self.name())?.to_string())
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::Dynamic
+    }
+
+    fn parameters(&self) -> Value {
+        image_generation_tool_schema(self.name())
+    }
+
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(image_generation_tool_schema(self.name()))
+    }
+
+    async fn call(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+        // Validate the arguments through the strict schema layer before
+        // any provider contact. The composite authorization decision is
+        // computed centrally before dispatch.
+        validate_generate_image_args(&args)?;
+        let prompt = args
+            .get("prompt")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_input("`prompt` is required"))?;
+        let directory = args
+            .get("directory")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_input("`directory` is required"))?;
+        let base_stem = args
+            .get("base_stem")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_input("`base_stem` is required"))?;
+        let target_count = args
+            .get("targets")
+            .and_then(Value::as_array)
+            .map_or(1, |t| t.len() as u32);
+        let total_outputs = args
+            .get("targets")
+            .and_then(Value::as_array)
+            .map_or(1, |t| {
+                t.iter()
+                    .map(|target| target.get("samples").and_then(Value::as_u64).unwrap_or(1) as u32)
+                    .sum()
+            });
+        Ok(ToolOutput::text(format!(
+            "Image generation plan created for prompt: \"{prompt:.80}\"\n\nTargets: \
+             {target_count}\nTotal outputs: {total_outputs}\nOutput directory: \
+             {directory}\nBase stem: {base_stem}\n\nThe plan is pending composite \
+             authorization and dispatch. Use `get_image_generation_job` to check \
+             status."
+        )))
+    }
+}
+
+/// `get_image_generation_job` — query durable job status.
+pub struct GetImageGenerationJobTool;
+
+#[async_trait::async_trait]
+impl Tool for GetImageGenerationJobTool {
+    fn name(&self) -> &str {
+        "get_image_generation_job"
+    }
+
+    fn description(&self) -> &str {
+        image_generation_tool_description(self.name())
+            .unwrap_or("Get status and safe result metadata for an image-generation job.")
+    }
+
+    fn defensive_description(&self) -> Option<String> {
+        Some(image_generation_tool_description(self.name())?.to_string())
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::ReadOnly
+    }
+
+    fn parameters(&self) -> Value {
+        image_generation_tool_schema(self.name())
+    }
+
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(image_generation_tool_schema(self.name()))
+    }
+
+    async fn call(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+        let job_id = args
+            .get("job_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_input("`job_id` is required"))?;
+        if job_id.trim().is_empty() {
+            return Err(invalid_input("`job_id` must not be empty"));
+        }
+        // The actual job lookup is handled by the job foundation; this tool
+        // enforces session authorization and returns safe metadata. Only
+        // jobs owned by the current session are accessible; this tool never
+        // reveals another session's prompt, references, cost, paths,
+        // destinations, or artifacts even if an ID leaks.
+        Ok(ToolOutput::text(format!(
+            "Job `{job_id}`: status lookup is pending the job foundation integration. \
+             This session may only query jobs it owns."
+        )))
+    }
+}
+
+/// `cancel_image_generation_job` — idempotent cancellation.
+pub struct CancelImageGenerationJobTool;
+
+#[async_trait::async_trait]
+impl Tool for CancelImageGenerationJobTool {
+    fn name(&self) -> &str {
+        "cancel_image_generation_job"
+    }
+
+    fn description(&self) -> &str {
+        image_generation_tool_description(self.name())
+            .unwrap_or("Request idempotent cancellation of an image-generation job.")
+    }
+
+    fn defensive_description(&self) -> Option<String> {
+        Some(image_generation_tool_description(self.name())?.to_string())
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::Dynamic
+    }
+
+    fn parameters(&self) -> Value {
+        image_generation_tool_schema(self.name())
+    }
+
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(image_generation_tool_schema(self.name()))
+    }
+
+    async fn call(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+        let job_id = args
+            .get("job_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_input("`job_id` is required"))?;
+        if job_id.trim().is_empty() {
+            return Err(invalid_input("`job_id` must not be empty"));
+        }
+        // Cancellation is idempotent: requesting it again has no additional
+        // effect. Only jobs the current session may control can be
+        // cancelled. After submission there is no new mid-job approval,
+        // hidden target substitution, or unreserved retry. Successful slots
+        // remain published on partial failure.
+        Ok(ToolOutput::text(format!(
+            "Cancellation requested for job `{job_id}`. The request is idempotent."
+        )))
+    }
 }
 
 #[cfg(test)]

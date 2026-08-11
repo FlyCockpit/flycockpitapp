@@ -12,8 +12,20 @@
     "owningVersion": 1
   },
   {
+    "magic": "FCAA",
+    "symbolicType": "RemoteRelayIdentityV1",
+    "owningPackage": "@flycockpit/cockpit-protocol",
+    "owningVersion": 1
+  },
+  {
     "magic": "FCAB",
     "symbolicType": "RemoteChildAuthenticationBundleV1",
+    "owningPackage": "@flycockpit/cockpit-protocol",
+    "owningVersion": 1
+  },
+  {
+    "magic": "FCAC",
+    "symbolicType": "RemoteRelayLeaseV1",
     "owningPackage": "@flycockpit/cockpit-protocol",
     "owningVersion": 1
   },
@@ -193,13 +205,13 @@
   },
   {
     "magic": "FCRI",
-    "symbolicType": "RemoteRelayIdentityV1",
+    "symbolicType": "RemoteIpConsentReceiptV1",
     "owningPackage": "@flycockpit/cockpit-protocol",
     "owningVersion": 1
   },
   {
     "magic": "FCRL",
-    "symbolicType": "RemoteRelayLeaseV1",
+    "symbolicType": "RemoteDeviceRelationshipV1",
     "owningPackage": "@flycockpit/cockpit-protocol",
     "owningVersion": 1
   },
@@ -211,7 +223,7 @@
   },
   {
     "magic": "FCRS",
-    "symbolicType": "RemoteRelationshipConsentStatusV1",
+    "symbolicType": "RemoteIpConsentStatusV1",
     "owningPackage": "@flycockpit/cockpit-protocol",
     "owningVersion": 1
   },

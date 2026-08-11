@@ -26,6 +26,7 @@
 
 pub mod remote_device_identity_enrollment;
 pub mod remote_identity_protocol;
+pub mod remote_ip_consent;
 pub mod remote_operation_fcor;
 pub mod remote_protocol_id;
 pub mod remote_public_service_policy;

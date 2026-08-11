@@ -42,6 +42,7 @@ fn config() -> ImageGenerationConfig {
             location: ImageLocationClass::Local,
             enabled: true,
             route_profile_version: IMAGE_GENERATION_ROUTE_PROFILE_VERSION,
+            exclusive_server: false,
         }],
         vec![ImageGenerationTarget {
             id: "portrait".into(),

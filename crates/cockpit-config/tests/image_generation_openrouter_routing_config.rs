@@ -29,6 +29,7 @@ fn image_generation_openrouter_routing_is_wired_through_registry() {
         location: ImageLocationClass::PublicCloud,
         enabled: true,
         route_profile_version: IMAGE_GENERATION_ROUTE_PROFILE_VERSION,
+        exclusive_server: false,
     };
     let target = ImageGenerationTarget {
         id: "flux".into(),

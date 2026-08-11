@@ -102,6 +102,14 @@ pub struct ImageEndpoint {
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub route_profile_version: u32,
+    /// Exclusive-server opt-in for no-ID `POST /interrupt`. Defaults to false
+    /// because no-ID interrupt is process-global and unsafe on shared servers.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub exclusive_server: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn default_true() -> bool {
@@ -159,6 +167,7 @@ impl ImageEndpoint {
             self.allow_insecure_transport,
             self.location,
             self.route_profile_version,
+            self.exclusive_server,
         ))
     }
 }

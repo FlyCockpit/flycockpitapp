@@ -955,7 +955,7 @@ pub fn provider_binding_digest(provider: &ProviderPin) -> Result<[u8; 32], IcePo
         "baseUrl": provider.base_url,
         "mtlsCaSha256": provider.mtls_ca_sha256,
         "mtlsLeafSpkiSha256": provider.mtls_leaf_spki_sha256,
-        "eventJwksDigest": hex::encode(jwks_digest),
+        "eventJwksDigest": hex::encode(&jwks_digest),
     }))?;
     Ok(Sha256::digest(canonical.as_bytes()).into())
 }

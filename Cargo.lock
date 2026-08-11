@@ -1280,6 +1280,7 @@ dependencies = [
  "rig-core",
  "rusqlite",
  "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1306,6 +1307,8 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
+ "turn-client-proto",
+ "turn-client-rustls",
  "unicode-normalization",
  "unicode-width",
  "urlencoding",
@@ -1377,6 +1380,7 @@ dependencies = [
  "quote",
  "serde",
  "serde_json",
+ "sha1 0.11.0",
  "sha2 0.11.0",
  "syn 2.0.119",
  "thiserror 2.0.20",
@@ -1385,6 +1389,7 @@ dependencies = [
  "unicode-normalization",
  "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -1618,6 +1623,21 @@ checksum = "8b2a41393f66f16b0823bb79094d54ac5fbd34ab292ddafb9a0456ac9f87d201"
 dependencies = [
  "libc",
 ]
+
+[[package]]
+name = "crc"
+version = "3.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5eb8a2a1cd12ab0d987a5d5e825195d372001a4094a0376319d5a0ad71c1ba0d"
+dependencies = [
+ "crc-catalog",
+]
+
+[[package]]
+name = "crc-catalog"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
 name = "crc32fast"
@@ -4102,6 +4122,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8863b587001c1b9a8a4e36008cebc6b3612cb1226fe2de94858e06092687b608"
 
 [[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest 0.10.7",
+]
+
+[[package]]
 name = "md5"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5581,7 +5611,7 @@ dependencies = [
  "rama-utils",
  "rand 0.9.5",
  "serde",
- "sha1",
+ "sha1 0.10.7",
 ]
 
 [[package]]
@@ -6480,6 +6510,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "sans-io-time"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e1c4baf93f2fbecd194191bdb8b911b14f37ae35f0d1e1cbfb4cb6e067e8c52"
+
+[[package]]
 name = "schannel"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6834,6 +6870,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.0",
+ "digest 0.11.3",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7137,6 +7184,43 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "stun-proto"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d93b223082474c3952d14cbea5b2d5356e913f6253e6b0e0659199149c483058"
+dependencies = [
+ "base64",
+ "byteorder",
+ "hashbrown 0.16.1",
+ "rand 0.9.5",
+ "sans-io-time",
+ "siphasher 1.0.3",
+ "smallvec",
+ "stun-types",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
+name = "stun-types"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d50df914b1fa980b7408d3f49bdab19db7223115f8c4ae6eb162c039d7d63ad3"
+dependencies = [
+ "byteorder",
+ "crc",
+ "hmac 0.12.1",
+ "md-5",
+ "rand 0.9.5",
+ "sha1 0.10.7",
+ "sha2 0.10.9",
+ "smallvec",
+ "subtle",
+ "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]
@@ -8041,7 +8125,7 @@ dependencies = [
  "rand 0.9.5",
  "rustls",
  "rustls-pki-types",
- "sha1",
+ "sha1 0.10.7",
  "thiserror 2.0.20",
  "utf-8",
 ]
@@ -8060,8 +8144,45 @@ dependencies = [
  "rand 0.9.5",
  "rustls",
  "rustls-pki-types",
- "sha1",
+ "sha1 0.10.7",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "turn-client-proto"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3cecb85f46bc0d695711183cdd36be9fd7fd30232f46235c0525276fe14093f2"
+dependencies = [
+ "byteorder",
+ "smallvec",
+ "stun-proto",
+ "thiserror 2.0.20",
+ "tracing",
+ "turn-types",
+]
+
+[[package]]
+name = "turn-client-rustls"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9759ad9615c5738e7e1a314204b5722ff9a545d23e09f0f2ff0c5c6f38c47da8"
+dependencies = [
+ "rustls",
+ "tracing",
+ "turn-client-proto",
+]
+
+[[package]]
+name = "turn-types"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b219ecb1e95783c98ff2819d51e95ef54dad78ae438be7ffa490d6480a3df0de"
+dependencies = [
+ "byteorder",
+ "stun-proto",
+ "stun-types",
+ "tracing",
 ]
 
 [[package]]

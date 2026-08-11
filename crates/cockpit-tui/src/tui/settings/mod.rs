@@ -42,6 +42,7 @@ mod dependencies_page;
 mod descriptor;
 mod grab;
 mod harnesses_page;
+mod image_generation;
 mod image_spend;
 mod lsp_page;
 mod mcp_page;
@@ -174,10 +175,19 @@ pub(super) enum SettingsPointerSurfaceKind {
     Mcp,
     Lsp,
     Dependencies,
+    GenerationList,
+    EndpointEditor,
+    TargetEditor,
+    WorkflowEditor,
+    BudgetEditor,
+    GrantList,
+    JobList,
+    JobDetail,
+    LateResultAction,
 }
 
 impl SettingsPointerSurfaceKind {
-    pub(super) const ALL: [Self; 14] = [
+    pub(super) const ALL: [Self; 23] = [
         Self::Root,
         Self::DefaultModel,
         Self::Agents,
@@ -192,6 +202,15 @@ impl SettingsPointerSurfaceKind {
         Self::Mcp,
         Self::Lsp,
         Self::Dependencies,
+        Self::GenerationList,
+        Self::EndpointEditor,
+        Self::TargetEditor,
+        Self::WorkflowEditor,
+        Self::BudgetEditor,
+        Self::GrantList,
+        Self::JobList,
+        Self::JobDetail,
+        Self::LateResultAction,
     ];
 }
 
@@ -440,6 +459,15 @@ pub(crate) enum TestPageRef<'a> {
     Skills(&'a SkillsPage),
     Mcp(&'a McpPage),
     Lsp(&'a LspPage),
+    GenerationList(&'a image_generation::GenerationListPage),
+    EndpointEditor(&'a image_generation::EndpointEditorPage),
+    TargetEditor(&'a image_generation::TargetEditorPage),
+    WorkflowEditor(&'a image_generation::WorkflowEditorPage),
+    BudgetEditor(&'a image_generation::BudgetEditorPage),
+    GrantList(&'a image_generation::GrantListPage),
+    JobList(&'a image_generation::JobListPage),
+    JobDetail(&'a image_generation::JobDetailPage),
+    LateResultAction(&'a image_generation::LateResultActionPage),
 }
 
 #[cfg(test)]
@@ -457,6 +485,15 @@ enum TestPageMut<'a> {
     Skills(&'a mut SkillsPage),
     Mcp(&'a mut McpPage),
     Lsp(&'a mut LspPage),
+    GenerationList(&'a mut image_generation::GenerationListPage),
+    EndpointEditor(&'a mut image_generation::EndpointEditorPage),
+    TargetEditor(&'a mut image_generation::TargetEditorPage),
+    WorkflowEditor(&'a mut image_generation::WorkflowEditorPage),
+    BudgetEditor(&'a mut image_generation::BudgetEditorPage),
+    GrantList(&'a mut image_generation::GrantListPage),
+    JobList(&'a mut image_generation::JobListPage),
+    JobDetail(&'a mut image_generation::JobDetailPage),
+    LateResultAction(&'a mut image_generation::LateResultActionPage),
 }
 
 #[cfg(test)]
@@ -477,6 +514,15 @@ impl std::fmt::Debug for TestPageRef<'_> {
             Self::Skills(_) => f.write_str("Skills"),
             Self::Mcp(_) => f.write_str("Mcp"),
             Self::Lsp(_) => f.write_str("Lsp"),
+            Self::GenerationList(_) => f.write_str("GenerationList"),
+            Self::EndpointEditor(_) => f.write_str("EndpointEditor"),
+            Self::TargetEditor(_) => f.write_str("TargetEditor"),
+            Self::WorkflowEditor(_) => f.write_str("WorkflowEditor"),
+            Self::BudgetEditor(_) => f.write_str("BudgetEditor"),
+            Self::GrantList(_) => f.write_str("GrantList"),
+            Self::JobList(_) => f.write_str("JobList"),
+            Self::JobDetail(_) => f.write_str("JobDetail"),
+            Self::LateResultAction(_) => f.write_str("LateResultAction"),
         }
     }
 }
@@ -498,6 +544,15 @@ impl std::fmt::Debug for TestPageMut<'_> {
             Self::Skills(_) => f.write_str("Skills"),
             Self::Mcp(_) => f.write_str("Mcp"),
             Self::Lsp(_) => f.write_str("Lsp"),
+            Self::GenerationList(_) => f.write_str("GenerationList"),
+            Self::EndpointEditor(_) => f.write_str("EndpointEditor"),
+            Self::TargetEditor(_) => f.write_str("TargetEditor"),
+            Self::WorkflowEditor(_) => f.write_str("WorkflowEditor"),
+            Self::BudgetEditor(_) => f.write_str("BudgetEditor"),
+            Self::GrantList(_) => f.write_str("GrantList"),
+            Self::JobList(_) => f.write_str("JobList"),
+            Self::JobDetail(_) => f.write_str("JobDetail"),
+            Self::LateResultAction(_) => f.write_str("LateResultAction"),
         }
     }
 }
@@ -1745,6 +1800,33 @@ impl SettingsDialog {
         if let Some(p) = self.page.downcast_ref::<LspPage>() {
             return TestPageRef::Lsp(p);
         }
+        if let Some(p) = self.page.downcast_ref::<image_generation::GenerationListPage>() {
+            return TestPageRef::GenerationList(p);
+        }
+        if let Some(p) = self.page.downcast_ref::<image_generation::EndpointEditorPage>() {
+            return TestPageRef::EndpointEditor(p);
+        }
+        if let Some(p) = self.page.downcast_ref::<image_generation::TargetEditorPage>() {
+            return TestPageRef::TargetEditor(p);
+        }
+        if let Some(p) = self.page.downcast_ref::<image_generation::WorkflowEditorPage>() {
+            return TestPageRef::WorkflowEditor(p);
+        }
+        if let Some(p) = self.page.downcast_ref::<image_generation::BudgetEditorPage>() {
+            return TestPageRef::BudgetEditor(p);
+        }
+        if let Some(p) = self.page.downcast_ref::<image_generation::GrantListPage>() {
+            return TestPageRef::GrantList(p);
+        }
+        if let Some(p) = self.page.downcast_ref::<image_generation::JobListPage>() {
+            return TestPageRef::JobList(p);
+        }
+        if let Some(p) = self.page.downcast_ref::<image_generation::JobDetailPage>() {
+            return TestPageRef::JobDetail(p);
+        }
+        if let Some(p) = self.page.downcast_ref::<image_generation::LateResultActionPage>() {
+            return TestPageRef::LateResultAction(p);
+        }
         unreachable!("unknown settings page")
     }
 
@@ -1799,6 +1881,69 @@ impl SettingsDialog {
         }
         if self.page.as_any().is::<LspPage>() {
             return TestPageMut::Lsp(self.page.downcast_mut::<LspPage>().unwrap());
+        }
+        if self.page.as_any().is::<image_generation::GenerationListPage>() {
+            return TestPageMut::GenerationList(
+                self.page
+                    .downcast_mut::<image_generation::GenerationListPage>()
+                    .unwrap(),
+            );
+        }
+        if self.page.as_any().is::<image_generation::EndpointEditorPage>() {
+            return TestPageMut::EndpointEditor(
+                self.page
+                    .downcast_mut::<image_generation::EndpointEditorPage>()
+                    .unwrap(),
+            );
+        }
+        if self.page.as_any().is::<image_generation::TargetEditorPage>() {
+            return TestPageMut::TargetEditor(
+                self.page
+                    .downcast_mut::<image_generation::TargetEditorPage>()
+                    .unwrap(),
+            );
+        }
+        if self.page.as_any().is::<image_generation::WorkflowEditorPage>() {
+            return TestPageMut::WorkflowEditor(
+                self.page
+                    .downcast_mut::<image_generation::WorkflowEditorPage>()
+                    .unwrap(),
+            );
+        }
+        if self.page.as_any().is::<image_generation::BudgetEditorPage>() {
+            return TestPageMut::BudgetEditor(
+                self.page
+                    .downcast_mut::<image_generation::BudgetEditorPage>()
+                    .unwrap(),
+            );
+        }
+        if self.page.as_any().is::<image_generation::GrantListPage>() {
+            return TestPageMut::GrantList(
+                self.page
+                    .downcast_mut::<image_generation::GrantListPage>()
+                    .unwrap(),
+            );
+        }
+        if self.page.as_any().is::<image_generation::JobListPage>() {
+            return TestPageMut::JobList(
+                self.page
+                    .downcast_mut::<image_generation::JobListPage>()
+                    .unwrap(),
+            );
+        }
+        if self.page.as_any().is::<image_generation::JobDetailPage>() {
+            return TestPageMut::JobDetail(
+                self.page
+                    .downcast_mut::<image_generation::JobDetailPage>()
+                    .unwrap(),
+            );
+        }
+        if self.page.as_any().is::<image_generation::LateResultActionPage>() {
+            return TestPageMut::LateResultAction(
+                self.page
+                    .downcast_mut::<image_generation::LateResultActionPage>()
+                    .unwrap(),
+            );
         }
         unreachable!("unknown settings page")
     }
@@ -2541,6 +2686,9 @@ impl SettingsPage for RootPage {
                             .to_string_lossy()
                             .into_owned(),
                     )),
+                    "Generation" => Some(image_generation::generation_list_page(
+                        image_generation::GenerationPrincipal::local_owner(),
+                    )),
                     "Privacy & Safety" => {
                         cx.reload_extended();
                         Some(category_page(CategoryPage::new(Category::Privacy)))
@@ -2718,6 +2866,11 @@ fn root_nodes() -> [NavNode; 15] {
             id: pointer_actions::RootNodeId::ImageSpend,
             title: "Image spend budgets",
             description: "Explicit request, session, and project image-generation budgets and project window. Suggestions do not authorize dispatch until reviewed and saved.",
+        },
+        NavNode {
+            id: pointer_actions::RootNodeId::Generation,
+            title: "Generation",
+            description: "Image-generation endpoints, targets, workflows, budget, destination grants, and job management. Visibility follows the control-plane authorization matrix.",
         },
         NavNode {
             id: pointer_actions::RootNodeId::Privacy,

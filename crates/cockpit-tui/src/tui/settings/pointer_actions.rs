@@ -5,6 +5,25 @@
 //! dynamic rows carry their stable domain identity rather than a cursor.
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct ImageEndpointId(pub String);
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct ImageTargetId(pub String);
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct ImageWorkflowId(pub String);
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct ImageJobId(pub String);
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct LateResultId(pub String);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum GenerationNodeId {
+    Endpoints,
+    Targets,
+    Workflows,
+    Budget,
+    Grants,
+    Jobs,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct AgentId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct ProviderId(pub String);
@@ -31,6 +50,7 @@ pub(super) enum RootNodeId {
     Behavior,
     Privacy,
     ImageSpend,
+    Generation,
     Translation,
     Tools,
     Harnesses,
@@ -40,7 +60,7 @@ pub(super) enum RootNodeId {
     Lsp,
 }
 impl RootNodeId {
-    pub(super) const ALL: [Self; 15] = [
+    pub(super) const ALL: [Self; 16] = [
         Self::DefaultModel,
         Self::Providers,
         Self::Dependencies,
@@ -49,6 +69,7 @@ impl RootNodeId {
         Self::Behavior,
         Self::Privacy,
         Self::ImageSpend,
+        Self::Generation,
         Self::Translation,
         Self::Tools,
         Self::Harnesses,
@@ -67,6 +88,7 @@ impl RootNodeId {
             Self::Behavior => "Behavior",
             Self::Privacy => "Privacy & Safety",
             Self::ImageSpend => "Image spend budgets",
+            Self::Generation => "Generation",
             Self::Translation => "Translation",
             Self::Tools => "Tools",
             Self::Harnesses => "Harnesses",
@@ -261,6 +283,7 @@ pub(super) enum SettingsPointerAction {
     List(ListAction),
     UtilityModel(UtilityModelAction),
     DefaultModel(DefaultModelAction),
+    Generation(GenerationAction),
 }
 
 impl From<HarnessesAction> for SettingsPointerAction {
@@ -485,4 +508,51 @@ pub(super) enum UtilityModelAction {
 pub(super) enum DefaultModelAction {
     Choose,
     Clear,
+}
+
+/// Sealed image-generation settings action vocabulary.
+///
+/// Each named settings state action is visible, disabled with a stable
+/// reason, or intentionally non-action; no keyboard-only action is allowed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) enum GenerationAction {
+    /// Open a Generation sub-node from the list page.
+    OpenNode(GenerationNodeId),
+    /// Refresh target health (admin-gated action).
+    RefreshHealth,
+    // Endpoint CRUD
+    CreateEndpoint,
+    EditEndpoint(ImageEndpointId),
+    DeleteEndpoint(ImageEndpointId),
+    // Target CRUD + default
+    CreateTarget,
+    EditTarget(ImageTargetId),
+    DeleteTarget(ImageTargetId),
+    SetDefaultTarget(ImageTargetId),
+    // Workflow upload/bind/delete
+    UploadWorkflow,
+    BindWorkflow(ImageWorkflowId),
+    DeleteWorkflow(ImageWorkflowId),
+    // Budget save
+    SaveBudget,
+    // Grant revoke
+    RevokeGrant(LateResultId),
+    // Job cancel
+    CancelJob(ImageJobId),
+    // Late result publish/discard (entered from JobDetail)
+    PublishLateResult(LateResultId),
+    DiscardLateResult(LateResultId),
+    // Confirmation choices for destructive actions
+    ConfirmCancelJob(ImageJobId, ConfirmationChoice),
+    ConfirmRevokeGrant(LateResultId, ConfirmationChoice),
+    ConfirmPublishLateResult(LateResultId, ConfirmationChoice),
+    ConfirmDiscardLateResult(LateResultId, ConfirmationChoice),
+    // Cancel/back from an editor
+    Cancel,
+}
+
+impl From<GenerationAction> for SettingsPointerAction {
+    fn from(action: GenerationAction) -> Self {
+        Self::Generation(action)
+    }
 }

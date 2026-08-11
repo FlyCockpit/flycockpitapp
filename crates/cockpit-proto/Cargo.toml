@@ -28,4 +28,5 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 quote = "1"
+sha2 = { workspace = true }
 syn = { version = "2", features = ["full"] }

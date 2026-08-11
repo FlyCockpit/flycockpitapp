@@ -6,6 +6,7 @@
 //! the Docker-gated coturn conformance job is separate (Linux-only CI).
 
 use super::*;
+use std::net::Ipv6Addr;
 
 // Helper: build a default authorized ICE entry for tests.
 fn test_entry(url: &str, relay_only: bool, expiry: u64) -> AuthorizedIceEntry {
@@ -39,7 +40,7 @@ fn make_provider(relay_only: bool, now: u64) -> TurnSocketProvider {
 // ===========================================================================
 
 #[test]
-fn remote_turn-socket-provider-transport-matrix() {
+fn remote_turn_socket_provider_transport_matrix() {
     // Accept turn: and turns:; reject stun: and stuns:.
     assert!(TurnServerUrl::parse("turn://example.com:3478").is_ok());
     assert!(TurnServerUrl::parse("turns://example.com:5349").is_ok());
@@ -84,10 +85,7 @@ fn remote_turn-socket-provider-transport-matrix() {
     assert_eq!(host.hostname(), Some("turn.example.com"));
 
     // Default ports.
-    assert_eq!(
-        TurnServerUrl::parse("turn://1.2.3.4").unwrap().port(),
-        3478
-    );
+    assert_eq!(TurnServerUrl::parse("turn://1.2.3.4").unwrap().port(), 3478);
     assert_eq!(
         TurnServerUrl::parse("turns://1.2.3.4").unwrap().port(),
         5349
@@ -153,14 +151,14 @@ fn remote_turn-socket-provider-transport-matrix() {
 // ===========================================================================
 
 #[test]
-fn remote-turn-socket-provider-lifecycle() {
+fn remote_turn_socket_provider_lifecycle() {
     let mut provider = make_provider(true, 1000);
     let entry = test_entry("turn://192.0.2.1:3478", true, 9999999999);
     let lifetime = Duration::from_secs(600);
 
     // Allocate.
-    let gen = provider.allocate(&entry, lifetime).unwrap();
-    assert_eq!(gen, 1);
+    let gen_tag = provider.allocate(&entry, lifetime).unwrap();
+    assert_eq!(gen_tag, 1);
     assert!(provider.has_current());
 
     // Lifecycle event: Current (auto-promoted, first allocation).
@@ -219,7 +217,7 @@ fn remote-turn-socket-provider-lifecycle() {
 // ===========================================================================
 
 #[test]
-fn remote-turn-socket-provider-relay-only-fail-closed() {
+fn remote_turn_socket_provider_relay_only_fail_closed() {
     let mut provider = make_provider(true, 1000);
     let entry = test_entry("turn://192.0.2.1:3478", true, 9999999999);
     provider.allocate(&entry, Duration::from_secs(600)).unwrap();
@@ -253,7 +251,7 @@ fn remote-turn-socket-provider-relay-only-fail-closed() {
 // ===========================================================================
 
 #[test]
-fn remote-turn-socket-provider-generation-races() {
+fn remote_turn_socket_provider_generation_races() {
     let mut provider = make_provider(true, 1000);
     let entry = test_entry("turn://192.0.2.1:3478", true, 9999999999);
     let lifetime = Duration::from_secs(600);
@@ -362,7 +360,7 @@ fn remote-turn-socket-provider-generation-races() {
 // ===========================================================================
 
 #[test]
-fn remote-turn-socket-provider-bounds() {
+fn remote_turn_socket_provider_bounds() {
     let mut provider = make_provider(true, 1000);
     let entry = test_entry("turn://192.0.2.1:3478", true, 9999999999);
     provider.allocate(&entry, Duration::from_secs(600)).unwrap();
@@ -370,10 +368,7 @@ fn remote-turn-socket-provider-bounds() {
 
     // Datagram exceeding max size (64 KiB + 1).
     let oversize = vec![0u8; MAX_DATAGRAM_BYTES + 1];
-    assert_eq!(
-        provider.send(oversize),
-        Err(SendError::DatagramTooLarge)
-    );
+    assert_eq!(provider.send(oversize), Err(SendError::DatagramTooLarge));
 
     // Fill the queue to capacity (256 datagrams).
     let small = vec![0u8; 100];
@@ -381,21 +376,15 @@ fn remote-turn-socket-provider-bounds() {
         provider.send(small.clone()).unwrap();
     }
     // Next send overflows -> closes the allocation.
-    assert_eq!(
-        provider.send(small.clone()),
-        Err(SendError::QueueOverflow)
-    );
+    assert_eq!(provider.send(small.clone()), Err(SendError::QueueOverflow));
     // Allocation is now closed.
     assert!(!provider.has_current());
     // Further sends fail.
-    assert_eq!(
-        provider.send(small),
-        Err(SendError::Closed)
-    );
+    assert_eq!(provider.send(small), Err(SendError::Closed));
 }
 
 #[test]
-fn remote-turn-socket-provider-bounds-byte-capacity() {
+fn remote_turn_socket_provider_bounds_byte_capacity() {
     let mut provider = make_provider(true, 1000);
     let entry = test_entry("turn://192.0.2.1:3478", true, 9999999999);
     provider.allocate(&entry, Duration::from_secs(600)).unwrap();
@@ -407,10 +396,7 @@ fn remote-turn-socket-provider-bounds-byte-capacity() {
         provider.send(big.clone()).unwrap();
     }
     // Next 1 MiB datagram overflows the byte cap.
-    assert_eq!(
-        provider.send(big),
-        Err(SendError::QueueOverflow)
-    );
+    assert_eq!(provider.send(big), Err(SendError::QueueOverflow));
 }
 
 // ===========================================================================
@@ -418,7 +404,7 @@ fn remote-turn-socket-provider-bounds-byte-capacity() {
 // ===========================================================================
 
 #[test]
-fn remote-turn-socket-provider-secret-redaction() {
+fn remote_turn_socket_provider_secret_redaction() {
     let creds = TurnCredentials::new("my-secret-user", "my-secret-pass");
 
     // Debug is redacted.
@@ -478,7 +464,7 @@ fn remote-turn-socket-provider-secret-redaction() {
 // ===========================================================================
 
 #[test]
-fn remote-turn-socket-provider-str0m-adapter() {
+fn remote_turn_socket_provider_str0m_adapter() {
     let mut provider = make_provider(true, 1000);
     let entry = test_entry("turn://192.0.2.1:3478", true, 9999999999);
     provider.allocate(&entry, Duration::from_secs(600)).unwrap();
@@ -486,8 +472,8 @@ fn remote-turn-socket-provider-str0m-adapter() {
 
     // Send a datagram, pump it, and convert to a str0m event.
     provider.send(b"dtls-ciphertext".to_vec()).unwrap();
-    let (gen, data) = provider.pump_outbound().unwrap();
-    let event = Str0mAdapter::to_event(gen, data.clone());
+    let (gen_tag, data) = provider.pump_outbound().unwrap();
+    let event = Str0mAdapter::to_event(gen_tag, data.clone());
 
     // Direct and relayed are distinguishable.
     assert_eq!(event.source, DatagramSource::Relayed);
@@ -517,7 +503,7 @@ fn remote-turn-socket-provider-str0m-adapter() {
 // ===========================================================================
 
 #[test]
-fn remote-turn-socket-provider-refresh-thresholds() {
+fn remote_turn_socket_provider_refresh_thresholds() {
     let mut provider = make_provider(true, 1000);
     let entry = test_entry("turn://192.0.2.1:3478", true, 9999999999);
 
@@ -534,7 +520,9 @@ fn remote-turn-socket-provider-refresh-thresholds() {
     // lifetime=600s but credential expires at 1050s (50s from now).
     let mut provider2 = make_provider(true, 1000);
     let entry_short = test_entry("turn://192.0.2.1:3478", true, 1050);
-    provider2.allocate(&entry_short, Duration::from_secs(600)).unwrap();
+    provider2
+        .allocate(&entry_short, Duration::from_secs(600))
+        .unwrap();
     let _ = provider2.poll_event();
     // effective_expiry = min(1600, 1050) = 1050. remaining=50.
     // half_lifetime=300. lead = 50-300 saturates to 0, but min with
@@ -547,14 +535,18 @@ fn remote-turn-socket-provider-refresh-thresholds() {
     // We need a mutable clock, so rebuild.
     let mut provider3 = make_provider(true, 1000);
     let entry_exp = test_entry("turn://192.0.2.1:3478", true, 1100);
-    provider3.allocate(&entry_exp, Duration::from_secs(600)).unwrap();
+    provider3
+        .allocate(&entry_exp, Duration::from_secs(600))
+        .unwrap();
     let _ = provider3.poll_event();
     // Now set clock past 1100 — but our clock is Box<dyn>, not mutable
     // from outside. Instead, test check_credential_expiry with a new
     // provider whose clock is already past.
     let mut provider4 = make_provider(true, 2000);
     let entry_past = test_entry("turn://192.0.2.1:3478", true, 1500);
-    provider4.allocate(&entry_past, Duration::from_secs(600)).unwrap();
+    provider4
+        .allocate(&entry_past, Duration::from_secs(600))
+        .unwrap();
     let _ = provider4.poll_event();
     provider4.check_credential_expiry();
     assert!(!provider4.has_current());
@@ -573,7 +565,7 @@ fn remote-turn-socket-provider-refresh-thresholds() {
 // ===========================================================================
 
 #[test]
-fn remote-turn-socket-provider-pair-caps() {
+fn remote_turn_socket_provider_pair_caps() {
     let mut provider = make_provider(true, 1000);
     let entry = test_entry("turn://192.0.2.1:3478", true, 9999999999);
     let lifetime = Duration::from_secs(600);
@@ -601,7 +593,7 @@ fn remote-turn-socket-provider-pair-caps() {
 // ===========================================================================
 
 #[test]
-fn remote-turn-socket-provider-revoke-and-interface-change() {
+fn remote_turn_socket_provider_revoke_and_interface_change() {
     let mut provider = make_provider(true, 1000);
     let entry = test_entry("turn://192.0.2.1:3478", true, 9999999999);
     provider.allocate(&entry, Duration::from_secs(600)).unwrap();
@@ -620,7 +612,9 @@ fn remote-turn-socket-provider-revoke-and-interface-change() {
 
     // Interface change.
     let mut provider2 = make_provider(true, 1000);
-    provider2.allocate(&entry, Duration::from_secs(600)).unwrap();
+    provider2
+        .allocate(&entry, Duration::from_secs(600))
+        .unwrap();
     let _ = provider2.poll_event();
     provider2.interface_change();
     assert!(!provider2.has_current());
@@ -639,7 +633,7 @@ fn remote-turn-socket-provider-revoke-and-interface-change() {
 // ===========================================================================
 
 #[test]
-fn remote-turn-socket-provider-drain-deadline() {
+fn remote_turn_socket_provider_drain_deadline() {
     // After cutover, the old allocation drains. It deallocates when windows
     // empty or 30 seconds. We verify the drain deadline constant and that
     // draining accepts no new operation.
@@ -679,7 +673,7 @@ fn remote-turn-socket-provider-drain-deadline() {
 // ===========================================================================
 
 #[test]
-fn remote-turn-socket-provider-dns-bounds() {
+fn remote_turn_socket_provider_dns_bounds() {
     let resolver = FakeDnsResolver {
         records: std::collections::HashMap::new(),
         fail: true,
@@ -719,7 +713,7 @@ fn remote-turn-socket-provider-dns-bounds() {
 // ===========================================================================
 
 #[test]
-fn remote-turn-socket-provider-lease-digest() {
+fn remote_turn_socket_provider_lease_digest() {
     let lease1 = ConnectionLease {
         old_allocation_generation: 1,
         new_allocation_generation: 2,
@@ -743,7 +737,7 @@ fn remote-turn-socket-provider-lease-digest() {
 // ===========================================================================
 
 #[test]
-fn remote-turn-socket-provider-credentials-zeroize() {
+fn remote_turn_socket_provider_credentials_zeroize() {
     let creds = TurnCredentials::new("zeroize-me", "zeroize-pass");
     let user_ptr = creds.username.as_str().as_ptr();
     let _ = creds; // dropped here

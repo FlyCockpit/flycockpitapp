@@ -1811,14 +1811,11 @@ mod tests {
             let mut pid = [0u8; 16];
             pid[15] = i;
             let caps: Vec<RemoteProjectCapabilityV1> =
-                RemoteProjectCapabilityV1::all().iter().copied().collect();
+                RemoteProjectCapabilityV1::all().to_vec();
             projects.push((pid, caps));
         }
         let c = RemotePermissionCeilingV1 {
-            attachment_capabilities: RemoteAttachmentCapabilityV1::all()
-                .iter()
-                .copied()
-                .collect(),
+            attachment_capabilities: RemoteAttachmentCapabilityV1::all().to_vec(),
             projects,
         };
         // 1 + 1 + 13 + 1 + 16*(16+1+15) = 1+1+13+1+16*32 = 529 > 512 -> rejected
@@ -2451,7 +2448,7 @@ mod tests {
         #[derive(Deserialize)]
         struct Wrap {
             #[serde(rename = "serviceVersion")]
-            sv: CanonicalU64DecimalStringV1,
+            _sv: CanonicalU64DecimalStringV1,
         }
         assert!(serde_json::from_str::<Wrap>(bad).is_err());
     }
@@ -2486,7 +2483,7 @@ mod tests {
         // Confirm it matches a manual computation and there is no alternative.
         let c = RemotePermissionCeilingV1::empty();
         let digest = permission_ceiling_digest(&c).unwrap();
-        let manual = Sha256::digest(&c.encode().unwrap());
+        let manual = Sha256::digest(c.encode().unwrap());
         assert_eq!(digest.as_bytes(), manual.as_slice());
         // Non-null: empty ceiling has a real digest.
         assert_ne!(digest.as_bytes(), &[0u8; 32]);

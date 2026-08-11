@@ -49,7 +49,10 @@ fn make_rgba_png(width: u32, height: u32, fill: [u8; 4]) -> Vec<u8> {
     let img: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_pixel(width, height, Rgba(fill));
     let mut bytes = Vec::new();
     image::DynamicImage::ImageRgba8(img)
-        .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
         .unwrap();
     bytes
 }
@@ -860,8 +863,8 @@ mod epoch_race {
         let frame2 = make_test_frame(1920, 1080, [200, 100, 50, 255]);
         let mut key2 = valid_key(&frame2);
         key2.observation_epoch = ObservationEpoch(2);
-        let dossier2 = ComputerDossier::new(key2, &frame2, vec![valid_entry()], valid_counts(), 2000)
-            .unwrap();
+        let dossier2 =
+            ComputerDossier::new(key2, &frame2, vec![valid_entry()], valid_counts(), 2000).unwrap();
         registry.register(dossier2);
         assert_eq!(registry.len(), 1);
         // The old dossier was released; the new one is current.
@@ -1188,7 +1191,12 @@ mod construction {
             1000,
         )
         .unwrap_err();
-        assert_eq!(err, ComputerDossierError::DuplicateElementId { id: "btn-1".to_string() });
+        assert_eq!(
+            err,
+            ComputerDossierError::DuplicateElementId {
+                id: "btn-1".to_string()
+            }
+        );
     }
 
     #[test]
@@ -1196,14 +1204,9 @@ mod construction {
         let frame = make_test_frame(1920, 1080, [137, 80, 78, 71]);
         let mut entry = valid_entry();
         entry.confidence_bp = ConfidenceBp(10_001);
-        let err = ComputerDossier::new(
-            valid_key(&frame),
-            &frame,
-            vec![entry],
-            valid_counts(),
-            1000,
-        )
-        .unwrap_err();
+        let err =
+            ComputerDossier::new(valid_key(&frame), &frame, vec![entry], valid_counts(), 1000)
+                .unwrap_err();
         assert_eq!(
             err,
             ComputerDossierError::ConfidenceOutOfRange {
@@ -1223,14 +1226,9 @@ mod construction {
             width_px: 300,
             height_px: 400,
         };
-        let err = ComputerDossier::new(
-            valid_key(&frame),
-            &frame,
-            vec![entry],
-            valid_counts(),
-            1000,
-        )
-        .unwrap_err();
+        let err =
+            ComputerDossier::new(valid_key(&frame), &frame, vec![entry], valid_counts(), 1000)
+                .unwrap_err();
         assert_eq!(err, ComputerDossierError::BoundsOutsideFrame);
     }
 
@@ -1244,14 +1242,9 @@ mod construction {
             width_px: 0,
             height_px: 30,
         };
-        let err = ComputerDossier::new(
-            valid_key(&frame),
-            &frame,
-            vec![entry],
-            valid_counts(),
-            1000,
-        )
-        .unwrap_err();
+        let err =
+            ComputerDossier::new(valid_key(&frame), &frame, vec![entry], valid_counts(), 1000)
+                .unwrap_err();
         assert_eq!(err, ComputerDossierError::ZeroWidth);
     }
 }

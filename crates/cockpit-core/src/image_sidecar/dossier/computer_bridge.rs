@@ -49,9 +49,9 @@ use super::{
     DOSSIER_SCHEMA_VERSION, DossierError, PixelBounds, StoragePayloadKind, StorageTarget,
     StorageWrite, StorageWriteTracker,
 };
+use crate::computer::PixelRect;
 use crate::computer::frame::{FrameChecksum, FrameDimensions, LiveComputerFrame};
 use crate::computer::observation::{GeometryGeneration, ObservationEpoch, TargetGeneration};
-use crate::computer::PixelRect;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -213,7 +213,10 @@ impl std::fmt::Debug for ComputerDossierKey {
             .field("display_generation", &self.display_generation)
             .field("frame_checksum_hex", &self.frame_checksum_hex)
             .field("dossier_schema_version", &self.dossier_schema_version)
-            .field("sidecar_destination_digest", &self.sidecar_destination_digest)
+            .field(
+                "sidecar_destination_digest",
+                &self.sidecar_destination_digest,
+            )
             .finish()
     }
 }
@@ -346,7 +349,12 @@ impl ObservationTransform {
         // Step 2: apply rotation. For 0/180, width/height are preserved.
         // For 90/270, width/height are swapped.
         let (x_rot, y_rot, right_rot, bottom_rot) = match self.rotation_deg {
-            0 => (x_after_crop, y_after_crop, right_after_crop, bottom_after_crop),
+            0 => (
+                x_after_crop,
+                y_after_crop,
+                right_after_crop,
+                bottom_after_crop,
+            ),
             180 => {
                 // 180: (x, y) -> (source_w - x - w, source_h - y - h)
                 let src_w = self.source_width_px.saturating_sub(cx);
@@ -450,9 +458,7 @@ fn floor_div(value: u32, num: u32, den: u32) -> Result<u32, TransformError> {
     if den == 0 {
         return Err(TransformError::ZeroDenominator);
     }
-    let product = value
-        .checked_mul(num)
-        .ok_or(TransformError::Overflow)?;
+    let product = value.checked_mul(num).ok_or(TransformError::Overflow)?;
     Ok(product / den)
 }
 
@@ -462,9 +468,7 @@ fn ceil_div(value: u32, num: u32, den: u32) -> Result<u32, TransformError> {
     if den == 0 {
         return Err(TransformError::ZeroDenominator);
     }
-    let product = value
-        .checked_mul(num)
-        .ok_or(TransformError::Overflow)?;
+    let product = value.checked_mul(num).ok_or(TransformError::Overflow)?;
     let q = product / den;
     let r = product % den;
     if r == 0 {
@@ -709,11 +713,7 @@ impl ComputerDossier {
 
     /// Whether this dossier's generations match the current snapshot. Any
     /// change is an exact invalidation.
-    pub fn generations_match(
-        &self,
-        focus: TargetGeneration,
-        display: GeometryGeneration,
-    ) -> bool {
+    pub fn generations_match(&self, focus: TargetGeneration, display: GeometryGeneration) -> bool {
         self.key.focus_generation == focus && self.key.display_generation == display
     }
 
@@ -747,13 +747,14 @@ impl ComputerDossier {
             .to_physical(entry.source_bounds)
             .map_err(ComputerDossierError::from)?;
         let low_conf = entry.confidence_bp.is_low_confidence();
-        let transform_applied = *transform != ObservationTransform::identity(
-            transform.geometry_generation,
-            transform.source_width_px,
-            transform.source_height_px,
-            transform.physical_width_px,
-            transform.physical_height_px,
-        );
+        let transform_applied = *transform
+            != ObservationTransform::identity(
+                transform.geometry_generation,
+                transform.source_width_px,
+                transform.source_height_px,
+                transform.physical_width_px,
+                transform.physical_height_px,
+            );
         let near_edge = is_near_edge(&entry.source_bounds, &self.frame_dimensions);
         Ok(CoordinateCandidate {
             source_bounds: entry.source_bounds,
@@ -894,7 +895,10 @@ impl ComputerDossierRegistry {
         let mut dossiers = self.dossiers.lock().unwrap();
         // Replace any existing dossier for the same delegation.
         let delegation_id = dossier.key().delegation_id.clone();
-        if let Some(idx) = dossiers.iter().position(|d| d.delegation_id == delegation_id) {
+        if let Some(idx) = dossiers
+            .iter()
+            .position(|d| d.delegation_id == delegation_id)
+        {
             let mut old = dossiers.remove(idx);
             old.dossier.release();
         }
@@ -945,7 +949,10 @@ impl ComputerDossierRegistry {
     /// handoff, cancellation, or delegation terminal state.
     pub fn release(&self, delegation_id: &str) {
         let mut dossiers = self.dossiers.lock().unwrap();
-        if let Some(idx) = dossiers.iter().position(|d| d.delegation_id == delegation_id) {
+        if let Some(idx) = dossiers
+            .iter()
+            .position(|d| d.delegation_id == delegation_id)
+        {
             let mut removed = dossiers.remove(idx);
             removed.dossier.release();
         }

@@ -566,6 +566,10 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "inspect_video",
         "extract_video_clip",
         "extract_audio",
+        "list_image_generation_targets",
+        "generate_image",
+        "get_image_generation_job",
+        "cancel_image_generation_job",
     ]
 }
 
@@ -832,6 +836,30 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
             summary: "Create a bounded PCM WAV derivative.",
             condition: Some("Requires FFmpeg PCM encoding and typed session attachments."),
         },
+        BuiltinToolInventoryItem {
+            family: "Image Generation",
+            name: "list_image_generation_targets",
+            summary: "List enabled image-generation targets with safe capability/health/cost projections.",
+            condition: Some("Requires configured image-generation targets."),
+        },
+        BuiltinToolInventoryItem {
+            family: "Image Generation",
+            name: "generate_image",
+            summary: "Generate one or more images from a text prompt.",
+            condition: Some("Requires configured image-generation targets."),
+        },
+        BuiltinToolInventoryItem {
+            family: "Image Generation",
+            name: "get_image_generation_job",
+            summary: "Get status and safe result metadata for an image-generation job.",
+            condition: Some("Requires a session-owned job."),
+        },
+        BuiltinToolInventoryItem {
+            family: "Image Generation",
+            name: "cancel_image_generation_job",
+            summary: "Request idempotent cancellation of an image-generation job.",
+            condition: Some("Requires a session-controlled job."),
+        },
     ]
 }
 
@@ -922,6 +950,10 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::audio_video::InspectVideoTool),
         Arc::new(tools::audio_video::ExtractVideoClipTool),
         Arc::new(tools::audio_video::ExtractAudioTool),
+        Arc::new(crate::image_generation_agent_tools::ListImageGenerationTargetsTool),
+        Arc::new(crate::image_generation_agent_tools::GenerateImageTool),
+        Arc::new(crate::image_generation_agent_tools::GetImageGenerationJobTool),
+        Arc::new(crate::image_generation_agent_tools::CancelImageGenerationJobTool),
         Arc::new(tools::docs::ListPackagesTool::new(
             tools::docs::DocsResolution::new(),
             "pkg".to_string(),
@@ -953,6 +985,18 @@ fn materialize_tool_by_name(
         "inspect_video" => tb.with(Arc::new(tools::audio_video::InspectVideoTool)),
         "extract_video_clip" => tb.with(Arc::new(tools::audio_video::ExtractVideoClipTool)),
         "extract_audio" => tb.with(Arc::new(tools::audio_video::ExtractAudioTool)),
+        "list_image_generation_targets" => tb.with(Arc::new(
+            crate::image_generation_agent_tools::ListImageGenerationTargetsTool,
+        )),
+        "generate_image" => tb.with(Arc::new(
+            crate::image_generation_agent_tools::GenerateImageTool,
+        )),
+        "get_image_generation_job" => tb.with(Arc::new(
+            crate::image_generation_agent_tools::GetImageGenerationJobTool,
+        )),
+        "cancel_image_generation_job" => tb.with(Arc::new(
+            crate::image_generation_agent_tools::CancelImageGenerationJobTool,
+        )),
         "bash" => tb.with(Arc::new(tools::bash::BashTool::new())),
         "escalate" => tb.with(Arc::new(tools::escalate::EscalateTool)),
         "write" => tb.with(Arc::new(tools::write::WriteTool)),

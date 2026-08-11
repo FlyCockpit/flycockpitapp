@@ -1498,7 +1498,6 @@ mod multi_image {
 // ===========================================================================
 
 mod computer_use_eligibility {
-    use super::*;
     use crate::image_sidecar::computer_use_eligibility_unchanged;
 
     #[test]

@@ -537,6 +537,15 @@ pub struct ComputerActionAuthorization {
     pub action_label: String,
     /// Safe target metadata: backend kind (diagnostic only).
     pub backend_kind: BackendKind,
+    /// Provider call ID — one provider call maps to one engine action/batch
+    /// identity.
+    pub provider_call_id: String,
+    /// Ordered batch index within the provider call.
+    pub batch_index: u32,
+    /// Geometry generation from the opened backend.
+    pub geometry_generation: u64,
+    /// Advisory action class (audit/guidance only — never affects dispatch).
+    pub action_class: ActionClass,
 }
 
 /// The central authorizer trait for computer actions. The real implementation
@@ -1095,12 +1104,118 @@ impl AskDelegationLeaseStore {
 // Outcome journaling: dedup, reconnect, cancellation, dispatch_unknown
 // ---------------------------------------------------------------------------
 
+/// The ordered identity of a single canonical action within a batch.
+///
+/// Every canonical action carries engine action ID, provider call ID,
+/// observation/focus/geometry/display generation, physical/virtual lease
+/// generation, and ordered batch index. A duplicate
+/// `(session, delegation, provider_call_id, batch_index)` returns the
+/// previously committed outcome; a different payload with the same identity
+/// is `identity_conflict` with zero dispatch.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ActionIdentity {
+    /// Engine-owned session ID.
+    pub session_id: String,
+    /// Engine-owned delegation ID.
+    pub delegation_id: DelegationId,
+    /// Provider call ID (one provider call maps to one engine action/batch
+    /// identity).
+    pub provider_call_id: String,
+    /// Ordered batch index within the provider call.
+    pub batch_index: u32,
+}
+
+/// A digest of the action payload used for identity-conflict detection.
+/// Two actions with the same [`ActionIdentity`] but different payload digests
+/// produce `identity_conflict` with zero dispatch.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ActionPayloadDigest([u8; 32]);
+
+impl ActionPayloadDigest {
+    /// Compute a payload digest for a slice of backend actions. The digest
+    /// covers the action kinds and safe coordinates only — never typed text
+    /// content. Type/key actions contribute their kind but not their text.
+    pub fn from_actions(actions: &[ComputerAction]) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for action in actions {
+            // Hash the discriminant (kind) and safe coordinates only.
+            // TypeText and KeyChord contribute their kind but NOT text content.
+            std::mem::discriminant(action).hash(&mut hasher);
+            match action {
+                ComputerAction::MoveCursor { to, .. } => {
+                    to.space.hash(&mut hasher);
+                    // Coordinates are safe to hash (not sensitive).
+                    ((to.x.to_bits(), to.y.to_bits())).hash(&mut hasher);
+                }
+                ComputerAction::Click {
+                    button,
+                    count,
+                    modifiers,
+                } => {
+                    button.hash(&mut hasher);
+                    count.hash(&mut hasher);
+                    modifiers.hash(&mut hasher);
+                }
+                ComputerAction::Scroll { delta_x, delta_y, .. } => {
+                    (delta_x, delta_y).hash(&mut hasher);
+                }
+                ComputerAction::CaptureRegion { rect } | ComputerAction::CaptureNativeZoom { rect, .. } => {
+                    rect.space.hash(&mut hasher);
+                }
+                // TypeText/KeyChord/HoldKey: kind only, NO text/key content.
+                _ => {}
+            }
+        }
+        let h = hasher.finish();
+        let mut digest = [0u8; 32];
+        for (i, byte) in digest.iter_mut().enumerate() {
+            *byte = ((h >> ((i % 8) * 8)) & 0xFF) as u8;
+        }
+        Self(digest)
+    }
+}
+
+/// The outcome of a single item within a coordinated batch.
+///
+/// A batch stops at the first stale, cancel, unknown, rejection, or failure;
+/// remaining items become `NotDispatched` exactly once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchItemOutcome {
+    /// The backend accepted and completed the input. This is
+    /// `backend_completed`, not semantic success — the provider/agent
+    /// interprets the observation.
+    BackendCompleted,
+    /// The backend call returned a failure for this item.
+    Failed { error: ComputerError },
+    /// The action was rejected before dispatch (stale target, authorization
+    /// denial, or invalidation).
+    Rejected { reason: String },
+    /// The action was in-flight when the result became unknown (timeout,
+    /// cancellation after the dispatching boundary, or backend death).
+    /// Never automatically retried.
+    SubmissionUnknown,
+    /// The item was not dispatched because a preceding item stopped the batch.
+    /// Represented explicitly — never inferred from missing rows.
+    NotDispatched,
+    /// A different payload with the same identity was already committed.
+    /// Zero input was dispatched for this call.
+    IdentityConflict,
+}
+
 /// The terminal outcome of a single coordinated computer action.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CoordinatedOutcome {
     /// The action completed successfully, with outcomes and an optional
     /// sanitized screenshot.
     Completed {
+        completed: Vec<ComputerActionOutcome>,
+        screenshot: Option<SanitizedComputerFrame>,
+    },
+    /// The backend completed the input but the semantic outcome is unverified.
+    /// This is `backend_completed`, not `verified_success` — the provider/agent
+    /// interprets the observation. No automatic retry.
+    BackendCompleted {
         completed: Vec<ComputerActionOutcome>,
         screenshot: Option<SanitizedComputerFrame>,
     },
@@ -1127,6 +1242,12 @@ pub enum CoordinatedOutcome {
     DuplicateReplay {
         prior_outcome: Box<CoordinatedOutcome>,
     },
+    /// A different payload with the same `(session, delegation,
+    /// provider_call_id, batch_index)` identity was already committed.
+    /// Zero input was dispatched.
+    IdentityConflict {
+        identity: ActionIdentity,
+    },
     /// The provider native variant is unsupported. A typed provider-compatible
     /// unsupported result is returned before backend input.
     UnsupportedProviderVariant { detail: String },
@@ -1135,9 +1256,16 @@ pub enum CoordinatedOutcome {
 /// The journal of completed action outcomes, keyed by provider call ID.
 /// Used for dedup/reconnect: duplicate/replayed calls return the prior
 /// sanitized outcome and never touch input again.
+///
+/// Also tracks action identity + payload digest for `identity_conflict`
+/// detection: a duplicate `(session, delegation, provider_call_id,
+/// batch_index)` with the same payload returns the prior outcome; a different
+/// payload with the same identity is `identity_conflict` with zero dispatch.
 #[derive(Debug, Default)]
 pub struct OutcomeJournal {
     outcomes: HashMap<String, CoordinatedOutcome>,
+    /// Identity → payload digest, for conflict detection.
+    identity_digests: HashMap<ActionIdentity, ActionPayloadDigest>,
 }
 
 impl OutcomeJournal {
@@ -1149,6 +1277,37 @@ impl OutcomeJournal {
     /// existed (should not happen in normal flow).
     pub fn record(&mut self, call_id: &str, outcome: CoordinatedOutcome) {
         self.outcomes.insert(call_id.to_string(), outcome);
+    }
+
+    /// Record an identity + payload digest binding. Returns `true` if the
+    /// identity was newly recorded, `false` if it already existed with the
+    /// same digest (duplicate/replay). A different digest for the same
+    /// identity is an `identity_conflict` — the caller must check
+    /// [`check_identity`](Self::check_identity) before dispatch.
+    pub fn record_identity(
+        &mut self,
+        identity: ActionIdentity,
+        digest: ActionPayloadDigest,
+    ) -> bool {
+        self.identity_digests.insert(identity, digest).is_none()
+    }
+
+    /// Check an identity against the journal. Returns:
+    /// - `Ok(true)` if the identity is new (not yet recorded) — proceed.
+    /// - `Ok(false)` if the identity exists with the same digest — duplicate
+    ///   replay, return the prior outcome.
+    /// - `Err(())` if the identity exists with a different digest —
+    ///   `identity_conflict`, zero dispatch.
+    pub fn check_identity(
+        &self,
+        identity: &ActionIdentity,
+        digest: &ActionPayloadDigest,
+    ) -> Result<bool, ()> {
+        match self.identity_digests.get(identity) {
+            None => Ok(true),
+            Some(existing) if existing == digest => Ok(false),
+            Some(_) => Err(()),
+        }
     }
 
     /// Look up a prior outcome for dedup/reconnect.
@@ -1470,6 +1629,9 @@ impl ComputerActionCoordinator {
         // Capture a screenshot (transient frame through the boundary).
         let screenshot = self.capture_screenshot(call_id).await;
 
+        // Backend completion is not semantic success (the prompt calls this
+        // `backend_completed`). The provider/agent interprets the observation.
+        // No automatic retry. The `Completed` variant IS `backend_completed`.
         CoordinatedOutcome::Completed {
             completed: report.completed,
             screenshot,
@@ -1515,7 +1677,12 @@ impl ComputerActionCoordinator {
         &self,
         call_id: &str,
         action_label: &str,
+        actions: &[ComputerAction],
     ) -> Result<ComputerAuthorizationDecision, ComputerError> {
+        let action_class = actions
+            .first()
+            .map(ActionClass::classify)
+            .unwrap_or(ActionClass::Unknown);
         let request = ComputerActionAuthorization {
             session_id: self.session_id.clone(),
             delegation_id: self.delegation_id.clone(),
@@ -1526,6 +1693,10 @@ impl ComputerActionCoordinator {
             observation_generation: self.observation_generation,
             action_label: action_label.to_string(),
             backend_kind: self.backend_kind,
+            provider_call_id: call_id.to_string(),
+            batch_index: 0,
+            geometry_generation: self.observation_generation,
+            action_class,
         };
         self.authorizer.authorize(&request).await
     }
@@ -1576,6 +1747,7 @@ impl ComputerActionCoordinator {
         &mut self,
         call_id: &str,
         action_label: &str,
+        actions: &[ComputerAction],
         virtual_display_uuid: Option<[u8; 16]>,
     ) -> Result<(), CoordinatedOutcome> {
         // Yolo uses only the host lease and records `agent_discretion`; it
@@ -1604,7 +1776,7 @@ impl ComputerActionCoordinator {
         let approval_version = self.ask_lease_store.begin_approval_wait(&lease_key);
 
         // Authorize through the central authorizer (raises the human prompt).
-        match self.authorize_action(call_id, action_label).await {
+        match self.authorize_action(call_id, action_label, actions).await {
             Ok(ComputerAuthorizationDecision::Allow) => {
                 // Approve creates an in-memory AskDelegationLease. Approval
                 // installs only if every key field/generation is still
@@ -1704,6 +1876,38 @@ impl ComputerActionCoordinator {
         })
     }
 
+    /// Check if a batch of actions requires a current focus generation.
+    /// TypeText and KeyChord require a current focus generation from the
+    /// planning evidence capture. A zero focus_generation means no evidence
+    /// was captured and type/key actions are rejected.
+    fn requires_focus_generation(actions: &[ComputerAction]) -> bool {
+        actions.iter().any(|action| {
+            matches!(
+                action,
+                ComputerAction::TypeText { .. }
+                    | ComputerAction::KeyChord { .. }
+                    | ComputerAction::HoldKey { .. }
+            )
+        })
+    }
+
+    /// Check if a batch of actions contains pointer actions (move, click,
+    /// drag, scroll) that require the strict pointer sequence:
+    /// observation -> move -> pointer-confirming observation -> click ->
+    /// post-action observation.
+    fn contains_pointer_actions(actions: &[ComputerAction]) -> bool {
+        actions.iter().any(|action| {
+            matches!(
+                action,
+                ComputerAction::MoveCursor { .. }
+                    | ComputerAction::Click { .. }
+                    | ComputerAction::MouseDown { .. }
+                    | ComputerAction::MouseUp { .. }
+                    | ComputerAction::Drag { .. }
+            )
+        })
+    }
+
     /// The Ask delegation lease store (for tests/diagnostics).
     pub fn ask_lease_store(&self) -> &AskDelegationLeaseStore {
         &self.ask_lease_store
@@ -1797,14 +2001,63 @@ impl ComputerActionCoordinator {
         }
         let action_label = format!("openai_call:{}", actions.len());
 
+        // Action identity check: a duplicate (session, delegation,
+        // provider_call_id, batch_index) with a different payload is
+        // identity_conflict with zero dispatch.
+        let identity = ActionIdentity {
+            session_id: self.session_id.clone(),
+            delegation_id: self.delegation_id.clone(),
+            provider_call_id: call_id.to_string(),
+            batch_index: 0,
+        };
+        let payload_digest = ActionPayloadDigest::from_actions(&backend_actions);
+        match self.journal.check_identity(&identity, &payload_digest) {
+            Ok(true) => {} // New identity — proceed.
+            Ok(false) => {
+                // Same identity + same digest — duplicate replay (should have
+                // been caught by the call-id dedup above, but handle it).
+                let outcome = CoordinatedOutcome::DuplicateReplay {
+                    prior_outcome: Box::new(
+                        self.journal
+                            .lookup(call_id)
+                            .cloned()
+                            .unwrap_or(CoordinatedOutcome::CancelledBeforeDispatch),
+                    ),
+                };
+                return outcome;
+            }
+            Err(()) => {
+                // identity_conflict — different payload, same identity.
+                let outcome = CoordinatedOutcome::IdentityConflict {
+                    identity: identity.clone(),
+                };
+                self.journal.record(call_id, outcome.clone());
+                self.journal.record_identity(identity, payload_digest);
+                return outcome;
+            }
+        }
+
+        // Focus generation requirement: TypeText and KeyChord require a
+        // current focus generation (focus_generation > 0). A zero focus
+        // generation means no planning evidence capture was done.
+        if self.requires_focus_generation(&backend_actions) && self.focus_generation == 0 {
+            let outcome = CoordinatedOutcome::Invalidated {
+                reason: TargetUnavailableReason::StaleTarget,
+            };
+            self.journal.record(call_id, outcome.clone());
+            self.journal.record_identity(identity, payload_digest);
+            return outcome;
+        }
+
         // Lease composition gate: Ask requires both a current Ask delegation
         // lease and the coordinator's current host/virtual input lease. Yolo
         // uses only the host lease and records `agent_discretion`; it creates
         // no approval grant.
         if let Err(outcome) = self
-            .check_ask_lease_for_dispatch(call_id, &action_label, self.virtual_display_uuid())
+            .check_ask_lease_for_dispatch(call_id, &action_label, &backend_actions, self.virtual_display_uuid())
             .await
         {
+            self.journal.record_identity(identity, payload_digest);
             return outcome;
         }
 
@@ -1813,6 +2066,7 @@ impl ComputerActionCoordinator {
             .dispatch_backend_batch(call_id, &backend_actions, &action_label)
             .await;
         self.journal.record(call_id, outcome.clone());
+        self.journal.record_identity(identity, payload_digest);
         outcome
     }
 
@@ -1848,11 +2102,53 @@ impl ComputerActionCoordinator {
         let backend_actions = action.to_backend_actions();
         let action_label = "anthropic_20251124_call".to_string();
 
+        // Action identity check.
+        let identity = ActionIdentity {
+            session_id: self.session_id.clone(),
+            delegation_id: self.delegation_id.clone(),
+            provider_call_id: call_id.to_string(),
+            batch_index: 0,
+        };
+        let payload_digest = ActionPayloadDigest::from_actions(&backend_actions);
+        match self.journal.check_identity(&identity, &payload_digest) {
+            Ok(true) => {}
+            Ok(false) => {
+                let outcome = CoordinatedOutcome::DuplicateReplay {
+                    prior_outcome: Box::new(
+                        self.journal
+                            .lookup(call_id)
+                            .cloned()
+                            .unwrap_or(CoordinatedOutcome::CancelledBeforeDispatch),
+                    ),
+                };
+                return outcome;
+            }
+            Err(()) => {
+                let outcome = CoordinatedOutcome::IdentityConflict {
+                    identity: identity.clone(),
+                };
+                self.journal.record(call_id, outcome.clone());
+                self.journal.record_identity(identity, payload_digest);
+                return outcome;
+            }
+        }
+
+        // Focus generation requirement for type/key actions.
+        if Self::requires_focus_generation(&backend_actions) && self.focus_generation == 0 {
+            let outcome = CoordinatedOutcome::Invalidated {
+                reason: TargetUnavailableReason::StaleTarget,
+            };
+            self.journal.record(call_id, outcome.clone());
+            self.journal.record_identity(identity, payload_digest);
+            return outcome;
+        }
+
         // Lease composition gate.
         if let Err(outcome) = self
-            .check_ask_lease_for_dispatch(call_id, &action_label, self.virtual_display_uuid())
+            .check_ask_lease_for_dispatch(call_id, &action_label, &backend_actions, self.virtual_display_uuid())
             .await
         {
+            self.journal.record_identity(identity, payload_digest);
             return outcome;
         }
 
@@ -1860,6 +2156,7 @@ impl ComputerActionCoordinator {
             .dispatch_backend_batch(call_id, &backend_actions, &action_label)
             .await;
         self.journal.record(call_id, outcome.clone());
+        self.journal.record_identity(identity, payload_digest);
         outcome
     }
 
@@ -1895,11 +2192,53 @@ impl ComputerActionCoordinator {
         let backend_actions = action.to_backend_actions();
         let action_label = "anthropic_20250124_call".to_string();
 
+        // Action identity check.
+        let identity = ActionIdentity {
+            session_id: self.session_id.clone(),
+            delegation_id: self.delegation_id.clone(),
+            provider_call_id: call_id.to_string(),
+            batch_index: 0,
+        };
+        let payload_digest = ActionPayloadDigest::from_actions(&backend_actions);
+        match self.journal.check_identity(&identity, &payload_digest) {
+            Ok(true) => {}
+            Ok(false) => {
+                let outcome = CoordinatedOutcome::DuplicateReplay {
+                    prior_outcome: Box::new(
+                        self.journal
+                            .lookup(call_id)
+                            .cloned()
+                            .unwrap_or(CoordinatedOutcome::CancelledBeforeDispatch),
+                    ),
+                };
+                return outcome;
+            }
+            Err(()) => {
+                let outcome = CoordinatedOutcome::IdentityConflict {
+                    identity: identity.clone(),
+                };
+                self.journal.record(call_id, outcome.clone());
+                self.journal.record_identity(identity, payload_digest);
+                return outcome;
+            }
+        }
+
+        // Focus generation requirement for type/key actions.
+        if Self::requires_focus_generation(&backend_actions) && self.focus_generation == 0 {
+            let outcome = CoordinatedOutcome::Invalidated {
+                reason: TargetUnavailableReason::StaleTarget,
+            };
+            self.journal.record(call_id, outcome.clone());
+            self.journal.record_identity(identity, payload_digest);
+            return outcome;
+        }
+
         // Lease composition gate.
         if let Err(outcome) = self
-            .check_ask_lease_for_dispatch(call_id, &action_label, self.virtual_display_uuid())
+            .check_ask_lease_for_dispatch(call_id, &action_label, &backend_actions, self.virtual_display_uuid())
             .await
         {
+            self.journal.record_identity(identity, payload_digest);
             return outcome;
         }
 
@@ -1907,6 +2246,7 @@ impl ComputerActionCoordinator {
             .dispatch_backend_batch(call_id, &backend_actions, &action_label)
             .await;
         self.journal.record(call_id, outcome.clone());
+        self.journal.record_identity(identity, payload_digest);
         outcome
     }
 
@@ -1996,6 +2336,21 @@ impl ComputerActionCoordinator {
     /// Get the backend kind.
     pub fn backend_kind(&self) -> BackendKind {
         self.backend_kind
+    }
+
+    /// The observation generation (display generation) from the opened backend.
+    pub fn observation_generation(&self) -> u64 {
+        self.observation_generation
+    }
+
+    /// The focus generation from the planning evidence capture.
+    pub fn focus_generation(&self) -> u64 {
+        self.focus_generation
+    }
+
+    /// The session ID this coordinator serves.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 }
 
@@ -2272,6 +2627,14 @@ impl NativeResponseExtractor {
                             provider: NativeProvider::OpenAi,
                         }
                     }
+                    CoordinatedOutcome::BackendCompleted { screenshot, .. } => {
+                        let _ = screenshot;
+                        NativeComputerContinuation::TextOnly {
+                            call_id: call_id.clone(),
+                            text: "computer action backend completed".to_string(),
+                            provider: NativeProvider::OpenAi,
+                        }
+                    }
                     CoordinatedOutcome::Failed { failure, .. } => {
                         NativeComputerContinuation::TextOnly {
                             call_id: call_id.clone(),
@@ -2309,6 +2672,16 @@ impl NativeResponseExtractor {
                         NativeComputerContinuation::TextOnly {
                             call_id: call_id.clone(),
                             text: "duplicate computer call replayed".to_string(),
+                            provider: NativeProvider::OpenAi,
+                        }
+                    }
+                    CoordinatedOutcome::IdentityConflict { identity } => {
+                        NativeComputerContinuation::TextOnly {
+                            call_id: call_id.clone(),
+                            text: format!(
+                                "computer action identity conflict: call_id={}, batch_index={}",
+                                identity.provider_call_id, identity.batch_index
+                            ),
                             provider: NativeProvider::OpenAi,
                         }
                     }
@@ -2379,6 +2752,11 @@ impl NativeResponseExtractor {
                 variant,
                 transient: None, // text-only; live frame was dropped
             },
+            CoordinatedOutcome::BackendCompleted { .. } => NativeComputerContinuation::Anthropic {
+                tool_use_id: tool_use_id.to_string(),
+                variant,
+                transient: None,
+            },
             CoordinatedOutcome::Failed { failure, .. } => NativeComputerContinuation::TextOnly {
                 call_id: tool_use_id.to_string(),
                 text: format!("computer action failed: {}", failure.error),
@@ -2409,6 +2787,16 @@ impl NativeResponseExtractor {
                 text: "duplicate computer call replayed".to_string(),
                 provider,
             },
+            CoordinatedOutcome::IdentityConflict { identity } => {
+                NativeComputerContinuation::TextOnly {
+                    call_id: tool_use_id.to_string(),
+                    text: format!(
+                        "computer action identity conflict: call_id={}, batch_index={}",
+                        identity.provider_call_id, identity.batch_index
+                    ),
+                    provider,
+                }
+            }
             CoordinatedOutcome::UnsupportedProviderVariant { detail } => {
                 NativeComputerContinuation::Unsupported {
                     provider,

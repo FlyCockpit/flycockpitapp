@@ -832,6 +832,12 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
             summary: "Create a bounded PCM WAV derivative.",
             condition: Some("Requires FFmpeg PCM encoding and typed session attachments."),
         },
+        BuiltinToolInventoryItem {
+            family: "Media",
+            name: "read_image",
+            summary: "Read, crop, and downscale an image into a typed media reference.",
+            condition: Some("Requires typed session attachments and the image crate."),
+        },
     ]
 }
 
@@ -922,6 +928,7 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::audio_video::InspectVideoTool),
         Arc::new(tools::audio_video::ExtractVideoClipTool),
         Arc::new(tools::audio_video::ExtractAudioTool),
+        Arc::new(tools::read_image::ReadImageTool),
         Arc::new(tools::docs::ListPackagesTool::new(
             tools::docs::DocsResolution::new(),
             "pkg".to_string(),
@@ -953,6 +960,7 @@ fn materialize_tool_by_name(
         "inspect_video" => tb.with(Arc::new(tools::audio_video::InspectVideoTool)),
         "extract_video_clip" => tb.with(Arc::new(tools::audio_video::ExtractVideoClipTool)),
         "extract_audio" => tb.with(Arc::new(tools::audio_video::ExtractAudioTool)),
+        "read_image" => tb.with(Arc::new(tools::read_image::ReadImageTool)),
         "bash" => tb.with(Arc::new(tools::bash::BashTool::new())),
         "escalate" => tb.with(Arc::new(tools::escalate::EscalateTool)),
         "write" => tb.with(Arc::new(tools::write::WriteTool)),
@@ -1409,6 +1417,15 @@ fn effective_tool_tier(
             _ => crate::agents::ToolTier::Disabled,
         };
     }
+    if matches!(tool, "read_image") {
+        return match def.name.as_str() {
+            "Build" | "Careful" | "Plan" | "explore" => crate::agents::ToolTier::Enabled,
+            "builder" | "deepthink" | "scout" | "bee" | "Multireview" => {
+                crate::agents::ToolTier::Discoverable
+            }
+            _ => crate::agents::ToolTier::Disabled,
+        };
+    }
     if is_assistant && default_assistant_discoverable_tools().contains(&tool) {
         return crate::agents::ToolTier::Discoverable;
     }
@@ -1440,6 +1457,21 @@ fn with_audio_video_tools(
             crate::agents::ToolTier::Disabled => tb,
         };
     }
+    Ok(tb)
+}
+
+fn with_read_image_tools(
+    mut tb: ToolBox,
+    def: &crate::agents::AgentDef,
+    args: &SpawnArgs,
+) -> Result<ToolBox> {
+    tb = match effective_tool_tier(def, "read_image", false) {
+        crate::agents::ToolTier::Enabled => add_tool_by_name(tb, "read_image", def, args)?,
+        crate::agents::ToolTier::Discoverable => {
+            add_discoverable_tool_by_name(tb, "read_image", def, args)?
+        }
+        crate::agents::ToolTier::Disabled => tb,
+    };
     Ok(tb)
 }
 
@@ -1777,6 +1809,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
         };
     }
     tb = with_audio_video_tools(tb, def, args)?;
+    tb = with_read_image_tools(tb, def, args)?;
     if !is_internal_agent_def_name(&def.name) || internal_agent_def_uses_custom_tools(&def.name) {
         // Custom-bash tools (webfetch/websearch/…) are config-driven, not part
         // of the named grant — attach them like the built-in factories do.

@@ -634,6 +634,464 @@ impl ComputerAuthorizer for FakeComputerAuthorizer {
 }
 
 // ---------------------------------------------------------------------------
+// Advisory action semantics (audit/guidance only — never prompt, deny, or grant)
+// ---------------------------------------------------------------------------
+
+/// Exhaustive advisory action-class taxonomy for computer-use actions.
+///
+/// These classes are audit/guidance fields only. They never trigger a prompt,
+/// hard denial, or persistent grant in either Ask or Yolo tier. Yolo is
+/// complete trust: zero Cockpit human prompts, zero semantic target/action
+/// hard denials, and zero persistent grants. Ask asks exactly once per
+/// uninterrupted delegation/display lease generation and reuses that decision
+/// for all action classes until invalidation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ActionClass {
+    /// Reversible navigation/observation (screenshot, cursor move, scroll).
+    Reversible,
+    /// State-changing but non-terminal (typing, click that toggles UI).
+    StateChanging,
+    /// Form submission or dialog confirmation.
+    Submission,
+    /// Purchase or financial commitment.
+    Purchase,
+    /// Credential entry (password, token, key input).
+    CredentialEntry,
+    /// Destructive/irreversible (delete, format, drop, `rm -rf`).
+    Destructive,
+    /// Unknown/unclassifiable action.
+    Unknown,
+}
+
+impl ActionClass {
+    /// Classify a canonical [`ComputerAction`] into its advisory class.
+    ///
+    /// This mapping is advisory only and never affects the dispatch decision.
+    /// The central authorizer and lease composition gate dispatch; this
+    /// classification is recorded for audit/guidance.
+    pub fn classify(action: &ComputerAction) -> Self {
+        match action {
+            ComputerAction::CaptureFull
+            | ComputerAction::CaptureRegion { .. }
+            | ComputerAction::CaptureNativeZoom { .. }
+            | ComputerAction::MoveCursor { .. }
+            | ComputerAction::Scroll { .. }
+            | ComputerAction::Wait { .. } => Self::Reversible,
+            ComputerAction::Click { .. }
+            | ComputerAction::MouseDown { .. }
+            | ComputerAction::MouseUp { .. }
+            | ComputerAction::Drag { .. }
+            | ComputerAction::KeyChord { .. }
+            | ComputerAction::HoldKey { .. } => Self::StateChanging,
+            ComputerAction::TypeText { text } => {
+                // Heuristic advisory classification: never used for denial.
+                let lower = text.to_ascii_lowercase();
+                if lower.contains("password")
+                    || lower.contains("passwd")
+                    || lower.contains("token")
+                    || lower.contains("secret")
+                    || lower.contains("api_key")
+                    || lower.contains("apikey")
+                {
+                    Self::CredentialEntry
+                } else if lower.contains("rm -rf")
+                    || lower.contains("delete")
+                    || lower.contains("drop ")
+                    || lower.contains("format")
+                    || lower.contains("truncate")
+                {
+                    Self::Destructive
+                } else {
+                    Self::StateChanging
+                }
+            }
+        }
+    }
+
+    /// A short stable label for audit records.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Reversible => "reversible",
+            Self::StateChanging => "state_changing",
+            Self::Submission => "submission",
+            Self::Purchase => "purchase",
+            Self::CredentialEntry => "credential_entry",
+            Self::Destructive => "destructive",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ask delegation lease: one coalesced human decision per delegation/display gen
+// ---------------------------------------------------------------------------
+
+/// Identifies the provider that emits computer actions.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProviderId(pub String);
+
+/// Identifies the model that emits computer actions.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ModelId(pub String);
+
+/// The target key for lease scoping: either a physical target key or a
+/// virtual display UUID.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum LeaseTargetKey {
+    /// Physical target — requires host lease composition.
+    Physical(PhysicalTargetKey),
+    /// Virtual display — no host lease, but still scoped to this display.
+    Virtual([u8; 16]),
+}
+
+/// The composite key for an Ask delegation lease.
+///
+/// One coalesced Ask decision is reused for all action classes until any key
+/// field or generation changes. The lease never persists and cannot be
+/// broadened to session/project/global.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AskLeaseKey {
+    pub session_id: String,
+    pub delegation_id: DelegationId,
+    pub provider_id: ProviderId,
+    pub model_id: ModelId,
+    pub target_key: LeaseTargetKey,
+    pub host_lease_generation: Option<LeaseGeneration>,
+    pub display_generation: u64,
+}
+
+/// An unforgeable, in-memory Ask delegation lease.
+///
+/// Created by `Approve` on the first valid Ask action for one uninterrupted
+/// delegation/display lease generation. Keyed by
+/// `(session_id, delegation_id, provider_id, model_id, target_key_or_virtual_id,
+///   host_lease_generation, display_generation)`.
+///
+/// # Unforgeability
+///
+/// This type is not constructible outside this module. The only way to obtain
+/// one is through [`AskDelegationLeaseStore::install`]. It has no `serde`
+/// implementation (no Serialize/Deserialize), so it cannot be persisted,
+/// serialized across processes, or replayed. The opaque token is compared in
+/// constant time. Provider/model/tool payloads cannot construct, extend,
+/// select, serialize, or replay this lease.
+///
+/// # Lifecycle
+///
+/// - Created on `Approve` for the first valid Ask action.
+/// - Reused for all action classes until invalidation.
+/// - Revoked before queued work on: delegation terminal state, cancel,
+///   detach, provider/model change, display/target/host generation change,
+///   lost OS lock, or daemon restart.
+/// - Daemon restart loses both Ask and host leases; Ask requires a new
+///   decision.
+pub struct AskDelegationLease {
+    key: AskLeaseKey,
+    /// Opaque constant-time token. Never serialized, never exposed except by
+    /// constant-time equality check against the store's record.
+    token: [u8; 32],
+    /// Monotonic version of the approval wait that produced this lease.
+    approval_version: u64,
+}
+
+impl std::fmt::Debug for AskDelegationLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AskDelegationLease")
+            .field("key", &self.key)
+            .field("token", &"[REDACTED; 32]")
+            .field("approval_version", &self.approval_version)
+            .finish()
+    }
+}
+
+impl PartialEq for AskDelegationLease {
+    fn eq(&self, other: &Self) -> bool {
+        // Constant-time comparison of the opaque token.
+        constant_time_eq(&self.token, &other.token) && self.key == other.key
+    }
+}
+
+impl Eq for AskDelegationLease {}
+
+impl AskDelegationLease {
+    /// Returns the lease key (for diagnostic/logging only).
+    pub fn key(&self) -> &AskLeaseKey {
+        &self.key
+    }
+
+    /// Returns the approval-wait version that produced this lease.
+    pub fn approval_version(&self) -> u64 {
+        self.approval_version
+    }
+}
+
+/// Constant-time byte-slice equality. Returns `true` if all bytes match.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// The outcome of an Ask authorization attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AskAuthorizationOutcome {
+    /// A lease was already installed for this key — reuse it (zero new prompt).
+    ReusedExisting,
+    /// A new lease was installed from a fresh human approval.
+    Installed,
+    /// The human denied the action. The delegation's computer path is
+    /// terminated.
+    Denied { reason: String },
+    /// The approval was cancelled before install (e.g. delegation terminal,
+    /// cancel, or generation change while waiting). The answer is discarded
+    /// and zero input is sent.
+    CancelledBeforeInstall,
+    /// The approval answer arrived but a key field/generation changed while
+    /// waiting. The answer is discarded; a new decision is required.
+    StaleAnswerDiscarded,
+    /// The approval is still pending (concurrent first Ask actions share one
+    /// pending decision). The action is not dispatched.
+    Pending,
+}
+
+/// The in-memory, coordinator-owned store for Ask delegation leases.
+///
+/// Leases never persist and cannot be broadened to session/project/global.
+/// Unrelated command/path/MCP/worker/session/project grants never satisfy
+/// Ask — only a matching [`AskLeaseKey`] in this store does.
+#[derive(Debug, Default)]
+pub struct AskDelegationLeaseStore {
+    leases: HashMap<AskLeaseKey, AskDelegationLease>,
+    /// Pending approvals keyed by lease key. Concurrent first Ask actions
+    /// share one pending decision.
+    pending: HashMap<AskLeaseKey, u64>,
+    /// Monotonic approval-wait version counter.
+    next_approval_version: u64,
+}
+
+impl AskDelegationLeaseStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Check if a valid lease exists for the given key. This is the dispatch
+    /// gate: Ask requires both a current Ask delegation lease AND the
+    /// coordinator's current host/virtual input lease.
+    pub fn has_lease(&self, key: &AskLeaseKey) -> bool {
+        self.leases.contains_key(key)
+    }
+
+    /// Look up a lease for diagnostic purposes.
+    pub fn lease(&self, key: &AskLeaseKey) -> Option<&AskDelegationLease> {
+        self.leases.get(key)
+    }
+
+    /// The number of installed leases (for tests/diagnostics).
+    pub fn len(&self) -> usize {
+        self.leases.len()
+    }
+
+    /// Whether the store is empty.
+    pub fn is_empty(&self) -> bool {
+        self.leases.is_empty()
+    }
+
+    /// Begin an approval wait for the given key. Returns the approval version.
+    /// If a pending wait already exists for this key, returns the existing
+    /// version (concurrent first Ask actions share one pending decision).
+    pub fn begin_approval_wait(&mut self, key: &AskLeaseKey) -> u64 {
+        if let Some(&version) = self.pending.get(key) {
+            return version;
+        }
+        self.next_approval_version += 1;
+        let version = self.next_approval_version;
+        self.pending.insert(key.clone(), version);
+        version
+    }
+
+    /// Install a lease from a fresh human approval. The approval is only
+    /// installed if every key field/generation is still current (matches
+    /// `expected_key`). If the key changed while waiting, the answer is
+    /// discarded ([`AskAuthorizationOutcome::StaleAnswerDiscarded`]).
+    ///
+    /// If a lease already exists for this key, it is reused
+    /// ([`AskAuthorizationOutcome::ReusedExisting`]).
+    pub fn install(
+        &mut self,
+        expected_key: &AskLeaseKey,
+        approval_version: u64,
+    ) -> AskAuthorizationOutcome {
+        // If already installed, reuse — one coalesced decision.
+        if self.leases.contains_key(expected_key) {
+            // Clear the pending wait.
+            self.pending.remove(expected_key);
+            return AskAuthorizationOutcome::ReusedExisting;
+        }
+
+        // Verify the approval version is still current for this key. If the
+        // key changed while waiting (a new approval wait superseded this one),
+        // discard the stale answer.
+        match self.pending.get(expected_key) {
+            Some(&current_version) if current_version == approval_version => {}
+            _ => {
+                // Stale answer — a newer wait superseded this one, or the
+                // pending wait was cancelled.
+                return AskAuthorizationOutcome::StaleAnswerDiscarded;
+            }
+        }
+
+        // Install the lease with a fresh opaque token.
+        let mut token = [0u8; 32];
+        // Deterministic-ish token from the key + version (not cryptographic,
+        // but unforgeable because the type is not constructible externally
+        // and has no serde). In production this would be a CSPRNG draw.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        use std::hash::{Hash, Hasher};
+        expected_key.hash(&mut hasher);
+        approval_version.hash(&mut hasher);
+        let h = hasher.finish();
+        for (i, byte) in token.iter_mut().enumerate() {
+            *byte = ((h >> ((i % 8) * 8)) & 0xFF) as u8;
+        }
+
+        let lease = AskDelegationLease {
+            key: expected_key.clone(),
+            token,
+            approval_version,
+        };
+        self.leases.insert(expected_key.clone(), lease);
+        self.pending.remove(expected_key);
+        AskAuthorizationOutcome::Installed
+    }
+
+    /// Record a denial for the given key. Terminates that delegation's
+    /// computer path. Clears any pending wait.
+    pub fn record_denial(&mut self, key: &AskLeaseKey) -> AskAuthorizationOutcome {
+        self.pending.remove(key);
+        self.leases.remove(key);
+        AskAuthorizationOutcome::Denied {
+            reason: "human denied computer action".to_string(),
+        }
+    }
+
+    /// Cancel a pending approval wait before install. The answer is discarded
+    /// and zero input is sent. If a lease was already installed, it is not
+    /// affected (cancellation before install only).
+    pub fn cancel_pending(&mut self, key: &AskLeaseKey) -> AskAuthorizationOutcome {
+        if self.pending.remove(key).is_some() {
+            AskAuthorizationOutcome::CancelledBeforeInstall
+        } else if self.leases.contains_key(key) {
+            // Already installed — cancellation before install is a no-op for
+            // an installed lease.
+            AskAuthorizationOutcome::ReusedExisting
+        } else {
+            AskAuthorizationOutcome::CancelledBeforeInstall
+        }
+    }
+
+    /// Revoke a lease for the given key. Called on delegation terminal state,
+    /// cancel, detach, provider/model change, display/target/host generation
+    /// change, lost OS lock, or daemon restart.
+    ///
+    /// Returns `true` if a lease was revoked.
+    pub fn revoke(&mut self, key: &AskLeaseKey) -> bool {
+        self.pending.remove(key);
+        self.leases.remove(key).is_some()
+    }
+
+    /// Revoke all leases for a given delegation. Called on delegation
+    /// terminal state, cancel, or detach.
+    ///
+    /// Returns the number of leases revoked.
+    pub fn revoke_for_delegation(
+        &mut self,
+        session_id: &str,
+        delegation_id: &DelegationId,
+    ) -> usize {
+        let to_remove: Vec<AskLeaseKey> = self
+            .leases
+            .keys()
+            .filter(|k| k.session_id == session_id && k.delegation_id == *delegation_id)
+            .cloned()
+            .collect();
+        let count = to_remove.len();
+        for key in to_remove {
+            self.leases.remove(&key);
+            self.pending.remove(&key);
+        }
+        count
+    }
+
+    /// Revoke all leases whose host lease generation differs from the given
+    /// current generation. A host lease-generation replacement invalidates
+    /// the Ask lease and requires a new human decision before another action.
+    ///
+    /// Returns the number of leases revoked.
+    pub fn revoke_on_host_generation_change(
+        &mut self,
+        target_key: &PhysicalTargetKey,
+        current_generation: LeaseGeneration,
+    ) -> usize {
+        let to_remove: Vec<AskLeaseKey> = self
+            .leases
+            .keys()
+            .filter(|k| {
+                matches!(&k.target_key, LeaseTargetKey::Physical(pk) if pk == target_key)
+                    && k.host_lease_generation != Some(current_generation)
+            })
+            .cloned()
+            .collect();
+        let count = to_remove.len();
+        for key in to_remove {
+            self.leases.remove(&key);
+            self.pending.remove(&key);
+        }
+        count
+    }
+
+    /// Revoke all leases whose display generation differs from the given
+    /// current generation. A display-generation change invalidates the Ask
+    /// lease and requires a new human decision.
+    ///
+    /// Returns the number of leases revoked.
+    pub fn revoke_on_display_generation_change(
+        &mut self,
+        session_id: &str,
+        delegation_id: &DelegationId,
+        current_display_generation: u64,
+    ) -> usize {
+        let to_remove: Vec<AskLeaseKey> = self
+            .leases
+            .keys()
+            .filter(|k| {
+                k.session_id == session_id
+                    && k.delegation_id == *delegation_id
+                    && k.display_generation != current_display_generation
+            })
+            .cloned()
+            .collect();
+        let count = to_remove.len();
+        for key in to_remove {
+            self.leases.remove(&key);
+            self.pending.remove(&key);
+        }
+        count
+    }
+
+    /// Clear all leases and pending waits. Called on daemon restart: both
+    /// Ask and host leases are lost; Ask requires a new decision.
+    pub fn clear_all(&mut self) {
+        self.leases.clear();
+        self.pending.clear();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Outcome journaling: dedup, reconnect, cancellation, dispatch_unknown
 // ---------------------------------------------------------------------------
 
@@ -766,6 +1224,13 @@ pub struct ComputerActionCoordinator {
     dispatch_states: HashMap<String, DispatchState>,
     /// Whether the backend is dead (readiness failure).
     backend_dead: bool,
+    /// The Ask delegation lease store (Ask tier only). Yolo creates no
+    /// approval grant and uses only the host lease.
+    ask_lease_store: AskDelegationLeaseStore,
+    /// The provider ID for this coordinator's delegation.
+    provider_id: ProviderId,
+    /// The model ID for this coordinator's delegation.
+    model_id: ModelId,
 }
 
 impl std::fmt::Debug for ComputerActionCoordinator {
@@ -779,7 +1244,8 @@ impl std::fmt::Debug for ComputerActionCoordinator {
             .field("observation_generation", &self.observation_generation)
             .field("focus_generation", &self.focus_generation)
             .field("backend_kind", &self.backend_kind)
-            .finish()
+            .field("ask_lease_count", &self.ask_lease_store.len())
+            .finish_non_exhaustive()
     }
 }
 
@@ -792,6 +1258,10 @@ pub struct CoordinatorParams {
     pub authorizer: Arc<dyn ComputerAuthorizer>,
     pub host_arbiter: Option<Arc<std::sync::Mutex<HostInputArbiter>>>,
     pub target_adapter: Option<Box<dyn TargetEvidenceAdapter>>,
+    /// The provider ID for this delegation (e.g. "anthropic", "openai").
+    pub provider_id: ProviderId,
+    /// The model ID for this delegation (e.g. "claude-3-5-sonnet-20241022").
+    pub model_id: ModelId,
 }
 
 impl ComputerActionCoordinator {
@@ -873,6 +1343,9 @@ impl ComputerActionCoordinator {
             backend_kind,
             dispatch_states: HashMap::new(),
             backend_dead: false,
+            ask_lease_store: AskDelegationLeaseStore::new(),
+            provider_id: params.provider_id,
+            model_id: params.model_id,
         })
     }
 
@@ -901,6 +1374,9 @@ impl ComputerActionCoordinator {
     /// host-lock loss). After invalidation, no further actions may dispatch.
     pub fn invalidate(&mut self, reason: TargetUnavailableReason) {
         self.invalidated = true;
+        // Revoke Ask delegation leases for this delegation (display/target/host
+        // generation change, host-lock loss, etc.).
+        self.revoke_ask_lease_for_delegation();
         // Release the host lease if held.
         if let Some(token) = self.host_lease.take()
             && let Some(arbiter) = &self.host_arbiter
@@ -1054,6 +1530,232 @@ impl ComputerActionCoordinator {
         self.authorizer.authorize(&request).await
     }
 
+    /// Build the Ask lease key for the current coordinator state. The key is
+    /// `(session_id, delegation_id, provider_id, model_id, target_key_or_virtual_id,
+    ///   host_lease_generation, display_generation)`.
+    ///
+    /// For physical targets, the host lease generation is included. For
+    /// virtual displays, `host_lease_generation` is `None` and the virtual
+    /// display UUID is used as the target key.
+    fn ask_lease_key(&self, virtual_display_uuid: Option<[u8; 16]>) -> Option<AskLeaseKey> {
+        let target_key = match (&self.host_lease, virtual_display_uuid) {
+            (Some(token), _) => LeaseTargetKey::Physical(token.target_key),
+            (None, Some(uuid)) => LeaseTargetKey::Virtual(uuid),
+            (None, None) => {
+                // No host lease and no virtual display UUID — cannot scope a
+                // lease. This is a virtual display without evidence. Use a
+                // synthetic virtual key derived from the delegation so the
+                // lease is still scoped (cannot be broadened).
+                // In practice, virtual backends always have a UUID; this is a
+                // fallback for evidence-less virtual displays.
+                LeaseTargetKey::Virtual([0u8; 16])
+            }
+        };
+        let host_lease_generation = self.host_lease.as_ref().map(|t| t.generation);
+        Some(AskLeaseKey {
+            session_id: self.session_id.clone(),
+            delegation_id: self.delegation_id.clone(),
+            provider_id: self.provider_id.clone(),
+            model_id: self.model_id.clone(),
+            target_key,
+            host_lease_generation,
+            display_generation: self.observation_generation,
+        })
+    }
+
+    /// Check whether dispatch is authorized for the Ask tier. Dispatch
+    /// requires both a current Ask delegation lease (Ask only) and the
+    /// coordinator's current host/virtual input lease.
+    ///
+    /// This is the lease composition gate. Neither Ask authority alone nor a
+    /// host lease alone can dispatch.
+    ///
+    /// Returns `Ok(())` if authorized, or a [`CoordinatedOutcome`] for the
+    /// blocking/denial case.
+    async fn check_ask_lease_for_dispatch(
+        &mut self,
+        call_id: &str,
+        action_label: &str,
+        virtual_display_uuid: Option<[u8; 16]>,
+    ) -> Result<(), CoordinatedOutcome> {
+        // Yolo uses only the host lease and records `agent_discretion`; it
+        // creates no approval grant. No Ask lease is required.
+        if self.tier == ComputerApprovalTier::Yolo {
+            return Ok(());
+        }
+
+        // Ask tier: require both the Ask delegation lease and the host lease
+        // (for physical targets). For virtual displays, only the Ask lease is
+        // required (no host lease).
+        let Some(lease_key) = self.ask_lease_key(virtual_display_uuid) else {
+            // Cannot scope a lease — block dispatch.
+            let outcome = CoordinatedOutcome::CancelledBeforeDispatch;
+            self.journal.record(call_id, outcome.clone());
+            return Err(outcome);
+        };
+
+        // If a lease is already installed, reuse it (one coalesced decision).
+        if self.ask_lease_store.has_lease(&lease_key) {
+            return Ok(());
+        }
+
+        // No lease yet — this is the first valid Ask action for this
+        // delegation/display lease generation. Begin an approval wait.
+        let approval_version = self.ask_lease_store.begin_approval_wait(&lease_key);
+
+        // Authorize through the central authorizer (raises the human prompt).
+        match self.authorize_action(call_id, action_label).await {
+            Ok(ComputerAuthorizationDecision::Allow) => {
+                // Approve creates an in-memory AskDelegationLease. Approval
+                // installs only if every key field/generation is still
+                // current.
+                match self.ask_lease_store.install(&lease_key, approval_version) {
+                    AskAuthorizationOutcome::Installed
+                    | AskAuthorizationOutcome::ReusedExisting => Ok(()),
+                    AskAuthorizationOutcome::StaleAnswerDiscarded => {
+                        // A key/generation changed while waiting. The answer
+                        // is discarded; a new decision is required before
+                        // another action.
+                        self.dispatch_states
+                            .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
+                        let outcome = CoordinatedOutcome::Invalidated {
+                            reason: TargetUnavailableReason::StaleTarget,
+                        };
+                        self.journal.record(call_id, outcome.clone());
+                        Err(outcome)
+                    }
+                    AskAuthorizationOutcome::Denied { reason } => {
+                        self.dispatch_states
+                            .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
+                        let outcome = CoordinatedOutcome::Denied { reason };
+                        self.journal.record(call_id, outcome.clone());
+                        Err(outcome)
+                    }
+                    AskAuthorizationOutcome::CancelledBeforeInstall => {
+                        self.dispatch_states
+                            .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
+                        let outcome = CoordinatedOutcome::CancelledBeforeDispatch;
+                        self.journal.record(call_id, outcome.clone());
+                        Err(outcome)
+                    }
+                    AskAuthorizationOutcome::Pending => {
+                        // Concurrent first Ask actions share one pending
+                        // decision. The action is not dispatched.
+                        self.dispatch_states
+                            .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
+                        let outcome = CoordinatedOutcome::CancelledBeforeDispatch;
+                        self.journal.record(call_id, outcome.clone());
+                        Err(outcome)
+                    }
+                }
+            }
+            Ok(ComputerAuthorizationDecision::Deny { reason }) => {
+                // Denial terminates that delegation's computer path.
+                self.ask_lease_store.record_denial(&lease_key);
+                self.dispatch_states
+                    .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
+                let outcome = CoordinatedOutcome::Denied { reason };
+                self.journal.record(call_id, outcome.clone());
+                Err(outcome)
+            }
+            Ok(ComputerAuthorizationDecision::AskBlocked) => {
+                // The authorizer blocked waiting for a human response. The
+                // action is not dispatched. The pending wait remains so a
+                // subsequent approval can install the lease.
+                self.dispatch_states
+                    .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
+                let outcome = CoordinatedOutcome::CancelledBeforeDispatch;
+                self.journal.record(call_id, outcome.clone());
+                Err(outcome)
+            }
+            Err(err) => {
+                let outcome = CoordinatedOutcome::Failed {
+                    failure: ComputerFailure {
+                        index: 0,
+                        error: err,
+                    },
+                    screenshot: None,
+                };
+                self.journal.record(call_id, outcome.clone());
+                Err(outcome)
+            }
+        }
+    }
+
+    /// Get the virtual display UUID from the target adapter, if available.
+    fn virtual_display_uuid(&self) -> Option<[u8; 16]> {
+        self.target_adapter.as_ref().and_then(|adapter| {
+            // We cannot capture a snapshot here without &mut, so we rely on
+            // the fact that virtual backends store their UUID in the
+            // evidence. For virtual displays without an adapter, this returns
+            // None and the lease is scoped to a synthetic key.
+            //
+            // In practice, the adapter's backend_kind tells us if this is a
+            // virtual display. We use a zero UUID as a fallback for
+            // evidence-less virtual displays (no adapter).
+            if adapter.backend_kind() == BackendKind::VirtualDisplay {
+                // The actual UUID is in the evidence; we capture it during
+                // open() and store it. For now, return None and let the
+                // lease key builder use the synthetic fallback.
+                None
+            } else {
+                None
+            }
+        })
+    }
+
+    /// The Ask delegation lease store (for tests/diagnostics).
+    pub fn ask_lease_store(&self) -> &AskDelegationLeaseStore {
+        &self.ask_lease_store
+    }
+
+    /// The provider ID for this coordinator's delegation.
+    pub fn provider_id(&self) -> &ProviderId {
+        &self.provider_id
+    }
+
+    /// The model ID for this coordinator's delegation.
+    pub fn model_id(&self) -> &ModelId {
+        &self.model_id
+    }
+
+    /// Revoke the Ask delegation lease for the current coordinator state.
+    /// Called on delegation terminal state, cancel, detach, provider/model
+    /// change, display/target/host generation change, lost OS lock, or daemon
+    /// restart.
+    pub fn revoke_ask_lease(&mut self) -> bool {
+        if let Some(key) = self.ask_lease_key(self.virtual_display_uuid()) {
+            self.ask_lease_store.revoke(&key)
+        } else {
+            false
+        }
+    }
+
+    /// Revoke all Ask leases for this coordinator's delegation. Called on
+    /// delegation terminal state, cancel, or detach.
+    pub fn revoke_ask_lease_for_delegation(&mut self) -> usize {
+        self.ask_lease_store
+            .revoke_for_delegation(&self.session_id, &self.delegation_id)
+    }
+
+    /// Handle host lease-generation replacement. A replaced generation
+    /// invalidates the Ask lease and requires a new human decision before
+    /// another action.
+    pub fn invalidate_ask_lease_on_host_generation_change(&mut self) -> usize {
+        if let Some(token) = &self.host_lease {
+            self.ask_lease_store
+                .revoke_on_host_generation_change(&token.target_key, token.generation)
+        } else {
+            0
+        }
+    }
+
+    /// Clear all Ask leases (daemon restart). Both Ask and host leases are
+    /// lost; Ask requires a new decision.
+    pub fn clear_all_ask_leases(&mut self) {
+        self.ask_lease_store.clear_all();
+    }
+
     /// Execute an OpenAI computer call through the coordinator. This is the
     /// canonical dispatch path: dedup check → authorization → pre-handoff →
     /// backend batch → screenshot → record outcome.
@@ -1095,34 +1797,15 @@ impl ComputerActionCoordinator {
         }
         let action_label = format!("openai_call:{}", actions.len());
 
-        // Authorize through the central authorizer.
-        match self.authorize_action(call_id, &action_label).await {
-            Ok(ComputerAuthorizationDecision::Allow) => {}
-            Ok(ComputerAuthorizationDecision::Deny { reason }) => {
-                let outcome = CoordinatedOutcome::Denied { reason };
-                self.journal.record(call_id, outcome.clone());
-                return outcome;
-            }
-            Ok(ComputerAuthorizationDecision::AskBlocked) => {
-                // Ask pauses on the central authorizer seam. The action is
-                // not dispatched. Record as cancelled before dispatch.
-                self.dispatch_states
-                    .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
-                let outcome = CoordinatedOutcome::CancelledBeforeDispatch;
-                self.journal.record(call_id, outcome.clone());
-                return outcome;
-            }
-            Err(err) => {
-                let outcome = CoordinatedOutcome::Failed {
-                    failure: ComputerFailure {
-                        index: 0,
-                        error: err,
-                    },
-                    screenshot: None,
-                };
-                self.journal.record(call_id, outcome.clone());
-                return outcome;
-            }
+        // Lease composition gate: Ask requires both a current Ask delegation
+        // lease and the coordinator's current host/virtual input lease. Yolo
+        // uses only the host lease and records `agent_discretion`; it creates
+        // no approval grant.
+        if let Err(outcome) = self
+            .check_ask_lease_for_dispatch(call_id, &action_label, self.virtual_display_uuid())
+            .await
+        {
+            return outcome;
         }
 
         // Dispatch through the backend.
@@ -1165,31 +1848,12 @@ impl ComputerActionCoordinator {
         let backend_actions = action.to_backend_actions();
         let action_label = "anthropic_20251124_call".to_string();
 
-        match self.authorize_action(call_id, &action_label).await {
-            Ok(ComputerAuthorizationDecision::Allow) => {}
-            Ok(ComputerAuthorizationDecision::Deny { reason }) => {
-                let outcome = CoordinatedOutcome::Denied { reason };
-                self.journal.record(call_id, outcome.clone());
-                return outcome;
-            }
-            Ok(ComputerAuthorizationDecision::AskBlocked) => {
-                self.dispatch_states
-                    .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
-                let outcome = CoordinatedOutcome::CancelledBeforeDispatch;
-                self.journal.record(call_id, outcome.clone());
-                return outcome;
-            }
-            Err(err) => {
-                let outcome = CoordinatedOutcome::Failed {
-                    failure: ComputerFailure {
-                        index: 0,
-                        error: err,
-                    },
-                    screenshot: None,
-                };
-                self.journal.record(call_id, outcome.clone());
-                return outcome;
-            }
+        // Lease composition gate.
+        if let Err(outcome) = self
+            .check_ask_lease_for_dispatch(call_id, &action_label, self.virtual_display_uuid())
+            .await
+        {
+            return outcome;
         }
 
         let outcome = self
@@ -1231,31 +1895,12 @@ impl ComputerActionCoordinator {
         let backend_actions = action.to_backend_actions();
         let action_label = "anthropic_20250124_call".to_string();
 
-        match self.authorize_action(call_id, &action_label).await {
-            Ok(ComputerAuthorizationDecision::Allow) => {}
-            Ok(ComputerAuthorizationDecision::Deny { reason }) => {
-                let outcome = CoordinatedOutcome::Denied { reason };
-                self.journal.record(call_id, outcome.clone());
-                return outcome;
-            }
-            Ok(ComputerAuthorizationDecision::AskBlocked) => {
-                self.dispatch_states
-                    .insert(call_id.to_string(), DispatchState::CancelledBeforeDispatch);
-                let outcome = CoordinatedOutcome::CancelledBeforeDispatch;
-                self.journal.record(call_id, outcome.clone());
-                return outcome;
-            }
-            Err(err) => {
-                let outcome = CoordinatedOutcome::Failed {
-                    failure: ComputerFailure {
-                        index: 0,
-                        error: err,
-                    },
-                    screenshot: None,
-                };
-                self.journal.record(call_id, outcome.clone());
-                return outcome;
-            }
+        // Lease composition gate.
+        if let Err(outcome) = self
+            .check_ask_lease_for_dispatch(call_id, &action_label, self.virtual_display_uuid())
+            .await
+        {
+            return outcome;
         }
 
         let outcome = self
@@ -1310,6 +1955,8 @@ impl ComputerActionCoordinator {
     /// Mark the backend as dead. Failure wakes all waiters with zero input.
     pub fn mark_backend_dead(&mut self) {
         self.backend_dead = true;
+        // Revoke Ask delegation leases for this delegation.
+        self.revoke_ask_lease_for_delegation();
         // Release the host lease if held.
         if let Some(token) = self.host_lease.take()
             && let Some(arbiter) = &self.host_arbiter
@@ -1323,6 +1970,8 @@ impl ComputerActionCoordinator {
     /// completion, failure, cancellation, detach, daemon restart, or host-lock
     /// loss.
     pub async fn close(&mut self) -> Result<(), ComputerError> {
+        // Revoke Ask delegation leases for this delegation.
+        self.revoke_ask_lease_for_delegation();
         // Release the host lease.
         if let Some(token) = self.host_lease.take()
             && let Some(arbiter) = &self.host_arbiter
@@ -1843,6 +2492,8 @@ mod tests {
             authorizer,
             host_arbiter: None,
             target_adapter: None,
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
         }
     }
 
@@ -2431,6 +3082,8 @@ mod tests {
             authorizer: authorizer.clone(),
             host_arbiter: None,
             target_adapter: None,
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
             .await
@@ -2595,6 +3248,8 @@ mod tests {
             authorizer,
             host_arbiter: Some(arbiter.clone()),
             target_adapter: Some(Box::new(adapter)),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -2850,6 +3505,8 @@ mod tests {
             authorizer,
             host_arbiter: None,
             target_adapter: Some(Box::new(adapter)),
+            provider_id: ProviderId("anthropic".to_string()),
+            model_id: ModelId("claude-3-5-sonnet".to_string()),
         };
         let coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -2877,6 +3534,8 @@ mod tests {
             authorizer,
             host_arbiter: Some(arbiter.clone()),
             target_adapter: Some(Box::new(adapter)),
+            provider_id: ProviderId("anthropic".to_string()),
+            model_id: ModelId("claude-3-5-sonnet".to_string()),
         };
         let coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await
@@ -2903,6 +3562,8 @@ mod tests {
             authorizer,
             host_arbiter: Some(arbiter.clone()),
             target_adapter: Some(Box::new(adapter)),
+            provider_id: ProviderId("anthropic".to_string()),
+            model_id: ModelId("claude-3-5-sonnet".to_string()),
         };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params)
             .await

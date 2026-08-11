@@ -392,10 +392,10 @@ pub fn tenant_key_info(tenant_id: &[u8; 16], version: u32) -> Vec<u8> {
 
 /// Cardinality token: first 16 bytes of HMAC-SHA-256(K, domain | alias | utcDay:u64be).
 pub fn cardinality_token(key: &[u8; 32], tenant_alias: &[u8; 16], utc_day: i64) -> [u8; 16] {
-    use hmac::{Hmac, Mac};
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_key(key);
+    use hmac::{Hmac, KeyInit, Mac};
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("hmac accepts 32-byte key");
     mac.update(CARDINALITY_DOMAIN.as_bytes());
-    mac.update([0x00]);
+    mac.update(&[0x00u8]);
     mac.update(tenant_alias);
     mac.update(&utc_day.to_be_bytes());
     let result = mac.finalize().into_bytes();

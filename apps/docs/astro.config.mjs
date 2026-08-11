@@ -18,6 +18,20 @@ export default defineConfig({
           ],
         },
         {
+          label: "Image Generation",
+          items: [
+            { label: "Overview", slug: "image-generation/overview" },
+            { label: "OpenAI Images", slug: "image-generation/openai" },
+            { label: "OpenRouter Images", slug: "image-generation/openrouter" },
+            { label: "Gemini Images", slug: "image-generation/gemini" },
+            { label: "ComfyUI", slug: "image-generation/comfyui" },
+            { label: "Security and Budgets", slug: "image-generation/security-and-budgets" },
+            { label: "Jobs and Artifacts", slug: "image-generation/jobs-and-artifacts" },
+            { label: "Remote Client", slug: "image-generation/remote-client" },
+            { label: "Troubleshooting", slug: "image-generation/troubleshooting" },
+          ],
+        },
+        {
           label: "Reference",
           items: [{ autogenerate: { directory: "reference" } }],
         },

@@ -809,6 +809,8 @@ mod adapter_sealed {
     pub trait Sealed {}
 }
 
+pub mod gemini;
+
 pub trait ImageRuntimeAdapter: adapter_sealed::Sealed + Send + Sync {
     fn kind(&self) -> ImageAdapterKind;
     /// Purely describes a read-only request. Header values remain ephemeral in

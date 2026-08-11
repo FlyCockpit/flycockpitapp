@@ -29,11 +29,13 @@
     "hono": "catalog:",
     "rate-limiter-flexible": "catalog:",
     "sharp": "catalog:",
+    "ws": "catalog:",
     "zod": "catalog:"
   },
   "devDependencies": {
     "@flycockpit/config": "workspace:*",
     "@types/node": "catalog:",
+    "@types/ws": "catalog:",
     "tsdown": "catalog:",
     "tsx": "catalog:",
     "typescript": "catalog:",

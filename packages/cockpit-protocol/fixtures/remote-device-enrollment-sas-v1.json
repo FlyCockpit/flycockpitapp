@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "prefix": "flycockpit-remote-enrollment-sas-v1",
+  "saltPreimageHex": "666c79636f636b7069742d72656d6f74652d656e726f6c6c6d656e742d7361732d76310073616c74",
+  "saltDigestHex": "5927e846e8ccc0210d666fa104e2aa7af9dcda3039ee97cae6b2978cc97b0508",
+  "infoPreimageHex": "666c79636f636b7069742d72656d6f74652d656e726f6c6c6d656e742d7361732d763100646967697473007631",
+  "forbiddenEscapeHex": "5c30",
+  "okmLen": 8160,
+  "blockCount": 1632,
+  "rejectThreshold": 1090000000000,
+  "modulus": 10000000000,
+  "vectors": [
+    {
+      "name": "zero_transcript",
+      "transcriptDigestHex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "acceptedIndex": 0,
+      "acceptedBlockHex": "74d1690507",
+      "acceptedBlockInteger": 501729527047,
+      "sas": "17295 27047",
+      "digits": "1729527047"
+    },
+    {
+      "name": "incrementing_transcript",
+      "transcriptDigestHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "acceptedIndex": 0,
+      "acceptedBlockHex": "3e0688fa1e",
+      "acceptedBlockInteger": 266397612574,
+      "sas": "63976 12574",
+      "digits": "6397612574"
+    },
+    {
+      "name": "all_ones_transcript",
+      "transcriptDigestHex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "acceptedIndex": 0,
+      "acceptedBlockHex": "33b5c5ee12",
+      "acceptedBlockInteger": 222092979730,
+      "sas": "20929 79730",
+      "digits": "2092979730"
+    },
+    {
+      "name": "rejection_vector",
+      "transcriptDigestHex": "696cbdedfc57246ef9fffd892f1981dae7710c3752df13555d14bd756145543b",
+      "acceptedIndex": 1,
+      "acceptedBlockHex": "98ef896679",
+      "acceptedBlockInteger": 656853788281,
+      "rejectedBlocks": [{ "index": 0, "blockHex": "fdeaff5e8c", "blockInteger": 1090569330316 }],
+      "sas": "68537 88281",
+      "digits": "6853788281"
+    }
+  ]
+}

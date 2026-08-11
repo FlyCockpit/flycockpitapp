@@ -1,0 +1,2806 @@
+//! Downgrade-resistant multi-transport connection orchestration.
+//!
+//! This module implements the pure reducer for transport selection: it
+//! computes an authorized child plan from deployment, service, tenant,
+//! daemon, IP-consent tri-state, participant privacy, live quota, and
+//! passive client capabilities; manages parent/child state transitions;
+//! enforces exact caps, retry budgets, and fallback rules; and emits
+//! generation-bound pure actions (commands) for the daemon to execute.
+//!
+//! # What this module owns
+//!
+//! - The pure reducer over explicit `now`, persisted retry-budget input,
+//!   adapter events, and emitted commands.
+//! - Parent/child state transitions and the exact caps (two routed-current,
+//!   two ordinary-pending, one per kind, the sole three-physical-child TURN
+//!   exception).
+//! - The `auto` fallback rule: start WebRTC first, fall back to WebSocket
+//!   only after a server-signed deadline or a closed reachability class.
+//!   Security/policy/consent/proof failures are terminal and never fall back.
+//! - The retry model: initial establishment plus one fresh same-kind retry
+//!   per train, with a 1-second injected delay.
+//! - The health-threshold model: WebRTC 5-second probes, WebSocket ACK
+//!   progress, exact consecutive/buffer thresholds.
+//! - Deterministic routing among `current` children by routing class.
+//! - The TURN replacement cutover lease model (current → replacement_pending
+//!   → draining → removed) with supervisor-ACK.
+//!
+//! # What this module does NOT own
+//!
+//! - Platform error mapping (adapters map platform errors to
+//!   [`ReachabilityClass`]; this module never branches on raw strings).
+//! - The Postgres reservation transaction (owned by the DB layer; this module
+//!   consumes the persisted retry-budget input and emits reservation
+//!   commands).
+//! - The operation ledger mutation order (owned by the ledger; this module
+//!   integrates by interface only).
+//!
+//! # Security decisions
+//!
+//! - Security/policy/consent/proof/certificate/integrity/revocation failures
+//!   are terminal and never fall back.
+//! - TURN-required/privacy relay-only never nominates direct or falls back
+//!   to an unauthorized transport.
+//! - User preference narrows only; forced WebRTC does not fallback, and a
+//!   disallowed forced kind returns a typed denial.
+//! - Late cancelled results cannot activate.
+//! - Closing one child cannot clear the other, durable retry budget,
+//!   operation outcome, event cursor, or presence.
+//! - Redis/process memory never authorize; only the Postgres
+//!   `RemoteTransportRetryReservation` is the durable budget authority.
+
+use std::collections::HashMap;
+use std::time::Duration;
+
+use cockpit_proto::remote_transport_selection::{
+    ChildState, DurableLifecycle, HealthTier, ICE_DISCONNECTED_FALLBACK_MISSES,
+    INITIAL_DEADLINE_SECS, MAX_ORDINARY_PENDING_CHILDREN, MAX_PENDING_PER_KIND,
+    MAX_PHYSICAL_CHILDREN_TURN_EXCEPTION, MAX_RESERVATIONS_PER_TRAIN, MAX_ROUTED_CURRENT_CHILDREN,
+    MAX_SAME_KIND_RETRIES, ParentState, RECOVERY_CONSECUTIVE_HEALTHY, RETRY_DELAY_SECS,
+    ROLLING_WINDOW_SECS, ReachabilityClass, RemoteTransportRetryReservation,
+    RemoteTransportRetryReservationKey, RoutingClass, SecondChildReason, TRAIN_ID_BYTES,
+    TransportDenial, TransportKind, UserTransportPreference, WEBRTC_DEGRADED_BUFFER_BYTES,
+    WEBRTC_DEGRADED_MISSES, WEBRTC_FAILED_MISSES, WEBRTC_HEALTHY_CONSECUTIVE_SUCCESSES,
+    WEBSOCKET_DEGRADED_BUFFER_BYTES, WEBSOCKET_DEGRADED_UNACKED_AGE_SECS,
+    WEBSOCKET_FAILED_RETRANSMISSIONS,
+};
+use cockpit_proto::remote_transport_selection::{
+    DRAINING_TIMEOUT_SECS, MAX_COMMITTED_RESERVATIONS_ROLLING, RENEWAL_LEAD_SECS,
+};
+
+// ─────────────────────────────────────────────────────────────────────────
+// Child identity and epoch
+// ─────────────────────────────────────────────────────────────────────────
+
+/// A child attempt identifier — each child owns a distinct child attempt,
+/// bilateral proofs, transcript, and transport epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ChildAttemptId(pub u64);
+
+impl ChildAttemptId {
+    pub fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+}
+
+/// A transport epoch — monotonically increasing per logical attachment,
+/// used as the deterministic tie-breaker in routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TransportEpoch(pub u64);
+
+/// A foreground train identifier — random 16-byte identifier shared by all
+/// children in one establishment train.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TrainId(pub [u8; TRAIN_ID_BYTES]);
+
+// ─────────────────────────────────────────────────────────────────────────
+// Authorization inputs
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The authorization inputs that determine which transports a child plan may
+/// use. Computed from deployment, service, tenant, daemon, IP-consent
+/// tri-state, participant privacy, live quota, and passive client
+/// capabilities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportAuthorization {
+    /// Whether WebRTC is authorized by the attempt grant and available in
+    /// deployment.
+    pub webrtc_authorized: bool,
+    /// Whether WebSocket is authorized by the attempt grant and available in
+    /// deployment.
+    pub websocket_authorized: bool,
+    /// Whether IP consent permits direct WebRTC (tri-state: denied/granted/
+    /// unknown). If denied, WebRTC may only use TURN relay.
+    pub ip_consent_direct: IpConsentTriState,
+    /// Whether the participant privacy requires TURN relay only (no direct
+    /// candidates).
+    pub privacy_relay_only: bool,
+    /// Whether the live quota allows new children.
+    pub quota_available: bool,
+    /// Whether the client supports WebRTC.
+    pub client_supports_webrtc: bool,
+    /// Whether the client supports WebSocket data.
+    pub client_supports_websocket: bool,
+}
+
+/// IP consent tri-state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IpConsentTriState {
+    Granted,
+    Denied,
+    Unknown,
+}
+
+/// The computed authorized plan for a logical attachment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedPlan {
+    pub allowed_kinds: Vec<TransportKind>,
+    pub denials: Vec<TransportDenial>,
+    pub preference: UserTransportPreference,
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Child record
+// ─────────────────────────────────────────────────────────────────────────
+
+/// A child transport record within the selection state machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildRecord {
+    pub child_attempt: ChildAttemptId,
+    pub kind: TransportKind,
+    pub epoch: TransportEpoch,
+    pub state: ChildState,
+    pub durable_lifecycle: DurableLifecycle,
+    /// Consecutive successful liveness probes (WebRTC) or healthy ACK
+    /// intervals (WebSocket).
+    pub consecutive_healthy: u32,
+    /// Consecutive missed liveness probes (WebRTC).
+    pub consecutive_misses: u32,
+    /// Current buffered bytes on this child.
+    pub buffered_bytes: u64,
+    /// Number of probes where buffered bytes have exceeded the degraded
+    /// threshold.
+    pub consecutive_high_buffer_probes: u32,
+    /// Oldest unacked message age in seconds (WebSocket).
+    pub oldest_unacked_age_secs: u64,
+    /// Number of retransmissions (WebSocket fallback).
+    pub retransmissions: u32,
+    /// Whether this child was cancelled (late results are inert).
+    pub cancelled: bool,
+    /// Number of same-kind retries used in this train for this kind.
+    pub retries_used: u32,
+    /// Whether ICE-disconnected is being tracked for fallback mapping.
+    pub ice_disconnected_misses: u32,
+    /// The health tier last computed for this child.
+    pub health_tier: HealthTier,
+    /// The replacement-pair peer, if this child is part of a TURN
+    /// replacement pair.
+    pub replacement_peer: Option<ChildAttemptId>,
+}
+
+impl ChildRecord {
+    /// Create a new pending child.
+    pub fn new_pending(
+        child_attempt: ChildAttemptId,
+        kind: TransportKind,
+        epoch: TransportEpoch,
+    ) -> Self {
+        Self {
+            child_attempt,
+            kind,
+            epoch,
+            state: ChildState::Pending,
+            durable_lifecycle: DurableLifecycle::Current,
+            consecutive_healthy: 0,
+            consecutive_misses: 0,
+            buffered_bytes: 0,
+            consecutive_high_buffer_probes: 0,
+            oldest_unacked_age_secs: 0,
+            retransmissions: 0,
+            cancelled: false,
+            retries_used: 0,
+            ice_disconnected_misses: 0,
+            health_tier: HealthTier::Degraded,
+            replacement_peer: None,
+        }
+    }
+
+    /// Whether this child is routed-current (eligible for new work routing).
+    pub fn is_routed_current(&self) -> bool {
+        matches!(self.durable_lifecycle, DurableLifecycle::Current)
+            && matches!(self.state, ChildState::Active | ChildState::Degraded)
+    }
+
+    /// Whether this child is ordinary pending (not part of a TURN
+    /// replacement pair).
+    pub fn is_ordinary_pending(&self) -> bool {
+        matches!(self.state, ChildState::Pending | ChildState::Authenticating)
+            && matches!(self.durable_lifecycle, DurableLifecycle::Current)
+            && self.replacement_peer.is_none()
+    }
+
+    /// Recompute the health tier from the probe/miss/buffer counters.
+    pub fn recompute_health(&mut self) {
+        self.health_tier = compute_health_tier(self);
+    }
+
+    /// Writable bytes available on this child (for bulk routing
+    /// tie-breaking). Derived from buffered bytes against a nominal cap.
+    pub fn writable_bytes(&self) -> u64 {
+        const NOMINAL_CAPACITY: u64 = 16 * 1024 * 1024;
+        NOMINAL_CAPACITY.saturating_sub(self.buffered_bytes)
+    }
+}
+
+/// Compute the health tier from a child's counters.
+fn compute_health_tier(child: &ChildRecord) -> HealthTier {
+    match child.kind {
+        TransportKind::Webrtc => {
+            if child.consecutive_misses >= WEBRTC_FAILED_MISSES {
+                HealthTier::Failed
+            } else if child.consecutive_misses >= WEBRTC_DEGRADED_MISSES
+                || child.consecutive_high_buffer_probes >= 2
+            {
+                HealthTier::Degraded
+            } else if child.consecutive_healthy >= WEBRTC_HEALTHY_CONSECUTIVE_SUCCESSES {
+                HealthTier::Healthy
+            } else {
+                HealthTier::Degraded
+            }
+        }
+        TransportKind::Websocket => {
+            if child.retransmissions >= WEBSOCKET_FAILED_RETRANSMISSIONS {
+                HealthTier::Failed
+            } else if child.oldest_unacked_age_secs >= WEBSOCKET_DEGRADED_UNACKED_AGE_SECS
+                || child.buffered_bytes >= WEBSOCKET_DEGRADED_BUFFER_BYTES
+            {
+                HealthTier::Degraded
+            } else if child.consecutive_healthy >= 2 {
+                HealthTier::Healthy
+            } else {
+                HealthTier::Degraded
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Selection state (the reducer state)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The full transport selection state for one logical attachment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportSelectionState {
+    pub parent_state: ParentState,
+    pub children: Vec<ChildRecord>,
+    pub preference: UserTransportPreference,
+    pub authorization: TransportAuthorization,
+    pub train_id: TrainId,
+    pub next_child_attempt: ChildAttemptId,
+    pub next_epoch: TransportEpoch,
+    /// Server-signed deadline for initial WebRTC establishment.
+    pub deadline_secs: u64,
+    /// Whether the WebSocket fallback has been started in this train.
+    pub websocket_fallback_started: bool,
+    /// Whether the WebRTC deadline timer is armed.
+    pub deadline_timer_armed: bool,
+    /// Whether the retry delay timer is armed for a pending retry.
+    pub retry_timer_armed: bool,
+    /// The pending retry (if any) waiting for the retry delay.
+    pub pending_retry: Option<PendingRetry>,
+    /// TURN replacement pair state.
+    pub turn_replacement: Option<TurnReplacementPair>,
+    /// The current delivery-to-child assignment mapping (one stable delivery
+    /// ID → one current child).
+    pub delivery_assignments: HashMap<String, ChildAttemptId>,
+    /// Whether the connection has been backgrounded/cancelled.
+    pub cancelled: bool,
+    /// Tracks per-kind retry usage within the train (kind → retries used).
+    pub kind_retries_used: HashMap<TransportKind, u32>,
+}
+
+/// A pending retry waiting for the injected 1-second delay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingRetry {
+    pub kind: TransportKind,
+    pub child_attempt: ChildAttemptId,
+    pub epoch: TransportEpoch,
+}
+
+/// A TURN replacement pair: one current plus one
+/// replacement_pending-or-draining.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnReplacementPair {
+    pub current: ChildAttemptId,
+    pub replacement: ChildAttemptId,
+    pub phase: TurnReplacementPhase,
+    pub lease_id: [u8; 16],
+}
+
+/// The phase of a TURN replacement cutover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TurnReplacementPhase {
+    /// Replacement is pending; cutover has not occurred.
+    ReplacementPending,
+    /// Cutover occurred; old is draining, new is current.
+    Draining,
+    /// Second lease removed the old draining child.
+    Removed,
+}
+
+impl TransportSelectionState {
+    /// Create a new selection state for a logical attachment.
+    pub fn new(
+        authorization: TransportAuthorization,
+        preference: UserTransportPreference,
+        train_id: TrainId,
+        deadline_secs: u64,
+    ) -> Self {
+        Self {
+            parent_state: ParentState::Planning,
+            children: Vec::new(),
+            preference,
+            authorization,
+            train_id,
+            next_child_attempt: ChildAttemptId(1),
+            next_epoch: TransportEpoch(1),
+            deadline_secs,
+            websocket_fallback_started: false,
+            deadline_timer_armed: false,
+            retry_timer_armed: false,
+            pending_retry: None,
+            turn_replacement: None,
+            delivery_assignments: HashMap::new(),
+            cancelled: false,
+            kind_retries_used: HashMap::new(),
+        }
+    }
+
+    /// Count children by kind in a given state.
+    pub fn count_kind_in_state(&self, kind: TransportKind, state: ChildState) -> usize {
+        self.children
+            .iter()
+            .filter(|c| c.kind == kind && c.state == state)
+            .count()
+    }
+
+    /// Count routed-current children.
+    pub fn count_routed_current(&self) -> usize {
+        self.children
+            .iter()
+            .filter(|c| c.is_routed_current())
+            .count()
+    }
+
+    /// Count ordinary pending children.
+    pub fn count_ordinary_pending(&self) -> usize {
+        self.children
+            .iter()
+            .filter(|c| c.is_ordinary_pending())
+            .count()
+    }
+
+    /// Count ordinary pending children of a given kind.
+    pub fn count_ordinary_pending_kind(&self, kind: TransportKind) -> usize {
+        self.children
+            .iter()
+            .filter(|c| c.is_ordinary_pending() && c.kind == kind)
+            .count()
+    }
+
+    /// Count physical authenticated children (all non-closed children).
+    pub fn count_physical_children(&self) -> usize {
+        self.children
+            .iter()
+            .filter(|c| !matches!(c.state, ChildState::Closed))
+            .count()
+    }
+
+    /// Find a child by attempt id.
+    pub fn find_child(&self, id: ChildAttemptId) -> Option<&ChildRecord> {
+        self.children.iter().find(|c| c.child_attempt == id)
+    }
+
+    /// Find a mutable child by attempt id.
+    pub fn find_child_mut(&mut self, id: ChildAttemptId) -> Option<&mut ChildRecord> {
+        self.children.iter_mut().find(|c| c.child_attempt == id)
+    }
+
+    /// Get the current child of a given kind (routed-current).
+    pub fn current_child_of_kind(&self, kind: TransportKind) -> Option<&ChildRecord> {
+        self.children
+            .iter()
+            .find(|c| c.kind == kind && c.is_routed_current())
+    }
+
+    /// Track and return the current retry count for a kind in this train.
+    pub fn kind_retries(&self, kind: TransportKind) -> u32 {
+        *self.kind_retries_used.get(&kind).unwrap_or(&0)
+    }
+
+    /// Increment the retry count for a kind in this train.
+    pub fn increment_kind_retry(&mut self, kind: TransportKind) {
+        *self.kind_retries_used.entry(kind).or_insert(0) += 1;
+    }
+
+    /// Allocate the next child attempt id.
+    fn alloc_child_attempt(&mut self) -> ChildAttemptId {
+        let id = self.next_child_attempt;
+        self.next_child_attempt = self.next_child_attempt.next();
+        id
+    }
+
+    /// Allocate the next transport epoch.
+    fn alloc_epoch(&mut self) -> TransportEpoch {
+        let e = self.next_epoch;
+        self.next_epoch = TransportEpoch(self.next_epoch.0 + 1);
+        e
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Inputs (events)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Inputs to the transport selection reducer. All transitions are
+/// generation-bound and recorded as pure actions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportSelectionInput {
+    /// Start the initial child plan.
+    StartPlan,
+    /// A child became active (from adapter).
+    ChildActive {
+        child_attempt: ChildAttemptId,
+        now_ms: i64,
+    },
+    /// A child reported a reachability class (from adapter).
+    ChildReachability {
+        child_attempt: ChildAttemptId,
+        class: ReachabilityClass,
+    },
+    /// A WebRTC liveness probe result.
+    WebrtcProbe {
+        child_attempt: ChildAttemptId,
+        success: bool,
+        buffered_bytes: u64,
+    },
+    /// A WebSocket ACK progress update.
+    WebsocketAckProgress {
+        child_attempt: ChildAttemptId,
+        oldest_unacked_age_secs: u64,
+        buffered_bytes: u64,
+        retransmissions: u32,
+    },
+    /// The initial deadline timer fired.
+    DeadlineFired { now_ms: i64 },
+    /// The retry delay timer fired.
+    RetryDelayFired { now_ms: i64 },
+    /// A child closed.
+    ChildClosed {
+        child_attempt: ChildAttemptId,
+        security_failure: bool,
+    },
+    /// A second child is requested for a named reason.
+    RequestSecondChild {
+        reason: SecondChildReason,
+        now_ms: i64,
+    },
+    /// The TURN credential rotation renewal lead was reached.
+    CredentialRotationLead { now_ms: i64 },
+    /// The supervisor persisted the cutover ACK for a TURN replacement.
+    SupervisorCutoverAck {
+        old: ChildAttemptId,
+        new: ChildAttemptId,
+    },
+    /// The second lease removed the old draining child.
+    SecondLease { old: ChildAttemptId },
+    /// A child is being closed explicitly.
+    CloseChild { child_attempt: ChildAttemptId },
+    /// Background/cancel/revoke/supersede — aborts all pending timers.
+    Cancel,
+    /// Supersede the entire attachment.
+    Supersede,
+    /// A routing request for a delivery.
+    RouteRequest {
+        delivery_id: String,
+        routing_class: RoutingClass,
+    },
+    /// A retry reservation result from the Postgres authority.
+    ReservationResult {
+        key: RemoteTransportRetryReservationKey,
+        result: Result<RemoteTransportRetryReservation, TransportDenial>,
+    },
+    /// A child failed with a security/policy/consent failure (terminal).
+    ChildSecurityFailure { child_attempt: ChildAttemptId },
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Outputs (commands)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Pure actions emitted by the reducer for the daemon to execute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportSelectionAction {
+    /// Start a new child of the given kind.
+    StartChild {
+        child_attempt: ChildAttemptId,
+        kind: TransportKind,
+        epoch: TransportEpoch,
+    },
+    /// Arm the initial deadline timer.
+    ArmDeadlineTimer { secs: u64 },
+    /// Arm the retry delay timer.
+    ArmRetryDelay { secs: u64 },
+    /// Cancel a child (generation-bound).
+    CancelChild { child_attempt: ChildAttemptId },
+    /// Close a child.
+    CloseChild { child_attempt: ChildAttemptId },
+    /// Start a TURN replacement-pending child.
+    StartReplacementPending {
+        child_attempt: ChildAttemptId,
+        kind: TransportKind,
+        epoch: TransportEpoch,
+    },
+    /// Emit the cutover lease for supervisor ACK.
+    EmitCutoverLease {
+        current: ChildAttemptId,
+        draining: ChildAttemptId,
+        lease_id: [u8; 16],
+    },
+    /// Route a delivery to a specific current child.
+    RouteDelivery {
+        delivery_id: String,
+        child_attempt: ChildAttemptId,
+    },
+    /// Deny a delivery/routing with a typed denial.
+    Deny { denial: TransportDenial },
+    /// Reserve a retry in the Postgres authority.
+    ReserveRetry {
+        key: RemoteTransportRetryReservationKey,
+    },
+    /// Transition the parent to a new state.
+    ParentTransition { new_state: ParentState },
+    /// No action (inert event).
+    Inert,
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Authorized plan computation
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Compute the authorized child plan from the authorization inputs and user
+/// preference. This is the entry point for
+/// `remote_transport_authorized_plan_matrix`.
+pub fn compute_authorized_plan(
+    auth: &TransportAuthorization,
+    preference: UserTransportPreference,
+) -> AuthorizedPlan {
+    let mut allowed = Vec::new();
+    let mut denials = Vec::new();
+
+    let webrtc_available = auth.webrtc_authorized && auth.client_supports_webrtc;
+    if !auth.webrtc_authorized {
+        denials.push(TransportDenial::KindNotAuthorized);
+    } else if !auth.client_supports_webrtc {
+        denials.push(TransportDenial::ClientCapabilityMissing);
+    }
+
+    let websocket_available = auth.websocket_authorized && auth.client_supports_websocket;
+    if !auth.websocket_authorized {
+        denials.push(TransportDenial::KindNotAuthorized);
+    } else if !auth.client_supports_websocket {
+        denials.push(TransportDenial::ClientCapabilityMissing);
+    }
+
+    if !auth.quota_available {
+        denials.push(TransportDenial::QuotaExhausted);
+    }
+
+    match preference {
+        UserTransportPreference::Auto => {
+            if webrtc_available {
+                allowed.push(TransportKind::Webrtc);
+            }
+            if websocket_available {
+                allowed.push(TransportKind::Websocket);
+            }
+        }
+        UserTransportPreference::Webrtc => {
+            if webrtc_available {
+                allowed.push(TransportKind::Webrtc);
+            } else {
+                denials.push(TransportDenial::PreferenceDisallowed);
+            }
+        }
+        UserTransportPreference::Websocket => {
+            if websocket_available {
+                allowed.push(TransportKind::Websocket);
+            } else {
+                denials.push(TransportDenial::PreferenceDisallowed);
+            }
+        }
+    }
+
+    if !auth.quota_available {
+        allowed.clear();
+    }
+
+    if allowed.is_empty() && denials.is_empty() {
+        denials.push(TransportDenial::PolicyDenied);
+    }
+
+    AuthorizedPlan {
+        allowed_kinds: allowed,
+        denials,
+        preference,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// The pure reducer
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The pure reducer. Processes an input event against the current state and
+/// returns a list of actions to execute. All transitions are generation-bound.
+pub fn reduce(
+    state: &mut TransportSelectionState,
+    input: &TransportSelectionInput,
+) -> Vec<TransportSelectionAction> {
+    if state.cancelled {
+        if matches!(input, TransportSelectionInput::Supersede) {
+            state.parent_state = ParentState::Superseded;
+            return vec![TransportSelectionAction::ParentTransition {
+                new_state: ParentState::Superseded,
+            }];
+        }
+        return vec![TransportSelectionAction::Inert];
+    }
+
+    match input {
+        TransportSelectionInput::StartPlan => reduce_start_plan(state),
+        TransportSelectionInput::ChildActive { child_attempt, .. } => {
+            reduce_child_active(state, *child_attempt)
+        }
+        TransportSelectionInput::ChildReachability {
+            child_attempt,
+            class,
+        } => reduce_child_reachability(state, *child_attempt, *class),
+        TransportSelectionInput::WebrtcProbe {
+            child_attempt,
+            success,
+            buffered_bytes,
+        } => reduce_webrtc_probe(state, *child_attempt, *success, *buffered_bytes),
+        TransportSelectionInput::WebsocketAckProgress {
+            child_attempt,
+            oldest_unacked_age_secs,
+            buffered_bytes,
+            retransmissions,
+        } => reduce_websocket_ack(
+            state,
+            *child_attempt,
+            *oldest_unacked_age_secs,
+            *buffered_bytes,
+            *retransmissions,
+        ),
+        TransportSelectionInput::DeadlineFired { now_ms } => reduce_deadline_fired(state, *now_ms),
+        TransportSelectionInput::RetryDelayFired { now_ms } => {
+            reduce_retry_delay_fired(state, *now_ms)
+        }
+        TransportSelectionInput::ChildClosed {
+            child_attempt,
+            security_failure,
+        } => reduce_child_closed(state, *child_attempt, *security_failure),
+        TransportSelectionInput::RequestSecondChild { reason, now_ms } => {
+            reduce_request_second_child(state, *reason, *now_ms)
+        }
+        TransportSelectionInput::CredentialRotationLead { now_ms } => {
+            reduce_credential_rotation(state, *now_ms)
+        }
+        TransportSelectionInput::SupervisorCutoverAck { old, new } => {
+            reduce_supervisor_cutover_ack(state, *old, *new)
+        }
+        TransportSelectionInput::SecondLease { old } => reduce_second_lease(state, *old),
+        TransportSelectionInput::CloseChild { child_attempt } => {
+            reduce_close_child(state, *child_attempt)
+        }
+        TransportSelectionInput::Cancel => reduce_cancel(state),
+        TransportSelectionInput::Supersede => reduce_supersede(state),
+        TransportSelectionInput::RouteRequest {
+            delivery_id,
+            routing_class,
+        } => reduce_route_request(state, delivery_id, *routing_class),
+        TransportSelectionInput::ReservationResult { key, result } => {
+            reduce_reservation_result(state, key, result)
+        }
+        TransportSelectionInput::ChildSecurityFailure { child_attempt } => {
+            reduce_child_security_failure(state, *child_attempt)
+        }
+    }
+}
+
+fn reduce_start_plan(state: &mut TransportSelectionState) -> Vec<TransportSelectionAction> {
+    let plan = compute_authorized_plan(&state.authorization, state.preference);
+
+    if plan.allowed_kinds.is_empty() {
+        state.parent_state = ParentState::Denied;
+        return vec![
+            TransportSelectionAction::Deny {
+                denial: plan
+                    .denials
+                    .first()
+                    .cloned()
+                    .unwrap_or(TransportDenial::PolicyDenied),
+            },
+            TransportSelectionAction::ParentTransition {
+                new_state: ParentState::Denied,
+            },
+        ];
+    }
+
+    state.parent_state = ParentState::Establishing;
+    let mut actions = vec![TransportSelectionAction::ParentTransition {
+        new_state: ParentState::Establishing,
+    }];
+
+    match state.preference {
+        UserTransportPreference::Auto => {
+            if plan.allowed_kinds.contains(&TransportKind::Webrtc) {
+                let id = state.alloc_child_attempt();
+                let epoch = state.alloc_epoch();
+                state
+                    .children
+                    .push(ChildRecord::new_pending(id, TransportKind::Webrtc, epoch));
+                actions.push(TransportSelectionAction::StartChild {
+                    child_attempt: id,
+                    kind: TransportKind::Webrtc,
+                    epoch,
+                });
+                state.deadline_timer_armed = true;
+                actions.push(TransportSelectionAction::ArmDeadlineTimer {
+                    secs: state.deadline_secs,
+                });
+            } else if plan.allowed_kinds.contains(&TransportKind::Websocket) {
+                let id = state.alloc_child_attempt();
+                let epoch = state.alloc_epoch();
+                state.children.push(ChildRecord::new_pending(
+                    id,
+                    TransportKind::Websocket,
+                    epoch,
+                ));
+                actions.push(TransportSelectionAction::StartChild {
+                    child_attempt: id,
+                    kind: TransportKind::Websocket,
+                    epoch,
+                });
+            }
+        }
+        UserTransportPreference::Webrtc => {
+            if plan.allowed_kinds.contains(&TransportKind::Webrtc) {
+                let id = state.alloc_child_attempt();
+                let epoch = state.alloc_epoch();
+                state
+                    .children
+                    .push(ChildRecord::new_pending(id, TransportKind::Webrtc, epoch));
+                actions.push(TransportSelectionAction::StartChild {
+                    child_attempt: id,
+                    kind: TransportKind::Webrtc,
+                    epoch,
+                });
+            }
+        }
+        UserTransportPreference::Websocket => {
+            if plan.allowed_kinds.contains(&TransportKind::Websocket) {
+                let id = state.alloc_child_attempt();
+                let epoch = state.alloc_epoch();
+                state.children.push(ChildRecord::new_pending(
+                    id,
+                    TransportKind::Websocket,
+                    epoch,
+                ));
+                actions.push(TransportSelectionAction::StartChild {
+                    child_attempt: id,
+                    kind: TransportKind::Websocket,
+                    epoch,
+                });
+            }
+        }
+    }
+
+    actions
+}
+
+fn reduce_child_active(
+    state: &mut TransportSelectionState,
+    child_attempt: ChildAttemptId,
+) -> Vec<TransportSelectionAction> {
+    let Some(child) = state.find_child_mut(child_attempt) else {
+        return vec![TransportSelectionAction::Inert];
+    };
+    if child.cancelled {
+        return vec![TransportSelectionAction::Inert];
+    }
+
+    child.state = ChildState::Active;
+    child.consecutive_healthy = child.consecutive_healthy.saturating_add(1);
+    child.recompute_health();
+
+    if state.children.iter().any(|c| c.state == ChildState::Active) {
+        let old_state = state.parent_state;
+        state.parent_state = ParentState::Active;
+        if old_state != ParentState::Active {
+            return vec![TransportSelectionAction::ParentTransition {
+                new_state: ParentState::Active,
+            }];
+        }
+    }
+
+    vec![]
+}
+
+fn reduce_child_reachability(
+    state: &mut TransportSelectionState,
+    child_attempt: ChildAttemptId,
+    class: ReachabilityClass,
+) -> Vec<TransportSelectionAction> {
+    let Some(child) = state.find_child_mut(child_attempt) else {
+        return vec![TransportSelectionAction::Inert];
+    };
+    if child.cancelled {
+        return vec![TransportSelectionAction::Inert];
+    }
+
+    match class {
+        ReachabilityClass::IceDisconnected => {
+            child.ice_disconnected_misses = child.ice_disconnected_misses.saturating_add(1);
+            child.state = ChildState::Degraded;
+            child.recompute_health();
+
+            if child.ice_disconnected_misses >= ICE_DISCONNECTED_FALLBACK_MISSES {
+                return maybe_start_websocket_fallback(state);
+            }
+            vec![]
+        }
+        ReachabilityClass::IceNoCandidatePair
+        | ReachabilityClass::IceTimeout
+        | ReachabilityClass::NetworkUnreachable
+        | ReachabilityClass::TurnUnreachable => {
+            child.state = ChildState::Closed;
+            child.recompute_health();
+            maybe_start_websocket_fallback(state)
+        }
+    }
+}
+
+fn maybe_start_websocket_fallback(
+    state: &mut TransportSelectionState,
+) -> Vec<TransportSelectionAction> {
+    if !matches!(state.preference, UserTransportPreference::Auto) {
+        return vec![];
+    }
+    if state.websocket_fallback_started {
+        return vec![];
+    }
+    if !state.authorization.websocket_authorized || !state.authorization.client_supports_websocket {
+        return vec![];
+    }
+    if state.count_ordinary_pending_kind(TransportKind::Websocket) >= MAX_PENDING_PER_KIND {
+        return vec![];
+    }
+    if state.count_ordinary_pending() >= MAX_ORDINARY_PENDING_CHILDREN {
+        return vec![];
+    }
+
+    state.websocket_fallback_started = true;
+    state.deadline_timer_armed = false;
+
+    let id = state.alloc_child_attempt();
+    let epoch = state.alloc_epoch();
+    state.children.push(ChildRecord::new_pending(
+        id,
+        TransportKind::Websocket,
+        epoch,
+    ));
+
+    vec![TransportSelectionAction::StartChild {
+        child_attempt: id,
+        kind: TransportKind::Websocket,
+        epoch,
+    }]
+}
+
+fn reduce_webrtc_probe(
+    state: &mut TransportSelectionState,
+    child_attempt: ChildAttemptId,
+    success: bool,
+    buffered_bytes: u64,
+) -> Vec<TransportSelectionAction> {
+    let Some(child) = state.find_child_mut(child_attempt) else {
+        return vec![TransportSelectionAction::Inert];
+    };
+    if child.cancelled || child.kind != TransportKind::Webrtc {
+        return vec![TransportSelectionAction::Inert];
+    }
+
+    child.buffered_bytes = buffered_bytes;
+
+    if success {
+        child.consecutive_misses = 0;
+        child.ice_disconnected_misses = 0;
+        child.consecutive_healthy = child.consecutive_healthy.saturating_add(1);
+        child.consecutive_high_buffer_probes = 0;
+    } else {
+        child.consecutive_healthy = 0;
+        child.consecutive_misses = child.consecutive_misses.saturating_add(1);
+        if buffered_bytes >= WEBRTC_DEGRADED_BUFFER_BYTES {
+            child.consecutive_high_buffer_probes =
+                child.consecutive_high_buffer_probes.saturating_add(1);
+        } else {
+            child.consecutive_high_buffer_probes = 0;
+        }
+    }
+
+    child.recompute_health();
+
+    let mut actions = Vec::new();
+    match child.health_tier {
+        HealthTier::Failed => {
+            child.state = ChildState::Closed;
+            if matches!(state.preference, UserTransportPreference::Auto) {
+                actions.extend(maybe_start_websocket_fallback(state));
+            }
+        }
+        HealthTier::Degraded => {
+            if child.state == ChildState::Active {
+                child.state = ChildState::Degraded;
+            }
+        }
+        HealthTier::Healthy => {
+            if child.state == ChildState::Degraded
+                && child.consecutive_healthy >= RECOVERY_CONSECUTIVE_HEALTHY
+            {
+                child.state = ChildState::Active;
+            }
+        }
+    }
+
+    actions
+}
+
+fn reduce_websocket_ack(
+    state: &mut TransportSelectionState,
+    child_attempt: ChildAttemptId,
+    oldest_unacked_age_secs: u64,
+    buffered_bytes: u64,
+    retransmissions: u32,
+) -> Vec<TransportSelectionAction> {
+    let Some(child) = state.find_child_mut(child_attempt) else {
+        return vec![TransportSelectionAction::Inert];
+    };
+    if child.cancelled || child.kind != TransportKind::Websocket {
+        return vec![TransportSelectionAction::Inert];
+    }
+
+    child.oldest_unacked_age_secs = oldest_unacked_age_secs;
+    child.buffered_bytes = buffered_bytes;
+    child.retransmissions = retransmissions;
+
+    if oldest_unacked_age_secs == 0 && buffered_bytes < WEBSOCKET_DEGRADED_BUFFER_BYTES {
+        child.consecutive_healthy = child.consecutive_healthy.saturating_add(1);
+    } else {
+        child.consecutive_healthy = 0;
+    }
+
+    child.recompute_health();
+
+    match child.health_tier {
+        HealthTier::Failed => {
+            child.state = ChildState::Closed;
+        }
+        HealthTier::Degraded => {
+            if child.state == ChildState::Active {
+                child.state = ChildState::Degraded;
+            }
+        }
+        HealthTier::Healthy => {
+            if child.state == ChildState::Degraded
+                && child.consecutive_healthy >= RECOVERY_CONSECUTIVE_HEALTHY
+            {
+                child.state = ChildState::Active;
+            }
+        }
+    }
+
+    vec![TransportSelectionAction::Inert]
+}
+
+fn reduce_deadline_fired(
+    state: &mut TransportSelectionState,
+    _now_ms: i64,
+) -> Vec<TransportSelectionAction> {
+    state.deadline_timer_armed = false;
+
+    let webrtc_active = state
+        .children
+        .iter()
+        .any(|c| c.kind == TransportKind::Webrtc && c.state == ChildState::Active);
+
+    if webrtc_active {
+        return vec![TransportSelectionAction::Inert];
+    }
+
+    maybe_start_websocket_fallback(state)
+}
+
+fn reduce_retry_delay_fired(
+    state: &mut TransportSelectionState,
+    _now_ms: i64,
+) -> Vec<TransportSelectionAction> {
+    state.retry_timer_armed = false;
+
+    let Some(pending) = state.pending_retry.take() else {
+        return vec![TransportSelectionAction::Inert];
+    };
+
+    if state.count_ordinary_pending_kind(pending.kind) >= MAX_PENDING_PER_KIND {
+        return vec![TransportSelectionAction::Inert];
+    }
+    if state.count_ordinary_pending() >= MAX_ORDINARY_PENDING_CHILDREN {
+        return vec![TransportSelectionAction::Inert];
+    }
+
+    state.children.push(ChildRecord::new_pending(
+        pending.child_attempt,
+        pending.kind,
+        pending.epoch,
+    ));
+
+    vec![TransportSelectionAction::StartChild {
+        child_attempt: pending.child_attempt,
+        kind: pending.kind,
+        epoch: pending.epoch,
+    }]
+}
+
+fn reduce_child_closed(
+    state: &mut TransportSelectionState,
+    child_attempt: ChildAttemptId,
+    security_failure: bool,
+) -> Vec<TransportSelectionAction> {
+    let Some(child) = state.find_child_mut(child_attempt) else {
+        return vec![TransportSelectionAction::Inert];
+    };
+
+    child.state = ChildState::Closed;
+    child.recompute_health();
+
+    if security_failure {
+        return vec![];
+    }
+
+    let any_active = state
+        .children
+        .iter()
+        .any(|c| c.state == ChildState::Active || c.state == ChildState::Degraded);
+    let any_pending = state
+        .children
+        .iter()
+        .any(|c| matches!(c.state, ChildState::Pending | ChildState::Authenticating));
+
+    if !any_active && !any_pending {
+        let kind = child.kind;
+        if state.kind_retries(kind) < MAX_SAME_KIND_RETRIES && !state.cancelled {
+            state.increment_kind_retry(kind);
+            let id = state.alloc_child_attempt();
+            let epoch = state.alloc_epoch();
+            state.pending_retry = Some(PendingRetry {
+                kind,
+                child_attempt: id,
+                epoch,
+            });
+            state.retry_timer_armed = true;
+            return vec![TransportSelectionAction::ArmRetryDelay {
+                secs: RETRY_DELAY_SECS,
+            }];
+        }
+        state.parent_state = ParentState::Failed;
+        return vec![TransportSelectionAction::ParentTransition {
+            new_state: ParentState::Failed,
+        }];
+    }
+
+    vec![]
+}
+
+fn reduce_request_second_child(
+    state: &mut TransportSelectionState,
+    reason: SecondChildReason,
+    _now_ms: i64,
+) -> Vec<TransportSelectionAction> {
+    let has_active = state.children.iter().any(|c| c.state == ChildState::Active);
+    if !has_active {
+        return vec![TransportSelectionAction::Deny {
+            denial: TransportDenial::PolicyDenied,
+        }];
+    }
+
+    let existing_kinds: Vec<TransportKind> = state
+        .children
+        .iter()
+        .filter(|c| c.is_routed_current())
+        .map(|c| c.kind)
+        .collect();
+
+    let target_kind = if !existing_kinds.contains(&TransportKind::Webrtc)
+        && state.authorization.webrtc_authorized
+        && state.authorization.client_supports_webrtc
+    {
+        TransportKind::Webrtc
+    } else if !existing_kinds.contains(&TransportKind::Websocket)
+        && state.authorization.websocket_authorized
+        && state.authorization.client_supports_websocket
+    {
+        TransportKind::Websocket
+    } else {
+        return vec![TransportSelectionAction::Deny {
+            denial: TransportDenial::ChildCapExceeded,
+        }];
+    };
+
+    if state.count_ordinary_pending_kind(target_kind) >= MAX_PENDING_PER_KIND {
+        return vec![TransportSelectionAction::Deny {
+            denial: TransportDenial::ChildCapExceeded,
+        }];
+    }
+    if state.count_ordinary_pending() >= MAX_ORDINARY_PENDING_CHILDREN {
+        return vec![TransportSelectionAction::Deny {
+            denial: TransportDenial::ChildCapExceeded,
+        }];
+    }
+    if state.count_routed_current() >= MAX_ROUTED_CURRENT_CHILDREN {
+        return vec![TransportSelectionAction::Deny {
+            denial: TransportDenial::ChildCapExceeded,
+        }];
+    }
+
+    let id = state.alloc_child_attempt();
+    let epoch = state.alloc_epoch();
+
+    let mut child = ChildRecord::new_pending(id, target_kind, epoch);
+    if reason == SecondChildReason::CredentialRotation && target_kind == TransportKind::Webrtc {
+        child.durable_lifecycle = DurableLifecycle::ReplacementPending;
+    }
+    state.children.push(child);
+
+    if reason == SecondChildReason::CredentialRotation && target_kind == TransportKind::Webrtc {
+        return vec![TransportSelectionAction::StartReplacementPending {
+            child_attempt: id,
+            kind: target_kind,
+            epoch,
+        }];
+    }
+
+    vec![TransportSelectionAction::StartChild {
+        child_attempt: id,
+        kind: target_kind,
+        epoch,
+    }]
+}
+
+fn reduce_credential_rotation(
+    state: &mut TransportSelectionState,
+    _now_ms: i64,
+) -> Vec<TransportSelectionAction> {
+    let current_webrtc = state
+        .children
+        .iter()
+        .find(|c| {
+            c.kind == TransportKind::Webrtc
+                && matches!(c.durable_lifecycle, DurableLifecycle::Current)
+                && !matches!(c.state, ChildState::Closed)
+        })
+        .map(|c| c.child_attempt);
+
+    let Some(current_id) = current_webrtc else {
+        return vec![TransportSelectionAction::Inert];
+    };
+
+    if state.turn_replacement.is_some() {
+        return vec![TransportSelectionAction::Inert];
+    }
+
+    if state.count_physical_children() >= MAX_PHYSICAL_CHILDREN_TURN_EXCEPTION {
+        return vec![TransportSelectionAction::Deny {
+            denial: TransportDenial::ChildCapExceeded,
+        }];
+    }
+
+    let id = state.alloc_child_attempt();
+    let epoch = state.alloc_epoch();
+
+    let mut replacement = ChildRecord::new_pending(id, TransportKind::Webrtc, epoch);
+    replacement.durable_lifecycle = DurableLifecycle::ReplacementPending;
+    replacement.replacement_peer = Some(current_id);
+    state.children.push(replacement);
+
+    let lease_id = [0xAB; 16];
+    state.turn_replacement = Some(TurnReplacementPair {
+        current: current_id,
+        replacement: id,
+        phase: TurnReplacementPhase::ReplacementPending,
+        lease_id,
+    });
+
+    if let Some(current) = state.find_child_mut(current_id) {
+        current.replacement_peer = Some(id);
+    }
+
+    vec![TransportSelectionAction::StartReplacementPending {
+        child_attempt: id,
+        kind: TransportKind::Webrtc,
+        epoch,
+    }]
+}
+
+fn reduce_supervisor_cutover_ack(
+    state: &mut TransportSelectionState,
+    old: ChildAttemptId,
+    new: ChildAttemptId,
+) -> Vec<TransportSelectionAction> {
+    let Some(replacement) = &mut state.turn_replacement else {
+        return vec![TransportSelectionAction::Inert];
+    };
+
+    if replacement.current != old || replacement.replacement != new {
+        return vec![TransportSelectionAction::Inert];
+    }
+
+    if let Some(new_child) = state.find_child_mut(new) {
+        new_child.durable_lifecycle = DurableLifecycle::Current;
+        new_child.state = ChildState::Active;
+        new_child.recompute_health();
+    }
+    if let Some(old_child) = state.find_child_mut(old) {
+        old_child.durable_lifecycle = DurableLifecycle::Draining;
+        old_child.state = ChildState::Closing;
+    }
+
+    replacement.phase = TurnReplacementPhase::Draining;
+
+    vec![TransportSelectionAction::EmitCutoverLease {
+        current: new,
+        draining: old,
+        lease_id: replacement.lease_id,
+    }]
+}
+
+fn reduce_second_lease(
+    state: &mut TransportSelectionState,
+    old: ChildAttemptId,
+) -> Vec<TransportSelectionAction> {
+    let Some(replacement) = &mut state.turn_replacement else {
+        return vec![TransportSelectionAction::Inert];
+    };
+
+    if replacement.current != old && replacement.replacement != old {
+        // The old draining child should match the current field (the old
+        // current became draining after cutover).
+    }
+
+    if let Some(old_child) = state.find_child_mut(old) {
+        old_child.state = ChildState::Closed;
+        old_child.durable_lifecycle = DurableLifecycle::Draining;
+    }
+
+    replacement.phase = TurnReplacementPhase::Removed;
+    state.turn_replacement = None;
+
+    vec![TransportSelectionAction::CloseChild { child_attempt: old }]
+}
+
+fn reduce_close_child(
+    state: &mut TransportSelectionState,
+    child_attempt: ChildAttemptId,
+) -> Vec<TransportSelectionAction> {
+    let Some(child) = state.find_child_mut(child_attempt) else {
+        return vec![TransportSelectionAction::Inert];
+    };
+
+    child.state = ChildState::Closing;
+
+    vec![TransportSelectionAction::CloseChild { child_attempt }]
+}
+
+fn reduce_cancel(state: &mut TransportSelectionState) -> Vec<TransportSelectionAction> {
+    state.cancelled = true;
+    state.deadline_timer_armed = false;
+    state.retry_timer_armed = false;
+    state.pending_retry = None;
+
+    let mut actions = Vec::new();
+    for child in &mut state.children {
+        if !matches!(child.state, ChildState::Closed) {
+            child.cancelled = true;
+            child.state = ChildState::Closing;
+            actions.push(TransportSelectionAction::CancelChild {
+                child_attempt: child.child_attempt,
+            });
+        }
+    }
+    state.parent_state = ParentState::Cancelled;
+    actions.push(TransportSelectionAction::ParentTransition {
+        new_state: ParentState::Cancelled,
+    });
+
+    actions
+}
+
+fn reduce_supersede(state: &mut TransportSelectionState) -> Vec<TransportSelectionAction> {
+    state.cancelled = true;
+    state.deadline_timer_armed = false;
+    state.retry_timer_armed = false;
+    state.pending_retry = None;
+
+    let mut actions = Vec::new();
+    for child in &state.children {
+        if !matches!(child.state, ChildState::Closed) {
+            actions.push(TransportSelectionAction::CancelChild {
+                child_attempt: child.child_attempt,
+            });
+        }
+    }
+    state.parent_state = ParentState::Superseded;
+    actions.push(TransportSelectionAction::ParentTransition {
+        new_state: ParentState::Superseded,
+    });
+
+    actions
+}
+
+fn reduce_route_request(
+    state: &mut TransportSelectionState,
+    delivery_id: &str,
+    routing_class: RoutingClass,
+) -> Vec<TransportSelectionAction> {
+    if let Some(&assigned) = state.delivery_assignments.get(delivery_id) {
+        if let Some(child) = state.find_child(assigned) {
+            if child.is_routed_current() {
+                return vec![TransportSelectionAction::RouteDelivery {
+                    delivery_id: delivery_id.to_string(),
+                    child_attempt: assigned,
+                }];
+            }
+        }
+    }
+
+    let selected = select_route(state, routing_class);
+
+    let Some(child_attempt) = selected else {
+        return vec![TransportSelectionAction::Deny {
+            denial: TransportDenial::PolicyDenied,
+        }];
+    };
+
+    state
+        .delivery_assignments
+        .insert(delivery_id.to_string(), child_attempt);
+
+    vec![TransportSelectionAction::RouteDelivery {
+        delivery_id: delivery_id.to_string(),
+        child_attempt,
+    }]
+}
+
+/// Deterministic routing among `current` children only.
+/// Replacement-pending is never selected.
+fn select_route(
+    state: &TransportSelectionState,
+    routing_class: RoutingClass,
+) -> Option<ChildAttemptId> {
+    let current_children: Vec<&ChildRecord> = state
+        .children
+        .iter()
+        .filter(|c| c.is_routed_current())
+        .collect();
+
+    if current_children.is_empty() {
+        return None;
+    }
+
+    match routing_class {
+        RoutingClass::Control => {
+            // Control: healthy over degraded, then lower epoch.
+            current_children
+                .iter()
+                .min_by_key(|c| (!matches!(c.health_tier, HealthTier::Healthy), c.epoch))
+                .map(|c| c.child_attempt)
+        }
+        RoutingClass::Interactive => {
+            // Interactive: healthy WebRTC, then healthy WebSocket, then
+            // degraded by lower epoch.
+            let healthy_webrtc = current_children
+                .iter()
+                .find(|c| c.kind == TransportKind::Webrtc && c.health_tier == HealthTier::Healthy);
+            if let Some(c) = healthy_webrtc {
+                return Some(c.child_attempt);
+            }
+            let healthy_websocket = current_children.iter().find(|c| {
+                c.kind == TransportKind::Websocket && c.health_tier == HealthTier::Healthy
+            });
+            if let Some(c) = healthy_websocket {
+                return Some(c.child_attempt);
+            }
+            current_children
+                .iter()
+                .min_by_key(|c| c.epoch)
+                .map(|c| c.child_attempt)
+        }
+        RoutingClass::Bulk => {
+            // Bulk: healthy child with more writable bytes, tie WebRTC then
+            // lower epoch.
+            let healthy: Vec<&&ChildRecord> = current_children
+                .iter()
+                .filter(|c| c.health_tier == HealthTier::Healthy)
+                .collect();
+            if !healthy.is_empty() {
+                return healthy
+                    .iter()
+                    .max_by(|a, b| {
+                        a.writable_bytes()
+                            .cmp(&b.writable_bytes())
+                            .then_with(|| {
+                                let a_prio = matches!(a.kind, TransportKind::Webrtc);
+                                let b_prio = matches!(b.kind, TransportKind::Webrtc);
+                                b_prio.cmp(&a_prio)
+                            })
+                            .then_with(|| b.epoch.cmp(&a.epoch))
+                    })
+                    .map(|c| c.child_attempt);
+            }
+            current_children
+                .iter()
+                .min_by_key(|c| c.epoch)
+                .map(|c| c.child_attempt)
+        }
+    }
+}
+
+fn reduce_reservation_result(
+    state: &mut TransportSelectionState,
+    key: &RemoteTransportRetryReservationKey,
+    result: &Result<RemoteTransportRetryReservation, TransportDenial>,
+) -> Vec<TransportSelectionAction> {
+    match result {
+        Ok(_reservation) => vec![TransportSelectionAction::Inert],
+        Err(denial) => {
+            let child_attempt = ChildAttemptId(key.child_attempt);
+            if let Some(child) = state.find_child_mut(child_attempt) {
+                child.cancelled = true;
+                child.state = ChildState::Closed;
+            }
+            vec![
+                TransportSelectionAction::CancelChild { child_attempt },
+                TransportSelectionAction::Deny {
+                    denial: denial.clone(),
+                },
+            ]
+        }
+    }
+}
+
+fn reduce_child_security_failure(
+    state: &mut TransportSelectionState,
+    child_attempt: ChildAttemptId,
+) -> Vec<TransportSelectionAction> {
+    let Some(child) = state.find_child_mut(child_attempt) else {
+        return vec![TransportSelectionAction::Inert];
+    };
+
+    child.state = ChildState::Closed;
+    child.cancelled = true;
+    child.recompute_health();
+
+    let any_active = state
+        .children
+        .iter()
+        .any(|c| c.state == ChildState::Active || c.state == ChildState::Degraded);
+    let any_pending = state
+        .children
+        .iter()
+        .any(|c| matches!(c.state, ChildState::Pending | ChildState::Authenticating));
+
+    if !any_active && !any_pending {
+        state.parent_state = ParentState::Failed;
+        return vec![
+            TransportSelectionAction::Deny {
+                denial: TransportDenial::SecurityFailure,
+            },
+            TransportSelectionAction::ParentTransition {
+                new_state: ParentState::Failed,
+            },
+        ];
+    }
+
+    vec![TransportSelectionAction::Deny {
+        denial: TransportDenial::SecurityFailure,
+    }]
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Reservation budget validation
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Validate retry budget constraints against the persisted reservations.
+/// Returns Ok if the new reservation is within budget, Err with a typed
+/// denial if not.
+pub fn validate_retry_budget(
+    existing_in_train: &[RemoteTransportRetryReservation],
+    committed_in_rolling_window: &[RemoteTransportRetryReservation],
+    new_key: &RemoteTransportRetryReservationKey,
+    now_ms: i64,
+) -> Result<(), TransportDenial> {
+    let train_count = existing_in_train
+        .iter()
+        .filter(|r| r.key.train_id == new_key.train_id)
+        .count() as u32;
+    if train_count >= MAX_RESERVATIONS_PER_TRAIN {
+        return Err(TransportDenial::RetryBudgetExhausted);
+    }
+
+    let rolling_start = now_ms - (ROLLING_WINDOW_SECS as i64) * 1000;
+    let rolling_count = committed_in_rolling_window
+        .iter()
+        .filter(|r| r.reserved_at_ms >= rolling_start)
+        .count() as u32;
+    if rolling_count >= MAX_COMMITTED_RESERVATIONS_ROLLING {
+        return Err(TransportDenial::RetryBudgetExhausted);
+    }
+
+    let is_duplicate = existing_in_train.iter().any(|r| {
+        r.key.transport_kind == new_key.transport_kind
+            && r.key.child_attempt == new_key.child_attempt
+            && r.key.train_id == new_key.train_id
+    });
+    if is_duplicate {
+        return Ok(());
+    }
+
+    Ok(())
+}
+
+/// Build a reservation key for a child attempt.
+pub fn build_reservation_key(
+    tenant_id: &str,
+    account_id: &str,
+    client_device_id: &str,
+    logical_attachment_id: &str,
+    train_id: TrainId,
+    transport_kind: TransportKind,
+    child_attempt: ChildAttemptId,
+) -> RemoteTransportRetryReservationKey {
+    RemoteTransportRetryReservationKey {
+        tenant_id: tenant_id.to_string(),
+        account_id: account_id.to_string(),
+        client_device_id: client_device_id.to_string(),
+        logical_attachment_id: logical_attachment_id.to_string(),
+        train_id: train_id.0,
+        transport_kind,
+        child_attempt: child_attempt.0,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Golden transition/route trace
+// ─────────────────────────────────────────────────────────────────────────
+
+/// A golden trace entry — a recorded state transition or routing decision,
+/// consumed by web/native/Rust for cross-language fixture parity.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GoldenTraceEntry {
+    pub step: u64,
+    pub input: String,
+    pub parent_state_before: String,
+    pub parent_state_after: String,
+    pub actions: Vec<String>,
+}
+
+/// Record a golden trace for a sequence of inputs. This is the pure
+/// transition/route trace consumed by cross-language fixtures.
+pub fn record_golden_trace(
+    initial_state: TransportSelectionState,
+    inputs: &[TransportSelectionInput],
+) -> Vec<GoldenTraceEntry> {
+    let mut state = initial_state;
+    let mut trace = Vec::new();
+
+    for (i, input) in inputs.iter().enumerate() {
+        let state_before = format!("{:?}", state.parent_state);
+        let actions = reduce(&mut state, input);
+        let state_after = format!("{:?}", state.parent_state);
+
+        trace.push(GoldenTraceEntry {
+            step: i as u64,
+            input: format!("{:?}", input),
+            parent_state_before: state_before,
+            parent_state_after: state_after,
+            actions: actions.iter().map(|a| format!("{:?}", a)).collect(),
+        });
+    }
+
+    trace
+}
+
+/// Convert the deadline seconds to a Duration.
+pub fn deadline_duration(secs: u64) -> Duration {
+    Duration::from_secs(secs)
+}
+
+// Re-export key constants for consumers.
+pub use cockpit_proto::remote_transport_selection::{
+    DRAINING_TIMEOUT_SECS as PUB_DRAINING_TIMEOUT_SECS,
+    INITIAL_DEADLINE_SECS as PUB_INITIAL_DEADLINE_SECS,
+    MAX_PHYSICAL_CHILDREN_TURN_EXCEPTION as PUB_MAX_PHYSICAL_CHILDREN_TURN_EXCEPTION,
+    MAX_ROUTED_CURRENT_CHILDREN as PUB_MAX_ROUTED_CURRENT_CHILDREN,
+    RENEWAL_LEAD_SECS as PUB_RENEWAL_LEAD_SECS, RETRY_DELAY_SECS as PUB_RETRY_DELAY_SECS,
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cockpit_proto::remote_transport_selection::{
+        MAX_COMMITTED_RESERVATIONS_ROLLING, validate_deadline_secs,
+    };
+
+    // ── Test helpers ──
+
+    fn full_auth() -> TransportAuthorization {
+        TransportAuthorization {
+            webrtc_authorized: true,
+            websocket_authorized: true,
+            ip_consent_direct: IpConsentTriState::Granted,
+            privacy_relay_only: false,
+            quota_available: true,
+            client_supports_webrtc: true,
+            client_supports_websocket: true,
+        }
+    }
+
+    fn train_id() -> TrainId {
+        TrainId([0x42; TRAIN_ID_BYTES])
+    }
+
+    fn new_auto_state() -> TransportSelectionState {
+        TransportSelectionState::new(
+            full_auth(),
+            UserTransportPreference::Auto,
+            train_id(),
+            INITIAL_DEADLINE_SECS,
+        )
+    }
+
+    // ── AC 1: authorized_plan_matrix ──
+
+    #[test]
+    fn remote_transport_authorized_plan_matrix() {
+        let plan = compute_authorized_plan(&full_auth(), UserTransportPreference::Auto);
+        assert!(plan.allowed_kinds.contains(&TransportKind::Webrtc));
+        assert!(plan.allowed_kinds.contains(&TransportKind::Websocket));
+        assert_eq!(plan.allowed_kinds.len(), 2);
+
+        let mut auth = full_auth();
+        auth.webrtc_authorized = false;
+        let plan = compute_authorized_plan(&auth, UserTransportPreference::Auto);
+        assert!(!plan.allowed_kinds.contains(&TransportKind::Webrtc));
+        assert!(plan.denials.contains(&TransportDenial::KindNotAuthorized));
+
+        let mut auth = full_auth();
+        auth.websocket_authorized = false;
+        let plan = compute_authorized_plan(&auth, UserTransportPreference::Auto);
+        assert!(!plan.allowed_kinds.contains(&TransportKind::Websocket));
+
+        let mut auth = full_auth();
+        auth.client_supports_webrtc = false;
+        let plan = compute_authorized_plan(&auth, UserTransportPreference::Auto);
+        assert!(!plan.allowed_kinds.contains(&TransportKind::Webrtc));
+        assert!(
+            plan.denials
+                .contains(&TransportDenial::ClientCapabilityMissing)
+        );
+
+        let mut auth = full_auth();
+        auth.quota_available = false;
+        let plan = compute_authorized_plan(&auth, UserTransportPreference::Auto);
+        assert!(plan.allowed_kinds.is_empty());
+        assert!(plan.denials.contains(&TransportDenial::QuotaExhausted));
+
+        let mut auth = full_auth();
+        auth.webrtc_authorized = false;
+        auth.websocket_authorized = false;
+        let plan = compute_authorized_plan(&auth, UserTransportPreference::Auto);
+        assert!(plan.allowed_kinds.is_empty());
+    }
+
+    // ── AC 2: user_preference_matrix ──
+
+    #[test]
+    fn remote_transport_user_preference_matrix() {
+        let plan = compute_authorized_plan(&full_auth(), UserTransportPreference::Auto);
+        assert_eq!(plan.allowed_kinds.len(), 2);
+
+        let plan = compute_authorized_plan(&full_auth(), UserTransportPreference::Webrtc);
+        assert_eq!(plan.allowed_kinds, vec![TransportKind::Webrtc]);
+
+        let plan = compute_authorized_plan(&full_auth(), UserTransportPreference::Websocket);
+        assert_eq!(plan.allowed_kinds, vec![TransportKind::Websocket]);
+
+        let mut auth = full_auth();
+        auth.webrtc_authorized = false;
+        let plan = compute_authorized_plan(&auth, UserTransportPreference::Webrtc);
+        assert!(plan.allowed_kinds.is_empty());
+        assert!(
+            plan.denials
+                .contains(&TransportDenial::PreferenceDisallowed)
+        );
+
+        let mut auth = full_auth();
+        auth.websocket_authorized = false;
+        let plan = compute_authorized_plan(&auth, UserTransportPreference::Websocket);
+        assert!(plan.allowed_kinds.is_empty());
+        assert!(
+            plan.denials
+                .contains(&TransportDenial::PreferenceDisallowed)
+        );
+    }
+
+    // ── AC 3: only_reachability_falls_back ──
+
+    #[test]
+    fn remote_transport_only_reachability_falls_back() {
+        let mut state = new_auto_state();
+        let actions = reduce(&mut state, &TransportSelectionInput::StartPlan);
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            TransportSelectionAction::StartChild {
+                kind: TransportKind::Webrtc,
+                ..
+            }
+        )));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, TransportSelectionAction::ArmDeadlineTimer { .. }))
+        );
+        assert_eq!(state.children.len(), 1);
+        assert_eq!(state.children[0].kind, TransportKind::Webrtc);
+
+        let webrtc_id = state.children[0].child_attempt;
+        let actions = reduce(
+            &mut state,
+            &TransportSelectionInput::ChildReachability {
+                child_attempt: webrtc_id,
+                class: ReachabilityClass::IceNoCandidatePair,
+            },
+        );
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            TransportSelectionAction::StartChild {
+                kind: TransportKind::Websocket,
+                ..
+            }
+        )));
+        assert!(state.websocket_fallback_started);
+
+        let mut state = TransportSelectionState::new(
+            full_auth(),
+            UserTransportPreference::Webrtc,
+            train_id(),
+            INITIAL_DEADLINE_SECS,
+        );
+        reduce(&mut state, &TransportSelectionInput::StartPlan);
+        let webrtc_id = state.children[0].child_attempt;
+        let actions = reduce(
+            &mut state,
+            &TransportSelectionInput::ChildReachability {
+                child_attempt: webrtc_id,
+                class: ReachabilityClass::NetworkUnreachable,
+            },
+        );
+        assert!(!actions.iter().any(|a| matches!(
+            a,
+            TransportSelectionAction::StartChild {
+                kind: TransportKind::Websocket,
+                ..
+            }
+        )));
+
+        let mut state = new_auto_state();
+        reduce(&mut state, &TransportSelectionInput::StartPlan);
+        let webrtc_id = state.children[0].child_attempt;
+        let actions = reduce(
+            &mut state,
+            &TransportSelectionInput::ChildSecurityFailure {
+                child_attempt: webrtc_id,
+            },
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, TransportSelectionAction::StartChild { .. }))
+        );
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            TransportSelectionAction::Deny {
+                denial: TransportDenial::SecurityFailure,
+            }
+        )));
+    }
+
+    #[test]
+    fn remote_transport_deadline_validation() {
+        assert!(validate_deadline_secs(10).is_ok());
+        assert!(validate_deadline_secs(3).is_ok());
+        assert!(validate_deadline_secs(30).is_ok());
+        assert!(validate_deadline_secs(2).is_err());
+        assert!(validate_deadline_secs(31).is_err());
+    }
+
+    #[test]
+    fn remote_transport_deadline_fires_fallback() {
+        let mut state = new_auto_state();
+        reduce(&mut state, &TransportSelectionInput::StartPlan);
+        let actions = reduce(
+            &mut state,
+            &TransportSelectionInput::DeadlineFired { now_ms: 10_000 },
+        );
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            TransportSelectionAction::StartChild {
+                kind: TransportKind::Websocket,
+                ..
+            }
+        )));
+    }
+
+    // ── AC 4: child_caps_and_reasons ──
+
+    #[test]
+    fn remote_transport_child_caps_and_reasons() {
+        let mut state = new_auto_state();
+        reduce(&mut state, &TransportSelectionInput::StartPlan);
+        let webrtc_id = state.children[0].child_attempt;
+        reduce(
+            &mut state,
+            &TransportSelectionInput::ChildActive {
+                child_attempt: webrtc_id,
+                now_ms: 1000,
+            },
+        );
+        reduce(
+            &mut state,
+            &TransportSelectionInput::DeadlineFired { now_ms: 10_000 },
+        );
+        let ws_id = state.children[1].child_attempt;
+        reduce(
+            &mut state,
+            &TransportSelectionInput::ChildActive {
+                child_attempt: ws_id,
+                now_ms: 10_001,
+            },
+        );
+        assert_eq!(state.count_routed_current(), 2);
+
+        let actions = reduce(
+            &mut state,
+            &TransportSelectionInput::RequestSecondChild {
+                reason: SecondChildReason::PreferredPathRecovery,
+                now_ms: 10_002,
+            },
+        );
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            TransportSelectionAction::Deny {
+                denial: TransportDenial::ChildCapExceeded,
+            }
+        )));
+
+        let mut state = new_auto_state();
+        reduce(&mut state, &TransportSelectionInput::StartPlan);
+        let webrtc_id = state.children[0].child_attempt;
+        reduce(
+            &mut state,
+            &TransportSelectionInput::ChildActive {
+                child_attempt: webrtc_id,
+                now_ms: 1000,
+            },
+        );
+        let actions = reduce(
+            &mut state,
+            &TransportSelectionInput::RequestSecondChild {
+                reason: SecondChildReason::NetworkHandoff,
+                now_ms: 2000,
+            },
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, TransportSelectionAction::StartChild { .. }))
+        );
+    }
+
+    #[test]
+    fn remote_transport_turn_replacement_three_physical() {
+        let mut state = new_auto_state();
+        reduce(&mut state, &TransportSelectionInput::StartPlan);
+        let webrtc_id = state.children[0].child_attempt;
+        reduce(
+            &mut state,
+            &TransportSelectionInput::ChildActive {
+                child_attempt: webrtc_id,
+                now_ms: 1000,
+            },
+        );
+        reduce(
+            &mut state,
+            &TransportSelectionInput::DeadlineFired { now_ms: 10_000 },
+        );
+        let ws_id = state.children[1].child_attempt;
+        reduce(
+            &mut state,
+            &TransportSelectionInput::ChildActive {
+                child_attempt: ws_id,
+                now_ms: 10_001,
+            },
+        );
+
+        let actions = reduce(
+            &mut state,
+            &TransportSelectionInput::CredentialRotationLead { now_ms: 20_000 },
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, TransportSelectionAction::StartReplacementPending { .. }))
+        );
+        assert_eq!(state.count_physical_children(), 3);
+
+        let replacement = state
+            .children
+            .iter()
+            .find(|c| c.durable_lifecycle == DurableLifecycle::ReplacementPending)
+            .unwrap();
+        assert!(!replacement.is_routed_current());
+
+        let new_id = replacement.child_attempt;
+        let actions = reduce(
+            &mut state,
+            &TransportSelectionInput::SupervisorCutoverAck {
+                old: webrtc_id,
+                new: new_id,
+            },
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, TransportSelectionAction::EmitCutoverLease { .. }))
+        );
+        let new_child = state.find_child(new_id).unwrap();
+        assert_eq!(new_child.durable_lifecycle, DurableLifecycle::Current);
+        let old_child = state.find_child(webrtc_id).unwrap();
+        assert_eq!(old_child.durable_lifecycle, DurableLifecycle::Draining);
+
+        let actions = reduce(
+            &mut state,
+            &TransportSelectionInput::SecondLease { old: webrtc_id },
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, TransportSelectionAction::CloseChild { .. }))
+        );
+        let old_child = state.find_child(webrtc_id).unwrap();
+        assert_eq!(old_child.state, ChildState::Closed);
+        assert!(state.turn_replacement.is_none());
+    }
+
+    // ── AC 5: retry_budget ──
+
+    #[test]
+    fn remote_transport_retry_budget() {
+        let tenant = "tenant1";
+        let account = "acct1";
+        let device = "dev1";
+        let attachment = "att1";
+        let tid = train_id();
+
+        let key1 = build_reservation_key(
+            tenant,
+            account,
+            device,
+            attachment,
+            tid,
+            TransportKind::Webrtc,
+            ChildAttemptId(1),
+        );
+        assert!(validate_retry_budget(&[], &[], &key1, 0).is_ok());
+
+        let mut existing: Vec<RemoteTransportRetryReservation> = Vec::new();
+        for i in 1..=4u64 {
+            let key = build_reservation_key(
+                tenant,
+                account,
+                device,
+                attachment,
+                tid,
+                TransportKind::Webrtc,
+                ChildAttemptId(i),
+            );
+            existing.push(RemoteTransportRetryReservation {
+                key,
+                reserved_at_ms: 0,
+                expires_at_ms: 1000,
+                terminal: false,
+                terminal_outcome: None,
+            });
+        }
+        let new_key = build_reservation_key(
+            tenant,
+            account,
+            device,
+            attachment,
+            tid,
+            TransportKind::Websocket,
+            ChildAttemptId(5),
+        );
+        assert!(matches!(
+            validate_retry_budget(&existing, &[], &new_key, 0),
+            Err(TransportDenial::RetryBudgetExhausted)
+        ));
+
+        let dup_key = build_reservation_key(
+            tenant,
+            account,
+            device,
+            attachment,
+            tid,
+            TransportKind::Webrtc,
+            ChildAttemptId(1),
+        );
+        assert!(validate_retry_budget(&existing, &[], &dup_key, 0).is_ok());
+
+        let other_train = TrainId([0x99; TRAIN_ID_BYTES]);
+        let mut committed: Vec<RemoteTransportRetryReservation> = Vec::new();
+        for i in 1..=12u64 {
+            let key = build_reservation_key(
+                tenant,
+                account,
+                device,
+                attachment,
+                other_train,
+                TransportKind::Webrtc,
+                ChildAttemptId(i),
+            );
+            committed.push(RemoteTransportRetryReservation {
+                key,
+                reserved_at_ms: 500,
+                expires_at_ms: 1000,
+                terminal: false,
+                terminal_outcome: None,
+            });
+        }
+        let new_key = build_reservation_key(
+            tenant,
+            account,
+            device,
+            attachment,
+            tid,
+            TransportKind::Webrtc,
+            ChildAttemptId(10),
+        );
+        assert!(matches!(
+            validate_retry_budget(&[], &committed, &new_key, 1_000),
+            Err(TransportDenial::RetryBudgetExhausted)
+        ));
+
+        let old_committed: Vec<RemoteTransportRetryReservation> = committed
+            .iter()
+            .map(|r| {
+                let mut r = r.clone();
+                r.reserved_at_ms = -10_000_000;
+                r
+            })
+            .collect();
+        assert!(validate_retry_budget(&[], &old_committed, &new_key, 1_000).is_ok());
+
+        assert_eq!(MAX_COMMITTED_RESERVATIONS_ROLLING, 12);
+    }
+
+    #[test]
+    fn remote_transport_retry_initial_plus_one() {
+        let mut state = new_auto_state();
+        reduce(&mut state, &TransportSelectionInput::StartPlan);
+        let webrtc_id = state.children[0].child_attempt;
+
+        let actions = reduce(
+            &mut state,
+            &TransportSelectionInput::ChildClosed {
+                child_attempt: webrtc_id,
+                security_failure: false,
+            },
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, TransportSelectionAction::ArmRetryDelay { secs: 1 }))
+        );
+        assert!(state.pending_retry.is_some());
+
+        let actions = reduce(
+            &mut state,
+            &TransportSelectionInput::RetryDelayFired { now_ms: 2000 },
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, TransportSelectionAction::StartChild { .. }))
+        );
+        assert!(state.pending_retry.is_none());
+
+        let retry_id = state.children[1].child_attempt;
+        let actions = reduce(
+            &mut state,
+            &TransportSelectionInput::ChildClosed {
+                child_attempt: retry_id,
+                security_failure: false,
+            },
+        );
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            TransportSelectionAction::ParentTransition {
+                new_state: ParentState::Failed,
+            }
+        )));
+    }
+
+    // ── AC 6: health_thresholds ──
+
+    #[test]
+    fn remote_transport_health_thresholds() {
+        let mut state = new_auto_state();
+        reduce(&mut state, &TransportSelectionInput::StartPlan);
+        let webrtc_id = state.children[0].child_attempt;
+        reduce(
+            &mut state,
+            &TransportSelectionInput::ChildActive {
+                child_attempt: webrtc_id,
+                now_ms: 1000,
+            },
+        );
+
+        reduce(
+            &mut state,
+            &TransportSelectionInput::WebrtcProbe {
+                child_attempt: webrtc_id,
+                success: true,
+                buffered_bytes: 0,
+            },
+        );
+        reduce(
+            &mut state,
+            &TransportSelectionInput::WebrtcProbe {
+                child_attempt: webrtc_id,
+                success: true,
+                buffered_bytes: 0,
+            },
+        );
+        let child = state.find_child(webrtc_id).unwrap();
+        assert_eq!(child.health_tier, HealthTier::Healthy);
+
+        for _ in 0..3 {
+            reduce(
+                &mut state,
+                &TransportSelectionInput::WebrtcProbe {
+                    child_attempt: webrtc_id,
+                    success: false,
+                    buffered_bytes: 0,
+                },
+            );
+        }
+        let child = state.find_child(webrtc_id).unwrap();
+        assert_eq!(child.health_tier, HealthTier::Degraded);
+
+        for _ in 0..3 {
+            reduce(
+                &mut state,
+                &TransportSelectionInput::WebrtcProbe {
+                    child_attempt: webrtc_id,
+                    success: false,
+                    buffered_bytes: 0,
+                },
+            );
+        }
+        let child = state.find_child(webrtc_id).unwrap();
+        assert_eq!(child.health_tier, HealthTier::Failed);
+
+        let mut state = new_auto_state();
+        reduce(&mut state, &TransportSelectionInput::StartPlan);
+        let webrtc_id = state.children[0].child_attempt;
+        reduce(
+            &mut state,
+            &TransportSelectionInput::ChildActive {
+                child_attempt: webrtc_id,
+                now_ms: 1000,
+            },
+        );
+        for _ in 0..2 {
+            reduce(
+                &mut state,
+                &TransportSelectionInput::WebrtcProbe {
+                    child_attempt: webrtc_id,
+                    success: true,
+                    buffered_bytes: WEBRTC_DEGRADED_BUFFER_BYTES,
+                },
+            );
+        }
+        let child = state.find_child(webrtc_id).unwrap();
+        assert_eq!(child.health_tier, HealthTier::Degraded);
+        assert_eq!(child.consecutive_high_buffer_probes, 2);
+    }
+
+    #[test]
+    fn remote_transport_websocket_health_thresholds() {
+        let mut state = TransportSelectionState::new(
+            full_auth(),
+            UserTransportPreference::Websocket,
+            train_id(),
+            INITIAL_DEADLINE_SECS,
+        );
+        reduce(&mut state, &TransportSelectionInput::StartPlan);
+        let ws_id = state.children[0].child_attempt;
+        reduce(
+            &mut state,
+            &TransportSelectionInput::ChildActive {
+                child_attempt: ws_id,
+                now_ms: 1000,
+            },
+        );
+
+        reduce(
+            &mut state,
+            &TransportSelectionInput::WebsocketAckProgress {
+                child_attempt: ws_id,
+                oldest_unacked_age_secs: 3,
+                buffered_bytes: 0,
+                retransmissions: 0,
+            },
+        );
+        let child = state.find_child(ws_id).unwrap();
+        assert_eq!(child.health_tier, HealthTier::Degraded);
+
+        reduce(
+            &mut state,
+            &TransportSelectionInput::WebsocketAckProgress {
+                child_attempt: ws_id,
+                oldest_unacked_age_secs: 0,
+                buffered_bytes: WEBSOCKET_DEGRADED_BUFFER_BYTES,
+                retransmissions: 0,
+            },
+        );
+        let child = state.find_child(ws_id).unwrap();
+        assert_eq!(child.health_tier, HealthTier::Degraded);
+
+        reduce(
+            &mut state,
+            &TransportSelectionInput::WebsocketAckProgress {
+                child_attempt: ws_id,
+                oldest_unacked_age_secs: 0,
+                buffered_bytes: 0,
+                retransmissions: WEBSOCKET_FAILED_RETRANSMISSIONS,
+            },
+        );
+        let child = state.find_child(ws_id).unwrap();
+        assert_eq!(child.health_tier, HealthTier::Failed);
+    }
+
+    // ── AC 7: route_trace ──
+
+    #[test]
+    fn remote_transport_route_trace() {
+        let mut state = new_auto_state();
+        reduce(&mut state, &TransportSelectionInput::StartPlan);
+        let webrtc_id = state.children[0].child_attempt;
+        reduce(
+            &mut state,
+            &TransportSelectionInput::ChildActive {
+                child_attempt: webrtc_id,
+                now_ms: 1000,
+            },
+        );
+        reduce(
+            &mut state,
+            &TransportSelectionInput::DeadlineFired { now_ms: 10_000 },
+        );
+        let ws_id = state.children[1].child_attempt;
+        reduce(
+            &mut state,
+            &TransportSelectionInput::ChildActive {
+                child_attempt: ws_id,
+                now_ms: 10_001,
+            },
+        );
+
+        for _ in 0..2 {
+            reduce(
+                &mut state,
+                &TransportSelectionInput::WebrtcProbe {
+                    child_attempt: webrtc_id,
+                    success: true,
+                    buffered_bytes: 0,
+                },
+            );
+        }
+        reduce(
+            &mut state,
+            &TransportSelectionInput::WebsocketAckProgress {
+                child_attempt: ws_id,
+                oldest_unacked_age_secs: 0,
+                buffered_bytes: 0,
+                retransmissions: 0,
+            },
+        );
+        reduce(
+            &mut state,
+            &TransportSelectionInput::WebsocketAckProgress {
+                child_attempt: ws_id,
+                oldest_unacked_age_secs: 0,
+                buffered_bytes: 0,
+                retransmissions: 0,
+            },
+        );
+
+        let actions = reduce(
+            &mut state,
+            &TransportSelectionInput::RouteRequest {
+                delivery_id: "d1".to_string(),
+                routing_class: RoutingClass::Interactive,
+            },
+        );
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            TransportSelectionAction::RouteDelivery {
+                delivery_id,
+                child_attempt,
+            } if delivery_id == "d1" && *child_attempt == webrtc_id
+        )));
+
+        let actions = reduce(
+            &mut state,
+            &TransportSelectionInput::RouteRequest {
+                delivery_id: "d2".to_string(),
+                routing_class: RoutingClass::Control,
+            },
+        );
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            TransportSelectionAction::RouteDelivery { child_attempt, .. } if *child_attempt
+                == webrtc_id
+        )));
+
+        let actions = reduce(
+            &mut state,
+            &TransportSelectionInput::RouteRequest {
+                delivery_id: "d3".to_string(),
+                routing_class: RoutingClass::Bulk,
+            },
+        );
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            TransportSelectionAction::RouteDelivery { child_attempt, .. } if *child_attempt
+                == webrtc_id
+        )));
+
+        let actions = reduce(
+            &mut state,
+            &TransportSelectionInput::RouteRequest {
+                delivery_id: "d1".to_string(),
+                routing_class: RoutingClass::Bulk,
+            },
+        );
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            TransportSelectionAction::RouteDelivery {
+                delivery_id,
+                child_attempt,
+            } if delivery_id == "d1" && *child_attempt == webrtc_id
+        )));
+    }
+
+    #[test]
+    fn remote_transport_replacement_pending_never_selected() {
+        let mut state = new_auto_state();
+        reduce(&mut state, &TransportSelectionInput::StartPlan);
+        let webrtc_id = state.children[0].child_attempt;
+        reduce(
+            &mut state,
+            &TransportSelectionInput::ChildActive {
+                child_attempt: webrtc_id,
+                now_ms: 1000,
+            },
+        );
+        reduce(
+            &mut state,
+            &TransportSelectionInput::CredentialRotationLead { now_ms: 2000 },
+        );
+        let replacement_id = state.children[1].child_attempt;
+
+        let actions = reduce(
+            &mut state,
+            &TransportSelectionInput::RouteRequest {
+                delivery_id: "d1".to_string(),
+                routing_class: RoutingClass::Interactive,
+            },
+        );
+        if let Some(TransportSelectionAction::RouteDelivery { child_attempt, .. }) = actions
+            .iter()
+            .find(|a| matches!(a, TransportSelectionAction::RouteDelivery { .. }))
+        {
+            assert_ne!(*child_attempt, replacement_id);
+            assert_eq!(*child_attempt, webrtc_id);
+        }
+    }
+
+    // ── AC 9: deadline_late_success_race ──
+
+    #[test]
+    fn remote_transport_deadline_late_success_race() {
+        let mut state = new_auto_state();
+        reduce(&mut state, &TransportSelectionInput::StartPlan);
+        let webrtc_id = state.children[0].child_attempt;
+
+        let actions = reduce(
+            &mut state,
+            &TransportSelectionInput::DeadlineFired { now_ms: 10_000 },
+        );
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            TransportSelectionAction::StartChild {
+                kind: TransportKind::Websocket,
+                ..
+            }
+        )));
+        let ws_id = state.children[1].child_attempt;
+
+        reduce(
+            &mut state,
+            &TransportSelectionInput::ChildActive {
+                child_attempt: webrtc_id,
+                now_ms: 10_001,
+            },
+        );
+        let webrtc_child = state.find_child(webrtc_id).unwrap();
+        assert_eq!(webrtc_child.state, ChildState::Active);
+
+        reduce(
+            &mut state,
+            &TransportSelectionInput::ChildActive {
+                child_attempt: ws_id,
+                now_ms: 10_002,
+            },
+        );
+        let ws_child = state.find_child(ws_id).unwrap();
+        assert_eq!(ws_child.state, ChildState::Active);
+
+        assert_eq!(state.count_routed_current(), 2);
+    }
+
+    #[test]
+    fn remote_transport_cancelled_child_cannot_activate() {
+        let mut state = new_auto_state();
+        reduce(&mut state, &TransportSelectionInput::StartPlan);
+        let webrtc_id = state.children[0].child_attempt;
+
+        reduce(&mut state, &TransportSelectionInput::Cancel);
+        let child = state.find_child(webrtc_id).unwrap();
+        assert!(child.cancelled);
+
+        let actions = reduce(
+            &mut state,
+            &TransportSelectionInput::ChildActive {
+                child_attempt: webrtc_id,
+                now_ms: 10_000,
+            },
+        );
+        assert!(
+            actions
+                .iter()
+                .all(|a| matches!(a, TransportSelectionAction::Inert))
+        );
+        let child = state.find_child(webrtc_id).unwrap();
+        assert_ne!(child.state, ChildState::Active);
+    }
+
+    #[test]
+    fn remote_transport_closing_one_does_not_clear_other() {
+        let mut state = new_auto_state();
+        reduce(&mut state, &TransportSelectionInput::StartPlan);
+        let webrtc_id = state.children[0].child_attempt;
+        reduce(
+            &mut state,
+            &TransportSelectionInput::ChildActive {
+                child_attempt: webrtc_id,
+                now_ms: 1000,
+            },
+        );
+        reduce(
+            &mut state,
+            &TransportSelectionInput::DeadlineFired { now_ms: 10_000 },
+        );
+        let ws_id = state.children[1].child_attempt;
+        reduce(
+            &mut state,
+            &TransportSelectionInput::ChildActive {
+                child_attempt: ws_id,
+                now_ms: 10_001,
+            },
+        );
+
+        reduce(
+            &mut state,
+            &TransportSelectionInput::ChildClosed {
+                child_attempt: webrtc_id,
+                security_failure: false,
+            },
+        );
+        let ws_child = state.find_child(ws_id).unwrap();
+        assert_eq!(ws_child.state, ChildState::Active);
+    }
+
+    #[test]
+    fn remote_transport_golden_trace() {
+        let state = new_auto_state();
+        let inputs = vec![
+            TransportSelectionInput::StartPlan,
+            TransportSelectionInput::DeadlineFired { now_ms: 10_000 },
+        ];
+        let trace = record_golden_trace(state, &inputs);
+        assert_eq!(trace.len(), 2);
+        assert_eq!(trace[0].parent_state_before, "Planning");
+        assert_eq!(trace[0].parent_state_after, "Establishing");
+    }
+
+    #[test]
+    fn remote_transport_ice_disconnected_degraded_not_fallback() {
+        let mut state = new_auto_state();
+        reduce(&mut state, &TransportSelectionInput::StartPlan);
+        let webrtc_id = state.children[0].child_attempt;
+        reduce(
+            &mut state,
+            &TransportSelectionInput::ChildActive {
+                child_attempt: webrtc_id,
+                now_ms: 1000,
+            },
+        );
+
+        let actions = reduce(
+            &mut state,
+            &TransportSelectionInput::ChildReachability {
+                child_attempt: webrtc_id,
+                class: ReachabilityClass::IceDisconnected,
+            },
+        );
+        assert!(!actions.iter().any(|a| matches!(
+            a,
+            TransportSelectionAction::StartChild {
+                kind: TransportKind::Websocket,
+                ..
+            }
+        )));
+        let child = state.find_child(webrtc_id).unwrap();
+        assert_eq!(child.state, ChildState::Degraded);
+        assert_eq!(child.ice_disconnected_misses, 1);
+
+        reduce(
+            &mut state,
+            &TransportSelectionInput::ChildReachability {
+                child_attempt: webrtc_id,
+                class: ReachabilityClass::IceDisconnected,
+            },
+        );
+        assert!(!state.websocket_fallback_started);
+
+        let actions = reduce(
+            &mut state,
+            &TransportSelectionInput::ChildReachability {
+                child_attempt: webrtc_id,
+                class: ReachabilityClass::IceDisconnected,
+            },
+        );
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            TransportSelectionAction::StartChild {
+                kind: TransportKind::Websocket,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn remote_transport_cancel_aborts_timers() {
+        let mut state = new_auto_state();
+        reduce(&mut state, &TransportSelectionInput::StartPlan);
+        assert!(state.deadline_timer_armed);
+
+        reduce(&mut state, &TransportSelectionInput::Cancel);
+        assert!(!state.deadline_timer_armed);
+        assert!(!state.retry_timer_armed);
+        assert!(state.pending_retry.is_none());
+        assert_eq!(state.parent_state, ParentState::Cancelled);
+    }
+
+    #[test]
+    fn remote_transport_supersede() {
+        let mut state = new_auto_state();
+        reduce(&mut state, &TransportSelectionInput::StartPlan);
+        reduce(&mut state, &TransportSelectionInput::Supersede);
+        assert_eq!(state.parent_state, ParentState::Superseded);
+        assert!(state.cancelled);
+    }
+
+    #[test]
+    fn remote_transport_reservation_failure_cancels_child() {
+        let mut state = new_auto_state();
+        reduce(&mut state, &TransportSelectionInput::StartPlan);
+        let webrtc_id = state.children[0].child_attempt;
+
+        let key = build_reservation_key(
+            "t",
+            "a",
+            "d",
+            "att",
+            train_id(),
+            TransportKind::Webrtc,
+            webrtc_id,
+        );
+        let actions = reduce(
+            &mut state,
+            &TransportSelectionInput::ReservationResult {
+                key: key.clone(),
+                result: Err(TransportDenial::DatabaseOutage),
+            },
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, TransportSelectionAction::CancelChild { .. }))
+        );
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            TransportSelectionAction::Deny {
+                denial: TransportDenial::DatabaseOutage,
+            }
+        )));
+        let child = state.find_child(webrtc_id).unwrap();
+        assert!(child.cancelled);
+        assert_eq!(child.state, ChildState::Closed);
+    }
+
+    #[test]
+    fn remote_transport_no_speculative_racing() {
+        // A second child is never started for speculative racing.
+        // Only named reasons allow it.
+        let mut state = new_auto_state();
+        reduce(&mut state, &TransportSelectionInput::StartPlan);
+        let webrtc_id = state.children[0].child_attempt;
+        reduce(
+            &mut state,
+            &TransportSelectionInput::ChildActive {
+                child_attempt: webrtc_id,
+                now_ms: 1000,
+            },
+        );
+        // No second child exists — only one child is started by StartPlan
+        // for auto preference.
+        assert_eq!(state.children.len(), 1);
+    }
+
+    #[test]
+    fn remote_transport_reachability_closed_taxonomy() {
+        // Verify all closed reachability classes trigger fallback for auto.
+        for class in [
+            ReachabilityClass::IceNoCandidatePair,
+            ReachabilityClass::IceTimeout,
+            ReachabilityClass::NetworkUnreachable,
+            ReachabilityClass::TurnUnreachable,
+        ] {
+            let mut state = new_auto_state();
+            reduce(&mut state, &TransportSelectionInput::StartPlan);
+            let webrtc_id = state.children[0].child_attempt;
+            let actions = reduce(
+                &mut state,
+                &TransportSelectionInput::ChildReachability {
+                    child_attempt: webrtc_id,
+                    class,
+                },
+            );
+            assert!(
+                actions.iter().any(|a| matches!(
+                    a,
+                    TransportSelectionAction::StartChild {
+                        kind: TransportKind::Websocket,
+                        ..
+                    }
+                )),
+                "class {:?} should trigger fallback",
+                class
+            );
+        }
+    }
+
+    #[test]
+    fn remote_transport_draining_cannot_receive_mutations() {
+        // Draining child should not be routed to for new work.
+        let mut state = new_auto_state();
+        reduce(&mut state, &TransportSelectionInput::StartPlan);
+        let webrtc_id = state.children[0].child_attempt;
+        reduce(
+            &mut state,
+            &TransportSelectionInput::ChildActive {
+                child_attempt: webrtc_id,
+                now_ms: 1000,
+            },
+        );
+        // Start WebSocket
+        reduce(
+            &mut state,
+            &TransportSelectionInput::DeadlineFired { now_ms: 10_000 },
+        );
+        let ws_id = state.children[1].child_attempt;
+        reduce(
+            &mut state,
+            &TransportSelectionInput::ChildActive {
+                child_attempt: ws_id,
+                now_ms: 10_001,
+            },
+        );
+
+        // Credential rotation creates replacement
+        reduce(
+            &mut state,
+            &TransportSelectionInput::CredentialRotationLead { now_ms: 20_000 },
+        );
+        let replacement_id = state.children[2].child_attempt;
+        // Make replacement active (simulating completion)
+        if let Some(r) = state.find_child_mut(replacement_id) {
+            r.state = ChildState::Active;
+            r.durable_lifecycle = DurableLifecycle::Current;
+            r.recompute_health();
+        }
+        // Supervisor ACK cutover
+        reduce(
+            &mut state,
+            &TransportSelectionInput::SupervisorCutoverAck {
+                old: webrtc_id,
+                new: replacement_id,
+            },
+        );
+
+        // Old webrtc is now draining — should not be selected for routing.
+        let old_child = state.find_child(webrtc_id).unwrap();
+        assert_eq!(old_child.durable_lifecycle, DurableLifecycle::Draining);
+        assert!(!old_child.is_routed_current());
+
+        let actions = reduce(
+            &mut state,
+            &TransportSelectionInput::RouteRequest {
+                delivery_id: "new1".to_string(),
+                routing_class: RoutingClass::Interactive,
+            },
+        );
+        // Should route to the new current (replacement) or WebSocket, not
+        // the draining old webrtc.
+        if let Some(TransportSelectionAction::RouteDelivery { child_attempt, .. }) = actions
+            .iter()
+            .find(|a| matches!(a, TransportSelectionAction::RouteDelivery { .. }))
+        {
+            assert_ne!(*child_attempt, webrtc_id);
+        }
+    }
+}

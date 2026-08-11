@@ -277,6 +277,34 @@ fixture_enum!(UtilityFixture {
     CancelCustom
 });
 fixture_enum!(DefaultModelFixture { Choose, Clear });
+fixture_enum!(GenerationFixture {
+    OpenNode,
+    RefreshHealth,
+    CreateEndpoint,
+    EditEndpoint,
+    DeleteEndpoint,
+    CreateTarget,
+    EditTarget,
+    DeleteTarget,
+    SetDefaultTarget,
+    UploadWorkflow,
+    BindWorkflow,
+    DeleteWorkflow,
+    SaveBudget,
+    RevokeGrant,
+    CancelJob,
+    PublishLateResult,
+    DiscardLateResult,
+    ConfirmCancelJobConfirm,
+    ConfirmCancelJobCancel,
+    ConfirmRevokeGrantConfirm,
+    ConfirmRevokeGrantCancel,
+    ConfirmPublishLateResultConfirm,
+    ConfirmPublishLateResultCancel,
+    ConfirmDiscardLateResultConfirm,
+    ConfirmDiscardLateResultCancel,
+    Cancel
+});
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum ActionFixtureKey {
@@ -292,6 +320,7 @@ pub(super) enum ActionFixtureKey {
     List(ListFixture),
     Utility(UtilityFixture),
     DefaultModel(DefaultModelFixture),
+    Generation(GenerationFixture),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -520,7 +549,8 @@ pub(super) fn payload_keys_for(action: &SettingsPointerAction) -> Vec<PayloadFix
         | SettingsPointerAction::Providers(_)
         | SettingsPointerAction::Lsp(_)
         | SettingsPointerAction::UtilityModel(_)
-        | SettingsPointerAction::DefaultModel(_) => Vec::new(),
+        | SettingsPointerAction::DefaultModel(_)
+        | SettingsPointerAction::Generation(_) => Vec::new(),
     }
 }
 
@@ -546,7 +576,8 @@ impl ActionFixtureKey {
             | Self::Lsp(_)
             | Self::List(_)
             | Self::Utility(_)
-            | Self::DefaultModel(DefaultModelFixture::Choose) => ExpectedReducerOutcome::Enabled,
+            | Self::DefaultModel(DefaultModelFixture::Choose)
+            | Self::Generation(_) => ExpectedReducerOutcome::Enabled,
         }
     }
 }
@@ -604,6 +635,12 @@ pub(super) fn all_keys() -> Vec<ActionFixtureKey> {
             .iter()
             .copied()
             .map(ActionFixtureKey::DefaultModel),
+    );
+    all.extend(
+        GenerationFixture::ALL
+            .iter()
+            .copied()
+            .map(ActionFixtureKey::Generation),
     );
     all
 }
@@ -814,6 +851,55 @@ pub(super) fn key_for(action: &SettingsPointerAction) -> ActionFixtureKey {
         SettingsPointerAction::DefaultModel(DefaultModelAction::Clear) => {
             K::DefaultModel(DefaultModelFixture::Clear)
         }
+        SettingsPointerAction::Generation(action) => K::Generation(generation_key(action)),
+    }
+}
+
+fn generation_key(action: &GenerationAction) -> GenerationFixture {
+    use GenerationAction as A;
+    match action {
+        A::OpenNode(_) => GenerationFixture::OpenNode,
+        A::RefreshHealth => GenerationFixture::RefreshHealth,
+        A::CreateEndpoint => GenerationFixture::CreateEndpoint,
+        A::EditEndpoint(_) => GenerationFixture::EditEndpoint,
+        A::DeleteEndpoint(_) => GenerationFixture::DeleteEndpoint,
+        A::CreateTarget => GenerationFixture::CreateTarget,
+        A::EditTarget(_) => GenerationFixture::EditTarget,
+        A::DeleteTarget(_) => GenerationFixture::DeleteTarget,
+        A::SetDefaultTarget(_) => GenerationFixture::SetDefaultTarget,
+        A::UploadWorkflow => GenerationFixture::UploadWorkflow,
+        A::BindWorkflow(_) => GenerationFixture::BindWorkflow,
+        A::DeleteWorkflow(_) => GenerationFixture::DeleteWorkflow,
+        A::SaveBudget => GenerationFixture::SaveBudget,
+        A::RevokeGrant(_) => GenerationFixture::RevokeGrant,
+        A::CancelJob(_) => GenerationFixture::CancelJob,
+        A::PublishLateResult(_) => GenerationFixture::PublishLateResult,
+        A::DiscardLateResult(_) => GenerationFixture::DiscardLateResult,
+        A::ConfirmCancelJob(_, ConfirmationChoice::Confirm) => {
+            GenerationFixture::ConfirmCancelJobConfirm
+        }
+        A::ConfirmCancelJob(_, ConfirmationChoice::Cancel) => {
+            GenerationFixture::ConfirmCancelJobCancel
+        }
+        A::ConfirmRevokeGrant(_, ConfirmationChoice::Confirm) => {
+            GenerationFixture::ConfirmRevokeGrantConfirm
+        }
+        A::ConfirmRevokeGrant(_, ConfirmationChoice::Cancel) => {
+            GenerationFixture::ConfirmRevokeGrantCancel
+        }
+        A::ConfirmPublishLateResult(_, ConfirmationChoice::Confirm) => {
+            GenerationFixture::ConfirmPublishLateResultConfirm
+        }
+        A::ConfirmPublishLateResult(_, ConfirmationChoice::Cancel) => {
+            GenerationFixture::ConfirmPublishLateResultCancel
+        }
+        A::ConfirmDiscardLateResult(_, ConfirmationChoice::Confirm) => {
+            GenerationFixture::ConfirmDiscardLateResultConfirm
+        }
+        A::ConfirmDiscardLateResult(_, ConfirmationChoice::Cancel) => {
+            GenerationFixture::ConfirmDiscardLateResultCancel
+        }
+        A::Cancel => GenerationFixture::Cancel,
     }
 }
 

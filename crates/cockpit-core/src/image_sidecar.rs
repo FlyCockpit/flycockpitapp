@@ -1992,5 +1992,7 @@ pub fn computer_use_eligibility_unchanged(
     primary_computer_use_capable
 }
 
+pub mod dossier;
+
 #[cfg(test)]
 mod tests;

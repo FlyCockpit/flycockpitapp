@@ -149,6 +149,9 @@ catalog:
   "expo-font": ~56.0.5
   "expo-haptics": ~56.0.3
   "expo-image-picker": ~56.0.18
+  "expo-document-picker": ~56.0.0
+  "expo-file-system": ~56.0.0
+  "expo-sharing": ~56.0.0
   "expo-linking": ~56.0.11
   "expo-network": ~56.0.4
   "expo-notifications": ~56.0.18

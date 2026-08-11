@@ -149,6 +149,143 @@ export const thinkingModeSchema = z.enum(["off", "low", "medium", "high"]);
 export type ThinkingMode = z.infer<typeof thinkingModeSchema>;
 export const promptCacheRetentionSchema = z.enum(["default", "extended"]);
 export type PromptCacheRetention = z.infer<typeof promptCacheRetentionSchema>;
+
+// ---------------------------------------------------------------------------
+// Typed media tool-result transport — canonical schema
+// ---------------------------------------------------------------------------
+
+/**
+ * Canonical media kind, mirroring Rust `CanonicalMediaKind`.
+ */
+export const canonicalMediaKindSchema = z.enum(["image", "audio", "video"]);
+export type CanonicalMediaKind = z.infer<typeof canonicalMediaKindSchema>;
+
+/**
+ * Availability snapshot at recording time, mirroring Rust
+ * `MediaReferenceAvailability`.
+ */
+export const mediaReferenceAvailabilitySchema = z.enum(["ready", "processing", "unavailable"]);
+export type MediaReferenceAvailability = z.infer<typeof mediaReferenceAvailabilitySchema>;
+
+/**
+ * Purpose of a media reference, mirroring Rust `MediaReferencePurpose`.
+ */
+export const mediaReferencePurposeSchema = z.enum(["primary", "sidecar", "contextual"]);
+export type MediaReferencePurpose = z.infer<typeof mediaReferencePurposeSchema>;
+
+/**
+ * Known image dimensions, mirroring Rust `MediaDimensions`.
+ */
+export const mediaDimensionsSchema = z
+  .object({
+    width: z.number().int().nonnegative(),
+    height: z.number().int().nonnegative(),
+  })
+  .strict();
+export type MediaDimensions = z.infer<typeof mediaDimensionsSchema>;
+
+/**
+ * Known media duration in milliseconds, mirroring Rust `MediaDurationMs`.
+ */
+export const mediaDurationMsSchema = z
+  .object({
+    durationMs: z.number().int().nonnegative(),
+  })
+  .strict();
+export type MediaDurationMs = z.infer<typeof mediaDurationMsSchema>;
+
+/**
+ * Sanitized provenance metadata, mirroring Rust `MediaProvenance`.
+ * Contains no raw paths, URLs, or credentials.
+ */
+export const mediaProvenanceSchema = z
+  .object({
+    toolName: z.string().min(1).max(256),
+    sourceLabel: z.string().min(1).max(1024).optional(),
+  })
+  .strict();
+export type MediaProvenance = z.infer<typeof mediaProvenanceSchema>;
+
+/**
+ * An opaque reference to a retained media attachment, mirroring Rust
+ * `MediaReference`. Contains no bytes, paths, provider URLs, or data URLs.
+ */
+export const mediaReferenceSchema = z
+  .object({
+    attachmentId: uuidSchema,
+    attachmentVersion: z.number().int().positive(),
+    mediaKind: canonicalMediaKindSchema,
+    mimeType: z.string().min(1).max(256),
+    ordinal: z.number().int().nonnegative(),
+    purpose: mediaReferencePurposeSchema,
+    checksum: z.string().regex(/^[0-9a-f]{64}$/),
+    byteCount: z.number().int().nonnegative(),
+    dimensions: mediaDimensionsSchema.optional(),
+    durationMs: mediaDurationMsSchema.optional(),
+    availability: mediaReferenceAvailabilitySchema,
+    provenance: mediaProvenanceSchema,
+  })
+  .strict();
+export type MediaReference = z.infer<typeof mediaReferenceSchema>;
+
+/**
+ * The one canonical media-bearing tool-result content union, mirroring Rust
+ * `CanonicalToolResultContent`. Persist/daemon/protocol always carry this
+ * union and never bytes/paths/provider URLs.
+ */
+export const canonicalToolResultContentSchema = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("text"),
+      text: z.string(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("json"),
+      value: z.unknown(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("media_reference"),
+      attachmentId: uuidSchema,
+      attachmentVersion: z.number().int().positive(),
+      mediaKind: canonicalMediaKindSchema,
+      mimeType: z.string().min(1).max(256),
+      ordinal: z.number().int().nonnegative(),
+      purpose: mediaReferencePurposeSchema,
+      checksum: z.string().regex(/^[0-9a-f]{64}$/),
+      byteCount: z.number().int().nonnegative(),
+      dimensions: mediaDimensionsSchema.optional(),
+      durationMs: mediaDurationMsSchema.optional(),
+      availability: mediaReferenceAvailabilitySchema,
+      provenance: mediaProvenanceSchema,
+    })
+    .strict(),
+]);
+export type CanonicalToolResultContent = z.infer<typeof canonicalToolResultContentSchema>;
+
+/**
+ * Safe media metadata for client rendering, mirroring Rust `SafeMediaMetadata`.
+ * Web/native/TUI render this without eager byte fetch or path assumptions.
+ */
+export const safeMediaMetadataSchema = z
+  .object({
+    attachmentId: uuidSchema,
+    mediaKind: canonicalMediaKindSchema,
+    mimeType: z.string().min(1).max(256),
+    byteCount: z.number().int().nonnegative(),
+    ordinal: z.number().int().nonnegative(),
+    purpose: mediaReferencePurposeSchema,
+    dimensions: mediaDimensionsSchema.optional(),
+    durationMs: mediaDurationMsSchema.optional(),
+    provenance: mediaProvenanceSchema,
+    artifactHandle: z.string().optional(),
+  })
+  .strict();
+export type SafeMediaMetadata = z.infer<typeof safeMediaMetadataSchema>;
+
 export const activeModelRefSchema = z
   .object({
     provider: z.string().min(1),

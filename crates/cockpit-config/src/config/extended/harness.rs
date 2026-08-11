@@ -64,7 +64,14 @@ pub(super) fn resolve_harnesses_from_paths(paths: &[PathBuf]) -> HashMap<String,
 const RETIRED_SEALED_BINDING_FIELDS: &[&str] =
     &["sealed_values", "sealedValues", "sealed_env", "sealedEnv"];
 
-/// Parse one harness entry, rejecting retired sealed-binding fields first.
+/// Retired harness auth-env field names. Config must reject these before
+/// harness dispatch (no silent ignore, no migration): external harnesses
+/// receive no Cockpit-provided secret environment value, including a
+/// dedicated harness authentication token.
+const RETIRED_AUTH_ENV_FIELDS: &[&str] = &["auth_env_vars", "authEnvVars"];
+
+/// Parse one harness entry, rejecting retired sealed-binding and auth-env
+/// fields first.
 pub(super) fn parse_harness_config(val: Value) -> Result<HarnessConfig, String> {
     if let Some(obj) = val.as_object() {
         for key in RETIRED_SEALED_BINDING_FIELDS {
@@ -74,8 +81,55 @@ pub(super) fn parse_harness_config(val: Value) -> Result<HarnessConfig, String> 
                 ));
             }
         }
+        for key in RETIRED_AUTH_ENV_FIELDS {
+            if obj.contains_key(*key) {
+                return Err(format!(
+                    "harness secret-environment delivery is retired; `{key}` is not accepted on harness config — a harness must authenticate independently without a Cockpit-provided secret"
+                ));
+            }
+        }
     }
     serde_json::from_value(val).map_err(|e| e.to_string())
+}
+
+/// The custody posture of one external OS harness.
+///
+/// This carries the same meaning as a model's data-custody class — `Trusted`
+/// may hold raw prompt content including sensitive/sealed literals, `Untrusted`
+/// must be handed a redacted rendering — but it is an explicitly configured
+/// harness-local policy. It is never inferred from provider/model
+/// configuration, locality, command, or `LlmMode`. An external harness is an
+/// OS process, not a trusted inference provider: it defaults to `Untrusted`,
+/// and only an explicit `trust: "trusted"` field opts into raw prompt
+/// delivery. Even a trusted harness receives no Cockpit-provided secret
+/// environment value.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HarnessTrust {
+    /// The harness may receive its raw prompt, including sensitive/sealed
+    /// literals. Only after the user explicitly configures `trust: "trusted"`.
+    /// Never permits Cockpit-provided secret environment values.
+    Trusted,
+    /// The harness receives a redacted rendering of the prompt. The default:
+    /// every external harness is untrusted until explicitly configured
+    /// otherwise.
+    #[default]
+    Untrusted,
+}
+
+impl HarnessTrust {
+    /// The lowercase config/serde spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HarnessTrust::Trusted => "trusted",
+            HarnessTrust::Untrusted => "untrusted",
+        }
+    }
+
+    /// `true` when this harness may receive raw prompt content.
+    pub fn is_trusted(self) -> bool {
+        matches!(self, HarnessTrust::Trusted)
+    }
 }
 
 /// Recursively deep-merge `overlay` into `base`: for two objects, recurse
@@ -167,14 +221,18 @@ pub struct HarnessConfig {
     /// with no native flag (e.g. goose's `GOOSE_SYSTEM_PROMPT_FILE_PATH`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_file_env: Option<String>,
-    /// Env vars whose presence proves the harness is authenticated. The
-    /// preflight check treats any one being set as authed before falling
-    /// back to [`Self::auth_probe_args`].
+    /// The custody posture of this harness. Defaults to `Untrusted`: every
+    /// external harness is untrusted until explicitly configured `trusted`.
+    /// A trusted harness may receive its raw prompt (including sensitive/sealed
+    /// literals); an untrusted harness receives a redacted rendering. Neither
+    /// class receives Cockpit-provided secret environment values. Never
+    /// inferred from model, locality, command, or `LlmMode`.
     #[serde(default)]
-    pub auth_env_vars: Vec<String>,
+    pub trust: HarnessTrust,
     /// A non-mutating command (relative to [`Self::command`]) whose exit 0
-    /// means the harness is authenticated. Run only when no
-    /// `auth_env_vars` are set. Empty skips the probe (assume authed).
+    /// means the harness is authenticated. Run when no auth env vars are
+    /// declared (the now-removed `auth_env_vars` path is retired). Empty
+    /// skips the probe (assume authed).
     #[serde(default)]
     pub auth_probe_args: Vec<String>,
     /// Skip the per-session harness-invocation approval for this harness.
@@ -321,7 +379,7 @@ pub fn builtin_harness_presets() -> Vec<(String, HarnessConfig)> {
                     "{agent_file}".to_string(),
                 ],
                 agent_file_env: None,
-                auth_env_vars: vec!["ANTHROPIC_API_KEY".to_string()],
+                trust: HarnessTrust::Untrusted,
                 auth_probe_args: vec![],
                 always_allow: false,
                 timeout_secs: DEFAULT_HARNESS_TIMEOUT_SECS,
@@ -357,7 +415,7 @@ pub fn builtin_harness_presets() -> Vec<(String, HarnessConfig)> {
                 supports_agent_file: false,
                 agent_file_args: vec![],
                 agent_file_env: None,
-                auth_env_vars: vec!["OPENAI_API_KEY".to_string()],
+                trust: HarnessTrust::Untrusted,
                 auth_probe_args: vec![],
                 always_allow: false,
                 timeout_secs: DEFAULT_HARNESS_TIMEOUT_SECS,
@@ -385,7 +443,7 @@ pub fn builtin_harness_presets() -> Vec<(String, HarnessConfig)> {
                 supports_agent_file: false,
                 agent_file_args: vec![],
                 agent_file_env: None,
-                auth_env_vars: vec![],
+                trust: HarnessTrust::Untrusted,
                 auth_probe_args: vec![],
                 always_allow: false,
                 timeout_secs: DEFAULT_HARNESS_TIMEOUT_SECS,
@@ -419,11 +477,7 @@ pub fn builtin_harness_presets() -> Vec<(String, HarnessConfig)> {
                 supports_agent_file: false,
                 agent_file_args: vec![],
                 agent_file_env: None,
-                auth_env_vars: vec![
-                    "COPILOT_GITHUB_TOKEN".to_string(),
-                    "GH_TOKEN".to_string(),
-                    "GITHUB_TOKEN".to_string(),
-                ],
+                trust: HarnessTrust::Untrusted,
                 auth_probe_args: vec![],
                 always_allow: false,
                 timeout_secs: DEFAULT_HARNESS_TIMEOUT_SECS,
@@ -436,8 +490,9 @@ pub fn builtin_harness_presets() -> Vec<(String, HarnessConfig)> {
         //   No simple stdout model-list command (only `goose local-models`),
         //   so no `model_list_args`. Goose auth is provider-key driven; the
         //   common case is a provider key in the environment, but the exact
-        //   var depends on GOOSE_PROVIDER — leave auth_env_vars empty so the
-        //   preflight doesn't false-negative, and let a failed run surface.
+        //   var depends on GOOSE_PROVIDER — leave auth_probe_args empty so
+        //   the preflight doesn't false-negative, and let a failed run
+        //   surface.
         (
             "goose".to_string(),
             HarnessConfig {
@@ -459,7 +514,7 @@ pub fn builtin_harness_presets() -> Vec<(String, HarnessConfig)> {
                 supports_agent_file: false,
                 agent_file_args: vec![],
                 agent_file_env: Some("GOOSE_SYSTEM_PROMPT_FILE_PATH".to_string()),
-                auth_env_vars: vec![],
+                trust: HarnessTrust::Untrusted,
                 auth_probe_args: vec![],
                 always_allow: false,
                 timeout_secs: DEFAULT_HARNESS_TIMEOUT_SECS,
@@ -496,7 +551,7 @@ pub fn builtin_harness_presets() -> Vec<(String, HarnessConfig)> {
                 supports_agent_file: true,
                 agent_file_args: vec!["--agent".to_string(), "{agent_file}".to_string()],
                 agent_file_env: None,
-                auth_env_vars: vec![],
+                trust: HarnessTrust::Untrusted,
                 always_allow: false,
                 auth_probe_args: vec![],
                 timeout_secs: DEFAULT_HARNESS_TIMEOUT_SECS,

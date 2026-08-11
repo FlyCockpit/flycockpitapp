@@ -304,7 +304,7 @@ mod tests {
     async fn child_receives_only_curated_env() {
         let env = crate::test_env::lock_async().await;
         env.set_var("SECRET_API_KEY", "hidden");
-        env.set_var("ALLOWED_AUTH_TOKEN", "visible");
+        env.set_var("ALLOWED_NONSECRET", "visible");
         let cfg = crate::config::extended::HarnessConfig {
             command: "sh".to_string(),
             args: vec![],
@@ -319,18 +319,20 @@ mod tests {
             supports_agent_file: false,
             agent_file_args: vec![],
             agent_file_env: None,
-            auth_env_vars: vec!["ALLOWED_AUTH_TOKEN".to_string()],
+            trust: crate::config::extended::HarnessTrust::Untrusted,
             auth_probe_args: vec![],
             always_allow: false,
             timeout_secs: 60,
         };
-        let env = crate::harness::env::harness_child_env(&cfg, None);
+        let mut overlay = std::collections::HashMap::new();
+        overlay.insert("ALLOWED_NONSECRET".to_string(), "visible".to_string());
+        let env = crate::harness::env::harness_child_env(&cfg, Some(&overlay));
         let out = run_to_completion(
             "test-harness",
             "sh",
             &[
                 "-c".to_string(),
-                "printf 'secret=%s\\nauth=%s\\n' \"${SECRET_API_KEY-unset}\" \"$ALLOWED_AUTH_TOKEN\""
+                "printf 'secret=%s\\nauth=%s\\n' \"${SECRET_API_KEY-unset}\" \"$ALLOWED_NONSECRET\""
                     .to_string(),
             ],
             &env,

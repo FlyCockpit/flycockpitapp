@@ -512,6 +512,95 @@ fn sealed_child_injection_is_absent_from_harness_config() {
     );
 }
 
+#[test]
+fn external_harness_has_no_secret_environment_configuration() {
+    // AC2: `auth_env_vars` and every auth-env code path are removed from
+    // `HarnessConfig`, config parsing, presets, and child launch. Legacy
+    // auth-env configuration is rejected rather than ignored or migrated.
+    for field in ["auth_env_vars", "authEnvVars"] {
+        let raw = serde_json::json!({
+            "command": "codex",
+            field: ["OPENAI_API_KEY"],
+        });
+        let err = parse_harness_config(raw).expect_err(field);
+        assert!(
+            err.contains("auth_env_vars")
+                || err.contains(field)
+                || err.contains("secret-environment"),
+            "field `{field}` must be rejected, got: {err}"
+        );
+    }
+    // Clean entry still parses.
+    parse_harness_config(serde_json::json!({"command": "codex"})).unwrap();
+
+    // resolve_harnesses drops entries that carry retired auth-env fields.
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("config.json");
+    std::fs::write(
+        &path,
+        r#"{"harnesses":{
+          "clean":{"command":"codex"},
+          "auth":{"command":"codex","auth_env_vars":["OPENAI_API_KEY"]}
+        }}"#,
+    )
+    .unwrap();
+    let merged = resolve_harnesses_from_paths(&[path]);
+    assert!(merged.contains_key("clean"));
+    assert!(
+        !merged.contains_key("auth"),
+        "harness with auth_env_vars must not be accepted for dispatch"
+    );
+
+    // No builtin preset carries auth_env_vars (the field no longer exists).
+    for (name, preset) in builtin_harness_presets() {
+        let json = serde_json::to_string(&preset).unwrap();
+        assert!(
+            !json.contains("auth_env_vars"),
+            "preset `{name}` serializes auth_env_vars: {json}"
+        );
+    }
+}
+
+#[test]
+fn external_harness_trust_is_explicit_and_default_untrusted() {
+    // AC3: a missing effective `harnesses.<name>.trust` field resolves to
+    // untrusted; only that explicit serialized field may set trusted.
+    let hc: HarnessConfig = serde_json::from_str(r#"{"command":"codex"}"#).unwrap();
+    assert_eq!(hc.trust, HarnessTrust::Untrusted);
+    assert!(!hc.trust.is_trusted());
+    assert_eq!(hc.trust.as_str(), "untrusted");
+
+    // Explicit untrusted.
+    let hc: HarnessConfig =
+        serde_json::from_str(r#"{"command":"codex","trust":"untrusted"}"#).unwrap();
+    assert_eq!(hc.trust, HarnessTrust::Untrusted);
+
+    // Explicit trusted.
+    let hc: HarnessConfig =
+        serde_json::from_str(r#"{"command":"codex","trust":"trusted"}"#).unwrap();
+    assert_eq!(hc.trust, HarnessTrust::Trusted);
+    assert!(hc.trust.is_trusted());
+    assert_eq!(hc.trust.as_str(), "trusted");
+
+    // Every builtin preset defaults to untrusted.
+    for (name, preset) in builtin_harness_presets() {
+        assert_eq!(
+            preset.trust,
+            HarnessTrust::Untrusted,
+            "preset `{name}` must default to untrusted"
+        );
+    }
+
+    // Trust is never inferred from model, locality, command, or mode: a
+    // harness with a model name resembling a trusted provider still
+    // resolves to untrusted unless explicitly configured trusted.
+    let hc: HarnessConfig = serde_json::from_str(
+        r#"{"command":"codex","default_model":"claude-opus","trust":"untrusted"}"#,
+    )
+    .unwrap();
+    assert_eq!(hc.trust, HarnessTrust::Untrusted);
+}
+
 /// `gitignore_allow` resolves as a de-duplicated **union** across layers in
 /// walk order — not a more-specific-wins override (it's a list-valued
 /// field like skills `scan_dirs`).

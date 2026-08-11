@@ -64,3 +64,14 @@ Trusted is meant for an endpoint you are content to hold raw content — typical
 Model class (`defensive`, `normal`, `frontier`) is a harness-steering posture only. It changes context rules, prompt and decomposition guidance, and defensive tool descriptions. It never changes provider eligibility, data custody, redaction, or whether a request containing secrets may be sent. Locality is descriptive and never implies trust — `local`, `remote`, and `private_remote` say where a provider runs, not what it may hold. Every trust/class combination is a valid configuration.
 
 Exports and client display stay redacted regardless of trust. Secrets are scrubbed through Cockpit's redaction table before they leave the machine for exports, sync, or client display boundaries, and for inference requests to untrusted models. Redaction is a safety boundary, but it is not a substitute for choosing providers and trust settings deliberately.
+
+## External Harness Custody
+
+External harnesses (claude, codex, opencode, copilot, goose, grok, and any custom harness configured under `harnesses` in `/settings → Harnesses`) are OS processes, not trusted inference providers. They are **untrusted by default**. An explicit per-harness `trust` custody field opts into raw prompt delivery only; it is never inferred from the harness's model name, locality, command, or `LlmMode` posture.
+
+- **Untrusted harness** (the default): receives a redacted rendering of the prompt. Sensitive environment, credential-store, and sealed values are redacted before every untrusted harness prompt regardless of its selected model string, location, or Defensive/Normal/Frontier harness posture. Disabling discretionary redaction (`redact.enabled = false`) does not disable this mandatory sensitive baseline.
+- **Trusted harness** (explicit opt-in via `trust: "trusted"`): receives its raw prompt, including sensitive/sealed literals, only after the user explicitly configures it as trusted. Trusted raw prompt/input/output frames are never persisted: invocation records, child output, process records, histories, diagnostics, and `/export debug` receive only generic-redacted representations before write.
+
+No harness, trusted or untrusted, receives Cockpit-provided secret environment values. The former `auth_env_vars` configuration field is retired and rejected: a harness must authenticate independently without a Cockpit-provided secret. Non-secret session-overlay entries may remain available to the subprocess.
+
+Harness custody is a separate policy from configured provider/model `ModelTrust` and from `LlmMode` posture. `ModelTrust` continues to apply to Cockpit's configured provider/model inference; harness trust uses the same custody meanings but is an explicitly configured harness-local policy, never inferred from provider/model configuration. `LlmMode` remains a separate harness-steering posture and never alters harness subprocess custody.

@@ -22,8 +22,8 @@ use ratatui::text::{Line, Span};
 
 use crate::tui::textfield::TextField;
 use cockpit_config::extended::{
-    ArgvOverflowBehavior, DEFAULT_HARNESS_TIMEOUT_SECS, HarnessConfig, PromptInputMode,
-    builtin_harness_presets,
+    ArgvOverflowBehavior, DEFAULT_HARNESS_TIMEOUT_SECS, HarnessConfig, HarnessTrust,
+    PromptInputMode, builtin_harness_presets,
 };
 
 use super::reset::{ResetButton, ResetOutcome};
@@ -78,7 +78,7 @@ enum Field {
     SupportsAgentFile,
     AgentFileArgs,
     AgentFileEnv,
-    AuthEnvVars,
+    Trust,
     AuthProbeArgs,
     Timeout,
     AlwaysAllow,
@@ -98,7 +98,7 @@ const FIELDS: [Field; 17] = [
     Field::SupportsAgentFile,
     Field::AgentFileArgs,
     Field::AgentFileEnv,
-    Field::AuthEnvVars,
+    Field::Trust,
     Field::Timeout,
     // AuthProbeArgs sits before Timeout in the struct but we keep the
     // common fields first; place it last so the high-traffic ones lead.
@@ -123,7 +123,7 @@ impl Field {
             Self::SupportsAgentFile => P::SupportsAgentFile,
             Self::AgentFileArgs => P::AgentFileArgs,
             Self::AgentFileEnv => P::AgentFileEnv,
-            Self::AuthEnvVars => P::AuthEnvVars,
+            Self::Trust => P::AuthEnvVars,
             Self::AuthProbeArgs => P::AuthProbeArgs,
             Self::Timeout => P::Timeout,
             Self::AlwaysAllow => P::AlwaysAllow,
@@ -145,7 +145,7 @@ impl Field {
             Field::SupportsAgentFile => "agent file (flag)",
             Field::AgentFileArgs => "agent-file args",
             Field::AgentFileEnv => "agent-file env",
-            Field::AuthEnvVars => "auth env vars",
+            Field::Trust => "trust (custody)",
             Field::AuthProbeArgs => "auth probe args",
             Field::Timeout => "timeout (secs)",
             Field::AlwaysAllow => "always allow (skip approval)",
@@ -160,6 +160,7 @@ impl Field {
                 | Field::ArgvOverflow
                 | Field::SupportsJson
                 | Field::SupportsAgentFile
+                | Field::Trust
                 | Field::AlwaysAllow
         )
     }
@@ -180,7 +181,7 @@ impl Field {
             Field::SupportsAgentFile => yesno(hc.supports_agent_file),
             Field::AgentFileArgs => join_args(&hc.agent_file_args),
             Field::AgentFileEnv => hc.agent_file_env.clone().unwrap_or_default(),
-            Field::AuthEnvVars => join_args(&hc.auth_env_vars),
+            Field::Trust => hc.trust.as_str().to_string(),
             Field::AuthProbeArgs => join_args(&hc.auth_probe_args),
             Field::Timeout => hc.timeout_secs.to_string(),
             Field::AlwaysAllow => yesno(hc.always_allow),
@@ -214,7 +215,6 @@ impl Field {
                     Some(t.to_string())
                 };
             }
-            Field::AuthEnvVars => hc.auth_env_vars = split_args(raw),
             Field::AuthProbeArgs => hc.auth_probe_args = split_args(raw),
             Field::Timeout => {
                 if let Ok(n) = raw.trim().parse::<u64>()
@@ -228,6 +228,7 @@ impl Field {
             | Field::ArgvOverflow
             | Field::SupportsJson
             | Field::SupportsAgentFile
+            | Field::Trust
             | Field::AlwaysAllow => {}
         }
     }
@@ -239,6 +240,12 @@ impl Field {
             Field::ArgvOverflow => hc.argv_overflow = hc.argv_overflow.cycled(),
             Field::SupportsJson => hc.supports_json_output = !hc.supports_json_output,
             Field::SupportsAgentFile => hc.supports_agent_file = !hc.supports_agent_file,
+            Field::Trust => {
+                hc.trust = match hc.trust {
+                    HarnessTrust::Untrusted => HarnessTrust::Trusted,
+                    HarnessTrust::Trusted => HarnessTrust::Untrusted,
+                };
+            }
             Field::AlwaysAllow => hc.always_allow = !hc.always_allow,
             _ => {}
         }
@@ -771,8 +778,9 @@ impl SettingsCx {
     }
 }
 
-/// A fresh blank harness — `stdin` delivery, default timeout, otherwise
-/// empty so the user fills it in (or seeds a preset instead).
+/// A fresh blank harness — `stdin` delivery, default timeout, untrusted
+/// custody, otherwise empty so the user fills it in (or seeds a preset
+/// instead).
 fn blank_harness() -> HarnessConfig {
     HarnessConfig {
         command: String::new(),
@@ -788,7 +796,7 @@ fn blank_harness() -> HarnessConfig {
         supports_agent_file: false,
         agent_file_args: vec![],
         agent_file_env: None,
-        auth_env_vars: vec![],
+        trust: HarnessTrust::Untrusted,
         auth_probe_args: vec![],
         always_allow: false,
         timeout_secs: DEFAULT_HARNESS_TIMEOUT_SECS,

@@ -1,15 +1,14 @@
 import { z } from "zod";
 import { canonicalU64DecimalStringSchema, decodeProtocolIdBase64Url } from "./remote-protocol-id";
 
-export * from "./remote-identity-protocol";
-export * from "./remote-noise-binding";
-export * from "./remote-websocket-fallback";
-export * from "./remote-wire-magic-registry";
-
 export * from "./dependency-health";
 export * from "./remote-connection-metadata";
 export * from "./remote-identity-protocol";
+export * from "./remote-identity-protocol";
+export * from "./remote-noise-binding";
 export * from "./remote-tenant-authority-protocol";
+export * from "./remote-websocket-fallback";
+export * from "./remote-wire-magic-registry";
 export * from "./remote-wire-magic-registry";
 export * from "./send-user-message-v2";
 
@@ -1906,3 +1905,4 @@ export * from "./remote-signaling-attempt-store";
 export * from "./remote-signaling-payloads";
 export * from "./remote-transport-lanes";
 export * from "./remote-version";
+export * from "./remote-webrtc-web-adapter";

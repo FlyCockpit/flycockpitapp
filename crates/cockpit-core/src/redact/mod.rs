@@ -51,6 +51,66 @@ pub(crate) mod protected_redaction_history;
 mod ssh;
 mod structured;
 
+/// The exact actionable marker rendered for a sealed value on untrusted
+/// interactive inference egress with an active exact grant.
+///
+/// This is a protocol-level instruction, not configurable UI copy. It uses the
+/// Unicode em dash and lowercase spelling exactly as specified by
+/// `sealed-value-untrusted-inference-marker`.
+pub const SEALED_UNTRUSTED_INFERENCE_MARKER_PREFIX: &str =
+    "**redacted by cockpit — to use this value, reference sealed value `";
+pub const SEALED_UNTRUSTED_INFERENCE_MARKER_SUFFIX: &str = "`**";
+
+/// Render the exact actionable marker for one sealed value id.
+///
+/// The value id is constrained by the sealed-value contract before it becomes
+/// marker text (lowercase letters, digits, `-`, `_`), so the marker cannot be
+/// used to inject headings, links, instructions, or code-fence syntax.
+pub fn sealed_untrusted_inference_marker(value_id: &str) -> String {
+    format!(
+        "{SEALED_UNTRUSTED_INFERENCE_MARKER_PREFIX}{value_id}{SEALED_UNTRUSTED_INFERENCE_MARKER_SUFFIX}"
+    )
+}
+
+/// A typed replacement descriptor for one redaction-table entry.
+///
+/// `Generic` entries (environment, credential, deny-list, file secrets) render
+/// the configured global [`RedactConfig::placeholder`]. `Sealed` entries render
+/// the exact actionable [`sealed_untrusted_inference_marker`] so an untrusted
+/// model that received a sealed literal in an interactive turn with an active
+/// exact grant sees an instruction to use the sealed-value mechanism rather
+/// than a content-free denial.
+///
+/// This is the one redaction architecture: there is no sealed-only regex or
+/// second Aho-Corasick pass beside the existing table. The per-entry
+/// replacement vector is parallel to the matcher's pattern list, so a single
+/// `replace_all` scan produces the correct renderer for each match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Replacement {
+    /// The configured global placeholder. Used for every ordinary secret and
+    /// for sealed entries whose exact grant is not active on the egress target.
+    Generic,
+    /// A sealed value with an active exact `(value, version, action)` grant on
+    /// the egress target. Renders the actionable marker using the canonical
+    /// value id.
+    Sealed { value_id: String },
+}
+
+impl Replacement {
+    /// Resolve this descriptor to its replacement text against a placeholder.
+    fn render(&self, placeholder: &str) -> String {
+        match self {
+            Self::Generic => placeholder.to_string(),
+            Self::Sealed { value_id } => sealed_untrusted_inference_marker(value_id),
+        }
+    }
+
+    /// `true` when this is a sealed-value replacement.
+    pub fn is_sealed(&self) -> bool {
+        matches!(self, Self::Sealed { .. })
+    }
+}
+
 #[cfg(test)]
 use self::dotenv::*;
 use self::dotenv::{collect_env_file_candidates, consume_marked_value, matched_dotenv_paths};
@@ -436,8 +496,13 @@ pub struct RedactionTable {
     /// Parallel to `matcher`'s pattern list. Used by
     /// `cockpit debug redact` to render `value (from $VAR)` rows.
     origins: Vec<String>,
-    /// What every match is replaced with. Distinctive on purpose so
-    /// leaks into provider logs are easy to grep for.
+    /// Parallel to `matcher`'s pattern list. The typed replacement descriptor
+    /// for each entry: `Generic` for ordinary secrets, `Sealed` for sealed
+    /// values with an active exact grant on the egress target.
+    replacements: Vec<Replacement>,
+    /// What every ordinary (`Generic`) match is replaced with. Distinctive on
+    /// purpose so leaks into provider logs are easy to grep for. Sealed
+    /// entries render [`sealed_untrusted_inference_marker`] instead.
     placeholder: String,
     /// `true` when the user disabled redaction at config level. The
     /// scrub call still returns the input unchanged; we keep the flag
@@ -698,11 +763,20 @@ impl RedactionTable {
         protected_path_conflicts.dedup();
         entries.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
         entries.dedup_by(|a, b| a.0 == b.0);
+        // Build the typed replacement vector parallel to the matcher's pattern
+        // list. Every entry that arrives through `from_entries` is `Generic`:
+        // sealed entries are registered with their canonical origin, but the
+        // actionable marker is an ephemeral per-target decision resolved by
+        // [`Self::with_sealed_replacements`] at egress time. Persisting a
+        // `Sealed` replacement here would freeze active authorization into the
+        // redaction entry, which the invariant forbids.
+        let replacements = vec![Replacement::Generic; entries.len()];
         if entries.is_empty() {
             return Ok(Self {
                 matcher: None,
                 entries,
                 origins: Vec::new(),
+                replacements,
                 placeholder,
                 disabled,
                 unsupported_files,
@@ -721,6 +795,7 @@ impl RedactionTable {
             matcher: Some(matcher),
             entries,
             origins,
+            replacements,
             placeholder,
             disabled,
             unsupported_files,
@@ -759,6 +834,61 @@ impl RedactionTable {
             self.unsupported_files.clone(),
             self.protected.clone(),
         )
+    }
+
+    /// Produce an egress-time derived table where sealed entries whose
+    /// canonical identity matches an active exact grant render the actionable
+    /// marker instead of the generic placeholder.
+    ///
+    /// `active_sealed_ids` is the set of canonical value ids (parsed from
+    /// sealed redaction origins by [`crate::sealed::parse_sealed_redaction_origin`])
+    /// that have an active exact `(value, version, action)` grant on the
+    /// egress target. Every sealed entry whose origin resolves to one of those
+    /// ids gets [`Replacement::Sealed`]; all other entries (ordinary secrets
+    /// and sealed entries without an active grant) keep [`Replacement::Generic`].
+    ///
+    /// This is the single place where active authorization meets the redaction
+    /// table. The persisted table never carries `Sealed` replacements, so
+    /// authorization is never frozen into a redaction entry. A revoked,
+    /// expired, or ungranted sealed value simply does not appear in
+    /// `active_sealed_ids` and falls back to the generic placeholder — it
+    /// never resurrects a literal and never advertises a stale handle.
+    ///
+    /// The returned table shares the same matcher and entries; only the
+    /// replacement vector is rebuilt. This is cheap and deterministic.
+    pub fn with_sealed_replacements(&self, active_sealed_ids: &std::collections::HashSet<String>) -> Self {
+        let replacements: Vec<Replacement> = self
+            .origins
+            .iter()
+            .map(|origin| {
+                if let Some(identity) =
+                    crate::sealed::parse_sealed_redaction_origin(origin)
+                {
+                    // The canonical value id for a scoped entry is its record
+                    // id; for a legacy session entry it is the name. Both are
+                    // constrained by the sealed-value contract.
+                    let value_id = identity
+                        .record_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| identity.name.as_str().to_string());
+                    if active_sealed_ids.contains(&value_id) {
+                        return Replacement::Sealed { value_id };
+                    }
+                }
+                Replacement::Generic
+            })
+            .collect();
+        Self {
+            matcher: self.matcher.clone(),
+            entries: self.entries.clone(),
+            origins: self.origins.clone(),
+            replacements,
+            placeholder: self.placeholder.clone(),
+            disabled: self.disabled,
+            unsupported_files: self.unsupported_files.clone(),
+            protected: self.protected.clone(),
+            protected_path_conflicts: self.protected_path_conflicts.clone(),
+        }
     }
 
     /// Register parsed values from one already-approved secret-bearing file.
@@ -903,8 +1033,26 @@ impl RedactionTable {
         if !matcher.is_match(body) {
             return Cow::Borrowed(body);
         }
-        let replacements = vec![self.placeholder.as_str(); self.origins.len()];
-        Cow::Owned(matcher.replace_all(body, &replacements))
+        // Render each entry's typed replacement descriptor to its replacement
+        // text. Ordinary secrets and sealed-without-active-grant entries render
+        // the configured global placeholder; sealed entries with an active
+        // exact grant render the actionable marker. The vector is parallel to
+        // the matcher's pattern list, so a single `replace_all` scan produces
+        // the correct renderer for each match — there is no second pass.
+        //
+        // When all entries are `Generic` (the common case, and always the case
+        // for the persisted table), the fast path renders the placeholder
+        // once and repeats it, avoiding per-entry allocation.
+        let rendered: Vec<String> = if self.replacements.iter().all(|r| r == &Replacement::Generic) {
+            vec![self.placeholder.clone(); self.origins.len()]
+        } else {
+            self.replacements
+                .iter()
+                .map(|r| r.render(&self.placeholder))
+                .collect()
+        };
+        let refs: Vec<&str> = rendered.iter().map(String::as_str).collect();
+        Cow::Owned(matcher.replace_all(body, &refs))
     }
     /// Scrub every secret in `body`. Returns the cleaned string.
     pub fn scrub(&self, body: &str) -> String {
@@ -936,6 +1084,7 @@ impl RedactionTable {
             matcher: self.matcher.clone(),
             entries: self.entries.clone(),
             origins: self.origins.clone(),
+            replacements: self.replacements.clone(),
             placeholder: self.placeholder.clone(),
             disabled: false,
             unsupported_files: self.unsupported_files.clone(),
@@ -974,6 +1123,7 @@ impl RedactionTable {
             matcher: None,
             entries: Vec::new(),
             origins: Vec::new(),
+            replacements: Vec::new(),
             placeholder: RedactConfig::default().placeholder,
             disabled: false,
             unsupported_files: Vec::new(),

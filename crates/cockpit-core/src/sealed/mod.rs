@@ -75,7 +75,7 @@ pub use grant::{
 };
 pub use identity::{
     SealedDescription, SealedName, SealedProjectKey, SealedProjectTrust, SealedRecordId,
-    SealedRedactionIdentity, SealedScopeKind, SealedScopeRef,
+    SealedRedactionIdentity, SealedScopeKind, SealedScopeRef, parse_sealed_redaction_origin,
 };
 pub use marker::{
     SealedCapabilityState, SealedMarkerIdentity, SealedMarkerPredicate,

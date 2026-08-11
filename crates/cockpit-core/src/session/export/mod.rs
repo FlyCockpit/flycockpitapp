@@ -388,12 +388,14 @@ pub struct BundleBytes {
 }
 
 /// Assemble the full debug bundle for `target` and return the zip bytes
-/// instead of writing them to a caller-selected path.
+/// instead of writing them to a caller-selected path. The archive is always
+/// redacted: there is no `include_sensitive` bypass. Provider trust may let
+/// raw values reach a trusted model during inference, but that custody
+/// decision never relaxes export redaction.
 pub async fn build_bundle_zip_bytes(
     db: &Db,
     target: &SessionRow,
     include_generated_artifacts: bool,
-    include_sensitive: bool,
 ) -> Result<BundleBytes> {
     let db_for_files = db.clone();
     let target_id = target.session_id;
@@ -405,7 +407,6 @@ pub async fn build_bundle_zip_bytes(
             target_id,
             ExportBundleOptions {
                 include_generated_artifacts,
-                include_sensitive,
             },
             &env,
         )
@@ -429,7 +430,6 @@ pub async fn write_bundle_zip(
     out_path: &std::path::Path,
     overwrite: bool,
     include_generated_artifacts: bool,
-    include_sensitive: bool,
 ) -> Result<BundleSummary> {
     if out_path.exists() && !overwrite {
         anyhow::bail!(
@@ -438,8 +438,7 @@ pub async fn write_bundle_zip(
         );
     }
 
-    let bundle =
-        build_bundle_zip_bytes(db, target, include_generated_artifacts, include_sensitive).await?;
+    let bundle = build_bundle_zip_bytes(db, target, include_generated_artifacts).await?;
 
     if let Some(parent) = out_path.parent()
         && !parent.as_os_str().is_empty()
@@ -459,7 +458,6 @@ pub fn write_bundle_zip_blocking_for_sync_cli(
     out_path: &std::path::Path,
     overwrite: bool,
     include_generated_artifacts: bool,
-    include_sensitive: bool,
 ) -> Result<BundleSummary> {
     if out_path.exists() && !overwrite {
         anyhow::bail!(
@@ -478,7 +476,6 @@ pub fn write_bundle_zip_blocking_for_sync_cli(
             target_id,
             ExportBundleOptions {
                 include_generated_artifacts,
-                include_sensitive,
             },
             &env,
         )
@@ -628,11 +625,12 @@ async fn collect_bundle(db: &Db, target_id: Uuid) -> Result<Vec<SessionRow>> {
 
 /// Assemble the `.zip` bytes in memory: `manifest.json`, the unified
 /// `events.json`, and one `inference_requests/` file per inference call
-/// across every session in the bundle.
+/// across every session in the bundle. The archive is always redacted:
+/// there is no `include_sensitive` escape hatch. Provider trust controls
+/// inference custody only; it never relaxes export redaction.
 #[derive(Debug, Clone, Copy, Default)]
 struct ExportBundleOptions {
     include_generated_artifacts: bool,
-    include_sensitive: bool,
 }
 
 #[cfg(test)]
@@ -696,7 +694,7 @@ fn build_zip_with_options_and_env_conn(
     options: ExportBundleOptions,
     env: &HashMap<String, String>,
 ) -> Result<Vec<u8>> {
-    let export_redactor = export_redaction_table_with_env(target, env, options.include_sensitive)?;
+    let export_redactor = export_redaction_table_with_env(target, env)?;
     build_zip_with_options_and_env_conn_with_redactor(
         db,
         conn,
@@ -820,12 +818,12 @@ fn build_zip_with_options_and_env_conn_with_redactor(
         }
         for inference_call in Db::list_inference_calls_for_session_conn(conn, s.session_id)? {
             let mut value = inference_call_export_json(&inference_call);
-            redact_value_for_export(&mut value, export_redactor, options.include_sensitive);
+            redact_value_for_export(&mut value, export_redactor);
             inference_call_index.push(value);
         }
         for tool_call in Db::list_tool_calls_for_session_conn(conn, s.session_id)? {
             let mut value = tool_call_export_json(&tool_call);
-            redact_value_for_export(&mut value, export_redactor, options.include_sensitive);
+            redact_value_for_export(&mut value, export_redactor);
             tool_call_index.push(value);
             let identity = tool_provider_identity_json(&tool_call)?;
             tool_identity_by_call
@@ -861,7 +859,7 @@ fn build_zip_with_options_and_env_conn_with_redactor(
         }
         for row in Db::list_task_delegation_steers_conn(conn, s.session_id)? {
             let body =
-                redact_string_for_export(row.body, export_redactor, options.include_sensitive);
+                redact_string_for_export(row.body, export_redactor);
             delegation_steer_index.push(json!({
                 "id": row.id,
                 "task_call_id": row.task_call_id,
@@ -889,7 +887,6 @@ fn build_zip_with_options_and_env_conn_with_redactor(
                     let body = redact_string_for_export(
                         payload.body,
                         export_redactor,
-                        options.include_sensitive,
                     );
                     (Some(row.excerpt(&body)), None::<String>, Some(body))
                 }
@@ -1008,7 +1005,7 @@ fn build_zip_with_options_and_env_conn_with_redactor(
             value["file"] = json!(path);
             request_files.push((path, call_id.to_string()));
         }
-        redact_value_for_export(&mut value, export_redactor, options.include_sensitive);
+        redact_value_for_export(&mut value, export_redactor);
         event_values.push(value);
     }
 
@@ -1094,7 +1091,7 @@ fn build_zip_with_options_and_env_conn_with_redactor(
                 },
                 "file": path,
             });
-            redact_value_for_export(&mut event, export_redactor, options.include_sensitive);
+            redact_value_for_export(&mut event, export_redactor);
             event_values.push(event);
         }
     }
@@ -1154,7 +1151,7 @@ fn build_zip_with_options_and_env_conn_with_redactor(
                 // references always exists.
                 None => json!({ "error": "no captured request payload for this call_id" }),
             };
-            redact_value_for_export(&mut payload, export_redactor, options.include_sensitive);
+            redact_value_for_export(&mut payload, export_redactor);
             zw.start_file(path, opts)
                 .with_context(|| format!("zip: request entry `{path}`"))?;
             zw.write_all(serde_json::to_string_pretty(&payload)?.as_bytes())
@@ -1167,7 +1164,7 @@ fn build_zip_with_options_and_env_conn_with_redactor(
         // field) — the export does not block waiting for it.
         for (path, body) in &tandem_files {
             let mut body = body.clone();
-            redact_value_for_export(&mut body, export_redactor, options.include_sensitive);
+            redact_value_for_export(&mut body, export_redactor);
             zw.start_file(path, opts)
                 .with_context(|| format!("zip: tandem entry `{path}`"))?;
             zw.write_all(serde_json::to_string_pretty(&body)?.as_bytes())
@@ -1176,7 +1173,7 @@ fn build_zip_with_options_and_env_conn_with_redactor(
 
         for (path, body) in &tool_output_files {
             let mut body = body.clone();
-            redact_value_for_export(&mut body, export_redactor, options.include_sensitive);
+            redact_value_for_export(&mut body, export_redactor);
             zw.start_file(path, opts)
                 .with_context(|| format!("zip: tool output entry `{path}`"))?;
             zw.write_all(serde_json::to_string_pretty(&body)?.as_bytes())
@@ -1208,7 +1205,7 @@ fn build_zip_with_options_and_env_conn_with_redactor(
             zw.start_file(path, opts)
                 .with_context(|| format!("zip: compressed result entry `{path}`"))?;
             let body =
-                redact_string_for_export(body.clone(), export_redactor, options.include_sensitive);
+                redact_string_for_export(body.clone(), export_redactor);
             zw.write_all(body.as_bytes())
                 .with_context(|| format!("zip: writing compressed result `{path}`"))?;
         }
@@ -1347,8 +1344,7 @@ fn build_manifest_conn(
         "session_count": bundle.len(),
         "excluded_generated_artifacts": !options.include_generated_artifacts,
         "include_generated_artifacts": options.include_generated_artifacts,
-        "redacted": !options.include_sensitive,
-        "include_sensitive": options.include_sensitive,
+        "redacted": true,
         "sessions": sessions,
     });
     if let Some(repair) = export_resume_repair_state_conn(conn, target)
@@ -1550,25 +1546,46 @@ fn process_env_map() -> HashMap<String, String> {
         .collect()
 }
 
+/// Public alias for [`process_env_map`] so the daemon dispatch can build the
+/// environment map inside a read connection without duplicating the env
+/// collection logic. The transcript JSON export shares this with the ZIP path.
+pub fn process_env_map_for_conn() -> HashMap<String, String> {
+    process_env_map()
+}
+
+/// Build the export redaction table for a session inside a read connection.
+/// This is the same non-bypassable redactor used by the debug ZIP path; the
+/// transcript JSON export shares it so both artifacts consume one portable
+/// redaction policy. The redactor is built from the target session's project
+/// root and the durable credential/environment journals — never from the
+/// inference-time provider-trust decision.
+pub fn redaction_table_for_session_conn(
+    _conn: &Connection,
+    target: &SessionRow,
+    env: &HashMap<String, String>,
+) -> Result<RedactionTable> {
+    export_redaction_table_with_env(target, env)
+}
+
+/// Recursively scrub every JSON string value (and nested object/array value)
+/// through the export redaction table. This is the same scrub the debug ZIP
+/// applies to every member; the transcript JSON export shares it so the RPC
+/// payload is redacted before base64/staging.
+pub fn scrub_export_json_value(value: &mut Value, redactor: &RedactionTable) {
+    redact_value_for_export(value, redactor);
+}
+
 fn export_redaction_table_with_env(
     target: &SessionRow,
     env: &HashMap<String, String>,
-    include_sensitive: bool,
 ) -> Result<RedactionTable> {
-    if include_sensitive {
-        tracing::warn!("exporting with --include-sensitive; redaction is explicitly disabled");
-        return Ok(RedactionTable::empty());
-    }
     let cwd = PathBuf::from(&target.project_root);
     let extended = crate::config::extended::load_for_cwd(&cwd);
     RedactionTable::build_with_env_and_store(&extended.redact, &cwd, env)
         .context("building export redaction table")
 }
 
-fn redact_value_for_export(value: &mut Value, redactor: &RedactionTable, include_sensitive: bool) {
-    if include_sensitive {
-        return;
-    }
+fn redact_value_for_export(value: &mut Value, redactor: &RedactionTable) {
     match value {
         Value::String(s) => {
             let scrubbed = redactor.scrub(s);
@@ -1578,28 +1595,20 @@ fn redact_value_for_export(value: &mut Value, redactor: &RedactionTable, include
         }
         Value::Array(items) => {
             for item in items {
-                redact_value_for_export(item, redactor, false);
+                redact_value_for_export(item, redactor);
             }
         }
         Value::Object(map) => {
             for item in map.values_mut() {
-                redact_value_for_export(item, redactor, false);
+                redact_value_for_export(item, redactor);
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
 }
 
-fn redact_string_for_export(
-    value: String,
-    redactor: &RedactionTable,
-    include_sensitive: bool,
-) -> String {
-    if include_sensitive {
-        value
-    } else {
-        redactor.scrub(&value)
-    }
+fn redact_string_for_export(value: String, redactor: &RedactionTable) -> String {
+    redactor.scrub(&value)
 }
 
 /// Format an epoch-seconds timestamp as an ISO-8601 / RFC 3339 UTC string.

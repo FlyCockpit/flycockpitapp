@@ -666,7 +666,7 @@ cockpit config export-policy -o cockpit-policy.json
 cockpit config import-policy cockpit-policy.json
 ```
 
-Debug exports are redacted by default using the active redaction table. Use `cockpit export --include-sensitive <session>` only when you intentionally need exact captured model/tool payloads; the command prints a warning because the archive may contain secrets sent to trusted models.
+Debug exports are permanently redacted using the active redaction table. Every `cockpit export` archive is a portable, shareable diagnostic artifact: sealed values, environment values, credential values, and contained leak values are scrubbed even when a trusted provider received raw values during the session. There is no unredacted export path.
 
 See [Redaction](docs/redaction.md) for `min_secret_length`, allowlist, denylist, and filesystem-path protection details.
 
@@ -752,7 +752,7 @@ Cockpit is built around explicit trust and scoped execution:
 - Command approval and safety-gate decisions are recorded.
 - Write-capable tools acquire daemon-managed path locks.
 - Credentials are stored outside project config and written with private file permissions on Unix.
-- Session exports are redacted by default; `--include-sensitive` is an explicit opt-in for exact captured payloads.
+- Session exports are permanently redacted; there is no unredacted export path. Sensitive-record recovery occurs only through the authenticated per-record `/sealed` or `/leaks` channel, never through archive generation.
 
 ## What Leaves Your Machine
 
@@ -785,8 +785,7 @@ Cockpit stores durable session data in
 see the exact resolved path). It includes session events and the full assembled
 post-redaction payload for model requests. Retention is disabled by default: no session payloads are pruned unless an operator explicitly configures a positive retention window.
 
-Use `cockpit session delete <session>` to permanently remove one session and all local associated data. The command prompts by default and requires `--yes` when non-interactive. Use `cockpit session purge --before <YYYY-MM-DD|30d>` for ended sessions; start with `--dry-run`. Exporting is not deletion: exports are redacted by default,
-while `--include-sensitive` intentionally includes exact captured payloads.
+Use `cockpit session delete <session>` to permanently remove one session and all local associated data. The command prompts by default and requires `--yes` when non-interactive. Use `cockpit session purge --before <YYYY-MM-DD|30d>` for ended sessions; start with `--dry-run`. Exporting is not deletion: exports are permanently redacted regardless of provider trust.
 
 ### Limits of the protections
 

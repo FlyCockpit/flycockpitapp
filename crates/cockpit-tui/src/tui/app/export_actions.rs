@@ -103,7 +103,6 @@ impl App {
             session_id,
             kind,
             include_generated_artifacts: false,
-            include_sensitive: false,
         };
         self.async_actions.start_export(
             AsyncActionKind::Blocking(action),
@@ -554,7 +553,6 @@ mod tests {
             request.request,
             Request::ExportSessionData {
                 kind: ExportSessionKind::TranscriptJson,
-                include_sensitive: false,
                 ..
             }
         ));
@@ -581,7 +579,6 @@ mod tests {
             request.request,
             Request::ExportSessionData {
                 kind: ExportSessionKind::DebugBundle,
-                include_sensitive: false,
                 ..
             }
         ));
@@ -621,7 +618,6 @@ mod tests {
             Request::ExportSessionData {
                 session_id: requested,
                 kind: ExportSessionKind::TranscriptJson,
-                include_sensitive: false,
                 ..
             } if requested == session_id
         ));
@@ -660,7 +656,6 @@ mod tests {
                 session_id,
                 kind: ExportSessionKind::TranscriptJson,
                 include_generated_artifacts: false,
-                include_sensitive: false,
             },
             ExportSessionKind::TranscriptJson,
             "x".to_string(),

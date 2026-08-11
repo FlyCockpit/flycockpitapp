@@ -2540,14 +2540,12 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             session_id,
             kind,
             include_generated_artifacts,
-            include_sensitive,
         } => {
             export_session_data(
                 ctx,
                 session_id,
                 kind,
                 include_generated_artifacts,
-                include_sensitive,
             )
             .await
         }
@@ -5583,14 +5581,12 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
             session_id,
             kind,
             include_generated_artifacts,
-            include_sensitive,
         } => {
             export_session_data(
                 &ctx,
                 session_id,
                 kind,
                 include_generated_artifacts,
-                include_sensitive,
             )
             .await
         }
@@ -7007,7 +7003,6 @@ pub(super) async fn export_session_data(
     session_id: Uuid,
     kind: proto::ExportSessionKind,
     include_generated_artifacts: bool,
-    include_sensitive: bool,
 ) -> std::result::Result<Response, ErrorPayload> {
     let db = ctx.db.clone();
     let target = db
@@ -7037,7 +7032,26 @@ pub(super) async fn export_session_data(
                 }
             }
             messages.sort_by_key(|message| message.seq);
-            let bytes = serde_json::to_vec_pretty(&messages).map_err(internal)?;
+            // The transcript JSON is a portable, permanently redacted
+            // artifact. It shares one export-redaction policy with the debug
+            // ZIP: scrub every message body before serialization so no sealed
+            // value, environment value, credential value, or contained leak
+            // reaches the staged transfer bytes. The redactor is built from
+            // the target session's project root and the durable
+            // credential/environment journals, never the inference-time
+            // provider-trust decision.
+            let export_redactor = db
+                .read(move |conn| {
+                    let env = crate::session::export::process_env_map_for_conn();
+                    crate::session::export::redaction_table_for_session_conn(
+                        conn, &target, &env,
+                    )
+                })
+                .await
+                .map_err(internal)?;
+            let mut messages_value = serde_json::to_value(&messages).map_err(internal)?;
+            crate::session::export::scrub_export_json_value(&mut messages_value, &export_redactor);
+            let bytes = serde_json::to_vec_pretty(&messages_value).map_err(internal)?;
             let transfer = stage_export_bytes(&bytes)?;
             Ok(proto::ExportSessionData {
                 session_id,
@@ -7054,7 +7068,6 @@ pub(super) async fn export_session_data(
                 &db,
                 &target,
                 include_generated_artifacts,
-                include_sensitive,
             )
             .await
             .map_err(internal)?;
@@ -7066,7 +7079,7 @@ pub(super) async fn export_session_data(
                 mime: "application/zip".to_string(),
                 transfer,
                 session_count: Some(bundle.summary.session_count),
-                redacted: !include_sensitive,
+                redacted: true,
             })
         }
     }?;

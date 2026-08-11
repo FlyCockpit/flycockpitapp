@@ -2429,12 +2429,13 @@ impl NativeResponseExtractor {
 
 #[cfg(test)]
 mod tests {
+    use super::super::host_identity::HostInstallationId;
     use super::super::target::{
-        FakeTargetEvidenceAdapter, HostInstallationId, TargetGeometry, empty_unavailable,
+        FakeTargetEvidenceAdapter, TargetGeometry, empty_unavailable,
         sample_physical_evidence,
     };
     use super::super::{
-        Anthropic20250124ComputerAction, Anthropic20251124ComputerAction, ComputerAction,
+        Anthropic20250124ComputerAction, Anthropic20251124ComputerAction,
         ComputerBackend, ComputerError, ComputerToolContract, CoordinateSpace, DisplayGeometry,
         FakeBackend, LogicalSize, Modifiers, OpenAiComputerAction, PixelSize, Point,
         ProviderPointerButton, ScaleFactor,

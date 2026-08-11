@@ -67,7 +67,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use serde_json::Value;
 use sha2::{Digest, Sha256};

@@ -562,6 +562,10 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "grep",
         "glob",
         "use_sealed_value",
+        "inspect_audio",
+        "inspect_video",
+        "extract_video_clip",
+        "extract_audio",
     ]
 }
 
@@ -802,6 +806,32 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
             summary: "Use a granted sealed value by reference through a granted action.",
             condition: Some("Requires an Owner-issued sealed-value action grant."),
         },
+        BuiltinToolInventoryItem {
+            family: "Media",
+            name: "inspect_audio",
+            summary: "Inspect bounded audio metadata.",
+            condition: Some("Requires FFprobe and typed session attachments."),
+        },
+        BuiltinToolInventoryItem {
+            family: "Media",
+            name: "inspect_video",
+            summary: "Inspect video metadata and deterministic storyboards.",
+            condition: Some(
+                "Requires a compatible FFmpeg/FFprobe pair and typed session attachments.",
+            ),
+        },
+        BuiltinToolInventoryItem {
+            family: "Media",
+            name: "extract_video_clip",
+            summary: "Create a bounded normalized video clip.",
+            condition: Some("Requires H.264/AAC encoders and typed session attachments."),
+        },
+        BuiltinToolInventoryItem {
+            family: "Media",
+            name: "extract_audio",
+            summary: "Create a bounded PCM WAV derivative.",
+            condition: Some("Requires FFmpeg PCM encoding and typed session attachments."),
+        },
     ]
 }
 
@@ -888,6 +918,10 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::grep::GrepTool),
         Arc::new(tools::glob::GlobTool),
         Arc::new(tools::use_sealed_value::UseSealedValueTool::new()),
+        Arc::new(tools::audio_video::InspectAudioTool),
+        Arc::new(tools::audio_video::InspectVideoTool),
+        Arc::new(tools::audio_video::ExtractVideoClipTool),
+        Arc::new(tools::audio_video::ExtractAudioTool),
         Arc::new(tools::docs::ListPackagesTool::new(
             tools::docs::DocsResolution::new(),
             "pkg".to_string(),
@@ -915,6 +949,10 @@ fn materialize_tool_by_name(
     let tb = match name {
         "read" => tb.with(Arc::new(tools::read::ReadTool)),
         "use_sealed_value" => tb.with(Arc::new(tools::use_sealed_value::UseSealedValueTool::new())),
+        "inspect_audio" => tb.with(Arc::new(tools::audio_video::InspectAudioTool)),
+        "inspect_video" => tb.with(Arc::new(tools::audio_video::InspectVideoTool)),
+        "extract_video_clip" => tb.with(Arc::new(tools::audio_video::ExtractVideoClipTool)),
+        "extract_audio" => tb.with(Arc::new(tools::audio_video::ExtractAudioTool)),
         "bash" => tb.with(Arc::new(tools::bash::BashTool::new())),
         "escalate" => tb.with(Arc::new(tools::escalate::EscalateTool)),
         "write" => tb.with(Arc::new(tools::write::WriteTool)),
@@ -1355,6 +1393,22 @@ fn effective_tool_tier(
     if let Some(tier) = def.tool_tiers.get(tool) {
         return *tier;
     }
+    if matches!(tool, "inspect_audio" | "inspect_video") {
+        return match def.name.as_str() {
+            "Build" | "Careful" | "Plan" | "explore" => crate::agents::ToolTier::Enabled,
+            "builder" | "deepthink" | "scout" | "bee" | "Multireview" => {
+                crate::agents::ToolTier::Discoverable
+            }
+            _ => crate::agents::ToolTier::Disabled,
+        };
+    }
+    if matches!(tool, "extract_video_clip" | "extract_audio") {
+        return match def.name.as_str() {
+            "Build" | "Careful" => crate::agents::ToolTier::Enabled,
+            "builder" => crate::agents::ToolTier::Discoverable,
+            _ => crate::agents::ToolTier::Disabled,
+        };
+    }
     if is_assistant && default_assistant_discoverable_tools().contains(&tool) {
         return crate::agents::ToolTier::Discoverable;
     }
@@ -1365,6 +1419,28 @@ fn effective_tool_tier(
         return crate::agents::ToolTier::Discoverable;
     }
     crate::agents::ToolTier::Enabled
+}
+
+fn with_audio_video_tools(
+    mut tb: ToolBox,
+    def: &crate::agents::AgentDef,
+    args: &SpawnArgs,
+) -> Result<ToolBox> {
+    for name in [
+        "inspect_audio",
+        "inspect_video",
+        "extract_video_clip",
+        "extract_audio",
+    ] {
+        tb = match effective_tool_tier(def, name, false) {
+            crate::agents::ToolTier::Enabled => add_tool_by_name(tb, name, def, args)?,
+            crate::agents::ToolTier::Discoverable => {
+                add_discoverable_tool_by_name(tb, name, def, args)?
+            }
+            crate::agents::ToolTier::Disabled => tb,
+        };
+    }
+    Ok(tb)
 }
 
 fn add_discoverable_tool_by_name(
@@ -1700,6 +1776,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
             crate::agents::ToolTier::Disabled => tb,
         };
     }
+    tb = with_audio_video_tools(tb, def, args)?;
     if !is_internal_agent_def_name(&def.name) || internal_agent_def_uses_custom_tools(&def.name) {
         // Custom-bash tools (webfetch/websearch/…) are config-driven, not part
         // of the named grant — attach them like the built-in factories do.

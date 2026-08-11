@@ -16,10 +16,12 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha256};
 
-use crate::remote_identity_protocol::{self as identity, FCCE, FCCF, FCEN, FCIP, FCPP, SubjectKind};
+use crate::remote_identity_protocol::{
+    self as identity, FCCE, FCCF, FCEN, FCIP, FCPP, SubjectKind,
+};
 use crate::remote_public_service_policy::{
-    self as policy, RemoteAuthorizedTupleSetV1, RemotePermissionCeilingV1,
-    RemotePermissionCeilingDigestV1, permission_ceiling_digest, validate_transport_bits,
+    self as policy, RemoteAuthorizedTupleSetV1, RemotePermissionCeilingDigestV1,
+    RemotePermissionCeilingV1, permission_ceiling_digest, validate_transport_bits,
 };
 use crate::remote_wire_magic_registry::{self as magic, assert_registered, parse_registry};
 
@@ -461,7 +463,11 @@ impl EvidenceType {
     }
     pub fn validate(self, bytes: &[u8]) -> Result<()> {
         if bytes.len() > self.cap() {
-            return evidence_err(format!("{} evidence exceeds cap {}", self.name(), self.cap()));
+            return evidence_err(format!(
+                "{} evidence exceeds cap {}",
+                self.name(),
+                self.cap()
+            ));
         }
         match self.category() {
             EvidenceCategory::Binary => {
@@ -471,7 +477,7 @@ impl EvidenceType {
                         self.name()
                     ))
                 })?;
-                if bytes.len() < 5 || &bytes[..4] != magic {
+                if bytes.len() < 5 || bytes[..4] != magic {
                     return evidence_err(format!("{} evidence magic mismatch", self.name()));
                 }
                 if bytes[4] != 1 {
@@ -481,21 +487,20 @@ impl EvidenceType {
                     if other == self {
                         continue;
                     }
-                    if let Some(other_magic) = other.wire_magic() {
-                        if bytes.len() >= 4 && &bytes[..4] == other_magic {
-                            return evidence_err(format!(
-                                "evidence bytes match {} not {}",
-                                other.name(),
-                                self.name()
-                            ));
-                        }
+                    if let Some(other_magic) = other.wire_magic()
+                        && bytes.len() >= 4
+                        && bytes[..4] == other_magic
+                    {
+                        return evidence_err(format!(
+                            "evidence bytes match {} not {}",
+                            other.name(),
+                            self.name()
+                        ));
                     }
                 }
                 match self {
                     Self::QuotaRequest => validate_quota_request(bytes)?,
-                    Self::IdentityRevocationRequest => {
-                        validate_identity_revocation_request(bytes)?
-                    }
+                    Self::IdentityRevocationRequest => validate_identity_revocation_request(bytes)?,
                     Self::MtlsIdentity => validate_mtls_identity(bytes)?,
                     Self::AttemptRequest => validate_attempt_request(bytes)?,
                     Self::RecoveryHistory => validate_recovery_history(bytes)?,
@@ -529,16 +534,14 @@ impl EvidenceType {
                         self.name()
                     ));
                 }
-                let header_bytes = URL_SAFE_NO_PAD
-                    .decode(parts[0].as_bytes())
-                    .map_err(|_| {
-                        TenantAuthorityProtocolError::Evidence(format!(
-                            "{} compact JWS header decode failed",
-                            self.name()
-                        ))
-                    })?;
-                let header: serde_json::Value = serde_json::from_slice(&header_bytes)
-                    .map_err(|_| {
+                let header_bytes = URL_SAFE_NO_PAD.decode(parts[0].as_bytes()).map_err(|_| {
+                    TenantAuthorityProtocolError::Evidence(format!(
+                        "{} compact JWS header decode failed",
+                        self.name()
+                    ))
+                })?;
+                let header: serde_json::Value =
+                    serde_json::from_slice(&header_bytes).map_err(|_| {
                         TenantAuthorityProtocolError::Evidence(format!(
                             "{} compact JWS header is not valid JSON",
                             self.name()
@@ -592,7 +595,10 @@ impl EvidenceType {
                     ))
                 })?;
                 if canonical.as_bytes() != bytes {
-                    return evidence_err(format!("{} canonical JSON noncanonical bytes", self.name()));
+                    return evidence_err(format!(
+                        "{} canonical JSON noncanonical bytes",
+                        self.name()
+                    ));
                 }
             }
         }
@@ -706,7 +712,9 @@ impl FctaEnvelope {
             return envelope_err("truncated issuer");
         }
         let issuer = std::str::from_utf8(&bytes[n..n + issuer_len])
-            .map_err(|_| envelope_err("issuer is not valid UTF-8"))?
+            .map_err(|_| {
+                TenantAuthorityProtocolError::Envelope("issuer is not valid UTF-8".into())
+            })?
             .to_string();
         normalized_https_origin(&issuer)?;
         n += issuer_len;
@@ -999,7 +1007,7 @@ impl FctoEnvelope {
         }
         let mut n = 5;
         let operation = bytes[n];
-        TenantAuthorityOperation::from_discriminant(operation)?;
+        let op = TenantAuthorityOperation::from_discriminant(operation)?;
         n += 1;
         if bytes.len() < n + 16 * 3 + 1 + 2 {
             return result_err("truncated header");
@@ -1223,7 +1231,13 @@ impl FcirReason {
         }
     }
     pub fn is_self_client_legal(self, kind: SubjectKind) -> bool {
-        matches!((kind, self), (SubjectKind::Client, Self::UserRequested | Self::KeyCompromised))
+        matches!(
+            (kind, self),
+            (
+                SubjectKind::Client,
+                Self::UserRequested | Self::KeyCompromised
+            )
+        )
     }
 }
 
@@ -1252,7 +1266,8 @@ impl FcirRevocationRequest {
     }
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         validate_identity_revocation_request(bytes)?;
-        let subject_kind = SubjectKind::try_from(bytes[5]).map_err(|e| evidence_err(e.0))?;
+        let subject_kind = SubjectKind::try_from(bytes[5])
+            .map_err(|e| TenantAuthorityProtocolError::Evidence(e.0))?;
         let subject_id = bytes[6..22].try_into().unwrap();
         let generation = u64::from_be_bytes(bytes[22..30].try_into().unwrap());
         let reason = FcirReason::from_discriminant(bytes[30])?;
@@ -1271,13 +1286,14 @@ fn validate_identity_revocation_request(bytes: &[u8]) -> Result<()> {
     if bytes.len() != FcirRevocationRequest::WIRE_SIZE {
         return evidence_err("FCIR must be exactly 39 bytes");
     }
-    if &bytes[..4] != FCIR {
+    if bytes[..4] != FCIR {
         return evidence_err("FCIR magic mismatch");
     }
     if bytes[4] != 1 {
         return evidence_err("FCIR version must be 1");
     }
-    let _kind = SubjectKind::try_from(bytes[5]).map_err(|e| evidence_err(e.0))?;
+    let _kind =
+        SubjectKind::try_from(bytes[5]).map_err(|e| TenantAuthorityProtocolError::Evidence(e.0))?;
     let id: [u8; 16] = bytes[6..22].try_into().unwrap();
     validate_nonzero_id(&id)?;
     FcirReason::from_discriminant(bytes[30])?;
@@ -1326,7 +1342,7 @@ fn validate_quota_request(bytes: &[u8]) -> Result<()> {
     if bytes.len() != FcqrQuotaRequest::WIRE_SIZE {
         return evidence_err("FCQR must be exactly 77 bytes");
     }
-    if &bytes[..4] != FCQR {
+    if bytes[..4] != FCQR {
         return evidence_err("FCQR magic mismatch");
     }
     if bytes[4] != 1 {
@@ -1352,14 +1368,18 @@ impl FcarAttemptRequest {
         validate_nonzero_id(&self.logical_attachment_id)?;
         validate_nonzero_id(&self.child_attempt_id)?;
         validate_nonzero_id(&self.daemon_instance_id)?;
-        validate_transport_bits(self.transport_bits).map_err(|e| evidence_err(e.to_string()))?;
+        validate_transport_bits(self.transport_bits)
+            .map_err(|e| TenantAuthorityProtocolError::Evidence(e.to_string()))?;
         let tuple_set = RemoteAuthorizedTupleSetV1 {
             tuple_ids: self.tuple_ids.clone(),
         };
-        let tuple_bytes = tuple_set.encode().map_err(|e| evidence_err(e.to_string()))?;
+        let tuple_bytes = tuple_set
+            .encode()
+            .map_err(|e| TenantAuthorityProtocolError::Evidence(e.to_string()))?;
         let ceiling = RemotePermissionCeilingV1::decode(&self.permission_ceiling)
-            .map_err(|e| evidence_err(e.to_string()))?;
-        let digest = permission_ceiling_digest(&ceiling).map_err(|e| evidence_err(e.to_string()))?;
+            .map_err(|e| TenantAuthorityProtocolError::Evidence(e.to_string()))?;
+        let digest = permission_ceiling_digest(&ceiling)
+            .map_err(|e| TenantAuthorityProtocolError::Evidence(e.to_string()))?;
         if digest.as_bytes() != &self.permission_ceiling_digest {
             return evidence_err("FCAR permission ceiling digest mismatch");
         }
@@ -1421,7 +1441,7 @@ impl FcarAttemptRequest {
 }
 
 fn validate_attempt_request(bytes: &[u8]) -> Result<()> {
-    if bytes.len() < 5 || &bytes[..4] != FCAR {
+    if bytes.len() < 5 || bytes[..4] != FCAR {
         return evidence_err("FCAR magic mismatch");
     }
     if bytes[4] != 1 {
@@ -1440,7 +1460,8 @@ fn validate_attempt_request(bytes: &[u8]) -> Result<()> {
         n += 16;
     }
     let transport_bits = bytes[n];
-    validate_transport_bits(transport_bits).map_err(|e| evidence_err(e.to_string()))?;
+    validate_transport_bits(transport_bits)
+        .map_err(|e| TenantAuthorityProtocolError::Evidence(e.to_string()))?;
     n += 1;
     if n >= bytes.len() {
         return evidence_err("FCAR truncated tuple count");
@@ -1478,8 +1499,9 @@ fn validate_attempt_request(bytes: &[u8]) -> Result<()> {
     }
     let permission_ceiling = &bytes[n..n + perm_len];
     let ceiling = RemotePermissionCeilingV1::decode(permission_ceiling)
-        .map_err(|e| evidence_err(e.to_string()))?;
-    let digest = permission_ceiling_digest(&ceiling).map_err(|e| evidence_err(e.to_string()))?;
+        .map_err(|e| TenantAuthorityProtocolError::Evidence(e.to_string()))?;
+    let digest = permission_ceiling_digest(&ceiling)
+        .map_err(|e| TenantAuthorityProtocolError::Evidence(e.to_string()))?;
     n += perm_len;
     let declared_digest: [u8; 32] = bytes[n..n + 32].try_into().unwrap();
     if digest.as_bytes() != &declared_digest {
@@ -1494,7 +1516,7 @@ fn validate_attempt_request(bytes: &[u8]) -> Result<()> {
 }
 
 fn validate_recovery_history(bytes: &[u8]) -> Result<()> {
-    if bytes.len() < 5 || &bytes[..4] != FCRH {
+    if bytes.len() < 5 || bytes[..4] != FCRH {
         return evidence_err("FCRH magic mismatch");
     }
     if bytes[4] != 1 {
@@ -1510,7 +1532,7 @@ fn validate_recovery_history(bytes: &[u8]) -> Result<()> {
 }
 
 fn validate_mtls_identity(bytes: &[u8]) -> Result<()> {
-    if bytes.len() < 5 || &bytes[..4] != FCMI {
+    if bytes.len() < 5 || bytes[..4] != FCMI {
         return evidence_err("FCMI magic mismatch");
     }
     if bytes[4] != 1 {
@@ -1557,7 +1579,7 @@ fn validate_mtls_identity(bytes: &[u8]) -> Result<()> {
 }
 
 fn validate_revocation_status(bytes: &[u8]) -> Result<()> {
-    if bytes.len() < 5 || &bytes[..4] != FCTV {
+    if bytes.len() < 5 || bytes[..4] != FCTV {
         return evidence_err("FCTV magic mismatch");
     }
     if bytes[4] != 1 {
@@ -1698,9 +1720,7 @@ pub fn approval_cardinality(
         }
         TenantAuthorityOperation::AttemptGrant
         | TenantAuthorityOperation::TenantAuthorityStatus
-        | TenantAuthorityOperation::TenantIdentityRevocationStatus => {
-            Ok(ApprovalCardinality::None)
-        }
+        | TenantAuthorityOperation::TenantIdentityRevocationStatus => Ok(ApprovalCardinality::None),
     }
 }
 
@@ -1769,7 +1789,7 @@ pub fn digest_hex(d: &[u8; 32]) -> String {
 
 // Wire-magic registry guard
 pub fn assert_tenant_authority_wire_magics(registry_json: &str) -> Result<()> {
-    let registry = parse_registry(registry_json).map_err(magic_err)?;
+    let registry = parse_registry(registry_json).map_err(TenantAuthorityProtocolError::Magic)?;
     assert_registered(
         &registry,
         &[
@@ -1779,7 +1799,7 @@ pub fn assert_tenant_authority_wire_magics(registry_json: &str) -> Result<()> {
             ("FCIR", "RemoteIdentityRevocationRequestV1"),
         ],
     )
-    .map_err(magic_err)?;
+    .map_err(TenantAuthorityProtocolError::Magic)?;
     assert_registered(
         &registry,
         &[
@@ -1787,7 +1807,7 @@ pub fn assert_tenant_authority_wire_magics(registry_json: &str) -> Result<()> {
             ("FCRS", "RemoteRelationshipConsentStatusV1"),
         ],
     )
-    .map_err(magic_err)?;
+    .map_err(TenantAuthorityProtocolError::Magic)?;
     Ok(())
 }
 
@@ -1809,8 +1829,12 @@ pub fn foundation_consumption_guard() {
     let _ = policy::TUPLE_SET_MIN;
     let _ = policy::PERMISSION_CEILING_MAX_BYTES;
     let _ = magic::parse_registry as fn(&str) -> _;
-    let _: fn(&RemotePermissionCeilingV1) -> policy::Result<RemotePermissionCeilingDigestV1> =
-        permission_ceiling_digest;
+    let _: fn(
+        &RemotePermissionCeilingV1,
+    ) -> std::result::Result<
+        RemotePermissionCeilingDigestV1,
+        policy::RemotePublicPolicyError,
+    > = permission_ceiling_digest;
 }
 
 // Closed-surface guard
@@ -1966,7 +1990,7 @@ mod tests {
 
     #[test]
     fn fcto_rejects_cross_protocol_magic() {
-        let mut bad = vec![b'F', b'C', b'T', b'R', 1];
+        let bad = vec![b'F', b'C', b'T', b'R', 1];
         assert!(matches!(
             FctoEnvelope::decode(&bad).unwrap_err(),
             TenantAuthorityProtocolError::Magic(_)
@@ -2043,7 +2067,8 @@ mod tests {
 
     #[test]
     fn fcir_rejects_wrong_length() {
-        let bad = vec![b'F', b'C', b'I', b'R', 1, 1, 0u8; 30];
+        let mut bad = vec![b'F', b'C', b'I', b'R', 1, 1];
+        bad.extend(std::iter::repeat_n(0u8, 30));
         assert!(FcirRevocationRequest::decode(&bad).is_err());
     }
 

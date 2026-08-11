@@ -54,6 +54,7 @@ struct JwsKindFixture {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 struct EnvelopeFixture {
     magic: String,
     version: u8,
@@ -83,9 +84,13 @@ struct StatementLifetimes {
 
 #[derive(Debug, Deserialize)]
 struct WireMagicsFixture {
+    #[serde(rename = "FCTA")]
     fcta: String,
+    #[serde(rename = "FCTO")]
     fcto: String,
+    #[serde(rename = "FCTV")]
     fctv: String,
+    #[serde(rename = "FCIR")]
     fcir: String,
 }
 
@@ -209,15 +214,24 @@ fn tenant_authority_protocol_cross_language_vectors() {
         assert_eq!(parsed.name(), rc.name);
     }
     assert_eq!(FctoReasonCode::None.discriminant(), 0);
-    let denial_reasons: Vec<_> = FctoReasonCode::ALL.iter().filter(|r| r.is_denial_reason()).collect();
+    let denial_reasons: Vec<_> = FctoReasonCode::ALL
+        .iter()
+        .filter(|r| r.is_denial_reason())
+        .collect();
     assert_eq!(denial_reasons.len(), 5);
-    let error_reasons: Vec<_> = FctoReasonCode::ALL.iter().filter(|r| r.is_error_reason()).collect();
+    let error_reasons: Vec<_> = FctoReasonCode::ALL
+        .iter()
+        .filter(|r| r.is_error_reason())
+        .collect();
     assert_eq!(error_reasons.len(), 13);
 
     // 5. JWS kinds and signing domains.
     assert_eq!(f.jws_kinds.len(), 5);
     for jk in &f.jws_kinds {
-        let domain = SigningDomain::ALL.iter().find(|d| d.name() == jk.name).unwrap();
+        let domain = SigningDomain::ALL
+            .iter()
+            .find(|d| d.name() == jk.name)
+            .unwrap();
         assert_eq!(domain.jws_typ(), Some(jk.typ.as_str()));
     }
     assert_eq!(f.signing_domains.len(), 6);
@@ -233,9 +247,18 @@ fn tenant_authority_protocol_cross_language_vectors() {
     assert_eq!(f.envelope.max_artifact_bytes, MAX_ARTIFACT_BYTES);
     assert_eq!(f.envelope.max_fctv_bytes, MAX_FCTV_RESULT_BYTES);
     assert_eq!(f.envelope.validity_seconds, FCTA_VALIDITY_SECONDS);
-    assert_eq!(f.envelope.future_issued_tolerance_seconds, FUTURE_ISSUED_TOLERANCE_SECONDS);
-    assert_eq!(f.envelope.network_deadline_seconds, NETWORK_DEADLINE_SECONDS);
-    assert_eq!(f.envelope.idempotency_retention_hours, IDEMPOTENCY_RETENTION_HOURS);
+    assert_eq!(
+        f.envelope.future_issued_tolerance_seconds,
+        FUTURE_ISSUED_TOLERANCE_SECONDS
+    );
+    assert_eq!(
+        f.envelope.network_deadline_seconds,
+        NETWORK_DEADLINE_SECONDS
+    );
+    assert_eq!(
+        f.envelope.idempotency_retention_hours,
+        IDEMPOTENCY_RETENTION_HOURS
+    );
 
     // 7. FCIR reasons.
     assert_eq!(f.fctir_reasons.len(), 5);
@@ -247,18 +270,39 @@ fn tenant_authority_protocol_cross_language_vectors() {
 
     // 8. Statement lifetimes.
     assert_eq!(f.statement_lifetimes.attempt, STATEMENT_LIFETIME_ATTEMPT);
-    assert_eq!(f.statement_lifetimes.activation, STATEMENT_LIFETIME_HIGH_ASSURANCE);
-    assert_eq!(f.statement_lifetimes.denial, STATEMENT_LIFETIME_DENIAL_STATUS);
-    assert_eq!(f.statement_lifetimes.status, STATEMENT_LIFETIME_DENIAL_STATUS);
-    assert_eq!(f.statement_lifetimes.verifier_cache_seconds, VERIFIER_CACHE_SECONDS);
-    assert_eq!(f.statement_lifetimes.verifier_skew_seconds, VERIFIER_SKEW_SECONDS);
-    assert_eq!(f.statement_lifetimes.retention_floor_seconds, RETENTION_FLOOR_SECONDS);
+    assert_eq!(
+        f.statement_lifetimes.activation,
+        STATEMENT_LIFETIME_HIGH_ASSURANCE
+    );
+    assert_eq!(
+        f.statement_lifetimes.denial,
+        STATEMENT_LIFETIME_DENIAL_STATUS
+    );
+    assert_eq!(
+        f.statement_lifetimes.status,
+        STATEMENT_LIFETIME_DENIAL_STATUS
+    );
+    assert_eq!(
+        f.statement_lifetimes.verifier_cache_seconds,
+        VERIFIER_CACHE_SECONDS
+    );
+    assert_eq!(
+        f.statement_lifetimes.verifier_skew_seconds,
+        VERIFIER_SKEW_SECONDS
+    );
+    assert_eq!(
+        f.statement_lifetimes.retention_floor_seconds,
+        RETENTION_FLOOR_SECONDS
+    );
 
     // 9. Wire-magic registry.
-    assert_eq!(f.wire_magics.fcta, "FCTA");
-    assert_eq!(f.wire_magics.fcto, "FCTO");
-    assert_eq!(f.wire_magics.fctv, "FCTV");
-    assert_eq!(f.wire_magics.fcir, "FCIR");
+    assert_eq!(f.wire_magics.fcta, "RemoteTenantAuthorityAuthorizationV1");
+    assert_eq!(f.wire_magics.fcto, "RemoteTenantAuthorityResultV1");
+    assert_eq!(
+        f.wire_magics.fctv,
+        "RemoteTenantAuthorityRevocationEvidenceV1"
+    );
+    assert_eq!(f.wire_magics.fcir, "RemoteIdentityRevocationRequestV1");
     let registry_json = include_str!(
         "../../../packages/cockpit-protocol/fixtures/remote-wire-magic-registry-v1.json"
     );
@@ -289,7 +333,10 @@ fn tenant_authority_protocol_cross_language_vectors() {
     assert_eq!(decoded, env);
     let mut bad = FCTR.to_vec();
     bad.push(1);
-    assert!(matches!(FctaEnvelope::decode(&bad).unwrap_err(), TenantAuthorityProtocolError::Magic(_)));
+    assert!(matches!(
+        FctaEnvelope::decode(&bad).unwrap_err(),
+        TenantAuthorityProtocolError::Magic(_)
+    ));
 
     let fcto = FctoEnvelope {
         operation: 9,
@@ -306,11 +353,26 @@ fn tenant_authority_protocol_cross_language_vectors() {
     assert_eq!(fcto_decoded, fcto);
 
     // 11. Approval cardinality matrix.
-    for op in [TenantAuthorityOperation::AttemptGrant, TenantAuthorityOperation::TenantAuthorityStatus, TenantAuthorityOperation::TenantIdentityRevocationStatus] {
-        assert_eq!(approval_cardinality(op, None).unwrap(), ApprovalCardinality::None);
+    for op in [
+        TenantAuthorityOperation::AttemptGrant,
+        TenantAuthorityOperation::TenantAuthorityStatus,
+        TenantAuthorityOperation::TenantIdentityRevocationStatus,
+    ] {
+        assert_eq!(
+            approval_cardinality(op, None).unwrap(),
+            ApprovalCardinality::None
+        );
     }
-    for op in [TenantAuthorityOperation::AuthorityActivation, TenantAuthorityOperation::AuthorityRotation, TenantAuthorityOperation::RecoveryExecution, TenantAuthorityOperation::CredentialRegistryRevision] {
-        assert_eq!(approval_cardinality(op, None).unwrap(), ApprovalCardinality::OwnerPlusSecurityAdmin);
+    for op in [
+        TenantAuthorityOperation::AuthorityActivation,
+        TenantAuthorityOperation::AuthorityRotation,
+        TenantAuthorityOperation::RecoveryExecution,
+        TenantAuthorityOperation::CredentialRegistryRevision,
+    ] {
+        assert_eq!(
+            approval_cardinality(op, None).unwrap(),
+            ApprovalCardinality::OwnerPlusSecurityAdmin
+        );
     }
 
     // 12. FCIR and FCQR round-trips.

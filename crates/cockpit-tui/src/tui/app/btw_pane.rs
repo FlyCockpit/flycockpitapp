@@ -471,6 +471,8 @@ impl BtwPane {
                 reasoning_offset: 0,
                 think_duration,
                 seq: p.seq,
+                performance: p.response_performance,
+                performance_expanded: false,
             });
         }
     }

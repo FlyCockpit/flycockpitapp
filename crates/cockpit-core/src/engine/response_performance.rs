@@ -80,7 +80,7 @@ impl std::fmt::Display for AssistantAttemptId {
 /// have the same result as unsplit text.
 ///
 /// No provider usage or model tokenizer participates.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ResponsePerformance {
     /// Time-to-first-token: milliseconds from attempt dispatch to the
     /// first non-whitespace presentation emission.

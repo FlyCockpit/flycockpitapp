@@ -300,7 +300,7 @@ export function assertTenantAuthorityWireMagics(registry: readonly RemoteWireMag
   ]);
   assertRegisteredProductionMagics(registry, [
     { magic: "FCTR", symbolicType: "RemoteTurnProviderResultV1" },
-    { magic: "FCRS", symbolicType: "RemoteRelationshipConsentStatusV1" },
+    { magic: "FCRS", symbolicType: "RemoteIpConsentStatusV1" },
   ]);
 }
 

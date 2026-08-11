@@ -1804,7 +1804,7 @@ pub fn assert_tenant_authority_wire_magics(registry_json: &str) -> Result<()> {
         &registry,
         &[
             ("FCTR", "RemoteTurnProviderResultV1"),
-            ("FCRS", "RemoteRelationshipConsentStatusV1"),
+            ("FCRS", "RemoteIpConsentStatusV1"),
         ],
     )
     .map_err(TenantAuthorityProtocolError::Magic)?;

@@ -61,6 +61,7 @@ pub mod pins;
 pub mod principals;
 pub mod project_notes;
 pub mod protected_redaction_history;
+pub mod protected_leak_records;
 pub mod prune_ledger;
 pub mod remote_attachment_operations;
 pub mod remote_audit_upload;

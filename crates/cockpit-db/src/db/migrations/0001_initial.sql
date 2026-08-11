@@ -3531,6 +3531,58 @@ CREATE INDEX idx_protected_redaction_artifact_refs_history
 CREATE INDEX idx_protected_redaction_artifact_refs_artifact
     ON protected_redaction_artifact_refs (artifact_kind, artifact_id);
 
+-- Protected leak containment records. One row per accepted `report_leak`
+-- call. Carries NO plaintext, prefix, length-derived identity, ciphertext,
+-- nonce, or key version: the encrypted literal lives in
+-- `protected_redaction_history` (source = 'ContainedLeak') and is referenced
+-- by `history_id`. This table holds only safe metadata: report id, keyed
+-- fingerprint, host-derived provenance, closed source, closed category,
+-- optional canonical connector id, status, timestamps, and rotation
+-- disposition. A `pending` row is not listable by generic audit/list/export;
+-- only `contained`/`rotated`/`superseded` rows are. Deduplication is on
+-- (session_id, leak_fingerprint): a re-report of the same literal updates
+-- safe `seen` metadata and clears rotation state.
+CREATE TABLE protected_leak_records (
+    report_id        TEXT    PRIMARY KEY,
+    session_id       TEXT    NOT NULL,
+    history_id       TEXT    NOT NULL,
+    -- Keyed fingerprint: SHA-256(session_id || source || literal_fingerprint).
+    -- Safe to expose; does not reveal the literal.
+    leak_fingerprint TEXT    NOT NULL,
+    -- Closed source set: model_output | tool_output | reasoning | env_leak |
+    -- credential_leak | other.
+    source           TEXT    NOT NULL CHECK (source IN
+        ('model_output', 'tool_output', 'reasoning', 'env_leak', 'credential_leak', 'other')),
+    -- Closed category: secret | token | key | password | pii | other.
+    category         TEXT    NOT NULL CHECK (category IN
+        ('secret', 'token', 'key', 'password', 'pii', 'other')),
+    -- Host-derived provenance: provider id, model id, generation. Never
+    -- model-supplied; the host stamps these from the active route.
+    provider_id      TEXT,
+    model_id         TEXT,
+    generation       INTEGER,
+    -- Optional canonical connector id, host-derived.
+    connector_id     TEXT,
+    -- Closed status: pending | contained | rotated | superseded | deleted.
+    status           TEXT    NOT NULL CHECK (status IN
+        ('pending', 'contained', 'rotated', 'superseded', 'deleted')),
+    -- Number of times this fingerprint was reported in this session.
+    seen_count       INTEGER NOT NULL CHECK (seen_count >= 1) DEFAULT 1,
+    -- Rotation disposition: none | pending_user | rotated | not_applicable.
+    rotation         TEXT    NOT NULL CHECK (rotation IN
+        ('none', 'pending_user', 'rotated', 'not_applicable')) DEFAULT 'none',
+    first_reported_ms INTEGER NOT NULL,
+    last_reported_ms  INTEGER NOT NULL,
+    contained_at_ms   INTEGER,
+    retired_at_ms     INTEGER,
+    FOREIGN KEY (history_id) REFERENCES protected_redaction_history(history_id) ON DELETE CASCADE,
+    UNIQUE (session_id, leak_fingerprint)
+);
+CREATE INDEX idx_protected_leak_records_session
+    ON protected_leak_records (session_id, status, last_reported_ms);
+CREATE INDEX idx_protected_leak_records_history
+    ON protected_leak_records (history_id);
+
 -- Explicit, versioned image-generation monetary policy. JSON is validated by
 -- the typed boundary before insertion; old versions remain referenced by the
 -- immutable ledger and are never rewritten by a settings change.

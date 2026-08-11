@@ -48,6 +48,7 @@ pub mod init;
 pub mod intel;
 pub mod jitter;
 pub mod knowledge;
+pub mod leak_report;
 pub mod locks;
 pub mod mcp;
 mod media_https;

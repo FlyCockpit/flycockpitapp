@@ -38,7 +38,6 @@ use crate::remote_public_service_policy::{
     SharedSessionRoute, TenantAuthorization, canonical_json_value,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------
@@ -180,10 +179,8 @@ pub fn validate_approval_cardinality(
             }
             // Exactly one OWNER and one SECURITY_ADMIN.
             let roles: Vec<_> = approvals.iter().map(|a| a.role).collect();
-            let has_owner = roles.iter().any(|r| *r == EnterpriseAdminRole::Owner);
-            let has_sec = roles
-                .iter()
-                .any(|r| *r == EnterpriseAdminRole::SecurityAdmin);
+            let has_owner = roles.contains(&EnterpriseAdminRole::Owner);
+            let has_sec = roles.contains(&EnterpriseAdminRole::SecurityAdmin);
             if !has_owner || !has_sec {
                 return auth_denied("weakening requires exactly one OWNER plus one SECURITY_ADMIN");
             }
@@ -966,6 +963,7 @@ pub fn foundation_consumption_guard() {
 mod tests {
     use super::*;
     use crate::remote_public_service_policy::initial_service_version_1_policy;
+    use serde_json::Value;
 
     fn sample_tenant_id() -> TenantAlias {
         let bytes = [

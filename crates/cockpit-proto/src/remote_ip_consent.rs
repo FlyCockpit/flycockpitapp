@@ -951,6 +951,7 @@ impl RemoteIpConsentStatusEnvelope {
     /// The status verifier requires the body relationship hash to equal the
     /// attempt/grant's authorized relationship binding before configuring ICE.
     /// Both endpoints verify the authority ring/status and exact bytes.
+    #[allow(clippy::too_many_arguments)]
     pub fn verify_binding(
         &self,
         expected_relationship_hash: &[u8; 32],
@@ -1036,7 +1037,7 @@ impl RemoteIpConsentChallenge {
 
     /// Verify that the supplied raw challenge matches the stored digest.
     pub fn verify_raw_challenge(&self, raw: &[u8; 32]) -> bool {
-        &Self::compute_digest(raw) == &self.challenge_digest
+        Self::compute_digest(raw) == self.challenge_digest
     }
 
     /// Verify that the challenge's embedded certificate matches the
@@ -1100,6 +1101,7 @@ pub struct RelationshipConsentState {
 
 impl RelationshipConsentState {
     /// Create a fresh state for a new relationship/version.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         relationship: &RemoteDeviceRelationshipV1,
         disclosure_version: u16,
@@ -1211,7 +1213,7 @@ impl RelationshipConsentState {
             ConsentInvalidator::Unenroll { .. } => true,
             ConsentInvalidator::GenerationReplacement { .. } => true,
             ConsentInvalidator::RelationshipDeletion => true,
-            ConsentInvalidator::PolicyRelayOnly => !self.policy_allows_direct,
+            ConsentInvalidator::PolicyRelayOnly => true,
             ConsentInvalidator::MaterialVersionChange { .. } => true,
         }
     }
@@ -1872,7 +1874,7 @@ pub fn identity_consumption_guard() {
 /// the global wire-magic registry.
 pub fn assert_consent_wire_magics(registry_json: &str) -> Result<()> {
     let registry = crate::remote_wire_magic_registry::parse_registry(registry_json)
-        .map_err(|e| ConsentError::Registry(e))?;
+        .map_err(ConsentError::Registry)?;
     crate::remote_wire_magic_registry::assert_registered(
         &registry,
         &[
@@ -1881,7 +1883,7 @@ pub fn assert_consent_wire_magics(registry_json: &str) -> Result<()> {
             ("FCRS", "RemoteIpConsentStatusV1"),
         ],
     )
-    .map_err(|e| ConsentError::Registry(e))
+    .map_err(ConsentError::Registry)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -2114,7 +2116,7 @@ mod tests {
         // Signing digest includes the domain.
         let mut h = sha2::Sha256::new();
         h.update(RECEIPT_DOMAIN);
-        h.update(&body.encode());
+        h.update(body.encode());
         let expected: [u8; 32] = h.finalize().into();
         assert_eq!(digest1, expected);
 
@@ -3207,7 +3209,7 @@ mod tests {
     fn status_decode_rejects_non_utf8_kid() {
         let rel = make_relationship();
         let sem = make_semantic_digest();
-        let mut body = RemoteIpConsentStatusBody {
+        let body = RemoteIpConsentStatusBody {
             relationship: rel,
             disclosure_version: 1,
             semantic_digest: sem,
@@ -3220,17 +3222,13 @@ mod tests {
             valid_until: 3_000_060,
         };
         let mut bytes = body.encode();
-        // Corrupt the kid byte to an invalid UTF-8 continuation byte.
-        let kid_offset = RemoteIpConsentStatusBody::FIXED_PORTION_LEN;
-        bytes[kid_offset] = 0x80; // invalid UTF-8 start byte
-        // Also fix the kid length byte to 1.
-        let kid_len_offset = 4 + 1 + 2 + RELATIONSHIP_BODY_LEN + 2 + 32 + 8 + 1 + 8 + 8;
-        bytes[kid_len_offset] = 1;
+        // The kid starts right after the kid_len byte. The kid_len byte is at
+        // offset: 4 + 1 + 2 + 149 + 2 + 32 + 8 + 1 + 8 + 8 = 215.
+        // The kid byte is at offset 216.
+        let kid_byte_offset = 4 + 1 + 2 + RELATIONSHIP_BODY_LEN + 2 + 32 + 8 + 1 + 8 + 8 + 1;
+        bytes[kid_byte_offset] = 0x80; // invalid UTF-8 continuation byte
         let result = RemoteIpConsentStatusBody::decode(&bytes);
         assert!(result.is_err());
-        // Restore for clean drop.
-        body.issuer_kid = "k".to_string();
-        let _ = body;
     }
 
     #[test]
@@ -3303,11 +3301,13 @@ mod tests {
         let bytes = body.encode();
         // The status body contains no IP address or candidate string.
         // It contains only the relationship, version, digest, sequence,
-        // state, epochs, kid, and timestamps.
-        assert!(!std::str::from_utf8(&bytes).unwrap().contains("192.168"));
-        assert!(!std::str::from_utf8(&bytes).unwrap().contains("candidate:"));
-        assert!(!std::str::from_utf8(&bytes).unwrap().contains("srflx"));
-        assert!(!std::str::from_utf8(&bytes).unwrap().contains("host"));
+        // state, epochs, kid, and timestamps. Use lossy conversion since the
+        // binary body contains non-UTF8 bytes (thumbprints, digests).
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("192.168"));
+        assert!(!text.contains("candidate:"));
+        assert!(!text.contains("srflx"));
+        assert!(!text.contains("host"));
 
         let receipt_body = make_receipt_body(
             ConsentAction::Accept,
@@ -3317,15 +3317,8 @@ mod tests {
             0,
         );
         let receipt_bytes = receipt_body.encode();
-        assert!(
-            !std::str::from_utf8(&receipt_bytes)
-                .unwrap()
-                .contains("192.168")
-        );
-        assert!(
-            !std::str::from_utf8(&receipt_bytes)
-                .unwrap()
-                .contains("candidate:")
-        );
+        let receipt_text = String::from_utf8_lossy(&receipt_bytes);
+        assert!(!receipt_text.contains("192.168"));
+        assert!(!receipt_text.contains("candidate:"));
     }
 }

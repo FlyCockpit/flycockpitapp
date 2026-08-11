@@ -525,10 +525,13 @@ pub fn list_listable_refs_conn(
          ORDER BY first_reported_ms ASC, report_id ASC",
     )?;
     let rows = stmt.query_map([session_id], map_leak_row)?;
-    let records: Vec<ProtectedLeakRecord> =
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .context("listing listable protected leak records")?;
-    Ok(records.iter().map(ProtectedLeakRecordRef::from_row).collect())
+    let records: Vec<ProtectedLeakRecord> = rows
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("listing listable protected leak records")?;
+    Ok(records
+        .iter()
+        .map(ProtectedLeakRecordRef::from_row)
+        .collect())
 }
 
 /// Count leak records for a session accepted since `since_ms`. Used for the

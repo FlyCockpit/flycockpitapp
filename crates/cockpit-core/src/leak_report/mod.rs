@@ -84,8 +84,8 @@ use crate::db::protected_redaction_history::{
 };
 use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input};
 use crate::redact::protected_redaction_history::{
-    ProtectedLiteral, ProtectedRedactionHistory, RedactionKeyResolver, RedactionHistorySource,
-    MAX_LITERAL_LEN,
+    MAX_LITERAL_LEN, ProtectedLiteral, ProtectedRedactionHistory, RedactionHistorySource,
+    RedactionKeyResolver,
 };
 
 /// The model-facing name of the leak report containment tool.
@@ -125,10 +125,7 @@ pub enum ProtectedSensitiveIngress {
     },
     /// Owner-initiated recovery: accepts no literal input and returns only an
     /// ephemeral local reveal frame. Owned by `sealed-value-owner-management`.
-    OwnerRecover {
-        record_id: String,
-        version: i64,
-    },
+    OwnerRecover { record_id: String, version: i64 },
     /// Host-issued trusted-child capture: transfers executor output in-process
     /// only into `set_sealed_value`. Owned by the trusted-child acquisition
     /// coordinator prompt.
@@ -142,9 +139,7 @@ pub enum ProtectedSensitiveIngress {
     },
     /// Untrusted model self-report of an accidentally-received secret.
     /// Owned by this module.
-    ReportLeak {
-        source: LeakSource,
-    },
+    ReportLeak { source: LeakSource },
 }
 
 /// Closed disposition for `OwnerWrite`.
@@ -205,10 +200,7 @@ pub enum LeakReportOutcome {
     /// The report was deduplicated against an existing containment record for
     /// the same keyed fingerprint. `seen_count` was incremented and rotation
     /// cleared. The model still receives `contained`.
-    Deduplicated {
-        report_id: String,
-        seen_count: i64,
-    },
+    Deduplicated { report_id: String, seen_count: i64 },
     /// The session has exceeded the 32-reports/hour rate limit. The model
     /// receives only `rate_limited`.
     RateLimited,
@@ -388,12 +380,7 @@ impl<'a> LeakReportHandler<'a> {
                 };
 
                 // Transition the new record from pending to contained.
-                transition_leak_status_conn(
-                    conn,
-                    &report_id,
-                    LeakRecordStatus::Contained,
-                    now_ms,
-                )?;
+                transition_leak_status_conn(conn, &report_id, LeakRecordStatus::Contained, now_ms)?;
                 Ok(LeakReportOutcome::Contained { report_id })
             })
             .await;
@@ -494,8 +481,8 @@ impl Tool for ReportLeakTool {
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         // Parse the closed argument schema. This is the sole consumer of the
         // literal; generic dispatch never sees the secret argument.
-        let request = parse_report_leak_args(&args)
-            .map_err(|error| invalid_input(error.to_string()))?;
+        let request =
+            parse_report_leak_args(&args).map_err(|error| invalid_input(error.to_string()))?;
 
         // The secret is consumed into a Zeroizing frame immediately.
         let secret = Zeroizing::new(request.secret);
@@ -521,7 +508,9 @@ impl Tool for ReportLeakTool {
             // Production: use a default key resolver. In practice the daemon
             // injects the native secure key store resolver; for the tool's
             // default path we fail closed if no resolver is available.
-            return Ok(ToolOutput::text(LeakReportOutcome::Failed.to_model_string()));
+            return Ok(ToolOutput::text(
+                LeakReportOutcome::Failed.to_model_string(),
+            ));
         };
 
         let handler =
@@ -639,7 +628,11 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 
 /// Keyed leak fingerprint: SHA-256(session_id || source || literal_fingerprint).
 /// Safe to expose; does not reveal the literal. Used for deduplication.
-pub fn keyed_leak_fingerprint(session_id: &str, source: LeakSource, literal_fingerprint: &str) -> String {
+pub fn keyed_leak_fingerprint(
+    session_id: &str,
+    source: LeakSource,
+    literal_fingerprint: &str,
+) -> String {
     let mut h = Sha256::new();
     h.update(session_id.as_bytes());
     h.update(source.as_str().as_bytes());

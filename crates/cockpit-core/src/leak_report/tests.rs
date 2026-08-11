@@ -26,13 +26,13 @@
 use super::*;
 use crate::db::Db;
 use crate::db::protected_leak_records::{
-    InsertLeakRecordInput, InsertLeakResult, LeakCategory, LeakRecordStatus, LeakSource,
-    LeakRotation, insert_leak_record_conn, transition_leak_status_conn,
+    InsertLeakRecordInput, InsertLeakResult, LeakCategory, LeakRecordStatus, LeakRotation,
+    LeakSource, insert_leak_record_conn, transition_leak_status_conn,
 };
 use crate::db::protected_redaction_history::ProtectedRedactionSource;
 use crate::redact::protected_redaction_history::{
-    MapKeyResolver, ProtectedLiteral, ProtectedRedactionHistory, RedactionHistorySource,
-    REDACTION_KEY_LEN,
+    MapKeyResolver, ProtectedLiteral, ProtectedRedactionHistory, REDACTION_KEY_LEN,
+    RedactionHistorySource,
 };
 
 /// A fixed test key (32 bytes) for key version 1.
@@ -399,7 +399,8 @@ async fn leak_protected_storage_is_encryption_only() {
     let row = &history[0];
     assert_eq!(row.source, ProtectedRedactionSource::ContainedLeak);
     assert_ne!(
-        row.ciphertext, secret_literal.as_bytes(),
+        row.ciphertext,
+        secret_literal.as_bytes(),
         "ciphertext must not be the plaintext bytes"
     );
     let row_debug = format!("{row:?}");
@@ -425,8 +426,11 @@ async fn leak_report_stamps_host_derived_provenance() {
         generation: Some(99),
         connector_id: Some("gh".to_owned()),
     };
-    let authority =
-        ReportLeakAuthority::new(LeakSource::ToolOutput, prov.clone(), session_id().to_owned());
+    let authority = ReportLeakAuthority::new(
+        LeakSource::ToolOutput,
+        prov.clone(),
+        session_id().to_owned(),
+    );
     handler
         .report(
             &authority,
@@ -463,7 +467,11 @@ fn keyed_leak_fingerprint_is_deterministic_and_distinct() {
     assert_ne!(fp_a, fp_c);
 
     // Different session → different keyed fingerprint.
-    let fp_d = keyed_leak_fingerprint("dddddddd-dddd-dddd-dddd-444444444444", LeakSource::ModelOutput, "abc123");
+    let fp_d = keyed_leak_fingerprint(
+        "dddddddd-dddd-dddd-dddd-444444444444",
+        LeakSource::ModelOutput,
+        "abc123",
+    );
     assert_ne!(fp_a, fp_d);
 }
 
@@ -683,20 +691,23 @@ async fn leak_report_literal_never_in_model_output() {
     let handler = LeakReportHandler::new(&db, &resolver, 1_000_000);
 
     let test_cases = [
-        ("AKIAIOSFODNN7EXAMPLE", LeakSource::ModelOutput, LeakCategory::Token),
-        ("ghp_abcdefghijklmnopqrstuvwxyz0123456789", LeakSource::ToolOutput, LeakCategory::Token),
+        (
+            "AKIAIOSFODNN7EXAMPLE",
+            LeakSource::ModelOutput,
+            LeakCategory::Token,
+        ),
+        (
+            "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+            LeakSource::ToolOutput,
+            LeakCategory::Token,
+        ),
         ("password123", LeakSource::Reasoning, LeakCategory::Password),
     ];
 
     for (secret, source, category) in test_cases {
-        let authority =
-            ReportLeakAuthority::new(source, provenance(), session_id().to_owned());
+        let authority = ReportLeakAuthority::new(source, provenance(), session_id().to_owned());
         let outcome = handler
-            .report(
-                &authority,
-                Zeroizing::new(secret.to_owned()),
-                category,
-            )
+            .report(&authority, Zeroizing::new(secret.to_owned()), category)
             .await
             .unwrap();
         let model_str = outcome.to_model_string();

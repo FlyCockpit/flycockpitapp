@@ -230,6 +230,29 @@ pub enum AuthorizationRequest<'a> {
         previous: &'a [u8],
         next: &'a [u8],
     },
+    /// Every canonical computer-use action goes through this exhaustive
+    /// central variant. It carries only engine-owned session/delegation/action
+    /// IDs, tier, host lease token, target/focus/observation generations, and
+    /// safe metadata. No pixel bytes, raw titles, or provider request payloads
+    /// are carried. Ask pauses on this seam; Yolo emits no human request and
+    /// imposes no semantic action/target denial.
+    ComputerAction {
+        session_id: &'a str,
+        delegation_id: &'a str,
+        action_id: &'a str,
+        /// "ask" or "yolo".
+        tier: &'a str,
+        /// Short safe action label (e.g. "openai_call:3").
+        action_label: &'a str,
+        /// Backend kind diagnostic label.
+        backend_kind: &'a str,
+        /// Focus generation from planning evidence.
+        focus_generation: u64,
+        /// Observation/display generation from the opened backend.
+        observation_generation: u64,
+        /// True if a host lease token is held (physical target).
+        has_host_lease: bool,
+    },
 }
 
 pub struct Approver {
@@ -268,6 +291,21 @@ impl Approver {
                 previous,
                 next,
             } => self.approve_file_write(path, previous, next).await,
+            AuthorizationRequest::ComputerAction {
+                action_id,
+                tier,
+                action_label,
+                ..
+            } => {
+                // The computer-use action coordinator resolves tier before
+                // reaching this seam. "ask" pauses for a human response;
+                // "yolo" emits no human request and imposes no semantic
+                // action/target denial. The central authorizer returns a
+                // Decision that the coordinator translates into its own
+                // CoordinatedOutcome.
+                self.approve_computer_action_inner(action_id, tier, action_label)
+                    .await
+            }
         }
     }
 }

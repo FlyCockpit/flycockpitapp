@@ -11,6 +11,7 @@
 
 #![allow(dead_code)]
 
+pub mod coordinator;
 pub mod frame;
 pub mod host_identity;
 pub mod platform;

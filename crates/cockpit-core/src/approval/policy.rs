@@ -593,6 +593,66 @@ impl Approver {
         .await;
         Ok(decision)
     }
+
+    /// Central authorization for every canonical computer-use action.
+    ///
+    /// The coordinator resolves tier before reaching this seam. "ask" pauses
+    /// for a human response (raised as an interrupt); "yolo" emits no human
+    /// request and imposes no semantic action/target denial — only capability
+    /// boundaries, stale evidence, missing grants, and unsupported backends
+    /// reject, which are checked by the coordinator before this point.
+    ///
+    /// This is a once-only, non-persistable per-action approval. Each
+    /// provider call ID maps to one engine action/batch identity; there is
+    /// no standing grant or reject for computer actions (the later lease
+    /// prompt defines one-decision reuse).
+    pub(super) async fn approve_computer_action_inner(
+        &self,
+        action_id: &str,
+        tier: &str,
+        action_label: &str,
+    ) -> Result<Decision> {
+        // Yolo tier: zero human requests, no semantic denial.
+        if tier == "yolo" || self.yolo_mode() {
+            return Ok(Decision::Allow { scope: Scope::Once });
+        }
+
+        // Ask tier: raise a human prompt. The action is blocked until the
+        // user responds. Noninteractive clients get a noninteractive deny.
+        let prompt = format!("Allow computer action `{action_label}` (id: {action_id})?");
+        let question = InterruptQuestion::Single {
+            prompt,
+            options: vec![opt(ApprovalOptionId::ApproveOnce, "Yes, allow")],
+            allow_freetext: false,
+            command_detail: None,
+            permission: true,
+            approval_class: None,
+            sandbox_escalation: None,
+        };
+        let description = format!("Computer action `{action_label}` (id: {action_id})");
+        let set =
+            ApprovalOptionSet::new("computer_action_approval", [ApprovalOptionId::ApproveOnce]);
+        let decision = self
+            .raise_and_decode(&description, question, |response| {
+                let Some(id) = decode_option_response(response, &set)? else {
+                    return Ok(Decision::Deny);
+                };
+                match id {
+                    ApprovalOptionId::ApproveOnce => Ok(Decision::Allow { scope: Scope::Once }),
+                    _ => Err(ForeignOptionId::new(&set, id.as_str())),
+                }
+            })
+            .await?;
+        self.record_permission_decision(
+            "computer_action",
+            action_id,
+            &[Scope::Once],
+            decision,
+            DecisionSource::UserPrompt,
+        )
+        .await;
+        Ok(decision)
+    }
 }
 
 fn mcp_server_connect_prompt(server: &str, identity: &str) -> String {

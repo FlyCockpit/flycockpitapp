@@ -21,10 +21,10 @@
 import { CustodyClass, PresenceMode, type SubjectKindV1 } from "@flycockpit/cockpit-protocol";
 
 /** The custody class this provider reports: origin-bound only. */
-export const REMOTE_BROWSER_IDENTITY_CUSTODY_CLASS = CustodyClass.origin_protected as const;
+export const REMOTE_BROWSER_IDENTITY_CUSTODY_CLASS = CustodyClass.origin_protected;
 
 /** The presence mode this provider reports. */
-export const REMOTE_BROWSER_IDENTITY_PRESENCE_MODE = PresenceMode.unattended as const;
+export const REMOTE_BROWSER_IDENTITY_PRESENCE_MODE = PresenceMode.unattended;
 
 /** IndexedDB database name (origin-scoped). */
 export const REMOTE_BROWSER_IDENTITY_DB_NAME = "flycockpit-remote-identity" as const;
@@ -147,7 +147,8 @@ function openIdentityDb(): Promise<IDBDatabase> {
 
 /** Compute the SHA-256 of the provider evidence bytes (hex string). */
 async function sha256Hex(bytes: Uint8Array): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  const copy = new Uint8Array(bytes);
+  const digest = await crypto.subtle.digest("SHA-256", copy.buffer);
   return Array.from(new Uint8Array(digest))
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
@@ -399,10 +400,11 @@ export class RemoteBrowserIdentityCustodyProvider {
    */
   async signPossessionProof(digest: Uint8Array): Promise<Uint8Array> {
     const record = this.current ?? (await this.reopen());
+    const copy = new Uint8Array(digest);
     const signature = await crypto.subtle.sign(
       { name: "ECDSA", hash: "SHA-256" },
       record.keyHandle,
-      digest,
+      copy.buffer,
     );
     return new Uint8Array(signature);
   }

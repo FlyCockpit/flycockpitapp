@@ -41,6 +41,19 @@ impl TiktokenEncoding {
         }
     }
 
+    /// Parse an encoding from its canonical string name (the inverse of
+    /// [`as_str`](Self::as_str)). Returns `None` for an unknown name.
+    pub fn from_str_name(name: &str) -> Option<Self> {
+        match name {
+            "r50k_base" => Some(Self::R50k),
+            "p50k_base" => Some(Self::P50k),
+            "p50k_edit" => Some(Self::P50kEdit),
+            "cl100k_base" => Some(Self::Cl100k),
+            "o200k_base" => Some(Self::O200k),
+            _ => None,
+        }
+    }
+
     pub fn count(self, text: &str) -> usize {
         if text.is_empty() {
             return 0;

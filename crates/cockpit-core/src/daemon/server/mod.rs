@@ -660,10 +660,15 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             session_id: _,
             agent: _,
             text,
+            presentation_text,
             reasoning,
             seq: _,
+            response_performance: _,
         } => {
             scrub_string(text, redact);
+            if let Some(presentation) = presentation_text {
+                scrub_string(presentation, redact);
+            }
             scrub_string(reasoning, redact);
         }
         proto::Event::UserMessageRecorded {
@@ -1027,11 +1032,16 @@ fn scrub_history_entry_free_text(entry: &mut proto::HistoryEntry, redact: &Redac
         proto::HistoryEntry::Assistant {
             agent: _,
             text,
+            presentation_text,
             reasoning,
+            response_performance: _,
             ts_ms: _,
             seq: _,
         } => {
             scrub_string(text, redact);
+            if let Some(presentation) = presentation_text {
+                scrub_string(presentation, redact);
+            }
             scrub_string(reasoning, redact);
         }
         proto::HistoryEntry::ToolCall {

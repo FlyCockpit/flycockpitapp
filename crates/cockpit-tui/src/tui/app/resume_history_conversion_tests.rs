@@ -162,9 +162,11 @@ fn converts_user_assistant_tool_call_to_tui_entries() {
         Wire::Assistant {
             agent: "Build".into(),
             text: "let me read it".into(),
+            presentation_text: None,
             reasoning: "thinking".into(),
             ts_ms: 1_700_000_001_000,
             seq: 2,
+            response_performance: None,
         },
         Wire::ToolCall {
             seq: 3,
@@ -377,9 +379,11 @@ fn active_subagent_snapshot_converts_to_running_row() {
         Wire::Assistant {
             agent: "builder".into(),
             text: "working".into(),
+            presentation_text: None,
             reasoning: String::new(),
             ts_ms: 1_700_000_001_000,
             seq: 2,
+            response_performance: None,
         },
     ]);
 

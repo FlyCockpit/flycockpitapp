@@ -83,15 +83,26 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
         TurnEvent::AssistantText {
             agent,
             text,
+            presentation_text,
             reasoning,
             seq,
+            response_performance,
         } => {
             vec![Event::AssistantText {
                 session_id,
                 agent,
                 text,
+                presentation_text,
                 reasoning,
                 seq,
+                response_performance: response_performance.map(|p| {
+                    crate::daemon::proto::ResponsePerformance {
+                        ttft_ms: p.ttft_ms,
+                        generation_ms: p.generation_ms,
+                        displayed_tokens: p.displayed_tokens,
+                        encoding: p.encoding.as_str().to_string(),
+                    }
+                }),
             }]
         }
         TurnEvent::UserMessageRecorded {

@@ -1540,6 +1540,12 @@ pub(crate) async fn run_turn(
         // us avoid). The `{ kind, stage }` shape still follows the GOALS §14
         // wire-vs-user recovery naming convention.
         let mut event_data = serde_json::json!({ "text": text, "reasoning": reasoning });
+        // Persist `presentation_text` when it differs from `text` (translation
+        // success). Silent fallback (identical) persists only `text`. Legacy
+        // rows without `presentation_text` display `text`.
+        if shown != text {
+            event_data["presentation_text"] = serde_json::json!(shown);
+        }
         if reasoning_rescue {
             event_data["recovery"] = serde_json::json!({
                 "kind": "reasoning_channel_rescue",
@@ -1582,9 +1588,11 @@ pub(crate) async fn run_turn(
         let _ = tx
             .send(TurnEvent::AssistantText {
                 agent: agent.name.clone(),
-                text: shown,
+                text: shown.clone(),
+                presentation_text: if shown != text { Some(shown) } else { None },
                 reasoning: reasoning.clone(),
                 seq,
+                response_performance: None,
             })
             .await;
     }

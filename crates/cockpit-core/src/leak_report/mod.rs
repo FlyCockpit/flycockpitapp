@@ -67,7 +67,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -84,8 +84,7 @@ use crate::db::protected_redaction_history::{
 };
 use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input};
 use crate::redact::protected_redaction_history::{
-    MAX_LITERAL_LEN, ProtectedLiteral, ProtectedRedactionHistory, RedactionHistorySource,
-    RedactionKeyResolver,
+    MAX_LITERAL_LEN, ProtectedLiteral, RedactionHistorySource, RedactionKeyResolver,
 };
 
 /// The model-facing name of the leak report containment tool.

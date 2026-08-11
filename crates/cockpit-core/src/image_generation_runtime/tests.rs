@@ -204,6 +204,7 @@ fn endpoint() -> ImageEndpoint {
         location: ImageLocationClass::PublicCloud,
         enabled: true,
         route_profile_version: 1,
+        exclusive_server: false,
     }
 }
 fn credential_digest(seed: u8) -> CredentialIdentityDigest {

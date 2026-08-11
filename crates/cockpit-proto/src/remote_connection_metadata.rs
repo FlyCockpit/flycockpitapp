@@ -451,7 +451,10 @@ mod tests {
         assert_eq!(DurationBucket::from_seconds(120), DurationBucket::Min2Lt10m);
         assert_eq!(DurationBucket::from_seconds(599), DurationBucket::Min2Lt10m);
         assert_eq!(DurationBucket::from_seconds(600), DurationBucket::Min10Lt1h);
-        assert_eq!(DurationBucket::from_seconds(3599), DurationBucket::Min10Lt1h);
+        assert_eq!(
+            DurationBucket::from_seconds(3599),
+            DurationBucket::Min10Lt1h
+        );
         assert_eq!(DurationBucket::from_seconds(3600), DurationBucket::Gte1h);
         assert_eq!(DurationBucket::from_seconds(99999), DurationBucket::Gte1h);
     }
@@ -465,10 +468,22 @@ mod tests {
         assert_eq!(BytesBucket::from_bytes(1048575), BytesBucket::Kib64Lt1Mib);
         assert_eq!(BytesBucket::from_bytes(1048576), BytesBucket::Mib1Lt16Mib);
         assert_eq!(BytesBucket::from_bytes(16777215), BytesBucket::Mib1Lt16Mib);
-        assert_eq!(BytesBucket::from_bytes(16777216), BytesBucket::Mib16Lt256Mib);
-        assert_eq!(BytesBucket::from_bytes(268435455), BytesBucket::Mib16Lt256Mib);
-        assert_eq!(BytesBucket::from_bytes(268435456), BytesBucket::Kib256Lt1Gib);
-        assert_eq!(BytesBucket::from_bytes(1073741823), BytesBucket::Kib256Lt1Gib);
+        assert_eq!(
+            BytesBucket::from_bytes(16777216),
+            BytesBucket::Mib16Lt256Mib
+        );
+        assert_eq!(
+            BytesBucket::from_bytes(268435455),
+            BytesBucket::Mib16Lt256Mib
+        );
+        assert_eq!(
+            BytesBucket::from_bytes(268435456),
+            BytesBucket::Kib256Lt1Gib
+        );
+        assert_eq!(
+            BytesBucket::from_bytes(1073741823),
+            BytesBucket::Kib256Lt1Gib
+        );
         assert_eq!(BytesBucket::from_bytes(1073741824), BytesBucket::Gte1Gib);
     }
 

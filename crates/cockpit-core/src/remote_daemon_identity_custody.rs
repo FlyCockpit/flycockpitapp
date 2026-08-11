@@ -45,9 +45,9 @@
 use std::collections::BTreeMap;
 
 use cockpit_proto::remote_device_identity_enrollment::{
-    self as enrollment, RemoteIdentityCustodyClassV1 as CustodyClass,
-    RemoteIdentityCustodyError, RemoteIdentityCustodyEvidenceV1 as CustodyEvidence,
-    RemoteIdentityCustodyHandleId, RemoteIdentityCustodyProvider, RemoteIdentityP256PublicKey,
+    self as enrollment, RemoteIdentityCustodyClassV1 as CustodyClass, RemoteIdentityCustodyError,
+    RemoteIdentityCustodyEvidenceV1 as CustodyEvidence, RemoteIdentityCustodyHandleId,
+    RemoteIdentityCustodyProvider, RemoteIdentityP256PublicKey,
     RemoteIdentityPresenceModeV1 as PresenceMode, RemoteSubjectKindV1 as SubjectKind,
 };
 use cockpit_proto::remote_public_service_policy::{
@@ -253,11 +253,7 @@ impl DaemonCustodyPolicyGate {
     /// Meet two daemon custody policy thresholds using the shared foundation
     /// meet table. Stronger-provider outage never downgrades: if either side
     /// is unavailable, the meet is unavailable (caller surfaces the error).
-    pub fn meet(
-        self,
-        a: DaemonCustodyPolicy,
-        b: DaemonCustodyPolicy,
-    ) -> DaemonCustodyPolicy {
+    pub fn meet(self, a: DaemonCustodyPolicy, b: DaemonCustodyPolicy) -> DaemonCustodyPolicy {
         a.meet(b)
     }
 
@@ -270,11 +266,15 @@ impl DaemonCustodyPolicyGate {
         class: CustodyCertificateClass,
     ) -> Result<DaemonCustodyPolicy, RemoteIdentityCustodyError> {
         match class {
-            CustodyCertificateClass::HardwareOrExternal => Ok(DaemonCustodyPolicy::HardwareOrExternal),
+            CustodyCertificateClass::HardwareOrExternal => {
+                Ok(DaemonCustodyPolicy::HardwareOrExternal)
+            }
             CustodyCertificateClass::OsProtected => Ok(DaemonCustodyPolicy::OsProtected),
-            CustodyCertificateClass::OriginProtected => Err(RemoteIdentityCustodyError::PolicyDenied(
-                "origin_protected is not a daemon custody class".into(),
-            )),
+            CustodyCertificateClass::OriginProtected => {
+                Err(RemoteIdentityCustodyError::PolicyDenied(
+                    "origin_protected is not a daemon custody class".into(),
+                ))
+            }
         }
     }
 }
@@ -458,8 +458,7 @@ impl DaemonCustodyAdapter for FakeDaemonCustodyAdapter {
         let handle = RemoteIdentityCustodyHandleId(handle_bytes);
         let public_key = Self::synthesize_public_key(handle);
         let evidence = Self::synthesize_evidence(profile, handle, self.generation_counter);
-        self.handles
-            .insert(handle_bytes, (public_key, profile));
+        self.handles.insert(handle_bytes, (public_key, profile));
         Ok(AdapterGeneration {
             handle_id: handle,
             public_key,
@@ -606,12 +605,11 @@ impl<A: DaemonCustodyAdapter> RemoteIdentityCustodyProvider for DaemonIdentityCu
         // The profile is selected by the caller's evidence; in this fake the
         // evidence carries the platform label. In production the configured
         // profile is selected at construction.
-        let profile = select_profile_from_evidence(provider_evidence)
-            .ok_or_else(|| {
-                RemoteIdentityCustodyError::InvalidEvidence(
-                    "provider evidence does not select a daemon custody profile".into(),
-                )
-            })?;
+        let profile = select_profile_from_evidence(provider_evidence).ok_or_else(|| {
+            RemoteIdentityCustodyError::InvalidEvidence(
+                "provider evidence does not select a daemon custody profile".into(),
+            )
+        })?;
         // Authorize the profile through the policy gate before generation.
         self.gate.authorize(profile, presence_mode)?;
         if profile.custody_class() != custody_class {
@@ -656,14 +654,8 @@ impl<A: DaemonCustodyAdapter> RemoteIdentityCustodyProvider for DaemonIdentityCu
     fn reopen(
         &self,
         handle: RemoteIdentityCustodyHandleId,
-    ) -> Result<
-        (
-            RemoteIdentityP256PublicKey,
-            CustodyClass,
-            PresenceMode,
-        ),
-        RemoteIdentityCustodyError,
-    > {
+    ) -> Result<(RemoteIdentityP256PublicKey, CustodyClass, PresenceMode), RemoteIdentityCustodyError>
+    {
         let record = self
             .records
             .get(&handle.0)
@@ -916,9 +908,13 @@ mod tests {
     fn remote_daemon_identity_provider_matrix_rejects_origin_protected() {
         let gate = DaemonCustodyPolicyGate;
         // origin_protected is not a daemon custody class; the gate rejects it.
-        assert!(gate
-            .authorize(DaemonCustodyProfile::MacosKeychain, PresenceMode::Unattended)
-            .is_ok());
+        assert!(
+            gate.authorize(
+                DaemonCustodyProfile::MacosKeychain,
+                PresenceMode::Unattended
+            )
+            .is_ok()
+        );
         // A hypothetical origin_protected profile would be rejected, but no
         // such profile exists. Instead, verify the class mapping rejects it.
         assert!(matches!(
@@ -974,7 +970,10 @@ mod tests {
         let gate = DaemonCustodyPolicyGate;
         // Stronger-provider outage is Unavailable, never a fallback. The
         // provider returns an error; it never generates a weaker replacement.
-        let result = gate.authorize(DaemonCustodyProfile::MacosSecureEnclave, PresenceMode::Unattended);
+        let result = gate.authorize(
+            DaemonCustodyProfile::MacosSecureEnclave,
+            PresenceMode::Unattended,
+        );
         assert!(result.is_ok());
         // If the stronger provider is unavailable, the caller surfaces the
         // error — there is no weaker fallback. Simulate by checking that a
@@ -992,19 +991,31 @@ mod tests {
         // Daemon meet table returns the stricter (higher-rank) value:
         // os×os=os; os×hardware=hardware; hardware×os=hardware; hardware×hardware=hardware.
         assert_eq!(
-            gate.meet(DaemonCustodyPolicy::OsProtected, DaemonCustodyPolicy::HardwareOrExternal),
+            gate.meet(
+                DaemonCustodyPolicy::OsProtected,
+                DaemonCustodyPolicy::HardwareOrExternal
+            ),
             DaemonCustodyPolicy::HardwareOrExternal
         );
         assert_eq!(
-            gate.meet(DaemonCustodyPolicy::HardwareOrExternal, DaemonCustodyPolicy::OsProtected),
+            gate.meet(
+                DaemonCustodyPolicy::HardwareOrExternal,
+                DaemonCustodyPolicy::OsProtected
+            ),
             DaemonCustodyPolicy::HardwareOrExternal
         );
         assert_eq!(
-            gate.meet(DaemonCustodyPolicy::HardwareOrExternal, DaemonCustodyPolicy::HardwareOrExternal),
+            gate.meet(
+                DaemonCustodyPolicy::HardwareOrExternal,
+                DaemonCustodyPolicy::HardwareOrExternal
+            ),
             DaemonCustodyPolicy::HardwareOrExternal
         );
         assert_eq!(
-            gate.meet(DaemonCustodyPolicy::OsProtected, DaemonCustodyPolicy::OsProtected),
+            gate.meet(
+                DaemonCustodyPolicy::OsProtected,
+                DaemonCustodyPolicy::OsProtected
+            ),
             DaemonCustodyPolicy::OsProtected
         );
     }
@@ -1018,13 +1029,15 @@ mod tests {
             DaemonCustodyPolicy::HardwareOrExternal
         );
         assert_eq!(
-            gate.certificate_class_to_policy(CustodyCertificateClass::OsProtected).unwrap(),
+            gate.certificate_class_to_policy(CustodyCertificateClass::OsProtected)
+                .unwrap(),
             DaemonCustodyPolicy::OsProtected
         );
         // origin_protected is not a daemon custody class.
-        assert!(gate
-            .certificate_class_to_policy(CustodyCertificateClass::OriginProtected)
-            .is_err());
+        assert!(
+            gate.certificate_class_to_policy(CustodyCertificateClass::OriginProtected)
+                .is_err()
+        );
     }
 
     // --- private-material guards ---
@@ -1050,9 +1063,7 @@ mod tests {
         // The handle id is 16 bytes; no private bytes.
         assert_eq!(handle.0.len(), 16);
         // Sign returns a 64-byte P1363 signature; no private bytes.
-        let sig = provider
-            .sign_possession_proof(handle, &[0xFF; 32])
-            .unwrap();
+        let sig = provider.sign_possession_proof(handle, &[0xFF; 32]).unwrap();
         assert_eq!(sig.len(), 64);
         assert!(low_s_valid(&sig));
         let sig2 = provider
@@ -1158,9 +1169,7 @@ mod tests {
         // Reopen after destroy fails.
         assert!(provider.reopen(handle).is_err());
         // Sign after destroy fails.
-        assert!(provider
-            .sign_possession_proof(handle, &[0xFF; 32])
-            .is_err());
+        assert!(provider.sign_possession_proof(handle, &[0xFF; 32]).is_err());
     }
 
     #[test]
@@ -1237,9 +1246,7 @@ mod tests {
         // The handle remains usable for reconnection (reopen + sign).
         let (pk, _, _) = provider.reopen(handle).unwrap();
         assert_eq!(pk.x.len(), 32);
-        let sig = provider
-            .sign_possession_proof(handle, &[0x42; 32])
-            .unwrap();
+        let sig = provider.sign_possession_proof(handle, &[0x42; 32]).unwrap();
         assert_eq!(sig.len(), 64);
         assert!(low_s_valid(&sig));
     }

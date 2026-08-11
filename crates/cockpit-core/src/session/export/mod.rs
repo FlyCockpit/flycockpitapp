@@ -858,8 +858,7 @@ fn build_zip_with_options_and_env_conn_with_redactor(
             compressed_result_files.push((path, entry.content));
         }
         for row in Db::list_task_delegation_steers_conn(conn, s.session_id)? {
-            let body =
-                redact_string_for_export(row.body, export_redactor);
+            let body = redact_string_for_export(row.body, export_redactor);
             delegation_steer_index.push(json!({
                 "id": row.id,
                 "task_call_id": row.task_call_id,
@@ -884,10 +883,7 @@ fn build_zip_with_options_and_env_conn_with_redactor(
             let loaded = load_task_delegation_payload_from_row(db, &row);
             let (excerpt, load_error, emit_file) = match loaded {
                 Ok(payload) => {
-                    let body = redact_string_for_export(
-                        payload.body,
-                        export_redactor,
-                    );
+                    let body = redact_string_for_export(payload.body, export_redactor);
                     (Some(row.excerpt(&body)), None::<String>, Some(body))
                 }
                 Err(e) => (None, Some(format!("{e:#}")), None),
@@ -1204,8 +1200,7 @@ fn build_zip_with_options_and_env_conn_with_redactor(
         for (path, body) in &compressed_result_files {
             zw.start_file(path, opts)
                 .with_context(|| format!("zip: compressed result entry `{path}`"))?;
-            let body =
-                redact_string_for_export(body.clone(), export_redactor);
+            let body = redact_string_for_export(body.clone(), export_redactor);
             zw.write_all(body.as_bytes())
                 .with_context(|| format!("zip: writing compressed result `{path}`"))?;
         }

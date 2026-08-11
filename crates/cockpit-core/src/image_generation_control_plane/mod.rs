@@ -857,7 +857,9 @@ impl ImageControlRequestTag {
             | Self::ImageDestinationGrantRevoke => RequestFamily::ConfigMutations,
             Self::ImageHealthRefresh => RequestFamily::HealthReadsAndRefresh,
             Self::ImageJobCancel => RequestFamily::JobCancel,
-            Self::ImageLateResultPublish | Self::ImageLateResultDiscard => RequestFamily::LateResult,
+            Self::ImageLateResultPublish | Self::ImageLateResultDiscard => {
+                RequestFamily::LateResult
+            }
         }
     }
 }
@@ -961,9 +963,7 @@ pub fn scope_requires_project_root(scope: HostedAccessScope) -> bool {
 /// never applies for this scope.
 pub fn validate_admin_grant_root(scope: HostedAccessScope, project_root: Option<&str>) -> bool {
     if scope.requires_project_root() {
-        project_root
-            .map(|r| !r.is_empty())
-            .unwrap_or(false)
+        project_root.map(|r| !r.is_empty()).unwrap_or(false)
     } else {
         true
     }
@@ -1004,19 +1004,16 @@ pub fn verify_image_generation_admin_ordinal() -> bool {
 /// without any local enum, codec, hash derivation, or moved ordinal.
 pub fn build_admin_permission_ceiling(
     project_id: [u8; 16],
-) -> Result<
-    (
-        RemotePermissionCeilingV1,
-        RemotePermissionCeilingDigestV1,
-    ),
-    &'static str,
-> {
+) -> Result<(RemotePermissionCeilingV1, RemotePermissionCeilingDigestV1), &'static str> {
     if project_id.iter().all(|&b| b == 0) {
         return Err("project id must be nonzero");
     }
     let ceiling = RemotePermissionCeilingV1 {
         attachment_capabilities: Vec::new(),
-        projects: vec![(project_id, vec![RemoteProjectCapabilityV1::ImageGenerationAdmin])],
+        projects: vec![(
+            project_id,
+            vec![RemoteProjectCapabilityV1::ImageGenerationAdmin],
+        )],
     };
     let digest = permission_ceiling_digest(&ceiling).map_err(|_| "digest computation failed")?;
     Ok((ceiling, digest))
@@ -1158,7 +1155,9 @@ pub fn validate_sha256_hex(digest: &str) -> bool {
     if digest.len() != 64 {
         return false;
     }
-    digest.bytes().all(|b| (b'a'..=b'f').contains(&b) || b.is_ascii_digit())
+    digest
+        .bytes()
+        .all(|b| (b'a'..=b'f').contains(&b) || b.is_ascii_digit())
 }
 
 /// Validate a lowercase hyphenated UUID.
@@ -1392,11 +1391,11 @@ impl BudgetScopeProjection {
     pub fn validate(&self) -> bool {
         match self.policy {
             BudgetPolicy::Unconfigured => self.generation.is_none(),
-            BudgetPolicy::Finite | BudgetPolicy::Unlimited => {
-                self.generation.as_ref().map(|g| {
-                    validate_canonical_decimal(g) && g != "0"
-                }).unwrap_or(false)
-            }
+            BudgetPolicy::Finite | BudgetPolicy::Unlimited => self
+                .generation
+                .as_ref()
+                .map(|g| validate_canonical_decimal(g) && g != "0")
+                .unwrap_or(false),
         }
     }
 }
@@ -1414,11 +1413,11 @@ pub fn validate_budget_set_pair(
     expected_generation: Option<&str>,
 ) -> bool {
     match (policy, expected_generation) {
-        (None, None) => true, // unchanged
+        (None, None) => true,                           // unchanged
         (Some(BudgetPolicy::Unconfigured), _) => false, // Unconfigured in a save rejects
         (Some(BudgetPolicy::Finite | BudgetPolicy::Unlimited), None) => true, // create generation 1
-        (Some(BudgetPolicy::Finite | BudgetPolicy::Unlimited), Some(gen)) => {
-            validate_canonical_decimal(gen) && gen != "0" // CAS-update
+        (Some(BudgetPolicy::Finite | BudgetPolicy::Unlimited), Some(generation)) => {
+            validate_canonical_decimal(generation) && generation != "0" // CAS-update
         }
         (None, Some(_)) => false, // half-present tuple rejects
     }
@@ -1483,10 +1482,7 @@ impl AccessGrantTransition {
     /// Returns `true` if this is a pending terminal transition that
     /// increments once and requires no claim drain.
     pub fn is_pending_terminal(self) -> bool {
-        matches!(
-            self,
-            Self::PendingDecline | Self::PendingExpiry
-        )
+        matches!(self, Self::PendingDecline | Self::PendingExpiry)
     }
 
     /// Returns `true` if this is an active terminal transition that uses the
@@ -1554,7 +1550,10 @@ pub fn validate_mutation_lease_header(header: &serde_json::Value) -> bool {
                 && map.get("alg").and_then(|v| v.as_str()) == Some("ES256")
                 && map.get("typ").and_then(|v| v.as_str())
                     == Some("flycockpit-image-admin-mutation-lease+jws")
-                && map.get("kid").and_then(|v| v.as_str()).is_some_and(|k| !k.is_empty())
+                && map
+                    .get("kid")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|k| !k.is_empty())
         }
         _ => false,
     }
@@ -1570,7 +1569,10 @@ pub fn validate_read_claim_header(header: &serde_json::Value) -> bool {
                 && map.get("alg").and_then(|v| v.as_str()) == Some("ES256")
                 && map.get("typ").and_then(|v| v.as_str())
                     == Some("flycockpit-image-admin-read-claim+jws")
-                && map.get("kid").and_then(|v| v.as_str()).is_some_and(|k| !k.is_empty())
+                && map
+                    .get("kid")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|k| !k.is_empty())
         }
         _ => false,
     }
@@ -1608,7 +1610,10 @@ pub fn validate_api_format_blob(
         && validate_base64url_id_22(transfer_id)
         && validate_canonical_decimal(total_length)
         && total_length != "0"
-        && total_length.parse::<u64>().map(|v| v <= 16_777_216).unwrap_or(false)
+        && total_length
+            .parse::<u64>()
+            .map(|v| v <= 16_777_216)
+            .unwrap_or(false)
         && validate_sha256_hex(sha256)
 }
 

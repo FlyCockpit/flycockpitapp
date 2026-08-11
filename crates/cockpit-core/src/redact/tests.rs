@@ -2126,8 +2126,8 @@ fn sealed_registration_paths_use_typed_entries() {
     // All three ultimately call RedactionTable::with_forced_literal with a
     // canonical origin. This test verifies the table accepts and preserves
     // the typed origin and that historical_redaction_inventory parses it back.
+    use crate::sealed::{SealedName, SealedRecordId, sealed_redaction_origin};
     use crate::sealed::{historical_redaction_inventory, parse_sealed_redaction_origin};
-    use crate::sealed::{sealed_redaction_origin, SealedName, SealedRecordId};
     use cockpit_db::db::sealed_scope::SealedScopeKind;
 
     let cfg = enabled_cfg();
@@ -2179,15 +2179,21 @@ fn sealed_marker_requires_exact_action_grant() {
     wrong.insert("other_value".to_string());
     let egress_wrong = table.with_sealed_replacements(&wrong);
     assert!(egress_wrong.scrub(literal).contains("***REDACT***"));
-    assert!(!egress_wrong.scrub(literal).contains("reference sealed value `exact`"));
+    assert!(
+        !egress_wrong
+            .scrub(literal)
+            .contains("reference sealed value `exact`")
+    );
 
     // Exact grant → marker.
     let mut exact = std::collections::HashSet::new();
     exact.insert("exact".to_string());
     let egress_exact = table.with_sealed_replacements(&exact);
-    assert!(egress_exact
-        .scrub(literal)
-        .contains("reference sealed value `exact`"));
+    assert!(
+        egress_exact
+            .scrub(literal)
+            .contains("reference sealed value `exact`")
+    );
 }
 
 #[test]
@@ -2201,7 +2207,10 @@ fn noninteractive_sealed_value_stays_generic() {
     let table = build_with_session_env(&cfg, dir.path(), &HashMap::new());
     let sealed_literal = "noninteractive-test-sealed-token";
     let table = table
-        .with_forced_literal(sealed_literal.to_string(), "sealed:noninteractive".to_string())
+        .with_forced_literal(
+            sealed_literal.to_string(),
+            "sealed:noninteractive".to_string(),
+        )
         .unwrap();
     // A noninteractive path holds the table as-is (no with_sealed_replacements
     // call), so it renders the generic placeholder even though a grant could

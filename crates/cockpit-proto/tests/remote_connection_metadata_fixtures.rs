@@ -1,7 +1,7 @@
 use cockpit_proto::remote_connection_metadata::{
-    self, BytesBucket, DurationBucket, MetadataError, Outcome, Region, RouteClass, ServiceTier,
+    self, BytesBucket, COMPONENT_KIND_ACCOUNT, COMPONENT_KIND_TENANT, DOMAIN_ACCOUNT,
+    DOMAIN_TENANT, DurationBucket, MetadataError, Outcome, Region, RouteClass, ServiceTier,
     cell_tuple, correction_closes_at, pseudonym_message, time_bucket, validate_retention_days,
-    COMPONENT_KIND_ACCOUNT, COMPONENT_KIND_TENANT, DOMAIN_ACCOUNT, DOMAIN_TENANT,
 };
 use serde::Deserialize;
 
@@ -123,7 +123,10 @@ fn remote_metadata_cross_language_fixtures() {
         assert_eq!(time_bucket(ex.epoch_seconds).unwrap(), ex.time_bucket);
     }
     for entry in &fixture.duration_buckets {
-        assert_eq!(DurationBucket::from_seconds(entry.seconds).as_u8(), entry.bucket);
+        assert_eq!(
+            DurationBucket::from_seconds(entry.seconds).as_u8(),
+            entry.bucket
+        );
     }
     for entry in &fixture.bytes_buckets {
         assert_eq!(BytesBucket::from_bytes(entry.bytes).as_u8(), entry.bucket);

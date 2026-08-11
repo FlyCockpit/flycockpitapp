@@ -653,7 +653,9 @@ pub fn encode_multipart(plan: &PlannedMultipart, audio: &[u8]) -> Result<Vec<u8>
                 )
                 .as_bytes(),
             );
-            buf.extend_from_slice(format!("Content-Type: {}\r\n", AUDIO_PART_CONTENT_TYPE).as_bytes());
+            buf.extend_from_slice(
+                format!("Content-Type: {}\r\n", AUDIO_PART_CONTENT_TYPE).as_bytes(),
+            );
         } else {
             buf.extend_from_slice(
                 format!("Content-Disposition: form-data; name=\"{}\"\r\n", part.name).as_bytes(),

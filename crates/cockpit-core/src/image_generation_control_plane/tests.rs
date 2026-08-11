@@ -11,9 +11,7 @@
 //! - `image_generation_admin_grant_resolution`: active authority key and lifecycle
 
 use super::*;
-use crate::daemon::principal::{
-    ClientPrincipal, PrincipalGrant, PrincipalScope, RemotePrincipal,
-};
+use crate::daemon::principal::{ClientPrincipal, PrincipalGrant, PrincipalScope, RemotePrincipal};
 use crate::daemon::relay_envelope::{RelayGrant, RelayGrantScope, RelayPrincipal};
 use cockpit_proto::remote_public_service_policy::{
     RemoteAttachmentCapabilityV1, RemotePermissionCeilingV1, RemoteProjectCapabilityV1,
@@ -78,7 +76,8 @@ mod authz {
 
     #[test]
     fn remote_principal_without_admin_grant_cannot_mutate() {
-        let principal = remote_principal(RelayGrantScope::Agent, Some("/workspace/app".to_string()));
+        let principal =
+            remote_principal(RelayGrantScope::Agent, Some("/workspace/app".to_string()));
         assert!(!legacy_grants_can_authorize_mutation(&principal));
     }
 
@@ -323,7 +322,10 @@ mod capability_matrix {
         let (_ceiling, digest) = build_admin_permission_ceiling(pid).unwrap();
         let hex = digest.to_hex();
         assert_eq!(hex.len(), 64);
-        assert!(hex.bytes().all(|b| (b'a'..=b'f').contains(&b) || b.is_ascii_digit()));
+        assert!(
+            hex.bytes()
+                .all(|b| (b'a'..=b'f').contains(&b) || b.is_ascii_digit())
+        );
     }
 
     #[test]
@@ -547,7 +549,11 @@ mod schema_conformance {
                     | ImageControlRequestTag::ImageLateResultPublish
                     | ImageControlRequestTag::ImageLateResultDiscard
             );
-            assert_eq!(requires, expected, "session requirement mismatch for {:?}", tag);
+            assert_eq!(
+                requires, expected,
+                "session requirement mismatch for {:?}",
+                tag
+            );
         }
     }
 
@@ -656,7 +662,10 @@ mod schema_conformance {
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["operationKind"], "remote_attachment");
-        assert_eq!(json["queriedOperationId"], "01923f5e-9a16-7abc-8def-0123456789ab");
+        assert_eq!(
+            json["queriedOperationId"],
+            "01923f5e-9a16-7abc-8def-0123456789ab"
+        );
         assert_eq!(json["state"], "committed");
         assert!(json["outcome"].is_null());
     }
@@ -770,9 +779,18 @@ mod redaction {
         let obj = json.as_object().unwrap();
         // The body contains no free-form message, path, provider body,
         // credential, workflow bytes, quarantine state, or hidden identity.
-        for forbidden in ["message", "path", "providerBody", "credential", "quarantine", "identity"]
-        {
-            assert!(!obj.contains_key(forbidden), "error must not contain {forbidden}");
+        for forbidden in [
+            "message",
+            "path",
+            "providerBody",
+            "credential",
+            "quarantine",
+            "identity",
+        ] {
+            assert!(
+                !obj.contains_key(forbidden),
+                "error must not contain {forbidden}"
+            );
         }
     }
 
@@ -904,21 +922,36 @@ mod budget_and_config {
     fn budget_set_pair_create() {
         // Nonnull policy with null expected generation creates generation 1.
         assert!(validate_budget_set_pair(Some(BudgetPolicy::Finite), None));
-        assert!(validate_budget_set_pair(Some(BudgetPolicy::Unlimited), None));
+        assert!(validate_budget_set_pair(
+            Some(BudgetPolicy::Unlimited),
+            None
+        ));
     }
 
     #[test]
     fn budget_set_pair_cas_update() {
         // Nonnull policy with positive expected generation CAS-updates.
-        assert!(validate_budget_set_pair(Some(BudgetPolicy::Finite), Some("1")));
-        assert!(validate_budget_set_pair(Some(BudgetPolicy::Unlimited), Some("5")));
+        assert!(validate_budget_set_pair(
+            Some(BudgetPolicy::Finite),
+            Some("1")
+        ));
+        assert!(validate_budget_set_pair(
+            Some(BudgetPolicy::Unlimited),
+            Some("5")
+        ));
     }
 
     #[test]
     fn budget_set_pair_unconfigured_rejects() {
         // Unconfigured in a save rejects.
-        assert!(!validate_budget_set_pair(Some(BudgetPolicy::Unconfigured), None));
-        assert!(!validate_budget_set_pair(Some(BudgetPolicy::Unconfigured), Some("1")));
+        assert!(!validate_budget_set_pair(
+            Some(BudgetPolicy::Unconfigured),
+            None
+        ));
+        assert!(!validate_budget_set_pair(
+            Some(BudgetPolicy::Unconfigured),
+            Some("1")
+        ));
     }
 
     #[test]
@@ -929,7 +962,10 @@ mod budget_and_config {
 
     #[test]
     fn budget_set_pair_zero_generation_rejects() {
-        assert!(!validate_budget_set_pair(Some(BudgetPolicy::Finite), Some("0")));
+        assert!(!validate_budget_set_pair(
+            Some(BudgetPolicy::Finite),
+            Some("0")
+        ));
     }
 
     #[test]
@@ -982,14 +1018,22 @@ mod budget_and_config {
         sort_config_changes(&mut changes);
         // After sort: Endpoint/abc, Endpoint/zzz, Target/zzz
         match &changes[0] {
-            ConfigChange::Upsert { entity_kind, entity_id, .. } => {
+            ConfigChange::Upsert {
+                entity_kind,
+                entity_id,
+                ..
+            } => {
                 assert_eq!(*entity_kind, ConfigEntityKind::Endpoint);
                 assert_eq!(entity_id, "abcdefghijklmnopqrstuv");
             }
             _ => panic!("expected upsert"),
         }
         match &changes[1] {
-            ConfigChange::Deleted { entity_kind, entity_id, .. } => {
+            ConfigChange::Deleted {
+                entity_kind,
+                entity_id,
+                ..
+            } => {
                 assert_eq!(*entity_kind, ConfigEntityKind::Endpoint);
                 assert_eq!(entity_id, "zzzzzzzzzzzzzzzzzzzzzz");
             }
@@ -1045,7 +1089,10 @@ mod grant_resolution {
     fn active_authority_key_is_lowercase_64_hex() {
         let key = compute_active_authority_key(b"instance-1", b"grantee-1", &nonzero_project_id());
         assert_eq!(key.len(), 64);
-        assert!(key.bytes().all(|b| (b'a'..=b'f').contains(&b) || b.is_ascii_digit()));
+        assert!(
+            key.bytes()
+                .all(|b| (b'a'..=b'f').contains(&b) || b.is_ascii_digit())
+        );
     }
 
     #[test]

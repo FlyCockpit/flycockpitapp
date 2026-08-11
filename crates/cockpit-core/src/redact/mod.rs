@@ -856,14 +856,15 @@ impl RedactionTable {
     ///
     /// The returned table shares the same matcher and entries; only the
     /// replacement vector is rebuilt. This is cheap and deterministic.
-    pub fn with_sealed_replacements(&self, active_sealed_ids: &std::collections::HashSet<String>) -> Self {
+    pub fn with_sealed_replacements(
+        &self,
+        active_sealed_ids: &std::collections::HashSet<String>,
+    ) -> Self {
         let replacements: Vec<Replacement> = self
             .origins
             .iter()
             .map(|origin| {
-                if let Some(identity) =
-                    crate::sealed::parse_sealed_redaction_origin(origin)
-                {
+                if let Some(identity) = crate::sealed::parse_sealed_redaction_origin(origin) {
                     // The canonical value id for a scoped entry is its record
                     // id; for a legacy session entry it is the name. Both are
                     // constrained by the sealed-value contract.
@@ -1043,7 +1044,8 @@ impl RedactionTable {
         // When all entries are `Generic` (the common case, and always the case
         // for the persisted table), the fast path renders the placeholder
         // once and repeats it, avoiding per-entry allocation.
-        let rendered: Vec<String> = if self.replacements.iter().all(|r| r == &Replacement::Generic) {
+        let rendered: Vec<String> = if self.replacements.iter().all(|r| r == &Replacement::Generic)
+        {
             vec![self.placeholder.clone(); self.origins.len()]
         } else {
             self.replacements

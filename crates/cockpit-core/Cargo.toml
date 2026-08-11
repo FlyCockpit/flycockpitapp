@@ -101,6 +101,16 @@ zeroize = { workspace = true }
 # Sealed-state HMAC: direct pin on this member only (not workspace.dependencies).
 # native-secure-sealed-state-store requires exactly 0.13.0 + zeroize feature.
 hmac = { version = "=0.13.0", default-features = false, features = ["zeroize"] }
+# WebRTC sans-I/O endpoint: exact str0m 0.21.0 with defaults off and
+# rust-crypto only (remote-webrtc-daemon-endpoint). No AWS-LC, OpenSSL,
+# platform TLS, or alternate WebRTC stack. The RustCrypto provider is
+# configured explicitly per Rtc instance; no process-wide default.
+str0m = { version = "=0.21.0", default-features = false, features = ["rust-crypto"] }
+# Direct dependency for the RustCrypto provider: str0m-rust-crypto is the
+# backend crate for the "rust-crypto" feature. We depend on it directly so
+# we can call default_provider() and install it per-Rtc. Exact 0.5.0 pin
+# matches str0m 0.21.0's transitive dependency.
+str0m-rust-crypto = { version = "=0.5.0", default-features = false }
 
 # TURN relay socket provider (`remote-rust-turn-socket-provider`).
 # Exact pins per prompt gates. `turn-client-proto` is the sans-I/O TURN

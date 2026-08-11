@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "apps/cli",
+    "apps/tenant-authority",
     "crates/cockpit-config",
     "crates/cockpit-core",
     "crates/cockpit-db",

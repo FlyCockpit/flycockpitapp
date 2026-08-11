@@ -784,10 +784,10 @@ pub fn extract_images(
             // Text/thought/tool parts within model_output are not successful
             // image slots; bounded non-sensitive text may be retained as
             // provider metadata only.
-            if let Some(text) = part_text(part) {
-                if let Some(bounded) = bound_text(&text) {
-                    provider_text.push(bounded);
-                }
+            if let Some(text) = part_text(part)
+                && let Some(bounded) = bound_text(&text)
+            {
+                provider_text.push(bounded);
             }
         }
     }
@@ -898,10 +898,10 @@ fn bound_text(text: &str) -> Option<String> {
 
 fn bounded_provider_text(content: &[GeminiContentPart]) -> Option<String> {
     for part in content {
-        if let Some(text) = part_text(part) {
-            if let Some(bounded) = bound_text(&text) {
-                return Some(bounded);
-            }
+        if let Some(text) = part_text(part)
+            && let Some(bounded) = bound_text(&text)
+        {
+            return Some(bounded);
         }
     }
     None

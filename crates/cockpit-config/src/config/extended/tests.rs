@@ -2338,3 +2338,970 @@ fn daemon_tokenizer_validation_keeps_whole_document_failures_advisory() {
         );
     }
 }
+
+/// Load-path, atomic-merge, fail-closed, and remote-strip coverage for the
+/// `image_generation` registry field of [`ExtendedConfig`].
+mod image_generation {
+    // `super` is the `tests` module (trusted_load_for_cwd, TempDir, PathBuf);
+    // `super::super` is `extended` itself (ExtendedConfigDoc, ConfigLayerOrigin,
+    // strip_remote_image_generation, load_merged_from_docs_with_warnings).
+    use super::super::*;
+    use super::*;
+    use crate::config::image_generation::*;
+    use crate::config::providers::{CapabilityStatus, HeaderSpec};
+    use chrono::{TimeZone, Utc};
+
+    /// Registry A: a ComfyUI endpoint with one enabled default workflow
+    /// target (matches the pure-type fixture in
+    /// `tests/image_generation_config.rs`).
+    fn registry_a() -> ImageGenerationConfig {
+        let graph_json = r#"{"1":{"inputs":{"seed":1}},"2":{"inputs":{}}}"#.to_owned();
+        let workflow = RegisteredComfyWorkflow {
+            id: "portrait-v1".into(),
+            graph_digest: canonical_workflow_digest(&graph_json).unwrap(),
+            graph_json,
+            bindings: vec![WorkflowBinding {
+                parameter: ImageParameter::Seed,
+                node_id: "1".into(),
+                input: "seed".into(),
+                value_type: WorkflowValueType::Integer,
+                min: Some(0),
+                max: Some(1_000_000),
+            }],
+            outputs: vec![WorkflowOutput {
+                node_id: "2".into(),
+                output: "images".into(),
+                value_type: WorkflowValueType::Image,
+            }],
+        };
+        let verified = Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).unwrap();
+        ImageGenerationConfig::new(
+            vec![ImageEndpoint {
+                id: "local-comfy".into(),
+                adapter: ImageAdapterKind::Comfyui,
+                origin: "http://127.0.0.1:8188/".into(),
+                path_prefix: Some("/tenant/a/".into()),
+                credential_ref: Some("comfy-token".into()),
+                headers: vec![HeaderSpec {
+                    name: "X-Token".into(),
+                    value: "$secret:comfy-token".into(),
+                }],
+                allow_insecure_transport: false,
+                location: ImageLocationClass::Local,
+                enabled: true,
+                route_profile_version: IMAGE_GENERATION_ROUTE_PROFILE_VERSION,
+                exclusive_server: false,
+            }],
+            vec![ImageGenerationTarget {
+                id: "portrait".into(),
+                display_name: Some("Portrait Studio".into()),
+                endpoint_id: "local-comfy".into(),
+                identity: ImageTargetIdentity::Workflow {
+                    workflow_id: workflow.id.clone(),
+                    workflow_digest: workflow.graph_digest.clone(),
+                },
+                enabled: true,
+                is_default: true,
+                formats: vec![ImageFormat::Png, ImageFormat::Webp],
+                reference_support: ReferenceImageSupport::Optional,
+                max_reference_images: 2,
+                max_samples: 2,
+                max_outputs: 2,
+                dimensions: ImageDimensionDescriptor::Discrete {
+                    candidates: vec![ImageDimensionCandidate {
+                        width: 1024,
+                        height: 1024,
+                        provider_value: "square".into(),
+                    }],
+                },
+                dimension_policy: ImageDimensionRequestPolicy::Nearest,
+                parameters: vec![ImageParameterDescriptor::Integer {
+                    parameter: ImageParameter::Seed,
+                    min: 0,
+                    max: 1_000_000,
+                }],
+                openrouter_routing: None,
+                generation_capability: ImageCapabilityEvidence::new(
+                    CapabilityStatus::Supported,
+                    Some(ImageEvidence::WorkflowDeclared {
+                        workflow_digest: workflow.graph_digest.clone(),
+                    }),
+                )
+                .unwrap(),
+                price: ImagePrice::Known {
+                    usd_micros: 25_000,
+                    unit: ImageBillableUnit::Image,
+                    variant: "1024-square".into(),
+                    method: ImagePriceMethod::ConservativeMaximum,
+                    evidence: ImageEvidence::CheckedIn {
+                        source_url: "https://example.com/pricing".into(),
+                        last_verified: verified,
+                    },
+                },
+            }],
+            vec![workflow],
+            vec!["fal".into(), "together".into()],
+        )
+        .unwrap()
+    }
+
+    /// Registry B: a completely different, valid hosted OpenAI-images
+    /// endpoint with its own enabled default target. Shares no IDs with A.
+    fn registry_b() -> ImageGenerationConfig {
+        ImageGenerationConfig::new(
+            vec![ImageEndpoint {
+                id: "openai-main".into(),
+                adapter: ImageAdapterKind::OpenaiImages,
+                origin: "https://api.openai.com/".into(),
+                path_prefix: None,
+                credential_ref: Some("openai-key".into()),
+                headers: vec![],
+                allow_insecure_transport: false,
+                location: ImageLocationClass::PublicCloud,
+                enabled: true,
+                route_profile_version: IMAGE_GENERATION_ROUTE_PROFILE_VERSION,
+                exclusive_server: false,
+            }],
+            vec![ImageGenerationTarget {
+                id: "gpt-image".into(),
+                display_name: None,
+                endpoint_id: "openai-main".into(),
+                identity: ImageTargetIdentity::HostedModel {
+                    model: "gpt-image-1".into(),
+                },
+                enabled: true,
+                is_default: true,
+                formats: vec![ImageFormat::Png],
+                reference_support: ReferenceImageSupport::Unsupported,
+                max_reference_images: 0,
+                max_samples: 1,
+                max_outputs: 1,
+                dimensions: ImageDimensionDescriptor::ProviderDefault,
+                dimension_policy: ImageDimensionRequestPolicy::ProviderDefault,
+                parameters: vec![],
+                openrouter_routing: None,
+                generation_capability: ImageCapabilityEvidence::new(
+                    CapabilityStatus::Unknown,
+                    None,
+                )
+                .unwrap(),
+                price: ImagePrice::Unknown,
+            }],
+            vec![],
+            vec![],
+        )
+        .unwrap()
+    }
+
+    fn write_config(path: &std::path::Path, value: serde_json::Value) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+    }
+
+    fn enabled_default_count(cfg: &ImageGenerationConfig) -> usize {
+        cfg.targets()
+            .iter()
+            .filter(|t| t.enabled && t.is_default)
+            .count()
+    }
+
+    /// Load through the real layered load path under workspace trust, keeping
+    /// the merge-time warnings (fail-closed events surfaced, not swallowed).
+    fn trusted_load_for_cwd_with_warnings(root: &std::path::Path) -> (ExtendedConfig, Vec<String>) {
+        let _trust = enter_trusted_workspace(root);
+        load_for_cwd_with_warnings(root)
+    }
+
+    /// Run ONE isolated home+project layered-load scenario, fully scoped so the
+    /// process-global test-env guard (and tempdir) drop before returning. Two
+    /// `IsolatedCockpitHome` guards alive at once would deadlock on the
+    /// non-reentrant `TEST_ENV_MUTEX` (`blocking_lock`), so multi-scenario
+    /// tests MUST route each scenario through a scoped helper like this rather
+    /// than shadowing `let _env` in the same function scope.
+    fn load_home_and_project(
+        home_config: serde_json::Value,
+        project_config: Option<serde_json::Value>,
+    ) -> ExtendedConfig {
+        let tmp = TempDir::new().unwrap();
+        let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        write_config(
+            &tmp.path().join("home/.config/cockpit/config.json"),
+            home_config,
+        );
+        let project = tmp.path().join("repo");
+        match project_config {
+            Some(project_config) => {
+                write_config(&project.join(".cockpit/config.json"), project_config)
+            }
+            None => std::fs::create_dir_all(&project).unwrap(),
+        }
+        trusted_load_for_cwd(&project)
+    }
+
+    // Criterion 1.
+    #[test]
+    fn image_generation_extended_field_default_and_parse() {
+        assert_eq!(
+            ExtendedConfig::default().image_generation,
+            ImageGenerationConfig::default()
+        );
+        assert!(
+            ExtendedConfig::default()
+                .image_generation
+                .endpoints()
+                .is_empty()
+        );
+
+        let mut cfg = ExtendedConfig::default();
+        cfg.image_generation = registry_a();
+        let json = serde_json::to_string(&cfg).unwrap();
+        let decoded: ExtendedConfig = serde_json::from_str(&json).unwrap();
+
+        let fixture = registry_a();
+        assert_eq!(decoded.image_generation, fixture);
+        assert_eq!(decoded.image_generation.endpoints(), fixture.endpoints());
+        assert_eq!(decoded.image_generation.targets(), fixture.targets());
+        assert_eq!(decoded.image_generation.workflows(), fixture.workflows());
+        assert_eq!(
+            decoded.image_generation.openrouter_provider_allowlist(),
+            fixture.openrouter_provider_allowlist()
+        );
+
+        // `#[serde(default)]`: a document that OMITS `image_generation`
+        // deserializes to the empty registry (fails if the attribute is
+        // dropped, which a round-trip of a serialized value would not catch).
+        let without: ExtendedConfig = serde_json::from_str(r#"{"name":"no-image-gen"}"#).unwrap();
+        assert_eq!(without.image_generation, ImageGenerationConfig::default());
+        assert_eq!(without.name.as_deref(), Some("no-image-gen"));
+    }
+
+    // Criterion 2.
+    #[test]
+    fn image_generation_load_for_cwd_round_trips_registry() {
+        let tmp = TempDir::new().unwrap();
+        let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        // Write a DELIBERATELY UN-normalized raw origin/prefix (trailing
+        // slashes) to disk. `registry_a()` normalizes before serializing, so
+        // writing its serialized form would make the normalization assertion
+        // vacuous; overwriting the raw JSON forces the load path to normalize.
+        let mut raw = serde_json::to_value(registry_a()).unwrap();
+        raw["endpoints"][0]["origin"] = "http://127.0.0.1:8188/".into();
+        raw["endpoints"][0]["path_prefix"] = "/tenant/a/".into();
+        assert_eq!(raw["endpoints"][0]["origin"], "http://127.0.0.1:8188/");
+        write_config(
+            &tmp.path().join("home/.config/cockpit/config.json"),
+            serde_json::json!({ "image_generation": raw }),
+        );
+        let project = tmp.path().join("repo");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let cfg = trusted_load_for_cwd(&project);
+
+        // The whole registry matches the normalized fixture.
+        assert_eq!(cfg.image_generation, registry_a());
+        let endpoint = &cfg.image_generation.endpoints()[0];
+        assert_eq!(endpoint.id, "local-comfy");
+        // Load-time normalization: the trailing slashes on disk are gone.
+        assert_eq!(endpoint.origin, "http://127.0.0.1:8188");
+        assert_eq!(endpoint.path_prefix.as_deref(), Some("/tenant/a"));
+        let target = &cfg.image_generation.targets()[0];
+        assert_eq!(target.id, "portrait");
+        assert!(target.enabled && target.is_default);
+        assert_eq!(cfg.image_generation.workflows()[0].id, "portrait-v1");
+    }
+
+    // Criterion 3.
+    #[test]
+    fn image_generation_atomic_layer_replace() {
+        // Project registry B fully replaces home registry A.
+        let cfg = load_home_and_project(
+            serde_json::json!({ "image_generation": serde_json::to_value(registry_a()).unwrap() }),
+            Some(
+                serde_json::json!({ "image_generation": serde_json::to_value(registry_b()).unwrap() }),
+            ),
+        );
+        assert_eq!(cfg.image_generation, registry_b());
+        // No leftover A endpoints/targets/workflows/allowlist entries.
+        assert!(
+            cfg.image_generation
+                .endpoints()
+                .iter()
+                .all(|e| e.id != "local-comfy")
+        );
+        assert!(cfg.image_generation.workflows().is_empty());
+        assert!(
+            cfg.image_generation
+                .openrouter_provider_allowlist()
+                .is_empty()
+        );
+
+        // Project omitting the key inherits home registry A.
+        let cfg = load_home_and_project(
+            serde_json::json!({ "image_generation": serde_json::to_value(registry_a()).unwrap() }),
+            Some(serde_json::json!({ "name": "Proj" })),
+        );
+        assert_eq!(cfg.name.as_deref(), Some("Proj"));
+        assert_eq!(cfg.image_generation, registry_a());
+
+        // Non-vacuity: a SPARSE overlay `{"image_generation": {}}` (a valid
+        // empty registry) must fully WIPE A. A non-atomic deep-merge of an
+        // empty object onto A would leave A's endpoints/workflows/allowlist
+        // intact; atomic whole-value replace yields the empty registry. This
+        // case fails if `image_generation` is removed from
+        // ATOMIC_CONFIG_VALUE_PATHS.
+        let cfg = load_home_and_project(
+            serde_json::json!({ "image_generation": serde_json::to_value(registry_a()).unwrap() }),
+            Some(serde_json::json!({ "image_generation": {} })),
+        );
+        assert_eq!(
+            cfg.image_generation,
+            ImageGenerationConfig::default(),
+            "sparse empty overlay atomically wipes A (no deep-merge leak)"
+        );
+        assert!(cfg.image_generation.workflows().is_empty());
+        assert!(
+            cfg.image_generation
+                .openrouter_provider_allowlist()
+                .is_empty()
+        );
+    }
+
+    // Criterion 4.
+    #[test]
+    fn image_generation_malformed_layer_fail_closed_hides_lower() {
+        // A present-but-invalid project registry: two enabled defaults.
+        let mut malformed = serde_json::to_value(registry_a()).unwrap();
+        let mut second = malformed["targets"][0].clone();
+        second["id"] = "portrait-2".into();
+        malformed["targets"].as_array_mut().unwrap().push(second);
+        assert!(
+            serde_json::from_value::<ImageGenerationConfig>(malformed.clone()).is_err(),
+            "fixture must be invalid (two enabled defaults)"
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        write_config(
+            &tmp.path().join("home/.config/cockpit/config.json"),
+            serde_json::json!({ "image_generation": serde_json::to_value(registry_a()).unwrap() }),
+        );
+        let project = tmp.path().join("repo");
+        let project_cfg = project.join(".cockpit/config.json");
+        write_config(
+            &project_cfg,
+            serde_json::json!({ "name": "Malformed", "image_generation": malformed }),
+        );
+
+        // Surface via the REAL layered load path (not a direct
+        // config_with_warnings on the raw doc): the merge-time fail-closed
+        // must record a non-secret warning, not happen silently.
+        let (cfg, warnings) = trusted_load_for_cwd_with_warnings(&project);
+        // Fail-closed to empty, NOT home registry A.
+        assert_eq!(cfg.image_generation, ImageGenerationConfig::default());
+        // The unrelated valid project field still loads.
+        assert_eq!(cfg.name.as_deref(), Some("Malformed"));
+        let warning = warnings
+            .iter()
+            .find(|w| w.contains("image_generation"))
+            .expect("the layered load path must surface a malformed image_generation warning");
+        // Non-secret: the warning must not leak credential refs / header values.
+        assert!(!warning.contains("comfy-token"));
+        assert!(!warning.contains("$secret"));
+    }
+
+    // Criterion 5.
+    #[test]
+    fn image_generation_dependent_removal_fails_layer() {
+        // Model the rejected atomic transaction: the endpoint an enabled
+        // target depends on is dropped while the target stays enabled.
+        let mut orphaned = serde_json::to_value(registry_b()).unwrap();
+        orphaned["endpoints"] = serde_json::json!([]);
+        assert!(
+            serde_json::from_value::<ImageGenerationConfig>(orphaned.clone()).is_err(),
+            "enabled target with a missing endpoint must be invalid"
+        );
+
+        // Seed a LOWER valid registry A so the assertion distinguishes
+        // "dependent-removal actively enforced (A wiped to empty)" from the
+        // vacuous "field never parsed / absent (would inherit A)".
+        let tmp = TempDir::new().unwrap();
+        let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        write_config(
+            &tmp.path().join("home/.config/cockpit/config.json"),
+            serde_json::json!({ "image_generation": serde_json::to_value(registry_a()).unwrap() }),
+        );
+        let project = tmp.path().join("repo");
+        write_config(
+            &project.join(".cockpit/config.json"),
+            serde_json::json!({ "image_generation": orphaned }),
+        );
+
+        let (cfg, warnings) = trusted_load_for_cwd_with_warnings(&project);
+        // The orphaned UPPER layer fails closed to empty — it neither keeps a
+        // subset of its own endpoints nor inherits lower registry A.
+        assert_eq!(
+            cfg.image_generation,
+            ImageGenerationConfig::default(),
+            "dependent-removal is enforced at load: the layer fails closed, not inherits A"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("image_generation")),
+            "the dependent-removal failure is surfaced as a redacted warning"
+        );
+    }
+
+    // Criterion 6.
+    #[test]
+    fn image_generation_effective_default_rule_after_merge() {
+        // Why a dual-default EFFECTIVE registry is structurally impossible:
+        // atomic replace (ATOMIC_CONFIG_VALUE_PATHS) makes the effective value
+        // exactly ONE layer's `image_generation`, and every layer's value is
+        // re-validated through `ImageGenerationConfig::new` (which enforces
+        // exactly-one-enabled-default). So the ONLY way a dual-default could
+        // reach the effective config is a single layer carrying two defaults —
+        // and that fails closed to empty at parse. Prove that focal property
+        // directly, as a single-layer document.
+        let mut single_layer_dual = serde_json::to_value(registry_a()).unwrap();
+        let mut extra_default = single_layer_dual["targets"][0].clone();
+        extra_default["id"] = "portrait-2".into();
+        single_layer_dual["targets"]
+            .as_array_mut()
+            .unwrap()
+            .push(extra_default);
+        // Two `is_default: true` enabled targets — invalid at the type level.
+        assert_eq!(
+            single_layer_dual["targets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|t| t["is_default"] == serde_json::json!(true))
+                .count(),
+            2
+        );
+        assert!(
+            serde_json::from_value::<ImageGenerationConfig>(single_layer_dual.clone()).is_err()
+        );
+        let cfg = load_home_and_project(
+            serde_json::json!({ "image_generation": single_layer_dual }),
+            None,
+        );
+        assert_eq!(
+            cfg.image_generation,
+            ImageGenerationConfig::default(),
+            "a single layer with two defaults fails closed to empty — never effective"
+        );
+        assert_eq!(enabled_default_count(&cfg.image_generation), 0);
+
+        // Merging two valid single-default registries never yields two
+        // defaults: atomic replace means exactly one layer's registry wins.
+        let cfg = load_home_and_project(
+            serde_json::json!({ "image_generation": serde_json::to_value(registry_a()).unwrap() }),
+            Some(
+                serde_json::json!({ "image_generation": serde_json::to_value(registry_b()).unwrap() }),
+            ),
+        );
+        assert_eq!(cfg.image_generation, registry_b());
+        assert_eq!(enabled_default_count(&cfg.image_generation), 1);
+
+        // Through the ACTUAL merge/load path: a project (upper) layer that
+        // would introduce a second enabled default fails closed to empty at
+        // load; the effective registry can never carry two defaults.
+        let mut dual = serde_json::to_value(registry_a()).unwrap();
+        let mut second = dual["targets"][0].clone();
+        second["id"] = "portrait-2".into();
+        dual["targets"].as_array_mut().unwrap().push(second);
+        assert!(
+            serde_json::from_value::<ImageGenerationConfig>(dual.clone()).is_err(),
+            "fixture must be an invalid dual-default registry"
+        );
+
+        let cfg = load_home_and_project(
+            serde_json::json!({ "image_generation": serde_json::to_value(registry_a()).unwrap() }),
+            Some(serde_json::json!({ "image_generation": dual })),
+        );
+        assert_eq!(
+            cfg.image_generation,
+            ImageGenerationConfig::default(),
+            "dual-default upper layer fails closed to empty on the load path"
+        );
+        assert_eq!(enabled_default_count(&cfg.image_generation), 0);
+    }
+
+    // Criterion 7.
+    #[test]
+    fn image_generation_remote_layer_cannot_supply_registry() {
+        // Pure helper: strip removes the key from a raw layer object.
+        let mut raw = serde_json::json!({
+            "name": "x",
+            "image_generation": serde_json::to_value(registry_b()).unwrap(),
+        });
+        strip_remote_image_generation(&mut raw);
+        assert!(raw.get("image_generation").is_none());
+        assert!(raw.get("name").is_some());
+
+        // Construct remote layers through the PRODUCTION constructor (not a raw
+        // struct literal / poked private field), so the strip is driven by the
+        // same non-forgettable factory a future remote-fetch must use.
+        fn remote_doc(raw: serde_json::Value) -> ExtendedConfigDoc {
+            ExtendedConfigDoc::from_remote_layer(raw)
+        }
+        fn local_doc(raw: serde_json::Value) -> ExtendedConfigDoc {
+            ExtendedConfigDoc {
+                path: PathBuf::from("<local>"),
+                raw,
+                origin: ConfigLayerOrigin::LocalTrusted,
+            }
+        }
+
+        // The remote CONSTRUCTOR itself classifies the layer as remote (this is
+        // what makes the strip non-forgettable — no caller can omit the origin).
+        assert!(remote_doc(serde_json::json!({})).layer_is_remote());
+        assert!(!local_doc(serde_json::json!({})).layer_is_remote());
+
+        // (c) Remote-only: a remote layer with a non-empty registry supplies
+        // nothing, even with allow_remote_config = true.
+        let remote_only = vec![remote_doc(serde_json::json!({
+            "allow_remote_config": true,
+            "image_generation": serde_json::to_value(registry_b()).unwrap(),
+        }))];
+        let effective = load_merged_from_docs_with_warnings(&remote_only).0;
+        assert!(
+            effective.allow_remote_config,
+            "remote scalar layer was still merged"
+        );
+        assert_eq!(
+            effective.image_generation,
+            ImageGenerationConfig::default(),
+            "remote registry content must not be applied"
+        );
+
+        // (d) Local + remote: local registry A survives; remote B (as the
+        // most-specific layer) is stripped, not applied, and does not wipe A.
+        let local_plus_remote = vec![
+            local_doc(serde_json::json!({
+                "image_generation": serde_json::to_value(registry_a()).unwrap(),
+            })),
+            remote_doc(serde_json::json!({
+                "allow_remote_config": true,
+                "image_generation": serde_json::to_value(registry_b()).unwrap(),
+            })),
+        ];
+        let effective = load_merged_from_docs_with_warnings(&local_plus_remote).0;
+        assert_eq!(
+            effective.image_generation,
+            registry_a(),
+            "local registry must be preserved, not replaced or wiped by remote"
+        );
+
+        // (e) A NON-OBJECT remote layer (null/string/array) must be neutralized
+        // before merge: it can neither supply a registry nor WIPE local A (a
+        // non-object overlay otherwise clobbers the whole accumulated config
+        // via deep_merge_value). Effective must still equal A.
+        for shape in [
+            serde_json::Value::Null,
+            serde_json::json!("x"),
+            serde_json::json!([1, 2, 3]),
+        ] {
+            let docs = vec![
+                local_doc(serde_json::json!({
+                    "image_generation": serde_json::to_value(registry_a()).unwrap(),
+                })),
+                remote_doc(shape.clone()),
+            ];
+            let effective = load_merged_from_docs_with_warnings(&docs).0;
+            assert_eq!(
+                effective.image_generation,
+                registry_a(),
+                "non-object remote layer {shape:?} must not wipe local registry A"
+            );
+            // The rest of the local config also survives the non-object remote.
+            assert_eq!(effective.name, ExtendedConfig::default().name);
+        }
+    }
+
+    // Criterion 7 (direct-parse regression): a remote-origin doc must not leak
+    // `image_generation` through the DIRECT typed-parse path either — not only
+    // through the merge path. `from_remote_layer` strips at construction, so
+    // the stored raw never carries the key and every typed-parse entry point
+    // (`config` / `config_with_warnings`) yields the empty registry.
+    #[test]
+    fn image_generation_remote_layer_direct_parse_cannot_leak_registry() {
+        let raw = serde_json::json!({
+            "name": "keep",
+            "allow_remote_config": true,
+            "image_generation": serde_json::to_value(registry_b()).unwrap(),
+        });
+        let doc = ExtendedConfigDoc::from_remote_layer(raw);
+        assert!(doc.layer_is_remote());
+        // The stored raw never carries the key (stripped at construction).
+        assert!(doc.raw_field("image_generation").is_none());
+
+        // `config()` — the direct typed parse — yields the empty registry,
+        // while unrelated scalar fields still parse (the layer wasn't nuked).
+        let cfg = doc.config();
+        assert_eq!(cfg.image_generation, ImageGenerationConfig::default());
+        assert_eq!(cfg.name.as_deref(), Some("keep"));
+        assert!(cfg.allow_remote_config);
+
+        // `config_with_warnings()` — same, and no spurious image_generation
+        // warning (the key is simply absent, not malformed).
+        let (cfg2, warnings) = doc.config_with_warnings();
+        assert_eq!(cfg2.image_generation, ImageGenerationConfig::default());
+        assert!(!warnings.iter().any(|w| w.contains("image_generation")));
+
+        // A non-object remote raw is neutralized to an empty object, so the
+        // direct parse is safe there too.
+        let null_doc = ExtendedConfigDoc::from_remote_layer(serde_json::Value::Null);
+        assert_eq!(
+            null_doc.config().image_generation,
+            ImageGenerationConfig::default()
+        );
+    }
+
+    // Criterion 8.
+    #[test]
+    fn image_generation_is_an_atomic_config_value_path() {
+        assert!(crate::config::merge::is_atomic_config_value_path(&[
+            "image_generation".to_string()
+        ]));
+
+        // Behavior: an overlay object fully REPLACES the base registry object
+        // rather than deep-merging nested keys.
+        let mut base = serde_json::json!({
+            "image_generation": serde_json::to_value(registry_a()).unwrap(),
+        });
+        let overlay = serde_json::json!({ "image_generation": {} });
+        crate::config::merge::deep_merge_value(&mut base, &overlay);
+        assert_eq!(
+            base["image_generation"],
+            serde_json::json!({}),
+            "atomic replace: base endpoints/targets must not survive under an empty overlay"
+        );
+    }
+
+    // Findings 1 + 2 + 8: a wrong JSON type fails closed to empty on the real
+    // load path, and the surfaced warning is REDACTED (the raw error would
+    // embed the attacker-supplied credential-like string; the warning must
+    // not).
+    #[test]
+    fn image_generation_wrong_json_type_fails_closed_with_redacted_warning() {
+        const SECRET: &str = "sk-live-SUPER-SECRET-abc123";
+        // Prove the underlying deserialization error *does* leak the secret,
+        // so the redacted-warning assertion below is non-vacuous.
+        let leaked = serde_json::from_value::<ImageGenerationConfig>(serde_json::json!(SECRET))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            leaked.contains(SECRET),
+            "precondition: the raw serde error embeds the attacker string"
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        let project = tmp.path().join("repo");
+        write_config(
+            &project.join(".cockpit/config.json"),
+            serde_json::json!({ "name": "x", "image_generation": SECRET }),
+        );
+
+        let (cfg, warnings) = trusted_load_for_cwd_with_warnings(&project);
+        assert_eq!(cfg.image_generation, ImageGenerationConfig::default());
+        assert_eq!(cfg.name.as_deref(), Some("x"));
+        let warning = warnings
+            .iter()
+            .find(|w| w.contains("image_generation"))
+            .expect("wrong-type image_generation must surface a warning");
+        assert!(
+            !warning.contains(SECRET),
+            "the surfaced warning must not leak the attacker string: {warning}"
+        );
+    }
+
+    // Finding 8: an explicit `image_generation: {}` is accepted as the empty
+    // registry (valid, no warning).
+    #[test]
+    fn image_generation_empty_object_is_empty_registry() {
+        let tmp = TempDir::new().unwrap();
+        let _env = crate::config::dirs::test_support::IsolatedCockpitHome::new(tmp.path());
+        let project = tmp.path().join("repo");
+        write_config(
+            &project.join(".cockpit/config.json"),
+            serde_json::json!({ "image_generation": {} }),
+        );
+
+        let (cfg, warnings) = trusted_load_for_cwd_with_warnings(&project);
+        assert_eq!(cfg.image_generation, ImageGenerationConfig::default());
+        assert!(
+            !warnings.iter().any(|w| w.contains("image_generation")),
+            "a valid empty registry must not warn"
+        );
+    }
+
+    // Finding 3 / decision 8: writing an unrelated field to a document whose
+    // on-disk `image_generation` is present-but-invalid must NOT persist the
+    // invalid registry — it is canonicalized to the typed value — while a
+    // document that never had the key keeps it absent.
+    #[test]
+    fn image_generation_write_canonicalizes_present_invalid_registry() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.json");
+
+        // Present-but-invalid: an enabled target whose endpoint was dropped.
+        let mut invalid = serde_json::to_value(registry_a()).unwrap();
+        invalid["endpoints"] = serde_json::json!([]);
+        assert!(serde_json::from_value::<ImageGenerationConfig>(invalid.clone()).is_err());
+        write_config(
+            &path,
+            serde_json::json!({ "name": "Before", "image_generation": invalid }),
+        );
+
+        let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+        let mut cfg = doc.config();
+        // Loader already failed the registry closed to empty.
+        assert_eq!(cfg.image_generation, ImageGenerationConfig::default());
+        cfg.name = Some("After".into());
+        doc.write(&cfg).unwrap();
+
+        let reloaded = ExtendedConfigDoc::load(&path).unwrap();
+        assert_eq!(reloaded.config().name.as_deref(), Some("After"));
+        let on_disk = reloaded
+            .raw_field("image_generation")
+            .expect("key was present, stays present");
+        // The persisted raw now deserializes cleanly to the empty registry:
+        // no referentially invalid registry survived on disk.
+        assert_eq!(
+            serde_json::from_value::<ImageGenerationConfig>(on_disk.clone()).unwrap(),
+            ImageGenerationConfig::default()
+        );
+
+        // Sparse preservation: a file that never had the key does not get it
+        // materialized by an unrelated write.
+        let sparse = tmp.path().join("sparse.json");
+        write_config(&sparse, serde_json::json!({ "name": "Sparse" }));
+        let mut doc = ExtendedConfigDoc::load(&sparse).unwrap();
+        let mut cfg = doc.config();
+        cfg.name = Some("SparseAfter".into());
+        doc.write(&cfg).unwrap();
+        let reloaded = ExtendedConfigDoc::load(&sparse).unwrap();
+        assert!(
+            reloaded.raw_field("image_generation").is_none(),
+            "unrelated write must not materialize image_generation into a sparse file"
+        );
+    }
+
+    // Finding 2 / decision 8: the write delta must be ATOMIC for
+    // `image_generation` — saving valid registry B over a present raw whose
+    // registry carries extra `workflows`/`openrouter_provider_allowlist` must
+    // persist exactly B, with no stale entries surviving via deep-merge.
+    #[test]
+    fn image_generation_write_replaces_stale_registry_atomically() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.json");
+
+        // Present raw whose registry has non-empty workflows + allowlist. It is
+        // malformed (two enabled defaults) so the loader's `config()` yields
+        // the empty registry — which is precisely what makes a non-atomic
+        // write delta skip the (empty==empty) workflows/allowlist sub-arrays
+        // and leave the on-disk entries stale.
+        let mut stale = serde_json::to_value(registry_a()).unwrap();
+        let mut second = stale["targets"][0].clone();
+        second["id"] = "portrait-2".into();
+        stale["targets"].as_array_mut().unwrap().push(second);
+        assert!(serde_json::from_value::<ImageGenerationConfig>(stale.clone()).is_err());
+        assert!(!stale["workflows"].as_array().unwrap().is_empty());
+        assert!(
+            !stale["openrouter_provider_allowlist"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        write_config(
+            &path,
+            serde_json::json!({ "name": "x", "image_generation": stale }),
+        );
+
+        // User saves a valid registry B (hosted; empty workflows + allowlist).
+        let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+        let mut cfg = doc.config();
+        cfg.image_generation = registry_b();
+        doc.write(&cfg).unwrap();
+
+        let reloaded = ExtendedConfigDoc::load(&path).unwrap();
+        let persisted = reloaded
+            .raw_field("image_generation")
+            .expect("registry was written");
+        // Persisted raw equals typed B exactly — no stale A workflows/allowlist.
+        assert_eq!(*persisted, serde_json::to_value(registry_b()).unwrap());
+        assert_eq!(persisted["workflows"], serde_json::json!([]));
+        assert_eq!(
+            persisted["openrouter_provider_allowlist"],
+            serde_json::json!([])
+        );
+        // And it round-trips back to B through the loader.
+        assert_eq!(reloaded.config().image_generation, registry_b());
+    }
+
+    // Finding (round 3) #1: the atomic-write replace must not clobber a
+    // registry written CONCURRENTLY by another writer between load and save
+    // when THIS caller never touched `image_generation`. The reloaded valid
+    // registry must be preserved.
+    #[test]
+    fn image_generation_write_preserves_concurrent_registry_when_caller_untouched() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.json");
+        // Caller loads a document that has NO image_generation.
+        write_config(&path, serde_json::json!({ "name": "orig" }));
+        let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+        let mut cfg = doc.config();
+        assert_eq!(cfg.image_generation, ImageGenerationConfig::default());
+
+        // Meanwhile another writer adds a valid registry A to the same file.
+        write_config(
+            &path,
+            serde_json::json!({
+                "name": "orig",
+                "image_generation": serde_json::to_value(registry_a()).unwrap(),
+            }),
+        );
+
+        // This caller saves an UNRELATED change; it never touched the registry.
+        cfg.name = Some("edited".into());
+        doc.write(&cfg).unwrap();
+
+        let reloaded = ExtendedConfigDoc::load(&path).unwrap();
+        let effective = reloaded.config();
+        assert_eq!(effective.name.as_deref(), Some("edited"));
+        assert_eq!(
+            effective.image_generation,
+            registry_a(),
+            "the concurrently-written valid registry must be preserved, not clobbered with the \
+             caller's default-empty value"
+        );
+    }
+
+    // Finding (round 3) #2: the DIRECT-parse warning path
+    // (`config_with_warnings`, distinct from the layered-merge path) must also
+    // redact secrets embedded in a malformed value's error.
+    #[test]
+    fn image_generation_direct_parse_warning_is_redacted() {
+        const SECRET: &str = "sk-live-DIRECT-PARSE-SECRET-xyz";
+        // A secret can also hide in the config PATH (e.g. a token-named dir).
+        const PATH_SECRET: &str = "tok-PATH-SECRET-9f8e";
+        // Non-vacuity: the raw serde error would leak the value secret.
+        let leaked = serde_json::from_value::<ImageGenerationConfig>(serde_json::json!(SECRET))
+            .unwrap_err()
+            .to_string();
+        assert!(leaked.contains(SECRET));
+
+        let tmp = TempDir::new().unwrap();
+        // Place the config under a directory named after a secret token, so a
+        // path-embedding warning would leak it.
+        let path = tmp.path().join(PATH_SECRET).join("config.json");
+        write_config(
+            &path,
+            serde_json::json!({ "name": "n", "image_generation": SECRET }),
+        );
+
+        let doc = ExtendedConfigDoc::load(&path).unwrap();
+        let (cfg, warnings) = doc.config_with_warnings();
+        assert_eq!(cfg.image_generation, ImageGenerationConfig::default());
+        assert_eq!(cfg.name.as_deref(), Some("n"));
+        let warning = warnings
+            .iter()
+            .find(|w| w.contains("image_generation"))
+            .expect("direct config_with_warnings must warn about malformed image_generation");
+        // Field-only, stable form: neither the malformed VALUE nor the PATH.
+        assert!(
+            !warning.contains(SECRET),
+            "direct-parse warning must not leak the attacker value: {warning}"
+        );
+        assert!(
+            !warning.contains(PATH_SECRET),
+            "direct-parse warning must not leak the config path: {warning}"
+        );
+        assert_eq!(
+            warning.as_str(),
+            "ignored malformed `image_generation` configuration"
+        );
+    }
+
+    // Minimal tracing capture (mirrors `capture_warn_logs` in providers/tests),
+    // so we can assert the emitted LOG line — not just the returned warning —
+    // is free of the config path and the malformed value.
+    #[derive(Clone)]
+    struct SharedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    struct LogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLog {
+        type Writer = LogWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            LogWriter(std::sync::Arc::clone(&self.0))
+        }
+    }
+    fn capture_warn_logs(f: impl FnOnce()) -> String {
+        let sink = SharedLog(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(sink.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(sink.0.lock().unwrap().clone()).unwrap()
+    }
+
+    // Round-6: the emitted tracing warning (not only the returned warning
+    // vector) must be free of the config path and the malformed value.
+    #[test]
+    fn image_generation_malformed_tracing_log_is_path_and_value_free() {
+        const VALUE_SECRET: &str = "sk-live-LOG-VALUE-SECRET-abc";
+        const PATH_SECRET: &str = "tok-LOG-PATH-SECRET-def";
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(PATH_SECRET).join("config.json");
+        write_config(
+            &path,
+            serde_json::json!({ "name": "n", "image_generation": VALUE_SECRET }),
+        );
+        let doc = ExtendedConfigDoc::load(&path).unwrap();
+
+        // Direct-parse path.
+        let logs = capture_warn_logs(|| {
+            let (_cfg, _warnings) = doc.config_with_warnings();
+        });
+        assert!(
+            logs.contains("image_generation"),
+            "a warning must be logged: {logs:?}"
+        );
+        assert!(
+            !logs.contains(VALUE_SECRET),
+            "log leaked the value: {logs:?}"
+        );
+        assert!(!logs.contains(PATH_SECRET), "log leaked the path: {logs:?}");
+
+        // Layered-merge path (raw_for_layer_merge).
+        let logs = capture_warn_logs(|| {
+            let _ = load_merged_from_docs_with_warnings(std::slice::from_ref(&doc));
+        });
+        assert!(
+            logs.contains("image_generation"),
+            "a merge warning must be logged: {logs:?}"
+        );
+        assert!(
+            !logs.contains(VALUE_SECRET),
+            "merge log leaked the value: {logs:?}"
+        );
+        assert!(
+            !logs.contains(PATH_SECRET),
+            "merge log leaked the path: {logs:?}"
+        );
+    }
+}

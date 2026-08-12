@@ -3120,6 +3120,134 @@ async fn config_snapshot_event_still_carries_no_secrets() {
     assert!(provider.entry.credential_ref.is_none());
 }
 
+#[test]
+fn redacted_extended_config_blanks_image_generation_secrets() {
+    use crate::config::image_generation::*;
+    use crate::config::providers::{CapabilityStatus, HeaderSpec};
+    use chrono::{TimeZone, Utc};
+
+    // Endpoint carrying a raw bearer-token header value + credential reference.
+    let endpoint = ImageEndpoint {
+        id: "openai-main".into(),
+        adapter: ImageAdapterKind::OpenaiImages,
+        origin: "https://api.openai.com/".into(),
+        path_prefix: None,
+        credential_ref: Some("cred-secret-token".into()),
+        headers: vec![HeaderSpec {
+            name: "Authorization".into(),
+            value: "Bearer header-secret-token".into(),
+        }],
+        allow_insecure_transport: false,
+        location: ImageLocationClass::PublicCloud,
+        enabled: true,
+        route_profile_version: IMAGE_GENERATION_ROUTE_PROFILE_VERSION,
+        exclusive_server: false,
+    }
+    .normalized()
+    .unwrap();
+    let endpoint_identity = endpoint.immutable_identity();
+
+    // Discovered evidence whose `source_url` hides a secret query token. Its
+    // `endpoint_identity` must match the endpoint, so a partial in-place
+    // redaction that mutated the endpoint would break this binding and panic —
+    // exactly why the snapshot omits the registry instead.
+    let fetched = Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap();
+    let expires = Utc.with_ymd_and_hms(2026, 8, 2, 0, 0, 0).unwrap();
+    let capability = ImageCapabilityEvidence::new(
+        CapabilityStatus::Supported,
+        Some(ImageEvidence::Discovered {
+            source_url: "https://disc.example.com/models?access_token=evidence-secret-token".into(),
+            fetched_at: fetched,
+            expires_at: expires,
+            endpoint_identity: endpoint_identity.clone(),
+        }),
+    )
+    .unwrap();
+
+    // Standalone workflow whose opaque `graph_json` hides a token anywhere.
+    let graph_json =
+        r#"{"1":{"inputs":{"seed":1,"api_key":"graph-secret-token"}},"2":{"inputs":{}}}"#
+            .to_owned();
+    let workflow = RegisteredComfyWorkflow {
+        id: "wf-1".into(),
+        graph_digest: canonical_workflow_digest(&graph_json).unwrap(),
+        graph_json,
+        bindings: vec![WorkflowBinding {
+            parameter: ImageParameter::Seed,
+            node_id: "1".into(),
+            input: "seed".into(),
+            value_type: WorkflowValueType::Integer,
+            min: Some(0),
+            max: Some(1_000_000),
+        }],
+        outputs: vec![WorkflowOutput {
+            node_id: "2".into(),
+            output: "images".into(),
+            value_type: WorkflowValueType::Image,
+        }],
+    };
+
+    let registry = ImageGenerationConfig::new(
+        vec![endpoint],
+        vec![ImageGenerationTarget {
+            id: "gpt-image".into(),
+            display_name: None,
+            endpoint_id: "openai-main".into(),
+            identity: ImageTargetIdentity::HostedModel {
+                model: "gpt-image-1".into(),
+            },
+            enabled: true,
+            is_default: true,
+            formats: vec![ImageFormat::Png],
+            reference_support: ReferenceImageSupport::Unsupported,
+            max_reference_images: 0,
+            max_samples: 1,
+            max_outputs: 1,
+            dimensions: ImageDimensionDescriptor::ProviderDefault,
+            dimension_policy: ImageDimensionRequestPolicy::ProviderDefault,
+            parameters: vec![],
+            openrouter_routing: None,
+            generation_capability: capability,
+            price: ImagePrice::Unknown,
+        }],
+        vec![workflow],
+        vec![],
+    )
+    .unwrap();
+
+    // Put the secret-bearing registry into a real session config snapshot.
+    let mut snapshot = snapshot_for_tests();
+    snapshot.extended.image_generation = registry.clone();
+
+    // Go through the ACTUAL client-facing serialization path (`to_proto`), not
+    // the redaction helper directly, so bypassing the helper inside to_proto
+    // would fail this test.
+    let wire = snapshot.to_proto(Uuid::new_v4());
+
+    // (b) The snapshot omits image-generation content entirely (empty
+    // registry): no panic on discovered evidence, no reliance on selectively
+    // scrubbing opaque graph_json.
+    assert_eq!(
+        wire.extended.image_generation,
+        ImageGenerationConfig::default()
+    );
+
+    // (a) The serialized proto clients receive leaks none of the secrets.
+    let encoded = serde_json::to_string(&wire).unwrap();
+    for secret in [
+        "header-secret-token",
+        "cred-secret-token",
+        "graph-secret-token",
+        "evidence-secret-token",
+        "access_token=evidence-secret-token",
+    ] {
+        assert!(!encoded.contains(secret), "leaked {secret}: {encoded}");
+    }
+
+    // (c) Redaction is snapshot-only: the live source config is not mutated.
+    assert_eq!(snapshot.extended.image_generation, registry);
+}
+
 #[tokio::test]
 async fn config_snapshot_carries_resolved_provider_view() {
     let wire = snapshot_for_tests().to_proto(Uuid::new_v4());

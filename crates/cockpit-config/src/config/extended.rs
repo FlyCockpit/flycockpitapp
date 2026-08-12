@@ -88,6 +88,21 @@ pub struct ExtendedConfig {
     /// blocks paid dispatch; loaders must not inject display suggestions.
     #[serde(default)]
     pub image_spend: crate::config::image_spend::ImageSpendSettings,
+
+    /// Image-generation endpoint/target/workflow registry.
+    ///
+    /// **Local-trust configuration only — never remote-supplied.** Endpoints
+    /// carry origins, credential references, and request headers, so a
+    /// remote/untrusted config layer must never contribute this key: it is
+    /// stripped before merge (see [`strip_remote_image_generation`]), and
+    /// `allow_remote_config` does not authorize remote image endpoints.
+    /// Defaults to the empty registry (zero endpoints/targets/workflows,
+    /// empty OpenRouter allowlist). Merged atomically as a whole-registry
+    /// replace across layers (see `ATOMIC_CONFIG_VALUE_PATHS`); a
+    /// present-but-invalid value fails closed to the empty registry rather
+    /// than exposing a lower layer's registry.
+    #[serde(default)]
+    pub image_generation: crate::config::image_generation::ImageGenerationConfig,
     #[serde(default)]
     pub harnesses: HashMap<String, HarnessConfig>,
 
@@ -1552,6 +1567,7 @@ impl Default for ExtendedConfig {
         Self {
             response_metrics_tokenizer: TiktokenEncoding::default(),
             image_spend: crate::config::image_spend::ImageSpendSettings::default(),
+            image_generation: crate::config::image_generation::ImageGenerationConfig::default(),
             harnesses: HashMap::new(),
             agent_guidance_files: default_agent_guidance_files(),
             concurrency: Concurrency::default(),
@@ -1791,6 +1807,19 @@ pub fn load_for_cwd(cwd: &Path) -> ExtendedConfig {
     load_for_cwd_with_computer_use_policy(cwd).0
 }
 
+/// Effective config plus the non-secret warnings raised while merging the
+/// layered documents. This is the real layered load path's warning channel:
+/// it surfaces fail-closed events that happen during layer merge (e.g. a
+/// present-but-invalid `image_generation` registry replaced with the empty
+/// registry) which the plain [`load_for_cwd`] discards. Warnings are
+/// field/path-only and never include deserialization error strings.
+pub fn load_for_cwd_with_warnings(cwd: &Path) -> (ExtendedConfig, Vec<String>) {
+    LOAD_FOR_CWD_CALLS.with(|calls| calls.set(calls.get() + 1));
+    let paths = config_file_paths_for_load(cwd);
+    let docs = load_existing_docs_from_paths(&paths);
+    resolve_loaded_docs_with_warnings(&docs)
+}
+
 /// Load the effective config and the most-restrictive computer-use policy
 /// from one captured set of layered documents.
 pub fn load_for_cwd_with_computer_use_policy(
@@ -1804,22 +1833,29 @@ pub fn load_for_cwd_with_computer_use_policy(
 }
 
 fn resolve_loaded_docs(docs: &[ExtendedConfigDoc]) -> ExtendedConfig {
+    resolve_loaded_docs_with_warnings(docs).0
+}
+
+fn resolve_loaded_docs_with_warnings(docs: &[ExtendedConfigDoc]) -> (ExtendedConfig, Vec<String>) {
     if !docs.is_empty() {
-        let mut cfg = load_merged_from_docs(docs);
+        let (mut cfg, warnings) = load_merged_from_docs_with_warnings(docs);
         cfg.gitignore_allow = resolve_gitignore_allow_from_docs(docs);
         let redact_unions = resolve_redact_list_unions_from_docs(docs);
         cfg.redact.denylist = redact_unions.denylist;
         cfg.redact.allowlist = redact_unions.allowlist;
         cfg.redact.extra_dotenv_paths = redact_unions.extra_dotenv_paths;
-        return cfg;
+        return (cfg, warnings);
     }
     // Fresh install: no config on disk. Materialize the seeded
     // skills scan-dirs so new users discover (and see in `/settings`) the
     // default skill directories.
-    ExtendedConfig {
-        skills: SkillsConfig::seeded_default(),
-        ..Default::default()
-    }
+    (
+        ExtendedConfig {
+            skills: SkillsConfig::seeded_default(),
+            ..Default::default()
+        },
+        Vec::new(),
+    )
 }
 
 /// Daemon-only effective loader. Existing settings/bootstrap callers remain
@@ -1844,7 +1880,11 @@ pub fn load_for_cwd_for_daemon_contract(cwd: &Path) -> Result<DaemonExtendedConf
         crate::config::providers::ConfigDoc::try_load_effective_with_layer_snapshot(&paths)?;
     let docs: Vec<_> = captured
         .into_iter()
-        .map(|(path, raw)| ExtendedConfigDoc { path, raw })
+        .map(|(path, raw)| ExtendedConfigDoc {
+            path,
+            raw,
+            origin: ConfigLayerOrigin::LocalTrusted,
+        })
         .collect();
     let mut validation = Ok(());
     for doc in &docs {
@@ -1909,18 +1949,23 @@ fn load_existing_docs_from_paths(paths: &[PathBuf]) -> Vec<ExtendedConfigDoc> {
     docs
 }
 
-fn load_merged_from_docs(docs: &[ExtendedConfigDoc]) -> ExtendedConfig {
+fn load_merged_from_docs_with_warnings(
+    docs: &[ExtendedConfigDoc],
+) -> (ExtendedConfig, Vec<String>) {
     let mut merged =
         serde_json::to_value(ExtendedConfig::default()).unwrap_or(Value::Object(Map::new()));
+    let mut warnings = Vec::new();
     for doc in docs {
-        let layer = doc.raw_for_layer_merge();
+        let layer = doc.raw_for_layer_merge(&mut warnings);
         deep_merge_value(&mut merged, &layer);
     }
-    ExtendedConfigDoc {
+    let cfg = ExtendedConfigDoc {
         path: PathBuf::from("<merged effective config>"),
         raw: merged,
+        origin: ConfigLayerOrigin::LocalTrusted,
     }
-    .config()
+    .config();
+    (cfg, warnings)
 }
 
 /// Resolve the explicitly configured computer-use policy across all config
@@ -1991,9 +2036,91 @@ fn resolve_computer_use_policy_from_docs(docs: &[ExtendedConfigDoc]) -> Option<C
 pub struct ExtendedConfigDoc {
     pub path: PathBuf,
     raw: Value,
+    origin: ConfigLayerOrigin,
+}
+
+/// Trust origin of a captured config layer.
+///
+/// Today the layered loader only walks local, trust-filtered paths
+/// ([`config_file_paths_for_load`] / [`discover_config_dirs`]), so every
+/// captured layer is [`ConfigLayerOrigin::LocalTrusted`]. [`ConfigLayerOrigin::Remote`]
+/// is the reserved extension point for a future `.well-known/cockpit` fetch:
+/// remote layers are stripped of `image_generation` before merge by
+/// [`ExtendedConfigDoc::raw_for_layer_merge`] via [`strip_remote_image_generation`],
+/// so a remote origin can never inject endpoints, credential refs, or
+/// workflows even when `allow_remote_config` is enabled.
+///
+/// SECURITY: this enum deliberately has **no** `Default`. Origin must be stated
+/// explicitly at every [`ExtendedConfigDoc`] construction so a
+/// remote/untrusted source can never be treated as trusted by omission. The
+/// only supported way to introduce a non-local-trusted layer is
+/// [`ExtendedConfigDoc::from_remote_layer`], which stamps `Remote`; `load`
+/// stamps `LocalTrusted` precisely because it only reads local trust-filtered
+/// paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfigLayerOrigin {
+    LocalTrusted,
+    Remote,
+}
+
+/// Neutralize a remote/untrusted config layer's `image_generation`
+/// contribution, regardless of raw shape.
+///
+/// Remote / untrusted layers must never contribute an image-generation
+/// registry: endpoints carry origins, credential references, and request
+/// headers, and `allow_remote_config` opts in only to remote *scalar*
+/// settings, never to image-generation endpoints. For an object layer we
+/// *remove* the `image_generation` key (rather than replacing it with `{}`),
+/// so the layer behaves exactly as if it never set the field and a lower
+/// **local** layer's registry is inherited unchanged — the opposite of the
+/// malformed-**local** fail-closed path in
+/// [`ExtendedConfigDoc::raw_for_layer_merge`], which replaces the value with
+/// `{}` to wipe (never inherit) a broken local layer. A **non-object** remote
+/// raw (`null` / string / array) carries no usable config and, left as-is,
+/// would clobber the entire accumulated local config via `deep_merge_value`
+/// (which replaces a base wholesale for a non-object overlay); neutralize it
+/// to an empty object so it can neither supply nor wipe the registry.
+///
+/// Applied at the single construction funnel [`ExtendedConfigDoc::from_remote_layer`]
+/// (so a remote doc's stored `raw` never carries `image_generation`, and every
+/// typed-parse and merge path is safe with no per-path guard), and again in
+/// [`ExtendedConfigDoc::raw_for_layer_merge`] as defense-in-depth.
+pub(crate) fn strip_remote_image_generation(raw: &mut Value) {
+    match raw.as_object_mut() {
+        Some(obj) => {
+            obj.remove("image_generation");
+        }
+        None => *raw = Value::Object(Map::new()),
+    }
+}
+
+/// Stable, secret-free warning for a malformed `image_generation` value.
+/// Deliberately omits BOTH the deserialization/validation error (whose `{:?}`
+/// rendering can embed attacker-supplied credential-like strings) AND the
+/// config file path (which can itself carry a secret, e.g. a token-named
+/// directory or `COCKPIT_CONFIG=/secrets/<token>/config.json`). Names only the
+/// field so nothing secret can ride along.
+fn image_generation_malformed_warning() -> String {
+    "ignored malformed `image_generation` configuration".to_string()
 }
 
 impl ExtendedConfigDoc {
+    /// Load a config layer from a LOCAL path and stamp it
+    /// [`ConfigLayerOrigin::LocalTrusted`].
+    ///
+    /// SECURITY: this is the local-trusted loader. It is only ever handed
+    /// config paths that have already passed the `dirs.rs` workspace-trust
+    /// filter (`config_file_paths_for_load` / `discover_config_dirs`), so the
+    /// content it reads is by definition local-trusted — a file on such a path
+    /// is equivalent to the user having placed it there, and a file carries no
+    /// origin metadata for `load` to infer otherwise. Consequently `load`
+    /// does NOT strip `image_generation`.
+    ///
+    /// Any REMOTE / untrusted config source (e.g. a future `.well-known/cockpit`
+    /// fetch) MUST be constructed via [`Self::from_remote_layer`] — never
+    /// cached to a file and read back through `load` — so its origin is stamped
+    /// [`ConfigLayerOrigin::Remote`] and `image_generation` is stripped at
+    /// construction. See the [`ConfigLayerOrigin`] invariant.
     pub fn load(path: &Path) -> Result<Self> {
         let raw_str = if path.exists() {
             std::fs::read_to_string(path)
@@ -2016,7 +2143,43 @@ impl ExtendedConfigDoc {
         Ok(Self {
             path: path.to_path_buf(),
             raw,
+            // Only local, trust-filtered paths reach this loader today.
+            origin: ConfigLayerOrigin::LocalTrusted,
         })
+    }
+
+    /// SECURITY: the ONLY supported way to introduce a config layer sourced
+    /// from a REMOTE / untrusted origin (e.g. a future `.well-known/cockpit`
+    /// fetch). It stamps [`ConfigLayerOrigin::Remote`], so
+    /// [`Self::raw_for_layer_merge`] strips `image_generation` before merge and
+    /// a remote origin can never inject endpoints, credential refs, or
+    /// workflows (nor wipe a lower local registry). [`Self::load`] stamps
+    /// `LocalTrusted` precisely because it only reads local trust-filtered
+    /// paths; any new remote source MUST route through this constructor rather
+    /// than reusing `load`, so the strip cannot be forgotten. `raw` is accepted
+    /// as-is (any JSON shape) — a non-object remote layer is neutralized here —
+    /// because remote responses are not pre-validated to be objects.
+    ///
+    /// SECURITY: `image_generation` is stripped from `raw` IMMEDIATELY, at this
+    /// single construction funnel, so the stored `raw` never carries it. Every
+    /// downstream path — [`Self::config`], [`Self::config_with_warnings`], and
+    /// [`Self::raw_for_layer_merge`] — then yields the empty registry for a
+    /// remote source with no per-parse-path guard to forget.
+    pub fn from_remote_layer(mut raw: Value) -> Self {
+        strip_remote_image_generation(&mut raw);
+        Self {
+            path: PathBuf::from("<remote .well-known/cockpit>"),
+            raw,
+            origin: ConfigLayerOrigin::Remote,
+        }
+    }
+
+    /// Whether this layer originated from a remote/untrusted source (see
+    /// [`Self::from_remote_layer`]). The gate for [`strip_remote_image_generation`]
+    /// in [`Self::raw_for_layer_merge`]. `false` for every layer produced by
+    /// [`Self::load`], which only walks local trust-filtered paths.
+    fn layer_is_remote(&self) -> bool {
+        matches!(self.origin, ConfigLayerOrigin::Remote)
     }
 
     /// Parse the raw object into the typed [`ExtendedConfig`]. Each known
@@ -2061,6 +2224,25 @@ impl ExtendedConfigDoc {
         parse_field!("harnesses", harnesses);
         parse_field!("response_metrics_tokenizer", response_metrics_tokenizer);
         parse_field!("image_spend", image_spend);
+        // `image_generation` is redacted specially: a malformed value's serde /
+        // validation error (`ImageGenerationConfigError` uses `{self:?}`, so
+        // `MissingEndpoint("…")`, wrong-type `invalid type: string "…"`, etc.)
+        // can embed attacker-supplied, credential-like strings. Never log or
+        // surface the error itself — emit a stable field/path-only warning.
+        if let Some(value) = raw.get("image_generation") {
+            match serde_json::from_value::<crate::config::image_generation::ImageGenerationConfig>(
+                value.clone(),
+            ) {
+                Ok(parsed) => cfg.image_generation = parsed,
+                Err(_) => {
+                    // Path-free AND error-free: the config path can itself carry
+                    // a secret (token-named dir) and the serde error can embed
+                    // credential-like values, so neither may reach the log.
+                    tracing::warn!("ignored malformed `image_generation` configuration");
+                    warnings.push(image_generation_malformed_warning());
+                }
+            }
+        }
         parse_field!("agent_guidance_files", agent_guidance_files);
         parse_field!("concurrency", concurrency);
         parse_field!("agent_dirs", agent_dirs);
@@ -2151,8 +2333,21 @@ impl ExtendedConfigDoc {
         (cfg, warnings)
     }
 
-    fn raw_for_layer_merge(&self) -> Value {
+    fn raw_for_layer_merge(&self, warnings: &mut Vec<String>) -> Value {
         let mut raw = self.raw.clone();
+        if self.layer_is_remote() {
+            // Defense-in-depth: a remote doc's stored `raw` is already stripped
+            // at construction ([`Self::from_remote_layer`]), so this is
+            // normally a no-op. Re-run it here so a remote layer can never
+            // contribute an image-generation registry nor WIPE a lower local
+            // one — `strip_remote_image_generation` removes the key from an
+            // object layer and neutralizes a non-object raw (null/string/array)
+            // that would otherwise clobber the accumulated local config via
+            // `deep_merge_value`. Distinct from the malformed-*local* fail-closed
+            // path below, which *replaces* with `{}` to wipe a broken local
+            // layer.
+            strip_remote_image_generation(&mut raw);
+        }
         let Some(obj) = raw.as_object_mut() else {
             return raw;
         };
@@ -2184,6 +2379,28 @@ impl ExtendedConfigDoc {
             // Invalid policy is an explicit fail-closed layer, not absence
             // that may reveal and authorize a lower layer's policy.
             obj.insert("image_spend".into(), serde_json::json!({}));
+        }
+        if let Some(value) = obj.get("image_generation")
+            && serde_json::from_value::<crate::config::image_generation::ImageGenerationConfig>(
+                value.clone(),
+            )
+            .is_err()
+        {
+            // A present-but-invalid registry (missing endpoint for an enabled
+            // target, dual defaults, workflow digest mismatch, dependent left
+            // enabled after its endpoint/workflow was dropped, etc.) is an
+            // explicit fail-closed layer. Replace with the empty-valid encoding
+            // rather than removing the key, so a broken upper layer cannot
+            // reveal and authorize a lower layer's registry — matching
+            // `image_spend` above. Record a redacted (field-only) warning so
+            // this fail-closed is surfaced through the layered load path instead
+            // of happening silently. The log is path-free AND error-free: the
+            // config path can itself carry a secret (token-named dir) and the
+            // serde error can embed credential-like values, so neither may reach
+            // the log or the returned warning.
+            tracing::warn!("ignored malformed `image_generation` configuration");
+            warnings.push(image_generation_malformed_warning());
+            obj.insert("image_generation".into(), serde_json::json!({}));
         }
         remove_malformed!("tui", TuiConfig);
         remove_malformed!("computer_use", Option<ComputerUseMode>);
@@ -2271,8 +2488,42 @@ impl ExtendedConfigDoc {
             .as_object_mut()
             .expect("config.json root is an object");
         let serialized = serde_json::to_value(cfg).context("serializing config")?;
+        // Did the caller actually change `image_generation` relative to what it
+        // loaded? Both `originally_loaded` and `serialized` always carry the
+        // field (no `skip_serializing_if`), so this is a pure value comparison.
+        let caller_changed_image_generation =
+            originally_loaded.get("image_generation") != serialized.get("image_generation");
         if let (Value::Object(base), Value::Object(desired)) = (originally_loaded, &serialized) {
             apply_object_delta(obj, base, desired);
+        }
+        // `image_generation` is a closed, typed-only, ATOMIC registry, but
+        // `apply_object_delta` above deep-merges nested objects and does not
+        // consult `ATOMIC_CONFIG_VALUE_PATHS`. A recursive merge can leave stale
+        // sub-arrays from the previous on-disk registry, yielding a persisted
+        // registry that diverges from the typed `cfg`. Whole-replace the
+        // freshly-reloaded raw with the typed value ONLY when either (a) this
+        // caller actually changed the field — an atomic write, no deep-merge
+        // hybrid — or (b) the reloaded raw is itself malformed/invalid
+        // (decision 8: never persist an invalid registry). Otherwise the
+        // reloaded value is a VALID registry this caller did not touch (it may
+        // have been written concurrently by another writer between load and
+        // this save) and must be preserved, not clobbered with this caller's
+        // stale typed value. An ABSENT key stays absent, so sparse layers never
+        // gain an `image_generation` they didn't have.
+        if obj.contains_key("image_generation") {
+            let reloaded_invalid = obj.get("image_generation").is_some_and(|value| {
+                serde_json::from_value::<crate::config::image_generation::ImageGenerationConfig>(
+                    value.clone(),
+                )
+                .is_err()
+            });
+            if caller_changed_image_generation || reloaded_invalid {
+                obj.insert(
+                    "image_generation".into(),
+                    serde_json::to_value(&cfg.image_generation)
+                        .context("serializing image_generation registry")?,
+                );
+            }
         }
         obj.remove("sandboxEscalationEnabled");
         obj.remove(&["trusted", "Only"].concat());

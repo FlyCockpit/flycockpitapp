@@ -1163,6 +1163,24 @@ impl ImageGenerationConfig {
     pub fn openrouter_provider_allowlist(&self) -> &[String] {
         &self.openrouter_provider_allowlist
     }
+
+    /// The registry as it may appear in a config SNAPSHOT that crosses a trust
+    /// boundary (e.g. the daemon session config snapshot): the empty registry.
+    ///
+    /// Image-generation config is secret-bearing in several places — endpoint
+    /// header values and `credential_ref`s, capability/price evidence
+    /// `source_url` query strings, and opaque workflow `graph_json` where a
+    /// token can hide anywhere — so it cannot be selectively scrubbed. Partial
+    /// in-place redaction is also unsafe: blanking an endpoint's
+    /// header/credential fields changes its immutable identity, which the
+    /// discovered-evidence `endpoint_identity` binding then rejects, so a
+    /// reconstruct-through-[`Self::new`] redaction would fail. Until a future
+    /// settings-UI prompt owns a safe non-secret projection, the snapshot omits
+    /// image-generation content entirely by emitting the empty registry.
+    pub fn redacted_for_snapshot(&self) -> ImageGenerationConfig {
+        ImageGenerationConfig::default()
+    }
+
     pub fn target_immutable_identity(
         &self,
         target_id: &str,
@@ -1272,6 +1290,18 @@ impl ImageGenerationConfig {
             workflows,
             openrouter_provider_allowlist: allowlist,
         })
+    }
+}
+
+impl Default for ImageGenerationConfig {
+    /// The empty registry: zero endpoints, targets, and workflows, and an
+    /// empty OpenRouter allowlist. Always valid (`enabled == 0 && defaults
+    /// == 0`), so `ExtendedConfig::default()` and a bare `{}` deserialize to
+    /// the same value. "Empty" means *no generation targets configured*; it
+    /// never invents endpoints.
+    fn default() -> Self {
+        Self::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            .expect("empty image-generation registry is always valid")
     }
 }
 

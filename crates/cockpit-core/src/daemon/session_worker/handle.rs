@@ -497,6 +497,11 @@ pub(super) fn redacted_extended_config(
         .iter()
         .map(|_| "[redacted]".to_string())
         .collect();
+    // Image-generation config is secret-bearing and cannot be safely redacted
+    // in place (see `ImageGenerationConfig::redacted_for_snapshot`); the policy
+    // — omit its content from the snapshot by emitting the empty registry —
+    // lives on the owned type.
+    extended.image_generation = extended.image_generation.redacted_for_snapshot();
     extended
 }
 

@@ -75,7 +75,7 @@ mod authz {
             RelayGrantScope::AgentReadonly,
             RelayGrantScope::ProjectFiles,
         ] {
-            let principal = remote_principal(scope, Some("/workspace/app".to_string()));
+            let principal = remote_principal(scope.clone(), Some("/workspace/app".to_string()));
             assert!(
                 !legacy_grants_can_authorize_mutation(&principal),
                 "Legacy {:?} grant must not authorize mutation",
@@ -717,7 +717,7 @@ mod schema_conformance {
         let mut seen = std::collections::BTreeSet::new();
         for k in kinds {
             let s = serde_json::to_string(&k).unwrap();
-            assert!(seen.insert(s), "duplicate event kind: {s}");
+            assert!(seen.insert(s.clone()), "duplicate event kind: {s}");
         }
         assert_eq!(seen.len(), 9);
     }
@@ -1129,11 +1129,11 @@ mod grant_resolution {
 
     #[test]
     fn grant_id_validates_cuid2() {
-        assert!(validate_grant_id("abcdefghijklmnopqrstuvx"));
+        assert!(validate_grant_id("abcdefghijklmnopqrstuvwx")); // 24 chars
         assert!(validate_grant_id("a12345678901234567890123"));
         assert!(!validate_grant_id("A12345678901234567890123")); // uppercase first
         assert!(!validate_grant_id("1abcdefghijklmnopqrstuvx")); // digit first
-        assert!(!validate_grant_id("abcdefghijklmnopqrstuv")); // 23 chars
+        assert!(!validate_grant_id("abcdefghijklmnopqrstuvw")); // 23 chars
         assert!(!validate_grant_id("abcdefghijklmnopqrstuvxyz")); // 25 chars
     }
 
@@ -1365,7 +1365,7 @@ mod validation_helpers {
     }
 
     #[test]
-    fn validate_stable_code() {
+    fn validate_stable_code_rules() {
         assert!(validate_stable_code("a"));
         assert!(validate_stable_code("abc_def_123"));
         assert!(!validate_stable_code("")); // empty
@@ -1375,7 +1375,7 @@ mod validation_helpers {
     }
 
     #[test]
-    fn validate_canonical_decimal() {
+    fn validate_canonical_decimal_rules() {
         assert!(validate_canonical_decimal("0"));
         assert!(validate_canonical_decimal("1"));
         assert!(validate_canonical_decimal("12345"));
@@ -1387,7 +1387,7 @@ mod validation_helpers {
     }
 
     #[test]
-    fn validate_sha256_hex() {
+    fn validate_sha256_hex_rules() {
         assert!(validate_sha256_hex(
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         ));

@@ -8,7 +8,7 @@
 //!   - `Dialog::CreateConfig`    no config yet — pick a location to scaffold
 //!   - `Dialog::Settings`        navigate the settings tree
 //!
-//! The Settings page tree (root has 15 nodes; see `root_nodes()`):
+//! The Settings page tree (root has 16 nodes; see `root_nodes()`):
 //!
 //! ```text
 //! Root
@@ -24,10 +24,13 @@
 //!  ├── Privacy & Safety   │ (descriptor list + optional picker)
 //!  ├── Translation        │
 //!  ├── Profile            ┘
+//!  ├── Image spend budgets
+//!  ├── Generation
 //!  ├── Tools
 //!  ├── Harnesses
 //!  ├── Skills
-//!  └── MCP
+//!  ├── MCP
+//!  └── LSP
 //! ```
 //!
 //! Async fetches (the `/models` endpoint after Save, or via the Edit
@@ -2872,7 +2875,7 @@ pub(super) const DEFAULT_MODEL_TITLE: &str = "Default model for new sessions";
 /// `Default model for new sessions` leads, then the locked scheme in order;
 /// MCP/LSP are kept as extra nodes so integration settings stay reachable
 /// from the menu.
-fn root_nodes() -> [NavNode; 15] {
+fn root_nodes() -> [NavNode; 16] {
     [
         NavNode {
             id: pointer_actions::RootNodeId::DefaultModel,

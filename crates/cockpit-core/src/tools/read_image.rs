@@ -35,10 +35,9 @@
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
-use image::{
-    ColorType, CompressionType, FilterType, GenericImageView, ImageFormat,
-    imageops::FilterType as ResizeFilter,
-};
+use image::codecs::png::{CompressionType, FilterType};
+use image::imageops::FilterType as ResizeFilter;
+use image::{AnimationDecoder, ColorType, ExtendedColorType, ImageEncoder, ImageFormat};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -375,26 +374,30 @@ pub fn encode_image(img: &image::DynamicImage, format: OutputFormat) -> Result<V
     match format {
         OutputFormat::Png => {
             let has_alpha = matches!(img.color(), ColorType::Rgba8 | ColorType::La8);
-            let png_img = if has_alpha {
-                img.to_rgba8()
-            } else {
-                img.to_rgb8()
-            };
-            let mut encoder = image::codecs::png::PngEncoder::new_with_quality(
+            let encoder = image::codecs::png::PngEncoder::new_with_quality(
                 &mut bytes,
                 CompressionType::Default,
                 FilterType::Adaptive,
             );
-            encoder.write_image(
-                png_img.as_raw(),
-                png_img.width(),
-                png_img.height(),
-                if has_alpha {
-                    ColorType::Rgba8
-                } else {
-                    ColorType::Rgb8
-                },
-            )?;
+            // Encode within each color branch: `Rgba8` and `Rgb8` buffers are
+            // distinct `ImageBuffer<_>` types and cannot share one binding.
+            if has_alpha {
+                let png_img = img.to_rgba8();
+                encoder.write_image(
+                    png_img.as_raw(),
+                    png_img.width(),
+                    png_img.height(),
+                    ExtendedColorType::Rgba8,
+                )?;
+            } else {
+                let png_img = img.to_rgb8();
+                encoder.write_image(
+                    png_img.as_raw(),
+                    png_img.width(),
+                    png_img.height(),
+                    ExtendedColorType::Rgb8,
+                )?;
+            }
             Ok(bytes)
         }
         OutputFormat::Jpeg => {
@@ -407,29 +410,33 @@ pub fn encode_image(img: &image::DynamicImage, format: OutputFormat) -> Result<V
                 }
             }
             let rgb = image::DynamicImage::ImageRgb8(img.to_rgb8());
-            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes);
-            encoder.set_quality(JPEG_QUALITY);
+            let mut encoder =
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, JPEG_QUALITY);
             encoder.encode_image(&rgb)?;
             Ok(bytes)
         }
         OutputFormat::Webp => {
-            let mut encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut bytes);
+            let encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut bytes);
             let has_alpha = matches!(img.color(), ColorType::Rgba8 | ColorType::La8);
-            let webp_img = if has_alpha {
-                img.to_rgba8()
+            // Encode within each color branch: `Rgba8` and `Rgb8` buffers are
+            // distinct `ImageBuffer<_>` types and cannot share one binding.
+            if has_alpha {
+                let webp_img = img.to_rgba8();
+                encoder.write_image(
+                    webp_img.as_raw(),
+                    webp_img.width(),
+                    webp_img.height(),
+                    ExtendedColorType::Rgba8,
+                )?;
             } else {
-                img.to_rgb8()
-            };
-            encoder.write_image(
-                webp_img.as_raw(),
-                webp_img.width(),
-                webp_img.height(),
-                if has_alpha {
-                    ColorType::Rgba8
-                } else {
-                    ColorType::Rgb8
-                },
-            )?;
+                let webp_img = img.to_rgb8();
+                encoder.write_image(
+                    webp_img.as_raw(),
+                    webp_img.width(),
+                    webp_img.height(),
+                    ExtendedColorType::Rgb8,
+                )?;
+            }
             Ok(bytes)
         }
         OutputFormat::Auto => unreachable!("effective() resolves auto"),
@@ -533,7 +540,7 @@ fn apply_orientation(img: image::DynamicImage) -> image::DynamicImage {
 }
 
 fn is_animated_gif(input: &[u8]) -> bool {
-    if let Ok(decoder) = image::codecs::gif::GifDecoder::new(input) {
+    if let Ok(decoder) = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(input)) {
         let frames = decoder.into_frames();
         let count = frames.collect_frames().map(|f| f.len()).unwrap_or(0);
         return count > 1;
@@ -637,7 +644,7 @@ impl Tool for ReadImageTool {
 
         let source_count = [parsed.path.is_some(), parsed.url.is_some()]
             .iter()
-            .filter(|b| *b)
+            .filter(|b| **b)
             .count();
         if source_count != 1 {
             return Err(invalid_input("exactly one of `path` or `url` is required"));

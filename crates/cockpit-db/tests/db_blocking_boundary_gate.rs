@@ -672,6 +672,14 @@ impl CrateCollector<'_> {
                         | "lazy_static"
                         | "once_cell"
                         | "constructor"
+                        // `dto!`/`state_enum!`/`text_enum!` (e.g. db/image_generation_plan.rs,
+                        // db/image_generation.rs) expand only to plain
+                        // `#[derive(Serialize, Deserialize)]` DTO `struct`s / enums — they
+                        // generate no `Db` methods and no blocking DB calls, so none can
+                        // reach an unguarded blocking boundary.
+                        | "dto"
+                        | "state_enum"
+                        | "text_enum"
                 );
                 if !allowed {
                     self.analysis.note_finding(GateFinding {

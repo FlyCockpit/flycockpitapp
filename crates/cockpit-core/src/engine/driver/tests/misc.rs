@@ -61,8 +61,13 @@ async fn stale_shadow_discarded() {
     let (mut driver, _tmp) = test_driver_without_network(8);
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
     append_complete_test_turns(&mut driver, 1);
-    install_test_providers(&mut driver, CacheMode::None, ContextConfig::default(), 100);
-    record_test_context_tokens(&driver, 55).await;
+    install_test_providers(
+        &mut driver,
+        CacheMode::None,
+        ContextConfig::default(),
+        10_000,
+    );
+    record_test_context_tokens(&driver, 5_500).await;
     assert!(driver.maybe_shadow_brief(&tx).await);
     wait_for_shadow_brief(&mut driver).await;
     append_complete_test_turns(&mut driver, 9);

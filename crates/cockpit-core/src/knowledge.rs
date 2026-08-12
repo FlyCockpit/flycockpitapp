@@ -1622,10 +1622,15 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
         let tmp = TempDir::new().unwrap();
         let db = crate::db::Db::open(&tmp.path().join("cockpit.db")).unwrap();
         db.read(|conn| {
+            // Vector/embedding STORAGE (tables, indexes, views) must never live
+            // in the main DB, and no object may pull in the sqlite-vec `vec0`
+            // module. Triggers named for the image-generation "cancellation
+            // vector" domain concept are not vector storage and are excluded.
             let count: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM sqlite_master
-                 WHERE lower(name) LIKE '%vector%'
-                    OR lower(name) LIKE '%embedding%'
+                 WHERE (type IN ('table','index','view')
+                        AND (lower(name) LIKE '%vector%'
+                             OR lower(name) LIKE '%embedding%'))
                     OR lower(sql) LIKE '%vec0%'",
                 [],
                 |row| row.get(0),

@@ -605,10 +605,28 @@ fn map_ref_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProtectedRedactionAr
 mod tests {
     use super::*;
 
+    // protected_redaction_history.session_id carries a cascading FK to
+    // sessions(session_id), so the referenced session row must exist before
+    // any history row is appended.
+    async fn seed_session(db: &Db, session_id: &str) {
+        let session_id = session_id.to_owned();
+        db.write(move |conn| {
+            conn.execute(
+                "INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) \
+                 VALUES(?1,'p','/redacted',1,1)",
+                [session_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn append_dedup_and_attach() {
         let db = Db::open_in_memory().unwrap();
         let session_id = "11111111-1111-1111-1111-111111111111";
+        seed_session(&db, session_id).await;
         // 64-char hex SHA-256-length fingerprint (schema enforces length 64).
         let fp = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
         let input = ProtectedRedactionHistoryAppend {
@@ -707,6 +725,7 @@ mod tests {
     async fn safe_ref_excludes_encrypted_material() {
         let db = Db::open_in_memory().unwrap();
         let session_id = "22222222-2222-2222-1111-111111111111";
+        seed_session(&db, session_id).await;
         let input = ProtectedRedactionHistoryAppend {
             session_id: session_id.to_owned(),
             sealed_record_id: None,
@@ -749,6 +768,7 @@ mod tests {
     async fn cannot_attach_to_retired() {
         let db = Db::open_in_memory().unwrap();
         let session_id = "33333333-3333-3333-1111-111111111111";
+        seed_session(&db, session_id).await;
         let input = ProtectedRedactionHistoryAppend {
             session_id: session_id.to_owned(),
             sealed_record_id: None,
@@ -794,6 +814,7 @@ mod tests {
     async fn atomic_attach_in_transaction() {
         let db = Db::open_in_memory().unwrap();
         let session_id = "44444444-4444-4444-1111-111111111111";
+        seed_session(&db, session_id).await;
         let input = ProtectedRedactionHistoryAppend {
             session_id: session_id.to_owned(),
             sealed_record_id: Some("rec-1".to_owned()),

@@ -776,6 +776,22 @@ mod tests {
         "bbbbbbbb-bbbb-bbbb-bbbb-222222222222"
     }
 
+    // protected_leak_records.session_id (and the protected_redaction_history
+    // row it links to) carry cascading FKs to sessions(session_id), so the
+    // referenced session row must exist before any leak/history row is written.
+    async fn seed_session(db: &Db) {
+        db.write(|conn| {
+            conn.execute(
+                "INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) \
+                 VALUES(?1,'p','/redacted',1,1)",
+                [session_id()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
     fn append_history(conn: &Connection) -> String {
         let fp = "c1d2e3f4a5b6c1d2e3f4a5b6c1d2e3f4c1d2e3f4a5b6c1d2e3f4a5b6c1d2e3f4";
         let input = ProtectedRedactionHistoryAppend {
@@ -798,6 +814,7 @@ mod tests {
     #[tokio::test]
     async fn insert_dedup_and_list() {
         let db = test_db();
+        seed_session(&db).await;
         let history_id = db
             .write(move |conn| Ok(append_history(conn)))
             .await
@@ -872,6 +889,7 @@ mod tests {
     #[tokio::test]
     async fn pending_rows_are_not_listable() {
         let db = test_db();
+        seed_session(&db).await;
         let history_id = db
             .write(move |conn| Ok(append_history(conn)))
             .await
@@ -910,6 +928,7 @@ mod tests {
     #[tokio::test]
     async fn transition_pending_to_contained() {
         let db = test_db();
+        seed_session(&db).await;
         let history_id = db
             .write(move |conn| Ok(append_history(conn)))
             .await

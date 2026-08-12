@@ -131,12 +131,18 @@ macro_rules! resolve_fcor_role {
         );
     }};
     ($resources:ident, $cwd:ident, $name:ident => project_root) => {{
-        let canonical = crate::daemon::fs_api::canonical_project_root($name)?;
-        push_fcor_resource(
-            &mut $resources,
-            proto::remote_operation_fcor::RemoteOperationResourceKind::ProjectRoot,
-            canonical_project_root_bytes(&canonical)?,
-        );
+        // `$name` is either a `&String` (mandatory root) or a `&Option<String>`
+        // (optional filter); `optional_text` yields `Some(&str)` for the former
+        // always and for the latter only when present, so a mandatory root still
+        // derives its resource unconditionally.
+        if let Some(raw) = $name.optional_text() {
+            let canonical = crate::daemon::fs_api::canonical_project_root(raw)?;
+            push_fcor_resource(
+                &mut $resources,
+                proto::remote_operation_fcor::RemoteOperationResourceKind::ProjectRoot,
+                canonical_project_root_bytes(&canonical)?,
+            );
+        }
     }};
     ($resources:ident, $cwd:ident, $name:ident => project) => {
         if let Some(value) = $name {

@@ -961,6 +961,8 @@ mod tests {
             reasoning_offset: 0,
             think_duration: None,
             seq,
+            performance: None,
+            performance_expanded: false,
         }
     }
 
@@ -1386,6 +1388,8 @@ mod tests {
             reasoning_offset: 0,
             think_duration: None,
             seq: Some(1),
+            performance: None,
+            performance_expanded: false,
         }]
         .into();
         app.enter_copy_pick_mode();

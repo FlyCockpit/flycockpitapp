@@ -744,14 +744,18 @@ pub fn extract_images(
 
     let mut images = Vec::new();
     let mut provider_text = Vec::new();
-    let mut seen_step_ids: std::collections::BTreeSet<(Option<String>, usize)> =
-        std::collections::BTreeSet::new();
+    let mut seen_step_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     for (step_index, step) in response.steps.iter().enumerate() {
-        // Idempotent duplicate-step replay by step identity.
-        if !seen_step_ids.insert((step.step_id.clone(), step_index)) && step.step_id.is_some() {
-            // A repeated step_id is a replay — skip it idempotently.
-            continue;
+        // Idempotent duplicate-step replay by step identity: a step that
+        // carries a step_id already seen is a replay and is skipped. Steps
+        // without a step_id are always processed. The key must be the step_id
+        // alone — mixing in the (always unique) step_index would defeat the
+        // deduplication entirely.
+        if let Some(step_id) = &step.step_id {
+            if !seen_step_ids.insert(step_id.clone()) {
+                continue;
+            }
         }
 
         if step.kind != "model_output" {

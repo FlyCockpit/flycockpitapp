@@ -2042,7 +2042,7 @@ impl ComputerActionCoordinator {
         // Focus generation requirement: TypeText and KeyChord require a
         // current focus generation (focus_generation > 0). A zero focus
         // generation means no planning evidence capture was done.
-        if self.requires_focus_generation(&backend_actions) && self.focus_generation == 0 {
+        if Self::requires_focus_generation(&backend_actions) && self.focus_generation == 0 {
             let outcome = CoordinatedOutcome::Invalidated {
                 reason: TargetUnavailableReason::StaleTarget,
             };
@@ -2908,6 +2908,29 @@ mod tests {
             .expect("coordinator open")
     }
 
+    /// Like [`make_coordinator_params`] but supplies a real target-evidence
+    /// adapter whose snapshot carries a nonzero focus generation, so a
+    /// coordinator opened with it satisfies the focus-generation gate for
+    /// type/key actions. `host_arbiter` stays `None`, so `open` acquires no
+    /// host lock (see `open`'s no-arbiter path).
+    fn make_coordinator_params_with_focus(
+        authorizer: Arc<dyn ComputerAuthorizer>,
+    ) -> CoordinatorParams {
+        CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Yolo,
+            owner_instance: OwnerInstance(1),
+            authorizer,
+            host_arbiter: None,
+            target_adapter: Some(Box::new(
+                FakeTargetEvidenceAdapter::new(physical_evidence()),
+            )),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+        }
+    }
+
     // =====================================================================
     // Acceptance criterion 1: computer_native_live_loop
     // Drives OpenAI and both Anthropic native fixtures through the actual
@@ -2919,7 +2942,14 @@ mod tests {
         let backend = Box::new(FakeBackend::new());
         let authorizer: Arc<dyn ComputerAuthorizer> =
             Arc::new(FakeComputerAuthorizer::always_allow());
-        let mut coordinator = make_coordinator(backend, authorizer).await;
+        // Opens with a real focus generation via the target-evidence adapter so
+        // the `type` action in the batch clears the focus-generation gate; the
+        // Completed assertion below is asserted against the coordinator path
+        // (not the direct helper).
+        let params = make_coordinator_params_with_focus(authorizer);
+        let mut coordinator = ComputerActionCoordinator::open(backend, params)
+            .await
+            .expect("coordinator open");
 
         // Simulate an OpenAI Responses output with a computer_call item.
         let output = vec![serde_json::json!({
@@ -3386,7 +3416,13 @@ mod tests {
     async fn computer_native_central_authorization_allow() {
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
         let backend = Box::new(FakeBackend::new());
-        let mut coordinator = make_coordinator(backend, authorizer.clone()).await;
+        // Ask tier: only the Ask dispatch path invokes the authorizer, so this
+        // outcome test opens on Ask (production Yolo short-circuits before the
+        // authorizer). Move/Click actions are not focus-gated.
+        let params = make_ask_coordinator_params(authorizer.clone(), "openai", "gpt-5");
+        let mut coordinator = ComputerActionCoordinator::open(backend, params)
+            .await
+            .expect("coordinator open");
 
         let actions = vec![OpenAiComputerAction::Move {
             to: Point {
@@ -3410,7 +3446,13 @@ mod tests {
             "policy blocks this action",
         ));
         let backend = Box::new(FakeBackend::new());
-        let mut coordinator = make_coordinator(backend, authorizer.clone()).await;
+        // Ask tier: only the Ask dispatch path invokes the authorizer, so a
+        // deny outcome can only surface on Ask (production Yolo short-circuits
+        // before the authorizer). Move actions are not focus-gated.
+        let params = make_ask_coordinator_params(authorizer.clone(), "openai", "gpt-5");
+        let mut coordinator = ComputerActionCoordinator::open(backend, params)
+            .await
+            .expect("coordinator open");
 
         let actions = vec![OpenAiComputerAction::Move {
             to: Point {
@@ -3438,7 +3480,13 @@ mod tests {
     async fn computer_native_central_authorization_ask_blocks() {
         let authorizer = Arc::new(FakeComputerAuthorizer::always_ask());
         let backend = Box::new(FakeBackend::new());
-        let mut coordinator = make_coordinator(backend, authorizer.clone()).await;
+        // Ask tier: only the Ask dispatch path invokes the authorizer, so an
+        // ask-block outcome can only surface on Ask (production Yolo
+        // short-circuits before the authorizer). Click is not focus-gated.
+        let params = make_ask_coordinator_params(authorizer.clone(), "openai", "gpt-5");
+        let mut coordinator = ComputerActionCoordinator::open(backend, params)
+            .await
+            .expect("coordinator open");
 
         let actions = vec![OpenAiComputerAction::Click {
             at: Some(Point {
@@ -3475,17 +3523,9 @@ mod tests {
         // is dispatched.
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
         let backend = FakeBackend::new();
-        let params = CoordinatorParams {
-            session_id: "session-1".to_string(),
-            delegation_id: DelegationId("delegation-1".to_string()),
-            tier: ComputerApprovalTier::Yolo,
-            owner_instance: OwnerInstance(1),
-            authorizer: authorizer.clone(),
-            host_arbiter: None,
-            target_adapter: None,
-            provider_id: ProviderId("openai".to_string()),
-            model_id: ModelId("gpt-5".to_string()),
-        };
+        // Yolo tier, but opened with a real focus generation so the TypeText
+        // action clears the focus-generation gate and can reach Completed.
+        let params = make_coordinator_params_with_focus(authorizer.clone());
         let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
             .await
             .expect("coordinator open");
@@ -3495,8 +3535,10 @@ mod tests {
         let actions = vec![OpenAiComputerAction::TypeText("rm -rf /".to_string())];
         let outcome = coordinator.execute_openai_call("call-yolo", &actions).await;
 
-        // The authorizer was called once, and it allowed (zero human requests).
-        assert_eq!(authorizer.call_count(), 1);
+        // Under Yolo the authorizer is never invoked — the dispatch path
+        // short-circuits before it (zero human requests, zero authorizer
+        // calls), matching computer_yolo_complete_trust_zero_human_requests.
+        assert_eq!(authorizer.call_count(), 0);
         // The action was dispatched — not denied.
         assert!(matches!(outcome, CoordinatedOutcome::Completed { .. }));
     }
@@ -3583,7 +3625,13 @@ mod tests {
         backend.fail_at = Some(1);
         backend.fail_with = ComputerError::Refused("mid-batch failure".to_string());
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
-        let mut coordinator = make_coordinator(Box::new(backend), authorizer).await;
+        // Opens with a real focus generation so the TypeText actions clear the
+        // focus gate; the mid-batch Failed { index: 1 } assertion is asserted
+        // against the coordinator path.
+        let params = make_coordinator_params_with_focus(authorizer);
+        let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
+            .await
+            .expect("coordinator open");
 
         let actions = vec![
             OpenAiComputerAction::Move {
@@ -3622,22 +3670,10 @@ mod tests {
             Box::new(os_lock),
             OwnerInstance(1),
         )));
-
-        // Acquire the host lock for a physical key.
         let key = physical_key();
-        {
-            let mut arb = arbiter.lock().unwrap();
-            let result = arb.try_acquire(&key, DelegationId("delegation-1".to_string()));
-            assert!(matches!(result, AcquireResult::Acquired(_)));
-        }
 
-        // Simulate OS lock loss by externally releasing.
-        {
-            let mut external = shared_os.shared_clone();
-            external.release(&key);
-        }
-
-        // Create a coordinator with the arbiter and a physical target adapter.
+        // Open a coordinator with the arbiter and a physical target adapter;
+        // open() acquires the host lease for the target's physical key.
         let adapter = FakeTargetEvidenceAdapter::new(physical_evidence());
         let authorizer: Arc<dyn ComputerAuthorizer> =
             Arc::new(FakeComputerAuthorizer::always_allow());
@@ -3656,16 +3692,15 @@ mod tests {
             .await
             .expect("coordinator open");
 
-        // The coordinator should have a host lease.
-        // (Note: the open() acquired a new lease; the external release above
-        // affected the old one.)
+        // Simulate OS lock loss by externally releasing the OS-level lock for
+        // the coordinator's key while the arbiter still records it as holder.
+        {
+            let mut external = shared_os.shared_clone();
+            external.release(&key);
+        }
 
-        // Detect lock loss — this invalidates the coordinator.
+        // Detect lock loss — this drives the host-lease invalidation mechanism.
         let valid = coordinator.check_host_lease();
-        // The coordinator's lease was acquired during open(), so it should
-        // still be valid (the external release was for the pre-open lease).
-        // If the open-time acquisition also shares the same OS lock, the
-        // check may detect loss. Either way, the test verifies the mechanism.
         let _ = valid;
     }
 
@@ -3725,7 +3760,14 @@ mod tests {
                 let proj_json = serde_json::to_string(&sanitized).unwrap();
                 assert!(!proj_json.contains("base64"));
                 assert!(!proj_json.contains("data:image"));
-                assert!(!proj_json.contains("png"));
+                // The `media_type` label ("png") is safe metadata, not pixel
+                // data; strip that field so this catches any *other* "png"
+                // occurrence (e.g. raw PNG bytes or a data URI).
+                assert!(
+                    !proj_json
+                        .replace("\"media_type\":\"png\"", "")
+                        .contains("png")
+                );
                 assert!(proj_json.contains("byte_count"));
                 assert!(proj_json.contains("checksum"));
             }
@@ -3775,7 +3817,12 @@ mod tests {
         // `execute_openai_computer_call` is not called here.
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
         let backend = Box::new(FakeBackend::new());
-        let mut coordinator = make_coordinator(backend, authorizer).await;
+        // Opens with a real focus generation so the TypeText action clears the
+        // focus gate; the Completed assertion is against the coordinator path.
+        let params = make_coordinator_params_with_focus(authorizer);
+        let mut coordinator = ComputerActionCoordinator::open(backend, params)
+            .await
+            .expect("coordinator open");
 
         let actions = vec![
             OpenAiComputerAction::Move {
@@ -3834,7 +3881,12 @@ mod tests {
 
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
         let backend = Box::new(FakeBackend::new());
-        let mut coordinator = make_coordinator(backend, authorizer).await;
+        // Opens with a real focus generation so the TypeText action clears the
+        // focus gate; the Completed assertion is against the coordinator path.
+        let params = make_coordinator_params_with_focus(authorizer);
+        let mut coordinator = ComputerActionCoordinator::open(backend, params)
+            .await
+            .expect("coordinator open");
 
         let outcome = coordinator.execute_openai_call(&call_id, &actions).await;
 
@@ -3858,7 +3910,10 @@ mod tests {
         // failing_at uses the default geometry; we need to ensure the
         // coordinator opens with this backend.
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
-        let params = make_coordinator_params(authorizer);
+        // Opens with a real focus generation so the TypeText actions clear the
+        // focus gate; the mid-batch Failed { index: 1 } assertion is against
+        // the coordinator path.
+        let params = make_coordinator_params_with_focus(authorizer);
         let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
             .await
             .expect("coordinator open");
@@ -4556,7 +4611,24 @@ mod tests {
         // Advisory classes never trigger a prompt/deny/grant difference.
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
         let backend = FakeBackend::new();
-        let params = make_ask_coordinator_params(authorizer.clone(), "openai", "gpt-5");
+        // Ask tier with a real focus generation via the target-evidence adapter
+        // so the destructive `type` action clears the focus-generation gate;
+        // `host_arbiter: None` skips lock acquisition. The advisory action class
+        // must not change the outcome (still Completed) or add an authorizer
+        // call (the lease is reused, so call_count stays 1).
+        let params = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-1".to_string()),
+            tier: ComputerApprovalTier::Ask,
+            owner_instance: OwnerInstance(1),
+            authorizer: authorizer.clone(),
+            host_arbiter: None,
+            target_adapter: Some(Box::new(
+                FakeTargetEvidenceAdapter::new(physical_evidence()),
+            )),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+        };
         let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
             .await
             .expect("coordinator open");
@@ -4787,7 +4859,7 @@ mod tests {
     async fn computer_action_identity_conflict_different_payload_zero_dispatch() {
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
         let backend = FakeBackend::new();
-        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::<ComputerAction>::new()));
         let backend_recorded = recorded.clone();
 
         // We use a custom backend wrapper to count execute calls.
@@ -5155,7 +5227,10 @@ mod tests {
         backend.fail_at = Some(1);
         backend.fail_with = ComputerError::Refused("mid-batch".to_string());
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
-        let params = make_coordinator_params(authorizer);
+        // Opens with a real focus generation so the TypeText actions clear the
+        // focus gate; the mid-batch Failed { index: 1 } assertion is against
+        // the coordinator path.
+        let params = make_coordinator_params_with_focus(authorizer);
         let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
             .await
             .expect("coordinator open");
@@ -5193,7 +5268,7 @@ mod tests {
         // call. The FakeBackend records actions; a duplicate should not add
         // to the recorded list.
         let authorizer = Arc::new(FakeComputerAuthorizer::always_allow());
-        let mut backend = FakeBackend::new();
+        let backend = FakeBackend::new();
         let params = make_coordinator_params(authorizer);
         let mut coordinator = ComputerActionCoordinator::open(Box::new(backend), params)
             .await

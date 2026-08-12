@@ -44,8 +44,24 @@ fn test_resolver() -> MapKeyResolver {
     MapKeyResolver::new().with_version(1, test_key_v1())
 }
 
-fn test_db() -> Db {
-    Db::open_in_memory().unwrap()
+async fn test_db() -> Db {
+    let db = Db::open_in_memory().unwrap();
+    // protected_redaction_history.session_id and protected_leak_records.session_id
+    // carry cascading FKs to sessions(session_id), so the referenced session rows
+    // must exist before the leak-report handler writes any protected record.
+    for session_id in [session_a(), session_b()] {
+        db.write(move |conn| {
+            conn.execute(
+                "INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) \
+                 VALUES(?1,'p','/redacted',1,1)",
+                [session_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+    db
 }
 
 fn session_a() -> &'static str {
@@ -151,7 +167,7 @@ fn leak_list_request_defaults_to_machine_wide() {
 
 #[tokio::test]
 async fn leak_list_snapshot_cursor_stable_across_concurrent_inserts() {
-    let db = test_db();
+    let db = test_db().await;
     let resolver = test_resolver();
     insert_contained_leak(
         &db,
@@ -229,7 +245,7 @@ async fn leak_list_snapshot_cursor_stable_across_concurrent_inserts() {
 
 #[tokio::test]
 async fn leak_list_snapshot_cursor_equal_timestamps_deterministic_order() {
-    let db = test_db();
+    let db = test_db().await;
     let resolver = test_resolver();
     let r1 = insert_contained_leak(
         &db,
@@ -282,7 +298,7 @@ async fn leak_list_snapshot_cursor_equal_timestamps_deterministic_order() {
 
 #[tokio::test]
 async fn leak_list_snapshot_filter_mismatch_returns_empty() {
-    let db = test_db();
+    let db = test_db().await;
     let resolver = test_resolver();
     insert_contained_leak(
         &db,
@@ -314,7 +330,7 @@ async fn leak_list_snapshot_filter_mismatch_returns_empty() {
 
 #[tokio::test]
 async fn leak_list_limits_and_errors() {
-    let db = test_db();
+    let db = test_db().await;
     let resolver = test_resolver();
     let service = LeaksService::new(&db, &resolver, 5_000_000);
 
@@ -406,7 +422,7 @@ fn leak_rotation_proposal_derivation_is_closed_vocabulary() {
 
 #[tokio::test]
 async fn leak_rotation_accept_dismiss_and_mark_rotated() {
-    let db = test_db();
+    let db = test_db().await;
     let resolver = test_resolver();
     let report_id = insert_contained_leak(
         &db,
@@ -475,7 +491,7 @@ async fn leak_rotation_accept_dismiss_and_mark_rotated() {
 
 #[tokio::test]
 async fn leak_rotation_update_missing_record_returns_invalid_cursor() {
-    let db = test_db();
+    let db = test_db().await;
     let resolver = test_resolver();
     let service = LeaksService::new(&db, &resolver, 5_000_000);
     let err = service
@@ -490,7 +506,7 @@ async fn leak_rotation_update_missing_record_returns_invalid_cursor() {
 
 #[tokio::test]
 async fn leak_protected_value_deletion_retains_historical_metadata() {
-    let db = test_db();
+    let db = test_db().await;
     let resolver = test_resolver();
     let report_id = insert_contained_leak(
         &db,
@@ -549,7 +565,7 @@ async fn leak_protected_value_deletion_retains_historical_metadata() {
 
 #[tokio::test]
 async fn leak_reveal_unauthorized_missing_report() {
-    let db = test_db();
+    let db = test_db().await;
     let resolver = test_resolver();
     let mut service = LeaksService::new(&db, &resolver, 5_000_000);
     let cap = service
@@ -566,7 +582,7 @@ async fn leak_reveal_unauthorized_missing_report() {
 
 #[tokio::test]
 async fn leak_reveal_succeeds_for_contained_record() {
-    let db = test_db();
+    let db = test_db().await;
     let resolver = test_resolver();
     let secret = "revealed-secret-value";
     let report_id = insert_contained_leak(
@@ -604,7 +620,7 @@ async fn leak_reveal_succeeds_for_contained_record() {
 
 #[tokio::test]
 async fn leak_reveal_rate_limits_at_3_per_minute() {
-    let db = test_db();
+    let db = test_db().await;
     let resolver = test_resolver();
     let mut service = LeaksService::new(&db, &resolver, 5_000_000);
 
@@ -723,7 +739,7 @@ fn leaks_pane_reveal_buffer_check_timeout_zeroizes() {
 
 #[tokio::test]
 async fn leak_mark_rotated_is_reversible_and_cleared_by_re_report() {
-    let db = test_db();
+    let db = test_db().await;
     let resolver = test_resolver();
     let report_id = insert_contained_leak(
         &db,
@@ -807,7 +823,7 @@ async fn leak_mark_rotated_is_reversible_and_cleared_by_re_report() {
 
 #[tokio::test]
 async fn machine_wide_leak_owner_access_across_sessions() {
-    let db = test_db();
+    let db = test_db().await;
     let resolver = test_resolver();
     let r1 = insert_contained_leak(
         &db,
@@ -898,7 +914,7 @@ async fn machine_wide_leak_owner_access_across_sessions() {
 
 #[tokio::test]
 async fn sentinel_plaintext_absent_from_list_output() {
-    let db = test_db();
+    let db = test_db().await;
     let resolver = test_resolver();
     let sentinel = "SENTINEL_PLAINTEXT_VALUE_12345";
     insert_contained_leak(
@@ -938,7 +954,7 @@ async fn sentinel_plaintext_absent_from_list_output() {
 
 #[tokio::test]
 async fn sentinel_plaintext_absent_from_rotation_and_delete_errors() {
-    let db = test_db();
+    let db = test_db().await;
     let resolver = test_resolver();
     let sentinel = "SENTINEL_ROTATION_SECRET";
     let _report_id = insert_contained_leak(

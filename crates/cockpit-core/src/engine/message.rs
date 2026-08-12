@@ -560,12 +560,17 @@ impl UserSubmissionQueue {
             .started_targets
             .values()
             .any(|target| target.id == target_id);
+        // Editable removal targets pending (not-yet-started) submissions. When
+        // any such submission exists it is removed, so the result must be
+        // `Removed` even if the target also has an in-flight started turn: the
+        // started turn is not an editable item and is left untouched. Reporting
+        // `AlreadyStarted` here while still staging indices would make the
+        // durable receipt inconsistent (`applied=false` with `removed_count>0`),
+        // which `RemoteQueueMutationReceiptV1::validate` rejects. `AlreadyStarted`
+        // is reserved for the case where nothing pending matched but a started
+        // turn exists — matching `stage_remove_newest_for`'s precedent.
         let result = if !indices.is_empty() {
-            if has_started_target {
-                RemoveQueuedMessageResult::AlreadyStarted
-            } else {
-                RemoveQueuedMessageResult::Removed
-            }
+            RemoveQueuedMessageResult::Removed
         } else if has_started_target {
             RemoveQueuedMessageResult::AlreadyStarted
         } else {
@@ -768,12 +773,11 @@ impl UserSubmissionQueue {
                 .started_targets
                 .values()
                 .any(|target| target.id == target_id);
+            // Mirror `stage_remove_editable_for`: removing any pending editable
+            // item yields `Removed`; `AlreadyStarted` is reserved for when
+            // nothing pending matched but a started turn exists.
             let result = if !removed.is_empty() {
-                if has_started_target {
-                    RemoveQueuedMessageResult::AlreadyStarted
-                } else {
-                    RemoveQueuedMessageResult::Removed
-                }
+                RemoveQueuedMessageResult::Removed
             } else if has_started_target {
                 RemoveQueuedMessageResult::AlreadyStarted
             } else {
@@ -2307,7 +2311,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn user_submission_queue_bulk_reports_started_after_partial_removal() {
+    async fn user_submission_queue_bulk_removes_editable_despite_started_target() {
         let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
         let queue = UserSubmissionQueue::new(updates_tx);
         let root = QueueTarget::root("Build");
@@ -2322,8 +2326,14 @@ mod tests {
             .push(UserSubmission::text("root editable"), root.clone())
             .await;
 
+        // The still-pending "root editable" submission is removed even though the
+        // target has an in-flight started turn ("root folding"): editable removal
+        // only ever touches pending items, so removing one is a genuine `Removed`.
+        // Reporting `AlreadyStarted` here would contradict the durable receipt
+        // invariant `removed == (removed_count > 0)` enforced by
+        // `RemoteQueueMutationReceiptV1::validate`.
         let (result, removed, snapshot) = queue.remove_editable_for(&root.id).await;
-        assert_eq!(result, RemoveQueuedMessageResult::AlreadyStarted);
+        assert_eq!(result, RemoveQueuedMessageResult::Removed);
         assert_eq!(
             removed
                 .iter()

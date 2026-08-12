@@ -2036,11 +2036,6 @@ mod llm_mode_tests {
         assert!(context_pack.contains("never prints file contents"));
         assert!(context_pack.contains("read"));
 
-        let goal = tool_by_name("goal").description().to_ascii_lowercase();
-        assert!(goal.contains("goal"));
-        assert!(goal.contains("control-plane"));
-        assert!(goal.contains("driver"));
-
         let note = tool_by_name("note").description().to_ascii_lowercase();
         assert!(note.contains("live progress note"));
         assert!(!note.contains("now; it reaches"));
@@ -2092,11 +2087,10 @@ mod llm_mode_tests {
             ("write", &["read", "edit"]),
             ("edit", &["read", "write"]),
             ("unlock", &["write", "edit"]),
-            ("plan_read", &["plan_edit", "plan_write", "todo", "goal"]),
-            ("plan_write", &["plan_edit", "todo", "goal"]),
+            ("plan_read", &["plan_edit", "plan_write", "todo"]),
+            ("plan_write", &["plan_edit", "todo"]),
             ("plan_edit", &["plan_read", "plan_write"]),
             ("todo", &["task"]),
-            ("goal", &["todo"]),
         ];
         for (name, siblings) in cases {
             let description = tool_by_name(name).description().to_ascii_lowercase();
@@ -2624,7 +2618,17 @@ mod llm_mode_tests {
             ("delegation_payload_retrieve", ToolEffect::Dynamic),
             ("edit", ToolEffect::Dynamic),
             ("escalate", ToolEffect::Dynamic),
-            ("goal", ToolEffect::Dynamic),
+            // Media tools: audio/video inspection (read-only) and derivation
+            // (mutating), image read (read-only), and image generation.
+            ("inspect_audio", ToolEffect::ReadOnly),
+            ("inspect_video", ToolEffect::ReadOnly),
+            ("extract_video_clip", ToolEffect::Mutating),
+            ("extract_audio", ToolEffect::Mutating),
+            ("read_image", ToolEffect::ReadOnly),
+            ("list_image_generation_targets", ToolEffect::ReadOnly),
+            ("generate_image", ToolEffect::Dynamic),
+            ("get_image_generation_job", ToolEffect::ReadOnly),
+            ("cancel_image_generation_job", ToolEffect::Dynamic),
             ("graph", ToolEffect::ReadOnly),
             ("glob", ToolEffect::ReadOnly),
             ("grep", ToolEffect::ReadOnly),

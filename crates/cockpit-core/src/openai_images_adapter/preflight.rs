@@ -121,10 +121,14 @@ pub fn preflight(
     let output_format = parse_required("output_format", &plan.output_format, OutputFormat::parse)?;
     let moderation = parse_required("moderation", &plan.moderation, Moderation::parse)?;
     let input_fidelity = validate_input_fidelity(&descriptor, plan.input_fidelity.as_deref())?;
+    // Transparency is validated before the generic capability gate so the
+    // model-specific "transparent background is rejected" reason surfaces for
+    // identities (e.g. gpt-image-2) that do not list transparent among their
+    // supported backgrounds.
+    validate_transparency(&descriptor, output_format, background)?;
     validate_capability(&descriptor, quality, background, output_format, moderation)?;
     validate_size(&descriptor, plan.width, plan.height)?;
     validate_compression(&descriptor, output_format, plan.compression)?;
-    validate_transparency(&descriptor, output_format, background)?;
     let route = if references.is_empty() {
         super::OpenaiImagesRoute::Generations
     } else {
@@ -357,7 +361,7 @@ fn validate_size(
         SizeContract::FixedAspect { candidates } => {
             let matched = candidates
                 .iter()
-                .any(|(_, w, h)| (*w == 0 && *h == 0) || (*w == width && *h == height));
+                .any(|(_, w, h)| *w == width && *h == height);
             if !matched {
                 return Err(PreflightFailure {
                     reason: format!(
@@ -426,9 +430,8 @@ pub fn size_value(descriptor: ImageModelDescriptor, (width, height): (u32, u32))
         SizeContract::FixedAspect { candidates } => {
             let candidate = candidates
                 .iter()
-                .find(|(_, w, h)| (*w == 0 && *h == 0) || (*w == width && *h == height));
+                .find(|(_, w, h)| *w == width && *h == height);
             match candidate {
-                Some((value, 0, 0)) => (*value).to_string(),
                 Some((value, _, _)) => (*value).to_string(),
                 None => format!("{width}x{height}"),
             }

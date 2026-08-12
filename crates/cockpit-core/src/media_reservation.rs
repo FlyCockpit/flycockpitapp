@@ -133,8 +133,7 @@ impl ReservationState {
                     | S::AccountingCorrupt
             ) | (
                 S::DispatchingExternal,
-                S::ExecutingLocal
-                    | S::ExternalPending
+                S::ExternalPending
                     | S::CancellationRequested
                     | S::Settling
                     | S::OverageQuarantined

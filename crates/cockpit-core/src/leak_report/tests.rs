@@ -44,8 +44,22 @@ fn test_resolver() -> MapKeyResolver {
     MapKeyResolver::new().with_version(1, test_key_v1())
 }
 
-fn test_db() -> Db {
-    Db::open_in_memory().unwrap()
+async fn test_db() -> Db {
+    let db = Db::open_in_memory().unwrap();
+    // protected_redaction_history.session_id and protected_leak_records.session_id
+    // carry cascading FKs to sessions(session_id), so the referenced session row
+    // must exist before the leak-report handler writes any protected record.
+    db.write(|conn| {
+        conn.execute(
+            "INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) \
+             VALUES(?1,'p','/redacted',1,1)",
+            [session_id()],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    db
 }
 
 fn session_id() -> &'static str {
@@ -200,7 +214,7 @@ fn leak_report_enforces_16_kib_utf8_payload_bound() {
 
 #[tokio::test]
 async fn leak_report_returns_only_contained_or_content_free_failure() {
-    let db = test_db();
+    let db = test_db().await;
     let resolver = test_resolver();
     let handler = LeakReportHandler::new(&db, &resolver, 1_000_000);
 
@@ -232,7 +246,7 @@ async fn leak_report_returns_only_contained_or_content_free_failure() {
 
 #[tokio::test]
 async fn leak_report_deduplicates_by_keyed_fingerprint() {
-    let db = test_db();
+    let db = test_db().await;
     let resolver = test_resolver();
     let handler = LeakReportHandler::new(&db, &resolver, 1_000_000);
 
@@ -301,7 +315,7 @@ async fn leak_report_deduplicates_by_keyed_fingerprint() {
 
 #[tokio::test]
 async fn leak_report_rate_limits_at_32_per_hour() {
-    let db = test_db();
+    let db = test_db().await;
     let resolver = test_resolver();
     // Use a fixed base time so all 32 fit in one hour window.
     let handler = LeakReportHandler::new(&db, &resolver, 2_000_000);
@@ -347,7 +361,7 @@ async fn leak_report_rate_limits_at_32_per_hour() {
 
 #[tokio::test]
 async fn leak_protected_storage_is_encryption_only() {
-    let db = test_db();
+    let db = test_db().await;
     let resolver = test_resolver();
     let handler = LeakReportHandler::new(&db, &resolver, 1_000_000);
 
@@ -416,7 +430,7 @@ async fn leak_protected_storage_is_encryption_only() {
 
 #[tokio::test]
 async fn leak_report_stamps_host_derived_provenance() {
-    let db = test_db();
+    let db = test_db().await;
     let resolver = test_resolver();
     let handler = LeakReportHandler::new(&db, &resolver, 1_000_000);
 
@@ -481,7 +495,7 @@ fn keyed_leak_fingerprint_is_deterministic_and_distinct() {
 
 #[tokio::test]
 async fn leak_report_pending_record_is_not_listable() {
-    let db = test_db();
+    let db = test_db().await;
 
     // Insert a record directly as pending (simulating a host-issued pending
     // containment before the protected persistence commits).
@@ -590,7 +604,7 @@ fn protected_sensitive_ingress_report_leak_is_closed_variant() {
 
 #[tokio::test]
 async fn leak_report_fails_closed_on_key_failure() {
-    let db = test_db();
+    let db = test_db().await;
     // Empty resolver: no key for version 1.
     let resolver = MapKeyResolver::new();
     let handler = LeakReportHandler::new(&db, &resolver, 1_000_000);
@@ -629,7 +643,7 @@ async fn leak_report_fails_closed_on_key_failure() {
 
 #[tokio::test]
 async fn leak_report_re_report_clears_rotation_state() {
-    let db = test_db();
+    let db = test_db().await;
     let resolver = test_resolver();
     let handler = LeakReportHandler::new(&db, &resolver, 1_000_000);
 
@@ -686,7 +700,7 @@ async fn leak_report_re_report_clears_rotation_state() {
 
 #[tokio::test]
 async fn leak_report_literal_never_in_model_output() {
-    let db = test_db();
+    let db = test_db().await;
     let resolver = test_resolver();
     let handler = LeakReportHandler::new(&db, &resolver, 1_000_000);
 

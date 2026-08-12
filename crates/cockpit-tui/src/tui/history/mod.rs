@@ -1501,6 +1501,8 @@ pub fn render_pending(msg: &PendingMsg, width: u16) -> Vec<Line<'static>> {
         width,
         true,
         None,
+        None,
+        false,
     )
     .lines
 }
@@ -2154,21 +2156,23 @@ fn render_agent(
                 }
                 let window =
                     inner_scroll_window(reasoning_rows.len(), THINKING_VISIBLE, reasoning_offset);
-                let insert_at = 1; // after the chip row
+                // The reasoning window is a single contiguous block appended
+                // after the chip/resize/body rows. `region_start` must anchor
+                // to the first row of that block (the `more above` indicator
+                // when present, else the first visible reasoning row) so the
+                // scroll region covers only the reasoning window — never the
+                // resize/body rows above it.
+                let region_start = out.len();
                 if window.more_above > 0 {
-                    out.insert(
-                        insert_at,
-                        Line::from(vec![
-                            Span::raw(" ".repeat(reasoning_indent)),
-                            Span::styled(
-                                format!("{} more above", window.more_above),
-                                Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
-                            ),
-                        ]),
-                    );
-                    conts.insert(insert_at, false);
+                    out.push(Line::from(vec![
+                        Span::raw(" ".repeat(reasoning_indent)),
+                        Span::styled(
+                            format!("{} more above", window.more_above),
+                            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                        ),
+                    ]));
+                    conts.push(false);
                 }
-                let region_start = insert_at + usize::from(window.more_above > 0);
                 for (line, continuation) in reasoning_rows
                     .iter()
                     .skip(window.offset)

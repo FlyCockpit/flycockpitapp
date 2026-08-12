@@ -245,7 +245,10 @@ mod tests {
     fn remote(scope: PrincipalScope, project_root: Option<String>) -> ClientPrincipal {
         ClientPrincipal::from_verified_remote(
             "user-1".to_string(),
-            vec![PrincipalGrant { scope, project_root }],
+            vec![PrincipalGrant {
+                scope,
+                project_root,
+            }],
             None,
         )
     }
@@ -313,6 +316,7 @@ mod tests {
             "guidance_estimate",
             "get_inventory_bundle",
             "list_assistants",
+            "list_leak_reports",
             "list_scheduled_jobs",
             "list_sessions",
             "read_bulk_transfer_chunk",
@@ -324,6 +328,7 @@ mod tests {
             "session_live_status",
             "stats_rollup",
             "subagent_transcript",
+            "terminal_ingress_status",
         ]);
         let actual: std::collections::BTreeSet<_> = rows
             .iter()

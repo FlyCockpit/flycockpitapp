@@ -747,6 +747,13 @@ pub(super) async fn claim_message_image_refs_admitted(
     refs: &[proto::ImageAttachmentRef],
 ) -> std::result::Result<Vec<Vec<u8>>, ErrorPayload> {
     validate_image_ref_shape(refs)?;
+    // A text-only message has no attachments to claim, so it must not depend on
+    // the media subsystem being provisioned. Short-circuit before touching the
+    // attachment state or media storage recovery, mirroring the empty-refs guard
+    // on the probe path in `handle_send_user_message`.
+    if refs.is_empty() {
+        return Ok(Vec::new());
+    }
     let attached =
         require_attached(state).map_err(|_| bad_request("media attachment unavailable"))?;
     if attached.handle.session_id != session_id {

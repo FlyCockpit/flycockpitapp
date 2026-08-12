@@ -558,35 +558,49 @@ pub(crate) fn read_file_nofollow(path: &Path) -> Result<Option<Vec<u8>>> {
 
 pub(crate) fn read_file_nofollow_with_identity(
     path: &Path,
+    writable: bool,
 ) -> Result<Option<(std::fs::File, Vec<u8>, super::TerminalIngressFileIdentity)>> {
     let (parent, file_name) = match open_parent_directory_nofollow(path) {
         Ok(parts) => parts,
         Err(error) if root_cause_is_not_found(&error) => return Ok(None),
         Err(error) => return Err(error),
     };
+    // Callers that later scrub the held exact object (truncating it through the
+    // retained descriptor) must open read-write; pure readers stay read-only.
+    #[cfg(unix)]
+    let access = if writable {
+        libc::O_RDWR
+    } else {
+        libc::O_RDONLY
+    };
     #[cfg(unix)]
     let file = open_file_at_nofollow(
         &parent,
         &file_name,
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        access | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         0,
     )?;
     #[cfg(windows)]
     let file = {
         use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
         use windows_sys::Win32::Storage::FileSystem::{
-            FILE_READ_ATTRIBUTES, FILE_READ_DATA, SYNCHRONIZE,
+            FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_WRITE_DATA, SYNCHRONIZE,
         };
-        open_windows_relative_nofollow(
-            &parent,
-            &file_name,
-            false,
-            FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-            FILE_OPEN,
-        )?
+        let mut access = FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+        if writable {
+            access |= FILE_WRITE_DATA;
+        }
+        open_windows_relative_nofollow(&parent, &file_name, false, access, FILE_OPEN)?
     };
     #[cfg(all(not(unix), not(windows)))]
-    let file = std::fs::File::open(path)?;
+    let file = if writable {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?
+    } else {
+        std::fs::File::open(path)?
+    };
     let before = file.metadata()?;
     if !before.is_file() {
         anyhow::bail!("terminal ingress entry is not a regular file");

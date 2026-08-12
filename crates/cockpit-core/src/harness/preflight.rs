@@ -41,14 +41,20 @@ impl std::fmt::Display for PreflightError {
                 harness,
                 command,
                 dependency_line,
-            } => match dependency_line {
-                Some(line) => f.write_str(line),
-                None => write!(
+            } => {
+                // Always name the harness and command per cockpit error
+                // conventions (backticked identifiers); append the dependency
+                // health context line when one is available.
+                write!(
                     f,
                     "harness `{harness}` is not installed: `{command}` was not found on PATH. \
                      Install it or fix the `command` in /settings.",
-                ),
-            },
+                )?;
+                if let Some(line) = dependency_line {
+                    write!(f, " {line}")?;
+                }
+                Ok(())
+            }
             PreflightError::NotAuthenticated { harness, command } => write!(
                 f,
                 "harness `{harness}` is not authenticated: `{command}` has no credentials. \

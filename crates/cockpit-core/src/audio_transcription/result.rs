@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 /// A caller-requested language: exactly `{kind:"requested",code}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename = "kind", deny_unknown_fields)]
+#[serde(tag = "kind", rename = "requested", deny_unknown_fields)]
 pub struct RequestedLanguageV1 {
     pub code: String,
 }
@@ -30,7 +30,7 @@ impl RequestedLanguageV1 {
 
 /// An applied (sent) language: exactly `{kind:"applied",code}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename = "kind", deny_unknown_fields)]
+#[serde(tag = "kind", rename = "applied", deny_unknown_fields)]
 pub struct AppliedLanguageV1 {
     pub code: String,
 }
@@ -43,7 +43,7 @@ impl AppliedLanguageV1 {
 
 /// A provider-detected language: exactly `{kind:"detected",code}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename = "kind", deny_unknown_fields)]
+#[serde(tag = "kind", rename = "detected", deny_unknown_fields)]
 pub struct DetectedLanguageV1 {
     pub code: String,
 }
@@ -375,6 +375,10 @@ pub fn is_valid_local_speaker(speaker: &str) -> bool {
     }
     // Must be all ASCII digits
     if !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    // Grammar forbids leading zeros (`[1-9]` first digit).
+    if rest.starts_with('0') {
         return false;
     }
     let n: u32 = match rest.parse() {

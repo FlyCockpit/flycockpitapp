@@ -69,7 +69,7 @@ pub fn write_terminal_ingress_private_file(
     bytes: &[u8],
 ) -> anyhow::Result<TerminalIngressFileIdentity> {
     files::prepare_atomic_write(path, bytes)?.commit_noreplace()?;
-    let (_, _, identity) = files::read_file_nofollow_with_identity(path)?
+    let (_, _, identity) = files::read_file_nofollow_with_identity(path, false)?
         .ok_or_else(|| anyhow::anyhow!("published terminal ingress file disappeared"))?;
     Ok(identity)
 }
@@ -117,17 +117,15 @@ impl Drop for VerifiedTerminalIngressFile {
 pub fn read_terminal_ingress_file_verified(
     path: &std::path::Path,
 ) -> anyhow::Result<Option<(Vec<u8>, TerminalIngressFileIdentity)>> {
-    Ok(
-        files::read_file_nofollow_with_identity(path)?
-            .map(|(_, bytes, identity)| (bytes, identity)),
-    )
+    Ok(files::read_file_nofollow_with_identity(path, false)?
+        .map(|(_, bytes, identity)| (bytes, identity)))
 }
 
 pub fn hold_terminal_ingress_file_verified(
     path: &std::path::Path,
 ) -> anyhow::Result<Option<VerifiedTerminalIngressFile>> {
     Ok(
-        files::read_file_nofollow_with_identity(path)?.map(|(file, bytes, identity)| {
+        files::read_file_nofollow_with_identity(path, true)?.map(|(file, bytes, identity)| {
             VerifiedTerminalIngressFile {
                 file,
                 bytes,

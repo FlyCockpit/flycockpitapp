@@ -287,10 +287,15 @@ pub fn audio_process(
 }
 
 fn source_schema() -> Value {
+    // Closed source branches: each `oneOf` branch names exactly its own source
+    // key and forbids extra keys (`additionalProperties: false`), matching the
+    // sibling media/`inspect_*` schemas and the strict-wire shape the responses
+    // transform already produces for these branches. Each branch's `properties`
+    // set equals its `required` set so the strict-object invariant holds.
     json!({"oneOf": [
-        {"required": ["attachment_id"], "properties": {"attachment_id": {"type": "string", "minLength": 1}}, "additionalProperties": true},
-        {"required": ["path"], "properties": {"path": {"type": "string", "minLength": 1}}, "additionalProperties": true},
-        {"required": ["url"], "properties": {"url": {"type": "string", "pattern": "^https://"}}, "additionalProperties": true}
+        {"required": ["attachment_id"], "properties": {"attachment_id": {"type": "string", "minLength": 1}}, "additionalProperties": false},
+        {"required": ["path"], "properties": {"path": {"type": "string", "minLength": 1}}, "additionalProperties": false},
+        {"required": ["url"], "properties": {"url": {"type": "string", "pattern": "^https://"}}, "additionalProperties": false}
     ]})
 }
 
@@ -356,7 +361,7 @@ async fn fail_closed(args: Value) -> Result<ToolOutput> {
 }
 
 macro_rules! media_tool {
-    ($name:ident, $wire:literal, $description:literal, $kind:expr, $effect:expr) => {
+    ($name:ident, $wire:literal, $description:literal, $defensive:literal, $kind:expr, $effect:expr) => {
         pub struct $name;
         #[async_trait]
         impl Tool for $name {
@@ -367,7 +372,7 @@ macro_rules! media_tool {
                 $description
             }
             fn defensive_description(&self) -> Option<String> {
-                Some($description.into())
+                Some($defensive.into())
             }
             fn effect(&self) -> ToolEffect {
                 $effect
@@ -389,6 +394,7 @@ media_tool!(
     InspectAudioTool,
     "inspect_audio",
     "Inspect bounded metadata for one authorized audio attachment.",
+    "Read safe, bounded metadata for one audio attachment you are already authorized to access by its attachment_id: duration, streams, codecs, and channel layout. Use it before extract_audio to confirm what a source contains. It is strictly read-only and never transcodes, downloads, or opens an arbitrary path or URL; the session attachment authority admits the source, so any request without a valid authorized id is rejected. Requires ffprobe.",
     ToolKind::InspectAudio,
     ToolEffect::ReadOnly
 );
@@ -396,6 +402,7 @@ media_tool!(
     InspectVideoTool,
     "inspect_video",
     "Inspect metadata or create a deterministic storyboard for one authorized video attachment.",
+    "Read safe, bounded metadata, or build a deterministic storyboard of frame timestamps, for one video attachment you are already authorized to access by its attachment_id. Use it before extract_video_clip to see the streams and choose an interval. It is read-only and never re-encodes or fetches an arbitrary path or URL; the storyboard frame count is capped and the source must be admitted by the session attachment authority. Requires ffprobe.",
     ToolKind::InspectVideo,
     ToolEffect::ReadOnly
 );
@@ -403,6 +410,7 @@ media_tool!(
     ExtractVideoClipTool,
     "extract_video_clip",
     "Create a bounded MP4 clip derivative from one authorized video attachment.",
+    "Create one bounded MP4 clip derivative from a single video attachment you are already authorized to access, covering only the interval you request. Use it after inspect_video has confirmed the stream and timing. This is a mutating operation: it writes a new derivative but never overwrites the original, and it refuses any source the session attachment authority has not admitted. Output resolution, frame rate, and duration are all bounded. Requires ffmpeg and ffprobe.",
     ToolKind::ExtractVideoClip,
     ToolEffect::Mutating
 );
@@ -410,6 +418,7 @@ media_tool!(
     ExtractAudioTool,
     "extract_audio",
     "Create a bounded WAV derivative from one authorized audio or video attachment.",
+    "Create one bounded WAV derivative from a single authorized audio or video attachment, capturing only the interval and stream you request. Use it after inspecting the source to confirm its streams. This is a mutating operation: it writes a new derivative, never replaces the original, and rejects any source the session attachment authority has not admitted. Sample rate, channel count, and duration are all bounded. Requires ffmpeg and ffprobe.",
     ToolKind::ExtractAudio,
     ToolEffect::Mutating
 );

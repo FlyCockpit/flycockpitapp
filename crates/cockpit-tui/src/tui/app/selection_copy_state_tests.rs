@@ -132,6 +132,8 @@ fn copy_selection_uses_visible_agent_semantics_without_provenance() {
         reasoning_offset: 0,
         think_duration: None,
         seq: None,
+        performance: None,
+        performance_expanded: false,
     }]
     .into();
     app.chat_area = Some(Rect::new(0, 0, 12, 1));
@@ -176,6 +178,8 @@ fn copy_selection_cross_message_falls_back_to_plaintext() {
             reasoning_offset: 0,
             think_duration: None,
             seq: None,
+            performance: None,
+            performance_expanded: false,
         },
     ]
     .into();

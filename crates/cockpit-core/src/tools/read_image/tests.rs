@@ -757,10 +757,20 @@ mod edge_cases {
         {
             let mut encoder = image::codecs::gif::GifEncoder::new(&mut bytes);
             encoder
-                .encode_frame(frame1, 0, 0, image::Delay::from_millis(100))
+                .encode_frame(image::Frame::from_parts(
+                    frame1,
+                    0,
+                    0,
+                    image::Delay::from_numer_denom_ms(100, 1),
+                ))
                 .unwrap();
             encoder
-                .encode_frame(frame2, 100, 0, image::Delay::from_millis(100))
+                .encode_frame(image::Frame::from_parts(
+                    frame2,
+                    100,
+                    0,
+                    image::Delay::from_numer_denom_ms(100, 1),
+                ))
                 .unwrap();
         }
 

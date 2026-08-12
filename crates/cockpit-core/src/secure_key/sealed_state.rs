@@ -599,9 +599,20 @@ mod tests {
             "hmac must not be in workspace dependencies"
         );
         assert!(!manifest.contains("hmac.workspace"));
-        // No other workspace member Cargo.toml declares hmac (skip owning member by name).
+        // Only the owning member (cockpit-core, sealed state) and cockpit-proto
+        // may declare hmac. cockpit-proto needs its own HMAC for remote
+        // transport crypto (device-identity enrollment HKDF, coturn TURN REST
+        // credentials); the crate graph forbids it from depending on
+        // cockpit-core, so it must pin the same exact secure build itself. Any
+        // other member declaring hmac — or a declaration that is not the exact
+        // secure pin — is a regression.
+        const SEALED_HMAC_PIN: &str =
+            "hmac = { version = \"=0.13.0\", default-features = false, features = [\"zeroize\"] }";
         let own_manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
         let own_canon = std::fs::canonicalize(&own_manifest).unwrap_or(own_manifest);
+        let proto_manifest =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../cockpit-proto/Cargo.toml");
+        let proto_canon = std::fs::canonicalize(&proto_manifest).unwrap_or(proto_manifest.clone());
         let crates_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
         let apps_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../apps");
         for dir in [crates_dir, apps_dir] {
@@ -609,7 +620,7 @@ mod tests {
                 for entry in entries.flatten() {
                     let path = entry.path().join("Cargo.toml");
                     let canon = std::fs::canonicalize(&path).unwrap_or(path.clone());
-                    if canon == own_canon {
+                    if canon == own_canon || canon == proto_canon {
                         continue;
                     }
                     if let Ok(text) = std::fs::read_to_string(&path) {
@@ -618,13 +629,26 @@ mod tests {
                                 let t = l.trim_start();
                                 t.starts_with("hmac ") || t.starts_with("hmac=")
                             }),
-                            "only cockpit-core may declare hmac: {}",
+                            "only cockpit-core and cockpit-proto may declare hmac: {}",
                             path.display()
                         );
                     }
                 }
             }
         }
+        // cockpit-proto must carry the same exact secure pin as sealed state so
+        // the centralization/pinning invariant is not weakened by the second
+        // legitimate declarer.
+        let proto_manifest_text =
+            std::fs::read_to_string(&proto_canon).expect("read cockpit-proto Cargo.toml");
+        assert!(
+            proto_manifest_text.contains(SEALED_HMAC_PIN),
+            "cockpit-proto must pin hmac exactly as sealed state does: {SEALED_HMAC_PIN}"
+        );
+        assert!(
+            manifest.contains(SEALED_HMAC_PIN),
+            "cockpit-core must pin hmac exactly: {SEALED_HMAC_PIN}"
+        );
         // Locked tree: direct sealed HMAC is 0.13.0. A transitive hmac 0.12.x may appear via
         // the Linux secret-service adapter stack; sealed production uses only 0.13.0.
         let lock = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"));

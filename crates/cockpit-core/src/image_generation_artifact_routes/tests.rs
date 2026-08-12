@@ -28,7 +28,9 @@ fn valid_metadata() -> ImageArtifactMetadataV1 {
         slot_generation: "1".into(),
         published_disposition: "ordinary".into(),
         published_disposition_generation: "1".into(),
-        media_kind: "image/png".into(),
+        // Canonical slash-free media-kind token: the redacted metadata must
+        // never carry a path/URL-shaped value (production accepts "png").
+        media_kind: "png".into(),
         width: 1024,
         height: 768,
         byte_length: "12345".into(),

@@ -209,8 +209,11 @@ mod coordinate_transform {
 
     #[test]
     fn computer_dossier_coordinate_transform_hidpi_scale_2x() {
-        // HiDPI 2x scale: physical = source * 2.
-        let t = transform(0, 0, 0, 2, 1, 0, 0, 960, 540, 1920, 1080);
+        // HiDPI 2x scale: physical = source * 2. The source frame (1920x1080)
+        // contains the rect (bottom-right 400,600) and the physical display is
+        // exactly twice the source (3840x2160), so the scaled rect
+        // (bottom-right 800,1200) stays inside the physical frame.
+        let t = transform(0, 0, 0, 2, 1, 0, 0, 1920, 1080, 3840, 2160);
         let src = SourcePixelRect {
             x_px: 100,
             y_px: 200,
@@ -236,13 +239,16 @@ mod coordinate_transform {
             height_px: 401,
         };
         let phys = t.to_physical(src).unwrap();
-        // floor(100/2) = 50, floor(200/2) = 100
-        // ceil(401/2) = 201, ceil(601/2) = 301
-        // width = 201 - 100 = 101, height = 301 - 200 = 101
+        // left/top floor, right/bottom ceil so the physical box encloses the
+        // source box:
+        //   left = floor(100/2) = 50,  top    = floor(200/2) = 100
+        //   right = ceil(401/2) = 201, bottom = ceil(601/2) = 301
+        //   width  = right - left   = 201 - 50  = 151
+        //   height = bottom - top   = 301 - 100 = 201
         assert_eq!(phys.x, 50);
         assert_eq!(phys.y, 100);
-        assert_eq!(phys.width, 101);
-        assert_eq!(phys.height, 151);
+        assert_eq!(phys.width, 151);
+        assert_eq!(phys.height, 201);
     }
 
     #[test]
@@ -428,6 +434,220 @@ mod coordinate_transform {
         assert_eq!(phys.width, 600);
         assert_eq!(phys.height, 800);
     }
+
+    #[test]
+    fn computer_dossier_coordinate_transform_zero_dims_noninvertible() {
+        // A zero source or physical dimension is not invertible. Both the
+        // direct validate() and the to_physical() entry point reject it.
+        let src = SourcePixelRect {
+            x_px: 10,
+            y_px: 10,
+            width_px: 20,
+            height_px: 20,
+        };
+
+        // source_width_px == 0
+        let t = transform(0, 0, 0, 1, 1, 0, 0, 0, 1080, 1920, 1080);
+        assert_eq!(t.validate().unwrap_err(), TransformError::Noninvertible);
+        assert_eq!(
+            t.to_physical(src).unwrap_err(),
+            TransformError::Noninvertible
+        );
+
+        // source_height_px == 0
+        let t = transform(0, 0, 0, 1, 1, 0, 0, 1920, 0, 1920, 1080);
+        assert_eq!(t.validate().unwrap_err(), TransformError::Noninvertible);
+        assert_eq!(
+            t.to_physical(src).unwrap_err(),
+            TransformError::Noninvertible
+        );
+
+        // physical_width_px == 0
+        let t = transform(0, 0, 0, 1, 1, 0, 0, 1920, 1080, 0, 1080);
+        assert_eq!(t.validate().unwrap_err(), TransformError::Noninvertible);
+        assert_eq!(
+            t.to_physical(src).unwrap_err(),
+            TransformError::Noninvertible
+        );
+
+        // physical_height_px == 0
+        let t = transform(0, 0, 0, 1, 1, 0, 0, 1920, 1080, 1920, 0);
+        assert_eq!(t.validate().unwrap_err(), TransformError::Noninvertible);
+        assert_eq!(
+            t.to_physical(src).unwrap_err(),
+            TransformError::Noninvertible
+        );
+    }
+
+    #[test]
+    fn computer_dossier_coordinate_transform_crop_exceeds_source_noninvertible() {
+        // A crop offset at or beyond the source dimension leaves an empty
+        // effective region — nothing to invert.
+        let src = SourcePixelRect {
+            x_px: 10,
+            y_px: 10,
+            width_px: 20,
+            height_px: 20,
+        };
+
+        // crop_x == source_width_px (empty in x)
+        let t = transform(0, 1920, 0, 1, 1, 0, 0, 1920, 1080, 1920, 1080);
+        assert_eq!(t.validate().unwrap_err(), TransformError::Noninvertible);
+        assert_eq!(
+            t.to_physical(src).unwrap_err(),
+            TransformError::Noninvertible
+        );
+
+        // crop_x > source_width_px
+        let t = transform(0, 2000, 0, 1, 1, 0, 0, 1920, 1080, 1920, 1080);
+        assert_eq!(t.validate().unwrap_err(), TransformError::Noninvertible);
+
+        // crop_y == source_height_px (empty in y)
+        let t = transform(0, 0, 1080, 1, 1, 0, 0, 1920, 1080, 1920, 1080);
+        assert_eq!(t.validate().unwrap_err(), TransformError::Noninvertible);
+        assert_eq!(
+            t.to_physical(src).unwrap_err(),
+            TransformError::Noninvertible
+        );
+
+        // crop_y > source_height_px
+        let t = transform(0, 0, 1200, 1, 1, 0, 0, 1920, 1080, 1920, 1080);
+        assert_eq!(t.validate().unwrap_err(), TransformError::Noninvertible);
+    }
+
+    #[test]
+    fn computer_dossier_coordinate_transform_enclosure_grid() {
+        // Property test: for a fixed interior source rect, sweep rotation ×
+        // crop × scale × letterbox and assert the production physical rect
+        // (i) encloses the exact rational image of the source-rect corners
+        // after crop → rotation → scale → letterbox, and (ii) is minimal
+        // (each edge within one pixel of the exact rational edge).
+        //
+        // The expected bounds are derived here with explicit i128 rational
+        // arithmetic (numerator over a shared denominator), transforming each
+        // of the four corners independently — sharing no code with
+        // `to_physical`'s floor/ceil implementation.
+        const SRC_W: i128 = 1000;
+        const SRC_H: i128 = 800;
+        // Fixed interior source rect, well inside the frame and inside every
+        // crop offset used below.
+        const RX: i128 = 100;
+        const RY: i128 = 120;
+        const RW: i128 = 200;
+        const RH: i128 = 160;
+        // Physical dims large enough that no combination clips.
+        const PHYS_W: u32 = 20_000;
+        const PHYS_H: u32 = 20_000;
+
+        for &rotation in &[0u16, 90, 180, 270] {
+            for &(crop_x, crop_y) in &[(0i128, 0i128), (10, 20)] {
+                for &(num, den) in &[(1i128, 1i128), (2, 1), (1, 3)] {
+                    for &(lb_x, lb_y) in &[(0i128, 0i128), (50, 60)] {
+                        let sw = SRC_W - crop_x;
+                        let sh = SRC_H - crop_y;
+
+                        // Transform each source-rect corner independently.
+                        let corners = [(RX, RY), (RX + RW, RY), (RX, RY + RH), (RX + RW, RY + RH)];
+                        let mut rxs = Vec::new();
+                        let mut rys = Vec::new();
+                        for &(px, py) in &corners {
+                            let cx = px - crop_x;
+                            let cy = py - crop_y;
+                            // Rotate the point within the cropped frame.
+                            let (rx, ry) = match rotation {
+                                0 => (cx, cy),
+                                90 => (sh - cy, cx),
+                                180 => (sw - cx, sh - cy),
+                                270 => (cy, sw - cx),
+                                _ => unreachable!(),
+                            };
+                            rxs.push(rx);
+                            rys.push(ry);
+                        }
+                        let min_rx = *rxs.iter().min().unwrap();
+                        let max_rx = *rxs.iter().max().unwrap();
+                        let min_ry = *rys.iter().min().unwrap();
+                        let max_ry = *rys.iter().max().unwrap();
+
+                        // Exact rational edges over the shared denominator `den`:
+                        //   edge = rotated_coord * num / den + letterbox.
+                        let left_num = min_rx * num + lb_x * den;
+                        let right_num = max_rx * num + lb_x * den;
+                        let top_num = min_ry * num + lb_y * den;
+                        let bottom_num = max_ry * num + lb_y * den;
+
+                        let t = transform(
+                            rotation,
+                            crop_x as u32,
+                            crop_y as u32,
+                            num as u32,
+                            den as u32,
+                            lb_x as u32,
+                            lb_y as u32,
+                            SRC_W as u32,
+                            SRC_H as u32,
+                            PHYS_W,
+                            PHYS_H,
+                        );
+                        let src = SourcePixelRect {
+                            x_px: RX as u32,
+                            y_px: RY as u32,
+                            width_px: RW as u32,
+                            height_px: RH as u32,
+                        };
+                        let phys = t.to_physical(src).unwrap_or_else(|e| {
+                            panic!("rot {rotation} crop ({crop_x},{crop_y}) scale {num}/{den} lb ({lb_x},{lb_y}): {e:?}")
+                        });
+
+                        let ret_left = i128::from(phys.x);
+                        let ret_top = i128::from(phys.y);
+                        let ret_right = i128::from(phys.x) + i128::from(phys.width);
+                        let ret_bottom = i128::from(phys.y) + i128::from(phys.height);
+
+                        let ctx = format!(
+                            "rot {rotation} crop ({crop_x},{crop_y}) scale {num}/{den} lb ({lb_x},{lb_y})"
+                        );
+
+                        // Left/top: enclose (<= exact) and minimal (> exact-1).
+                        assert!(
+                            ret_left * den <= left_num,
+                            "{ctx}: left {ret_left} does not enclose exact {left_num}/{den}"
+                        );
+                        assert!(
+                            (ret_left + 1) * den > left_num,
+                            "{ctx}: left {ret_left} not minimal vs exact {left_num}/{den}"
+                        );
+                        assert!(
+                            ret_top * den <= top_num,
+                            "{ctx}: top {ret_top} does not enclose exact {top_num}/{den}"
+                        );
+                        assert!(
+                            (ret_top + 1) * den > top_num,
+                            "{ctx}: top {ret_top} not minimal vs exact {top_num}/{den}"
+                        );
+
+                        // Right/bottom: enclose (>= exact) and minimal (< exact+1).
+                        assert!(
+                            ret_right * den >= right_num,
+                            "{ctx}: right {ret_right} does not enclose exact {right_num}/{den}"
+                        );
+                        assert!(
+                            (ret_right - 1) * den < right_num,
+                            "{ctx}: right {ret_right} not minimal vs exact {right_num}/{den}"
+                        );
+                        assert!(
+                            ret_bottom * den >= bottom_num,
+                            "{ctx}: bottom {ret_bottom} does not enclose exact {bottom_num}/{den}"
+                        );
+                        assert!(
+                            (ret_bottom - 1) * den < bottom_num,
+                            "{ctx}: bottom {ret_bottom} not minimal vs exact {bottom_num}/{den}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ===========================================================================
@@ -531,7 +751,10 @@ mod transient_privacy {
         let json = serde_json::to_string(&sanitized).unwrap();
         // No dossier content in the sanitized metadata.
         assert!(!json.contains("summary"));
-        assert!(!json.contains("ocr"));
+        // `ocr_count` (a bounded count) is the only permitted OCR-related
+        // token; no OCR text/content may appear. Strip the allowed count field
+        // first so this catches any other "ocr" occurrence.
+        assert!(!json.replace("ocr_count", "").contains("ocr"));
         assert!(!json.contains("text"));
         assert!(!json.contains("rationale"));
         assert!(!json.contains("coordinates"));
@@ -618,14 +841,21 @@ mod transient_privacy {
     fn computer_dossier_transient_privacy_no_pixel_bytes_in_debug() {
         // Debug formatting never includes pixel bytes.
         let frame = make_test_frame(10, 10, [137, 80, 78, 71]);
-        let dossier = ComputerDossier::new(
-            valid_key(&frame),
-            &frame,
-            vec![valid_entry()],
-            valid_counts(),
-            1000,
-        )
-        .unwrap();
+        // A small entry that fits inside the 10x10 frame (valid_entry is sized
+        // for a full-size frame and would exceed these bounds).
+        let entry = DossierSpatialEntry {
+            id: "btn-1".to_string(),
+            source_bounds: SourcePixelRect {
+                x_px: 1,
+                y_px: 2,
+                width_px: 4,
+                height_px: 3,
+            },
+            confidence_bp: ConfidenceBp(9_000),
+        };
+        let dossier =
+            ComputerDossier::new(valid_key(&frame), &frame, vec![entry], valid_counts(), 1000)
+                .unwrap();
         let debug = format!("{dossier:?}");
         assert!(!debug.contains("137"));
         assert!(!debug.contains("[137"));

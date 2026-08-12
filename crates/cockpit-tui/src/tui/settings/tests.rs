@@ -632,6 +632,29 @@ pub(super) fn settings_mouse(kind: MouseEventKind, column: u16, row: u16) -> Mou
     }
 }
 
+/// Render height for pointer-acceptance tools-page fixtures.
+///
+/// The tools page renders the whole built-in inventory (45 tools across 14
+/// families) plus the web/user/MCP sections and the bottom contextual detail
+/// controls (`[Enable/disable]`, `[Delete]`, `[Reset field]`). The inventory
+/// is NOT 59 rows: `wrap_chunks` breaks each summary at the ~78-column value
+/// width, and 10 long summaries (the Media + Image-Generation families —
+/// `read_image`, `inspect_audio`, `extract_audio`, `extract_video_clip`,
+/// `list_image_generation_targets`, `generate_image`,
+/// `get_image_generation_job`, `cancel_image_generation_job`, plus `graph`
+/// and `use_sealed_value`) wrap to two rows, so the built-in section alone is
+/// 69 rows. Counting the section headers, web/user/MCP rows, the reset row and
+/// the bottom detail controls, the tallest fixture (a user tool selected, so
+/// the contextual `[Enable/disable]`/`[Delete]` pair sits last) is ~93 rows
+/// with its deepest control at row index ~90. The settings dialog gives the
+/// page a list body of `render_height - 4` rows (2 block borders + a header
+/// row + a footer row), so any height short of ~95 scrolls those bottom
+/// detail controls off-screen and `render_control_lines` never registers them
+/// — which is exactly why 90 (body 86) still failed the exhaustiveness
+/// assertions. Render these fixtures tall enough that every page fits on
+/// screen (offset stays 0) and every control target is registered.
+const POINTER_TOOLS_FIXTURE_HEIGHT: u16 = 98;
+
 /// Real rendered/reducer regressions reused by the named pointer acceptance
 /// suites. Keeping these here lets them share the same concrete page fixtures
 /// as the keyboard contract instead of rebuilding synthetic registries.
@@ -1081,7 +1104,7 @@ fn pointer_user_tool_action_family_dispatches_from_fresh_sources() {
     ];
     let source_tmp = TempDir::new().unwrap();
     let source = dialog_with_user_tool(&source_tmp);
-    let _ = render_settings_rows(&source, 100, 80);
+    let _ = render_settings_rows(&source, 100, POINTER_TOOLS_FIXTURE_HEIGHT);
     for action in &actions {
         let expected = SettingsPointerAction::Tools(action.clone());
         assert!(
@@ -1160,7 +1183,7 @@ fn pointer_tool_field_reset_family_dispatches_from_fresh_sources() {
         let action = SettingsPointerAction::Tools(ToolsAction::ResetToolField(field));
         let source_tmp = TempDir::new().unwrap();
         let source = dialog_for_field(&source_tmp, field);
-        let _ = render_settings_rows(&source, 100, 80);
+        let _ = render_settings_rows(&source, 100, POINTER_TOOLS_FIXTURE_HEIGHT);
         assert!(
             source
                 .pointer_surface
@@ -1388,7 +1411,12 @@ fn pointer_standalone_root_actions_dispatch_from_fresh_sources() {
         let source_tmp = TempDir::new().unwrap();
         let mut source = standalone_pointer_dialog(&source_tmp, title);
         enter_root_node(&mut source, title);
-        let _ = render_settings_rows(&source, 100, 80);
+        // Render tall enough that the whole page fits (offset stays 0). The Tools
+        // page's tail rows (`AddUserTool`/`Reset`/`McpJump`) sit below an 80-row
+        // viewport now that the image-generation tool family grew the page, so a
+        // short render scrolls them off and they never appear as enabled targets
+        // to dispatch — the same invariant `click_settings_action` pins.
+        let _ = render_settings_rows(&source, 100, POINTER_TOOLS_FIXTURE_HEIGHT);
         let actions = source
             .pointer_surface
             .targets
@@ -1488,6 +1516,11 @@ fn pointer_standalone_root_actions_dispatch_from_fresh_sources() {
                 _ => panic!("unclassified fresh standalone action {action:?}"),
             };
             assert!(semantic_outcome, "{action:?} produced no semantic outcome");
+            // This matrix is the sole dispatch site for the standalone root
+            // action buttons (e.g. Tools `AddUserTool`/`Reset`/`McpJump`); record
+            // them so the exhaustiveness gate counts them as operable-and-dispatched
+            // rather than flagging them as rendered-but-never-dispatched.
+            super::pointer_acceptance_tests::record_dispatched_action(&action);
         }
     }
 }
@@ -2229,7 +2262,15 @@ fn click_settings_action(
         };
         state.cursor = index;
     }
-    let _ = render_settings_rows(dialog, 100, 80);
+    // Dispatch fixtures include the Tools page, whose tallest variant (a user
+    // tool selected, so the contextual detail controls sit last) is ~93 rows
+    // with its deepest control near row index 90. A short viewport scrolls
+    // those bottom controls off-screen and `render_control_lines` never
+    // registers them, so their pointer targets never appear and the lookup
+    // below panics. Render every dispatch source tall enough that the whole
+    // page fits (offset stays 0) — the same invariant the source-harvest
+    // fixtures already pin with `POINTER_TOOLS_FIXTURE_HEIGHT`.
+    let _ = render_settings_rows(dialog, 100, POINTER_TOOLS_FIXTURE_HEIGHT);
     let target = dialog
         .pointer_surface
         .targets
@@ -2449,7 +2490,8 @@ fn pointer_harness_list_actions_dispatch_from_fresh_sources() {
             | SettingsPointerAction::Lsp(_)
             | SettingsPointerAction::List(_)
             | SettingsPointerAction::UtilityModel(_)
-            | SettingsPointerAction::DefaultModel(_) => {
+            | SettingsPointerAction::DefaultModel(_)
+            | SettingsPointerAction::Generation(_) => {
                 panic!("populated Harnesses fixture harvested unexpected action {action:?}")
             }
         }
@@ -2548,6 +2590,15 @@ fn pointer_harness_field_actions_dispatch_from_fresh_sources() {
                 assert!(state.editing.is_none());
                 assert_eq!(after.always_allow, !before.always_allow);
             }
+            HarnessField::AuthEnvVars => {
+                // `AuthEnvVars` is a stale pointer-id name for the harness
+                // `trust` custody row (`HarnessConfig.trust: HarnessTrust`);
+                // there is no `auth_env_vars` config field. It is a cycled
+                // enum (Untrusted↔Trusted), not a text editor, so activating
+                // it flips trust in place rather than opening an edit buffer.
+                assert!(state.editing.is_none());
+                assert_ne!(after.trust, before.trust);
+            }
             HarnessField::Command
             | HarnessField::Args
             | HarnessField::ModelArgs
@@ -2557,7 +2608,6 @@ fn pointer_harness_field_actions_dispatch_from_fresh_sources() {
             | HarnessField::JsonOutputArgs
             | HarnessField::AgentFileArgs
             | HarnessField::AgentFileEnv
-            | HarnessField::AuthEnvVars
             | HarnessField::AuthProbeArgs
             | HarnessField::Timeout => {
                 assert!(state.editing.is_some());

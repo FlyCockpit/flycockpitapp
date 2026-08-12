@@ -31,6 +31,29 @@ fn read(path: impl AsRef<Path>) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
 }
 
+/// Whether `text` contains the forbidden `output_dir` identifier as a whole
+/// token. The renamed spawn anchor was named exactly `output_dir`; a longer
+/// identifier that merely shares the prefix (e.g. `output_directory`, the
+/// image-generation output directory) is a different name and not a
+/// regression.
+fn contains_output_dir_identifier(text: &str) -> bool {
+    let needle = "output_dir";
+    let bytes = text.as_bytes();
+    let mut start = 0;
+    while let Some(pos) = text[start..].find(needle) {
+        let idx = start + pos;
+        let after = idx + needle.len();
+        let next_is_ident_continuation = bytes
+            .get(after)
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
+        if !next_is_ident_continuation {
+            return true;
+        }
+        start = after;
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // AC1: the spawn surface requires write_scope
 // ---------------------------------------------------------------------------
@@ -257,7 +280,7 @@ fn no_spawn_anchor_retains_output_dir_anywhere_in_cockpit_core() {
     let mut offenders = Vec::new();
     for file in &files {
         let text = read(file);
-        if !text.contains("output_dir") {
+        if !contains_output_dir_identifier(&text) {
             continue;
         }
         let relative = file
@@ -374,31 +397,38 @@ fn unrelated_output_dir_identifiers_remain_semantically_unchanged() {
 }
 
 #[test]
-fn the_write_scope_tables_are_folded_into_the_single_initial_migration() {
+fn the_write_scope_tables_are_defined_only_in_the_initial_migration() {
+    // The schema uses an append-only migration set (0001_initial.sql plus later
+    // upgrade migrations). The write-scope tables are foundational: they are
+    // defined in 0001_initial.sql and never redefined by a later migration.
     let migrations_dir = repo_root().join("crates/cockpit-db/src/db/migrations");
-    let mut sql_files: Vec<String> = std::fs::read_dir(&migrations_dir)
-        .unwrap()
-        .flatten()
-        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("sql"))
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    sql_files.sort();
-    assert_eq!(
-        sql_files,
-        vec!["0001_initial.sql".to_string()],
-        "pre-release: schema changes fold into 0001_initial.sql, no second migration"
-    );
-
-    let migration = read(migrations_dir.join("0001_initial.sql"));
+    let initial = read(migrations_dir.join("0001_initial.sql"));
+    let later_migrations: Vec<String> = {
+        let mut v: Vec<String> = std::fs::read_dir(&migrations_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("sql"))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "0001_initial.sql")
+            .collect();
+        v.sort();
+        v
+    };
     for table in [
         "CREATE TABLE write_scope_leases",
         "CREATE TABLE write_scope_transfers",
         "CREATE TABLE write_scope_permits",
     ] {
         assert!(
-            migration.contains(table),
+            initial.contains(table),
             "0001_initial.sql must define {table}"
         );
+        for later in &later_migrations {
+            assert!(
+                !read(migrations_dir.join(later)).contains(table),
+                "{table} must be defined only in 0001_initial.sql, not {later}"
+            );
+        }
     }
 }
 

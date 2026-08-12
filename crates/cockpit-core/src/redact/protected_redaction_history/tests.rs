@@ -30,8 +30,22 @@ fn test_resolver() -> MapKeyResolver {
         .with_version(2, test_key_v2())
 }
 
-fn test_db() -> Db {
-    Db::open_in_memory().unwrap()
+async fn test_db() -> Db {
+    let db = Db::open_in_memory().unwrap();
+    // protected_redaction_history.session_id carries a cascading FK to
+    // sessions(session_id), so the referenced session row must exist before any
+    // history row is appended.
+    db.write(|conn| {
+        conn.execute(
+            "INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) \
+             VALUES(?1,'p','/redacted',1,1)",
+            [session_id()],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    db
 }
 
 fn session_id() -> &'static str {
@@ -53,7 +67,7 @@ async fn protected_redaction_history_schema_is_nonexportable() {
     // retired_at_ms. We verify at runtime that projecting from a full row
     // strips the encrypted material.
 
-    let db = test_db();
+    let db = test_db().await;
     let resolver = test_resolver();
     let history = ProtectedRedactionHistory::new(&db, &resolver);
 
@@ -117,7 +131,7 @@ async fn protected_redaction_history_schema_is_nonexportable() {
 /// both committed or neither.
 #[tokio::test]
 async fn trusted_artifact_history_commit_is_atomic() {
-    let db = test_db();
+    let db = test_db().await;
     let resolver = test_resolver();
     let history = ProtectedRedactionHistory::new(&db, &resolver);
 
@@ -422,7 +436,7 @@ async fn trusted_artifact_history_commit_is_atomic() {
 /// with post-snapshot writes excluded rather than partially visible.
 #[tokio::test]
 async fn history_snapshot_is_consistent() {
-    let db = test_db();
+    let db = test_db().await;
     let resolver = test_resolver();
     let history = ProtectedRedactionHistory::new(&db, &resolver);
 
@@ -558,7 +572,7 @@ async fn history_snapshot_is_consistent() {
 /// and no secret reaches a generic record.
 #[tokio::test]
 async fn unknown_trusted_sensitive_artifact_fails_closed() {
-    let db = test_db();
+    let db = test_db().await;
     let resolver = test_resolver();
     let _history = ProtectedRedactionHistory::new(&db, &resolver);
 
@@ -623,7 +637,7 @@ async fn unknown_trusted_sensitive_artifact_fails_closed() {
 /// shape before session persistence.
 #[tokio::test]
 async fn portable_import_is_redacted_diagnostic_only() {
-    let db = test_db();
+    let db = test_db().await;
     let resolver = test_resolver();
     let history = ProtectedRedactionHistory::new(&db, &resolver);
 
@@ -736,7 +750,7 @@ async fn portable_import_is_redacted_diagnostic_only() {
 /// redaction frames.
 #[tokio::test]
 async fn history_rehydration_is_bounded_and_zeroized() {
-    let db = test_db();
+    let db = test_db().await;
     let resolver = test_resolver();
     let history = ProtectedRedactionHistory::new(&db, &resolver);
 
@@ -890,7 +904,7 @@ async fn history_rehydration_is_bounded_and_zeroized() {
 
 #[tokio::test]
 async fn key_rotation_rehydrides_with_correct_version() {
-    let db = test_db();
+    let db = test_db().await;
     // Version 1 has one key, version 2 has a different key.
     let resolver = test_resolver();
     let history = ProtectedRedactionHistory::new(&db, &resolver);

@@ -230,15 +230,15 @@
       "rustVersion": null,
       "source": "registry+https://github.com/rust-lang/crates.io-index"
     },
-    "zerocopy-derive@0.8.55": {
-      "checksum": "0fe976fb70c78cd64cccfe3a6fc142244e8a77b70959b30faf9d0ac37ee228eb",
+    "zerocopy-derive@0.8.56": {
+      "checksum": "f2ab42fc20575779bd240faa45f94a74256f755c0fa9e89f0ede20d91d0cdfc1",
       "rawMetadataFeatureUnion": [],
       "license": "BSD-2-Clause OR Apache-2.0 OR MIT",
       "rustVersion": null,
       "source": "registry+https://github.com/rust-lang/crates.io-index"
     },
-    "zerocopy@0.8.55": {
-      "checksum": "b5a105cd7b140f6eeec8acff2ea38135d3cab283ada58540f629fe51e46696eb",
+    "zerocopy@0.8.56": {
+      "checksum": "556764e583adb45a9f8d413c2a147fa7e8d821e48e12b14fd560b607998b75eb",
       "rawMetadataFeatureUnion": ["derive", "simd", "zerocopy-derive"],
       "license": "BSD-2-Clause OR Apache-2.0 OR MIT",
       "rustVersion": "1.56.0",
@@ -251,8 +251,8 @@
       "rustVersion": "1.75",
       "source": "registry+https://github.com/rust-lang/crates.io-index"
     },
-    "zune-core@0.5.1": {
-      "checksum": "cb8a0807f7c01457d0379ba880ba6322660448ddebc890ce29bb64da71fb40f9",
+    "zune-core@0.5.3": {
+      "checksum": "d56377fd46368984a170bc5aac5567e52ca5da874caa60bea39fcbca78fb658b",
       "rawMetadataFeatureUnion": ["std"],
       "license": "MIT OR Apache-2.0 OR Zlib",
       "rustVersion": "1.75.0",
@@ -333,10 +333,10 @@
         "tiff@0.11.3": ["default", "deflate", "fax", "jpeg", "lzw"],
         "unicode-ident@1.0.24": [],
         "weezl@0.1.12": ["alloc", "default", "std"],
-        "zerocopy-derive@0.8.55": [],
-        "zerocopy@0.8.55": ["derive", "simd", "zerocopy-derive"],
+        "zerocopy-derive@0.8.56": [],
+        "zerocopy@0.8.56": ["derive", "simd", "zerocopy-derive"],
         "zlib-rs@0.6.7": ["rust-allocator", "std"],
-        "zune-core@0.5.1": ["std"],
+        "zune-core@0.5.3": ["std"],
         "zune-jpeg@0.5.15": ["default", "neon", "std", "x86"]
       },
       "edges": [
@@ -390,7 +390,7 @@
         },
         {
           "from": "half@2.7.1",
-          "to": "zerocopy@0.8.55",
+          "to": "zerocopy@0.8.56",
           "target": "aarch64-apple-darwin",
           "provenance": "image-descendant"
         },
@@ -462,7 +462,7 @@
         },
         {
           "from": "image@0.25.10",
-          "to": "zune-core@0.5.1",
+          "to": "zune-core@0.5.3",
           "target": "aarch64-apple-darwin",
           "provenance": "image-descendant"
         },
@@ -599,32 +599,32 @@
           "provenance": "image-descendant"
         },
         {
-          "from": "zerocopy-derive@0.8.55",
+          "from": "zerocopy-derive@0.8.56",
           "to": "proc-macro2@1.0.107",
           "target": "aarch64-apple-darwin",
           "provenance": "image-descendant"
         },
         {
-          "from": "zerocopy-derive@0.8.55",
+          "from": "zerocopy-derive@0.8.56",
           "to": "quote@1.0.47",
           "target": "aarch64-apple-darwin",
           "provenance": "image-descendant"
         },
         {
-          "from": "zerocopy-derive@0.8.55",
+          "from": "zerocopy-derive@0.8.56",
           "to": "syn@2.0.119",
           "target": "aarch64-apple-darwin",
           "provenance": "image-descendant"
         },
         {
-          "from": "zerocopy@0.8.55",
-          "to": "zerocopy-derive@0.8.55",
+          "from": "zerocopy@0.8.56",
+          "to": "zerocopy-derive@0.8.56",
           "target": "aarch64-apple-darwin",
           "provenance": "image-descendant"
         },
         {
           "from": "zune-jpeg@0.5.15",
-          "to": "zune-core@0.5.1",
+          "to": "zune-core@0.5.3",
           "target": "aarch64-apple-darwin",
           "provenance": "image-descendant"
         }
@@ -658,10 +658,10 @@
         "tiff@0.11.3",
         "unicode-ident@1.0.24",
         "weezl@0.1.12",
-        "zerocopy-derive@0.8.55",
-        "zerocopy@0.8.55",
+        "zerocopy-derive@0.8.56",
+        "zerocopy@0.8.56",
         "zlib-rs@0.6.7",
-        "zune-core@0.5.1",
+        "zune-core@0.5.3",
         "zune-jpeg@0.5.15"
       ],
       "probeFormats": ["gif", "jpeg", "png", "webp"],
@@ -747,7 +747,7 @@
         "simd-adler32@0.3.10": ["const-generics", "default", "std"],
         "weezl@0.1.12": ["alloc", "default", "std"],
         "zlib-rs@0.6.7": ["rust-allocator", "std"],
-        "zune-core@0.5.1": ["std"],
+        "zune-core@0.5.3": ["std"],
         "zune-jpeg@0.5.15": ["default", "neon", "std", "x86"]
       },
       "edges": [
@@ -855,7 +855,7 @@
         },
         {
           "from": "image@0.25.10",
-          "to": "zune-core@0.5.1",
+          "to": "zune-core@0.5.3",
           "target": "x86_64-pc-windows-msvc",
           "provenance": "image-descendant"
         },
@@ -927,7 +927,7 @@
         },
         {
           "from": "zune-jpeg@0.5.15",
-          "to": "zune-core@0.5.1",
+          "to": "zune-core@0.5.3",
           "target": "x86_64-pc-windows-msvc",
           "provenance": "image-descendant"
         }
@@ -955,7 +955,7 @@
         "simd-adler32@0.3.10",
         "weezl@0.1.12",
         "zlib-rs@0.6.7",
-        "zune-core@0.5.1",
+        "zune-core@0.5.3",
         "zune-jpeg@0.5.15"
       ],
       "probeFormats": ["gif", "jpeg", "png", "webp"],
@@ -1041,7 +1041,7 @@
         "simd-adler32@0.3.10": ["const-generics", "default", "std"],
         "weezl@0.1.12": ["alloc", "default", "std"],
         "zlib-rs@0.6.7": ["rust-allocator", "std"],
-        "zune-core@0.5.1": ["std"],
+        "zune-core@0.5.3": ["std"],
         "zune-jpeg@0.5.15": ["default", "neon", "std", "x86"]
       },
       "edges": [
@@ -1149,7 +1149,7 @@
         },
         {
           "from": "image@0.25.10",
-          "to": "zune-core@0.5.1",
+          "to": "zune-core@0.5.3",
           "target": "x86_64-unknown-linux-gnu",
           "provenance": "image-descendant"
         },
@@ -1221,7 +1221,7 @@
         },
         {
           "from": "zune-jpeg@0.5.15",
-          "to": "zune-core@0.5.1",
+          "to": "zune-core@0.5.3",
           "target": "x86_64-unknown-linux-gnu",
           "provenance": "image-descendant"
         }
@@ -1249,7 +1249,7 @@
         "simd-adler32@0.3.10",
         "weezl@0.1.12",
         "zlib-rs@0.6.7",
-        "zune-core@0.5.1",
+        "zune-core@0.5.3",
         "zune-jpeg@0.5.15"
       ],
       "probeFormats": ["gif", "jpeg", "png", "webp"],

@@ -165,7 +165,7 @@ mod tests {
         );
         overlay.insert("MY_SERVICE_TOKEN".to_string(), "tok-overlay".to_string());
         overlay.insert("DATABASE_PASSWORD".to_string(), "pw-overlay".to_string());
-        overlay.insert("NON_SECRET_VAR".to_string(), "ok-value".to_string());
+        overlay.insert("APP_LOCALE".to_string(), "ok-value".to_string());
         overlay.insert("PROJECT_NAME".to_string(), "my-project".to_string());
         let env = harness_child_env(&cfg(), Some(&overlay));
         assert!(
@@ -182,7 +182,7 @@ mod tests {
         );
         assert!(
             env.iter()
-                .any(|(key, value)| key == "NON_SECRET_VAR" && value == "ok-value"),
+                .any(|(key, value)| key == "APP_LOCALE" && value == "ok-value"),
             "non-secret overlay entry was filtered: {env:?}"
         );
         assert!(

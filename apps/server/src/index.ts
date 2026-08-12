@@ -11,7 +11,6 @@ import { auth, type Session } from "@flycockpit/auth";
 import { runWithAllowedUserCreation } from "@flycockpit/auth/user-creation-policy";
 import { THEME_INIT_SCRIPT } from "@flycockpit/config/theme-init";
 import prisma from "@flycockpit/db";
-import { ADMIN_EMAILS, env, SIGNUP_ENABLED } from "@flycockpit/env/server";
 import {
   ADMIN_EMAILS,
   env,
@@ -45,8 +44,8 @@ import {
 import { mountRelayRoutes } from "./relay-routes.js";
 import { mountRemoteAuthorityRoutes } from "./remote-authority-routes.js";
 import { createServerRemoteAuthority } from "./remote-authority-runtime.js";
-import { getRemoteVersionReadiness } from "./remote-version-readiness.js";
 import { loadRemoteFallbackRouteBindingKeyRuntime } from "./remote-fallback-route-keys.js";
+import { getRemoteVersionReadiness } from "./remote-version-readiness.js";
 import { validateSameSiteJsonRequest } from "./request-origin.js";
 import { mountSecurityHeaders } from "./security-headers.js";
 import { registerSeoRoutes } from "./seo.js";

@@ -67,7 +67,7 @@ pub struct LogicalSize {
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct ScaleFactor(pub f64);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CoordinateSpace {
     Physical,
     Logical,
@@ -89,21 +89,21 @@ pub struct Rect {
     pub space: CoordinateSpace,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MouseButton {
     Left,
     Right,
     Middle,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ClickCount {
     Single,
     Double,
     Triple,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Modifiers {
     pub shift: bool,
     pub control: bool,
@@ -2816,6 +2816,8 @@ mod tests {
         // direct helper `execute_openai_computer_call` does not carry
         // IDs/generations, journal handoff, or `not_dispatched` tails. The
         // new assertions below reject the old direct execution path.
+        use super::host_identity::HostInstallationId;
+        use super::target::{FakeTargetEvidenceAdapter, sample_physical_evidence};
         use coordinator::{
             ActionIdentity, ComputerActionCoordinator, ComputerApprovalTier, CoordinatedOutcome,
             CoordinatorParams, DelegationId, FakeComputerAuthorizer, ModelId, OwnerInstance,
@@ -2825,6 +2827,17 @@ mod tests {
         let backend = FakeBackend::failing_at(1, ComputerError::Refused("blocked".to_string()));
         let authorizer: std::sync::Arc<dyn coordinator::ComputerAuthorizer> =
             std::sync::Arc::new(FakeComputerAuthorizer::always_allow());
+        // Opens with a real focus generation via the target-evidence adapter so
+        // the TypeText actions clear the focus-generation gate; the mid-batch
+        // Failed { index: 1 } assertion is asserted against the coordinator
+        // path.
+        let adapter = FakeTargetEvidenceAdapter::new(sample_physical_evidence(
+            HostInstallationId([1u8; 32]),
+            [2u8; 32],
+            [3u8; 32],
+            [4u8; 16],
+            1234,
+        ));
         let params = CoordinatorParams {
             session_id: "session-1".to_string(),
             delegation_id: DelegationId("delegation-1".to_string()),
@@ -2832,7 +2845,7 @@ mod tests {
             owner_instance: OwnerInstance(1),
             authorizer,
             host_arbiter: None,
-            target_adapter: None,
+            target_adapter: Some(Box::new(adapter)),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
         };

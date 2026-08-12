@@ -326,6 +326,7 @@ async fn transcript_json_is_ordered_user_facing_turns() {
                 "reasoning": "thinking",
                 "timestamp": ts(2_000),
                 "think_ms": null,
+                "response_performance": null,
             },
             {
                 "type": "tool_calls",
@@ -400,6 +401,7 @@ async fn transcript_json_includes_user_note_in_order() {
                 "reasoning": "",
                 "timestamp": ts(2_000),
                 "think_ms": null,
+                "response_performance": null,
             },
         ])
     );
@@ -4101,15 +4103,31 @@ fn export_has_no_include_sensitive_escape_hatch() {
                 if trimmed.contains(allow_phrase) {
                     continue;
                 }
+                // Comment lines never carry an executable bypass surface. This
+                // also covers this test's own doc comment, which names the
+                // removed flag while describing the invariant it enforces.
+                if trimmed.starts_with("//") {
+                    continue;
+                }
                 for needle in forbidden {
-                    if line.contains(needle) {
-                        hits.push(format!(
-                            "{}:{}: {}",
-                            path.display(),
-                            lineno + 1,
-                            line.trim_end()
-                        ));
+                    let Some(idx) = line.find(needle) else {
+                        continue;
+                    };
+                    // A match inside a double-quoted string literal is not a
+                    // code surface: it is either this test's own pattern list
+                    // or a test asserting the removed flag is rejected. Only an
+                    // unquoted code token (a real field, argument, or field
+                    // access) constitutes an actual bypass surface.
+                    let quotes_before = line[..idx].matches('"').count();
+                    if quotes_before % 2 == 1 {
+                        continue;
                     }
+                    hits.push(format!(
+                        "{}:{}: {}",
+                        path.display(),
+                        lineno + 1,
+                        line.trim_end()
+                    ));
                 }
             }
         }

@@ -49,6 +49,7 @@ fn commit_boundary_bails_on_line_initial_link_reference() {
         tag_partial: String::new(),
         seq: None,
         strip_think: true,
+        response_performance: None,
     };
     let mut state = PendingRenderState::default();
     for chunk in text.as_bytes().chunks(11) {
@@ -661,6 +662,8 @@ fn agent_timestamp_stays_anchored_when_text_would_overlap() {
         width,
         false,
         None,
+        None,
+        false,
     );
     assert!(!rendered.lines.is_empty());
     // The first line carries the timestamp and must fit in `width`
@@ -689,6 +692,8 @@ fn collapsed_chip_does_not_push_timestamp_off_row_one() {
         width,
         /* markdown */ false,
         None,
+        None,
+        false,
     );
     assert!(line_width(&rendered.lines[0]) <= width as usize);
 }
@@ -707,6 +712,8 @@ fn expanded_short_reasoning_renders_without_window_ui() {
         80,
         false,
         None,
+        None,
+        false,
     );
     let text = rendered
         .lines
@@ -740,6 +747,8 @@ fn expanded_long_reasoning_windows_and_keeps_answer_after_it() {
         80,
         false,
         None,
+        None,
+        false,
     );
     let text = rendered
         .lines
@@ -778,6 +787,8 @@ fn expanded_long_reasoning_offset_clamps_and_shows_more_above() {
         80,
         false,
         None,
+        None,
+        false,
     );
     let text = rendered
         .lines
@@ -811,6 +822,8 @@ fn expanded_long_wrapped_reasoning_windows_by_display_rows() {
         12,
         false,
         None,
+        None,
+        false,
     );
     let text = rendered
         .lines
@@ -852,6 +865,8 @@ async fn agent_markdown_first_line_has_no_timestamp_orphan() {
         width,
         true,
         None,
+        None,
+        false,
     );
     assert!(rendered.lines.len() >= 3, "long text must wrap >= 3 rows");
     // Row 1 carries the timestamp and must fit inside the area.
@@ -1561,6 +1576,8 @@ fn agent_inline_controls_sit_left_of_timestamp_for_both_states() {
             width,
             false,
             Some(ctrl(pinned)),
+            None,
+            false,
         );
         let first = line_text(&r.lines[0]);
         let ts: String = first.chars().rev().take(TIMESTAMP_WIDTH).collect();
@@ -1608,7 +1625,83 @@ fn agent_inline_controls_drop_fork_before_pin_on_narrow_width() {
         is_pick: false,
     };
 
-    let pin_only = render_agent(
+    // Wide enough to host the full `[fork] [pin]` block: both controls render
+    // and the recorded region carries the fork columns. This is the baseline
+    // the narrower bands degrade away from.
+    let both = render_agent(
+        "Auto",
+        "ok",
+        "",
+        fixed_ts(),
+        false,
+        0,
+        None,
+        25,
+        false,
+        Some(ctrl),
+        None,
+        false,
+    );
+    let both_first = line_text(&both.lines[0]);
+    let both_fork_at = both_first
+        .find("[fork]")
+        .expect("fork renders when the row is wide enough for the full control block");
+    let both_pin_at = both_first
+        .find("[pin]")
+        .expect("pin renders in the full block");
+    // The drop-fork-before-pin ordering: `[fork]` is drawn to the left of
+    // `[pin]`, so it is the control that would be shed first as width shrinks.
+    assert!(
+        both_fork_at < both_pin_at,
+        "fork sits left of pin in the full control block"
+    );
+    let both_region = both.pin_region.expect("both controls recorded a region");
+    assert!(both_region.fork_col_start.is_some());
+    assert!(both_region.fork_col_end.is_some());
+
+    // At exactly RESPONSE_HEADER_MIN_WIDTH — the minimum interactive width — the
+    // full `[fork] [pin]` block STILL fits, so fork is NOT dropped here. The
+    // first content line reserves the right-edge control columns before
+    // wrapping, which forces this short body to hard-break to a single leading
+    // glyph; that frees exactly enough width for the full block to remain. The
+    // fork-before-pin degradation band (where `[fork]` drops while `[pin]` is
+    // kept) therefore lives entirely below the 24-column resize floor and is
+    // shadowed by the resize indicator: there is no reachable width at or above
+    // the floor where fork is dropped but pin survives.
+    let floor = render_agent(
+        "Auto",
+        "ok",
+        "",
+        fixed_ts(),
+        false,
+        0,
+        None,
+        RESPONSE_HEADER_MIN_WIDTH,
+        false,
+        Some(ctrl),
+        None,
+        false,
+    );
+    let first = line_text(&floor.lines[0]);
+    assert!(
+        first.contains("[fork]"),
+        "the full control block still fits at the minimum interactive width"
+    );
+    assert!(first.contains("[pin]"));
+    let region = floor
+        .pin_region
+        .expect("controls recorded a region at the floor");
+    assert!(region.fork_col_start.is_some());
+    assert!(region.fork_col_end.is_some());
+    assert_eq!(region.col_end - region.col_start, 5);
+
+    // Below RESPONSE_HEADER_MIN_WIDTH the response-header redesign replaces ALL
+    // header chrome (metric/timestamp/fork/pin) with a single noninteractive
+    // `↔` resize indicator: neither control renders and no clickable region is
+    // recorded. This is the graceful terminal degradation — the whole control
+    // block collapses at once below the resize floor rather than degrading
+    // control-by-control there.
+    let too_narrow = render_agent(
         "Auto",
         "ok",
         "",
@@ -1619,28 +1712,14 @@ fn agent_inline_controls_drop_fork_before_pin_on_narrow_width() {
         20,
         false,
         Some(ctrl),
-    );
-    let first = line_text(&pin_only.lines[0]);
-    assert!(!first.contains("[fork]"));
-    assert!(first.contains("[pin]"));
-    let region = pin_only.pin_region.expect("pin survives narrow fallback");
-    assert_eq!(region.fork_col_start, None);
-    assert_eq!(region.fork_col_end, None);
-    assert_eq!(region.col_end - region.col_start, 5);
-
-    let too_narrow = render_agent(
-        "Auto",
-        "ok",
-        "",
-        fixed_ts(),
-        false,
-        0,
         None,
-        12,
         false,
-        Some(ctrl),
     );
     let first = line_text(&too_narrow.lines[0]);
+    assert!(
+        first.contains('↔'),
+        "the resize indicator replaces the header below the minimum width"
+    );
     assert!(!first.contains("[fork]") && !first.contains("[pin]"));
     assert!(too_narrow.pin_region.is_none());
 }
@@ -1662,6 +1741,8 @@ fn agent_no_pin_when_control_hidden() {
         width,
         false,
         None,
+        None,
+        false,
     );
     assert!(r.pin_region.is_none(), "no region when not shown");
     let first = line_text(&r.lines[0]);

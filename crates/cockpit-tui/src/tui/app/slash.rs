@@ -539,6 +539,14 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
         describe: describe_sealed,
     },
     SlashCommand {
+        name: "leaks",
+        description: "List, rotate, or delete contained leak reports machine-wide",
+        takes_args: true,
+        run: run_leaks,
+        available: available_always,
+        describe: describe_static,
+    },
+    SlashCommand {
         name: "permissions",
         description: "View and delete persisted command/path approvals across project and global scopes",
         takes_args: false,
@@ -1148,6 +1156,111 @@ fn run_note(app: &mut App, args: &str) -> bool {
 fn run_sealed(app: &mut App, args: &str) -> bool {
     app.handle_sealed_command(args);
     false
+}
+
+fn run_leaks(app: &mut App, args: &str) -> bool {
+    app.handle_leaks_command(args);
+    false
+}
+
+/// Parse `/leaks` arguments into the metadata-only Owner RPC to send, or `None`
+/// (usage) for anything unrecognized. Recognizes exactly the subcommands in the
+/// usage string: bare/`list`, `rotate <id> <accept|dismiss|rotated>`, and
+/// `delete <id>`. No `reveal` subcommand is parsed here.
+fn leaks_request(args: &str) -> Option<cockpit_core::daemon::proto::Request> {
+    use cockpit_core::daemon::proto::{LeakRotationDisposition, Request};
+    let args = args.trim();
+    if args.is_empty() || args == "list" {
+        return Some(Request::ListLeakReports {
+            cursor: None,
+            limit: None,
+            project_root: None,
+            session_id: None,
+        });
+    }
+    let mut tokens = args.split_whitespace();
+    match tokens.next() {
+        Some("rotate") => {
+            let report_id = tokens.next()?.to_string();
+            let rotation = match tokens.next()? {
+                "accept" => LeakRotationDisposition::Accept,
+                "dismiss" => LeakRotationDisposition::Dismiss,
+                "rotated" => LeakRotationDisposition::Rotated,
+                _ => return None,
+            };
+            if tokens.next().is_some() {
+                return None;
+            }
+            Some(Request::MarkLeakRotated {
+                report_id,
+                rotation,
+            })
+        }
+        Some("delete") => {
+            let report_id = tokens.next()?.to_string();
+            if tokens.next().is_some() {
+                return None;
+            }
+            Some(Request::DeleteLeakReport { report_id })
+        }
+        _ => None,
+    }
+}
+
+/// Render a page of leak-report metadata as transcript text. Takes only
+/// `&LeakReportsPage`, which cannot represent plaintext, ciphertext, prefix,
+/// length, or fingerprint by construction; every rendered field is safe
+/// metadata.
+fn format_leak_reports(page: &cockpit_core::daemon::proto::LeakReportsPage) -> String {
+    if page.reports.is_empty() {
+        return "/leaks: no contained leak reports".to_string();
+    }
+    let mut out = String::from(
+        "/leaks: report_id | source | category | status | rotation | rotation_plan | seen_count | last_reported_ms",
+    );
+    for report in &page.reports {
+        let rotation_plan = match report.rotation_plan {
+            Some(plan) => format!("{plan:?}"),
+            None => "-".to_string(),
+        };
+        out.push('\n');
+        out.push_str(&format!(
+            "{} | {} | {} | {} | {} | {} | {} | {}",
+            report.report_id,
+            report.source,
+            report.category,
+            report.status,
+            report.rotation,
+            rotation_plan,
+            report.seen_count,
+            report.last_reported_ms,
+        ));
+    }
+    if page.has_more {
+        out.push_str("\n/leaks: more reports available; paging arrives with the LeaksPane");
+    }
+    out
+}
+
+/// Map a `/leaks` daemon result to transcript text. Follows the `/sealed`
+/// shape; there is no `Response::Error` variant, and the unexpected-response
+/// arm never renders the `Debug` of a daemon response.
+fn leak_response_text(result: Result<cockpit_core::daemon::proto::Response, String>) -> String {
+    use cockpit_core::daemon::proto::Response;
+    match result {
+        Ok(Response::LeakReports { page }) => format_leak_reports(&page),
+        Ok(Response::LeakRotationUpdated {
+            report_id,
+            rotation,
+        }) => {
+            format!("/leaks: rotated {report_id} -> {rotation}")
+        }
+        Ok(Response::LeakReportDeleted { report_id }) => {
+            format!("/leaks: deleted protected value for {report_id}; safe metadata retained")
+        }
+        Ok(_) => "/leaks: unexpected response".to_string(),
+        Err(e) => format!("/leaks: {e}"),
+    }
 }
 
 fn describe_sealed(_: &App, _: &SlashCommand) -> String {
@@ -2381,8 +2494,9 @@ impl App {
     }
 
     /// Handle the `/leaks` command: list, rotate, or delete contained leak
-    /// reports machine-wide. Uses metadata-only Owner RPCs; recovery uses
-    /// the protected local sensitive channel.
+    /// reports machine-wide. Uses metadata-only Owner RPCs; recovery (the
+    /// authenticated reveal) is not yet wired and arrives with
+    /// `implement-leak-reveal`.
     pub(super) fn handle_leaks_command(&mut self, args: &str) {
         let Some(request) = leaks_request(args) else {
             self.push_plain(
@@ -2400,29 +2514,9 @@ impl App {
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc(label),
             AsyncActionPolicy::AllowConcurrent,
-            move || match agent_runner::daemon_request_blocking(request) {
-                Ok(cockpit_core::daemon::proto::Response::LeakReports { page }) => {
-                    let text = format_leak_reports(&page);
-                    Ok(AsyncActionPayload::Text(text))
-                }
-                Ok(cockpit_core::daemon::proto::Response::LeakRotationUpdated {
-                    report_id,
-                    rotation,
-                }) => Ok(AsyncActionPayload::Text(format!(
-                    "/leaks: rotated {report_id} -> {rotation}"
-                ))),
-                Ok(cockpit_core::daemon::proto::Response::LeakReportDeleted { report_id }) => {
-                    Ok(AsyncActionPayload::Text(format!(
-                        "/leaks: deleted protected value for {report_id}; safe metadata retained"
-                    )))
-                }
-                Ok(cockpit_core::daemon::proto::Response::Error(err)) => {
-                    Ok(AsyncActionPayload::Text(format!("/leaks: {}", err.message)))
-                }
-                Ok(other) => Ok(AsyncActionPayload::Text(format!(
-                    "/leaks: unexpected response: {other:?}"
-                ))),
-                Err(e) => Ok(AsyncActionPayload::Text(format!("/leaks: {e:#}"))),
+            move || {
+                let text = leak_response_text(agent_runner::daemon_request_blocking(request));
+                Ok(AsyncActionPayload::Text(text))
             },
         );
     }
@@ -3222,6 +3316,166 @@ mod table_tests {
         assert!(rendered.contains("a | very-secret-literal | fork | 1"));
         assert!(rendered.find("a | ").unwrap() < rendered.find("z | ").unwrap());
         assert!(!rendered.contains("actual-secret-value"));
+    }
+
+    fn leak_report_row(
+        id: &str,
+        plan: Option<cockpit_core::daemon::proto::LeakRotationPlan>,
+    ) -> cockpit_core::daemon::proto::LeakReportMetadata {
+        cockpit_core::daemon::proto::LeakReportMetadata {
+            report_id: id.to_string(),
+            session_id: uuid::Uuid::nil(),
+            source: "provider".to_string(),
+            category: "api_key".to_string(),
+            provider_id: None,
+            model_id: None,
+            generation: None,
+            connector_id: None,
+            status: "contained".to_string(),
+            rotation: "pending".to_string(),
+            rotation_plan: plan,
+            seen_count: 3,
+            first_reported_ms: 100,
+            last_reported_ms: 200,
+            contained_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn leaks_request_parses_list_rotate_delete_variants() {
+        use cockpit_core::daemon::proto::{LeakRotationDisposition, Request};
+        for input in ["", "  ", "list"] {
+            assert!(
+                matches!(
+                    leaks_request(input),
+                    Some(Request::ListLeakReports {
+                        cursor: None,
+                        limit: None,
+                        project_root: None,
+                        session_id: None,
+                    })
+                ),
+                "expected list variant for {input:?}"
+            );
+        }
+        for (input, expected) in [
+            ("rotate r1 accept", LeakRotationDisposition::Accept),
+            ("rotate r1 dismiss", LeakRotationDisposition::Dismiss),
+            ("rotate r1 rotated", LeakRotationDisposition::Rotated),
+        ] {
+            match leaks_request(input) {
+                Some(Request::MarkLeakRotated {
+                    report_id,
+                    rotation,
+                }) => {
+                    assert_eq!(report_id, "r1");
+                    assert_eq!(rotation, expected);
+                }
+                other => panic!("expected MarkLeakRotated for {input:?}, got {other:?}"),
+            }
+        }
+        match leaks_request("delete r1") {
+            Some(Request::DeleteLeakReport { report_id }) => assert_eq!(report_id, "r1"),
+            other => panic!("expected DeleteLeakReport for `delete r1`, got {other:?}"),
+        }
+        for input in [
+            "rotate",
+            "rotate r1",
+            "rotate r1 bogus",
+            "delete",
+            "nonsense",
+        ] {
+            assert!(
+                leaks_request(input).is_none(),
+                "expected None for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn leaks_registry_row_is_registered() {
+        let row = slash_command_by_name("leaks").expect("/leaks registry row");
+        assert!(row.takes_args);
+    }
+
+    #[test]
+    fn leaks_response_text_maps_known_variants_and_hides_unexpected_debug() {
+        use cockpit_core::daemon::proto::{LeakReportsPage, Response};
+        let page = LeakReportsPage {
+            reports: vec![leak_report_row("rpt-a", None)],
+            next_cursor: None,
+            has_more: false,
+        };
+        // (a) list response equals the pure formatter output.
+        assert_eq!(
+            leak_response_text(Ok(Response::LeakReports { page: page.clone() })),
+            format_leak_reports(&page)
+        );
+        // (b) rotation updated.
+        assert_eq!(
+            leak_response_text(Ok(Response::LeakRotationUpdated {
+                report_id: "rpt-a".to_string(),
+                rotation: "rotated".to_string(),
+            })),
+            "/leaks: rotated rpt-a -> rotated"
+        );
+        // (c) deleted.
+        assert_eq!(
+            leak_response_text(Ok(Response::LeakReportDeleted {
+                report_id: "rpt-a".to_string(),
+            })),
+            "/leaks: deleted protected value for rpt-a; safe metadata retained"
+        );
+        // (d) typed daemon/auth failure folded to Err(String) by request_ok.
+        assert_eq!(
+            leak_response_text(Err("daemon error: unauthorized".to_string())),
+            "/leaks: daemon error: unauthorized"
+        );
+        // (e) unrelated success variant -> fixed line, no Debug payload.
+        let unexpected = leak_response_text(Ok(Response::Ack));
+        assert_eq!(unexpected, "/leaks: unexpected response");
+        assert!(!unexpected.contains("Ack"));
+        // (f) transport-style error surfaces prefixed.
+        let transport = leak_response_text(Err("connect: broken pipe".to_string()));
+        assert!(transport.starts_with("/leaks: "));
+        assert!(transport.contains("connect: broken pipe"));
+    }
+
+    #[test]
+    fn leaks_format_reports_renders_empty_rows_and_has_more() {
+        use cockpit_core::daemon::proto::LeakReportsPage;
+        let empty = LeakReportsPage {
+            reports: vec![],
+            next_cursor: None,
+            has_more: false,
+        };
+        assert_eq!(
+            format_leak_reports(&empty),
+            "/leaks: no contained leak reports"
+        );
+
+        let two = LeakReportsPage {
+            reports: vec![
+                leak_report_row("rpt-a", None),
+                leak_report_row("rpt-b", None),
+            ],
+            next_cursor: None,
+            has_more: false,
+        };
+        let rendered = format_leak_reports(&two);
+        assert!(rendered.contains(
+            "report_id | source | category | status | rotation | rotation_plan | seen_count | last_reported_ms"
+        ));
+        assert!(rendered.contains("rpt-a"));
+        assert!(rendered.contains("rpt-b"));
+        assert!(!rendered.contains("more reports available"));
+
+        let more = LeakReportsPage {
+            reports: vec![leak_report_row("rpt-a", None)],
+            next_cursor: Some("cursor".to_string()),
+            has_more: true,
+        };
+        assert!(format_leak_reports(&more).contains("more reports available"));
     }
 }
 

@@ -1,2444 +1,2754 @@
 {
-  "schemaVersion": 1,
   "rows": [
     {
-      "tag": "attach",
-      "fcorSchema": "session_id:Option<Uuid>|since_seq:Option<i64>|project_root:Option<String>|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|interactive:bool|model_override:Option<cockpit_config::config::providers::ActiveModelRef>|client_protocol_version:u32|env_snapshot:Option<EnvSnapshotWire>|env_policy:EnvDriftPolicy",
-      "fcorCanonicalSchema": "session_id:option<uuid>|since_seq:option<i64>|project_root:option<string>|initial_model:option<struct:ActiveModelRef:v1>|no_sandbox:bool|interactive:bool|model_override:option<struct:ActiveModelRef:v1>|client_protocol_version:u32|env_snapshot:option<struct:EnvSnapshotWire:v1>|env_policy:enum16:EnvDriftPolicy",
       "class": "idempotent_adapter_mutation",
-      "strategy": "domain_transaction",
       "evidence": "domain_result_tuple",
+      "fcorCanonicalSchema": "session_id:option<uuid>|since_seq:option<i64>|project_root:option<string>|initial_model:option<struct:ActiveModelRef:v1>|no_sandbox:bool|interactive:bool|model_override:option<struct:ActiveModelRef:v1>|client_protocol_version:u32|env_snapshot:option<struct:EnvSnapshotWire:v1>|env_policy:enum16:EnvDriftPolicy",
       "fcorRoles": [
         {
           "field": "session_id",
-          "type": "Option<Uuid>",
-          "role": "session"
+          "role": "session",
+          "type": "Option<Uuid>"
         },
         {
           "field": "since_seq",
-          "type": "Option<i64>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<i64>"
         },
         {
           "field": "project_root",
-          "type": "Option<String>",
-          "role": "project_root_effective"
+          "role": "project_root_effective",
+          "type": "Option<String>"
         },
         {
           "field": "initial_model",
-          "type": "Option<cockpit_config::config::providers::ActiveModelRef>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<cockpit_config::config::providers::ActiveModelRef>"
         },
         {
           "field": "no_sandbox",
-          "type": "bool",
-          "role": "param"
+          "role": "param",
+          "type": "bool"
         },
         {
           "field": "interactive",
-          "type": "bool",
-          "role": "param"
+          "role": "param",
+          "type": "bool"
         },
         {
           "field": "model_override",
-          "type": "Option<cockpit_config::config::providers::ActiveModelRef>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<cockpit_config::config::providers::ActiveModelRef>"
         },
         {
           "field": "client_protocol_version",
-          "type": "u32",
-          "role": "param"
+          "role": "param",
+          "type": "u32"
         },
         {
           "field": "env_snapshot",
-          "type": "Option<EnvSnapshotWire>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<EnvSnapshotWire>"
         },
         {
           "field": "env_policy",
-          "type": "EnvDriftPolicy",
-          "role": "param"
+          "role": "param",
+          "type": "EnvDriftPolicy"
         }
-      ]
+      ],
+      "fcorSchema": "session_id:Option<Uuid>|since_seq:Option<i64>|project_root:Option<String>|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|interactive:bool|model_override:Option<cockpit_config::config::providers::ActiveModelRef>|client_protocol_version:u32|env_snapshot:Option<EnvSnapshotWire>|env_policy:EnvDriftPolicy",
+      "strategy": "domain_transaction",
+      "tag": "attach"
     },
     {
-      "tag": "subagent_transcript",
-      "fcorSchema": "session_id:Uuid|task_call_id:String|label:String",
-      "fcorCanonicalSchema": "session_id:uuid|task_call_id:string|label:string",
       "class": "read_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid|task_call_id:string|label:string",
       "fcorRoles": [
         {
           "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
+          "role": "session",
+          "type": "Uuid"
         },
         {
           "field": "task_call_id",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         },
         {
           "field": "label",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         }
-      ]
+      ],
+      "fcorSchema": "session_id:Uuid|task_call_id:String|label:String",
+      "strategy": "none",
+      "tag": "subagent_transcript"
     },
     {
-      "tag": "send_user_message",
-      "fcorSchema": "client_submission_id:Uuid|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|text:String|display_text:Option<String>|tag_expansions:Vec<TagExpansionMeta>|image_refs:Vec<ImageAttachmentRef>|forced_skill:Option<String>|run_invocation_options:Option<RunInvocationOptions>",
-      "fcorCanonicalSchema": "client_submission_id:uuid|expected_model_state_generation:option<u64>|expected_model:option<struct:ActiveModelRef:v1>|text:string|display_text:option<string>|tag_expansions:list<struct:TagExpansionMeta:v1>|image_refs:list<struct:ImageAttachmentRef:v1>|forced_skill:option<string>|run_invocation_options:option<struct:RunInvocationOptions:v1>",
       "class": "transactional_mutation",
-      "strategy": "sql_transaction",
       "evidence": null,
+      "fcorCanonicalSchema": "client_submission_id:uuid|expected_model_state_generation:option<u64>|expected_model:option<struct:ActiveModelRef:v1>|text:string|display_text:option<string>|tag_expansions:list<struct:TagExpansionMeta:v1>|image_refs:list<struct:ImageAttachmentRef:v1>|forced_skill:option<string>|run_invocation_options:option<struct:RunInvocationOptions:v1>",
       "fcorRoles": [
         {
           "field": "client_submission_id",
-          "type": "Uuid",
-          "role": "legacy_message"
+          "role": "legacy_message",
+          "type": "Uuid"
         },
         {
           "field": "expected_model_state_generation",
-          "type": "Option<u64>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<u64>"
         },
         {
           "field": "expected_model",
-          "type": "Option<cockpit_config::config::providers::ActiveModelRef>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<cockpit_config::config::providers::ActiveModelRef>"
         },
         {
           "field": "text",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         },
         {
           "field": "display_text",
-          "type": "Option<String>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<String>"
         },
         {
           "field": "tag_expansions",
-          "type": "Vec<TagExpansionMeta>",
-          "role": "param"
+          "role": "param",
+          "type": "Vec<TagExpansionMeta>"
         },
         {
           "field": "image_refs",
-          "type": "Vec<ImageAttachmentRef>",
-          "role": "param"
+          "role": "param",
+          "type": "Vec<ImageAttachmentRef>"
         },
         {
           "field": "forced_skill",
-          "type": "Option<String>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<String>"
         },
         {
           "field": "run_invocation_options",
-          "type": "Option<RunInvocationOptions>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<RunInvocationOptions>"
         }
-      ]
-    },
-    {
-      "tag": "get_run_invocation_status",
-      "fcorSchema": "client_submission_id:Uuid",
-      "fcorCanonicalSchema": "client_submission_id:uuid",
-      "class": "read_only",
-      "strategy": "none",
-      "evidence": null,
-      "fcorRoles": [
-        {
-          "field": "client_submission_id",
-          "type": "Uuid",
-          "role": "param"
-        }
-      ]
-    },
-    {
-      "tag": "operation_status",
-      "fcorSchema": "operation_id:Uuid",
-      "fcorCanonicalSchema": "operation_id:uuid",
-      "class": "read_only",
-      "strategy": "none",
-      "evidence": null,
-      "fcorRoles": [{ "field": "operation_id", "type": "Uuid", "role": "param" }]
-    },
-    {
-      "tag": "cancel_run_invocation",
-      "fcorSchema": "client_submission_id:Uuid",
-      "fcorCanonicalSchema": "client_submission_id:uuid",
-      "class": "transactional_mutation",
+      ],
+      "fcorSchema": "client_submission_id:Uuid|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|text:String|display_text:Option<String>|tag_expansions:Vec<TagExpansionMeta>|image_refs:Vec<ImageAttachmentRef>|forced_skill:Option<String>|run_invocation_options:Option<RunInvocationOptions>",
       "strategy": "sql_transaction",
+      "tag": "send_user_message"
+    },
+    {
+      "class": "read_only",
       "evidence": null,
+      "fcorCanonicalSchema": "client_submission_id:uuid",
       "fcorRoles": [
         {
           "field": "client_submission_id",
-          "type": "Uuid",
-          "role": "param"
+          "role": "param",
+          "type": "Uuid"
         }
-      ]
+      ],
+      "fcorSchema": "client_submission_id:Uuid",
+      "strategy": "none",
+      "tag": "get_run_invocation_status"
     },
     {
-      "tag": "steer_delegation",
-      "fcorSchema": "session_id:Uuid|task_call_id:String|label:String|message:String",
-      "fcorCanonicalSchema": "session_id:uuid|task_call_id:string|label:string|message:string",
-      "class": "nonrepeatable_mutation",
-      "strategy": "nonrepeatable_dispatch",
+      "class": "read_only",
       "evidence": null,
+      "fcorCanonicalSchema": "operation_id:uuid",
+      "fcorRoles": [
+        {
+          "field": "operation_id",
+          "role": "param",
+          "type": "Uuid"
+        }
+      ],
+      "fcorSchema": "operation_id:Uuid",
+      "strategy": "none",
+      "tag": "operation_status"
+    },
+    {
+      "class": "transactional_mutation",
+      "evidence": null,
+      "fcorCanonicalSchema": "client_submission_id:uuid",
+      "fcorRoles": [
+        {
+          "field": "client_submission_id",
+          "role": "param",
+          "type": "Uuid"
+        }
+      ],
+      "fcorSchema": "client_submission_id:Uuid",
+      "strategy": "sql_transaction",
+      "tag": "cancel_run_invocation"
+    },
+    {
+      "class": "nonrepeatable_mutation",
+      "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid|task_call_id:string|label:string|message:string",
       "fcorRoles": [
         {
           "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
+          "role": "session",
+          "type": "Uuid"
         },
         {
           "field": "task_call_id",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         },
         {
           "field": "label",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         },
         {
           "field": "message",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         }
-      ]
+      ],
+      "fcorSchema": "session_id:Uuid|task_call_id:String|label:String|message:String",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "steer_delegation"
     },
     {
-      "tag": "begin_attachment_upload",
-      "fcorSchema": "mime:String|byte_len:u64|sha256:String|purpose:AttachmentPurpose",
-      "fcorCanonicalSchema": "mime:string|byte_len:u64|sha256:string|purpose:enum16:AttachmentPurpose",
       "class": "idempotent_adapter_mutation",
-      "strategy": "domain_transaction",
       "evidence": "domain_result_tuple",
+      "fcorCanonicalSchema": "mime:string|byte_len:u64|sha256:string|purpose:enum16:AttachmentPurpose",
       "fcorRoles": [
         {
           "field": "mime",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         },
         {
           "field": "byte_len",
-          "type": "u64",
-          "role": "param"
+          "role": "param",
+          "type": "u64"
         },
         {
           "field": "sha256",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         },
         {
           "field": "purpose",
-          "type": "AttachmentPurpose",
-          "role": "param"
+          "role": "param",
+          "type": "AttachmentPurpose"
         }
-      ]
+      ],
+      "fcorSchema": "mime:String|byte_len:u64|sha256:String|purpose:AttachmentPurpose",
+      "strategy": "domain_transaction",
+      "tag": "begin_attachment_upload"
     },
     {
-      "tag": "upload_attachment_chunk",
-      "fcorSchema": "upload_id:Uuid|offset:u64|data_base64:String",
-      "fcorCanonicalSchema": "upload_id:uuid|offset:u64|data_base64:string",
       "class": "idempotent_adapter_mutation",
-      "strategy": "domain_transaction",
       "evidence": "domain_result_tuple",
+      "fcorCanonicalSchema": "upload_id:uuid|offset:u64|data_base64:string",
       "fcorRoles": [
         {
           "field": "upload_id",
-          "type": "Uuid",
-          "role": "upload"
+          "role": "upload",
+          "type": "Uuid"
         },
         {
           "field": "offset",
-          "type": "u64",
-          "role": "param"
+          "role": "param",
+          "type": "u64"
         },
         {
           "field": "data_base64",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         }
-      ]
+      ],
+      "fcorSchema": "upload_id:Uuid|offset:u64|data_base64:String",
+      "strategy": "domain_transaction",
+      "tag": "upload_attachment_chunk"
     },
     {
-      "tag": "finish_attachment_upload",
-      "fcorSchema": "upload_id:Uuid",
-      "fcorCanonicalSchema": "upload_id:uuid",
       "class": "idempotent_adapter_mutation",
-      "strategy": "domain_transaction",
       "evidence": "domain_result_tuple",
+      "fcorCanonicalSchema": "upload_id:uuid",
       "fcorRoles": [
         {
           "field": "upload_id",
-          "type": "Uuid",
-          "role": "upload"
+          "role": "upload",
+          "type": "Uuid"
         }
-      ]
+      ],
+      "fcorSchema": "upload_id:Uuid",
+      "strategy": "domain_transaction",
+      "tag": "finish_attachment_upload"
     },
     {
-      "tag": "cancel_attachment_upload",
-      "fcorSchema": "upload_id:Uuid",
-      "fcorCanonicalSchema": "upload_id:uuid",
       "class": "idempotent_adapter_mutation",
-      "strategy": "domain_transaction",
       "evidence": "domain_result_tuple",
+      "fcorCanonicalSchema": "upload_id:uuid",
       "fcorRoles": [
         {
           "field": "upload_id",
-          "type": "Uuid",
-          "role": "upload"
+          "role": "upload",
+          "type": "Uuid"
         }
-      ]
+      ],
+      "fcorSchema": "upload_id:Uuid",
+      "strategy": "domain_transaction",
+      "tag": "cancel_attachment_upload"
     },
     {
-      "tag": "remove_queued_user_message",
-      "fcorSchema": "queue_item_id:Uuid",
-      "fcorCanonicalSchema": "queue_item_id:uuid",
       "class": "transactional_mutation",
-      "strategy": "sql_transaction",
       "evidence": null,
+      "fcorCanonicalSchema": "queue_item_id:uuid",
       "fcorRoles": [
         {
           "field": "queue_item_id",
-          "type": "Uuid",
-          "role": "queue"
+          "role": "queue",
+          "type": "Uuid"
         }
-      ]
+      ],
+      "fcorSchema": "queue_item_id:Uuid",
+      "strategy": "sql_transaction",
+      "tag": "remove_queued_user_message"
     },
     {
-      "tag": "remove_newest_queued_user_message",
-      "fcorSchema": "target_id:Option<String>",
-      "fcorCanonicalSchema": "target_id:option<string>",
       "class": "transactional_mutation",
-      "strategy": "sql_transaction",
       "evidence": null,
+      "fcorCanonicalSchema": "target_id:option<string>",
       "fcorRoles": [
         {
           "field": "target_id",
-          "type": "Option<String>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<String>"
         }
-      ]
+      ],
+      "fcorSchema": "target_id:Option<String>",
+      "strategy": "sql_transaction",
+      "tag": "remove_newest_queued_user_message"
     },
     {
-      "tag": "remove_editable_queued_user_messages",
-      "fcorSchema": "target_id:Option<String>",
-      "fcorCanonicalSchema": "target_id:option<string>",
       "class": "transactional_mutation",
-      "strategy": "sql_transaction",
       "evidence": null,
+      "fcorCanonicalSchema": "target_id:option<string>",
       "fcorRoles": [
         {
           "field": "target_id",
-          "type": "Option<String>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<String>"
         }
-      ]
+      ],
+      "fcorSchema": "target_id:Option<String>",
+      "strategy": "sql_transaction",
+      "tag": "remove_editable_queued_user_messages"
     },
     {
-      "tag": "resume_paused_work",
-      "fcorSchema": "session_id:Uuid",
-      "fcorCanonicalSchema": "session_id:uuid",
       "class": "transactional_mutation",
-      "strategy": "sql_transaction",
       "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid",
       "fcorRoles": [
         {
           "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
+          "role": "session",
+          "type": "Uuid"
         }
-      ]
+      ],
+      "fcorSchema": "session_id:Uuid",
+      "strategy": "sql_transaction",
+      "tag": "resume_paused_work"
     },
     {
-      "tag": "cancel_paused_work",
-      "fcorSchema": "session_id:Uuid",
-      "fcorCanonicalSchema": "session_id:uuid",
       "class": "transactional_mutation",
-      "strategy": "sql_transaction",
       "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid",
       "fcorRoles": [
         {
           "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
+          "role": "session",
+          "type": "Uuid"
         }
-      ]
+      ],
+      "fcorSchema": "session_id:Uuid",
+      "strategy": "sql_transaction",
+      "tag": "cancel_paused_work"
     },
     {
-      "tag": "repair_resume",
-      "fcorSchema": "session_id:Uuid",
-      "fcorCanonicalSchema": "session_id:uuid",
       "class": "nonrepeatable_mutation",
-      "strategy": "nonrepeatable_dispatch",
       "evidence": null,
-      "fcorRoles": [
-        {
-          "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
-        }
-      ]
-    },
-    {
-      "tag": "goal_status",
-      "fcorSchema": "session_id:Uuid",
       "fcorCanonicalSchema": "session_id:uuid",
-      "class": "read_only",
-      "strategy": "none",
-      "evidence": null,
       "fcorRoles": [
         {
           "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
+          "role": "session",
+          "type": "Uuid"
         }
-      ]
+      ],
+      "fcorSchema": "session_id:Uuid",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "repair_resume"
     },
     {
-      "tag": "create_goal",
-      "fcorSchema": "session_id:Uuid|objective:String|token_budget:Option<i64>",
-      "fcorCanonicalSchema": "session_id:uuid|objective:string|token_budget:option<i64>",
-      "class": "transactional_mutation",
-      "strategy": "sql_transaction",
+      "class": "read_only",
       "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid",
       "fcorRoles": [
         {
           "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
+          "role": "session",
+          "type": "Uuid"
+        }
+      ],
+      "fcorSchema": "session_id:Uuid",
+      "strategy": "none",
+      "tag": "goal_status"
+    },
+    {
+      "class": "transactional_mutation",
+      "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid|objective:string|token_budget:option<i64>",
+      "fcorRoles": [
+        {
+          "field": "session_id",
+          "role": "session",
+          "type": "Uuid"
         },
         {
           "field": "objective",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         },
         {
           "field": "token_budget",
-          "type": "Option<i64>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<i64>"
         }
-      ]
+      ],
+      "fcorSchema": "session_id:Uuid|objective:String|token_budget:Option<i64>",
+      "strategy": "sql_transaction",
+      "tag": "create_goal"
     },
     {
-      "tag": "set_goal_status",
-      "fcorSchema": "session_id:Uuid|status:GoalDisposition",
-      "fcorCanonicalSchema": "session_id:uuid|status:enum16:GoalDisposition",
       "class": "transactional_mutation",
-      "strategy": "sql_transaction",
       "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid|status:enum16:GoalDisposition",
       "fcorRoles": [
         {
           "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
+          "role": "session",
+          "type": "Uuid"
         },
         {
           "field": "status",
-          "type": "GoalDisposition",
-          "role": "param"
+          "role": "param",
+          "type": "GoalDisposition"
         }
-      ]
+      ],
+      "fcorSchema": "session_id:Uuid|status:GoalDisposition",
+      "strategy": "sql_transaction",
+      "tag": "set_goal_status"
     },
     {
-      "tag": "clear_goal",
-      "fcorSchema": "session_id:Uuid",
+      "class": "transactional_mutation",
+      "evidence": null,
       "fcorCanonicalSchema": "session_id:uuid",
-      "class": "transactional_mutation",
-      "strategy": "sql_transaction",
-      "evidence": null,
       "fcorRoles": [
         {
           "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
+          "role": "session",
+          "type": "Uuid"
         }
-      ]
+      ],
+      "fcorSchema": "session_id:Uuid",
+      "strategy": "sql_transaction",
+      "tag": "clear_goal"
     },
     {
-      "tag": "pin_message",
-      "fcorSchema": "session_id:Uuid|seq:i64",
-      "fcorCanonicalSchema": "session_id:uuid|seq:i64",
       "class": "transactional_mutation",
-      "strategy": "sql_transaction",
       "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid|seq:i64",
       "fcorRoles": [
         {
           "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
+          "role": "session",
+          "type": "Uuid"
         },
         {
           "field": "seq",
-          "type": "i64",
-          "role": "param"
+          "role": "param",
+          "type": "i64"
         }
-      ]
+      ],
+      "fcorSchema": "session_id:Uuid|seq:i64",
+      "strategy": "sql_transaction",
+      "tag": "pin_message"
     },
     {
-      "tag": "unpin_message",
-      "fcorSchema": "session_id:Uuid|seq:i64",
-      "fcorCanonicalSchema": "session_id:uuid|seq:i64",
       "class": "transactional_mutation",
-      "strategy": "sql_transaction",
       "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid|seq:i64",
       "fcorRoles": [
         {
           "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
+          "role": "session",
+          "type": "Uuid"
         },
         {
           "field": "seq",
-          "type": "i64",
-          "role": "param"
+          "role": "param",
+          "type": "i64"
         }
-      ]
+      ],
+      "fcorSchema": "session_id:Uuid|seq:i64",
+      "strategy": "sql_transaction",
+      "tag": "unpin_message"
     },
     {
-      "tag": "toggle_pinned_message",
-      "fcorSchema": "session_id:Uuid|seq:i64",
-      "fcorCanonicalSchema": "session_id:uuid|seq:i64",
       "class": "transactional_mutation",
-      "strategy": "sql_transaction",
       "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid|seq:i64",
       "fcorRoles": [
         {
           "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
+          "role": "session",
+          "type": "Uuid"
         },
         {
           "field": "seq",
-          "type": "i64",
-          "role": "param"
+          "role": "param",
+          "type": "i64"
         }
-      ]
+      ],
+      "fcorSchema": "session_id:Uuid|seq:i64",
+      "strategy": "sql_transaction",
+      "tag": "toggle_pinned_message"
     },
     {
-      "tag": "count_pinned_messages",
-      "fcorSchema": "session_id:Uuid",
-      "fcorCanonicalSchema": "session_id:uuid",
       "class": "read_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid",
       "fcorRoles": [
         {
           "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
+          "role": "session",
+          "type": "Uuid"
         }
-      ]
+      ],
+      "fcorSchema": "session_id:Uuid",
+      "strategy": "none",
+      "tag": "count_pinned_messages"
     },
     {
-      "tag": "list_pinned_message_seqs",
-      "fcorSchema": "session_id:Uuid",
-      "fcorCanonicalSchema": "session_id:uuid",
       "class": "read_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid",
       "fcorRoles": [
         {
           "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
+          "role": "session",
+          "type": "Uuid"
         }
-      ]
+      ],
+      "fcorSchema": "session_id:Uuid",
+      "strategy": "none",
+      "tag": "list_pinned_message_seqs"
     },
     {
-      "tag": "list_pinned_messages_with_text",
-      "fcorSchema": "session_id:Uuid",
-      "fcorCanonicalSchema": "session_id:uuid",
       "class": "read_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid",
       "fcorRoles": [
         {
           "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
+          "role": "session",
+          "type": "Uuid"
         }
-      ]
+      ],
+      "fcorSchema": "session_id:Uuid",
+      "strategy": "none",
+      "tag": "list_pinned_messages_with_text"
     },
     {
-      "tag": "pinned_message_state",
-      "fcorSchema": "session_id:Uuid",
-      "fcorCanonicalSchema": "session_id:uuid",
       "class": "read_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid",
       "fcorRoles": [
         {
           "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
+          "role": "session",
+          "type": "Uuid"
         }
-      ]
+      ],
+      "fcorSchema": "session_id:Uuid",
+      "strategy": "none",
+      "tag": "pinned_message_state"
     },
     {
-      "tag": "list_sealed_values",
-      "fcorSchema": "session_id:Uuid",
-      "fcorCanonicalSchema": "session_id:uuid",
       "class": "local_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid",
       "fcorRoles": [
         {
           "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
+          "role": "session",
+          "type": "Uuid"
         }
-      ]
+      ],
+      "fcorSchema": "session_id:Uuid",
+      "strategy": "none",
+      "tag": "list_sealed_values"
     },
     {
-      "tag": "delete_sealed_value",
-      "fcorSchema": "session_id:Uuid|value_id:String",
+      "class": "local_only",
+      "evidence": null,
       "fcorCanonicalSchema": "session_id:uuid|value_id:string",
-      "class": "local_only",
-      "strategy": "none",
-      "evidence": null,
       "fcorRoles": [
         {
           "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
+          "role": "session",
+          "type": "Uuid"
         },
         {
           "field": "value_id",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         }
-      ]
+      ],
+      "fcorSchema": "session_id:Uuid|value_id:String",
+      "strategy": "none",
+      "tag": "delete_sealed_value"
     },
     {
-      "tag": "list_project_notes",
-      "fcorSchema": "project_root:String",
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "cursor:option<string>|limit:option<u32>|project_root:option<string>|session_id:option<uuid>",
+      "fcorRoles": [
+        {
+          "field": "cursor",
+          "role": "param",
+          "type": "Option<String>"
+        },
+        {
+          "field": "limit",
+          "role": "param",
+          "type": "Option<u32>"
+        },
+        {
+          "field": "project_root",
+          "role": "project_root_effective",
+          "type": "Option<String>"
+        },
+        {
+          "field": "session_id",
+          "role": "param",
+          "type": "Option<Uuid>"
+        }
+      ],
+      "fcorSchema": "cursor:Option<String>|limit:Option<u32>|project_root:Option<String>|session_id:Option<Uuid>",
+      "strategy": "none",
+      "tag": "list_leak_reports"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "report_id:string",
+      "fcorRoles": [
+        {
+          "field": "report_id",
+          "role": "param",
+          "type": "String"
+        }
+      ],
+      "fcorSchema": "report_id:String",
+      "strategy": "none",
+      "tag": "begin_leak_reveal"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "capability:string",
+      "fcorRoles": [
+        {
+          "field": "capability",
+          "role": "param",
+          "type": "String"
+        }
+      ],
+      "fcorSchema": "capability:String",
+      "strategy": "none",
+      "tag": "reveal_leak_report_secret"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "report_id:string|rotation:enum16:LeakRotationDisposition",
+      "fcorRoles": [
+        {
+          "field": "report_id",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "rotation",
+          "role": "param",
+          "type": "LeakRotationDisposition"
+        }
+      ],
+      "fcorSchema": "report_id:String|rotation:LeakRotationDisposition",
+      "strategy": "none",
+      "tag": "mark_leak_rotated"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "report_id:string",
+      "fcorRoles": [
+        {
+          "field": "report_id",
+          "role": "param",
+          "type": "String"
+        }
+      ],
+      "fcorSchema": "report_id:String",
+      "strategy": "none",
+      "tag": "delete_leak_report"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
       "fcorCanonicalSchema": "project_root:string",
-      "class": "local_only",
-      "strategy": "none",
-      "evidence": null,
       "fcorRoles": [
         {
           "field": "project_root",
-          "type": "String",
-          "role": "project_root"
+          "role": "project_root",
+          "type": "String"
         }
-      ]
+      ],
+      "fcorSchema": "project_root:String",
+      "strategy": "none",
+      "tag": "list_project_notes"
     },
     {
-      "tag": "create_project_note",
-      "fcorSchema": "project_root:String|name:String",
-      "fcorCanonicalSchema": "project_root:string|name:string",
       "class": "local_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|name:string",
       "fcorRoles": [
         {
           "field": "project_root",
-          "type": "String",
-          "role": "project_root"
+          "role": "project_root",
+          "type": "String"
         },
         {
           "field": "name",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         }
-      ]
+      ],
+      "fcorSchema": "project_root:String|name:String",
+      "strategy": "none",
+      "tag": "create_project_note"
     },
     {
-      "tag": "set_project_note_content",
-      "fcorSchema": "project_root:String|id:Uuid|content:String",
-      "fcorCanonicalSchema": "project_root:string|id:uuid|content:string",
       "class": "local_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|id:uuid|content:string",
       "fcorRoles": [
         {
           "field": "project_root",
-          "type": "String",
-          "role": "project_root"
+          "role": "project_root",
+          "type": "String"
         },
         {
           "field": "id",
-          "type": "Uuid",
-          "role": "param"
+          "role": "param",
+          "type": "Uuid"
         },
         {
           "field": "content",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         }
-      ]
+      ],
+      "fcorSchema": "project_root:String|id:Uuid|content:String",
+      "strategy": "none",
+      "tag": "set_project_note_content"
     },
     {
-      "tag": "rename_project_note",
-      "fcorSchema": "project_root:String|id:Uuid|name:String",
-      "fcorCanonicalSchema": "project_root:string|id:uuid|name:string",
       "class": "local_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|id:uuid|name:string",
       "fcorRoles": [
         {
           "field": "project_root",
-          "type": "String",
-          "role": "project_root"
+          "role": "project_root",
+          "type": "String"
         },
         {
           "field": "id",
-          "type": "Uuid",
-          "role": "param"
+          "role": "param",
+          "type": "Uuid"
         },
         {
           "field": "name",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         }
-      ]
+      ],
+      "fcorSchema": "project_root:String|id:Uuid|name:String",
+      "strategy": "none",
+      "tag": "rename_project_note"
     },
     {
-      "tag": "delete_project_note",
-      "fcorSchema": "project_root:String|id:Uuid",
-      "fcorCanonicalSchema": "project_root:string|id:uuid",
       "class": "local_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|id:uuid",
       "fcorRoles": [
         {
           "field": "project_root",
-          "type": "String",
-          "role": "project_root"
+          "role": "project_root",
+          "type": "String"
         },
         {
           "field": "id",
-          "type": "Uuid",
-          "role": "param"
+          "role": "param",
+          "type": "Uuid"
         }
-      ]
+      ],
+      "fcorSchema": "project_root:String|id:Uuid",
+      "strategy": "none",
+      "tag": "delete_project_note"
     },
     {
-      "tag": "set_workspace_trust",
-      "fcorSchema": "project_root:String|mode:WorkspaceTrustMode|expected_config_generation:u64",
-      "fcorCanonicalSchema": "project_root:string|mode:enum16:WorkspaceTrustMode|expected_config_generation:u64",
       "class": "local_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|mode:enum16:WorkspaceTrustMode|expected_config_generation:u64",
       "fcorRoles": [
         {
           "field": "project_root",
-          "type": "String",
-          "role": "project_root"
+          "role": "project_root",
+          "type": "String"
         },
         {
           "field": "mode",
-          "type": "WorkspaceTrustMode",
-          "role": "param"
+          "role": "param",
+          "type": "WorkspaceTrustMode"
         },
         {
           "field": "expected_config_generation",
-          "type": "u64",
-          "role": "param"
+          "role": "param",
+          "type": "u64"
         }
-      ]
+      ],
+      "fcorSchema": "project_root:String|mode:WorkspaceTrustMode|expected_config_generation:u64",
+      "strategy": "none",
+      "tag": "set_workspace_trust"
     },
     {
-      "tag": "get_startup_disclosures",
-      "fcorSchema": "project_root:String",
-      "fcorCanonicalSchema": "project_root:string",
       "class": "local_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "project_root:string",
       "fcorRoles": [
         {
           "field": "project_root",
-          "type": "String",
-          "role": "project_root"
+          "role": "project_root",
+          "type": "String"
         }
-      ]
+      ],
+      "fcorSchema": "project_root:String",
+      "strategy": "none",
+      "tag": "get_startup_disclosures"
     },
     {
-      "tag": "get_app_flag",
-      "fcorSchema": "key:AppFlagKey",
+      "class": "local_only",
+      "evidence": null,
       "fcorCanonicalSchema": "key:enum16:AppFlagKey",
-      "class": "local_only",
-      "strategy": "none",
-      "evidence": null,
       "fcorRoles": [
         {
           "field": "key",
-          "type": "AppFlagKey",
-          "role": "param"
+          "role": "param",
+          "type": "AppFlagKey"
         }
-      ]
+      ],
+      "fcorSchema": "key:AppFlagKey",
+      "strategy": "none",
+      "tag": "get_app_flag"
     },
     {
-      "tag": "mark_app_flag_seen",
-      "fcorSchema": "key:AppFlagKey|expected_version:u64",
-      "fcorCanonicalSchema": "key:enum16:AppFlagKey|expected_version:u64",
       "class": "local_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "key:enum16:AppFlagKey|expected_version:u64",
       "fcorRoles": [
         {
           "field": "key",
-          "type": "AppFlagKey",
-          "role": "param"
+          "role": "param",
+          "type": "AppFlagKey"
         },
         {
           "field": "expected_version",
-          "type": "u64",
-          "role": "param"
+          "role": "param",
+          "type": "u64"
         }
-      ]
+      ],
+      "fcorSchema": "key:AppFlagKey|expected_version:u64",
+      "strategy": "none",
+      "tag": "mark_app_flag_seen"
     },
     {
-      "tag": "resolve_assistant_session",
-      "fcorSchema": "assistant_id:String|project_root:String|mode:AssistantSessionResolutionMode",
-      "fcorCanonicalSchema": "assistant_id:string|project_root:string|mode:enum16:AssistantSessionResolutionMode",
       "class": "local_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "assistant_id:string|project_root:string|mode:enum16:AssistantSessionResolutionMode",
       "fcorRoles": [
         {
           "field": "assistant_id",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         },
         {
           "field": "project_root",
-          "type": "String",
-          "role": "project_root"
+          "role": "project_root",
+          "type": "String"
         },
         {
           "field": "mode",
-          "type": "AssistantSessionResolutionMode",
-          "role": "param"
+          "role": "param",
+          "type": "AssistantSessionResolutionMode"
         }
-      ]
+      ],
+      "fcorSchema": "assistant_id:String|project_root:String|mode:AssistantSessionResolutionMode",
+      "strategy": "none",
+      "tag": "resolve_assistant_session"
     },
     {
-      "tag": "list_assistants",
-      "fcorSchema": "-",
+      "class": "local_only",
+      "evidence": null,
       "fcorCanonicalSchema": "-",
-      "class": "local_only",
+      "fcorRoles": [],
+      "fcorSchema": "-",
       "strategy": "none",
-      "evidence": null,
-      "fcorRoles": []
+      "tag": "list_assistants"
     },
     {
-      "tag": "upsert_assistant",
-      "fcorSchema": "name:String|home_dir:String|config_json:String|content_hash:String",
-      "fcorCanonicalSchema": "name:string|home_dir:string|config_json:string|content_hash:string",
       "class": "local_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "name:string|home_dir:string|config_json:string|content_hash:string",
       "fcorRoles": [
         {
           "field": "name",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         },
         {
           "field": "home_dir",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         },
         {
           "field": "config_json",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         },
         {
           "field": "content_hash",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         }
-      ]
+      ],
+      "fcorSchema": "name:String|home_dir:String|config_json:String|content_hash:String",
+      "strategy": "none",
+      "tag": "upsert_assistant"
     },
     {
-      "tag": "create_assistant_session",
-      "fcorSchema": "name:String|project_root:String|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|env_snapshot:Option<EnvSnapshotWire>",
-      "fcorCanonicalSchema": "name:string|project_root:string|initial_model:option<struct:ActiveModelRef:v1>|no_sandbox:bool|env_snapshot:option<struct:EnvSnapshotWire:v1>",
       "class": "local_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "name:string|project_root:string|initial_model:option<struct:ActiveModelRef:v1>|no_sandbox:bool|env_snapshot:option<struct:EnvSnapshotWire:v1>",
       "fcorRoles": [
         {
           "field": "name",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         },
         {
           "field": "project_root",
-          "type": "String",
-          "role": "project_root"
+          "role": "project_root",
+          "type": "String"
         },
         {
           "field": "initial_model",
-          "type": "Option<cockpit_config::config::providers::ActiveModelRef>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<cockpit_config::config::providers::ActiveModelRef>"
         },
         {
           "field": "no_sandbox",
-          "type": "bool",
-          "role": "param"
+          "role": "param",
+          "type": "bool"
         },
         {
           "field": "env_snapshot",
-          "type": "Option<EnvSnapshotWire>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<EnvSnapshotWire>"
         }
-      ]
-    },
-    {
-      "tag": "auto_title",
-      "fcorSchema": "session_id:Uuid",
-      "fcorCanonicalSchema": "session_id:uuid",
-      "class": "idempotent_adapter_mutation",
-      "strategy": "durable_dispatch_key",
-      "evidence": "dispatch_key_and_generation",
-      "fcorRoles": [
-        {
-          "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
-        }
-      ]
-    },
-    {
-      "tag": "export_session_data",
-      "fcorSchema": "session_id:Uuid|kind:ExportSessionKind|include_generated_artifacts:bool",
-      "fcorCanonicalSchema": "session_id:uuid|kind:enum16:ExportSessionKind|include_generated_artifacts:bool",
-      "class": "local_only",
+      ],
+      "fcorSchema": "name:String|project_root:String|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|env_snapshot:Option<EnvSnapshotWire>",
       "strategy": "none",
-      "evidence": null,
+      "tag": "create_assistant_session"
+    },
+    {
+      "class": "idempotent_adapter_mutation",
+      "evidence": "dispatch_key_and_generation",
+      "fcorCanonicalSchema": "session_id:uuid",
       "fcorRoles": [
         {
           "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
+          "role": "session",
+          "type": "Uuid"
+        }
+      ],
+      "fcorSchema": "session_id:Uuid",
+      "strategy": "durable_dispatch_key",
+      "tag": "auto_title"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid|kind:enum16:ExportSessionKind|include_generated_artifacts:bool",
+      "fcorRoles": [
+        {
+          "field": "session_id",
+          "role": "session",
+          "type": "Uuid"
         },
         {
           "field": "kind",
-          "type": "ExportSessionKind",
-          "role": "param"
+          "role": "param",
+          "type": "ExportSessionKind"
         },
         {
           "field": "include_generated_artifacts",
-          "type": "bool",
-          "role": "param"
+          "role": "param",
+          "type": "bool"
         }
-      ]
+      ],
+      "fcorSchema": "session_id:Uuid|kind:ExportSessionKind|include_generated_artifacts:bool",
+      "strategy": "none",
+      "tag": "export_session_data"
     },
     {
-      "tag": "import_session_archive",
-      "fcorSchema": "transfer:crate::remote_transport::bulk::RemoteBulkTransferRef|as_new:bool",
-      "fcorCanonicalSchema": "transfer:struct:RemoteBulkTransferRef:v1|as_new:bool",
       "class": "local_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "transfer:struct:RemoteBulkTransferRef:v1|as_new:bool",
       "fcorRoles": [
         {
           "field": "transfer",
-          "type": "crate::remote_transport::bulk::RemoteBulkTransferRef",
-          "role": "param"
+          "role": "param",
+          "type": "crate::remote_transport::bulk::RemoteBulkTransferRef"
         },
         {
           "field": "as_new",
-          "type": "bool",
-          "role": "param"
+          "role": "param",
+          "type": "bool"
         }
-      ]
+      ],
+      "fcorSchema": "transfer:crate::remote_transport::bulk::RemoteBulkTransferRef|as_new:bool",
+      "strategy": "none",
+      "tag": "import_session_archive"
     },
     {
-      "tag": "write_bulk_transfer_chunk",
-      "fcorSchema": "transfer:crate::remote_transport::bulk::RemoteBulkTransferRef|chunk_index:u32|data_base64:String",
-      "fcorCanonicalSchema": "transfer:struct:RemoteBulkTransferRef:v1|chunk_index:u32|data_base64:string",
       "class": "local_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "transfer:struct:RemoteBulkTransferRef:v1|chunk_index:u32|data_base64:string",
       "fcorRoles": [
         {
           "field": "transfer",
-          "type": "crate::remote_transport::bulk::RemoteBulkTransferRef",
-          "role": "param"
+          "role": "param",
+          "type": "crate::remote_transport::bulk::RemoteBulkTransferRef"
         },
         {
           "field": "chunk_index",
-          "type": "u32",
-          "role": "param"
+          "role": "param",
+          "type": "u32"
         },
         {
           "field": "data_base64",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         }
-      ]
+      ],
+      "fcorSchema": "transfer:crate::remote_transport::bulk::RemoteBulkTransferRef|chunk_index:u32|data_base64:String",
+      "strategy": "none",
+      "tag": "write_bulk_transfer_chunk"
     },
     {
-      "tag": "read_bulk_transfer_chunk",
-      "fcorSchema": "transfer_id:crate::remote_protocol_id::RemoteTransferId|chunk_index:u32",
-      "fcorCanonicalSchema": "transfer_id:struct:RemoteTransferId:v1|chunk_index:u32",
       "class": "local_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "transfer_id:struct:RemoteTransferId:v1|chunk_index:u32",
       "fcorRoles": [
         {
           "field": "transfer_id",
-          "type": "crate::remote_protocol_id::RemoteTransferId",
-          "role": "param"
+          "role": "param",
+          "type": "crate::remote_protocol_id::RemoteTransferId"
         },
         {
           "field": "chunk_index",
-          "type": "u32",
-          "role": "param"
+          "role": "param",
+          "type": "u32"
         }
-      ]
+      ],
+      "fcorSchema": "transfer_id:crate::remote_protocol_id::RemoteTransferId|chunk_index:u32",
+      "strategy": "none",
+      "tag": "read_bulk_transfer_chunk"
     },
     {
-      "tag": "curator",
-      "fcorSchema": "project_root:String|action:CuratorAction",
-      "fcorCanonicalSchema": "project_root:string|action:enum16:CuratorAction",
       "class": "local_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|action:enum16:CuratorAction",
       "fcorRoles": [
         {
           "field": "project_root",
-          "type": "String",
-          "role": "project_root"
+          "role": "project_root",
+          "type": "String"
         },
         {
           "field": "action",
-          "type": "CuratorAction",
-          "role": "param"
+          "role": "param",
+          "type": "CuratorAction"
         }
-      ]
-    },
-    {
-      "tag": "cancel_turn",
-      "fcorSchema": "-",
-      "fcorCanonicalSchema": "-",
-      "class": "nonrepeatable_mutation",
-      "strategy": "nonrepeatable_dispatch",
-      "evidence": null,
-      "fcorRoles": []
-    },
-    {
-      "tag": "fs_list",
-      "fcorSchema": "project_root:String|path:String|show_hidden:bool",
-      "fcorCanonicalSchema": "project_root:string|path:string|show_hidden:bool",
-      "class": "read_only",
+      ],
+      "fcorSchema": "project_root:String|action:CuratorAction",
       "strategy": "none",
+      "tag": "curator"
+    },
+    {
+      "class": "nonrepeatable_mutation",
       "evidence": null,
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "cancel_turn"
+    },
+    {
+      "class": "read_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|path:string|show_hidden:bool",
       "fcorRoles": [
         {
           "field": "project_root",
-          "type": "String",
-          "role": "project_root"
+          "role": "project_root",
+          "type": "String"
         },
         {
           "field": "path",
-          "type": "String",
-          "role": "file_existing(project_root)"
+          "role": "file_existing(project_root)",
+          "type": "String"
         },
         {
           "field": "show_hidden",
-          "type": "bool",
-          "role": "param"
+          "role": "param",
+          "type": "bool"
         }
-      ]
+      ],
+      "fcorSchema": "project_root:String|path:String|show_hidden:bool",
+      "strategy": "none",
+      "tag": "fs_list"
     },
     {
-      "tag": "fs_stat",
-      "fcorSchema": "project_root:String|path:String",
+      "class": "read_only",
+      "evidence": null,
       "fcorCanonicalSchema": "project_root:string|path:string",
-      "class": "read_only",
-      "strategy": "none",
-      "evidence": null,
       "fcorRoles": [
         {
           "field": "project_root",
-          "type": "String",
-          "role": "project_root"
+          "role": "project_root",
+          "type": "String"
         },
         {
           "field": "path",
-          "type": "String",
-          "role": "file_existing(project_root)"
+          "role": "file_existing(project_root)",
+          "type": "String"
         }
-      ]
+      ],
+      "fcorSchema": "project_root:String|path:String",
+      "strategy": "none",
+      "tag": "fs_stat"
     },
     {
-      "tag": "fs_read",
-      "fcorSchema": "project_root:String|path:String|base64:bool",
-      "fcorCanonicalSchema": "project_root:string|path:string|base64:bool",
       "class": "read_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|path:string|base64:bool",
       "fcorRoles": [
         {
           "field": "project_root",
-          "type": "String",
-          "role": "project_root"
+          "role": "project_root",
+          "type": "String"
         },
         {
           "field": "path",
-          "type": "String",
-          "role": "file_existing(project_root)"
+          "role": "file_existing(project_root)",
+          "type": "String"
         },
         {
           "field": "base64",
-          "type": "bool",
-          "role": "param"
+          "role": "param",
+          "type": "bool"
         }
-      ]
+      ],
+      "fcorSchema": "project_root:String|path:String|base64:bool",
+      "strategy": "none",
+      "tag": "fs_read"
     },
     {
-      "tag": "fs_write",
-      "fcorSchema": "project_root:String|path:String|content:String|base_hash:Option<String>",
-      "fcorCanonicalSchema": "project_root:string|path:string|content:string|base_hash:option<string>",
       "class": "idempotent_adapter_mutation",
-      "strategy": "staged_filesystem_commit",
       "evidence": "staged_artifact_fingerprints_and_fsync_barriers",
+      "fcorCanonicalSchema": "project_root:string|path:string|content:string|base_hash:option<string>",
       "fcorRoles": [
         {
           "field": "project_root",
-          "type": "String",
-          "role": "project_root"
+          "role": "project_root",
+          "type": "String"
         },
         {
           "field": "path",
-          "type": "String",
-          "role": "file_write_target(project_root)"
+          "role": "file_write_target(project_root)",
+          "type": "String"
         },
         {
           "field": "content",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         },
         {
           "field": "base_hash",
-          "type": "Option<String>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<String>"
         }
-      ]
+      ],
+      "fcorSchema": "project_root:String|path:String|content:String|base_hash:Option<String>",
+      "strategy": "staged_filesystem_commit",
+      "tag": "fs_write"
     },
     {
-      "tag": "fs_create_dir",
-      "fcorSchema": "project_root:String|path:String",
-      "fcorCanonicalSchema": "project_root:string|path:string",
       "class": "idempotent_adapter_mutation",
-      "strategy": "staged_filesystem_commit",
       "evidence": "staged_artifact_fingerprints_and_fsync_barriers",
+      "fcorCanonicalSchema": "project_root:string|path:string",
       "fcorRoles": [
         {
           "field": "project_root",
-          "type": "String",
-          "role": "project_root"
+          "role": "project_root",
+          "type": "String"
         },
         {
           "field": "path",
-          "type": "String",
-          "role": "file_write_target(project_root)"
+          "role": "file_write_target(project_root)",
+          "type": "String"
         }
-      ]
+      ],
+      "fcorSchema": "project_root:String|path:String",
+      "strategy": "staged_filesystem_commit",
+      "tag": "fs_create_dir"
     },
     {
-      "tag": "fs_rename",
-      "fcorSchema": "project_root:String|from_path:String|to_path:String",
-      "fcorCanonicalSchema": "project_root:string|from_path:string|to_path:string",
       "class": "idempotent_adapter_mutation",
-      "strategy": "staged_filesystem_commit",
       "evidence": "staged_artifact_fingerprints_and_fsync_barriers",
+      "fcorCanonicalSchema": "project_root:string|from_path:string|to_path:string",
       "fcorRoles": [
         {
           "field": "project_root",
-          "type": "String",
-          "role": "project_root"
+          "role": "project_root",
+          "type": "String"
         },
         {
           "field": "from_path",
-          "type": "String",
-          "role": "rename_source(project_root)"
+          "role": "rename_source(project_root)",
+          "type": "String"
         },
         {
           "field": "to_path",
-          "type": "String",
-          "role": "file_write_target(project_root)"
+          "role": "file_write_target(project_root)",
+          "type": "String"
         }
-      ]
+      ],
+      "fcorSchema": "project_root:String|from_path:String|to_path:String",
+      "strategy": "staged_filesystem_commit",
+      "tag": "fs_rename"
     },
     {
-      "tag": "fs_delete",
-      "fcorSchema": "project_root:String|path:String",
-      "fcorCanonicalSchema": "project_root:string|path:string",
       "class": "local_only",
-      "strategy": "none",
       "evidence": null,
-      "fcorRoles": [
-        {
-          "field": "project_root",
-          "type": "String",
-          "role": "project_root"
-        },
-        {
-          "field": "path",
-          "type": "String",
-          "role": "file_existing(project_root)"
-        }
-      ]
-    },
-    {
-      "tag": "git_status",
-      "fcorSchema": "project_root:String",
-      "fcorCanonicalSchema": "project_root:string",
-      "class": "read_only",
-      "strategy": "none",
-      "evidence": null,
-      "fcorRoles": [
-        {
-          "field": "project_root",
-          "type": "String",
-          "role": "project_root"
-        }
-      ]
-    },
-    {
-      "tag": "git_diff_file",
-      "fcorSchema": "project_root:String|path:String",
       "fcorCanonicalSchema": "project_root:string|path:string",
-      "class": "read_only",
-      "strategy": "none",
-      "evidence": null,
       "fcorRoles": [
         {
           "field": "project_root",
-          "type": "String",
-          "role": "project_root"
+          "role": "project_root",
+          "type": "String"
         },
         {
           "field": "path",
-          "type": "String",
-          "role": "file_existing(project_root)"
+          "role": "file_existing(project_root)",
+          "type": "String"
         }
-      ]
+      ],
+      "fcorSchema": "project_root:String|path:String",
+      "strategy": "none",
+      "tag": "fs_delete"
     },
     {
-      "tag": "open_terminal",
-      "fcorSchema": "cwd:Option<String>|cols:u16|rows:u16",
-      "fcorCanonicalSchema": "cwd:option<string>|cols:u16|rows:u16",
+      "class": "read_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "project_root:string",
+      "fcorRoles": [
+        {
+          "field": "project_root",
+          "role": "project_root",
+          "type": "String"
+        }
+      ],
+      "fcorSchema": "project_root:String",
+      "strategy": "none",
+      "tag": "git_status"
+    },
+    {
+      "class": "read_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|path:string",
+      "fcorRoles": [
+        {
+          "field": "project_root",
+          "role": "project_root",
+          "type": "String"
+        },
+        {
+          "field": "path",
+          "role": "file_existing(project_root)",
+          "type": "String"
+        }
+      ],
+      "fcorSchema": "project_root:String|path:String",
+      "strategy": "none",
+      "tag": "git_diff_file"
+    },
+    {
       "class": "idempotent_adapter_mutation",
-      "strategy": "durable_dispatch_key",
       "evidence": "dispatch_key_and_generation",
+      "fcorCanonicalSchema": "cwd:option<string>|cols:u16|rows:u16",
       "fcorRoles": [
         {
           "field": "cwd",
-          "type": "Option<String>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<String>"
         },
         {
           "field": "cols",
-          "type": "u16",
-          "role": "param"
+          "role": "param",
+          "type": "u16"
         },
         {
           "field": "rows",
-          "type": "u16",
-          "role": "param"
+          "role": "param",
+          "type": "u16"
         }
-      ]
+      ],
+      "fcorSchema": "cwd:Option<String>|cols:u16|rows:u16",
+      "strategy": "durable_dispatch_key",
+      "tag": "open_terminal"
     },
     {
-      "tag": "attach_terminal",
-      "fcorSchema": "terminal_id:Uuid|cols:u16|rows:u16",
-      "fcorCanonicalSchema": "terminal_id:uuid|cols:u16|rows:u16",
       "class": "read_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "terminal_id:uuid|cols:u16|rows:u16",
       "fcorRoles": [
         {
           "field": "terminal_id",
-          "type": "Uuid",
-          "role": "terminal"
+          "role": "terminal",
+          "type": "Uuid"
         },
         {
           "field": "cols",
-          "type": "u16",
-          "role": "param"
+          "role": "param",
+          "type": "u16"
         },
         {
           "field": "rows",
-          "type": "u16",
-          "role": "param"
+          "role": "param",
+          "type": "u16"
         }
-      ]
+      ],
+      "fcorSchema": "terminal_id:Uuid|cols:u16|rows:u16",
+      "strategy": "none",
+      "tag": "attach_terminal"
     },
     {
-      "tag": "terminal_input",
-      "fcorSchema": "terminal_id:Uuid|bytes:Vec<u8>",
-      "fcorCanonicalSchema": "terminal_id:uuid|bytes:bytes",
       "class": "nonrepeatable_mutation",
-      "strategy": "nonrepeatable_dispatch",
       "evidence": null,
+      "fcorCanonicalSchema": "terminal_id:uuid|bytes:bytes",
       "fcorRoles": [
         {
           "field": "terminal_id",
-          "type": "Uuid",
-          "role": "terminal"
+          "role": "terminal",
+          "type": "Uuid"
         },
         {
           "field": "bytes",
-          "type": "Vec<u8>",
-          "role": "param"
+          "role": "param",
+          "type": "Vec<u8>"
         }
-      ]
+      ],
+      "fcorSchema": "terminal_id:Uuid|bytes:Vec<u8>",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "terminal_input"
     },
     {
-      "tag": "terminal_resize",
-      "fcorSchema": "terminal_id:Uuid|cols:u16|rows:u16",
-      "fcorCanonicalSchema": "terminal_id:uuid|cols:u16|rows:u16",
       "class": "nonrepeatable_mutation",
-      "strategy": "nonrepeatable_dispatch",
       "evidence": null,
+      "fcorCanonicalSchema": "terminal_id:uuid|cols:u16|rows:u16",
       "fcorRoles": [
         {
           "field": "terminal_id",
-          "type": "Uuid",
-          "role": "terminal"
+          "role": "terminal",
+          "type": "Uuid"
         },
         {
           "field": "cols",
-          "type": "u16",
-          "role": "param"
+          "role": "param",
+          "type": "u16"
         },
         {
           "field": "rows",
-          "type": "u16",
-          "role": "param"
+          "role": "param",
+          "type": "u16"
         }
-      ]
+      ],
+      "fcorSchema": "terminal_id:Uuid|cols:u16|rows:u16",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "terminal_resize"
     },
     {
-      "tag": "close_terminal",
-      "fcorSchema": "terminal_id:Uuid",
-      "fcorCanonicalSchema": "terminal_id:uuid",
       "class": "idempotent_adapter_mutation",
-      "strategy": "durable_dispatch_key",
       "evidence": "dispatch_key_and_generation",
+      "fcorCanonicalSchema": "terminal_id:uuid",
       "fcorRoles": [
         {
           "field": "terminal_id",
-          "type": "Uuid",
-          "role": "terminal"
+          "role": "terminal",
+          "type": "Uuid"
         }
-      ]
+      ],
+      "fcorSchema": "terminal_id:Uuid",
+      "strategy": "durable_dispatch_key",
+      "tag": "close_terminal"
     },
     {
-      "tag": "lsp_control",
-      "fcorSchema": "project_root:String|server_id:String|action:LspControlAction",
-      "fcorCanonicalSchema": "project_root:string|server_id:string|action:enum16:LspControlAction",
+      "class": "nonrepeatable_mutation",
+      "evidence": null,
+      "fcorCanonicalSchema": "terminal_id:uuid|binding:struct:TerminalBinding:v1|metadata:struct:TerminalIngressMetadata:v1",
+      "fcorRoles": [
+        {
+          "field": "terminal_id",
+          "role": "terminal",
+          "type": "Uuid"
+        },
+        {
+          "field": "binding",
+          "role": "param",
+          "type": "terminal::TerminalBinding"
+        },
+        {
+          "field": "metadata",
+          "role": "param",
+          "type": "terminal::TerminalIngressMetadata"
+        }
+      ],
+      "fcorSchema": "terminal_id:Uuid|binding:crate::terminal::TerminalBinding|metadata:crate::terminal::TerminalIngressMetadata",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "terminal_ingress_begin"
+    },
+    {
+      "class": "nonrepeatable_mutation",
+      "evidence": null,
+      "fcorCanonicalSchema": "terminal_id:uuid|binding:struct:TerminalBinding:v1|operation_id:uuid|offset:u64|data_base64:string",
+      "fcorRoles": [
+        {
+          "field": "terminal_id",
+          "role": "terminal",
+          "type": "Uuid"
+        },
+        {
+          "field": "binding",
+          "role": "param",
+          "type": "terminal::TerminalBinding"
+        },
+        {
+          "field": "operation_id",
+          "role": "param",
+          "type": "Uuid"
+        },
+        {
+          "field": "offset",
+          "role": "param",
+          "type": "u64"
+        },
+        {
+          "field": "data_base64",
+          "role": "param",
+          "type": "String"
+        }
+      ],
+      "fcorSchema": "terminal_id:Uuid|binding:crate::terminal::TerminalBinding|operation_id:Uuid|offset:u64|data_base64:String",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "terminal_ingress_chunk"
+    },
+    {
+      "class": "nonrepeatable_mutation",
+      "evidence": null,
+      "fcorCanonicalSchema": "terminal_id:uuid|binding:struct:TerminalBinding:v1|operation_id:uuid",
+      "fcorRoles": [
+        {
+          "field": "terminal_id",
+          "role": "terminal",
+          "type": "Uuid"
+        },
+        {
+          "field": "binding",
+          "role": "param",
+          "type": "terminal::TerminalBinding"
+        },
+        {
+          "field": "operation_id",
+          "role": "param",
+          "type": "Uuid"
+        }
+      ],
+      "fcorSchema": "terminal_id:Uuid|binding:crate::terminal::TerminalBinding|operation_id:Uuid",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "terminal_ingress_finish"
+    },
+    {
+      "class": "read_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "terminal_id:uuid|binding:struct:TerminalBinding:v1|operation_id:uuid",
+      "fcorRoles": [
+        {
+          "field": "terminal_id",
+          "role": "terminal",
+          "type": "Uuid"
+        },
+        {
+          "field": "binding",
+          "role": "param",
+          "type": "terminal::TerminalBinding"
+        },
+        {
+          "field": "operation_id",
+          "role": "param",
+          "type": "Uuid"
+        }
+      ],
+      "fcorSchema": "terminal_id:Uuid|binding:crate::terminal::TerminalBinding|operation_id:Uuid",
+      "strategy": "none",
+      "tag": "terminal_ingress_status"
+    },
+    {
       "class": "idempotent_adapter_mutation",
-      "strategy": "durable_dispatch_key",
       "evidence": "dispatch_key_and_generation",
+      "fcorCanonicalSchema": "project_root:string|server_id:string|action:enum16:LspControlAction",
       "fcorRoles": [
         {
           "field": "project_root",
-          "type": "String",
-          "role": "project_root"
+          "role": "project_root",
+          "type": "String"
         },
         {
           "field": "server_id",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         },
         {
           "field": "action",
-          "type": "LspControlAction",
-          "role": "param"
+          "role": "param",
+          "type": "LspControlAction"
         }
-      ]
+      ],
+      "fcorSchema": "project_root:String|server_id:String|action:LspControlAction",
+      "strategy": "durable_dispatch_key",
+      "tag": "lsp_control"
     },
     {
-      "tag": "resolve_interrupt",
-      "fcorSchema": "interrupt_id:Uuid|response:ResolveResponse",
-      "fcorCanonicalSchema": "interrupt_id:uuid|response:struct:ResolveResponse:v1",
       "class": "idempotent_adapter_mutation",
-      "strategy": "durable_dispatch_key",
       "evidence": "dispatch_key_and_generation",
+      "fcorCanonicalSchema": "interrupt_id:uuid|response:struct:ResolveResponse:v1",
       "fcorRoles": [
         {
           "field": "interrupt_id",
-          "type": "Uuid",
-          "role": "interrupt"
+          "role": "interrupt",
+          "type": "Uuid"
         },
         {
           "field": "response",
-          "type": "ResolveResponse",
-          "role": "param"
+          "role": "param",
+          "type": "ResolveResponse"
         }
-      ]
+      ],
+      "fcorSchema": "interrupt_id:Uuid|response:ResolveResponse",
+      "strategy": "durable_dispatch_key",
+      "tag": "resolve_interrupt"
     },
     {
-      "tag": "list_sessions",
-      "fcorSchema": "project_id:Option<String>|parent_session_id:Option<Uuid>",
-      "fcorCanonicalSchema": "project_id:option<string>|parent_session_id:option<uuid>",
       "class": "read_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "project_id:option<string>|parent_session_id:option<uuid>",
       "fcorRoles": [
         {
           "field": "project_id",
-          "type": "Option<String>",
-          "role": "project"
+          "role": "project",
+          "type": "Option<String>"
         },
         {
           "field": "parent_session_id",
-          "type": "Option<Uuid>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<Uuid>"
         }
-      ]
+      ],
+      "fcorSchema": "project_id:Option<String>|parent_session_id:Option<Uuid>",
+      "strategy": "none",
+      "tag": "list_sessions"
     },
     {
-      "tag": "read_session_messages",
-      "fcorSchema": "session_id:Uuid|before_seq:Option<i64>|limit:u32",
-      "fcorCanonicalSchema": "session_id:uuid|before_seq:option<i64>|limit:u32",
       "class": "read_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid|before_seq:option<i64>|limit:u32",
       "fcorRoles": [
         {
           "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
+          "role": "session",
+          "type": "Uuid"
         },
         {
           "field": "before_seq",
-          "type": "Option<i64>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<i64>"
         },
         {
           "field": "limit",
-          "type": "u32",
-          "role": "param"
+          "role": "param",
+          "type": "u32"
         }
-      ]
+      ],
+      "fcorSchema": "session_id:Uuid|before_seq:Option<i64>|limit:u32",
+      "strategy": "none",
+      "tag": "read_session_messages"
     },
     {
-      "tag": "read_client_submission_receipt",
-      "fcorSchema": "session_id:Uuid|client_submission_id:Uuid",
-      "fcorCanonicalSchema": "session_id:uuid|client_submission_id:uuid",
       "class": "read_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid|client_submission_id:uuid",
       "fcorRoles": [
         {
           "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
+          "role": "session",
+          "type": "Uuid"
         },
         {
           "field": "client_submission_id",
-          "type": "Uuid",
-          "role": "param"
+          "role": "param",
+          "type": "Uuid"
         }
-      ]
+      ],
+      "fcorSchema": "session_id:Uuid|client_submission_id:Uuid",
+      "strategy": "none",
+      "tag": "read_client_submission_receipt"
     },
     {
-      "tag": "read_history_page",
-      "fcorSchema": "session_id:Uuid|before_seq:Option<i64>|limit:u32",
-      "fcorCanonicalSchema": "session_id:uuid|before_seq:option<i64>|limit:u32",
       "class": "read_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid|before_seq:option<i64>|limit:u32",
       "fcorRoles": [
         {
           "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
+          "role": "session",
+          "type": "Uuid"
         },
         {
           "field": "before_seq",
-          "type": "Option<i64>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<i64>"
         },
         {
           "field": "limit",
-          "type": "u32",
-          "role": "param"
+          "role": "param",
+          "type": "u32"
         }
-      ]
+      ],
+      "fcorSchema": "session_id:Uuid|before_seq:Option<i64>|limit:u32",
+      "strategy": "none",
+      "tag": "read_history_page"
     },
     {
-      "tag": "read_subagent_history_page",
-      "fcorSchema": "session_id:Uuid|task_call_id:String|label:String|before_seq:Option<i64>|limit:u32",
-      "fcorCanonicalSchema": "session_id:uuid|task_call_id:string|label:string|before_seq:option<i64>|limit:u32",
       "class": "read_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid|task_call_id:string|label:string|before_seq:option<i64>|limit:u32",
       "fcorRoles": [
         {
           "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
+          "role": "session",
+          "type": "Uuid"
         },
         {
           "field": "task_call_id",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         },
         {
           "field": "label",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         },
         {
           "field": "before_seq",
-          "type": "Option<i64>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<i64>"
         },
         {
           "field": "limit",
-          "type": "u32",
-          "role": "param"
+          "role": "param",
+          "type": "u32"
         }
-      ]
+      ],
+      "fcorSchema": "session_id:Uuid|task_call_id:String|label:String|before_seq:Option<i64>|limit:u32",
+      "strategy": "none",
+      "tag": "read_subagent_history_page"
     },
     {
-      "tag": "session_live_status",
-      "fcorSchema": "session_ids:Vec<Uuid>",
-      "fcorCanonicalSchema": "session_ids:list<uuid>",
       "class": "read_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "session_ids:list<uuid>",
       "fcorRoles": [
         {
           "field": "session_ids",
-          "type": "Vec<Uuid>",
-          "role": "param"
+          "role": "param",
+          "type": "Vec<Uuid>"
         }
-      ]
+      ],
+      "fcorSchema": "session_ids:Vec<Uuid>",
+      "strategy": "none",
+      "tag": "session_live_status"
     },
     {
-      "tag": "archive_session",
-      "fcorSchema": "session_id:Uuid|cascade:bool",
-      "fcorCanonicalSchema": "session_id:uuid|cascade:bool",
       "class": "transactional_mutation",
-      "strategy": "sql_transaction",
       "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid|cascade:bool",
       "fcorRoles": [
         {
           "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
+          "role": "session",
+          "type": "Uuid"
         },
         {
           "field": "cascade",
-          "type": "bool",
-          "role": "param"
+          "role": "param",
+          "type": "bool"
         }
-      ]
+      ],
+      "fcorSchema": "session_id:Uuid|cascade:bool",
+      "strategy": "sql_transaction",
+      "tag": "archive_session"
     },
     {
-      "tag": "unarchive_session",
-      "fcorSchema": "session_id:Uuid",
-      "fcorCanonicalSchema": "session_id:uuid",
       "class": "transactional_mutation",
-      "strategy": "sql_transaction",
       "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid",
       "fcorRoles": [
         {
           "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
+          "role": "session",
+          "type": "Uuid"
         }
-      ]
+      ],
+      "fcorSchema": "session_id:Uuid",
+      "strategy": "sql_transaction",
+      "tag": "unarchive_session"
     },
     {
-      "tag": "fork_session",
-      "fcorSchema": "parent_session_id:Uuid|fork_point_turn_id:Option<String>|ephemeral:bool",
-      "fcorCanonicalSchema": "parent_session_id:uuid|fork_point_turn_id:option<string>|ephemeral:bool",
       "class": "transactional_mutation",
-      "strategy": "sql_transaction",
       "evidence": null,
+      "fcorCanonicalSchema": "parent_session_id:uuid|fork_point_turn_id:option<string>|ephemeral:bool",
       "fcorRoles": [
         {
           "field": "parent_session_id",
-          "type": "Uuid",
-          "role": "param"
+          "role": "param",
+          "type": "Uuid"
         },
         {
           "field": "fork_point_turn_id",
-          "type": "Option<String>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<String>"
         },
         {
           "field": "ephemeral",
-          "type": "bool",
-          "role": "param"
+          "role": "param",
+          "type": "bool"
         }
-      ]
+      ],
+      "fcorSchema": "parent_session_id:Uuid|fork_point_turn_id:Option<String>|ephemeral:bool",
+      "strategy": "sql_transaction",
+      "tag": "fork_session"
     },
     {
-      "tag": "discard_session",
-      "fcorSchema": "session_id:Uuid",
-      "fcorCanonicalSchema": "session_id:uuid",
       "class": "transactional_mutation",
-      "strategy": "sql_transaction",
       "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid",
       "fcorRoles": [
         {
           "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
+          "role": "session",
+          "type": "Uuid"
         }
-      ]
+      ],
+      "fcorSchema": "session_id:Uuid",
+      "strategy": "sql_transaction",
+      "tag": "discard_session"
     },
     {
-      "tag": "btw_create",
-      "fcorSchema": "parent_session_id:Uuid|tangent:bool",
-      "fcorCanonicalSchema": "parent_session_id:uuid|tangent:bool",
       "class": "transactional_mutation",
-      "strategy": "sql_transaction",
       "evidence": null,
+      "fcorCanonicalSchema": "parent_session_id:uuid|tangent:bool",
       "fcorRoles": [
         {
           "field": "parent_session_id",
-          "type": "Uuid",
-          "role": "param"
+          "role": "param",
+          "type": "Uuid"
         },
         {
           "field": "tangent",
-          "type": "bool",
-          "role": "param"
+          "role": "param",
+          "type": "bool"
         }
-      ]
+      ],
+      "fcorSchema": "parent_session_id:Uuid|tangent:bool",
+      "strategy": "sql_transaction",
+      "tag": "btw_create"
     },
     {
-      "tag": "btw_end",
-      "fcorSchema": "parent_session_id:Uuid",
-      "fcorCanonicalSchema": "parent_session_id:uuid",
       "class": "transactional_mutation",
-      "strategy": "sql_transaction",
       "evidence": null,
+      "fcorCanonicalSchema": "parent_session_id:uuid",
       "fcorRoles": [
         {
           "field": "parent_session_id",
-          "type": "Uuid",
-          "role": "param"
+          "role": "param",
+          "type": "Uuid"
         }
-      ]
+      ],
+      "fcorSchema": "parent_session_id:Uuid",
+      "strategy": "sql_transaction",
+      "tag": "btw_end"
     },
     {
-      "tag": "rename_session",
-      "fcorSchema": "session_id:Uuid|title:String",
-      "fcorCanonicalSchema": "session_id:uuid|title:string",
       "class": "transactional_mutation",
-      "strategy": "sql_transaction",
       "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid|title:string",
       "fcorRoles": [
         {
           "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
+          "role": "session",
+          "type": "Uuid"
         },
         {
           "field": "title",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         }
-      ]
+      ],
+      "fcorSchema": "session_id:Uuid|title:String",
+      "strategy": "sql_transaction",
+      "tag": "rename_session"
     },
     {
-      "tag": "share_session",
-      "fcorSchema": "session_id:Uuid|shared:bool",
-      "fcorCanonicalSchema": "session_id:uuid|shared:bool",
       "class": "local_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid|shared:bool",
       "fcorRoles": [
         {
           "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
+          "role": "session",
+          "type": "Uuid"
         },
         {
           "field": "shared",
-          "type": "bool",
-          "role": "param"
+          "role": "param",
+          "type": "bool"
         }
-      ]
+      ],
+      "fcorSchema": "session_id:Uuid|shared:bool",
+      "strategy": "none",
+      "tag": "share_session"
     },
     {
-      "tag": "record_session_note",
-      "fcorSchema": "session_id:Uuid|text:String",
-      "fcorCanonicalSchema": "session_id:uuid|text:string",
       "class": "transactional_mutation",
-      "strategy": "sql_transaction",
       "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid|text:string",
       "fcorRoles": [
         {
           "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
+          "role": "session",
+          "type": "Uuid"
         },
         {
           "field": "text",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         }
-      ]
+      ],
+      "fcorSchema": "session_id:Uuid|text:String",
+      "strategy": "sql_transaction",
+      "tag": "record_session_note"
     },
     {
-      "tag": "delete_session",
-      "fcorSchema": "session_id:Uuid",
-      "fcorCanonicalSchema": "session_id:uuid",
       "class": "transactional_mutation",
-      "strategy": "sql_transaction",
       "evidence": null,
+      "fcorCanonicalSchema": "session_id:uuid",
       "fcorRoles": [
         {
           "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
+          "role": "session",
+          "type": "Uuid"
         }
-      ]
+      ],
+      "fcorSchema": "session_id:Uuid",
+      "strategy": "sql_transaction",
+      "tag": "delete_session"
     },
     {
-      "tag": "get_inventory_bundle",
-      "fcorSchema": "project_root:String|session_id:Uuid|selected_agent:String",
-      "fcorCanonicalSchema": "project_root:string|session_id:uuid|selected_agent:string",
       "class": "read_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|session_id:uuid|selected_agent:string",
       "fcorRoles": [
         {
           "field": "project_root",
-          "type": "String",
-          "role": "project_root"
+          "role": "project_root",
+          "type": "String"
         },
         {
           "field": "session_id",
-          "type": "Uuid",
-          "role": "session"
+          "role": "session",
+          "type": "Uuid"
         },
         {
           "field": "selected_agent",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         }
-      ]
+      ],
+      "fcorSchema": "project_root:String|session_id:Uuid|selected_agent:String",
+      "strategy": "none",
+      "tag": "get_inventory_bundle"
     },
     {
-      "tag": "resource_snapshot",
-      "fcorSchema": "-",
+      "class": "local_only",
+      "evidence": null,
       "fcorCanonicalSchema": "-",
-      "class": "local_only",
+      "fcorRoles": [],
+      "fcorSchema": "-",
       "strategy": "none",
-      "evidence": null,
-      "fcorRoles": []
+      "tag": "resource_snapshot"
     },
     {
-      "tag": "promote_resource",
-      "fcorSchema": "request_id:String|session_id:Option<Uuid>",
-      "fcorCanonicalSchema": "request_id:string|session_id:option<uuid>",
       "class": "local_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "request_id:string|session_id:option<uuid>",
       "fcorRoles": [
         {
           "field": "request_id",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         },
         {
           "field": "session_id",
-          "type": "Option<Uuid>",
-          "role": "session"
+          "role": "session",
+          "type": "Option<Uuid>"
         }
-      ]
+      ],
+      "fcorSchema": "request_id:String|session_id:Option<Uuid>",
+      "strategy": "none",
+      "tag": "promote_resource"
     },
     {
-      "tag": "create_scheduled_job",
-      "fcorSchema": "job:ScheduledJobCreate",
-      "fcorCanonicalSchema": "job:struct:ScheduledJobCreate:v1",
       "class": "local_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "job:struct:ScheduledJobCreate:v1",
       "fcorRoles": [
         {
           "field": "job",
-          "type": "ScheduledJobCreate",
-          "role": "scheduled"
+          "role": "scheduled",
+          "type": "ScheduledJobCreate"
         }
-      ]
+      ],
+      "fcorSchema": "job:ScheduledJobCreate",
+      "strategy": "none",
+      "tag": "create_scheduled_job"
     },
     {
-      "tag": "list_scheduled_jobs",
-      "fcorSchema": "owner:Option<String>",
-      "fcorCanonicalSchema": "owner:option<string>",
       "class": "local_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "owner:option<string>",
       "fcorRoles": [
         {
           "field": "owner",
-          "type": "Option<String>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<String>"
         }
-      ]
+      ],
+      "fcorSchema": "owner:Option<String>",
+      "strategy": "none",
+      "tag": "list_scheduled_jobs"
     },
     {
-      "tag": "delete_scheduled_job",
-      "fcorSchema": "id:String",
+      "class": "local_only",
+      "evidence": null,
       "fcorCanonicalSchema": "id:string",
-      "class": "local_only",
-      "strategy": "none",
-      "evidence": null,
       "fcorRoles": [
         {
           "field": "id",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         }
-      ]
+      ],
+      "fcorSchema": "id:String",
+      "strategy": "none",
+      "tag": "delete_scheduled_job"
     },
     {
-      "tag": "set_scheduled_job_enabled",
-      "fcorSchema": "id:String|enabled:bool",
-      "fcorCanonicalSchema": "id:string|enabled:bool",
       "class": "local_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "id:string|enabled:bool",
       "fcorRoles": [
         {
           "field": "id",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         },
         {
           "field": "enabled",
-          "type": "bool",
-          "role": "param"
+          "role": "param",
+          "type": "bool"
         }
-      ]
+      ],
+      "fcorSchema": "id:String|enabled:bool",
+      "strategy": "none",
+      "tag": "set_scheduled_job_enabled"
     },
     {
-      "tag": "run_scheduled_job",
-      "fcorSchema": "id:String",
-      "fcorCanonicalSchema": "id:string",
       "class": "local_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "id:string",
       "fcorRoles": [
         {
           "field": "id",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         }
-      ]
+      ],
+      "fcorSchema": "id:String",
+      "strategy": "none",
+      "tag": "run_scheduled_job"
     },
     {
-      "tag": "set_model_favorite",
-      "fcorSchema": "provider:String|model:String|favorite:bool",
-      "fcorCanonicalSchema": "provider:string|model:string|favorite:bool",
       "class": "local_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "provider:string|model:string|favorite:bool",
       "fcorRoles": [
         {
           "field": "provider",
-          "type": "String",
-          "role": "provider_model_left(model)"
+          "role": "provider_model_left(model)",
+          "type": "String"
         },
         {
           "field": "model",
-          "type": "String",
-          "role": "provider_model_right(provider)"
+          "role": "provider_model_right(provider)",
+          "type": "String"
         },
         {
           "field": "favorite",
-          "type": "bool",
-          "role": "param"
+          "role": "param",
+          "type": "bool"
         }
-      ]
+      ],
+      "fcorSchema": "provider:String|model:String|favorite:bool",
+      "strategy": "none",
+      "tag": "set_model_favorite"
     },
     {
-      "tag": "set_default_model",
-      "fcorSchema": "default_update_id:Uuid|provider:Option<String>|model:Option<String>|reasoning_effort:Option<String>|thinking_mode:Option<cockpit_config::config::providers::ThinkingMode>|prompt_cache_retention:Option<PromptCacheRetention>|clear:bool",
-      "fcorCanonicalSchema": "default_update_id:uuid|provider:option<string>|model:option<string>|reasoning_effort:option<string>|thinking_mode:option<enum16:ThinkingMode>|prompt_cache_retention:option<enum16:PromptCacheRetention>|clear:bool",
       "class": "local_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "default_update_id:uuid|provider:option<string>|model:option<string>|reasoning_effort:option<string>|thinking_mode:option<enum16:ThinkingMode>|prompt_cache_retention:option<enum16:PromptCacheRetention>|clear:bool",
       "fcorRoles": [
         {
           "field": "default_update_id",
-          "type": "Uuid",
-          "role": "param"
+          "role": "param",
+          "type": "Uuid"
         },
         {
           "field": "provider",
-          "type": "Option<String>",
-          "role": "provider_model_left(model)"
+          "role": "provider_model_left(model)",
+          "type": "Option<String>"
         },
         {
           "field": "model",
-          "type": "Option<String>",
-          "role": "provider_model_right(provider)"
+          "role": "provider_model_right(provider)",
+          "type": "Option<String>"
         },
         {
           "field": "reasoning_effort",
-          "type": "Option<String>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<String>"
         },
         {
           "field": "thinking_mode",
-          "type": "Option<cockpit_config::config::providers::ThinkingMode>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<cockpit_config::config::providers::ThinkingMode>"
         },
         {
           "field": "prompt_cache_retention",
-          "type": "Option<PromptCacheRetention>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<PromptCacheRetention>"
         },
         {
           "field": "clear",
-          "type": "bool",
-          "role": "param"
+          "role": "param",
+          "type": "bool"
         }
-      ]
+      ],
+      "fcorSchema": "default_update_id:Uuid|provider:Option<String>|model:Option<String>|reasoning_effort:Option<String>|thinking_mode:Option<cockpit_config::config::providers::ThinkingMode>|prompt_cache_retention:Option<PromptCacheRetention>|clear:bool",
+      "strategy": "none",
+      "tag": "set_default_model"
     },
     {
-      "tag": "set_active_model",
-      "fcorSchema": "selection_id:Uuid|provider:String|model:String|persist_as_default:bool|trigger:ActiveModelSwitchTrigger|reasoning_effort:Option<String>|thinking_mode:Option<cockpit_config::config::providers::ThinkingMode>|prompt_cache_retention:Option<PromptCacheRetention>",
-      "fcorCanonicalSchema": "selection_id:uuid|provider:string|model:string|persist_as_default:bool|trigger:enum16:ActiveModelSwitchTrigger|reasoning_effort:option<string>|thinking_mode:option<enum16:ThinkingMode>|prompt_cache_retention:option<enum16:PromptCacheRetention>",
       "class": "idempotent_adapter_mutation",
-      "strategy": "durable_desired_state",
       "evidence": "desired_state_generation_and_observed_digest",
+      "fcorCanonicalSchema": "selection_id:uuid|provider:string|model:string|persist_as_default:bool|trigger:enum16:ActiveModelSwitchTrigger|reasoning_effort:option<string>|thinking_mode:option<enum16:ThinkingMode>|prompt_cache_retention:option<enum16:PromptCacheRetention>",
       "fcorRoles": [
         {
           "field": "selection_id",
-          "type": "Uuid",
-          "role": "param"
+          "role": "param",
+          "type": "Uuid"
         },
         {
           "field": "provider",
-          "type": "String",
-          "role": "provider_model_left(model)"
+          "role": "provider_model_left(model)",
+          "type": "String"
         },
         {
           "field": "model",
-          "type": "String",
-          "role": "provider_model_right(provider)"
+          "role": "provider_model_right(provider)",
+          "type": "String"
         },
         {
           "field": "persist_as_default",
-          "type": "bool",
-          "role": "param"
+          "role": "param",
+          "type": "bool"
         },
         {
           "field": "trigger",
-          "type": "ActiveModelSwitchTrigger",
-          "role": "param"
+          "role": "param",
+          "type": "ActiveModelSwitchTrigger"
         },
         {
           "field": "reasoning_effort",
-          "type": "Option<String>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<String>"
         },
         {
           "field": "thinking_mode",
-          "type": "Option<cockpit_config::config::providers::ThinkingMode>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<cockpit_config::config::providers::ThinkingMode>"
         },
         {
           "field": "prompt_cache_retention",
-          "type": "Option<PromptCacheRetention>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<PromptCacheRetention>"
         }
-      ]
+      ],
+      "fcorSchema": "selection_id:Uuid|provider:String|model:String|persist_as_default:bool|trigger:ActiveModelSwitchTrigger|reasoning_effort:Option<String>|thinking_mode:Option<cockpit_config::config::providers::ThinkingMode>|prompt_cache_retention:Option<PromptCacheRetention>",
+      "strategy": "durable_desired_state",
+      "tag": "set_active_model"
     },
     {
-      "tag": "set_agent",
-      "fcorSchema": "name:String",
-      "fcorCanonicalSchema": "name:string",
       "class": "idempotent_adapter_mutation",
-      "strategy": "durable_desired_state",
       "evidence": "desired_state_generation_and_observed_digest",
+      "fcorCanonicalSchema": "name:string",
       "fcorRoles": [
         {
           "field": "name",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         }
-      ]
-    },
-    {
-      "tag": "set_llm_mode",
-      "fcorSchema": "mode:Option<LlmMode>",
-      "fcorCanonicalSchema": "mode:option<enum16:LlmMode>",
-      "class": "nonrepeatable_mutation",
-      "strategy": "nonrepeatable_dispatch",
-      "evidence": null,
-      "fcorRoles": [
-        {
-          "field": "mode",
-          "type": "Option<LlmMode>",
-          "role": "param"
-        }
-      ]
-    },
-    {
-      "tag": "set_session_llm_mode",
-      "fcorSchema": "mode:LlmMode",
-      "fcorCanonicalSchema": "mode:enum16:LlmMode",
-      "class": "idempotent_adapter_mutation",
+      ],
+      "fcorSchema": "name:String",
       "strategy": "durable_desired_state",
-      "evidence": "desired_state_generation_and_observed_digest",
+      "tag": "set_agent"
+    },
+    {
+      "class": "nonrepeatable_mutation",
+      "evidence": null,
+      "fcorCanonicalSchema": "mode:option<enum16:LlmMode>",
       "fcorRoles": [
         {
           "field": "mode",
-          "type": "LlmMode",
-          "role": "param"
+          "role": "param",
+          "type": "Option<LlmMode>"
         }
-      ]
+      ],
+      "fcorSchema": "mode:Option<LlmMode>",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "set_llm_mode"
     },
     {
-      "tag": "set_tool_surface_override",
-      "fcorSchema": "override_json:String|persist_session:bool|prune_after_switch:bool|monty_nudge:Option<String>",
-      "fcorCanonicalSchema": "override_json:string|persist_session:bool|prune_after_switch:bool|monty_nudge:option<string>",
+      "class": "idempotent_adapter_mutation",
+      "evidence": "desired_state_generation_and_observed_digest",
+      "fcorCanonicalSchema": "mode:enum16:LlmMode",
+      "fcorRoles": [
+        {
+          "field": "mode",
+          "role": "param",
+          "type": "LlmMode"
+        }
+      ],
+      "fcorSchema": "mode:LlmMode",
+      "strategy": "durable_desired_state",
+      "tag": "set_session_llm_mode"
+    },
+    {
       "class": "nonrepeatable_mutation",
-      "strategy": "nonrepeatable_dispatch",
       "evidence": null,
+      "fcorCanonicalSchema": "override_json:string|persist_session:bool|prune_after_switch:bool|monty_nudge:option<string>",
       "fcorRoles": [
         {
           "field": "override_json",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         },
         {
           "field": "persist_session",
-          "type": "bool",
-          "role": "param"
+          "role": "param",
+          "type": "bool"
         },
         {
           "field": "prune_after_switch",
-          "type": "bool",
-          "role": "param"
+          "role": "param",
+          "type": "bool"
         },
         {
           "field": "monty_nudge",
-          "type": "Option<String>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<String>"
         }
-      ]
+      ],
+      "fcorSchema": "override_json:String|persist_session:bool|prune_after_switch:bool|monty_nudge:Option<String>",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "set_tool_surface_override"
     },
     {
-      "tag": "set_goal_settings_override",
-      "fcorSchema": "override_json:Option<String>|persist_session:bool",
-      "fcorCanonicalSchema": "override_json:option<string>|persist_session:bool",
       "class": "nonrepeatable_mutation",
-      "strategy": "nonrepeatable_dispatch",
       "evidence": null,
+      "fcorCanonicalSchema": "override_json:option<string>|persist_session:bool",
       "fcorRoles": [
         {
           "field": "override_json",
-          "type": "Option<String>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<String>"
         },
         {
           "field": "persist_session",
-          "type": "bool",
-          "role": "param"
+          "role": "param",
+          "type": "bool"
         }
-      ]
+      ],
+      "fcorSchema": "override_json:Option<String>|persist_session:bool",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "set_goal_settings_override"
     },
     {
-      "tag": "set_approval_mode",
-      "fcorSchema": "mode:ApprovalMode",
-      "fcorCanonicalSchema": "mode:enum16:ApprovalMode",
       "class": "nonrepeatable_mutation",
-      "strategy": "nonrepeatable_dispatch",
       "evidence": null,
+      "fcorCanonicalSchema": "mode:enum16:ApprovalMode",
       "fcorRoles": [
         {
           "field": "mode",
-          "type": "ApprovalMode",
-          "role": "param"
+          "role": "param",
+          "type": "ApprovalMode"
         }
-      ]
+      ],
+      "fcorSchema": "mode:ApprovalMode",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "set_approval_mode"
     },
     {
-      "tag": "set_delegation_recursion",
-      "fcorSchema": "enabled:bool|default_depth:u32",
-      "fcorCanonicalSchema": "enabled:bool|default_depth:u32",
       "class": "nonrepeatable_mutation",
-      "strategy": "nonrepeatable_dispatch",
       "evidence": null,
+      "fcorCanonicalSchema": "enabled:bool|default_depth:u32",
       "fcorRoles": [
         {
           "field": "enabled",
-          "type": "bool",
-          "role": "param"
+          "role": "param",
+          "type": "bool"
         },
         {
           "field": "default_depth",
-          "type": "u32",
-          "role": "param"
+          "role": "param",
+          "type": "u32"
         }
-      ]
+      ],
+      "fcorSchema": "enabled:bool|default_depth:u32",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "set_delegation_recursion"
     },
     {
-      "tag": "set_sandbox",
-      "fcorSchema": "mode:Option<SandboxMode>|container_network_enabled:Option<bool>",
-      "fcorCanonicalSchema": "mode:option<enum16:SandboxMode>|container_network_enabled:option<bool>",
       "class": "nonrepeatable_mutation",
-      "strategy": "nonrepeatable_dispatch",
       "evidence": null,
+      "fcorCanonicalSchema": "mode:option<enum16:SandboxMode>|container_network_enabled:option<bool>",
       "fcorRoles": [
         {
           "field": "mode",
-          "type": "Option<SandboxMode>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<SandboxMode>"
         },
         {
           "field": "container_network_enabled",
-          "type": "Option<bool>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<bool>"
         }
-      ]
+      ],
+      "fcorSchema": "mode:Option<SandboxMode>|container_network_enabled:Option<bool>",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "set_sandbox"
     },
     {
-      "tag": "set_sandbox_escalation",
-      "fcorSchema": "enabled:bool",
+      "class": "nonrepeatable_mutation",
+      "evidence": null,
       "fcorCanonicalSchema": "enabled:bool",
-      "class": "nonrepeatable_mutation",
-      "strategy": "nonrepeatable_dispatch",
-      "evidence": null,
       "fcorRoles": [
         {
           "field": "enabled",
-          "type": "bool",
-          "role": "param"
+          "role": "param",
+          "type": "bool"
         }
-      ]
+      ],
+      "fcorSchema": "enabled:bool",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "set_sandbox_escalation"
     },
     {
-      "tag": "set_preflight",
-      "fcorSchema": "enabled:Option<bool>",
+      "class": "nonrepeatable_mutation",
+      "evidence": null,
       "fcorCanonicalSchema": "enabled:option<bool>",
-      "class": "nonrepeatable_mutation",
-      "strategy": "nonrepeatable_dispatch",
-      "evidence": null,
       "fcorRoles": [
         {
           "field": "enabled",
-          "type": "Option<bool>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<bool>"
         }
-      ]
-    },
-    {
-      "tag": "set_longcache",
+      ],
       "fcorSchema": "enabled:Option<bool>",
-      "fcorCanonicalSchema": "enabled:option<bool>",
-      "class": "nonrepeatable_mutation",
       "strategy": "nonrepeatable_dispatch",
+      "tag": "set_preflight"
+    },
+    {
+      "class": "nonrepeatable_mutation",
       "evidence": null,
+      "fcorCanonicalSchema": "enabled:option<bool>",
       "fcorRoles": [
         {
           "field": "enabled",
-          "type": "Option<bool>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<bool>"
         }
-      ]
+      ],
+      "fcorSchema": "enabled:Option<bool>",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "set_longcache"
     },
     {
-      "tag": "set_redaction",
-      "fcorSchema": "scan_environment:Option<bool>|scan_dotenv:Option<bool>|scan_ssh_keys:Option<bool>",
+      "class": "nonrepeatable_mutation",
+      "evidence": null,
       "fcorCanonicalSchema": "scan_environment:option<bool>|scan_dotenv:option<bool>|scan_ssh_keys:option<bool>",
-      "class": "nonrepeatable_mutation",
-      "strategy": "nonrepeatable_dispatch",
-      "evidence": null,
       "fcorRoles": [
         {
           "field": "scan_environment",
-          "type": "Option<bool>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<bool>"
         },
         {
           "field": "scan_dotenv",
-          "type": "Option<bool>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<bool>"
         },
         {
           "field": "scan_ssh_keys",
-          "type": "Option<bool>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<bool>"
         }
-      ]
+      ],
+      "fcorSchema": "scan_environment:Option<bool>|scan_dotenv:Option<bool>|scan_ssh_keys:Option<bool>",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "set_redaction"
     },
     {
-      "tag": "set_tandem_models",
-      "fcorSchema": "models:Vec<(String,String)>",
-      "fcorCanonicalSchema": "models:list<tuple<string,string>>",
       "class": "nonrepeatable_mutation",
-      "strategy": "nonrepeatable_dispatch",
       "evidence": null,
+      "fcorCanonicalSchema": "models:list<tuple<string,string>>",
       "fcorRoles": [
         {
           "field": "models",
-          "type": "Vec<(String,String)>",
-          "role": "param"
+          "role": "param",
+          "type": "Vec<(String,String)>"
         }
-      ]
+      ],
+      "fcorSchema": "models:Vec<(String,String)>",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "set_tandem_models"
     },
     {
-      "tag": "set_caffeinate",
-      "fcorSchema": "mode:CaffeinateMode",
-      "fcorCanonicalSchema": "mode:enum16:CaffeinateMode",
       "class": "local_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "mode:enum16:CaffeinateMode",
       "fcorRoles": [
         {
           "field": "mode",
-          "type": "CaffeinateMode",
-          "role": "param"
+          "role": "param",
+          "type": "CaffeinateMode"
         }
-      ]
+      ],
+      "fcorSchema": "mode:CaffeinateMode",
+      "strategy": "none",
+      "tag": "set_caffeinate"
     },
     {
-      "tag": "cancel_schedule",
-      "fcorSchema": "job_id:String",
-      "fcorCanonicalSchema": "job_id:string",
       "class": "idempotent_adapter_mutation",
-      "strategy": "durable_dispatch_key",
       "evidence": "dispatch_key_and_generation",
+      "fcorCanonicalSchema": "job_id:string",
       "fcorRoles": [
         {
           "field": "job_id",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         }
-      ]
+      ],
+      "fcorSchema": "job_id:String",
+      "strategy": "durable_dispatch_key",
+      "tag": "cancel_schedule"
     },
     {
-      "tag": "prune",
-      "fcorSchema": "-",
-      "fcorCanonicalSchema": "-",
       "class": "nonrepeatable_mutation",
-      "strategy": "nonrepeatable_dispatch",
       "evidence": null,
-      "fcorRoles": []
-    },
-    {
-      "tag": "compact",
-      "fcorSchema": "-",
       "fcorCanonicalSchema": "-",
-      "class": "nonrepeatable_mutation",
+      "fcorRoles": [],
+      "fcorSchema": "-",
       "strategy": "nonrepeatable_dispatch",
-      "evidence": null,
-      "fcorRoles": []
+      "tag": "prune"
     },
     {
-      "tag": "pin",
-      "fcorSchema": "text:String",
+      "class": "nonrepeatable_mutation",
+      "evidence": null,
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "compact"
+    },
+    {
+      "class": "nonrepeatable_mutation",
+      "evidence": null,
       "fcorCanonicalSchema": "text:string",
-      "class": "nonrepeatable_mutation",
-      "strategy": "nonrepeatable_dispatch",
-      "evidence": null,
       "fcorRoles": [
         {
           "field": "text",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         }
-      ]
+      ],
+      "fcorSchema": "text:String",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "pin"
     },
     {
-      "tag": "store_flycockpit_credential",
-      "fcorSchema": "credential:StoredFlycockpitCredential",
-      "fcorCanonicalSchema": "credential:struct:StoredFlycockpitCredential:v1",
       "class": "local_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "credential:struct:StoredFlycockpitCredential:v1",
       "fcorRoles": [
         {
           "field": "credential",
-          "type": "StoredFlycockpitCredential",
-          "role": "param"
+          "role": "param",
+          "type": "StoredFlycockpitCredential"
         }
-      ]
+      ],
+      "fcorSchema": "credential:StoredFlycockpitCredential",
+      "strategy": "none",
+      "tag": "store_flycockpit_credential"
     },
     {
-      "tag": "clear_flycockpit_credential",
-      "fcorSchema": "-",
-      "fcorCanonicalSchema": "-",
       "class": "local_only",
-      "strategy": "none",
       "evidence": null,
-      "fcorRoles": []
-    },
-    {
-      "tag": "daemon_status",
-      "fcorSchema": "-",
       "fcorCanonicalSchema": "-",
-      "class": "read_only",
+      "fcorRoles": [],
+      "fcorSchema": "-",
       "strategy": "none",
-      "evidence": null,
-      "fcorRoles": []
+      "tag": "clear_flycockpit_credential"
     },
     {
-      "tag": "refresh_env",
-      "fcorSchema": "vars:HashMap<String,String>",
-      "fcorCanonicalSchema": "vars:map<string,string>",
-      "class": "nonrepeatable_mutation",
-      "strategy": "nonrepeatable_dispatch",
+      "class": "read_only",
       "evidence": null,
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "none",
+      "tag": "daemon_status"
+    },
+    {
+      "class": "nonrepeatable_mutation",
+      "evidence": null,
+      "fcorCanonicalSchema": "vars:map<string,string>",
       "fcorRoles": [
         {
           "field": "vars",
-          "type": "HashMap<String,String>",
-          "role": "param"
+          "role": "param",
+          "type": "HashMap<String,String>"
         }
-      ]
-    },
-    {
-      "tag": "refresh_config",
-      "fcorSchema": "-",
-      "fcorCanonicalSchema": "-",
-      "class": "nonrepeatable_mutation",
+      ],
+      "fcorSchema": "vars:HashMap<String,String>",
       "strategy": "nonrepeatable_dispatch",
-      "evidence": null,
-      "fcorRoles": []
+      "tag": "refresh_env"
     },
     {
-      "tag": "record_usage",
-      "fcorSchema": "kind:UsageKind|key:String|project_id:Option<String>",
-      "fcorCanonicalSchema": "kind:enum16:UsageKind|key:string|project_id:option<string>",
-      "class": "local_only",
-      "strategy": "none",
+      "class": "nonrepeatable_mutation",
       "evidence": null,
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "nonrepeatable_dispatch",
+      "tag": "refresh_config"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "kind:enum16:UsageKind|key:string|project_id:option<string>",
       "fcorRoles": [
         {
           "field": "kind",
-          "type": "UsageKind",
-          "role": "param"
+          "role": "param",
+          "type": "UsageKind"
         },
         {
           "field": "key",
-          "type": "String",
-          "role": "param"
+          "role": "param",
+          "type": "String"
         },
         {
           "field": "project_id",
-          "type": "Option<String>",
-          "role": "project"
+          "role": "project",
+          "type": "Option<String>"
         }
-      ]
+      ],
+      "fcorSchema": "kind:UsageKind|key:String|project_id:Option<String>",
+      "strategy": "none",
+      "tag": "record_usage"
     },
     {
-      "tag": "get_usage_counts",
-      "fcorSchema": "project_id:Option<String>",
+      "class": "local_only",
+      "evidence": null,
       "fcorCanonicalSchema": "project_id:option<string>",
-      "class": "local_only",
-      "strategy": "none",
-      "evidence": null,
       "fcorRoles": [
         {
           "field": "project_id",
-          "type": "Option<String>",
-          "role": "project"
+          "role": "project",
+          "type": "Option<String>"
         }
-      ]
+      ],
+      "fcorSchema": "project_id:Option<String>",
+      "strategy": "none",
+      "tag": "get_usage_counts"
     },
     {
-      "tag": "stats_rollup",
-      "fcorSchema": "project_id:Option<String>|range:StatsRange|by_role:bool",
-      "fcorCanonicalSchema": "project_id:option<string>|range:enum16:StatsRange|by_role:bool",
       "class": "local_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "project_id:option<string>|range:enum16:StatsRange|by_role:bool",
       "fcorRoles": [
         {
           "field": "project_id",
-          "type": "Option<String>",
-          "role": "project"
+          "role": "project",
+          "type": "Option<String>"
         },
         {
           "field": "range",
-          "type": "StatsRange",
-          "role": "param"
+          "role": "param",
+          "type": "StatsRange"
         },
         {
           "field": "by_role",
-          "type": "bool",
-          "role": "param"
+          "role": "param",
+          "type": "bool"
         }
-      ]
+      ],
+      "fcorSchema": "project_id:Option<String>|range:StatsRange|by_role:bool",
+      "strategy": "none",
+      "tag": "stats_rollup"
     },
     {
-      "tag": "guidance_estimate",
-      "fcorSchema": "project_root:String|provider:Option<String>|model:Option<String>",
-      "fcorCanonicalSchema": "project_root:string|provider:option<string>|model:option<string>",
       "class": "read_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|provider:option<string>|model:option<string>",
       "fcorRoles": [
         {
           "field": "project_root",
-          "type": "String",
-          "role": "project_root"
+          "role": "project_root",
+          "type": "String"
         },
         {
           "field": "provider",
-          "type": "Option<String>",
-          "role": "provider_model_left(model)"
+          "role": "provider_model_left(model)",
+          "type": "Option<String>"
         },
         {
           "field": "model",
-          "type": "Option<String>",
-          "role": "provider_model_right(provider)"
+          "role": "provider_model_right(provider)",
+          "type": "Option<String>"
         }
-      ]
+      ],
+      "fcorSchema": "project_root:String|provider:Option<String>|model:Option<String>",
+      "strategy": "none",
+      "tag": "guidance_estimate"
     },
     {
-      "tag": "stop_daemon",
-      "fcorSchema": "grace_secs:Option<u64>",
-      "fcorCanonicalSchema": "grace_secs:option<u64>",
       "class": "local_only",
-      "strategy": "none",
       "evidence": null,
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "none",
+      "tag": "recover_security_blocked_media"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "none",
+      "tag": "register_local_path_media"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "none",
+      "tag": "retain_https_media"
+    },
+    {
+      "class": "read_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "none",
+      "tag": "get_media_attachment_status"
+    },
+    {
+      "class": "read_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "none",
+      "tag": "get_media_attachment_preview"
+    },
+    {
+      "class": "idempotent_adapter_mutation",
+      "evidence": "domain_result_tuple",
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "domain_transaction",
+      "tag": "begin_media_upload"
+    },
+    {
+      "class": "idempotent_adapter_mutation",
+      "evidence": "domain_result_tuple",
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "domain_transaction",
+      "tag": "append_media_upload_chunk"
+    },
+    {
+      "class": "idempotent_adapter_mutation",
+      "evidence": "domain_result_tuple",
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "domain_transaction",
+      "tag": "cancel_media_upload"
+    },
+    {
+      "class": "idempotent_adapter_mutation",
+      "evidence": "domain_result_tuple",
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "domain_transaction",
+      "tag": "discard_unreferenced_media_attachment"
+    },
+    {
+      "class": "read_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "none",
+      "tag": "get_media_upload_status"
+    },
+    {
+      "class": "idempotent_adapter_mutation",
+      "evidence": "domain_result_tuple",
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "domain_transaction",
+      "tag": "finalize_media_upload"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "grace_secs:option<u64>",
       "fcorRoles": [
         {
           "field": "grace_secs",
-          "type": "Option<u64>",
-          "role": "param"
+          "role": "param",
+          "type": "Option<u64>"
         }
-      ]
-    },
-    {
-      "tag": "restart_if_idle",
-      "fcorSchema": "-",
-      "fcorCanonicalSchema": "-",
-      "class": "local_only",
+      ],
+      "fcorSchema": "grace_secs:Option<u64>",
       "strategy": "none",
-      "evidence": null,
-      "fcorRoles": []
+      "tag": "stop_daemon"
     },
     {
-      "tag": "unknown",
-      "fcorSchema": "-",
-      "fcorCanonicalSchema": "-",
-      "class": "rejected",
-      "strategy": "rejected_before_dispatch",
+      "class": "local_only",
       "evidence": null,
-      "fcorRoles": []
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "none",
+      "tag": "restart_if_idle"
+    },
+    {
+      "class": "rejected",
+      "evidence": null,
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "rejected_before_dispatch",
+      "tag": "unknown"
     }
-  ]
+  ],
+  "schemaVersion": 1
 }

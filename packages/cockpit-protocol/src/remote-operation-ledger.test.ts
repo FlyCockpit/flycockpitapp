@@ -5,7 +5,7 @@ describe("remote operation classification fixture", () => {
   it("is unique, total, and locks reviewed recovery evidence", () => {
     expect(fixture.schemaVersion).toBe(1);
     expect(fixture.rows.length).toBeGreaterThan(100);
-    expect(fixture.rows.length).toBe(123);
+    expect(fixture.rows.length).toBe(143);
     expect(new Set(fixture.rows.map((row) => row.tag)).size).toBe(fixture.rows.length);
     expect(fixture.rows.every((row) => typeof row.fcorSchema === "string")).toBe(true);
     expect(fixture.rows.every((row) => typeof row.fcorCanonicalSchema === "string")).toBe(true);

@@ -8,6 +8,7 @@ name: CLI CI
       - master
     paths:
       - "apps/cli/**"
+      - "apps/tenant-authority/**"
       - "crates/**"
       # Rust tests read the shared cross-language protocol fixtures, so a
       # change to them must trigger the Rust gate as well as the TS one.
@@ -18,6 +19,7 @@ name: CLI CI
   pull_request:
     paths:
       - "apps/cli/**"
+      - "apps/tenant-authority/**"
       - "crates/**"
       # Rust tests read the shared cross-language protocol fixtures, so a
       # change to them must trigger the Rust gate as well as the TS one.

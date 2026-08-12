@@ -8,8 +8,7 @@
 //! statement.
 
 use cockpit_proto::remote_tenant_authority_protocol::{
-    self as proto, FctaEnvelope, FctoEnvelope, FctoReasonCode, FctoResultKind,
-    TenantAuthorityOperation,
+    self as proto, FctaEnvelope, FctoEnvelope, FctoReasonCode, TenantAuthorityOperation,
 };
 
 use crate::key_provider::{SigningDomain, TenantKeyProvider};
@@ -205,22 +204,17 @@ impl ClosedHandlerTable {
             return Err(HandlerError::ProviderUnavailable);
         }
 
-        // Complete canonical evidence verification is performed by the handler
-        // implementation; here we return the closed result envelope shape.
-        // The acceptance suite verifies the closed surface and the
-        // submit-credential-insufficient property: a malicious control plane
-        // with valid mTLS obtains no statement from hashes/assertions or
-        // incomplete evidence.
-        Ok(FctoEnvelope {
-            operation: envelope.operation,
-            request_id: envelope.request_id,
-            tenant_id: envelope.tenant_id,
-            authority_id: envelope.authority_id,
-            result_kind: FctoResultKind::Error as u8,
-            reason_code: HandlerError::NotReady.reason_code() as u16,
-            statement_jws: vec![],
-            artifact: vec![],
-        })
+        // Complete canonical evidence verification (credential-registry
+        // generation, WebAuthn signatures, possession, governance/policy/quota/
+        // revocation state and exact epochs) is not yet implemented, so the
+        // closed handler fails closed: a valid submit certificate is
+        // insufficient to authorize any statement. Until per-handler evidence
+        // verification exists, no statement can be signed and dispatch returns
+        // `NotReady` rather than an authorized envelope. This is the
+        // submit-credential-insufficient property the acceptance suite pins: a
+        // malicious control plane with valid mTLS obtains no statement from
+        // hashes/assertions or incomplete evidence.
+        Err(HandlerError::NotReady)
     }
 }
 

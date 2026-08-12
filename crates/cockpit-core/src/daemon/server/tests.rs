@@ -493,10 +493,16 @@ fn pin_rpc_registration_tiers_match_spec() {
 #[tokio::test]
 async fn project_note_rpc_parity_with_direct_db_calls() {
     let ctx = test_ctx();
+    // Project-note RPCs run through the uniform `project_root` FCOR
+    // authorization, which canonicalizes the root and requires it to exist on
+    // disk. Use a real temp dir and key the direct db calls by the same string
+    // so the parity assertions hold.
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path().to_str().unwrap().to_string();
     let mut state = owner_state();
     let response = handle_request(
         Request::CreateProjectNote {
-            project_root: "/repo".into(),
+            project_root: root.clone(),
             name: "todo".into(),
         },
         &mut state,
@@ -510,7 +516,7 @@ async fn project_note_rpc_parity_with_direct_db_calls() {
     assert_eq!(note.name, "todo");
     handle_request(
         Request::SetProjectNoteContent {
-            project_root: "/repo".into(),
+            project_root: root.clone(),
             id: note.id,
             content: "body".into(),
         },
@@ -520,12 +526,12 @@ async fn project_note_rpc_parity_with_direct_db_calls() {
     .await
     .unwrap();
     assert_eq!(
-        ctx.db.list_project_notes("/repo").await.unwrap()[0].content,
+        ctx.db.list_project_notes(&root).await.unwrap()[0].content,
         "body"
     );
     let response = handle_request(
         Request::RenameProjectNote {
-            project_root: "/repo".into(),
+            project_root: root.clone(),
             id: note.id,
             name: "renamed".into(),
         },
@@ -537,7 +543,7 @@ async fn project_note_rpc_parity_with_direct_db_calls() {
     assert!(matches!(response, Response::ProjectNoteRenamed { name } if name == "renamed"));
     let response = handle_request(
         Request::ListProjectNotes {
-            project_root: "/repo".into(),
+            project_root: root.clone(),
         },
         &mut state,
         &ctx,
@@ -547,13 +553,13 @@ async fn project_note_rpc_parity_with_direct_db_calls() {
     let Response::ProjectNotes { notes } = response else {
         panic!("expected project notes")
     };
-    let direct = ctx.db.list_project_notes("/repo").await.unwrap();
+    let direct = ctx.db.list_project_notes(&root).await.unwrap();
     assert_eq!(notes.len(), direct.len());
     assert_eq!(notes[0].id, direct[0].id);
     assert_eq!(notes[0].name, direct[0].name);
     let response = handle_request(
         Request::DeleteProjectNote {
-            project_root: "/repo".into(),
+            project_root: root.clone(),
             id: note.id,
         },
         &mut state,
@@ -562,18 +568,27 @@ async fn project_note_rpc_parity_with_direct_db_calls() {
     .await
     .unwrap();
     assert!(matches!(response, Response::Ack));
-    assert!(ctx.db.list_project_notes("/repo").await.unwrap().is_empty());
+    assert!(ctx.db.list_project_notes(&root).await.unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn project_note_rejects_id_from_another_project_root() {
     let ctx = test_ctx();
-    let note = ctx.db.create_project_note("/one", "todo").await.unwrap();
+    // Both roots must exist so `project_root` FCOR authorization succeeds; the
+    // rejection under test is the handler's cross-root membership check, which
+    // surfaces as `BadRequest`.
+    let one = tempfile::tempdir().unwrap();
+    let two = tempfile::tempdir().unwrap();
+    let note = ctx
+        .db
+        .create_project_note(one.path().to_str().unwrap(), "todo")
+        .await
+        .unwrap();
     let mut state = owner_state();
 
     let error = handle_request(
         Request::SetProjectNoteContent {
-            project_root: "/two".into(),
+            project_root: two.path().to_str().unwrap().to_string(),
             id: note.id,
             content: "cross project".into(),
         },
@@ -624,11 +639,13 @@ async fn project_note_rpcs_reject_unauthorized_project_root() {
 #[tokio::test]
 async fn project_note_create_returns_resolved_name() {
     let ctx = test_ctx();
-    ctx.db.create_project_note("/repo", "todo").await.unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path().to_str().unwrap().to_string();
+    ctx.db.create_project_note(&root, "todo").await.unwrap();
     let mut state = owner_state();
     let response = handle_request(
         Request::CreateProjectNote {
-            project_root: "/repo".into(),
+            project_root: root.clone(),
             name: "todo".into(),
         },
         &mut state,
@@ -645,12 +662,14 @@ async fn project_note_create_returns_resolved_name() {
 #[tokio::test]
 async fn project_note_list_preserves_sidebar_order() {
     let ctx = test_ctx();
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path().to_str().unwrap().to_string();
     for name in ["first", "second", "third"] {
-        ctx.db.create_project_note("/repo", name).await.unwrap();
+        ctx.db.create_project_note(&root, name).await.unwrap();
     }
     let expected: Vec<_> = ctx
         .db
-        .list_project_notes("/repo")
+        .list_project_notes(&root)
         .await
         .unwrap()
         .into_iter()
@@ -659,7 +678,7 @@ async fn project_note_list_preserves_sidebar_order() {
     let mut state = owner_state();
     let response = handle_request(
         Request::ListProjectNotes {
-            project_root: "/repo".into(),
+            project_root: root.clone(),
         },
         &mut state,
         &ctx,
@@ -1455,11 +1474,20 @@ async fn remote_queue_envelope_stamps_server_operation_context_into_worker() {
         &writer_tx,
         &mut concurrent,
     ));
-    tokio::select! {
+    // Authorization now resolves session sharing through an async DB read
+    // before the worker receipt, so the request future yields at least once
+    // before it enqueues. Drive it concurrently with the worker receive rather
+    // than polling it a single time, while still proving it never *returns*
+    // before the worker receipt.
+    // `select!` polls both futures concurrently in a single await: if the
+    // request future returns before the worker receipt that is the bug we are
+    // guarding against (panic); otherwise we take the delivered work. No loop is
+    // needed — the future is driven concurrently by the select, not re-polled.
+    let work = tokio::select! {
+        biased;
         result = &mut pending => panic!("serialized queue request returned before worker receipt: {result:?}"),
-        _ = tokio::task::yield_now() => {}
-    }
-    let work = work_rx.recv().await.expect("queue work delivered");
+        work = work_rx.recv() => work.expect("queue work delivered"),
+    };
     let SessionWork::RemoveQueuedUserMessage {
         queue_item_id: delivered,
         remote_operation: Some(stamp),
@@ -7736,6 +7764,9 @@ enum ReadonlyDispatchCaseKind {
     GetInventoryBundle,
     DaemonStatus,
     GuidanceEstimate,
+    GetMediaAttachmentStatus,
+    GetMediaAttachmentPreview,
+    GetMediaUploadStatus,
 }
 
 fn readonly_dispatch_happy_cases() -> Vec<ReadonlyDispatchCase> {
@@ -7815,6 +7846,18 @@ fn readonly_dispatch_case_list() -> Vec<ReadonlyDispatchCase> {
         ReadonlyDispatchCase {
             kind: "guidance_estimate",
             case: ReadonlyDispatchCaseKind::GuidanceEstimate,
+        },
+        ReadonlyDispatchCase {
+            kind: "get_media_attachment_status",
+            case: ReadonlyDispatchCaseKind::GetMediaAttachmentStatus,
+        },
+        ReadonlyDispatchCase {
+            kind: "get_media_attachment_preview",
+            case: ReadonlyDispatchCaseKind::GetMediaAttachmentPreview,
+        },
+        ReadonlyDispatchCase {
+            kind: "get_media_upload_status",
+            case: ReadonlyDispatchCaseKind::GetMediaUploadStatus,
         },
     ]
 }
@@ -8287,6 +8330,31 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             effect_class: InMemory,
             observation: "restart decision enters drain only while daemon is idle",
         },
+        MutatingDispatchCase {
+            kind: "begin_media_upload",
+            effect_class: Durable,
+            observation: "durable upload reservation receipt is returned for a fresh draft",
+        },
+        MutatingDispatchCase {
+            kind: "append_media_upload_chunk",
+            effect_class: Durable,
+            observation: "chunk append advances the durable upload generation",
+        },
+        MutatingDispatchCase {
+            kind: "cancel_media_upload",
+            effect_class: Durable,
+            observation: "durable cancel receipt terminates an in-progress upload",
+        },
+        MutatingDispatchCase {
+            kind: "finalize_media_upload",
+            effect_class: Durable,
+            observation: "finalize materializes the durable attachment for the upload",
+        },
+        MutatingDispatchCase {
+            kind: "discard_unreferenced_media_attachment",
+            effect_class: Durable,
+            observation: "discard receipt is returned for a materialized unreferenced attachment",
+        },
     ]
 }
 
@@ -8555,10 +8623,27 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "cancel_schedule"
         | "prune"
         | "compact"
-        | "pin"
-        | "recover_security_blocked_media"
-        | "register_local_path_media"
-        | "retain_https_media" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
+        | "pin" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
+        // `recover_security_blocked_media` validates the owner-principal binding
+        // first, then short-circuits on the missing storage authority before the
+        // attach check, so a detached owner reaches the `Internal` "media storage
+        // authority is unavailable" post-auth error.
+        "recover_security_blocked_media" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
+        // `register_local_path_media` and `retain_https_media` both call
+        // `require_attached` before anything else and map the detached state to
+        // `media_attachment_unavailable`, so the owner-allowed cell surfaces
+        // `BadRequest` (retain additionally maps its missing-storage authority to
+        // the same `BadRequest`, never `Internal`).
+        "register_local_path_media" | "retain_https_media" => {
+            AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
+        }
+        "list_leak_reports" | "reveal_leak_report_secret" => AuthzAllowedOutcome::Response,
+        // These leak commands pass the owner-only gate, then the dispatch handler
+        // maps a missing leak record (existence-hiding) to `Authorization`
+        // "unauthorized" for the bogus report id used by the matrix request.
+        "begin_leak_reveal" | "mark_leak_rotated" | "delete_leak_report" => {
+            AuthzAllowedOutcome::Error(ErrorCode::Authorization)
+        }
         other => panic!("unhandled authz allowed outcome for {other}"),
     }
 }
@@ -8685,6 +8770,11 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("recover_security_blocked_media"),
         authz_owner_only("register_local_path_media"),
         authz_owner_only("retain_https_media"),
+        authz_owner_only("list_leak_reports"),
+        authz_owner_only("begin_leak_reveal"),
+        authz_owner_only("reveal_leak_report_secret"),
+        authz_owner_only("mark_leak_rotated"),
+        authz_owner_only("delete_leak_report"),
         authz_project_read("guidance_estimate"),
         authz_owner_only("stop_daemon"),
         authz_owner_only("restart_if_idle"),
@@ -9902,6 +9992,72 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             provider: None,
             model: None,
         },
+        "recover_security_blocked_media" => Request::RecoverSecurityBlockedMedia(
+            cockpit_db::media_attachments::RecoverSecurityBlockedMediaV1 {
+                schema_version: 1,
+                kind: "recoverSecurityBlockedMedia".into(),
+                local_request_id: Uuid::now_v7(),
+                // Bind to the dispatching owner so the handler's owner-principal
+                // check passes and dispatch reaches the missing storage authority.
+                owner_principal_digest: super::run_invocation::principal_digest(
+                    &ClientPrincipal::owner(),
+                ),
+                attachment_id: Uuid::now_v7(),
+                attachment_version: 1,
+                expected_availability_generation: 1,
+                affected_components: vec![],
+                borrowed_source_evidence_digest: None,
+                disposition:
+                    cockpit_db::media_attachments::MediaSecurityRecoveryDisposition::RetainBlocked,
+            },
+        ),
+        "register_local_path_media" => Request::RegisterLocalPathMedia(
+            cockpit_db::media_attachments::RegisterLocalPathMediaV1 {
+                schema_version: 1,
+                kind: "registerLocalPathMedia".into(),
+                local_operation_id: Uuid::now_v7(),
+                owner_principal_digest: "11".repeat(32),
+                session_id: Uuid::now_v7(),
+                canonical_project_digest: "22".repeat(32),
+                client_draft_id: Uuid::now_v7(),
+                requested_media_kind:
+                    cockpit_db::media_attachments::RequestedLocalPathMediaKind::Image,
+                path: "/repo/file.png".into(),
+            },
+        ),
+        "retain_https_media" => {
+            Request::RetainHttpsMedia(cockpit_db::media_attachments::RetainHttpsMediaV1 {
+                schema_version: 1,
+                kind: "retainHttpsMedia".into(),
+                local_operation_id: Uuid::now_v7(),
+                owner_principal_digest: "11".repeat(32),
+                session_id: Uuid::now_v7(),
+                canonical_project_digest: "22".repeat(32),
+                client_draft_id: Uuid::now_v7(),
+                requested_media_kind:
+                    cockpit_db::media_attachments::RequestedLocalPathMediaKind::Image,
+                url: "https://example.com/image.png".into(),
+            })
+        }
+        "list_leak_reports" => Request::ListLeakReports {
+            cursor: None,
+            limit: None,
+            project_root: None,
+            session_id: None,
+        },
+        "begin_leak_reveal" => Request::BeginLeakReveal {
+            report_id: "missing".into(),
+        },
+        "reveal_leak_report_secret" => Request::RevealLeakReportSecret {
+            capability: "authz-capability-token".into(),
+        },
+        "mark_leak_rotated" => Request::MarkLeakRotated {
+            report_id: "missing".into(),
+            rotation: proto::LeakRotationDisposition::Dismiss,
+        },
+        "delete_leak_report" => Request::DeleteLeakReport {
+            report_id: "missing".into(),
+        },
         "stop_daemon" => Request::StopDaemon {
             grace_secs: Some(1),
         },
@@ -10278,11 +10434,32 @@ impl ReadonlyDispatchCaseKind {
             }
             Self::OperationStatus => {
                 let ctx = test_ctx();
-                let operation_id = Uuid::from_u128(99);
-                let response =
-                    dispatch_matrix_request(&ctx, Request::OperationStatus { operation_id })
-                        .await
-                        .expect("operation_status happy");
+                let operation_id = Uuid::now_v7();
+                // `operation_status` is a cross-transport remote read: the handler
+                // rejects the local owner and requires an authenticated remote
+                // actor binding. Dispatch it over the socket as a bound remote
+                // principal so the happy cell reaches the DB lookup (which returns
+                // no row for a never-recorded operation).
+                let principal = ClientPrincipal::Remote(principal::RemotePrincipal {
+                    user_id: "operation-status-reader".into(),
+                    grants: Vec::new(),
+                    actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
+                        schema_version: 1,
+                        device_id: Uuid::now_v7(),
+                        device_generation: 1,
+                        logical_attachment_id: Uuid::now_v7(),
+                    }),
+                });
+                let response = dispatch_authz_request_after(
+                    &ctx,
+                    principal,
+                    Vec::new(),
+                    None,
+                    None,
+                    Request::OperationStatus { operation_id },
+                )
+                .await
+                .expect("operation_status happy");
                 let Response::RemoteOperationStatus { status } = response else {
                     panic!("expected RemoteOperationStatus, got {response:?}");
                 };
@@ -10314,11 +10491,78 @@ impl ReadonlyDispatchCaseKind {
                 assert_eq!(tokens, 0);
                 assert!(system_tokens > 0);
             }
+            Self::GetMediaUploadStatus => {
+                let materialized = fully_materialize_media().await;
+                let mut harness = materialized.harness;
+                let response = harness
+                    .upload_status(
+                        materialized.draft,
+                        materialized.upload_id,
+                        materialized.materialized_generation,
+                    )
+                    .await
+                    .expect("get_media_upload_status happy");
+                let Response::MediaUploadStatus(status) = response else {
+                    panic!("expected MediaUploadStatus, got {response:?}");
+                };
+                assert!(matches!(
+                    status.detail,
+                    cockpit_db::media_attachments::MediaUploadStateDetailV1::Materialized { .. }
+                ));
+            }
+            Self::GetMediaAttachmentStatus => {
+                let materialized = fully_materialize_media().await;
+                let mut harness = materialized.harness;
+                let response = harness
+                    .attachment_status(materialized.attachment_id)
+                    .await
+                    .expect("get_media_attachment_status happy");
+                let Response::MediaAttachmentStatus(status) = response else {
+                    panic!("expected MediaAttachmentStatus, got {response:?}");
+                };
+                assert_eq!(status.attachment_id, materialized.attachment_id);
+                assert!(matches!(
+                    status.detail,
+                    cockpit_db::media_attachments::MediaAttachmentStatusDetailV1::Ready { .. }
+                ));
+            }
+            Self::GetMediaAttachmentPreview => {
+                let materialized = fully_materialize_media().await;
+                let mut harness = materialized.harness;
+                let response = harness
+                    .attachment_preview(
+                        materialized.attachment_id,
+                        materialized.attachment_version,
+                        materialized.availability_generation,
+                        &materialized.preview,
+                    )
+                    .await
+                    .expect("get_media_attachment_preview happy");
+                let Response::MediaAttachmentPreview(preview) = response else {
+                    panic!("expected MediaAttachmentPreview, got {response:?}");
+                };
+                assert_eq!(preview.content_type, "image/png");
+                assert_eq!(preview.content_length, preview.body.len() as u64);
+                assert!(preview.body.starts_with(b"\x89PNG\r\n\x1a\n"));
+            }
         }
     }
 
     async fn assert_malformed_socket_case(self) {
         match self {
+            Self::GetMediaAttachmentStatus
+            | Self::GetMediaAttachmentPreview
+            | Self::GetMediaUploadStatus => {
+                // A detached socket connection reaches each media-read handler,
+                // whose first action is `require_attached`; the missing
+                // attachment session is mapped to a typed `BadRequest`
+                // "media_attachment_unavailable" over the real dispatch path.
+                let ctx = test_ctx();
+                let err = dispatch_matrix_request(&ctx, media_read_request(self))
+                    .await
+                    .expect_err("detached media read is rejected");
+                assert_eq!(err.code, ErrorCode::BadRequest);
+            }
             Self::FsList => {
                 let ctx = test_ctx();
                 let tmp = tempfile::tempdir().unwrap();
@@ -10847,6 +11091,13 @@ async fn assert_mutating_happy_socket_case(case: MutatingDispatchCase) {
         "terminal_ingress_begin" | "terminal_ingress_chunk" | "terminal_ingress_finish" => {
             assert_terminal_ingress_mutating_happy(case.kind).await;
         }
+        "begin_media_upload"
+        | "append_media_upload_chunk"
+        | "cancel_media_upload"
+        | "finalize_media_upload"
+        | "discard_unreferenced_media_attachment" => {
+            assert_media_mutating_happy(case.kind).await;
+        }
         other => panic!("unhandled mutating happy case {other}"),
     }
 }
@@ -11110,6 +11361,13 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
         }
         "terminal_ingress_begin" | "terminal_ingress_chunk" | "terminal_ingress_finish" => {
             assert_terminal_ingress_mutating_malformed(case.kind).await;
+        }
+        "begin_media_upload"
+        | "append_media_upload_chunk"
+        | "cancel_media_upload"
+        | "finalize_media_upload"
+        | "discard_unreferenced_media_attachment" => {
+            assert_media_mutating_malformed(case.kind).await;
         }
         other => panic!("unhandled mutating malformed case {other}"),
     }
@@ -11915,8 +12173,20 @@ async fn assert_fs_mutating_malformed(kind: &str) {
 
 #[cfg(unix)]
 async fn assert_attachment_mutating_happy(kind: &str) {
-    let ctx = test_ctx();
+    let mut ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
+    let media_tmp = tempfile::tempdir().unwrap();
+    // The durable attachment finalize path requires provisioned media storage;
+    // mirror the `media_upload_production_dispatch_cancel_finalize_and_status`
+    // reference so storage is available end-to-end over the socket-backed ctx.
+    let db = ctx.db.clone();
+    Arc::get_mut(&mut ctx).unwrap().media_storage_recovery = Some(Arc::new(
+        crate::media_storage::MediaStorageRecovery::open_or_create(
+            db,
+            &media_tmp.path().join("media"),
+        )
+        .unwrap(),
+    ));
     let (session_id, _work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
     let png = sample_png();
     let sha = sha256_hex(&png);
@@ -12104,6 +12374,572 @@ async fn assert_attachment_mutating_malformed(kind: &str) {
         }
         _ => unreachable!(),
     };
+    assert_eq!(err.code, ErrorCode::BadRequest);
+}
+
+/// Storage-backed harness for the durable media-upload dispatch commands. It
+/// provisions `media_storage_recovery`, attaches a real trusted session, and
+/// drives the production `handle_request` dispatch path exactly as the
+/// `media_upload_production_dispatch_cancel_finalize_and_status` reference test
+/// does, so the coverage cases exercise the real durable media flow.
+#[cfg(unix)]
+struct MediaUploadHarness {
+    ctx: Arc<DaemonContext>,
+    state: MutableClientState,
+    session_id: Uuid,
+    project_digest: String,
+    principal: String,
+    png: Vec<u8>,
+    reservation_digest: String,
+    _tmp: tempfile::TempDir,
+    _media_tmp: tempfile::TempDir,
+}
+
+#[cfg(unix)]
+async fn media_upload_harness() -> MediaUploadHarness {
+    use sha2::{Digest as _, Sha256};
+    let tmp = tempfile::tempdir().unwrap();
+    let media_tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let mut ctx = test_ctx();
+    let db = ctx.db.clone();
+    Arc::get_mut(&mut ctx).unwrap().media_storage_recovery = Some(Arc::new(
+        crate::media_storage::MediaStorageRecovery::open_or_create(
+            db,
+            &media_tmp.path().join("media"),
+        )
+        .unwrap(),
+    ));
+    let (state, session_id) = attached_state(&ctx, &project).await;
+    let project_digest = crate::intel::hex_lower(&Sha256::digest(
+        state
+            .attached
+            .as_ref()
+            .unwrap()
+            .handle
+            .project_root
+            .to_str()
+            .unwrap()
+            .as_bytes(),
+    ));
+    let principal = super::run_invocation::principal_digest(&state.principal);
+    let png = sample_png();
+    let policy = cockpit_config::config::media_budget::MediaResourcePolicy::default();
+    let reservation_digest =
+        crate::media_storage::media_upload_reservation_digest(&policy, png.len() as u64).unwrap();
+    MediaUploadHarness {
+        ctx,
+        state,
+        session_id,
+        project_digest,
+        principal,
+        png,
+        reservation_digest,
+        _tmp: tmp,
+        _media_tmp: media_tmp,
+    }
+}
+
+#[cfg(unix)]
+impl MediaUploadHarness {
+    async fn begin(&mut self, draft: Uuid) -> (Uuid, u64) {
+        use cockpit_db::media_attachments::{
+            LocalMediaActorRoleV1, LocalMediaMutationPayloadV1, LocalMediaMutationTransitionV1,
+            LocalMediaMutationV1, RequestedLocalPathMediaKind,
+        };
+        let begin = LocalMediaMutationV1 {
+            schema_version: 1,
+            kind: "localMediaMutation".into(),
+            local_operation_id: Uuid::now_v7(),
+            actor_principal_digest: self.principal.clone(),
+            actor_role: LocalMediaActorRoleV1::Owner,
+            payload: LocalMediaMutationPayloadV1::Begin {
+                session_id: self.session_id,
+                canonical_project_digest: self.project_digest.clone(),
+                client_draft_id: draft,
+                media_kind: RequestedLocalPathMediaKind::Image,
+                declared_total_bytes: self.png.len() as u64,
+                reservation_digest: self.reservation_digest.clone(),
+            },
+        };
+        let Response::LocalMediaMutation(receipt) =
+            handle_request(Request::BeginMediaUpload(begin), &mut self.state, &self.ctx)
+                .await
+                .expect("begin media upload")
+        else {
+            panic!("expected LocalMediaMutation from begin");
+        };
+        let generation = match receipt.transition {
+            LocalMediaMutationTransitionV1::Upload {
+                generation_after, ..
+            } => generation_after,
+            other => panic!("unexpected begin transition: {other:?}"),
+        };
+        (receipt.subject_id, generation)
+    }
+
+    fn append_request(&self, draft: Uuid, upload_id: Uuid, upload_generation: u64) -> Request {
+        use base64::Engine as _;
+        use cockpit_db::media_attachments::{
+            AppendMediaUploadChunkV1, LocalMediaActorRoleV1, LocalMediaMutationPayloadV1,
+            LocalMediaMutationV1,
+        };
+        use sha2::{Digest as _, Sha256};
+        Request::AppendMediaUploadChunk(AppendMediaUploadChunkV1 {
+            mutation: LocalMediaMutationV1 {
+                schema_version: 1,
+                kind: "localMediaMutation".into(),
+                local_operation_id: Uuid::now_v7(),
+                actor_principal_digest: self.principal.clone(),
+                actor_role: LocalMediaActorRoleV1::Owner,
+                payload: LocalMediaMutationPayloadV1::Append {
+                    session_id: self.session_id,
+                    canonical_project_digest: self.project_digest.clone(),
+                    client_draft_id: draft,
+                    upload_id,
+                    upload_generation,
+                    chunk_index: 0,
+                    chunk_length: self.png.len() as u32,
+                    chunk_sha256: crate::intel::hex_lower(&Sha256::digest(&self.png)),
+                },
+            },
+            data_base64: base64::engine::general_purpose::STANDARD.encode(&self.png),
+        })
+    }
+
+    async fn append(&mut self, draft: Uuid, upload_id: Uuid, upload_generation: u64) -> u64 {
+        use cockpit_db::media_attachments::LocalMediaMutationTransitionV1;
+        let request = self.append_request(draft, upload_id, upload_generation);
+        let Response::LocalMediaMutation(receipt) =
+            handle_request(request, &mut self.state, &self.ctx)
+                .await
+                .expect("append media upload chunk")
+        else {
+            panic!("expected LocalMediaMutation from append");
+        };
+        match receipt.transition {
+            LocalMediaMutationTransitionV1::Upload {
+                generation_after, ..
+            } => generation_after,
+            other => panic!("unexpected append transition: {other:?}"),
+        }
+    }
+
+    fn finalize_request(&self, draft: Uuid, upload_id: Uuid, upload_generation: u64) -> Request {
+        use cockpit_db::media_attachments::{
+            LocalMediaActorRoleV1, LocalMediaMutationPayloadV1, LocalMediaMutationV1,
+        };
+        use sha2::{Digest as _, Sha256};
+        Request::FinalizeMediaUpload(LocalMediaMutationV1 {
+            schema_version: 1,
+            kind: "localMediaMutation".into(),
+            local_operation_id: Uuid::now_v7(),
+            actor_principal_digest: self.principal.clone(),
+            actor_role: LocalMediaActorRoleV1::Owner,
+            payload: LocalMediaMutationPayloadV1::Finalize {
+                session_id: self.session_id,
+                canonical_project_digest: self.project_digest.clone(),
+                client_draft_id: draft,
+                upload_id,
+                upload_generation,
+                chunk_count: 1,
+                total_bytes: self.png.len() as u64,
+                object_sha256: crate::intel::hex_lower(&Sha256::digest(&self.png)),
+            },
+        })
+    }
+
+    async fn finalize(&mut self, draft: Uuid, upload_id: Uuid, upload_generation: u64) {
+        let request = self.finalize_request(draft, upload_id, upload_generation);
+        let response = handle_request(request, &mut self.state, &self.ctx)
+            .await
+            .expect("finalize media upload");
+        assert!(matches!(response, Response::LocalMediaMutation(_)));
+    }
+
+    fn cancel_request(&self, draft: Uuid, upload_id: Uuid, upload_generation: u64) -> Request {
+        use cockpit_db::media_attachments::{
+            LocalMediaActorRoleV1, LocalMediaMutationPayloadV1, LocalMediaMutationV1,
+        };
+        Request::CancelMediaUpload(LocalMediaMutationV1 {
+            schema_version: 1,
+            kind: "localMediaMutation".into(),
+            local_operation_id: Uuid::now_v7(),
+            actor_principal_digest: self.principal.clone(),
+            actor_role: LocalMediaActorRoleV1::Owner,
+            payload: LocalMediaMutationPayloadV1::Cancel {
+                session_id: self.session_id,
+                canonical_project_digest: self.project_digest.clone(),
+                client_draft_id: draft,
+                upload_id,
+                upload_generation,
+            },
+        })
+    }
+
+    async fn upload_status(
+        &mut self,
+        draft: Uuid,
+        upload_id: Uuid,
+        upload_generation: u64,
+    ) -> std::result::Result<Response, ErrorPayload> {
+        use cockpit_db::media_attachments::GetMediaUploadStatusV1;
+        handle_request(
+            Request::GetMediaUploadStatus(GetMediaUploadStatusV1 {
+                schema_version: 1,
+                kind: "getMediaUploadStatus".into(),
+                session_id: self.session_id,
+                canonical_project_digest: self.project_digest.clone(),
+                client_draft_id: draft,
+                upload_id,
+                upload_generation,
+            }),
+            &mut self.state,
+            &self.ctx,
+        )
+        .await
+    }
+
+    async fn attachment_status(
+        &mut self,
+        attachment_id: Uuid,
+    ) -> std::result::Result<Response, ErrorPayload> {
+        use cockpit_db::media_attachments::GetMediaAttachmentStatusV1;
+        handle_request(
+            Request::GetMediaAttachmentStatus(GetMediaAttachmentStatusV1 {
+                schema_version: 1,
+                kind: "getMediaAttachmentStatus".into(),
+                session_id: self.session_id,
+                canonical_project_digest: self.project_digest.clone(),
+                attachment_id,
+            }),
+            &mut self.state,
+            &self.ctx,
+        )
+        .await
+    }
+
+    async fn attachment_preview(
+        &mut self,
+        attachment_id: Uuid,
+        attachment_version: u64,
+        availability_generation: u64,
+        preview: &cockpit_db::media_attachments::MediaAttachmentPreviewSummaryV1,
+    ) -> std::result::Result<Response, ErrorPayload> {
+        use cockpit_db::media_attachments::GetMediaAttachmentPreviewV1;
+        handle_request(
+            Request::GetMediaAttachmentPreview(GetMediaAttachmentPreviewV1 {
+                schema_version: 1,
+                kind: "getMediaAttachmentPreview".into(),
+                session_id: self.session_id,
+                canonical_project_digest: self.project_digest.clone(),
+                attachment_id,
+                attachment_version,
+                availability_generation,
+                preview_generation: preview.generation,
+                preview_checksum: preview.checksum.clone(),
+            }),
+            &mut self.state,
+            &self.ctx,
+        )
+        .await
+    }
+
+    async fn discard(
+        &mut self,
+        attachment_id: Uuid,
+        attachment_version: u64,
+        availability_generation: u64,
+        reference_generation: u64,
+        origin_upload: Option<cockpit_db::media_attachments::MediaOriginUploadV1>,
+    ) -> std::result::Result<Response, ErrorPayload> {
+        use cockpit_db::media_attachments::{
+            LocalMediaActorRoleV1, LocalMediaMutationPayloadV1, LocalMediaMutationV1,
+        };
+        handle_request(
+            Request::DiscardUnreferencedMediaAttachment(LocalMediaMutationV1 {
+                schema_version: 1,
+                kind: "localMediaMutation".into(),
+                local_operation_id: Uuid::now_v7(),
+                actor_principal_digest: self.principal.clone(),
+                actor_role: LocalMediaActorRoleV1::Owner,
+                payload: LocalMediaMutationPayloadV1::Discard {
+                    session_id: self.session_id,
+                    canonical_project_digest: self.project_digest.clone(),
+                    attachment_id,
+                    attachment_version,
+                    availability_generation,
+                    reference_generation,
+                    origin_upload,
+                },
+            }),
+            &mut self.state,
+            &self.ctx,
+        )
+        .await
+    }
+}
+
+/// A fully materialized durable media attachment plus the handles needed to
+/// exercise every media read command against it.
+#[cfg(unix)]
+struct MaterializedMedia {
+    harness: MediaUploadHarness,
+    draft: Uuid,
+    upload_id: Uuid,
+    materialized_generation: u64,
+    attachment_id: Uuid,
+    attachment_version: u64,
+    availability_generation: u64,
+    reference_generation: u64,
+    preview: cockpit_db::media_attachments::MediaAttachmentPreviewSummaryV1,
+}
+
+#[cfg(unix)]
+async fn fully_materialize_media() -> MaterializedMedia {
+    use cockpit_db::media_attachments::{MediaAttachmentStatusDetailV1, MediaUploadStateDetailV1};
+    let mut harness = media_upload_harness().await;
+    let draft = Uuid::now_v7();
+    let (upload_id, begin_generation) = harness.begin(draft).await;
+    let append_generation = harness.append(draft, upload_id, begin_generation).await;
+    harness.finalize(draft, upload_id, append_generation).await;
+    let materialized_generation = append_generation + 1;
+    let Response::MediaUploadStatus(status) = harness
+        .upload_status(draft, upload_id, materialized_generation)
+        .await
+        .expect("materialized upload status")
+    else {
+        panic!("expected MediaUploadStatus");
+    };
+    let MediaUploadStateDetailV1::Materialized {
+        attachment_id,
+        attachment_version,
+    } = status.detail
+    else {
+        panic!("expected Materialized upload detail");
+    };
+    let Response::MediaAttachmentStatus(attachment_status) = harness
+        .attachment_status(attachment_id)
+        .await
+        .expect("materialized attachment status")
+    else {
+        panic!("expected MediaAttachmentStatus");
+    };
+    let availability_generation = attachment_status.availability_generation;
+    let reference_generation = attachment_status.reference_generation;
+    let MediaAttachmentStatusDetailV1::Ready {
+        preview: Some(preview),
+        ..
+    } = attachment_status.detail
+    else {
+        panic!("expected Ready attachment with preview");
+    };
+    MaterializedMedia {
+        harness,
+        draft,
+        upload_id,
+        materialized_generation,
+        attachment_id,
+        attachment_version,
+        availability_generation,
+        reference_generation,
+        preview,
+    }
+}
+
+#[cfg(unix)]
+fn media_read_request(kind: ReadonlyDispatchCaseKind) -> Request {
+    use cockpit_db::media_attachments::{
+        GetMediaAttachmentPreviewV1, GetMediaAttachmentStatusV1, GetMediaUploadStatusV1,
+    };
+    match kind {
+        ReadonlyDispatchCaseKind::GetMediaAttachmentStatus => {
+            Request::GetMediaAttachmentStatus(GetMediaAttachmentStatusV1 {
+                schema_version: 1,
+                kind: "getMediaAttachmentStatus".into(),
+                session_id: Uuid::now_v7(),
+                canonical_project_digest: "22".repeat(32),
+                attachment_id: Uuid::now_v7(),
+            })
+        }
+        ReadonlyDispatchCaseKind::GetMediaAttachmentPreview => {
+            Request::GetMediaAttachmentPreview(GetMediaAttachmentPreviewV1 {
+                schema_version: 1,
+                kind: "getMediaAttachmentPreview".into(),
+                session_id: Uuid::now_v7(),
+                canonical_project_digest: "22".repeat(32),
+                attachment_id: Uuid::now_v7(),
+                attachment_version: 1,
+                availability_generation: 1,
+                preview_generation: 1,
+                preview_checksum: "33".repeat(32),
+            })
+        }
+        ReadonlyDispatchCaseKind::GetMediaUploadStatus => {
+            Request::GetMediaUploadStatus(GetMediaUploadStatusV1 {
+                schema_version: 1,
+                kind: "getMediaUploadStatus".into(),
+                session_id: Uuid::now_v7(),
+                canonical_project_digest: "22".repeat(32),
+                client_draft_id: Uuid::now_v7(),
+                upload_id: Uuid::now_v7(),
+                upload_generation: 1,
+            })
+        }
+        other => panic!("media_read_request called with non-media kind: {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+async fn assert_media_mutating_happy(kind: &str) {
+    match kind {
+        "begin_media_upload" => {
+            let mut harness = media_upload_harness().await;
+            let draft = Uuid::now_v7();
+            // `begin` internally asserts the LocalMediaMutation receipt shape.
+            let (_upload_id, _generation) = harness.begin(draft).await;
+        }
+        "append_media_upload_chunk" => {
+            let mut harness = media_upload_harness().await;
+            let draft = Uuid::now_v7();
+            let (upload_id, begin_generation) = harness.begin(draft).await;
+            let request = harness.append_request(draft, upload_id, begin_generation);
+            let response = handle_request(request, &mut harness.state, &harness.ctx)
+                .await
+                .expect("append media upload chunk happy");
+            assert!(matches!(response, Response::LocalMediaMutation(_)));
+        }
+        "cancel_media_upload" => {
+            let mut harness = media_upload_harness().await;
+            let draft = Uuid::now_v7();
+            let (upload_id, begin_generation) = harness.begin(draft).await;
+            let generation = harness.append(draft, upload_id, begin_generation).await;
+            let request = harness.cancel_request(draft, upload_id, generation);
+            let response = handle_request(request, &mut harness.state, &harness.ctx)
+                .await
+                .expect("cancel media upload happy");
+            assert!(matches!(response, Response::LocalMediaMutation(_)));
+        }
+        "finalize_media_upload" => {
+            let mut harness = media_upload_harness().await;
+            let draft = Uuid::now_v7();
+            let (upload_id, begin_generation) = harness.begin(draft).await;
+            let generation = harness.append(draft, upload_id, begin_generation).await;
+            let request = harness.finalize_request(draft, upload_id, generation);
+            let response = handle_request(request, &mut harness.state, &harness.ctx)
+                .await
+                .expect("finalize media upload happy");
+            assert!(matches!(response, Response::LocalMediaMutation(_)));
+        }
+        "discard_unreferenced_media_attachment" => {
+            let materialized = fully_materialize_media().await;
+            let mut harness = materialized.harness;
+            let response = harness
+                .discard(
+                    materialized.attachment_id,
+                    materialized.attachment_version,
+                    materialized.availability_generation,
+                    materialized.reference_generation,
+                    // A materialized attachment carries the durable upload origin
+                    // recorded at finalize; the discard must present the exact
+                    // origin (client draft, upload id, and the post-finalize
+                    // generation) or the handler rejects it as an origin conflict.
+                    Some(cockpit_db::media_attachments::MediaOriginUploadV1 {
+                        client_draft_id: materialized.draft,
+                        upload_id: materialized.upload_id,
+                        upload_generation: materialized.materialized_generation,
+                    }),
+                )
+                .await
+                .expect("discard media attachment happy");
+            assert!(matches!(response, Response::LocalMediaMutation(_)));
+        }
+        other => panic!("unhandled media mutating happy case {other}"),
+    }
+}
+
+#[cfg(unix)]
+async fn assert_media_mutating_malformed(kind: &str) {
+    // Each media mutation calls `require_attached` up front; a detached socket
+    // connection therefore reaches the handler and is rejected with a typed
+    // `BadRequest` "media_attachment_unavailable" over the real dispatch path.
+    use cockpit_db::media_attachments::{
+        AppendMediaUploadChunkV1, LocalMediaActorRoleV1, LocalMediaMutationPayloadV1,
+        LocalMediaMutationV1, RequestedLocalPathMediaKind,
+    };
+    let ctx = test_ctx();
+    let digest = "22".repeat(32);
+    let principal = "11".repeat(32);
+    let mutation = |payload: LocalMediaMutationPayloadV1| LocalMediaMutationV1 {
+        schema_version: 1,
+        kind: "localMediaMutation".into(),
+        local_operation_id: Uuid::now_v7(),
+        actor_principal_digest: principal.clone(),
+        actor_role: LocalMediaActorRoleV1::Owner,
+        payload,
+    };
+    let request = match kind {
+        "begin_media_upload" => {
+            Request::BeginMediaUpload(mutation(LocalMediaMutationPayloadV1::Begin {
+                session_id: Uuid::now_v7(),
+                canonical_project_digest: digest.clone(),
+                client_draft_id: Uuid::now_v7(),
+                media_kind: RequestedLocalPathMediaKind::Image,
+                declared_total_bytes: 1,
+                reservation_digest: "33".repeat(32),
+            }))
+        }
+        "append_media_upload_chunk" => Request::AppendMediaUploadChunk(AppendMediaUploadChunkV1 {
+            mutation: mutation(LocalMediaMutationPayloadV1::Append {
+                session_id: Uuid::now_v7(),
+                canonical_project_digest: digest.clone(),
+                client_draft_id: Uuid::now_v7(),
+                upload_id: Uuid::now_v7(),
+                upload_generation: 1,
+                chunk_index: 0,
+                chunk_length: 1,
+                chunk_sha256: "33".repeat(32),
+            }),
+            data_base64: "AA==".into(),
+        }),
+        "cancel_media_upload" => {
+            Request::CancelMediaUpload(mutation(LocalMediaMutationPayloadV1::Cancel {
+                session_id: Uuid::now_v7(),
+                canonical_project_digest: digest.clone(),
+                client_draft_id: Uuid::now_v7(),
+                upload_id: Uuid::now_v7(),
+                upload_generation: 1,
+            }))
+        }
+        "finalize_media_upload" => {
+            Request::FinalizeMediaUpload(mutation(LocalMediaMutationPayloadV1::Finalize {
+                session_id: Uuid::now_v7(),
+                canonical_project_digest: digest.clone(),
+                client_draft_id: Uuid::now_v7(),
+                upload_id: Uuid::now_v7(),
+                upload_generation: 1,
+                chunk_count: 1,
+                total_bytes: 1,
+                object_sha256: "33".repeat(32),
+            }))
+        }
+        "discard_unreferenced_media_attachment" => Request::DiscardUnreferencedMediaAttachment(
+            mutation(LocalMediaMutationPayloadV1::Discard {
+                session_id: Uuid::now_v7(),
+                canonical_project_digest: digest.clone(),
+                attachment_id: Uuid::now_v7(),
+                attachment_version: 1,
+                availability_generation: 1,
+                reference_generation: 1,
+                origin_upload: None,
+            }),
+        ),
+        other => panic!("unhandled media mutating malformed case {other}"),
+    };
+    let err = dispatch_matrix_request(&ctx, request)
+        .await
+        .expect_err("detached media mutation is rejected");
     assert_eq!(err.code, ErrorCode::BadRequest);
 }
 
@@ -13926,6 +14762,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
         "guidance_estimate",
         "get_inventory_bundle",
         "list_assistants",
+        "list_leak_reports",
         "list_pinned_message_seqs",
         "list_pinned_messages_with_text",
         "list_scheduled_jobs",
@@ -13942,6 +14779,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
         "session_live_status",
         "stats_rollup",
         "subagent_transcript",
+        "terminal_ingress_status",
     ]);
     assert_eq!(actual, expected);
     for serialized in [
@@ -15153,6 +15991,55 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             mutating: true,
         },
         CommandMetadataCase {
+            request: Request::ListLeakReports {
+                cursor: None,
+                limit: None,
+                project_root: None,
+                session_id: None,
+            },
+            kind: "list_leak_reports",
+            session_id: None,
+            audit_path: None,
+            mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::BeginLeakReveal {
+                report_id: "report".into(),
+            },
+            kind: "begin_leak_reveal",
+            session_id: None,
+            audit_path: None,
+            mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::RevealLeakReportSecret {
+                capability: "capability".into(),
+            },
+            kind: "reveal_leak_report_secret",
+            session_id: None,
+            audit_path: None,
+            mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::MarkLeakRotated {
+                report_id: "report".into(),
+                rotation: proto::LeakRotationDisposition::Accept,
+            },
+            kind: "mark_leak_rotated",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::DeleteLeakReport {
+                report_id: "report".into(),
+            },
+            kind: "delete_leak_report",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
             request: Request::ListProjectNotes {
                 project_root: project_root.clone(),
             },
@@ -15574,6 +16461,11 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         PinnedMessageState,
         ListSealedValues,
         DeleteSealedValue,
+        ListLeakReports,
+        BeginLeakReveal,
+        RevealLeakReportSecret,
+        MarkLeakRotated,
+        DeleteLeakReport,
         ListProjectNotes,
         CreateProjectNote,
         SetProjectNoteContent,
@@ -15778,6 +16670,60 @@ async fn finish_upload_for(
     }
 }
 
+/// Stage a user-message image through the durable *admitted* attachment flow
+/// (`begin_attachment_upload_admitted` -> chunk -> `finish_attachment_upload_admitted`),
+/// which materializes the bytes in `media_storage_recovery` and returns a ref
+/// whose id is the durable attachment id consumed by the admitted
+/// `SendUserMessage` claim path. Requires `ctx.media_storage_recovery` to be
+/// provisioned and the client state to be attached.
+async fn finish_upload_admitted_for(
+    ctx: &Arc<DaemonContext>,
+    state: &mut MutableClientState,
+    png: &[u8],
+) -> proto::ImageAttachmentRef {
+    let response = begin_attachment_upload_admitted(
+        ctx,
+        state,
+        proto::IMAGE_ATTACHMENT_MIME_PNG.into(),
+        png.len(),
+        sha256_hex(png),
+        proto::AttachmentPurpose::UserMessageImage,
+    )
+    .await
+    .expect("admitted begin upload");
+    let Response::AttachmentUploadStarted { upload_id, .. } = response else {
+        panic!("unexpected admitted begin response: {response:?}");
+    };
+    let data_base64 = base64::engine::general_purpose::STANDARD.encode(png);
+    upload_attachment_chunk(state, upload_id, 0, data_base64).expect("admitted chunk");
+    match finish_attachment_upload_admitted(ctx, state, upload_id)
+        .await
+        .expect("admitted finish upload")
+    {
+        Response::AttachmentUploaded { image_ref } => image_ref,
+        other => panic!("unexpected admitted finish response: {other:?}"),
+    }
+}
+
+/// Assert a durable message-image attachment persists in `media_attachments`
+/// so it remains reusable by later submissions — the durable-flow analogue of
+/// the legacy `state.ready_attachments.contains_key` presence check.
+async fn assert_durable_attachment_persists(ctx: &Arc<DaemonContext>, attachment_id: Uuid) {
+    let count: i64 = ctx
+        .db
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM media_attachments WHERE attachment_id=?1",
+                [attachment_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+        })
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "durable message image must persist for reuse");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn terminal_client_submission_is_refused_in_fresh_worker_epoch() {
     let ctx = test_ctx();
@@ -15926,7 +16872,18 @@ fn image_submission_exact_retry_dedupes_before_reconsuming_ref() {
 }
 
 async fn image_submission_exact_retry_case() {
-    let ctx = test_ctx();
+    let mut ctx = test_ctx();
+    let media_dir = tempfile::tempdir().unwrap();
+    let db = ctx.db.clone();
+    // The admitted `SendUserMessage` image-claim path requires durable media
+    // storage; provision it so staged refs materialize and remain reusable.
+    Arc::get_mut(&mut ctx).unwrap().media_storage_recovery = Some(Arc::new(
+        crate::media_storage::MediaStorageRecovery::open_or_create(
+            db,
+            &media_dir.path().join("media"),
+        )
+        .unwrap(),
+    ));
     let project = tempfile::tempdir().unwrap();
     ctx.db
         .set_workspace_trust(
@@ -15966,7 +16923,7 @@ async fn image_submission_exact_retry_case() {
     let Response::Attached { session_id, .. } = attached else {
         panic!("expected Attached response");
     };
-    let image_ref = finish_upload_for(&mut state, &sample_png()).await;
+    let image_ref = finish_upload_admitted_for(&ctx, &mut state, &sample_png()).await;
     let client_submission_id = Uuid::new_v4();
     let request = |id, text: &str| Request::SendUserMessage {
         expected_model_state_generation: None,
@@ -15999,7 +16956,8 @@ async fn image_submission_exact_retry_case() {
         panic!("expected queued first submission");
     };
     assert_eq!(first.id, client_submission_id);
-    assert!(state.ready_attachments.contains_key(&image_ref.id));
+    // The durable message image is reusable and not consumed by the first send.
+    assert_durable_attachment_persists(&ctx, image_ref.id).await;
 
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
@@ -16063,7 +17021,7 @@ async fn image_submission_exact_retry_case() {
     // A re-upload gets a fresh ref id and therefore a different wire
     // fingerprint. It must fall through to byte-based content comparison and
     // still dedupe when the complete consumed payload is identical.
-    let reuploaded_ref = finish_upload_for(&mut state, &sample_png()).await;
+    let reuploaded_ref = finish_upload_admitted_for(&ctx, &mut state, &sample_png()).await;
     let reuploaded = handle_request(
         Request::SendUserMessage {
             expected_model_state_generation: None,
@@ -16087,7 +17045,8 @@ async fn image_submission_exact_retry_case() {
     .await
     .expect("same bytes under a fresh ref dedupe by content");
     assert!(matches!(reuploaded, Response::UserMessageQueued { .. }));
-    assert!(state.ready_attachments.contains_key(&reuploaded_ref.id));
+    // The re-uploaded bytes materialize a fresh durable attachment that persists.
+    assert_durable_attachment_persists(&ctx, reuploaded_ref.id).await;
 
     let conflict = handle_request(
         request(client_submission_id, "different payload"),
@@ -16121,11 +17080,24 @@ async fn image_submission_exact_retry_case() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ambiguous_image_submission_binds_ref_to_first_uuid() {
-    let ctx = test_ctx();
+    let mut ctx = test_ctx();
+    let media_dir = tempfile::tempdir().unwrap();
+    let db = ctx.db.clone();
+    // Production `SendUserMessage` claims image refs through the admitted durable
+    // path (`claim_message_image_refs_admitted`), which requires provisioned
+    // media storage; provision it and stage the ref durably so the claim
+    // resolves instead of failing before the worker receipt.
+    Arc::get_mut(&mut ctx).unwrap().media_storage_recovery = Some(Arc::new(
+        crate::media_storage::MediaStorageRecovery::open_or_create(
+            db,
+            &media_dir.path().join("media"),
+        )
+        .unwrap(),
+    ));
     let project = tempfile::tempdir().unwrap();
     let (mut state, _, mut work_rx) =
         attached_state_with_worker_receiver(&ctx, project.path()).await;
-    let image_ref = finish_upload_for(&mut state, &sample_png()).await;
+    let image_ref = finish_upload_admitted_for(&ctx, &mut state, &sample_png()).await;
     let first_id = Uuid::new_v4();
     let request = |id| Request::SendUserMessage {
         expected_model_state_generation: None,
@@ -16168,7 +17140,10 @@ async fn ambiguous_image_submission_binds_ref_to_first_uuid() {
     let (mut state, result) = first.await.unwrap();
     let error = result.expect_err("lost worker response is ambiguous");
     assert_eq!(error.code, ErrorCode::Internal);
-    assert!(state.ready_attachments.contains_key(&image_ref.id));
+    // Immutable durable media is never exclusively owned by an ambiguous
+    // submission, so the attachment persists and stays reusable — the
+    // durable-flow analogue of the legacy `ready_attachments` presence check.
+    assert_durable_attachment_persists(&ctx, image_ref.id).await;
 
     let competing_ctx = ctx.clone();
     let competing_request = request(Uuid::new_v4());
@@ -19215,7 +20190,14 @@ async fn in_process_broadcast_lag_emits_typed_event() {
     assert!(saw_lag, "in-process broadcast lag should emit typed event");
 }
 
-#[tokio::test(start_paused = true)]
+// Real time (no `start_paused`): this test drives `request_ok(DaemonStatus)`,
+// whose handler reads the database on a `spawn_blocking` worker. Under a paused
+// clock the runtime auto-advances virtual time to the `request()` REQUEST_TIMEOUT
+// deadline while that real-time blocking read is still in flight, firing a
+// spurious timeout before the response returns. The passing sibling
+// (`in_process_broadcast_lag_emits_typed_event`) runs on the same real-time
+// `#[tokio::test]` flavor.
+#[tokio::test]
 async fn in_process_full_event_queue_emits_lag_marker() {
     const DROPPED: usize = 7;
     let base = test_ctx();

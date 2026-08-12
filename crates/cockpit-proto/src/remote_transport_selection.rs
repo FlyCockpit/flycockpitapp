@@ -205,6 +205,8 @@ pub enum TransportDenial {
     PreferenceDisallowed,
     #[error("policy denies this transport combination")]
     PolicyDenied,
+    #[error("relay is required but TURN is unavailable")]
+    RelayRequiredTurnUnavailable,
     #[error("retry budget exhausted")]
     RetryBudgetExhausted,
     #[error("database outage denies new children")]
@@ -262,10 +264,6 @@ pub const RECOVERY_CONSECUTIVE_HEALTHY: u32 = 2;
 
 /// Draining timeout: old draining finishes within this many seconds.
 pub const DRAINING_TIMEOUT_SECS: u64 = 30;
-
-/// TURN credential renewal lead time (seconds before expiry when
-/// replacement_pending starts).
-pub const RENEWAL_LEAD_SECS: u64 = 30;
 
 /// Maximum routed-current children per logical attachment (one per kind).
 pub const MAX_ROUTED_CURRENT_CHILDREN: usize = 2;

@@ -2575,7 +2575,11 @@ mod tests {
     }
 
     #[test]
-    fn no_second_migration_file_exists() {
+    fn migration_files_on_disk_match_expected_set() {
+        // Migrations are append-only: the `.sql` files on disk must be exactly
+        // the registered set, with no orphaned or missing file. The expected
+        // list is an independent literal so a stray file (or a deletion) is
+        // caught rather than mirrored back from the `MIGRATIONS` registry.
         let migrations_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src")
             .join("db")
@@ -2587,6 +2591,13 @@ mod tests {
             .collect();
         migrations.sort();
 
-        assert_eq!(migrations, vec!["0001_initial.sql"]);
+        assert_eq!(
+            migrations,
+            vec![
+                "0001_initial.sql".to_string(),
+                "0002_goal_inference_provenance.sql".to_string(),
+                "0003_media_resource_reservation_ledger.sql".to_string(),
+            ]
+        );
     }
 }

@@ -249,6 +249,39 @@ async fn rename_and_note_errors_surface_from_async_results() {
 }
 
 #[tokio::test]
+async fn leaks_async_drain_pushes_text_and_prefixes_err() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = configured_app_async(&tmp).await;
+
+    app.async_actions.start(
+        AsyncActionKind::DaemonRpc("leaks-list"),
+        AsyncActionPolicy::AllowConcurrent,
+        async {
+            Ok(AsyncActionPayload::Text(
+                "leaks-success-marker-9f".to_string(),
+            ))
+        },
+    );
+    app.async_actions.start(
+        AsyncActionKind::DaemonRpc("leaks-rotate"),
+        AsyncActionPolicy::AllowConcurrent,
+        async { Err("leaks-err-marker-7c".to_string()) },
+    );
+
+    tokio::task::yield_now().await;
+    app.drain_async_actions();
+
+    assert!(app.history.iter().any(|entry| matches!(
+        entry,
+        HistoryEntry::Plain { line } if line == "leaks-success-marker-9f"
+    )));
+    assert!(app.history.iter().any(|entry| matches!(
+        entry,
+        HistoryEntry::Plain { line } if line == "/leaks: leaks-err-marker-7c"
+    )));
+}
+
+#[tokio::test]
 async fn stale_fork_result_is_ignored_after_context_changes() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = configured_app_async(&tmp).await;

@@ -2845,11 +2845,13 @@ fn validate_registration(request: &RegisterLocalPathMediaV1) -> Result<()> {
         request.schema_version == 1 && request.kind == "registerLocalPathMedia",
         "invalid local path registration schema or kind"
     );
+    // `session_id` is a canonical session identifier (UUIDv4), not a v7 operation
+    // id (RetainHttpsMedia at this layer imposes no v7 check on it either). Only the
+    // operation/draft ids are v7. Session validity is enforced by the session layer
+    // and the `sessions` foreign key.
     ensure!(
-        is_uuid_v7(request.local_operation_id)
-            && is_uuid_v7(request.session_id)
-            && is_uuid_v7(request.client_draft_id),
-        "local path registration ids must be UUIDv7"
+        is_uuid_v7(request.local_operation_id) && is_uuid_v7(request.client_draft_id),
+        "local path registration operation ids must be UUIDv7"
     );
     ensure!(
         request.owner_principal_digest.len() == 64

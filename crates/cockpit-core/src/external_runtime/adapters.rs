@@ -1391,10 +1391,22 @@ mod tests {
             &CancelToken::new(),
         );
         assert!(media_runtime_pair_is_compatible(&snapshot));
-        assert!(descriptors.iter().all(|desc| matches!(
-            snapshot.get(desc.id.as_str()).map(|entry| &entry.state),
-            Some(HealthState::Available { version_evidence: Some(major), .. }) if major == "7"
-        )));
+        // `version_evidence` holds the full sanitized probe line (e.g.
+        // "ffmpeg version 7.1 Copyright FFmpeg"); the release major is derived
+        // from it exactly as `media_runtime_pair_is_compatible` does.
+        assert!(descriptors.iter().all(|desc| {
+            let Some(HealthState::Available {
+                version_evidence: Some(evidence),
+                ..
+            }) = snapshot.get(desc.id.as_str()).map(|entry| &entry.state)
+            else {
+                return false;
+            };
+            evidence
+                .split(|character: char| !character.is_ascii_digit())
+                .find(|part| !part.is_empty())
+                == Some("7")
+        }));
 
         let failed_executor = RecordingProbeExecutor::new().with_resolve("ffmpeg", "/tools/ffmpeg");
         failed_executor.set_handler(|_, _| crate::external_runtime::ProbeCommandResult {
@@ -1463,6 +1475,8 @@ mod tests {
                 ID_ACCEL_FD,
                 ID_ACCEL_GSED,
                 ID_JQ_EXTERNAL,
+                ID_MEDIA_FFMPEG,
+                ID_MEDIA_FFPROBE,
             ]
         );
 

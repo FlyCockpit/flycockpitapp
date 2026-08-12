@@ -1251,8 +1251,8 @@ async fn shadow_killswitch_restores_sync() {
         compact_shadow: false,
         ..ContextConfig::default()
     };
-    install_test_providers(&mut driver, CacheMode::None, cfg, 100);
-    record_test_context_tokens(&driver, 55).await;
+    install_test_providers(&mut driver, CacheMode::None, cfg, 10_000);
+    record_test_context_tokens(&driver, 5_500).await;
     assert!(!driver.maybe_shadow_brief(&tx).await);
     driver.do_compact(&tx).await;
     drop(tx);

@@ -270,6 +270,15 @@ fn remote_turn_socket_provider_generation_races() {
     assert!(provider.has_pending());
     assert!(!provider.has_draining());
 
+    // The replacement allocation enqueues an `AllocatedPending` event; drain it
+    // so the FIFO event queue's next entry is the `CutoverReady` emitted by
+    // `prepare_cutover` below.
+    let pending_event = provider.poll_event().unwrap();
+    assert!(matches!(
+        pending_event,
+        LifecycleEvent::AllocatedPending { generation: 2, .. }
+    ));
+
     // Pending and draining cannot coexist — we only have pending.
     // A second noncurrent would fail.
     assert_eq!(
@@ -390,12 +399,18 @@ fn remote_turn_socket_provider_bounds_byte_capacity() {
     provider.allocate(&entry, Duration::from_secs(600)).unwrap();
     let _ = provider.poll_event();
 
-    // Fill the queue to the byte capacity (4 MiB) with large datagrams.
-    let big = vec![0u8; 1024 * 1024]; // 1 MiB
-    for _ in 0..4 {
+    // Fill the queue to the byte capacity (4 MiB) with maximum-size datagrams.
+    // Each datagram is 64 KiB (the per-datagram cap), so it takes 64 of them to
+    // reach the 4 MiB byte capacity while staying well under the 256-datagram
+    // count cap — isolating the byte cap as the overflow trigger. (1 MiB
+    // datagrams would each be rejected as DatagramTooLarge before ever queuing.)
+    let big = vec![0u8; MAX_DATAGRAM_BYTES]; // 64 KiB
+    let fill = QUEUE_CAPACITY_BYTES / MAX_DATAGRAM_BYTES; // 64 datagrams == 4 MiB
+    assert!(fill < QUEUE_CAPACITY_DATAGRAMS);
+    for _ in 0..fill {
         provider.send(big.clone()).unwrap();
     }
-    // Next 1 MiB datagram overflows the byte cap.
+    // The next datagram exceeds the byte cap (not the datagram-count cap).
     assert_eq!(provider.send(big), Err(SendError::QueueOverflow));
 }
 

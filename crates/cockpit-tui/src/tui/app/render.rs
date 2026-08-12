@@ -2358,6 +2358,7 @@ impl App {
             tool_result_scroll_regions,
             reasoning_scroll_region,
             pin_region,
+            metric_region: _,
         } = rendered;
         let is_box = matches!(entry, HistoryEntry::ToolBox { .. });
         let diff_path = match entry {
@@ -5574,6 +5575,8 @@ mod render_history_spacing_tests {
             reasoning_offset: 0,
             think_duration: None,
             seq: None,
+            performance: None,
+            performance_expanded: false,
         }
     }
 
@@ -6753,6 +6756,7 @@ mod render_history_spacing_tests {
             tag_partial: String::new(),
             seq: None,
             strip_think: true,
+            response_performance: None,
         });
 
         render_history_no_selection(&mut app, 80, 12);
@@ -7156,6 +7160,7 @@ mod render_history_spacing_tests {
             tag_partial: String::new(),
             seq: None,
             strip_think: true,
+            response_performance: None,
         });
 
         reset_markdown_counters();
@@ -7189,6 +7194,7 @@ mod render_history_spacing_tests {
             tag_partial: String::new(),
             seq: None,
             strip_think: true,
+            response_performance: None,
         }
     }
 
@@ -7382,6 +7388,7 @@ mod render_history_spacing_tests {
                 tag_partial: String::new(),
                 seq: None,
                 strip_think: true,
+                response_performance: None,
             };
             let mut state = PendingRenderState::default();
             for chunk in case.as_bytes().chunks(7) {
@@ -7406,6 +7413,7 @@ mod render_history_spacing_tests {
             tag_partial: String::new(),
             seq: None,
             strip_think: true,
+            response_performance: None,
         };
         let mut state = PendingRenderState::default();
         let mut incremental_bytes = 0usize;
@@ -7471,6 +7479,7 @@ mod render_history_spacing_tests {
             tag_partial: String::new(),
             seq: None,
             strip_think: true,
+            response_performance: None,
         };
         let doc = (0..400)
             .map(|idx| format!("paragraph {idx} has **bold** text and `code`\n\n"))
@@ -8774,6 +8783,7 @@ mod render_history_spacing_tests {
             tag_partial: String::new(),
             seq: None,
             strip_think: false,
+            response_performance: None,
         });
 
         reset_count_call_count();
@@ -9714,6 +9724,7 @@ mod render_history_spacing_tests {
             tag_partial: String::new(),
             seq: None,
             strip_think: true,
+            response_performance: None,
         });
         let after = buffer_rows(&render_history_buffer(&mut app, 24, 4), 24, 4)[0].clone();
 

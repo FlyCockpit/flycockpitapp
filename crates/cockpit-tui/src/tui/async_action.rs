@@ -1463,11 +1463,14 @@ mod tests {
         let owner = AsyncActionCancellation::default();
         owner.own_export_temp(partial.clone());
         assert!(owner.schedule_export_temp_cleanup_retry());
+        // The retry is serviced by the background reaper OS thread; give it
+        // real wall-clock time to unlink + fsync rather than busy-yielding
+        // within this task (which starves the reaper of observable progress).
         for _ in 0..100 {
             if !partial.exists() {
                 return;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("independent export cleanup retry left an orphan");
     }
@@ -1481,11 +1484,17 @@ mod tests {
         owner.own_export_temp(partial.clone());
         drop(owner);
 
+        // `drop` enqueues the reap into the background reaper channel
+        // synchronously, before this task awaits anything (that is the
+        // "before any await" contract). Observing the unlink, however,
+        // requires giving the reaper OS thread real wall-clock time to
+        // service the queued path — busy-yielding within this task starves
+        // the reaper of observable progress (see the sibling retry test).
         for _ in 0..100 {
             if !partial.exists() {
                 return;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("dropping cleanup ownership stranded a partial");
     }

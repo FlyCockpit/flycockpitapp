@@ -16,6 +16,7 @@
 #![allow(clippy::needless_pass_by_value)]
 
 use cockpit_proto::remote_tenant_authority_protocol as proto;
+use tenant_authority::key_provider::TenantKeyProvider;
 use tenant_authority::{
     UnsupportedPlatform, config, handlers, identity_status, key_provider, mtls, policy_reducer,
     routes, service,
@@ -469,7 +470,7 @@ fn tenant_authority_service_identity_status_contract() {
         subject_state_generation: 0,
         recorded_at: 1_000,
     };
-    store.enroll(row).unwrap();
+    store.enroll(row.clone()).unwrap();
 
     // Second active rejected.
     assert!(
@@ -668,7 +669,7 @@ fn tenant_authority_fixed_preparation_and_identity_rotation() {
         subject_state_generation: 0,
         recorded_at: 1_000,
     };
-    store.enroll(row).unwrap();
+    store.enroll(row.clone()).unwrap();
 
     // Rotate: old becomes superseded, new becomes active.
     let next = identity_status::IdentityStatusRecord {

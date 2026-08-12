@@ -5269,6 +5269,11 @@ mod paste_routing_tests {
     async fn long_text_paste_inserts_pending_placeholder_then_async_count_updates() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = input_ready_app(&tmp);
+        // Load the cl100k singleton up front so the background token-count
+        // task measured below reflects the count itself, not the one-time
+        // tokenizer initialization latency (which can exceed the drain
+        // budget on a busy debug test host).
+        cockpit_core::tokens::warm_cl100k();
         let pasted = long_paste("alpha");
 
         app.handle_paste(pasted.clone());

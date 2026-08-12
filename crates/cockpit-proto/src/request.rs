@@ -1508,7 +1508,7 @@ macro_rules! command {
             (Request::PinnedMessageState { session_id }, "pinned_message_state", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::ListSealedValues { session_id }, "list_sealed_values", owner_only, field(session_id), false, local_only, none, concurrent, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::DeleteSealedValue { session_id, value_id }, "delete_sealed_value", owner_only, field(session_id), true, local_only, none, serialized, none, "session_id:Uuid|value_id:String", [session_id: Uuid => session, value_id: String => param]);
-            (Request::ListLeakReports { cursor, limit, project_root, session_id }, "list_leak_reports", owner_only, none, false, local_only, none, concurrent, none, "cursor:Option<String>|limit:Option<u32>|project_root:Option<String>|session_id:Option<Uuid>", [cursor: Option<String> => param, limit: Option<u32> => param, project_root: Option<String> => project_root, session_id: Option<Uuid> => param]);
+            (Request::ListLeakReports { cursor, limit, project_root, session_id }, "list_leak_reports", owner_only, none, false, local_only, none, concurrent, none, "cursor:Option<String>|limit:Option<u32>|project_root:Option<String>|session_id:Option<Uuid>", [cursor: Option<String> => param, limit: Option<u32> => param, project_root: Option<String> => project_root_effective, session_id: Option<Uuid> => param]);
             (Request::BeginLeakReveal { report_id }, "begin_leak_reveal", owner_only, none, false, local_only, none, serialized, none, "report_id:String", [report_id: String => param]);
             (Request::RevealLeakReportSecret { capability }, "reveal_leak_report_secret", owner_only, none, false, local_only, none, serialized, none, "capability:String", [capability: String => param]);
             (Request::MarkLeakRotated { report_id, rotation }, "mark_leak_rotated", owner_only, none, true, local_only, none, serialized, none, "report_id:String|rotation:LeakRotationDisposition", [report_id: String => param, rotation: LeakRotationDisposition => param]);
@@ -1612,12 +1612,12 @@ macro_rules! command {
             (Request::RetainHttpsMedia(..), "retain_https_media", owner_only, none, true, local_only, none, serialized, none, "-", []);
             (Request::GetMediaAttachmentStatus(..), "get_media_attachment_status", public_read, none, false, read_only, none, serialized, none, "-", []);
             (Request::GetMediaAttachmentPreview(..), "get_media_attachment_preview", public_read, none, false, read_only, none, serialized, none, "-", []);
-            (Request::BeginMediaUpload(..), "begin_media_upload", public_read, none, true, idempotent_adapter_mutation, none, serialized, none, "-", []);
-            (Request::AppendMediaUploadChunk(..), "append_media_upload_chunk", public_read, none, true, idempotent_adapter_mutation, none, serialized, none, "-", []);
-            (Request::CancelMediaUpload(..), "cancel_media_upload", public_read, none, true, idempotent_adapter_mutation, none, serialized, none, "-", []);
-            (Request::DiscardUnreferencedMediaAttachment(..), "discard_unreferenced_media_attachment", public_read, none, true, idempotent_adapter_mutation, none, serialized, none, "-", []);
+            (Request::BeginMediaUpload(..), "begin_media_upload", public_read, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "-", []);
+            (Request::AppendMediaUploadChunk(..), "append_media_upload_chunk", public_read, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "-", []);
+            (Request::CancelMediaUpload(..), "cancel_media_upload", public_read, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "-", []);
+            (Request::DiscardUnreferencedMediaAttachment(..), "discard_unreferenced_media_attachment", public_read, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "-", []);
             (Request::GetMediaUploadStatus(..), "get_media_upload_status", public_read, none, false, read_only, none, serialized, none, "-", []);
-            (Request::FinalizeMediaUpload(..), "finalize_media_upload", public_read, none, true, idempotent_adapter_mutation, none, serialized, none, "-", []);
+            (Request::FinalizeMediaUpload(..), "finalize_media_upload", public_read, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "-", []);
             (Request::StopDaemon { grace_secs }, "stop_daemon", owner_only, none, true, local_only, none, serialized, none, "grace_secs:Option<u64>", [grace_secs: Option<u64> => param]);
             (Request::RestartIfIdle, "restart_if_idle", owner_only, none, true, local_only, none, serialized, none, "-", []);
             (Request::Unknown, "unknown", owner_only, none, false, rejected, rejected_before_dispatch, serialized, none, "-", []);
@@ -1908,6 +1908,7 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
         "Option<Uuid>" => "option<uuid>",
         "Option<bool>" => "option<bool>",
         "Option<i64>" => "option<i64>",
+        "Option<u32>" => "option<u32>",
         "Option<u64>" => "option<u64>",
         "Vec<Uuid>" => "list<uuid>",
         "Vec<(String,String)>" => "list<tuple<string,string>>",
@@ -1933,12 +1934,20 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
         | "EnvDriftPolicy"
         | "ExportSessionKind"
         | "GoalDisposition"
+        | "LeakRotationDisposition"
         | "LlmMode"
         | "LspControlAction"
         | "UsageKind"
         | "WorkspaceTrustMode"
         | "StatsRange" => "enum16",
         "ResolveResponse" | "ScheduledJobCreate" | "StoredFlycockpitCredential" => "struct:v1",
+        // Fully-path-qualified struct types used by some command fcor schemas map to
+        // their short canonical `struct:<Name>:v1` form (crate paths never leak into the
+        // cross-language canonical identifier).
+        "crate::terminal::TerminalBinding" => "struct:TerminalBinding:v1",
+        "crate::terminal::TerminalIngressMetadata" => "struct:TerminalIngressMetadata:v1",
+        "crate::remote_transport::bulk::RemoteBulkTransferRef" => "struct:RemoteBulkTransferRef:v1",
+        "crate::remote_protocol_id::RemoteTransferId" => "struct:RemoteTransferId:v1",
         "crate::remote_protocol_id::RemoteTransferId" => "struct:RemoteTransferId:v1",
         "crate::remote_transport::bulk::RemoteBulkTransferRef" => "struct:RemoteBulkTransferRef:v1",
         _ => return None,
@@ -2202,9 +2211,11 @@ mod tests {
             .map(|variant| {
                 let schema = match variant.fields {
                     syn::Fields::Unit => "-".to_owned(),
-                    syn::Fields::Unnamed(_) => {
-                        panic!("Request tuple variants are unsupported: {}", variant.ident)
-                    }
+                    // Newtype variants wrap an opaque versioned payload whose
+                    // fields live in `cockpit-db` and are FCOR-audited there.
+                    // At the proto level they are opaque, matching the "-"
+                    // schema the command table declares for them.
+                    syn::Fields::Unnamed(_) => "-".to_owned(),
                     syn::Fields::Named(fields) => fields
                         .named
                         .into_iter()
@@ -2233,8 +2244,11 @@ mod tests {
         let mut variants = std::collections::BTreeSet::new();
         let mut tags = std::collections::BTreeSet::new();
         for (pattern, tag, schema, typed_fields) in rows {
+            // Newtype/unit variants are FCOR-opaque (schema "-") and their
+            // patterns legitimately use `(..)`; only named-field patterns can
+            // conceal auditable fields behind `..`.
             assert!(
-                !pattern.contains(".."),
+                schema == "-" || !pattern.contains(".."),
                 "FCOR pattern conceals fields: {pattern}"
             );
             let variant = pattern
@@ -2335,7 +2349,11 @@ mod tests {
                 "evidence": remote_evidence_json!($($recovery_evidence)?),
                 "fcorSchema": $fcor_schema,
                 "fcorCanonicalSchema": canonical_remote_operation_fcor_schema_for_tag($tag)
-                    .expect("registered canonical FCOR schema"),
+                    .unwrap_or_else(|| panic!(
+                        "no registered canonical FCOR schema for tag {} (source schema {:?})",
+                        $tag,
+                        remote_operation_fcor_schema_for_tag($tag)
+                    )),
                 "fcorRoles": [$({
                     "field": stringify!($fcor_field),
                     "type": stringify!($fcor_type).replace(' ', "").replace("$crate", "crate"),
@@ -2405,14 +2423,29 @@ mod tests {
             None
         );
 
+        let rows = serde_json::Value::Array(crate::command!(remote_operation_fixture_rows));
+        // Golden-update path (parity with the other cross-language fixtures): regenerate
+        // the shared classification fixture with `COCKPIT_UPDATE_GOLDEN=1`.
+        if std::env::var("COCKPIT_UPDATE_GOLDEN").is_ok() {
+            let out = serde_json::json!({ "schemaVersion": 1, "rows": rows });
+            let path = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../packages/cockpit-protocol/fixtures/remote-operation-classification-v1.json"
+            );
+            std::fs::write(
+                path,
+                format!("{}\n", serde_json::to_string_pretty(&out).unwrap()),
+            )
+            .unwrap();
+            return;
+        }
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../../packages/cockpit-protocol/fixtures/remote-operation-classification-v1.json"
         ))
         .unwrap();
         assert_eq!(fixture["schemaVersion"], 1);
         assert_eq!(
-            fixture["rows"],
-            serde_json::Value::Array(crate::command!(remote_operation_fixture_rows)),
+            fixture["rows"], rows,
             "the shared Rust/TypeScript classification fixture must match every command column exactly"
         );
     }

@@ -3438,8 +3438,12 @@ mod tests {
             );
         }
 
-        // A `0002_*.sql` would raise the expected version past one.
-        assert_eq!(crate::db::EXPECTED_SCHEMA_VERSION, 1);
+        // The external-journal schema lives entirely in `0001_initial.sql`;
+        // later migrations (`0002_goal_inference_provenance`,
+        // `0003_media_resource_reservation_ledger`) add unrelated tables. Three
+        // migration files ship in this build, so the expected schema version is
+        // three. Adding a fourth migration must update this literal.
+        assert_eq!(crate::db::EXPECTED_SCHEMA_VERSION, 3);
 
         let db = Db::open_in_memory().unwrap();
         let tables = db
@@ -3741,14 +3745,30 @@ mod tests {
         }
     }
 
+    /// The external-journal schema is defined only in `0001_initial.sql`. Later
+    /// append-only migrations may *reference* external-journal objects (e.g. a
+    /// foreign key), but none may `CREATE` external-journal tables — the whole
+    /// journal schema stays squashed into the initial migration.
     #[test]
-    fn external_journal_schema_squashed_has_no_0002_migration() {
+    fn external_journal_tables_are_defined_only_in_0001_initial() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/db/migrations");
-        let names: Vec<String> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(names, vec!["0001_initial.sql".to_string()]);
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let sql = std::fs::read_to_string(entry.path()).unwrap();
+            let defines_journal = sql.contains("CREATE TABLE external_journal");
+            if name == "0001_initial.sql" {
+                assert!(
+                    defines_journal,
+                    "0001_initial.sql must define the external-journal schema"
+                );
+            } else {
+                assert!(
+                    !defines_journal,
+                    "{name} must not create external-journal tables"
+                );
+            }
+        }
     }
 
     // ---- criterion 6: fault convergence without blind resubmission --------

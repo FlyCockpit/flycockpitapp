@@ -419,7 +419,10 @@ fn validate_item_text(s: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// The decoded whisper-1 verbose_json response.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Cannot derive `Eq`: it transitively holds float-bearing `WhisperSegment`
+/// values (via `segments`), so only `PartialEq` is available.
+#[derive(Debug, Clone, PartialEq)]
 pub struct WhisperVerboseResponse {
     pub task: String,
     pub language: String,

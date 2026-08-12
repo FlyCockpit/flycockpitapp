@@ -824,24 +824,48 @@ fn hex_lower(bytes: &[u8]) -> String {
     s
 }
 
-/// Return the tool description for one of the four canonical
-/// image-generation agent tools. Descriptions instruct discovery first
-/// and accurately explain exact/nearest/provider-default dimensions,
-/// samples/caps, reference egress, partial failure, cancellation, and
-/// no substitution.
+/// Return the terse (Normal/Frontier) tool description for one of the four
+/// canonical image-generation agent tools. Each stays within the terse
+/// description budget and instructs discovery first; the fuller, more cautious
+/// account of exact/nearest/provider-default dimensions, samples/caps,
+/// reference egress, partial failure, cancellation, and no substitution lives
+/// in [`image_generation_tool_defensive_description`].
 pub fn image_generation_tool_description(name: &str) -> Option<&'static str> {
     Some(match name {
         "list_image_generation_targets" => {
-            "List enabled image-generation targets with safe capability, health, freshness, and cost projections. Call this first before generate_image. Returns no secrets, headers, raw workflow, disabled targets, grants, or authority."
+            "List enabled image-generation targets with capability, health, freshness, and cost projections. Call this first before generate_image. Returns no secrets, workflow, disabled targets, or authority."
         }
         "generate_image" => {
-            "Generate images from a prompt with optional per-target overrides, shared dimensions, references (attachment_id or daemon-local local_path), and required output directory/base_stem. Omitted targets means the configured default with one sample. Raw URLs, provider JSON, workflow data, duplicate targets, and unknown fields are rejected. Dimensions resolve to exact, nearest supported, or provider default. Partial failure keeps successful slots published; cancellation is idempotent; no mid-job substitution."
+            "Submit an image-generation job from a prompt with per-target overrides, shared dimensions, and references. Partial failure keeps slots; cancellation is idempotent; no mid-job substitution."
         }
         "get_image_generation_job" => {
             "Return session-authorized durable status and safe result metadata for an image-generation job. Never reveals another session's prompt, references, cost, paths, destinations, or artifacts."
         }
         "cancel_image_generation_job" => {
             "Request idempotent cancellation for an image-generation job the current session may control. Successful slots remain published on partial failure."
+        }
+        _ => return None,
+    })
+}
+
+/// Return the verbose Defensive-mode description for one of the four canonical
+/// image-generation agent tools. Each is a longer, more cautious form of the
+/// terse [`image_generation_tool_description`]: it adds explicit
+/// when-to-use / when-not-to-use steering and spells out the read-only,
+/// session-scoped, authority-bounded guarantees without changing the semantics.
+pub fn image_generation_tool_defensive_description(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "list_image_generation_targets" => {
+            "List the enabled image-generation targets with their safe capability, health, freshness, and cost projections. Call this first, before generate_image, so you choose a target_id that exists and is healthy. It is strictly read-only discovery and never grants generation authority; it returns no secrets, headers, raw workflow, disabled targets, or credentials. Omitting a target later uses the configured default with one sample."
+        }
+        "generate_image" => {
+            "Submit an image-generation job from a prompt, with optional per-target overrides, shared dimensions, references (attachment_id or daemon-local local_path), and a required output directory and base_stem. Call list_image_generation_targets first to pick a target_id; omitting targets uses the configured default with one sample. Raw URLs, provider JSON, workflow data, duplicate targets, and unknown fields are rejected. Dimensions resolve to exact, nearest supported, or provider default. Partial failure keeps successful slots published, cancellation is idempotent, and there is never a mid-job substitution."
+        }
+        "get_image_generation_job" => {
+            "Return the durable status and safe result metadata for one image-generation job the current session is authorized to see. Use it to poll a job you submitted until it finishes. It is read-only and session-scoped: it never reveals another session's prompt, references, cost projections, filesystem paths, destinations, or artifacts, even if a job id leaks, and it grants no control over the job."
+        }
+        "cancel_image_generation_job" => {
+            "Request cancellation of one image-generation job the current session is allowed to control. Use it to stop a job you no longer need. Cancellation is idempotent, so requesting it again has no additional effect, and only jobs this session owns can be cancelled; already successful slots stay published, and there is no hidden retry or target substitution afterward."
         }
         _ => return None,
     })
@@ -867,7 +891,7 @@ impl Tool for ListImageGenerationTargetsTool {
     }
 
     fn defensive_description(&self) -> Option<String> {
-        Some(image_generation_tool_description(self.name())?.to_string())
+        Some(image_generation_tool_defensive_description(self.name())?.to_string())
     }
 
     fn effect(&self) -> ToolEffect {
@@ -920,7 +944,7 @@ impl Tool for GenerateImageTool {
     }
 
     fn defensive_description(&self) -> Option<String> {
-        Some(image_generation_tool_description(self.name())?.to_string())
+        Some(image_generation_tool_defensive_description(self.name())?.to_string())
     }
 
     fn effect(&self) -> ToolEffect {
@@ -989,7 +1013,7 @@ impl Tool for GetImageGenerationJobTool {
     }
 
     fn defensive_description(&self) -> Option<String> {
-        Some(image_generation_tool_description(self.name())?.to_string())
+        Some(image_generation_tool_defensive_description(self.name())?.to_string())
     }
 
     fn effect(&self) -> ToolEffect {
@@ -1039,7 +1063,7 @@ impl Tool for CancelImageGenerationJobTool {
     }
 
     fn defensive_description(&self) -> Option<String> {
-        Some(image_generation_tool_description(self.name())?.to_string())
+        Some(image_generation_tool_defensive_description(self.name())?.to_string())
     }
 
     fn effect(&self) -> ToolEffect {
@@ -1119,13 +1143,19 @@ mod tests {
         }
     }
 
+    /// A single default grant with a `'static` lifetime so `base_inputs` can
+    /// hand out a `&'a [ImageGenerationGrantTuple]` that outlives each test's
+    /// borrowed `AuthorizationInputs`.
+    static BASE_GRANTS: std::sync::LazyLock<[ImageGenerationGrantTuple; 1]> =
+        std::sync::LazyLock::new(|| [base_grant()]);
+
     fn base_inputs<'a>(projection: &'a ImageGenerationPlanProjection) -> AuthorizationInputs<'a> {
         AuthorizationInputs {
             fanout: 1,
             total_outputs: 1,
             cost_maximum: Some(100_000),
             reference_egress_unmatched: false,
-            grants: &[base_grant()],
+            grants: &BASE_GRANTS[..],
             spend_request: SpendPolicyChoice::Finite {
                 usd_micros: 1_000_000,
             },
@@ -1162,7 +1192,7 @@ mod tests {
     fn generate_image_schema_requires_prompt_directory_base_stem() {
         let schema = image_generation_tool_schema("generate_image");
         let required = schema["required"].as_array().unwrap();
-        let required_names: Vec<&str> = required.iter().map(Value::as_str).unwrap().collect();
+        let required_names: Vec<&str> = required.iter().map(|v| v.as_str().unwrap()).collect();
         assert!(required_names.contains(&"prompt"));
         assert!(required_names.contains(&"directory"));
         assert!(required_names.contains(&"base_stem"));
@@ -1473,7 +1503,8 @@ mod tests {
         // The enum only has Once, Session, Project.
         let scopes = ["once", "session", "project"];
         for scope in scopes {
-            let _: ReferenceEgressScope = serde_json::from_str(scope)
+            let quoted = format!("\"{scope}\"");
+            let _: ReferenceEgressScope = serde_json::from_str(&quoted)
                 .unwrap_or_else(|_| panic!("`{scope}` must deserialize as a ReferenceEgressScope"));
         }
         // A "global" variant must not deserialize.
@@ -1617,7 +1648,8 @@ mod tests {
         let mut grant = base_grant();
         grant.maximum_known_cost_usd_micros = None;
         grant.unknown_cost_allowed = true;
-        inputs.grants = &[grant];
+        let grants = [grant];
+        inputs.grants = &grants;
         let auth = authorize_generate_image(&inputs);
         assert!(
             auth.authorized,
@@ -1638,7 +1670,8 @@ mod tests {
         let mut grant = base_grant();
         grant.maximum_known_cost_usd_micros = None;
         grant.unknown_cost_allowed = true;
-        inputs.grants = &[grant];
+        let grants = [grant];
+        inputs.grants = &grants;
         let auth = authorize_generate_image(&inputs);
         assert!(!auth.authorized);
         assert!(auth.reasons.iter().any(|r| r.contains("Unlimited")));

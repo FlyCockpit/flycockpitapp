@@ -207,9 +207,11 @@ mod request_tests {
         assert!(validate_prompt(&ok).is_ok());
         let too_long = "a".repeat(PROMPT_MAX_SCALARS + 1);
         assert!(validate_prompt(&too_long).is_err());
-        let ok_bytes = "é".repeat(PROMPT_MAX_UTF8_BYTES / 2);
+        // "𝕏" (U+1D54F) is 4 UTF-8 bytes / 1 scalar; the byte cap is only
+        // reachable within the scalar cap using maximal-width scalars.
+        let ok_bytes = "𝕏".repeat(PROMPT_MAX_UTF8_BYTES / 4);
         assert!(validate_prompt(&ok_bytes).is_ok());
-        let too_many_bytes = "é".repeat(PROMPT_MAX_UTF8_BYTES / 2 + 1);
+        let too_many_bytes = "𝕏".repeat(PROMPT_MAX_UTF8_BYTES / 4 + 1);
         assert!(validate_prompt(&too_many_bytes).is_err());
     }
 
@@ -658,7 +660,9 @@ mod result_tests {
 
     #[test]
     fn normalized_transcription_result_v1_text_projection_truncates_bytes() {
-        let text = "a".repeat(TEXT_PROJECTION_MAX_UTF8_BYTES + 100);
+        // "𝕏" (U+1D54F) is 4 UTF-8 bytes / 1 scalar; the byte cap is only
+        // reachable within the scalar cap using maximal-width scalars.
+        let text = "𝕏".repeat(TEXT_PROJECTION_MAX_UTF8_BYTES / 4 + 100);
         let outcome = project_text(&text);
         assert!(!outcome.complete);
         assert_eq!(outcome.text.len(), TEXT_PROJECTION_MAX_UTF8_BYTES);

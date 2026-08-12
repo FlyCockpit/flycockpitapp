@@ -62,6 +62,16 @@ const assertDigestHex64 = (value: unknown, field: string) => {
   expect((value as string).length, `${field} digest must be 64 chars`).toBe(64);
   expect((value as string).toLowerCase(), `${field} must be lowercase`).toBe(value);
 };
+// RFC 7638 P-256 JWK thumbprint: 43-char base64url without padding (SHA-256 of
+// the canonical JWK). This is NOT a hex digest — the Rust source of truth
+// (`crates/cockpit-proto/tests/remote_attempt_grant_fixtures.rs`) pins it to 43
+// base64url characters, mirroring the on-wire identity thumbprint.
+const assertP256Thumbprint = (value: unknown, field: string) => {
+  expect(typeof value, `${field} must be a string`).toBe("string");
+  expect((value as string).length, `${field} P-256 thumbprint must be 43 base64url chars`).toBe(43);
+  for (const char of value as string)
+    expect(/[A-Za-z0-9\-_]/.test(char), `${field} thumbprint must be base64url`).toBe(true);
+};
 const assertCapabilityOrds = (value: unknown, max: number, field: string, allowEmpty: boolean) => {
   expect(Array.isArray(value), `${field} must be array`).toBe(true);
   const arr = value as number[];
@@ -104,7 +114,7 @@ const validateGrantPayload = (
     assertAlias22(idObj.deviceId, `${side}.deviceId`);
     assertAlias22(idObj.certificateId, `${side}.certificateId`);
     assertDecimalString(idObj.generation, `${side}.generation`);
-    assertDigestHex64(idObj.p256Thumbprint, `${side}.p256Thumbprint`);
+    assertP256Thumbprint(idObj.p256Thumbprint, `${side}.p256Thumbprint`);
   }
 
   for (const field of [

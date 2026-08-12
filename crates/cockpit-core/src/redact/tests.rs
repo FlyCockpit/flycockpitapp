@@ -2042,7 +2042,8 @@ fn sealed_untrusted_inference_marker_scoped_origin_resolves_by_record_id() {
     // Scoped sealed values carry the richer typed origin grammar
     // `sealed:1:<scope>:<record_id>:<version>:<name>`. The renderer must use
     // the canonical record_id as the value id, not the name.
-    use crate::sealed::{SealedName, SealedRecordId, sealed_redaction_origin};
+    use crate::sealed::identity::sealed_redaction_origin;
+    use crate::sealed::{SealedName, SealedRecordId};
     use cockpit_db::db::sealed_scope::SealedScopeKind;
 
     let cfg = enabled_cfg();
@@ -2126,7 +2127,8 @@ fn sealed_registration_paths_use_typed_entries() {
     // All three ultimately call RedactionTable::with_forced_literal with a
     // canonical origin. This test verifies the table accepts and preserves
     // the typed origin and that historical_redaction_inventory parses it back.
-    use crate::sealed::{SealedName, SealedRecordId, sealed_redaction_origin};
+    use crate::sealed::identity::sealed_redaction_origin;
+    use crate::sealed::{SealedName, SealedRecordId};
     use crate::sealed::{historical_redaction_inventory, parse_sealed_redaction_origin};
     use cockpit_db::db::sealed_scope::SealedScopeKind;
 

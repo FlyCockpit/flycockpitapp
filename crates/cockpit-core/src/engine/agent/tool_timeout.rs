@@ -33,6 +33,7 @@ const TOOL_ABANDON_HOOK_TIMEOUT: Duration = Duration::from_secs(5);
 const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::abandon_safe("add-package"),
     ToolTimeoutSafety::honors_cancel("bash"),
+    ToolTimeoutSafety::abandon_safe("cancel_image_generation_job"),
     ToolTimeoutSafety::abandon_safe("change_impact"),
     ToolTimeoutSafety::abandon_safe("code"),
     ToolTimeoutSafety::abandon_safe("context_pack"),
@@ -40,13 +41,25 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::abandon_safe("delegation_payload_retrieve"),
     ToolTimeoutSafety::abandon_safe("edit"),
     ToolTimeoutSafety::human_blocking("escalate"),
+    // Media derivation/inspection and image-generation tools: no
+    // `honors_dispatch_cancel` override and no owned outbound transport that
+    // could leave a half-landed external effect, so they are abandon-safe
+    // under the dispatcher-level drop contract (generate/get/cancel enqueue or
+    // read session-owned jobs that survive the tool call independently).
+    ToolTimeoutSafety::abandon_safe("extract_audio"),
+    ToolTimeoutSafety::abandon_safe("extract_video_clip"),
+    ToolTimeoutSafety::abandon_safe("generate_image"),
+    ToolTimeoutSafety::abandon_safe("get_image_generation_job"),
     ToolTimeoutSafety::abandon_safe("glob"),
     ToolTimeoutSafety::abandon_safe("goal"),
     ToolTimeoutSafety::abandon_safe("grep"),
     ToolTimeoutSafety::abandon_safe("harness_invoke"),
     ToolTimeoutSafety::abandon_safe("harness_list"),
     ToolTimeoutSafety::abandon_safe("graph"),
+    ToolTimeoutSafety::abandon_safe("inspect_audio"),
+    ToolTimeoutSafety::abandon_safe("inspect_video"),
     ToolTimeoutSafety::abandon_safe("list-packages"),
+    ToolTimeoutSafety::abandon_safe("list_image_generation_targets"),
     ToolTimeoutSafety::abandon_safe("lsp"),
     ToolTimeoutSafety::nested_dispatch_or_owned_transport("mcp"),
     ToolTimeoutSafety::abandon_safe("memory_search"),
@@ -56,6 +69,7 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::abandon_safe("plan_write"),
     ToolTimeoutSafety::human_blocking("question"),
     ToolTimeoutSafety::abandon_safe("read"),
+    ToolTimeoutSafety::abandon_safe("read_image"),
     ToolTimeoutSafety::abandon_safe("return"),
     ToolTimeoutSafety::abandon_safe("schedule"),
     ToolTimeoutSafety::abandon_safe("search"),

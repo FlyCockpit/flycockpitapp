@@ -26,6 +26,7 @@ struct Harness {
     runtime: SealedRuntime,
     probe: Arc<ProbeAction>,
     record_id: SealedRecordId,
+    grant_id: String,
     sink: RecordingRedactionSink,
 }
 
@@ -41,7 +42,7 @@ impl Harness {
         let probe = Arc::new(ProbeAction::new(1));
         let registry = registry_with(vec![probe.clone() as Arc<dyn SealedHostAction>]);
         let runtime = SealedRuntime::new(fixture.db.clone(), fixture.compartment.clone(), registry);
-        fixture
+        let grant = fixture
             .directory()
             .issue_action_grant(
                 SealedFixture::owner(),
@@ -64,6 +65,7 @@ impl Harness {
             runtime,
             probe,
             record_id: seeded.record_id,
+            grant_id: grant.grant_id.to_string(),
             sink: RecordingRedactionSink::new(),
         }
     }
@@ -408,52 +410,73 @@ async fn sealed_action_grant_authorization_precedes_lookup() {
     );
 }
 
-/// Two real `use_sealed_value` calls racing on one grant.
+/// Two uses racing on one grant's `use_epoch` resolve by compare-and-swap.
 ///
-/// The earlier shape of this test completed one use and then hand-submitted a
-/// stale DB claim, which proved nothing: a regression that resolved the
-/// literal or invoked the action *before* checking the CAS would still have
-/// passed. These are two genuine futures observing the same `use_epoch`.
+/// A successful claim *advances* the epoch (`SET use_epoch = use_epoch + 1`), so
+/// the single-winner guarantee is per-epoch: of any number of claims naming the
+/// same epoch, the atomic `WHERE use_epoch = ?` admits exactly one. Racing two
+/// full `use_sealed_value` futures cannot express this deterministically —
+/// each future reads the epoch for itself, and unless both reads land before
+/// either claim commits (which the runtime does not order), each observes a
+/// fresh epoch and both legitimately win. The genuine same-epoch race is
+/// therefore driven directly against the ownership token: two concurrent claims
+/// of one epoch, exactly one of which may win. (The complementary "a use whose
+/// claim loses reads no literal and reaches no action" path is proven
+/// deterministically in `a_delete_between_authorization_and_claim_denies_at_the_claim`.)
 #[tokio::test]
 async fn concurrent_uses_resolve_by_deterministic_compare_and_swap() {
     let harness = Harness::new().await;
     let request = harness.request();
     let ctx = harness.context();
 
-    let (a, b) = tokio::join!(
-        harness.runtime.use_sealed_value(
+    // One end-to-end use claims epoch 0: it reads exactly one literal and
+    // reaches the host action exactly once, advancing the epoch to 1.
+    harness
+        .runtime
+        .use_sealed_value(
             &request,
             &ctx,
             &harness.sink,
-            &crate::sealed::runtime::FixedProjectTrust(SealedProjectTrust::Trusted)
-        ),
-        harness.runtime.use_sealed_value(
-            &request,
-            &ctx,
-            &harness.sink,
-            &crate::sealed::runtime::FixedProjectTrust(SealedProjectTrust::Trusted)
+            &crate::sealed::runtime::FixedProjectTrust(SealedProjectTrust::Trusted),
         )
-    );
+        .await
+        .expect("the first use wins its epoch");
+    assert_eq!(harness.runtime.literal_reads(), 1);
+    assert_eq!(harness.probe.invocations(), 1);
 
-    // Exactly one winner, and the loser is the ordinary content-free denial.
+    // Two genuine claims now race for the current epoch (1). The compare-and-swap
+    // is a single atomic statement, so exactly one racer changes a row; the
+    // loser changes zero rows.
+    let (a, b) = tokio::join!(
+        harness
+            .fixture
+            .db
+            .claim_sealed_action_grant(harness.grant_id.clone(), 1, ctx.now_ms),
+        harness
+            .fixture
+            .db
+            .claim_sealed_action_grant(harness.grant_id.clone(), 1, ctx.now_ms),
+    );
+    let a = a.expect("claim a did not error");
+    let b = b.expect("claim b did not error");
     assert_eq!(
-        u8::from(a.is_ok()) + u8::from(b.is_ok()),
+        u8::from(a.is_some()) + u8::from(b.is_some()),
         1,
-        "exactly one of two racing uses may win the claim"
+        "exactly one of two racing claims at one epoch may win"
     );
-    let denial = a.err().or(b.err()).expect("one side denied");
-    assert_eq!(denial.to_string(), SEALED_USE_DENIED_MESSAGE);
 
-    // The loser performed no lookup and no outbound action.
+    // Neither claim — winner or loser — resolves a literal or reaches the host
+    // action: those happen only inside `use_sealed_value` after a successful
+    // claim. The counts are unchanged from the single end-to-end use above.
     assert_eq!(
         harness.runtime.literal_reads(),
         1,
-        "the loser of the race must read no secret"
+        "a bare claim reads no secret"
     );
     assert_eq!(
         harness.probe.invocations(),
         1,
-        "the loser of the race must reach no host action"
+        "a bare claim reaches no host action"
     );
 }
 

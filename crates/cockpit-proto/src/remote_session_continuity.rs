@@ -517,6 +517,15 @@ impl RemoteConnectionLeasePayloadV1 {
             .filter(|c| c.lifecycle == RemoteLeaseChildLifecycle::Draining)
             .count();
 
+        // Hard total cap takes precedence over the per-transport caps: more
+        // than three children is always rejected regardless of composition.
+        // Checked first so a per-transport sub-cap cannot shadow it — with the
+        // sub-caps applied first a 4+ child set would otherwise always trip a
+        // transport/draining cap and leave `TooManyChildren` unreachable.
+        if self.active_children.len() > 3 {
+            return Err(LeaseValidationError::TooManyChildren);
+        }
+
         // At most one current WebRTC.
         let current_webrtc = self
             .active_children
@@ -549,11 +558,10 @@ impl RemoteConnectionLeasePayloadV1 {
             return Err(LeaseValidationError::TooManyDraining);
         }
 
-        // Total cap: normally 2, TURN cutover 3.
+        // Total cap: normally 2, TURN cutover 3. The >3 rejection is enforced
+        // above (before the per-transport caps); only the exactly-three
+        // draining requirement remains here.
         let total = self.active_children.len();
-        if total > 3 {
-            return Err(LeaseValidationError::TooManyChildren);
-        }
         if total == 3 && draining_count != 1 {
             return Err(LeaseValidationError::ThreeChildrenRequireDraining);
         }

@@ -335,12 +335,19 @@ impl FrameComparator {
         let old_rgba = decode_rgba8(old_bytes)?;
         let new_rgba = decode_rgba8(new_bytes)?;
 
-        // Build the mask.
-        let mask = MaskBuilder::new(width, height)
-            .with_pointer(old_pointer, self.policy.pointer_mask_padding)
-            .with_pointer(new_pointer, self.policy.pointer_mask_padding)
-            .with_click_mask(action, dispatched_point, self.policy.click_mask_size())
-            .build();
+        // Build the mask. Only cursor-bearing actions (move/click) legitimately
+        // change pixels around the pointer or click point, so only those get a
+        // pointer/click mask. Type/key/drag/scroll/wait/capture actions get no
+        // mask, so every changed pixel is counted outside the (empty) mask.
+        let mask = if action_is_maskable(action) {
+            MaskBuilder::new(width, height)
+                .with_pointer(old_pointer, self.policy.pointer_mask_padding)
+                .with_pointer(new_pointer, self.policy.pointer_mask_padding)
+                .with_click_mask(action, dispatched_point, self.policy.click_mask_size())
+                .build()
+        } else {
+            MaskBuilder::new(width, height).build()
+        };
 
         // Compare pixels.
         let threshold = self.policy.channel_delta_threshold;
@@ -382,13 +389,13 @@ impl FrameComparator {
         if total == 0 {
             return Err(ComparisonError::EmptyRegion);
         }
-        // Fraction threshold: outside <= (total * basis_points) / 1_000_000.
+        // Fraction threshold: outside <= (total * basis_points) / 10_000.
         // basis_points is in 1/100th of a percent, so 10 basis points = 0.1%.
-        // total * 10 / 1_000_000 == total / 100_000.
+        // A basis point is 1/10,000, so total * 10 / 10_000 == total / 1_000.
         let fraction_limit = (total)
             .checked_mul(self.policy.outside_mask_fraction_basis_points)
             .ok_or(ComparisonError::ArithmeticOverflow)?
-            / 1_000_000;
+            / 10_000;
         let cap = self.policy.outside_mask_absolute_cap;
         // Tolerated only while <= fraction_limit AND <= cap.
         Ok(result.outside_mask_changed <= fraction_limit && result.outside_mask_changed <= cap)
@@ -463,6 +470,29 @@ impl Mask {
         }
         let idx = (y as usize) * (self.width as usize) + (x as usize);
         self.bits[idx / 8] & (1 << (idx % 8)) != 0
+    }
+}
+
+/// Whether an action produces any comparison mask. Only cursor-bearing actions
+/// — move and single/multi click — legitimately change pixels around the
+/// pointer or click point, so only those get a pointer/click mask. Every other
+/// action (type/key/hold/drag/scroll/wait/capture/mouse-down/mouse-up) gets no
+/// mask, so all of its changed pixels are counted outside the mask. Exhaustive
+/// so a new [`ComputerAction`] variant must choose maskability explicitly.
+fn action_is_maskable(action: &ComputerAction) -> bool {
+    match action {
+        ComputerAction::MoveCursor { .. } | ComputerAction::Click { .. } => true,
+        ComputerAction::CaptureFull
+        | ComputerAction::CaptureRegion { .. }
+        | ComputerAction::CaptureNativeZoom { .. }
+        | ComputerAction::MouseDown { .. }
+        | ComputerAction::MouseUp { .. }
+        | ComputerAction::Drag { .. }
+        | ComputerAction::TypeText { .. }
+        | ComputerAction::KeyChord { .. }
+        | ComputerAction::HoldKey { .. }
+        | ComputerAction::Scroll { .. }
+        | ComputerAction::Wait { .. } => false,
     }
 }
 
@@ -1539,6 +1569,29 @@ mod tests {
     }
 
     #[test]
+    fn computer_observation_diff_policy_fraction_1920x1080_boundary() {
+        // 1920x1080 = 2_073_600 physical pixels. 10 basis points (0.1%) of that
+        // is 2_073_600 / 1_000 = 2_073 (integer floor). Literals below are
+        // hand-derived, not computed from the production formula.
+        let comparator = FrameComparator::new(ObservationVerificationPolicy::v1());
+        let total = 2_073_600u64;
+
+        let within = ComparisonResult {
+            total_pixels: total,
+            outside_mask_changed: 2_073, // exactly the floor limit — within (<=).
+            inside_mask_changed: 0,
+        };
+        assert!(comparator.outside_mask_within_tolerance(&within).unwrap());
+
+        let exceeds = ComparisonResult {
+            total_pixels: total,
+            outside_mask_changed: 2_074, // one past the floor limit — rejected.
+            inside_mask_changed: 0,
+        };
+        assert!(!comparator.outside_mask_within_tolerance(&exceeds).unwrap());
+    }
+
+    #[test]
     fn computer_observation_diff_policy_conjunction_both_thresholds() {
         // Both thresholds must be satisfied (conjunction). A count that
         // exceeds the fraction but not the cap still fails.
@@ -1999,7 +2052,7 @@ mod tests {
                 super::super::frame::ObservationId("obs-1".to_string()),
                 super::super::frame::ActionId("act-1".to_string()),
                 super::super::frame::CaptureEpoch(1),
-                h,
+                handle1,
                 None,
             )
             .unwrap()

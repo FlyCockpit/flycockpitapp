@@ -839,7 +839,9 @@ pub fn sample_physical_evidence(
             },
             EvidenceSource::InjectedTest,
         ),
-        focus_generation: 0,
+        // Injected-test fixture carries a live focus generation so coordinator
+        // paths that dispatch focus-gated actions can pass the focus gate.
+        focus_generation: 1,
         adapter_observed_epoch: 1,
         synchronous_recheck: false,
         virtual_display_uuid: None,

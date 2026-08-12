@@ -1973,13 +1973,17 @@ f()",
         let msg = err.to_string();
         // Fail-closed external-runtime health may block before OS spawn when
         // the configured command is Missing; otherwise typed child failures
-        // report spawn/timeout stages.
+        // report spawn/timeout stages. A configured-command health block
+        // surfaces the dependency context line ("… missing; Review the
+        // configured executable path; …") rather than a spawn stage.
+        let health_blocked = msg.contains("external-runtime health")
+            || msg.contains("not Available")
+            || msg.contains("Review the configured executable path");
         assert!(
             msg.contains("stage=spawn")
                 || msg.contains("stage=timeout")
                 || msg.contains("mcp child failure")
-                || msg.contains("external-runtime health")
-                || msg.contains("not Available"),
+                || health_blocked,
             "typed child failure or health gate expected: {msg}"
         );
         assert!(
@@ -1990,7 +1994,7 @@ f()",
         let rows = child_rows(&ctx.session, "outer-stdio-matrix").await;
         // Health-blocked launches never create a child process; spawn-stage
         // failures still record a hard-fail child row.
-        if msg.contains("external-runtime health") || msg.contains("not Available") {
+        if health_blocked {
             assert!(
                 rows.is_empty() || rows.iter().all(|r| r.hard_fail),
                 "health-blocked launch has no successful child: {rows:?}"

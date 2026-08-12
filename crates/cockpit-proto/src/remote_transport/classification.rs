@@ -363,6 +363,31 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
+        "list_leak_reports",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "begin_leak_reveal",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "reveal_leak_report_secret",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "mark_leak_rotated",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "delete_leak_report",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
         "list_project_notes",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
@@ -1048,6 +1073,31 @@ pub const RESPONSE_CLASSIFICATION: &[RemoteMessageClassification] = &[
     ),
     row(
         "sealed_values",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "leak_reports",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Paged,
+    ),
+    row(
+        "leak_reveal_capability",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "leak_revealed_secret",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "leak_rotation_updated",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "leak_report_deleted",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
@@ -1747,6 +1797,7 @@ pub const OVERSIZED_MESSAGE_INVENTORY: &[(RemoteMessageKind, &str)] = &[
     (RemoteMessageKind::Request, "write_bulk_transfer_chunk"),
     (RemoteMessageKind::Request, "fs_write"),
     (RemoteMessageKind::Request, "terminal_input"),
+    (RemoteMessageKind::Request, "terminal_ingress_chunk"),
     (RemoteMessageKind::Request, "resolve_interrupt"),
     (RemoteMessageKind::Request, "session_live_status"),
     (RemoteMessageKind::Request, "record_session_note"),
@@ -1773,6 +1824,7 @@ pub const OVERSIZED_MESSAGE_INVENTORY: &[(RemoteMessageKind, &str)] = &[
     (RemoteMessageKind::Response, "subagent_history_page"),
     (RemoteMessageKind::Response, "pins_with_text"),
     (RemoteMessageKind::Response, "project_notes"),
+    (RemoteMessageKind::Response, "leak_reports"),
     (RemoteMessageKind::Response, "project_note_created"),
     (RemoteMessageKind::Response, "assistants"),
     (RemoteMessageKind::Response, "assistant_upserted"),
@@ -1950,8 +2002,8 @@ mod tests {
         }
 
         // Exact table sizes, so a silent shrink is caught.
-        assert_eq!(REQUEST_CLASSIFICATION.len(), 137);
-        assert_eq!(RESPONSE_CLASSIFICATION.len(), 88);
+        assert_eq!(REQUEST_CLASSIFICATION.len(), 142);
+        assert_eq!(RESPONSE_CLASSIFICATION.len(), 93);
         assert_eq!(EVENT_CLASSIFICATION.len(), 76);
     }
 
@@ -2007,7 +2059,7 @@ mod tests {
         // The committed >512 KiB inventory is non-trivial and every member has
         // an explicit disposition other than `Bounded`.
         assert!(!OVERSIZED_MESSAGE_INVENTORY.is_empty());
-        assert_eq!(OVERSIZED_MESSAGE_INVENTORY.len(), 67);
+        assert_eq!(OVERSIZED_MESSAGE_INVENTORY.len(), 69);
 
         for (kind, tag) in OVERSIZED_MESSAGE_INVENTORY {
             let row = classify(*kind, tag).unwrap_or_else(|_| {

@@ -167,6 +167,11 @@
           "gitignore_allow": [],
           "harnesses": {},
           "hintToolCallCorrections": false,
+          "image_spend": {
+            "project": "unconfigured",
+            "request": "unconfigured",
+            "session": "unconfigured"
+          },
           "inlineThink": true,
           "intelCentralityRanking": true,
           "knowledge_inject_max_tokens": 2048,

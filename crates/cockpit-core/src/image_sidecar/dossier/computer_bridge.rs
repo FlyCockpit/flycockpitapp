@@ -307,6 +307,20 @@ impl ObservationTransform {
         if self.scale_denominator == 0 {
             return Err(TransformError::ZeroDenominator);
         }
+        // A zero source or physical dimension leaves nothing to map between —
+        // the geometry is not invertible.
+        if self.source_width_px == 0
+            || self.source_height_px == 0
+            || self.physical_width_px == 0
+            || self.physical_height_px == 0
+        {
+            return Err(TransformError::Noninvertible);
+        }
+        // A crop offset at or beyond the source dimension leaves an empty
+        // effective source region — nothing to invert.
+        if self.crop_x_px >= self.source_width_px || self.crop_y_px >= self.source_height_px {
+            return Err(TransformError::Noninvertible);
+        }
         Ok(())
     }
 
@@ -357,8 +371,14 @@ impl ObservationTransform {
             ),
             180 => {
                 // 180: (x, y) -> (source_w - x - w, source_h - y - h)
-                let src_w = self.source_width_px.saturating_sub(cx);
-                let src_h = self.source_height_px.saturating_sub(cy);
+                let src_w = self
+                    .source_width_px
+                    .checked_sub(cx)
+                    .ok_or(TransformError::Overflow)?;
+                let src_h = self
+                    .source_height_px
+                    .checked_sub(cy)
+                    .ok_or(TransformError::Overflow)?;
                 let new_x = src_w
                     .checked_sub(right_after_crop)
                     .ok_or(TransformError::Overflow)?;
@@ -375,7 +395,10 @@ impl ObservationTransform {
             }
             90 => {
                 // 90 CW: (x, y) -> (src_h - y - h, x)
-                let src_h = self.source_height_px.saturating_sub(cy);
+                let src_h = self
+                    .source_height_px
+                    .checked_sub(cy)
+                    .ok_or(TransformError::Overflow)?;
                 let new_x = src_h
                     .checked_sub(bottom_after_crop)
                     .ok_or(TransformError::Overflow)?;
@@ -388,7 +411,10 @@ impl ObservationTransform {
             }
             270 => {
                 // 270 CW: (x, y) -> (y, src_w - x - w)
-                let src_w = self.source_width_px.saturating_sub(cx);
+                let src_w = self
+                    .source_width_px
+                    .checked_sub(cx)
+                    .ok_or(TransformError::Overflow)?;
                 let new_x = y_after_crop;
                 let new_y = src_w
                     .checked_sub(right_after_crop)
@@ -425,13 +451,15 @@ impl ObservationTransform {
             .checked_add(self.letterbox_y_px)
             .ok_or(TransformError::Overflow)?;
 
-        // Step 5: compute width/height. Ceil for bottom/right minus floor for
-        // top/left so the box encloses the source.
+        // Step 5: compute width/height from the letterboxed edges. The
+        // letterbox translates the box; it never resizes it, so width/height
+        // are the letterboxed right/bottom minus the letterboxed left/top
+        // (equivalently the pre-letterbox difference).
         let phys_width = phys_right
-            .checked_sub(phys_left)
+            .checked_sub(phys_x)
             .ok_or(TransformError::Overflow)?;
         let phys_height = phys_bottom
-            .checked_sub(phys_top)
+            .checked_sub(phys_y)
             .ok_or(TransformError::Overflow)?;
 
         // Step 6: clip to physical display bounds.
@@ -623,6 +651,7 @@ pub struct ComputerDossierSanitizedMetadata {
 ///
 /// This type is deliberately **not** `Serialize` and **not** `Clone`. It is
 /// move-only and module-private except for the sanitized metadata.
+#[derive(Debug)]
 pub struct ComputerDossier {
     key: ComputerDossierKey,
     entries: Vec<DossierSpatialEntry>,
@@ -926,23 +955,28 @@ impl ComputerDossierRegistry {
             .iter()
             .position(|d| d.delegation_id == delegation_id)
             .ok_or(ComputerDossierError::KeyMismatch)?;
-        let registered = &mut dossiers[idx];
+        // Any invalidation removes the dossier from the registry and releases
+        // it exactly once (matching `register`/`release`), so a released husk
+        // never lingers in the registry.
         // Check expiry.
-        if registered.dossier.is_expired(clock.now_ms()) {
-            registered.dossier.release();
+        if dossiers[idx].dossier.is_expired(clock.now_ms()) {
+            let mut removed = dossiers.remove(idx);
+            removed.dossier.release();
             return Err(ComputerDossierError::Expired);
         }
         // Check stale.
-        if registered.dossier.is_stale_relative_to(current_epoch) {
-            registered.dossier.release();
+        if dossiers[idx].dossier.is_stale_relative_to(current_epoch) {
+            let mut removed = dossiers.remove(idx);
+            removed.dossier.release();
             return Err(ComputerDossierError::Expired);
         }
         // Check generations.
-        if !registered.dossier.generations_match(focus, display) {
-            registered.dossier.release();
+        if !dossiers[idx].dossier.generations_match(focus, display) {
+            let mut removed = dossiers.remove(idx);
+            removed.dossier.release();
             return Err(ComputerDossierError::KeyMismatch);
         }
-        registered.dossier.to_candidate(entry_id, transform)
+        dossiers[idx].dossier.to_candidate(entry_id, transform)
     }
 
     /// Release the dossier for a delegation exactly once. Called on action

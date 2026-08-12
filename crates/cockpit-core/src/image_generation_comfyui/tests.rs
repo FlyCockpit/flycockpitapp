@@ -223,15 +223,10 @@ fn comfyui_route_profile_applies_prefix_and_substitutes_params() {
     let queue = profile.fixed(ImageRoute::Queue).unwrap();
     assert_eq!(queue.url, "http://127.0.0.1:8188/tenant/a/queue");
 
-    let interrupt = profile.fixed(ImageRoute::Job).unwrap();
-    assert_eq!(
-        interrupt.url,
-        "http://127.0.0.1:8188/tenant/a/api/jobs/{job_id}"
-    );
-    // Job route has a param placeholder — fixed() should reject it.
-    let result = profile.fixed(ImageRoute::Cancel);
-    // Cancel has {job_id} — fixed should fail.
-    assert!(result.is_err());
+    // Job route has a {job_id} placeholder — fixed() must reject it.
+    assert!(profile.fixed(ImageRoute::Job).is_err());
+    // Cancel also has {job_id} — fixed should fail.
+    assert!(profile.fixed(ImageRoute::Cancel).is_err());
 
     // Param route.
     let cancel = profile.param(ImageRoute::Cancel, "job-123").unwrap();

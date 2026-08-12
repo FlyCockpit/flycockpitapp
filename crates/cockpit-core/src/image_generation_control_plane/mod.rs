@@ -1112,7 +1112,9 @@ pub fn validate_stable_code(code: &str) -> bool {
         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_')
 }
 
-/// Validate a canonical decimal string matching `0|[1-9][0-9]{0,19}`.
+/// Validate a canonical decimal string matching `0|[1-9][0-9]{0,19}` whose
+/// value additionally fits an unsigned 64-bit integer (a 20-digit token may
+/// otherwise exceed `u64::MAX`).
 pub fn validate_canonical_decimal(s: &str) -> bool {
     if s.is_empty() || s.len() > 20 {
         return false;
@@ -1124,7 +1126,7 @@ pub fn validate_canonical_decimal(s: &str) -> bool {
     if !(bytes[0] as char).is_ascii_digit() || bytes[0] == b'0' {
         return false;
     }
-    bytes.iter().all(|b| b.is_ascii_digit())
+    bytes.iter().all(|b| b.is_ascii_digit()) && s.parse::<u64>().is_ok()
 }
 
 /// Validate a 22-character unpadded base64url ID (random 16-byte alias).

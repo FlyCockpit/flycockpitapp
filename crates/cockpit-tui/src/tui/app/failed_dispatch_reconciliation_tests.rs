@@ -125,6 +125,7 @@ fn seed_session_live_state(app: &mut App) {
         tag_partial: String::new(),
         seq: None,
         strip_think: true,
+        response_performance: None,
     });
     app.prunable_tokens = 42;
     app.elided_event_ids.insert("event-1".to_string());

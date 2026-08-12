@@ -994,7 +994,12 @@ fn tui_image_codec_dependency_inventory() {
     assert_eq!(root_image["default-features"].as_bool(), Some(false));
     assert_eq!(
         root_image["features"],
-        toml::Value::Array(vec!["png".into()])
+        toml::Value::Array(vec![
+            "png".into(),
+            "jpeg".into(),
+            "gif".into(),
+            "webp".into()
+        ])
     );
     let tui_dependencies = tui_manifest["dependencies"].as_table().unwrap();
     let direct_image_declarations = image_declarations(&tui_manifest);

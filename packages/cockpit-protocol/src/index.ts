@@ -4,12 +4,10 @@ import { canonicalU64DecimalStringSchema, decodeProtocolIdBase64Url } from "./re
 export * from "./dependency-health";
 export * from "./remote-connection-metadata";
 export * from "./remote-identity-protocol";
-export * from "./remote-identity-protocol";
 export * from "./remote-noise-binding";
 export * from "./remote-tenant-authority-protocol";
 export * from "./remote-transport-selection";
 export * from "./remote-websocket-fallback";
-export * from "./remote-wire-magic-registry";
 export * from "./remote-wire-magic-registry";
 export * from "./send-user-message-v2";
 

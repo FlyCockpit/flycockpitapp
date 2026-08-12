@@ -50,11 +50,11 @@ pub const GPT_TRANSCRIBE_PROVENANCE: CatalogProvenance = CatalogProvenance {
 /// canonical insertion order.
 pub const GPT_TRANSCRIBE_ALPHA2: &[&str] = &[
     "af", "am", "ar", "as", "az", "ba", "be", "bg", "bn", "bs", "ca", "cs", "cy", "da", "de", "el",
-    "es", "et", "eu", "fa", "fi", "fo", "fr", "gl", "gu", "ha", "haw", "he", "hi", "hr", "hu",
-    "hy", "id", "is", "it", "ja", "ka", "kk", "km", "kn", "ko", "la", "lb", "ln", "lo", "lt", "lv",
-    "mg", "mi", "mk", "ml", "mn", "mr", "ms", "mt", "my", "ne", "nl", "no", "oc", "pa", "pl", "ps",
-    "pt", "ro", "ru", "sa", "sd", "si", "sk", "sl", "sn", "so", "sq", "sr", "su", "sv", "sw", "ta",
-    "te", "tg", "th", "tk", "tl", "tr", "tt", "ug", "uk", "ur", "uz", "vi", "yi", "yo", "zh",
+    "en", "es", "et", "eu", "fa", "fi", "fo", "fr", "gl", "gu", "ha", "haw", "he", "hi", "hr",
+    "hu", "hy", "id", "is", "it", "ja", "ka", "kk", "km", "kn", "ko", "la", "lb", "ln", "lo", "lt",
+    "lv", "mg", "mi", "mk", "ml", "mn", "mr", "ms", "mt", "my", "ne", "nl", "no", "oc", "pa", "pl",
+    "ps", "pt", "ro", "ru", "sa", "sd", "si", "sk", "sl", "sn", "so", "sq", "sr", "su", "sv", "sw",
+    "ta", "te", "tg", "th", "tk", "tl", "tr", "tt", "ug", "uk", "ur", "uz", "vi", "yi", "yo", "zh",
 ];
 
 /// The selected ISO 639-3 codes in the GPT-transcribe catalog.

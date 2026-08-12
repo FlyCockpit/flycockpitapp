@@ -857,7 +857,12 @@ mod tests {
 
     #[test]
     fn apply_models_defaults_known_frontier_model_ids() {
+        // Known-frontier model defaults gate on the provider's persisted
+        // *template* identity (`effective_template`), not the config-map key, so
+        // the entry must carry the `codex-oauth` template for `gpt-5.5` to be
+        // recognized as a first-party frontier id.
         let mut entry = ProviderEntry {
+            template: Some("codex-oauth".to_string()),
             mode: Some(crate::config::extended::LlmMode::Defensive),
             models: vec![model("existing")],
             ..ProviderEntry::default()

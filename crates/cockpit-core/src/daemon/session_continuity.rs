@@ -50,7 +50,7 @@
 //! - Closing one child cannot mutate other epochs or attachment state.
 //! - The daemon outbox is the only application event replay source.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -563,7 +563,7 @@ pub fn process_reattach(
             },
         )
         .collect();
-    validate_replay_page(&proto_events)?;
+    validate_replay_page(&proto_events).map_err(|_| ReattachError::ReplayPageExceedsBounds)?;
 
     let has_more = outbox_events
         .iter()
@@ -612,14 +612,9 @@ pub fn resolve_pending_operation(
 // TURN credential renewal lead
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Compute the TURN credential renewal lead seconds. Begin when remaining
-/// lifetime first becomes less than or equal to:
-/// `renewalLeadSeconds = min(120, max(15, floor(encodedTtlSeconds/3)))`.
-pub fn turn_renewal_lead_seconds(encoded_ttl_seconds: u64) -> u64 {
-    let third = encoded_ttl_seconds / 3;
-    let clamped = third.max(15);
-    clamped.min(120)
-}
+// The renewal-lead rule has a single home: `cockpit_proto::remote_turn_ice_policy::renewal_lead_seconds`
+// (`clamp(ttl/3, 15, 120)`). The former duplicate helper here was deleted; any
+// caller computes the lead from a real credential TTL via that function.
 
 /// The maximum overlap for TURN child replacement: 30 seconds.
 pub const TURN_REPLACEMENT_MAX_OVERLAP_SECONDS: u64 = 30;
@@ -1085,6 +1080,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn remote_reattach_replay_page_over_byte_bound_errors() {
+        // 20 events × 200,000 bytes = 4,000,000 bytes, which exceeds the
+        // 2 MiB (REMOTE_REPLAY_MAX_BYTES_PER_PAGE) per-page byte bound while
+        // staying at 20 ≤ 256 events, so the page is truncated by event count
+        // to all 20 events and then rejected on bytes.
+        let events: Vec<_> = (1..=20)
+            .map(|i| RemoteOutboxEventRef {
+                event_seq: i,
+                delivery_id: format!("del-{i}"),
+                kind: "test".into(),
+                canonical_payload: vec![0u8; 200_000],
+            })
+            .collect();
+
+        let result = process_reattach(0, 0, 20, &events, "snap-1", &[]);
+        assert_eq!(result, Err(ReattachError::ReplayPageExceedsBounds));
+    }
+
     // ── Operation recovery ────────────────────────────────────────────────
 
     #[test]
@@ -1106,26 +1120,10 @@ mod tests {
     }
 
     // ── TURN renewal lead ─────────────────────────────────────────────────
-
-    #[test]
-    fn remote_turn_renewal_lead() {
-        // floor(60/3) = 20, max(15, 20) = 20, min(120, 20) = 20.
-        assert_eq!(turn_renewal_lead_seconds(60), 20);
-
-        // floor(30/3) = 10, max(15, 10) = 15, min(120, 15) = 15.
-        assert_eq!(turn_renewal_lead_seconds(30), 15);
-
-        // floor(360/3) = 120, max(15, 120) = 120, min(120, 120) = 120.
-        assert_eq!(turn_renewal_lead_seconds(360), 120);
-
-        // floor(600/3) = 200, max(15, 200) = 200, min(120, 200) = 120.
-        assert_eq!(turn_renewal_lead_seconds(600), 120);
-
-        // floor(45/3) = 15, max(15, 15) = 15, min(120, 15) = 15.
-        assert_eq!(turn_renewal_lead_seconds(45), 15);
-
-        assert_eq!(TURN_REPLACEMENT_MAX_OVERLAP_SECONDS, 30);
-    }
+    //
+    // The renewal-lead vectors now live with the single source of truth in
+    // `cockpit_proto::remote_turn_ice_policy` (`renewal_lead_seconds_vectors`);
+    // the duplicate helper and its vector test were removed here.
 
     // ── Mobile background/foreground ──────────────────────────────────────
 

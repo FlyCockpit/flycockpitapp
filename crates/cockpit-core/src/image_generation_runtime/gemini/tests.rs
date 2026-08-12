@@ -838,6 +838,7 @@ fn gemini_adapter_request_uses_interactions_route() {
         location: ImageLocationClass::PublicCloud,
         enabled: true,
         route_profile_version: 1,
+        exclusive_server: false,
     };
     let resolved_headers = reqwest::header::HeaderMap::new();
     let probe = ProbeRequest {
@@ -875,6 +876,7 @@ fn gemini_adapter_parse_rejects_auth_failure_status() {
         location: ImageLocationClass::PublicCloud,
         enabled: true,
         route_profile_version: 1,
+        exclusive_server: false,
     };
     let probe = ProbeRequest {
         endpoint,
@@ -925,6 +927,7 @@ fn gemini_adapter_parse_success_returns_healthy() {
         location: ImageLocationClass::PublicCloud,
         enabled: true,
         route_profile_version: 1,
+        exclusive_server: false,
     };
     let probe = ProbeRequest {
         endpoint,
@@ -1008,7 +1011,7 @@ fn gemini_provider_text_is_bounded_and_control_stripped() {
                 {{
                     "type": "model_output",
                     "content": [
-                        {{"type": "text", "text": "{long_text}\x00\x01"}}
+                        {{"type": "text", "text": "{long_text}\u0000\u0001"}}
                     ]
                 }}
             ]

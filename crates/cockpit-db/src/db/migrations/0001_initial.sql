@@ -433,7 +433,7 @@ CREATE TABLE media_security_recovery_operations (
 CREATE TABLE media_local_path_registration_operations (
     local_operation_id       TEXT PRIMARY KEY,
     authoritative_operation_id TEXT NOT NULL,
-    session_id               TEXT NOT NULL,
+    session_id               TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
     canonical_project_digest TEXT NOT NULL,
     client_draft_id          TEXT NOT NULL,
     request_binding_digest   TEXT NOT NULL,
@@ -467,7 +467,7 @@ CREATE TABLE media_local_path_registration_audit (
 CREATE TABLE media_retained_https_operations (
     local_operation_id         TEXT PRIMARY KEY,
     authoritative_operation_id TEXT NOT NULL,
-    session_id                 TEXT NOT NULL,
+    session_id                 TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
     canonical_project_digest   TEXT NOT NULL,
     client_draft_id            TEXT NOT NULL,
     request_binding_digest     TEXT NOT NULL,
@@ -570,7 +570,7 @@ CREATE TABLE media_attachment_processing_output_security_evidence (
 );
 
 CREATE TABLE media_uploads (
-    upload_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, canonical_project_digest TEXT NOT NULL,
+    upload_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE, canonical_project_digest TEXT NOT NULL,
     client_draft_id TEXT NOT NULL, media_kind TEXT NOT NULL CHECK(media_kind IN ('image','audio','video')),
     state TEXT NOT NULL CHECK(state IN ('open','finalizing','materialized','cancelled','expired','failed')),
     upload_generation TEXT NOT NULL, declared_total_bytes TEXT NOT NULL, acknowledged_chunks INTEGER NOT NULL,
@@ -3486,7 +3486,7 @@ END;
 -- in the same session reuses one encrypted row and increments its ref_count.
 CREATE TABLE protected_redaction_history (
     history_id       TEXT    PRIMARY KEY,
-    session_id       TEXT    NOT NULL,
+    session_id       TEXT    NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
     sealed_record_id TEXT,
     sealed_version   INTEGER,
     source           TEXT    NOT NULL CHECK (source IN ('Sealed', 'Environment', 'Credential', 'ContainedLeak')),
@@ -3544,7 +3544,7 @@ CREATE INDEX idx_protected_redaction_artifact_refs_artifact
 -- safe `seen` metadata and clears rotation state.
 CREATE TABLE protected_leak_records (
     report_id        TEXT    PRIMARY KEY,
-    session_id       TEXT    NOT NULL,
+    session_id       TEXT    NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
     history_id       TEXT    NOT NULL,
     -- Keyed fingerprint: SHA-256(session_id || source || literal_fingerprint).
     -- Safe to expose; does not reveal the literal.

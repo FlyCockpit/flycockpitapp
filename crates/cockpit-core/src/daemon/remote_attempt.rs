@@ -414,8 +414,9 @@ impl EndpointProofGate {
     /// The transport epoch shared by both proofs.
     pub fn transport_epoch(&self) -> &[u8; 16] {
         // transportEpoch starts at offset 1 + 16 = 17 in agreement
-        let epoch: [u8; 16] = self.client_proof.agreement[17..33].try_into().unwrap();
-        epoch.as_ref()
+        (&self.client_proof.agreement[17..33])
+            .try_into()
+            .expect("agreement always carries a 16-byte transport epoch")
     }
 }
 
@@ -546,13 +547,14 @@ mod tests {
                 permission_ceiling_digest(&ceiling)
                     .unwrap()
                     .as_bytes()
+                    .iter()
                     .copied()
                     .collect::<Vec<_>>()
                     .try_into()
                     .unwrap()
             },
             authorized_transports: 0x03,
-            compatible_tuple_ids: vec![1, 2],
+            compatible_tuple_ids: vec![1],
             tenant_authorization_digest: None,
             iat: now,
             nbf: now,
@@ -590,9 +592,11 @@ mod tests {
         g.compatible_tuple_ids = vec![];
         assert!(g.validate_claims(now).is_err());
 
-        // Mutate tuple set to unsorted.
+        // Mutate tuple set to a non-strictly-increasing list. The enabled
+        // registry holds a single tuple, so a duplicate is the ordering
+        // violation available with in-registry ids.
         let mut g = base.clone();
-        g.compatible_tuple_ids = vec![2, 1];
+        g.compatible_tuple_ids = vec![1, 1];
         assert!(g.validate_claims(now).is_err());
 
         // Mutate permission ceiling digest to wrong value.
@@ -656,14 +660,13 @@ mod tests {
         // Transport-bit values 0x01/0x02/0x03.
         assert_eq!(TRANSPORT_BITS_VALID, [0x01, 0x02, 0x03]);
 
-        // Tuple set ordering and registry check.
-        let ts = RemoteAuthorizedTupleSetV1 {
-            tuple_ids: vec![1, 2, 3],
-        };
+        // Tuple set ordering and registry check. The enabled registry holds a
+        // single tuple (id 1), so the valid set contains exactly that id.
+        let ts = RemoteAuthorizedTupleSetV1 { tuple_ids: vec![1] };
         ts.encode().unwrap();
-        // Unsorted fails.
+        // A non-strictly-increasing list fails ordering validation.
         let bad_ts = RemoteAuthorizedTupleSetV1 {
-            tuple_ids: vec![3, 1],
+            tuple_ids: vec![1, 1],
         };
         assert!(bad_ts.encode().is_err());
 
@@ -702,6 +705,7 @@ mod tests {
         g.permission_ceiling_digest = permission_ceiling_digest(&ceiling)
             .unwrap()
             .as_bytes()
+            .iter()
             .copied()
             .collect::<Vec<_>>()
             .try_into()
@@ -719,6 +723,7 @@ mod tests {
         g2.permission_ceiling_digest = permission_ceiling_digest(&ceiling2)
             .unwrap()
             .as_bytes()
+            .iter()
             .copied()
             .collect::<Vec<_>>()
             .try_into()

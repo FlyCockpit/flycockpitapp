@@ -328,14 +328,21 @@ fn computer_guidance_schema_rationale_caps_at_512_scalars() {
 
 #[test]
 fn computer_guidance_schema_rationale_caps_at_2048_bytes() {
-    // 2048 bytes of ASCII → OK.
-    let ok = "a".repeat(2048);
+    // ASCII cannot exercise the byte cap in isolation: 2,048 ASCII scalars
+    // already exceed the 512-scalar cap, which is checked first. A 4-byte
+    // scalar (U+10000) lets the byte count reach 2,048 while staying at 512
+    // scalars — exactly both caps → OK.
+    let ok = "\u{10000}".repeat(512);
+    assert_eq!(ok.len(), 2048);
+    assert_eq!(ok.chars().count(), 512);
     assert!(normalize_rationale(&ok).is_ok());
-    // 2049 bytes of ASCII → reject.
-    let too_many = "a".repeat(2049);
+    // One more 4-byte scalar is 2,052 bytes over 513 scalars: it exceeds both
+    // caps, and the scalar cap (checked first) is the reported error.
+    let too_many = "\u{10000}".repeat(513);
+    assert_eq!(too_many.len(), 2052);
     assert_eq!(
         normalize_rationale(&too_many),
-        Err(RationaleError::TooManyBytes)
+        Err(RationaleError::TooManyScalars)
     );
 }
 
@@ -458,7 +465,11 @@ fn computer_guidance_compiler_proves_no_proposal_bytes_injected_verbatim() {
         "compiler must not inject rationale bytes"
     );
     // No provider/model/project bytes.
-    for injection in [b"openai", b"gpt-4", b"/home/user/project"] {
+    for injection in [
+        b"openai".as_slice(),
+        b"gpt-4".as_slice(),
+        b"/home/user/project".as_slice(),
+    ] {
         assert!(
             !compiled.windows(injection.len()).any(|w| w == injection),
             "compiler must not inject {:?} bytes",

@@ -206,9 +206,12 @@ impl ConsentAction {
 ///
 /// Client and daemon candidate factories accept this typed verified status,
 /// never a boolean. `direct_allowed` requires current mutual receipts and
-/// policy. `relay_only` means direct is forbidden/unconsented but an
-/// authorized TURN-only or E2E WebSocket path exists. `unavailable` means
-/// neither safe route exists or status cannot be proven.
+/// policy. `relay_only` means direct ICE is forbidden/unconsented but an
+/// authorized TURN-only WebRTC path (and the independent E2E WebSocket kind)
+/// may still be admitted. `unavailable` means neither a safe direct/ICE route
+/// **nor** any authorized transport plan kind may be admitted until consent is
+/// proven: it is not "WebRTC-only", so the E2E WebSocket kind is withheld too.
+/// This is distinct from `relay_only`, under which WebSocket stays open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum ConsentCapability {
@@ -1186,8 +1189,10 @@ impl RelationshipConsentState {
     ///
     /// `direct_allowed` requires current mutual receipts and policy.
     /// `relay_only` means direct is forbidden/unconsented but an authorized
-    /// TURN-only or E2E WebSocket path exists. `unavailable` means neither
-    /// safe route exists or status cannot be proven.
+    /// TURN-only WebRTC path (and the independent E2E WebSocket kind) may still
+    /// be admitted. `unavailable` means neither a safe direct route nor any
+    /// authorized transport plan kind — WebSocket included — may be admitted
+    /// until status is proven.
     pub fn evaluate_capability(&self) -> ConsentCapability {
         let mutual_consent = self.daemon_accepted && self.client_accepted;
         let direct_allowed = mutual_consent && self.policy_allows_direct;

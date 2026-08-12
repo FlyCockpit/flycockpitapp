@@ -53,12 +53,19 @@ pub const ALLOWED_RASTER_MIME_TYPES: &[&str] =
 // Checked decimal/rational money arithmetic (no binary floating point).
 // ---------------------------------------------------------------------------
 
-/// A checked nonnegative decimal amount represented as integer microdollars
-/// plus a residual fractional scale. All pricing `cost_usd` values are parsed
-/// from the JSON number's lexical decimal form with checked arithmetic.
+/// A checked nonnegative amount in microdollars, held as the exact rational
+/// `micros_num / micros_den` where `micros_den` is a power of ten. Keeping the
+/// sub-micro residual (rather than ceiling at parse time) lets multiplication
+/// by a count and summation of billable lines stay exact; the ceiling to
+/// integer microdollars is deferred to [`ceiling_microdollars`] / [`as_micros`]
+/// so a fractional unit price does not round up once per unit. All pricing
+/// `cost_usd` values are parsed from the JSON number's lexical decimal form
+/// with checked arithmetic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckedMicrodollars {
-    micros: u128,
+    micros_num: u128,
+    /// Always a power of ten (>= 1).
+    micros_den: u128,
 }
 
 impl CheckedMicrodollars {
@@ -93,55 +100,77 @@ impl CheckedMicrodollars {
         } else {
             int_part.parse().ok()?
         };
-        // Take at most 6 fractional digits (microdollar resolution); remaining
-        // digits influence the ceiling.
-        let frac_trimmed = if frac_part.len() > 6 {
-            &frac_part[..6]
-        } else {
-            frac_part
-        };
-        let frac_value: u128 = if frac_trimmed.is_empty() {
+        // Exact microdollar amount: the dollar value is
+        //   int_value + frac_value / 10^L    (L = number of fractional digits)
+        // and micros = dollars * 10^6 = int_value*10^6 + frac_value*10^(6-L).
+        // For L <= 6 this is an integer (den = 1); for L > 6 the sub-micro
+        // residual is preserved exactly as den = 10^(L-6) so the ceiling can be
+        // deferred until after multiplication and summation. Overflow (e.g. a
+        // pathologically long fraction) yields `None` (unknown), never a wrong
+        // finite maximum.
+        let frac_len = frac_part.len() as u32;
+        let frac_value: u128 = if frac_part.is_empty() {
             0
         } else {
-            let parsed: u128 = frac_trimmed.parse().ok()?;
-            let scale = 6u32.saturating_sub(frac_trimmed.len() as u32);
-            parsed.checked_mul(10u128.checked_pow(scale)?)?
+            frac_part.parse().ok()?
         };
-        let has_more_frac = frac_part.len() > 6 && frac_part[6..].bytes().any(|b| b != b'0');
         let int_micros = int_value.checked_mul(MICROS_PER_DOLLAR as u128)?;
-        let micros = int_micros.checked_add(frac_value)?;
-        // Ceiling: if there are nonzero digits beyond microdollar resolution,
-        // round up by one micro.
-        let micros = if has_more_frac {
-            micros.checked_add(1)?
+        let (micros_num, micros_den) = if frac_len <= 6 {
+            let scale = 6u32 - frac_len;
+            let scaled_frac = frac_value.checked_mul(10u128.checked_pow(scale)?)?;
+            (int_micros.checked_add(scaled_frac)?, 1u128)
         } else {
-            micros
+            let den = 10u128.checked_pow(frac_len - 6)?;
+            let scaled_int = int_micros.checked_mul(den)?;
+            (scaled_int.checked_add(frac_value)?, den)
         };
-        Some(Self { micros })
+        Some(Self {
+            micros_num,
+            micros_den,
+        })
     }
 
     /// Construct from already-validated integer microdollars.
     pub const fn from_micros(micros: u128) -> Self {
-        Self { micros }
+        Self {
+            micros_num: micros,
+            micros_den: 1,
+        }
     }
 
-    /// Checked addition of two microdollar amounts.
+    /// Checked addition of two microdollar amounts. Both denominators are powers
+    /// of ten, so the larger is an exact multiple of the smaller.
     pub fn checked_add(&self, other: &Self) -> Option<Self> {
+        if self.micros_den == other.micros_den {
+            return Some(Self {
+                micros_num: self.micros_num.checked_add(other.micros_num)?,
+                micros_den: self.micros_den,
+            });
+        }
+        let (den, hi, lo) = if self.micros_den > other.micros_den {
+            (self.micros_den, self, other)
+        } else {
+            (other.micros_den, other, self)
+        };
+        let factor = den / lo.micros_den;
+        let lo_scaled = lo.micros_num.checked_mul(factor)?;
         Some(Self {
-            micros: self.micros.checked_add(other.micros)?,
+            micros_num: hi.micros_num.checked_add(lo_scaled)?,
+            micros_den: den,
         })
     }
 
     /// Checked multiplication of a microdollar unit price by an integer count.
     pub fn checked_mul_count(&self, count: u128) -> Option<Self> {
         Some(Self {
-            micros: self.micros.checked_mul(count)?,
+            micros_num: self.micros_num.checked_mul(count)?,
+            micros_den: self.micros_den,
         })
     }
 
-    /// The integer microdollar value (already ceiling-converted).
-    pub const fn as_micros(&self) -> u128 {
-        self.micros
+    /// The integer microdollar value, ceiling of the exact rational amount.
+    pub fn as_micros(&self) -> u128 {
+        self.micros_num.div_ceil(self.micros_den)
     }
 }
 
@@ -169,21 +198,29 @@ impl ExactRatio {
     /// digits, and `auto`.
     pub fn parse(text: &str) -> Option<Self> {
         let (left, right) = text.split_once(':')?;
-        let num = Self::parse_decimal_component(left)?;
-        let den = Self::parse_decimal_component(right)?;
-        if num == 0 || den == 0 {
+        let (num_digits, num_scale) = Self::parse_decimal_component(left)?;
+        let (den_digits, den_scale) = Self::parse_decimal_component(right)?;
+        if num_digits == 0 || den_digits == 0 {
             return None;
         }
+        // Each component carries its own fractional scale (number of decimal
+        // places). To store an exact ratio, cross-scale the components so both
+        // share a common power-of-ten denominator:
+        //   num_value/den_value
+        //     = (num_digits / 10^num_scale) / (den_digits / 10^den_scale)
+        //     = (num_digits * 10^den_scale) / (den_digits * 10^num_scale).
+        let numerator = num_digits.checked_mul(10u128.checked_pow(den_scale)?)?;
+        let denominator = den_digits.checked_mul(10u128.checked_pow(num_scale)?)?;
         Some(Self {
-            numerator: num,
-            denominator: den,
+            numerator,
+            denominator,
         })
     }
 
     /// Parse a single decimal component matching `[1-9][0-9]*(\.[0-9]+)?` into
-    /// a scaled integer (numerator over a power-of-ten denominator encoded by
-    /// returning the raw digits and scale).
-    fn parse_decimal_component(text: &str) -> Option<u128> {
+    /// its integer digits (with the decimal point removed) and the fractional
+    /// scale (number of fractional digits). The caller normalizes scales.
+    fn parse_decimal_component(text: &str) -> Option<(u128, u32)> {
         if text.is_empty() {
             return None;
         }
@@ -209,17 +246,17 @@ impl ExactRatio {
         }
         if frac_part.is_empty() {
             // A bare integer is allowed (matches `[1-9][0-9]*` with no
-            // fractional part). But if a dot was present, fraction digits are
-            // required.
-            return int_part.parse().ok();
+            // fractional part): zero fractional scale.
+            return Some((int_part.parse().ok()?, 0));
         }
         if !frac_part.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
         // Combine into a single integer by removing the decimal point; the
-        // scale is implicit and handled by cross multiplication.
+        // fractional scale is the number of fractional digits, normalized by
+        // the caller via cross multiplication.
         let combined = format!("{int_part}{frac_part}");
-        combined.parse().ok()
+        Some((combined.parse().ok()?, frac_part.len() as u32))
     }
 
     /// Returns `true` when `width / height` exactly equals this ratio, proved
@@ -1253,8 +1290,8 @@ pub fn explicit_pixel_megapixels(request: &OpenrouterImageRequest) -> Option<u12
     let size = SizeValue::parse(size_text)?;
     match size {
         SizeValue::Pixels { product, .. } => {
-            let megapixel_micros = product.checked_mul(1_000_000)?;
-            let count = megapixel_micros.div_ceil(1_000_000);
+            // Megapixels are width*height / 1_000_000, rounded up (ceiling).
+            let count = product.div_ceil(1_000_000);
             Some(count as u128)
         }
         SizeValue::Tier(_) => None,
@@ -1483,9 +1520,10 @@ pub fn attribution_headers() -> Vec<(&'static str, &'static str)> {
 }
 
 /// Merge attribution headers into a resolved header set collision-safe: a
-/// non-empty configured value is preserved; an empty configured value is
-/// removed; a missing header gets the canonical default. This mirrors the
-/// `openrouter-attribution-headers` contract.
+/// non-empty configured value is preserved; an empty configured value is reset
+/// to the canonical default (attribution is always present); a missing header
+/// gets the canonical default. This mirrors the `openrouter-attribution-headers`
+/// contract.
 pub fn merge_attribution(headers: &mut Vec<(String, String)>) {
     for (name, default) in attribution_headers() {
         match headers
@@ -1493,7 +1531,7 @@ pub fn merge_attribution(headers: &mut Vec<(String, String)>) {
             .position(|(n, _)| n.eq_ignore_ascii_case(name))
         {
             Some(index) if headers[index].1.is_empty() => {
-                headers.remove(index);
+                headers[index].1 = default.to_string();
             }
             Some(_) => {}
             None => headers.push((name.to_string(), default.to_string())),
@@ -1973,14 +2011,20 @@ mod tests {
             preflight(&req_n0, &eps),
             PreflightOutcome::Reject(PreflightReason::NOutOfRange)
         );
-        let req_n11 = OpenrouterImageRequest { n: 11, ..req_n0 };
+        let req_n11 = OpenrouterImageRequest {
+            n: 11,
+            ..req_n0.clone()
+        };
         assert_eq!(
             preflight(&req_n11, &eps),
             PreflightOutcome::Reject(PreflightReason::NOutOfRange)
         );
 
         // n above an endpoint cap.
-        let req_n5 = OpenrouterImageRequest { n: 5, ..req_n0 };
+        let req_n5 = OpenrouterImageRequest {
+            n: 5,
+            ..req_n0.clone()
+        };
         assert_eq!(
             preflight(&req_n5, &eps),
             PreflightOutcome::Reject(PreflightReason::NAboveEndpointCap)
@@ -2564,13 +2608,15 @@ mod tests {
         let max = endpoint_max_microdollars(&ep_frac, &req).unwrap();
         assert_eq!(max, 1);
 
-        // checked overflow: a huge cost_usd overflows.
+        // checked overflow: a huge cost_usd overflows the microdollar
+        // conversion. This integer fits in u128 but its checked multiply by
+        // 1_000_000 micros/dollar does not, so the maximum is unknown (None).
         let mut ep_overflow = endpoint_with_tag(Some("qwen"));
         ep_overflow.pricing = Some(EndpointPricing {
             prompt: None,
             image_request: None,
             image_output: Some(CostLine {
-                cost_usd: "99999999999999999999999999".into(),
+                cost_usd: "9999999999999999999999999999999999".into(),
                 unit: Some("image".into()),
             }),
             image_megapixel: None,
@@ -2665,9 +2711,9 @@ mod tests {
         // valid response with matching media_type.
         let body = serde_json::json!({
             "data": [{ "b64_json": png_b64, "media_type": "image/png" }],
-            "usage": { "cost": "0.01" }
+            "usage": { "cost": 0.01 }
         });
-        let parsed = parse_response(serde_json::to_vec(&body).unwrap()).unwrap();
+        let parsed = parse_response(&serde_json::to_vec(&body).unwrap()).unwrap();
         assert_eq!(parsed.outputs.len(), 1);
         assert_eq!(parsed.outputs[0].media_type, "image/png");
         assert_eq!(parsed.usage.cost, Some(10_000));
@@ -2676,7 +2722,7 @@ mod tests {
         let body = serde_json::json!({
             "data": [{ "b64_json": jpeg_b64, "media_type": "image/jpeg" }]
         });
-        let parsed = parse_response(serde_json::to_vec(&body).unwrap()).unwrap();
+        let parsed = parse_response(&serde_json::to_vec(&body).unwrap()).unwrap();
         assert_eq!(parsed.outputs[0].media_type, "image/jpeg");
 
         // present conflicting media type.
@@ -2684,7 +2730,7 @@ mod tests {
             "data": [{ "b64_json": png_b64, "media_type": "image/jpeg" }]
         });
         assert_eq!(
-            parse_response(serde_json::to_vec(&body).unwrap()).unwrap_err(),
+            parse_response(&serde_json::to_vec(&body).unwrap()).unwrap_err(),
             ResponseParseError::MediaTypeConflict
         );
 
@@ -2692,7 +2738,7 @@ mod tests {
         let body = serde_json::json!({
             "data": [{ "b64_json": png_b64 }]
         });
-        let parsed = parse_response(serde_json::to_vec(&body).unwrap()).unwrap();
+        let parsed = parse_response(&serde_json::to_vec(&body).unwrap()).unwrap();
         assert_eq!(parsed.outputs[0].media_type, "image/png");
 
         // undetectable bytes with absent media type fails.
@@ -2701,7 +2747,7 @@ mod tests {
             "data": [{ "b64_json": garbage_b64 }]
         });
         assert_eq!(
-            parse_response(serde_json::to_vec(&body).unwrap()).unwrap_err(),
+            parse_response(&serde_json::to_vec(&body).unwrap()).unwrap_err(),
             ResponseParseError::UndetectableBytes
         );
 
@@ -2711,7 +2757,7 @@ mod tests {
         let body = serde_json::json!({
             "data": [{ "b64_json": svg_b64, "media_type": "image/svg+xml" }]
         });
-        let parsed = parse_response(serde_json::to_vec(&body).unwrap()).unwrap();
+        let parsed = parse_response(&serde_json::to_vec(&body).unwrap()).unwrap();
         assert_eq!(parsed.outputs[0].media_type, "image/svg+xml");
 
         // SVG sanitization failure (script tag).
@@ -2721,23 +2767,23 @@ mod tests {
             "data": [{ "b64_json": bad_svg_b64, "media_type": "image/svg+xml" }]
         });
         assert_eq!(
-            parse_response(serde_json::to_vec(&body).unwrap()).unwrap_err(),
+            parse_response(&serde_json::to_vec(&body).unwrap()).unwrap_err(),
             ResponseParseError::SvgSanitizationFailed
         );
 
         // valid usage.cost.
         let body = serde_json::json!({
             "data": [{ "b64_json": png_b64 }],
-            "usage": { "cost": "0.001" }
+            "usage": { "cost": 0.001 }
         });
-        let parsed = parse_response(serde_json::to_vec(&body).unwrap()).unwrap();
+        let parsed = parse_response(&serde_json::to_vec(&body).unwrap()).unwrap();
         assert_eq!(parsed.usage.cost, Some(1_000));
 
         // absent usage.cost: unknown (None), not zero.
         let body = serde_json::json!({
             "data": [{ "b64_json": png_b64 }]
         });
-        let parsed = parse_response(serde_json::to_vec(&body).unwrap()).unwrap();
+        let parsed = parse_response(&serde_json::to_vec(&body).unwrap()).unwrap();
         assert_eq!(parsed.usage.cost, None);
 
         // wrong-typed usage.cost.
@@ -2746,17 +2792,17 @@ mod tests {
             "usage": { "cost": "not-a-number" }
         });
         assert_eq!(
-            parse_response(serde_json::to_vec(&body).unwrap()).unwrap_err(),
+            parse_response(&serde_json::to_vec(&body).unwrap()).unwrap_err(),
             ResponseParseError::InvalidUsageCost
         );
 
         // negative usage.cost.
         let body = serde_json::json!({
             "data": [{ "b64_json": png_b64 }],
-            "usage": { "cost": "-0.01" }
+            "usage": { "cost": -0.01 }
         });
         assert_eq!(
-            parse_response(serde_json::to_vec(&body).unwrap()).unwrap_err(),
+            parse_response(&serde_json::to_vec(&body).unwrap()).unwrap_err(),
             ResponseParseError::InvalidUsageCost
         );
 
@@ -2766,28 +2812,28 @@ mod tests {
             "usage": { "cost": "99999999999999999999999999" }
         });
         assert_eq!(
-            parse_response(serde_json::to_vec(&body).unwrap()).unwrap_err(),
+            parse_response(&serde_json::to_vec(&body).unwrap()).unwrap_err(),
             ResponseParseError::InvalidUsageCost
         );
 
         // missing outputs.
         let body = serde_json::json!({ "data": [] });
         assert_eq!(
-            parse_response(serde_json::to_vec(&body).unwrap()).unwrap_err(),
+            parse_response(&serde_json::to_vec(&body).unwrap()).unwrap_err(),
             ResponseParseError::MissingOutputs
         );
 
         // missing b64_json.
         let body = serde_json::json!({ "data": [{ "media_type": "image/png" }] });
         assert_eq!(
-            parse_response(serde_json::to_vec(&body).unwrap()).unwrap_err(),
+            parse_response(&serde_json::to_vec(&body).unwrap()).unwrap_err(),
             ResponseParseError::MissingB64Json
         );
 
         // invalid base64.
         let body = serde_json::json!({ "data": [{ "b64_json": "!!!not-base64!!!" }] });
         assert_eq!(
-            parse_response(serde_json::to_vec(&body).unwrap()).unwrap_err(),
+            parse_response(&serde_json::to_vec(&body).unwrap()).unwrap_err(),
             ResponseParseError::InvalidB64Json
         );
     }
@@ -2850,12 +2896,12 @@ mod tests {
         let body = serde_json::json!({
             "data": [{ "b64_json": png_b64 }, { "b64_json": png_b64 }]
         });
-        let parsed = parse_response(serde_json::to_vec(&body).unwrap()).unwrap();
+        let parsed = parse_response(&serde_json::to_vec(&body).unwrap()).unwrap();
         assert_eq!(parsed.outputs.len(), 2);
 
         // missing outputs produces a stable failure.
         let body = serde_json::json!({ "data": [] });
-        assert!(parse_response(serde_json::to_vec(&body).unwrap()).is_err());
+        assert!(parse_response(&serde_json::to_vec(&body).unwrap()).is_err());
 
         // extra outputs: the response is parsed as-is; the caller validates
         // the count against the planned n. Here we assert deterministic

@@ -455,6 +455,22 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
                 scrub_string(&mut value.origin, redact);
             }
         }
+        // Leak responses are secret-free by construction: plaintext, ciphertext,
+        // prefix, length, and fingerprint never ride these frames (the reveal
+        // plaintext travels only on the protected local sensitive channel), so
+        // report ids, rotation disposition, and generation counters carry no
+        // free text to scrub.
+        proto::Response::LeakReports { page: _ }
+        | proto::Response::LeakRevealCapability { capability: _ }
+        | proto::Response::LeakRevealedSecret {
+            report_id: _,
+            generation: _,
+        }
+        | proto::Response::LeakRotationUpdated {
+            report_id: _,
+            rotation: _,
+        }
+        | proto::Response::LeakReportDeleted { report_id: _ } => {}
         proto::Response::ProjectNotes { notes } => {
             for note in notes {
                 scrub_string(&mut note.project_root, redact);
@@ -3438,6 +3454,34 @@ where
     loop {
         match reader.recv().await {
             Ok(Some(frame)) => {
+                // A protocol-version mismatch terminates the connection. The
+                // executor is never allowed to exit cleanly (see
+                // `select_client_task`), so the close must run here in the
+                // reader — the one task whose clean exit is normal. Answer a
+                // versioned request with a `ProtocolVersion` error (flushed via
+                // ack) before closing, then exit cleanly.
+                if let RecvFrame::VersionMismatch { v, kind, id } = &frame {
+                    if kind == "req"
+                        && let Some(id) = id
+                    {
+                        let envelope = Envelope::error(
+                            Some(*id),
+                            ErrorPayload {
+                                code: ErrorCode::ProtocolVersion,
+                                message: proto::version_mismatch_message(*v),
+                            },
+                        );
+                        let _ = send_writer_envelope_with_ack(&writer_tx, envelope).await;
+                    } else {
+                        tracing::debug!(
+                            version = *v,
+                            kind = kind.as_str(),
+                            ?id,
+                            "closing client after protocol version mismatch"
+                        );
+                    }
+                    return Ok(());
+                }
                 if let Some(version) = negotiated_writer_version_for_frame(&frame) {
                     if writer_tx
                         .send(ClientWriterMessage::SetVersion(version))

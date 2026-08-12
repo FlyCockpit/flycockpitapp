@@ -1324,6 +1324,8 @@ mod affordance_hover_tests {
             reasoning_offset: offset,
             think_duration: None,
             seq: None,
+            performance: None,
+            performance_expanded: false,
         }
     }
 

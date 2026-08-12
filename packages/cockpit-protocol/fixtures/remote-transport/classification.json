@@ -52,8 +52,8 @@
   ],
   "counts": {
     "event": 76,
-    "request": 126,
-    "response": 81
+    "request": 142,
+    "response": 93
   },
   "messages": {
     "event": [
@@ -693,6 +693,36 @@
         "class": "bounded_request_response",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
+        "tag": "list_leak_reports"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "begin_leak_reveal"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "reveal_leak_report_secret"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "mark_leak_rotated"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "delete_leak_report"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
         "tag": "list_project_notes"
       },
       {
@@ -1270,6 +1300,72 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "resolve_assistant_session"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "recover_security_blocked_media"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "register_local_path_media"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "retain_https_media"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "get_media_attachment_status"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "get_media_attachment_preview"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "begin_media_upload"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "truncated_by_cap",
+        "lane": "interactive",
+        "tag": "append_media_upload_chunk"
+      },
+      {
+        "class": "cancel",
+        "inlinePayloadBound": "bounded",
+        "lane": "control",
+        "tag": "cancel_media_upload"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "discard_unreferenced_media_attachment"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "get_media_upload_status"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "finalize_media_upload"
       }
     ],
     "response": [
@@ -1446,6 +1542,36 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "sealed_values"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "paged",
+        "lane": "interactive",
+        "tag": "leak_reports"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "leak_reveal_capability"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "leak_revealed_secret"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "leak_rotation_updated"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "leak_report_deleted"
       },
       {
         "class": "bounded_request_response",
@@ -1758,6 +1884,48 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "remote_goal_outcome"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "local_media_mutation"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "local_path_media_registration"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "media_owner_recovery"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "retained_https_media"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "media_attachment_status"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "media_attachment_preview"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "media_upload_status"
       }
     ]
   },
@@ -1808,6 +1976,10 @@
     },
     {
       "kind": "request",
+      "tag": "terminal_ingress_chunk"
+    },
+    {
+      "kind": "request",
       "tag": "resolve_interrupt"
     },
     {
@@ -1837,6 +2009,10 @@
     {
       "kind": "request",
       "tag": "refresh_env"
+    },
+    {
+      "kind": "request",
+      "tag": "append_media_upload_chunk"
     },
     {
       "kind": "response",
@@ -1881,6 +2057,10 @@
     {
       "kind": "response",
       "tag": "project_notes"
+    },
+    {
+      "kind": "response",
+      "tag": "leak_reports"
     },
     {
       "kind": "response",

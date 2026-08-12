@@ -481,7 +481,7 @@ pub fn entry_mac(key: &[u8], entry_bytes: &[u8]) -> [u8; 32] {
     );
     let mut mac = HmacSha256::new_from_slice(key).expect("hmac accepts any key length");
     mac.update(ENTRY_MAC_DOMAIN);
-    mac.update([0x00]);
+    mac.update(&[0x00]);
     mac.update(entry_bytes);
     mac.finalize().into_bytes().into()
 }
@@ -663,37 +663,37 @@ impl ComputerAuditEntryV1 {
         }
         let event_kind =
             AuditEventKind::from_byte(buf[5]).ok_or(AuditDecodeError::InvalidEventKind(buf[5]))?;
-        let present_bits = u32::from_be_bytes(buf[8..12].try_into().unwrap());
+        let present_bits = u32::from_be_bytes(buf[6..10].try_into().unwrap());
         if present_bits & !present_bits::ALL_VALID != 0 {
             return Err(AuditDecodeError::ReservedPresentBits(present_bits));
         }
-        let sequence = u64::from_be_bytes(buf[12..20].try_into().unwrap());
-        let previous_mac: [u8; 32] = buf[20..52].try_into().unwrap();
-        let session_id: [u8; 16] = buf[52..68].try_into().unwrap();
-        let delegation_id: [u8; 16] = buf[68..84].try_into().unwrap();
-        let action_id: [u8; 16] = buf[84..100].try_into().unwrap();
-        let operation_id: [u8; 16] = buf[100..116].try_into().unwrap();
-        let proposal_id: [u8; 16] = buf[116..132].try_into().unwrap();
-        let disposition = buf[132];
-        let scope = buf[133];
-        let canonical_project_digest: [u8; 32] = buf[134..166].try_into().unwrap();
-        let provider_digest: [u8; 32] = buf[166..198].try_into().unwrap();
-        let model_digest: [u8; 32] = buf[198..230].try_into().unwrap();
-        let physical_target_digest: [u8; 32] = buf[230..262].try_into().unwrap();
-        let focus_digest: [u8; 32] = buf[262..294].try_into().unwrap();
-        let observation_digest: [u8; 32] = buf[294..326].try_into().unwrap();
-        let host_lease_digest: [u8; 32] = buf[326..358].try_into().unwrap();
-        let record_digest: [u8; 32] = buf[358..390].try_into().unwrap();
-        let ask_yolo = buf[390];
-        let action_class = buf[391];
-        let journal_state = buf[392];
-        let verification_state = buf[393];
-        let journal_version = u64::from_be_bytes(buf[394..402].try_into().unwrap());
-        let monotonic_nanos = u64::from_be_bytes(buf[402..410].try_into().unwrap());
-        let wall_unix_millis = i64::from_be_bytes(buf[410..418].try_into().unwrap());
-        let error_code = u16::from_be_bytes(buf[418..420].try_into().unwrap());
-        let rule_kind_bits = u16::from_be_bytes(buf[420..422].try_into().unwrap());
-        let key_version = u32::from_be_bytes(buf[422..426].try_into().unwrap());
+        let sequence = u64::from_be_bytes(buf[10..18].try_into().unwrap());
+        let previous_mac: [u8; 32] = buf[18..50].try_into().unwrap();
+        let session_id: [u8; 16] = buf[50..66].try_into().unwrap();
+        let delegation_id: [u8; 16] = buf[66..82].try_into().unwrap();
+        let action_id: [u8; 16] = buf[82..98].try_into().unwrap();
+        let operation_id: [u8; 16] = buf[98..114].try_into().unwrap();
+        let proposal_id: [u8; 16] = buf[114..130].try_into().unwrap();
+        let disposition = buf[130];
+        let scope = buf[131];
+        let canonical_project_digest: [u8; 32] = buf[132..164].try_into().unwrap();
+        let provider_digest: [u8; 32] = buf[164..196].try_into().unwrap();
+        let model_digest: [u8; 32] = buf[196..228].try_into().unwrap();
+        let physical_target_digest: [u8; 32] = buf[228..260].try_into().unwrap();
+        let focus_digest: [u8; 32] = buf[260..292].try_into().unwrap();
+        let observation_digest: [u8; 32] = buf[292..324].try_into().unwrap();
+        let host_lease_digest: [u8; 32] = buf[324..356].try_into().unwrap();
+        let record_digest: [u8; 32] = buf[356..388].try_into().unwrap();
+        let ask_yolo = buf[388];
+        let action_class = buf[389];
+        let journal_state = buf[390];
+        let verification_state = buf[391];
+        let journal_version = u64::from_be_bytes(buf[392..400].try_into().unwrap());
+        let monotonic_nanos = u64::from_be_bytes(buf[400..408].try_into().unwrap());
+        let wall_unix_millis = i64::from_be_bytes(buf[408..416].try_into().unwrap());
+        let error_code = u16::from_be_bytes(buf[416..418].try_into().unwrap());
+        let rule_kind_bits = u16::from_be_bytes(buf[418..420].try_into().unwrap());
+        let key_version = u32::from_be_bytes(buf[420..424].try_into().unwrap());
 
         Ok(Self {
             event_kind,

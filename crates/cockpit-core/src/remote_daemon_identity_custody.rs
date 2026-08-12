@@ -557,7 +557,7 @@ impl<A: DaemonCustodyAdapter> DaemonIdentityCustodyProvider<A> {
         provider_evidence: &[u8],
         observed_at: i64,
     ) -> Result<CustodyEvidence, RemoteIdentityCustodyError> {
-        let evidence_digest = Sha256::digest(provider_evidence);
+        let evidence_digest: [u8; 32] = Sha256::digest(provider_evidence).into();
         // Construct the foundation CustodyEvidence and round-trip it through
         // encode/decode to prove the seam consumes the foundation codec.
         let evidence = CustodyEvidence {
@@ -1058,8 +1058,10 @@ mod tests {
         assert_eq!(public_key.x.len(), 32);
         assert_eq!(public_key.y.len(), 32);
         // The custody evidence carries provider evidence bytes, not private
-        // bytes. The evidence digest is SHA-256 of the provider evidence.
-        assert!(custody_evidence.verify_evidence(&custody_evidence.provider_evidence));
+        // bytes. The evidence digest is SHA-256 of the provider evidence; the
+        // wire encoder rejects any evidence whose digest does not bind its
+        // provider bytes, so a successful encode proves the binding holds.
+        assert!(custody_evidence.encode().is_ok());
         // The handle id is 16 bytes; no private bytes.
         assert_eq!(handle.0.len(), 16);
         // Sign returns a 64-byte P1363 signature; no private bytes.

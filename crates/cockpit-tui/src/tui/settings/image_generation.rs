@@ -412,9 +412,18 @@ impl JobReducer {
         if self.daemon_instance != daemon_instance
             || self.project_id != project_id
             || self.session_id != session_id
-            || self.config_generation != config_generation
-            || version < self.monotonic_version
         {
+            return false;
+        }
+        // Config generation is adopted on bootstrap (a freshly-constructed
+        // reducer carries an empty generation) and must match thereafter;
+        // a generation change forces a reload rather than committing.
+        if self.config_generation.is_empty() {
+            self.config_generation = config_generation.to_string();
+        } else if self.config_generation != config_generation {
+            return false;
+        }
+        if version < self.monotonic_version {
             return false;
         }
         // Gap detection: if version jumps, force reload.
@@ -790,6 +799,14 @@ impl SettingsPage for GenerationListPage {
         SettingsPointerSurfaceKind::GenerationList
     }
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
+        // While the resize blocker is showing, list navigation is inert; only
+        // the back/quit keys remain live so the user can leave the surface.
+        if self.viewport == GenerationViewportMode::Blocked {
+            return match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left | KeyCode::Char('h') => Nav::Back,
+                _ => Nav::Stay,
+            };
+        }
         self.handle_node_key(cx, key)
     }
     fn render(&self, _cx: &SettingsCx, frame: &mut Frame, area: Rect) {
@@ -1282,8 +1299,8 @@ impl SettingsPage for JobDetailPage {
             lines.push(Line::from("Job not found."));
         }
         if let Some((action, choice)) = &self.confirm {
-            if let Some(text) = confirmation_text(*action) {
-                let (confirm_label, _) = confirmation_buttons(*action).unwrap();
+            if let Some(text) = confirmation_text(action.clone()) {
+                let (confirm_label, _) = confirmation_buttons(action.clone()).unwrap();
                 lines.push(Line::from(""));
                 lines.push(Line::from(format!("{text} [{confirm_label}] [Cancel]")));
                 let _ = choice;
@@ -1403,18 +1420,18 @@ mod tests {
         }
     }
 
-    fn test_dialog() -> super::SettingsDialog {
+    fn test_dialog() -> super::super::SettingsDialog {
         use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("config.json");
         std::fs::write(&path, "{}").unwrap();
         std::mem::forget(tmp);
-        super::SettingsDialog::open(path)
+        super::super::SettingsDialog::open(path)
     }
 
     fn render_page_lines(
         page: &dyn SettingsPage,
-        dialog: &super::SettingsDialog,
+        dialog: &super::super::SettingsDialog,
         width: u16,
         height: u16,
     ) -> Vec<String> {
@@ -1830,8 +1847,8 @@ mod tests {
             quarantined_late_result_count: 0,
             stale: false,
         };
-        assert!(!reducer.apply_job_event("d2", "p1", "s1", job, "c1", 4));
-        assert!(!reducer.apply_job_event("d1", "p2", "s1", job, "c1", 4));
+        assert!(!reducer.apply_job_event("d2", "p1", "s1", job.clone(), "c1", 4));
+        assert!(!reducer.apply_job_event("d1", "p2", "s1", job.clone(), "c1", 4));
         assert!(!reducer.apply_job_event("d1", "p1", "s2", job, "c1", 4));
 
         let job = JobCard {

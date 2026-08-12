@@ -566,6 +566,7 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "inspect_video",
         "extract_video_clip",
         "extract_audio",
+        "read_image",
         "list_image_generation_targets",
         "generate_image",
         "get_image_generation_job",
@@ -706,12 +707,6 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
             family: "Planning",
             name: "todo",
             summary: "Manage session todos and notes.",
-            condition: Some("interactive sessions"),
-        },
-        BuiltinToolInventoryItem {
-            family: "Planning",
-            name: "goal",
-            summary: "Create, read, or update the session goal.",
             condition: Some("interactive sessions"),
         },
         BuiltinToolInventoryItem {
@@ -1445,10 +1440,18 @@ fn effective_tool_tier(
     if let Some(tier) = def.tool_tiers.get(tool) {
         return *tier;
     }
+    // Media tiers respect the discoverable-mcp reachability invariant
+    // (`validate_discoverable_mcp_reachable`): a Discoverable tool is only
+    // reachable on an agent that also grants `mcp`. `Careful` keeps a small
+    // direct surface and reaches broader Build capabilities through `mcp`, so
+    // its media tools are Discoverable (mcp-reachable), not direct. The read
+    // workers `scout`/`bee` hold no `mcp` grant and keep a fixed direct
+    // surface (their embedded factories carry no media), so media tiers to
+    // Disabled for them rather than to an unreachable Discoverable entry.
     if matches!(tool, "inspect_audio" | "inspect_video") {
         return match def.name.as_str() {
-            "Build" | "Careful" | "Plan" | "explore" => crate::agents::ToolTier::Enabled,
-            "builder" | "deepthink" | "scout" | "bee" | "Multireview" => {
+            "Build" | "Plan" | "explore" => crate::agents::ToolTier::Enabled,
+            "Careful" | "builder" | "deepthink" | "Multireview" => {
                 crate::agents::ToolTier::Discoverable
             }
             _ => crate::agents::ToolTier::Disabled,
@@ -1456,15 +1459,15 @@ fn effective_tool_tier(
     }
     if matches!(tool, "extract_video_clip" | "extract_audio") {
         return match def.name.as_str() {
-            "Build" | "Careful" => crate::agents::ToolTier::Enabled,
-            "builder" => crate::agents::ToolTier::Discoverable,
+            "Build" => crate::agents::ToolTier::Enabled,
+            "Careful" | "builder" => crate::agents::ToolTier::Discoverable,
             _ => crate::agents::ToolTier::Disabled,
         };
     }
     if matches!(tool, "read_image") {
         return match def.name.as_str() {
-            "Build" | "Careful" | "Plan" | "explore" => crate::agents::ToolTier::Enabled,
-            "builder" | "deepthink" | "scout" | "bee" | "Multireview" => {
+            "Build" | "Plan" | "explore" => crate::agents::ToolTier::Enabled,
+            "Careful" | "builder" | "deepthink" | "Multireview" => {
                 crate::agents::ToolTier::Discoverable
             }
             _ => crate::agents::ToolTier::Disabled,
@@ -4870,8 +4873,12 @@ mod tests {
         let args = test_spawn_args(tmp.path());
         let names = known_agent_tool_names();
         assert!(names.contains(&"todo"));
-        assert!(names.contains(&"goal"));
         assert!(names.contains(&"session_lineage_search"));
+        // `goal` is deliberately not a grantable/runtime tool: the session goal
+        // is host/driver-owned durable state, not a tool an agent may mention in
+        // `tools:` (see `worker_cannot_create_or_mutate_goal`). Its retired
+        // sub-action verbs must also stay ungrantable.
+        assert!(!names.contains(&"goal"));
         for removed in [
             format!("todo_{}", "read"),
             format!("create_{}", "goal"),
@@ -4883,7 +4890,7 @@ mod tests {
                 "{removed} should not be grantable"
             );
         }
-        for name in ["todo", "goal", "session_lineage_search"] {
+        for name in ["todo", "session_lineage_search"] {
             let tb = materialize_tool_by_name(ToolBox::new(), name, None, &args).unwrap();
             assert_eq!(tb.names(), vec![name]);
         }

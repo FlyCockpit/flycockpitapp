@@ -84,17 +84,31 @@ impl<'a> ComfyRouteProfile<'a> {
             .adapter
             .route(route)
             .context("route is not available for this adapter")?;
-        let placeholder = relative
-            .strip_suffix("}")
-            .and_then(|s| s.rsplit_once('{'))
+        // Locate the single `{param}` placeholder, which may appear anywhere in
+        // the route (e.g. `/api/jobs/{job_id}/cancel`), not only at the end.
+        let open = relative
+            .find('{')
             .context("route has no parameter placeholder")?;
+        let close = relative[open..]
+            .find('}')
+            .map(|offset| open + offset)
+            .context("route has no parameter placeholder")?;
+        let prefix = &relative[..open];
+        let suffix = &relative[close + 1..];
+        ensure!(
+            !prefix.contains('{')
+                && !prefix.contains('}')
+                && !suffix.contains('{')
+                && !suffix.contains('}'),
+            "route has more than one parameter placeholder"
+        );
         ensure!(
             !value.contains('{') && !value.contains('}'),
             "remote identifier contains reserved characters"
         );
         validate_remote_identifier(value)?;
         Ok(ComfyRouteUrl {
-            url: format!("{}{}{}", self.base(), placeholder.0, value),
+            url: format!("{}{}{}{}", self.base(), prefix, value, suffix),
             route,
         })
     }
@@ -931,7 +945,9 @@ impl PromptExecutionState {
                 }
             }
             ComfyWsEvent::ExecutionError { .. } => {
-                if !self.completed {
+                // A late error after any terminal state (completed or
+                // interrupted) is an out-of-order event and is ignored.
+                if !self.completed && !self.interrupted {
                     self.failed = true;
                 }
             }

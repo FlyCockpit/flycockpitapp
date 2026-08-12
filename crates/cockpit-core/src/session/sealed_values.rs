@@ -311,10 +311,22 @@ mod tests {
             .filter(|name| name.ends_with(".sql"))
             .cloned()
             .collect();
-        assert_eq!(
-            sql_migrations,
-            vec!["0001_initial.sql".to_string()],
-            "sealed-value repair must not add any migration beyond the squashed initial schema"
+        // The schema is append-only: the squashed initial migration carries the
+        // sealed-value tables, and later migrations (e.g. 0002/0003) add
+        // unrelated features. The invariant the sealed-value repair must hold is
+        // narrower than "only one migration exists": it must not append a
+        // *dedicated* sealed-value migration — its tables stay in the initial
+        // squashed schema — so no migration beyond the initial one names sealed
+        // values.
+        assert!(
+            sql_migrations.contains(&"0001_initial.sql".to_string()),
+            "the sealed-value schema lives in the squashed initial migration"
+        );
+        assert!(
+            !sql_migrations
+                .iter()
+                .any(|name| name != "0001_initial.sql" && name.contains("sealed")),
+            "sealed-value repair must not append a dedicated sealed-value migration"
         );
     }
 }

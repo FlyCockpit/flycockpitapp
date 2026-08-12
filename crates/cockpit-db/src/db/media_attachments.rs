@@ -2343,15 +2343,22 @@ impl super::Db {
             "SELECT intent_id,attachment_id,attachment_version,expected_availability_generation,expected_reference_generation,component_set_digest,reason,created_at_unix_ms FROM media_attachment_cleanup_intents WHERE attachment_id=?1",
             [attachment_id.to_string()],
             |row| {
-                let intent_id = Uuid::parse_str(&row.get::<_, String>(0)?).map_err(|error| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error)))?;
-                let persisted_attachment_id = Uuid::parse_str(&row.get::<_, String>(1)?).map_err(|error| rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(error)))?;
-                let parse = |column, field| parse_decimal(row.get(column)?, field).map_err(|error| rusqlite::Error::FromSqlConversionFailure(column, rusqlite::types::Type::Text, error.into()));
+                let intent_id = component_uuid(row, 0)?;
+                let persisted_attachment_id = component_uuid(row, 1)?;
                 Ok(MediaCleanupIntent {
                     intent_id,
                     attachment_id: persisted_attachment_id,
-                    attachment_version: parse(2, "cleanup attachment version")?,
-                    expected_availability_generation: parse(3, "cleanup availability generation")?,
-                    expected_reference_generation: parse(4, "cleanup reference generation")?,
+                    attachment_version: component_decimal(row, 2, "cleanup attachment version")?,
+                    expected_availability_generation: component_decimal(
+                        row,
+                        3,
+                        "cleanup availability generation",
+                    )?,
+                    expected_reference_generation: component_decimal(
+                        row,
+                        4,
+                        "cleanup reference generation",
+                    )?,
                     component_set_digest: row.get(5)?,
                     reason: row.get(6)?,
                     created_at_unix_ms: row.get(7)?,
@@ -2441,13 +2448,11 @@ impl super::Db {
                 "SELECT component_id,storage_id,component_generation,stable_identity_digest,byte_length,sha256,reservation_id,created_at_unix_ms,updated_at_unix_ms FROM media_attachment_components WHERE attachment_id=?1 AND attachment_version=?2 AND component_kind=?3 AND lifecycle_state='ready'",
                 params![attachment_id.to_string(), decimal(expected_version)?, component_kind],
                 |row| {
-                    let uuid = |column| Uuid::parse_str(&row.get::<_, String>(column)?).map_err(|error| rusqlite::Error::FromSqlConversionFailure(column, rusqlite::types::Type::Text, Box::new(error)));
-                    let number = |column, field| parse_decimal(row.get(column)?, field).map_err(|error| rusqlite::Error::FromSqlConversionFailure(column, rusqlite::types::Type::Text, error.into()));
                     Ok(MediaAttachmentComponent {
-                        component_id: uuid(0)?, attachment_id, attachment_version: expected_version,
-                        component_kind: component_kind.to_owned(), storage_id: uuid(1)?, lifecycle_state: "ready".into(),
-                        component_generation: number(2, "component generation")?, stable_identity_digest: row.get(3)?,
-                        byte_length: number(4, "component byte length")?, sha256: row.get(5)?, reservation_id: row.get(6)?,
+                        component_id: component_uuid(row, 0)?, attachment_id, attachment_version: expected_version,
+                        component_kind: component_kind.to_owned(), storage_id: component_uuid(row, 1)?, lifecycle_state: "ready".into(),
+                        component_generation: component_decimal(row, 2, "component generation")?, stable_identity_digest: row.get(3)?,
+                        byte_length: component_decimal(row, 4, "component byte length")?, sha256: row.get(5)?, reservation_id: row.get(6)?,
                         created_at_unix_ms: row.get(7)?, updated_at_unix_ms: row.get(8)?,
                     })
                 },
@@ -2641,6 +2646,31 @@ fn parse_decimal(value: String, field: &'static str) -> Result<u64> {
         .with_context(|| format!("invalid {field}"))?;
     ensure!(parsed > 0, "{field} must be positive");
     Ok(parsed)
+}
+
+/// Parse a UUID text column from a component row. A module-level free
+/// function (not a row-scoped closure) so the blocking-boundary gate can
+/// resolve every call site through the crate's public accessors.
+fn component_uuid(row: &rusqlite::Row, column: usize) -> rusqlite::Result<Uuid> {
+    Uuid::parse_str(&row.get::<_, String>(column)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
+/// Parse a canonical decimal column from a component row, mapping the
+/// validation failure into a `rusqlite` conversion error.
+fn component_decimal(
+    row: &rusqlite::Row,
+    column: usize,
+    field: &'static str,
+) -> rusqlite::Result<u64> {
+    parse_decimal(row.get(column)?, field).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(column, rusqlite::types::Type::Text, error.into())
+    })
 }
 
 fn validate_digest(value: &str, field: &str) -> Result<()> {

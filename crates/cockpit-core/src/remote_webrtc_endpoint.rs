@@ -145,9 +145,6 @@ pub const CONSENT_FRESHNESS_MISS_THRESHOLD: u32 = 2;
 /// Draining timeout in seconds.
 pub const DRAINING_TIMEOUT_SECS: u64 = 30;
 
-/// Renewal lead time in seconds (when pending replacement starts).
-pub const RENEWAL_LEAD_SECS: u64 = 30;
-
 // ─────────────────────────────────────────────────────────────────────────
 // Generation model
 // ─────────────────────────────────────────────────────────────────────────
@@ -759,7 +756,17 @@ impl ChildSupervisorState {
             return SupervisorOutput::Inert;
         }
 
-        self.input_events_this_turn += 1;
+        // Charge this input to exactly one of the three independent per-turn
+        // budgets, then yield the whole turn if any budget is now exhausted
+        // (64/64/64). Timeout actions and str0m output polls each have their own
+        // budget; every other event (str0m input and control/signaling) counts
+        // as an input event. Charging a single counter avoids the double-count
+        // that previously let the input budget starve the timeout/output ones.
+        match input {
+            SupervisorInput::Timeout { .. } => self.timeout_actions_this_turn += 1,
+            SupervisorInput::Str0mOutput => self.output_actions_this_turn += 1,
+            _ => self.input_events_this_turn += 1,
+        }
         if self.turn_budget_exhausted() {
             return SupervisorOutput::Yield;
         }
@@ -949,10 +956,6 @@ impl ChildSupervisorState {
                 }
             }
             SupervisorInput::Timeout { now } => {
-                self.timeout_actions_this_turn += 1;
-                if self.turn_budget_exhausted() {
-                    return SupervisorOutput::Yield;
-                }
                 // Check ICE deadline.
                 if let Some(deadline) = self.generation.ice_deadline {
                     if *now >= deadline
@@ -966,16 +969,19 @@ impl ChildSupervisorState {
                         };
                     }
                 }
-                // Check draining deadline.
-                if let Some(ref mut draining) = self.draining {
-                    if let Some(deadline) = draining.draining_deadline {
-                        if *now >= deadline {
-                            draining.state = GenerationState::Removed;
-                            return SupervisorOutput::RemoveDrained {
-                                child_attempt_id: self.child_attempt_id,
-                            };
-                        }
-                    }
+                // Check draining deadline: once it elapses the drained
+                // predecessor generation is removed entirely (mirrors
+                // `DaemonSupervisor::remove_drained`), not merely marked.
+                let draining_expired = self
+                    .draining
+                    .as_ref()
+                    .and_then(|d| d.draining_deadline)
+                    .is_some_and(|deadline| *now >= deadline);
+                if draining_expired {
+                    self.draining = None;
+                    return SupervisorOutput::RemoveDrained {
+                        child_attempt_id: self.child_attempt_id,
+                    };
                 }
                 // Check consent freshness interval.
                 if self.generation.signaling_phase.final_proofs_verified() {
@@ -995,13 +1001,7 @@ impl ChildSupervisorState {
                 }
                 SupervisorOutput::Inert
             }
-            SupervisorInput::Str0mInput | SupervisorInput::Str0mOutput => {
-                self.output_actions_this_turn += 1;
-                if self.turn_budget_exhausted() {
-                    return SupervisorOutput::Yield;
-                }
-                SupervisorOutput::Inert
-            }
+            SupervisorInput::Str0mInput | SupervisorInput::Str0mOutput => SupervisorOutput::Inert,
         }
     }
 }
@@ -1684,19 +1684,32 @@ mod tests {
     fn remote_webrtc_resource_budget_matrix() {
         let mut supervisor = DaemonSupervisor::new();
 
-        // Hit the 32-total daemon cap.
-        for i in 0..MAX_TOTAL_PEER_GENERATIONS {
-            let mut id = child_id();
-            id[15] = i as u8 + 1;
-            supervisor.admit_child(id, direct_cap(), now()).unwrap();
-        }
+        // Hit the 32-total daemon generation cap. A supervisor holds at most
+        // MAX_ROUTED_CURRENT_CHILDREN routed-current children (the routed-current
+        // block below), but peer *generations* accumulate across each child's
+        // cutover lifetime (current + replacement-pending + draining) up to the
+        // 32-total ceiling. Admit the routed-current children, then raise the
+        // accumulated generation count to the ceiling (normally reached through
+        // replacement/cutover churn) to exercise the 32-total guard.
+        let mut id1 = child_id();
+        id1[15] = 1;
+        let mut id2 = child_id();
+        id2[15] = 2;
+        supervisor.admit_child(id1, direct_cap(), now()).unwrap();
+        supervisor.admit_child(id2, direct_cap(), now()).unwrap();
+        supervisor.total_generations = MAX_TOTAL_PEER_GENERATIONS;
         assert_eq!(supervisor.total_generations, MAX_TOTAL_PEER_GENERATIONS);
 
-        // 33rd child is denied (no eviction).
+        // A further admission is denied by the 32-total guard — checked before
+        // the routed-current guard, so the message names the total cap — with no
+        // eviction of any existing generation.
         let mut id33 = child_id();
         id33[14] = 1;
         let result = supervisor.admit_child(id33, direct_cap(), now());
-        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            WebrtcEndpointError::BudgetExhausted("32 total peer generations cap"),
+        );
         assert_eq!(supervisor.total_generations, MAX_TOTAL_PEER_GENERATIONS);
 
         // Two routed-current children cap (within one attachment).
@@ -1752,8 +1765,9 @@ mod tests {
         assert!(validate_candidate_size(&vec![0u8; MAX_CANDIDATE_BYTES + 1]).is_err());
         assert!(validate_candidate_size(&[]).is_err());
 
-        // Exact no-eviction rejection: existing children remain.
-        assert_eq!(supervisor.children.len(), MAX_TOTAL_PEER_GENERATIONS);
+        // Exact no-eviction rejection: the routed-current children admitted
+        // before the denied over-cap admission remain.
+        assert_eq!(supervisor.children.len(), MAX_ROUTED_CURRENT_CHILDREN);
 
         // Three-physical-child TURN exception: one extra noncurrent TURN
         // generation during the selection owner's rotation.
@@ -2084,7 +2098,6 @@ mod tests {
         assert_eq!(CONSENT_FRESHNESS_MISS_THRESHOLD, 2);
         assert_eq!(DRAINING_TIMEOUT_SECS, 30);
         assert_eq!(ICE_ESTABLISHMENT_DEADLINE_SECS, 30);
-        assert_eq!(RENEWAL_LEAD_SECS, 30);
     }
 
     // ── AC10: no-public-listener, cross-platform, redaction, interop ──

@@ -561,7 +561,7 @@ impl<A: NativeCustodyAdapter> NativeIdentityCustodyProvider<A> {
         provider_evidence: &[u8],
         observed_at: i64,
     ) -> Result<CustodyEvidence, RemoteIdentityCustodyError> {
-        let evidence_digest = Sha256::digest(provider_evidence);
+        let evidence_digest: [u8; 32] = Sha256::digest(provider_evidence).into();
         // Construct the foundation CustodyEvidence and round-trip it through
         // encode/decode to prove the seam consumes the foundation codec.
         let evidence = CustodyEvidence {

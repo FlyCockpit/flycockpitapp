@@ -1010,8 +1010,8 @@ mod tests {
             operation,
         )
         .unwrap();
-        assert!(matches!(first, Response::Ack));
-        assert!(matches!(reconciled, Response::Ack));
+        assert!(matches!(first, Response::FsWrite { .. }));
+        assert!(matches!(reconciled, Response::FsWrite { .. }));
         assert_eq!(
             std::fs::metadata(root.join("nested/value.txt"))
                 .unwrap()

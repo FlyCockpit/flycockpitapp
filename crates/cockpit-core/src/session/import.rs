@@ -468,13 +468,30 @@ fn restore_archive_conn(
                 .get("status")
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("inference request sidecar lacks status"))?;
+            // Round-trip the attempt ordinal + phase columns + per-attempt
+            // metadata without re-injecting phases into the immutable body.
+            // Absent (legacy archive) → ordinal 0, empty phases.
+            let ordinal = sidecar.get("ordinal").and_then(Value::as_i64).unwrap_or(0);
+            let phases = sidecar.get("phases");
+            let phase_ms = |key: &str| phases.and_then(|p| p.get(key)).and_then(Value::as_i64);
             Db::insert_inference_request_conn(
                 conn,
-                call_id,
-                id_map[&event.source_session_id],
-                event.ts_ms,
-                request,
-                status,
+                &cockpit_db::db::session_log::ImportedInferenceRequest {
+                    call_id,
+                    ordinal,
+                    session_id: id_map[&event.source_session_id],
+                    ts_ms: event.ts_ms,
+                    payload: request,
+                    status,
+                    provider: sidecar.get("provider").and_then(Value::as_str),
+                    model: sidecar.get("model").and_then(Value::as_str),
+                    trust: sidecar.get("trust").and_then(Value::as_str),
+                    phases: cockpit_db::db::session_log::InferencePhaseTimings {
+                        first_token_ms: phase_ms("first_token_ms"),
+                        completed_ms: phase_ms("completed_ms"),
+                        failed_ms: phase_ms("failed_ms"),
+                    },
+                },
             )?;
         }
         let restored_seq = Db::insert_session_event_json_conn(

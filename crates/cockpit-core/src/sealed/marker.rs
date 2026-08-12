@@ -29,9 +29,7 @@ use cockpit_db::db::Db;
 use cockpit_db::db::sealed_scope::SealedScopeKind;
 
 use super::action::{SealedActionId, SealedActionRegistry, SealedActionRevision};
-use super::identity::{
-    SealedName, SealedRecordId, SealedRedactionIdentity, parse_sealed_redaction_origin,
-};
+use super::identity::{SealedName, SealedRecordId, SealedRedactionIdentity};
 
 /// Canonical typed identity of one sealed value, for renderers and exports.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,16 +124,13 @@ impl SealedMarkerPredicate {
 /// are no longer usable. That is the point — a transcript written while the
 /// value was live must stay scrubbed forever.
 ///
-/// This reads origins only. `RedactionTable::entries_for_debug` returns
-/// origins, never values, so no literal can pass through here.
+/// This reads the typed classification directly via
+/// `RedactionTable::sealed_identities`, which returns canonical identities,
+/// never values, so no literal can pass through here.
 pub fn historical_redaction_inventory(
     table: &crate::redact::RedactionTable,
 ) -> Vec<SealedRedactionIdentity> {
-    let mut inventory: Vec<_> = table
-        .entries_for_debug()
-        .into_iter()
-        .filter_map(parse_sealed_redaction_origin)
-        .collect();
+    let mut inventory: Vec<_> = table.sealed_identities();
     inventory.sort_by(|a, b| {
         (a.scope.as_str(), a.name.as_str(), a.version).cmp(&(
             b.scope.as_str(),

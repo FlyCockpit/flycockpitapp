@@ -34,7 +34,7 @@ use super::grant::{
     SealedAuthorizationInputs, SealedUseContext, SealedUseDenied, UseSealedValueRequest,
     authorize_sealed_use, sealed_grant_selector,
 };
-use super::identity::{SealedName, SealedProjectTrust, SealedRecordId, sealed_redaction_origin};
+use super::identity::{SealedName, SealedProjectTrust, SealedRecordId, SealedRedactionIdentity};
 
 /// Where a resolved literal is registered for redaction before it is used.
 ///
@@ -65,10 +65,16 @@ impl SealedProjectTrustSource for FixedProjectTrust {
 }
 
 pub trait SealedRedactionSink: Send + Sync {
-    /// Register `literal` under its canonical typed `origin`. Returning `Err`
-    /// aborts the use — a literal is never used if it could not be redacted
-    /// first.
-    fn register_before_use(&self, literal: &SealedLiteral, origin: &str) -> anyhow::Result<()>;
+    /// Register `literal` under its canonical typed `identity`. Classification
+    /// is carried by the typed [`SealedRedactionIdentity`] end-to-end — the sink
+    /// never serializes to and reparses a diagnostic origin string to recover
+    /// sealedness. Returning `Err` aborts the use — a literal is never used if it
+    /// could not be redacted first.
+    fn register_before_use(
+        &self,
+        literal: &SealedLiteral,
+        identity: &SealedRedactionIdentity,
+    ) -> anyhow::Result<()>;
 }
 
 /// The runtime half of sealed values: closed registry + durable stores.
@@ -196,14 +202,22 @@ impl SealedRuntime {
         let literal = self.resolve_literal(&claimed).await?;
 
         // ---- 5. redaction before use ------------------------------------
-        let origin = sealed_redaction_origin(
-            claimed.scope,
-            SealedRecordId::parse(&claimed.record_id).map_err(|_| SealedUseDenied)?,
-            u32::try_from(claimed.active_version).map_err(|_| SealedUseDenied)?,
-            &SealedName::canonical(&claimed.name).map_err(|_| SealedUseDenied)?,
-        );
+        // Build the TYPED sealed identity and register it directly. Sealedness
+        // travels as typed state from here to the redaction table; nothing on
+        // this path serializes to a `sealed:<id>` string and reparses it to
+        // reconstruct classification (the round-trip the settled decision
+        // forbids). The diagnostic origin string is derived from this identity
+        // only for `cockpit debug redact` display, never for classification.
+        let identity = SealedRedactionIdentity {
+            scope: claimed.scope,
+            record_id: Some(
+                SealedRecordId::parse(&claimed.record_id).map_err(|_| SealedUseDenied)?,
+            ),
+            name: SealedName::canonical(&claimed.name).map_err(|_| SealedUseDenied)?,
+            version: u32::try_from(claimed.active_version).map_err(|_| SealedUseDenied)?,
+        };
         redaction
-            .register_before_use(&literal, &origin)
+            .register_before_use(&literal, &identity)
             .map_err(|_| SealedUseDenied)?;
 
         // ---- 6. invoke, then answer at the declared fixed deadline ------
@@ -312,11 +326,18 @@ impl RecordingRedactionSink {
 }
 
 impl SealedRedactionSink for RecordingRedactionSink {
-    fn register_before_use(&self, _literal: &SealedLiteral, origin: &str) -> anyhow::Result<()> {
+    fn register_before_use(
+        &self,
+        _literal: &SealedLiteral,
+        identity: &SealedRedactionIdentity,
+    ) -> anyhow::Result<()> {
+        // Record the derived diagnostic origin string so existing observability
+        // assertions still read the canonical origin. The string is derived FROM
+        // the typed identity, never parsed back into classification.
         self.origins
             .lock()
             .expect("sink mutex")
-            .push(origin.to_string());
+            .push(identity.display_origin());
         Ok(())
     }
 }
@@ -341,16 +362,21 @@ impl SessionRedactionSink {
 }
 
 impl SealedRedactionSink for SessionRedactionSink {
-    fn register_before_use(&self, literal: &SealedLiteral, origin: &str) -> anyhow::Result<()> {
+    fn register_before_use(
+        &self,
+        literal: &SealedLiteral,
+        identity: &SealedRedactionIdentity,
+    ) -> anyhow::Result<()> {
         // Fail **closed**. A detached hub owns no redaction table, so
-        // `seal_redaction_at_origin` returns `Ok(None)` having registered
+        // `seal_redaction_with_identity` returns `Ok(None)` having registered
         // nothing. Treating that as success would hand the literal to an
         // action with egress unscrubbed — exactly the stored-but-unredacted
-        // window this ordering exists to prevent.
-        let registered = self.interrupts.seal_redaction_at_origin(
+        // window this ordering exists to prevent. The typed identity is passed
+        // straight through; no origin string is parsed to recover sealedness.
+        let registered = self.interrupts.seal_redaction_with_identity(
             &self.session,
             literal.expose_for_redaction().to_string(),
-            origin,
+            identity.clone(),
         )?;
         if registered.is_none() {
             anyhow::bail!("sealed value cannot be used without a live redaction table");

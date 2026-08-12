@@ -111,6 +111,104 @@ impl Replacement {
     }
 }
 
+/// The classification carried by one redaction-table entry. Typed identity
+/// lives on the entry itself — there is no parallel origins/replacements vector
+/// to drift out of sync, and egress reads the classification directly instead
+/// of parsing a diagnostic-origin string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EntryClass {
+    /// An ordinary secret (environment, credential, deny-list, file, or
+    /// approved-secret-file value). `origin` is the diagnostic label
+    /// (`$VAR`, `$denylist`, `$ssh:…`) shown by `cockpit debug redact`.
+    Ordinary { origin: String },
+    /// A sealed value, carrying its canonical typed identity. The actionable
+    /// sealed marker is an ephemeral per-target decision resolved by
+    /// [`RedactionTable::with_sealed_replacements`] from this identity; it is
+    /// never frozen into the persisted table.
+    Sealed(crate::sealed::identity::SealedRedactionIdentity),
+}
+
+impl EntryClass {
+    /// The diagnostic origin *string* for `cockpit debug redact` display. For a
+    /// sealed entry this is derived from the typed identity — the string is a
+    /// display artifact, never re-parsed to recover sealedness.
+    fn origin_display(&self) -> String {
+        match self {
+            EntryClass::Ordinary { origin } => origin.clone(),
+            EntryClass::Sealed(identity) => sealed_identity_origin(identity),
+        }
+    }
+}
+
+/// Derive the canonical redaction-origin string for one sealed identity, for
+/// diagnostic display only. A legacy session entry (no record id) renders the
+/// pre-scoping `sealed:<name>` form; a scoped entry renders the full grammar.
+fn sealed_identity_origin(identity: &crate::sealed::identity::SealedRedactionIdentity) -> String {
+    identity.display_origin()
+}
+
+/// The canonical value id rendered into the sealed marker (`use_sealed_value`
+/// references it): the record id for a scoped entry, or the legacy name for a
+/// session entry registered before scoping existed. This is the WIRE text, not
+/// the active-set lookup key — the lookup key is version-scoped (see
+/// [`sealed_active_key`]).
+fn sealed_value_id(identity: &crate::sealed::identity::SealedRedactionIdentity) -> String {
+    identity
+        .record_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| identity.name.as_str().to_string())
+}
+
+/// The VERSION-SCOPED key used to test a sealed entry against the active-grant
+/// set (built the same way on the grant side by
+/// [`crate::sealed::active_sealed_value_ids`]). A scoped entry keys on
+/// `(record_id, version)`; a legacy entry keys on `(name, version)`. Including
+/// the version means a grant for one version can never activate a persisted
+/// entry sealed at a different version, and — because legacy entries are
+/// version 0 while a real grant is version `>= 1` — a scoped grant can never
+/// activate a legacy same-name entry of a different record.
+fn sealed_active_key(identity: &crate::sealed::identity::SealedRedactionIdentity) -> String {
+    match identity.record_id {
+        Some(record_id) => crate::sealed::identity::sealed_scoped_active_key(
+            &record_id.to_string(),
+            identity.version,
+        ),
+        None => crate::sealed::identity::sealed_legacy_active_key(
+            identity.name.as_str(),
+            identity.version,
+        ),
+    }
+}
+
+/// One typed redaction-table entry: the literal to match, its typed
+/// classification, and the replacement descriptor resolved for the current
+/// egress target (always [`Replacement::Generic`] except on a table derived by
+/// [`RedactionTable::with_sealed_replacements`]).
+#[derive(Debug, Clone)]
+pub(crate) struct RedactionEntry {
+    value: String,
+    class: EntryClass,
+    replacement: Replacement,
+}
+
+impl RedactionEntry {
+    fn ordinary(value: String, origin: String) -> Self {
+        Self {
+            value,
+            class: EntryClass::Ordinary { origin },
+            replacement: Replacement::Generic,
+        }
+    }
+
+    fn sealed(value: String, identity: crate::sealed::identity::SealedRedactionIdentity) -> Self {
+        Self {
+            value,
+            class: EntryClass::Sealed(identity),
+            replacement: Replacement::Generic,
+        }
+    }
+}
+
 #[cfg(test)]
 use self::dotenv::*;
 use self::dotenv::{collect_env_file_candidates, consume_marked_value, matched_dotenv_paths};
@@ -469,7 +567,11 @@ fn url_encode(bytes: &[u8]) -> String {
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct PersistedRedactionTable {
-    entries: Vec<(String, String)>,
+    /// Typed entries: the literal plus its explicit classification. Pre-release
+    /// the representation changes in place (no migration / no back-compat
+    /// shim); an entry's sealedness serializes as data, never as a `sealed:`
+    /// origin string that egress would have to re-parse.
+    entries: Vec<PersistedEntry>,
     /// Origin-only coverage markers for values collected from files on disk.
     /// These deliberately carry no values, so session resume can detect lost
     /// coverage without turning the database into a copy of file secrets.
@@ -482,6 +584,100 @@ struct PersistedRedactionTable {
     protected: Vec<String>,
 }
 
+/// One serialized redaction entry: the literal plus its explicit typed
+/// classification.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct PersistedEntry {
+    value: String,
+    #[serde(flatten)]
+    class: PersistedEntryClass,
+}
+
+/// The persisted classification. `Ordinary` carries its diagnostic origin;
+/// `Sealed` carries the canonical typed identity fields so egress reads
+/// sealedness directly.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "class", rename_all = "snake_case")]
+enum PersistedEntryClass {
+    Ordinary {
+        origin: String,
+    },
+    Sealed {
+        scope: String,
+        #[serde(default)]
+        record_id: Option<String>,
+        name: String,
+        version: u32,
+    },
+}
+
+impl PersistedEntry {
+    fn from_entry(entry: &RedactionEntry) -> Self {
+        let class = match &entry.class {
+            EntryClass::Ordinary { origin } => PersistedEntryClass::Ordinary {
+                origin: origin.clone(),
+            },
+            EntryClass::Sealed(identity) => PersistedEntryClass::Sealed {
+                scope: identity.scope.as_str().to_string(),
+                record_id: identity.record_id.map(|id| id.to_string()),
+                name: identity.name.as_str().to_string(),
+                version: identity.version,
+            },
+        };
+        Self {
+            value: entry.value.clone(),
+            class,
+        }
+    }
+
+    fn into_entry(self) -> Result<RedactionEntry> {
+        let class = match self.class {
+            PersistedEntryClass::Ordinary { origin } => EntryClass::Ordinary { origin },
+            PersistedEntryClass::Sealed {
+                scope,
+                record_id,
+                name,
+                version,
+            } => {
+                use crate::sealed::identity::{
+                    SealedName, SealedRecordId, SealedRedactionIdentity, SealedScopeKind,
+                };
+                let identity = SealedRedactionIdentity {
+                    scope: SealedScopeKind::parse(&scope)
+                        .map_err(|e| anyhow::anyhow!("persisted sealed scope: {e}"))?,
+                    record_id: record_id
+                        .map(|id| SealedRecordId::parse(&id))
+                        .transpose()
+                        .map_err(|e| anyhow::anyhow!("persisted sealed record id: {e}"))?,
+                    name: SealedName::canonical(&name)
+                        .map_err(|e| anyhow::anyhow!("persisted sealed name: {e}"))?,
+                    version,
+                };
+                EntryClass::Sealed(identity)
+            }
+        };
+        Ok(RedactionEntry {
+            value: self.value,
+            class,
+            replacement: Replacement::Generic,
+        })
+    }
+
+    fn origin_display(&self) -> String {
+        match &self.class {
+            PersistedEntryClass::Ordinary { origin } => origin.clone(),
+            // A sealed entry is never disk-derived, so its exact origin string
+            // only needs to be non-disk-derived; derive the legacy/scoped form.
+            PersistedEntryClass::Sealed {
+                record_id, name, ..
+            } => match record_id {
+                Some(_) => String::new(),
+                None => format!("{}{}", crate::sealed::identity::SEALED_ORIGIN_PREFIX, name),
+            },
+        }
+    }
+}
+
 /// A built lookup of `value → origin-name` pairs the next outbound
 /// request must be scrubbed against. Hold one per session (cheap to
 /// rebuild; small in-memory footprint).
@@ -490,16 +686,11 @@ pub struct RedactionTable {
     /// scrub or redaction is disabled. Keeping it `Option` lets
     /// [`scrub`] short-circuit without allocating.
     matcher: Option<AhoCorasick>,
-    /// Canonical `(value, origin)` entries used to build `matcher`. Stored so
-    /// monotonic egress tables can union candidates and compile one matcher.
-    entries: Vec<(String, String)>,
-    /// Parallel to `matcher`'s pattern list. Used by
-    /// `cockpit debug redact` to render `value (from $VAR)` rows.
-    origins: Vec<String>,
-    /// Parallel to `matcher`'s pattern list. The typed replacement descriptor
-    /// for each entry: `Generic` for ordinary secrets, `Sealed` for sealed
-    /// values with an active exact grant on the egress target.
-    replacements: Vec<Replacement>,
+    /// The single typed entry vector used to build `matcher`, aligned 1:1 with
+    /// the matcher's pattern list by construction. There is no parallel
+    /// origins/replacements vector to drift: each entry carries its own typed
+    /// classification and per-target replacement descriptor.
+    entries: Vec<RedactionEntry>,
     /// What every ordinary (`Generic`) match is replaced with. Distinctive on
     /// purpose so leaks into provider logs are easy to grep for. Sealed
     /// entries render [`sealed_untrusted_inference_marker`] instead.
@@ -523,7 +714,7 @@ impl std::fmt::Debug for RedactionTable {
     /// exists to hide. Show only counts + flags.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RedactionTable")
-            .field("patterns", &self.origins.len())
+            .field("patterns", &self.entries.len())
             .field("disabled", &self.disabled)
             .field("unsupported_files", &self.unsupported_files.len())
             .field(
@@ -715,17 +906,39 @@ impl RedactionTable {
         )
     }
 
+    /// Build a table from `(value, origin)` pairs. Every pair becomes an
+    /// [`EntryClass::Ordinary`] entry; sealed entries enter through
+    /// [`Self::with_forced_sealed_literal`], never here.
     fn from_entries(
-        mut entries: Vec<(String, String)>,
+        entries: Vec<(String, String)>,
         placeholder: String,
         disabled: bool,
         unsupported_files: Vec<PathBuf>,
         protected: ProtectedPaths,
     ) -> Result<Self> {
-        entries.retain(|(value, origin)| {
-            if value.len() < MIN_REDACTION_ENTRY_LENGTH {
+        let typed = entries
+            .into_iter()
+            .map(|(value, origin)| RedactionEntry::ordinary(value, origin))
+            .collect();
+        Self::from_redaction_entries(typed, placeholder, disabled, unsupported_files, protected)
+    }
+
+    /// The single construction funnel for a [`RedactionTable`]. Every builder
+    /// (`from_entries`, `union`, `with_forced_literal`,
+    /// `with_forced_sealed_literal`, `from_persisted_json`) routes here, so the
+    /// entry vector and the matcher's pattern list are 1:1 by construction and
+    /// the length invariant cannot be violated by a caller.
+    fn from_redaction_entries(
+        mut entries: Vec<RedactionEntry>,
+        placeholder: String,
+        disabled: bool,
+        unsupported_files: Vec<PathBuf>,
+        protected: ProtectedPaths,
+    ) -> Result<Self> {
+        entries.retain(|entry| {
+            if entry.value.len() < MIN_REDACTION_ENTRY_LENGTH {
                 tracing::warn!(
-                    origin = %origin,
+                    origin = %entry.class.origin_display(),
                     min_length = MIN_REDACTION_ENTRY_LENGTH,
                     "dropping redaction entry below the hard minimum length"
                 );
@@ -737,16 +950,20 @@ impl RedactionTable {
 
         let protected_conflicting_origins: HashSet<String> = entries
             .iter()
-            .filter(|(value, origin)| {
-                !origin_is_forced(origin)
-                    && (protected.contains_value(value) || is_existing_absolute_path(value))
+            .filter(|entry| {
+                let origin = entry.class.origin_display();
+                !origin_is_forced(&origin)
+                    && (protected.contains_value(&entry.value)
+                        || is_existing_absolute_path(&entry.value))
             })
-            .map(|(_, origin)| origin.clone())
+            .map(|entry| entry.class.origin_display())
             .collect();
         let mut protected_path_conflicts: Vec<String> = Vec::new();
-        entries.retain(|(value, origin)| {
-            let conflicts = protected.contains_value(value) || is_existing_absolute_path(value);
-            if origin_is_forced(origin) {
+        entries.retain(|entry| {
+            let origin = entry.class.origin_display();
+            let conflicts =
+                protected.contains_value(&entry.value) || is_existing_absolute_path(&entry.value);
+            if origin_is_forced(&origin) {
                 if conflicts {
                     protected_path_conflicts.push(origin.clone());
                     tracing::warn!(
@@ -756,27 +973,29 @@ impl RedactionTable {
                 }
                 true
             } else {
-                !conflicts && !protected_conflicting_origins.contains(origin)
+                !conflicts && !protected_conflicting_origins.contains(&origin)
             }
         });
         protected_path_conflicts.sort();
         protected_path_conflicts.dedup();
-        entries.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
-        entries.dedup_by(|a, b| a.0 == b.0);
-        // Build the typed replacement vector parallel to the matcher's pattern
-        // list. Every entry that arrives through `from_entries` is `Generic`:
-        // sealed entries are registered with their canonical origin, but the
+        entries.sort_by(|a, b| {
+            b.value
+                .len()
+                .cmp(&a.value.len())
+                .then_with(|| a.value.cmp(&b.value))
+        });
+        entries.dedup_by(|a, b| a.value == b.value);
+        // The persisted/base table never carries a `Sealed` replacement: the
         // actionable marker is an ephemeral per-target decision resolved by
-        // [`Self::with_sealed_replacements`] at egress time. Persisting a
-        // `Sealed` replacement here would freeze active authorization into the
-        // redaction entry, which the invariant forbids.
-        let replacements = vec![Replacement::Generic; entries.len()];
+        // [`Self::with_sealed_replacements`] at egress time. Freezing it here
+        // would bake active authorization into a redaction entry.
+        for entry in entries.iter_mut() {
+            entry.replacement = Replacement::Generic;
+        }
         if entries.is_empty() {
             return Ok(Self {
                 matcher: None,
                 entries,
-                origins: Vec::new(),
-                replacements,
                 placeholder,
                 disabled,
                 unsupported_files,
@@ -784,18 +1003,22 @@ impl RedactionTable {
                 protected_path_conflicts,
             });
         }
-        let patterns: Vec<&str> = entries.iter().map(|(v, _)| v.as_str()).collect();
+        let patterns: Vec<&str> = entries.iter().map(|entry| entry.value.as_str()).collect();
+        // Single-vector invariant: the matcher's pattern list is derived from
+        // the one entry vector, so their lengths are equal by construction.
+        assert_eq!(
+            patterns.len(),
+            entries.len(),
+            "redaction matcher patterns must be 1:1 with typed entries"
+        );
         let matcher = AhoCorasick::builder()
             .match_kind(MatchKind::LeftmostLongest)
             .ascii_case_insensitive(false)
             .build(&patterns)
             .map_err(|e| anyhow::anyhow!("building aho-corasick: {e}"))?;
-        let origins = entries.iter().map(|(_, o)| o.clone()).collect();
         Ok(Self {
             matcher: Some(matcher),
             entries,
-            origins,
-            replacements,
             placeholder,
             disabled,
             unsupported_files,
@@ -812,7 +1035,7 @@ impl RedactionTable {
         unsupported_files.sort();
         unsupported_files.dedup();
         let protected = self.protected.union(&other.protected);
-        Self::from_entries(
+        Self::from_redaction_entries(
             entries,
             self.placeholder.clone(),
             self.disabled && other.disabled,
@@ -821,13 +1044,13 @@ impl RedactionTable {
         )
     }
 
-    /// Add one caller-supplied literal to this table.  Sealed-value storage
-    /// uses this before making the literal durable, so all subsequent egress
-    /// observes the redaction without a stored-but-unscrubbed window.
+    /// Add one caller-supplied ordinary literal to this table.  Sealed-value
+    /// storage uses [`Self::with_forced_sealed_literal`] instead so the entry
+    /// carries typed identity; this remains for ordinary forced literals.
     pub fn with_forced_literal(&self, value: String, origin: String) -> Result<Self> {
         let mut entries = self.entries.clone();
-        entries.push((value, origin));
-        Self::from_entries(
+        entries.push(RedactionEntry::ordinary(value, origin));
+        Self::from_redaction_entries(
             entries,
             self.placeholder.clone(),
             self.disabled,
@@ -836,16 +1059,39 @@ impl RedactionTable {
         )
     }
 
-    /// Produce an egress-time derived table where sealed entries whose
-    /// canonical identity matches an active exact grant render the actionable
-    /// marker instead of the generic placeholder.
+    /// Add one caller-supplied **sealed** literal, carrying its canonical typed
+    /// identity. This is the typed registration API the three live sealed
+    /// routes use; the entry's sealedness is stored as classification, never
+    /// inferred by parsing a diagnostic-origin string at egress.
+    pub fn with_forced_sealed_literal(
+        &self,
+        value: String,
+        identity: crate::sealed::identity::SealedRedactionIdentity,
+    ) -> Result<Self> {
+        let mut entries = self.entries.clone();
+        entries.push(RedactionEntry::sealed(value, identity));
+        Self::from_redaction_entries(
+            entries,
+            self.placeholder.clone(),
+            self.disabled,
+            self.unsupported_files.clone(),
+            self.protected.clone(),
+        )
+    }
+
+    /// Produce an egress-time derived table where sealed entries whose typed
+    /// identity matches an active exact grant render the actionable marker
+    /// instead of the generic placeholder.
     ///
-    /// `active_sealed_ids` is the set of canonical value ids (parsed from
-    /// sealed redaction origins by [`crate::sealed::parse_sealed_redaction_origin`])
-    /// that have an active exact `(value, version, action)` grant on the
-    /// egress target. Every sealed entry whose origin resolves to one of those
-    /// ids gets [`Replacement::Sealed`]; all other entries (ordinary secrets
-    /// and sealed entries without an active grant) keep [`Replacement::Generic`].
+    /// `active_sealed_ids` is the set of VERSION-SCOPED keys (see
+    /// [`sealed_active_key`]) that have an active exact
+    /// `(value, version, action, revision)` grant on the egress target.
+    /// Sealedness is read from each entry's [`EntryClass::Sealed`] typed
+    /// identity — no diagnostic-origin string is parsed here. Every
+    /// sealed entry whose version-scoped key is in the set gets
+    /// [`Replacement::Sealed`];
+    /// all other entries (ordinary secrets and sealed entries without an active
+    /// grant) keep [`Replacement::Generic`].
     ///
     /// This is the single place where active authorization meets the redaction
     /// table. The persisted table never carries `Sealed` replacements, so
@@ -854,36 +1100,49 @@ impl RedactionTable {
     /// `active_sealed_ids` and falls back to the generic placeholder — it
     /// never resurrects a literal and never advertises a stale handle.
     ///
-    /// The returned table shares the same matcher and entries; only the
-    /// replacement vector is rebuilt. This is cheap and deterministic.
+    /// The returned table shares the same matcher and entries; only each
+    /// entry's replacement descriptor is rebuilt. This is cheap and deterministic.
     pub fn with_sealed_replacements(
         &self,
         active_sealed_ids: &std::collections::HashSet<String>,
     ) -> Self {
-        let replacements: Vec<Replacement> = self
-            .origins
+        let entries: Vec<RedactionEntry> = self
+            .entries
             .iter()
-            .map(|origin| {
-                if let Some(identity) = crate::sealed::parse_sealed_redaction_origin(origin) {
-                    // The canonical value id for a scoped entry is its record
-                    // id; for a legacy session entry it is the name. Both are
-                    // constrained by the sealed-value contract.
-                    let value_id = identity
-                        .record_id
-                        .map(|id| id.to_string())
-                        .unwrap_or_else(|| identity.name.as_str().to_string());
-                    if active_sealed_ids.contains(&value_id) {
-                        return Replacement::Sealed { value_id };
+            .map(|entry| {
+                let replacement = match &entry.class {
+                    EntryClass::Sealed(identity) => {
+                        // Look the entry up by its VERSION-SCOPED key: a scoped
+                        // entry matches iff `(record_id, version)` is active; a
+                        // legacy entry matches iff `(name, version)` is active.
+                        // The version binding stops a grant for one version from
+                        // activating a persisted entry sealed at another version,
+                        // and a scoped grant from activating a legacy same-name
+                        // entry of a different record.
+                        let key = sealed_active_key(identity);
+                        if active_sealed_ids.contains(&key) {
+                            // The rendered marker still references the canonical
+                            // value id (bare record id / legacy name) — the key
+                            // is only for matching, not for the wire text.
+                            Replacement::Sealed {
+                                value_id: sealed_value_id(identity),
+                            }
+                        } else {
+                            Replacement::Generic
+                        }
                     }
+                    EntryClass::Ordinary { .. } => Replacement::Generic,
+                };
+                RedactionEntry {
+                    value: entry.value.clone(),
+                    class: entry.class.clone(),
+                    replacement,
                 }
-                Replacement::Generic
             })
             .collect();
         Self {
             matcher: self.matcher.clone(),
-            entries: self.entries.clone(),
-            origins: self.origins.clone(),
-            replacements,
+            entries,
             placeholder: self.placeholder.clone(),
             disabled: self.disabled,
             unsupported_files: self.unsupported_files.clone(),
@@ -945,9 +1204,8 @@ impl RedactionTable {
         let mut disk_derived_origins: Vec<String> = self
             .entries
             .iter()
-            .map(|(_, origin)| origin)
+            .map(|entry| entry.class.origin_display())
             .filter(|origin| origin_is_disk_derived(origin))
-            .cloned()
             .collect();
         disk_derived_origins.sort();
         disk_derived_origins.dedup();
@@ -955,8 +1213,8 @@ impl RedactionTable {
             entries: self
                 .entries
                 .iter()
-                .filter(|(_, origin)| !origin_is_disk_derived(origin))
-                .cloned()
+                .filter(|entry| !origin_is_disk_derived(&entry.class.origin_display()))
+                .map(PersistedEntry::from_entry)
                 .collect(),
             disk_derived_origins,
             placeholder: self.placeholder.clone(),
@@ -975,12 +1233,15 @@ impl RedactionTable {
     pub fn from_persisted_json(json: &str) -> Result<Self> {
         let snapshot: PersistedRedactionTable =
             serde_json::from_str(json).context("deserializing redaction table")?;
-        Self::from_entries(
-            snapshot
-                .entries
-                .into_iter()
-                .filter(|(_, origin)| !origin_is_disk_derived(origin))
-                .collect(),
+        let mut entries: Vec<RedactionEntry> = Vec::with_capacity(snapshot.entries.len());
+        for persisted in snapshot.entries {
+            if origin_is_disk_derived(&persisted.origin_display()) {
+                continue;
+            }
+            entries.push(persisted.into_entry()?);
+        }
+        Self::from_redaction_entries(
+            entries,
             snapshot.placeholder,
             snapshot.disabled,
             snapshot
@@ -1003,7 +1264,7 @@ impl RedactionTable {
             snapshot
                 .entries
                 .into_iter()
-                .map(|(_, origin)| origin)
+                .map(|entry| entry.origin_display())
                 .filter(|origin| origin_is_disk_derived(origin)),
         );
         origins.sort();
@@ -1014,7 +1275,7 @@ impl RedactionTable {
     pub fn has_origin(&self, origin: &str) -> bool {
         self.entries
             .iter()
-            .any(|(_, candidate_origin)| candidate_origin == origin)
+            .any(|entry| entry.class.origin_display() == origin)
     }
 
     /// Scrub every secret in `body`. Returns the cleaned string. The
@@ -1044,13 +1305,16 @@ impl RedactionTable {
         // When all entries are `Generic` (the common case, and always the case
         // for the persisted table), the fast path renders the placeholder
         // once and repeats it, avoiding per-entry allocation.
-        let rendered: Vec<String> = if self.replacements.iter().all(|r| r == &Replacement::Generic)
+        let rendered: Vec<String> = if self
+            .entries
+            .iter()
+            .all(|entry| entry.replacement == Replacement::Generic)
         {
-            vec![self.placeholder.clone(); self.origins.len()]
+            vec![self.placeholder.clone(); self.entries.len()]
         } else {
-            self.replacements
+            self.entries
                 .iter()
-                .map(|r| r.render(&self.placeholder))
+                .map(|entry| entry.replacement.render(&self.placeholder))
                 .collect()
         };
         let refs: Vec<&str> = rendered.iter().map(String::as_str).collect();
@@ -1085,8 +1349,6 @@ impl RedactionTable {
         Self {
             matcher: self.matcher.clone(),
             entries: self.entries.clone(),
-            origins: self.origins.clone(),
-            replacements: self.replacements.clone(),
             placeholder: self.placeholder.clone(),
             disabled: false,
             unsupported_files: self.unsupported_files.clone(),
@@ -1124,8 +1386,6 @@ impl RedactionTable {
         Self {
             matcher: None,
             entries: Vec::new(),
-            origins: Vec::new(),
-            replacements: Vec::new(),
             placeholder: RedactConfig::default().placeholder,
             disabled: false,
             unsupported_files: Vec::new(),
@@ -1147,13 +1407,30 @@ impl RedactionTable {
         &self.unsupported_files
     }
 
-    /// `(value, origin)` pairs for the debug command. Values themselves
+    /// Diagnostic origin strings for the debug command. Values themselves
     /// are sensitive — only call this from local `cockpit debug
-    /// redact` after the user has explicitly asked.
+    /// redact` after the user has explicitly asked. Sealed origins are derived
+    /// from the typed identity for display only.
     // Retained for `cockpit debug redact` introspection.
     #[allow(dead_code)]
-    pub fn entries_for_debug(&self) -> Vec<&str> {
-        self.origins.iter().map(|s| s.as_str()).collect()
+    pub fn entries_for_debug(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .map(|entry| entry.class.origin_display())
+            .collect()
+    }
+
+    /// The canonical typed identities of every sealed entry, read directly from
+    /// the typed classification (no diagnostic-origin string parsing). This is
+    /// how the historical-redaction inventory reads sealedness after typing.
+    pub fn sealed_identities(&self) -> Vec<crate::sealed::identity::SealedRedactionIdentity> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match &entry.class {
+                EntryClass::Sealed(identity) => Some(identity.clone()),
+                EntryClass::Ordinary { .. } => None,
+            })
+            .collect()
     }
 
     /// Forced-secret origins that matched protected filesystem paths.

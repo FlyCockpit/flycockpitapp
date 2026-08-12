@@ -1054,12 +1054,29 @@ CREATE INDEX packages_source_url ON packages(source_url);
 --     engine `TurnEvent` vocabulary; per-type fields ride in `data_json`
 --     so the schema stays stable as the event set grows.
 
+-- One row per DISPATCHED TARGET ATTEMPT of a logical inference call. The
+-- primary attempt is ordinal 0; each backup/failover attempt shares the logical
+-- `call_id` and takes the next ordinal (same-target HTTP retries reuse the row).
+-- `payload_json` is the IMMUTABLE post-render request body for that target,
+-- written once at dispatch and never rewritten. Lifecycle metadata lives beside
+-- it: `status` plus dedicated nullable phase-timestamp columns (ms from
+-- dispatch), advanced monotonically by the status-advance path only. Per-attempt
+-- `provider` / `model` / `trust` record where and under which custody the body
+-- was rendered so cross-trust failover attempts are individually auditable.
 CREATE TABLE inference_requests (
-    call_id      TEXT    PRIMARY KEY,           -- == inference_calls.call_id
-    session_id   TEXT    NOT NULL,
-    ts_ms        INTEGER NOT NULL,              -- epoch milliseconds
-    payload_json TEXT    NOT NULL,              -- full post-redaction request
-    status       TEXT    NOT NULL DEFAULT 'completed' CHECK (status IN ('pending', 'completed', 'errored', 'timed_out', 'cancelled')),
+    call_id        TEXT    NOT NULL,            -- == inference_calls.call_id
+    ordinal        INTEGER NOT NULL DEFAULT 0,  -- dispatched-target attempt index
+    session_id     TEXT    NOT NULL,
+    ts_ms          INTEGER NOT NULL,            -- epoch milliseconds (dispatch)
+    payload_json   TEXT    NOT NULL,            -- immutable post-render request body
+    status         TEXT    NOT NULL DEFAULT 'completed' CHECK (status IN ('pending', 'completed', 'errored', 'timed_out', 'cancelled')),
+    provider       TEXT,                        -- per-attempt provider id
+    model          TEXT,                        -- per-attempt model id
+    trust          TEXT,                        -- per-attempt custody ('trusted'|'untrusted')
+    first_token_ms INTEGER,                     -- phase: dispatch -> first token (ms)
+    completed_ms   INTEGER,                     -- phase: dispatch -> completion (ms)
+    failed_ms      INTEGER,                     -- phase: dispatch -> failure/timeout (ms)
+    PRIMARY KEY (call_id, ordinal),
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
 

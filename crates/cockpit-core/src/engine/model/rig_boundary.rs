@@ -319,6 +319,7 @@ mod tests {
             InferenceErrorClass::ResponsesToolIdentity,
             InferenceErrorClass::ProviderNotConfigured,
             InferenceErrorClass::ProviderRateLimit,
+            InferenceErrorClass::UnrenderableWireField,
             InferenceErrorClass::Other("novel_provider_class".to_string()),
         ];
         for class in cases {

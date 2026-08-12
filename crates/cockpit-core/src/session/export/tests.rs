@@ -7,6 +7,35 @@ use crate::engine::tool::Tool;
 use crate::session::{Session, ToolCallProviderIdentity, ToolCallRow};
 use std::io::Read;
 
+/// Test seam: seed one inference attempt (ordinal 0) with its immutable body and
+/// advance it to `status`, mirroring the live dispatch→settle split against the
+/// per-attempt `(call_id, ordinal)` schema. Returns `Result` so existing call
+/// sites keep their trailing `.await.unwrap()`.
+async fn seed_inference_request(
+    db: &Db,
+    call_id: &str,
+    session_id: Uuid,
+    payload: &serde_json::Value,
+    status: crate::db::session_log::InferenceRequestStatus,
+) -> Result<()> {
+    db.insert_inference_request(
+        call_id,
+        0,
+        session_id,
+        payload,
+        crate::db::session_log::InferenceAttemptMeta::default(),
+        None,
+    )
+    .await?;
+    db.advance_inference_request(
+        call_id,
+        0,
+        status,
+        crate::db::session_log::InferencePhaseTimings::default(),
+    )
+    .await
+}
+
 fn trusted_test_policy(root: &Path) -> crate::config::trust::WorkspaceTrustPolicy {
     crate::config::trust::WorkspaceTrustPolicy {
         root: crate::config::trust::TrustRoot {
@@ -657,7 +686,8 @@ async fn export_bundles_main_and_subagent_requests() {
 
     // Main agent inference call + captured request.
     let call_main = Uuid::new_v4();
-    db.insert_inference_request(
+    seed_inference_request(
+        &db,
         &call_main.to_string(),
         sid,
         &json!({"model": "m", "system": "sys", "tools": [], "history": [{"role":"user"}]}),
@@ -686,7 +716,8 @@ async fn export_bundles_main_and_subagent_requests() {
     .unwrap();
     // Subagent inference call (shares session_id, distinct agent).
     let call_sub = Uuid::new_v4();
-    db.insert_inference_request(
+    seed_inference_request(
+        &db,
         &call_sub.to_string(),
         sid,
         &json!({"model": "m", "system": "explore-sys", "tools": [], "history": []}),
@@ -778,6 +809,143 @@ async fn export_bundles_main_and_subagent_requests() {
     assert_eq!(tool_call["data"]["wire_input"]["path"], "/proj/a.rs");
 }
 
+/// FINDING 2: two attempts under ONE `call_id` — a failed primary (ordinal 0)
+/// and a successful failover (ordinal 1) — must BOTH export their immutable
+/// request body. A successful sibling ordinal must NOT suppress the failed
+/// primary's `inference_failure` file. Against the pre-fix per-call suppression,
+/// the ordinal-0 body was dropped (only one file emitted), so this fails on the
+/// broken behavior.
+#[tokio::test]
+async fn export_retains_both_attempts_of_one_call_id_when_primary_failed() {
+    use crate::db::session_log::{
+        InferenceAttemptMeta, InferencePhaseTimings, InferenceRequestStatus,
+    };
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
+    std::fs::write(
+        tmp.path().join(".cockpit/config.json"),
+        r#"{"redact":{"scan_environment":false,"scan_dotenv":false}}"#,
+    )
+    .unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let s = create_test_session(&db, "p", tmp.path().to_string_lossy().as_ref(), "Build").await;
+    let sid = s.session_id;
+
+    // One logical call, two dispatched attempts sharing the `call_id`.
+    let call = Uuid::new_v4().to_string();
+
+    // Ordinal 0: the primary attempt — its immutable post-render body, advanced
+    // to `errored`.
+    db.insert_inference_request(
+        &call,
+        0,
+        sid,
+        &json!({"model": "primary-m", "system": "primary-sys", "tools": [], "history": []}),
+        InferenceAttemptMeta {
+            provider: Some("primary-provider"),
+            model: Some("primary-m"),
+            trust: Some("trusted"),
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    db.advance_inference_request(
+        &call,
+        0,
+        InferenceRequestStatus::Errored,
+        InferencePhaseTimings::default(),
+    )
+    .await
+    .unwrap();
+
+    // Ordinal 1: the failover attempt — its own immutable body, advanced to
+    // `completed`.
+    db.insert_inference_request(
+        &call,
+        1,
+        sid,
+        &json!({"model": "failover-m", "system": "failover-sys", "tools": [], "history": []}),
+        InferenceAttemptMeta {
+            provider: Some("failover-provider"),
+            model: Some("failover-m"),
+            trust: Some("untrusted"),
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    db.advance_inference_request(
+        &call,
+        1,
+        InferenceRequestStatus::Completed,
+        InferencePhaseTimings::default(),
+    )
+    .await
+    .unwrap();
+
+    // The failed primary records an `inference_failure` event (ordinal 0); the
+    // successful failover records an `inference_request` event (ordinal 1). Both
+    // carry the ordinal that correlates them to their attempt row.
+    db.insert_session_event(
+        sid,
+        SessionEventKind::InferenceFailure,
+        Some("Build"),
+        Some(&call),
+        &json!({"ordinal": 0, "phase_reached": "dispatch", "error_class": "provider"}),
+    )
+    .await
+    .unwrap();
+    db.insert_session_event(
+        sid,
+        SessionEventKind::InferenceRequest,
+        Some("Build"),
+        Some(&call),
+        &json!({"ordinal": 1, "usage": {"input_tokens": 7}}),
+    )
+    .await
+    .unwrap();
+
+    let target = get_test_session(&db, sid).await;
+    let bundle = collect_bundle(&db, sid).await.unwrap();
+    let zip = build_zip(&db, &target, &bundle).await.unwrap();
+
+    // BOTH attempts of the one call_id are exported as DISTINCT files carrying
+    // the ordinal segment — neither dropped.
+    let names = entry_names(&zip);
+    let req_files: Vec<String> = names
+        .into_iter()
+        .filter(|n| n.starts_with("inference_requests/"))
+        .collect();
+    assert_eq!(
+        req_files.len(),
+        2,
+        "both attempts of one call_id export a file: {req_files:?}"
+    );
+    let o0 = req_files
+        .iter()
+        .find(|n| n.ends_with("_o0.json"))
+        .expect("ordinal-0 (failed primary) file present");
+    let o1 = req_files
+        .iter()
+        .find(|n| n.ends_with("_o1.json"))
+        .expect("ordinal-1 (failover) file present");
+
+    // The failed primary's IMMUTABLE body is exported, not dropped.
+    let primary: Value = serde_json::from_str(&read_zip_entry(&zip, o0.as_str()).unwrap()).unwrap();
+    assert_eq!(primary["ordinal"], 0);
+    assert_eq!(primary["status"], "errored");
+    assert_eq!(primary["request"]["system"], "primary-sys");
+
+    // The failover's immutable body is exported alongside it, distinct.
+    let failover: Value =
+        serde_json::from_str(&read_zip_entry(&zip, o1.as_str()).unwrap()).unwrap();
+    assert_eq!(failover["ordinal"], 1);
+    assert_eq!(failover["status"], "completed");
+    assert_eq!(failover["request"]["system"], "failover-sys");
+}
+
 #[tokio::test]
 async fn export_request_payloads_are_redacted_with_no_bypass() {
     let tmp = tempfile::tempdir().unwrap();
@@ -792,7 +960,8 @@ async fn export_request_payloads_are_redacted_with_no_bypass() {
     let db = Db::open_in_memory().unwrap();
     let s = create_test_session(&db, "p", tmp.path().to_str().unwrap(), "Build").await;
     let call = Uuid::new_v4();
-    db.insert_inference_request(
+    seed_inference_request(
+        &db,
         &call.to_string(),
         s.session_id,
         &json!({
@@ -1221,7 +1390,8 @@ async fn export_sanitizes_inference_request_call_id_filename_segment() {
     let sid = s.session_id;
     let call_id = "call/../evil:id?";
 
-    db.insert_inference_request(
+    seed_inference_request(
+        &db,
         call_id,
         sid,
         &json!({"model": "m", "system": "sys", "tools": [], "history": []}),
@@ -1248,8 +1418,11 @@ async fn export_sanitizes_inference_request_call_id_filename_segment() {
         .filter(|n| n.starts_with("inference_requests/"))
         .collect();
     assert_eq!(request_files.len(), 1);
+    // The per-attempt ordinal suffix (`_o0`) follows the sanitized call-id segment;
+    // the sanitization proof is that the evil `/` never survives into the path
+    // (asserted by the single-`/` check below).
     assert!(
-        request_files[0].ends_with("_call_.._evil_id_.json"),
+        request_files[0].ends_with("_call_.._evil_id__o0.json"),
         "call id filename segment is sanitized: {request_files:?}"
     );
     assert_eq!(request_files[0].matches('/').count(), 1);
@@ -1291,7 +1464,8 @@ async fn export_includes_context_pruned_before_next_inference_request() {
         .await
         .unwrap();
     let call = Uuid::new_v4();
-    db.insert_inference_request(
+    seed_inference_request(
+        &db,
         &call.to_string(),
         sid,
         &json!({"model": "m", "system": "s", "tools": [], "history": []}),
@@ -1420,7 +1594,8 @@ async fn export_of_hung_turn_has_inference_record_and_failure_event() {
 
     // Dispatch-time record settled to `timed_out` (what `turn()` writes on
     // a hang).
-    db.insert_inference_request(
+    seed_inference_request(
+        &db,
         &call.to_string(),
         sid,
         &json!({"model": "qwen3", "system": "s", "tools": [], "history": []}),
@@ -1486,7 +1661,8 @@ async fn export_follows_session_compacted_successor() {
     // Each session has one inference call.
     for s in [&pred, &succ] {
         let call = Uuid::new_v4();
-        db.insert_inference_request(
+        seed_inference_request(
+            &db,
             &call.to_string(),
             s.id,
             &json!({"model": "m", "system": "s", "tools": [], "history": []}),
@@ -2655,7 +2831,8 @@ async fn build_zip_writes_to_disk_and_manifest_lists_sessions() {
     let db = Db::open_in_memory().unwrap();
     let s = create_test_session(&db, "p", "/proj", "builder").await;
     let call = Uuid::new_v4();
-    db.insert_inference_request(
+    seed_inference_request(
+        &db,
         &call.to_string(),
         s.session_id,
         &json!({"model": "m", "system": "s", "tools": [], "history": []}),
@@ -2884,7 +3061,8 @@ async fn write_bundle_zip_overwrite_mode_vs_clobber_guard() {
     let db = Db::open_in_memory().unwrap();
     let s = create_test_session(&db, "p", "/proj", "builder").await;
     let call = Uuid::new_v4();
-    db.insert_inference_request(
+    seed_inference_request(
+        &db,
         &call.to_string(),
         s.session_id,
         &json!({"model": "m", "system": "s", "tools": [], "history": []}),
@@ -3017,7 +3195,8 @@ async fn add_inference_call(db: &Db, sid: Uuid, agent: &str, is_utility: bool) -
     })
     .await
     .unwrap();
-    db.insert_inference_request(
+    seed_inference_request(
+        &db,
         &call_id.to_string(),
         sid,
         &json!({"model": "m", "system": "s", "tools": [], "history": []}),

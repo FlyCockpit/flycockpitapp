@@ -1096,6 +1096,30 @@ impl Db {
         .await
     }
 
+    /// Every action grant issued for one `(session, generation)`, regardless of
+    /// liveness. The caller applies revocation/expiry/version/revision liveness
+    /// (the marker predicate) on top; this is a pure metadata read.
+    pub async fn sealed_action_grants_for_session(
+        &self,
+        session_id: String,
+        session_generation: i64,
+    ) -> Result<Vec<SealedActionGrantRow>> {
+        self.read(move |conn| {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT {GRANT_COLUMNS} FROM sealed_action_grants
+                      WHERE session_id = ?1 AND session_generation = ?2"
+                ))
+                .context("preparing sealed grants for session")?;
+            let rows = stmt
+                .query_map(params![session_id, session_generation], decode_grant)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .context("reading sealed grants for session")?;
+            Ok(rows)
+        })
+        .await
+    }
+
     /// Deterministic compare-and-swap ownership of one use.
     ///
     /// This is the **authoritative** gate, not a formality on top of an

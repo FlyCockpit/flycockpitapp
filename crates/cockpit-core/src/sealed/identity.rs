@@ -213,6 +213,23 @@ pub struct SealedRedactionIdentity {
     pub version: u32,
 }
 
+impl SealedRedactionIdentity {
+    /// The canonical diagnostic origin *string* for `cockpit debug redact`
+    /// display, derived FROM this typed identity. A scoped entry renders the
+    /// full grammar; a legacy session entry (no record id) renders the
+    /// pre-scoping `sealed:<name>` form. This is a display artifact only — it is
+    /// NEVER parsed back to recover sealedness (classification is carried by the
+    /// typed identity end-to-end).
+    pub fn display_origin(&self) -> String {
+        match self.record_id {
+            Some(record_id) => {
+                sealed_redaction_origin(self.scope, record_id, self.version, &self.name)
+            }
+            None => format!("{SEALED_ORIGIN_PREFIX}{}", self.name),
+        }
+    }
+}
+
 /// Redaction-origin prefix shared by every sealed entry, scoped or legacy.
 pub const SEALED_ORIGIN_PREFIX: &str = "sealed:";
 /// Version tag of the scoped origin grammar.
@@ -235,6 +252,30 @@ pub fn sealed_redaction_origin(
         version,
         name
     )
+}
+
+/// The version-scoped, namespaced key that binds a scoped sealed redaction
+/// entry (or the scoped side of a live grant) to the active-grant set.
+///
+/// The `version` is part of the key, so a grant pinned to version N never
+/// activates a persisted entry sealed at a *different* version of the same
+/// record. The `scoped:`/`legacy:` namespace prefix additionally prevents a
+/// record-id key from ever colliding with a name key. Neither a record-id
+/// (a UUID) nor a canonical name contains `@`, so the version suffix is
+/// unambiguous.
+pub(crate) fn sealed_scoped_active_key(record_id: &str, version: u32) -> String {
+    format!("scoped:{record_id}@{version}")
+}
+
+/// The version-scoped, namespaced key for a legacy (pre-scoping) session entry
+/// keyed by canonical name, or the legacy side of a live grant.
+///
+/// A legacy entry is always version `0`; a real grant is version `>= 1`. Binding
+/// the version into the key means a scoped grant for a versioned record never
+/// activates a legacy same-name entry of a *different* record — closing the
+/// same-name cross-record leak. See [`sealed_scoped_active_key`].
+pub(crate) fn sealed_legacy_active_key(name: &str, version: u32) -> String {
+    format!("legacy:{name}@{version}")
 }
 
 /// Parse a redaction origin back into canonical typed identity.

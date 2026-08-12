@@ -53,10 +53,14 @@ impl Db {
         // under retention and grow past an old baseline before anyone polls;
         // charging each uniquely keyed call exactly once avoids that ambiguity.
         conn.execute(
+            // `inference_requests` is now keyed `(call_id, ordinal)`; every
+            // ordinal of a call carries the same goal provenance, so select the
+            // primary attempt (`MIN(ordinal)`) to keep the scalar subquery
+            // single-valued and deterministic under multi-attempt rows.
             "UPDATE session_goals
                 SET tokens_used = tokens_used + MAX(0, ?1 + ?2)
-              WHERE id = (SELECT goal_id FROM inference_requests WHERE call_id = ?3)
-                AND attempt_generation = (SELECT goal_attempt_generation FROM inference_requests WHERE call_id = ?3)
+              WHERE id = (SELECT goal_id FROM inference_requests WHERE call_id = ?3 ORDER BY ordinal ASC LIMIT 1)
+                AND attempt_generation = (SELECT goal_attempt_generation FROM inference_requests WHERE call_id = ?3 ORDER BY ordinal ASC LIMIT 1)
                 AND token_budget IS NOT NULL
                 AND ?4 = 0",
             params![
@@ -278,11 +282,12 @@ mod tests {
         assert_eq!(running.tokens_used, 0);
 
         let utility_call = Uuid::new_v4();
-        db.insert_inference_request_with_goal_provenance(
+        db.insert_inference_request(
             &utility_call.to_string(),
+            0,
             session.session_id,
             &serde_json::json!({}),
-            crate::db::session_log::InferenceRequestStatus::Pending,
+            crate::db::session_log::InferenceAttemptMeta::default(),
             Some((goal.id, goal.attempt_generation)),
         )
         .await
@@ -292,11 +297,12 @@ mod tests {
             .unwrap();
 
         let matching_call = Uuid::new_v4();
-        db.insert_inference_request_with_goal_provenance(
+        db.insert_inference_request(
             &matching_call.to_string(),
+            0,
             session.session_id,
             &serde_json::json!({}),
-            crate::db::session_log::InferenceRequestStatus::Pending,
+            crate::db::session_log::InferenceAttemptMeta::default(),
             Some((goal.id, goal.attempt_generation)),
         )
         .await
@@ -309,11 +315,12 @@ mod tests {
             .await
             .unwrap();
         let paused_call = Uuid::new_v4();
-        db.insert_inference_request_with_goal_provenance(
+        db.insert_inference_request(
             &paused_call.to_string(),
+            0,
             session.session_id,
             &serde_json::json!({}),
-            crate::db::session_log::InferenceRequestStatus::Pending,
+            crate::db::session_log::InferenceAttemptMeta::default(),
             Some((goal.id, goal.attempt_generation)),
         )
         .await
@@ -340,11 +347,12 @@ mod tests {
         assert!(resumed.attempt_generation > goal.attempt_generation);
 
         let stale_call = Uuid::new_v4();
-        db.insert_inference_request_with_goal_provenance(
+        db.insert_inference_request(
             &stale_call.to_string(),
+            0,
             session.session_id,
             &serde_json::json!({}),
-            crate::db::session_log::InferenceRequestStatus::Pending,
+            crate::db::session_log::InferenceAttemptMeta::default(),
             Some((goal.id, goal.attempt_generation)),
         )
         .await
@@ -354,11 +362,12 @@ mod tests {
             .unwrap();
 
         let resumed_call = Uuid::new_v4();
-        db.insert_inference_request_with_goal_provenance(
+        db.insert_inference_request(
             &resumed_call.to_string(),
+            0,
             session.session_id,
             &serde_json::json!({}),
-            crate::db::session_log::InferenceRequestStatus::Pending,
+            crate::db::session_log::InferenceAttemptMeta::default(),
             Some((resumed.id, resumed.attempt_generation)),
         )
         .await

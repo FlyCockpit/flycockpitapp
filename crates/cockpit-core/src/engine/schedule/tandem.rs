@@ -178,9 +178,19 @@ fn spawn_all(session: &Arc<Session>, set: &TandemSet, dispatch: TandemDispatch) 
             // Dispatch-time pending record (no response yet). Best-effort —
             // auditing must never break anything (and there is nothing to
             // break: the main loop never observes this task).
-            let pending_body = target
+            let pending_body = match target
                 .handle
-                .assemble_dispatch_request(&system, &history, &prompt, &tools, &params);
+                .assemble_dispatch_request(&system, &history, &prompt, &tools, &params)
+            {
+                Ok(body) => body,
+                Err(e) => {
+                    // A non-renderable wire field on an untrusted tandem target:
+                    // there is no scrubbed body to record, and the follow-up
+                    // completion would fail identically, so skip this shadow.
+                    tracing::warn!(error = %e, "assemble tandem dispatch request failed");
+                    return;
+                }
+            };
             if let Err(e) = session
                 .record_tandem_inference(
                     &row_id,

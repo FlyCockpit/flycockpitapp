@@ -14,6 +14,7 @@ const CLASS_CLIENT_SIDE_TOOLS_UNSUPPORTED: &str = "client_side_tools_unsupported
 const CLASS_RESPONSES_TOOL_IDENTITY: &str = "responses_tool_identity";
 const CLASS_PROVIDER_NOT_CONFIGURED: &str = "provider_not_configured";
 const CLASS_PROVIDER_RATE_LIMIT: &str = "provider_rate_limit";
+const CLASS_UNRENDERABLE_WIRE_FIELD: &str = "unrenderable_wire_field";
 const DEFAULT_MISSING_TOOL_FEATURE: &str = "client_side_tools";
 
 /// Authoritative active-model state embedded in a completed selection.
@@ -163,6 +164,11 @@ pub enum InferenceErrorClass {
     ProviderNotConfigured,
     /// Provider reported a rate or usage limit without a concrete HTTP class.
     ProviderRateLimit,
+    /// A message wire field had no renderer for an untrusted dispatch — a
+    /// non-renderable media source (`Raw`/`FileId`/`Unknown`) on a route that
+    /// must redact. The provider was never contacted; the dispatch fails
+    /// closed at prep rather than passing an unscrubbable channel to the wire.
+    UnrenderableWireField,
     /// A novel class preserved exactly at the string boundary.
     Other(String),
 }
@@ -181,6 +187,7 @@ impl InferenceErrorClass {
             Self::ResponsesToolIdentity => CLASS_RESPONSES_TOOL_IDENTITY.to_string(),
             Self::ProviderNotConfigured => CLASS_PROVIDER_NOT_CONFIGURED.to_string(),
             Self::ProviderRateLimit => CLASS_PROVIDER_RATE_LIMIT.to_string(),
+            Self::UnrenderableWireField => CLASS_UNRENDERABLE_WIRE_FIELD.to_string(),
             Self::Other(value) => value.clone(),
         }
     }
@@ -219,6 +226,7 @@ impl FromStr for InferenceErrorClass {
             CLASS_RESPONSES_TOOL_IDENTITY => Self::ResponsesToolIdentity,
             CLASS_PROVIDER_NOT_CONFIGURED => Self::ProviderNotConfigured,
             CLASS_PROVIDER_RATE_LIMIT => Self::ProviderRateLimit,
+            CLASS_UNRENDERABLE_WIRE_FIELD => Self::UnrenderableWireField,
             value => match value
                 .strip_prefix(CLASS_HTTP_PREFIX)
                 .and_then(|s| s.parse::<u16>().ok())
@@ -296,6 +304,7 @@ impl<'de> Deserialize<'de> for InferenceErrorClass {
             CLASS_RESPONSES_TOOL_IDENTITY => Ok(Self::ResponsesToolIdentity),
             CLASS_PROVIDER_NOT_CONFIGURED => Ok(Self::ProviderNotConfigured),
             CLASS_PROVIDER_RATE_LIMIT => Ok(Self::ProviderRateLimit),
+            CLASS_UNRENDERABLE_WIRE_FIELD => Ok(Self::UnrenderableWireField),
             other => Ok(Self::Other(other.to_string())),
         }
     }
@@ -343,6 +352,10 @@ mod error_class_wire_tests {
             (
                 InferenceErrorClass::ProviderRateLimit,
                 json!("provider_rate_limit"),
+            ),
+            (
+                InferenceErrorClass::UnrenderableWireField,
+                json!("unrenderable_wire_field"),
             ),
             (
                 InferenceErrorClass::Other("future_error".to_string()),

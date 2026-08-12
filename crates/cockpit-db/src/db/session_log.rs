@@ -406,6 +406,123 @@ impl InferenceRequestStatus {
     }
 }
 
+/// Per-attempt provider/model/trust metadata stamped on an inference-attempt
+/// row at body-insert time. Nullable columns: a write path that does not know
+/// one leaves it `None`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InferenceAttemptMeta<'a> {
+    pub provider: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub trust: Option<&'a str>,
+}
+
+/// Phase timestamps (ms from dispatch) written by the monotonic status-advance
+/// path only. A `None` field leaves the existing column untouched (`COALESCE`),
+/// so an advance never clears a phase a prior advance recorded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InferencePhaseTimings {
+    pub first_token_ms: Option<i64>,
+    pub completed_ms: Option<i64>,
+    pub failed_ms: Option<i64>,
+}
+
+/// One inference-attempt row read back from `inference_requests`, keyed
+/// `(call_id, ordinal)`. `payload` is the immutable post-render request body;
+/// lifecycle metadata (`status` + phase columns) lives beside it, never inside
+/// it. (`serde_json::Value` is not `Eq`, so this derives `PartialEq` only.)
+#[derive(Debug, Clone, PartialEq)]
+pub struct InferenceRequestRow {
+    pub call_id: String,
+    pub ordinal: i64,
+    pub session_id: String,
+    pub ts_ms: i64,
+    pub payload: Value,
+    pub status: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub trust: Option<String>,
+    pub first_token_ms: Option<i64>,
+    pub completed_ms: Option<i64>,
+    pub failed_ms: Option<i64>,
+}
+
+/// A full inference-attempt row restored by the import path. Unlike live
+/// dispatch (body insert then monotonic status-advance), a restore writes the
+/// already-terminal row — body, status, phases, and per-attempt metadata — in
+/// one authoritative insert.
+#[derive(Debug, Clone)]
+pub struct ImportedInferenceRequest<'a> {
+    pub call_id: &'a str,
+    pub ordinal: i64,
+    pub session_id: Uuid,
+    pub ts_ms: i64,
+    pub payload: &'a Value,
+    pub status: &'a str,
+    pub provider: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub trust: Option<&'a str>,
+    pub phases: InferencePhaseTimings,
+}
+
+/// Columns of `inference_requests` in canonical read order.
+const INFERENCE_REQUEST_COLUMNS: &str = "call_id, ordinal, session_id, ts_ms, payload_json, \
+     status, provider, model, trust, first_token_ms, completed_ms, failed_ms";
+
+struct RawInferenceRequestRow {
+    call_id: String,
+    ordinal: i64,
+    session_id: String,
+    ts_ms: i64,
+    payload_json: String,
+    status: String,
+    provider: Option<String>,
+    model: Option<String>,
+    trust: Option<String>,
+    first_token_ms: Option<i64>,
+    completed_ms: Option<i64>,
+    failed_ms: Option<i64>,
+}
+
+fn decode_inference_request_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<RawInferenceRequestRow> {
+    Ok(RawInferenceRequestRow {
+        call_id: row.get(0)?,
+        ordinal: row.get(1)?,
+        session_id: row.get(2)?,
+        ts_ms: row.get(3)?,
+        payload_json: row.get(4)?,
+        status: row.get(5)?,
+        provider: row.get(6)?,
+        model: row.get(7)?,
+        trust: row.get(8)?,
+        first_token_ms: row.get(9)?,
+        completed_ms: row.get(10)?,
+        failed_ms: row.get(11)?,
+    })
+}
+
+impl RawInferenceRequestRow {
+    fn into_row(self) -> Result<InferenceRequestRow> {
+        let payload: Value =
+            serde_json::from_str(&self.payload_json).context("deserializing payload_json")?;
+        Ok(InferenceRequestRow {
+            call_id: self.call_id,
+            ordinal: self.ordinal,
+            session_id: self.session_id,
+            ts_ms: self.ts_ms,
+            payload,
+            status: self.status,
+            provider: self.provider,
+            model: self.model,
+            trust: self.trust,
+            first_token_ms: self.first_token_ms,
+            completed_ms: self.completed_ms,
+            failed_ms: self.failed_ms,
+        })
+    }
+}
+
 /// Optional context stamped onto a `session_events` row.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SessionEventContext<'a> {
@@ -605,121 +722,192 @@ impl Db {
             .await
     }
 
+    /// Read one inference attempt keyed `(call_id, ordinal)`.
     pub fn get_inference_request_conn(
         conn: &Connection,
         call_id: &str,
-    ) -> Result<Option<(Value, String)>> {
-        let result: rusqlite::Result<(String, String)> = conn.query_row(
-            "SELECT payload_json, status FROM inference_requests WHERE call_id = ?1",
-            [call_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+        ordinal: i64,
+    ) -> Result<Option<InferenceRequestRow>> {
+        let result: rusqlite::Result<RawInferenceRequestRow> = conn.query_row(
+            &format!(
+                "SELECT {INFERENCE_REQUEST_COLUMNS} FROM inference_requests \
+                 WHERE call_id = ?1 AND ordinal = ?2"
+            ),
+            params![call_id, ordinal],
+            decode_inference_request_row,
         );
         match result {
-            Ok((payload_json, status)) => {
-                let payload: Value =
-                    serde_json::from_str(&payload_json).context("deserializing payload_json")?;
-                Ok(Some((payload, status)))
-            }
+            Ok(raw) => Ok(Some(raw.into_row()?)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e).context("querying inference_request"),
         }
     }
 
-    /// Restore an exported inference request within an existing transaction.
-    /// The archive timestamp is authoritative; unlike live dispatch this does
-    /// not substitute the current clock.
-    pub fn insert_inference_request_conn(
+    /// Every attempt of one logical `call_id`, ordered by ordinal ascending
+    /// (primary first). Multi-attempt consumers (export, failover auditing)
+    /// read the per-attempt immutable bodies through this.
+    pub fn list_inference_requests_for_call_conn(
         conn: &Connection,
         call_id: &str,
-        session_id: Uuid,
-        ts_ms: i64,
-        payload: &Value,
-        status: &str,
+    ) -> Result<Vec<InferenceRequestRow>> {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {INFERENCE_REQUEST_COLUMNS} FROM inference_requests \
+                 WHERE call_id = ?1 ORDER BY ordinal ASC"
+            ))
+            .context("preparing list_inference_requests_for_call")?;
+        let rows = stmt.query_map([call_id], decode_inference_request_row)?;
+        let mut out = Vec::new();
+        for raw in rows {
+            out.push(raw.context("querying inference_requests")?.into_row()?);
+        }
+        Ok(out)
+    }
+
+    /// Restore an exported inference attempt within an existing transaction.
+    /// A restore writes the already-terminal row authoritatively — body,
+    /// status, phase columns, and per-attempt provider/model/trust — keyed
+    /// `(call_id, ordinal)`. The archive timestamp is authoritative; unlike
+    /// live dispatch this does not substitute the current clock.
+    ///
+    /// The IMMUTABLE audited body (`payload_json`) is NEVER rewritten on
+    /// conflict: a re-import of an already-present `(call_id, ordinal)` refreshes
+    /// only lifecycle columns (status, phase timestamps) and leaves the stored
+    /// post-render body byte-for-byte as first imported. Re-import stays
+    /// idempotent (identical archive ⇒ identical row) but cannot mutate a stored
+    /// body, preserving the immutability funnel across the import path too.
+    pub fn insert_inference_request_conn(
+        conn: &Connection,
+        req: &ImportedInferenceRequest<'_>,
     ) -> Result<()> {
         if !matches!(
-            status,
+            req.status,
             "pending" | "completed" | "errored" | "timed_out" | "cancelled"
         ) {
-            bail!("invalid imported inference request status `{status}`");
+            bail!("invalid imported inference request status `{}`", req.status);
         }
-        let payload_json = serde_json::to_string(payload).context("serializing request payload")?;
+        let payload_json =
+            serde_json::to_string(req.payload).context("serializing request payload")?;
         conn.execute(
             "INSERT INTO inference_requests
-               (call_id, session_id, ts_ms, payload_json, status)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(call_id) DO UPDATE SET
-               session_id = excluded.session_id,
-               ts_ms = excluded.ts_ms,
-               payload_json = excluded.payload_json,
-               status = excluded.status",
-            params![call_id, session_id.to_string(), ts_ms, payload_json, status],
+               (call_id, ordinal, session_id, ts_ms, payload_json, status,
+                provider, model, trust, first_token_ms, completed_ms, failed_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT(call_id, ordinal) DO UPDATE SET
+               session_id     = excluded.session_id,
+               ts_ms          = excluded.ts_ms,
+               status         = excluded.status,
+               provider       = excluded.provider,
+               model          = excluded.model,
+               trust          = excluded.trust,
+               first_token_ms = excluded.first_token_ms,
+               completed_ms   = excluded.completed_ms,
+               failed_ms      = excluded.failed_ms",
+            params![
+                req.call_id,
+                req.ordinal,
+                req.session_id.to_string(),
+                req.ts_ms,
+                payload_json,
+                req.status,
+                req.provider,
+                req.model,
+                req.trust,
+                req.phases.first_token_ms,
+                req.phases.completed_ms,
+                req.phases.failed_ms,
+            ],
         )
         .context("restoring inference_request")?;
         Ok(())
     }
 
-    /// Store the full assembled (post-redaction) request body for one
-    /// inference call with its lifecycle `status`. `call_id` must match the
-    /// `inference_calls` row's `call_id` so the export can join usage onto the
-    /// payload. The conflict update enforces monotonic precedence: pending
-    /// can advance to any terminal status, completed wins over other terminal
-    /// observations, and no terminal row can regress to pending. The original
-    /// dispatch timestamp is retained on conflict.
+    /// Insert the IMMUTABLE post-render request body for one dispatched-target
+    /// attempt, keyed `(call_id, ordinal)`, with initial status `pending` and
+    /// the per-attempt provider/model/trust metadata. This is INSERT-ONLY: a
+    /// second body write to an existing `(call_id, ordinal)` raises a UNIQUE
+    /// constraint error rather than rewriting the audited body. Phase columns
+    /// and the terminal status are filled separately by
+    /// [`Self::advance_inference_request`].
     pub async fn insert_inference_request(
         &self,
         call_id: &str,
+        ordinal: i64,
         session_id: Uuid,
         payload: &Value,
-        status: InferenceRequestStatus,
-    ) -> Result<()> {
-        self.insert_inference_request_with_goal_provenance(
-            call_id, session_id, payload, status, None,
-        )
-        .await
-    }
-
-    pub async fn insert_inference_request_with_goal_provenance(
-        &self,
-        call_id: &str,
-        session_id: Uuid,
-        payload: &Value,
-        status: InferenceRequestStatus,
+        meta: InferenceAttemptMeta<'_>,
         goal_provenance: Option<(Uuid, i64)>,
     ) -> Result<()> {
         let payload_json = serde_json::to_string(payload).context("serializing request payload")?;
         let ts_ms = now_ms();
         let call_id = call_id.to_owned();
+        let provider = meta.provider.map(str::to_owned);
+        let model = meta.model.map(str::to_owned);
+        let trust = meta.trust.map(str::to_owned);
         self.write(move |conn| {
             conn.execute(
                 "INSERT INTO inference_requests
-                   (call_id, session_id, ts_ms, payload_json, status, goal_id, goal_attempt_generation)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(call_id) DO UPDATE SET
-               payload_json = CASE
-                 WHEN inference_requests.status = 'completed'
-                   OR excluded.status = 'pending' THEN inference_requests.payload_json
-                 WHEN inference_requests.status = 'pending'
-                   OR excluded.status = 'completed' THEN excluded.payload_json
-                 ELSE inference_requests.payload_json
-               END,
-               status = CASE
-                 WHEN inference_requests.status = 'completed'
-                   OR excluded.status = 'pending' THEN inference_requests.status
-                 WHEN inference_requests.status = 'pending'
-                   OR excluded.status = 'completed' THEN excluded.status
-                 ELSE inference_requests.status
-               END",
+                   (call_id, ordinal, session_id, ts_ms, payload_json, status,
+                    provider, model, trust, goal_id, goal_attempt_generation)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7, ?8, ?9, ?10)",
                 params![
                     call_id,
+                    ordinal,
                     session_id.to_string(),
                     ts_ms,
                     payload_json,
-                    status.as_str(),
+                    provider,
+                    model,
+                    trust,
                     goal_provenance.map(|(goal_id, _)| goal_id.to_string()),
                     goal_provenance.map(|(_, generation)| generation),
                 ],
             )
             .context("inserting inference_request")?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Advance one attempt's lifecycle: set `status` (monotonically) and fill
+    /// phase-timestamp columns. This NEVER touches `payload_json` — the body is
+    /// immutable once inserted. Status precedence: ONLY a `pending` row may
+    /// advance, and it advances to whatever terminal the incoming status names;
+    /// once a row holds any terminal (`completed`/`errored`/`timed_out`/
+    /// `cancelled`) that terminal is STICKY — no later advance (terminal or
+    /// `pending`) can change it. This guarantees a terminal never regresses,
+    /// including the `errored → completed` direction a late success observation
+    /// could otherwise force. Phase columns are `COALESCE`d so an advance only
+    /// fills a column it actually carries.
+    pub async fn advance_inference_request(
+        &self,
+        call_id: &str,
+        ordinal: i64,
+        status: InferenceRequestStatus,
+        phases: InferencePhaseTimings,
+    ) -> Result<()> {
+        let call_id = call_id.to_owned();
+        self.write(move |conn| {
+            conn.execute(
+                "UPDATE inference_requests SET
+                   status = CASE
+                     WHEN status = 'pending' AND ?3 <> 'pending' THEN ?3
+                     ELSE status
+                   END,
+                   first_token_ms = COALESCE(?4, first_token_ms),
+                   completed_ms   = COALESCE(?5, completed_ms),
+                   failed_ms      = COALESCE(?6, failed_ms)
+                 WHERE call_id = ?1 AND ordinal = ?2",
+                params![
+                    call_id,
+                    ordinal,
+                    status.as_str(),
+                    phases.first_token_ms,
+                    phases.completed_ms,
+                    phases.failed_ms,
+                ],
+            )
+            .context("advancing inference_request status")?;
             Ok(())
         })
         .await
@@ -1251,14 +1439,28 @@ impl Db {
         Ok((messages, has_more))
     }
 
-    /// Look up the stored (post-redaction) request payload + lifecycle
-    /// `status` for one `call_id`. `None` when no payload was captured (e.g. a
-    /// pre-0009 call). The export writes the payload verbatim and surfaces the
-    /// status on the emitted file so a hung/failed turn's record carries its
-    /// non-`completed` status.
-    pub async fn get_inference_request(&self, call_id: &str) -> Result<Option<(Value, String)>> {
+    /// Look up one inference attempt keyed `(call_id, ordinal)`: its immutable
+    /// post-render request body plus lifecycle `status` and phase columns.
+    /// `None` when that attempt has no row. The export writes the body verbatim
+    /// and surfaces status + phases beside it (never folded into the body) so a
+    /// hung/failed turn's attempt carries its non-`completed` status.
+    pub async fn get_inference_request(
+        &self,
+        call_id: &str,
+        ordinal: i64,
+    ) -> Result<Option<InferenceRequestRow>> {
         let call_id = call_id.to_string();
-        self.read(move |conn| Self::get_inference_request_conn(conn, &call_id))
+        self.read(move |conn| Self::get_inference_request_conn(conn, &call_id, ordinal))
+            .await
+    }
+
+    /// Every attempt of one `call_id`, ordered by ordinal ascending.
+    pub async fn list_inference_requests_for_call(
+        &self,
+        call_id: &str,
+    ) -> Result<Vec<InferenceRequestRow>> {
+        let call_id = call_id.to_string();
+        self.read(move |conn| Self::list_inference_requests_for_call_conn(conn, &call_id))
             .await
     }
 }
@@ -2200,56 +2402,114 @@ mod tests {
         });
         db.insert_inference_request(
             &call_id,
+            0,
             s.session_id,
             &payload,
-            InferenceRequestStatus::Completed,
+            InferenceAttemptMeta {
+                provider: Some("anthropic"),
+                model: Some("claude-opus-4-7"),
+                trust: Some("untrusted"),
+            },
+            None,
         )
         .await
         .unwrap();
-        let (got, status) = db.get_inference_request(&call_id).await.unwrap().unwrap();
-        assert_eq!(got, payload);
-        assert_eq!(status, "completed");
-        // Unknown call_id resolves to None.
-        assert!(db.get_inference_request("missing").await.unwrap().is_none());
+        db.advance_inference_request(
+            &call_id,
+            0,
+            InferenceRequestStatus::Completed,
+            InferencePhaseTimings {
+                completed_ms: Some(42),
+                ..InferencePhaseTimings::default()
+            },
+        )
+        .await
+        .unwrap();
+        let row = db
+            .get_inference_request(&call_id, 0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.payload, payload);
+        assert_eq!(row.status, "completed");
+        assert_eq!(row.provider.as_deref(), Some("anthropic"));
+        assert_eq!(row.trust.as_deref(), Some("untrusted"));
+        assert_eq!(row.completed_ms, Some(42));
+        // Unknown (call_id, ordinal) resolves to None.
+        assert!(
+            db.get_inference_request("missing", 0)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_inference_request(&call_id, 1)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
-    async fn inference_request_dispatch_then_terminal_update_supersedes() {
-        // The dispatch-time write (status `pending`) and the terminal update
-        // (status `timed_out`) for one call_id collapse onto a single row,
-        // with the terminal status + payload winning — the
-        // dispatch-time-recording lifecycle
-        // (implementation note).
+    async fn inference_request_body_is_immutable_across_status_advance() {
+        // Renamed from `inference_request_dispatch_then_terminal_update_supersedes`:
+        // the old contract (terminal payload *supersedes* the pending body on a
+        // single mutable row) is exactly what the immutable-body design rejects.
+        // Now: the body is written once at dispatch and a monotonic status-advance
+        // fills status + phase columns WITHOUT touching `payload_json`. This test
+        // fails against the old CASE-overwrite behavior, which rewrote the blob on
+        // the terminal write.
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "builder").await.unwrap();
         let call_id = Uuid::new_v4().to_string();
-        let pending_payload = json!({ "model": "m", "status_hint": "pre-dispatch" });
+        let body = json!({ "model": "m", "history": [{ "role": "user", "content": "hi" }] });
         db.insert_inference_request(
             &call_id,
+            0,
             s.session_id,
-            &pending_payload,
-            InferenceRequestStatus::Pending,
+            &body,
+            InferenceAttemptMeta::default(),
+            None,
         )
         .await
         .unwrap();
-        let (_, status) = db.get_inference_request(&call_id).await.unwrap().unwrap();
-        assert_eq!(status, "pending");
+        let before = db
+            .get_inference_request(&call_id, 0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.status, "pending");
+        assert_eq!(before.first_token_ms, None);
+        assert_eq!(before.completed_ms, None);
+        let before_bytes = serde_json::to_string(&before.payload).unwrap();
 
-        // Terminal update: a hung turn that timed out.
-        let final_payload = json!({ "model": "m", "phases": { "dispatched_ms": 0 } });
-        db.insert_inference_request(
+        // A hung turn that timed out: status advances, phase column populates.
+        db.advance_inference_request(
             &call_id,
-            s.session_id,
-            &final_payload,
+            0,
             InferenceRequestStatus::TimedOut,
+            InferencePhaseTimings {
+                first_token_ms: Some(7),
+                failed_ms: Some(9000),
+                ..InferencePhaseTimings::default()
+            },
         )
         .await
         .unwrap();
-        let (got, status) = db.get_inference_request(&call_id).await.unwrap().unwrap();
-        assert_eq!(status, "timed_out");
-        assert_eq!(got, final_payload, "terminal payload supersedes pending");
+        let after = db
+            .get_inference_request(&call_id, 0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.status, "timed_out");
+        assert_eq!(after.first_token_ms, Some(7));
+        assert_eq!(after.failed_ms, Some(9000));
+        // The body blob is byte-identical before and after the status-advance.
+        let after_bytes = serde_json::to_string(&after.payload).unwrap();
+        assert_eq!(before_bytes, after_bytes, "body blob is immutable");
+        assert_eq!(after.payload, body);
 
-        // Exactly one row — the update collapsed onto the dispatch row.
+        // Still exactly one row for this attempt.
         let count_call_id = call_id.clone();
         let count: i64 = db
             .read(move |c| {
@@ -2270,63 +2530,331 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/x", "builder").await.unwrap();
         let call_id = Uuid::new_v4().to_string();
-        let terminal = json!({ "phase": "terminal" });
+        let body = json!({ "phase": "terminal" });
         db.insert_inference_request(
             &call_id,
+            0,
             session.session_id,
-            &terminal,
-            InferenceRequestStatus::Completed,
+            &body,
+            InferenceAttemptMeta::default(),
+            None,
         )
         .await
         .unwrap();
-
-        let late_pending = json!({ "phase": "late-pending" });
-        db.insert_inference_request(
+        db.advance_inference_request(
             &call_id,
-            session.session_id,
-            &late_pending,
+            0,
+            InferenceRequestStatus::Completed,
+            InferencePhaseTimings::default(),
+        )
+        .await
+        .unwrap();
+        // A later erroneous re-advance must not regress the terminal status.
+        db.advance_inference_request(
+            &call_id,
+            0,
             InferenceRequestStatus::Pending,
+            InferencePhaseTimings::default(),
         )
         .await
         .unwrap();
-        db.insert_inference_request(
+        db.advance_inference_request(
             &call_id,
-            session.session_id,
-            &json!({ "phase": "duplicate-terminal" }),
+            0,
             InferenceRequestStatus::Errored,
+            InferencePhaseTimings::default(),
         )
         .await
         .unwrap();
-
-        let (payload, status) = db.get_inference_request(&call_id).await.unwrap().unwrap();
-        assert_eq!(status, "completed");
-        assert_eq!(payload, terminal);
-
-        let failover_call_id = Uuid::new_v4().to_string();
-        db.insert_inference_request(
-            &failover_call_id,
-            session.session_id,
-            &json!({ "attempt": "primary" }),
-            InferenceRequestStatus::Errored,
-        )
-        .await
-        .unwrap();
-        let backup = json!({ "attempt": "backup" });
-        db.insert_inference_request(
-            &failover_call_id,
-            session.session_id,
-            &backup,
-            InferenceRequestStatus::Completed,
-        )
-        .await
-        .unwrap();
-        let (payload, status) = db
-            .get_inference_request(&failover_call_id)
+        let row = db
+            .get_inference_request(&call_id, 0)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(status, "completed");
-        assert_eq!(payload, backup);
+        assert_eq!(
+            row.status, "completed",
+            "completed is sticky; terminal never regresses"
+        );
+        assert_eq!(row.payload, body);
+
+        // Every terminal is sticky in EVERY direction — including the
+        // errored/timed_out/cancelled → completed direction the old CASE
+        // (`WHEN status = 'pending' OR ?3 = 'completed' THEN ?3`) wrongly let
+        // regress to `completed` whenever a late success observation arrived.
+        // Advancing any already-terminal row with `completed` must be a no-op.
+        for terminal in [
+            InferenceRequestStatus::Errored,
+            InferenceRequestStatus::TimedOut,
+            InferenceRequestStatus::Cancelled,
+        ] {
+            let sticky_call_id = Uuid::new_v4().to_string();
+            let sticky_body = json!({ "terminal": terminal.as_str() });
+            db.insert_inference_request(
+                &sticky_call_id,
+                0,
+                session.session_id,
+                &sticky_body,
+                InferenceAttemptMeta::default(),
+                None,
+            )
+            .await
+            .unwrap();
+            db.advance_inference_request(
+                &sticky_call_id,
+                0,
+                terminal,
+                InferencePhaseTimings::default(),
+            )
+            .await
+            .unwrap();
+            // A late `completed` observation must NOT overwrite the terminal.
+            db.advance_inference_request(
+                &sticky_call_id,
+                0,
+                InferenceRequestStatus::Completed,
+                InferencePhaseTimings::default(),
+            )
+            .await
+            .unwrap();
+            let sticky = db
+                .get_inference_request(&sticky_call_id, 0)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                sticky.status,
+                terminal.as_str(),
+                "{} must stay sticky against a later completed advance",
+                terminal.as_str()
+            );
+        }
+
+        // Per-attempt failover: primary (ordinal 0) and backup (ordinal 1) share
+        // one call_id and are BOTH retained as distinct rows with distinct
+        // immutable payloads. The old design collapsed them onto one row and let
+        // the backup body replace the primary's — this segment asserts the
+        // opposite.
+        let failover_call_id = Uuid::new_v4().to_string();
+        let primary = json!({ "attempt": "primary" });
+        let backup = json!({ "attempt": "backup" });
+        db.insert_inference_request(
+            &failover_call_id,
+            0,
+            session.session_id,
+            &primary,
+            InferenceAttemptMeta::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        db.advance_inference_request(
+            &failover_call_id,
+            0,
+            InferenceRequestStatus::Errored,
+            InferencePhaseTimings::default(),
+        )
+        .await
+        .unwrap();
+        db.insert_inference_request(
+            &failover_call_id,
+            1,
+            session.session_id,
+            &backup,
+            InferenceAttemptMeta::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        db.advance_inference_request(
+            &failover_call_id,
+            1,
+            InferenceRequestStatus::Completed,
+            InferencePhaseTimings::default(),
+        )
+        .await
+        .unwrap();
+
+        // A second body write to an existing (call_id, ordinal) errors — the
+        // audited body cannot be rewritten through the API.
+        assert!(
+            db.insert_inference_request(
+                &failover_call_id,
+                0,
+                session.session_id,
+                &json!({ "attempt": "rewrite" }),
+                InferenceAttemptMeta::default(),
+                None,
+            )
+            .await
+            .is_err(),
+            "a second body insert to (call_id, 0) must error"
+        );
+
+        let attempts = db
+            .list_inference_requests_for_call(&failover_call_id)
+            .await
+            .unwrap();
+        assert_eq!(attempts.len(), 2, "both attempts retained");
+        assert_eq!(attempts[0].ordinal, 0);
+        assert_eq!(attempts[0].payload, primary);
+        assert_eq!(attempts[0].status, "errored");
+        assert_eq!(attempts[1].ordinal, 1);
+        assert_eq!(attempts[1].payload, backup);
+        assert_eq!(attempts[1].status, "completed");
+    }
+
+    #[tokio::test]
+    async fn inference_attempt_log_preserves_cross_trust_retries() {
+        // AC11: a trusted primary attempt (ordinal 0) and an untrusted failover
+        // attempt (ordinal 1) under one call_id both persist with distinct
+        // immutable payloads and correct per-attempt provider/model/trust; a
+        // second body write to an existing (call_id, ordinal) errors; a
+        // status-advance populates phase columns without altering the body;
+        // terminal never regresses; goal provenance round-trips when supplied.
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("p", "/x", "builder").await.unwrap();
+        let call_id = Uuid::new_v4().to_string();
+        let goal_id = Uuid::new_v4();
+        let provenance = Some((goal_id, 3_i64));
+
+        // Trusted primary carries the raw sentinel (raw custody is not a leak).
+        let trusted_body = json!({ "model": "local", "history": [{ "role": "user", "content": "raw SENTINEL here" }] });
+        db.insert_inference_request(
+            &call_id,
+            0,
+            s.session_id,
+            &trusted_body,
+            InferenceAttemptMeta {
+                provider: Some("local"),
+                model: Some("primary-model"),
+                trust: Some("trusted"),
+            },
+            provenance,
+        )
+        .await
+        .unwrap();
+        db.advance_inference_request(
+            &call_id,
+            0,
+            InferenceRequestStatus::Errored,
+            InferencePhaseTimings {
+                failed_ms: Some(120),
+                ..InferencePhaseTimings::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Untrusted failover carries the redacted body (no sentinel).
+        let untrusted_body = json!({ "model": "cloud", "history": [{ "role": "user", "content": "raw ***REDACT*** here" }] });
+        db.insert_inference_request(
+            &call_id,
+            1,
+            s.session_id,
+            &untrusted_body,
+            InferenceAttemptMeta {
+                provider: Some("cloud"),
+                model: Some("backup-model"),
+                trust: Some("untrusted"),
+            },
+            provenance,
+        )
+        .await
+        .unwrap();
+        let before = db
+            .get_inference_request(&call_id, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        let before_bytes = serde_json::to_string(&before.payload).unwrap();
+        db.advance_inference_request(
+            &call_id,
+            1,
+            InferenceRequestStatus::Completed,
+            InferencePhaseTimings {
+                first_token_ms: Some(30),
+                completed_ms: Some(210),
+                ..InferencePhaseTimings::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // A second body write to (call_id, 1) errors.
+        assert!(
+            db.insert_inference_request(
+                &call_id,
+                1,
+                s.session_id,
+                &json!({ "attempt": "rewrite" }),
+                InferenceAttemptMeta::default(),
+                provenance,
+            )
+            .await
+            .is_err()
+        );
+
+        let attempts = db.list_inference_requests_for_call(&call_id).await.unwrap();
+        assert_eq!(attempts.len(), 2);
+
+        let primary = &attempts[0];
+        assert_eq!(primary.ordinal, 0);
+        assert_eq!(primary.payload, trusted_body);
+        assert_eq!(primary.trust.as_deref(), Some("trusted"));
+        assert_eq!(primary.provider.as_deref(), Some("local"));
+        assert_eq!(primary.status, "errored");
+        assert!(
+            serde_json::to_string(&primary.payload)
+                .unwrap()
+                .contains("SENTINEL"),
+            "trusted attempt keeps the raw sentinel"
+        );
+
+        let failover = &attempts[1];
+        assert_eq!(failover.ordinal, 1);
+        assert_eq!(failover.payload, untrusted_body);
+        assert_eq!(failover.trust.as_deref(), Some("untrusted"));
+        assert_eq!(failover.provider.as_deref(), Some("cloud"));
+        assert_eq!(failover.status, "completed");
+        assert_eq!(failover.first_token_ms, Some(30));
+        assert_eq!(failover.completed_ms, Some(210));
+        // The body blob was not altered by the status-advance.
+        assert_eq!(
+            serde_json::to_string(&failover.payload).unwrap(),
+            before_bytes
+        );
+        assert!(
+            !serde_json::to_string(&failover.payload)
+                .unwrap()
+                .contains("SENTINEL"),
+            "untrusted attempt holds no raw sentinel"
+        );
+
+        // Goal provenance round-trips on every ordinal.
+        let goal_col_call_id = call_id.clone();
+        let goal_ids: Vec<Option<String>> = db
+            .read(move |c| {
+                let mut stmt = c
+                    .prepare(
+                        "SELECT goal_id FROM inference_requests WHERE call_id = ?1 ORDER BY ordinal",
+                    )
+                    .map_err(anyhow::Error::from)?;
+                let rows = stmt
+                    .query_map([goal_col_call_id.as_str()], |r| r.get::<_, Option<String>>(0))
+                    .map_err(anyhow::Error::from)?;
+                let mut out = Vec::new();
+                for r in rows {
+                    out.push(r.map_err(anyhow::Error::from)?);
+                }
+                Ok(out)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            goal_ids,
+            vec![Some(goal_id.to_string()), Some(goal_id.to_string())],
+            "goal provenance present on every ordinal"
+        );
     }
 
     #[tokio::test]

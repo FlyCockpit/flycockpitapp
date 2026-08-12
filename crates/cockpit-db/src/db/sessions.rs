@@ -3162,7 +3162,7 @@ mod tests {
         });
         parent.model_selection_json = Some(model_selection.to_string());
         parent.redaction_table_json = Some(
-            r#"{"entries":[["fork-secret","$TEST"]],"placeholder":"[redacted]","disabled":false,"unsupported_files":[]}"#
+            r#"{"entries":[{"value":"fork-secret","class":"ordinary","origin":"$TEST"}],"placeholder":"[redacted]","disabled":false,"unsupported_files":[]}"#
                 .to_string(),
         );
         parent.model_system_prompt_snapshot_json =

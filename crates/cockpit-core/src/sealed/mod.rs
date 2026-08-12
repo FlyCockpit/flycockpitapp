@@ -41,6 +41,7 @@ pub mod action;
 pub mod action_admin;
 pub mod compartment;
 pub mod custody;
+pub mod egress;
 pub mod grant;
 pub mod identity;
 pub mod marker;
@@ -70,6 +71,7 @@ pub use custody::{
     SealedCustodyRequest, SealedLiteralCustody, sealed_literal_custody,
     sealed_literal_custody_for_trust,
 };
+pub use egress::active_sealed_value_ids;
 pub use grant::{
     SEALED_USE_DENIED_MESSAGE, SealedUseContext, SealedUseDenied, UseSealedValueRequest,
 };

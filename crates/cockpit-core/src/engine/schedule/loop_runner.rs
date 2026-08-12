@@ -228,6 +228,9 @@ async fn run_iteration(
             // A loop-fork iteration isn't a tandem-shadowed substantive turn; a
             // fresh per-round id satisfies the shared `turn` contract.
             uuid::Uuid::new_v4(),
+            // A loop fork bypasses the backup wrapper: it is always the primary
+            // (and only) attempt, so ordinal 0.
+            0,
             // Loop-fork iterations are out of the tandem-shadow scope.
             None,
             None,

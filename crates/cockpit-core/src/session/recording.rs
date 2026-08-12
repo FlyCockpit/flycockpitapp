@@ -300,91 +300,72 @@ impl Session {
             .context("inserting inference_call")
     }
 
-    /// Persist the full assembled (post-redaction) outbound request body
-    /// for one inference call, keyed by `call_id` (session-log-export
-    /// Part A), with its lifecycle `status`. Always-on — every call, every
-    /// session. The payload is the exact as-sent form; no second redaction
-    /// pass is applied. Written at DISPATCH with status `pending` and updated
-    /// to its terminal value on settle so a hung/failed turn still records an
-    /// attempt (implementation note).
-    pub async fn record_inference_request(
+    /// Insert the IMMUTABLE post-render request body for one dispatched-target
+    /// attempt keyed `(call_id, ordinal)` (session-log-export Part A) with
+    /// initial status `pending`. Always-on — every attempt, every session. The
+    /// payload is the exact as-sent form for that target; no second redaction
+    /// pass is applied and it is never rewritten. Phase timestamps and the
+    /// terminal status are filled by [`Self::advance_inference_request`]. A
+    /// second body write to an existing `(call_id, ordinal)` errors.
+    pub async fn insert_inference_attempt(
         &self,
         call_id: Uuid,
+        ordinal: i64,
         payload: &Value,
-        status: crate::db::session_log::InferenceRequestStatus,
-    ) -> Result<()> {
-        self.record_inference_request_with_goal_provenance(call_id, payload, status, None)
-            .await
-    }
-
-    pub(crate) async fn record_inference_request_with_goal_provenance(
-        &self,
-        call_id: Uuid,
-        payload: &Value,
-        status: crate::db::session_log::InferenceRequestStatus,
+        meta: crate::db::session_log::InferenceAttemptMeta<'_>,
         provenance: Option<(Uuid, i64)>,
     ) -> Result<()> {
         self.db
-            .insert_inference_request_with_goal_provenance(
+            .insert_inference_request(
                 &call_id.to_string(),
+                ordinal,
                 self.id,
                 payload,
-                status,
+                meta,
                 provenance,
             )
             .await
             .context("inserting inference_request")
     }
 
-    /// Async variant for inference dispatch hot paths. It uses the DB writer
-    /// actor directly instead of adding another `spawn_blocking` wrapper around
-    /// the synchronous convenience method.
-    pub async fn record_inference_request_async(
+    /// Advance one attempt's lifecycle status (monotonically) and fill phase
+    /// columns. Never touches the immutable `payload_json`.
+    pub async fn advance_inference_request(
         &self,
         call_id: Uuid,
-        payload: Value,
+        ordinal: i64,
         status: crate::db::session_log::InferenceRequestStatus,
+        phases: crate::db::session_log::InferencePhaseTimings,
     ) -> Result<()> {
-        self.record_inference_request_async_with_goal_provenance(call_id, payload, status, None)
+        self.db
+            .advance_inference_request(&call_id.to_string(), ordinal, status, phases)
             .await
+            .context("advancing inference_request status")
     }
 
-    pub(crate) async fn record_inference_request_async_with_goal_provenance(
+    /// Convenience for single-attempt utility writes (e.g. the `/compact`
+    /// brief): insert the body at ordinal 0, then advance to `status`.
+    pub async fn record_inference_request(
         &self,
         call_id: Uuid,
-        payload: Value,
+        payload: &Value,
         status: crate::db::session_log::InferenceRequestStatus,
-        provenance: Option<(Uuid, i64)>,
     ) -> Result<()> {
-        let payload_json =
-            serde_json::to_string(&payload).context("serializing request payload")?;
-        let ts_ms = crate::db::session_log::now_ms();
-        let call_id = call_id.to_string();
-        let session_id = self.id.to_string();
-        self.db
-            .write(move |conn| {
-                conn.execute(
-                    "INSERT INTO inference_requests
-                       (call_id, session_id, ts_ms, payload_json, status, goal_id, goal_attempt_generation)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                     ON CONFLICT(call_id) DO UPDATE SET
-                       payload_json = excluded.payload_json,
-                       status       = excluded.status",
-                    params![
-                        call_id,
-                        session_id,
-                        ts_ms,
-                        payload_json,
-                        status.as_str(),
-                        provenance.map(|(goal_id, _)| goal_id.to_string()),
-                        provenance.map(|(_, generation)| generation),
-                    ],
-                )
-                .context("inserting inference_request")?;
-                Ok(())
-            })
-            .await
-            .context("inserting inference_request")
+        self.insert_inference_attempt(
+            call_id,
+            0,
+            payload,
+            crate::db::session_log::InferenceAttemptMeta::default(),
+            None,
+        )
+        .await?;
+        self.advance_inference_request(
+            call_id,
+            0,
+            status,
+            crate::db::session_log::InferencePhaseTimings::default(),
+        )
+        .await
     }
 
     /// Persist (or update) one tandem (shadow) inference record for

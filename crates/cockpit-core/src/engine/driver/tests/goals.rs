@@ -186,11 +186,12 @@ async fn goal_budget_autopause_idle_reason_is_budget_limited() {
     driver
         .session
         .db
-        .insert_inference_request_with_goal_provenance(
+        .insert_inference_request(
             &call.call_id.to_string(),
+            0,
             driver.session.id,
             &serde_json::json!({}),
-            crate::db::session_log::InferenceRequestStatus::Pending,
+            crate::db::session_log::InferenceAttemptMeta::default(),
             Some((goal.id, goal.attempt_generation)),
         )
         .await
@@ -257,11 +258,12 @@ async fn stalled_goal_token_budget_exhaustion_needs_intervention() {
     driver
         .session
         .db
-        .insert_inference_request_with_goal_provenance(
+        .insert_inference_request(
             &call.call_id.to_string(),
+            0,
             driver.session.id,
             &serde_json::json!({}),
-            crate::db::session_log::InferenceRequestStatus::Pending,
+            crate::db::session_log::InferenceAttemptMeta::default(),
             Some((goal.id, goal.attempt_generation)),
         )
         .await

@@ -2475,11 +2475,12 @@ mod tests {
 
     async fn insert_goal_inference(db: &Db, goal: &SessionGoal, tokens: i64) {
         let row = inference_row(goal, tokens);
-        db.insert_inference_request_with_goal_provenance(
+        db.insert_inference_request(
             &row.call_id.to_string(),
+            0,
             goal.session_id,
             &serde_json::json!({}),
-            crate::db::session_log::InferenceRequestStatus::Pending,
+            crate::db::session_log::InferenceAttemptMeta::default(),
             Some((goal.id, goal.attempt_generation)),
         )
         .await

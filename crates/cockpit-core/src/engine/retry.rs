@@ -114,6 +114,7 @@ pub(crate) fn failure_retry_decision_and_rationale(
         | InferenceErrorClass::ResponsesToolIdentity
         | InferenceErrorClass::ProviderNotConfigured
         | InferenceErrorClass::ProviderRateLimit
+        | InferenceErrorClass::UnrenderableWireField
         | InferenceErrorClass::Http(_)
         | InferenceErrorClass::Other(_) => ("fail_fast", "non_retryable_or_unclassified_failure"),
     }

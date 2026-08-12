@@ -363,12 +363,16 @@ async fn sync_event_json(db: &Db, row: &SessionEventRow) -> Result<Option<Value>
     });
     if row.kind == "inference_request"
         && let Some(call_id) = row.call_id.as_deref()
-        && let Some((payload, status)) = db.get_inference_request(call_id).await?
     {
-        event["inferenceRequest"] = json!({
-            "status": status,
-            "payload": payload,
-        });
+        // The attempt this event owns (absent → primary, ordinal 0).
+        let ordinal = row.data.get("ordinal").and_then(Value::as_i64).unwrap_or(0);
+        if let Some(request) = db.get_inference_request(call_id, ordinal).await? {
+            event["inferenceRequest"] = json!({
+                "status": request.status,
+                "ordinal": request.ordinal,
+                "payload": request.payload,
+            });
+        }
     }
     Ok(Some(scrub_json_value(event, &redaction)))
 }

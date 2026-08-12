@@ -4,6 +4,7 @@
 //! Each submodule carries one acceptance criterion and is named for it.
 
 mod authorization;
+mod egress;
 mod lifecycle_sagas;
 mod marker_predicate;
 mod non_enumeration;

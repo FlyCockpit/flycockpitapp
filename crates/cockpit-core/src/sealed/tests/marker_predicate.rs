@@ -118,34 +118,40 @@ async fn sealed_marker_capability_predicate() {
 
     // ---- historical redaction inventory --------------------------------------
     // Redaction is monotonic: an entry survives deletion of the value it names.
+    use crate::sealed::identity::SealedRedactionIdentity;
     let table = crate::redact::RedactionTable::empty();
     let table = table
-        .with_forced_literal(
+        .with_forced_sealed_literal(
             TEST_LITERAL.to_string(),
-            crate::sealed::identity::sealed_redaction_origin(
-                SealedScopeKind::Project,
-                seeded.record_id,
-                1,
-                &SealedName::canonical("deploy_token").expect("name"),
-            ),
+            SealedRedactionIdentity {
+                scope: SealedScopeKind::Project,
+                record_id: Some(seeded.record_id),
+                name: SealedName::canonical("deploy_token").expect("name"),
+                version: 1,
+            },
         )
         .expect("registered v1");
     let table = table
-        .with_forced_literal(
+        .with_forced_sealed_literal(
             "rotated-literal-value-0002".to_string(),
-            crate::sealed::identity::sealed_redaction_origin(
-                SealedScopeKind::Project,
-                seeded.record_id,
-                2,
-                &SealedName::canonical("deploy_token").expect("name"),
-            ),
+            SealedRedactionIdentity {
+                scope: SealedScopeKind::Project,
+                record_id: Some(seeded.record_id),
+                name: SealedName::canonical("deploy_token").expect("name"),
+                version: 2,
+            },
         )
         .expect("registered v2");
     // A pre-scope session entry is still inventoried.
     let table = table
-        .with_forced_literal(
+        .with_forced_sealed_literal(
             "legacy-session-literal-x".to_string(),
-            "sealed:prod_token".to_string(),
+            SealedRedactionIdentity {
+                scope: SealedScopeKind::Session,
+                record_id: None,
+                name: SealedName::canonical("prod_token").expect("name"),
+                version: 0,
+            },
         )
         .expect("registered legacy");
 

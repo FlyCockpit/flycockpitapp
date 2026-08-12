@@ -190,6 +190,9 @@ pub fn failure_engages_backup(class: &InferenceErrorClass) -> bool {
         | InferenceErrorClass::ResponsesToolIdentity
         | InferenceErrorClass::ProviderNotConfigured
         | InferenceErrorClass::ProviderRateLimit
+        // A non-renderable wire field fails the same way on any untrusted
+        // target, so a different model cannot answer it — hard-fail, no backup.
+        | InferenceErrorClass::UnrenderableWireField
         | InferenceErrorClass::Other(_) => false,
     }
 }

@@ -21,6 +21,7 @@ async fn prepared_request_is_not_prepared_or_scrubbed_again_on_dispatch() {
             &[],
             &ModelParams::default(),
             false,
+            None,
         )
         .unwrap();
     let captured = prepared.captured.clone();
@@ -61,6 +62,7 @@ async fn prepared_request_is_not_prepared_or_scrubbed_again_on_dispatch() {
                 &[],
                 &ModelParams::default(),
                 false,
+                None,
             )
             .unwrap()
             .captured,
@@ -634,7 +636,7 @@ fn redaction_preserves_assistant_tool_call_identity_fields() {
         Some("provider-call"),
     )]);
 
-    let scrubbed = scrub_message(redact.as_ref(), &msg);
+    let scrubbed = scrub_message(redact.as_ref(), &msg).unwrap();
     let tc = first_assistant_tool_call(&scrubbed);
 
     assert_eq!(tc.id, "provider-item");
@@ -868,8 +870,9 @@ fn dispatch_request_records_responses_identity_repair() {
     let history = vec![assistant(vec![responses_tool_call("provider-item", None)])];
     let prompt = tool_result_message("provider-item", None);
 
-    let captured =
-        model.assemble_dispatch_request("system", &history, &prompt, &[], &ModelParams::default());
+    let captured = model
+        .assemble_dispatch_request("system", &history, &prompt, &[], &ModelParams::default())
+        .unwrap();
 
     assert_eq!(
         captured["responses_tool_identity"][0]["provider_call_id"],
@@ -1022,13 +1025,15 @@ fn native_anthropic_dispatch_preserves_reasoning_tool_use_replay() {
         tool_call("tc-1"),
     ])];
 
-    let captured = model.assemble_dispatch_request(
-        "system",
-        &history,
-        &Message::user("next"),
-        &[],
-        &ModelParams::default(),
-    );
+    let captured = model
+        .assemble_dispatch_request(
+            "system",
+            &history,
+            &Message::user("next"),
+            &[],
+            &ModelParams::default(),
+        )
+        .unwrap();
 
     let content = captured["history"][0]["content"]
         .as_array()
@@ -1053,13 +1058,15 @@ fn native_anthropic_strips_unsigned_reasoning_but_keeps_tool_use() {
         tool_call("tc-unsigned"),
     ])];
 
-    let captured = model.assemble_dispatch_request(
-        "system",
-        &history,
-        &Message::user("next"),
-        &[],
-        &ModelParams::default(),
-    );
+    let captured = model
+        .assemble_dispatch_request(
+            "system",
+            &history,
+            &Message::user("next"),
+            &[],
+            &ModelParams::default(),
+        )
+        .unwrap();
 
     let wire = serde_json::to_string(&captured).unwrap();
     assert!(
@@ -1078,13 +1085,15 @@ fn dispatch_preserves_consecutive_user_turns_and_scrubs_each() {
         Message::user(format!("second queued {SECRET}")),
     ];
 
-    let captured = model.assemble_dispatch_request(
-        "system",
-        &history,
-        &Message::user("final queued"),
-        &[],
-        &ModelParams::default(),
-    );
+    let captured = model
+        .assemble_dispatch_request(
+            "system",
+            &history,
+            &Message::user("final queued"),
+            &[],
+            &ModelParams::default(),
+        )
+        .unwrap();
 
     let wire_history = captured["history"].as_array().expect("history array");
     assert_eq!(
@@ -1127,13 +1136,15 @@ fn dispatch_hoists_queued_time_prelude_out_of_user_turns() {
         Message::user("second queued"),
     ];
 
-    let captured = model.assemble_dispatch_request(
-        "system",
-        &history,
-        &Message::user("third queued"),
-        &[],
-        &ModelParams::default(),
-    );
+    let captured = model
+        .assemble_dispatch_request(
+            "system",
+            &history,
+            &Message::user("third queued"),
+            &[],
+            &ModelParams::default(),
+        )
+        .unwrap();
 
     let wire_history = captured["history"].as_array().expect("history array");
     assert_eq!(wire_history.len(), 3);
@@ -1171,13 +1182,15 @@ fn openai_compatible_dispatch_still_strips_reasoning() {
         tool_call("tc-1"),
     ])];
 
-    let captured = model.assemble_dispatch_request(
-        "system",
-        &history,
-        &Message::user("next"),
-        &[],
-        &ModelParams::default(),
-    );
+    let captured = model
+        .assemble_dispatch_request(
+            "system",
+            &history,
+            &Message::user("next"),
+            &[],
+            &ModelParams::default(),
+        )
+        .unwrap();
 
     let wire = serde_json::to_string(&captured).unwrap();
     assert!(!wire.contains("openai scratch"), "{wire}");
@@ -1201,7 +1214,9 @@ fn native_anthropic_dispatch_capture_matches_shared_assembly() {
         ..ModelParams::default()
     };
 
-    let dispatch = model.assemble_dispatch_request("system", &history, &prompt, &[], &params);
+    let dispatch = model
+        .assemble_dispatch_request("system", &history, &prompt, &[], &params)
+        .unwrap();
     let expected = assembled_request(
         model.model_id(),
         model.provider_label(),
@@ -2429,13 +2444,15 @@ fn responses_wire_gets_transformed_tools_chat_wire_does_not() {
     };
     let tools = vec![tool.clone()];
     let capture = |model: &Model| {
-        model.assemble_dispatch_request(
-            "system",
-            &[],
-            &Message::user("hi"),
-            &tools,
-            &ModelParams::default(),
-        )
+        model
+            .assemble_dispatch_request(
+                "system",
+                &[],
+                &Message::user("hi"),
+                &tools,
+                &ModelParams::default(),
+            )
+            .unwrap()
     };
 
     let responses = capture(&openai_model(WireApi::Responses));
@@ -2952,13 +2969,15 @@ fn native_anthropic_reasoning_summary_is_redacted_and_preserved() {
         tool_call("tc-1"),
     ])];
 
-    let captured = model.assemble_dispatch_request(
-        "system",
-        &history,
-        &Message::user("next"),
-        &[],
-        &ModelParams::default(),
-    );
+    let captured = model
+        .assemble_dispatch_request(
+            "system",
+            &history,
+            &Message::user("next"),
+            &[],
+            &ModelParams::default(),
+        )
+        .unwrap();
     let wire = serde_json::to_string(&captured).unwrap();
 
     assert!(wire.contains("signed thinking"), "{wire}");
@@ -2979,13 +2998,15 @@ fn native_anthropic_reasoning_text_is_redacted_but_signature_is_preserved() {
         tool_call("tc-1"),
     ])];
 
-    let captured = model.assemble_dispatch_request(
-        "system",
-        &history,
-        &Message::user("next"),
-        &[],
-        &ModelParams::default(),
-    );
+    let captured = model
+        .assemble_dispatch_request(
+            "system",
+            &history,
+            &Message::user("next"),
+            &[],
+            &ModelParams::default(),
+        )
+        .unwrap();
     let wire = serde_json::to_string(&captured).unwrap();
 
     assert!(wire.contains(PLACEHOLDER), "{wire}");
@@ -3215,7 +3236,15 @@ async fn capture_anthropic_body(
         resolved_max_tokens,
     );
     let prepared = model
-        .prepare_completion_request("system", &[], &Message::user("hi"), &[], &params, false)
+        .prepare_completion_request(
+            "system",
+            &[],
+            &Message::user("hi"),
+            &[],
+            &params,
+            false,
+            None,
+        )
         .unwrap();
     assert_eq!(
         prepared.captured["params"]["max_tokens"],
@@ -4645,13 +4674,15 @@ async fn utility_and_streaming_share_endpoint_resolution() {
             "properties": { "optional": { "type": "string" } }
         }),
     };
-    let captured = model.assemble_dispatch_request(
-        "system",
-        &[],
-        &Message::user("hi"),
-        std::slice::from_ref(&tool),
-        &ModelParams::default(),
-    );
+    let captured = model
+        .assemble_dispatch_request(
+            "system",
+            &[],
+            &Message::user("hi"),
+            std::slice::from_ref(&tool),
+            &ModelParams::default(),
+        )
+        .unwrap();
     assert_eq!(
         captured["tools"][0]["parameters"]["properties"]["optional"]["type"],
         json!(["string", "null"]),
@@ -5879,7 +5910,7 @@ fn every_model_carries_a_redaction_table() {
 }
 
 #[test]
-fn redact_preserves_opaque_reasoning_and_every_tool_result_part() {
+fn redact_scrubs_every_tool_result_part_and_preserves_opaque_reasoning() {
     let (_tmp, redact) = secret_table();
     let opaque_encrypted = format!("encrypted:{SECRET}");
     let opaque_redacted = format!("redacted:{SECRET}");
@@ -5902,7 +5933,7 @@ fn redact_preserves_opaque_reasoning_and_every_tool_result_part() {
             reasoning
         })),
     };
-    let scrubbed = scrub_message(&redact, &message);
+    let scrubbed = scrub_message(&redact, &message).unwrap();
     let Message::Assistant { content, .. } = scrubbed else {
         panic!("expected assistant message");
     };
@@ -5928,8 +5959,10 @@ fn redact_preserves_opaque_reasoning_and_every_tool_result_part() {
     ));
 
     // Rig 0.41 represents one tool result as a non-empty ordered collection,
-    // not one flattened string. Preserve opaque JSON while scrubbing every
-    // text member so multipart results retain their provider meaning.
+    // not one flattened string. Every text member is scrubbed, and a JSON
+    // member has BOTH its values and its keys scrubbed recursively — a secret
+    // used as a JSON object key or value must never survive to an untrusted
+    // wire (the pre-fix behavior passed `Json` members through verbatim).
     let tool_result = Message::User {
         content: OneOrMany::one(UserContent::tool_result_with_call_id(
             "tool-call",
@@ -5937,14 +5970,14 @@ fn redact_preserves_opaque_reasoning_and_every_tool_result_part() {
             OneOrMany::many(vec![
                 ToolResultContent::text(format!("first:{SECRET}")),
                 ToolResultContent::Json {
-                    value: json!({"secret": SECRET}),
+                    value: json!({"secret": SECRET, (SECRET): "as-a-key"}),
                 },
                 ToolResultContent::text(format!("last:{SECRET}")),
             ])
             .expect("multipart tool result is non-empty"),
         )),
     };
-    let scrubbed = scrub_message(&redact, &tool_result);
+    let scrubbed = scrub_message(&redact, &tool_result).unwrap();
     let Message::User { content } = scrubbed else {
         panic!("expected user message");
     };
@@ -5958,12 +5991,905 @@ fn redact_preserves_opaque_reasoning_and_every_tool_result_part() {
         parts[0],
         ToolResultContent::Text(text) if text.text.contains(PLACEHOLDER)
     ));
-    assert!(matches!(
-        parts[1],
-        ToolResultContent::Json { value } if *value == json!({"secret": SECRET})
-    ));
+    let ToolResultContent::Json { value } = parts[1] else {
+        panic!("expected json member");
+    };
+    // Value scrubbed: {"secret": <PLACEHOLDER>, <PLACEHOLDER>: "as-a-key"}.
+    assert_eq!(value["secret"], json!(PLACEHOLDER));
+    assert_eq!(value[PLACEHOLDER], json!("as-a-key"), "key was scrubbed");
+    let json_bytes = serde_json::to_string(value).unwrap();
+    assert!(
+        !json_bytes.contains(SECRET),
+        "no raw secret survives in the json member: {json_bytes}"
+    );
     assert!(matches!(
         parts[2],
         ToolResultContent::Text(text) if text.text.contains(PLACEHOLDER)
     ));
+}
+
+/// A redaction table that scrubs each of `secrets` → [`PLACEHOLDER`], via the
+/// real builder with a forced denylist (so two distinct secrets share the same
+/// generic placeholder — the AC3 collision precondition).
+fn denylist_table(secrets: &[&str]) -> TestArc<RedactionTable> {
+    use crate::config::extended::RedactConfig;
+    let cfg = RedactConfig {
+        enabled: true,
+        scan_environment: false,
+        scan_dotenv: false,
+        scan_ssh_keys: false,
+        ssh_key_dir: None,
+        dotenv_patterns: crate::config::extended::default_dotenv_patterns(),
+        extra_dotenv_paths: vec![],
+        secret_path_patterns: vec![],
+        min_secret_length: 4,
+        placeholder: PLACEHOLDER.into(),
+        denylist: secrets.iter().map(|s| s.to_string()).collect(),
+        allowlist: vec![],
+    };
+    TestArc::new(RedactionTable::build(&cfg, std::path::Path::new(".")).unwrap())
+}
+
+// AC2: JSON tool-result values AND keys, and tool-call argument keys, are
+// scrubbed through the real `prepare_completion_request` entry point — zero
+// sentinel bytes reach the captured wire body.
+#[test]
+fn untrusted_json_tool_result_values_and_keys_are_scrubbed() {
+    use rig::message::{ToolCall, ToolFunction};
+    let (_tmp, redact) = secret_table();
+    let model = model_at("http://127.0.0.1:1/v1", redact);
+
+    let tool_result = Message::User {
+        content: OneOrMany::one(UserContent::tool_result_with_call_id(
+            "tool",
+            "call".to_string(),
+            OneOrMany::one(ToolResultContent::Json {
+                value: json!({
+                    "nested": { "inner": SECRET },
+                    (SECRET): "value-under-secret-key",
+                    "arr": [SECRET, "clean"],
+                }),
+            }),
+        )),
+    };
+    // Tool-call arguments prove key scrubbing through the same entry point.
+    let assistant_msg = assistant(vec![AssistantContent::ToolCall(ToolCall::new(
+        "tc-1".to_string(),
+        ToolFunction::new(
+            "lookup".to_string(),
+            json!({ "path": SECRET, (SECRET): "arg-key-position" }),
+        ),
+    ))]);
+    let history = vec![assistant_msg, tool_result];
+    let prompt = Message::user("continue");
+
+    // Precondition: the RAW fixture really carries the sentinel as a nested
+    // value, an object key, an array member, and in tool-call arguments — so a
+    // vacuous pass (the secret was never there) is impossible.
+    let raw_history = serde_json::to_string(&history).unwrap();
+    assert!(
+        raw_history.matches(SECRET).count() >= 4,
+        "raw fixture must carry the sentinel in every channel before prep: {raw_history}"
+    );
+
+    let prepared = model
+        .prepare_completion_request(
+            "system",
+            &history,
+            &prompt,
+            &[],
+            &ModelParams::default(),
+            false,
+            None,
+        )
+        .unwrap();
+    // Assert on the scrubbed MESSAGES themselves (production entry rewrites the
+    // history/prompt in place), not merely the serialized captured body — so a
+    // regression that scrubbed only the capture would still fail here.
+    let scrubbed_messages = serde_json::to_string(&prepared.history).unwrap();
+    assert!(
+        !scrubbed_messages.contains(SECRET),
+        "scrubbed messages must contain zero sentinel bytes: {scrubbed_messages}"
+    );
+    assert!(
+        scrubbed_messages.contains(PLACEHOLDER),
+        "the scrubbed messages must render the placeholder"
+    );
+    // Structural proof through the production entry: the tool-result JSON member
+    // has its value, its key, and its array member scrubbed.
+    let Message::User { content } = &prepared.history[1] else {
+        panic!("expected the tool-result user message");
+    };
+    let UserContent::ToolResult(result) = content.first() else {
+        panic!("expected a tool result");
+    };
+    let ToolResultContent::Json { value } = result.content.first() else {
+        panic!("expected a json member");
+    };
+    assert_eq!(
+        value["nested"]["inner"],
+        json!(PLACEHOLDER),
+        "nested value scrubbed"
+    );
+    assert_eq!(
+        value[PLACEHOLDER],
+        json!("value-under-secret-key"),
+        "object key scrubbed"
+    );
+    assert_eq!(value["arr"][0], json!(PLACEHOLDER), "array member scrubbed");
+
+    let captured = serde_json::to_string(&prepared.captured).unwrap();
+    assert!(
+        !captured.contains(SECRET),
+        "captured wire body must contain zero sentinel bytes: {captured}"
+    );
+    assert!(
+        captured.contains(PLACEHOLDER),
+        "the scrubbed body must render the placeholder"
+    );
+}
+
+// AC3: two distinct secret keys in one object collapse to the exact terminal
+// collision object; a non-colliding sibling stays intact; re-scrub is stable.
+#[test]
+fn colliding_scrubbed_json_keys_collapse_to_terminal_redaction_object() {
+    const SECRET_A: &str = "collide-secret-alpha-1111";
+    const SECRET_B: &str = "collide-secret-bravo-2222";
+    let table = denylist_table(&[SECRET_A, SECRET_B]);
+    // Precondition: both secrets render the same generic placeholder, so scrubbed
+    // keys collide.
+    assert_eq!(table.scrub(SECRET_A), PLACEHOLDER);
+    assert_eq!(table.scrub(SECRET_B), PLACEHOLDER);
+    let model = model_at("http://127.0.0.1:1/v1", table);
+
+    let msg = Message::User {
+        content: OneOrMany::one(UserContent::tool_result(
+            "tool",
+            OneOrMany::one(ToolResultContent::Json {
+                value: json!({
+                    "collide": { (SECRET_A): 1, (SECRET_B): 2 },
+                    "sibling": { "clean": SECRET_A },
+                }),
+            }),
+        )),
+    };
+    // Precondition: the raw fixture really carries both colliding secret keys.
+    let raw = serde_json::to_string(&msg).unwrap();
+    assert!(raw.contains(SECRET_A) && raw.contains(SECRET_B));
+
+    // Drive the PRODUCTION entry point and assert on the scrubbed message.
+    let prepared = model
+        .prepare_completion_request(
+            "system",
+            std::slice::from_ref(&msg),
+            &Message::user("continue"),
+            &[],
+            &ModelParams::default(),
+            false,
+            None,
+        )
+        .unwrap();
+    let Message::User { content } = &prepared.history[0] else {
+        panic!("expected user message");
+    };
+    let UserContent::ToolResult(result) = content.first() else {
+        panic!("expected tool result");
+    };
+    let ToolResultContent::Json { value } = result.content.first() else {
+        panic!("expected json member");
+    };
+    assert_eq!(
+        value["collide"],
+        json!({ "**REDACTED BY COCKPIT**": "**REDACTED BY COCKPIT**" }),
+        "the colliding object collapses to exactly the terminal object"
+    );
+    assert_eq!(
+        value["sibling"],
+        json!({ "clean": PLACEHOLDER }),
+        "a non-colliding sibling keeps its structure with values scrubbed"
+    );
+
+    // Re-preparing the already-scrubbed history through the production entry is a
+    // byte-stable no-op (the terminal collision object never re-renders).
+    let reprepared = model
+        .prepare_completion_request(
+            "system",
+            std::slice::from_ref(&prepared.history[0]),
+            &Message::user("continue"),
+            &[],
+            &ModelParams::default(),
+            false,
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::to_string(&reprepared.history[0]).unwrap(),
+        serde_json::to_string(&prepared.history[0]).unwrap(),
+        "re-scrub through the production entry must be byte-stable"
+    );
+}
+
+// AC4a: document/image `data` string channels (String/Url/Base64) and
+// `additional_params` are scrubbed on an untrusted dispatch.
+#[test]
+fn untrusted_document_and_media_string_channels_are_scrubbed() {
+    use base64::Engine as _;
+    use rig::message::{Audio, Document, DocumentSourceKind, Image, Video};
+    let (_tmp, redact) = secret_table();
+    let model = model_at("http://127.0.0.1:1/v1", redact);
+
+    let base64_secret = base64::engine::general_purpose::STANDARD.encode(SECRET);
+    // Every media part variant (Image/Audio/Video/Document) across BOTH the
+    // `String` and `Base64` data channels (plus `Url` where cockpit builds it),
+    // with `additional_params` carrying the sentinel on a representative case of
+    // each — nothing in this message may survive to an untrusted wire.
+    let message = Message::User {
+        content: OneOrMany::many(vec![
+            UserContent::Image(Image {
+                data: DocumentSourceKind::String(SECRET.to_string()),
+                additional_params: Some(json!({ "caption": SECRET })),
+                ..Image::default()
+            }),
+            UserContent::Image(Image {
+                data: DocumentSourceKind::Base64(base64_secret.clone()),
+                ..Image::default()
+            }),
+            UserContent::Audio(Audio {
+                data: DocumentSourceKind::Base64(base64_secret.clone()),
+                additional_params: Some(json!({ "transcript": SECRET })),
+                ..Audio::default()
+            }),
+            UserContent::Audio(Audio {
+                data: DocumentSourceKind::String(SECRET.to_string()),
+                ..Audio::default()
+            }),
+            UserContent::Video(Video {
+                data: DocumentSourceKind::Url(format!("https://v/{SECRET}")),
+                additional_params: Some(json!({ "poster": SECRET })),
+                ..Video::default()
+            }),
+            UserContent::Video(Video {
+                data: DocumentSourceKind::String(SECRET.to_string()),
+                ..Video::default()
+            }),
+            UserContent::Video(Video {
+                data: DocumentSourceKind::Base64(base64_secret.clone()),
+                ..Video::default()
+            }),
+            UserContent::Document(Document {
+                data: DocumentSourceKind::Url(format!("https://example/{SECRET}")),
+                ..Document::default()
+            }),
+            UserContent::Document(Document {
+                data: DocumentSourceKind::String(SECRET.to_string()),
+                additional_params: Some(json!({ "note": SECRET })),
+                ..Document::default()
+            }),
+            UserContent::Document(Document {
+                data: DocumentSourceKind::Base64(base64_secret.clone()),
+                additional_params: Some(json!({ "meta": SECRET })),
+                ..Document::default()
+            }),
+        ])
+        .unwrap(),
+    };
+    // Precondition: the raw media message really carries the sentinel in its
+    // data/additional_params channels, so a vacuous pass is impossible.
+    let raw = serde_json::to_string(&message).unwrap();
+    assert!(raw.contains(SECRET) && raw.contains(base64_secret.as_str()));
+    let prepared = model
+        .prepare_completion_request(
+            "system",
+            &[message],
+            &Message::user("go"),
+            &[],
+            &ModelParams::default(),
+            false,
+            None,
+        )
+        .unwrap();
+    // Assert on the scrubbed messages AND the captured body.
+    let scrubbed_messages = serde_json::to_string(&prepared.history).unwrap();
+    let captured = serde_json::to_string(&prepared.captured).unwrap();
+    for body in [&scrubbed_messages, &captured] {
+        assert!(
+            !body.contains(SECRET),
+            "media string channels leaked the sentinel: {body}"
+        );
+        assert!(
+            !body.contains(base64_secret.as_str()),
+            "base64-encoded sentinel leaked: {body}"
+        );
+    }
+}
+
+// AC4b: EVERY non-renderable media source (`Raw`/`FileId`/`Unknown`) on an
+// untrusted dispatch fails closed with a typed prep failure and provably NO
+// provider I/O (a live `ScriptedProvider` captures zero requests); the identical
+// message on a trusted model gets past our prep gate (raw custody), and a
+// trusted renderable dispatch actually reaches the provider carrying its raw
+// content.
+#[tokio::test]
+async fn untrusted_non_renderable_wire_field_fails_before_network() {
+    use rig::message::{DocumentSourceKind, Image};
+
+    let non_renderable = [
+        DocumentSourceKind::Raw(vec![1, 2, 3, 4]),
+        DocumentSourceKind::FileId("file-123".to_string()),
+        DocumentSourceKind::Unknown,
+    ];
+
+    for data in non_renderable {
+        let media = || Message::User {
+            content: OneOrMany::one(UserContent::Image(Image {
+                data: data.clone(),
+                ..Image::default()
+            })),
+        };
+        let (_tmp, redact) = secret_table();
+        let provider = sse_capture_provider().await;
+        let untrusted = model_at(&provider.base_url(), redact);
+        assert!(!untrusted.is_trusted());
+
+        // (b) `prepare_completion_request` fails closed with the typed prep
+        // failure BEFORE any network I/O.
+        let err = untrusted
+            .prepare_completion_request(
+                "system",
+                &[media()],
+                &Message::user("go"),
+                &[],
+                &ModelParams::default(),
+                false,
+                None,
+            )
+            .expect_err("non-renderable media on an untrusted route must fail closed");
+        let failure = as_inference_failure(&err).expect("typed prep failure");
+        assert_eq!(failure.phase, "prep");
+        assert_eq!(
+            failure.class,
+            crate::daemon::proto::InferenceErrorClass::UnrenderableWireField
+        );
+
+        // Prove zero provider I/O by driving the full dispatch path: the error
+        // must surface AND the live provider must capture zero requests.
+        let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+        let cancel = CancellationToken::new();
+        let dispatched = untrusted
+            .complete_captured(
+                "system",
+                &[media()],
+                Message::user("go"),
+                &[],
+                ModelParams::default(),
+                "Build",
+                Some(&tx),
+                &cancel,
+                None,
+            )
+            .await;
+        assert!(
+            dispatched.is_err(),
+            "untrusted non-renderable must not dispatch"
+        );
+        assert_eq!(
+            provider.request_count(),
+            0,
+            "fail-closed must reach zero provider I/O; captured {}",
+            provider.request_count()
+        );
+        // Drain guard: nothing was queued at the wire.
+        assert!(provider.captured().is_empty());
+
+        // The identical message on a TRUSTED model (raw custody) does NOT trip
+        // OUR fail-closed gate: prep succeeds. (rig itself still rejects these
+        // non-renderable channels downstream of our gate — the point is our
+        // untrusted-only gate did not fire.)
+        let trusted = build_openai_model_from_resolved(
+            "p",
+            &resolved_local_request(provider.base_url()),
+            "m",
+            &crate::config::providers::TimeoutConfig::default(),
+            false,
+            ClientSideToolsCapability::default(),
+            crate::config::providers::WireApi::Completions,
+            true,
+            true, // trusted
+            None,
+            0,
+            0,
+            false,
+            TestArc::new(RedactionTable::empty()),
+            TestArc::new(RedactionTable::empty()),
+        )
+        .unwrap();
+        assert!(trusted.is_trusted());
+        let trusted_prep = trusted.prepare_completion_request(
+            "system",
+            &[media()],
+            &Message::user("go"),
+            &[],
+            &ModelParams::default(),
+            false,
+            None,
+        );
+        assert!(
+            trusted_prep.is_ok(),
+            "trusted raw custody must pass our prep gate for the identical message"
+        );
+    }
+
+    // (c) A trusted model actually DISPATCHES to the provider: a renderable
+    // message carrying the raw sentinel reaches the wire under trusted custody.
+    let mut provider = sse_capture_provider().await;
+    let trusted = build_openai_model_from_resolved(
+        "p",
+        &resolved_local_request(provider.base_url()),
+        "m",
+        &crate::config::providers::TimeoutConfig::default(),
+        false,
+        ClientSideToolsCapability::default(),
+        crate::config::providers::WireApi::Completions,
+        true,
+        true, // trusted
+        None,
+        0,
+        0,
+        false,
+        TestArc::new(RedactionTable::empty()),
+        TestArc::new(RedactionTable::empty()),
+    )
+    .unwrap();
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    let cancel = CancellationToken::new();
+    let _ = trusted
+        .complete_captured(
+            "system",
+            &[],
+            Message::user(format!("dispatch this {SECRET}")),
+            &[],
+            ModelParams::default(),
+            "Build",
+            Some(&tx),
+            &cancel,
+            None,
+        )
+        .await;
+    let body = request_body_string(&provider.next_request().await);
+    assert!(
+        provider.request_count() >= 1,
+        "trusted dispatch must reach the provider"
+    );
+    assert!(
+        body.contains(SECRET),
+        "trusted raw custody carries the literal to the wire: {body}"
+    );
+}
+
+// AC6: every content variant carries a declared policy, asserted through the
+// production scrub walk. The `match` arms below are exhaustive with no wildcard
+// over the exhaustive-capable rig enums, so a new rig variant is a compile error
+// rather than a silent leak — AND every variant is actually DRIVEN through the
+// production `scrub_message` entry point with a sentinel, asserting its declared
+// policy (rendered→scrubbed / enumerated-safe passthrough / non-renderable→
+// error). Naming a variant in a match that returns `true` is not enough.
+#[test]
+fn wire_field_policy_walk_is_exhaustive_for_every_content_variant() {
+    use rig::message::{Audio, Document, DocumentSourceKind, Image, ToolCall, ToolFunction, Video};
+    let (_tmp, redact) = secret_table();
+
+    // Media part carrying the sentinel in a renderable string channel.
+    let media_image = || Image {
+        data: DocumentSourceKind::String(SECRET.to_string()),
+        ..Image::default()
+    };
+
+    // --- UserContent: exhaustive (no wildcard) AND every variant driven. Each
+    // variant is `rendered`: its string channels are scrubbed to zero sentinel
+    // bytes through the production entry point.
+    let user_parts = [
+        UserContent::text(format!("text:{SECRET}")),
+        UserContent::tool_result(
+            "id",
+            OneOrMany::one(ToolResultContent::text(format!("tr:{SECRET}"))),
+        ),
+        UserContent::Image(media_image()),
+        UserContent::Audio(Audio {
+            data: DocumentSourceKind::String(SECRET.to_string()),
+            ..Audio::default()
+        }),
+        UserContent::Video(Video {
+            data: DocumentSourceKind::Url(format!("https://v/{SECRET}")),
+            ..Video::default()
+        }),
+        UserContent::Document(Document {
+            data: DocumentSourceKind::String(SECRET.to_string()),
+            ..Document::default()
+        }),
+    ];
+    for part in user_parts {
+        // Structural guarantee: a new rig `UserContent` variant is a compile
+        // error here (no wildcard).
+        let declared_renderable = match &part {
+            UserContent::Text(_)
+            | UserContent::ToolResult(_)
+            | UserContent::Image(_)
+            | UserContent::Audio(_)
+            | UserContent::Video(_)
+            | UserContent::Document(_) => true,
+        };
+        assert!(declared_renderable);
+        let msg = Message::User {
+            content: OneOrMany::one(part),
+        };
+        let scrubbed = serde_json::to_string(&scrub_message(&redact, &msg).unwrap()).unwrap();
+        assert!(!scrubbed.contains(SECRET), "user part leaked: {scrubbed}");
+    }
+
+    // --- AssistantContent: exhaustive AND every variant driven, all rendered.
+    let assistant_parts = [
+        AssistantContent::text(format!("say:{SECRET}")),
+        AssistantContent::ToolCall(ToolCall::new(
+            "id".to_string(),
+            ToolFunction::new(
+                format!("fn-{SECRET}"),
+                json!({ "a": SECRET, (SECRET): "k" }),
+            ),
+        )),
+        AssistantContent::Reasoning({
+            let mut r = Reasoning::new("seed");
+            r.content = vec![
+                ReasoningContent::Text {
+                    text: format!("thought {SECRET}"),
+                    signature: Some("sig".into()),
+                },
+                ReasoningContent::Summary(format!("summary {SECRET}")),
+            ];
+            r
+        }),
+        AssistantContent::Image(Image {
+            data: DocumentSourceKind::String(SECRET.to_string()),
+            ..Image::default()
+        }),
+    ];
+    for part in assistant_parts {
+        let declared = match &part {
+            AssistantContent::Text(_)
+            | AssistantContent::ToolCall(_)
+            | AssistantContent::Reasoning(_)
+            | AssistantContent::Image(_) => true,
+        };
+        assert!(declared);
+        let msg = assistant(vec![part]);
+        let scrubbed = serde_json::to_string(&scrub_message(&redact, &msg).unwrap()).unwrap();
+        assert!(
+            !scrubbed.contains(SECRET),
+            "assistant part leaked: {scrubbed}"
+        );
+    }
+
+    // --- ToolResultContent: exhaustive AND every variant driven through
+    // `scrub_message` (wrapped in a tool result), all rendered.
+    let tool_result_parts = [
+        ToolResultContent::text(format!("tr-text:{SECRET}")),
+        ToolResultContent::Image(media_image()),
+        ToolResultContent::Json {
+            value: json!({ "v": SECRET, (SECRET): "k", "arr": [SECRET] }),
+        },
+    ];
+    for content in tool_result_parts {
+        let declared = match &content {
+            ToolResultContent::Text(_)
+            | ToolResultContent::Image(_)
+            | ToolResultContent::Json { .. } => true,
+        };
+        assert!(declared);
+        let msg = Message::User {
+            content: OneOrMany::one(UserContent::tool_result("t", OneOrMany::one(content))),
+        };
+        let scrubbed = serde_json::to_string(&scrub_message(&redact, &msg).unwrap()).unwrap();
+        assert!(
+            !scrubbed.contains(SECRET),
+            "tool-result member leaked: {scrubbed}"
+        );
+    }
+
+    // --- ReasoningContent: the rendered text channels vs the enumerated-safe
+    // opaque provider blocks, each driven through `scrub_message`.
+    // Rendered: Text + Summary scrub to zero sentinel bytes.
+    for block in [
+        ReasoningContent::Text {
+            text: format!("rt {SECRET}"),
+            signature: None,
+        },
+        ReasoningContent::Summary(format!("rs {SECRET}")),
+    ] {
+        let mut r = Reasoning::new("seed");
+        r.content = vec![block];
+        let msg = assistant(vec![AssistantContent::Reasoning(r)]);
+        let scrubbed = serde_json::to_string(&scrub_message(&redact, &msg).unwrap()).unwrap();
+        assert!(
+            !scrubbed.contains(SECRET),
+            "reasoning text channel leaked: {scrubbed}"
+        );
+    }
+    // Enumerated-safe: Encrypted + Redacted are opaque provider-authenticated
+    // blobs (no user free text) — passed through unchanged, never errored.
+    const OPAQUE: &str = "opaque-provider-authenticated-blob-9a7";
+    for block in [
+        ReasoningContent::Encrypted(OPAQUE.to_string()),
+        ReasoningContent::Redacted {
+            data: OPAQUE.to_string(),
+        },
+    ] {
+        let mut r = Reasoning::new("seed");
+        r.content = vec![block];
+        let msg = assistant(vec![AssistantContent::Reasoning(r)]);
+        let out = scrub_message(&redact, &msg).expect("enumerated-safe reasoning passes through");
+        let serialized = serde_json::to_string(&out).unwrap();
+        assert!(
+            serialized.contains(OPAQUE),
+            "enumerated-safe reasoning block is passed through, not dropped: {serialized}"
+        );
+    }
+
+    // --- DocumentSourceKind: every variant driven through the production media
+    // renderer. Renderable string channels (String/Url/Base64) scrub to zero
+    // sentinel bytes; non-renderable channels (Raw/FileId/Unknown) fail closed.
+    let renderable = [
+        DocumentSourceKind::String(SECRET.to_string()),
+        DocumentSourceKind::Url(format!("https://h/{SECRET}")),
+        DocumentSourceKind::Base64(SECRET.to_string()),
+    ];
+    for data in renderable {
+        let msg = Message::User {
+            content: OneOrMany::one(UserContent::Image(Image {
+                data,
+                ..Image::default()
+            })),
+        };
+        let out = scrub_message(&redact, &msg).expect("renderable media channel scrubs");
+        let scrubbed = serde_json::to_string(&out).unwrap();
+        assert!(
+            !scrubbed.contains(SECRET),
+            "renderable media channel leaked: {scrubbed}"
+        );
+    }
+    let non_renderable = [
+        DocumentSourceKind::Raw(vec![1, 2, 3, 4]),
+        DocumentSourceKind::FileId(format!("file-{SECRET}")),
+        DocumentSourceKind::Unknown,
+    ];
+    for data in non_renderable {
+        let msg = Message::User {
+            content: OneOrMany::one(UserContent::Image(Image {
+                data,
+                ..Image::default()
+            })),
+        };
+        assert!(
+            scrub_message(&redact, &msg).is_err(),
+            "a non-renderable media channel must fail closed"
+        );
+    }
+}
+
+// AC5: the untrusted provider wire inventory is closed. Driven through the REAL
+// production egress (`complete_captured`, real rig adapters, real HTTP capture)
+// for BOTH wire dialects, plus the full-inventory assembly via the production
+// `prepare_completion_request`, with an untrusted table that starts with only
+// the sentinel entry. Every wire-reaching string channel renders zero sentinel
+// bytes on the captured body, and a non-renderable channel fails pre-network.
+#[tokio::test]
+async fn untrusted_provider_wire_inventory_is_closed() {
+    use base64::Engine as _;
+    use rig::message::{DocumentSourceKind, Image, ImageMediaType, ToolCall, ToolFunction};
+    let (_tmp, redact) = secret_table();
+    let base64_secret = base64::engine::general_purpose::STANDARD.encode(SECRET);
+
+    // Full inventory (every wire-reaching content variant) through the
+    // production assembly. The captured assembled body must carry zero sentinel
+    // bytes even though the untrusted table holds only the sentinel entry.
+    let full_history = vec![
+        Message::user(format!("user text {SECRET}")),
+        assistant(vec![
+            AssistantContent::text(format!("assistant text {SECRET}")),
+            AssistantContent::ToolCall(ToolCall::new(
+                "tc".to_string(),
+                ToolFunction::new(
+                    "lookup".to_string(),
+                    json!({ "path": SECRET, (SECRET): "arg-key" }),
+                ),
+            )),
+            AssistantContent::Reasoning({
+                let mut r = Reasoning::new("seed");
+                r.content = vec![
+                    ReasoningContent::Text {
+                        text: format!("thought {SECRET}"),
+                        signature: Some("sig".into()),
+                    },
+                    ReasoningContent::Summary(format!("summary {SECRET}")),
+                ];
+                r
+            }),
+        ]),
+        Message::User {
+            content: OneOrMany::one(UserContent::tool_result(
+                "t",
+                OneOrMany::one(ToolResultContent::Json {
+                    value: json!({ "v": SECRET, (SECRET): "k", "arr": [SECRET] }),
+                }),
+            )),
+        },
+        Message::User {
+            content: OneOrMany::one(UserContent::Image(Image {
+                data: DocumentSourceKind::Base64(base64_secret.clone()),
+                additional_params: Some(json!({ "alt": SECRET })),
+                ..Image::default()
+            })),
+        },
+    ];
+    let chat = openai_model_at_with_wire_and_redact(
+        "http://127.0.0.1:1/v1",
+        WireApi::Completions,
+        true,
+        redact.clone(),
+    );
+    let prepared = chat
+        .prepare_completion_request(
+            "system",
+            &full_history,
+            &Message::user(format!("final {SECRET}")),
+            &[],
+            &ModelParams::default(),
+            false,
+            None,
+        )
+        .unwrap();
+    let assembled = serde_json::to_string(&prepared.captured).unwrap();
+    assert!(
+        !assembled.contains(SECRET) && !assembled.contains(base64_secret.as_str()),
+        "full-inventory assembled body must carry zero sentinel bytes: {assembled}"
+    );
+    assert!(assembled.contains(PLACEHOLDER));
+
+    // Real HTTP capture through both wire dialects. Chat exercises text +
+    // tool-result JSON + media string channels; Responses exercises the text
+    // channels — both must render zero sentinel bytes on the actual wire body.
+    // Chat dialect.
+    let mut chat_provider = ScriptedProvider::builder()
+        .turn(Turn::Text("ok".into()))
+        .start()
+        .await;
+    let chat_wire = openai_model_at_with_wire_and_redact(
+        &chat_provider.base_url(),
+        WireApi::Completions,
+        true,
+        redact.clone(),
+    );
+    let chat_history = vec![
+        Message::user(format!("user text {SECRET}")),
+        assistant(vec![AssistantContent::text(format!("assistant {SECRET}"))]),
+        Message::User {
+            content: OneOrMany::one(UserContent::tool_result(
+                "t",
+                OneOrMany::one(ToolResultContent::Json {
+                    value: json!({ "v": SECRET, (SECRET): "k" }),
+                }),
+            )),
+        },
+        Message::User {
+            content: OneOrMany::one(UserContent::Image(Image {
+                data: DocumentSourceKind::Base64(base64_secret.clone()),
+                // rig's OpenAI completion adapter requires a media type to
+                // render a base64 image onto the wire; without it the request
+                // fails to serialize pre-network. The scrub walk preserves this
+                // field and scrubs only the base64 data + additional_params, so
+                // the sentinel-bearing channels still reach the wire redacted.
+                media_type: Some(ImageMediaType::PNG),
+                additional_params: Some(json!({ "alt": SECRET })),
+                ..Image::default()
+            })),
+        },
+        Message::User {
+            content: OneOrMany::one(UserContent::Image(Image {
+                data: DocumentSourceKind::Url(format!("https://h/{SECRET}")),
+                ..Image::default()
+            })),
+        },
+    ];
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    let cancel = CancellationToken::new();
+    let _ = chat_wire
+        .complete_captured(
+            "system",
+            &chat_history,
+            Message::user(format!("final {SECRET}")),
+            &[],
+            ModelParams::default(),
+            "Build",
+            Some(&tx),
+            &cancel,
+            None,
+        )
+        .await;
+    let chat_body = request_body_string(&chat_provider.next_request().await);
+    assert!(
+        !chat_body.contains(SECRET) && !chat_body.contains(base64_secret.as_str()),
+        "chat wire body must carry zero sentinel bytes: {chat_body}"
+    );
+
+    // Responses dialect (text channels).
+    let mut resp_provider = ScriptedProvider::builder()
+        .dialect(WireDialect::Responses)
+        .turn(Turn::Text("ok".into()))
+        .start()
+        .await;
+    let resp_wire = openai_model_at_with_wire_and_redact(
+        &resp_provider.base_url(),
+        WireApi::Responses,
+        true,
+        redact.clone(),
+    );
+    let resp_history = vec![
+        Message::user(format!("user text {SECRET}")),
+        assistant(vec![AssistantContent::text(format!("assistant {SECRET}"))]),
+    ];
+    let (tx2, _rx2) = mpsc::channel::<TurnEvent>(64);
+    let _ = resp_wire
+        .complete_captured(
+            "system",
+            &resp_history,
+            Message::user(format!("final {SECRET}")),
+            &[],
+            ModelParams::default(),
+            "Build",
+            Some(&tx2),
+            &cancel,
+            None,
+        )
+        .await;
+    let resp_body = request_body_string(&resp_provider.next_request().await);
+    assert!(
+        !resp_body.contains(SECRET),
+        "responses wire body must carry zero sentinel bytes: {resp_body}"
+    );
+
+    // A non-renderable channel fails pre-network for an untrusted dispatch: no
+    // request reaches the provider.
+    let nr_provider = ScriptedProvider::builder()
+        .turn(Turn::Text("ok".into()))
+        .start()
+        .await;
+    let nr_model = openai_model_at_with_wire_and_redact(
+        &nr_provider.base_url(),
+        WireApi::Completions,
+        true,
+        redact.clone(),
+    );
+    let (tx3, _rx3) = mpsc::channel::<TurnEvent>(64);
+    let nr = nr_model
+        .complete_captured(
+            "system",
+            &[Message::User {
+                content: OneOrMany::one(UserContent::Image(Image {
+                    data: DocumentSourceKind::Raw(vec![1, 2, 3]),
+                    ..Image::default()
+                })),
+            }],
+            Message::user("go"),
+            &[],
+            ModelParams::default(),
+            "Build",
+            Some(&tx3),
+            &cancel,
+            None,
+        )
+        .await;
+    assert!(nr.is_err(), "non-renderable channel must fail pre-network");
+    assert_eq!(
+        nr_provider.request_count(),
+        0,
+        "no provider I/O on fail-closed"
+    );
 }

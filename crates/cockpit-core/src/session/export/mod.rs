@@ -769,25 +769,31 @@ fn build_zip_with_options_and_env_conn_with_redactor(
         .filter_map(|e| e.call_id.clone())
         .collect();
     let utility_call_ids = Db::utility_call_ids_conn(conn, &candidate_call_ids)?;
-    // Call ids that have a successful `inference_request` event: those own the
-    // captured-body file. A failed/hung turn records an `inference_failure`
-    // event (not an `inference_request`) instead — its captured body (status
-    // `timed_out`/`errored`/`pending`) is still stored, so we assign a file
-    // off the failure event when no request event exists for that call
-    // (implementation note). This keeps
-    // exactly one file per call id while ensuring a hung/failed turn is no
-    // longer an empty export.
-    let request_event_call_ids: HashSet<String> = all_events
+    // `(call_id, ordinal)` pairs that have a successful `inference_request`
+    // event: each owns its own captured-body file. A failed/hung ATTEMPT records
+    // an `inference_failure` event (not an `inference_request`) instead — its
+    // captured body (status `timed_out`/`errored`/`pending`) is still stored, so
+    // we assign a file off the failure event when no request event exists for
+    // that SAME `(call_id, ordinal)`. The key is per-attempt, not per call: a
+    // failed primary (ordinal 0) whose logical call later SUCCEEDED on a
+    // failover attempt (ordinal 1) keeps its own immutable body file — the
+    // sibling ordinal's success must never suppress it, or the export drops the
+    // failed attempt's audited request body.
+    let request_event_keys: HashSet<(String, i64)> = all_events
         .iter()
         .filter(|e| e.kind == "inference_request")
-        .filter_map(|e| e.call_id.clone())
+        .filter_map(|e| {
+            let call_id = e.call_id.clone()?;
+            let ordinal = e.data.get("ordinal").and_then(Value::as_i64).unwrap_or(0);
+            Some((call_id, ordinal))
+        })
         .collect();
 
     // First pass: assign inference_request filenames so the matching
     // event can reference the exact file (explicit correlation).
     // `{seq:05}_{short_id}_{call_id}.json`, in `inference_requests/` for
     // regular calls and `inference_requests_utility/` for utility calls.
-    let mut request_files: Vec<(String, String)> = Vec::new(); // (path, call_id)
+    let mut request_files: Vec<(String, String, i64)> = Vec::new(); // (path, call_id, ordinal)
     let mut tool_output_files: Vec<(String, Value)> = Vec::new(); // (path, sidecar payload)
     let mut compressed_result_files: Vec<(String, String)> = Vec::new(); // (path, content)
     let mut compressed_result_index: Vec<Value> = Vec::new();
@@ -977,16 +983,24 @@ fn build_zip_with_options_and_env_conn_with_redactor(
             }
             tool_output_files.push((path, sidecar));
         }
-        // An `inference_request` event always owns a file; an
-        // `inference_failure` event owns one only when there's no successful
-        // request event for the same call (the hung/failed case — the captured
-        // body still exists, with a non-`completed` status).
+        // The dispatched-target attempt index this event owns. Two attempts of
+        // one logical call share `call_id`, so the ordinal is part of the file
+        // name and never collides on disk. Absent (compact-brief / legacy
+        // events) → ordinal 0.
+        let ordinal = ev.data.get("ordinal").and_then(Value::as_i64).unwrap_or(0);
+        // An `inference_request` event always owns its `(call_id, ordinal)` file;
+        // an `inference_failure` event owns one only when no successful request
+        // event exists for the SAME `(call_id, ordinal)` (the hung/failed
+        // ATTEMPT — the captured body still exists, with a non-`completed`
+        // status). Keying per attempt means a failed primary whose logical call
+        // later succeeded on a DIFFERENT ordinal is NOT suppressed by that
+        // sibling's success: its immutable body is exported for auditability.
         let owns_file = match ev.kind.as_str() {
             "inference_request" => true,
             "inference_failure" => ev
                 .call_id
                 .as_deref()
-                .is_some_and(|c| !request_event_call_ids.contains(c)),
+                .is_some_and(|c| !request_event_keys.contains(&(c.to_string(), ordinal))),
             _ => false,
         };
         if owns_file && let Some(call_id) = ev.call_id.as_deref() {
@@ -995,11 +1009,17 @@ fn build_zip_with_options_and_env_conn_with_redactor(
             } else {
                 REQ_DIR
             };
-            let path = format!("{dir}/{:05}_{}_{}.json", ev.seq, short, fs_safe(call_id));
+            let path = format!(
+                "{dir}/{:05}_{}_{}_o{}.json",
+                ev.seq,
+                short,
+                fs_safe(call_id),
+                ordinal
+            );
             // Surface the file reference on the event itself — pointing at
             // the correct (regular vs utility) folder.
             value["file"] = json!(path);
-            request_files.push((path, call_id.to_string()));
+            request_files.push((path, call_id.to_string(), ordinal));
         }
         redact_value_for_export(&mut value, export_redactor);
         event_values.push(value);
@@ -1135,13 +1155,26 @@ fn build_zip_with_options_and_env_conn_with_redactor(
         // persisted flag. The payload is the full post-redaction request body
         // — no second redaction pass (the leak-detection use case wants the
         // exact wire form).
-        for (path, call_id) in &request_files {
-            let mut payload = match Db::get_inference_request_conn(conn, call_id)? {
-                // Surface the dispatch-time lifecycle `status` on the emitted
-                // file so a hung/failed turn's record carries its non-
-                // `completed` status without a separate lookup
-                // (implementation note).
-                Some((payload, status)) => json!({ "status": status, "request": payload }),
+        for (path, call_id, ordinal) in &request_files {
+            let mut payload = match Db::get_inference_request_conn(conn, call_id, *ordinal)? {
+                // Envelope: the immutable `request` body, the dispatch-time
+                // lifecycle `status`, and the phase timestamps read from their
+                // dedicated columns — phases are NOT re-injected into `request`,
+                // so the body stays the exact wire form. Per-attempt
+                // provider/model/trust + the ordinal ride alongside.
+                Some(row) => json!({
+                    "status": row.status,
+                    "ordinal": row.ordinal,
+                    "provider": row.provider,
+                    "model": row.model,
+                    "trust": row.trust,
+                    "request": row.payload,
+                    "phases": {
+                        "first_token_ms": row.first_token_ms,
+                        "completed_ms": row.completed_ms,
+                        "failed_ms": row.failed_ms,
+                    },
+                }),
                 // A captured event without a stored payload (e.g. capture
                 // failed mid-turn). Emit a marker so the file the event
                 // references always exists.

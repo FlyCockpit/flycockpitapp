@@ -47,7 +47,8 @@ use anyhow::{Context, Result};
 use futures::{future::BoxFuture, future::Shared};
 use rig::client::CompletionClient;
 use rig::message::{
-    Message, Reasoning, ReasoningContent, ToolChoice, ToolResultContent, UserContent,
+    DocumentSourceKind, Message, Reasoning, ReasoningContent, ToolChoice, ToolResultContent,
+    UserContent,
 };
 use rig::streaming::StreamedAssistantContent;
 use serde_json::json;

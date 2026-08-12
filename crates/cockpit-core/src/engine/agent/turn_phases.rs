@@ -197,6 +197,10 @@ pub(crate) struct TurnCtx<'a> {
     pub(crate) deferred_log: crate::engine::deferred::DeferredLog,
     pub(crate) emit_inference_error_ui: bool,
     pub(crate) call_id: Uuid,
+    /// Dispatched-target attempt index for the immutable per-attempt inference
+    /// log: 0 for the primary path that bypasses `turn_with_backup`; the backup
+    /// loop threads incrementing ordinals sharing the logical `call_id`.
+    pub(crate) ordinal: i64,
     pub(crate) tandem: Option<&'a crate::engine::schedule::TandemSet>,
     pub(crate) goal_provenance: Option<(Uuid, i64)>,
     pub(crate) turn_id: Option<String>,
@@ -871,6 +875,7 @@ pub(crate) async fn run_turn(
     let deferred_log = ctx.deferred_log;
     let emit_inference_error_ui = ctx.emit_inference_error_ui;
     let call_id = ctx.call_id;
+    let ordinal = ctx.ordinal;
     let tandem = ctx.tandem;
     let goal_provenance = ctx.goal_provenance;
     let turn_id = ctx.turn_id;
@@ -1055,6 +1060,37 @@ pub(crate) async fn run_turn(
     // export's file-per-call pass picks up the record either way without
     // double-counting. Best-effort: auditing must never break a live turn (same
     // posture as the existing post-success write).
+    // Sealed marker wired to real grants (`sealed-value-untrusted-inference-
+    // marker`): derive the per-attempt egress table so that a sealed literal an
+    // untrusted interactive turn received renders the actionable
+    // `use_sealed_value` marker instead of the generic placeholder. All gating
+    // and derivation live in ONE production seam
+    // (`derive_untrusted_interactive_sealed_egress`, extracted so the chokepoint
+    // is drivable end-to-end in tests — removing the derivation there fails a
+    // test): it fires ONLY when untrusted custody, an interactive attachment, a
+    // callable `use_sealed_value` in THIS request's tool roster, and a live exact
+    // grant for that value in this session generation all hold. Derivation is
+    // fresh per attempt (a grant revoked between primary and failover renders the
+    // marker then generic), the `Model` never gets a DB handle (we derive here
+    // and pass the table to `prepare_completion_request`), and a DB error falls
+    // back to `None` / the generic table — fail closed to safe rendering, never
+    // to a stale marker, a raw literal, or a dispatch error. Trusted targets and
+    // noninteractive egress (utility/tandem/embeddings, which never reach here)
+    // are untouched.
+    let registry = crate::sealed::action::installed_sealed_action_registry();
+    let sealed_egress: Option<Arc<RedactionTable>> =
+        crate::sealed::egress::derive_untrusted_interactive_sealed_egress(
+            model,
+            interrupts.is_interactive_attached(),
+            &tools,
+            &session.db,
+            &registry,
+            session.id,
+            config.generation(),
+            crate::db::session_log::now_ms(),
+        )
+        .await;
+
     let mut prepared_request = model.prepare_completion_request(
         &agent.system,
         history,
@@ -1062,22 +1098,34 @@ pub(crate) async fn run_turn(
         &tools,
         &agent.params,
         endpoint_recovery.is_some(),
+        sealed_egress.as_deref(),
     )?;
-    let dispatch_payload = with_phases(
-        prepared_request.captured.clone(),
-        &serde_json::json!({ "dispatched_ms": 0 }),
-    );
+    // The immutable post-render request body for this dispatched-target attempt.
+    // Written once, at dispatch, keyed `(call_id, ordinal)`; phase timestamps
+    // and the terminal status land in dedicated columns via a status-advance,
+    // never by rewriting this blob.
+    let dispatch_payload = prepared_request.captured.clone();
+    let attempt_meta = crate::db::session_log::InferenceAttemptMeta {
+        provider: Some(model.provider_id()),
+        model: Some(model.model_id_ref()),
+        trust: Some(if model.is_trusted() {
+            "trusted"
+        } else {
+            "untrusted"
+        }),
+    };
     let mut journal_attempt =
         prepare_inference_journal(&session, model, &dispatch_payload, call_id).await?;
-    let pending_write_failed = record_inference_request_async(
-        session.clone(),
-        call_id,
-        dispatch_payload.clone(),
-        crate::db::session_log::InferenceRequestStatus::Pending,
-        goal_provenance,
-    )
-    .await
-    .is_err();
+    let pending_write_failed = session
+        .insert_inference_attempt(
+            call_id,
+            ordinal,
+            &dispatch_payload,
+            attempt_meta,
+            goal_provenance,
+        )
+        .await
+        .is_err();
     if pending_write_failed {
         tracing::warn!("primary inference audit write failed; durable journal recovery is active");
     }
@@ -1121,18 +1169,20 @@ pub(crate) async fn run_turn(
         )
         .await;
 
-    let ((msg_id, choice, usage), captured_request, timing) = match completion {
+    let ((msg_id, choice, usage), _captured_request, timing) = match completion {
         Ok(out) => out,
         Err(e) => {
             // Settle the dispatch-time record to its terminal status and
             // surface the failure (inline error + recorded event), unless this
             // was a clean cancel / drain unwind (those keep their dedicated
-            // sentinels and are handled by the driver without a red error).
+            // sentinels and are handled by the driver without a red error). The
+            // body blob is immutable: settle only advances status + phase
+            // columns for this attempt's `(call_id, ordinal)`.
             record_inference_outcome(
                 InferenceOutcomeRecord {
                     session: session.clone(),
                     call_id,
-                    dispatch_payload: &dispatch_payload,
+                    ordinal,
                     agent_name: &agent.name,
                     wire_api: model.wire_api_label(),
                     routing_metadata: model.routing_metadata_json(None),
@@ -1149,25 +1199,22 @@ pub(crate) async fn run_turn(
         }
     };
 
-    // Settle the dispatch-time record to `completed`, folding in the phase
-    // timestamps now known (`first_token_ms` / `completed_ms`). Best-effort.
-    let completed_payload = with_phases(
-        captured_request.clone(),
-        &serde_json::json!({
-            "dispatched_ms": 0,
-            "first_token_ms": timing.first_token_ms,
-            "completed_ms": timing.completed_ms,
-        }),
-    );
-    if record_inference_request_async(
-        session.clone(),
-        call_id,
-        completed_payload.clone(),
-        crate::db::session_log::InferenceRequestStatus::Completed,
-        goal_provenance,
-    )
-    .await
-    .is_err()
+    // Settle the dispatch-time record to `completed`, filling the phase-timestamp
+    // columns now known (`first_token_ms` / `completed_ms`) WITHOUT touching the
+    // immutable body blob. Best-effort.
+    if session
+        .advance_inference_request(
+            call_id,
+            ordinal,
+            crate::db::session_log::InferenceRequestStatus::Completed,
+            crate::db::session_log::InferencePhaseTimings {
+                first_token_ms: timing.first_token_ms.map(|ms| ms as i64),
+                completed_ms: Some(timing.completed_ms as i64),
+                failed_ms: None,
+            },
+        )
+        .await
+        .is_err()
     {
         tracing::warn!("primary inference audit terminal write failed");
     }
@@ -1199,6 +1246,10 @@ pub(crate) async fn run_turn(
             &serde_json::json!({
                 "usage": usage_json,
                 "routing": model.routing_metadata_json(None),
+                // The dispatched-target attempt index correlates this event to
+                // its immutable `(call_id, ordinal)` inference-request row so
+                // the export emits and names the right attempt file.
+                "ordinal": ordinal,
             }),
         )
         .await

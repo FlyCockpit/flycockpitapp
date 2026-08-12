@@ -344,24 +344,27 @@ impl InterruptHub {
     }
 
     /// Register a sealed literal in the worker's live egress redaction table
-    /// and persist that table, under a caller-supplied canonical origin.
+    /// and persist that table, under its TYPED canonical identity.
     ///
-    /// Scoped sealed values carry a richer typed identity than a bare value id
-    /// (`sealed:1:<scope>:<record_id>:<version>:<name>`), which the downstream
-    /// historical-redaction inventory parses back out. This is the single
+    /// Sealedness is carried by the typed [`SealedRedactionIdentity`] the whole
+    /// way through — it is registered directly via `with_forced_sealed_literal`,
+    /// never by serializing the identity to a `sealed:<id>` origin string and
+    /// reparsing it here to reconstruct classification. `parse_sealed_redaction_origin`
+    /// is kept off this live registration path entirely. This is the single
     /// place where a sealed literal becomes redacted; the legacy
     /// `sealed:<value_id>` wrapper is gone along with the agent-facing sealed
     /// write paths that were its only callers.
-    pub fn seal_redaction_at_origin(
+    pub fn seal_redaction_with_identity(
         &self,
         session: &crate::session::Session,
         value: String,
-        origin: &str,
+        identity: crate::sealed::identity::SealedRedactionIdentity,
     ) -> anyhow::Result<Option<Arc<crate::redact::RedactionTable>>> {
         let Some(redaction) = &self.redaction else {
             return Ok(None);
         };
-        let table = current_redaction(redaction).with_forced_literal(value, origin.to_string())?;
+        let base = current_redaction(redaction);
+        let table = base.with_forced_sealed_literal(value, identity)?;
         let table = Arc::new(table);
         session.persist_redaction_table(&table)?;
         set_current_redaction(redaction, table.clone());

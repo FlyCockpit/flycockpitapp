@@ -5421,6 +5421,7 @@ async fn export_rpc_returns_redacted_data() {
     ctx.db
         .insert_inference_request(
             &call_id,
+            0,
             session.session_id,
             &serde_json::json!({
                 "model": "m",
@@ -5428,7 +5429,17 @@ async fn export_rpc_returns_redacted_data() {
                 "tools": [],
                 "history": []
             }),
+            crate::db::session_log::InferenceAttemptMeta::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    ctx.db
+        .advance_inference_request(
+            &call_id,
+            0,
             crate::db::session_log::InferenceRequestStatus::Completed,
+            crate::db::session_log::InferencePhaseTimings::default(),
         )
         .await
         .unwrap();

@@ -507,6 +507,10 @@ impl Model {
             tools,
             &params,
             endpoint_recovery.is_some(),
+            // This `complete`/`complete_captured` path is not the interactive
+            // sealed-marker chokepoint; it renders the model's own effective
+            // table (generic). Sealed-marker derivation is done in the turn.
+            None,
         )?;
         self.complete_prepared_with_pre_drain(
             prepared,
@@ -1187,6 +1191,26 @@ impl Model {
         wire_schema::definitions_for_wire(wire, tools)
     }
 
+    /// Map a fail-closed [`UnrenderableWireField`] into the typed pre-network
+    /// [`InferenceFailure`] (phase `prep`,
+    /// [`InferenceErrorClass::UnrenderableWireField`]) the prep entry points
+    /// return. The provider is never contacted.
+    fn unrenderable_wire_failure(
+        &self,
+        field: UnrenderableWireField,
+        started: std::time::Instant,
+    ) -> anyhow::Error {
+        anyhow::Error::new(InferenceFailure {
+            provider: self.provider_id().to_string(),
+            model: self.model_id().to_string(),
+            phase: InferencePhase::Prep.as_str().to_string(),
+            class: InferenceErrorClass::UnrenderableWireField,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            retry_attempts: 1,
+            detail: field.detail(),
+        })
+    }
+
     pub(crate) fn prepare_completion_request(
         &self,
         system: &str,
@@ -1195,6 +1219,16 @@ impl Model {
         tools: &[ToolDefinition],
         params: &ModelParams,
         endpoint_recovery_enabled: bool,
+        // Optional per-attempt egress table override. The interactive turn
+        // derives this by applying `with_sealed_replacements` to the model's own
+        // effective table when (and only when) an untrusted, interactive request
+        // with a callable `use_sealed_value` holds a live exact sealed grant, so
+        // a sealed literal renders the actionable marker instead of the generic
+        // placeholder. `None` uses the model's own effective table (the default
+        // for every other route). The `Model` never gets a DB handle: the table
+        // is derived in the turn and passed here. This override is a *rendering*
+        // choice over the same enforced entries — it cannot release raw custody.
+        sealed_egress: Option<&RedactionTable>,
     ) -> Result<PreparedCompletionRequest> {
         let prep_started = std::time::Instant::now();
         let params = self.with_resolved_model_params(params.clone());
@@ -1206,13 +1240,28 @@ impl Model {
         // (including tool results), and the prompt — before assembling the
         // captured body and before any provider work. Static tool *schemas*
         // carry no user secrets and are left untouched.
-        let redact = self.redact();
+        // The effective egress table: the sealed-marker override when the turn
+        // derived one, else the model's own effective table. Both carry the same
+        // enforced entries; the override differs only in rendering a sealed
+        // entry as its actionable marker instead of the generic placeholder, so
+        // it can never widen custody.
+        let redact = sealed_egress.unwrap_or_else(|| self.redact());
         let system = redact.scrub(system);
         let mut history = history;
         let mut prompt = prompt.clone();
-        if !redact.is_empty() {
-            history = history.iter().map(|m| scrub_message(redact, m)).collect();
-            prompt = scrub_message(redact, &prompt);
+        // Trusted raw custody sends raw bytes and skips the wire walk entirely.
+        // Every untrusted route runs the fail-closed walk even when the table
+        // has no entries (the string scrub is a byte-stable no-op; the walk
+        // still fails closed on any non-renderable media channel), so
+        // `redact.is_empty()` can never skip the untrusted policy.
+        if !self.is_trusted() {
+            history = history
+                .iter()
+                .map(|m| scrub_message(redact, m))
+                .collect::<std::result::Result<Vec<Message>, _>>()
+                .map_err(|field| self.unrenderable_wire_failure(field, prep_started))?;
+            prompt = scrub_message(redact, &prompt)
+                .map_err(|field| self.unrenderable_wire_failure(field, prep_started))?;
         }
         let identity_records =
             if self.needs_responses_tool_identity_normalization(endpoint_recovery_enabled) {
@@ -1289,16 +1338,29 @@ impl Model {
         prompt: &Message,
         tools: &[ToolDefinition],
         params: &ModelParams,
-    ) -> serde_json::Value {
+    ) -> Result<serde_json::Value> {
+        let prep_started = std::time::Instant::now();
         let params = self.with_resolved_model_params(params.clone());
         // Scrub identically to `complete_captured` so the pre-dispatch
         // `pending` record and the terminal captured record describe
-        // byte-identical requests (GOALS §7).
+        // byte-identical requests (GOALS §7). A trusted raw-custody route keeps
+        // the raw history; an untrusted route runs the fail-closed wire walk
+        // and propagates a non-renderable channel as a typed prep failure.
         let redact = self.redact();
         let history = self.prepare_history_for_request(history);
-        let mut history: Vec<Message> = history.iter().map(|m| scrub_message(redact, m)).collect();
         let system = redact.scrub(system);
-        let mut prompt = scrub_message(redact, prompt);
+        let (mut history, mut prompt): (Vec<Message>, Message) = if self.is_trusted() {
+            (history, prompt.clone())
+        } else {
+            let scrubbed_history = history
+                .iter()
+                .map(|m| scrub_message(redact, m))
+                .collect::<std::result::Result<Vec<Message>, _>>()
+                .map_err(|field| self.unrenderable_wire_failure(field, prep_started))?;
+            let scrubbed_prompt = scrub_message(redact, prompt)
+                .map_err(|field| self.unrenderable_wire_failure(field, prep_started))?;
+            (scrubbed_history, scrubbed_prompt)
+        };
         let identity_metadata = if self.needs_responses_tool_identity_normalization(false) {
             match normalize_responses_tool_call_identity(&mut history, &mut prompt) {
                 Ok(records) if !records.is_empty() => Some((
@@ -1335,7 +1397,7 @@ impl Model {
         if let Some((key, value)) = identity_metadata {
             captured[key] = value;
         }
-        captured
+        Ok(captured)
     }
 
     /// One-shot **tandem (shadow) completion** for model-comparison mode
@@ -1378,11 +1440,40 @@ impl Model {
         // in are already the main turn's post-scrub forms; re-scrubbing here is
         // idempotent and keeps the redaction chokepoint authoritative (GOALS §7).
         let redact = self.redact();
-        let stripped = self.prepare_history_for_request(history);
-        let stripped: Vec<Message> = stripped.iter().map(|m| scrub_message(redact, m)).collect();
+        let stripped_raw = self.prepare_history_for_request(history);
         let system_scrubbed = redact.scrub(system);
         let system = system_scrubbed.as_str();
-        let prompt_scrubbed = scrub_message(redact, prompt);
+        // Trusted tandem keeps raw custody; an untrusted tandem runs the
+        // fail-closed wire walk. A non-renderable channel is recorded as an
+        // errored tandem outcome rather than passed unscrubbed to the wire.
+        let scrub_result: std::result::Result<(Vec<Message>, Message), UnrenderableWireField> =
+            if self.is_trusted() {
+                Ok((stripped_raw, prompt.clone()))
+            } else {
+                (|| {
+                    let history = stripped_raw
+                        .iter()
+                        .map(|m| scrub_message(redact, m))
+                        .collect::<std::result::Result<Vec<Message>, _>>()?;
+                    let prompt = scrub_message(redact, prompt)?;
+                    Ok((history, prompt))
+                })()
+            };
+        let (stripped, prompt_scrubbed) = match scrub_result {
+            Ok(pair) => pair,
+            Err(field) => {
+                return TandemOutcome {
+                    request: serde_json::json!({
+                        "model": self.model_id(),
+                        "provider": self.provider_label(),
+                        "prep_error": field.detail(),
+                    }),
+                    response: Some(tandem_failure_response("error", field.detail())),
+                    usage: None,
+                    status: InferenceRequestStatus::Errored,
+                };
+            }
+        };
         let prompt = &prompt_scrubbed;
         let wire_tools = self.definitions_for_initial_wire(tools);
         let request = assembled_request(

@@ -510,23 +510,6 @@ pub(crate) async fn maybe_store_retrievable_truncated_tool_result(
     Ok(Some(hash))
 }
 
-async fn record_inference_request_async(
-    session: Arc<Session>,
-    call_id: Uuid,
-    payload: Value,
-    status: crate::db::session_log::InferenceRequestStatus,
-    goal_provenance: Option<(Uuid, i64)>,
-) -> anyhow::Result<()> {
-    session
-        .record_inference_request_async_with_goal_provenance(
-            call_id,
-            payload,
-            status,
-            goal_provenance,
-        )
-        .await
-}
-
 async fn record_usage_blocking(
     session: Arc<Session>,
     call_id: Uuid,
@@ -583,6 +566,10 @@ pub async fn turn(
     // `inference_request` timeline event — so the export joins them
     // (session-log-export Parts A/B).
     call_id: Uuid,
+    // Dispatched-target attempt index for the immutable per-attempt inference
+    // log (`(call_id, ordinal)`): 0 for the primary/standalone path; the
+    // per-turn backup wrapper threads incrementing ordinals sharing `call_id`.
+    ordinal: i64,
     // Model-comparison tandem (shadow) set (`model-comparison-tandem-
     // inference.md`). When `Some` + non-empty this turn's assembled request is
     // ALSO sent to each tandem model — fired from inside `turn` so it reuses the
@@ -615,24 +602,13 @@ pub async fn turn(
         deferred_log,
         emit_inference_error_ui,
         call_id,
+        ordinal,
         tandem,
         goal_provenance,
         turn_id,
         tx,
     };
     turn_phases::run_turn(ctx, history, prompt).await
-}
-
-/// Fold a `phases` sub-object (per-turn phase timestamps, in ms from
-/// dispatch) into a captured request payload for the dispatch-time record
-/// (implementation note #5). The
-/// payload is an object (`assembled_request` always builds one); a
-/// pathological non-object is returned unchanged so we never panic on it.
-fn with_phases(mut payload: Value, phases: &Value) -> Value {
-    if let Value::Object(map) = &mut payload {
-        map.insert("phases".to_string(), phases.clone());
-    }
-    payload
 }
 
 /// Build the assistant turn that enters stored wire history, given how the

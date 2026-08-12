@@ -36,137 +36,346 @@ pub(crate) fn sanitized_extra_params(
     }
 }
 
+/// Protocol constant for the key-collision terminal object. When scrubbing the
+/// keys of one JSON object produces a duplicate key, that entire object is
+/// replaced by exactly `{"**REDACTED BY COCKPIT**":"**REDACTED BY COCKPIT**"}`
+/// (parent-prompt spec — deliberately NOT the configurable placeholder). It is
+/// terminal: it carries no source data, is syntactically valid, and re-scrubs
+/// to itself (both key and value are protocol text, never a registered secret).
+pub(super) const REDACTED_COLLISION_MARKER: &str = "**REDACTED BY COCKPIT**";
+
+/// A wire field that has no renderer for an **untrusted** dispatch: a media
+/// source that is not a scrubbable string channel (`Raw` bytes, a provider
+/// `FileId`, `Unknown`, or a future rig variant). Rather than pass an
+/// unscrubbable channel to a provider that may retain it, the prep step fails
+/// closed and the three prep entry points map this into a typed
+/// [`InferenceFailure`] with phase `prep` and class
+/// [`InferenceErrorClass::UnrenderableWireField`]. Trusted raw custody never
+/// runs the walk, so this can only arise on a route that must redact.
+#[derive(Debug, Clone)]
+pub(crate) struct UnrenderableWireField {
+    /// The channel that could not be rendered, for the failure detail.
+    pub(crate) channel: &'static str,
+}
+
+impl UnrenderableWireField {
+    fn new(channel: &'static str) -> Self {
+        Self { channel }
+    }
+
+    pub(crate) fn detail(&self) -> String {
+        format!(
+            "message wire field `{}` has no renderer for an untrusted dispatch",
+            self.channel
+        )
+    }
+}
+
 /// Scrub every dynamic text field of one history/prompt [`Message`] through
 /// `redact`, returning a rewritten copy (GOALS §7,
-/// `redaction-cover-all-llm-requests.md`). Covers the system content, every
-/// user/assistant `Text` part, the string content of every **tool result**,
-/// and the stringified arguments of every assistant tool call. Static,
+/// `redaction-cover-all-llm-requests.md`). This is the untrusted-egress wire
+/// walk: it is only invoked for a route that must redact (a trusted raw-custody
+/// route bypasses it entirely), so it fails **closed** on any channel it cannot
+/// render.
+///
+/// The walk is a closed policy over every rig content variant — there is no
+/// silent passthrough. Each string channel is scrubbed: the system content,
+/// every user/assistant `Text` part (and its `additional_params`), every
+/// **tool result** member (text, image data strings, and recursively every
+/// value **and key** of a JSON member), every assistant tool call's function
+/// **name**, arguments (recursively, values and keys), and `additional_params`,
+/// reasoning text/summaries, and the `data` string channels
+/// (`Url`/`Base64`/`String`) plus `additional_params` of every image / audio /
+/// video / document part. Non-string scalars, media-type enums, provider
+/// signatures, and opaque encrypted/redacted reasoning blocks are
+/// enumerated-safe passthroughs. A media `data` channel with no renderer
+/// (`Raw`/`FileId`/`Unknown`) returns [`UnrenderableWireField`]. Static,
 /// harness-defined tool *schemas* are not part of a message and are never
-/// scrubbed here (they carry no user secrets). Opaque non-text parts (images,
-/// audio, video, documents, encrypted/redacted reasoning, and JSON tool-result
-/// members) pass through untouched. Rig 0.41 tool results are ordered non-empty
-/// multipart collections, so each text member is scrubbed independently without
-/// flattening, reordering, or altering opaque members.
+/// scrubbed here.
 ///
 /// `scrub` is deterministic + idempotent, so re-scrubbing already-scrubbed
 /// cached history each turn yields byte-stable output — prompt caching is
 /// unaffected (verified by the redact module's determinism test).
-pub(super) fn scrub_message(redact: &RedactionTable, msg: &Message) -> Message {
+pub(super) fn scrub_message(
+    redact: &RedactionTable,
+    msg: &Message,
+) -> Result<Message, UnrenderableWireField> {
     #[cfg(test)]
     SCRUB_MESSAGE_CALLS.with(|calls| calls.set(calls.get() + 1));
     match msg {
-        Message::System { content } => Message::System {
+        Message::System { content } => Ok(Message::System {
             content: redact.scrub(content),
-        },
+        }),
         Message::User { content } => {
-            let parts: Vec<UserContent> = content
-                .iter()
-                .map(|part| scrub_user_content(redact, part))
-                .collect();
+            let mut parts: Vec<UserContent> = Vec::with_capacity(content.iter().count());
+            for part in content.iter() {
+                parts.push(scrub_user_content(redact, part)?);
+            }
             // `parts` is rebuilt 1:1 from a non-empty `OneOrMany`, so it is
             // non-empty; `many` cannot fail. Fall back to the original on the
             // impossible empty case rather than panic.
             match OneOrMany::many(parts) {
-                Ok(content) => Message::User { content },
-                Err(_) => msg.clone(),
+                Ok(content) => Ok(Message::User { content }),
+                Err(_) => Ok(msg.clone()),
             }
         }
         Message::Assistant { id, content } => {
-            let parts: Vec<AssistantContent> = content
-                .iter()
-                .map(|part| scrub_assistant_content(redact, part))
-                .collect();
+            let mut parts: Vec<AssistantContent> = Vec::with_capacity(content.iter().count());
+            for part in content.iter() {
+                parts.push(scrub_assistant_content(redact, part)?);
+            }
             match OneOrMany::many(parts) {
-                Ok(content) => Message::Assistant {
+                Ok(content) => Ok(Message::Assistant {
                     id: id.clone(),
                     content,
-                },
-                Err(_) => msg.clone(),
+                }),
+                Err(_) => Ok(msg.clone()),
             }
         }
     }
 }
 
-/// Scrub the text-bearing fields of one [`UserContent`] part. `Text` parts and
-/// the `Text` content of a `ToolResult` are scrubbed; images/audio/video/
-/// documents pass through.
-fn scrub_user_content(redact: &RedactionTable, part: &UserContent) -> UserContent {
+/// Scrub one optional `additional_params` JSON blob (present on `Text`,
+/// `ToolCall`, and every media part). `None` stays `None`.
+fn scrub_additional_params(
+    redact: &RedactionTable,
+    params: &Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    params.as_ref().map(|value| scrub_json_value(redact, value))
+}
+
+/// The single recursive JSON renderer for both tool-result `Json` values and
+/// tool-call arguments. Every string leaf (array element, object value) **and
+/// every object key** is scrubbed. When scrubbing an object's keys collides two
+/// rendered keys, that innermost object collapses to the terminal collision
+/// object. Non-string scalars (numbers/bools/null) are enumerated-safe and pass
+/// through. `serde_json::Value` is not a rig content enum, so its scalar
+/// passthrough is not a wire-inventory hole.
+fn scrub_json_value(redact: &RedactionTable, value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(s) => serde_json::Value::String(redact.scrub(s)),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(|v| scrub_json_value(redact, v)).collect())
+        }
+        serde_json::Value::Object(map) => scrub_json_object(redact, map),
+        // Numbers, bools, and null carry no string channel.
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            value.clone()
+        }
+    }
+}
+
+/// Scrub the keys and values of one JSON object. Values are rendered first
+/// (so nested/inner collisions collapse before this level is checked —
+/// innermost first). If two rendered keys collide, the whole object collapses
+/// to the terminal collision object.
+fn scrub_json_object(
+    redact: &RedactionTable,
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Value {
+    let mut out = serde_json::Map::with_capacity(map.len());
+    for (key, value) in map {
+        let scrubbed_key = redact.scrub(key);
+        let scrubbed_value = scrub_json_value(redact, value);
+        if out.contains_key(&scrubbed_key) {
+            // Two rendered keys are equal: the object cannot be represented
+            // without dropping a member, so it collapses to the terminal
+            // collision object at this innermost colliding level only.
+            return redacted_collision_object();
+        }
+        out.insert(scrubbed_key, scrubbed_value);
+    }
+    serde_json::Value::Object(out)
+}
+
+/// `{"**REDACTED BY COCKPIT**":"**REDACTED BY COCKPIT**"}` — the fixed,
+/// terminal, source-data-free replacement for a key-collided object.
+fn redacted_collision_object() -> serde_json::Value {
+    let mut map = serde_json::Map::with_capacity(1);
+    map.insert(
+        REDACTED_COLLISION_MARKER.to_string(),
+        serde_json::Value::String(REDACTED_COLLISION_MARKER.to_string()),
+    );
+    serde_json::Value::Object(map)
+}
+
+/// Render one media `data` source. The three string channels
+/// (`Url`/`Base64`/`String`) are scrubbed against the table; the non-string
+/// channels (`Raw`/`FileId`/`Unknown`, or a future rig variant) have no
+/// renderer and fail closed on an untrusted dispatch. This match is over the
+/// `#[non_exhaustive]` `DocumentSourceKind`, so the compiler requires a final
+/// arm — it fails **closed** (never a silent passthrough).
+fn scrub_media_source(
+    redact: &RedactionTable,
+    data: &DocumentSourceKind,
+    channel: &'static str,
+) -> Result<DocumentSourceKind, UnrenderableWireField> {
+    match data {
+        DocumentSourceKind::Url(s) => Ok(DocumentSourceKind::Url(redact.scrub(s))),
+        DocumentSourceKind::Base64(s) => Ok(DocumentSourceKind::Base64(redact.scrub(s))),
+        DocumentSourceKind::String(s) => Ok(DocumentSourceKind::String(redact.scrub(s))),
+        // `DocumentSourceKind` is `#[non_exhaustive]` in rig, so this crate
+        // (external to rig) CANNOT write a compile-forced exhaustive match over
+        // it — the wildcard arm is unavoidable, not a lazy `_`. It is therefore
+        // deliberately fail-CLOSED: the non-string channels (`Raw` bytes, a
+        // provider `FileId`, `Unknown`) have no renderer, and any future rig
+        // source kind lands here too, so every one errors on an untrusted
+        // dispatch rather than reaching a provider unscrubbed. AC6's variant
+        // walk asserts each of these arms returns `UnrenderableWireField`.
+        _ => Err(UnrenderableWireField::new(channel)),
+    }
+}
+
+/// Scrub one [`UserContent`] part. Exhaustive over every rig `UserContent`
+/// variant with no silent-passthrough arm, so a new rig variant is a compile
+/// error rather than a leak.
+fn scrub_user_content(
+    redact: &RedactionTable,
+    part: &UserContent,
+) -> Result<UserContent, UnrenderableWireField> {
     match part {
-        UserContent::Text(t) => UserContent::text(redact.scrub(&t.text)),
+        UserContent::Text(t) => {
+            let mut t = t.clone();
+            t.text = redact.scrub(&t.text);
+            t.additional_params = scrub_additional_params(redact, &t.additional_params);
+            Ok(UserContent::Text(t))
+        }
         UserContent::ToolResult(tr) => {
-            let scrubbed: Vec<ToolResultContent> = tr
-                .content
-                .iter()
-                .map(|c| match c {
-                    ToolResultContent::Text(t) => ToolResultContent::text(redact.scrub(&t.text)),
-                    other => other.clone(),
-                })
-                .collect();
+            let mut scrubbed: Vec<ToolResultContent> =
+                Vec::with_capacity(tr.content.iter().count());
+            for c in tr.content.iter() {
+                scrubbed.push(scrub_tool_result_content(redact, c)?);
+            }
             let content = OneOrMany::many(scrubbed).unwrap_or_else(|_| tr.content.clone());
-            match &tr.call_id {
+            Ok(match &tr.call_id {
                 Some(call_id) => {
                     UserContent::tool_result_with_call_id(tr.id.clone(), call_id.clone(), content)
                 }
                 None => UserContent::tool_result(tr.id.clone(), content),
-            }
+            })
         }
-        other => other.clone(),
+        UserContent::Image(image) => {
+            let mut image = image.clone();
+            image.data = scrub_media_source(redact, &image.data, "user.image.data")?;
+            image.additional_params = scrub_additional_params(redact, &image.additional_params);
+            Ok(UserContent::Image(image))
+        }
+        UserContent::Audio(audio) => {
+            let mut audio = audio.clone();
+            audio.data = scrub_media_source(redact, &audio.data, "user.audio.data")?;
+            audio.additional_params = scrub_additional_params(redact, &audio.additional_params);
+            Ok(UserContent::Audio(audio))
+        }
+        UserContent::Video(video) => {
+            let mut video = video.clone();
+            video.data = scrub_media_source(redact, &video.data, "user.video.data")?;
+            video.additional_params = scrub_additional_params(redact, &video.additional_params);
+            Ok(UserContent::Video(video))
+        }
+        UserContent::Document(document) => {
+            let mut document = document.clone();
+            document.data = scrub_media_source(redact, &document.data, "user.document.data")?;
+            document.additional_params =
+                scrub_additional_params(redact, &document.additional_params);
+            Ok(UserContent::Document(document))
+        }
     }
 }
 
-/// Scrub the text-bearing fields of one [`AssistantContent`] part. `Text`
-/// parts and the (stringified JSON) arguments of a tool call are scrubbed so a
-/// secret the model echoes into a tool argument can't leak on replay; text
+/// Scrub one tool-result member. Exhaustive over `ToolResultContent` — text is
+/// scrubbed, image data string channels are scrubbed (fail closed on
+/// non-renderable), and JSON members run the recursive value+key renderer.
+fn scrub_tool_result_content(
+    redact: &RedactionTable,
+    content: &ToolResultContent,
+) -> Result<ToolResultContent, UnrenderableWireField> {
+    match content {
+        ToolResultContent::Text(t) => {
+            let mut t = t.clone();
+            t.text = redact.scrub(&t.text);
+            t.additional_params = scrub_additional_params(redact, &t.additional_params);
+            Ok(ToolResultContent::Text(t))
+        }
+        ToolResultContent::Image(image) => {
+            let mut image = image.clone();
+            image.data = scrub_media_source(redact, &image.data, "tool_result.image.data")?;
+            image.additional_params = scrub_additional_params(redact, &image.additional_params);
+            Ok(ToolResultContent::Image(image))
+        }
+        ToolResultContent::Json { value } => Ok(ToolResultContent::Json {
+            value: scrub_json_value(redact, value),
+        }),
+    }
+}
+
+/// Scrub one [`AssistantContent`] part. Exhaustive over every rig
+/// `AssistantContent` variant. `Text` and the tool call's function **name** +
+/// arguments (values and keys) + `additional_params` are scrubbed; text
 /// reasoning is scrubbed while provider signatures and opaque encrypted /
-/// redacted reasoning blocks pass through unchanged.
-fn scrub_assistant_content(redact: &RedactionTable, part: &AssistantContent) -> AssistantContent {
+/// redacted reasoning blocks are enumerated-safe passthroughs. The tool call's
+/// correlation identifiers (`id`, `call_id`) and provider `signature` are
+/// structural and preserved so tool-result correlation and provider
+/// authentication survive.
+fn scrub_assistant_content(
+    redact: &RedactionTable,
+    part: &AssistantContent,
+) -> Result<AssistantContent, UnrenderableWireField> {
     match part {
-        AssistantContent::Text(t) => AssistantContent::text(redact.scrub(&t.text)),
+        AssistantContent::Text(t) => {
+            let mut t = t.clone();
+            t.text = redact.scrub(&t.text);
+            t.additional_params = scrub_additional_params(redact, &t.additional_params);
+            Ok(AssistantContent::Text(t))
+        }
         AssistantContent::ToolCall(tc) => {
             let mut tc = tc.clone();
-            tc.function.arguments = scrub_json_strings(redact, &tc.function.arguments);
-            AssistantContent::ToolCall(tc)
+            tc.function.name = redact.scrub(&tc.function.name);
+            tc.function.arguments = scrub_json_value(redact, &tc.function.arguments);
+            tc.additional_params = scrub_additional_params(redact, &tc.additional_params);
+            Ok(AssistantContent::ToolCall(tc))
         }
-        AssistantContent::Reasoning(reasoning) => {
-            AssistantContent::Reasoning(scrub_reasoning(redact, reasoning))
+        AssistantContent::Reasoning(reasoning) => Ok(AssistantContent::Reasoning(scrub_reasoning(
+            redact, reasoning,
+        )?)),
+        AssistantContent::Image(image) => {
+            let mut image = image.clone();
+            image.data = scrub_media_source(redact, &image.data, "assistant.image.data")?;
+            image.additional_params = scrub_additional_params(redact, &image.additional_params);
+            Ok(AssistantContent::Image(image))
         }
-        other => other.clone(),
     }
 }
 
-fn scrub_reasoning(redact: &RedactionTable, reasoning: &Reasoning) -> Reasoning {
-    let mut reasoning = reasoning.clone();
-    reasoning.content = reasoning
-        .content
-        .into_iter()
-        .map(|content| match content {
+fn scrub_reasoning(
+    redact: &RedactionTable,
+    reasoning: &Reasoning,
+) -> Result<Reasoning, UnrenderableWireField> {
+    let mut out = reasoning.clone();
+    let mut content = Vec::with_capacity(out.content.len());
+    for block in out.content.into_iter() {
+        content.push(match block {
             ReasoningContent::Text { text, signature } => ReasoningContent::Text {
                 text: redact.scrub(&text),
                 signature,
             },
             ReasoningContent::Summary(text) => ReasoningContent::Summary(redact.scrub(&text)),
-            other => other,
-        })
-        .collect();
-    reasoning
-}
-
-fn scrub_json_strings(redact: &RedactionTable, value: &serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::String(s) => serde_json::Value::String(redact.scrub(s)),
-        serde_json::Value::Array(items) => serde_json::Value::Array(
-            items
-                .iter()
-                .map(|v| scrub_json_strings(redact, v))
-                .collect(),
-        ),
-        serde_json::Value::Object(map) => serde_json::Value::Object(
-            map.iter()
-                .map(|(k, v)| (k.clone(), scrub_json_strings(redact, v)))
-                .collect(),
-        ),
-        other => other.clone(),
+            // Opaque provider-authenticated / provider-redacted reasoning blobs
+            // are enumerated-safe: they carry no user free text we can render.
+            ReasoningContent::Encrypted(data) => ReasoningContent::Encrypted(data),
+            ReasoningContent::Redacted { data } => ReasoningContent::Redacted { data },
+            // `ReasoningContent` is `#[non_exhaustive]` in rig, so this crate
+            // (external to rig) CANNOT write a compile-forced exhaustive match —
+            // the wildcard arm is unavoidable, not a lazy `_`, and is the
+            // maximal enforcement possible here. It is deliberately fail-CLOSED:
+            // a future reasoning variant might carry unrendered free text, so it
+            // errors on untrusted egress rather than replaying another
+            // provider's raw reasoning verbatim. AC6's variant walk asserts this
+            // arm returns `UnrenderableWireField` (not a silent pass).
+            _ => return Err(UnrenderableWireField::new("assistant.reasoning")),
+        });
     }
+    out.content = content;
+    Ok(out)
 }
 
 /// Remove unsigned reasoning blocks before replaying history to native

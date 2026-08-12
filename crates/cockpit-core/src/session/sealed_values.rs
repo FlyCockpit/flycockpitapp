@@ -83,8 +83,16 @@ impl Session {
         origin: &str,
     ) -> Result<crate::db::sealed_values::SealedValueMetadata> {
         validate_sealed_value(value_id, value).map_err(anyhow::Error::from)?;
-        let unioned =
-            redaction.with_forced_literal(value.to_owned(), format!("sealed:{value_id}"))?;
+        // Register through the typed sealed API: a legacy session value keyed by
+        // name alone (no record id, unversioned). Sealedness is stored as typed
+        // classification, never as a `sealed:<id>` origin string egress reparses.
+        let identity = crate::sealed::identity::SealedRedactionIdentity {
+            scope: crate::sealed::identity::SealedScopeKind::Session,
+            record_id: None,
+            name: crate::sealed::identity::SealedName::canonical(value_id)?,
+            version: 0,
+        };
+        let unioned = redaction.with_forced_sealed_literal(value.to_owned(), identity)?;
         self.persist_redaction_table(&unioned)?;
         self.db
             .upsert_sealed_value(self.id, value_id, value, reason, origin)

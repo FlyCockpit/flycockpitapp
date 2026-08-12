@@ -1,63 +1,47 @@
 //! macOS daemon custody adapter (`#[cfg(target_os = "macos")]`).
 //!
-//! Nonexportable P-256 in the Secure Enclave (`kSecAttrTokenIDSecureEnclave`)
-//! for [`DaemonCustodyProfile::MacosSecureEnclave`] or a software-backed
-//! nonexportable Keychain SecKey for [`DaemonCustodyProfile::MacosKeychain`],
-//! with `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` accessibility and no
-//! `kSecAttrSynchronizable`. Signing uses
-//! `ecdsaSignatureMessageX962SHA256`... except the Rust seam is digest-based, so
-//! this adapter signs the precomputed digest with the pre-hashed X9.62 variant
-//! and normalizes the DER result to low-S P1363 via
-//! [`super::der_signature_to_low_s_p1363`].
+//! TODO(native-platform): the real nonexportable P-256 adapter — Secure Enclave
+//! (`kSecAttrTokenIDSecureEnclave`) for [`DaemonCustodyProfile::MacosSecureEnclave`]
+//! or a software-backed Keychain `SecKey` for [`DaemonCustodyProfile::MacosKeychain`],
+//! with `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`, digest signing via
+//! `ecdsaSignatureDigestX962SHA256`, DER→low-S P1363 normalization, and
+//! reopen/delete through `SecItemCopyMatching`/`SecItemDelete` keyed by a
+//! ThisDeviceOnly application tag — must be built AND run on the macOS CI matrix
+//! leg. It cannot be compiled or exercised on the Linux gate box, so it is NOT
+//! shipped here.
 //!
-//! `SecKey` and the CoreFoundation handles are ref-counted RAII values owned by
-//! the `security-framework` wrappers; they release on drop. Every `SecKey`
-//! failure is translated to a typed [`RemoteIdentityCustodyError`]. This module
-//! compiles and is exercised only on the macOS CI matrix leg — it cannot be
-//! built on the Linux gate box.
+//! Until that CI leg lands, this adapter is a deliberate **fail-closed stub**:
+//! every operation returns `Unavailable`/`NotFound` rather than a
+//! plausible-but-wrong value, so macOS daemon custody is *unavailable*, never
+//! silently insecure. The provider / store / policy-gate logic in the parent
+//! module is fully exercised on every platform through
+//! [`super::FakeDaemonCustodyAdapter`]. Nothing constructs this adapter yet (the
+//! daemon custody module is landed core, not wired into a runtime path).
+//! See `apps/native/modules/remote-identity-custody/NATIVE-PLATFORM-TODO.md`.
 
 use cockpit_proto::remote_device_identity_enrollment::{
     RemoteIdentityCustodyError, RemoteIdentityCustodyHandleId, RemoteIdentityP256PublicKey,
     RemoteSubjectKindV1 as SubjectKind,
 };
-use security_framework::access_control::{ProtectionMode, SecAccessControl};
-use security_framework::key::{Algorithm, GenerateKeyOptions, KeyType, SecKey, Token};
 
 use super::{AdapterKeyMaterial, DaemonCustodyAdapter, DaemonCustodyProfile};
 
-fn unavailable(context: &str, error: impl std::fmt::Display) -> RemoteIdentityCustodyError {
-    RemoteIdentityCustodyError::Unavailable(format!("macos custody {context}: {error}"))
-}
-
-/// macOS Secure Enclave / Keychain custody adapter. The configured profile
-/// selects the token; caller-supplied bytes never influence it.
+/// Fail-closed macOS custody adapter stub. See the module docs — the real
+/// Secure Enclave / Keychain adapter is verified only on the macOS CI leg.
 pub struct MacosCustodyAdapter {
+    // Retained so the real adapter (which selects the token from the profile) is
+    // a drop-in replacement; unread while this is a stub.
+    #[allow(dead_code)]
     profile: DaemonCustodyProfile,
-    // Live SecKey handles keyed by (handle, generation), cached for the process
-    // lifetime.
-    //
-    // TODO(native-platform): reopen-across-restart and durable delete are NOT
-    // implemented. A production adapter must reopen from the Keychain via
-    // `SecItemCopyMatching` and delete via `SecItemDelete`, keyed by the
-    // ThisDeviceOnly application tag below. Until then this in-memory map is a
-    // process-lifetime cache, NOT a durable store: after a restart the map is
-    // empty, so `reopen` returns `NotFound` (fails closed) rather than silently
-    // succeeding. These SecItem calls compile and are exercised only on the
-    // macOS CI leg — they cannot be built on the Linux gate box. See
-    // apps/native/modules/remote-identity-custody/NATIVE-PLATFORM-TODO.md and the
-    // batch report.
-    handles: std::collections::BTreeMap<([u8; 16], u64), SecKey>,
 }
 
 impl MacosCustodyAdapter {
-    /// Construct an adapter for a macOS profile.
+    /// Construct an adapter for a macOS profile. Non-macOS profiles are rejected
+    /// exactly as the real adapter will reject them.
     pub fn new(profile: DaemonCustodyProfile) -> Result<Self, RemoteIdentityCustodyError> {
         match profile {
             DaemonCustodyProfile::MacosSecureEnclave | DaemonCustodyProfile::MacosKeychain => {
-                Ok(Self {
-                    profile,
-                    handles: std::collections::BTreeMap::new(),
-                })
+                Ok(Self { profile })
             }
             other => Err(RemoteIdentityCustodyError::PolicyDenied(format!(
                 "{} is not a macOS custody profile",
@@ -65,75 +49,13 @@ impl MacosCustodyAdapter {
             ))),
         }
     }
+}
 
-    fn application_tag(handle: RemoteIdentityCustodyHandleId, generation: u64) -> String {
-        // Non-synchronizable, ThisDeviceOnly Keychain tag encoding the handle id
-        // AND the generation, so a key and its record can never desync.
-        format!(
-            "com.flycockpit.remote.daemon.custody.{}.{generation}",
-            hex16(&handle.0)
-        )
-    }
-
-    fn generate_key(
-        &self,
-        handle: RemoteIdentityCustodyHandleId,
-        generation: u64,
-    ) -> Result<SecKey, RemoteIdentityCustodyError> {
-        // ThisDeviceOnly accessibility, no synchronizable flag; the private key
-        // is non-extractable (Secure Enclave, or a Keychain-permanent SecKey).
-        let access_control = SecAccessControl::create_with_protection(
-            Some(ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly),
-            0,
-        )
-        .map_err(|e| unavailable("access control", e))?;
-
-        let mut options = GenerateKeyOptions::default();
-        options
-            .set_key_type(KeyType::ec())
-            .set_size_in_bits(256)
-            .set_access_control(access_control)
-            .set_label(Self::application_tag(handle, generation));
-        if self.profile == DaemonCustodyProfile::MacosSecureEnclave {
-            options.set_token(Token::SecureEnclave);
-        }
-        SecKey::new(&options).map_err(|e| unavailable("generate", e))
-    }
-
-    fn public_key_of(
-        key: &SecKey,
-    ) -> Result<RemoteIdentityP256PublicKey, RemoteIdentityCustodyError> {
-        let public = key
-            .public_key()
-            .ok_or_else(|| unavailable("public_key", "no public key"))?;
-        // SEC1 uncompressed external representation: 0x04 || X(32) || Y(32).
-        let data = public
-            .external_representation()
-            .ok_or_else(|| unavailable("external_representation", "unavailable"))?;
-        let bytes = data.to_vec();
-        if bytes.len() != 65 || bytes[0] != 0x04 {
-            return Err(RemoteIdentityCustodyError::InvalidEvidence(
-                "unexpected SecKey public representation".into(),
-            ));
-        }
-        let mut x = [0u8; 32];
-        let mut y = [0u8; 32];
-        x.copy_from_slice(&bytes[1..33]);
-        y.copy_from_slice(&bytes[33..65]);
-        Ok(RemoteIdentityP256PublicKey { x, y })
-    }
-
-    fn attestation(&self, public_key: &RemoteIdentityP256PublicKey) -> Vec<u8> {
-        use sha2::{Digest, Sha256};
-        let mut fingerprint = Sha256::new();
-        fingerprint.update(public_key.x);
-        fingerprint.update(public_key.y);
-        let mut evidence = Vec::new();
-        evidence.extend_from_slice(self.profile.platform_label().as_bytes());
-        evidence.push(0x00);
-        evidence.extend_from_slice(&fingerprint.finalize());
-        evidence
-    }
+fn unimplemented_macos(op: &str) -> RemoteIdentityCustodyError {
+    RemoteIdentityCustodyError::Unavailable(format!(
+        "macOS daemon custody {op} is not implemented in this build; the real Secure Enclave / \
+         Keychain adapter is compiled and verified only on the macOS CI leg (TODO native-platform)"
+    ))
 }
 
 impl DaemonCustodyAdapter for MacosCustodyAdapter {
@@ -141,80 +63,42 @@ impl DaemonCustodyAdapter for MacosCustodyAdapter {
         &mut self,
         _profile: DaemonCustodyProfile,
         _subject_kind: SubjectKind,
-        handle: RemoteIdentityCustodyHandleId,
-        generation: u64,
+        _handle: RemoteIdentityCustodyHandleId,
+        _generation: u64,
     ) -> Result<AdapterKeyMaterial, RemoteIdentityCustodyError> {
-        let key = self.generate_key(handle, generation)?;
-        let public_key = Self::public_key_of(&key)?;
-        let provider_evidence = self.attestation(&public_key);
-        self.handles.insert((handle.0, generation), key);
-        Ok(AdapterKeyMaterial {
-            public_key,
-            provider_evidence,
-        })
+        Err(unimplemented_macos("create"))
     }
 
     fn reopen(
         &self,
-        handle: RemoteIdentityCustodyHandleId,
-        generation: u64,
+        _handle: RemoteIdentityCustodyHandleId,
+        _generation: u64,
     ) -> Result<RemoteIdentityP256PublicKey, RemoteIdentityCustodyError> {
-        // TODO(native-platform): reopen from the Keychain via SecItemCopyMatching
-        // keyed by the (handle, generation) application tag. Until then this only
-        // finds keys created in THIS process; after a restart the cache is empty
-        // and this returns NotFound (fails closed) — it never fabricates a hit.
-        let key = self
-            .handles
-            .get(&(handle.0, generation))
-            .ok_or(RemoteIdentityCustodyError::NotFound)?;
-        Self::public_key_of(key)
+        // Fail closed: never fabricate a hit for a key this build cannot open.
+        Err(RemoteIdentityCustodyError::NotFound)
     }
 
     fn sign(
         &mut self,
-        handle: RemoteIdentityCustodyHandleId,
-        generation: u64,
-        digest: &[u8; 32],
+        _handle: RemoteIdentityCustodyHandleId,
+        _generation: u64,
+        _digest: &[u8; 32],
     ) -> Result<[u8; 64], RemoteIdentityCustodyError> {
-        let key = self
-            .handles
-            .get(&(handle.0, generation))
-            .ok_or(RemoteIdentityCustodyError::NotFound)?;
-        // Digest-based signing (the Rust seam supplies a precomputed digest); the
-        // X9.62 DER result is normalized to low-S P1363.
-        let der = key
-            .create_signature(Algorithm::ECDSASignatureDigestX962SHA256, digest)
-            .map_err(|e| unavailable("create_signature", e))?;
-        super::der_signature_to_low_s_p1363(&der)
+        Err(unimplemented_macos("sign"))
     }
 
     fn retire(
         &mut self,
-        handle: RemoteIdentityCustodyHandleId,
-        generation: u64,
+        _handle: RemoteIdentityCustodyHandleId,
+        _generation: u64,
     ) -> Result<(), RemoteIdentityCustodyError> {
-        // Production must also SecItemDelete the Keychain item for this
-        // (handle, generation) application tag.
-        self.handles
-            .remove(&(handle.0, generation))
-            .map(|_| ())
-            .ok_or(RemoteIdentityCustodyError::NotFound)
+        Err(unimplemented_macos("retire"))
     }
 
     fn destroy_all(
         &mut self,
-        handle: RemoteIdentityCustodyHandleId,
+        _handle: RemoteIdentityCustodyHandleId,
     ) -> Result<(), RemoteIdentityCustodyError> {
-        let before = self.handles.len();
-        self.handles.retain(|(h, _), _| *h != handle.0);
-        if self.handles.len() < before {
-            Ok(())
-        } else {
-            Err(RemoteIdentityCustodyError::NotFound)
-        }
+        Err(unimplemented_macos("destroy"))
     }
-}
-
-fn hex16(bytes: &[u8; 16]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

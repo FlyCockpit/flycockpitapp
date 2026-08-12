@@ -556,7 +556,9 @@ mod imp {
                         | libc::O_EXCL
                         | libc::O_NOFOLLOW
                         | libc::O_CLOEXEC,
-                    0o600 as libc::mode_t,
+                    // Variadic `openat` mode: promote to `c_uint` (mode_t is u16 on
+                    // Apple targets, which cannot be passed to a C variadic directly).
+                    0o600 as libc::c_uint,
                 )
             };
             if fd < 0 {

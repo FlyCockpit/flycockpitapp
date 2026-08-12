@@ -1948,8 +1948,6 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
         "crate::terminal::TerminalIngressMetadata" => "struct:TerminalIngressMetadata:v1",
         "crate::remote_transport::bulk::RemoteBulkTransferRef" => "struct:RemoteBulkTransferRef:v1",
         "crate::remote_protocol_id::RemoteTransferId" => "struct:RemoteTransferId:v1",
-        "crate::remote_protocol_id::RemoteTransferId" => "struct:RemoteTransferId:v1",
-        "crate::remote_transport::bulk::RemoteBulkTransferRef" => "struct:RemoteBulkTransferRef:v1",
         _ => return None,
     })
 }

@@ -54,7 +54,6 @@ struct JwsKindFixture {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
 struct EnvelopeFixture {
     magic: String,
     version: u8,
@@ -240,6 +239,12 @@ fn tenant_authority_protocol_cross_language_vectors() {
     }
 
     // 6. Envelope constants.
+    // Magic and version come from the checked-in cross-language fixture and are
+    // compared to the named production constants — the same conformance pattern
+    // as every other envelope field below (the fixture is the independent
+    // source of truth, not a re-declared literal).
+    assert_eq!(f.envelope.magic.as_bytes(), FCTA);
+    assert_eq!(f.envelope.version, FCTA_ENVELOPE_VERSION);
     assert_eq!(f.envelope.max_body_bytes, MAX_BODY_BYTES);
     assert_eq!(f.envelope.max_request_bytes, MAX_REQUEST_BYTES);
     assert_eq!(f.envelope.max_result_bytes, MAX_RESULT_BYTES);

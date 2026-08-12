@@ -67,6 +67,18 @@ Rules that follow from the graph:
 - Use Skeletons for content loading states.
 - Avoid `transition: all` and Tailwind `transition-all`.
 
+### Test integrity
+
+Never make a failing check pass by weakening its test. Do not convert an
+assertion of failure into an assertion of success, delete or conditionally skip
+assertions (`if result.is_ok() { continue; }` and the like), add
+`#[allow(dead_code)]` to test scaffolding so a parsed-but-unasserted field stops
+warning, narrow a broad assertion down to a few whitelisted spellings, or add
+`--passWithNoTests`-style escapes. Fix the production defect, or change the
+contract explicitly in the owning prompt. Reviewers must flag any diff that does
+the above. The `scripts/check-test-assertion-integrity.sh` ratchet enforces the
+`#[allow(dead_code)]` half mechanically in the Rust test targets.
+
 ## Checks
 
 Run the narrowest useful checks for the change, and broaden when shared contracts are touched:

@@ -7,6 +7,7 @@ import {
   closedSurfaceGuard,
   EVIDENCE_TYPES,
   FCIR_REASONS,
+  FCTA_ENVELOPE_VERSION,
   FCTA_VALIDITY_SECONDS,
   FCTO_REASON_CODES,
   FCTO_RESULT_KINDS,
@@ -26,6 +27,7 @@ import {
   STATEMENT_LIFETIME_ATTEMPT,
   STATEMENT_LIFETIME_DENIAL_STATUS,
   STATEMENT_LIFETIME_HIGH_ASSURANCE,
+  TENANT_AUTHORITY_MAGICS,
   TENANT_AUTHORITY_OPERATIONS,
   tenantAuthorityOperationFromDiscriminant,
   VERIFIER_CACHE_SECONDS,
@@ -89,6 +91,8 @@ describe("tenant_authority_protocol_cross_language_vectors", () => {
   });
 
   it("proves envelope constants match the fixture", () => {
+    expect(fixture.envelope.magic).toBe(TENANT_AUTHORITY_MAGICS.fcta);
+    expect(fixture.envelope.version).toBe(FCTA_ENVELOPE_VERSION);
     expect(fixture.envelope.maxBodyBytes).toBe(MAX_BODY_BYTES);
     expect(fixture.envelope.maxRequestBytes).toBe(MAX_REQUEST_BYTES);
     expect(fixture.envelope.maxResultBytes).toBe(MAX_RESULT_BYTES);

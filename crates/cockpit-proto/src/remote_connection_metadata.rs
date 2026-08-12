@@ -264,6 +264,10 @@ pub enum MetadataError {
     DomainComponentMismatch,
     #[error("component bytes must be nonzero 16 bytes")]
     InvalidComponentBytes,
+    #[error("trailing bytes after pseudonym message")]
+    TrailingByte,
+    #[error("truncated pseudonym message")]
+    Truncated,
     #[error("digest must be 32 bytes")]
     InvalidDigest,
     #[error("pseudonym must be 16 bytes")]
@@ -349,28 +353,119 @@ fn nonzero_16(bytes: &[u8; 16]) -> Result<(), MetadataError> {
     Ok(())
 }
 
+/// A single pseudonym component: a kind discriminant and its 16-byte alias.
+/// The pseudonym schemas are single-component, so a well-formed message carries
+/// exactly one of these; zero or multiple components are rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PseudonymComponent {
+    pub kind: u8,
+    pub bytes: [u8; 16],
+}
+
+/// The decoded form of a canonical pseudonym message: the domain string and its
+/// single component.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedPseudonymMessage {
+    pub domain: String,
+    pub component: PseudonymComponent,
+}
+
 /// Builds the canonical HMAC message for a pseudonym schema:
 /// `domainUtf8 | 0x00 | componentCount:u8 | components`.
 /// Each component is `kind:u8 | length:u16be | bytes`.
+///
+/// Rejects an unknown domain, a component slice that does not hold exactly one
+/// component, a kind that does not match the domain, and all-zero alias bytes —
+/// mirroring the TypeScript `remoteMetadataPseudonymMessage` construction API.
 pub fn pseudonym_message(
     domain: &str,
-    kind: u8,
-    alias: &[u8; 16],
+    components: &[PseudonymComponent],
 ) -> Result<Vec<u8>, MetadataError> {
     let required = required_kind_for_domain(domain).ok_or(MetadataError::UnknownDomain)?;
-    if kind != required {
+    if components.len() != 1 {
+        return Err(MetadataError::ComponentCount);
+    }
+    let component = &components[0];
+    if component.kind != required {
         return Err(MetadataError::DomainComponentMismatch);
     }
-    nonzero_16(alias)?;
+    nonzero_16(&component.bytes)?;
     let domain_utf8 = domain.as_bytes();
     let mut out = Vec::with_capacity(domain_utf8.len() + 3 + 16);
     out.extend_from_slice(domain_utf8);
     out.push(0x00);
     out.push(1);
-    out.push(kind);
+    out.push(component.kind);
     out.extend_from_slice(&16u16.to_be_bytes());
-    out.extend_from_slice(alias);
+    out.extend_from_slice(&component.bytes);
     Ok(out)
+}
+
+/// Decodes a canonical pseudonym message
+/// (`domainUtf8 | 0x00 | componentCount:u8 | kind:u8 | length:u16be | bytes`)
+/// back into its domain and single component.
+///
+/// This is the missing verify path: the fixture's malformed corpus is a byte
+/// payload per vector, and this function enforces every rejection class the
+/// framing can express. Checks are ordered to match construction: unknown
+/// domain first, then component count, then a fully-parsed single component,
+/// then an exact-length check (a trailing byte fails), then the kind/domain
+/// match, then the nonzero-bytes rule.
+pub fn decode_pseudonym_message(bytes: &[u8]) -> Result<DecodedPseudonymMessage, MetadataError> {
+    // The domain is ASCII and never contains a 0x00, so the first 0x00 is the
+    // separator between the domain and the component count.
+    let sep = bytes
+        .iter()
+        .position(|&b| b == 0x00)
+        .ok_or(MetadataError::Truncated)?;
+    if sep == 0 {
+        return Err(MetadataError::UnknownDomain);
+    }
+    let domain = std::str::from_utf8(&bytes[..sep]).map_err(|_| MetadataError::UnknownDomain)?;
+    let required = required_kind_for_domain(domain).ok_or(MetadataError::UnknownDomain)?;
+
+    let mut n = sep + 1;
+    let count = *bytes.get(n).ok_or(MetadataError::Truncated)?;
+    n += 1;
+    // Reject zero/multiple from the declared count byte without parsing a
+    // second component: a count of exactly one is the only valid shape.
+    if count != 1 {
+        return Err(MetadataError::ComponentCount);
+    }
+
+    let kind = *bytes.get(n).ok_or(MetadataError::Truncated)?;
+    n += 1;
+    let len_hi = *bytes.get(n).ok_or(MetadataError::Truncated)?;
+    let len_lo = *bytes.get(n + 1).ok_or(MetadataError::Truncated)?;
+    n += 2;
+    let length = u16::from_be_bytes([len_hi, len_lo]) as usize;
+    if length != 16 {
+        return Err(MetadataError::InvalidComponentBytes);
+    }
+    if n + 16 > bytes.len() {
+        return Err(MetadataError::Truncated);
+    }
+    let mut component_bytes = [0u8; 16];
+    component_bytes.copy_from_slice(&bytes[n..n + 16]);
+    n += 16;
+
+    // Exact length: any leftover byte after the single component fails. A count
+    // of one followed by extra bytes is a trailing byte, not a count error.
+    if n != bytes.len() {
+        return Err(MetadataError::TrailingByte);
+    }
+    if kind != required {
+        return Err(MetadataError::DomainComponentMismatch);
+    }
+    nonzero_16(&component_bytes)?;
+
+    Ok(DecodedPseudonymMessage {
+        domain: domain.to_string(),
+        component: PseudonymComponent {
+            kind,
+            bytes: component_bytes,
+        },
+    })
 }
 
 /// HKDF-SHA-256 salt = SHA-256("flycockpit.remote.metadata.hkdf.salt.v1").
@@ -496,13 +591,18 @@ mod tests {
         assert!(validate_retention_days(366).is_err());
     }
 
+    fn component(kind: u8, bytes: [u8; 16]) -> PseudonymComponent {
+        PseudonymComponent { kind, bytes }
+    }
+
     #[test]
     fn pseudonym_message_tenant_is_exact() {
         let alias: [u8; 16] = [
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
             0x0f, 0x10,
         ];
-        let msg = pseudonym_message(DOMAIN_TENANT, COMPONENT_KIND_TENANT, &alias).unwrap();
+        let msg =
+            pseudonym_message(DOMAIN_TENANT, &[component(COMPONENT_KIND_TENANT, alias)]).unwrap();
         let mut expected = Vec::new();
         expected.extend_from_slice(DOMAIN_TENANT.as_bytes());
         expected.push(0x00);
@@ -515,29 +615,212 @@ mod tests {
 
     #[test]
     fn pseudonym_message_rejects_wrong_kind() {
-        let alias = [1u8; 16];
         assert!(matches!(
-            pseudonym_message(DOMAIN_TENANT, COMPONENT_KIND_ACCOUNT, &alias),
+            pseudonym_message(
+                DOMAIN_TENANT,
+                &[component(COMPONENT_KIND_ACCOUNT, [1u8; 16])]
+            ),
             Err(MetadataError::DomainComponentMismatch)
         ));
     }
 
     #[test]
     fn pseudonym_message_rejects_unknown_domain() {
-        let alias = [1u8; 16];
         assert!(matches!(
-            pseudonym_message("flycockpit.remote.metadata.unknown.v1", 1, &alias),
+            pseudonym_message(
+                "flycockpit.remote.metadata.unknown.v1",
+                &[component(1, [1u8; 16])]
+            ),
             Err(MetadataError::UnknownDomain)
         ));
     }
 
     #[test]
     fn pseudonym_message_rejects_zero_alias() {
-        let alias = [0u8; 16];
         assert!(matches!(
-            pseudonym_message(DOMAIN_TENANT, COMPONENT_KIND_TENANT, &alias),
+            pseudonym_message(
+                DOMAIN_TENANT,
+                &[component(COMPONENT_KIND_TENANT, [0u8; 16])]
+            ),
             Err(MetadataError::InvalidComponentBytes)
         ));
+    }
+
+    #[test]
+    fn pseudonym_message_rejects_zero_components() {
+        assert_eq!(
+            pseudonym_message(DOMAIN_TENANT, &[]),
+            Err(MetadataError::ComponentCount)
+        );
+    }
+
+    #[test]
+    fn pseudonym_message_rejects_multiple_components() {
+        assert_eq!(
+            pseudonym_message(
+                DOMAIN_TENANT,
+                &[
+                    component(COMPONENT_KIND_TENANT, [1u8; 16]),
+                    component(COMPONENT_KIND_TENANT, [2u8; 16]),
+                ]
+            ),
+            Err(MetadataError::ComponentCount)
+        );
+    }
+
+    #[test]
+    fn decode_round_trips_construction() {
+        let alias = [0x11u8; 16];
+        let msg =
+            pseudonym_message(DOMAIN_TENANT, &[component(COMPONENT_KIND_TENANT, alias)]).unwrap();
+        let decoded = decode_pseudonym_message(&msg).unwrap();
+        assert_eq!(decoded.domain, DOMAIN_TENANT);
+        assert_eq!(decoded.component.kind, COMPONENT_KIND_TENANT);
+        assert_eq!(decoded.component.bytes, alias);
+        let reencoded = pseudonym_message(&decoded.domain, &[decoded.component]).unwrap();
+        assert_eq!(reencoded, msg);
+    }
+
+    #[test]
+    fn decode_rejects_trailing_byte() {
+        let mut msg = pseudonym_message(
+            DOMAIN_TENANT,
+            &[component(COMPONENT_KIND_TENANT, [0x11u8; 16])],
+        )
+        .unwrap();
+        msg.push(0x00);
+        assert_eq!(
+            decode_pseudonym_message(&msg),
+            Err(MetadataError::TrailingByte)
+        );
+    }
+
+    #[test]
+    fn decode_rejects_zero_components() {
+        let mut msg = Vec::new();
+        msg.extend_from_slice(DOMAIN_TENANT.as_bytes());
+        msg.push(0x00);
+        msg.push(0); // declared component count == 0
+        assert_eq!(
+            decode_pseudonym_message(&msg),
+            Err(MetadataError::ComponentCount)
+        );
+    }
+
+    #[test]
+    fn decode_rejects_multiple_components() {
+        let mut msg = Vec::new();
+        msg.extend_from_slice(DOMAIN_TENANT.as_bytes());
+        msg.push(0x00);
+        msg.push(2); // declared component count == 2, rejected before parsing
+        assert_eq!(
+            decode_pseudonym_message(&msg),
+            Err(MetadataError::ComponentCount)
+        );
+    }
+
+    #[test]
+    fn decode_rejects_unknown_domain() {
+        let mut msg = Vec::new();
+        msg.extend_from_slice(b"flycockpit.remote.metadata.unknown.v1");
+        msg.push(0x00);
+        msg.push(1);
+        msg.push(1);
+        msg.extend_from_slice(&16u16.to_be_bytes());
+        msg.extend_from_slice(&[0x11u8; 16]);
+        assert_eq!(
+            decode_pseudonym_message(&msg),
+            Err(MetadataError::UnknownDomain)
+        );
+    }
+
+    #[test]
+    fn decode_rejects_empty_domain() {
+        // A leading 0x00 (empty domain segment) is an unknown domain, not a
+        // truncation — matching construction, which treats "" as unknown. This
+        // keeps the Rust and TS decoders aligned on the empty-domain case.
+        assert_eq!(
+            decode_pseudonym_message(&[0x00]),
+            Err(MetadataError::UnknownDomain)
+        );
+        // No 0x00 separator at all is a genuine truncation.
+        assert_eq!(
+            decode_pseudonym_message(b"flycockpit"),
+            Err(MetadataError::Truncated)
+        );
+    }
+
+    #[test]
+    fn rejects_prototype_name_domain() {
+        // A JS prototype property name like "toString" must be an unknown domain
+        // in both languages — never silently classified as a kind mismatch or
+        // carried further into framing. (TS uses own-property lookup for this.)
+        assert_eq!(
+            pseudonym_message("toString", &[component(1, [1u8; 16])]),
+            Err(MetadataError::UnknownDomain)
+        );
+        let mut msg = Vec::new();
+        msg.extend_from_slice(b"toString");
+        msg.push(0x00);
+        msg.push(1);
+        msg.push(1);
+        msg.extend_from_slice(&16u16.to_be_bytes());
+        msg.extend_from_slice(&[0x11u8; 16]);
+        assert_eq!(
+            decode_pseudonym_message(&msg),
+            Err(MetadataError::UnknownDomain)
+        );
+    }
+
+    #[test]
+    fn decode_rejects_truncated_and_bad_length() {
+        // Truncated after the separator: no component-count byte.
+        let mut truncated = Vec::new();
+        truncated.extend_from_slice(DOMAIN_TENANT.as_bytes());
+        truncated.push(0x00);
+        assert_eq!(
+            decode_pseudonym_message(&truncated),
+            Err(MetadataError::Truncated)
+        );
+
+        // Declared component length != 16.
+        let mut bad_len = Vec::new();
+        bad_len.extend_from_slice(DOMAIN_TENANT.as_bytes());
+        bad_len.push(0x00);
+        bad_len.push(1);
+        bad_len.push(COMPONENT_KIND_TENANT);
+        bad_len.extend_from_slice(&17u16.to_be_bytes());
+        bad_len.extend_from_slice(&[0x11u8; 17]);
+        assert_eq!(
+            decode_pseudonym_message(&bad_len),
+            Err(MetadataError::InvalidComponentBytes)
+        );
+
+        // Declared length 16 but the payload is truncated mid-component.
+        let mut short = Vec::new();
+        short.extend_from_slice(DOMAIN_TENANT.as_bytes());
+        short.push(0x00);
+        short.push(1);
+        short.push(COMPONENT_KIND_TENANT);
+        short.extend_from_slice(&16u16.to_be_bytes());
+        short.extend_from_slice(&[0x11u8; 10]);
+        assert_eq!(
+            decode_pseudonym_message(&short),
+            Err(MetadataError::Truncated)
+        );
+
+        // All-zero component bytes are rejected on decode too.
+        let mut zero_bytes = Vec::new();
+        zero_bytes.extend_from_slice(DOMAIN_TENANT.as_bytes());
+        zero_bytes.push(0x00);
+        zero_bytes.push(1);
+        zero_bytes.push(COMPONENT_KIND_TENANT);
+        zero_bytes.extend_from_slice(&16u16.to_be_bytes());
+        zero_bytes.extend_from_slice(&[0u8; 16]);
+        assert_eq!(
+            decode_pseudonym_message(&zero_bytes),
+            Err(MetadataError::InvalidComponentBytes)
+        );
     }
 
     #[test]

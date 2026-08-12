@@ -37,6 +37,10 @@ pub const FCMI: [u8; 4] = *b"FCMI";
 pub const FCTR: [u8; 4] = *b"FCTR";
 pub const FCRS: [u8; 4] = *b"FCRS";
 
+// Envelope version — the single supported FCTA envelope format version. Do not
+// reuse this for FCTO/evidence-type version bytes; those carry their own.
+pub const FCTA_ENVELOPE_VERSION: u8 = 1;
+
 // Envelope size constants
 pub const MAX_BODY_BYTES: usize = 261_760;
 pub const MAX_REQUEST_BYTES: usize = 262_144;
@@ -644,7 +648,7 @@ impl FctaEnvelope {
         }
         let mut buf = Vec::with_capacity(64 + issuer_bytes.len() + self.body.len());
         buf.extend_from_slice(&FCTA);
-        buf.push(1);
+        buf.push(FCTA_ENVELOPE_VERSION);
         buf.push(op.discriminant());
         buf.extend_from_slice(&self.request_id);
         buf.extend_from_slice(&self.tenant_id);
@@ -681,7 +685,7 @@ impl FctaEnvelope {
         if bytes.len() < 5 {
             return envelope_err("truncated envelope");
         }
-        if bytes[4] != 1 {
+        if bytes[4] != FCTA_ENVELOPE_VERSION {
             return envelope_err("unsupported envelope version");
         }
         let mut n = 5;

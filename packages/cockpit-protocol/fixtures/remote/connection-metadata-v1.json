@@ -229,33 +229,48 @@
   "malformedVectors": [
     {
       "name": "wrong_domain_type_pairing",
-      "domain": "flycockpit.remote.metadata.tenant.v1",
-      "componentKind": 2,
-      "rejection": "domain_component_mismatch"
+      "rejection": "domain_component_mismatch",
+      "messageHex": "666c79636f636b7069742e72656d6f74652e6d657461646174612e74656e616e742e763100010200100102030405060708090a0b0c0d0e0f10",
+      "construction": {
+        "domain": "flycockpit.remote.metadata.tenant.v1",
+        "components": [{ "kind": 2, "aliasHex": "0102030405060708090a0b0c0d0e0f10" }]
+      }
     },
     {
       "name": "zero_components",
-      "domain": "flycockpit.remote.metadata.tenant.v1",
-      "componentKind": 0,
-      "rejection": "zero_components"
+      "rejection": "zero_components",
+      "messageHex": "666c79636f636b7069742e72656d6f74652e6d657461646174612e74656e616e742e76310000",
+      "construction": {
+        "domain": "flycockpit.remote.metadata.tenant.v1",
+        "components": []
+      }
     },
     {
       "name": "multiple_components",
-      "domain": "flycockpit.remote.metadata.tenant.v1",
-      "componentKind": 1,
-      "rejection": "multiple_components"
+      "rejection": "multiple_components",
+      "messageHex": "666c79636f636b7069742e72656d6f74652e6d657461646174612e74656e616e742e763100020100100102030405060708090a0b0c0d0e0f100100101112131415161718191a1b1c1d1e1f20",
+      "construction": {
+        "domain": "flycockpit.remote.metadata.tenant.v1",
+        "components": [
+          { "kind": 1, "aliasHex": "0102030405060708090a0b0c0d0e0f10" },
+          { "kind": 1, "aliasHex": "1112131415161718191a1b1c1d1e1f20" }
+        ]
+      }
     },
     {
       "name": "unknown_domain",
-      "domain": "flycockpit.remote.metadata.unknown.v1",
-      "componentKind": 1,
-      "rejection": "unknown_domain"
+      "rejection": "unknown_domain",
+      "messageHex": "666c79636f636b7069742e72656d6f74652e6d657461646174612e756e6b6e6f776e2e763100010100100102030405060708090a0b0c0d0e0f10",
+      "construction": {
+        "domain": "flycockpit.remote.metadata.unknown.v1",
+        "components": [{ "kind": 1, "aliasHex": "0102030405060708090a0b0c0d0e0f10" }]
+      }
     },
     {
       "name": "trailing_byte",
-      "domain": "flycockpit.remote.metadata.tenant.v1",
-      "componentKind": 1,
-      "rejection": "trailing_byte"
+      "rejection": "trailing_byte",
+      "messageHex": "666c79636f636b7069742e72656d6f74652e6d657461646174612e74656e616e742e763100010100100102030405060708090a0b0c0d0e0f1000",
+      "construction": null
     }
   ]
 }

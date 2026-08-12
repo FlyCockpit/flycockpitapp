@@ -1703,6 +1703,85 @@ mod tests {
 
     // --- Audit record omits sensitive data ---
 
+    /// Sensitive word tokens that must never appear as (a token of) any JSON key
+    /// in a serialized audit record. `ip`/`ips` catch address fields;
+    /// `signature`, `credential`, `device` catch key/proof/stable-identifier
+    /// fields. Token comparison (not substring) is what lets `approverPrincipalIds`
+    /// through while still catching `clientIp`/`sourceIp`.
+    const SENSITIVE_KEY_TOKENS: &[&str] = &["ip", "ips", "signature", "credential", "device"];
+
+    /// Splits a JSON object key into lowercased word tokens on `_`/`-`,
+    /// lower→upper camelCase boundaries, AND acronym→word boundaries. E.g.
+    /// `approverPrincipalIds` → `["approver", "principal", "ids"]`; `client_ip`
+    /// → `["client", "ip"]`; `clientIPAddress`/`IPAddress` → `[.., "ip",
+    /// "address"]` (so an embedded acronym like `IP` is not buried inside a
+    /// single `ipaddress` token and thereby missed).
+    fn key_tokens(key: &str) -> Vec<String> {
+        let chars: Vec<char> = key.chars().collect();
+        let mut tokens = Vec::new();
+        let mut current = String::new();
+        let mut prev: Option<char> = None;
+        for (i, &ch) in chars.iter().enumerate() {
+            if ch == '_' || ch == '-' {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+                prev = None;
+                continue;
+            }
+            let next = chars.get(i + 1).copied();
+            // `client` | `IP` : a lowercase/digit run gives way to an uppercase.
+            let lower_to_upper = prev.is_some_and(|p| p.is_ascii_lowercase() || p.is_ascii_digit())
+                && ch.is_ascii_uppercase();
+            // `IP` | `Address` : the last capital of an acronym begins a new
+            // capitalized word (uppercase followed by an uppercase-then-lower).
+            let acronym_to_word = prev.is_some_and(|p| p.is_ascii_uppercase())
+                && ch.is_ascii_uppercase()
+                && next.is_some_and(|n| n.is_ascii_lowercase());
+            if (lower_to_upper || acronym_to_word) && !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            current.push(ch.to_ascii_lowercase());
+            prev = Some(ch);
+        }
+        if !current.is_empty() {
+            tokens.push(current);
+        }
+        tokens
+    }
+
+    /// Recursively collects every object key in a JSON value.
+    fn collect_keys(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                for (k, v) in map {
+                    out.push(k.clone());
+                    collect_keys(v, out);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    collect_keys(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Returns every key (at any depth) whose word tokens include a sensitive
+    /// token. An empty result means the value is clean.
+    fn scan_sensitive_keys(value: &Value) -> Vec<String> {
+        let mut keys = Vec::new();
+        collect_keys(value, &mut keys);
+        keys.into_iter()
+            .filter(|key| {
+                key_tokens(key)
+                    .iter()
+                    .any(|token| SENSITIVE_KEY_TOKENS.contains(&token.as_str()))
+            })
+            .collect()
+    }
+
     #[test]
     fn remote_policy_audit_omits_sensitive_data() {
         let rev = sample_revision(1);
@@ -1719,19 +1798,80 @@ mod tests {
             step_up_performed: true,
             committed_at_ms: 1_000_000,
         };
+        // Scan the exact production JSON string (`serde_json::to_string`), not a
+        // `to_value` intermediate, so any serializer difference between the two
+        // paths cannot leave emitted JSON unscanned (AC10).
         let json = serde_json::to_string(&audit).unwrap();
-        // No credential hashes, no IP addresses, no signature bytes, no
-        // stable device identifiers. The checks use specific field names
-        // rather than generic substrings (e.g. "ip" would false-match
-        // "PrincipalIds").
-        assert!(!json.contains("credential_id_hash"));
-        assert!(!json.contains("credentialIdHash"));
-        assert!(!json.contains("signature"));
-        assert!(!json.contains("ipAddress"));
-        assert!(!json.contains("ip_address"));
-        assert!(!json.contains("peerIp"));
-        assert!(!json.contains("device_id"));
-        assert!(!json.contains("deviceId"));
+        let value: Value = serde_json::from_str(&json).unwrap();
+
+        // No key anywhere in the serialized record encodes an IP, signature
+        // byte, credential hash, or stable device identifier. Scanning by word
+        // token (not substring) means any future `clientIp`/`sourceIp`/`ips` or
+        // `deviceFingerprint` key is caught, while `approverPrincipalIds`
+        // (tokens `approver`/`principal`/`ids`) is not a false match.
+        let flagged = scan_sensitive_keys(&value);
+        assert!(flagged.is_empty(), "sensitive keys leaked: {flagged:?}");
+
+        // Exact top-level key set — a newly added field forces a deliberate test
+        // update rather than silently shipping unreviewed.
+        let top_level: std::collections::BTreeSet<String> =
+            value.as_object().unwrap().keys().cloned().collect();
+        let expected: std::collections::BTreeSet<String> = [
+            "policyId",
+            "tenantId",
+            "epoch",
+            "digestHex",
+            "action",
+            "changeClass",
+            "approverPrincipalIds",
+            "signerAccepted",
+            "stepUpPerformed",
+            "committedAtMs",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(top_level, expected);
+    }
+
+    #[test]
+    fn audit_key_scan_flags_planted_sensitive_keys() {
+        // Keys that the previous weakened substring list (`ipAddress`,
+        // `ip_address`, `peerIp`) provably missed must now be flagged.
+        let planted = serde_json::json!({
+            "clientIp": "10.0.0.1",
+            "source_ip": "10.0.0.2",
+            "deviceFingerprint": "abc",
+            "clientIPAddress": "10.0.0.3",
+            "IPAddress": "10.0.0.4",
+            "sourceIP": "10.0.0.5",
+            "nested": { "peerSignature": "sig" },
+        });
+        let flagged = scan_sensitive_keys(&planted);
+        let is_flagged = |key: &str| flagged.iter().any(|k| k == key);
+        assert!(is_flagged("clientIp"), "clientIp not flagged");
+        assert!(is_flagged("source_ip"), "source_ip not flagged");
+        assert!(
+            is_flagged("deviceFingerprint"),
+            "deviceFingerprint not flagged"
+        );
+        assert!(
+            is_flagged("peerSignature"),
+            "nested peerSignature not flagged"
+        );
+        // Acronym-boundary keys the old lower→upper-only splitter missed
+        // (they tokenized to a single `ipaddress` token, never `ip`).
+        assert!(is_flagged("clientIPAddress"), "clientIPAddress not flagged");
+        assert!(is_flagged("IPAddress"), "IPAddress not flagged");
+        assert!(is_flagged("sourceIP"), "sourceIP not flagged");
+
+        // The real audit key `approverPrincipalIds` must not false-match: token
+        // `principal` is not `ip`, and `ids` is not `ips`.
+        let benign = serde_json::json!({ "approverPrincipalIds": ["p1", "p2"] });
+        assert!(
+            scan_sensitive_keys(&benign).is_empty(),
+            "approverPrincipalIds must not false-match"
+        );
     }
 
     // --- Foundation consumption guard ---

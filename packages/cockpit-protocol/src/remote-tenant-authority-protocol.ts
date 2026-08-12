@@ -33,6 +33,10 @@ export const TENANT_AUTHORITY_MAGICS = {
   fcrs: "FCRS",
 } as const;
 
+// The single supported FCTA envelope format version. Mirrors the Rust
+// `FCTA_ENVELOPE_VERSION`; not shared with FCTO/evidence-type version bytes.
+export const FCTA_ENVELOPE_VERSION = 1;
+
 export const MAX_BODY_BYTES = 261_760;
 export const MAX_REQUEST_BYTES = 262_144;
 export const MAX_RESULT_BYTES = 16_384;

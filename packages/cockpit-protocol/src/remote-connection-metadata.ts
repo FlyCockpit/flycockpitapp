@@ -226,7 +226,50 @@ export interface RemoteMetadataPseudonymComponent {
   bytes: Uint8Array;
 }
 
-export class RemoteMetadataError extends Error {}
+/**
+ * Rejection codes for pseudonym-message construction and decode. For the
+ * fixture's malformed vectors these equal the fixture `rejection` strings
+ * exactly; `invalid_component_bytes`/`truncated` cover non-fixture failures.
+ */
+export type RemoteMetadataErrorCode =
+  | "unknown_domain"
+  | "zero_components"
+  | "multiple_components"
+  | "domain_component_mismatch"
+  | "invalid_component_bytes"
+  | "trailing_byte"
+  | "truncated";
+
+export class RemoteMetadataError extends Error {
+  /**
+   * Present on construction/decode rejections; equals the fixture `rejection`
+   * string for malformed vectors. Undefined for other validation errors
+   * (retention, bucket, digest, pseudonym length).
+   */
+  readonly code?: RemoteMetadataErrorCode;
+  constructor(message: string, code?: RemoteMetadataErrorCode) {
+    super(message);
+    this.name = "RemoteMetadataError";
+    this.code = code;
+  }
+}
+
+// Descriptive `Error.message` for each rejection code. These preserve the
+// original human-readable messages (callers may branch on/report `.message`)
+// while the machine-readable wire code is passed via the 2nd constructor arg.
+const REMOTE_METADATA_REJECTION_MESSAGES: Record<RemoteMetadataErrorCode, string> = {
+  unknown_domain: "unknown pseudonym domain",
+  zero_components: "exactly one component required",
+  multiple_components: "exactly one component required",
+  domain_component_mismatch: "domain-component kind mismatch",
+  invalid_component_bytes: "component bytes must be nonzero 16 bytes",
+  trailing_byte: "trailing bytes after message",
+  truncated: "truncated pseudonym message",
+};
+
+function rejectMetadata(code: RemoteMetadataErrorCode): RemoteMetadataError {
+  return new RemoteMetadataError(REMOTE_METADATA_REJECTION_MESSAGES[code], code);
+}
 
 const te = new TextEncoder();
 
@@ -241,6 +284,20 @@ function concat(...parts: Uint8Array[]): Uint8Array {
 }
 
 /**
+ * Runtime shape check for a pseudonym component at the public API boundary: a
+ * sparse array element, `null`, or a wrong-typed field must fail closed with a
+ * stable `invalid_component_bytes` code rather than a raw `TypeError`.
+ */
+function isPseudonymComponent(c: unknown): c is RemoteMetadataPseudonymComponent {
+  return (
+    typeof c === "object" &&
+    c !== null &&
+    typeof (c as { kind?: unknown }).kind === "number" &&
+    (c as { bytes?: unknown }).bytes instanceof Uint8Array
+  );
+}
+
+/**
  * Builds the canonical HMAC message for a pseudonym schema:
  * `domainUtf8 | 0x00 | componentCount:u8 | components`.
  * Each component is `kind:u8 | length:u16be | bytes`.
@@ -249,20 +306,94 @@ export function remoteMetadataPseudonymMessage(
   domain: string,
   components: RemoteMetadataPseudonymComponent[],
 ): Uint8Array {
-  const requiredKind = SCHEMA_REQUIRED_KIND[domain];
-  if (requiredKind === undefined) throw new RemoteMetadataError("unknown pseudonym domain");
-  if (components.length !== 1) throw new RemoteMetadataError("exactly one component required");
-  if (components[0]!.kind !== requiredKind)
-    throw new RemoteMetadataError("domain-component kind mismatch");
-  const c = components[0]!;
+  // Fail closed on a null/undefined/non-array container before touching
+  // `.length`, so a malformed call at the public boundary yields a stable
+  // RemoteMetadataError code instead of a raw TypeError.
+  if (!Array.isArray(components)) throw rejectMetadata("invalid_component_bytes");
+  // Own-property lookup only: a prototype name like "toString" must be an
+  // unknown domain (parity with Rust), not an inherited function that slips
+  // past an `=== undefined` check into later kind/framing classification.
+  if (!Object.hasOwn(SCHEMA_REQUIRED_KIND, domain)) throw rejectMetadata("unknown_domain");
+  const requiredKind = SCHEMA_REQUIRED_KIND[domain]!;
+  if (components.length === 0) throw rejectMetadata("zero_components");
+  if (components.length > 1) throw rejectMetadata("multiple_components");
+  const c = components[0];
+  if (!isPseudonymComponent(c)) throw rejectMetadata("invalid_component_bytes");
+  if (c.kind !== requiredKind) throw rejectMetadata("domain_component_mismatch");
   if (c.bytes.length !== 16 || c.bytes.every((b) => b === 0))
-    throw new RemoteMetadataError("component bytes must be nonzero 16 bytes");
+    throw rejectMetadata("invalid_component_bytes");
   const domainUtf8 = te.encode(domain);
   const comp = new Uint8Array(3 + 16);
   comp[0] = c.kind;
   new DataView(comp.buffer).setUint16(1, 16);
   comp.set(c.bytes, 3);
   return concat(domainUtf8, Uint8Array.of(0x00), Uint8Array.of(1), comp);
+}
+
+/**
+ * Decodes a canonical pseudonym message
+ * (`domainUtf8 | 0x00 | componentCount:u8 | kind:u8 | length:u16be | bytes`)
+ * back into its domain and single component. This is the verify path that ties
+ * every malformed fixture vector to a real rejection. Checks are ordered to
+ * match construction: unknown domain, then component count, then a fully-parsed
+ * single component, then an exact-length check (a trailing byte fails), then
+ * the kind/domain match, then the nonzero-bytes rule.
+ */
+export function remoteMetadataDecodePseudonymMessage(bytes: Uint8Array): {
+  domain: string;
+  components: RemoteMetadataPseudonymComponent[];
+} {
+  // Fail closed on a null/undefined/non-Uint8Array input before touching
+  // `.indexOf`, so a malformed call at the public boundary yields a stable
+  // RemoteMetadataError code instead of a raw TypeError (parity with the
+  // construct boundary's Array.isArray guard).
+  if (!(bytes instanceof Uint8Array)) throw rejectMetadata("invalid_component_bytes");
+  // The domain is ASCII and never contains 0x00, so the first 0x00 is the
+  // separator between the domain and the component count. A missing separator
+  // is truncation; a leading 0x00 (empty domain segment) is an unknown domain,
+  // matching Rust and the construction API (which treats "" as unknown).
+  const sep = bytes.indexOf(0x00);
+  if (sep === -1) throw rejectMetadata("truncated");
+  if (sep === 0) throw rejectMetadata("unknown_domain");
+  let domain: string;
+  try {
+    domain = new TextDecoder("utf-8", { fatal: true }).decode(bytes.slice(0, sep));
+  } catch {
+    throw rejectMetadata("unknown_domain");
+  }
+  // Own-property lookup only: a prototype name like "toString" must be an
+  // unknown domain (parity with Rust), not an inherited function that slips
+  // past an `=== undefined` check into later kind/framing classification.
+  if (!Object.hasOwn(SCHEMA_REQUIRED_KIND, domain)) throw rejectMetadata("unknown_domain");
+  const requiredKind = SCHEMA_REQUIRED_KIND[domain]!;
+
+  let n = sep + 1;
+  if (n >= bytes.length) throw rejectMetadata("truncated");
+  const count = bytes[n]!;
+  n += 1;
+  // Reject zero/multiple from the declared count byte without parsing a second
+  // component: a count of exactly one is the only valid shape.
+  if (count === 0) throw rejectMetadata("zero_components");
+  if (count > 1) throw rejectMetadata("multiple_components");
+
+  if (n >= bytes.length) throw rejectMetadata("truncated");
+  const kind = bytes[n]!;
+  n += 1;
+  if (n + 2 > bytes.length) throw rejectMetadata("truncated");
+  const length = (bytes[n]! << 8) | bytes[n + 1]!;
+  n += 2;
+  if (length !== 16) throw rejectMetadata("invalid_component_bytes");
+  if (n + 16 > bytes.length) throw rejectMetadata("truncated");
+  const componentBytes = bytes.slice(n, n + 16);
+  n += 16;
+
+  // Exact length: any leftover byte after the single component fails. A count
+  // of one followed by extra bytes is a trailing byte, not a count error.
+  if (n !== bytes.length) throw rejectMetadata("trailing_byte");
+  if (kind !== requiredKind) throw rejectMetadata("domain_component_mismatch");
+  if (componentBytes.every((b) => b === 0)) throw rejectMetadata("invalid_component_bytes");
+
+  return { domain, components: [{ kind, bytes: componentBytes }] };
 }
 
 /**

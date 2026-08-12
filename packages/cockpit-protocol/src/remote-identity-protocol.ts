@@ -678,10 +678,20 @@ export async function derivePossessionChallenge(
   all.set(digest, d.length + 48);
   return remoteIdentitySha256(all);
 }
-export async function possessionProofSigningDigest(
+/**
+ * The exact bytes a custody provider signs for a possession proof: the
+ * signature domain concatenated with the 175-byte unsigned proof
+ * (`domain || unsigned`). Platform providers that hash internally
+ * (WebCrypto `ECDSA{hash:SHA-256}`, iOS `ecdsaSignatureMessageX962SHA256`,
+ * Android `SHA256withECDSA`) sign THIS message; the resulting signature is over
+ * `SHA-256(message)`, which equals {@link possessionProofSigningDigest}. The
+ * structural validation is identical to the digest helper, so the message and
+ * the digest are two views of one contract.
+ */
+export function possessionProofSigningMessage(
   unsignedProof: Uint8Array,
   p: PossessionPurposeV1,
-) {
+): Uint8Array {
   if (
     unsignedProof.length !== 175 ||
     !unsignedProof.slice(0, 4).every((b, i) => b === te.encode("FCPP")[i]) ||
@@ -697,7 +707,13 @@ export async function possessionProofSigningDigest(
     all = new Uint8Array(d.length + unsignedProof.length);
   all.set(d);
   all.set(unsignedProof, d.length);
-  return remoteIdentitySha256(all);
+  return all;
+}
+export async function possessionProofSigningDigest(
+  unsignedProof: Uint8Array,
+  p: PossessionPurposeV1,
+) {
+  return remoteIdentitySha256(possessionProofSigningMessage(unsignedProof, p));
 }
 
 export interface PossessionProofV1 {
@@ -825,10 +841,16 @@ export function decodeEnrollmentConfirmation(bytes: Uint8Array): EnrollmentConfi
   encodeEnrollmentConfirmation(v);
   return v;
 }
-export async function enrollmentConfirmationSigningDigest(
+/**
+ * The exact bytes a custody provider signs for an enrollment confirmation:
+ * `domain || unsigned` (104-byte unsigned confirmation). Message-based
+ * providers sign this; the signature is over `SHA-256(message)`, which equals
+ * {@link enrollmentConfirmationSigningDigest}.
+ */
+export function enrollmentConfirmationSigningMessage(
   unsignedConfirmation: Uint8Array,
   role: EnrollmentRoleV1,
-) {
+): Uint8Array {
   if (
     unsignedConfirmation.length !== 104 ||
     !unsignedConfirmation.slice(0, 4).every((b, i) => b === te.encode("FCCF")[i]) ||
@@ -844,7 +866,13 @@ export async function enrollmentConfirmationSigningDigest(
     all = new Uint8Array(d.length + unsignedConfirmation.length);
   all.set(d);
   all.set(unsignedConfirmation, d.length);
-  return remoteIdentitySha256(all);
+  return all;
+}
+export async function enrollmentConfirmationSigningDigest(
+  unsignedConfirmation: Uint8Array,
+  role: EnrollmentRoleV1,
+) {
+  return remoteIdentitySha256(enrollmentConfirmationSigningMessage(unsignedConfirmation, role));
 }
 
 /** Exact JWS structural parser. Signature verification/trust is deliberately caller-owned. */

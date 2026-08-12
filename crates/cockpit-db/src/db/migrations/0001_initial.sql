@@ -4635,3 +4635,41 @@ CREATE TRIGGER image_generation_publication_rights_immutable
 BEFORE UPDATE ON image_generation_publication_right_facts BEGIN
   SELECT RAISE(ABORT, 'image generation publication-right facts are immutable');
 END;
+
+-- ---- remote_daemon_custody_generation_seq ----------------------------------
+-- Monotonic high-water sequence for daemon durable-P-256 custody generations.
+-- Exactly one row (id = 1). `high_water` only ever increases; `destroy` never
+-- resets or deletes it, so a destroyed + regenerated identity always receives a
+-- strictly greater generation. Possession proofs bind (certificateId,
+-- generation), so a reused generation would let a superseded proof replay.
+CREATE TABLE remote_daemon_custody_generation_seq (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    high_water  INTEGER NOT NULL CHECK (high_water >= 0)
+);
+
+CREATE TRIGGER remote_daemon_custody_generation_seq_monotonic
+BEFORE UPDATE ON remote_daemon_custody_generation_seq
+WHEN NEW.high_water < OLD.high_water BEGIN
+  SELECT RAISE(ABORT, 'remote daemon custody generation sequence must not decrease');
+END;
+
+-- ---- remote_daemon_custody_records -----------------------------------------
+-- Durable daemon custody generation records. One row per live handle. The row
+-- is the crash-safe unit: a generation is durable only once its handle id,
+-- public key, custody discriminants, generation, and evidence digest are all
+-- persisted together (inside one transaction with the sequence bump). Never
+-- stores private key bytes — the private key lives only in the platform
+-- keystore behind the handle. `profile` is the construction-time configured
+-- daemon custody profile label, never caller-supplied evidence.
+CREATE TABLE remote_daemon_custody_records (
+    handle_id        BLOB    PRIMARY KEY CHECK (length(handle_id) = 16),
+    subject_kind     INTEGER NOT NULL CHECK (subject_kind IN (1, 2)),
+    custody_class    INTEGER NOT NULL CHECK (custody_class IN (1, 2, 3)),
+    presence_mode    INTEGER NOT NULL CHECK (presence_mode IN (1, 2, 3, 4)),
+    profile          TEXT    NOT NULL,
+    generation       INTEGER NOT NULL CHECK (generation >= 1),
+    public_key_x     BLOB    NOT NULL CHECK (length(public_key_x) = 32),
+    public_key_y     BLOB    NOT NULL CHECK (length(public_key_y) = 32),
+    evidence_digest  BLOB    NOT NULL CHECK (length(evidence_digest) = 32),
+    created_at       INTEGER NOT NULL
+);

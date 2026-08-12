@@ -143,3 +143,49 @@ jobs:
 
       - name: Format
         run: cargo fmt --all -- --check
+
+  daemon-custody-pkcs11-softhsm:
+    name: Daemon custody PKCS#11 (SoftHSM2)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Install and initialize SoftHSM2
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y softhsm2 opensc
+          conf="$RUNNER_TEMP/softhsm2.conf"
+          tokens="$RUNNER_TEMP/softhsm-tokens"
+          mkdir -p "$tokens"
+          printf 'directories.tokendir = %s\nobjectstore.backend = file\n' "$tokens" > "$conf"
+          export SOFTHSM2_CONF="$conf"
+          softhsm2-util --init-token --slot 0 --label flycockpit --so-pin 123456 --pin 1234
+          module="$(dpkg -L libsofthsm2 | grep -m1 'libsofthsm2\.so$')"
+          {
+            echo "SOFTHSM2_CONF=$conf"
+            echo "COCKPIT_SOFTHSM_MODULE=$module"
+            echo "COCKPIT_SOFTHSM_TOKEN_LABEL=flycockpit"
+            echo "COCKPIT_SOFTHSM_USER_PIN=1234"
+          } >> "$GITHUB_ENV"
+
+      # Runs ONLY the #[ignore]d PKCS#11 conformance tests against the real
+      # SoftHSM2 token, with the `daemon-custody-pkcs11` feature enabled. The
+      # default serialized gate leaves these ignored, so it stays green without
+      # SoftHSM installed. No `--locked`: this leg resolves the optional cryptoki
+      # dependency.
+      - name: Run PKCS#11 conformance (ignored-only)
+        run: >
+          cargo nextest run -p cockpit-core
+          --features daemon-custody-pkcs11
+          --run-ignored ignored-only
+          -E 'test(remote_daemon_custody_pkcs11_softhsm)'

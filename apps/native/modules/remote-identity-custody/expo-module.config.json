@@ -1,0 +1,9 @@
+{
+  "platforms": ["apple", "android"],
+  "apple": {
+    "modules": ["RemoteIdentityCustodyModule"]
+  },
+  "android": {
+    "modules": ["expo.modules.remoteidentitycustody.RemoteIdentityCustodyModule"]
+  }
+}

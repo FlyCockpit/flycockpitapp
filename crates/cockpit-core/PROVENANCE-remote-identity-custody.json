@@ -1,0 +1,72 @@
+{
+  "schema": "flycockpit.provenance.v1",
+  "subject": "remote-daemon-identity-custody",
+  "description": "Pinned dependency provenance for the daemon remote identity custody adapters (macOS security-framework, Windows NCrypt via windows-sys, Linux/WSL cryptoki) and the p256 ECDSA low-S normalization + real-key test fake. Cross-checked against crates/cockpit-core/Cargo.toml and the workspace Cargo.lock by the test remote_daemon_identity_custody_provenance_matches_manifest.",
+  "rustMsrv": "1.95",
+  "manifest": "crates/cockpit-core/Cargo.toml",
+  "dependencies": [
+    {
+      "name": "p256",
+      "version": "0.13.2",
+      "checksum": "c9863ad85fa8f4460f9c48cb909d38a0d689dba1f6f6988a5e3e0d31071bcd4b",
+      "license": "Apache-2.0 OR MIT",
+      "features": ["ecdsa", "arithmetic", "pem", "digest"],
+      "target": null,
+      "usage": "DER->P1363 low-S normalization in every platform adapter; real p256 signing keys in the test fake."
+    },
+    {
+      "name": "security-framework",
+      "version": "3.7.0",
+      "checksum": "b7f4bc775c73d9a02cde8bf7b2ec4c9d12743edf609006c7facc23998404cd1d",
+      "license": "MIT OR Apache-2.0",
+      "features": [],
+      "target": "cfg(target_os = \"macos\")",
+      "usage": "Secure Enclave / Keychain nonexportable P-256 custody adapter (macOS)."
+    },
+    {
+      "name": "security-framework-sys",
+      "version": "2.17.0",
+      "checksum": "6ce2691df843ecc5d231c0b14ece2acc3efb62c0a398c7e1d875f3983ce020e3",
+      "license": "MIT OR Apache-2.0",
+      "features": [],
+      "target": "cfg(target_os = \"macos\")",
+      "usage": "Low-level SecKey/SecAccessControl constants for the macOS adapter."
+    },
+    {
+      "name": "cryptoki",
+      "version": "0.12.0",
+      "checksum": "ff765b99fc49f3116c9a908484486a2b92fd73c48da45c3a69716471c6cc56c6",
+      "license": "Apache-2.0",
+      "features": [],
+      "target": "cfg(target_os = \"linux\")",
+      "usage": "PKCS#11 nonexportable P-256 custody adapter loading only an explicitly configured absolute module path (Linux/WSL). NOTE: not yet present in Cargo.lock at authoring time — the cargo gate must refresh the lock (cargo fetch / cargo build) before running with --locked."
+    },
+    {
+      "name": "windows-sys",
+      "version": "0.61.2",
+      "checksum": "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc",
+      "license": "MIT OR Apache-2.0",
+      "features": [
+        "Win32_Foundation",
+        "Win32_Security",
+        "Win32_Security_Cryptography",
+        "Win32_System_IO",
+        "Win32_System_JobObjects",
+        "Win32_System_Threading"
+      ],
+      "target": "cfg(target_os = \"windows\")",
+      "usage": "NCrypt (CNG) key-storage APIs for the Windows adapter; the Win32_Security_Cryptography feature was added by this workflow to the existing workspace-pinned windows-sys 0.61.2."
+    }
+  ],
+  "forbiddenProductionDependencies": [
+    "keyring",
+    "secret-service",
+    "openssl",
+    "@noble/*",
+    "handwritten-pkcs11-abi",
+    "vendor-hsm-sdk"
+  ],
+  "commands": {
+    "verify": "CARGO_TARGET_DIR=target cargo nextest run --locked -p cockpit-core -E 'test(remote_daemon_identity_custody_provenance_matches_manifest)'"
+  }
+}

@@ -11,6 +11,11 @@ publish = false
 
 [features]
 test-support = []
+# Compiles the real Linux/WSL PKCS#11 daemon custody adapter (cryptoki). OFF by
+# default so the serialized local gate stays green and lock-stable without a
+# PKCS#11 module present; the SoftHSM CI job enables it. macOS/Windows adapters
+# are target-gated instead (they compile only on their CI matrix legs).
+daemon-custody-pkcs11 = ["dep:cryptoki"]
 
 [lints]
 workspace = true
@@ -60,6 +65,14 @@ keepawake = { workspace = true }
 base64 = { workspace = true }
 sha2 = { workspace = true }
 rand = { workspace = true }
+# Daemon remote identity custody: P-256 ECDSA for the real-key test fake and for
+# DER->P1363 low-S normalization in every platform adapter. Exact pin per
+# `identity-custody-dedup-and-hardening`; provenance recorded in
+# PROVENANCE-remote-identity-custody.json. Already present in Cargo.lock 0.13.2.
+# Features: ecdsa (sign+verify) + arithmetic + pem (enables ecdsa DER parsing for
+# der_signature_to_low_s_p1363) + digest (hazmat PrehashSigner). All transitive
+# crates (rfc6979/primeorder/pem-rfc7468/digest) are already in Cargo.lock.
+p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa", "arithmetic", "pem", "digest"] }
 urlencoding = { workspace = true }
 which = { workspace = true }
 monty = { workspace = true }
@@ -129,12 +142,24 @@ rustls-native-certs = { version = "0.8", default-features = false }
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { workspace = true }
 zbus-secret-service-keyring-store = { version = "=1.0.0", default-features = false, features = ["rt-tokio-crypto-rust"] }
+# Linux/WSL daemon custody: PKCS#11 loading only an explicitly configured
+# absolute module path (no dlopen search path). Exact pin + crates.io checksum
+# per `identity-custody-dedup-and-hardening`; provenance recorded. Optional +
+# gated by the `daemon-custody-pkcs11` feature (SoftHSM CI enables it). NOTE:
+# cryptoki is NOT yet in Cargo.lock — the gate must refresh the lock (cargo
+# fetch / cargo build) before running with `--locked`.
+cryptoki = { version = "=0.12.0", default-features = false, optional = true }
 # Computer target identity (X11 RandR + optional AT-SPI). Exact audited pins.
 x11rb = { version = "=0.13.2", default-features = false, features = ["randr"] }
 atspi = { version = "=0.30.0", default-features = false, features = ["connection", "proxies", "tokio"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "=1.0.1", default-features = false, features = ["keychain"] }
+# macOS daemon custody: Secure Enclave / Keychain nonexportable P-256 via the
+# pinned security-framework wrapper. Exact pins per prompt; provenance recorded.
+# Both already present in Cargo.lock (3.7.0 / 2.17.0).
+security-framework = "=3.7.0"
+security-framework-sys = "=2.17.0"
 # Computer target identity — exact audited pins from computer-use-target-identity-and-denylist.
 mach2 = { version = "=0.6.0", default-features = false }
 block2 = { version = "=0.6.2", default-features = false, features = ["std"] }
@@ -152,6 +177,10 @@ windows-native-keyring-store = { version = "=1.1.0", default-features = false }
 windows-sys = { version = "=0.61.2", default-features = false, features = [
     "Win32_Foundation",
     "Win32_Security",
+    # Win32_Security_Cryptography: NCrypt (CNG) key-storage APIs for the Windows
+    # daemon custody adapter (TPM Platform Crypto Provider / Software KSP),
+    # added by `identity-custody-dedup-and-hardening`. No new crate; feature only.
+    "Win32_Security_Cryptography",
     "Win32_System_IO",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
@@ -193,6 +222,9 @@ cockpit-config = { path = "../cockpit-config", features = ["test-support"] }
 cockpit-test-support = { path = "../cockpit-test-support" }
 predicates = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+# Source-scan guard for the daemon custody module (syn AST visitor). Already in
+# Cargo.lock at 2.x via the workspace; matches cockpit-proto's dev use.
+syn = { version = "2", features = ["full", "visit"] }
 rcgen = "=0.14.8"
 rustls = "=0.23.43"
 tokio-rustls = "=0.26.4"

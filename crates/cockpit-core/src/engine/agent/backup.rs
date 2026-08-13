@@ -69,6 +69,9 @@ pub fn suggested_action_for_failure_class(
         | crate::engine::model::InferenceErrorClass::ResponsesToolIdentity
         | crate::engine::model::InferenceErrorClass::ProviderNotConfigured
         | crate::engine::model::InferenceErrorClass::ProviderRateLimit
+        // Treated like its ProviderRateLimit/quota sibling pending
+        // harness-reliability-remediation's final policy.
+        | crate::engine::model::InferenceErrorClass::BillingOrQuotaExhausted
         | crate::engine::model::InferenceErrorClass::UnrenderableWireField
         | crate::engine::model::InferenceErrorClass::Http(_)
         | crate::engine::model::InferenceErrorClass::Other(_) => "inspect_failure",

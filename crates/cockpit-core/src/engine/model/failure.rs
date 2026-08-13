@@ -190,6 +190,10 @@ pub fn failure_engages_backup(class: &InferenceErrorClass) -> bool {
         | InferenceErrorClass::ResponsesToolIdentity
         | InferenceErrorClass::ProviderNotConfigured
         | InferenceErrorClass::ProviderRateLimit
+        // Treated like its ProviderRateLimit/quota sibling pending
+        // harness-reliability-remediation's final policy: no backup model can
+        // restore an exhausted account balance/quota, so no backup is engaged.
+        | InferenceErrorClass::BillingOrQuotaExhausted
         // A non-renderable wire field fails the same way on any untrusted
         // target, so a different model cannot answer it — hard-fail, no backup.
         | InferenceErrorClass::UnrenderableWireField

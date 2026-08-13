@@ -114,6 +114,10 @@ pub(crate) fn failure_retry_decision_and_rationale(
         | InferenceErrorClass::ResponsesToolIdentity
         | InferenceErrorClass::ProviderNotConfigured
         | InferenceErrorClass::ProviderRateLimit
+        // Treated like its ProviderRateLimit/quota sibling pending
+        // harness-reliability-remediation's final policy: retrying cannot
+        // restore an exhausted balance/quota, so it fails fast here.
+        | InferenceErrorClass::BillingOrQuotaExhausted
         | InferenceErrorClass::UnrenderableWireField
         | InferenceErrorClass::Http(_)
         | InferenceErrorClass::Other(_) => ("fail_fast", "non_retryable_or_unclassified_failure"),
@@ -691,6 +695,15 @@ mod tests {
         );
         assert_eq!(
             failure_retry_decision_and_rationale(&InferenceErrorClass::Other("weird".into()), None),
+            ("fail_fast", "non_retryable_or_unclassified_failure")
+        );
+        // Billing/quota exhaustion is terminal: retrying cannot restore quota,
+        // so it fails fast (grouped with its ProviderRateLimit sibling).
+        assert_eq!(
+            failure_retry_decision_and_rationale(
+                &InferenceErrorClass::BillingOrQuotaExhausted,
+                None
+            ),
             ("fail_fast", "non_retryable_or_unclassified_failure")
         );
     }

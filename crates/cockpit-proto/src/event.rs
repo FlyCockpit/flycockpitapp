@@ -14,6 +14,7 @@ const CLASS_CLIENT_SIDE_TOOLS_UNSUPPORTED: &str = "client_side_tools_unsupported
 const CLASS_RESPONSES_TOOL_IDENTITY: &str = "responses_tool_identity";
 const CLASS_PROVIDER_NOT_CONFIGURED: &str = "provider_not_configured";
 const CLASS_PROVIDER_RATE_LIMIT: &str = "provider_rate_limit";
+const CLASS_BILLING_OR_QUOTA_EXHAUSTED: &str = "billing_or_quota_exhausted";
 const CLASS_UNRENDERABLE_WIRE_FIELD: &str = "unrenderable_wire_field";
 const DEFAULT_MISSING_TOOL_FEATURE: &str = "client_side_tools";
 
@@ -164,6 +165,13 @@ pub enum InferenceErrorClass {
     ProviderNotConfigured,
     /// Provider reported a rate or usage limit without a concrete HTTP class.
     ProviderRateLimit,
+    /// Provider reported billing or account-quota exhaustion (an out-of-balance
+    /// account or an exhausted resource package), as distinct from a transient
+    /// throttle. Deliberately provider-neutral and data-free: it carries no
+    /// provider body text, provider code, account identifier, balance, or
+    /// limit. The observed HTTP status (often 429) is retained separately on
+    /// core's diagnostic record, not on this semantic class.
+    BillingOrQuotaExhausted,
     /// A message wire field had no renderer for an untrusted dispatch — a
     /// non-renderable media source (`Raw`/`FileId`/`Unknown`) on a route that
     /// must redact. The provider was never contacted; the dispatch fails
@@ -187,6 +195,7 @@ impl InferenceErrorClass {
             Self::ResponsesToolIdentity => CLASS_RESPONSES_TOOL_IDENTITY.to_string(),
             Self::ProviderNotConfigured => CLASS_PROVIDER_NOT_CONFIGURED.to_string(),
             Self::ProviderRateLimit => CLASS_PROVIDER_RATE_LIMIT.to_string(),
+            Self::BillingOrQuotaExhausted => CLASS_BILLING_OR_QUOTA_EXHAUSTED.to_string(),
             Self::UnrenderableWireField => CLASS_UNRENDERABLE_WIRE_FIELD.to_string(),
             Self::Other(value) => value.clone(),
         }
@@ -226,6 +235,7 @@ impl FromStr for InferenceErrorClass {
             CLASS_RESPONSES_TOOL_IDENTITY => Self::ResponsesToolIdentity,
             CLASS_PROVIDER_NOT_CONFIGURED => Self::ProviderNotConfigured,
             CLASS_PROVIDER_RATE_LIMIT => Self::ProviderRateLimit,
+            CLASS_BILLING_OR_QUOTA_EXHAUSTED => Self::BillingOrQuotaExhausted,
             CLASS_UNRENDERABLE_WIRE_FIELD => Self::UnrenderableWireField,
             value => match value
                 .strip_prefix(CLASS_HTTP_PREFIX)
@@ -304,6 +314,7 @@ impl<'de> Deserialize<'de> for InferenceErrorClass {
             CLASS_RESPONSES_TOOL_IDENTITY => Ok(Self::ResponsesToolIdentity),
             CLASS_PROVIDER_NOT_CONFIGURED => Ok(Self::ProviderNotConfigured),
             CLASS_PROVIDER_RATE_LIMIT => Ok(Self::ProviderRateLimit),
+            CLASS_BILLING_OR_QUOTA_EXHAUSTED => Ok(Self::BillingOrQuotaExhausted),
             CLASS_UNRENDERABLE_WIRE_FIELD => Ok(Self::UnrenderableWireField),
             other => Ok(Self::Other(other.to_string())),
         }
@@ -352,6 +363,10 @@ mod error_class_wire_tests {
             (
                 InferenceErrorClass::ProviderRateLimit,
                 json!("provider_rate_limit"),
+            ),
+            (
+                InferenceErrorClass::BillingOrQuotaExhausted,
+                json!("billing_or_quota_exhausted"),
             ),
             (
                 InferenceErrorClass::UnrenderableWireField,
@@ -431,6 +446,44 @@ mod error_class_wire_tests {
         );
         let parsed = serde_json::from_value::<Event>(json.clone()).unwrap();
         assert_eq!(serde_json::to_value(parsed).unwrap(), json);
+    }
+
+    #[test]
+    fn error_class_wire_billing_or_quota_exhausted_round_trips() {
+        let class = InferenceErrorClass::BillingOrQuotaExhausted;
+
+        // Stable string surfaces: as_str, Display, and JSON are the exact wire
+        // token, and the semantic class exposes no HTTP status (the observed
+        // 429 lives on core's diagnostic record, not here).
+        assert_eq!(class.as_str(), "billing_or_quota_exhausted");
+        assert_eq!(class.to_string(), "billing_or_quota_exhausted");
+        assert_eq!(class.provider_status(), None);
+
+        // Serialize is the bare stable string, not an object.
+        let json = serde_json::to_string(&class).unwrap();
+        assert_eq!(json, "\"billing_or_quota_exhausted\"");
+
+        // The stable string deserializes back to exactly the new variant
+        // through the real serde path.
+        let parsed: InferenceErrorClass = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, InferenceErrorClass::BillingOrQuotaExhausted);
+
+        // FromStr resolves the token to the closed variant, not Other(_).
+        assert_eq!(
+            "billing_or_quota_exhausted"
+                .parse::<InferenceErrorClass>()
+                .unwrap(),
+            InferenceErrorClass::BillingOrQuotaExhausted
+        );
+
+        // A bare 429 is NOT reclassified as billing/quota exhaustion at this
+        // boundary: it deserializes to Http(429) and keeps its provider_status,
+        // which the billing/quota class must never claim.
+        let http_429: InferenceErrorClass =
+            serde_json::from_value(json!({ "kind": "http", "status": 429 })).unwrap();
+        assert_eq!(http_429, InferenceErrorClass::Http(429));
+        assert_ne!(http_429, InferenceErrorClass::BillingOrQuotaExhausted);
+        assert_eq!(http_429.provider_status(), Some(429));
     }
 
     #[test]

@@ -56,6 +56,8 @@ pub struct SnapshotCell {
     pub col: u16,
     pub text: String,
     pub inverse: bool,
+    /// Indexed SGR foreground, when the cell is not the default color.
+    pub fg_index: Option<u8>,
 }
 
 impl ScreenSnapshot {
@@ -74,15 +76,23 @@ impl ScreenSnapshot {
         let mut cells = Vec::with_capacity(usize::from(rows) * usize::from(cols));
         for row in 0..rows {
             for col in 0..cols {
-                let (text, inverse) = match screen.cell(row, col) {
-                    Some(cell) => (cell.contents().to_string(), cell.inverse()),
-                    None => (String::new(), false),
+                let (text, inverse, fg_index) = match screen.cell(row, col) {
+                    Some(cell) => (
+                        cell.contents().to_string(),
+                        cell.inverse(),
+                        match cell.fgcolor() {
+                            vt100::Color::Idx(idx) => Some(idx),
+                            _ => None,
+                        },
+                    ),
+                    None => (String::new(), false, None),
                 };
                 cells.push(SnapshotCell {
                     row,
                     col,
                     text,
                     inverse,
+                    fg_index,
                 });
             }
         }
@@ -152,20 +162,60 @@ impl ScreenSnapshot {
     }
 
     pub fn find_text(&self, needle: &str) -> Option<CellPos> {
+        self.find_text_span(needle).map(|(start, _)| start)
+    }
+
+    /// Inclusive start/end cells of a contiguous `needle` on one row.
+    pub fn find_text_span(&self, needle: &str) -> Option<(CellPos, CellPos)> {
         if needle.is_empty() {
             return None;
         }
         let chars: Vec<char> = needle.chars().collect();
+        let last = u16::try_from(chars.len().saturating_sub(1)).ok()?;
         for row in 0..self.rows {
             let mut col = 0u16;
             while col < self.cols {
                 if self.row_matches(row, col, &chars) {
-                    return Some(CellPos { row, col });
+                    return Some((
+                        CellPos { row, col },
+                        CellPos {
+                            row,
+                            col: col.saturating_add(last),
+                        },
+                    ));
                 }
                 col = col.saturating_add(1);
             }
         }
         None
+    }
+
+    pub fn has_inverse(&self) -> bool {
+        self.cells.iter().any(|cell| cell.inverse)
+    }
+
+    pub fn inverse_cells(&self) -> impl Iterator<Item = &SnapshotCell> {
+        self.cells.iter().filter(|cell| cell.inverse)
+    }
+
+    /// First non-whitespace cell and last non-whitespace cell on `row`.
+    pub fn row_content_span(&self, row: u16) -> Option<(CellPos, CellPos)> {
+        let mut first = None;
+        let mut last = None;
+        for col in 0..self.cols {
+            let Some(cell) = self.cell_at(row, col) else {
+                continue;
+            };
+            if cell.text.chars().all(char::is_whitespace) {
+                continue;
+            }
+            let pos = CellPos { row, col };
+            if first.is_none() {
+                first = Some(pos);
+            }
+            last = Some(pos);
+        }
+        Some((first?, last?))
     }
 
     fn row_matches(&self, row: u16, start_col: u16, needle: &[char]) -> bool {

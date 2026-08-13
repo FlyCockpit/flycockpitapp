@@ -250,6 +250,7 @@ pub struct HermeticLaunchSpec {
     xdg_cache_home: PathBuf,
     project: PathBuf,
     profile: HermeticProfile,
+    extra_env: Vec<(String, String)>,
 }
 
 impl HermeticLaunchSpec {
@@ -264,6 +265,7 @@ impl HermeticLaunchSpec {
             xdg_cache_home: home.xdg_cache_home().to_path_buf(),
             project: home.project_path().to_path_buf(),
             profile,
+            extra_env: Vec::new(),
         }
     }
 
@@ -288,7 +290,7 @@ impl HermeticLaunchSpec {
     }
 
     pub fn subprocess_env(&self) -> Vec<(String, String)> {
-        vec![
+        let mut env = vec![
             ("HOME".into(), self.home.display().to_string()),
             (
                 "XDG_CONFIG_HOME".into(),
@@ -313,7 +315,9 @@ impl HermeticLaunchSpec {
             ("TERM".into(), HERMETIC_TERM.into()),
             ("LANG".into(), HERMETIC_LOCALE.into()),
             ("LC_ALL".into(), HERMETIC_LOCALE.into()),
-        ]
+        ];
+        env.extend(self.extra_env.iter().cloned());
+        env
     }
 
     pub fn pty_env(&self) -> Vec<(String, String)> {
@@ -420,6 +424,8 @@ pub struct HermeticCockpit {
     reaped_pty_pid: Option<u32>,
     reaped_daemon_pid: Option<u32>,
     pty: Option<PtyHandles>,
+    #[cfg(target_os = "linux")]
+    _secret_service: Option<super::MockSecretService>,
 }
 
 impl HermeticCockpit {
@@ -443,6 +449,8 @@ impl HermeticCockpit {
             reaped_pty_pid: None,
             reaped_daemon_pid: None,
             pty: None,
+            #[cfg(target_os = "linux")]
+            _secret_service: None,
         }
     }
 
@@ -471,6 +479,19 @@ impl HermeticCockpit {
     pub fn home(&self) -> &IsolatedHome {
         &self.home
     }
+
+    /// Start a private-bus Secret Service so the isolated daemon can attach.
+    #[cfg(target_os = "linux")]
+    pub fn enable_isolated_secret_service(&mut self) {
+        let service = super::start_mock_secret_service();
+        self.spec
+            .extra_env
+            .push(("DBUS_SESSION_BUS_ADDRESS".into(), service.address.clone()));
+        self._secret_service = Some(service);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn enable_isolated_secret_service(&mut self) {}
 
     pub fn project_path(&self) -> &Path {
         self.home.project_path()

@@ -16,6 +16,8 @@ use cockpit_cli::integration::{DaemonClient, DaemonStatus};
 
 #[cfg(unix)]
 mod hermetic;
+#[cfg(target_os = "linux")]
+mod mock_secret_service;
 #[cfg(unix)]
 mod osc52_observer;
 #[cfg(unix)]
@@ -23,6 +25,8 @@ mod tui_pty;
 
 #[cfg(unix)]
 pub use hermetic::*;
+#[cfg(target_os = "linux")]
+pub use mock_secret_service::*;
 #[cfg(unix)]
 pub use osc52_observer::*;
 #[cfg(unix)]
@@ -155,6 +159,38 @@ impl IsolatedHome {
             ),
         )
         .expect("write integration provider config");
+    }
+
+    /// Merge mouse-copy TUI flags into the isolated `config.json` written by
+    /// [`Self::write_local_provider_config`]. Call after pointing the local
+    /// provider at a loopback scripted listener.
+    pub fn merge_tui_mouse_copy_config(&self) {
+        let path = self.config_dir().join("config.json");
+        let raw = std::fs::read_to_string(&path).expect("read isolated config.json");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&raw).expect("parse isolated config.json");
+        let object = value
+            .as_object_mut()
+            .expect("isolated config.json must be an object");
+        object.insert(
+            "tui".into(),
+            serde_json::json!({
+                "mouse_capture": true,
+                "copy_on_release": true
+            }),
+        );
+        std::fs::write(
+            &path,
+            serde_json::to_string(&value).expect("serialize merged config.json"),
+        )
+        .expect("write merged isolated config.json");
+    }
+
+    /// Rewrite the dummy local provider to `base_url` and enable mouse capture
+    /// plus copy-on-release in `HOME/.config/cockpit/config.json`.
+    pub fn write_scripted_provider_with_tui_mouse(&self, base_url: &str) {
+        self.write_local_provider_config(base_url);
+        self.merge_tui_mouse_copy_config();
     }
 
     pub fn trust_project(&self) {

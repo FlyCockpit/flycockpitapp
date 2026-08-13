@@ -22,6 +22,8 @@ mod multi_client_queue;
 #[cfg(unix)]
 mod run_noninteractive;
 #[cfg(unix)]
+mod tui_mouse_gesture_pty;
+#[cfg(unix)]
 mod tui_pty_fixture;
 #[cfg(unix)]
 mod tui_pty_mouse;

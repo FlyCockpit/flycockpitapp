@@ -8652,7 +8652,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         "register_local_path_media" | "retain_https_media" => {
             AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
         }
-        "list_leak_reports" | "reveal_leak_report_secret" => AuthzAllowedOutcome::Response,
+        "list_leak_reports" => AuthzAllowedOutcome::Response,
         // These leak commands pass the owner-only gate, then the dispatch handler
         // maps a missing leak record (existence-hiding) to `Authorization`
         // "unauthorized" for the bogus report id used by the matrix request.
@@ -8787,7 +8787,6 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("retain_https_media"),
         authz_owner_only("list_leak_reports"),
         authz_owner_only("begin_leak_reveal"),
-        authz_owner_only("reveal_leak_report_secret"),
         authz_owner_only("mark_leak_rotated"),
         authz_owner_only("delete_leak_report"),
         authz_project_read("guidance_estimate"),
@@ -10059,12 +10058,10 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             limit: None,
             project_root: None,
             session_id: None,
+            rotation: None,
         },
         "begin_leak_reveal" => Request::BeginLeakReveal {
             report_id: "missing".into(),
-        },
-        "reveal_leak_report_secret" => Request::RevealLeakReportSecret {
-            capability: "authz-capability-token".into(),
         },
         "mark_leak_rotated" => Request::MarkLeakRotated {
             report_id: "missing".into(),
@@ -16015,6 +16012,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 limit: None,
                 project_root: None,
                 session_id: None,
+                rotation: None,
             },
             kind: "list_leak_reports",
             session_id: None,
@@ -16026,15 +16024,6 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                 report_id: "report".into(),
             },
             kind: "begin_leak_reveal",
-            session_id: None,
-            audit_path: None,
-            mutating: false,
-        },
-        CommandMetadataCase {
-            request: Request::RevealLeakReportSecret {
-                capability: "capability".into(),
-            },
-            kind: "reveal_leak_report_secret",
             session_id: None,
             audit_path: None,
             mutating: false,
@@ -16482,7 +16471,6 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         DeleteSealedValue,
         ListLeakReports,
         BeginLeakReveal,
-        RevealLeakReportSecret,
         MarkLeakRotated,
         DeleteLeakReport,
         ListProjectNotes,
@@ -20190,6 +20178,8 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         process_containment: None,
         write_scope: None,
         _process_containment_actor: None,
+        leak_reveal_state: base.leak_reveal_state.clone(),
+        leak_cursor_key: base.leak_cursor_key,
     });
     let client = crate::daemon::client::DaemonClient::from_in_process(ctx.clone());
 
@@ -20269,6 +20259,8 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         process_containment: None,
         write_scope: None,
         _process_containment_actor: None,
+        leak_reveal_state: base.leak_reveal_state.clone(),
+        leak_cursor_key: base.leak_cursor_key,
     });
     let client = crate::daemon::client::DaemonClient::from_in_process(ctx.clone());
 

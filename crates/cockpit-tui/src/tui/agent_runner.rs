@@ -2696,6 +2696,30 @@ pub fn daemon_request_at_blocking(socket: &Path, req: Request) -> Result<Respons
     })
 }
 
+/// Reveal a leak secret over the sensitive local channel (in-process handoff or
+/// the Unix peer-authenticated reveal socket, chosen off the control socket).
+/// Returns the revealed `Zeroizing` plaintext **directly** to the caller — it
+/// never rides an `AsyncActionPayload` or any ordinary daemon codec.
+pub fn daemon_reveal_leak_blocking(
+    control_socket: &Path,
+    capability: &str,
+) -> Result<
+    cockpit_core::daemon::leak_reveal::RevealedLeakSecret,
+    cockpit_core::daemon::leak_reveal::LeakRevealDenied,
+> {
+    let runtime = match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => runtime,
+        Err(_) => return Err(cockpit_core::daemon::leak_reveal::LeakRevealDenied::UnavailablePlatform),
+    };
+    let socket = control_socket.to_path_buf();
+    let capability = capability.to_owned();
+    tokio::task::block_in_place(|| {
+        runtime.block_on(async move {
+            cockpit_core::daemon::leak_reveal::reveal_leak_secret(&socket, &capability).await
+        })
+    })
+}
+
 /// Run one request-response RPC against the daemon at `socket`. Unlike
 /// [`daemon_request_blocking`] (which probes the *canonical* daemon paths),
 /// this targets a specific socket — the one the live runner is attached to.

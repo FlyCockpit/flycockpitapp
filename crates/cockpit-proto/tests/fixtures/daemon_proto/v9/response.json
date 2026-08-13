@@ -1187,10 +1187,6 @@
     },
     "response": "leak_reveal_capability"
   },
-  "leak_revealed_secret": {
-    "data": { "generation": 1, "report_id": "leak-1" },
-    "response": "leak_revealed_secret"
-  },
   "leak_rotation_updated": {
     "data": { "report_id": "leak-1", "rotation": "accept" },
     "response": "leak_rotation_updated"

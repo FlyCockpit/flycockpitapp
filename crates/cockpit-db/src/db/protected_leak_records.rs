@@ -345,22 +345,39 @@ impl Db {
             .await
     }
 
-    /// Machine-wide Owner list of safe leak-record refs, newest-first, with
-    /// stable paging. Optional `session_filter` narrows to one session
-    /// without changing ownership scope; `None` means all Owner-visible
-    /// machine records. The cursor is the opaque `(last_seen_ms, report_id)`
-    /// pair from the prior page's last row; `None` starts a new traversal.
-    /// Only `contained`/`rotated`/`superseded` rows are listable.
-    pub async fn protected_leak_records_machine_refs(
+    /// Compute the machine-wide leak-list snapshot high watermark: the maximum
+    /// `last_reported_ms` over listable rows matching `filters`, or `0` when no
+    /// row matches. Bound into the first-page cursor so concurrent inserts and
+    /// re-reports (which advance `last_reported_ms`) never shift, duplicate, or
+    /// skip a snapshot page chain.
+    pub async fn protected_leak_records_watermark(&self, filters: LeakListFilters) -> Result<i64> {
+        self.read(move |conn| watermark_conn(conn, &filters)).await
+    }
+
+    /// One page of the machine-wide Owner leak list, newest-first, constrained
+    /// to `last_reported_ms <= snapshot_high_watermark`. Optional filters narrow
+    /// to a session, a `project_root` (joined via the `sessions` table), and/or
+    /// a rotation state without changing ownership scope. The cursor is the
+    /// opaque `(last_seen_ms, report_id)` pair from the prior page's last row;
+    /// `None` starts the traversal. Only `contained`/`rotated`/`superseded`
+    /// rows are listable. `fetch_limit` is the raw row cap the caller passes —
+    /// callers wanting a `has_more` signal pass `limit + 1` and truncate.
+    pub async fn protected_leak_records_machine_page(
         &self,
-        session_filter: Option<&str>,
+        filters: LeakListFilters,
+        snapshot_high_watermark: i64,
         cursor: Option<LeakListCursor>,
-        limit: i64,
+        fetch_limit: i64,
     ) -> Result<Vec<ProtectedLeakRecordRef>> {
-        let session_filter = session_filter.map(str::to_owned);
         let cursor = cursor.map(|c| (c.last_seen_ms, c.report_id));
         self.read(move |conn| {
-            list_machine_refs_conn(conn, session_filter.as_deref(), cursor.as_ref(), limit)
+            list_machine_refs_conn(
+                conn,
+                &filters,
+                snapshot_high_watermark,
+                cursor.as_ref(),
+                fetch_limit,
+            )
         })
         .await
     }
@@ -379,16 +396,22 @@ impl Db {
 
     /// Delete the protected plaintext/ciphertext for a leak record while
     /// retaining safe historical report metadata. Sets status to `deleted`,
-    /// stamps `retired_at_ms`, and retires the protected-redaction-history
+    /// stamps `retired_at_ms`, and force-retires the protected-redaction-history
     /// row so future recovery fails closed. The safe report metadata
     /// (source, category, provenance, timestamps, rotation) is retained.
+    ///
+    /// Runs inside a single [`Db::transaction`] so the history force-retire
+    /// (zeroing) and the leak-record status update commit together or not at
+    /// all: a crash/error between them can never leave a zeroed history row
+    /// paired with a still-`contained`, still-listable report (AC9
+    /// crash-safety).
     pub async fn protected_leak_record_delete_protected_value(
         &self,
         report_id: &str,
         now_ms: i64,
     ) -> Result<()> {
         let report_id = report_id.to_owned();
-        self.write(move |conn| delete_protected_value_conn(conn, &report_id, now_ms))
+        self.transaction(move |conn| delete_protected_value_conn(conn, &report_id, now_ms))
             .await
     }
 }
@@ -401,6 +424,51 @@ impl Db {
 pub struct LeakListCursor {
     pub last_seen_ms: i64,
     pub report_id: String,
+}
+
+/// Filters for the machine-wide leak list. All three narrow the listable set
+/// without changing ownership scope; `None` on each is "no narrowing". The
+/// `project_root` filter is honored via a join against the `sessions` table
+/// (`session_id IN (SELECT session_id FROM sessions WHERE project_root = ?)`),
+/// so records whose originating session row no longer exists are excluded by a
+/// `project_root` filter but remain in the machine-wide default.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LeakListFilters {
+    pub session_filter: Option<String>,
+    pub project_root: Option<String>,
+    pub rotation: Option<LeakRotation>,
+}
+
+impl LeakListFilters {
+    /// Append the shared `WHERE` predicates (status + optional filters) for the
+    /// listable-rows query onto `sql`, pushing bound values onto `params_vec`.
+    /// `next_index` is advanced past each placeholder consumed. The status
+    /// predicate is always emitted; the caller has already opened the clause.
+    fn push_predicates(
+        &self,
+        sql: &mut String,
+        params_vec: &mut Vec<rusqlite::types::Value>,
+        next_index: &mut usize,
+    ) {
+        if let Some(sid) = &self.session_filter {
+            sql.push_str(&format!(" AND session_id = ?{}", *next_index));
+            params_vec.push(rusqlite::types::Value::from(sid.clone()));
+            *next_index += 1;
+        }
+        if let Some(root) = &self.project_root {
+            sql.push_str(&format!(
+                " AND session_id IN (SELECT session_id FROM sessions WHERE project_root = ?{})",
+                *next_index
+            ));
+            params_vec.push(rusqlite::types::Value::from(root.clone()));
+            *next_index += 1;
+        }
+        if let Some(rotation) = self.rotation {
+            sql.push_str(&format!(" AND rotation = ?{}", *next_index));
+            params_vec.push(rusqlite::types::Value::from(rotation.as_str().to_owned()));
+            *next_index += 1;
+        }
+    }
 }
 
 // ---- Connection-scoped writers (compose inside one transaction) ------------
@@ -529,14 +597,20 @@ pub fn set_rotation_conn(conn: &Connection, report_id: &str, rotation: LeakRotat
 
 /// Delete the protected plaintext/ciphertext for a leak record while
 /// retaining safe historical report metadata. Sets status to `deleted`,
-/// stamps `retired_at_ms`, and retires the protected-redaction-history row so
-/// future recovery fails closed. The safe report metadata is retained.
-/// Connection-scoped so callers compose it inside one transaction with the
-/// history retirement.
+/// stamps `retired_at_ms`, and **force-retires** the protected-redaction-history
+/// row (zeroing ciphertext/nonce/AEAD-tag/fingerprint) so future recovery fails
+/// closed — **regardless of live artifact references**. Artifact refs may keep
+/// pointing at the zeroed row; every artifact-side rehydrate then fails closed.
+/// The safe report metadata (source, category, provenance, timestamps,
+/// rotation) is retained. No error path references a reference count.
+///
+/// Connection-scoped so the history force-retire and the leak-record status
+/// update commit in one transaction (crash-safe: neither the zeroing nor the
+/// status change survives a rollback).
 pub fn delete_protected_value_conn(conn: &Connection, report_id: &str, now_ms: i64) -> Result<()> {
     let row = get_leak_record_conn(conn, report_id)?
         .ok_or_else(|| anyhow::anyhow!("protected leak record not found: {report_id}"))?;
-    crate::db::protected_redaction_history::retire_history_conn(conn, &row.history_id)?;
+    crate::db::protected_redaction_history::force_retire_history_conn(conn, &row.history_id)?;
     let n = conn
         .execute(
             "UPDATE protected_leak_records
@@ -645,18 +719,38 @@ pub fn count_recent_conn(conn: &Connection, session_id: &str, since_ms: i64) -> 
     .context("counting recent protected leak records")
 }
 
-/// Machine-wide Owner list of safe leak-record refs, newest-first, with
-/// stable paging. Optional `session_filter` narrows to one session without
-/// changing ownership scope. The cursor is the opaque
-/// `(last_seen_ms, report_id)` pair from the prior page's last row; `None`
-/// starts a new traversal. Only `contained`/`rotated`/`superseded` rows are
-/// listable. `limit` is clamped to 1..=100 by the caller; this function
-/// trusts the caller's bound.
+/// Compute the snapshot high watermark (`MAX(last_reported_ms)`, or `0` when
+/// empty) over listable rows matching `filters`.
+pub fn watermark_conn(conn: &Connection, filters: &LeakListFilters) -> Result<i64> {
+    let mut sql = String::from(
+        "SELECT COALESCE(MAX(last_reported_ms), 0)
+         FROM protected_leak_records
+         WHERE status IN ('contained', 'rotated', 'superseded')",
+    );
+    let mut param_index = 1usize;
+    let mut params_vec: Vec<rusqlite::types::Value> = Vec::new();
+    filters.push_predicates(&mut sql, &mut params_vec, &mut param_index);
+    let params: Vec<&dyn rusqlite::ToSql> = params_vec
+        .iter()
+        .map(|v| v as &dyn rusqlite::ToSql)
+        .collect();
+    conn.query_row(&sql, params.as_slice(), |row| row.get(0))
+        .context("computing protected leak record watermark")
+}
+
+/// Machine-wide Owner list of safe leak-record refs, newest-first, constrained
+/// to `last_reported_ms <= snapshot_high_watermark`. Filters narrow to a
+/// session, `project_root` (sessions join), and/or rotation state. The cursor
+/// is the opaque `(last_seen_ms, report_id)` pair from the prior page's last
+/// row; `None` starts a new traversal. Only `contained`/`rotated`/`superseded`
+/// rows are listable. `fetch_limit` is the raw row cap (callers pass `limit+1`
+/// to detect `has_more`).
 pub fn list_machine_refs_conn(
     conn: &Connection,
-    session_filter: Option<&str>,
+    filters: &LeakListFilters,
+    snapshot_high_watermark: i64,
     cursor: Option<&(i64, String)>,
-    limit: i64,
+    fetch_limit: i64,
 ) -> Result<Vec<ProtectedLeakRecordRef>> {
     let mut sql = String::from(
         "SELECT report_id, session_id, history_id, leak_fingerprint, source, category,
@@ -665,14 +759,17 @@ pub fn list_machine_refs_conn(
          FROM protected_leak_records
          WHERE status IN ('contained', 'rotated', 'superseded')",
     );
-    let mut param_index = 1;
+    let mut param_index = 1usize;
     let mut params_vec: Vec<rusqlite::types::Value> = Vec::new();
 
-    if let Some(sid) = session_filter {
-        sql.push_str(&format!(" AND session_id = ?{param_index}"));
-        params_vec.push(rusqlite::types::Value::from(sid.to_owned()));
-        param_index += 1;
-    }
+    // Snapshot watermark: rows newer than the first-page high watermark never
+    // appear in this page chain.
+    sql.push_str(&format!(" AND last_reported_ms <= ?{param_index}"));
+    params_vec.push(rusqlite::types::Value::from(snapshot_high_watermark));
+    param_index += 1;
+
+    filters.push_predicates(&mut sql, &mut params_vec, &mut param_index);
+
     if let Some((last_seen_ms, report_id)) = cursor {
         sql.push_str(&format!(
             " AND (last_reported_ms < ?{param_index} OR (last_reported_ms = ?{param_index} AND report_id < ?{}))",
@@ -685,7 +782,7 @@ pub fn list_machine_refs_conn(
     sql.push_str(&format!(
         " ORDER BY last_reported_ms DESC, report_id DESC LIMIT ?{param_index}"
     ));
-    params_vec.push(rusqlite::types::Value::from(limit));
+    params_vec.push(rusqlite::types::Value::from(fetch_limit));
 
     let mut stmt = conn.prepare(&sql)?;
     let params: Vec<&dyn rusqlite::ToSql> = params_vec
@@ -976,5 +1073,158 @@ mod tests {
         // Now listable.
         let refs = db.protected_leak_records_refs(session_id()).await.unwrap();
         assert_eq!(refs.len(), 1);
+    }
+
+    /// AC9 (db half): deleting a leak record whose history row still has a live
+    /// artifact reference zeroes ciphertext/nonce/fingerprint in the same
+    /// committed transaction (force-retire), stamps `retired_at_ms`, and marks
+    /// the leak record `deleted` while retaining safe metadata — despite the
+    /// ref. This fails against the old stamp-only `retire_history_conn`, which
+    /// bailed on live references and never zeroed the ciphertext.
+    #[tokio::test]
+    async fn leak_delete_zeroes_ciphertext_despite_refs() {
+        use crate::db::protected_redaction_history::{
+            ProtectedRedactionArtifactKind, attach_artifact_ref_conn, get_history_conn,
+        };
+        let db = test_db();
+        seed_session(&db).await;
+        // Seed the history row through the real append path with NON-ZERO
+        // ciphertext/nonce so the "zeroed after delete" assertions are
+        // meaningful (the module's `append_history` helper uses all-zero
+        // ciphertext, which would make the zeroing check vacuous).
+        let history_id = db
+            .write(move |conn| {
+                let input = ProtectedRedactionHistoryAppend {
+                    session_id: session_id().to_owned(),
+                    sealed_record_id: None,
+                    sealed_version: None,
+                    source: ProtectedRedactionSource::ContainedLeak,
+                    fingerprint: "be".repeat(32),
+                    // 272 = smallest bucket (256) + 16-byte AEAD tag.
+                    ciphertext: vec![0xABu8; 272],
+                    nonce: vec![0xCDu8; 12],
+                    key_version: 1,
+                };
+                let r = append_history_conn(conn, &input)?;
+                Ok(match r {
+                    AppendHistoryResult::Created { history_id } => history_id,
+                    AppendHistoryResult::Existing { history_id } => history_id,
+                })
+            })
+            .await
+            .unwrap();
+
+        // Link a leak record to that history row.
+        let input = InsertLeakRecordInput {
+            report_id: String::new(),
+            session_id: session_id().to_owned(),
+            history_id: history_id.clone(),
+            leak_fingerprint: "beadfeed".to_owned(),
+            source: LeakSource::CredentialLeak,
+            category: LeakCategory::Password,
+            provenance: LeakProvenance::default(),
+            status: LeakRecordStatus::Contained,
+            now_ms: 1000,
+        };
+        let report_id = db
+            .write(move |conn| {
+                let r = insert_leak_record_conn(conn, &input)?;
+                Ok(match r {
+                    InsertLeakResult::Created { report_id } => report_id,
+                    InsertLeakResult::Existing { report_id, .. } => report_id,
+                })
+            })
+            .await
+            .unwrap();
+
+        // Attach a live artifact reference to the history row (ref_count = 1).
+        let hid = history_id.clone();
+        db.write(move |conn| {
+            attach_artifact_ref_conn(conn, ProtectedRedactionArtifactKind::Request, "req-1", &hid)
+        })
+        .await
+        .unwrap();
+        let hid = history_id.clone();
+        let before = db
+            .read(move |conn| get_history_conn(conn, &hid))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.ref_count, 1, "precondition: a live artifact ref");
+        assert!(
+            before.ciphertext.iter().any(|&b| b != 0),
+            "precondition: ciphertext is non-zero before delete"
+        );
+
+        // Atomicity: a failure AFTER the force-retire (inside one transaction)
+        // must roll BOTH the history zeroing and the leak-record status change
+        // back — never a zeroed history paired with a still-contained report.
+        let rid = report_id.clone();
+        let rolled: Result<()> = db
+            .transaction(move |conn| {
+                delete_protected_value_conn(conn, &rid, 1500)?;
+                bail!("injected failure after delete within the transaction");
+            })
+            .await;
+        assert!(rolled.is_err());
+        let hid = history_id.clone();
+        let rb = db
+            .read(move |conn| get_history_conn(conn, &hid))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(rb.retired_at_ms.is_none(), "delete must have rolled back");
+        assert!(
+            rb.ciphertext.iter().any(|&b| b != 0),
+            "ciphertext must be intact after rollback"
+        );
+        let rec = db
+            .protected_leak_record_get(&report_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rec.status,
+            LeakRecordStatus::Contained,
+            "leak record must remain contained after rollback"
+        );
+
+        // Delete succeeds despite the live reference — drives the transactional
+        // PRODUCTION path (`Db::transaction` composes both UPDATEs atomically).
+        db.protected_leak_record_delete_protected_value(&report_id, 2000)
+            .await
+            .unwrap();
+
+        // History row: ciphertext/nonce/fingerprint zeroed, retired stamped.
+        let hid = history_id.clone();
+        let after = db
+            .read(move |conn| get_history_conn(conn, &hid))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(after.retired_at_ms.is_some());
+        assert_eq!(after.ciphertext.len(), before.ciphertext.len());
+        assert!(after.ciphertext.iter().all(|&b| b == 0), "ciphertext zeroed");
+        assert_eq!(after.nonce, vec![0u8; 12]);
+        assert_eq!(after.fingerprint, "0".repeat(64));
+        // Schema invariant: a retired row carries ref_count 0 even though it was
+        // force-retired with a live artifact ref (the ref row is now orphaned).
+        assert_eq!(after.ref_count, 0, "retired row must have ref_count 0");
+
+        // Leak record: deleted, retired, safe metadata retained.
+        let record = db
+            .protected_leak_record_get(&report_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.status, LeakRecordStatus::Deleted);
+        assert!(record.retired_at_ms.is_some());
+        assert_eq!(record.source, LeakSource::CredentialLeak);
+        assert_eq!(record.category, LeakCategory::Password);
+
+        // Idempotent: a second delete succeeds via the production path.
+        db.protected_leak_record_delete_protected_value(&report_id, 3000)
+            .await
+            .unwrap();
     }
 }

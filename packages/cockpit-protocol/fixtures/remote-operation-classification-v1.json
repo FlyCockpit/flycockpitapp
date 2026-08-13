@@ -623,7 +623,7 @@
     {
       "class": "local_only",
       "evidence": null,
-      "fcorCanonicalSchema": "cursor:option<string>|limit:option<u32>|project_root:option<string>|session_id:option<uuid>",
+      "fcorCanonicalSchema": "cursor:option<string>|limit:option<u32>|project_root:option<string>|session_id:option<uuid>|rotation:option<enum16:LeakRotationState>",
       "fcorRoles": [
         {
           "field": "cursor",
@@ -644,9 +644,14 @@
           "field": "session_id",
           "role": "param",
           "type": "Option<Uuid>"
+        },
+        {
+          "field": "rotation",
+          "role": "param",
+          "type": "Option<LeakRotationState>"
         }
       ],
-      "fcorSchema": "cursor:Option<String>|limit:Option<u32>|project_root:Option<String>|session_id:Option<Uuid>",
+      "fcorSchema": "cursor:Option<String>|limit:Option<u32>|project_root:Option<String>|session_id:Option<Uuid>|rotation:Option<LeakRotationState>",
       "strategy": "none",
       "tag": "list_leak_reports"
     },
@@ -664,21 +669,6 @@
       "fcorSchema": "report_id:String",
       "strategy": "none",
       "tag": "begin_leak_reveal"
-    },
-    {
-      "class": "local_only",
-      "evidence": null,
-      "fcorCanonicalSchema": "capability:string",
-      "fcorRoles": [
-        {
-          "field": "capability",
-          "role": "param",
-          "type": "String"
-        }
-      ],
-      "fcorSchema": "capability:String",
-      "strategy": "none",
-      "tag": "reveal_leak_report_secret"
     },
     {
       "class": "local_only",

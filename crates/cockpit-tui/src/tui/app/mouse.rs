@@ -349,6 +349,7 @@ impl App {
                 }
                 return;
             }
+            Overlay::Leaks(_) => return,
             Overlay::ModelPicker(_)
             | Overlay::Multireview(_)
             | Overlay::Usage(_)
@@ -779,6 +780,7 @@ impl App {
                     | Overlay::Permissions(_)
                     | Overlay::Context(_)
                     | Overlay::Notes(_)
+                    | Overlay::Leaks(_)
                     | Overlay::Diff(_)
             )
             || self.pane.is_some()

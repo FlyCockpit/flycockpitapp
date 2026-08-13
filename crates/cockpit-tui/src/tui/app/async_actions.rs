@@ -737,6 +737,16 @@ impl App {
                     pane.apply_rpc_result(payload);
                 }
             }
+            AsyncActionKind::Internal("leaks.rpc") => {
+                if let Overlay::Leaks(pane) = &mut self.overlay {
+                    let payload = match result.payload {
+                        Ok(AsyncActionPayload::LeaksRpc(result)) => Ok(result),
+                        Ok(_) => Err("leaks daemon returned an unexpected response".to_string()),
+                        Err(e) => Err(e),
+                    };
+                    pane.apply_rpc_result(payload);
+                }
+            }
             AsyncActionKind::DaemonRpc(
                 "goal.create" | "goal.disposition" | "goal.set" | "goal.clear",
             ) => match result.payload {

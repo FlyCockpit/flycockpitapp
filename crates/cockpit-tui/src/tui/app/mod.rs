@@ -1179,6 +1179,7 @@ pub(super) enum Overlay {
     Quick(crate::tui::quick_dialog::QuickDialog),
     Context(crate::tui::context_pane::ContextPane),
     Notes(crate::tui::notes_pane::NotesPane),
+    Leaks(crate::tui::leaks_pane::LeaksPane),
     Diff(crate::tui::diff_pane::DiffPane),
     Help(help_overlay::HelpOverlay),
 }
@@ -1215,6 +1216,7 @@ impl Overlay {
             | Self::Tools(_)
             | Self::GoalSettings(_)
             | Self::Context(_)
+            | Self::Leaks(_)
             | Self::Help(_) => None,
         }
     }
@@ -2091,6 +2093,11 @@ pub struct App {
     /// reset and needs the event loop's terminal handle to invalidate the
     /// alt-screen buffers. Attach failures never set this latch.
     pub(super) new_session_terminal_clear_pending: bool,
+    /// Set when the `/leaks` reveal buffer is zeroized (close/hide/detach) and
+    /// the alt-screen backbuffer must be fully cleared so the revealed plaintext
+    /// can't persist in stale cells. Serviced in the event loop where the
+    /// terminal handle is available (mirrors `new_session_terminal_clear_pending`).
+    pub(super) leaks_reveal_clear_pending: bool,
     /// Provider-reported usage from the most recent round-trip. Anchors
     /// the live context counter (see `context_tokens`): the displayed
     /// value is this total plus a local estimate of everything streamed
@@ -3358,6 +3365,7 @@ impl App {
             slash_cycle_stem: None,
             pending_new_session: false,
             new_session_terminal_clear_pending: false,
+            leaks_reveal_clear_pending: false,
             last_usage: None,
             estimate_at_last_usage: 0,
             history_estimate_cache: Cell::new(None),
@@ -3862,6 +3870,11 @@ impl App {
         // scrollback (alt screen doesn't have scrollback). The
         // wheel-scroll path handles in-app scrollback instead.
         changed |= self.maybe_service_new_session(terminal)?;
+        // Expire the /leaks reveal TTL (idle-safe) BEFORE servicing the clear, so
+        // an expiry flags + clears within the same wake and the next render draws
+        // on a scrubbed screen.
+        changed |= self.tick_leaks_reveal();
+        changed |= self.maybe_service_leaks_reveal_clear(terminal);
         changed |= self
             .maybe_service_external_edit(terminal, terminal_input)
             .await?;
@@ -4092,6 +4105,30 @@ impl App {
             || self.dialog.is_active()
             || self.question_dialog.is_some()
             || self.daemon_prompt.is_some()
+            // Keep the 100ms tick alive while a `/leaks` secret is revealed so
+            // its 30s TTL expires (and clears the screen) even on an idle pane.
+            || self.leaks_reveal_active()
+    }
+
+    fn leaks_reveal_active(&self) -> bool {
+        matches!(&self.overlay, Overlay::Leaks(pane) if pane.reveal_buffer().is_active())
+    }
+
+    /// Timed tick for the `/leaks` reveal buffer: expire the 30s TTL (even when
+    /// the pane is idle and never re-rendered) and flag a full clear so the
+    /// revealed plaintext cannot linger in the terminal backbuffer past 30s.
+    /// Returns whether a redraw is needed.
+    pub(super) fn tick_leaks_reveal(&mut self) -> bool {
+        let (expired, needs_clear) = if let Overlay::Leaks(pane) = &mut self.overlay {
+            let expired = pane.tick();
+            (expired, pane.take_pending_clear())
+        } else {
+            (false, false)
+        };
+        if needs_clear {
+            self.leaks_reveal_clear_pending = true;
+        }
+        expired
     }
 
     fn async_action_animation_active(&self, now: Instant) -> bool {

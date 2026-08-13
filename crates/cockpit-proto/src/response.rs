@@ -220,16 +220,12 @@ pub enum Response {
         page: LeakReportsPage,
     },
     /// BeginLeakReveal response: a fresh one-use capability bound to exactly
-    /// one report id. Secret-free.
+    /// one report id. Secret-free. The reveal consumption itself has **no**
+    /// ordinary-proto response — the plaintext travels only on the sensitive
+    /// local endpoint (in-process handoff or the Unix peer-authenticated reveal
+    /// socket), so ordinary codecs cannot represent a revealed secret.
     LeakRevealCapability {
         capability: LeakRevealCapability,
-    },
-    /// RevealLeakReportSecret response: an acknowledgement with a generation
-    /// id the TUI uses to invalidate stale buffers. The plaintext is never in
-    /// this frame; it travels only on the protected local sensitive channel.
-    LeakRevealedSecret {
-        report_id: String,
-        generation: u64,
     },
     /// MarkLeakRotated response: the updated rotation disposition.
     LeakRotationUpdated {
@@ -815,7 +811,6 @@ macro_rules! response_variants {
             (Response::SealedValues { .. }, "sealed_values");
             (Response::LeakReports { .. }, "leak_reports");
             (Response::LeakRevealCapability { .. }, "leak_reveal_capability");
-            (Response::LeakRevealedSecret { .. }, "leak_revealed_secret");
             (Response::LeakRotationUpdated { .. }, "leak_rotation_updated");
             (Response::LeakReportDeleted { .. }, "leak_report_deleted");
             (Response::ProjectNotes { .. }, "project_notes");
@@ -999,14 +994,6 @@ mod tests {
             }
             .wire_tag(),
             "leak_reveal_capability"
-        );
-        assert_eq!(
-            Response::LeakRevealedSecret {
-                report_id: String::new(),
-                generation: 0,
-            }
-            .wire_tag(),
-            "leak_revealed_secret"
         );
         assert_eq!(
             Response::LeakRotationUpdated {

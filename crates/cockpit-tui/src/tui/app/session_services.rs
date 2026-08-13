@@ -221,6 +221,28 @@ impl App {
         self.maybe_service_new_session_with_clear(|| terminal.clear().map_err(Into::into))
     }
 
+    /// Force a full alt-screen clear after the `/leaks` reveal buffer was
+    /// zeroized (close/hide/detach/timeout), so the revealed plaintext can't
+    /// persist in stale backbuffer cells. Best-effort, mirroring the `/new`
+    /// clear: the in-memory zeroize already happened, so a failed clear only
+    /// degrades to the next full redraw. Returns whether a clear was performed.
+    pub(super) fn maybe_service_leaks_reveal_clear(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+    ) -> bool {
+        if !self.leaks_reveal_clear_pending {
+            return false;
+        }
+        self.leaks_reveal_clear_pending = false;
+        if let Err(error) = terminal.clear() {
+            tracing::warn!(
+                error = %error,
+                "terminal clear after leak-reveal zeroize failed; continuing with redraw"
+            );
+        }
+        true
+    }
+
     pub(super) fn maybe_service_new_session_with_clear(
         &mut self,
         mut clear_terminal: impl FnMut() -> Result<()>,

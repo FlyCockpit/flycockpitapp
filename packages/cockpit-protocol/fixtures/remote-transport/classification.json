@@ -52,8 +52,8 @@
   ],
   "counts": {
     "event": 76,
-    "request": 142,
-    "response": 93
+    "request": 141,
+    "response": 92
   },
   "messages": {
     "event": [
@@ -700,12 +700,6 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "begin_leak_reveal"
-      },
-      {
-        "class": "bounded_request_response",
-        "inlinePayloadBound": "bounded",
-        "lane": "interactive",
-        "tag": "reveal_leak_report_secret"
       },
       {
         "class": "bounded_request_response",
@@ -1554,12 +1548,6 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "leak_reveal_capability"
-      },
-      {
-        "class": "bounded_request_response",
-        "inlinePayloadBound": "bounded",
-        "lane": "interactive",
-        "tag": "leak_revealed_secret"
       },
       {
         "class": "bounded_request_response",

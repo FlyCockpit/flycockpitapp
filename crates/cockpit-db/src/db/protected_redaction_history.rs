@@ -523,6 +523,53 @@ pub fn retire_history_conn(conn: &Connection, history_id: &str) -> Result<()> {
     }
 }
 
+/// Force-retire a specific history row **regardless of live artifact
+/// references** — the destructive delete primitive for leak-report protected
+/// value deletion. Like [`retire_history_conn`] this is **forget**: the same
+/// UPDATE that stamps `retired_at_ms` overwrites `ciphertext` with
+/// `zeroblob(length(ciphertext))` (length preserved so the bucket CHECK holds;
+/// the appended 16-byte AEAD tag lives inside `ciphertext`, so zeroing the
+/// blob zeroes the tag too), `nonce` with 12 zero bytes, and `fingerprint`
+/// with 64 `'0'` chars.
+///
+/// Unlike [`retire_history_conn`], it does **not** count or reject on
+/// `ref_count`: artifact references may keep pointing at the now-zeroed row and
+/// every artifact-side rehydrate fails closed (a retired row can no longer be
+/// decrypted). Idempotent for an already-retired row. No error path references
+/// `ref_count` — deletion never surfaces a reference count.
+pub fn force_retire_history_conn(conn: &Connection, history_id: &str) -> Result<()> {
+    let now = now_ms();
+    // `ref_count` is reset to 0 in the SAME update: the schema invariant
+    // `CHECK ((retired_at_ms IS NULL) OR (ref_count = 0))` requires a retired
+    // row to carry no live-ref count. Any `protected_redaction_artifact_refs`
+    // rows survive (now orphaned, pointing at a zeroed/retired row that
+    // rehydrates fail-closed); a later `detach_artifact_ref_conn` clamps at
+    // `MAX(ref_count - 1, 0)`, so the counter never underflows.
+    let n = conn
+        .execute(
+            "UPDATE protected_redaction_history
+         SET retired_at_ms = ?1,
+             ciphertext = zeroblob(length(ciphertext)),
+             nonce = zeroblob(12),
+             fingerprint = ?3,
+             ref_count = 0
+         WHERE history_id = ?2 AND retired_at_ms IS NULL",
+            params![now, history_id, ZEROED_FINGERPRINT],
+        )
+        .context("force-retiring protected redaction history row")?;
+    if n == 0 {
+        // Already retired or not found — idempotent for already-retired.
+        let row = get_history_conn(conn, history_id)?;
+        match row {
+            Some(r) if r.retired_at_ms.is_some() => Ok(()),
+            None => bail!("protected redaction history not found: {history_id}"),
+            _ => bail!("force-retire CAS failed for protected redaction history: {history_id}"),
+        }
+    } else {
+        Ok(())
+    }
+}
+
 /// Retire all zero-ref history rows for a session. Returns the count retired.
 /// Zeroizes ciphertext, nonce, and fingerprint in the same UPDATE (see
 /// [`retire_history_conn`]).

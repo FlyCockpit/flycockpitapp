@@ -321,6 +321,12 @@ canonical_unit_enum16!(crate::LeakRotationDisposition, {
     Dismiss = 2,
     Rotated = 3,
 });
+canonical_unit_enum16!(crate::LeakRotationState, {
+    None = 1,
+    PendingUser = 2,
+    Rotated = 3,
+    NotApplicable = 4,
+});
 
 macro_rules! canonical_struct {
     ($ty:ty, $value:ident, $out:ident, [$($field:ident),+ $(,)?]) => {

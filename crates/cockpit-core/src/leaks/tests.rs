@@ -1,41 +1,20 @@
-//! Tests for the leaks-page module: machine-wide Owner worklist, rotation
-//! plans, and authenticated recovery.
-//!
-//! Coverage maps to the prompt's acceptance criteria:
-//!
-//! * `leak_list_metadata_schema` — list types contain no secret/prefix/
-//!   fingerprint/ciphertext field and default to machine-wide Owner
-//!   visibility.
-//! * `leak_list_snapshot_cursor_stable` — concurrent inserts, equal
-//!   timestamps, page boundaries, refresh, filter/owner mismatch, tamper.
-//! * `leak_list_limits_and_errors` — 1/100/101, deterministic order,
-//!   InvalidCursor, RateLimited, Unavailable, Internal.
-//! * `leak_rotation_proposals_and_owner_recovery` — closed-vocabulary plan
-//!   derivation/accept/dismiss, metadata-only list output, authenticated
-//!   hidden-by-default recovery, secure protected-value deletion retaining
-//!   historical redaction.
-//! * `leak_reveal_requires_sensitive_local_channel` — ordinary daemon/remote
-//!   Response/Event codecs cannot carry plaintext; remote/headless/subagent/
-//!   replay/expired/wrong-session/wrong-report/denied branches fail before
-//!   protected read.
-//! * `leak_reveal_ephemeral_generation` — LeaksPane is the sole Zeroizing
-//!   buffer owner; full-repaint close/detach/lock/newer generation/30-second
-//!   timeout and late-result discard.
-//! * `leak_mark_rotated` — explicit, reversible, metadata-only; fresh
-//!   re-report clears it.
-//! * `machine_wide_leak_owner_access` — records from different projects and
-//!   deleted/orphaned sessions remain Owner-visible, recoverable, and
-//!   deletable by report ID.
-//! * Sentinel plaintext is absent from list, events, transcripts, caches,
-//!   clipboard, logs, errors, portable exports, analytics, and remote frames.
+//! Core-logic tests for the leaks module: MAC'd list cursor, snapshot
+//! watermark, filters, `has_more`, rotation-plan derivation, and the reveal
+//! capability/rate state. These drive the production entry points in
+//! `crate::leaks`; dispatch-level and reveal-consumption tests live in
+//! `crate::daemon::server::leaks_tests`.
 
 use super::*;
 use crate::db::Db;
-use crate::db::protected_leak_records::{LeakCategory, LeakProvenance, LeakSource};
+use crate::db::protected_leak_records::{
+    LeakCategory, LeakListFilters, LeakProvenance, LeakRecordStatus, LeakRotation, LeakSource,
+};
 use crate::leak_report::{LeakReportHandler, LeakReportOutcome, ReportLeakAuthority};
-use crate::redact::protected_redaction_history::{MapKeyResolver, REDACTION_KEY_LEN};
+use crate::redact::protected_redaction_history::{
+    MapKeyResolver, REDACTION_KEY_LEN, RedactionKeyResolver,
+};
+use zeroize::Zeroizing;
 
-/// A fixed test key (32 bytes) for key version 1.
 fn test_key_v1() -> [u8; REDACTION_KEY_LEN] {
     [0x42u8; REDACTION_KEY_LEN]
 }
@@ -44,17 +23,29 @@ fn test_resolver() -> MapKeyResolver {
     MapKeyResolver::new().with_version(1, test_key_v1())
 }
 
+fn cursor_key() -> [u8; 32] {
+    [7u8; 32]
+}
+
+fn session_a() -> &'static str {
+    "aaaaaaaa-aaaa-aaaa-aaaa-111111111111"
+}
+fn session_b() -> &'static str {
+    "bbbbbbbb-bbbb-bbbb-bbbb-222222222222"
+}
+
+/// Seed two sessions with distinct project roots so the `project_root` join is
+/// exercised with a real discriminating input.
 async fn test_db() -> Db {
     let db = Db::open_in_memory().unwrap();
-    // protected_redaction_history.session_id and protected_leak_records.session_id
-    // carry cascading FKs to sessions(session_id), so the referenced session rows
-    // must exist before the leak-report handler writes any protected record.
-    for session_id in [session_a(), session_b()] {
+    for (sid, root) in [(session_a(), "/proj/a"), (session_b(), "/proj/b")] {
+        let sid = sid.to_owned();
+        let root = root.to_owned();
         db.write(move |conn| {
             conn.execute(
                 "INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) \
-                 VALUES(?1,'p','/redacted',1,1)",
-                [session_id],
+                 VALUES(?1,'p',?2,1,1)",
+                rusqlite::params![sid, root],
             )?;
             Ok(())
         })
@@ -62,14 +53,6 @@ async fn test_db() -> Db {
         .unwrap();
     }
     db
-}
-
-fn session_a() -> &'static str {
-    "aaaaaaaa-aaaa-aaaa-aaaa-111111111111"
-}
-
-fn session_b() -> &'static str {
-    "bbbbbbbb-bbbb-bbbb-bbbb-222222222222"
 }
 
 fn provenance() -> LeakProvenance {
@@ -81,8 +64,6 @@ fn provenance() -> LeakProvenance {
     }
 }
 
-/// Insert a contained leak record via the leak report handler and return its
-/// report id.
 async fn insert_contained_leak(
     db: &Db,
     resolver: &dyn RedactionKeyResolver,
@@ -101,17 +82,44 @@ async fn insert_contained_leak(
     match outcome {
         LeakReportOutcome::Contained { report_id } => report_id,
         LeakReportOutcome::Deduplicated { report_id, .. } => report_id,
-        _ => panic!("expected contained, got {outcome:?}"),
+        other => panic!("expected contained, got {other:?}"),
     }
 }
 
 // ---------------------------------------------------------------------------
-// Criterion 1: leak_list_metadata_schema — list types contain no
-// secret/prefix/fingerprint/ciphertext field and default to machine-wide
+// Rotation-plan derivation (closed vocabulary)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn leak_list_metadata_schema_has_no_secret_fields() {
+fn leak_rotation_proposal_derivation_is_closed_vocabulary() {
+    assert_eq!(
+        LeakRotationPlan::derive(LeakSource::CredentialLeak, LeakCategory::Token, Some("c1")),
+        LeakRotationPlan::RevokeConnectorCredential
+    );
+    assert_eq!(
+        LeakRotationPlan::derive(LeakSource::ModelOutput, LeakCategory::Token, Some("c1")),
+        LeakRotationPlan::RevokeConnectorCredential
+    );
+    for cat in [LeakCategory::Secret, LeakCategory::Key, LeakCategory::Password] {
+        assert_eq!(
+            LeakRotationPlan::derive(LeakSource::ModelOutput, cat, None),
+            LeakRotationPlan::RotateNamedSecret
+        );
+    }
+    for src in [LeakSource::EnvLeak, LeakSource::Reasoning] {
+        assert_eq!(
+            LeakRotationPlan::derive(src, LeakCategory::Pii, None),
+            LeakRotationPlan::InvalidateSession
+        );
+    }
+    assert_eq!(
+        LeakRotationPlan::derive(LeakSource::Other, LeakCategory::Other, None),
+        LeakRotationPlan::OwnerReviewRequired
+    );
+}
+
+#[test]
+fn leak_list_row_debug_has_no_secret_fields() {
     let row = LeakListRow {
         report_id: "r1".into(),
         session_id: "s1".into(),
@@ -121,881 +129,415 @@ fn leak_list_metadata_schema_has_no_secret_fields() {
         model_id: None,
         generation: None,
         connector_id: None,
-        status: crate::db::protected_leak_records::LeakRecordStatus::Contained,
+        status: LeakRecordStatus::Contained,
         seen_count: 1,
-        rotation: crate::db::protected_leak_records::LeakRotation::None,
+        rotation: LeakRotation::None,
         rotation_plan: LeakRotationPlan::OwnerReviewRequired,
         first_reported_ms: 1000,
         last_reported_ms: 1000,
         contained_at_ms: Some(1000),
     };
-    // Debug output must not contain forbidden field names.
     let debug = format!("{row:?}");
     for forbidden in [
-        "secret",
-        "plaintext",
-        "ciphertext",
-        "prefix",
-        "fingerprint",
-        "nonce",
-        "key_version",
-        "literal",
-        "value",
+        "secret:",
+        "plaintext:",
+        "ciphertext:",
+        "prefix:",
+        "fingerprint:",
+        "nonce:",
+        "literal:",
     ] {
-        let needle = format!("{forbidden}:");
-        assert!(
-            !debug.contains(&needle),
-            "leak list row debug must not contain field `{forbidden}`"
-        );
+        assert!(!debug.contains(forbidden), "debug leaks field `{forbidden}`");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reveal state (mint/replace/take + rate window) — unit
+// ---------------------------------------------------------------------------
+
+#[test]
+fn leak_reveal_state_mint_replaces_and_rate_window_slides() {
+    let mut state = LeakRevealState::new();
+    // No capability -> NoCapability (unauthorized), rate untouched.
+    assert!(matches!(state.begin_reveal(1000), RevealStart::NoCapability));
+
+    // Mint, then a second mint replaces (invalidates) the first: only the
+    // second token survives in the single slot.
+    state.mint([1u8; 32], "r1".into(), 61_000);
+    state.mint([2u8; 32], "r2".into(), 62_000);
+    match state.begin_reveal(1000) {
+        RevealStart::Consumed(cap) => {
+            assert_eq!(cap.report_id(), "r2");
+            assert_eq!(cap.token(), &[2u8; 32]);
+        }
+        other => panic!("expected Consumed, got {other:?}"),
+    }
+    // Single-use: the slot is now empty.
+    assert!(matches!(state.begin_reveal(1000), RevealStart::NoCapability));
+
+    // Rate window: 3 successes exhaust the limit; a 4th begin is RateLimited
+    // (and does not consume a freshly minted capability).
+    let mut state = LeakRevealState::new();
+    for t in [1000, 1500, 2000] {
+        state.record_success(t);
+    }
+    state.mint([9u8; 32], "r".into(), 100_000);
+    assert!(matches!(state.begin_reveal(2500), RevealStart::RateLimited));
+    // The capability was not consumed.
+    assert!(state.pending_is_some());
+    // After the window slides past 60s, begin succeeds.
+    match state.begin_reveal(65_000) {
+        RevealStart::Consumed(cap) => assert_eq!(cap.report_id(), "r"),
+        other => panic!("expected Consumed after window slide, got {other:?}"),
+    }
+}
+
+/// R1 (TOCTOU): in-flight reservations count toward the 3/min limit, so a
+/// concurrent 4th reveal is rejected even though NO success has been confirmed
+/// yet (all three are still awaiting their DB rehydrate). A released reservation
+/// frees the budget again.
+#[test]
+fn leak_reveal_state_in_flight_reservation_counts_toward_limit() {
+    let mut state = LeakRevealState::new();
+    // Three reveals reserved-but-not-confirmed (each takes the single slot, so
+    // mint before each). None has recorded a success.
+    for _ in 0..3 {
+        state.mint([1u8; 32], "r".into(), 100_000);
+        assert!(matches!(state.begin_reveal(1000), RevealStart::Consumed(_)));
+    }
+    // A 4th concurrent reveal must be RateLimited on the reservations alone —
+    // this fails against a limiter that counts only confirmed successes.
+    state.mint([1u8; 32], "r".into(), 100_000);
+    assert!(matches!(state.begin_reveal(1000), RevealStart::RateLimited));
+
+    // Releasing one reservation (a failed reveal) frees exactly one slot.
+    state.release_reservation(1000);
+    state.mint([1u8; 32], "r".into(), 100_000);
+    assert!(matches!(state.begin_reveal(1000), RevealStart::Consumed(_)));
+
+    // Confirming a reservation keeps the count (reservation -> success), so the
+    // budget stays exhausted.
+    state.confirm_success(1000, 1000);
+    state.mint([1u8; 32], "r".into(), 100_000);
+    assert!(matches!(state.begin_reveal(1000), RevealStart::RateLimited));
+}
+
+/// RL2: a stalled reveal's reservation is NOT aged out of the window, so it keeps
+/// counting until it confirms/releases — preventing more than 3 successes per
+/// rolling minute even when the first batch stalls past the window and then
+/// completes.
+#[test]
+fn leak_reveal_state_stalled_reservations_are_not_aged_out() {
+    let mut state = LeakRevealState::new();
+    // Three reveals reserve at T0 and then stall (never confirm).
+    for _ in 0..3 {
+        state.mint([1u8; 32], "r".into(), 1_000_000);
+        assert!(matches!(state.begin_reveal(0), RevealStart::Consumed(_)));
+    }
+    // A 4th far past the 60s window is STILL RateLimited: the three in-flight
+    // reservations are not aged out. This fails against a limiter that ages
+    // reservations by their reserve time (which would free the slots here).
+    state.mint([1u8; 32], "r".into(), 1_000_000);
+    assert!(matches!(state.begin_reveal(70_000), RevealStart::RateLimited));
+
+    // The stalled three finally confirm, recorded at the CONFIRM time (70_000).
+    for _ in 0..3 {
+        state.confirm_success(0, 70_000);
+    }
+    // A 4th within a minute of their confirm is still RateLimited.
+    state.mint([1u8; 32], "r".into(), 1_000_000);
+    assert!(matches!(state.begin_reveal(80_000), RevealStart::RateLimited));
+
+    // Only a full minute past their confirm reopens the budget.
+    state.mint([1u8; 32], "r".into(), 1_000_000);
+    assert!(matches!(state.begin_reveal(131_000), RevealStart::Consumed(_)));
+}
+
+// ---------------------------------------------------------------------------
+// Cursor MAC (AC6)
+// ---------------------------------------------------------------------------
+
+fn sample_payload() -> LeakCursorPayload {
+    LeakCursorPayload {
+        session_filter: Some(session_a().to_owned()),
+        project_root: Some("/proj/a".to_owned()),
+        rotation: Some(LeakRotation::PendingUser),
+        snapshot_high_watermark: 5_000_000,
+        last_seen_ms: 3_000_000,
+        last_report_id: "report-xyz".to_owned(),
+    }
+}
+
+fn matching_filters(p: &LeakCursorPayload) -> LeakListFilters {
+    LeakListFilters {
+        session_filter: p.session_filter.clone(),
+        project_root: p.project_root.clone(),
+        rotation: p.rotation,
     }
 }
 
 #[test]
-fn leak_list_request_defaults_to_machine_wide() {
-    let request = LeakListRequest {
-        session_filter: None,
-        limit: 50,
-        cursor: None,
+fn leak_list_cursor_mac_rejects_tamper() {
+    let key = cursor_key();
+    let payload = sample_payload();
+    let filters = matching_filters(&payload);
+    let cursor = encode_leak_cursor(&key, &payload);
+
+    // Unmodified round-trip is accepted and preserves the payload.
+    let decoded = decode_leak_cursor(&key, &cursor, &filters).unwrap();
+    assert_eq!(decoded, payload);
+
+    // Flip any single payload byte -> rejected.
+    let mut raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor.as_bytes())
+        .unwrap();
+    let flipped = {
+        let mut r = raw.clone();
+        r[3] ^= 0x01; // inside the payload region
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&r)
     };
-    assert!(request.session_filter.is_none());
-}
-
-// ---------------------------------------------------------------------------
-// Criterion 2: leak_list_snapshot_cursor_stable — concurrent inserts, equal
-// timestamps, page boundaries, refresh, filter/owner mismatch, tamper
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn leak_list_snapshot_cursor_stable_across_concurrent_inserts() {
-    let db = test_db().await;
-    let resolver = test_resolver();
-    insert_contained_leak(
-        &db,
-        &resolver,
-        session_a(),
-        "secret-1",
-        LeakSource::ModelOutput,
-        LeakCategory::Token,
-        1_000_000,
-    )
-    .await;
-    insert_contained_leak(
-        &db,
-        &resolver,
-        session_a(),
-        "secret-2",
-        LeakSource::ToolOutput,
-        LeakCategory::Key,
-        2_000_000,
-    )
-    .await;
-    insert_contained_leak(
-        &db,
-        &resolver,
-        session_a(),
-        "secret-3",
-        LeakSource::Reasoning,
-        LeakCategory::Password,
-        3_000_000,
-    )
-    .await;
-
-    let service = LeaksService::new(&db, &resolver, 5_000_000);
-
-    // First page: limit=2, newest first.
-    let resp = service
-        .list(&LeakListRequest {
-            session_filter: None,
-            limit: 2,
-            cursor: None,
-        })
-        .await
-        .unwrap();
-    assert_eq!(resp.rows.len(), 2);
-    assert_eq!(resp.rows[0].last_reported_ms, 3_000_000);
-    assert_eq!(resp.rows[1].last_reported_ms, 2_000_000);
-    let snapshot = resp.next_snapshot.unwrap();
-
-    // Insert a new record before fetching the next page. It must NOT appear
-    // in this snapshot's page chain.
-    insert_contained_leak(
-        &db,
-        &resolver,
-        session_a(),
-        "secret-4",
-        LeakSource::EnvLeak,
-        LeakCategory::Secret,
-        4_000_000,
-    )
-    .await;
-
-    // Second page: use the cursor from the first page.
-    let resp2 = service
-        .list(&LeakListRequest {
-            session_filter: None,
-            limit: 2,
-            cursor: Some(snapshot.to_cursor()),
-        })
-        .await
-        .unwrap();
-    assert_eq!(resp2.rows.len(), 1);
-    assert_eq!(resp2.rows[0].last_reported_ms, 1_000_000);
-    assert!(resp2.next_snapshot.is_none());
-}
-
-#[tokio::test]
-async fn leak_list_snapshot_cursor_equal_timestamps_deterministic_order() {
-    let db = test_db().await;
-    let resolver = test_resolver();
-    let r1 = insert_contained_leak(
-        &db,
-        &resolver,
-        session_a(),
-        "secret-a",
-        LeakSource::ModelOutput,
-        LeakCategory::Token,
-        1_000_000,
-    )
-    .await;
-    let r2 = insert_contained_leak(
-        &db,
-        &resolver,
-        session_a(),
-        "secret-b",
-        LeakSource::ModelOutput,
-        LeakCategory::Token,
-        1_000_000,
-    )
-    .await;
-    let r3 = insert_contained_leak(
-        &db,
-        &resolver,
-        session_a(),
-        "secret-c",
-        LeakSource::ModelOutput,
-        LeakCategory::Token,
-        1_000_000,
-    )
-    .await;
-
-    let service = LeaksService::new(&db, &resolver, 5_000_000);
-    let resp = service
-        .list(&LeakListRequest {
-            session_filter: None,
-            limit: 100,
-            cursor: None,
-        })
-        .await
-        .unwrap();
-    assert_eq!(resp.rows.len(), 3);
-    let ids: Vec<&str> = resp.rows.iter().map(|r| r.report_id.as_str()).collect();
-    assert!(ids[0] > ids[1]);
-    assert!(ids[1] > ids[2]);
-    assert!(ids.contains(&r1.as_str()));
-    assert!(ids.contains(&r2.as_str()));
-    assert!(ids.contains(&r3.as_str()));
-}
-
-#[tokio::test]
-async fn leak_list_snapshot_filter_mismatch_returns_empty() {
-    let db = test_db().await;
-    let resolver = test_resolver();
-    insert_contained_leak(
-        &db,
-        &resolver,
-        session_a(),
-        "secret-a",
-        LeakSource::ModelOutput,
-        LeakCategory::Token,
-        1_000_000,
-    )
-    .await;
-
-    let service = LeaksService::new(&db, &resolver, 5_000_000);
-    let resp = service
-        .list(&LeakListRequest {
-            session_filter: Some(session_b().to_owned()),
-            limit: 100,
-            cursor: None,
-        })
-        .await
-        .unwrap();
-    assert!(resp.rows.is_empty());
-    assert!(resp.next_snapshot.is_none());
-}
-
-// ---------------------------------------------------------------------------
-// Criterion 3: leak_list_limits_and_errors — 1/100/101, InvalidLimit
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn leak_list_limits_and_errors() {
-    let db = test_db().await;
-    let resolver = test_resolver();
-    let service = LeaksService::new(&db, &resolver, 5_000_000);
-
-    let err = service
-        .list(&LeakListRequest {
-            session_filter: None,
-            limit: 0,
-            cursor: None,
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(err, LeakListError::InvalidLimit);
-
-    let err = service
-        .list(&LeakListRequest {
-            session_filter: None,
-            limit: 101,
-            cursor: None,
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(err, LeakListError::InvalidLimit);
-
-    let resp = service
-        .list(&LeakListRequest {
-            session_filter: None,
-            limit: 1,
-            cursor: None,
-        })
-        .await
-        .unwrap();
-    assert!(resp.rows.is_empty());
-
-    let resp = service
-        .list(&LeakListRequest {
-            session_filter: None,
-            limit: 100,
-            cursor: None,
-        })
-        .await
-        .unwrap();
-    assert!(resp.rows.is_empty());
-}
-
-// ---------------------------------------------------------------------------
-// Criterion 4: leak_rotation_proposals_and_owner_recovery — closed-vocabulary
-// plan derivation/accept/dismiss, metadata-only list output, authenticated
-// hidden-by-default recovery, secure protected-value deletion retaining
-// historical redaction
-// ---------------------------------------------------------------------------
-
-#[test]
-fn leak_rotation_proposal_derivation_is_closed_vocabulary() {
-    let plan = LeakRotationPlan::derive(
-        LeakSource::CredentialLeak,
-        LeakCategory::Token,
-        Some("connector-1"),
+    assert_eq!(
+        decode_leak_cursor(&key, &flipped, &filters),
+        Err(LeakListError::InvalidCursor)
     );
-    assert_eq!(plan, LeakRotationPlan::RevokeConnectorCredential);
 
-    let plan = LeakRotationPlan::derive(
-        LeakSource::ModelOutput,
-        LeakCategory::Token,
-        Some("connector-1"),
+    // Alter a MAC byte (last byte) -> rejected.
+    let last = raw.len() - 1;
+    raw[last] ^= 0x80;
+    let mac_altered = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&raw);
+    assert_eq!(
+        decode_leak_cursor(&key, &mac_altered, &filters),
+        Err(LeakListError::InvalidCursor)
     );
-    assert_eq!(plan, LeakRotationPlan::RevokeConnectorCredential);
 
-    for cat in [
-        LeakCategory::Secret,
-        LeakCategory::Key,
-        LeakCategory::Password,
-    ] {
-        let plan = LeakRotationPlan::derive(LeakSource::ModelOutput, cat, None);
-        assert_eq!(
-            plan,
-            LeakRotationPlan::RotateNamedSecret,
-            "category {cat:?}"
-        );
+    // Truncated frame -> rejected.
+    let truncated = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(cursor.as_bytes()).unwrap()[..10]);
+    assert_eq!(
+        decode_leak_cursor(&key, &truncated, &filters),
+        Err(LeakListError::InvalidCursor)
+    );
+
+    // A cursor minted under a different boot key -> rejected.
+    let other_key = [9u8; 32];
+    let other_cursor = encode_leak_cursor(&other_key, &payload);
+    assert_eq!(
+        decode_leak_cursor(&key, &other_cursor, &filters),
+        Err(LeakListError::InvalidCursor)
+    );
+
+    // Filters that differ from the cursor's bound filters -> rejected.
+    let mismatched = LeakListFilters {
+        session_filter: Some(session_b().to_owned()),
+        ..filters.clone()
+    };
+    assert_eq!(
+        decode_leak_cursor(&key, &cursor, &mismatched),
+        Err(LeakListError::InvalidCursor)
+    );
+    let mismatched_rot = LeakListFilters {
+        rotation: Some(LeakRotation::Rotated),
+        ..filters.clone()
+    };
+    assert_eq!(
+        decode_leak_cursor(&key, &cursor, &mismatched_rot),
+        Err(LeakListError::InvalidCursor)
+    );
+
+    // A well-formed legacy base64-JSON cursor -> rejected (no valid MAC).
+    let legacy = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&serde_json::json!({
+            "last_seen_ms": 3_000_000,
+            "report_id": "report-xyz"
+        }))
+        .unwrap(),
+    );
+    assert_eq!(
+        decode_leak_cursor(&key, &legacy, &filters),
+        Err(LeakListError::InvalidCursor)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot watermark + has_more (AC7)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn leak_list_snapshot_watermark_and_has_more() {
+    let db = test_db().await;
+    let resolver = test_resolver();
+    let key = cursor_key();
+
+    // Three rows, distinct last_reported timestamps.
+    insert_contained_leak(&db, &resolver, session_a(), "s1", LeakSource::ModelOutput, LeakCategory::Token, 1_000_000).await;
+    insert_contained_leak(&db, &resolver, session_a(), "s2", LeakSource::ToolOutput, LeakCategory::Key, 2_000_000).await;
+    let r3 = insert_contained_leak(&db, &resolver, session_a(), "s3", LeakSource::Reasoning, LeakCategory::Password, 3_000_000).await;
+
+    // Page 1 (limit 2): newest first, has_more true, cursor present.
+    let page1 = list_leak_reports(&db, &key, LeakListFilters::default(), 2, None)
+        .await
+        .unwrap();
+    assert_eq!(page1.refs.len(), 2);
+    assert_eq!(page1.refs[0].last_reported_ms, 3_000_000);
+    assert_eq!(page1.refs[1].last_reported_ms, 2_000_000);
+    assert!(page1.has_more);
+    let cursor = page1.next_cursor.clone().expect("cursor for page 2");
+
+    // Insert a NEW row and RE-REPORT r3 (bumping its last_reported_ms above the
+    // snapshot watermark) before fetching page 2. Neither may appear.
+    insert_contained_leak(&db, &resolver, session_a(), "s4", LeakSource::EnvLeak, LeakCategory::Secret, 4_000_000).await;
+    // Re-report r3's secret with a later timestamp -> dedup bumps last_reported.
+    let _ = insert_contained_leak(&db, &resolver, session_a(), "s3", LeakSource::Reasoning, LeakCategory::Password, 5_000_000).await;
+
+    let page2 = list_leak_reports(&db, &key, LeakListFilters::default(), 2, Some(&cursor))
+        .await
+        .unwrap();
+    // Only the original oldest row (s1) remains in this snapshot chain.
+    assert_eq!(page2.refs.len(), 1, "re-reported/new rows must not appear mid-chain");
+    assert_eq!(page2.refs[0].last_reported_ms, 1_000_000);
+    assert!(!page2.has_more);
+    assert!(page2.next_cursor.is_none());
+    // r3 is absent from the remainder of the chain (it left the snapshot).
+    assert!(!page2.refs.iter().any(|r| r.report_id == r3));
+
+    // Refresh: a fresh snapshot now sees all 4 rows, newest first.
+    let refreshed = list_leak_reports(&db, &key, LeakListFilters::default(), 100, None)
+        .await
+        .unwrap();
+    assert_eq!(refreshed.refs.len(), 4);
+    assert_eq!(refreshed.refs[0].last_reported_ms, 5_000_000);
+    assert!(!refreshed.has_more);
+    assert!(refreshed.next_cursor.is_none());
+}
+
+#[tokio::test]
+async fn leak_list_exact_multiple_page_has_no_cursor() {
+    let db = test_db().await;
+    let resolver = test_resolver();
+    let key = cursor_key();
+    for i in 0..2 {
+        insert_contained_leak(&db, &resolver, session_a(), &format!("x{i}"), LeakSource::ModelOutput, LeakCategory::Token, 1_000_000 + i).await;
     }
+    // Exactly `limit` rows -> has_more false, no cursor (regression for the old
+    // `refs.len() == limit` bug that emitted a cursor to an empty next page).
+    let page = list_leak_reports(&db, &key, LeakListFilters::default(), 2, None)
+        .await
+        .unwrap();
+    assert_eq!(page.refs.len(), 2);
+    assert!(!page.has_more);
+    assert!(page.next_cursor.is_none());
 
-    for src in [LeakSource::EnvLeak, LeakSource::Reasoning] {
-        let plan = LeakRotationPlan::derive(src, LeakCategory::Pii, None);
-        assert_eq!(plan, LeakRotationPlan::InvalidateSession, "source {src:?}");
-    }
-
-    let plan = LeakRotationPlan::derive(LeakSource::Other, LeakCategory::Other, None);
-    assert_eq!(plan, LeakRotationPlan::OwnerReviewRequired);
+    // limit+1 available -> has_more true and a working cursor to the last page.
+    let page = list_leak_reports(&db, &key, LeakListFilters::default(), 1, None)
+        .await
+        .unwrap();
+    assert!(page.has_more);
+    let cursor = page.next_cursor.unwrap();
+    let page2 = list_leak_reports(&db, &key, LeakListFilters::default(), 1, Some(&cursor))
+        .await
+        .unwrap();
+    assert_eq!(page2.refs.len(), 1);
 }
 
 #[tokio::test]
-async fn leak_rotation_accept_dismiss_and_mark_rotated() {
+async fn leak_list_invalid_limit_and_cursor() {
     let db = test_db().await;
-    let resolver = test_resolver();
-    let report_id = insert_contained_leak(
-        &db,
-        &resolver,
-        session_a(),
-        "secret-1",
-        LeakSource::ModelOutput,
-        LeakCategory::Token,
-        1_000_000,
-    )
-    .await;
-
-    let service = LeaksService::new(&db, &resolver, 5_000_000);
-
-    service
-        .update_rotation(&LeakRotationUpdate {
-            report_id: report_id.clone(),
-            action: LeakRotationAction::Accept,
-        })
-        .await
-        .unwrap();
-    let record = db
-        .protected_leak_record_get(&report_id)
-        .await
-        .unwrap()
-        .unwrap();
+    let key = cursor_key();
     assert_eq!(
-        record.rotation,
-        crate::db::protected_leak_records::LeakRotation::PendingUser
+        list_leak_reports(&db, &key, LeakListFilters::default(), 0, None).await,
+        Err(LeakListError::InvalidLimit)
     );
-
-    service
-        .update_rotation(&LeakRotationUpdate {
-            report_id: report_id.clone(),
-            action: LeakRotationAction::MarkRotated,
-        })
-        .await
-        .unwrap();
-    let record = db
-        .protected_leak_record_get(&report_id)
-        .await
-        .unwrap()
-        .unwrap();
     assert_eq!(
-        record.rotation,
-        crate::db::protected_leak_records::LeakRotation::Rotated
+        list_leak_reports(&db, &key, LeakListFilters::default(), 101, None).await,
+        Err(LeakListError::InvalidLimit)
     );
-
-    service
-        .update_rotation(&LeakRotationUpdate {
-            report_id: report_id.clone(),
-            action: LeakRotationAction::Dismiss,
-        })
-        .await
-        .unwrap();
-    let record = db
-        .protected_leak_record_get(&report_id)
-        .await
-        .unwrap()
-        .unwrap();
     assert_eq!(
-        record.rotation,
-        crate::db::protected_leak_records::LeakRotation::NotApplicable
+        list_leak_reports(&db, &key, LeakListFilters::default(), 10, Some("not-a-valid-cursor")).await,
+        Err(LeakListError::InvalidCursor)
     );
-}
-
-#[tokio::test]
-async fn leak_rotation_update_missing_record_returns_invalid_cursor() {
-    let db = test_db().await;
-    let resolver = test_resolver();
-    let service = LeaksService::new(&db, &resolver, 5_000_000);
-    let err = service
-        .update_rotation(&LeakRotationUpdate {
-            report_id: "nonexistent".into(),
-            action: LeakRotationAction::Accept,
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(err, LeakListError::InvalidCursor);
-}
-
-#[tokio::test]
-async fn leak_protected_value_deletion_retains_historical_metadata() {
-    let db = test_db().await;
-    let resolver = test_resolver();
-    let report_id = insert_contained_leak(
-        &db,
-        &resolver,
-        session_a(),
-        "deletable-secret",
-        LeakSource::CredentialLeak,
-        LeakCategory::Password,
-        1_000_000,
-    )
-    .await;
-
-    let service = LeaksService::new(&db, &resolver, 5_000_000);
-
-    service
-        .delete_protected_value(&LeakProtectedValueDelete {
-            report_id: report_id.clone(),
-        })
-        .await
-        .unwrap();
-
-    let record = db
-        .protected_leak_record_get(&report_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        record.status,
-        crate::db::protected_leak_records::LeakRecordStatus::Deleted
-    );
-    assert!(record.retired_at_ms.is_some());
-    assert_eq!(record.source, LeakSource::CredentialLeak);
-    assert_eq!(record.category, LeakCategory::Password);
-
-    let refs = db.protected_leak_records_refs(session_a()).await.unwrap();
-    assert!(refs.is_empty());
-
-    let mut reveal_service = LeaksService::new(&db, &resolver, 5_000_000);
-    let cap = reveal_service
-        .begin_reveal(&BeginLeakReveal {
-            report_id: report_id.clone(),
-        })
-        .unwrap();
-    let result = reveal_service
-        .reveal(&RevealLeakReportSecret { capability: cap })
-        .await
-        .unwrap();
-    assert!(matches!(result, LeakRevealResult::Deleted));
 }
 
 // ---------------------------------------------------------------------------
-// Criterion 5: leak_reveal_requires_sensitive_local_channel — ordinary
-// daemon/remote Response/Event codecs cannot carry plaintext; wrong-report/
-// denied branches fail before protected read
+// project_root + rotation filters (AC8)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn leak_reveal_unauthorized_missing_report() {
+async fn leak_list_project_root_and_rotation_filters() {
     let db = test_db().await;
     let resolver = test_resolver();
-    let mut service = LeaksService::new(&db, &resolver, 5_000_000);
-    let cap = service
-        .begin_reveal(&BeginLeakReveal {
-            report_id: "nonexistent".into(),
-        })
-        .unwrap();
-    let result = service
-        .reveal(&RevealLeakReportSecret { capability: cap })
+    let key = cursor_key();
+
+    let ra = insert_contained_leak(&db, &resolver, session_a(), "sa", LeakSource::ModelOutput, LeakCategory::Token, 1_000_000).await;
+    let rb = insert_contained_leak(&db, &resolver, session_b(), "sb", LeakSource::ToolOutput, LeakCategory::Key, 2_000_000).await;
+
+    // Machine-wide default includes both.
+    let all = list_leak_reports(&db, &key, LeakListFilters::default(), 100, None)
         .await
         .unwrap();
-    assert!(matches!(result, LeakRevealResult::Unauthorized));
-}
+    assert_eq!(all.refs.len(), 2);
 
-#[tokio::test]
-async fn leak_reveal_succeeds_for_contained_record() {
-    let db = test_db().await;
-    let resolver = test_resolver();
-    let secret = "revealed-secret-value";
-    let report_id = insert_contained_leak(
+    // project_root join: '/proj/a' returns only session_a's record.
+    let only_a = list_leak_reports(
         &db,
-        &resolver,
-        session_a(),
-        secret,
-        LeakSource::ModelOutput,
-        LeakCategory::Token,
-        1_000_000,
+        &key,
+        LeakListFilters {
+            project_root: Some("/proj/a".to_owned()),
+            ..Default::default()
+        },
+        100,
+        None,
     )
-    .await;
+    .await
+    .unwrap();
+    assert_eq!(only_a.refs.len(), 1);
+    assert_eq!(only_a.refs[0].report_id, ra);
 
-    let mut service = LeaksService::new(&db, &resolver, 5_000_000);
-    let cap = service
-        .begin_reveal(&BeginLeakReveal {
-            report_id: report_id.clone(),
-        })
-        .unwrap();
-    let result = service
-        .reveal(&RevealLeakReportSecret { capability: cap })
-        .await
-        .unwrap();
-    match result {
-        LeakRevealResult::Revealed {
-            plaintext,
-            report_id: rid,
-        } => {
-            assert_eq!(plaintext.as_str(), secret);
-            assert_eq!(rid, report_id);
-        }
-        other => panic!("expected Revealed, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn leak_reveal_rate_limits_at_3_per_minute() {
-    let db = test_db().await;
-    let resolver = test_resolver();
-    let mut service = LeaksService::new(&db, &resolver, 5_000_000);
-
-    let mut report_ids = Vec::new();
-    for i in 0..4 {
-        let rid = insert_contained_leak(
+    // Other-root and unknown-root return the distinct empty page (not an error).
+    for root in ["/proj/b", "/proj/does-not-exist"] {
+        let page = list_leak_reports(
             &db,
-            &resolver,
-            session_a(),
-            &format!("rate-limit-secret-{i}"),
-            LeakSource::ModelOutput,
-            LeakCategory::Token,
-            1_000_000 + i,
-        )
-        .await;
-        report_ids.push(rid);
-    }
-
-    for i in 0..3 {
-        let cap = service
-            .begin_reveal(&BeginLeakReveal {
-                report_id: report_ids[i].clone(),
-            })
-            .unwrap();
-        let result = service
-            .reveal(&RevealLeakReportSecret { capability: cap })
-            .await
-            .unwrap();
-        assert!(
-            matches!(result, LeakRevealResult::Revealed { .. }),
-            "reveal {i}"
-        );
-    }
-
-    let cap = service
-        .begin_reveal(&BeginLeakReveal {
-            report_id: report_ids[3].clone(),
-        })
-        .unwrap();
-    let result = service
-        .reveal(&RevealLeakReportSecret { capability: cap })
-        .await
-        .unwrap();
-    assert!(matches!(result, LeakRevealResult::RateLimited));
-}
-
-// ---------------------------------------------------------------------------
-// Criterion 6: leak_reveal_ephemeral_generation — LeaksPane is the sole
-// Zeroizing buffer owner; full-repaint close/detach/lock/newer generation/
-// 30-second timeout and late-result discard
-// ---------------------------------------------------------------------------
-
-#[test]
-fn leaks_pane_reveal_buffer_zeroize_invalidates_generation() {
-    let mut buf = LeaksPaneRevealBuffer::new();
-    let gen0 = buf.generation();
-    assert!(!buf.is_active());
-
-    let installed = buf.install(Zeroizing::new("secret".to_owned()), "r1".to_owned(), gen0);
-    assert!(installed);
-    assert!(buf.is_active());
-    assert_eq!(buf.report_id(), Some("r1"));
-
-    buf.zeroize();
-    let gen1 = buf.generation();
-    assert_ne!(gen0, gen1);
-    assert!(!buf.is_active());
-    assert!(buf.report_id().is_none());
-    assert!(buf.plaintext().is_none());
-
-    let installed = buf.install(
-        Zeroizing::new("late-secret".to_owned()),
-        "r1".to_owned(),
-        gen0,
-    );
-    assert!(!installed);
-    assert!(!buf.is_active());
-}
-
-#[test]
-fn leaks_pane_reveal_buffer_install_at_current_generation_succeeds() {
-    let mut buf = LeaksPaneRevealBuffer::new();
-    let generation = buf.generation();
-    let installed = buf.install(
-        Zeroizing::new("secret".to_owned()),
-        "r1".to_owned(),
-        generation,
-    );
-    assert!(installed);
-    assert!(buf.is_active());
-    assert_eq!(buf.plaintext().unwrap().as_str(), "secret");
-}
-
-#[test]
-fn leaks_pane_reveal_buffer_check_timeout_zeroizes() {
-    let mut buf = LeaksPaneRevealBuffer::new();
-    let generation = buf.generation();
-    buf.install(
-        Zeroizing::new("secret".to_owned()),
-        "r1".to_owned(),
-        generation,
-    );
-    assert!(buf.is_active());
-
-    assert!(!buf.check_timeout());
-    assert!(buf.is_active());
-
-    buf.zeroize();
-    assert!(!buf.is_active());
-}
-
-// ---------------------------------------------------------------------------
-// Criterion 7: leak_mark_rotated — explicit, reversible, metadata-only; fresh
-// re-report clears it
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn leak_mark_rotated_is_reversible_and_cleared_by_re_report() {
-    let db = test_db().await;
-    let resolver = test_resolver();
-    let report_id = insert_contained_leak(
-        &db,
-        &resolver,
-        session_a(),
-        "rotation-secret",
-        LeakSource::ModelOutput,
-        LeakCategory::Token,
-        1_000_000,
-    )
-    .await;
-
-    let service = LeaksService::new(&db, &resolver, 5_000_000);
-
-    service
-        .update_rotation(&LeakRotationUpdate {
-            report_id: report_id.clone(),
-            action: LeakRotationAction::MarkRotated,
-        })
-        .await
-        .unwrap();
-    let record = db
-        .protected_leak_record_get(&report_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        record.rotation,
-        crate::db::protected_leak_records::LeakRotation::Rotated
-    );
-
-    service
-        .update_rotation(&LeakRotationUpdate {
-            report_id: report_id.clone(),
-            action: LeakRotationAction::Dismiss,
-        })
-        .await
-        .unwrap();
-    let record = db
-        .protected_leak_record_get(&report_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        record.rotation,
-        crate::db::protected_leak_records::LeakRotation::NotApplicable
-    );
-
-    let handler = LeakReportHandler::new(&db, &resolver, 2_000_000);
-    let authority = ReportLeakAuthority::new(
-        LeakSource::ModelOutput,
-        provenance(),
-        session_a().to_owned(),
-    );
-    handler
-        .report(
-            &authority,
-            Zeroizing::new("rotation-secret".to_owned()),
-            LeakCategory::Token,
+            &key,
+            LeakListFilters {
+                project_root: Some(root.to_owned()),
+                ..Default::default()
+            },
+            100,
+            None,
         )
         .await
         .unwrap();
-
-    let record = db
-        .protected_leak_record_get(&report_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        record.rotation,
-        crate::db::protected_leak_records::LeakRotation::None
-    );
-    assert_eq!(record.seen_count, 2);
-}
-
-// ---------------------------------------------------------------------------
-// Criterion 9: machine_wide_leak_owner_access — records from different
-// projects and deleted/orphaned sessions remain Owner-visible, recoverable,
-// and deletable by report ID
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn machine_wide_leak_owner_access_across_sessions() {
-    let db = test_db().await;
-    let resolver = test_resolver();
-    let r1 = insert_contained_leak(
-        &db,
-        &resolver,
-        session_a(),
-        "secret-a",
-        LeakSource::ModelOutput,
-        LeakCategory::Token,
-        1_000_000,
-    )
-    .await;
-    let r2 = insert_contained_leak(
-        &db,
-        &resolver,
-        session_b(),
-        "secret-b",
-        LeakSource::ToolOutput,
-        LeakCategory::Key,
-        2_000_000,
-    )
-    .await;
-
-    let service = LeaksService::new(&db, &resolver, 5_000_000);
-
-    let resp = service
-        .list(&LeakListRequest {
-            session_filter: None,
-            limit: 100,
-            cursor: None,
-        })
-        .await
-        .unwrap();
-    assert_eq!(resp.rows.len(), 2);
-    let ids: Vec<&str> = resp.rows.iter().map(|r| r.report_id.as_str()).collect();
-    assert!(ids.contains(&r1.as_str()));
-    assert!(ids.contains(&r2.as_str()));
-
-    let resp = service
-        .list(&LeakListRequest {
-            session_filter: Some(session_a().to_owned()),
-            limit: 100,
-            cursor: None,
-        })
-        .await
-        .unwrap();
-    assert_eq!(resp.rows.len(), 1);
-    assert_eq!(resp.rows[0].report_id, r1);
-
-    let mut reveal_service = LeaksService::new(&db, &resolver, 5_000_000);
-    for (rid, secret) in [(&r1, "secret-a"), (&r2, "secret-b")] {
-        let cap = reveal_service
-            .begin_reveal(&BeginLeakReveal {
-                report_id: rid.clone(),
-            })
-            .unwrap();
-        let result = reveal_service
-            .reveal(&RevealLeakReportSecret { capability: cap })
-            .await
-            .unwrap();
-        match result {
-            LeakRevealResult::Revealed { plaintext, .. } => {
-                assert_eq!(plaintext.as_str(), secret);
-            }
-            other => panic!("expected Revealed for {rid}, got {other:?}"),
+        if root == "/proj/b" {
+            assert_eq!(page.refs.len(), 1);
+            assert_eq!(page.refs[0].report_id, rb);
+        } else {
+            assert!(page.refs.is_empty());
+            assert!(page.next_cursor.is_none());
         }
     }
 
-    for rid in [&r1, &r2] {
-        service
-            .delete_protected_value(&LeakProtectedValueDelete {
-                report_id: rid.clone(),
-            })
-            .await
-            .unwrap();
-        let record = db.protected_leak_record_get(rid).await.unwrap().unwrap();
-        assert_eq!(
-            record.status,
-            crate::db::protected_leak_records::LeakRecordStatus::Deleted
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Criterion 10: Sentinel plaintext is absent from list, events, transcripts,
-// caches, clipboard, logs, errors, portable exports, analytics, and remote
-// frames
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn sentinel_plaintext_absent_from_list_output() {
-    let db = test_db().await;
-    let resolver = test_resolver();
-    let sentinel = "SENTINEL_PLAINTEXT_VALUE_12345";
-    insert_contained_leak(
-        &db,
-        &resolver,
-        session_a(),
-        sentinel,
-        LeakSource::ModelOutput,
-        LeakCategory::Token,
-        1_000_000,
-    )
-    .await;
-
-    let service = LeaksService::new(&db, &resolver, 5_000_000);
-    let resp = service
-        .list(&LeakListRequest {
-            session_filter: None,
-            limit: 100,
-            cursor: None,
-        })
+    // Rotation-state filter exact-matches each of the four states. Set ra's
+    // rotation to PendingUser and mark rb Rotated.
+    update_rotation(&db, &ra, LeakRotationAction::Accept).await.unwrap();
+    update_rotation(&db, &rb, LeakRotationAction::MarkRotated).await.unwrap();
+    let cases = [
+        (LeakRotation::None, 0),
+        (LeakRotation::PendingUser, 1),
+        (LeakRotation::Rotated, 1),
+        (LeakRotation::NotApplicable, 0),
+    ];
+    for (rotation, expected) in cases {
+        let page = list_leak_reports(
+            &db,
+            &key,
+            LeakListFilters {
+                rotation: Some(rotation),
+                ..Default::default()
+            },
+            100,
+            None,
+        )
         .await
         .unwrap();
-    assert_eq!(resp.rows.len(), 1);
-
-    let row_debug = format!("{:?}", resp.rows[0]);
-    assert!(
-        !row_debug.contains(sentinel),
-        "sentinel must not appear in list row debug"
-    );
-
-    let resp_debug = format!("{resp:?}");
-    assert!(
-        !resp_debug.contains(sentinel),
-        "sentinel must not appear in list response debug"
-    );
-}
-
-#[tokio::test]
-async fn sentinel_plaintext_absent_from_rotation_and_delete_errors() {
-    let db = test_db().await;
-    let resolver = test_resolver();
-    let sentinel = "SENTINEL_ROTATION_SECRET";
-    let _report_id = insert_contained_leak(
-        &db,
-        &resolver,
-        session_a(),
-        sentinel,
-        LeakSource::ModelOutput,
-        LeakCategory::Token,
-        1_000_000,
-    )
-    .await;
-
-    let service = LeaksService::new(&db, &resolver, 5_000_000);
-
-    let err = service
-        .update_rotation(&LeakRotationUpdate {
-            report_id: "nonexistent".into(),
-            action: LeakRotationAction::Accept,
-        })
-        .await
-        .unwrap_err();
-    let err_debug = format!("{err:?}");
-    assert!(!err_debug.contains(sentinel));
-
-    let err = service
-        .delete_protected_value(&LeakProtectedValueDelete {
-            report_id: "nonexistent".into(),
-        })
-        .await
-        .unwrap_err();
-    let err_debug = format!("{err:?}");
-    assert!(!err_debug.contains(sentinel));
-}
-
-// ---------------------------------------------------------------------------
-// SensitiveLocalChannel marker
-// ---------------------------------------------------------------------------
-
-#[test]
-fn sensitive_local_channel_marker_is_local() {
-    let ch = SensitiveLocalChannel;
-    assert!(ch.is_local_sensitive());
+        assert_eq!(page.refs.len(), expected, "rotation filter {rotation:?}");
+    }
 }

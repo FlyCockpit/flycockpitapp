@@ -932,6 +932,36 @@ impl App {
                 }
                 return false;
             }
+            Overlay::Leaks(mut pane) => {
+                match pane.handle_key(key) {
+                    crate::tui::leaks_pane::LeaksOutcome::Close => {
+                        // Zeroize the reveal buffer and request a full alt-screen
+                        // clear so no stale plaintext cells survive the close
+                        // (serviced with the terminal handle in the event loop).
+                        pane.zeroize_reveal();
+                        self.leaks_reveal_clear_pending = true;
+                    }
+                    crate::tui::leaks_pane::LeaksOutcome::Stay => {
+                        self.overlay = Overlay::Leaks(pane);
+                    }
+                    crate::tui::leaks_pane::LeaksOutcome::ForceClear => {
+                        self.overlay = Overlay::Leaks(pane);
+                        self.leaks_reveal_clear_pending = true;
+                    }
+                    crate::tui::leaks_pane::LeaksOutcome::Rpc(action) => {
+                        self.overlay = Overlay::Leaks(pane);
+                        self.start_leaks_rpc_action(action);
+                    }
+                    crate::tui::leaks_pane::LeaksOutcome::Reveal {
+                        report_id,
+                        generation,
+                    } => {
+                        self.overlay = Overlay::Leaks(pane);
+                        self.reveal_leak_into_pane(report_id, generation);
+                    }
+                }
+                return false;
+            }
             Overlay::Diff(mut pane) => {
                 if !pane.handle_key(key) {
                     self.overlay = Overlay::Diff(pane);
@@ -3359,6 +3389,7 @@ impl App {
                     | Overlay::Resources(_)
                     | Overlay::Quick(_)
                     | Overlay::Context(_)
+                    | Overlay::Leaks(_)
                     | Overlay::Diff(_)
                     | Overlay::Help(_)
             )
@@ -3578,6 +3609,7 @@ impl App {
                     | Overlay::ModelPicker(_)
                     | Overlay::Multireview(_)
                     | Overlay::Notes(_)
+                    | Overlay::Leaks(_)
                     | Overlay::Help(_)
             )
             && self.question_dialog.is_none()

@@ -373,11 +373,6 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
-        "reveal_leak_report_secret",
-        RemoteMessageClass::BoundedRequestResponse,
-        RemoteInlinePayloadBound::Bounded,
-    ),
-    row(
         "mark_leak_rotated",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
@@ -1083,11 +1078,6 @@ pub const RESPONSE_CLASSIFICATION: &[RemoteMessageClassification] = &[
     ),
     row(
         "leak_reveal_capability",
-        RemoteMessageClass::BoundedRequestResponse,
-        RemoteInlinePayloadBound::Bounded,
-    ),
-    row(
-        "leak_revealed_secret",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
@@ -2002,8 +1992,8 @@ mod tests {
         }
 
         // Exact table sizes, so a silent shrink is caught.
-        assert_eq!(REQUEST_CLASSIFICATION.len(), 142);
-        assert_eq!(RESPONSE_CLASSIFICATION.len(), 93);
+        assert_eq!(REQUEST_CLASSIFICATION.len(), 141);
+        assert_eq!(RESPONSE_CLASSIFICATION.len(), 92);
         assert_eq!(EVENT_CLASSIFICATION.len(), 76);
     }
 

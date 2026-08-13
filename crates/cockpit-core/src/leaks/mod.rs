@@ -1,90 +1,55 @@
 //! `/leaks`: machine-wide Owner leak worklist, rotation plans, and
-//! authenticated recovery.
-//!
-//! ## Goal
-//!
-//! Provide a machine-wide Owner worklist, with optional safe project/session
-//! filters, that never lists secret material, proposes safe rotation steps,
-//! and offers separate local authenticated recovery or protected-value
-//! deletion.
+//! authenticated recovery — the single production implementation the daemon
+//! dispatch delegates to.
 //!
 //! ## What this module owns
 //!
-//! * [`LeakListRequest`] / [`LeakListResponse`] — the metadata-only list
-//!   request/response types. List rows contain no plaintext, ciphertext,
-//!   masked prefix, length-derived identity, or keyed fingerprint.
-//! * [`LeakListSnapshot`] — the opaque cursor that binds authenticated Owner,
-//!   machine-wide scope, optional project/session filters, rotation state,
-//!   high watermark, and last key. Concurrent new rows never shift/duplicate/
-//!   skip the traversal; refresh begins a new snapshot.
-//! * [`LeakRotationPlan`] — the closed rotation plan derived from the closed
-//!   report `source`, `category`, and connector ID enums. Owner may accept,
-//!   dismiss, and mark rotation without entering arbitrary plan text.
-//! * [`BeginLeakReveal`] / [`LeakRevealCapability`] — the two-stage single-use
-//!   capability for authenticated local recovery. BeginLeakReveal is
-//!   secret-free and binds a fresh one-use capability to exactly one report
-//!   ID. RevealLeakReportSecret accepts that capability alone on the
-//!   sensitive local endpoint.
-//! * [`LeakRevealResult`] — the result of a reveal call. The plaintext lives
-//!   only in a [`Zeroizing<String>`] inside [`LeakRevealResult::Revealed`]
-//!   and is never copied into App messages, cached Text, history, search,
-//!   selection, clipboard, analytics, or diagnostics.
-//! * [`LeaksService`] — the service that coordinates list/update/delete/
-//!   reveal operations against the protected store and the sensitive local
-//!   channel.
+//! * List paging over the protected leak store: a per-daemon-boot MAC'd cursor
+//!   ([`encode_leak_cursor`] / [`decode_leak_cursor`]) bound to owner + filters
+//!   + rotation state + snapshot high watermark + last key; a first-page
+//!   watermark snapshot; `project_root`/`session`/`rotation` filters; and a
+//!   correct `has_more` via a `limit + 1` fetch ([`list_leak_reports`]).
+//! * The closed rotation plan derivation ([`LeakRotationPlan`]).
+//! * Rotation update and true protected-value delete wrappers
+//!   ([`update_rotation`], [`delete_protected_value`]).
+//! * The reveal capability slot + successful-reveal rate window
+//!   ([`LeakRevealState`]) that lives inside the daemon context. Minting a new
+//!   capability **replaces** (invalidates) any outstanding one, so exactly one
+//!   is in flight by construction; the raw 32-byte token is stored here (never
+//!   the hex string) and consumed once.
 //!
-//! ## What this module does NOT own
+//! ## Reveal channel (honest)
 //!
-//! * The TUI LeaksPane rendering and ephemeral buffer — that belongs to
-//!   `cockpit-tui`. This module supplies the metadata-only list types and the
-//!   sensitive-channel reveal primitive only.
-//! * The durable protected leak record storage — that belongs to
-//!   `cockpit-db::protected_leak_records`. This module composes those
-//!   connection-scoped readers/writers inside its service methods.
-//! * The protected-redaction-history encryption/rehydration — that belongs
-//!   to `cockpit-core::redact::protected_redaction_history`. This module
-//!   uses the public rehydrate-by-history-id primitive.
+//! The revealed plaintext never rides an ordinary daemon response/event or any
+//! remote codec — after this landing the ordinary protocol cannot even express
+//! a reveal. Plaintext is produced only by the consumption core in
+//! [`crate::daemon::leak_reveal`], reached over exactly two production paths:
 //!
-//! ## Invariants
+//! * **in-process** ([`crate::daemon::leak_reveal::reveal_leak_secret_in_process`]) —
+//!   when the TUI hosts the daemon, and the **only** path on Windows (no
+//!   external socket transport exists there);
+//! * **Unix peer-authenticated reveal socket** ([`crate::daemon::leak_reveal_socket`]) —
+//!   a dedicated 0600 socket, path a pure function of the control socket, that
+//!   accepts only after the same same-uid peer check the control socket uses.
 //!
-//! * List rows contain no plaintext, ciphertext, masked prefix,
-//!   length-derived identity, or keyed fingerprint.
-//! * Every row receives one closed rotation plan from
-//!   `RevokeConnectorCredential | RotateNamedSecret | InvalidateSession |
-//!   OwnerReviewRequired`; derivation consumes only closed report `source`,
-//!   `category`, and connector ID enums.
-//! * The first page captures `snapshot_high_watermark` and `(last_seen,id)`
-//!   order. Its opaque cursor binds authenticated Owner, machine-wide scope,
-//!   optional project/session filters, rotation state, high watermark, and
-//!   last key. Concurrent new rows never shift/duplicate/skip the traversal;
-//!   refresh begins a new snapshot.
-//! * Limit is 1..=100, newest first, one snapshot per page chain. Re-report
-//!   clears rotation and appears only after refresh.
-//! * BeginLeakReveal is secret-free and binds a fresh one-use capability to
-//!   exactly one report ID. RevealLeakReportSecret accepts that capability
-//!   alone on the sensitive local endpoint; mismatched/second report
-//!   selectors are rejected before lookup. The foreground Owner alone may
-//!   reveal, one at a time, at most three successful reveals/minute.
-//! * Delete removes protected plaintext/ciphertext and prevents future
-//!   recovery while retaining safe historical report metadata and mandatory
-//!   redaction.
+//! The plaintext buffer with its 30-second TTL lives in the TUI `LeaksPane`,
+//! the sole plaintext owner; this module never holds the revealed literal.
 
-use std::time::{Duration, Instant};
-
-use anyhow::Result;
-use zeroize::Zeroizing;
+use base64::Engine;
+use hmac::{Hmac, KeyInit as _, Mac};
+use rand::Rng;
+use sha2::Sha256;
 
 use crate::db::Db;
 use crate::db::protected_leak_records::{
-    LeakCategory, LeakListCursor, LeakRecordStatus, LeakRotation, LeakSource,
+    LeakCategory, LeakListCursor, LeakListFilters, LeakRecordStatus, LeakRotation, LeakSource,
     ProtectedLeakRecordRef,
-};
-use crate::redact::protected_redaction_history::{
-    ProtectedRedactionHistory, RedactionKeyResolver, RehydratedLiteral,
 };
 
 #[cfg(test)]
 mod tests;
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// Minimum page size for the leak list.
 pub const LEAK_LIST_MIN_LIMIT: i64 = 1;
@@ -92,61 +57,56 @@ pub const LEAK_LIST_MIN_LIMIT: i64 = 1;
 /// Maximum page size for the leak list.
 pub const LEAK_LIST_MAX_LIMIT: i64 = 100;
 
-/// Maximum successful reveals per minute per Owner.
+/// Maximum successful reveals per rolling minute (machine-wide/owner-scoped).
 pub const LEAK_REVEAL_RATE_LIMIT_PER_MINUTE: usize = 3;
 
-/// The reveal buffer lifetime: 30 seconds. After this the buffer is zeroized
-/// and the generation is invalidated.
-pub const LEAK_REVEAL_BUFFER_TTL: Duration = Duration::from_secs(30);
+/// Reveal capability TTL: 60 seconds.
+pub const LEAK_REVEAL_CAPABILITY_TTL_MS: i64 = 60_000;
+
+/// The rolling rate-limit window: 60 seconds.
+pub const LEAK_REVEAL_RATE_WINDOW_MS: i64 = 60_000;
+
+/// Hard cap on a revealed secret's UTF-8 byte length on the sensitive channel.
+pub const LEAK_REVEAL_MAX_PLAINTEXT_BYTES: usize = 65_536;
 
 /// The closed rotation plan proposed for each leak record. Derived from the
 /// closed report `source`, `category`, and connector ID enums only; the Owner
 /// never enters arbitrary plan text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LeakRotationPlan {
-    /// Revoke a connector credential. Proposed when a connector id is
-    /// present and the category is `token` or `credential_leak`.
+    /// Revoke a connector credential.
     RevokeConnectorCredential,
-    /// Rotate a named secret. Proposed when the category is `secret`, `key`,
-    /// or `password`.
+    /// Rotate a named secret.
     RotateNamedSecret,
-    /// Invalidate the session. Proposed when the source is `env_leak` or
-    /// `reasoning` and no connector id is present.
+    /// Invalidate the session.
     InvalidateSession,
-    /// Owner review required. Proposed for `other` or ambiguous cases.
+    /// Owner review required.
     OwnerReviewRequired,
 }
 
 impl LeakRotationPlan {
     /// Derive the closed rotation plan from the closed report `source`,
-    /// `category`, and optional connector id. The derivation is deterministic
-    /// and consumes only closed enums; it never reads the literal, a prefix,
-    /// a length, or a fingerprint.
+    /// `category`, and optional connector id. Consumes only closed enums; never
+    /// reads the literal, a prefix, a length, or a fingerprint.
     pub fn derive(source: LeakSource, category: LeakCategory, connector_id: Option<&str>) -> Self {
-        // If a connector id is present and the category is token/credential,
-        // revoke the connector credential.
         if connector_id.is_some()
             && matches!(category, LeakCategory::Token)
             && matches!(source, LeakSource::CredentialLeak)
         {
             return Self::RevokeConnectorCredential;
         }
-        // If a connector id is present for a token, revoke regardless of source.
         if connector_id.is_some() && matches!(category, LeakCategory::Token) {
             return Self::RevokeConnectorCredential;
         }
-        // Named secret rotation for secret/key/password categories.
         if matches!(
             category,
             LeakCategory::Secret | LeakCategory::Key | LeakCategory::Password
         ) {
             return Self::RotateNamedSecret;
         }
-        // Session invalidation for env_leak/reasoning without a connector.
         if matches!(source, LeakSource::EnvLeak | LeakSource::Reasoning) && connector_id.is_none() {
             return Self::InvalidateSession;
         }
-        // Everything else: owner review.
         Self::OwnerReviewRequired
     }
 
@@ -182,7 +142,6 @@ pub struct LeakListRow {
     pub status: LeakRecordStatus,
     pub seen_count: i64,
     pub rotation: LeakRotation,
-    /// The closed rotation plan derived from source/category/connector.
     pub rotation_plan: LeakRotationPlan,
     pub first_reported_ms: i64,
     pub last_reported_ms: i64,
@@ -215,67 +174,24 @@ impl LeakListRow {
     }
 }
 
-/// The opaque snapshot cursor for the leak list. Binds the
-/// `(last_seen_ms, report_id)` ordering key, the high watermark captured at
-/// the first page, and the scope/filter bindings. Concurrent new rows never
-/// shift/duplicate/skip the traversal; refresh begins a new snapshot.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LeakListSnapshot {
-    /// The high watermark captured at the first page: the maximum
-    /// `last_reported_ms` at snapshot time. Rows newer than this never appear
-    /// in this snapshot's page chain.
-    pub snapshot_high_watermark: i64,
-    /// The last row's ordering key from the prior page.
-    pub last_seen_ms: i64,
-    /// The last row's report id from the prior page.
-    pub last_report_id: String,
-    /// The optional session filter bound at snapshot creation.
-    pub session_filter: Option<String>,
-}
-
-impl LeakListSnapshot {
-    /// Build a cursor from this snapshot for the next page request.
-    pub fn to_cursor(&self) -> LeakListCursor {
-        LeakListCursor {
-            last_seen_ms: self.last_seen_ms,
-            report_id: self.last_report_id.clone(),
-        }
-    }
-}
-
-/// The leak list request. Defaults to all Owner-visible machine records;
-/// optional `session_filter` narrows to one session without changing
-/// ownership scope.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LeakListRequest {
-    /// Optional session filter. `None` means all Owner-visible machine records.
-    pub session_filter: Option<String>,
-    /// Page limit, clamped to 1..=100.
-    pub limit: i64,
-    /// Opaque cursor from the prior page's snapshot; `None` starts a new
-    /// traversal.
-    pub cursor: Option<LeakListCursor>,
-}
-
-/// The leak list response. Contains safe metadata rows and the next-page
-/// snapshot (if more rows remain).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LeakListResponse {
-    pub rows: Vec<LeakListRow>,
-    /// The next-page snapshot, if more rows remain in this page chain.
-    /// `None` means this was the last page or the list is empty.
-    pub next_snapshot: Option<LeakListSnapshot>,
+/// The rotation action the Owner may take on a leak record. Metadata-only and
+/// reversible; a fresh re-report clears it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LeakRotationAction {
+    Accept,
+    Dismiss,
+    MarkRotated,
 }
 
 /// The leak list error. Closed vocabulary; no secret-derived information.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeakListError {
-    /// The cursor is invalid (tampered, expired, or mismatched scope).
+    /// The cursor is invalid (tampered, wrong boot key, or filter mismatch).
     InvalidCursor,
     /// The limit is out of the 1..=100 range.
     InvalidLimit,
-    /// The daemon is detached or the protected store is unavailable.
-    Unavailable,
+    /// The report id was not found (indistinguishable-unauthorized at dispatch).
+    NotFound,
     /// An internal error occurred. No secret-derived information.
     Internal,
 }
@@ -285,7 +201,7 @@ impl std::fmt::Display for LeakListError {
         match self {
             Self::InvalidCursor => f.write_str("invalid_cursor"),
             Self::InvalidLimit => f.write_str("invalid_limit"),
-            Self::Unavailable => f.write_str("unavailable"),
+            Self::NotFound => f.write_str("not_found"),
             Self::Internal => f.write_str("internal"),
         }
     }
@@ -293,421 +209,539 @@ impl std::fmt::Display for LeakListError {
 
 impl std::error::Error for LeakListError {}
 
-/// The rotation action the Owner may take on a leak record. Metadata-only and
-/// reversible; a fresh re-report clears it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum LeakRotationAction {
-    /// Accept the proposed rotation plan (sets rotation to `pending_user`).
-    Accept,
-    /// Dismiss the proposed rotation plan (sets rotation to `not_applicable`).
-    Dismiss,
-    /// Mark the rotation as completed (sets rotation to `rotated`).
-    MarkRotated,
-}
+// ---------------------------------------------------------------------------
+// Reveal capability slot + rate window (lives inside the daemon context)
+// ---------------------------------------------------------------------------
 
-/// The result of a reveal call. The plaintext lives only in the
-/// `Revealed` variant's [`Zeroizing<String>`] and is never copied into App
-/// messages, cached Text, history, search, selection, clipboard, analytics,
-/// or diagnostics.
-#[derive(Debug)]
-pub enum LeakRevealResult {
-    /// The reveal succeeded. The plaintext is in a zeroizing buffer that the
-    /// caller (LeaksPane) owns and zeroizes on close/navigation/detach/lock/
-    /// generation-change/timeout.
-    Revealed {
-        /// The zeroizing plaintext buffer. The sole plaintext owner is the
-        /// LeaksPane; this is never copied into App messages, cached Text,
-        /// history, search, selection, clipboard, analytics, or diagnostics.
-        plaintext: Zeroizing<String>,
-        report_id: String,
-    },
-    /// The report id is unauthorized, missing, or deleted. One
-    /// indistinguishable response for all such cases.
-    Unauthorized,
-    /// The capability is invalid, expired, replayed, or mismatched.
-    InvalidCapability,
-    /// The protected value has been deleted; recovery is impossible.
-    Deleted,
-    /// The reveal rate limit (3/minute) has been exceeded.
-    RateLimited,
-    /// An internal error occurred. No secret-derived information.
-    Internal,
-}
-
-/// A fresh one-use capability minted by BeginLeakReveal and bound to exactly
-/// one report id. RevealLeakReportSecret accepts this capability alone on the
-/// sensitive local endpoint; mismatched/second report selectors are rejected
-/// before lookup.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LeakRevealCapability {
-    /// The single report id this capability is bound to.
+/// A minted, single-use, one-in-flight reveal capability at rest. Stores the
+/// **raw 32 token bytes only** (never the hex string), the bound report id, and
+/// the absolute expiry. Consumed by the reveal core under the state lock.
+pub struct PendingCapability {
+    token: [u8; 32],
     report_id: String,
-    /// A random opaque token; never derived from the secret.
-    token: String,
-    /// Whether this capability has been consumed (single-use).
-    consumed: bool,
+    expires_at_ms: i64,
 }
 
-impl LeakRevealCapability {
-    /// The report id this capability is bound to.
+impl PendingCapability {
+    /// The raw 32-byte token for constant-time comparison after hex-decode.
+    pub fn token(&self) -> &[u8; 32] {
+        &self.token
+    }
+    /// The single report id this capability is bound to.
     pub fn report_id(&self) -> &str {
         &self.report_id
     }
-
-    /// The opaque token; never derived from the secret.
-    pub fn token(&self) -> &str {
-        &self.token
+    /// Absolute expiry (unix ms).
+    pub fn expires_at_ms(&self) -> i64 {
+        self.expires_at_ms
     }
 }
 
-/// The BeginLeakReveal request. Secret-free: it binds a fresh one-use
-/// capability to exactly one report id.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BeginLeakReveal {
-    pub report_id: String,
+impl std::fmt::Debug for PendingCapability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the raw token bytes.
+        f.debug_struct("PendingCapability")
+            .field("token", &"[REDACTED; 32 bytes]")
+            .field("report_id", &self.report_id)
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
 }
 
-/// The RevealLeakReportSecret request. Accepts the capability alone on the
-/// sensitive local endpoint; mismatched/second report selectors are rejected
-/// before lookup.
-#[derive(Debug, Clone)]
-pub struct RevealLeakReportSecret {
-    pub capability: LeakRevealCapability,
+/// The outcome of beginning a reveal under the state lock.
+#[derive(Debug)]
+pub enum RevealStart {
+    /// The rolling rate limit is exhausted; the pending capability is **not**
+    /// consumed (it still expires on its own clock).
+    RateLimited,
+    /// No capability was pending (or a later mint replaced it); indistinguishable
+    /// unauthorized.
+    NoCapability,
+    /// The pending capability was consumed (taken from the slot). It is gone even
+    /// if the subsequent verification/read fails (fail-closed).
+    Consumed(PendingCapability),
 }
 
-/// The leak rotation update request. Metadata-only and reversible.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LeakRotationUpdate {
-    pub report_id: String,
-    pub action: LeakRotationAction,
+/// The daemon-held reveal state: one pending-capability slot plus the recent
+/// reveal timestamp window. Both live behind one mutex in the daemon context;
+/// time is injected (no `Instant::now`/`Utc::now` inside this logic).
+///
+/// The rate limit counts confirmed successes **plus in-flight reservations**:
+/// `begin_reveal` reserves a slot atomically under the lock (before the caller
+/// releases it to do the DB rehydrate across `.await`s), so concurrent reveals
+/// cannot all pass a `< 3` check while their successes are still pending. Every
+/// non-success path must [`Self::release_reservation`]; a success path
+/// [`Self::confirm_success`], which records the success at the CONFIRM time and
+/// removes the reservation.
+///
+/// An in-flight reservation is **never aged out purely by time** — it stays
+/// counted until it is confirmed or released, and only confirmed successes age
+/// by their own confirm time (RL2). If a reservation aged out on its own, a set
+/// of stalled reveals could vacate their slots at the window boundary, let a
+/// fresh batch through, and then complete — exceeding 3 successes in a rolling
+/// minute. The reservation count is bounded by the limit (a 4th cannot reserve),
+/// and a daemon restart resets all state, so a dropped/cancelled reveal that
+/// never finalizes can at worst shrink the budget (fail-closed), never grow it.
+#[derive(Debug, Default)]
+pub struct LeakRevealState {
+    pending: Option<PendingCapability>,
+    /// Unix-ms timestamps of recent confirmed successful reveals (rolling 60s).
+    successes: Vec<i64>,
+    /// Reservation keys of reveals reserved-but-not-yet-confirmed. Not aged.
+    in_flight: Vec<i64>,
 }
 
-/// The protected-value delete request. Removes protected plaintext/ciphertext
-/// and prevents future recovery while retaining safe historical report
-/// metadata and mandatory redaction.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LeakProtectedValueDelete {
-    pub report_id: String,
-}
-
-/// The leaks service. Coordinates list/update/delete/reveal operations
-/// against the protected store and the sensitive local channel. The
-/// foreground Owner alone may reveal, one at a time, at most three
-/// successful reveals/minute.
-pub struct LeaksService<'a> {
-    db: &'a Db,
-    key_resolver: &'a dyn RedactionKeyResolver,
-    /// The rate limiter: timestamps of recent successful reveals.
-    reveal_timestamps: Vec<Instant>,
-    now_ms: i64,
-}
-
-impl<'a> LeaksService<'a> {
-    /// Create a new leaks service bound to a database and key resolver.
-    /// `now_ms` stamps the delete/rotation timestamps; in production this is
-    /// `chrono::Utc::now().timestamp_millis()`.
-    pub fn new(db: &'a Db, key_resolver: &'a dyn RedactionKeyResolver, now_ms: i64) -> Self {
-        Self {
-            db,
-            key_resolver,
-            reveal_timestamps: Vec::new(),
-            now_ms,
-        }
+impl LeakRevealState {
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// List leak records per the request. Returns safe metadata rows and the
-    /// next-page snapshot. Limit is clamped to 1..=100; an out-of-range limit
-    /// returns `InvalidLimit`.
-    pub async fn list(&self, request: &LeakListRequest) -> Result<LeakListResponse, LeakListError> {
-        // Clamp the limit.
-        if request.limit < LEAK_LIST_MIN_LIMIT || request.limit > LEAK_LIST_MAX_LIMIT {
-            return Err(LeakListError::InvalidLimit);
-        }
-
-        let session_filter = request.session_filter.as_deref();
-        let cursor = request.cursor.clone();
-        let limit = request.limit;
-
-        let refs = self
-            .db
-            .protected_leak_records_machine_refs(session_filter, cursor, limit)
-            .await
-            .map_err(|_| LeakListError::Internal)?;
-
-        // Determine if there are more rows: if we got exactly `limit` rows,
-        // there may be more. The next snapshot is built from the last row.
-        let has_more = refs.len() as i64 == limit;
-        let next_snapshot = if has_more {
-            if let Some(last) = refs.last() {
-                Some(LeakListSnapshot {
-                    snapshot_high_watermark: last.last_reported_ms,
-                    last_seen_ms: last.last_reported_ms,
-                    last_report_id: last.report_id.clone(),
-                    session_filter: request.session_filter.clone(),
-                })
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let rows: Vec<LeakListRow> = refs.iter().map(LeakListRow::from_ref).collect();
-        Ok(LeakListResponse {
-            rows,
-            next_snapshot,
-        })
-    }
-
-    /// Update the rotation disposition of a leak record. Metadata-only and
-    /// reversible; a fresh re-report clears it.
-    pub async fn update_rotation(&self, update: &LeakRotationUpdate) -> Result<(), LeakListError> {
-        let rotation = match update.action {
-            LeakRotationAction::Accept => LeakRotation::PendingUser,
-            LeakRotationAction::Dismiss => LeakRotation::NotApplicable,
-            LeakRotationAction::MarkRotated => LeakRotation::Rotated,
-        };
-        self.db
-            .protected_leak_record_set_rotation(&update.report_id, rotation)
-            .await
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("not found") {
-                    LeakListError::InvalidCursor
-                } else {
-                    LeakListError::Internal
-                }
-            })
-    }
-
-    /// Delete the protected plaintext/ciphertext for a leak record while
-    /// retaining safe historical report metadata. Prevents future recovery.
-    pub async fn delete_protected_value(
-        &self,
-        delete: &LeakProtectedValueDelete,
-    ) -> Result<(), LeakListError> {
-        self.db
-            .protected_leak_record_delete_protected_value(&delete.report_id, self.now_ms)
-            .await
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("not found") {
-                    LeakListError::InvalidCursor
-                } else {
-                    LeakListError::Internal
-                }
-            })
-    }
-
-    /// Begin a leak reveal: mint a fresh one-use capability bound to exactly
-    /// one report id. Secret-free. The capability is consumed by
-    /// [`Self::reveal`].
-    pub fn begin_reveal(
-        &self,
-        request: &BeginLeakReveal,
-    ) -> Result<LeakRevealCapability, LeakListError> {
-        let token = generate_capability_token();
-        Ok(LeakRevealCapability {
-            report_id: request.report_id.clone(),
+    /// Mint a new capability, **replacing** (thereby invalidating) any
+    /// outstanding one — one-in-flight by construction.
+    pub fn mint(&mut self, token: [u8; 32], report_id: String, expires_at_ms: i64) {
+        self.pending = Some(PendingCapability {
             token,
-            consumed: false,
-        })
+            report_id,
+            expires_at_ms,
+        });
     }
 
-    /// Reveal the protected literal for a leak report. Accepts the capability
-    /// alone on the sensitive local endpoint; mismatched/second report
-    /// selectors are rejected before lookup. The foreground Owner alone may
-    /// reveal, one at a time, at most three successful reveals/minute.
-    ///
-    /// The returned plaintext lives only in the `Revealed` variant's
-    /// [`Zeroizing<String>`] and is never copied into App messages, cached
-    /// Text, history, search, selection, clipboard, analytics, or
-    /// diagnostics.
-    pub async fn reveal(
-        &mut self,
-        request: &RevealLeakReportSecret,
-    ) -> Result<LeakRevealResult, ()> {
-        // 1. Validate the capability: it must not be consumed.
-        if request.capability.consumed {
-            return Ok(LeakRevealResult::InvalidCapability);
+    fn prune(&mut self, now_ms: i64) {
+        // Only confirmed successes age out (by their own confirm time). In-flight
+        // reservations are NEVER aged by time — a stalled reveal stays counted
+        // until it confirms or releases, so slow reveals can't let extra ones
+        // slip through the rolling window (RL2).
+        self.successes
+            .retain(|t| now_ms.saturating_sub(*t) < LEAK_REVEAL_RATE_WINDOW_MS);
+    }
+
+    /// Begin a reveal under the lock: enforce the rate limit against confirmed
+    /// **and** in-flight reveals, then take the pending capability and RESERVE
+    /// an in-flight slot in the same critical section. A rate-limit rejection
+    /// neither reserves nor consumes.
+    pub fn begin_reveal(&mut self, now_ms: i64) -> RevealStart {
+        self.prune(now_ms);
+        if self.successes.len() + self.in_flight.len() >= LEAK_REVEAL_RATE_LIMIT_PER_MINUTE {
+            return RevealStart::RateLimited;
         }
-
-        // 2. Rate limit: at most 3 successful reveals/minute.
-        let now = Instant::now();
-        self.reveal_timestamps
-            .retain(|t| now.duration_since(*t) < Duration::from_secs(60));
-        if self.reveal_timestamps.len() >= LEAK_REVEAL_RATE_LIMIT_PER_MINUTE {
-            return Ok(LeakRevealResult::RateLimited);
+        match self.pending.take() {
+            Some(cap) => {
+                self.in_flight.push(now_ms);
+                RevealStart::Consumed(cap)
+            }
+            None => RevealStart::NoCapability,
         }
+    }
 
-        // 3. Load the leak record by report id. This is a metadata-only check
-        //    before the protected read.
-        let report_id = request.capability.report_id.clone();
-        let record = match self.db.protected_leak_record_get(&report_id).await {
-            Ok(Some(r)) => r,
-            Ok(None) => return Ok(LeakRevealResult::Unauthorized),
-            Err(_) => return Ok(LeakRevealResult::Internal),
-        };
+    /// Convert an in-flight reservation into a confirmed success (on the
+    /// happy path). `reserve_ms` is the `now_ms` passed to `begin_reveal`.
+    pub fn confirm_success(&mut self, reserve_ms: i64, now_ms: i64) {
+        remove_one(&mut self.in_flight, reserve_ms);
+        self.successes.push(now_ms);
+    }
 
-        // 4. If the record is deleted, recovery is impossible.
-        if record.status == LeakRecordStatus::Deleted {
-            return Ok(LeakRevealResult::Deleted);
-        }
+    /// Release an in-flight reservation without recording a success (every
+    /// non-success path: decode/mismatch/expiry/DB error/rehydrate failure).
+    pub fn release_reservation(&mut self, reserve_ms: i64) {
+        remove_one(&mut self.in_flight, reserve_ms);
+    }
 
-        // 5. Rehydrate the literal from the protected-redaction-history row.
-        //    This is the sole plaintext path; it uses the sensitive local
-        //    channel and fails closed on key failure, integrity mismatch, or
-        //    retired row.
-        let history = ProtectedRedactionHistory::new(self.db, self.key_resolver);
-        let rehydrated: RehydratedLiteral =
-            match history.rehydrate_by_history_id(&record.history_id).await {
-                Ok(l) => l,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if msg.contains("retired") {
-                        return Ok(LeakRevealResult::Deleted);
-                    }
-                    return Ok(LeakRevealResult::Internal);
-                }
-            };
+    /// Record a confirmed success directly (test seam for the rate window).
+    #[cfg(test)]
+    pub fn record_success(&mut self, now_ms: i64) {
+        self.prune(now_ms);
+        self.successes.push(now_ms);
+    }
 
-        let plaintext = match rehydrated.as_str() {
-            Ok(s) => s,
-            Err(_) => return Ok(LeakRevealResult::Internal),
-        };
-
-        // 6. Record the successful reveal for rate limiting.
-        self.reveal_timestamps.push(now);
-
-        // 7. Return the zeroizing plaintext buffer. The caller (LeaksPane) is
-        //    the sole plaintext owner.
-        Ok(LeakRevealResult::Revealed {
-            plaintext,
-            report_id,
-        })
+    #[cfg(test)]
+    pub fn pending_is_some(&self) -> bool {
+        self.pending.is_some()
     }
 }
 
-/// Generate a random opaque capability token. Never derived from the secret.
-fn generate_capability_token() -> String {
-    use rand::Rng;
+/// Remove the first element equal to `val` (count-preserving reservation
+/// bookkeeping; concurrent reservations may share a timestamp).
+fn remove_one(v: &mut Vec<i64>, val: i64) {
+    if let Some(pos) = v.iter().position(|&t| t == val) {
+        v.swap_remove(pos);
+    }
+}
+
+/// Generate a fresh 32-byte reveal token (raw bytes) and its lowercase-hex
+/// wire encoding (64 hex chars). Only the raw bytes are stored at rest.
+pub fn mint_reveal_token() -> ([u8; 32], String) {
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    let hex = hex_lower_32(&bytes);
+    (bytes, hex)
 }
 
-/// The TUI LeaksPane ephemeral reveal buffer. This is the sole plaintext owner
-/// in the TUI: a `Zeroizing<String>` exists for at most 30 seconds and is never
-/// copied into App messages, cached Text, history, search, selection,
-/// clipboard, analytics, or diagnostics. Close/navigation/detach/lock/
-/// generation-change/timeout zeroizes, invalidates the generation, and fully
-/// repaints the overlay.
-#[derive(Debug)]
-pub struct LeaksPaneRevealBuffer {
-    /// The zeroizing plaintext. None when no reveal is active.
-    plaintext: Option<Zeroizing<String>>,
-    /// The report id this buffer is bound to.
-    report_id: Option<String>,
-    /// The generation counter. Incremented on close/navigation/detach/lock/
-    /// generation-change/timeout to invalidate late results.
-    generation: u64,
-    /// The instant the buffer was created, for the 30-second TTL.
-    created_at: Option<Instant>,
+/// A per-daemon-boot random 32-byte cursor-MAC key. Rotated on restart, so
+/// stale cursors fail closed into a fresh snapshot.
+pub fn random_cursor_key() -> [u8; 32] {
+    let mut key = [0u8; 32];
+    rand::rng().fill_bytes(&mut key);
+    key
 }
 
-impl LeaksPaneRevealBuffer {
-    /// Create a new empty reveal buffer.
-    pub fn new() -> Self {
-        Self {
-            plaintext: None,
-            report_id: None,
-            generation: 0,
-            created_at: None,
+/// Lowercase-hex encode 32 bytes into a 64-char string.
+fn hex_lower_32(bytes: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(64);
+    for &b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
+/// Decode exactly 64 lowercase/uppercase hex chars into 32 raw bytes. Returns
+/// `None` on any non-hex byte or wrong length (treated as unauthorized after
+/// structural failure by the caller).
+pub fn decode_hex_32(s: &str) -> Option<[u8; 32]> {
+    let bytes = s.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        let hi = hex_val(bytes[2 * i])?;
+        let lo = hex_val(bytes[2 * i + 1])?;
+        out[i] = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Constant-time equality of two fixed-length 32-byte tokens. Fixed-length,
+/// branch-free comparison — no early return on the first differing byte.
+pub fn ct_eq_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let mut diff: u8 = 0;
+    for i in 0..32 {
+        diff |= a[i] ^ b[i];
+    }
+    // black_box the accumulator so the compiler cannot fold the comparison into
+    // an early-out.
+    std::hint::black_box(diff) == 0
+}
+
+// ---------------------------------------------------------------------------
+// List cursor: base64url(payload || HMAC-SHA256(key, payload))
+// ---------------------------------------------------------------------------
+
+/// The versioned, canonically-encoded cursor payload. Binds owner tag, all
+/// filters, rotation state, the snapshot high watermark, and the last ordering
+/// key. Its MAC is verified constant-time on decode and its filters checked for
+/// equality with the incoming request's filters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeakCursorPayload {
+    pub session_filter: Option<String>,
+    pub project_root: Option<String>,
+    pub rotation: Option<LeakRotation>,
+    pub snapshot_high_watermark: i64,
+    pub last_seen_ms: i64,
+    pub last_report_id: String,
+}
+
+const LEAK_CURSOR_VERSION: u8 = 1;
+const LEAK_CURSOR_OWNER_TAG: u8 = 1;
+
+fn rotation_wire(r: LeakRotation) -> u8 {
+    match r {
+        LeakRotation::None => 1,
+        LeakRotation::PendingUser => 2,
+        LeakRotation::Rotated => 3,
+        LeakRotation::NotApplicable => 4,
+    }
+}
+
+fn rotation_from_wire(v: u8) -> Option<LeakRotation> {
+    match v {
+        1 => Some(LeakRotation::None),
+        2 => Some(LeakRotation::PendingUser),
+        3 => Some(LeakRotation::Rotated),
+        4 => Some(LeakRotation::NotApplicable),
+        _ => None,
+    }
+}
+
+fn push_opt_str(buf: &mut Vec<u8>, s: Option<&str>) {
+    match s {
+        Some(s) => {
+            buf.push(1);
+            buf.extend_from_slice(&(s.len() as u32).to_be_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
+        None => buf.push(0),
+    }
+}
+
+fn push_str(buf: &mut Vec<u8>, s: &str) {
+    buf.extend_from_slice(&(s.len() as u32).to_be_bytes());
+    buf.extend_from_slice(s.as_bytes());
+}
+
+fn encode_cursor_payload_bytes(p: &LeakCursorPayload) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.push(LEAK_CURSOR_VERSION);
+    buf.push(LEAK_CURSOR_OWNER_TAG);
+    push_opt_str(&mut buf, p.session_filter.as_deref());
+    push_opt_str(&mut buf, p.project_root.as_deref());
+    match p.rotation {
+        Some(r) => {
+            buf.push(1);
+            buf.push(rotation_wire(r));
+        }
+        None => buf.push(0),
+    }
+    buf.extend_from_slice(&p.snapshot_high_watermark.to_be_bytes());
+    buf.extend_from_slice(&p.last_seen_ms.to_be_bytes());
+    push_str(&mut buf, &p.last_report_id);
+    buf
+}
+
+struct Reader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn u8(&mut self) -> Option<u8> {
+        let b = *self.buf.get(self.pos)?;
+        self.pos += 1;
+        Some(b)
+    }
+    fn i64(&mut self) -> Option<i64> {
+        let end = self.pos.checked_add(8)?;
+        let slice = self.buf.get(self.pos..end)?;
+        self.pos = end;
+        Some(i64::from_be_bytes(slice.try_into().ok()?))
+    }
+    fn str(&mut self) -> Option<String> {
+        let end = self.pos.checked_add(4)?;
+        let len_slice = self.buf.get(self.pos..end)?;
+        self.pos = end;
+        let len = u32::from_be_bytes(len_slice.try_into().ok()?) as usize;
+        let s_end = self.pos.checked_add(len)?;
+        let s_slice = self.buf.get(self.pos..s_end)?;
+        self.pos = s_end;
+        String::from_utf8(s_slice.to_vec()).ok()
+    }
+    fn opt_str(&mut self) -> Option<Option<String>> {
+        match self.u8()? {
+            0 => Some(None),
+            1 => Some(Some(self.str()?)),
+            _ => None,
         }
     }
-
-    /// The current generation. Incremented on zeroize to invalidate late
-    /// results.
-    pub fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    /// Whether a reveal is currently active (plaintext is held).
-    pub fn is_active(&self) -> bool {
-        self.plaintext.is_some()
-    }
-
-    /// The report id this buffer is bound to, if active.
-    pub fn report_id(&self) -> Option<&str> {
-        self.report_id.as_deref()
-    }
-
-    /// Install a revealed plaintext. Binds the buffer to the report id and
-    /// starts the 30-second TTL. The generation is captured so a late result
-    /// (from a prior generation) can be discarded.
-    pub fn install(
-        &mut self,
-        plaintext: Zeroizing<String>,
-        report_id: String,
-        generation: u64,
-    ) -> bool {
-        // Discard late results from a prior generation.
-        if generation != self.generation {
-            return false;
-        }
-        self.plaintext = Some(plaintext);
-        self.report_id = Some(report_id);
-        self.created_at = Some(Instant::now());
-        true
-    }
-
-    /// Check if the 30-second TTL has expired. If so, zeroize, invalidate the
-    /// generation, and return true.
-    pub fn check_timeout(&mut self) -> bool {
-        if let Some(created) = self.created_at {
-            if created.elapsed() >= LEAK_REVEAL_BUFFER_TTL {
-                self.zeroize();
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Zeroize the buffer, invalidate the generation, and clear the binding.
-    /// Called on close/navigation/detach/lock/generation-change/timeout.
-    pub fn zeroize(&mut self) {
-        self.plaintext = None;
-        self.report_id = None;
-        self.created_at = None;
-        self.generation = self.generation.wrapping_add(1);
-    }
-
-    /// Access the plaintext. The caller must never copy it into App messages,
-    /// cached Text, history, search, selection, clipboard, analytics, or
-    /// diagnostics.
-    pub fn plaintext(&self) -> Option<&Zeroizing<String>> {
-        self.plaintext.as_ref()
+    fn at_end(&self) -> bool {
+        self.pos == self.buf.len()
     }
 }
 
-impl Default for LeaksPaneRevealBuffer {
-    fn default() -> Self {
-        Self::new()
+fn decode_cursor_payload_bytes(buf: &[u8]) -> Option<LeakCursorPayload> {
+    let mut r = Reader { buf, pos: 0 };
+    if r.u8()? != LEAK_CURSOR_VERSION {
+        return None;
     }
+    if r.u8()? != LEAK_CURSOR_OWNER_TAG {
+        return None;
+    }
+    let session_filter = r.opt_str()?;
+    let project_root = r.opt_str()?;
+    let rotation = match r.u8()? {
+        0 => None,
+        1 => Some(rotation_from_wire(r.u8()?)?),
+        _ => return None,
+    };
+    let snapshot_high_watermark = r.i64()?;
+    let last_seen_ms = r.i64()?;
+    let last_report_id = r.str()?;
+    if !r.at_end() {
+        return None;
+    }
+    Some(LeakCursorPayload {
+        session_filter,
+        project_root,
+        rotation,
+        snapshot_high_watermark,
+        last_seen_ms,
+        last_report_id,
+    })
 }
 
-/// The sensitive local channel marker. This is a type-level marker that the
-/// reveal path uses the protected local sensitive channel from
-/// `leak-report-tool`; ordinary daemon responses/events and remote codecs
-/// cannot represent plaintext.
-#[derive(Debug, Clone, Copy)]
-pub struct SensitiveLocalChannel;
+/// Encode a cursor payload as `base64url(payload || HMAC-SHA256(key, payload))`.
+pub fn encode_leak_cursor(key: &[u8; 32], p: &LeakCursorPayload) -> String {
+    let payload = encode_cursor_payload_bytes(p);
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(&payload);
+    let tag = mac.finalize().into_bytes();
+    let mut framed = payload;
+    framed.extend_from_slice(tag.as_slice());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&framed)
+}
 
-impl SensitiveLocalChannel {
-    /// Whether this channel is the local sensitive channel. Always true:
-    /// this is a compile-time marker that the reveal path uses the protected
-    /// local channel and not an ordinary daemon response/event stream.
-    pub fn is_local_sensitive(self) -> bool {
-        true
+/// Decode + constant-time MAC-verify a cursor, then require its bound filters to
+/// equal `filters`. Any failure (bad base64, short frame, wrong version/owner,
+/// MAC mismatch, filter mismatch, legacy JSON cursor, wrong boot key) →
+/// [`LeakListError::InvalidCursor`].
+pub fn decode_leak_cursor(
+    key: &[u8; 32],
+    cursor: &str,
+    filters: &LeakListFilters,
+) -> Result<LeakCursorPayload, LeakListError> {
+    let framed = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor.as_bytes())
+        .map_err(|_| LeakListError::InvalidCursor)?;
+    if framed.len() < 32 {
+        return Err(LeakListError::InvalidCursor);
+    }
+    let (payload, tag) = framed.split_at(framed.len() - 32);
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(payload);
+    // Constant-time verification of the 32-byte tag.
+    mac.verify_slice(tag).map_err(|_| LeakListError::InvalidCursor)?;
+    let parsed = decode_cursor_payload_bytes(payload).ok_or(LeakListError::InvalidCursor)?;
+    if parsed.session_filter != filters.session_filter
+        || parsed.project_root != filters.project_root
+        || parsed.rotation != filters.rotation
+    {
+        return Err(LeakListError::InvalidCursor);
+    }
+    Ok(parsed)
+}
+
+// ---------------------------------------------------------------------------
+// List / rotation / delete (the single dispatch-backing implementation)
+// ---------------------------------------------------------------------------
+
+/// One page of the machine-wide Owner leak list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeakListPage {
+    pub refs: Vec<ProtectedLeakRecordRef>,
+    /// The opaque MAC'd cursor for the next page; `None` on the last page.
+    pub next_cursor: Option<String>,
+    /// True iff a further page exists (a `limit + 1` row was fetched).
+    pub has_more: bool,
+}
+
+/// List one page of leak reports. The first page (no cursor) captures the
+/// snapshot high watermark and binds it into the returned cursor; every page is
+/// constrained to `last_reported_ms <= watermark`, so concurrent inserts and
+/// re-reports never shift/duplicate/skip the traversal. `has_more` is computed
+/// by fetching `limit + 1` rows and truncating.
+pub async fn list_leak_reports(
+    db: &Db,
+    cursor_key: &[u8; 32],
+    filters: LeakListFilters,
+    limit: i64,
+    cursor: Option<&str>,
+) -> Result<LeakListPage, LeakListError> {
+    if !(LEAK_LIST_MIN_LIMIT..=LEAK_LIST_MAX_LIMIT).contains(&limit) {
+        return Err(LeakListError::InvalidLimit);
+    }
+
+    let (watermark, position) = match cursor {
+        Some(cursor) => {
+            let payload = decode_leak_cursor(cursor_key, cursor, &filters)?;
+            (
+                payload.snapshot_high_watermark,
+                Some(LeakListCursor {
+                    last_seen_ms: payload.last_seen_ms,
+                    report_id: payload.last_report_id,
+                }),
+            )
+        }
+        None => {
+            let watermark = db
+                .protected_leak_records_watermark(filters.clone())
+                .await
+                .map_err(|_| LeakListError::Internal)?;
+            (watermark, None)
+        }
+    };
+
+    let mut refs = db
+        .protected_leak_records_machine_page(filters.clone(), watermark, position, limit + 1)
+        .await
+        .map_err(|_| LeakListError::Internal)?;
+
+    let has_more = refs.len() as i64 > limit;
+    if has_more {
+        refs.truncate(limit as usize);
+    }
+
+    let next_cursor = if has_more {
+        refs.last().map(|last| {
+            encode_leak_cursor(
+                cursor_key,
+                &LeakCursorPayload {
+                    session_filter: filters.session_filter.clone(),
+                    project_root: filters.project_root.clone(),
+                    rotation: filters.rotation,
+                    snapshot_high_watermark: watermark,
+                    last_seen_ms: last.last_reported_ms,
+                    last_report_id: last.report_id.clone(),
+                },
+            )
+        })
+    } else {
+        None
+    };
+
+    Ok(LeakListPage {
+        refs,
+        next_cursor,
+        has_more,
+    })
+}
+
+/// Update the rotation disposition of a leak record. Metadata-only and
+/// reversible; a fresh re-report clears it. A missing record maps to
+/// [`LeakListError::NotFound`] (indistinguishable-unauthorized at dispatch).
+pub async fn update_rotation(
+    db: &Db,
+    report_id: &str,
+    action: LeakRotationAction,
+) -> Result<(), LeakListError> {
+    let rotation = match action {
+        LeakRotationAction::Accept => LeakRotation::PendingUser,
+        LeakRotationAction::Dismiss => LeakRotation::NotApplicable,
+        LeakRotationAction::MarkRotated => LeakRotation::Rotated,
+    };
+    db.protected_leak_record_set_rotation(report_id, rotation)
+        .await
+        .map_err(|e| classify_not_found(&e))
+}
+
+/// Delete the protected plaintext/ciphertext for a leak record while retaining
+/// safe historical report metadata. Destroys the ciphertext/nonce/tag in one
+/// transaction regardless of artifact references (see
+/// [`crate::db::protected_leak_records::delete_protected_value_conn`]). A
+/// missing record maps to [`LeakListError::NotFound`]. No error path carries a
+/// reference count.
+pub async fn delete_protected_value(
+    db: &Db,
+    report_id: &str,
+    now_ms: i64,
+) -> Result<(), LeakListError> {
+    db.protected_leak_record_delete_protected_value(report_id, now_ms)
+        .await
+        .map_err(|e| classify_not_found(&e))
+}
+
+fn classify_not_found(e: &anyhow::Error) -> LeakListError {
+    if e.to_string().contains("not found") {
+        LeakListError::NotFound
+    } else {
+        LeakListError::Internal
     }
 }

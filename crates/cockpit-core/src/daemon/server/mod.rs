@@ -462,10 +462,6 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         // free text to scrub.
         proto::Response::LeakReports { page: _ }
         | proto::Response::LeakRevealCapability { capability: _ }
-        | proto::Response::LeakRevealedSecret {
-            report_id: _,
-            generation: _,
-        }
         | proto::Response::LeakRotationUpdated {
             report_id: _,
             rotation: _,
@@ -1821,6 +1817,14 @@ pub struct DaemonContext {
     /// treat `None` as "no durable write-scope lifecycle is available", which is
     /// safe because the spawn gate independently refuses writable delegation.
     pub write_scope: Option<std::sync::Arc<crate::write_scope::WriteScopeCoordinator>>,
+    /// Leak-reveal capability slot + successful-reveal rate window, behind one
+    /// mutex. In-memory only: a daemon restart invalidates outstanding
+    /// capabilities (fail-closed), and secrets-adjacent tokens never touch disk.
+    /// Single slot ⇒ one reveal in flight; minting replaces the prior token.
+    pub(crate) leak_reveal_state: Arc<StdMutex<crate::leaks::LeakRevealState>>,
+    /// Per-daemon-boot random 32-byte HMAC key for the leak-list cursor. Rotated
+    /// on restart, so stale cursors fail closed into a fresh snapshot.
+    pub(crate) leak_cursor_key: [u8; 32],
 }
 
 #[cfg(test)]
@@ -1993,6 +1997,8 @@ impl DaemonContext {
             process_containment: None,
             _process_containment_actor: None,
             write_scope: None,
+            leak_reveal_state: Arc::new(StdMutex::new(crate::leaks::LeakRevealState::new())),
+            leak_cursor_key: crate::leaks::random_cursor_key(),
         }
     }
 
@@ -2672,8 +2678,12 @@ async fn run_retention_tick_db(db: Db, cfg: RetentionConfig) {
     run_retention_pass(db, cfg, now_secs).await;
 }
 
+/// Same-uid peer check used by the control-socket accept loop **and** the
+/// dedicated leak-reveal socket accept loop — one shared policy, never a
+/// hand-rolled second `SO_PEERCRED`/`getpeereid` path. Elevated to `pub(crate)`
+/// so the reveal accept loop (a sibling `daemon` module) reuses it.
 #[cfg(unix)]
-fn validate_peer_owner(stream: &UnixStream) -> Result<()> {
+pub(crate) fn validate_peer_owner(stream: &UnixStream) -> Result<()> {
     let peer_uid = peer_uid(stream)?;
     let daemon_uid = current_uid();
     validate_peer_uid(peer_uid, daemon_uid)
@@ -4372,6 +4382,8 @@ pub(crate) mod inventory;
 mod sessions;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod leaks_tests;
 
 pub use attachments::validate_png_attachment_blocking;
 pub use dispatch::request_shutdown;

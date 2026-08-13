@@ -1176,6 +1176,7 @@ fn leaks_request(args: &str) -> Option<cockpit_core::daemon::proto::Request> {
             limit: None,
             project_root: None,
             session_id: None,
+            rotation: None,
         });
     }
     let mut tokens = args.split_whitespace();
@@ -2493,11 +2494,15 @@ impl App {
         );
     }
 
-    /// Handle the `/leaks` command: list, rotate, or delete contained leak
-    /// reports machine-wide. Uses metadata-only Owner RPCs; recovery (the
-    /// authenticated reveal) is not yet wired and arrives with
-    /// `implement-leak-reveal`.
+    /// Handle the `/leaks` command. Bare `/leaks` and `/leaks list` open the
+    /// interactive [`LeaksPane`] (metadata list + authenticated reveal);
+    /// `/leaks rotate|delete <id>` remain metadata-only textual passthrough.
     pub(super) fn handle_leaks_command(&mut self, args: &str) {
+        let trimmed = args.trim();
+        if trimmed.is_empty() || trimmed == "list" {
+            self.open_leaks_pane();
+            return;
+        }
         let Some(request) = leaks_request(args) else {
             self.push_plain(
                 "/leaks: usage `/leaks`, `/leaks list`, `/leaks rotate <id> <accept|dismiss|rotated>`, `/leaks delete <id>`"
@@ -3353,6 +3358,7 @@ mod table_tests {
                         limit: None,
                         project_root: None,
                         session_id: None,
+                        rotation: None,
                     })
                 ),
                 "expected list variant for {input:?}"

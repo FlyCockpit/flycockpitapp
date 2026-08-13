@@ -1384,6 +1384,15 @@ impl App {
                     pane.render(frame, rects.body);
                     self.overlay = Overlay::Notes(pane);
                 }
+                Overlay::Leaks(mut pane) => {
+                    pane.render(frame, rects.body);
+                    // A render-time TTL expiry flags a clear; drive the screen
+                    // scrub on the next wake.
+                    if pane.take_pending_clear() {
+                        self.leaks_reveal_clear_pending = true;
+                    }
+                    self.overlay = Overlay::Leaks(pane);
+                }
                 Overlay::Diff(mut pane) => {
                     pane.render(frame, rects.body);
                     self.overlay = Overlay::Diff(pane);
@@ -6132,6 +6141,125 @@ mod render_history_spacing_tests {
             terminal.draw(|frame| app.render(frame)).unwrap();
         });
         terminal.backend().buffer().clone()
+    }
+
+    fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
+        let area = *buf.area();
+        let mut out = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// AC11: driving the real `App`, a revealed sentinel is drawn only while the
+    /// `LeaksPane` buffer is active, never enters transcript/history, and is
+    /// gone from the rendered backend after zeroize + repaint. The type carrying
+    /// the plaintext has a `Debug` that omits it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn leaks_pane_plaintext_never_reaches_transcript() {
+        const SENTINEL: &str = "ZZZSENTINELLEAKPLAINTEXTZZZ";
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = empty_banner_app(tmp.path());
+
+        let mut pane = crate::tui::leaks_pane::LeaksPane::open(None);
+        let generation = pane.reveal_buffer().generation();
+        pane.install_reveal(
+            zeroize::Zeroizing::new(SENTINEL.to_owned()),
+            "r1".to_owned(),
+            generation,
+        );
+        assert!(pane.reveal_buffer().is_active());
+        app.overlay = super::Overlay::Leaks(pane);
+
+        // Precondition: the sentinel renders while the buffer is active.
+        let buffer = render_app_buffer(&mut app, 100, 24);
+        assert!(
+            buffer_text(&buffer).contains(SENTINEL),
+            "sentinel must render while the reveal buffer is active"
+        );
+
+        // The sentinel never entered transcript/history/message state.
+        assert!(
+            !app.history.iter().any(|entry| format!("{entry:?}").contains(SENTINEL)),
+            "sentinel must not appear in history/transcript state"
+        );
+
+        // Close: zeroize + repaint. A fresh backend must no longer show it.
+        if let super::Overlay::Leaks(pane) = &mut app.overlay {
+            assert!(pane.zeroize_reveal());
+        }
+        let buffer = render_app_buffer(&mut app, 100, 24);
+        assert!(
+            !buffer_text(&buffer).contains(SENTINEL),
+            "sentinel must be gone from the rendered buffer after zeroize + repaint"
+        );
+
+        // The plaintext-carrying type's Debug omits the secret.
+        let secret = cockpit_core::daemon::leak_reveal::RevealedLeakSecret {
+            report_id: "r1".to_owned(),
+            plaintext: zeroize::Zeroizing::new(SENTINEL.to_owned()),
+            generation: 0,
+        };
+        assert!(!format!("{secret:?}").contains(SENTINEL));
+    }
+
+    /// TU1: the 30s TTL expiry drives the App's `leaks_reveal_clear_pending` flag
+    /// AND a shorter post-expiry render (drawn into the SAME terminal after the
+    /// forced clear) leaves no stale secret cells in the backbuffer.
+    #[tokio::test(flavor = "current_thread")]
+    async fn leaks_pane_ttl_expiry_clears_stale_secret_cells() {
+        const SENTINEL: &str = "ZZZSTALESECRETCELLSZZZ";
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = empty_banner_app(tmp.path());
+
+        let mut pane = crate::tui::leaks_pane::LeaksPane::open(None);
+        let generation = pane.reveal_buffer().generation();
+        pane.install_reveal(
+            zeroize::Zeroizing::new(SENTINEL.to_owned()),
+            "r1".to_owned(),
+            generation,
+        );
+        app.overlay = super::Overlay::Leaks(pane);
+
+        // Draw two frames into the SAME terminal so stale cells are observable.
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        crate::tui::banner_box::with_test_banner_visible(|| {
+            terminal.draw(|f| app.render(f)).unwrap();
+        });
+        assert!(
+            buffer_text(terminal.backend().buffer()).contains(SENTINEL),
+            "the secret renders while the buffer is active"
+        );
+
+        // Expire the TTL (injected clock) on the idle pane, then run the App tick
+        // that drives the clear flag.
+        let base = std::time::Instant::now();
+        if let super::Overlay::Leaks(pane) = &mut app.overlay {
+            assert!(pane.tick_at(base + std::time::Duration::from_secs(31)));
+            assert!(!pane.reveal_buffer().is_active(), "TTL zeroizes the buffer");
+        }
+        assert!(!app.leaks_reveal_clear_pending);
+        app.tick_leaks_reveal();
+        assert!(
+            app.leaks_reveal_clear_pending,
+            "TTL expiry must set the App clear-pending flag"
+        );
+
+        // The App's clear service scrubs the backbuffer; the next (shorter)
+        // render must leave no stale secret cells.
+        terminal.clear().unwrap();
+        crate::tui::banner_box::with_test_banner_visible(|| {
+            terminal.draw(|f| app.render(f)).unwrap();
+        });
+        assert!(
+            !buffer_text(terminal.backend().buffer()).contains(SENTINEL),
+            "no stale secret cells may survive the TTL clear"
+        );
     }
 
     fn banner_top_row(buffer: &ratatui::buffer::Buffer, width: u16, height: u16) -> usize {

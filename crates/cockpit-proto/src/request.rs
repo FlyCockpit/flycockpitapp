@@ -336,17 +336,18 @@ pub enum Request {
         project_root: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<Uuid>,
+        /// Optional rotation-state filter. `None` means all rotation states.
+        /// Bound into the list cursor MAC alongside the other filters.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rotation: Option<LeakRotationState>,
     },
     /// Begin a leak reveal: mint a fresh one-use capability bound to exactly
-    /// one report id. Secret-free.
+    /// one report id. Secret-free. The reveal itself is **not** an ordinary
+    /// proto request — the protected literal travels only on the sensitive
+    /// local endpoint (in-process handoff or the Unix peer-authenticated reveal
+    /// socket), never on any ordinary codec.
     BeginLeakReveal {
         report_id: String,
-    },
-    /// Reveal the protected literal on the sensitive local endpoint. Accepts
-    /// the capability alone; mismatched/second report selectors are rejected
-    /// before lookup.
-    RevealLeakReportSecret {
-        capability: String,
     },
     /// Update the rotation disposition of a leak record. Metadata-only and
     /// reversible.
@@ -1328,7 +1329,6 @@ macro_rules! request_variants {
             (Request::DeleteSealedValue { .. }, "delete_sealed_value");
             (Request::ListLeakReports { .. }, "list_leak_reports");
             (Request::BeginLeakReveal { .. }, "begin_leak_reveal");
-            (Request::RevealLeakReportSecret { .. }, "reveal_leak_report_secret");
             (Request::MarkLeakRotated { .. }, "mark_leak_rotated");
             (Request::DeleteLeakReport { .. }, "delete_leak_report");
             (Request::ListProjectNotes { .. }, "list_project_notes");
@@ -1508,9 +1508,8 @@ macro_rules! command {
             (Request::PinnedMessageState { session_id }, "pinned_message_state", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::ListSealedValues { session_id }, "list_sealed_values", owner_only, field(session_id), false, local_only, none, concurrent, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::DeleteSealedValue { session_id, value_id }, "delete_sealed_value", owner_only, field(session_id), true, local_only, none, serialized, none, "session_id:Uuid|value_id:String", [session_id: Uuid => session, value_id: String => param]);
-            (Request::ListLeakReports { cursor, limit, project_root, session_id }, "list_leak_reports", owner_only, none, false, local_only, none, concurrent, none, "cursor:Option<String>|limit:Option<u32>|project_root:Option<String>|session_id:Option<Uuid>", [cursor: Option<String> => param, limit: Option<u32> => param, project_root: Option<String> => project_root_effective, session_id: Option<Uuid> => param]);
+            (Request::ListLeakReports { cursor, limit, project_root, session_id, rotation }, "list_leak_reports", owner_only, none, false, local_only, none, concurrent, none, "cursor:Option<String>|limit:Option<u32>|project_root:Option<String>|session_id:Option<Uuid>|rotation:Option<LeakRotationState>", [cursor: Option<String> => param, limit: Option<u32> => param, project_root: Option<String> => project_root_effective, session_id: Option<Uuid> => param, rotation: Option<LeakRotationState> => param]);
             (Request::BeginLeakReveal { report_id }, "begin_leak_reveal", owner_only, none, false, local_only, none, serialized, none, "report_id:String", [report_id: String => param]);
-            (Request::RevealLeakReportSecret { capability }, "reveal_leak_report_secret", owner_only, none, false, local_only, none, serialized, none, "capability:String", [capability: String => param]);
             (Request::MarkLeakRotated { report_id, rotation }, "mark_leak_rotated", owner_only, none, true, local_only, none, serialized, none, "report_id:String|rotation:LeakRotationDisposition", [report_id: String => param, rotation: LeakRotationDisposition => param]);
             (Request::DeleteLeakReport { report_id }, "delete_leak_report", owner_only, none, true, local_only, none, serialized, none, "report_id:String", [report_id: String => param]);
             (Request::ListProjectNotes { project_root }, "list_project_notes", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String", [project_root: String => project_root]);
@@ -1917,6 +1916,7 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
         "Vec<TagExpansionMeta>" => "list<struct:TagExpansionMeta:v1>",
         "Option<EnvSnapshotWire>" => "option<struct:EnvSnapshotWire:v1>",
         "Option<RunInvocationOptions>" => "option<struct:RunInvocationOptions:v1>",
+        "Option<LeakRotationState>" => "option<enum16:LeakRotationState>",
         "Option<LlmMode>" => "option<enum16:LlmMode>",
         "Option<PromptCacheRetention>" => "option<enum16:PromptCacheRetention>",
         "Option<SandboxMode>" => "option<enum16:SandboxMode>",
@@ -2560,12 +2560,10 @@ mod tests {
                 limit: Some(50),
                 project_root: None,
                 session_id: None,
+                rotation: None,
             },
             Request::BeginLeakReveal {
                 report_id: "r1".into(),
-            },
-            Request::RevealLeakReportSecret {
-                capability: "cap".into(),
             },
             Request::MarkLeakRotated {
                 report_id: "r1".into(),
@@ -2581,7 +2579,6 @@ mod tests {
             [
                 "list_leak_reports",
                 "begin_leak_reveal",
-                "reveal_leak_report_secret",
                 "mark_leak_rotated",
                 "delete_leak_report",
             ]

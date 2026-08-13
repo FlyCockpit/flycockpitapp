@@ -34,6 +34,10 @@ pub mod egress;
 pub mod ephemeral_guard;
 pub mod fs_api;
 pub mod image_upload;
+pub mod leak_reveal;
+pub mod leak_reveal_frame;
+#[cfg(unix)]
+pub mod leak_reveal_socket;
 pub mod lsp;
 pub mod org_sync;
 pub mod principal;
@@ -454,6 +458,39 @@ impl DaemonPaths {
         Self::from_ephemeral_values(socket, pid_file)
     }
 
+    /// The dedicated leak-reveal socket path for this daemon instance: same
+    /// parent directory as the control socket, basename
+    /// `{control_file_stem}-leak-reveal.sock`. Recomputed from `self.socket`
+    /// via the single pure derivation ([`Self::leak_reveal_socket_path`]) so
+    /// daemon bind and TUI/client connect never diverge and ephemeral
+    /// uniqueness is inherited from the control stem.
+    pub fn leak_reveal_socket(&self) -> PathBuf {
+        Self::leak_reveal_socket_path(&self.socket)
+    }
+
+    /// The **only** leak-reveal socket path derivation: a pure function of the
+    /// control socket path. Same parent directory; basename is the control
+    /// file stem (filename without final extension) + `-leak-reveal.sock`.
+    ///
+    /// * `…/cockpit.sock` → `…/cockpit-leak-reveal.sock`
+    /// * `…/daemon.sock` → `…/daemon-leak-reveal.sock`
+    /// * `…/cockpit-eph-<pid>-<nonce>.sock` →
+    ///   `…/cockpit-eph-<pid>-<nonce>-leak-reveal.sock`
+    ///
+    /// Never a fixed global basename, so concurrent ephemeral daemons never
+    /// collide on the reveal-socket bind.
+    pub fn leak_reveal_socket_path(control_socket: &Path) -> PathBuf {
+        let stem = control_socket
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("cockpit");
+        let file_name = format!("{stem}-leak-reveal.sock");
+        match control_socket.parent() {
+            Some(parent) => parent.join(file_name),
+            None => PathBuf::from(file_name),
+        }
+    }
+
     fn from_ephemeral_values(
         socket: Option<PathBuf>,
         pid_file: Option<PathBuf>,
@@ -495,7 +532,7 @@ fn runtime_dir() -> Option<PathBuf> {
 }
 
 #[cfg(unix)]
-fn bind_private_socket(socket: &std::path::Path) -> Result<UnixListener> {
+pub(crate) fn bind_private_socket(socket: &std::path::Path) -> Result<UnixListener> {
     use std::os::unix::fs::PermissionsExt;
 
     if let Some(parent) = socket.parent() {
@@ -1221,6 +1258,29 @@ async fn run_foreground_inner_with_boot_db(
     let connector_task = connector::spawn_background(ctx.clone());
     let remote_outbox_task = remote_outbox_worker::spawn_background(ctx.clone());
 
+    // Dedicated Unix peer-authenticated leak-reveal socket (sibling of the
+    // control socket; path a pure function of it). Carries only the closed
+    // reveal frame — never ordinary proto — and accepts only after the same
+    // same-uid peer check the control socket uses. A bind failure is non-fatal
+    // for daemon boot: reveal-over-socket is simply unavailable then.
+    #[cfg(unix)]
+    let leak_reveal_task = match leak_reveal_socket::bind_reveal_socket(&ctx) {
+        Ok(reveal_listener) => {
+            let ctx = ctx.clone();
+            Some(tokio::spawn(async move {
+                if let Err(error) =
+                    leak_reveal_socket::run_reveal_accept_loop(ctx, reveal_listener).await
+                {
+                    tracing::warn!(%error, "leak-reveal accept loop ended with error");
+                }
+            }))
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to bind leak-reveal socket; reveal-over-socket unavailable");
+            None
+        }
+    };
+
     timer.phase("signal_and_watchdog");
     timer.done();
     let accept = server::run_accept_loop(ctx.clone(), listener);
@@ -1342,6 +1402,12 @@ async fn run_foreground_inner_with_boot_db(
     remote_audit_upload_task.abort();
     connector_task.abort();
     remote_outbox_task.abort();
+    #[cfg(unix)]
+    if let Some(task) = leak_reveal_task {
+        task.abort();
+    }
+    #[cfg(unix)]
+    let _ = std::fs::remove_file(paths.leak_reveal_socket());
     result
 }
 
@@ -2118,6 +2184,69 @@ mod tests {
         assert_eq!(mode(socket.parent().unwrap()), 0o700);
         assert_eq!(mode(&socket), 0o600);
         drop(listener);
+    }
+
+    /// The leak-reveal socket path is a pure function of the control socket:
+    /// same parent, `{control_stem}-leak-reveal.sock`. Independent literals are
+    /// used for the expected values (no re-derivation via the fn under test).
+    #[test]
+    fn leak_reveal_socket_path_derivation() {
+        let cases = [
+            ("/run/user/1000/cockpit/cockpit.sock", "/run/user/1000/cockpit/cockpit-leak-reveal.sock"),
+            ("/home/u/.local/state/cockpit/daemon.sock", "/home/u/.local/state/cockpit/daemon-leak-reveal.sock"),
+            ("/run/user/1000/cockpit/cockpit-eph-1-aaa.sock", "/run/user/1000/cockpit/cockpit-eph-1-aaa-leak-reveal.sock"),
+        ];
+        for (control, expected) in cases {
+            assert_eq!(
+                DaemonPaths::leak_reveal_socket_path(Path::new(control)),
+                PathBuf::from(expected),
+                "derivation for {control}"
+            );
+        }
+        // A `DaemonPaths` value exposes the same derivation via the method.
+        let paths = DaemonPaths {
+            pid_file: PathBuf::from("/run/user/1000/cockpit/cockpit.pid"),
+            socket: PathBuf::from("/run/user/1000/cockpit/cockpit.sock"),
+            ephemeral: false,
+        };
+        assert_eq!(
+            paths.leak_reveal_socket(),
+            PathBuf::from("/run/user/1000/cockpit/cockpit-leak-reveal.sock")
+        );
+    }
+
+    /// Two ephemeral daemons (distinct control stems) in one runtime dir get
+    /// distinct reveal sockets that also differ from their control sockets, and
+    /// both bind concurrently without collision.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn leak_reveal_ephemeral_sockets_distinct() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = DaemonPaths::ephemeral_with_nonce_in(
+            1,
+            "aaa".to_owned(),
+            &dir.path().join("state"),
+            Some(&dir.path().join("runtime")),
+        )
+        .expect("ephemeral a");
+        let b = DaemonPaths::ephemeral_with_nonce_in(
+            2,
+            "bbb".to_owned(),
+            &dir.path().join("state"),
+            Some(&dir.path().join("runtime")),
+        )
+        .expect("ephemeral b");
+        let ra = a.leak_reveal_socket();
+        let rb = b.leak_reveal_socket();
+        assert_ne!(ra, rb, "distinct ephemeral reveal sockets");
+        assert_ne!(ra, a.socket);
+        assert_ne!(rb, b.socket);
+        let la = bind_private_socket(&ra).expect("bind reveal a");
+        let lb = bind_private_socket(&rb).expect("bind reveal b concurrently");
+        assert_eq!(mode(&ra), 0o600);
+        assert_eq!(mode(&rb), 0o600);
+        drop(la);
+        drop(lb);
     }
 
     /// Layer B wiring: a daemon child started for an ephemeral run binds

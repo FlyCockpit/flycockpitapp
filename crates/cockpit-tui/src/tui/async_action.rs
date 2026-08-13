@@ -133,6 +133,7 @@ pub enum AsyncActionPayload {
     Skills(crate::tui::skills_pane::SkillsPaneFetchResult),
     InventoryBundle(cockpit_core::daemon::proto::Response),
     NotesRpc(crate::tui::notes_pane::NotesRpcResult),
+    LeaksRpc(crate::tui::leaks_pane::LeaksRpcResult),
     PasteTokenCount {
         block_id: u64,
         tokens: usize,

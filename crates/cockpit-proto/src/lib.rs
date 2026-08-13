@@ -1883,6 +1883,19 @@ pub enum LeakRotationDisposition {
     Rotated,
 }
 
+/// The rotation-state filter for `ListLeakReports`. A closed enum mirroring the
+/// stored rotation disposition, used to narrow the machine-wide list to one
+/// rotation state (and bound into the list cursor MAC). Distinct from
+/// [`LeakRotationDisposition`], which is the *action* the Owner takes.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum LeakRotationState {
+    None,
+    PendingUser,
+    Rotated,
+    NotApplicable,
+}
+
 /// One safe metadata-only leak report row. Contains no plaintext, ciphertext,
 /// masked prefix, length-derived identity, or keyed fingerprint.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

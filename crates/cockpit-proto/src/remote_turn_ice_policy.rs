@@ -612,9 +612,21 @@ fn parse_host_port(authority: &str) -> Result<(String, Option<u16>), IcePolicyEr
             if host.is_empty() {
                 return Err(IcePolicyError::BadUrl("empty host".into()));
             }
+            // A remaining colon in the host means an unbracketed IPv6 literal
+            // (e.g. `turn:2001:db8::1`), which RFC 7065 forbids: IPv6 must be
+            // bracketed. Reject rather than mis-split host/port.
+            if host.contains(':') {
+                return Err(IcePolicyError::BadUrl(
+                    "unbracketed IPv6 literal; use [addr]".into(),
+                ));
+            }
             Ok((host.to_string(), Some(parse_port(port)?)))
         }
-        None => Ok((authority.to_string(), None)),
+        None => {
+            // No colon: a hostname or IPv4 literal. (An unbracketed IPv6 always
+            // contains colons and is caught above.)
+            Ok((authority.to_string(), None))
+        }
     }
 }
 
@@ -1647,6 +1659,18 @@ mod tests {
         );
         let u = validate_turn_url("turn:turn.example.com:3478", false).unwrap();
         assert_eq!(u.to_url_string(), "turn:turn.example.com:3478");
+
+        // Unbracketed IPv6 literal is rejected (RFC 7065 requires brackets);
+        // without this it would mis-split as host `2001:db8:` port `1`.
+        assert!(validate_turn_url("turn:2001:db8::1", true).is_err());
+        assert!(validate_turn_url("turn:2001:db8::1:3478", true).is_err());
+        // Bracketed IPv6 literal with a port is accepted when literals allowed.
+        let u = validate_turn_url("turn:[2001:db8::1]:3478", true).unwrap();
+        assert!(u.is_ip_literal);
+        assert_eq!(u.host, "[2001:db8::1]");
+        assert_eq!(u.port, Some(3478));
+        // Bracketed IPv6 literal requires allowIpLiterals.
+        assert!(validate_turn_url("turn:[2001:db8::1]:3478", false).is_err());
     }
 
     #[test]

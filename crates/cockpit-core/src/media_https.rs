@@ -278,6 +278,12 @@ impl VettedHttpsHop {
     /// Reqwest keeps the URL hostname for Host and TLS SNI while dialing only
     /// the supplied socket addresses.
     pub(crate) fn bound_client(&self, limits: &HttpsFetchLimits) -> Result<reqwest::Client> {
+        // Pin the process-global rustls provider to `aws_lc_rs` before building
+        // any rustls-backed client, so production retained-media HTTPS never
+        // initializes rustls under an implicitly-selected or foreign
+        // process-default provider. Fail closed on a provider conflict.
+        crate::tls_crypto_provider::install_process_default()
+            .context("install aws_lc_rs rustls crypto provider for retained-media HTTPS")?;
         let host = self.url.host_str().context("vetted HTTPS hop lost host")?;
         self.bound_client_builder(limits)
             .resolve_to_addrs(host, &self.socket_addrs)
@@ -471,10 +477,9 @@ mod tests {
     use super::*;
 
     fn install_test_crypto_provider() {
-        static INSTALL: std::sync::Once = std::sync::Once::new();
-        INSTALL.call_once(|| {
-            let _ = rustls::crypto::ring::default_provider().install_default();
-        });
+        // Process-global rustls provider is `aws_lc_rs` (USER-SETTLED); share
+        // the one install helper so media HTTPS tests never claim `ring`.
+        crate::tls_crypto_provider::install_for_tests();
     }
 
     fn ip(value: &str) -> IpAddr {
@@ -493,6 +498,25 @@ mod tests {
                     .then_some(value.trim())
             })
             .collect()
+    }
+
+    // Non-vacuous under nextest's process-per-test isolation: this test does
+    // NOT pre-install a provider (it must not call `install_test_crypto_provider`)
+    // and reqwest's own config build does not install a process default, so a
+    // provider becomes the process default ONLY because `bound_client` installs
+    // it. Removing the `install_process_default()` call from `bound_client`
+    // leaves `get_default() == None` and fails this test.
+    #[test]
+    fn bound_client_installs_process_crypto_provider() {
+        let hop = initial_https_hop("https://media.example.test/a", &[ip("93.184.216.34")])
+            .expect("vetted hop");
+        let _client = hop
+            .bound_client(&HttpsFetchLimits::default())
+            .expect("bound_client builds");
+        assert!(
+            rustls::crypto::CryptoProvider::get_default().is_some(),
+            "bound_client() must install the process-global rustls crypto provider"
+        );
     }
 
     #[test]

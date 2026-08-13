@@ -44,6 +44,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::daemon::turn_socket_provider::{AuthorizedIceEntry, TurnSocketProvider};
 use cockpit_proto::remote_ip_consent::{ConsentCapability, VerifiedDirectCapability};
 use cockpit_proto::remote_signaling_attempt_store::{
     RemoteSignalingCommitAckV1, SignalingCodecError,
@@ -226,6 +227,8 @@ pub enum WebrtcEndpointError {
     ConsentFreshnessFailure(u32),
     #[error("redaction violation: sensitive data in output")]
     RedactionViolation,
+    #[error("turn allocation failed")]
+    TurnAllocationFailed,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -403,6 +406,11 @@ impl ConsentGatedResourceFactory {
     /// Create a TURN allocation. Only permitted with `DirectAllowed` or
     /// `RelayOnly`. With `RelayOnly`, this is the only network resource
     /// created.
+    ///
+    /// This capability-gate-only entry point is retained for callers that do
+    /// not yet have a full authorized ICE entry; it does not itself open a
+    /// relay. The real provider call site is
+    /// [`create_turn_allocation_via_provider`](Self::create_turn_allocation_via_provider).
     pub fn create_turn_allocation(
         &mut self,
         capability: &VerifiedDirectCapability,
@@ -413,6 +421,38 @@ impl ConsentGatedResourceFactory {
                 Ok(())
             }
             _ => Err(WebrtcEndpointError::ConsentDenied),
+        }
+    }
+
+    /// Real TURN provider call site (minimal wire).
+    ///
+    /// For consent-allowed capabilities (`DirectAllowed` | `RelayOnly`), drive
+    /// a genuine allocation attempt through the injected
+    /// [`TurnSocketProvider`] using the already-authorized ICE entry — the
+    /// provider is the sole socket-opening seam, so `RelayOnly` still cannot
+    /// open a direct socket. The `turn_allocations_created` counter reflects
+    /// real attempts (incremented once an attempt is started), and the result
+    /// is the provider's real success/failure, never a fabricated one.
+    ///
+    /// This wire does not mint credentials, re-validate ICE policy, or build
+    /// the str0m/Tokio pump — those belong to `webrtc-endpoint-tokio-driver`.
+    pub fn create_turn_allocation_via_provider(
+        &mut self,
+        capability: &VerifiedDirectCapability,
+        provider: &mut TurnSocketProvider,
+        entry: &AuthorizedIceEntry,
+        allocation_lifetime: Duration,
+    ) -> Result<u64, WebrtcEndpointError> {
+        match capability.capability {
+            ConsentCapability::DirectAllowed | ConsentCapability::RelayOnly => {
+                // A real attempt is starting; reflect it in the counter even if
+                // the provider then fails closed.
+                self.turn_allocations_created += 1;
+                provider
+                    .allocate(entry, allocation_lifetime)
+                    .map_err(|_| WebrtcEndpointError::TurnAllocationFailed)
+            }
+            ConsentCapability::Unavailable => Err(WebrtcEndpointError::ConsentDenied),
         }
     }
 

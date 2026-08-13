@@ -83,6 +83,7 @@ pub mod tags;
 #[cfg(test)]
 pub mod test_env;
 pub mod text;
+pub mod tls_crypto_provider;
 pub mod tokens;
 pub mod tools;
 pub mod typed_media_result;

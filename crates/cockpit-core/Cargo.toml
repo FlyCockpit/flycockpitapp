@@ -16,6 +16,12 @@ test-support = []
 # PKCS#11 module present; the SoftHSM CI job enables it. macOS/Windows adapters
 # are target-gated instead (they compile only on their CI matrix legs).
 daemon-custody-pkcs11 = ["dep:cryptoki"]
+# Compiles the real Tokio + turn-client-proto/turn-client-rustls TURN allocation
+# driver (`daemon::turn_socket_provider::io`) and the ignored coturn conformance
+# test. OFF by default so the serialized gate never depends on live TURN
+# infrastructure and stays lock-stable; the Linux coturn CI leg enables it. No
+# new crates — it cfg-gates code over deps already present.
+turn-coturn-conformance = []
 
 [lints]
 workspace = true
@@ -131,19 +137,30 @@ str0m = { version = "=0.21.0", default-features = false, features = ["rust-crypt
 # matches str0m 0.21.0's transitive dependency.
 str0m-rust-crypto = { version = "=0.5.0", default-features = false }
 
-# TURN relay socket provider (`remote-rust-turn-socket-provider`).
+# TURN relay socket provider (`remote-rust-turn-socket-provider` /
+# `turn-socket-provider-real-io`).
 # Exact pins per prompt gates. `turn-client-proto` is the sans-I/O TURN
 # protocol state machine (RFC 5766/8656); `turn-client-rustls` adds TLS
 # transport. Both are MIT OR Apache-2.0, MSRV 1.80.0, edition 2021.
 # `default-features = false` + `std` only: disables the optional `openssl`
 # feature on turn-client-proto (OpenSSL/native-TLS is forbidden) and avoids
 # pulling any server/default features not required by the audited client path.
-# `turn-client-rustls` deliberately selects no crypto provider; the provider
-# installs `aws_lc_rs` explicitly once at process startup instead.
+# The real Tokio driver over these crates is compiled only under the
+# `turn-coturn-conformance` feature (verified against pinned coturn on Linux CI).
+# `turn-client-rustls` selects no crypto provider; the process installs
+# `aws_lc_rs` (only — never `ring`) once via `crate::tls_crypto_provider`
+# before any TLS client config is built.
 turn-client-proto = { version = "=0.7.1", default-features = false, features = ["std"] }
 turn-client-rustls = { version = "=0.1.0", default-features = false, features = ["std"] }
-# System roots for TLS-to-TURN-server verification (rustls-native-certs).
-rustls-native-certs = { version = "0.8", default-features = false }
+# System roots for TLS-to-TURN-server verification (rustls-native-certs). Exact
+# pin (no caret) matching the audited lock version.
+rustls-native-certs = { version = "=0.8.4", default-features = false }
+# Process-global rustls provider install (`aws_lc_rs`) shared by TURN TLS and
+# media HTTPS. Default features keep the `aws_lc_rs` provider available; `ring`
+# is never installed as the process default. Already resolved in Cargo.lock at
+# 0.23.43 (previously a dev-dependency), so promoting it to a normal dependency
+# adds no new lock entry.
+rustls = "=0.23.43"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { workspace = true }
@@ -232,5 +249,6 @@ tokio = { workspace = true, features = ["test-util"] }
 # Cargo.lock at 2.x via the workspace; matches cockpit-proto's dev use.
 syn = { version = "2", features = ["full", "visit"] }
 rcgen = "=0.14.8"
-rustls = "=0.23.43"
+# `rustls` is now a normal dependency (process-global aws_lc_rs provider install);
+# see `[dependencies]`. `tokio-rustls` stays dev-only for media_https test servers.
 tokio-rustls = "=0.26.4"

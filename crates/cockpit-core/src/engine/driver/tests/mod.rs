@@ -111,6 +111,7 @@ fn test_driver_with_url(max_schedules: usize, provider_url: String) -> (Driver, 
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        assistant_identity_prefix: None,
     });
     let driver = Driver::with_max_schedules(session, locks, redact, root, agent, max_schedules);
     (driver, tmp)
@@ -254,6 +255,7 @@ fn learn_driver(
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        assistant_identity_prefix: None,
     });
     let db = crate::db::Db::open_in_memory().unwrap();
     let session = Arc::new(
@@ -1186,6 +1188,7 @@ fn driver_with_skill_caller() -> (Driver, tempfile::TempDir) {
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         env_overlay: old.env_overlay.clone(),
+        assistant_identity_prefix: None,
     });
     (driver, tmp)
 }

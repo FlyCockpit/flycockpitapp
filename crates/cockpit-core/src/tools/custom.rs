@@ -143,6 +143,14 @@ impl Tool for CustomBashTool {
         }
     }
 
+    // A user-authored shell template is NEVER a registered ordinary operation,
+    // even when `approval_exempt` makes its `effect()` read `ReadOnly`: it can run
+    // an arbitrary command, so it must not qualify a child for read-only
+    // concurrent admission.
+    fn is_registered_ordinary_operation(&self) -> bool {
+        false
+    }
+
     fn parameters(&self) -> Value {
         self.build_schema()
     }

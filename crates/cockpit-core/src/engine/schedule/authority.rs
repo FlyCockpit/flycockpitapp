@@ -964,6 +964,7 @@ mod tests {
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            assistant_identity_prefix: None,
         });
 
         let (event_tx, event_rx) = mpsc::channel(64);

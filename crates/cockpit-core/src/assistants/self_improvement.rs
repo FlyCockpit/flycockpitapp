@@ -242,6 +242,7 @@ fn review_agent_from(root_agent: Agent) -> Agent {
         scan_tool_results: false,
         llm_mode: root_agent.llm_mode,
         lock_identity: root_agent.lock_identity,
+        assistant_identity_prefix: root_agent.assistant_identity_prefix,
         write_scope: root_agent.write_scope,
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),

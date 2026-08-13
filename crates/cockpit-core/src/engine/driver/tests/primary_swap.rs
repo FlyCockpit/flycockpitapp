@@ -938,6 +938,7 @@ async fn fresh_driver_rehydrates_persisted_pruned_context() {
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        assistant_identity_prefix: None,
     });
     let mut driver2 =
         Driver::with_max_schedules(s2.clone(), locks, redact, s2.project_root.clone(), agent, 1);

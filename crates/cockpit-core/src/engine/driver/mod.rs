@@ -6054,8 +6054,11 @@ impl Driver {
         // interactive path anyway). Best-effort: a failed persist just omits the
         // handle footer. The handle rides the report so both the user-facing
         // event and the parent's tool_result carry it.
-        let llm_mode = self.stack[0].agent.llm_mode;
-        let followup_enabled = crate::engine::tool::Capability::FollowupSeed.enabled(llm_mode);
+        // Seeding a re-query handle for the finished child is a child-execution
+        // capability, so it is gated on the CHILD's own resolved posture — the
+        // child was built with its selected model's mode — not the root frame's.
+        let followup_enabled =
+            crate::engine::tool::Capability::FollowupSeed.enabled(child.agent.llm_mode);
         let followup_handle = if followup_enabled
             && crate::engine::builtin::is_followup_eligible(&child.agent.name)
         {
@@ -8030,8 +8033,11 @@ impl Driver {
             assistant_identity_prefix: self.assistant_identity_prefix.clone(),
             model_system_prompt_snapshot: self.session.model_system_prompt_snapshot(),
             interactive,
-            // The active LLM mode rides on the root agent; child spawns
-            // inherit it so the whole invocation tree renders one mode.
+            // The root frame's posture. This is the authoritative mode only for
+            // a root/primary build; a DELEGATED child re-resolves its own
+            // posture from its selected model at build time
+            // ([`crate::engine::builtin::child_llm_mode_for_model`]), so this
+            // value is just the baseline a non-delegated spawn keeps.
             llm_mode: self.stack[0].agent.llm_mode,
             // A plan-level model override propagates to the whole delegation
             // tree so every spawned agent runs under it.

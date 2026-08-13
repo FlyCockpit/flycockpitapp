@@ -107,6 +107,13 @@ pub async fn run(
 ) -> Result<DocsPipelineReport> {
     let input = parse_input(brief);
 
+    // `spawn_args.config` is the caller's PINNED per-attempt handle (repinned once
+    // when the delegation attempt settled), so every read here returns one frozen
+    // snapshot: Docs.1 (resolver) and Docs.2 (answerer, which re-reads
+    // `spawn_args.config`) resolve their models under ONE generation, consistent
+    // with the handoff expansion, by construction — no in-pipeline generation
+    // check is needed because the config physically cannot move mid-attempt.
+
     // The docs pipeline's two stages are leaf agents (`docs-resolver` /
     // `docs-answerer`) — neither carries the `question` tool, so they
     // never raise a human-answer interrupt through their loop. A detached
@@ -124,7 +131,7 @@ pub async fn run(
         input.package.clone(),
         approver,
         Some(package_add_interrupts),
-    );
+    )?;
     // Capture the resolver's resolved model before `run_noninteractive`
     // consumes the agent: on a resolution failure the resolver authors the
     // returned text, so its model identity/trust drives that report's frame.
@@ -180,7 +187,7 @@ pub async fn run(
         cwd: resolved.path.clone(),
         ..spawn_args.clone()
     };
-    let answerer = docs_answerer(&answerer_args);
+    let answerer = docs_answerer(&answerer_args)?;
     // Capture the answerer's resolved model before dispatch: it authors the
     // returned answer text, so its identity/trust drives the report frame.
     let answerer_model = answerer.model.clone();

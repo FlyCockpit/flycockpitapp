@@ -486,6 +486,18 @@ pub trait Tool: Send + Sync {
         ToolEffect::Dynamic
     }
 
+    /// Whether this is a REGISTERED ORDINARY built-in operation — not a
+    /// user-authored / custom-bash / unregistered tool. A tool is admissible for
+    /// surface-gated read-only CONCURRENT execution only when this is `true` AND
+    /// its [`Self::effect`] is [`ToolEffect::ReadOnly`]: a user's custom-bash
+    /// template marked `approval_exempt` claims a `ReadOnly` effect but runs an
+    /// arbitrary shell command, so it must NOT count as a proven-read-only
+    /// operation. Defaults `true` for the built-in tool set; custom/unregistered
+    /// tools override it to `false`.
+    fn is_registered_ordinary_operation(&self) -> bool {
+        true
+    }
+
     fn binary_requirements(&self) -> Vec<crate::capabilities::BinaryRequirement> {
         Vec::new()
     }

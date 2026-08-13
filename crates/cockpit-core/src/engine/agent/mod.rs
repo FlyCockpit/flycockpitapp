@@ -99,6 +99,12 @@ pub struct Agent {
     pub delegated: bool,
     pub delegation_recursion: crate::engine::builtin::DelegationRecursionContext,
     pub env_overlay: Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
+    /// The assistant identity prefix (SOUL/USER identity + instructions) that was
+    /// prepended to [`Self::system`] at build time, retained so a per-candidate
+    /// failover re-posture can recompose a system that is byte-identical to a
+    /// fresh build for that candidate model (identity prefix + role body). `None`
+    /// for non-assistant sessions.
+    pub assistant_identity_prefix: Option<String>,
 }
 
 pub(crate) async fn turn_toolbox(

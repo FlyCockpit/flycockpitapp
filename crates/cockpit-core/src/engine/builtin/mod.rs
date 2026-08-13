@@ -1762,6 +1762,363 @@ fn is_delegating(agent: &Agent) -> bool {
     agent.tools.names().contains(&"task")
 }
 
+/// Resolve the harness posture ([`crate::config::extended::LlmMode`]) the agent
+/// built from `args` should render and enforce, from the child's OWN selected
+/// `model` rather than the inherited root frame.
+///
+/// A root/primary spawn (`!args.delegated`) keeps `args.llm_mode`: the session
+/// posture, already resolved for the session model at session start and on each
+/// `/llm-mode` switch. A delegated child resolves its own posture from its
+/// selected provider/model with the same precedence as a root turn — model
+/// `mode` override → provider `mode` override → global default — reading the
+/// config generation pinned on `args` so identity and posture always come from
+/// one generation. This is the delegated analogue of
+/// [`crate::engine::driver::Driver::effective_llm_mode_for`], and it never
+/// re-reads the parent frame's posture.
+pub(crate) fn child_llm_mode_for_model(
+    args: &SpawnArgs,
+    model: &Model,
+) -> crate::config::extended::LlmMode {
+    if !args.delegated {
+        return args.llm_mode;
+    }
+    let (extended, providers) = crate::engine::model_roles::load_model_role_config(&args.config);
+    providers.resolve_mode(model.provider_id(), model.model_id_ref(), extended.llm_mode)
+}
+
+/// Side-effect-free resolution of the concrete model a delegated child named
+/// `name` would run under, using the SAME precedence the agent build applies
+/// (`model_override` → agent-file frontmatter / caller selector → session
+/// model), from the config generation pinned on `args`.
+///
+/// This lets the driver gate a child-execution capability (follow-up
+/// eligibility, handoff-tag expansion) on the child's OWN resolved posture
+/// before the child agent is built, without re-reading the parent frame. It
+/// resolves nothing but a model — it creates no task/child record, spawns no
+/// agent, and mutates no lifecycle state.
+pub(crate) fn resolve_child_model(name: &str, args: &SpawnArgs) -> Result<Arc<Model>> {
+    if let Some(model) = &args.model_override {
+        return Ok(model.clone());
+    }
+    let def = resolve_child_def(name, &args.cwd)?;
+    resolve_agent_model(&def, args)
+}
+
+/// Resolve the SAME [`crate::agents::AgentDef`] the dispatch will build the child
+/// from. The `docs` pipeline stages and `computer` are internal-only defs that
+/// ALWAYS build the EMBEDDED def — so any on-disk `docs-resolver.md` /
+/// `docs-answerer.md` / `computer.md` override is intentionally ignored here,
+/// keeping the resolved handoff/failover posture identical to the dispatched
+/// stage. Every other agent resolves through the normal on-disk/embedded path.
+fn resolve_child_def(name: &str, cwd: &Path) -> Result<crate::agents::AgentDef> {
+    if is_internal_agent_def_name(name) {
+        return crate::agents::embedded_internal_default(name)
+            .ok_or_else(|| anyhow::anyhow!("unknown internal agent `{name}`"));
+    }
+    match crate::agents::resolve(cwd, name)? {
+        Some(def) => Ok(def),
+        None => crate::agents::embedded_internal_default(name)
+            .ok_or_else(|| anyhow::anyhow!("unknown agent `{name}`")),
+    }
+}
+
+/// Like [`resolve_child_def`] but resolving through the SAME workspace +
+/// assistant-DB path the original build used
+/// ([`load_with_assistant_db_and_tool_surface_override`]), so an
+/// assistant-DB-backed agent's def is found (not just on-disk/embedded ones).
+async fn resolve_child_def_with_db(
+    name: &str,
+    cwd: &Path,
+    db: &crate::db::Db,
+) -> Result<crate::agents::AgentDef> {
+    if is_internal_agent_def_name(name) {
+        return crate::agents::embedded_internal_default(name)
+            .ok_or_else(|| anyhow::anyhow!("unknown internal agent `{name}`"));
+    }
+    match crate::agents::resolve_with_assistant_db(cwd, name, db).await? {
+        Some(def) => Ok(def),
+        None => crate::agents::embedded_internal_default(name)
+            .ok_or_else(|| anyhow::anyhow!("unknown agent `{name}`")),
+    }
+}
+
+/// Re-render an already-built delegated child's mode-dependent surface for a
+/// FAILOVER/BACKUP candidate `candidate_model` whose effective posture differs
+/// from the child's primary posture, so **every dispatched target renders its
+/// own effective mode** (not the primary's).
+///
+/// The toolbox is preserved intact — only its descriptions/schemas re-render at
+/// [`ToolBox::definitions`] time from the new `llm_mode`, so per-delegation
+/// grants and the exact tool SET are never disturbed. Only `llm_mode`, the
+/// composed `system` (role body recomposed for the candidate posture from the
+/// SAME def), and `role_prompt` change.
+///
+/// Returns `Ok(None)` ONLY when the candidate is the SAME model AND the same
+/// posture as the current agent (the primary attempt — no re-render needed).
+/// Any different MODEL (even at the same mode) re-renders, because the composed
+/// `system` is model-specific (it prepends the candidate model's own system
+/// prompt): a same-mode, different-model backup must NOT reuse the primary
+/// model's composed system.
+///
+/// For a SAME-mode candidate the agent's OWN role body is reused (no
+/// re-resolution — this works for assistant-DB-backed agents too). For a
+/// DIFFERENT-mode candidate the def is re-resolved through the SAME workspace +
+/// assistant-DB path the original build used, so a DB-backed agent's failover
+/// succeeds with the candidate mode's role + its own identity. Fails CLOSED with
+/// a content-safe error only when the agent's def can no longer be resolved by
+/// ANY path — never dispatching the wrong mode's role text on a different model.
+pub(crate) async fn reposture_agent_for_candidate(
+    agent: &Agent,
+    candidate_model: &Arc<Model>,
+    candidate_mode: crate::config::extended::LlmMode,
+    session: &crate::session::Session,
+    cwd: &Path,
+    db: &crate::db::Db,
+) -> Result<Option<Agent>> {
+    let same_model = agent.model.provider_id() == candidate_model.provider_id()
+        && agent.model.model_id_ref() == candidate_model.model_id_ref();
+    if same_model && candidate_mode == agent.llm_mode {
+        return Ok(None);
+    }
+    let role = if candidate_mode == agent.llm_mode {
+        // Same posture, different model: the role body is unchanged, so reuse the
+        // agent's OWN resolved role (no re-resolution — works for DB-backed
+        // agents even when `resolve_child_def` cannot find them).
+        agent.role_prompt.clone()
+    } else {
+        // Different posture: re-resolve the def (through the SAME workspace +
+        // assistant-DB path the original build used) for the candidate mode's
+        // role body. Fail closed if it cannot be resolved by any path — never
+        // retain the wrong mode's role text.
+        let def = resolve_child_def_with_db(&agent.name, cwd, db)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "cannot re-resolve agent `{}` to render its failover posture: {e}",
+                    agent.name
+                )
+            })?;
+        def.resolved_prompt_for(candidate_mode).to_string()
+    };
+    // Recompose the system for the ACTUAL candidate model (its own model-specific
+    // system prompt), applying the SAME assistant identity prefix the initial
+    // build used, so the repostured system is byte-identical to a fresh build for
+    // this candidate model+mode.
+    let system = compose_reposture_system(
+        &role,
+        candidate_model,
+        agent.assistant_identity_prefix.as_deref(),
+        session,
+        cwd,
+    );
+    let mut reposed = agent.clone();
+    reposed.llm_mode = candidate_mode;
+    reposed.role_prompt = role;
+    reposed.system = system;
+    reposed.model = candidate_model.clone();
+    Ok(Some(reposed))
+}
+
+/// Recompose the cached system block for a failover candidate's posture. Mirrors
+/// [`compose_system_prompt_for_model`] exactly, using the pieces available at
+/// dispatch time (the session snapshot + short id + cwd) plus the retained
+/// `assistant_identity_prefix`, so an assistant-owned session's failover keeps
+/// its SOUL/USER identity/instructions.
+fn compose_reposture_system(
+    role: &str,
+    model: &Model,
+    assistant_identity_prefix: Option<&str>,
+    session: &crate::session::Session,
+    cwd: &Path,
+) -> String {
+    let snapshot = session.model_system_prompt_snapshot();
+    let role = assistant_role_prompt(role, assistant_identity_prefix);
+    let role_system = compose_system_prompt(&role, &session.short_id, cwd);
+    match snapshot.get(model.provider_id(), model.model_id_ref()) {
+        Some(model_prompt) => {
+            let mut out = String::with_capacity(model_prompt.len() + 2 + role_system.len());
+            out.push_str(model_prompt);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push('\n');
+            out.push_str(&role_system);
+            out
+        }
+        None => role_system,
+    }
+}
+
+/// Immutable, side-effect-free description of the execution surface a delegated
+/// child would present if dispatched now, resolved from the child's OWN
+/// selected provider/model at a single config generation.
+///
+/// It is the ONLY contract a caller may use to admit a child for concurrent
+/// execution, and it is bound (by [`Self::config_generation`]) to the attempt
+/// that consumes it: if the generation changes before the attempt starts, the
+/// caller must discard this surface and re-resolve from the generation that
+/// actually starts, rather than admitting a child under stale posture or
+/// capabilities. Constructing one is a pure resolution/preflight operation — it
+/// creates no task/child record, spawns no agent, pregrants no write scope,
+/// requests no approval, and mutates no task lifecycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedChildExecutionSurface {
+    /// The provider the child inference request will actually go to.
+    pub provider: String,
+    /// The model id the child inference request will actually go to.
+    pub model: String,
+    /// The config generation this surface was resolved from. The caller binds
+    /// the admitted attempt to this value; a generation change invalidates it.
+    pub config_generation: u64,
+    /// The harness posture resolved from the child's OWN model — never the
+    /// parent frame's.
+    pub llm_mode: crate::config::extended::LlmMode,
+    /// The child's actual tool/capability names (its enumerated surface).
+    pub tools: Vec<String>,
+    /// Whether the attempt carries write authority — it holds a single-writer
+    /// lock/write tool, or a `write_scope` confinement was requested for it.
+    /// INFORMATIONAL ONLY: this is NOT the concurrent-admission key (a requested
+    /// `write_scope` alone never grants concurrency). Concurrent admission is
+    /// decided by [`batch_child_concurrently_admissible`] from
+    /// `parallel_read_only_eligible` OR the parent-scoped write-admission gate.
+    pub write_authority: bool,
+    /// Closed derived boolean: true ONLY when a noninteractive child exposes
+    /// exclusively registered ordinary [`crate::engine::tool::ToolEffect::ReadOnly`]
+    /// operations (plus the structural `return` completion envelope) and NO
+    /// approval-required / `Dynamic` / mutating / unknown-unregistered /
+    /// write-authority-or-scope / nested-delegation / task-control / scheduling
+    /// capability; false whenever any surface component cannot be enumerated.
+    pub parallel_read_only_eligible: bool,
+}
+
+/// Build the [`ResolvedChildExecutionSurface`] for a child named `name` under
+/// `args`. Side-effect-free: it builds the child agent (a pure construction —
+/// [`load`] creates no lifecycle state) and derives the surface from the actual
+/// built agent, so the surface's identity, posture, tool summary, and derived
+/// booleans equal the attempt subsequently built from the same generation.
+///
+/// On child-agent build or model/mode resolution failure this returns the
+/// existing content-safe routing error, so the caller fails BEFORE dispatch and
+/// never falls back to the parent posture for a different selected model.
+pub fn resolve_child_execution_surface(
+    name: &str,
+    args: &SpawnArgs,
+) -> Result<ResolvedChildExecutionSurface> {
+    // Pin the generation BEFORE building the child, and stamp the surface with
+    // the pinned value. A config refresh landing between build and stamp can then
+    // only make the stamped generation OLDER than reality (so the consumer's
+    // start-check reliably detects the change and recomputes), never NEWER (which
+    // would falsely match a now-stale surface and skip the recompute).
+    let config_generation = args.config.generation();
+    let child = load(name, args)?;
+    Ok(surface_from_built_child(&child, args, config_generation))
+}
+
+/// Whether a batch scheduler may admit this child for CONCURRENT execution. The
+/// concurrency KEY is exactly two signals:
+///   - `surface.parallel_read_only_eligible` — the surface PROVES the child
+///     exposes exclusively registered ordinary read-only operations; OR
+///   - `parent_write_admitted` — the child PASSED the existing parent-scoped
+///     disjoint-scope write-admission gate (its REAL single-writer capability
+///     [`is_write_capable`] plus the batch's Frontier + disjoint-scope policy),
+///     decided by the batch scheduler and passed in here.
+///
+/// `surface.write_authority` is INFORMATIONAL ONLY and is NEVER the concurrency
+/// key: a child that merely carries a requested `write_scope` but has no real
+/// single-writer capability and did not pass parent write-admission (e.g. a
+/// custom/dynamic bash child handed a `write_scope`) is NOT concurrently
+/// admissible — `parallel_read_only_eligible` is false for it and
+/// `parent_write_admitted` is false, so it runs under the EXCLUSIVE guard. Every
+/// other child (a read-only-SOUNDING child whose real surface holds a
+/// dynamic/mutating tool, or a nested/task/scheduling child) is likewise NOT
+/// concurrently admissible and runs alone.
+pub(crate) fn batch_child_concurrently_admissible(
+    surface: &ResolvedChildExecutionSurface,
+    parent_write_admitted: bool,
+) -> bool {
+    surface.parallel_read_only_eligible || parent_write_admitted
+}
+
+/// Build the execution surface for an already-loaded child, without re-loading.
+/// Same result as [`resolve_child_execution_surface`] for the same `(child,
+/// args)` — the scheduler uses this to bind a surface to a child it has just
+/// built for admission. `config_generation` MUST be the generation pinned
+/// BEFORE the child was built (not read here), so the stamp cannot be newer than
+/// the build.
+pub(crate) fn surface_for_built_child(
+    child: &Agent,
+    args: &SpawnArgs,
+    config_generation: u64,
+) -> ResolvedChildExecutionSurface {
+    surface_from_built_child(child, args, config_generation)
+}
+
+fn surface_from_built_child(
+    child: &Agent,
+    args: &SpawnArgs,
+    config_generation: u64,
+) -> ResolvedChildExecutionSurface {
+    let write_authority = is_write_capable(child) || args.write_scope.is_some();
+    ResolvedChildExecutionSurface {
+        provider: child.model.provider_id().to_string(),
+        model: child.model.model_id_ref().to_string(),
+        config_generation,
+        llm_mode: child.llm_mode,
+        tools: child
+            .tools
+            .names()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        write_authority,
+        parallel_read_only_eligible: derive_parallel_read_only_eligible(child, args),
+    }
+}
+
+/// The closed derivation for [`ResolvedChildExecutionSurface::parallel_read_only_eligible`].
+/// Conservative and fail-closed: any capability that cannot be proven a
+/// registered ordinary read-only operation makes the whole surface ineligible.
+fn derive_parallel_read_only_eligible(child: &Agent, args: &SpawnArgs) -> bool {
+    // Only a noninteractive, non-pipeline child can be admitted for concurrent
+    // read-only execution. An interactive attempt or a `docs` pipeline stage
+    // (routed, never enumerable here) is not eligible.
+    if args.interactive || !is_noninteractive(&child.name) || is_docs_pipeline(&child.name) {
+        return false;
+    }
+    // Any write authority (held lock/write tool) or requested write scope, or a
+    // nested-delegation (`task`) surface, forecloses eligibility.
+    if args.write_scope.is_some() || is_write_capable(child) || is_delegating(child) {
+        return false;
+    }
+    // Every exposed tool must be a registered ordinary read-only operation. The
+    // structural `return` completion envelope is the only non-operation tool a
+    // delegated leaf carries; it is not a capability, so it does not disqualify.
+    // Anything else that is `Dynamic` (bash, search, mcp, schedule, spawn,
+    // approval-gated tools) or `Mutating`, that cannot be looked up, OR that is
+    // not a REGISTERED ORDINARY built-in operation (a user-authored custom-bash
+    // template — even one marked `approval_exempt` whose `effect()` reads
+    // `ReadOnly` — can run an arbitrary shell command) makes the surface
+    // ineligible.
+    let names = child.tools.names();
+    if names.iter().all(|&name| name == "return") {
+        // A surface with no enumerable ordinary operation is not a positive
+        // admission signal.
+        return false;
+    }
+    for &name in &names {
+        if name == "return" {
+            continue;
+        }
+        match child.tools.get(name) {
+            Some(tool)
+                if tool.is_registered_ordinary_operation()
+                    && tool.effect() == crate::engine::tool::ToolEffect::ReadOnly => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Register the structural `return` tool on `tb` for a **delegated subagent**
 /// (implementation note). Every delegated subagent
 /// — `builder`/`explore` and any custom subagent — finishes by
@@ -1806,11 +2163,13 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
         && crate::agents::embedded_default(&def.name).is_none();
     if def.name == "deepthink" {
         let model = resolve_agent_model(def, args)?;
+        // Posture follows the child's OWN resolved model, not the root frame.
+        let llm_mode = child_llm_mode_for_model(args, &model);
         let mut params = args.params.clone();
         if let Some(temp) = def.temperature {
             params.temperature = Some(temp as f64);
         }
-        let role = def.resolved_prompt_for(args.llm_mode);
+        let role = def.resolved_prompt_for(llm_mode);
         return Ok(Agent {
             name: def.name.clone(),
             system: compose_system_prompt_for_model(role, &model, args),
@@ -1819,7 +2178,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
             model,
             params,
             scan_tool_results: false,
-            llm_mode: args.llm_mode,
+            llm_mode,
             lock_identity: args
                 .lock_identity
                 .clone()
@@ -1833,6 +2192,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
                 same_model_only: false,
             },
             env_overlay: args.env_overlay.clone(),
+            assistant_identity_prefix: args.assistant_identity_prefix.clone(),
         });
     }
 
@@ -1891,13 +2251,18 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
     // session). A malformed explicit frontmatter selector fails loudly because
     // it is a direct user setting; unset or unconfigured role slots fall back.
     let model = resolve_agent_model(def, args)?;
+    // The child's harness posture is resolved from its OWN selected model
+    // (model → provider → global precedence), never inherited from the root
+    // frame. Rendered into the role prompt below and carried on the agent so
+    // the tool-description seam ([`ToolBox::definitions`]) uses it too.
+    let llm_mode = child_llm_mode_for_model(args, &model);
 
     let mut params = args.params.clone();
     if let Some(temp) = def.temperature {
         params.temperature = Some(temp as f64);
     }
 
-    let role = def.resolved_prompt_for(args.llm_mode);
+    let role = def.resolved_prompt_for(llm_mode);
     Ok(Agent {
         name: def.name.clone(),
         system: compose_system_prompt_for_model(role, &model, args),
@@ -1908,7 +2273,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
         scan_tool_results: def
             .scan_tool_results
             .unwrap_or_else(|| crate::agents::default_scan_tool_results(&def.name, def.mode)),
-        llm_mode: args.llm_mode,
+        llm_mode,
         lock_identity: args
             .lock_identity
             .clone()
@@ -1917,6 +2282,7 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
         delegated: args.delegated,
         delegation_recursion: args.delegation_recursion.clone(),
         env_overlay: args.env_overlay.clone(),
+        assistant_identity_prefix: args.assistant_identity_prefix.clone(),
     })
 }
 
@@ -2209,13 +2575,14 @@ pub fn build(args: &SpawnArgs) -> Agent {
         },
     );
 
+    let model = args.effective_model();
+    let llm_mode = child_llm_mode_for_model(args, &model);
     let role = builtin_prompt_for(
         BUILD_PROMPT,
         Some(BUILD_PROMPT_NORMAL),
         Some(BUILD_PROMPT_FRONTIER),
-        args.llm_mode,
+        llm_mode,
     );
-    let model = args.effective_model();
     let params = params_with_direct_computer(args, &model);
     Agent {
         name: "Build".to_string(),
@@ -2225,7 +2592,7 @@ pub fn build(args: &SpawnArgs) -> Agent {
         model,
         params,
         scan_tool_results: true,
-        llm_mode: args.llm_mode,
+        llm_mode,
         lock_identity: args
             .lock_identity
             .clone()
@@ -2234,6 +2601,7 @@ pub fn build(args: &SpawnArgs) -> Agent {
         delegated: args.delegated,
         delegation_recursion: args.delegation_recursion.clone(),
         env_overlay: args.env_overlay.clone(),
+        assistant_identity_prefix: args.assistant_identity_prefix.clone(),
     }
 }
 
@@ -2274,15 +2642,16 @@ pub fn history(args: &SpawnArgs) -> Agent {
 /// no grant application. It receives only the caller-authored brief plus
 /// context already materialized in the delegation prompt.
 pub fn deepthink(args: &SpawnArgs) -> Agent {
+    let model = args.effective_model();
     Agent {
         name: "deepthink".to_string(),
         system: compose_system_prompt_for_effective_model(DEEPTHINK_PROMPT, args),
         role_prompt: DEEPTHINK_PROMPT.to_string(),
         tools: ToolBox::new(),
-        model: args.effective_model(),
+        llm_mode: child_llm_mode_for_model(args, &model),
+        model,
         params: args.params.clone(),
         scan_tool_results: false,
-        llm_mode: args.llm_mode,
         lock_identity: args
             .lock_identity
             .clone()
@@ -2296,6 +2665,7 @@ pub fn deepthink(args: &SpawnArgs) -> Agent {
             same_model_only: false,
         },
         env_overlay: args.env_overlay.clone(),
+        assistant_identity_prefix: args.assistant_identity_prefix.clone(),
     }
 }
 
@@ -2394,16 +2764,18 @@ pub fn scout(args: &SpawnArgs) -> Agent {
     );
     let tools = with_return_tool(tools, "scout");
 
-    let role = builtin_prompt_for(SCOUT_PROMPT, Some(SCOUT_PROMPT_NORMAL), None, args.llm_mode);
+    let model = args.effective_model();
+    let llm_mode = child_llm_mode_for_model(args, &model);
+    let role = builtin_prompt_for(SCOUT_PROMPT, Some(SCOUT_PROMPT_NORMAL), None, llm_mode);
     Agent {
         name: "scout".to_string(),
         system: compose_system_prompt_for_effective_model(role, args),
         role_prompt: role.to_string(),
         tools,
-        model: args.effective_model(),
+        model,
         params: args.params.clone(),
         scan_tool_results: false,
-        llm_mode: args.llm_mode,
+        llm_mode,
         lock_identity: args
             .lock_identity
             .clone()
@@ -2412,6 +2784,7 @@ pub fn scout(args: &SpawnArgs) -> Agent {
         delegated: args.delegated,
         delegation_recursion: args.delegation_recursion.clone(),
         env_overlay: args.env_overlay.clone(),
+        assistant_identity_prefix: args.assistant_identity_prefix.clone(),
     }
 }
 
@@ -2448,15 +2821,18 @@ pub fn goal_control(
             unreachable!("ordinary swarm workers are built by their dedicated factories")
         }
     };
+    let model = args.effective_model();
     Agent {
         name: name.to_string(),
         system: compose_system_prompt_for_effective_model(system, args),
         role_prompt: system.to_string(),
         tools,
-        model: args.effective_model(),
+        // Scheduler-only goal workers inherit the parent's host-chosen model
+        // (no selector), so posture resolves from that model's own config.
+        llm_mode: child_llm_mode_for_model(args, &model),
+        model,
         params: args.params.clone(),
         scan_tool_results: true,
-        llm_mode: args.llm_mode,
         lock_identity: name.to_string(),
         write_scope: None,
         delegated: true,
@@ -2467,6 +2843,7 @@ pub fn goal_control(
             same_model_only: true,
         },
         env_overlay: args.env_overlay.clone(),
+        assistant_identity_prefix: args.assistant_identity_prefix.clone(),
     }
 }
 
@@ -2499,16 +2876,18 @@ pub fn plan(args: &SpawnArgs) -> Agent {
         args,
     );
 
-    let role = builtin_prompt_for(PLAN_PROMPT, Some(PLAN_PROMPT_NORMAL), None, args.llm_mode);
+    let model = args.effective_model();
+    let llm_mode = child_llm_mode_for_model(args, &model);
+    let role = builtin_prompt_for(PLAN_PROMPT, Some(PLAN_PROMPT_NORMAL), None, llm_mode);
     Agent {
         name: "Plan".to_string(),
         system: compose_system_prompt_for_effective_model(role, args),
         role_prompt: role.to_string(),
         tools,
-        model: args.effective_model(),
+        model,
         params: args.params.clone(),
         scan_tool_results: true,
-        llm_mode: args.llm_mode,
+        llm_mode,
         lock_identity: args
             .lock_identity
             .clone()
@@ -2517,6 +2896,7 @@ pub fn plan(args: &SpawnArgs) -> Agent {
         delegated: args.delegated,
         delegation_recursion: args.delegation_recursion.clone(),
         env_overlay: args.env_overlay.clone(),
+        assistant_identity_prefix: args.assistant_identity_prefix.clone(),
     }
 }
 
@@ -2547,21 +2927,23 @@ pub fn multireview(args: &SpawnArgs) -> Agent {
         args,
     );
 
+    let model = args.effective_model();
+    let llm_mode = child_llm_mode_for_model(args, &model);
     let role = builtin_prompt_for(
         MULTIREVIEW_PROMPT,
         Some(MULTIREVIEW_PROMPT_NORMAL),
         None,
-        args.llm_mode,
+        llm_mode,
     );
     Agent {
         name: "Multireview".to_string(),
         system: compose_system_prompt_for_effective_model(role, args),
         role_prompt: role.to_string(),
         tools,
-        model: args.effective_model(),
+        model,
         params: args.params.clone(),
         scan_tool_results: true,
-        llm_mode: args.llm_mode,
+        llm_mode,
         lock_identity: args
             .lock_identity
             .clone()
@@ -2570,6 +2952,7 @@ pub fn multireview(args: &SpawnArgs) -> Agent {
         delegated: args.delegated,
         delegation_recursion: args.delegation_recursion.clone(),
         env_overlay: args.env_overlay.clone(),
+        assistant_identity_prefix: args.assistant_identity_prefix.clone(),
     }
 }
 
@@ -2617,21 +3000,23 @@ pub fn bee(args: &SpawnArgs) -> Agent {
     // dedicated output) up to its parent.
     let tools = with_return_tool(tools, "bee");
 
+    let model = args.effective_model();
+    let llm_mode = child_llm_mode_for_model(args, &model);
     let role = builtin_prompt_for(
         BEE_PROMPT,
         Some(BEE_PROMPT_NORMAL),
         Some(BEE_PROMPT_FRONTIER),
-        args.llm_mode,
+        llm_mode,
     );
     Agent {
         name: "bee".to_string(),
         system: compose_system_prompt_for_effective_model(role, args),
         role_prompt: role.to_string(),
         tools,
-        model: args.effective_model(),
+        model,
         params: args.params.clone(),
         scan_tool_results: true,
-        llm_mode: args.llm_mode,
+        llm_mode,
         lock_identity: args
             .lock_identity
             .clone()
@@ -2640,6 +3025,7 @@ pub fn bee(args: &SpawnArgs) -> Agent {
         delegated: args.delegated,
         delegation_recursion: args.delegation_recursion.clone(),
         env_overlay: args.env_overlay.clone(),
+        assistant_identity_prefix: args.assistant_identity_prefix.clone(),
     }
 }
 
@@ -2656,10 +3042,13 @@ pub fn docs_resolver(
     target: String,
     approver: Option<Arc<crate::approval::Approver>>,
     interrupts: Option<Arc<crate::engine::interrupt::InterruptHub>>,
-) -> Agent {
+) -> Result<Agent> {
     let def = crate::agents::embedded_internal_default("docs-resolver")
         .expect("docs-resolver has an internal agent definition");
-    let mut agent = agent_from_def(&def, args).expect("docs-resolver internal def is valid");
+    // FAIL CLOSED on an unresolvable docs-resolver model (e.g. a config refresh
+    // after the docs preflight made the stage model unresolvable): propagate the
+    // content-safe error to the pipeline caller rather than panic mid-pipeline.
+    let mut agent = agent_from_def(&def, args)?;
     agent.tools = agent
         .tools
         .with(Arc::new(crate::tools::docs::ListPackagesTool::new(
@@ -2674,7 +3063,7 @@ pub fn docs_resolver(
         .with(Arc::new(crate::tools::docs::AddPackageTool::new(
             resolution, approver, interrupts,
         )));
-    agent
+    Ok(agent)
 }
 
 /// Docs.2 — the answerer stage of the `docs` pipeline. Runs in the
@@ -2683,10 +3072,12 @@ pub fn docs_resolver(
 /// write** (prompt `docs-agent.md` decision 2/3). The sandbox confines
 /// every path to `args.cwd`, which is why bash can be denied: Docs.2 runs
 /// inside untrusted third-party source.
-pub fn docs_answerer(args: &SpawnArgs) -> Agent {
+pub fn docs_answerer(args: &SpawnArgs) -> Result<Agent> {
     let def = crate::agents::embedded_internal_default("docs-answerer")
         .expect("docs-answerer has an internal agent definition");
-    agent_from_def(&def, args).expect("docs-answerer internal def is valid")
+    // FAIL CLOSED on an unresolvable docs-answerer model rather than panic
+    // mid-pipeline; the pipeline caller returns the content-safe routing error.
+    agent_from_def(&def, args)
 }
 
 #[cfg(test)]
@@ -3093,7 +3484,7 @@ mod tests {
         }
 
         let resolution = crate::tools::docs::DocsResolution::new();
-        let resolver = docs_resolver(&args, resolution, "pkg".to_string(), None, None);
+        let resolver = docs_resolver(&args, resolution, "pkg".to_string(), None, None).unwrap();
         assert_eq!(
             sorted_tool_names(&resolver),
             vec![
@@ -3105,7 +3496,7 @@ mod tests {
             ]
         );
 
-        let answerer = docs_answerer(&args);
+        let answerer = docs_answerer(&args).unwrap();
         assert_eq!(sorted_tool_names(&answerer), vec!["glob", "grep", "read"]);
     }
 
@@ -3640,7 +4031,7 @@ mod tests {
         }
 
         let tmp = tempfile::tempdir().unwrap();
-        let answerer = docs_answerer(&test_spawn_args(tmp.path()));
+        let answerer = docs_answerer(&test_spawn_args(tmp.path())).unwrap();
         for tool in ["grep", "glob"] {
             let desc = answerer
                 .tools
@@ -4248,7 +4639,7 @@ mod tests {
         // `add-package` (the package-add gate lives on the resolver, not
         // here), so it cannot raise any prompt under any configuration.
         let tmp = tempfile::tempdir().unwrap();
-        let agent = docs_answerer(&test_spawn_args(tmp.path()));
+        let agent = docs_answerer(&test_spawn_args(tmp.path())).unwrap();
         assert_eq!(agent.name, "docs-answerer");
         let mut names = agent.tools.names();
         names.sort_unstable();

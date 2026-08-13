@@ -182,6 +182,44 @@ pub async fn turn_with_backup(
         } else {
             candidates[attempt_index - 1].as_ref()
         };
+        // Every dispatched target renders ITS OWN effective posture AND its own
+        // model-specific system context. The primary (attempt 0) already carries
+        // both; each failover/backup candidate is a DIFFERENT model (and may
+        // resolve a different effective mode), so re-render this child's
+        // model-dependent surface (model-specific composed system + role body +
+        // tool schemas/descriptions + `llm_mode`) for the candidate before the
+        // turn. The toolbox (and any grants) is preserved intact — only its
+        // rendering switches.
+        let repostured: Option<Agent> = if attempt_index == 0 {
+            None
+        } else {
+            let candidate_arc: &Arc<Model> = candidates[attempt_index - 1];
+            let candidate_mode = config.providers().resolve_mode(
+                candidate_arc.provider_id(),
+                candidate_arc.model_id_ref(),
+                config.extended().llm_mode,
+            );
+            match crate::engine::builtin::reposture_agent_for_candidate(
+                agent,
+                candidate_arc,
+                candidate_mode,
+                &session,
+                &cwd,
+                &session.db,
+            )
+            .await
+            {
+                Ok(reposed) => reposed,
+                // Fail CLOSED: the candidate's own posture cannot be rendered, so
+                // this failover candidate is NEVER dispatched under the primary's
+                // posture. The def is the same for every candidate, so no later
+                // candidate could re-render either — abort the whole failover with
+                // the content-safe error (nothing was dispatched for this
+                // candidate).
+                Err(err) => return Err(err),
+            }
+        };
+        let dispatch_agent: &Agent = repostured.as_ref().unwrap_or(agent);
         let has_later_candidate = attempt_index < candidates.len();
         // Suppress `turn`'s own red inline error when a custody block exists so
         // this function can emit the same event with the custody reason
@@ -196,7 +234,7 @@ pub async fn turn_with_backup(
         // failover attempts from their primary.)
         let attempt_ordinal = attempt_index as i64;
         let attempt_result = turn(
-            agent,
+            dispatch_agent,
             current_model,
             history,
             prompt.clone(),
@@ -944,6 +982,7 @@ mod backup_fallback_tests {
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            assistant_identity_prefix: None,
         }
     }
 

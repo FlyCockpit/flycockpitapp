@@ -109,6 +109,7 @@ fn docs_style_agent_without_return_tool_reports_plain_answer() {
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         env_overlay: driver.stack[0].agent.env_overlay.clone(),
+        assistant_identity_prefix: None,
     };
     let history = vec![Message::assistant("The answer is to call foo() with bar.")];
     let deferred = crate::engine::deferred::DeferredLog::new();

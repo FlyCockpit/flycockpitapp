@@ -1286,6 +1286,7 @@ async fn prepare_apply_fixture() -> (Driver, tempfile::TempDir) {
         delegated: false,
         delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
         env_overlay: old.env_overlay.clone(),
+        assistant_identity_prefix: None,
     });
     install_test_providers(
         &mut driver,

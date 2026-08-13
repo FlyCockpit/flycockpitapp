@@ -528,36 +528,117 @@ async fn write_capable_entry_requires_write_scope() {
     );
 }
 
-#[tokio::test]
-async fn scoped_child_subtree_is_pre_granted_read_write() {
-    let (mut driver, tmp) = test_driver(8);
-    set_root_llm_mode(&mut driver, crate::config::extended::LlmMode::Frontier);
-    let approver = install_test_approver(&mut driver);
-    let scope = tmp.path().join("scope");
-    std::fs::create_dir_all(&scope).unwrap();
-    let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
-    let task = BatchNoninteractiveTask {
-        entries: vec![batch_entry_with_scope("scoped", "builder", "scope")],
-        child_cwds: vec![root_child_cwd(&driver)],
-        why: "test".to_string(),
-        repair_notes: Vec::new(),
-        task_call_id: "task-pregrant".to_string(),
-        task_function_call_id: None,
-    };
-
-    let _ = driver
-        .execute_batch_noninteractive_task(task, &tx, tokio_util::sync::CancellationToken::new())
-        .await
+#[test]
+fn scoped_child_subtree_is_pre_granted_read_write() {
+    // The write-scope grant is DEFERRED to the child's dispatch point (AFTER its
+    // post-build generation guard, so a generation move records no lingering
+    // grant). The grant is recorded immediately BEFORE the child's first inference
+    // request. On a big-stack thread (avoiding the pre-existing deep-batch stack
+    // overflow) run the scoped `builder` against a long-delayed provider; once the
+    // request is in flight the pregrant has already run, so poll the shared grant
+    // store from THIS thread, then cancel before the 20s delay elapses.
+    let provider = cockpit_test_support::provider::ScriptedProvider::builder()
+        .dialect(cockpit_test_support::provider::WireDialect::ChatCompletions)
+        .turn(cockpit_test_support::provider::Turn::Text("done".into()))
+        .with_delay(std::time::Duration::from_secs(20))
+        .repeat_last()
+        .start_blocking();
+    let url = provider.base_url();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let batch_cancel = cancel.clone();
+    let (handoff_tx, handoff_rx) = std::sync::mpsc::channel::<(
+        std::sync::Arc<crate::approval::Approver>,
+        std::path::PathBuf,
+    )>();
+    let batch_thread = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let (mut driver, _tmp) = test_driver_with_url(8, url.clone());
+                    let config_dir = driver.cwd.join(".cockpit");
+                    let providers_dir = config_dir.join("providers");
+                    std::fs::create_dir_all(&providers_dir).unwrap();
+                    std::fs::write(
+                        config_dir.join("config.json"),
+                        r#"{"agent_chooses_subagent_model": true, "active_model": {"provider":"lmstudio","model":"local"}}"#,
+                    )
+                    .unwrap();
+                    std::fs::write(
+                        providers_dir.join("lmstudio.json"),
+                        serde_json::json!({
+                            "url": url,
+                            "models": [{ "id": "local", "subagent_invokable": true }]
+                        })
+                        .to_string(),
+                    )
+                    .unwrap();
+                    driver.refresh_config_from_disk_for_tests();
+                    set_root_llm_mode(&mut driver, crate::config::extended::LlmMode::Frontier);
+                    let trust_cwd = driver.cwd.clone();
+                    let _trust = crate::config::trust::enter_workspace_trust_policy(
+                        crate::config::trust::WorkspaceTrustPolicy {
+                            root: crate::config::trust::resolve_trust_root(&trust_cwd)
+                                .unwrap_or_else(|_| crate::config::trust::TrustRoot {
+                                    opened_path: trust_cwd.clone(),
+                                    root: trust_cwd.clone(),
+                                    kind: crate::config::trust::TrustRootKind::Directory,
+                                }),
+                            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+                        },
+                    );
+                    let approver = install_test_approver(&mut driver);
+                    let scope = driver.cwd.join("scope");
+                    std::fs::create_dir_all(&scope).unwrap();
+                    // Hand the shared approver + scope to the probing thread so it
+                    // can poll the grant while this batch holds its guard.
+                    handoff_tx.send((approver.clone(), scope.clone())).unwrap();
+                    seed_batch_task_delegation(&driver, "task-pregrant", &["scoped"]).await;
+                    seed_task_payload(&driver, "task-pregrant", "scoped", "builder").await;
+                    let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+                    let task = BatchNoninteractiveTask {
+                        entries: vec![batch_entry_with_scope("scoped", "builder", "scope")],
+                        child_cwds: vec![root_child_cwd(&driver)],
+                        why: "test".to_string(),
+                        repair_notes: Vec::new(),
+                        task_call_id: "task-pregrant".to_string(),
+                        task_function_call_id: None,
+                    };
+                    let _ = driver
+                        .execute_batch_noninteractive_task(task, &tx, batch_cancel)
+                        .await;
+                })
+        })
         .unwrap();
 
-    assert!(
-        approver
-            .store()
-            .is_path_granted_for(
+    let (approver, scope) = handoff_rx.recv().unwrap();
+    // Wait for the child's inference request to reach the provider — the pregrant
+    // is recorded immediately before it — then confirm the scoped subtree grant.
+    let probe_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut granted = false;
+    for _ in 0..200 {
+        if provider.request_count() >= 1
+            && probe_rt.block_on(approver.store().is_path_granted_for(
                 &scope,
-                crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite
-            )
-            .await
+                crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+            ))
+        {
+            granted = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    cancel.cancel();
+    batch_thread.join().unwrap();
+    assert!(
+        granted,
+        "a scoped child that dispatches has its subtree pre-granted read-write (recorded before its first request)"
     );
 }
 
@@ -1561,6 +1642,589 @@ async fn docs_pipeline_emits_no_routing_amend() {
             .filter(|event| matches!(event, TurnEvent::SubagentReport { task_call_id, .. } if task_call_id == "task-docs-routing"))
             .count(),
         1
+    );
+}
+
+/// Run a batch of `[docs, readonly-probe]` against a long-delayed provider and
+/// return how many child requests are in flight while the first is outstanding.
+/// The docs entry runs its OWN pipeline (not `builtin::load`) under the EXCLUSIVE
+/// write guard, so it can NEVER overlap the read-only-eligible sibling (which
+/// takes a shared read guard) — exactly 1 in flight. If docs were wrongly admitted
+/// concurrently (a shared read guard), BOTH would dispatch → 2. The batch runs on
+/// a dedicated big-stack thread; the probe runs on THIS thread against the
+/// provider's cross-thread atomic counter, then cancels so the 20s delay is never
+/// fully waited.
+fn dmh_docs_batch_exclusive_in_flight() -> usize {
+    let provider = cockpit_test_support::provider::ScriptedProvider::builder()
+        .dialect(cockpit_test_support::provider::WireDialect::ChatCompletions)
+        .turn(cockpit_test_support::provider::Turn::Text("done".into()))
+        .with_delay(std::time::Duration::from_secs(20))
+        .repeat_last()
+        .start_blocking();
+    let url = provider.base_url();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let batch_cancel = cancel.clone();
+    let batch_thread = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let (mut driver, _tmp) = test_driver_with_url(8, url.clone());
+                    let config_dir = driver.cwd.join(".cockpit");
+                    let providers_dir = config_dir.join("providers");
+                    std::fs::create_dir_all(&providers_dir).unwrap();
+                    // `web.provider = custom` (no commands) suppresses the default
+                    // webfetch/websearch (Dynamic) so the read-only sibling is
+                    // genuinely eligible for a shared read guard.
+                    std::fs::write(
+                        config_dir.join("config.json"),
+                        r#"{"agent_chooses_subagent_model": true, "web": {"provider": "custom"}, "active_model": {"provider":"lmstudio","model":"local"}}"#,
+                    )
+                    .unwrap();
+                    std::fs::write(
+                        providers_dir.join("lmstudio.json"),
+                        serde_json::json!({
+                            "url": url,
+                            "models": [{ "id": "local", "subagent_invokable": true }]
+                        })
+                        .to_string(),
+                    )
+                    .unwrap();
+                    let agents_dir = config_dir.join("agents");
+                    std::fs::create_dir_all(&agents_dir).unwrap();
+                    std::fs::write(
+                        agents_dir.join("readonly-probe.md"),
+                        "---\ndescription: read-only leaf\nmode: subagent\ntools: [read]\n---\nInvestigate read-only.\n",
+                    )
+                    .unwrap();
+                    driver.refresh_config_from_disk_for_tests();
+                    let trust_cwd = driver.cwd.clone();
+                    let _trust = crate::config::trust::enter_workspace_trust_policy(
+                        crate::config::trust::WorkspaceTrustPolicy {
+                            root: crate::config::trust::resolve_trust_root(&trust_cwd)
+                                .unwrap_or_else(|_| crate::config::trust::TrustRoot {
+                                    opened_path: trust_cwd.clone(),
+                                    root: trust_cwd.clone(),
+                                    kind: crate::config::trust::TrustRootKind::Directory,
+                                }),
+                            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+                        },
+                    );
+                    seed_batch_task_delegation(&driver, "task-docs-excl", &["docs", "probe"]).await;
+                    seed_task_payload(&driver, "task-docs-excl", "docs", "docs").await;
+                    seed_task_payload(&driver, "task-docs-excl", "probe", "readonly-probe").await;
+                    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+                    let task = BatchNoninteractiveTask {
+                        entries: vec![
+                            batch_entry("docs", "docs", None),
+                            batch_entry("probe", "readonly-probe", None),
+                        ],
+                        child_cwds: vec![root_child_cwd(&driver), root_child_cwd(&driver)],
+                        why: "test".to_string(),
+                        repair_notes: Vec::new(),
+                        task_call_id: "task-docs-excl".to_string(),
+                        task_function_call_id: None,
+                    };
+                    let _ = driver
+                        .execute_batch_noninteractive_task(task, &tx, batch_cancel)
+                        .await;
+                })
+        })
+        .unwrap();
+
+    for _ in 0..200 {
+        if provider.request_count() >= 1 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let in_flight = provider.request_count();
+    cancel.cancel();
+    batch_thread.join().unwrap();
+    in_flight
+}
+
+/// Fγ/Fiv: a `docs` batch entry runs its OWN 2-stage pipeline (the admission loop
+/// must NOT `builtin::load("docs")`), reaching real inference — and it runs
+/// EXCLUSIVELY: it never overlaps a read-only-eligible sibling. (Non-vacuous: a
+/// wrongly-concurrent docs entry would overlap the sibling → 2 in flight.)
+#[test]
+fn batch_docs_entry_runs_exclusively() {
+    assert_eq!(
+        dmh_docs_batch_exclusive_in_flight(),
+        1,
+        "a docs batch entry runs its pipeline EXCLUSIVELY: it never overlaps the read-only sibling"
+    );
+}
+
+/// Fii/Fiv: an unresolvable docs-stage model fails CLOSED with the content-safe
+/// routing error — no panic, nothing dispatched. (`docs` is also not
+/// surface-resolvable, so it is never concurrently admitted.)
+#[tokio::test]
+async fn batch_docs_entry_fails_closed_on_unresolvable_model() {
+    let (mut driver, _tmp) = test_driver(8);
+    dmh_install_config(
+        &mut driver,
+        serde_json::json!({}),
+        vec![dmh_model("local", None, None)],
+    );
+    let cwd = driver.cwd.clone();
+    // docs is not surface-resolvable (its stage name is rejected by `load`), so it
+    // can never be admitted concurrently through the surface path.
+    let probe_args = driver.spawn_args_delegated_in_cwd(
+        &cwd,
+        false,
+        Vec::new(),
+        None,
+        crate::engine::builtin::DelegationRecursionContext::default(),
+    );
+    assert!(
+        crate::engine::builtin::resolve_child_execution_surface("docs", &probe_args).is_err(),
+        "docs is not surface-resolvable → never concurrently admitted"
+    );
+
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+    let task = BatchNoninteractiveTask {
+        entries: vec![
+            batch_entry(
+                "docs-entry",
+                "docs",
+                Some(exact_model_selector("does-not-exist")),
+            ),
+            batch_entry("sib", "explore", None),
+        ],
+        child_cwds: vec![root_child_cwd(&driver), root_child_cwd(&driver)],
+        why: "test".to_string(),
+        repair_notes: Vec::new(),
+        task_call_id: "task-docs-badmodel".to_string(),
+        task_function_call_id: None,
+    };
+    let completion = driver
+        .execute_batch_noninteractive_task(task, &tx, tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(
+        completion
+            .children
+            .iter()
+            .all(|c| !c.report.contains("could not load")),
+        "an unresolvable docs model must NOT surface a `load(\"docs\")` error: {:?}",
+        completion
+            .children
+            .iter()
+            .map(|c| &c.report)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        completion
+            .children
+            .iter()
+            .any(|c| c.failed && c.report.contains("docs-entry")),
+        "the unresolvable docs-stage model fails CLOSED with a content-safe routing error: {:?}",
+        completion
+            .children
+            .iter()
+            .map(|c| &c.report)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// K1 (AC7/AC8): a child's agent DEFINITION is a second live input the config pin
+/// does NOT cover — `builtin::load` re-reads the workspace/DB def at dispatch,
+/// independent of the admission-surface resolution. A read-only custom child is
+/// admitted to a SHARED READ guard; its def is then rewritten to expose a `write`
+/// tool BEFORE the dispatch build (a concurrent def edit, driven here by a task
+/// that rewrites the def file while the batch is suspended at its first await,
+/// AFTER the admission loop read the read-only def). The built child is now
+/// write-capable — it must NOT dispatch write-capable under the read guard it
+/// holds: the post-build re-derivation catches that its real surface is more
+/// privileged than its guard class and FAILS CLOSED, dispatching NO inference.
+/// (Pre-fix, the child would build write-capable and dispatch under the read
+/// guard — a concurrent-write violation — so this test is non-vacuous.)
+#[test]
+fn batch_read_only_child_fails_closed_if_def_gains_write_before_build() {
+    let provider = cockpit_test_support::provider::ScriptedProvider::builder()
+        .dialect(cockpit_test_support::provider::WireDialect::ChatCompletions)
+        .turn(cockpit_test_support::provider::Turn::Text("done".into()))
+        .repeat_last()
+        .start_blocking();
+    let url = provider.base_url();
+    let batch_thread = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let (mut driver, _tmp) = test_driver_with_url(8, url.clone());
+                    let config_dir = driver.cwd.join(".cockpit");
+                    let providers_dir = config_dir.join("providers");
+                    std::fs::create_dir_all(&providers_dir).unwrap();
+                    // `web.provider = custom` suppresses the default webfetch/websearch
+                    // (Dynamic) so a `[read]` custom child is genuinely read-only
+                    // eligible → admitted to a SHARED read guard.
+                    std::fs::write(
+                        config_dir.join("config.json"),
+                        r#"{"agent_chooses_subagent_model": true, "web": {"provider": "custom"}, "active_model": {"provider":"lmstudio","model":"local"}}"#,
+                    )
+                    .unwrap();
+                    std::fs::write(
+                        providers_dir.join("lmstudio.json"),
+                        serde_json::json!({
+                            "url": url,
+                            "models": [{ "id": "local", "subagent_invokable": true }]
+                        })
+                        .to_string(),
+                    )
+                    .unwrap();
+                    let agents_dir = config_dir.join("agents");
+                    std::fs::create_dir_all(&agents_dir).unwrap();
+                    let probe_path = agents_dir.join("probe.md");
+                    // Admission-time def: read-only → concurrently admissible.
+                    std::fs::write(
+                        &probe_path,
+                        "---\ndescription: read-only probe\nmode: subagent\ntools: [read]\n---\nInvestigate read-only.\n",
+                    )
+                    .unwrap();
+                    driver.refresh_config_from_disk_for_tests();
+                    let trust_cwd = driver.cwd.clone();
+                    let _trust = crate::config::trust::enter_workspace_trust_policy(
+                        crate::config::trust::WorkspaceTrustPolicy {
+                            root: crate::config::trust::resolve_trust_root(&trust_cwd)
+                                .unwrap_or_else(|_| crate::config::trust::TrustRoot {
+                                    opened_path: trust_cwd.clone(),
+                                    root: trust_cwd.clone(),
+                                    kind: crate::config::trust::TrustRootKind::Directory,
+                                }),
+                            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+                        },
+                    );
+                    seed_batch_task_delegation(&driver, "task-def-race", &["probe"]).await;
+                    seed_task_payload(&driver, "task-def-race", "probe", "probe").await;
+                    // Def-mutator: on its first poll — during the batch's first await,
+                    // AFTER the synchronous admission loop already read the read-only
+                    // def, BEFORE the child future's dispatch `load` — rewrite the def
+                    // to expose a `write` tool (a concurrent def edit).
+                    let mutate_path = probe_path.clone();
+                    tokio::spawn(async move {
+                        std::fs::write(
+                            &mutate_path,
+                            "---\ndescription: now writes\nmode: subagent\ntools: [read, write]\n---\nInvestigate.\n",
+                        )
+                        .unwrap();
+                    });
+                    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+                    let task = BatchNoninteractiveTask {
+                        entries: vec![batch_entry("probe", "probe", None)],
+                        child_cwds: vec![root_child_cwd(&driver)],
+                        why: "test".to_string(),
+                        repair_notes: Vec::new(),
+                        task_call_id: "task-def-race".to_string(),
+                        task_function_call_id: None,
+                    };
+                    driver
+                        .execute_batch_noninteractive_task(
+                            task,
+                            &tx,
+                            tokio_util::sync::CancellationToken::new(),
+                        )
+                        .await
+                        .unwrap()
+                })
+        })
+        .unwrap();
+
+    let completion = batch_thread.join().unwrap();
+    assert_eq!(completion.children.len(), 1);
+    let child = &completion.children[0];
+    assert!(
+        child.failed && child.report.contains("re-delegate"),
+        "a read-only child whose def gained `write` before the build FAILS CLOSED rather than \
+         dispatching write-capable under its read guard: {}",
+        child.report
+    );
+    assert_eq!(
+        provider.request_count(),
+        0,
+        "no inference is dispatched under the read guard on the fail-closed path"
+    );
+}
+
+/// Round-10: single delegation repins the config to a held snapshot for the
+/// attempt, so a concurrent refresh mid-attempt is INVISIBLE to the attempt — the
+/// child builds, dispatches, and records its write-scope grant under the PINNED
+/// (pre-refresh) generation, with NO split and NO fail-closed. Driven on a
+/// big-stack thread (avoiding the pre-existing deep-batch overflow): a bumper
+/// advances the LIVE shared generation while `execute_single` is suspended at its
+/// first await (AFTER the synchronous repin), then a long-delayed provider parks
+/// the child's request in flight so the main thread can confirm the child
+/// dispatched AND its grant was recorded — proving the attempt ran the pinned
+/// generation, not the refreshed one. (Under the old fail-closed behaviour the
+/// move would abort with no request and no grant.)
+#[test]
+fn single_delegation_runs_under_pinned_generation_across_refresh() {
+    let provider = cockpit_test_support::provider::ScriptedProvider::builder()
+        .dialect(cockpit_test_support::provider::WireDialect::ChatCompletions)
+        .turn(cockpit_test_support::provider::Turn::Text("done".into()))
+        .with_delay(std::time::Duration::from_secs(20))
+        .repeat_last()
+        .start_blocking();
+    let url = provider.base_url();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let attempt_cancel = cancel.clone();
+    let bumped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let bumped_thread = bumped.clone();
+    let (handoff_tx, handoff_rx) = std::sync::mpsc::channel::<(
+        std::sync::Arc<crate::approval::Approver>,
+        std::path::PathBuf,
+    )>();
+    let attempt_thread = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let (mut driver, _tmp) = test_driver_with_url(8, url.clone());
+                    let config_dir = driver.cwd.join(".cockpit");
+                    let providers_dir = config_dir.join("providers");
+                    std::fs::create_dir_all(&providers_dir).unwrap();
+                    std::fs::write(
+                        config_dir.join("config.json"),
+                        r#"{"agent_chooses_subagent_model": true, "llm_mode": "frontier", "active_model": {"provider":"lmstudio","model":"local"}}"#,
+                    )
+                    .unwrap();
+                    std::fs::write(
+                        providers_dir.join("lmstudio.json"),
+                        serde_json::json!({
+                            "url": url,
+                            "models": [
+                                { "id": "local", "subagent_invokable": true },
+                                { "id": "child-x", "subagent_invokable": true }
+                            ]
+                        })
+                        .to_string(),
+                    )
+                    .unwrap();
+                    driver.refresh_config_from_disk_for_tests();
+                    set_root_llm_mode(&mut driver, crate::config::extended::LlmMode::Frontier);
+                    // Install a LIVE handle over a shared cell we control, so a bump
+                    // is observable to any LIVE reader — but NOT to the pinned
+                    // attempt (which is exactly the invariant under test).
+                    let snapshot = (*driver.config.snapshot()).clone();
+                    let shared = std::sync::Arc::new(std::sync::RwLock::new(snapshot));
+                    driver.set_config_handle(
+                        crate::daemon::session_worker::SessionConfigHandle::new(shared.clone()),
+                    );
+                    let approver = install_test_approver(&mut driver);
+                    let scope = driver.cwd.join("scope");
+                    std::fs::create_dir_all(&scope).unwrap();
+                    seed_task_delegation(&driver, "task-pin", "default").await;
+                    seed_task_payload(&driver, "task-pin", "default", "builder").await;
+                    handoff_tx.send((approver.clone(), scope.clone())).unwrap();
+                    // Bump the LIVE shared generation on the bumper's first poll —
+                    // performed when `execute_single` first suspends, i.e. AFTER its
+                    // synchronous repin pinned the attempt and BEFORE the child is
+                    // built/dispatched.
+                    tokio::spawn(async move {
+                        let mut w = shared.write().unwrap();
+                        w.generation += 1;
+                        bumped_thread.store(true, std::sync::atomic::Ordering::SeqCst);
+                    });
+                    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+                    let mut task = single_task(
+                        &driver,
+                        "builder",
+                        "task-pin",
+                        Some(exact_model_selector("child-x")),
+                        None,
+                    );
+                    task.write_scope = Some("scope".to_string());
+                    let _ = driver
+                        .execute_single_noninteractive_task(task, &tx, attempt_cancel)
+                        .await;
+                })
+        })
+        .unwrap();
+
+    let (approver, scope) = handoff_rx.recv().unwrap();
+    let probe_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut dispatched_and_granted = false;
+    for _ in 0..200 {
+        if provider.request_count() >= 1
+            && probe_rt.block_on(approver.store().is_path_granted_for(
+                &scope,
+                crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+            ))
+        {
+            dispatched_and_granted = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    cancel.cancel();
+    attempt_thread.join().unwrap();
+    assert!(
+        bumped.load(std::sync::atomic::Ordering::SeqCst),
+        "the concurrent refresh (live-generation bump) ran during the attempt"
+    );
+    assert!(
+        dispatched_and_granted,
+        "the child dispatched and its write-scope grant was recorded under the PINNED generation \
+         despite a concurrent refresh — no split, no fail-closed, no orphaned grant"
+    );
+}
+
+/// Round-10/11 (docs): the docs pipeline runs entirely under the attempt's PINNED
+/// config — `docs_pipeline::run` and BOTH its stages read `spawn_args.config`,
+/// which is the pinned handle. A concurrent refresh mid-attempt is therefore
+/// invisible: Docs.1 (resolver) AND Docs.2 (answerer, which re-reads the SAME
+/// `spawn_args.config`) dispatch under one generation, consistent with the handoff
+/// expansion. Non-vacuous: the resolver is scripted to call `list-packages`, which
+/// records a pre-registered `DocsResolution`, so Docs.2 actually launches — and we
+/// assert BOTH stages dispatched (`request_count >= 2`) across a concurrent
+/// refresh. A bumper advances the LIVE shared generation while `execute_single` is
+/// suspended (AFTER its repin).
+#[test]
+fn docs_pipeline_runs_under_pinned_generation_across_refresh() {
+    let provider = cockpit_test_support::provider::ScriptedProvider::builder()
+        .dialect(cockpit_test_support::provider::WireDialect::ChatCompletions)
+        // Docs.1: the resolver calls `list-packages` (records the pre-registered
+        // package as resolved), then concludes with text; Docs.2's answerer then
+        // gets text too (repeat_last) and concludes. Both stages issue a request.
+        .turn(cockpit_test_support::provider::Turn::ToolCall {
+            id: "call-1".into(),
+            name: "list-packages".into(),
+            arguments: serde_json::json!({}),
+        })
+        .turn(cockpit_test_support::provider::Turn::Text(
+            "resolved".into(),
+        ))
+        .repeat_last()
+        .start_blocking();
+    let url = provider.base_url();
+    let bumped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let bumped_thread = bumped.clone();
+    let attempt_thread = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let (mut driver, _tmp) = test_driver_with_url(8, url.clone());
+                    let config_dir = driver.cwd.join(".cockpit");
+                    let providers_dir = config_dir.join("providers");
+                    std::fs::create_dir_all(&providers_dir).unwrap();
+                    std::fs::write(
+                        config_dir.join("config.json"),
+                        r#"{"agent_chooses_subagent_model": true, "active_model": {"provider":"lmstudio","model":"local"}}"#,
+                    )
+                    .unwrap();
+                    std::fs::write(
+                        providers_dir.join("lmstudio.json"),
+                        serde_json::json!({
+                            "url": url,
+                            "models": [
+                                { "id": "local", "subagent_invokable": true },
+                                { "id": "docs-child", "subagent_invokable": true }
+                            ]
+                        })
+                        .to_string(),
+                    )
+                    .unwrap();
+                    driver.refresh_config_from_disk_for_tests();
+                    let snapshot = (*driver.config.snapshot()).clone();
+                    let shared = std::sync::Arc::new(std::sync::RwLock::new(snapshot));
+                    driver.set_config_handle(
+                        crate::daemon::session_worker::SessionConfigHandle::new(shared.clone()),
+                    );
+                    // Pre-register (on disk) the package the resolver's
+                    // `list-packages` call will match, so Docs.1 records a
+                    // `DocsResolution` and Docs.2 launches.
+                    let pkg_dir = driver.cwd.join("pkg-src");
+                    std::fs::create_dir_all(&pkg_dir).unwrap();
+                    driver
+                        .session
+                        .db
+                        .upsert_package(&crate::db::packages::NewPackage {
+                            identifier: "cargo:testpkg".into(),
+                            display_name: "testpkg".into(),
+                            source_type: crate::db::packages::SourceType::Local,
+                            source_url: None,
+                            source_branch: None,
+                            path: pkg_dir.to_string_lossy().into_owned(),
+                            shallow: false,
+                            prepare_scope: "global".into(),
+                        })
+                        .await
+                        .unwrap();
+                    seed_task_delegation(&driver, "task-docs-pin", "default").await;
+                    // The docs payload-delivery path requires the payload row to
+                    // exist (content is unused for docs — the delivered brief is the
+                    // task's own `brief`, set below).
+                    seed_task_payload(&driver, "task-docs-pin", "default", "docs").await;
+                    tokio::spawn(async move {
+                        let mut w = shared.write().unwrap();
+                        w.generation += 1;
+                        bumped_thread.store(true, std::sync::atomic::Ordering::SeqCst);
+                    });
+                    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+                    let mut task = single_task(
+                        &driver,
+                        "docs",
+                        "task-docs-pin",
+                        Some(exact_model_selector("docs-child")),
+                        None,
+                    );
+                    // A structured docs brief naming the pre-registered package (the
+                    // docs pipeline parses the package + question out of the brief).
+                    // The question carries a distinctive marker: it is WITHHELD from
+                    // the resolver (Docs.1's brief is only `Package: <name>`) and
+                    // appears ONLY in the answerer's (Docs.2's) brief, so finding it
+                    // in a captured request body proves Docs.2 actually dispatched.
+                    task.brief =
+                        r#"{"package": "testpkg", "question": "ANSWERER-QUESTION-MARKER how do I use it?"}"#
+                            .to_string();
+                    let _ = driver
+                        .execute_single_noninteractive_task(
+                            task,
+                            &tx,
+                            tokio_util::sync::CancellationToken::new(),
+                        )
+                        .await;
+                })
+        })
+        .unwrap();
+
+    attempt_thread.join().unwrap();
+    assert!(
+        bumped.load(std::sync::atomic::Ordering::SeqCst),
+        "the concurrent refresh ran during the docs attempt"
+    );
+    // Genuinely non-vacuous: Docs.1 alone makes 2 requests (its `list-packages`
+    // tool call + the follow-up text), so a bare `>= 2` would pass even if Docs.2
+    // were bypassed. Prove the ANSWERER dispatched by finding its unique question
+    // marker in a captured request body (never present in the resolver's brief).
+    let captured = provider.captured();
+    let answerer_dispatched = captured
+        .iter()
+        .any(|req| req.body.to_string().contains("ANSWERER-QUESTION-MARKER"));
+    assert!(
+        answerer_dispatched,
+        "Docs.2 (answerer) dispatched its own request (bearing the withheld question) under the \
+         pinned generation across a concurrent refresh; captured {} requests",
+        captured.len()
     );
 }
 
@@ -2577,4 +3241,1877 @@ async fn docs_faulted_journaling_session(
     )
     .unwrap();
     (session, actor)
+}
+
+// ---------------------------------------------------------------------------
+// delegated-model-harness-posture (AC1–AC8)
+//
+// Every delegated child renders and enforces the harness posture resolved for
+// its OWN selected model, while `ModelTrust` stays an orthogonal dimension and
+// parent-request batch admission stays parent-scoped.
+// ---------------------------------------------------------------------------
+
+/// Run `f` with `cwd` marked workspace-trusted, so an on-disk agent override in
+/// `.cockpit/agents` is loaded (matching a trusted session root).
+fn dmh_trusted<T>(cwd: &std::path::Path, f: impl FnOnce() -> T) -> T {
+    let policy = crate::config::trust::WorkspaceTrustPolicy {
+        root: crate::config::trust::resolve_trust_root(cwd).unwrap_or_else(|_| {
+            crate::config::trust::TrustRoot {
+                opened_path: cwd.to_path_buf(),
+                root: cwd.to_path_buf(),
+                kind: crate::config::trust::TrustRootKind::Directory,
+            }
+        }),
+        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    };
+    crate::config::trust::with_workspace_trust_policy(policy, f)
+}
+
+/// One `lmstudio` model entry, optionally pinning a per-model `mode` (harness
+/// posture) and/or `trust` (inference custody) override.
+fn dmh_model(id: &str, mode: Option<&str>, trust: Option<&str>) -> serde_json::Value {
+    let mut m = serde_json::json!({ "id": id, "subagent_invokable": true });
+    if let Some(mode) = mode {
+        m["mode"] = serde_json::json!(mode);
+    }
+    if let Some(trust) = trust {
+        m["trust"] = serde_json::json!(trust);
+    }
+    m
+}
+
+/// Install a delegated-model config: a base config (with the given overrides
+/// merged in) plus the `lmstudio` provider carrying `models`, then refresh the
+/// driver's config handle from disk.
+fn dmh_install_config(
+    driver: &mut Driver,
+    config_overrides: serde_json::Value,
+    models: Vec<serde_json::Value>,
+) {
+    let config_dir = driver.cwd.join(".cockpit");
+    let providers_dir = config_dir.join("providers");
+    std::fs::create_dir_all(&providers_dir).unwrap();
+    let mut cfg = serde_json::json!({
+        "agent_chooses_subagent_model": true,
+        "active_model": { "provider": "lmstudio", "model": "local" }
+    });
+    if let serde_json::Value::Object(map) = config_overrides {
+        let obj = cfg.as_object_mut().unwrap();
+        for (k, v) in map {
+            obj.insert(k, v);
+        }
+    }
+    std::fs::write(config_dir.join("config.json"), cfg.to_string()).unwrap();
+    std::fs::write(
+        providers_dir.join("lmstudio.json"),
+        serde_json::json!({ "url": test_provider_base_url(), "models": models }).to_string(),
+    )
+    .unwrap();
+    driver.refresh_config_from_disk_for_tests();
+}
+
+/// Build a delegated child under `cwd`-trust and return the loaded agent.
+fn dmh_build_child(
+    driver: &Driver,
+    child_agent: &str,
+    interactive: bool,
+    model: Option<crate::engine::model_roles::DelegationModelSelector>,
+    recursion: crate::engine::builtin::DelegationRecursionContext,
+) -> crate::engine::agent::Agent {
+    let cwd = driver.cwd.clone();
+    let args = driver.spawn_args_delegated_in_cwd(&cwd, interactive, Vec::new(), model, recursion);
+    dmh_trusted(&cwd, || crate::engine::builtin::load(child_agent, &args)).unwrap()
+}
+
+/// Observable tool-schema/description posture: the `read` tool's rendered
+/// description at the agent's own resolved mode.
+fn dmh_read_desc(agent: &crate::engine::agent::Agent) -> String {
+    agent
+        .tools
+        .definitions(agent.llm_mode)
+        .into_iter()
+        .find(|d| d.name == "read")
+        .map(|d| d.description)
+        .expect("child holds a `read` tool")
+}
+
+/// The defensive `read` description carries explicit steering absent from the
+/// terse normal/frontier form — an observable, not the internal enum.
+fn dmh_read_is_defensive(agent: &crate::engine::agent::Agent) -> bool {
+    dmh_read_desc(agent).contains("burns a whole turn")
+}
+
+/// Write a custom `probe` subagent in per-mode DIRECTORY form, so its role
+/// prompt body is DISTINCT for Defensive/Normal/Frontier (the built-in agents
+/// only carry Defensive+Normal, so Frontier would be indistinguishable from
+/// Normal). Roster is exactly `[read]` so it stays a read-only leaf.
+fn dmh_write_mode_probe_agent(driver: &Driver) {
+    let dir = driver.cwd.join(".cockpit").join("agents").join("probe");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (file, marker) in [
+        ("defensive.md", "PROBE-BODY-DEFENSIVE-VARIANT"),
+        ("normal.md", "PROBE-BODY-NORMAL-VARIANT"),
+        ("frontier.md", "PROBE-BODY-FRONTIER-VARIANT"),
+    ] {
+        std::fs::write(
+            dir.join(file),
+            format!("---\ndescription: mode probe\nmode: subagent\ntools: [read]\n---\n{marker}\n"),
+        )
+        .unwrap();
+    }
+}
+
+/// A redaction sentinel: content that a session-scoped protected literal scrubs
+/// on the outbound wire.
+const DMH_WIRE_SECRET: &str = "sk-live-delegation-secret-XYZ";
+
+/// Give the session model a redaction table carrying [`DMH_WIRE_SECRET`], so a
+/// delegated child model INHERITS it: an untrusted child keeps the session
+/// table (scrubs the sentinel on the wire), a trusted child resolves to the
+/// empty passthrough (sentinel rides raw). Call after `dmh_install_config` so
+/// the providers config is already on the config handle.
+fn dmh_inject_session_secret(driver: &mut Driver) {
+    let providers = driver.config.providers();
+    let table = crate::redact::RedactionTable::empty()
+        .with_forced_literal(DMH_WIRE_SECRET.to_string(), "REDACTED".to_string())
+        .expect("forced literal");
+    let model = std::sync::Arc::new(
+        crate::engine::model::Model::from_config(&providers, std::sync::Arc::new(table)).unwrap(),
+    );
+    std::sync::Arc::make_mut(&mut driver.stack[0].agent).model = model;
+}
+
+/// AC1 + AC2: a delegated exact-model child renders its OWN posture for every
+/// parent/child Defensive/Normal/Frontier mismatch, across interactive and
+/// noninteractive delegation. This fails against the previous inherited-root
+/// behavior (the child used to render the root frame's mode).
+#[test]
+fn delegated_child_mode_follows_selected_model() {
+    use crate::config::extended::LlmMode;
+    // A host-authored custom subagent with a DISTINCT prompt body per mode
+    // (`defensive.md`/`normal.md`/`frontier.md`), so the observable child
+    // prompt/context distinguishes ALL THREE postures — Defensive vs Normal vs
+    // Frontier — not just Defensive from the rest.
+    let body_marker = |mode: LlmMode| -> &'static str {
+        match mode {
+            LlmMode::Defensive => "PROBE-BODY-DEFENSIVE-VARIANT",
+            LlmMode::Normal => "PROBE-BODY-NORMAL-VARIANT",
+            LlmMode::Frontier => "PROBE-BODY-FRONTIER-VARIANT",
+        }
+    };
+    let cells = [
+        ("child-defensive", LlmMode::Defensive),
+        ("child-normal", LlmMode::Normal),
+        ("child-frontier", LlmMode::Frontier),
+    ];
+    for parent in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
+        for (model_id, child_mode) in cells {
+            for interactive in [true, false] {
+                let (mut driver, _tmp) = test_driver(8);
+                dmh_install_config(
+                    &mut driver,
+                    serde_json::json!({ "llm_mode": "normal" }),
+                    vec![
+                        dmh_model("local", None, None),
+                        dmh_model("child-defensive", Some("defensive"), None),
+                        dmh_model("child-normal", Some("normal"), None),
+                        dmh_model("child-frontier", Some("frontier"), None),
+                    ],
+                );
+                dmh_write_mode_probe_agent(&driver);
+                set_root_llm_mode(&mut driver, parent);
+                let child = dmh_build_child(
+                    &driver,
+                    "probe",
+                    interactive,
+                    Some(exact_model_selector(model_id)),
+                    crate::engine::builtin::DelegationRecursionContext::default(),
+                );
+                assert_eq!(
+                    child.model.model_id_ref(),
+                    model_id,
+                    "selected model (parent={parent:?}, interactive={interactive})"
+                );
+                assert_eq!(
+                    child.llm_mode, child_mode,
+                    "child posture follows its OWN model, not parent {parent:?} (interactive={interactive})"
+                );
+                // Observable child prompt/context posture distinguishes ALL three
+                // modes (Normal is not confused with Frontier).
+                assert_eq!(
+                    child.role_prompt.trim(),
+                    body_marker(child_mode),
+                    "observable child role prompt follows child mode (parent={parent:?}, interactive={interactive})"
+                );
+                assert!(
+                    child.system.contains(body_marker(child_mode)),
+                    "composed child context carries the child-mode body (parent={parent:?}, interactive={interactive})"
+                );
+                for other in [LlmMode::Defensive, LlmMode::Normal, LlmMode::Frontier] {
+                    if other != child_mode {
+                        assert!(
+                            !child.system.contains(body_marker(other)),
+                            "child context must not carry a different mode's body ({other:?} leaked into {child_mode:?})"
+                        );
+                    }
+                }
+                // Observable tool-schema/description posture (defensive rendering
+                // is distinct from the terse normal/frontier form).
+                assert_eq!(
+                    dmh_read_is_defensive(&child),
+                    child_mode == LlmMode::Defensive,
+                    "observable tool-description posture follows child mode (parent={parent:?}, interactive={interactive})"
+                );
+            }
+        }
+    }
+}
+
+/// AC3: category, configured-role, same-model-only recursion, and
+/// fallback/backup target selection each dispatch a child whose posture is its
+/// actual target's effective mode — never the parent frame's.
+#[test]
+fn delegated_policy_and_role_child_mode_follows_selected_model() {
+    use crate::config::extended::LlmMode;
+    use crate::engine::model_roles::DelegationModelSelector;
+
+    // (1) Same-model-only recursion: the child runs on the parent's model, so it
+    //     resolves that model's OWN configured posture, not the parent's live
+    //     frame mode.
+    {
+        let (mut driver, _tmp) = test_driver(8);
+        dmh_install_config(
+            &mut driver,
+            serde_json::json!({ "llm_mode": "normal" }),
+            vec![dmh_model("local", Some("frontier"), None)],
+        );
+        set_root_llm_mode(&mut driver, LlmMode::Defensive);
+        let child = dmh_build_child(
+            &driver,
+            "explore",
+            false,
+            None,
+            crate::engine::builtin::DelegationRecursionContext {
+                same_model_only: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(child.model.model_id_ref(), "local");
+        assert_eq!(child.llm_mode, LlmMode::Frontier);
+    }
+
+    // (2) Category selection resolves the child's target by category; the child
+    //     adopts that model's posture.
+    {
+        let (mut driver, _tmp) = test_driver(8);
+        let mut cat = dmh_model("cat-code", Some("defensive"), None);
+        cat["availability"] = serde_json::json!({ "categories": ["cheap_code"] });
+        dmh_install_config(
+            &mut driver,
+            serde_json::json!({ "llm_mode": "frontier" }),
+            vec![
+                serde_json::json!({ "id": "local", "subagent_invokable": false }),
+                cat,
+            ],
+        );
+        set_root_llm_mode(&mut driver, LlmMode::Frontier);
+        let selector = DelegationModelSelector::Category {
+            category: Some("cheap_code".into()),
+            optimize: crate::config::providers::ModelOptimization::Balanced,
+            required_capabilities: Vec::new(),
+            min_context_tokens: None,
+        };
+        let child = dmh_build_child(
+            &driver,
+            "explore",
+            false,
+            Some(selector),
+            Default::default(),
+        );
+        assert_eq!(child.model.model_id_ref(), "cat-code");
+        assert_eq!(child.llm_mode, LlmMode::Defensive);
+        assert!(dmh_read_is_defensive(&child));
+    }
+
+    // (3) Configured-role selection: with no explicit category, `explore`'s
+    //     default coding role (cheap_code) selects the configured model, whose
+    //     posture the child adopts.
+    {
+        let (mut driver, _tmp) = test_driver(8);
+        let mut role_model = dmh_model("role-code", Some("defensive"), None);
+        role_model["availability"] = serde_json::json!({ "categories": ["cheap_code"] });
+        dmh_install_config(
+            &mut driver,
+            serde_json::json!({ "llm_mode": "frontier" }),
+            vec![
+                serde_json::json!({ "id": "local", "subagent_invokable": false }),
+                role_model,
+            ],
+        );
+        set_root_llm_mode(&mut driver, LlmMode::Frontier);
+        let selector = DelegationModelSelector::Category {
+            category: None,
+            optimize: crate::config::providers::ModelOptimization::Balanced,
+            required_capabilities: Vec::new(),
+            min_context_tokens: None,
+        };
+        let child = dmh_build_child(
+            &driver,
+            "explore",
+            false,
+            Some(selector),
+            Default::default(),
+        );
+        assert_eq!(child.model.model_id_ref(), "role-code");
+        assert_eq!(child.llm_mode, LlmMode::Defensive);
+    }
+
+    // (4) Fallback/backup target selection at BUILD time: the child built for its
+    //     selected primary carries that model's posture. The REAL per-turn
+    //     failover (primary errors → backup answers under the backup's OWN
+    //     posture, observed on the dispatched wire request) is proven by
+    //     `delegated_failover_dispatches_backup_posture` below.
+    {
+        let (mut driver, _tmp) = test_driver(8);
+        dmh_install_config(
+            &mut driver,
+            serde_json::json!({ "llm_mode": "frontier" }),
+            vec![
+                dmh_model("local", None, None),
+                dmh_model("child-primary", Some("normal"), None),
+            ],
+        );
+        set_root_llm_mode(&mut driver, LlmMode::Frontier);
+        let child = dmh_build_child(
+            &driver,
+            "explore",
+            false,
+            Some(exact_model_selector("child-primary")),
+            Default::default(),
+        );
+        assert_eq!(child.model.model_id_ref(), "child-primary");
+        assert_eq!(child.llm_mode, LlmMode::Normal);
+    }
+}
+
+/// AC3 (failover, non-vacuous): the REAL per-turn failover path. The PRIMARY
+/// child model (`child-flaky`, Normal) errors; the configured BACKUP model
+/// (`backup-model`, Defensive) answers. Driving the actual delegated turn
+/// through `turn_with_backup`, the DISPATCHED backup request renders the BACKUP
+/// model's Defensive role/context posture — not the primary's Normal — observed
+/// on the captured wire request, not a hand-called helper. Fails if the
+/// per-candidate re-posturing is removed.
+#[test]
+fn delegated_failover_dispatches_backup_posture() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let (mut driver, _tmp) = test_driver(8);
+                    let cwd = driver.cwd.clone();
+                    // The current-thread runtime runs the whole delegation on this
+                    // thread, so a thread-local trust guard makes the custom `probe`
+                    // agent resolvable throughout the async dispatch.
+                    let _trust = crate::config::trust::enter_workspace_trust_policy(
+                        crate::config::trust::WorkspaceTrustPolicy {
+                            root: crate::config::trust::resolve_trust_root(&cwd).unwrap_or_else(
+                                |_| crate::config::trust::TrustRoot {
+                                    opened_path: cwd.clone(),
+                                    root: cwd.clone(),
+                                    kind: crate::config::trust::TrustRootKind::Directory,
+                                },
+                            ),
+                            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+                        },
+                    );
+                    let primary_provider = failing_provider();
+                    let backup_provider = cockpit_test_support::provider::ScriptedProvider::builder()
+                        .dialect(cockpit_test_support::provider::WireDialect::ChatCompletions)
+                        .turn(cockpit_test_support::provider::Turn::Text("backup answered".into()))
+                        .repeat_last()
+                        .start_blocking();
+                    let config_dir = driver.cwd.join(".cockpit");
+                    let providers_dir = config_dir.join("providers");
+                    std::fs::create_dir_all(&providers_dir).unwrap();
+                    std::fs::write(
+                        config_dir.join("config.json"),
+                        r#"{"agent_chooses_subagent_model": true, "active_model": {"provider":"lmstudio","model":"local"}}"#,
+                    )
+                    .unwrap();
+                    std::fs::write(
+                        providers_dir.join("lmstudio.json"),
+                        serde_json::json!({
+                            "url": test_provider_base_url(),
+                            "models": [{ "id": "local", "subagent_invokable": true }]
+                        })
+                        .to_string(),
+                    )
+                    .unwrap();
+                    std::fs::write(
+                        providers_dir.join("flaky.json"),
+                        serde_json::json!({
+                            "url": primary_provider.base_url(),
+                            "backup": { "provider": "reliable", "model": "backup-model" },
+                            "models": [{ "id": "child-flaky", "mode": "normal", "subagent_invokable": true }]
+                        })
+                        .to_string(),
+                    )
+                    .unwrap();
+                    std::fs::write(
+                        providers_dir.join("reliable.json"),
+                        serde_json::json!({
+                            "url": backup_provider.base_url(),
+                            "models": [{ "id": "backup-model", "mode": "defensive", "subagent_invokable": true }]
+                        })
+                        .to_string(),
+                    )
+                    .unwrap();
+                    driver.refresh_config_from_disk_for_tests();
+                    dmh_write_mode_probe_agent(&driver);
+
+                    seed_task_delegation(&driver, "task-failover-posture", "default").await;
+                    seed_task_payload(&driver, "task-failover-posture", "default", "probe").await;
+                    let (tx, _rx) = mpsc::channel::<TurnEvent>(256);
+                    let completion = driver
+                        .execute_single_noninteractive_task(
+                            single_task(
+                                &driver,
+                                "probe",
+                                "task-failover-posture",
+                                Some(crate::engine::model_roles::DelegationModelSelector::Exact {
+                                    selector: "flaky:child-flaky".to_string(),
+                                    required_capabilities: Vec::new(),
+                                    min_context_tokens: None,
+                                }),
+                                None,
+                            ),
+                            &tx,
+                            tokio_util::sync::CancellationToken::new(),
+                        )
+                        .await
+                        .unwrap();
+                    assert!(!completion.failed, "backup answered: {}", completion.report);
+
+                    // The PRIMARY request carried the primary model's Normal body.
+                    let primary = primary_provider.captured();
+                    assert!(!primary.is_empty(), "primary model was dispatched");
+                    let primary_body = primary[0].body.to_string();
+                    assert!(
+                        primary_body.contains("PROBE-BODY-NORMAL-VARIANT"),
+                        "primary rendered its own Normal posture"
+                    );
+                    assert!(!primary_body.contains("PROBE-BODY-DEFENSIVE-VARIANT"));
+
+                    // The BACKUP request carried the BACKUP model's OWN Defensive
+                    // body — NOT the primary's Normal.
+                    let backup = backup_provider.captured();
+                    assert!(!backup.is_empty(), "backup model was dispatched");
+                    let backup_body = backup[0].body.to_string();
+                    assert!(
+                        backup_body.contains("PROBE-BODY-DEFENSIVE-VARIANT"),
+                        "dispatched backup rendered the backup model's Defensive posture"
+                    );
+                    assert!(
+                        !backup_body.contains("PROBE-BODY-NORMAL-VARIANT"),
+                        "the dispatched backup did NOT render the primary's Normal posture"
+                    );
+                });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+/// AC3 (failover trigger): per-candidate re-posture fires on a MODEL change even
+/// at the SAME mode, because the composed `system` is model-specific (it prepends
+/// the candidate model's own system prompt). A same-mode, different-model backup
+/// is re-rendered (carrying the candidate model); the primary model+mode is a
+/// no-op. Fails if the trigger reverts to mode-only.
+///
+/// (The model-specific system CONTENT is not asserted here: injecting a per-model
+/// system prompt requires it to be present in the test session's captured
+/// snapshot, which is fixed at session creation and not settable in the harness.
+/// `delegated_failover_dispatches_backup_posture` proves the wire-level re-render
+/// for the different-mode case.)
+#[tokio::test]
+async fn delegated_failover_reposture_fires_on_model_change() {
+    use crate::config::extended::LlmMode;
+    let (mut driver, _tmp) = test_driver(8);
+    dmh_install_config(
+        &mut driver,
+        serde_json::json!({ "llm_mode": "normal" }),
+        vec![
+            dmh_model("local", None, None),
+            dmh_model("model-a", Some("normal"), None),
+            dmh_model("model-b", Some("normal"), None),
+        ],
+    );
+    // An assistant-owned session: the identity/SOUL/USER prefix is prepended to
+    // every child's composed system at build time.
+    driver.set_assistant_identity_prefix(Some("SOUL-IDENTITY-MARKER".to_string()));
+    let agent_a = dmh_build_child(
+        &driver,
+        "explore",
+        false,
+        Some(exact_model_selector("model-a")),
+        crate::engine::builtin::DelegationRecursionContext::default(),
+    );
+    let agent_b = dmh_build_child(
+        &driver,
+        "explore",
+        false,
+        Some(exact_model_selector("model-b")),
+        crate::engine::builtin::DelegationRecursionContext::default(),
+    );
+    assert_eq!(agent_a.model.model_id_ref(), "model-a");
+    assert_eq!(agent_a.llm_mode, LlmMode::Normal);
+    assert_eq!(agent_b.model.model_id_ref(), "model-b");
+    assert_eq!(agent_b.llm_mode, LlmMode::Normal);
+    // The build applied the identity prefix to the composed system.
+    assert!(agent_a.system.contains("SOUL-IDENTITY-MARKER"));
+    assert_eq!(
+        agent_a.assistant_identity_prefix.as_deref(),
+        Some("SOUL-IDENTITY-MARKER")
+    );
+    // Same mode (Normal), DIFFERENT model → re-render (Some), carrying model-b.
+    // Same-mode re-render reuses the agent's own role (no def re-resolution / no
+    // workspace-trust needed).
+    let reposed = crate::engine::builtin::reposture_agent_for_candidate(
+        &agent_a,
+        &agent_b.model,
+        LlmMode::Normal,
+        &driver.session,
+        &driver.cwd,
+        &driver.session.db,
+    )
+    .await
+    .unwrap()
+    .expect("a same-mode, different-model candidate is re-rendered");
+    assert_eq!(
+        reposed.model.model_id_ref(),
+        "model-b",
+        "the re-rendered agent carries the CANDIDATE model, not the primary's"
+    );
+    assert_eq!(reposed.llm_mode, LlmMode::Normal);
+    // The repostured system KEEPS the assistant identity prefix, and is
+    // byte-identical to a fresh build for the candidate model (identity prefix +
+    // role body) — fails if the reposture drops the prefix.
+    assert!(
+        reposed.system.contains("SOUL-IDENTITY-MARKER"),
+        "the repostured system keeps the assistant identity prefix"
+    );
+    assert_eq!(
+        reposed.system, agent_b.system,
+        "the repostured system == a fresh build for the candidate model"
+    );
+    assert_eq!(
+        reposed.assistant_identity_prefix.as_deref(),
+        Some("SOUL-IDENTITY-MARKER")
+    );
+
+    // Same model AND same mode → no-op (None).
+    let noop = crate::engine::builtin::reposture_agent_for_candidate(
+        &agent_a,
+        &agent_a.model,
+        LlmMode::Normal,
+        &driver.session,
+        &driver.cwd,
+        &driver.session.db,
+    )
+    .await
+    .unwrap();
+    assert!(noop.is_none(), "the primary model+mode is a no-op");
+}
+
+/// FE: an assistant-DB-backed custom agent that failover-swaps to a
+/// DIFFERENT-posture model re-renders through the SAME assistant-DB resolution
+/// path the initial build used — succeeding with the candidate's posture and the
+/// agent's OWN (DB) role, NOT failing closed. Proves the reposture reaches the DB,
+/// not just the on-disk/embedded resolver.
+#[tokio::test]
+async fn delegated_failover_reposture_resolves_db_backed_agent() {
+    use crate::config::extended::LlmMode;
+    let (mut driver, _tmp) = test_driver(8);
+    dmh_install_config(
+        &mut driver,
+        serde_json::json!({ "llm_mode": "normal" }),
+        vec![
+            dmh_model("local", None, None),
+            dmh_model("model-a", Some("normal"), None),
+            dmh_model("model-b", Some("defensive"), None),
+        ],
+    );
+    // Seed a DB-only assistant agent whose home is OUTSIDE the workspace agent
+    // search path, so it is resolvable ONLY through the assistant DB (never the
+    // on-disk/embedded resolver).
+    let home = tempfile::tempdir().unwrap();
+    crate::assistants::create_assistant(
+        &driver.session.db,
+        crate::assistants::CreateAssistantSpec {
+            name: "dbonly-helper".to_string(),
+            description: "db-backed helper".to_string(),
+            mode: crate::agents::AgentMode::Subagent,
+            tools: Some(vec!["read".to_string()]),
+            tool_tiers: Default::default(),
+            model: None,
+            prompt: "DB-ONLY-ROLE-MARKER investigate.".to_string(),
+            home_dir: home.path().to_path_buf(),
+        },
+    )
+    .await
+    .unwrap();
+    // The on-disk/embedded resolver cannot see it: only the assistant-DB path can.
+    assert!(
+        crate::agents::resolve(&driver.cwd, "dbonly-helper")
+            .unwrap()
+            .is_none(),
+        "the assistant agent is resolvable ONLY through the DB"
+    );
+    // Build a real child (explore) at model-a/Normal, then retarget its NAME to
+    // the DB-only agent so a DIFFERENT-mode failover must re-resolve the def
+    // through the assistant-DB path (an on-disk/embedded lookup would fail closed).
+    let mut agent = dmh_build_child(
+        &driver,
+        "explore",
+        false,
+        Some(exact_model_selector("model-a")),
+        crate::engine::builtin::DelegationRecursionContext::default(),
+    );
+    agent.name = "dbonly-helper".to_string();
+    assert_eq!(agent.llm_mode, LlmMode::Normal);
+    assert!(!agent.role_prompt.contains("DB-ONLY-ROLE-MARKER"));
+    // The candidate carries model-b, whose posture (Defensive) differs from the
+    // primary (Normal): the DIFFERENT-mode branch re-resolves the def.
+    let agent_b = dmh_build_child(
+        &driver,
+        "explore",
+        false,
+        Some(exact_model_selector("model-b")),
+        crate::engine::builtin::DelegationRecursionContext::default(),
+    );
+    assert_eq!(agent_b.llm_mode, LlmMode::Defensive);
+    let reposed = crate::engine::builtin::reposture_agent_for_candidate(
+        &agent,
+        &agent_b.model,
+        LlmMode::Defensive,
+        &driver.session,
+        &driver.cwd,
+        &driver.session.db,
+    )
+    .await
+    .unwrap()
+    .expect("a different-mode candidate re-renders");
+    assert_eq!(reposed.model.model_id_ref(), "model-b");
+    assert_eq!(
+        reposed.llm_mode,
+        LlmMode::Defensive,
+        "the failover renders the CANDIDATE model's own posture"
+    );
+    assert!(
+        reposed.role_prompt.contains("DB-ONLY-ROLE-MARKER"),
+        "the failover role body comes from the agent's OWN DB def (via the \
+         assistant-DB resolution path), not the primary's: {}",
+        reposed.role_prompt
+    );
+    assert!(
+        reposed.system.contains("DB-ONLY-ROLE-MARKER"),
+        "the recomposed system embeds the DB def's role body"
+    );
+}
+
+/// AC4: the full trust × mode cartesian for a delegated child — trust alone
+/// selects raw-vs-redacted egress; mode alone selects the documented harness
+/// output. Changing one axis never moves the other.
+#[test]
+fn delegated_trust_and_mode_cartesian_matrix() {
+    use crate::config::extended::LlmMode;
+    let modes = [
+        ("defensive", LlmMode::Defensive, true),
+        ("normal", LlmMode::Normal, false),
+        ("frontier", LlmMode::Frontier, false),
+    ];
+    let trusts = [("trusted", true), ("untrusted", false)];
+
+    // Collect the two observables per cell, then assert orthogonality.
+    for (trust_str, trusted) in trusts {
+        // Egress class is constant across the three modes at a fixed trust.
+        let mut egress_across_modes = Vec::new();
+        for (mode_str, mode_enum, defensive) in modes {
+            let (mut driver, _tmp) = test_driver(8);
+            dmh_install_config(
+                &mut driver,
+                serde_json::json!({ "llm_mode": "normal" }),
+                vec![
+                    dmh_model("local", None, None),
+                    dmh_model("probe", Some(mode_str), Some(trust_str)),
+                ],
+            );
+            // Reach the trusted/untrusted probe through a HOST-authored
+            // frontmatter model, so custody is the target's own class (a
+            // model-directed selector would force redacted-untrusted custody).
+            let agents_dir = driver.cwd.join(".cockpit").join("agents");
+            std::fs::create_dir_all(&agents_dir).unwrap();
+            std::fs::write(
+                agents_dir.join("explore.md"),
+                "---\ndescription: probe\nmode: subagent\nmodel: lmstudio:probe\ntools: [read]\n---\nInvestigate read-only.\n",
+            )
+            .unwrap();
+            // The session model carries a redaction sentinel so the child model
+            // inherits it by trust class.
+            dmh_inject_session_secret(&mut driver);
+            // Parent frame posture is deliberately different from every cell.
+            set_root_llm_mode(&mut driver, LlmMode::Defensive);
+
+            let child = dmh_build_child(
+                &driver,
+                "explore",
+                false,
+                None,
+                crate::engine::builtin::DelegationRecursionContext::default(),
+            );
+            assert_eq!(
+                child.model.model_id_ref(),
+                "probe",
+                "cell {trust_str}/{mode_str}"
+            );
+            // Mode axis: posture follows the child model's mode only.
+            assert_eq!(child.llm_mode, mode_enum, "mode axis (trust={trust_str})");
+            assert_eq!(
+                dmh_read_is_defensive(&child),
+                defensive,
+                "harness output follows mode only (trust={trust_str}, mode={mode_str})"
+            );
+            // Trust axis: the ACTUAL raw-vs-redacted WIRE egress follows trust
+            // only. Scrub a sentinel-bearing payload through the child model's
+            // effective outbound redaction table — the table that scrubs its
+            // provider request body — and confirm the sentinel is removed iff
+            // the child is untrusted, identically across modes.
+            let wire = child
+                .model
+                .redact_table()
+                .scrub(&format!("deploy with {DMH_WIRE_SECRET} now"));
+            if trusted {
+                assert!(
+                    wire.contains(DMH_WIRE_SECRET),
+                    "trusted child egress rides raw (trust={trust_str}, mode={mode_str}): {wire}"
+                );
+            } else {
+                assert!(
+                    !wire.contains(DMH_WIRE_SECRET),
+                    "untrusted child egress scrubs the sentinel (trust={trust_str}, mode={mode_str}): {wire}"
+                );
+            }
+            assert_eq!(
+                child.model.is_trusted(),
+                trusted,
+                "egress class follows trust only (trust={trust_str}, mode={mode_str})"
+            );
+            egress_across_modes.push(wire.contains(DMH_WIRE_SECRET));
+        }
+        // WIRE egress (sentinel present-or-scrubbed) is constant across the three
+        // modes at a fixed trust: mode never moves egress.
+        assert!(
+            egress_across_modes.iter().all(|raw| *raw == trusted),
+            "wire egress is constant across modes at trust={trust_str}"
+        );
+    }
+}
+
+/// Drive ONE trust cell through the REAL delegated production turn against a
+/// request-capturing provider, with a redaction sentinel in the brief, and
+/// return whether the sentinel rode RAW in the actual captured request body.
+fn dmh_captured_request_has_sentinel(trust: &str) -> bool {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn({
+            let trust = trust.to_string();
+            move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async move {
+                        let provider = cockpit_test_support::provider::ScriptedProvider::builder()
+                            .dialect(cockpit_test_support::provider::WireDialect::ChatCompletions)
+                            .turn(cockpit_test_support::provider::Turn::Text("done".into()))
+                            .repeat_last()
+                            .start_blocking();
+                        let (mut driver, _tmp) = test_driver_with_url(8, provider.base_url());
+                        let cwd = driver.cwd.clone();
+                        let _trust = crate::config::trust::enter_workspace_trust_policy(
+                            crate::config::trust::WorkspaceTrustPolicy {
+                                root: crate::config::trust::resolve_trust_root(&cwd)
+                                    .unwrap_or_else(|_| crate::config::trust::TrustRoot {
+                                        opened_path: cwd.clone(),
+                                        root: cwd.clone(),
+                                        kind: crate::config::trust::TrustRootKind::Directory,
+                                    }),
+                                mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+                            },
+                        );
+                        let config_dir = driver.cwd.join(".cockpit");
+                        let providers_dir = config_dir.join("providers");
+                        std::fs::create_dir_all(&providers_dir).unwrap();
+                        std::fs::write(
+                            config_dir.join("config.json"),
+                            r#"{"agent_chooses_subagent_model": true, "active_model": {"provider":"lmstudio","model":"local"}}"#,
+                        )
+                        .unwrap();
+                        std::fs::write(
+                            providers_dir.join("lmstudio.json"),
+                            serde_json::json!({
+                                "url": provider.base_url(),
+                                "models": [
+                                    { "id": "local", "subagent_invokable": true },
+                                    { "id": "probe", "trust": trust, "subagent_invokable": true }
+                                ]
+                            })
+                            .to_string(),
+                        )
+                        .unwrap();
+                        // Host-authored frontmatter model → the child model keeps
+                        // its OWN custody class (trusted or untrusted).
+                        let agents_dir = config_dir.join("agents");
+                        std::fs::create_dir_all(&agents_dir).unwrap();
+                        std::fs::write(
+                            agents_dir.join("explore.md"),
+                            "---\ndescription: probe\nmode: subagent\nmodel: lmstudio:probe\ntools: [read]\n---\nInvestigate read-only.\n",
+                        )
+                        .unwrap();
+                        driver.refresh_config_from_disk_for_tests();
+                        // The session model carries the sentinel redaction table so
+                        // the child model inherits it by trust class.
+                        dmh_inject_session_secret(&mut driver);
+
+                        seed_task_delegation(&driver, "task-wire-egress", "default").await;
+                        seed_task_payload(&driver, "task-wire-egress", "default", "explore").await;
+                        let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+                        let mut task = single_task(&driver, "explore", "task-wire-egress", None, None);
+                        // The delegation brief carries the sentinel.
+                        task.brief = format!("investigate {DMH_WIRE_SECRET} in the codebase");
+                        let _ = driver
+                            .execute_single_noninteractive_task(
+                                task,
+                                &tx,
+                                tokio_util::sync::CancellationToken::new(),
+                            )
+                            .await
+                            .unwrap();
+
+                        let captured = provider.captured();
+                        assert!(!captured.is_empty(), "the child dispatched a request");
+                        captured
+                            .iter()
+                            .any(|r| r.body.to_string().contains(DMH_WIRE_SECRET))
+                    })
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+/// AC4 (wire egress, end-to-end): drive a trusted and an untrusted child through
+/// the REAL delegated turn against a request-capturing provider — the CAPTURED
+/// request body carries the sentinel RAW only for the TRUSTED target and SCRUBBED
+/// for the untrusted one. This fails if production stopped applying the redaction
+/// table at network egress. (The full six-cell orthogonality is covered at the
+/// table level by `delegated_trust_and_mode_cartesian_matrix`; two cells are
+/// driven end-to-end here because full dispatch per cell is slow.)
+#[test]
+fn delegated_trust_wire_egress_is_raw_only_for_trusted() {
+    assert!(
+        dmh_captured_request_has_sentinel("trusted"),
+        "a trusted child's captured request carries the sentinel RAW"
+    );
+    assert!(
+        !dmh_captured_request_has_sentinel("untrusted"),
+        "an untrusted child's captured request SCRUBS the sentinel"
+    );
+}
+
+/// AC5: parent-request batch admission preserves its documented parent-mode
+/// policy, while each admitted child's execution uses the child posture and
+/// cannot inherit the parent's tool definitions.
+#[tokio::test]
+async fn delegated_parent_authorization_remains_parent_scoped() {
+    use crate::config::extended::LlmMode;
+
+    // (a) A Frontier parent admits the write-capable parallel batch
+    //     (parent-scoped policy); the admitted child still renders its OWN
+    //     defensive posture, not the parent's Frontier tool definitions.
+    {
+        let (mut driver, tmp) = test_driver(8);
+        dmh_install_config(
+            &mut driver,
+            serde_json::json!({ "llm_mode": "normal" }),
+            vec![
+                dmh_model("local", None, None),
+                dmh_model("child-defensive", Some("defensive"), None),
+            ],
+        );
+        set_root_llm_mode(&mut driver, LlmMode::Frontier);
+        std::fs::create_dir_all(tmp.path().join("a")).unwrap();
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+        let mut entry = batch_entry_with_scope("a", "builder", "a");
+        entry.model = Some(exact_model_selector("child-defensive"));
+        let task = BatchNoninteractiveTask {
+            entries: vec![entry],
+            child_cwds: vec![root_child_cwd(&driver)],
+            why: "test".to_string(),
+            repair_notes: Vec::new(),
+            task_call_id: "task-parent-scope-admit".to_string(),
+            task_function_call_id: None,
+        };
+        let completion = driver
+            .execute_batch_noninteractive_task(
+                task,
+                &tx,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !completion.children[0].report.contains("Frontier-only"),
+            "parent-Frontier admits the write-capable batch: {}",
+            completion.children[0].report
+        );
+        let _ = drain_turn_events(&mut rx);
+
+        let child = dmh_build_child(
+            &driver,
+            "builder",
+            false,
+            Some(exact_model_selector("child-defensive")),
+            crate::engine::builtin::DelegationRecursionContext::default(),
+        );
+        assert_eq!(child.llm_mode, LlmMode::Defensive);
+        assert!(
+            dmh_read_is_defensive(&child),
+            "child execution renders its own posture, not the parent's Frontier tool defs"
+        );
+    }
+
+    // (b) The same admission stays parent-scoped: a non-Frontier parent refuses
+    //     the write-capable batch even when the child target's mode is Frontier.
+    {
+        let (mut driver, tmp) = test_driver(8);
+        dmh_install_config(
+            &mut driver,
+            serde_json::json!({ "llm_mode": "normal" }),
+            vec![
+                dmh_model("local", None, None),
+                dmh_model("child-frontier", Some("frontier"), None),
+            ],
+        );
+        set_root_llm_mode(&mut driver, LlmMode::Normal);
+        std::fs::create_dir_all(tmp.path().join("a")).unwrap();
+        let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+        let mut entry = batch_entry_with_scope("a", "builder", "a");
+        entry.model = Some(exact_model_selector("child-frontier"));
+        let task = BatchNoninteractiveTask {
+            entries: vec![entry],
+            child_cwds: vec![root_child_cwd(&driver)],
+            why: "test".to_string(),
+            repair_notes: Vec::new(),
+            task_call_id: "task-parent-scope-refuse".to_string(),
+            task_function_call_id: None,
+        };
+        let completion = driver
+            .execute_batch_noninteractive_task(
+                task,
+                &tx,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(completion.children[0].failed);
+        assert!(
+            completion.children[0].report.contains("Frontier-only"),
+            "admission is parent-scoped: a Normal parent refuses despite a Frontier child target: {}",
+            completion.children[0].report
+        );
+    }
+}
+
+/// AC6: identity and posture always come from ONE config generation, and a
+/// resolution/build failure yields no surface (and thus no dispatch), never a
+/// fall back to the parent posture for a different selected model.
+#[tokio::test]
+async fn delegated_mode_refresh_or_build_failure_dispatches_nothing() {
+    use crate::config::extended::LlmMode;
+    let (mut driver, _tmp) = test_driver(8);
+    dmh_install_config(
+        &mut driver,
+        serde_json::json!({ "llm_mode": "normal" }),
+        vec![
+            dmh_model("local", None, None),
+            dmh_model("child-frontier", Some("frontier"), None),
+        ],
+    );
+    set_root_llm_mode(&mut driver, LlmMode::Defensive);
+    let cwd = driver.cwd.clone();
+
+    // A good child: its surface's mode equals resolve_mode of its OWN resolved
+    // identity at the generation it was resolved from — no cross-model or
+    // cross-generation mix.
+    let good_args = driver.spawn_args_delegated_in_cwd(
+        &cwd,
+        false,
+        Vec::new(),
+        Some(exact_model_selector("child-frontier")),
+        crate::engine::builtin::DelegationRecursionContext::default(),
+    );
+    let surface = dmh_trusted(&cwd, || {
+        crate::engine::builtin::resolve_child_execution_surface("explore", &good_args)
+    })
+    .expect("good child resolves a surface");
+    let (extended, providers) = good_args.config.configs();
+    assert_eq!(surface.config_generation, good_args.config.generation());
+    assert_eq!(
+        surface.llm_mode,
+        providers.resolve_mode(&surface.provider, &surface.model, extended.llm_mode),
+        "posture and identity resolved from one generation"
+    );
+    assert_eq!(surface.llm_mode, LlmMode::Frontier);
+    assert_eq!(surface.model, "child-frontier");
+    assert_ne!(surface.llm_mode, driver.stack[0].agent.llm_mode);
+
+    // Build/resolution failure: an unresolvable selected model yields NO surface
+    // (nothing can be admitted or dispatched) and the content-safe routing
+    // error — never a fall back to the parent posture.
+    let bad_args = driver.spawn_args_delegated_in_cwd(
+        &cwd,
+        false,
+        Vec::new(),
+        Some(exact_model_selector("does-not-exist")),
+        crate::engine::builtin::DelegationRecursionContext::default(),
+    );
+    let err = dmh_trusted(&cwd, || {
+        crate::engine::builtin::resolve_child_execution_surface("explore", &bad_args)
+    })
+    .expect_err("unresolvable model yields no surface");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("subagent model selector"),
+        "content-safe routing error, not a parent-posture fallback: {msg}"
+    );
+    // The failing build produced no child agent, so there is nothing to dispatch.
+    assert!(dmh_trusted(&cwd, || crate::engine::builtin::load("explore", &bad_args)).is_err());
+
+    // Drive the REAL single-delegation dispatch path with an unresolvable child
+    // model (+ a write scope, an approver, and a request-counting provider): the
+    // resolution failure fails closed at the VERY START — BEFORE the first child
+    // lifecycle/spawn side effect — so there is NO `SubagentSpawned` event, NO
+    // write-scope grant, and ZERO inference requests.
+    let provider = cockpit_test_support::provider::ScriptedProvider::builder()
+        .dialect(cockpit_test_support::provider::WireDialect::ChatCompletions)
+        .turn(cockpit_test_support::provider::Turn::Text(
+            "SHOULD-NEVER-BE-DISPATCHED".into(),
+        ))
+        .repeat_last()
+        .start_blocking();
+    let (mut driver, tmp2) = test_driver_with_url(8, provider.base_url());
+    let config_dir = driver.cwd.join(".cockpit");
+    let providers_dir = config_dir.join("providers");
+    std::fs::create_dir_all(&providers_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.json"),
+        r#"{"agent_chooses_subagent_model": true, "active_model": {"provider":"lmstudio","model":"local"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        providers_dir.join("lmstudio.json"),
+        serde_json::json!({
+            "url": provider.base_url(),
+            "models": [{ "id": "local", "subagent_invokable": true }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    driver.refresh_config_from_disk_for_tests();
+    let approver = install_test_approver(&mut driver);
+    let scope = tmp2.path().join("scope");
+    std::fs::create_dir_all(&scope).unwrap();
+
+    // Drive the REAL backgroundable entry point (the one that PERSISTS the task
+    // and REGISTERS the running child before spawning the inner executor). NOTE:
+    // the task delegation is deliberately NOT seeded — a fail-closed preflight
+    // must persist it itself only AFTER validation, i.e. never here.
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+    let mut task = single_task(
+        &driver,
+        "builder",
+        "task-build-failure",
+        Some(exact_model_selector("does-not-exist")),
+        None,
+    );
+    task.write_scope = Some(scope.display().to_string());
+    let message = driver
+        .run_single_noninteractive_task_backgroundable(
+            task,
+            &queue,
+            &tx,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    // The wrapper returned the content-safe routing error as the tool result.
+    let text = tool_result_text(&message);
+    assert!(
+        text.contains("subagent model selector"),
+        "content-safe routing error from the real backgroundable path: {text}"
+    );
+    assert!(!text.contains("SHOULD-NEVER-BE-DISPATCHED"));
+    // No running child was registered (register_running was never reached).
+    assert!(
+        !driver
+            .noninteractive_delegations
+            .is_live("task-build-failure", "default"),
+        "a fail-closed preflight registers/persists no running child"
+    );
+    // Zero inference.
+    assert_eq!(
+        provider.request_count(),
+        0,
+        "resolution/build failure must perform NO inference dispatch"
+    );
+    // No spawn event.
+    let events = drain_turn_events(&mut rx);
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            TurnEvent::SubagentSpawned { task_call_id, .. } if task_call_id == "task-build-failure"
+        )),
+        "no SubagentSpawned event on a fail-closed preflight"
+    );
+    // No write-scope pregrant.
+    assert!(
+        !approver
+            .store()
+            .is_path_granted_for(
+                &scope,
+                crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite
+            )
+            .await,
+        "no write-scope grant on a fail-closed preflight"
+    );
+
+    // FD: the BATCH background entry point also fails closed BEFORE persisting or
+    // registering any child. A batch with an unresolvable entry model leaves no
+    // task registration and dispatches no inference.
+    {
+        let (mut driver, _tmp3) = test_driver_with_url(8, provider.base_url());
+        let config_dir = driver.cwd.join(".cockpit");
+        let providers_dir = config_dir.join("providers");
+        std::fs::create_dir_all(&providers_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.json"),
+            r#"{"agent_chooses_subagent_model": true, "active_model": {"provider":"lmstudio","model":"local"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            providers_dir.join("lmstudio.json"),
+            serde_json::json!({
+                "url": provider.base_url(),
+                "models": [{ "id": "local", "subagent_invokable": true }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        driver.refresh_config_from_disk_for_tests();
+        let requests_before = provider.request_count();
+
+        let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+        let queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+        let mut good = batch_entry("good", "explore", None);
+        good.prompt = "ok".to_string();
+        let mut bad = batch_entry(
+            "bad",
+            "explore",
+            Some(exact_model_selector("does-not-exist")),
+        );
+        bad.prompt = "ok".to_string();
+        let task = BatchNoninteractiveTask {
+            entries: vec![good, bad],
+            child_cwds: vec![root_child_cwd(&driver), root_child_cwd(&driver)],
+            why: "test".to_string(),
+            repair_notes: Vec::new(),
+            task_call_id: "task-batch-build-failure".to_string(),
+            task_function_call_id: None,
+        };
+        let message = driver
+            .run_batch_noninteractive_task_backgroundable(
+                task,
+                &queue,
+                &tx,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            tool_result_text(&message).contains("subagent model selector"),
+            "content-safe routing error from the batch backgroundable path: {}",
+            tool_result_text(&message)
+        );
+        // No entry was registered running (register_running never reached).
+        assert!(
+            !driver
+                .noninteractive_delegations
+                .is_live("task-batch-build-failure", "good")
+                && !driver
+                    .noninteractive_delegations
+                    .is_live("task-batch-build-failure", "bad"),
+            "a fail-closed batch preflight registers no running child"
+        );
+        // No spawn event, no inference.
+        let events = drain_turn_events(&mut rx);
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            TurnEvent::SubagentSpawned { task_call_id, .. } if task_call_id == "task-batch-build-failure"
+        )));
+        assert_eq!(
+            provider.request_count(),
+            requests_before,
+            "a bad-model batch entry dispatches NO inference"
+        );
+    }
+}
+
+/// AC7: interactive and noninteractive selection expose one immutable surface
+/// equal to the subsequently built attempt, with the child's OWN posture (no
+/// root leak). `parallel_read_only_eligible` is false for a read-only-sounding
+/// child whose real surface carries a dynamic/mutating tool, and for a child
+/// exposing nested task/control/scheduling capability.
+#[test]
+fn resolved_child_execution_surface_matches_actual_attempt() {
+    use crate::config::extended::LlmMode;
+
+    // The surface equals the subsequently built attempt for both interactive
+    // and noninteractive delegation, and no root posture leaks in.
+    for interactive in [true, false] {
+        let (mut driver, _tmp) = test_driver(8);
+        dmh_install_config(
+            &mut driver,
+            serde_json::json!({ "llm_mode": "normal" }),
+            vec![
+                dmh_model("local", None, None),
+                dmh_model("child-defensive", Some("defensive"), None),
+            ],
+        );
+        set_root_llm_mode(&mut driver, LlmMode::Frontier);
+        let cwd = driver.cwd.clone();
+        let args = driver.spawn_args_delegated_in_cwd(
+            &cwd,
+            interactive,
+            Vec::new(),
+            Some(exact_model_selector("child-defensive")),
+            crate::engine::builtin::DelegationRecursionContext::default(),
+        );
+        let surface = dmh_trusted(&cwd, || {
+            crate::engine::builtin::resolve_child_execution_surface("explore", &args)
+        })
+        .unwrap();
+        let child = dmh_trusted(&cwd, || crate::engine::builtin::load("explore", &args)).unwrap();
+        assert_eq!(surface.provider, child.model.provider_id());
+        assert_eq!(surface.model, child.model.model_id_ref());
+        assert_eq!(surface.config_generation, args.config.generation());
+        assert_eq!(surface.llm_mode, child.llm_mode);
+        assert_eq!(surface.llm_mode, LlmMode::Defensive, "child's own posture");
+        assert_ne!(
+            surface.llm_mode, driver.stack[0].agent.llm_mode,
+            "no root posture leaks into the surface"
+        );
+        assert_eq!(
+            surface.tools,
+            child
+                .tools
+                .names()
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            surface.write_authority,
+            crate::engine::builtin::is_write_capable(&child)
+        );
+    }
+
+    // Positive: a purely read-only noninteractive leaf is admissible. A
+    // host-authored custom subagent whose entire roster is registered ordinary
+    // read-only operations drives a REAL child surface (via `load`), so the
+    // boolean is proven true — not against a hand-built agent. A unique name is
+    // used so no built-in factory tiers extra tools onto the roster; `web` is
+    // set to a command-less custom provider so the default `webfetch`/
+    // `websearch` (Dynamic network tools) are not attached to the surface.
+    {
+        let (mut driver, _tmp) = test_driver(8);
+        dmh_install_config(
+            &mut driver,
+            serde_json::json!({ "web": { "provider": "custom" } }),
+            vec![dmh_model("local", None, None)],
+        );
+        let agents_dir = driver.cwd.join(".cockpit").join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("readonly-probe.md"),
+            "---\ndescription: read-only leaf\nmode: subagent\ntools: [read]\n---\nInvestigate read-only.\n",
+        )
+        .unwrap();
+        let cwd = driver.cwd.clone();
+        let args = driver.spawn_args_delegated_in_cwd(
+            &cwd,
+            false,
+            Vec::new(),
+            None,
+            crate::engine::builtin::DelegationRecursionContext::default(),
+        );
+        let surface = dmh_trusted(&cwd, || {
+            crate::engine::builtin::resolve_child_execution_surface("readonly-probe", &args)
+        })
+        .unwrap();
+        assert!(
+            surface.parallel_read_only_eligible,
+            "a read-only leaf is admissible: {:?}",
+            surface.tools
+        );
+        assert!(!surface.write_authority);
+    }
+
+    // False (registered-ordinary): the same read-only leaf ALSO exposes a
+    // user-authored custom-bash template (`webfetch` from a `web.custom` command).
+    // `approval_exempt` makes its `effect()` read `ReadOnly`, but it can run an
+    // arbitrary shell command, so it is NOT a registered ordinary operation → the
+    // child is NOT `parallel_read_only_eligible`.
+    {
+        let (mut driver, _tmp) = test_driver(8);
+        dmh_install_config(
+            &mut driver,
+            serde_json::json!({ "web": { "provider": "custom", "custom": { "fetch_command": "echo {url}" } } }),
+            vec![dmh_model("local", None, None)],
+        );
+        let agents_dir = driver.cwd.join(".cockpit").join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("readonly-probe.md"),
+            "---\ndescription: read-only leaf\nmode: subagent\ntools: [read]\n---\nInvestigate read-only.\n",
+        )
+        .unwrap();
+        let cwd = driver.cwd.clone();
+        let args = driver.spawn_args_delegated_in_cwd(
+            &cwd,
+            false,
+            Vec::new(),
+            None,
+            crate::engine::builtin::DelegationRecursionContext::default(),
+        );
+        let surface = dmh_trusted(&cwd, || {
+            crate::engine::builtin::resolve_child_execution_surface("readonly-probe", &args)
+        })
+        .unwrap();
+        assert!(
+            surface.tools.contains(&"webfetch".to_string()),
+            "the custom-bash webfetch template is on the surface: {:?}",
+            surface.tools
+        );
+        assert!(
+            !surface.parallel_read_only_eligible,
+            "a custom approval_exempt bash template forecloses eligibility despite a ReadOnly effect"
+        );
+    }
+
+    // False: a read-only-SOUNDING child whose real surface carries a dynamic
+    // tool (bash). The built-in `explore` holds `bash` (Dynamic).
+    {
+        let (mut driver, _tmp) = test_driver(8);
+        dmh_install_config(
+            &mut driver,
+            serde_json::json!({}),
+            vec![dmh_model("local", None, None)],
+        );
+        let cwd = driver.cwd.clone();
+        let args = driver.spawn_args_delegated_in_cwd(
+            &cwd,
+            false,
+            Vec::new(),
+            None,
+            crate::engine::builtin::DelegationRecursionContext::default(),
+        );
+        let surface = dmh_trusted(&cwd, || {
+            crate::engine::builtin::resolve_child_execution_surface("explore", &args)
+        })
+        .unwrap();
+        assert!(
+            surface.tools.contains(&"bash".to_string()),
+            "explore exposes a dynamic tool: {:?}",
+            surface.tools
+        );
+        assert!(
+            !surface.parallel_read_only_eligible,
+            "a dynamic tool forecloses eligibility"
+        );
+    }
+
+    // False: a write-capable child (granted mutating authority).
+    {
+        let (mut driver, _tmp) = test_driver(8);
+        dmh_install_config(
+            &mut driver,
+            serde_json::json!({}),
+            vec![dmh_model("local", None, None)],
+        );
+        let cwd = driver.cwd.clone();
+        let args = driver.spawn_args_delegated_in_cwd(
+            &cwd,
+            false,
+            Vec::new(),
+            None,
+            crate::engine::builtin::DelegationRecursionContext::default(),
+        );
+        let surface = dmh_trusted(&cwd, || {
+            crate::engine::builtin::resolve_child_execution_surface("builder", &args)
+        })
+        .unwrap();
+        assert!(surface.write_authority);
+        assert!(!surface.parallel_read_only_eligible);
+    }
+
+    // False: a child exposing nested task-control / scheduling capability.
+    //     `scout` holds `spawn` (recursive fan-out, Dynamic).
+    {
+        let (mut driver, _tmp) = test_driver(8);
+        dmh_install_config(
+            &mut driver,
+            serde_json::json!({}),
+            vec![dmh_model("local", None, None)],
+        );
+        let cwd = driver.cwd.clone();
+        let args = driver.spawn_args_delegated_in_cwd(
+            &cwd,
+            false,
+            Vec::new(),
+            None,
+            crate::engine::builtin::DelegationRecursionContext::default(),
+        );
+        let surface = dmh_trusted(&cwd, || {
+            crate::engine::builtin::resolve_child_execution_surface("scout", &args)
+        })
+        .unwrap();
+        assert!(
+            surface.tools.contains(&"spawn".to_string()),
+            "scout exposes a nested-delegation capability: {:?}",
+            surface.tools
+        );
+        assert!(
+            !surface.parallel_read_only_eligible,
+            "nested task/scheduling capability forecloses eligibility"
+        );
+    }
+
+    // The surface is the ONLY contract for concurrent admission. The batch
+    // scheduler admits a child concurrently via exactly
+    // `batch_child_concurrently_admissible`, driven by the child's real surface:
+    // a read-only leaf is admitted; a read-only-sounding dynamic child (explore)
+    // and a nested child (scout) are REFUSED concurrent admission; a
+    // write-capable child keeps its (separate) parent-scoped write-admission.
+    {
+        let (mut driver, _tmp) = test_driver(8);
+        dmh_install_config(
+            &mut driver,
+            serde_json::json!({ "web": { "provider": "custom" } }),
+            vec![dmh_model("local", None, None)],
+        );
+        let agents_dir = driver.cwd.join(".cockpit").join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("readonly-probe.md"),
+            "---\ndescription: read-only leaf\nmode: subagent\ntools: [read]\n---\nInvestigate read-only.\n",
+        )
+        .unwrap();
+        let cwd = driver.cwd.clone();
+        let args = driver.spawn_args_delegated_in_cwd(
+            &cwd,
+            false,
+            Vec::new(),
+            None,
+            crate::engine::builtin::DelegationRecursionContext::default(),
+        );
+        // The concurrency key is `parallel_read_only_eligible` OR the child's REAL
+        // parent write-admission (`is_write_capable`), never a bare `write_scope`.
+        let gate = |agent: &str| -> bool {
+            let (surface, write_capable) = dmh_trusted(&cwd, || {
+                let surface =
+                    crate::engine::builtin::resolve_child_execution_surface(agent, &args).unwrap();
+                let child = crate::engine::builtin::load(agent, &args).unwrap();
+                let write_capable = crate::engine::builtin::is_write_capable(&child);
+                (surface, write_capable)
+            });
+            crate::engine::builtin::batch_child_concurrently_admissible(&surface, write_capable)
+        };
+        assert!(
+            gate("readonly-probe"),
+            "read-only leaf is concurrently admissible"
+        );
+        assert!(
+            !gate("explore"),
+            "a dynamic child is refused concurrent admission (exclusive)"
+        );
+        assert!(
+            !gate("scout"),
+            "a nested child is refused concurrent admission (exclusive)"
+        );
+        assert!(
+            gate("builder"),
+            "a write-capable child keeps its parent-scoped concurrent write-admission"
+        );
+    }
+
+    // Fα: a custom/dynamic child handed a `write_scope` that did NOT pass parent
+    // disjoint-scope write-admission (it has no REAL single-writer capability) is
+    // NOT concurrently admissible — its surface carries `write_authority` (a scope
+    // was requested), but `write_authority` is informational only. It is neither
+    // `parallel_read_only_eligible` nor parent-write-admitted, so it runs
+    // EXCLUSIVELY.
+    {
+        let (mut driver, tmp) = test_driver(8);
+        dmh_install_config(
+            &mut driver,
+            serde_json::json!({ "web": { "provider": "custom", "custom": { "fetch_command": "echo {url}" } } }),
+            vec![dmh_model("local", None, None)],
+        );
+        let agents_dir = driver.cwd.join(".cockpit").join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        // A custom subagent whose only non-read tool is the custom-bash `webfetch`
+        // template (arbitrary shell under `approval_exempt`) — dynamic, NOT
+        // write-capable in the single-writer-lock sense.
+        std::fs::write(
+            agents_dir.join("custom-writer.md"),
+            "---\ndescription: custom bash child\nmode: subagent\ntools: [read, webfetch]\n---\nInvestigate.\n",
+        )
+        .unwrap();
+        let scope = tmp.path().join("scope");
+        std::fs::create_dir_all(&scope).unwrap();
+        let cwd = driver.cwd.clone();
+        let args = driver.spawn_args_delegated_in_cwd_scoped(
+            &cwd,
+            false,
+            Vec::new(),
+            None,
+            crate::engine::builtin::DelegationRecursionContext::default(),
+            DelegationConfinement {
+                lock_identity: None,
+                write_scope: Some(scope.clone()),
+            },
+        );
+        let (surface, write_capable) = dmh_trusted(&cwd, || {
+            let surface =
+                crate::engine::builtin::resolve_child_execution_surface("custom-writer", &args)
+                    .unwrap();
+            let child = crate::engine::builtin::load("custom-writer", &args).unwrap();
+            let write_capable = crate::engine::builtin::is_write_capable(&child);
+            (surface, write_capable)
+        });
+        assert!(
+            surface.write_authority,
+            "a requested write_scope sets the informational write_authority flag"
+        );
+        assert!(
+            !write_capable,
+            "a custom-bash child holds no single-writer lock/write tool"
+        );
+        assert!(
+            !surface.parallel_read_only_eligible,
+            "a custom approval_exempt bash template forecloses read-only eligibility"
+        );
+        assert!(
+            !crate::engine::builtin::batch_child_concurrently_admissible(&surface, write_capable),
+            "a write_scope-only custom child that did NOT pass parent write-admission runs EXCLUSIVELY, not concurrently"
+        );
+    }
+}
+
+/// AC8: preflight is side-effect-free — it creates no write-scope grant (a real
+/// dispatch pregrants) — and a generation change before start discards the old
+/// surface rather than using stale posture.
+#[tokio::test]
+async fn resolved_child_execution_surface_preflight_is_side_effect_free() {
+    use crate::config::extended::LlmMode;
+    let (mut driver, tmp) = test_driver(8);
+    dmh_install_config(
+        &mut driver,
+        serde_json::json!({ "llm_mode": "normal" }),
+        vec![
+            dmh_model("local", None, None),
+            dmh_model("child-defensive", Some("defensive"), None),
+        ],
+    );
+    let approver = install_test_approver(&mut driver);
+    let scope = tmp.path().join("scope");
+    std::fs::create_dir_all(&scope).unwrap();
+    let cwd = driver.cwd.clone();
+
+    // Preflight a write-scoped child. A real dispatch pregrants the scope; the
+    // side-effect-free surface resolution must NOT.
+    let args = driver.spawn_args_delegated_in_cwd_scoped(
+        &cwd,
+        false,
+        Vec::new(),
+        Some(exact_model_selector("child-defensive")),
+        crate::engine::builtin::DelegationRecursionContext::default(),
+        DelegationConfinement {
+            lock_identity: None,
+            write_scope: Some(scope.clone()),
+        },
+    );
+    let surface = dmh_trusted(&cwd, || {
+        crate::engine::builtin::resolve_child_execution_surface("builder", &args)
+    })
+    .unwrap();
+    assert_eq!(surface.llm_mode, LlmMode::Defensive);
+    assert!(
+        surface.write_authority,
+        "builder + write_scope carries write authority"
+    );
+    assert!(!surface.parallel_read_only_eligible);
+    assert_eq!(surface.config_generation, driver.config.generation());
+
+    // No write-scope pregrant, no approval — construction is a pure resolution.
+    assert!(
+        !approver
+            .store()
+            .is_path_granted_for(
+                &scope,
+                crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite
+            )
+            .await,
+        "preflight must not pregrant the write scope"
+    );
+
+    // A generation change before start: re-resolve from the generation that
+    // actually starts. The old surface's posture is discarded, not reused.
+    dmh_install_config(
+        &mut driver,
+        serde_json::json!({ "llm_mode": "normal" }),
+        vec![
+            dmh_model("local", None, None),
+            // `child-defensive` now carries a Frontier posture.
+            dmh_model("child-defensive", Some("frontier"), None),
+        ],
+    );
+    let args2 = driver.spawn_args_delegated_in_cwd_scoped(
+        &cwd,
+        false,
+        Vec::new(),
+        Some(exact_model_selector("child-defensive")),
+        crate::engine::builtin::DelegationRecursionContext::default(),
+        DelegationConfinement::default(),
+    );
+    let surface2 = dmh_trusted(&cwd, || {
+        crate::engine::builtin::resolve_child_execution_surface("builder", &args2)
+    })
+    .unwrap();
+    assert_eq!(
+        surface2.llm_mode,
+        LlmMode::Frontier,
+        "re-resolved from the generation that actually starts"
+    );
+    assert_ne!(
+        surface.llm_mode, surface2.llm_mode,
+        "the stale surface's posture is discarded, not reused"
+    );
+
+    // Drive the REAL batch admission path: read-only-sounding DYNAMIC children
+    // (explore holds `bash`) are not concurrently admissible, so the scheduler
+    // routes them to SERIAL execution — and BOTH still complete and are
+    // collected. Gating concurrency never drops or reorders results.
+    {
+        let (mut driver, _tmp3) = test_driver(8);
+        dmh_install_config(
+            &mut driver,
+            serde_json::json!({}),
+            vec![dmh_model("local", None, None)],
+        );
+        let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+        let task = BatchNoninteractiveTask {
+            entries: vec![
+                batch_entry("first", "explore", None),
+                batch_entry("second", "explore", None),
+            ],
+            child_cwds: vec![root_child_cwd(&driver), root_child_cwd(&driver)],
+            why: "test".to_string(),
+            repair_notes: Vec::new(),
+            task_call_id: "task-serial-admission".to_string(),
+            task_function_call_id: None,
+        };
+        let completion = driver
+            .execute_batch_noninteractive_task(
+                task,
+                &tx,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            completion.children.len(),
+            2,
+            "both serially-admitted children are collected"
+        );
+        let labels: std::collections::BTreeSet<&str> = completion
+            .children
+            .iter()
+            .map(|c| c.label.as_str())
+            .collect();
+        assert!(
+            labels.contains("first") && labels.contains("second"),
+            "both serial children produced a result: {labels:?}"
+        );
+    }
+}
+
+/// Run a 2-child batch of `child_agent` against a provider whose responses are
+/// long-delayed, and return how many child requests are simultaneously IN FLIGHT
+/// while the first child's (delayed) response is still outstanding. A
+/// non-admissible (dynamic) child holds the EXCLUSIVE write guard → the second
+/// cannot dispatch → 1 in flight. Concurrently-admissible (read-only) children
+/// share read guards → both dispatch → 2 in flight.
+///
+/// The batch runs on a dedicated big-stack thread (avoiding the pre-existing
+/// deep-batch stack overflow); the probe runs on THIS thread against the
+/// provider's cross-thread atomic request counter using real-time sleeps, so its
+/// timing is independent of the batch's scheduling. The batch is cancelled once
+/// the count is read, so the long delay is never fully waited.
+fn dmh_batch_in_flight_while_first_delayed(child_agent: &str, custom_read_only: bool) -> usize {
+    let provider = cockpit_test_support::provider::ScriptedProvider::builder()
+        .dialect(cockpit_test_support::provider::WireDialect::ChatCompletions)
+        .turn(cockpit_test_support::provider::Turn::Text("done".into()))
+        .with_delay(std::time::Duration::from_secs(20))
+        .repeat_last()
+        .start_blocking();
+    let url = provider.base_url();
+    let agent = child_agent.to_string();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let batch_cancel = cancel.clone();
+    let batch_thread = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let (mut driver, _tmp) = test_driver_with_url(8, url.clone());
+                    let config_dir = driver.cwd.join(".cockpit");
+                    let providers_dir = config_dir.join("providers");
+                    std::fs::create_dir_all(&providers_dir).unwrap();
+                    // `web.provider = custom` (no commands) suppresses the default
+                    // webfetch/websearch (Dynamic) so a read-only custom agent is
+                    // genuinely eligible.
+                    std::fs::write(
+                        config_dir.join("config.json"),
+                        r#"{"agent_chooses_subagent_model": true, "web": {"provider": "custom"}, "active_model": {"provider":"lmstudio","model":"local"}}"#,
+                    )
+                    .unwrap();
+                    std::fs::write(
+                        providers_dir.join("lmstudio.json"),
+                        serde_json::json!({
+                            "url": url,
+                            "models": [{ "id": "local", "subagent_invokable": true }]
+                        })
+                        .to_string(),
+                    )
+                    .unwrap();
+                    if custom_read_only {
+                        let agents_dir = config_dir.join("agents");
+                        std::fs::create_dir_all(&agents_dir).unwrap();
+                        std::fs::write(
+                            agents_dir.join("readonly-probe.md"),
+                            "---\ndescription: read-only leaf\nmode: subagent\ntools: [read]\n---\nInvestigate read-only.\n",
+                        )
+                        .unwrap();
+                    }
+                    driver.refresh_config_from_disk_for_tests();
+                    let trust_cwd = driver.cwd.clone();
+                    let _trust = crate::config::trust::enter_workspace_trust_policy(
+                        crate::config::trust::WorkspaceTrustPolicy {
+                            root: crate::config::trust::resolve_trust_root(&trust_cwd)
+                                .unwrap_or_else(|_| crate::config::trust::TrustRoot {
+                                    opened_path: trust_cwd.clone(),
+                                    root: trust_cwd.clone(),
+                                    kind: crate::config::trust::TrustRootKind::Directory,
+                                }),
+                            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+                        },
+                    );
+
+                    // Each batch member needs its delegation job + payload
+                    // persisted so payload delivery succeeds and the child actually
+                    // dispatches.
+                    seed_batch_task_delegation(&driver, "task-concurrency", &["a", "b"]).await;
+                    seed_task_payload(&driver, "task-concurrency", "a", &agent).await;
+                    seed_task_payload(&driver, "task-concurrency", "b", &agent).await;
+                    let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
+                    let task = BatchNoninteractiveTask {
+                        entries: vec![
+                            batch_entry("a", &agent, None),
+                            batch_entry("b", &agent, None),
+                        ],
+                        child_cwds: vec![root_child_cwd(&driver), root_child_cwd(&driver)],
+                        why: "test".to_string(),
+                        repair_notes: Vec::new(),
+                        task_call_id: "task-concurrency".to_string(),
+                        task_function_call_id: None,
+                    };
+                    let _ = driver
+                        .execute_batch_noninteractive_task(task, &tx, batch_cancel)
+                        .await;
+                })
+        })
+        .unwrap();
+
+    // Probe on THIS thread (real-time, independent of the batch's scheduling).
+    // Wait (generously) for the FIRST child's request to reach the provider,
+    // then give a would-be-concurrent second child ample time to ALSO dispatch,
+    // and read how many are in flight while the first is still delayed.
+    for _ in 0..200 {
+        if provider.request_count() >= 1 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let in_flight = provider.request_count();
+    // Stop the batch early — the 20s delay is never fully waited.
+    cancel.cancel();
+    batch_thread.join().unwrap();
+    in_flight
+}
+
+/// AC7/AC8 (non-vacuous concurrency gate): the surface's admission decision is
+/// enforced by the read/write lock in the REAL batch path. A dynamic child runs
+/// EXCLUSIVELY (only one request in flight while it holds the write guard); two
+/// read-only-eligible children OVERLAP (both in flight under shared read guards).
+/// Removing the write guard makes the dynamic case show 2 in flight → this fails.
+#[test]
+fn delegated_batch_admission_gate_serializes_dynamic_and_overlaps_read_only() {
+    // `explore` holds `bash` (Dynamic) → not admissible → EXCLUSIVE write guard →
+    // the second child is blocked → 1 in flight.
+    assert_eq!(
+        dmh_batch_in_flight_while_first_delayed("explore", false),
+        1,
+        "a dynamic (non-admissible) child runs EXCLUSIVELY: the second is blocked on the write guard"
+    );
+    // A read-only-eligible leaf → SHARED read guards → both children overlap → 2
+    // in flight.
+    assert_eq!(
+        dmh_batch_in_flight_while_first_delayed("readonly-probe", true),
+        2,
+        "read-only-eligible children run CONCURRENTLY under shared read guards"
+    );
 }

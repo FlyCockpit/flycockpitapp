@@ -797,6 +797,94 @@ impl Driver {
         Ok((Arc::new(session), history))
     }
 
+    /// Validate a single-delegation child's execution surface from its OWN
+    /// selected model, side-effect-free. Resolves the write scope and either the
+    /// full child surface (ordinary child) or the EMBEDDED docs resolver-stage
+    /// model (docs pipeline — the model the pipeline actually builds). Returns
+    /// the content-safe routing error string on failure so a caller can fail
+    /// closed BEFORE any task persist / registration / lifecycle mutation, and
+    /// never falls back to the parent posture for a different selected model.
+    fn preflight_single_delegation(
+        &self,
+        task: &SingleNoninteractiveTask,
+    ) -> std::result::Result<(), String> {
+        let scope = resolve_write_scope(
+            task.write_scope.as_deref(),
+            &task.child_cwd.resolved,
+            &self.cwd,
+        )
+        .map_err(|e| format!("Error: {e}"))?;
+        if task.child_agent == "docs" {
+            let docs_args = self.spawn_args_delegated_in_cwd(
+                &task.child_cwd.resolved,
+                false,
+                task.granted_tools.clone(),
+                task.model.clone(),
+                task.child_recursion.clone(),
+            );
+            crate::engine::builtin::resolve_child_model("docs-resolver", &docs_args)
+                .map_err(|e| format!("Error: {e:#}"))?;
+        } else {
+            let args = self.spawn_args_delegated_in_cwd_scoped(
+                &task.child_cwd.resolved,
+                false,
+                task.granted_tools.clone(),
+                task.model.clone(),
+                task.child_recursion.clone(),
+                DelegationConfinement {
+                    lock_identity: None,
+                    write_scope: scope,
+                },
+            );
+            crate::engine::builtin::resolve_child_execution_surface(&task.child_agent, &args)
+                .map_err(|e| format!("Error: {e:#}"))?;
+        }
+        Ok(())
+    }
+
+    /// Validate ONE batch entry's child (or docs-stage) model, side-effect-free —
+    /// the batch analogue of [`Self::preflight_single_delegation`]. Returns the
+    /// content-safe routing error string on failure so the batch fails closed
+    /// BEFORE persisting/registering any child.
+    fn preflight_batch_entry(
+        &self,
+        entry: &crate::engine::agent::BatchTaskEntry,
+        child_cwd: &ChildCwd,
+    ) -> std::result::Result<(), String> {
+        let child_recursion = self
+            .resolve_task_recursion(&entry.child_agent, entry.remaining_depth, &entry.model)
+            .map_err(|e| format!("Error: batch entry `{}`: {e}", entry.label))?;
+        let scope =
+            resolve_write_scope(entry.write_scope.as_deref(), &child_cwd.resolved, &self.cwd)
+                .map_err(|e| format!("Error: batch entry `{}`: {e}", entry.label))?;
+        if entry.child_agent == "docs" {
+            let docs_args = self.spawn_args_delegated_in_cwd(
+                &child_cwd.resolved,
+                false,
+                entry.granted_tools.clone(),
+                entry.model.clone(),
+                child_recursion,
+            );
+            crate::engine::builtin::resolve_child_model("docs-resolver", &docs_args)
+                .map_err(|e| format!("Error: batch entry `{}`: {e:#}", entry.label))?;
+        } else {
+            let args = self.spawn_args_delegated_in_cwd_scoped(
+                &child_cwd.resolved,
+                false,
+                entry.granted_tools.clone(),
+                entry.model.clone(),
+                child_recursion,
+                DelegationConfinement {
+                    lock_identity: None,
+                    write_scope: scope,
+                },
+            );
+            crate::engine::builtin::resolve_child_execution_surface(&entry.child_agent, &args)
+                .map_err(|e| format!("Error: batch entry `{}`: {e:#}", entry.label))?;
+        }
+        Ok(())
+    }
+
     pub(in crate::engine::driver) async fn run_single_noninteractive_task_backgroundable(
         &mut self,
         mut task: SingleNoninteractiveTask,
@@ -804,6 +892,18 @@ impl Driver {
         tx: &mpsc::Sender<TurnEvent>,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<Message> {
+        // FAIL CLOSED before ANY task persist / registration / lifecycle mutation:
+        // validate the child's execution surface from its OWN selected model. An
+        // unresolvable child model (or docs-stage model) returns the content-safe
+        // routing error having persisted no task delegation, registered no running
+        // child, spawned nothing, and dispatched no inference.
+        if let Err(err) = self.preflight_single_delegation(&task) {
+            return Ok(Message::tool_result_with_call_id(
+                task.task_call_id.clone(),
+                task.task_function_call_id.clone(),
+                prepend_task_repair_notes(err, &task.repair_notes),
+            ));
+        }
         let task_call_id = task.task_call_id.clone();
         let task_function_call_id = task.task_function_call_id.clone();
         let resolved_cwd_display = task.child_cwd.resolved_display();
@@ -1007,6 +1107,121 @@ impl Driver {
             task_function_call_id,
         } = task;
 
+        // Repin the config to a held snapshot for THIS delegation attempt. A
+        // pinned handle's reads return the fixed snapshot and do NOT observe later
+        // live refreshes, so every read below — child model resolution, posture
+        // (`child_llm_mode_for_model`), surface, handoff-tag expansion,
+        // `pregrant_write_scope`, `builtin::load`/build, dispatch, and the docs
+        // pipeline's internal `spawn_args.config` reads — sees ONE generation. The
+        // child's identity AND posture come from the pinned generation by
+        // construction (AC6), a concurrent refresh affects only the NEXT
+        // delegation, and the write-scope grant cannot be orphaned by a move
+        // because the config physically cannot move mid-attempt.
+        self.config = self.config.repin();
+
+        // FAIL CLOSED before ANY child lifecycle / spawn side effect. Resolve the
+        // write scope and the child's execution surface from its OWN selected
+        // model FIRST: an invalid write scope or an unresolvable child model
+        // returns the content-safe routing error having registered NO running
+        // delegation, emitted/journaled NO `SubagentSpawned` event, begun NO
+        // delegation-shrink, and pregranted NO write scope. `llm_mode` is the
+        // child's OWN resolved posture — never a parent-frame fallback for a
+        // different selected model; `docs` resolves its posture from the model its
+        // stages actually build under (`docs-resolver`).
+        let resolved_write_scope =
+            match resolve_write_scope(write_scope.as_deref(), &child_cwd.resolved, &self.cwd) {
+                Ok(scope) => scope,
+                Err(err) => {
+                    return Ok(SingleNoninteractiveCompletion {
+                        child_agent,
+                        task_call_id,
+                        task_function_call_id,
+                        report: format!("Error: {err}"),
+                        failed: true,
+                        failure: None,
+                        partial_progress: DelegationPartialProgress::default(),
+                        new_handle: None,
+                        snapshot: NoninteractiveDelegationSnapshot::empty(),
+                        shrink: None,
+                        repair_notes,
+                        child_routing: None,
+                    });
+                }
+            };
+        // The child's posture is derived from the pinned attempt config, so the
+        // `llm_mode` here (→ follow-up/child-only capability) and the handoff-tag
+        // expansion below share the SAME generation as the later build/dispatch —
+        // no split is possible.
+        let llm_mode = if child_agent == "docs" {
+            // The `docs` pipeline builds its EMBEDDED resolver/answerer stages from
+            // that stage model, so validate its resolvability here and FAIL CLOSED
+            // — never substitute the parent posture. (The pinned attempt config
+            // guarantees the pipeline's stages resolve under this same generation.)
+            let docs_args = self.spawn_args_delegated_in_cwd(
+                &child_cwd.resolved,
+                false,
+                granted_tools.clone(),
+                model.clone(),
+                child_recursion.clone(),
+            );
+            match crate::engine::builtin::resolve_child_model("docs-resolver", &docs_args) {
+                Ok(docs_model) => {
+                    crate::engine::builtin::child_llm_mode_for_model(&docs_args, &docs_model)
+                }
+                Err(e) => {
+                    return Ok(SingleNoninteractiveCompletion {
+                        child_agent,
+                        task_call_id,
+                        task_function_call_id,
+                        report: format!("Error: {e:#}"),
+                        failed: true,
+                        failure: None,
+                        partial_progress: DelegationPartialProgress::default(),
+                        new_handle: None,
+                        snapshot: NoninteractiveDelegationSnapshot::empty(),
+                        shrink: None,
+                        repair_notes,
+                        child_routing: None,
+                    });
+                }
+            }
+        } else {
+            let preflight_args = self.spawn_args_delegated_in_cwd_scoped(
+                &child_cwd.resolved,
+                false,
+                granted_tools.clone(),
+                model.clone(),
+                child_recursion.clone(),
+                DelegationConfinement {
+                    lock_identity: None,
+                    write_scope: resolved_write_scope.clone(),
+                },
+            );
+            match crate::engine::builtin::resolve_child_execution_surface(
+                &child_agent,
+                &preflight_args,
+            ) {
+                Ok(surface) => surface.llm_mode,
+                Err(e) => {
+                    return Ok(SingleNoninteractiveCompletion {
+                        child_agent,
+                        task_call_id,
+                        task_function_call_id,
+                        report: format!("Error: {e:#}"),
+                        failed: true,
+                        failure: None,
+                        partial_progress: DelegationPartialProgress::default(),
+                        new_handle: None,
+                        snapshot: NoninteractiveDelegationSnapshot::empty(),
+                        shrink: None,
+                        repair_notes,
+                        child_routing: None,
+                    });
+                }
+            }
+        };
+        let followup_enabled = crate::engine::tool::Capability::FollowupSeed.enabled(llm_mode);
+
         self.noninteractive_delegations.register_running(
             &task_call_id,
             "default",
@@ -1158,34 +1373,9 @@ impl Driver {
             .clone();
         let (tracker, shrink_handle) = self.begin_delegation_shrink(parent_full);
 
-        let llm_mode = self.stack[0].agent.llm_mode;
-        let followup_enabled = crate::engine::tool::Capability::FollowupSeed.enabled(llm_mode);
-        let resolved_write_scope =
-            match resolve_write_scope(write_scope.as_deref(), &child_cwd.resolved, &self.cwd) {
-                Ok(scope) => scope,
-                Err(err) => {
-                    return Ok(SingleNoninteractiveCompletion {
-                        child_agent,
-                        task_call_id,
-                        task_function_call_id,
-                        report: format!("Error: {err}"),
-                        failed: true,
-                        failure: None,
-                        partial_progress: DelegationPartialProgress::default(),
-                        new_handle: None,
-                        snapshot: NoninteractiveDelegationSnapshot::empty(),
-                        shrink: Some(PendingDelegationShrink {
-                            tracker,
-                            handle: shrink_handle,
-                        }),
-                        repair_notes,
-                        child_routing: None,
-                    });
-                }
-            };
-        if let Some(scope) = resolved_write_scope.as_ref() {
-            self.pregrant_write_scope(scope).await;
-        }
+        // NOTE: `pregrant_write_scope` is DEFERRED to each branch's dispatch point,
+        // AFTER that branch's final generation-consistency check (docs / non-docs
+        // below), so a generation move never records a lingering write-scope grant.
         let mut child_session = self.session.clone();
         let mut fork_prior_history = Vec::new();
         if context == crate::engine::agent::TaskContext::Fork {
@@ -1246,6 +1436,12 @@ impl Driver {
             if resume_handle.is_some() {
                 DelegationChildOutcome::failed(stale_handle_error(&child_agent))
             } else {
+                // The pinned attempt config makes the pipeline's stages
+                // generation-consistent with this handoff; record the write-scope
+                // grant (it cannot be orphaned — the config cannot move).
+                if let Some(scope) = resolved_write_scope.as_ref() {
+                    self.pregrant_write_scope(scope).await;
+                }
                 match crate::engine::docs_pipeline::run(
                     &composed_brief,
                     &self.spawn_args_delegated_in_cwd(
@@ -1328,6 +1524,13 @@ impl Driver {
                             });
                         }
                     };
+                    // The child was BUILT from the pinned attempt config, so its
+                    // model + posture match the `llm_mode`/handoff derived above by
+                    // construction — no generation split is possible. Record the
+                    // write-scope grant (it cannot be orphaned by a move).
+                    if let Some(scope) = resolved_write_scope.as_ref() {
+                        self.pregrant_write_scope(scope).await;
+                    }
                     let child_routing = ChildRoutingMetadata::from_model(&child.model);
                     self.emit_subagent_routing_amend(
                         tx,
@@ -2527,6 +2730,19 @@ impl Driver {
     ) -> Result<Message> {
         let task_call_id = task.task_call_id.clone();
         let task_function_call_id = task.task_function_call_id.clone();
+        // FAIL CLOSED before ANY batch persist / registration: validate EVERY
+        // entry's child (or docs-stage) model. An unresolvable entry returns the
+        // content-safe routing error having persisted no task, registered no
+        // running child, and spawned nothing.
+        for (entry, child_cwd) in task.entries.iter().zip(task.child_cwds.iter()) {
+            if let Err(err) = self.preflight_batch_entry(entry, child_cwd) {
+                return Ok(Message::tool_result_with_call_id(
+                    task_call_id,
+                    task_function_call_id,
+                    prepend_task_repair_notes(err, &task.repair_notes),
+                ));
+            }
+        }
         let child_todo_json = task
             .entries
             .iter()
@@ -2776,6 +2992,24 @@ impl Driver {
         let mut resolved_write_scopes = Vec::with_capacity(entries.len());
         let mut write_capable_scopes = Vec::new();
         let mut has_write_capable_entry = false;
+        // The execution surface is THE contract for concurrent admission. Each
+        // child's surface (resolved from its OWN selected model) decides whether
+        // it may run CONCURRENTLY: a read-only child only when its surface proves
+        // it exposes exclusively registered ordinary read-only operations; a
+        // write-capable child keeps its existing parent-scoped concurrent
+        // write-admission (below); every other child runs serially. The surface
+        // is bound to the attempt by its config generation, re-validated when
+        // the child's dispatch actually starts.
+        let mut concurrent_admissible = Vec::with_capacity(entries.len());
+        // Per-entry: did the child PASS the parent-scoped disjoint-scope
+        // write-admission gate (real single-writer capability + Frontier +
+        // disjoint scopes)? This — NOT a mere requested `write_scope` — is the
+        // write half of the concurrency key. Preserved across generation churn
+        // (the gate's inputs are frame-stable), so the recompute under churn keeps
+        // a legitimately-admitted disjoint-scope writer concurrent while it
+        // re-derives read-only eligibility from the fresh surface.
+        let mut parent_write_admitted = Vec::with_capacity(entries.len());
+        let mut admission_generations = Vec::with_capacity(entries.len());
         for (entry, child_cwd) in entries.iter().zip(child_cwds.iter()) {
             let child_recursion = match self.resolve_task_recursion(
                 &entry.child_agent,
@@ -2788,6 +3022,49 @@ impl Driver {
                     break;
                 }
             };
+            // Pin the config generation BEFORE building the child, so the surface
+            // is stamped with the generation the child was actually built under
+            // (never a newer one from a refresh landing between build and stamp).
+            let pinned_generation = self.config.generation();
+            let resolved_write_scope = match resolve_write_scope(
+                entry.write_scope.as_deref(),
+                &child_cwd.resolved,
+                &self.cwd,
+            ) {
+                Ok(scope) => scope,
+                Err(err) => {
+                    batch_refusal = Some(format!("batch entry `{}`: {err}", entry.label));
+                    break;
+                }
+            };
+            // The `docs` pipeline is NOT a `builtin::load`-able agent — `load`
+            // explicitly REJECTS docs stage names — and it is NOT a
+            // concurrently-admissible read-only leaf: it runs its own 2-stage
+            // pipeline (`docs_pipeline::run`) and MUST run under the EXCLUSIVE
+            // guard. Validate its posture via the embedded `docs-resolver` (as the
+            // preflight does) WITHOUT calling `load("docs")`, then record it as
+            // NON-concurrently-admissible and NON-write-admitted.
+            if entry.child_agent == "docs" {
+                let docs_args = self.spawn_args_delegated_in_cwd(
+                    &child_cwd.resolved,
+                    false,
+                    entry.granted_tools.clone(),
+                    entry.model.clone(),
+                    child_recursion.clone(),
+                );
+                if let Err(e) =
+                    crate::engine::builtin::resolve_child_model("docs-resolver", &docs_args)
+                {
+                    batch_refusal = Some(format!("batch entry `{}`: {e:#}", entry.label));
+                    break;
+                }
+                concurrent_admissible.push(false);
+                parent_write_admitted.push(false);
+                admission_generations.push(pinned_generation);
+                child_recursions.push(child_recursion);
+                resolved_write_scopes.push(resolved_write_scope);
+                continue;
+            }
             let child = match crate::engine::builtin::load(
                 &entry.child_agent,
                 &self.spawn_args_delegated_in_cwd(
@@ -2805,17 +3082,6 @@ impl Driver {
                 }
             };
             let write_capable = crate::engine::builtin::is_write_capable(&child);
-            let resolved_write_scope = match resolve_write_scope(
-                entry.write_scope.as_deref(),
-                &child_cwd.resolved,
-                &self.cwd,
-            ) {
-                Ok(scope) => scope,
-                Err(err) => {
-                    batch_refusal = Some(format!("batch entry `{}`: {err}", entry.label));
-                    break;
-                }
-            };
             if write_capable && entry.write_scope.is_none() {
                 batch_refusal = Some(format!(
                     "parallel write-capable entry `{}` (`{}`) requires `write_scope`",
@@ -2829,13 +3095,51 @@ impl Driver {
                     write_capable_scopes.push((entry.label.clone(), scope.clone()));
                 }
             }
+            // Bind the surface to this child's dispatch args (scoped) and to the
+            // generation PINNED before the child was built; derive its
+            // concurrent-admission decision. The write half of the key is the
+            // child's REAL single-writer capability (`write_capable`), which — for
+            // a batch that survives the Frontier + disjoint-scope checks below —
+            // is exactly "passed parent write-admission". A requested `write_scope`
+            // WITHOUT real write capability never grants concurrency.
+            let surface = crate::engine::builtin::surface_for_built_child(
+                &child,
+                &self.spawn_args_delegated_in_cwd_scoped(
+                    &child_cwd.resolved,
+                    false,
+                    entry.granted_tools.clone(),
+                    entry.model.clone(),
+                    child_recursion.clone(),
+                    DelegationConfinement {
+                        lock_identity: None,
+                        write_scope: resolved_write_scope.clone(),
+                    },
+                ),
+                pinned_generation,
+            );
+            concurrent_admissible.push(
+                crate::engine::builtin::batch_child_concurrently_admissible(
+                    &surface,
+                    write_capable,
+                ),
+            );
+            parent_write_admitted.push(write_capable);
+            admission_generations.push(surface.config_generation);
             child_recursions.push(child_recursion);
             resolved_write_scopes.push(resolved_write_scope);
         }
-        let llm_mode = self.stack[0].agent.llm_mode;
+        // Parent-request batch admission: whether the PARENT may request a
+        // parallel write-capable batch at all is a parent-scoped policy about
+        // the parent request, so it is evaluated under the parent frame's
+        // posture (decision: pre-selection batch admission stays parent-mode).
+        // This is deliberately NOT a child-execution capability — each child's
+        // own posture is resolved later at its build. Named distinctly so the
+        // root-mode read stays intentional and reviewable.
+        let parent_request_llm_mode = self.stack[0].agent.llm_mode;
         if batch_refusal.is_none()
             && has_write_capable_entry
-            && !crate::engine::tool::Capability::ScopedParallelWrite.enabled(llm_mode)
+            && !crate::engine::tool::Capability::ScopedParallelWrite
+                .enabled(parent_request_llm_mode)
         {
             batch_refusal = Some(
                 "parallel write-capable task batches are Frontier-only; use sequential delegation or run in Frontier mode"
@@ -2868,11 +3172,10 @@ impl Driver {
                 repair_notes,
             });
         }
-
-        for scope in resolved_write_scopes.iter().flatten() {
-            self.pregrant_write_scope(scope).await;
-        }
-
+        // NOTE: `pregrant_write_scope` is DEFERRED into each child's future, AFTER
+        // that child's post-build generation guard (non-docs) / pre-dispatch docs
+        // guard, so a mid-wait generation move never records a lingering
+        // write-scope grant for a child that then fails closed.
         for entry in &entries {
             self.noninteractive_delegations.register_running(
                 &task_call_id,
@@ -2885,12 +3188,39 @@ impl Driver {
         use futures::StreamExt as _;
 
         let mut runs = futures::stream::FuturesUnordered::new();
+        // The surface is the ONLY contract for concurrent admission, enforced by a
+        // shared read-write lock each child acquires INSIDE its own future (so the
+        // `FuturesUnordered` execution/stack structure is unchanged and the guard
+        // is released by RAII on completion, error, or panic):
+        //   - a concurrently-admissible child (`parallel_read_only_eligible` OR a
+        //     parent-scoped-write-admitted child) takes a SHARED read guard, so
+        //     admissible children run concurrently WITH EACH OTHER;
+        //   - a NON-admissible child (read-only-sounding but dynamic/nested, or
+        //     unknown, and not write-admitted) takes the EXCLUSIVE write guard,
+        //     which blocks every read AND write guard — so it runs ALONE, never
+        //     concurrently with ANY other child.
+        // (A plain `Semaphore` acquired only by non-admissible children would let
+        // an admissible child, which took no permit, still overlap it — the write
+        // lock is what excludes the admissible readers.)
+        let admission_lock = std::sync::Arc::new(tokio::sync::RwLock::new(()));
         let mut children = Vec::new();
-        for (idx, (((mut entry, child_cwd), child_recursion), resolved_write_scope)) in entries
+        for (
+            idx,
+            (
+                (
+                    ((((mut entry, child_cwd), child_recursion), resolved_write_scope), concurrent),
+                    entry_parent_write_admitted,
+                ),
+                admission_generation,
+            ),
+        ) in entries
             .into_iter()
             .zip(child_cwds)
             .zip(child_recursions)
             .zip(resolved_write_scopes)
+            .zip(concurrent_admissible)
+            .zip(parent_write_admitted)
+            .zip(admission_generations)
             .enumerate()
         {
             let driver = &*self;
@@ -3007,11 +3337,81 @@ impl Driver {
             }
 
             let child_cancel = cancel.clone();
-            runs.push(async move {
+            let child_admission_lock = admission_lock.clone();
+            let child_fut = async move {
+                // Surface-gated concurrency (RAII, released on completion / error
+                // / panic): an admissible child holds a SHARED read guard (runs
+                // with other admissible children); a NON-admissible child holds the
+                // EXCLUSIVE write guard, blocking every read and write guard, so it
+                // runs ALONE — never concurrently with ANY other child.
+                //
+                // Pin the config to a held snapshot for THIS child's attempt BEFORE
+                // deciding the guard class, so admission-generation == run-generation
+                // by construction. `driver.config` is the TURN-pinned handle, but
+                // `repin()` freezes the LIVE shared generation; deciding the class
+                // off one and dispatching off the other could DISAGREE (a
+                // now-write-capable child slipping under a shared read guard). With
+                // `pinned` frozen the generation cannot move mid-attempt: the guard
+                // class, the child build, its dispatch, and the docs pipeline all
+                // read `pinned`. A refresh during the RwLock wait intentionally
+                // applies to the NEXT attempt (identical to the driver's
+                // turn-boundary repin), so there is no generation-move retry — the
+                // class is computed ONCE and the matching guard acquired ONCE. NO
+                // live `driver.config` read remains inside the attempt.
+                let pinned = driver.config.repin();
+                // Recompute admissibility from the PINNED surface ONLY if a refresh
+                // landed between batch admission (turn-pinned) and this attempt's
+                // pin; otherwise the batch-time decision already matches. Read-only
+                // eligibility is re-derived under `pinned`; the parent
+                // write-admission decided at preflight (`entry_parent_write_admitted`)
+                // is frame-stable (real write capability + Frontier + disjoint
+                // scopes) and retained.
+                let concurrent = if pinned.generation() != admission_generation {
+                    let fresh_args = crate::engine::builtin::SpawnArgs {
+                        config: pinned.clone(),
+                        ..driver.spawn_args_delegated_in_cwd_scoped(
+                            &child_cwd.resolved,
+                            false,
+                            entry.granted_tools.clone(),
+                            entry.model.clone(),
+                            child_recursion.clone(),
+                            DelegationConfinement {
+                                lock_identity: None,
+                                write_scope: resolved_write_scope.clone(),
+                            },
+                        )
+                    };
+                    match crate::engine::builtin::resolve_child_execution_surface(
+                        &entry.child_agent,
+                        &fresh_args,
+                    ) {
+                        Ok(fresh) => crate::engine::builtin::batch_child_concurrently_admissible(
+                            &fresh,
+                            entry_parent_write_admitted,
+                        ),
+                        // Unresolvable under the pin (e.g. the `docs` pipeline, whose
+                        // stage name `load` rejects) → NOT concurrently admissible;
+                        // run exclusively. The build/pipeline below surfaces any
+                        // routing error.
+                        Err(_) => false,
+                    }
+                } else {
+                    concurrent
+                };
+                let (_read_guard, _write_guard) = if concurrent {
+                    (Some(child_admission_lock.clone().read_owned().await), None)
+                } else {
+                    (None, Some(child_admission_lock.clone().write_owned().await))
+                };
+                // Whether this child holds a SHARED read guard (runs concurrently).
+                // Used to re-validate the ACTUALLY-BUILT child below: a read guard is
+                // safe only for a child whose real surface is still concurrently
+                // admissible.
+                let held_read = _read_guard.is_some();
                 let mut snapshot = NoninteractiveDelegationSnapshot::empty();
                 let outcome = if let Some(err) = grant_rejection(
                     &child_cwd.resolved,
-                    &driver.config,
+                    &pinned,
                     &parent,
                     &entry.child_agent,
                     &entry.granted_tools,
@@ -3031,42 +3431,93 @@ impl Driver {
                     if entry.resume_handle.is_some() {
                         DelegationChildOutcome::failed(stale_handle_error(&entry.child_agent))
                     } else {
-                        match crate::engine::docs_pipeline::run(
-                            &entry.prompt,
-                            &driver.spawn_args_delegated_in_cwd(
+                        // Build the docs stage args under the PINNED attempt config
+                        // so `resolve_child_model`, `child_llm_mode_for_model`, and
+                        // the pipeline's internal `spawn_args.config` reads (Docs.1 +
+                        // Docs.2) all resolve under ONE generation, consistent with
+                        // the handoff expansion.
+                        let docs_args = crate::engine::builtin::SpawnArgs {
+                            config: pinned.clone(),
+                            ..driver.spawn_args_delegated_in_cwd(
                                 &child_cwd.resolved,
                                 false,
                                 Vec::new(),
                                 entry.model.clone(),
                                 child_recursion.clone(),
-                            ),
-                            driver.session.clone(),
-                            driver.locks.clone(),
-                            driver.redact.clone(),
-                            driver.config.clone(),
-                            driver.approver.clone(),
-                            driver.interrupts.clone(),
-                            child_cancel.clone(),
-                            Some(driver.tandem_set.clone()),
-                            Some(tx.clone()),
-                            Some(NoninteractiveSteerTarget::new(
-                                entry_task_call_id.clone(),
-                                entry.label.clone(),
-                            )),
-                        )
-                        .await
-                        {
-                            Ok(report) => DelegationChildOutcome::ok(report.report)
-                                .with_child_routing(ChildRoutingMetadata::from_model(
-                                    report.report_model.as_ref(),
-                                )),
+                            )
+                        };
+                        // J1: resolve the PINNED docs-resolver stage model FIRST
+                        // (the per-child pin may capture a newer generation than the
+                        // batch preflight validated). Fail CLOSED with the
+                        // content-safe routing error — and record NO write-scope
+                        // grant — if it is unresolvable under the pin, so a resolve
+                        // failure never leaves an orphaned authorization side effect.
+                        // Fiii: derive the docs-resolver posture and expand the
+                        // entry's handoff tags UNDER it, matching the single-docs
+                        // path.
+                        match crate::engine::builtin::resolve_child_model(
+                            "docs-resolver",
+                            &docs_args,
+                        ) {
                             Err(e) => DelegationChildOutcome::failed(format!("Error: {e:#}")),
+                            Ok(docs_model) => {
+                                let docs_llm_mode =
+                                    crate::engine::builtin::child_llm_mode_for_model(
+                                        &docs_args,
+                                        &docs_model,
+                                    );
+                                let docs_brief = driver.expand_handoff_tags(
+                                    &entry.prompt,
+                                    &child_cwd.resolved,
+                                    docs_llm_mode,
+                                    &entry.child_agent,
+                                );
+                                // Model resolved → this is a dispatchable attempt.
+                                // NOW record any write-scope grant (never before the
+                                // resolve above — no grant on a fail-closed path).
+                                if let Some(scope) = resolved_write_scope.as_ref() {
+                                    driver.pregrant_write_scope(scope).await;
+                                }
+                                match crate::engine::docs_pipeline::run(
+                                    &docs_brief,
+                                    &docs_args,
+                                    driver.session.clone(),
+                                    driver.locks.clone(),
+                                    driver.redact.clone(),
+                                    pinned.clone(),
+                                    driver.approver.clone(),
+                                    driver.interrupts.clone(),
+                                    child_cancel.clone(),
+                                    Some(driver.tandem_set.clone()),
+                                    Some(tx.clone()),
+                                    Some(NoninteractiveSteerTarget::new(
+                                        entry_task_call_id.clone(),
+                                        entry.label.clone(),
+                                    )),
+                                )
+                                .await
+                                {
+                                    Ok(report) => DelegationChildOutcome::ok(report.report)
+                                        .with_child_routing(ChildRoutingMetadata::from_model(
+                                            report.report_model.as_ref(),
+                                        )),
+                                    Err(e) => {
+                                        DelegationChildOutcome::failed(format!("Error: {e:#}"))
+                                    }
+                                }
+                            }
                         }
                     }
                 } else {
-                    let child = match crate::engine::builtin::load(
-                        &entry.child_agent,
-                        &driver.spawn_args_delegated_in_cwd_scoped(
+                    // Build + dispatch the child under the PINNED attempt config, so
+                    // its model, posture, and every downstream read share the
+                    // admitted generation. The admission decision was settled under
+                    // that generation (the guard is held), and the pin makes it
+                    // impossible for the config to move between build and dispatch —
+                    // no split, no post-build generation re-check needed.
+                    let dispatch_args = crate::engine::builtin::SpawnArgs {
+                        config: pinned.clone(),
+                        ..driver.spawn_args_delegated_in_cwd_scoped(
                             &child_cwd.resolved,
                             false,
                             entry.granted_tools.clone(),
@@ -3079,18 +3530,57 @@ impl Driver {
                                 )),
                                 write_scope: resolved_write_scope.clone(),
                             },
-                        ),
-                    ) {
-                        Ok(child) => child,
-                        Err(e) => {
-                            return (
-                                idx,
-                                entry,
-                                DelegationChildOutcome::failed(format!("Error: {e:#}")),
-                                snapshot,
-                            );
-                        }
+                        )
                     };
+                    let child =
+                        match crate::engine::builtin::load(&entry.child_agent, &dispatch_args) {
+                            Ok(child) => child,
+                            Err(e) => {
+                                return (
+                                    idx,
+                                    entry,
+                                    DelegationChildOutcome::failed(format!("Error: {e:#}")),
+                                    snapshot,
+                                );
+                            }
+                        };
+                    // K1: the guard CLASS was decided from the child's admission
+                    // surface, but the child is BUILT here from a SECOND, independent
+                    // resolution of its agent DEFINITION (`load` re-reads the
+                    // workspace/assistant-DB, which the config pin does NOT cover). A
+                    // concurrent def edit that adds `write`/`edit` between admission
+                    // and this build would make the ACTUAL child write-capable while
+                    // it holds the SHARED read guard it was admitted under — a
+                    // concurrent-write (AC7/AC8) violation. Re-derive the BUILT
+                    // child's admissibility from its real surface: if it holds a read
+                    // guard but is no longer concurrently admissible (now
+                    // write-capable / non-read-eligible, and it did not earn
+                    // parent-write-admission), FAIL CLOSED (content-safe re-delegate)
+                    // rather than dispatch a child more privileged than its held
+                    // guard. The exclusive write guard runs alone, so it needs no
+                    // re-check. The guard is released by RAII on this return.
+                    if held_read
+                        && !crate::engine::builtin::batch_child_concurrently_admissible(
+                            &crate::engine::builtin::surface_for_built_child(
+                                &child,
+                                &dispatch_args,
+                                pinned.generation(),
+                            ),
+                            entry_parent_write_admitted,
+                        )
+                    {
+                        let report = format!(
+                            "Error: batch entry `{}`: the child's built surface is more privileged than its admitted read-guard class (its agent definition changed between admission and build); re-delegate",
+                            entry.label
+                        );
+                        return (idx, entry, DelegationChildOutcome::failed(report), snapshot);
+                    }
+                    // Record any write-scope grant under the pinned attempt config,
+                    // only AFTER the built child's surface is confirmed to match its
+                    // held guard (no orphaned grant on the fail-closed path above).
+                    if let Some(scope) = resolved_write_scope.as_ref() {
+                        driver.pregrant_write_scope(scope).await;
+                    }
                     let child_routing = ChildRoutingMetadata::from_model(&child.model);
                     driver
                         .emit_subagent_routing_amend(
@@ -3145,7 +3635,7 @@ impl Driver {
                     // a trusted (self-hosted / no-log) child gets it unchanged.
                     let brief = {
                         let (extended, providers) =
-                            crate::engine::model_roles::load_model_role_config(&driver.config);
+                            crate::engine::model_roles::load_model_role_config(&pinned);
                         crate::engine::model_roles::render_brief_for_model(
                             &providers,
                             &child.model,
@@ -3161,7 +3651,7 @@ impl Driver {
                         driver.locks.clone(),
                         driver.redact.clone(),
                         child_cwd.resolved.clone(),
-                        driver.config.clone(),
+                        pinned.clone(),
                         driver.interrupts.clone(),
                         child_cancel.clone(),
                         driver.approver.clone(),
@@ -3232,7 +3722,8 @@ impl Driver {
                     }
                 };
                 (idx, entry, outcome, snapshot)
-            });
+            };
+            runs.push(child_fut);
         }
 
         while let Some((idx, entry, outcome, snapshot)) = runs.next().await {

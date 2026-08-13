@@ -294,6 +294,7 @@ fn build_fork_agent(
         // render identically (implementation note).
         llm_mode: parent.llm_mode,
         lock_identity: parent.lock_identity.clone(),
+        assistant_identity_prefix: parent.assistant_identity_prefix.clone(),
         write_scope: parent.write_scope.clone(),
         delegated: parent.delegated,
         delegation_recursion: parent.delegation_recursion.clone(),
@@ -406,6 +407,7 @@ mod tests {
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            assistant_identity_prefix: None,
         })
     }
 

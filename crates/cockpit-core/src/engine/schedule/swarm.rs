@@ -252,9 +252,12 @@ async fn run_swarm_loop(
     turn_tx: &mpsc::Sender<TurnEvent>,
     cmd_tx: &mpsc::Sender<ScheduleCommand>,
 ) -> anyhow::Result<String> {
-    let child = build_swarm_child(spec, ctx)?;
-    let custody = child.custody;
-    let agent = Arc::new(child.agent);
+    let SwarmChild {
+        agent,
+        custody,
+        pinned,
+    } = build_swarm_child(spec, ctx)?;
+    let agent = Arc::new(agent);
     let mut history: Vec<Message> = Vec::new();
     let brief = swarm_child_brief(spec, &custody);
     tracing::debug!(
@@ -276,9 +279,11 @@ async fn run_swarm_loop(
     // Per-turn backup-model fallback for the background `Swarm` child
     // (implementation note): `Swarm` is in scope, so the
     // child inherits the same mechanism, resolved against the model it runs on.
-    let backup_model = crate::engine::driver::resolve_backup_model_for(&ctx.config, &agent.model);
-    let fallback_models =
-        crate::engine::driver::resolve_failover_models_for(&ctx.config, &agent.model);
+    // Resolve backup/failover under the child's PINNED config (never live
+    // `ctx.config`), so failover/reposture/dispatch share the same generation the
+    // child's identity/posture were built under.
+    let backup_model = crate::engine::driver::resolve_backup_model_for(&pinned, &agent.model);
+    let fallback_models = crate::engine::driver::resolve_failover_models_for(&pinned, &agent.model);
 
     for _ in 0..SWARM_MAX_TURNS {
         let outcome = crate::engine::agent::turn_with_backup(
@@ -291,7 +296,7 @@ async fn run_swarm_loop(
             ctx.locks.clone(),
             ctx.redact.clone(),
             ctx.cwd.clone(),
-            ctx.config.clone(),
+            pinned.clone(),
             interrupts.clone(),
             cancel.clone(),
             None,
@@ -473,7 +478,12 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
         SpawnWorkerKind::GoalGatekeeper => "goal-gatekeeper",
         SpawnWorkerKind::GoalColdSkeptic => "goal-cold-skeptic",
     };
-    let (extended, providers) = crate::engine::model_roles::load_model_role_config(&ctx.config);
+    // Pin the config to a held snapshot for THIS swarm child's build: model
+    // selection AND the agent build below both read the same frozen generation,
+    // so a concurrent refresh can never split the child's identity from its
+    // posture (it affects only the next spawn).
+    let pinned = ctx.config.repin();
+    let (extended, providers) = crate::engine::model_roles::load_model_role_config(&pinned);
     // `spawn.model` is a model-authored selector exactly like
     // `task.payload.model`, so it takes the same custody-typed, forced
     // redacted-untrusted route with subagent-invokable and capability checks.
@@ -527,9 +537,11 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
         params: ctx.agent.params.clone(),
         env_overlay: ctx.agent.env_overlay.clone(),
         cwd: ctx.cwd.clone(),
-        config: ctx.config.clone(),
+        config: pinned.clone(),
         session_short_id: ctx.session.short_id.clone(),
-        assistant_identity_prefix: None,
+        // Inherit the parent agent's identity prefix so a `spawn` → bee/scout/goal
+        // worker in an assistant session keeps the SOUL/USER identity.
+        assistant_identity_prefix: ctx.agent.assistant_identity_prefix.clone(),
         model_system_prompt_snapshot: ctx.session.model_system_prompt_snapshot(),
         // A background swarm child is noninteractive (no human attached).
         interactive: false,
@@ -562,6 +574,7 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
             }
         },
         custody,
+        pinned,
     })
 }
 
@@ -571,6 +584,13 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
 struct SwarmChild {
     agent: Agent,
     custody: crate::engine::model_roles::DelegationCustody,
+    /// The pinned config snapshot the child's model selection + build resolved
+    /// under. Carried out so the WHOLE attempt — backup/failover resolution and
+    /// every `turn_with_backup` dispatch — reads this SAME frozen generation, so a
+    /// concurrent refresh can never split the child's pinned identity/posture from
+    /// a newer-generation failover/reposture/dispatch (it applies to the next
+    /// spawn only).
+    pinned: crate::daemon::session_worker::SessionConfigHandle,
 }
 
 /// The brief the child actually receives.
@@ -894,6 +914,7 @@ mod tests {
             delegated: false,
             delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
             env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            assistant_identity_prefix: None,
         };
         let ctx = ScheduleContext {
             session,

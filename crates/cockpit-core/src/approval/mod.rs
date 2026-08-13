@@ -1843,6 +1843,55 @@ mod tests {
         })
     }
 
+    fn computer_action_request<'a>(action_id: &'a str) -> AuthorizationRequest<'a> {
+        AuthorizationRequest::ComputerAction {
+            session_id: "session-1",
+            delegation_id: "delegation-1",
+            action_id,
+            tier: "ask",
+            action_label: "openai_call:1",
+            backend_kind: "virtual_display",
+            focus_generation: 1,
+            observation_generation: 1,
+            has_host_lease: false,
+        }
+    }
+
+    /// Choosing the explicit Deny option decodes to `Decision::Deny`.
+    #[tokio::test]
+    async fn computer_action_dialog_reject_decodes_deny() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (approver, _) = approver(tmp.path());
+        let resolver = resolve_sequence(&approver, &[ID_REJECT]);
+        let decision = approver
+            .authorize(computer_action_request("call-1"))
+            .await
+            .unwrap();
+        resolver.await.unwrap();
+        assert_eq!(decision, Decision::Deny);
+    }
+
+    /// The raised Ask computer-action interrupt offers exactly the allow and
+    /// deny options, asserted from the open interrupt's recorded question.
+    #[tokio::test]
+    async fn computer_action_dialog_offers_allow_and_deny() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (approver, _) = approver(tmp.path());
+        let resolver = resolve_sequence_collecting_questions(&approver, &[ID_APPROVE_ONCE]);
+        let decision = approver
+            .authorize(computer_action_request("call-1"))
+            .await
+            .unwrap();
+        let questions = resolver.await.unwrap();
+        assert_eq!(decision, Decision::Allow { scope: Scope::Once });
+
+        let InterruptQuestion::Single { options, .. } = &questions[0] else {
+            panic!("expected a single-question computer-action interrupt");
+        };
+        let ids: Vec<&str> = options.iter().map(|option| option.id.as_str()).collect();
+        assert_eq!(ids, vec![ID_APPROVE_ONCE, ID_REJECT]);
+    }
+
     #[tokio::test]
     async fn sandbox_escalation_grant_prompt_records_path_and_retries_confined_choice() {
         let tmp = tempfile::tempdir().unwrap();

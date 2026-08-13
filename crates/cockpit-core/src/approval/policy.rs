@@ -622,7 +622,10 @@ impl Approver {
         let prompt = format!("Allow computer action `{action_label}` (id: {action_id})?");
         let question = InterruptQuestion::Single {
             prompt,
-            options: vec![opt(ApprovalOptionId::ApproveOnce, "Yes, allow")],
+            options: vec![
+                opt(ApprovalOptionId::ApproveOnce, "Yes, allow"),
+                opt(ApprovalOptionId::Reject, "Deny"),
+            ],
             allow_freetext: false,
             command_detail: None,
             permission: true,
@@ -630,15 +633,19 @@ impl Approver {
             sandbox_escalation: None,
         };
         let description = format!("Computer action `{action_label}` (id: {action_id})");
-        let set =
-            ApprovalOptionSet::new("computer_action_approval", [ApprovalOptionId::ApproveOnce]);
+        let set = ApprovalOptionSet::new(
+            "computer_action_approval",
+            [ApprovalOptionId::ApproveOnce, ApprovalOptionId::Reject],
+        );
         let decision = self
             .raise_and_decode(&description, question, |response| {
+                // Dismissal (no selection) still denies.
                 let Some(id) = decode_option_response(response, &set)? else {
                     return Ok(Decision::Deny);
                 };
                 match id {
                     ApprovalOptionId::ApproveOnce => Ok(Decision::Allow { scope: Scope::Once }),
+                    ApprovalOptionId::Reject => Ok(Decision::Deny),
                     _ => Err(ForeignOptionId::new(&set, id.as_str())),
                 }
             })

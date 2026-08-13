@@ -46,6 +46,10 @@ pub enum TargetUnavailableReason {
     XwaylandFallbackForbidden,
     PartialEvidence,
     QueryMismatch,
+    /// An Ask-tier dispatch has neither a host lease nor a known virtual
+    /// display UUID, so the delegation lease cannot be scoped to a real
+    /// target. Dispatch fails closed: no human prompt, no backend input.
+    VirtualIdentityUnavailable,
 }
 
 /// Source of a particular evidence field.

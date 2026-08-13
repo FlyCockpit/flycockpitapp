@@ -139,10 +139,16 @@ pub enum SessionEventKind {
     /// A configured hook handler reached an observable execution outcome.
     /// Carries only bounded, redacted audit metadata and is data/export only.
     HookRun,
+    /// A turn scheduler recorded its lane/barrier decision for a tool call.
+    /// The payload is core-owned JSON that records original call ids,
+    /// lane/barrier classifications, and the terminal scheduling outcome
+    /// only — never tool arguments, title candidates, or provider bodies.
+    /// Data/export only; never enters the model's context.
+    ToolCallScheduling,
 }
 
 impl SessionEventKind {
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 28] = [
         Self::UserMessage,
         Self::UserNote,
         Self::AssistantMessage,
@@ -170,6 +176,7 @@ impl SessionEventKind {
         Self::Notice,
         Self::ModelSwitch,
         Self::HookRun,
+        Self::ToolCallScheduling,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -201,6 +208,7 @@ impl SessionEventKind {
             SessionEventKind::Notice => "notice",
             SessionEventKind::ModelSwitch => "model_switch",
             SessionEventKind::HookRun => "hook_run",
+            SessionEventKind::ToolCallScheduling => "tool_call_scheduling",
         }
     }
 }
@@ -1686,11 +1694,53 @@ mod tests {
             "notice",
             "model_switch",
             "hook_run",
+            "tool_call_scheduling",
         ];
         let actual = SessionEventKind::ALL.map(SessionEventKind::as_str);
         assert_eq!(actual, expected);
         assert_eq!(actual.iter().filter(|kind| **kind == "hook_run").count(), 1);
         assert_eq!(SessionEventKind::HookRun.as_str(), "hook_run");
+    }
+
+    #[test]
+    fn tool_call_scheduling_event_kind_is_exhaustive_and_stable() {
+        // `ToolCallScheduling` is present in the closed inventory exactly once
+        // and maps to the stable wire string. Independent literals — not a
+        // re-derivation of `as_str` — so a rename of either side is caught.
+        let kinds = SessionEventKind::ALL.map(SessionEventKind::as_str);
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|kind| **kind == "tool_call_scheduling")
+                .count(),
+            1,
+            "tool_call_scheduling must appear exactly once in ALL"
+        );
+        assert_eq!(SessionEventKind::ToolCallScheduling.as_str(), "tool_call_scheduling");
+        // The kind grew the inventory to 28 (appended, not substituted) and
+        // every wire string is distinct.
+        assert_eq!(SessionEventKind::ALL.len(), 28);
+        let unique: std::collections::BTreeSet<&str> = kinds.iter().copied().collect();
+        assert_eq!(unique.len(), kinds.len(), "event-kind strings must be distinct");
+    }
+
+    #[tokio::test]
+    async fn tool_call_scheduling_event_writes_through_schema_check() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        let data = json!({ "outcome": "dispatched" });
+        db.insert_session_event(
+            session.session_id,
+            SessionEventKind::ToolCallScheduling,
+            None,
+            None,
+            &data,
+        )
+        .await
+        .expect("tool_call_scheduling must satisfy the session_events.type CHECK");
+        let events = db.list_session_events(session.session_id).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "tool_call_scheduling");
     }
 
     #[tokio::test]

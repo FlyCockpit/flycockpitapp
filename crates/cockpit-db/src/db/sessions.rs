@@ -94,6 +94,60 @@ const CROCKFORD_BASE32: &[u8] = b"0123456789abcdefghjkmnpqrstvwxyz";
 /// Length of a session's human-display short id, in characters.
 pub const SHORT_ID_LEN: usize = 6;
 
+/// Durable one-shot recovery-nudge latch for a session whose automatic
+/// title attempt failed (issue #23). The closed domain mirrors the
+/// `title_recovery_nudge_state` CHECK constraint in `0001_initial.sql`. It
+/// carries NO title text, prompt, or provider body — only the latch position,
+/// so a post-failure Monty nudge can survive a daemon restart and be consumed
+/// exactly once before main-model dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleRecoveryNudgeState {
+    /// No pending recovery nudge — the default at creation and the state a
+    /// stored title returns the latch to.
+    None,
+    /// A title failure armed a nudge that has not yet been consumed.
+    Pending,
+    /// The nudge was atomically claimed before main-model dispatch.
+    Consumed,
+}
+
+impl TitleRecoveryNudgeState {
+    pub const ALL: [Self; 3] = [Self::None, Self::Pending, Self::Consumed];
+
+    /// The integer encoding stored in `sessions.title_recovery_nudge_state`.
+    pub fn as_i64(self) -> i64 {
+        match self {
+            Self::None => 0,
+            Self::Pending => 1,
+            Self::Consumed => 2,
+        }
+    }
+
+    /// Decode the stored integer. `None` for any value outside the closed
+    /// domain so a corrupt row fails loudly rather than defaulting silently.
+    pub fn from_i64(value: i64) -> Option<Self> {
+        match value {
+            0 => Some(Self::None),
+            1 => Some(Self::Pending),
+            2 => Some(Self::Consumed),
+            _ => None,
+        }
+    }
+}
+
+fn nudge_state_from_sql(value: i64) -> rusqlite::Result<TitleRecoveryNudgeState> {
+    TitleRecoveryNudgeState::from_i64(value).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Integer,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid title_recovery_nudge_state {value}"),
+            )),
+        )
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionRow {
     pub session_id: Uuid,
@@ -159,6 +213,10 @@ pub struct SessionRow {
     /// slot (`0`, `1`, `2`, `4`, `8`, or `16`). Persisted so a resumed session
     /// does not repeat the same automatic utility call.
     pub title_stage: i64,
+    /// Durable one-shot post-auto-title-failure recovery nudge latch (issue
+    /// #23). Defaults [`TitleRecoveryNudgeState::None`]; never inherited by a
+    /// fork/tangent/copy, and cleared whenever a title is successfully stored.
+    pub title_recovery_nudge_state: TitleRecoveryNudgeState,
     /// Frozen guidance baseline path/hash copied into forks so live guidance
     /// diffs continue from the same system-instruction baseline.
     pub guidance_baseline_path: Option<String>,
@@ -231,6 +289,9 @@ impl SessionRow {
             btw_tangent: row.get::<_, i64>("btw_tangent").unwrap_or(0) != 0,
             user_content_tokens: row.get("user_content_tokens")?,
             title_stage: row.get("title_stage")?,
+            title_recovery_nudge_state: nudge_state_from_sql(
+                row.get("title_recovery_nudge_state")?,
+            )?,
             guidance_baseline_path: row.get("guidance_baseline_path")?,
             guidance_baseline_hash: row.get("guidance_baseline_hash")?,
             redaction_table_json: row.get("redaction_table_json")?,
@@ -438,10 +499,11 @@ fn execute_fork_insert(
           parent_session_id, fork_point_turn_id,
           provider, model, session_llm_mode, tool_surface_override_json,
           goal_settings_override_json, ephemeral, user_content_tokens, title_stage,
+          title_recovery_nudge_state,
           guidance_baseline_path, guidance_baseline_hash, redaction_table_json, created_by_principal,
           shared_with_collaborators, btw_parent_session_id, btw_tangent, model_selection_json,
           model_system_prompt_snapshot_json, assistant_name, active_model_revision)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -460,6 +522,7 @@ fn execute_fork_insert(
             row.ephemeral as i64,
             row.user_content_tokens,
             row.title_stage,
+            row.title_recovery_nudge_state.as_i64(),
             row.guidance_baseline_path,
             row.guidance_baseline_hash,
             row.redaction_table_json,
@@ -563,6 +626,8 @@ fn build_session_row(
         btw_tangent: false,
         user_content_tokens: 0,
         title_stage: 0,
+        // A brand-new session never carries a recovery nudge.
+        title_recovery_nudge_state: TitleRecoveryNudgeState::None,
         guidance_baseline_path: None,
         guidance_baseline_hash: None,
         redaction_table_json: None,
@@ -1088,6 +1153,9 @@ impl Db {
                     parent.user_content_tokens
                 },
                 title_stage: if tangent { 0 } else { parent.title_stage },
+                // A `/btw` fork is a distinct session: never inherit the
+                // parent's unconsumed recovery nudge (tangent or seeded).
+                title_recovery_nudge_state: TitleRecoveryNudgeState::None,
                 guidance_baseline_path: parent.guidance_baseline_path,
                 guidance_baseline_hash: parent.guidance_baseline_hash,
                 redaction_table_json: parent.redaction_table_json,
@@ -1197,6 +1265,9 @@ impl Db {
             btw_tangent: false,
             user_content_tokens: parent.user_content_tokens,
             title_stage: parent.title_stage,
+            // A fork (plain or ephemeral `/side`) is a distinct session:
+            // never inherit the parent's unconsumed recovery nudge.
+            title_recovery_nudge_state: TitleRecoveryNudgeState::None,
             guidance_baseline_path: parent.guidance_baseline_path,
             guidance_baseline_hash: parent.guidance_baseline_hash,
             redaction_table_json: parent.redaction_table_json,
@@ -1378,7 +1449,8 @@ impl Db {
     /// to lock out the auto-titling pass (GOALS §17d).
     pub fn rename_session_conn(conn: &Connection, session_id: Uuid, title: &str) -> Result<()> {
         conn.execute(
-            "UPDATE sessions SET title = ?1, user_renamed = 1 WHERE session_id = ?2",
+            "UPDATE sessions SET title = ?1, user_renamed = 1, title_recovery_nudge_state = 0
+             WHERE session_id = ?2",
             params![title, session_id.to_string()],
         )
         .context("renaming session")?;
@@ -1398,7 +1470,7 @@ impl Db {
         self.write(move |conn| {
             let affected = conn
                 .execute(
-                    "UPDATE sessions SET title = ?1
+                    "UPDATE sessions SET title = ?1, title_recovery_nudge_state = 0
                  WHERE session_id = ?2 AND user_renamed = 0 AND ephemeral = 0",
                     params![title, session_id.to_string()],
                 )
@@ -1417,7 +1489,7 @@ impl Db {
         self.write(move |conn| {
             let affected = conn
                 .execute(
-                    "UPDATE sessions SET title = ?1, user_renamed = 0
+                    "UPDATE sessions SET title = ?1, user_renamed = 0, title_recovery_nudge_state = 0
                  WHERE session_id = ?2 AND ephemeral = 0",
                     params![title, session_id.to_string()],
                 )
@@ -1439,7 +1511,7 @@ impl Db {
         self.write(move |conn| {
             let affected = conn
                 .execute(
-                    "UPDATE sessions SET title = ?1, user_renamed = 0
+                    "UPDATE sessions SET title = ?1, user_renamed = 0, title_recovery_nudge_state = 0
                  WHERE session_id = ?2 AND ephemeral = 0 AND title IS NULL",
                     params![title, session_id.to_string()],
                 )
@@ -1471,6 +1543,64 @@ impl Db {
             Ok(())
         })
         .await
+    }
+
+    /// Arm the durable one-shot title-recovery nudge (issue #23) for a session
+    /// whose automatic title attempt failed. Transitions the latch to
+    /// `pending` from either `none` or `consumed`, but ONLY while the session
+    /// is still eligible: untitled, not user-renamed, and not ephemeral.
+    ///
+    /// A session already `pending` is left unchanged — repeated utility
+    /// failures coalesce into a single nudge. A `consumed` nudge may be
+    /// re-armed by a later distinct failure while eligibility still holds.
+    /// Returns `true` iff this call moved the latch to `pending`. Fails closed:
+    /// a DB error propagates and arms nothing.
+    pub async fn arm_title_recovery_nudge(&self, session_id: Uuid) -> Result<bool> {
+        self.write(move |conn| Self::arm_title_recovery_nudge_conn(conn, session_id))
+            .await
+    }
+
+    pub fn arm_title_recovery_nudge_conn(conn: &Connection, session_id: Uuid) -> Result<bool> {
+        // Transition-specific predicate rather than read-then-write: `pending`
+        // is excluded from the source set so a duplicate arm cannot re-arm, and
+        // the eligibility columns are checked atomically inside the same
+        // statement so a concurrent title/rename that lands first wins.
+        let affected = conn
+            .execute(
+                "UPDATE sessions
+                    SET title_recovery_nudge_state = 1
+                  WHERE session_id = ?1
+                    AND title_recovery_nudge_state IN (0, 2)
+                    AND title IS NULL
+                    AND user_renamed = 0
+                    AND ephemeral = 0",
+                params![session_id.to_string()],
+            )
+            .context("arming title recovery nudge")?;
+        Ok(affected > 0)
+    }
+
+    /// Atomically claim a pending title-recovery nudge exactly once,
+    /// transitioning `pending → consumed`. Returns `true` for the single caller
+    /// that observed `pending`; every other state — including a second claim of
+    /// the same nudge, or a nudge cleared by a stored title — returns `false`.
+    /// Fails closed: a DB error propagates and claims nothing.
+    pub async fn claim_title_recovery_nudge(&self, session_id: Uuid) -> Result<bool> {
+        self.write(move |conn| Self::claim_title_recovery_nudge_conn(conn, session_id))
+            .await
+    }
+
+    pub fn claim_title_recovery_nudge_conn(conn: &Connection, session_id: Uuid) -> Result<bool> {
+        let affected = conn
+            .execute(
+                "UPDATE sessions
+                    SET title_recovery_nudge_state = 2
+                  WHERE session_id = ?1
+                    AND title_recovery_nudge_state = 1",
+                params![session_id.to_string()],
+            )
+            .context("claiming title recovery nudge")?;
+        Ok(affected > 0)
     }
 
     /// Direct children of a session in the fork tree. Most-recent-first.
@@ -2417,6 +2547,16 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use tracing::Level;
     use tracing_subscriber::fmt::MakeWriter;
+
+    /// Load a session's persisted recovery-nudge latch through the real
+    /// get+decode path.
+    async fn nudge_of(db: &Db, session_id: Uuid) -> TitleRecoveryNudgeState {
+        db.get_session(session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .title_recovery_nudge_state
+    }
 
     #[derive(Clone)]
     struct CaptureWriter(std::sync::Arc<StdMutex<Vec<u8>>>);
@@ -3539,6 +3679,143 @@ mod tests {
         let row = db.get_session(s.session_id).await.unwrap().unwrap();
         assert!(!row.user_renamed);
         assert_eq!(row.title.as_deref(), Some("first-name"));
+    }
+
+    #[tokio::test]
+    async fn title_recovery_nudge_state_transitions_are_atomic() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("p", "/x", "a").await.unwrap();
+
+        // Precondition: a brand-new session loads with no nudge, read back
+        // through the real create+load path (not the in-memory struct).
+        let created = db.get_session(s.session_id).await.unwrap().unwrap();
+        assert_eq!(
+            created.title_recovery_nudge_state,
+            TitleRecoveryNudgeState::None,
+            "a new session must default to none"
+        );
+
+        // Arm an eligible, untitled session: none -> pending, reports the move.
+        assert!(db.arm_title_recovery_nudge(s.session_id).await.unwrap());
+        assert_eq!(nudge_of(&db, s.session_id).await, TitleRecoveryNudgeState::Pending);
+
+        // Duplicate arm while pending is a no-op: reports false and leaves a
+        // single pending state (repeated failures coalesce into one nudge).
+        assert!(!db.arm_title_recovery_nudge(s.session_id).await.unwrap());
+        assert_eq!(nudge_of(&db, s.session_id).await, TitleRecoveryNudgeState::Pending);
+
+        // Claim is exactly once: the first claim wins pending -> consumed.
+        assert!(db.claim_title_recovery_nudge(s.session_id).await.unwrap());
+        assert_eq!(nudge_of(&db, s.session_id).await, TitleRecoveryNudgeState::Consumed);
+        // A second claim finds no pending state and reports false.
+        assert!(!db.claim_title_recovery_nudge(s.session_id).await.unwrap());
+        assert_eq!(nudge_of(&db, s.session_id).await, TitleRecoveryNudgeState::Consumed);
+
+        // A later distinct failure re-arms a consumed, still-eligible session.
+        assert!(db.arm_title_recovery_nudge(s.session_id).await.unwrap());
+        assert_eq!(nudge_of(&db, s.session_id).await, TitleRecoveryNudgeState::Pending);
+
+        // Storing an automatic title clears the latch back to none.
+        assert!(db.set_auto_title(s.session_id, "auto-name").await.unwrap());
+        let titled = db.get_session(s.session_id).await.unwrap().unwrap();
+        assert_eq!(titled.title.as_deref(), Some("auto-name"));
+        assert_eq!(
+            titled.title_recovery_nudge_state,
+            TitleRecoveryNudgeState::None,
+            "a stored title must clear a pending nudge"
+        );
+
+        // A titled session is ineligible: arm refuses and the latch stays none.
+        assert!(!db.arm_title_recovery_nudge(s.session_id).await.unwrap());
+        assert_eq!(nudge_of(&db, s.session_id).await, TitleRecoveryNudgeState::None);
+        // Claiming a session with no pending nudge reports false.
+        assert!(!db.claim_title_recovery_nudge(s.session_id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn title_recovery_nudge_arm_refuses_ineligible_sessions() {
+        let db = Db::open_in_memory().unwrap();
+
+        // User-renamed session: user intent wins, arm refuses.
+        let renamed = db.create_session("p", "/x", "a").await.unwrap();
+        db.rename_session(renamed.session_id, "mine").await.unwrap();
+        assert!(
+            !db.arm_title_recovery_nudge(renamed.session_id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(nudge_of(&db, renamed.session_id).await, TitleRecoveryNudgeState::None);
+
+        // Ephemeral `/side` fork: never nudged.
+        let parent = db.create_session("p", "/x", "a").await.unwrap();
+        let side = db
+            .create_ephemeral_fork(parent.session_id, None)
+            .await
+            .unwrap();
+        assert!(side.ephemeral);
+        assert!(!db.arm_title_recovery_nudge(side.session_id).await.unwrap());
+        assert_eq!(nudge_of(&db, side.session_id).await, TitleRecoveryNudgeState::None);
+
+        // Already-titled (auto) session: ineligible because title is set.
+        let autotitled = db.create_session("p", "/x", "a").await.unwrap();
+        assert!(
+            db.set_auto_title(autotitled.session_id, "auto")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db.arm_title_recovery_nudge(autotitled.session_id)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn forks_and_tangents_start_with_no_title_recovery_nudge() {
+        let db = Db::open_in_memory().unwrap();
+
+        // Plain fork: arm the parent to pending, then fork. The child must NOT
+        // inherit the pending nudge (unlike user_content_tokens/title_stage,
+        // which forks copy).
+        let parent = db.create_session("p", "/proj", "Build").await.unwrap();
+        assert!(
+            db.arm_title_recovery_nudge(parent.session_id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            nudge_of(&db, parent.session_id).await,
+            TitleRecoveryNudgeState::Pending,
+            "parent must be pending so the test is non-vacuous"
+        );
+
+        let fork = db.create_fork(parent.session_id, None).await.unwrap();
+        assert_eq!(fork.title_recovery_nudge_state, TitleRecoveryNudgeState::None);
+        assert_eq!(nudge_of(&db, fork.session_id).await, TitleRecoveryNudgeState::None);
+
+        // Ephemeral `/side` fork from the pending parent: also none.
+        let side = db
+            .create_ephemeral_fork(parent.session_id, None)
+            .await
+            .unwrap();
+        assert_eq!(side.title_recovery_nudge_state, TitleRecoveryNudgeState::None);
+        assert_eq!(nudge_of(&db, side.session_id).await, TitleRecoveryNudgeState::None);
+
+        // Non-tangent `/btw` fork from the pending parent: also none.
+        let btw = db.create_btw_fork(parent.session_id, false).await.unwrap();
+        assert!(btw.created);
+        assert_eq!(nudge_of(&db, btw.info.session_id).await, TitleRecoveryNudgeState::None);
+
+        // Tangent `/btw` fork from a second pending parent: also none.
+        let parent2 = db.create_session("p", "/proj", "Build").await.unwrap();
+        assert!(
+            db.arm_title_recovery_nudge(parent2.session_id)
+                .await
+                .unwrap()
+        );
+        let tangent = db.create_btw_fork(parent2.session_id, true).await.unwrap();
+        assert!(tangent.created);
+        assert_eq!(nudge_of(&db, tangent.info.session_id).await, TitleRecoveryNudgeState::None);
     }
 
     #[tokio::test]

@@ -120,6 +120,14 @@ CREATE TABLE sessions (
     user_content_tokens INTEGER NOT NULL DEFAULT 0,
     title_stage         INTEGER NOT NULL DEFAULT 0,
 
+    -- Durable one-shot post-auto-title-failure recovery nudge latch (issue
+    -- #23): 0 = none, 1 = pending (a title attempt failed and a nudge is
+    -- armed), 2 = consumed (the nudge was atomically claimed before
+    -- main-model dispatch). Defaults `none`; never inherited by a
+    -- fork/tangent/copy. Carries no title text, prompt, or provider body.
+    title_recovery_nudge_state INTEGER NOT NULL DEFAULT 0
+        CHECK (title_recovery_nudge_state IN (0, 1, 2)),
+
     -- remote principal attribution + collaborator sharing.
     created_by_principal TEXT,
     shared_with_collaborators INTEGER NOT NULL DEFAULT 0 CHECK (shared_with_collaborators IN (0, 1)),
@@ -1095,7 +1103,7 @@ CREATE TABLE session_events (
         'primary_swap', 'inference_failure', 'failed_turn_recovery',
         'turn_interrupted', 'skill_auto_select', 'auto_prune_diagnostic',
         'goal_progress_diagnostic', 'resource_promotion', 'notice',
-        'model_switch', 'hook_run'
+        'model_switch', 'hook_run', 'tool_call_scheduling'
     )),
     agent       TEXT,                              -- emitting agent, when known
     call_id     TEXT,                              -- correlation key, when applicable

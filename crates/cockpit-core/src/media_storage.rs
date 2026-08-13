@@ -3039,47 +3039,75 @@ struct AvProbeStream {
     default_disposition: bool,
 }
 
+pub(crate) const TYPED_AUDIO_CONTAINER_CODECS: &[(&str, &[&str])] = &[
+    ("wav", &["pcm_s16le", "pcm_s24le", "pcm_s32le", "pcm_f32le"]),
+    ("mp3", &["mp3"]),
+    ("m4a", &["aac", "alac"]),
+    ("flac", &["flac"]),
+    ("ogg", &["vorbis", "opus", "flac"]),
+    ("mp4", &["aac", "alac", "mp3"]),
+    ("webm", &["opus", "vorbis"]),
+    (
+        "mov",
+        &["aac", "alac", "pcm_s16le", "pcm_s24le", "pcm_s32le"],
+    ),
+];
+
+pub(crate) const TYPED_VIDEO_CONTAINER_CODECS: &[(&str, &[&str])] = &[
+    ("mp4", &["h264", "hevc", "av1"]),
+    ("webm", &["vp8", "vp9", "av1"]),
+    ("mov", &["h264", "hevc", "prores"]),
+];
+
+fn container_codec_allowed(table: &[(&str, &[&str])], container: &str, codec: &str) -> bool {
+    table
+        .iter()
+        .find(|(name, _)| *name == container)
+        .is_some_and(|(_, codecs)| codecs.contains(&codec))
+}
+
+pub(crate) fn container_allows_audio_codec(container: &str, codec: &str) -> bool {
+    container_codec_allowed(TYPED_AUDIO_CONTAINER_CODECS, container, codec)
+}
+
+pub(crate) fn container_allows_video_codec(container: &str, codec: &str) -> bool {
+    container_codec_allowed(TYPED_VIDEO_CONTAINER_CODECS, container, codec)
+}
+
+fn is_audio_only_container(container: &str) -> bool {
+    TYPED_AUDIO_CONTAINER_CODECS
+        .iter()
+        .any(|(name, _)| *name == container)
+        && !is_video_container(container)
+}
+
+fn is_video_container(container: &str) -> bool {
+    TYPED_VIDEO_CONTAINER_CODECS
+        .iter()
+        .any(|(name, _)| *name == container)
+}
+
 fn select_av_streams(
     container: &str,
     streams: &[AvProbeStream],
 ) -> Result<(Option<AvProbeStream>, Option<AvProbeStream>)> {
     ensure!(!streams.is_empty() && streams.len() <= 64, "invalid_media");
-    let allowed_audio = |codec: &str| match container {
-        "wav" => matches!(codec, "pcm_s16le" | "pcm_s24le" | "pcm_s32le" | "pcm_f32le"),
-        "mp3" => codec == "mp3",
-        "m4a" => matches!(codec, "aac" | "alac"),
-        "flac" => codec == "flac",
-        "ogg" => matches!(codec, "vorbis" | "opus" | "flac"),
-        "mp4" => matches!(codec, "aac" | "alac" | "mp3"),
-        "webm" => matches!(codec, "opus" | "vorbis"),
-        "mov" => matches!(
-            codec,
-            "aac" | "alac" | "pcm_s16le" | "pcm_s24le" | "pcm_s32le"
-        ),
-        _ => false,
-    };
-    let allowed_video = |codec: &str| match container {
-        "mp4" => matches!(codec, "h264" | "hevc" | "av1"),
-        "webm" => matches!(codec, "vp8" | "vp9" | "av1"),
-        "mov" => matches!(codec, "h264" | "hevc" | "prores"),
-        _ => false,
-    };
-    let choose = |kind: &str, allowed: &dyn Fn(&str) -> bool| {
+    let choose = |kind: &str, allowed: fn(&str, &str) -> bool| {
         streams
             .iter()
-            .filter(|stream| stream.kind == kind && allowed(&stream.codec))
+            .filter(|stream| stream.kind == kind && allowed(container, &stream.codec))
             .min_by_key(|stream| (!stream.default_disposition, stream.index))
             .cloned()
     };
-    let audio = choose("audio", &allowed_audio);
-    let video = choose("video", &allowed_video);
-    if matches!(container, "wav" | "mp3" | "m4a" | "flac" | "ogg") {
+    let audio = choose("audio", container_allows_audio_codec);
+    let video = choose("video", container_allows_video_codec);
+    if is_audio_only_container(container) {
         ensure!(
             audio.is_some() && streams.iter().all(|stream| stream.kind != "video"),
             "ambiguous_or_unsupported_container"
         );
         Ok((None, audio))
-    } else if matches!(container, "mp4" | "webm" | "mov") {
+    } else if is_video_container(container) {
         ensure!(video.is_some(), "ambiguous_or_unsupported_container");
         Ok((video, audio))
     } else {

@@ -1,8 +1,9 @@
 //! Bounded audio/video inspection and extraction contracts.
 //!
-//! The executable boundary is deliberately attachment-ID based. Source URLs
-//! and paths are admitted only by the session attachment authority; this
-//! module never opens an arbitrary model-supplied path itself.
+//! The first call admits a nested `source` object (`attachment_id`, `path`,
+//! or `url`); later calls reuse `source: {attachment_id}`. Paths and URLs
+//! are admitted only by the session attachment authority; this module never
+//! opens an arbitrary model-supplied path itself.
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
@@ -155,11 +156,52 @@ pub struct StoryboardFrame {
     pub actual_pts_ms: u64,
 }
 
+/// Source pixel geometry reported with each selected storyboard frame.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StoryboardSourceGeometry {
+    pub rotation_degrees: i32,
+    pub sar_num: u32,
+    pub sar_den: u32,
+    pub dar_num: u32,
+    pub dar_den: u32,
+}
+
+/// Selected frame plus the source rotation/SAR/DAR applied to its pixels.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StoryboardFrameReport {
+    pub requested_ms: u64,
+    pub actual_pts_ms: u64,
+    pub rotation_degrees: i32,
+    pub sar_num: u32,
+    pub sar_den: u32,
+    pub dar_num: u32,
+    pub dar_den: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StoryboardSelection {
     pub frames: Vec<StoryboardFrame>,
     pub sample_unavailable_ms: Vec<u64>,
     pub omitted_duplicates: Vec<StoryboardFrame>,
+}
+
+/// Copy source rotation/SAR/DAR onto selected frames without changing PTS.
+pub fn report_storyboard_frames(
+    frames: &[StoryboardFrame],
+    source: &StoryboardSourceGeometry,
+) -> Vec<StoryboardFrameReport> {
+    frames
+        .iter()
+        .map(|frame| StoryboardFrameReport {
+            requested_ms: frame.requested_ms,
+            actual_pts_ms: frame.actual_pts_ms,
+            rotation_degrees: source.rotation_degrees,
+            sar_num: source.sar_num,
+            sar_den: source.sar_den,
+            dar_num: source.dar_num,
+            dar_den: source.dar_den,
+        })
+        .collect()
 }
 
 /// Select the first PTS at or after each request, enforce the positive-delta
@@ -287,26 +329,33 @@ pub fn audio_process(
 }
 
 fn source_schema() -> Value {
-    // Closed source branches: each `oneOf` branch names exactly its own source
-    // key and forbids extra keys (`additionalProperties: false`), matching the
-    // sibling media/`inspect_*` schemas and the strict-wire shape the responses
-    // transform already produces for these branches. Each branch's `properties`
-    // set equals its `required` set so the strict-object invariant holds.
-    json!({"oneOf": [
-        {"required": ["attachment_id"], "properties": {"attachment_id": {"type": "string", "minLength": 1}}, "additionalProperties": false},
-        {"required": ["path"], "properties": {"path": {"type": "string", "minLength": 1}}, "additionalProperties": false},
-        {"required": ["url"], "properties": {"url": {"type": "string", "pattern": "^https://"}}, "additionalProperties": false}
-    ]})
+    json!({
+        "anyOf": [
+            {
+                "type": "object",
+                "properties": { "attachment_id": { "type": "string", "minLength": 1 } },
+                "required": ["attachment_id"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": { "path": { "type": "string", "minLength": 1 } },
+                "required": ["path"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": { "url": { "type": "string", "pattern": "^https://" } },
+                "required": ["url"],
+                "additionalProperties": false
+            }
+        ]
+    })
 }
 
 fn schema(kind: ToolKind) -> Value {
     let mut properties = serde_json::Map::new();
-    properties.insert(
-        "attachment_id".into(),
-        json!({"type":"string","minLength":1}),
-    );
-    properties.insert("path".into(), json!({"type":"string","minLength":1}));
-    properties.insert("url".into(), json!({"type":"string","pattern":"^https://"}));
+    properties.insert("source".into(), source_schema());
     properties.insert("stream_index".into(), json!({"type":"integer","minimum":0}));
     properties.insert(
         "start".into(),
@@ -317,12 +366,44 @@ fn schema(kind: ToolKind) -> Value {
         json!({"type":"number","exclusiveMinimum":0,"multipleOf":0.001}),
     );
     if kind == ToolKind::InspectVideo {
-        properties.insert("sampling".into(), json!({"oneOf":[
-            {"type":"object","required":["every_seconds"],"properties":{"every_seconds":{"type":"number","exclusiveMinimum":0,"multipleOf":0.001}},"additionalProperties":false},
-            {"type":"object","required":["max_frames"],"properties":{"max_frames":{"type":"integer","minimum":1,"maximum":MAX_STORYBOARD_FRAMES}},"additionalProperties":false}
-        ]}));
+        properties.insert(
+            "sampling".into(),
+            json!({
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "required": ["every_seconds"],
+                        "properties": {
+                            "every_seconds": {
+                                "type": "number",
+                                "exclusiveMinimum": 0,
+                                "multipleOf": 0.001
+                            }
+                        },
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "required": ["max_frames"],
+                        "properties": {
+                            "max_frames": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": MAX_STORYBOARD_FRAMES
+                            }
+                        },
+                        "additionalProperties": false
+                    }
+                ]
+            }),
+        );
     }
-    json!({"type":"object","properties":properties,"allOf":[source_schema()],"additionalProperties":false})
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": ["source"],
+        "additionalProperties": false
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -342,19 +423,17 @@ fn requirements(kind: ToolKind) -> Vec<BinaryRequirement> {
     result
 }
 
-async fn fail_closed(args: Value) -> Result<ToolOutput> {
-    // Validate the mutually-exclusive source contract before reporting the
-    // unavailable custody service, so malformed model calls stay invocation
-    // failures rather than environmental failures.
-    let sources = ["attachment_id", "path", "url"]
-        .into_iter()
-        .filter(|key| args.get(key).is_some())
-        .count();
-    if sources != 1 {
-        return Err(invalid_input(
-            "exactly one of attachment_id, path, or url is required",
-        ));
-    }
+fn validate_tool_args(args: &Value, kind: ToolKind) -> Result<()> {
+    let compiled = schema(kind);
+    let validator =
+        jsonschema::validator_for(&compiled).map_err(|error| invalid_input(error.to_string()))?;
+    validator
+        .validate(args)
+        .map_err(|error| invalid_input(error.to_string()))
+}
+
+async fn fail_closed(args: Value, kind: ToolKind) -> Result<ToolOutput> {
+    validate_tool_args(&args, kind)?;
     bail!(
         "media_attachment_authority_unavailable: this repository does not yet expose the typed session attachment authority required for safe media execution"
     )
@@ -384,7 +463,7 @@ macro_rules! media_tool {
                 schema($kind)
             }
             async fn call(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
-                fail_closed(args).await
+                fail_closed(args, $kind).await
             }
         }
     };
@@ -393,110 +472,35 @@ macro_rules! media_tool {
 media_tool!(
     InspectAudioTool,
     "inspect_audio",
-    "Inspect bounded metadata for one authorized audio attachment.",
-    "Read safe, bounded metadata for one audio attachment you are already authorized to access by its attachment_id: duration, streams, codecs, and channel layout. Use it before extract_audio to confirm what a source contains. It is strictly read-only and never transcodes, downloads, or opens an arbitrary path or URL; the session attachment authority admits the source, so any request without a valid authorized id is rejected. Requires ffprobe.",
+    "Inspect bounded metadata for one authorized audio source. First call uses source: {attachment_id|path|url}; later calls reuse source: {attachment_id}.",
+    "Read safe, bounded metadata for one audio source: duration, streams, codecs, and channel layout. First call uses source: {attachment_id|path|url} and immediately creates a typed session attachment; later calls reuse source: {attachment_id}. Use it before extract_audio to confirm what a source contains. It is strictly read-only and never transcodes or downloads; the session attachment authority admits the source. Requires ffprobe.",
     ToolKind::InspectAudio,
     ToolEffect::ReadOnly
 );
 media_tool!(
     InspectVideoTool,
     "inspect_video",
-    "Inspect metadata or create a deterministic storyboard for one authorized video attachment.",
-    "Read safe, bounded metadata, or build a deterministic storyboard of frame timestamps, for one video attachment you are already authorized to access by its attachment_id. Use it before extract_video_clip to see the streams and choose an interval. It is read-only and never re-encodes or fetches an arbitrary path or URL; the storyboard frame count is capped and the source must be admitted by the session attachment authority. Requires ffprobe.",
+    "Inspect metadata or create a deterministic storyboard for one authorized video source. First call uses source: {attachment_id|path|url}; later calls reuse source: {attachment_id}.",
+    "Read safe, bounded metadata, or build a deterministic storyboard of frame timestamps, for one video source. First call uses source: {attachment_id|path|url} and immediately creates a typed session attachment; later calls reuse source: {attachment_id}. Use it before extract_video_clip to see the streams and choose an interval. It is read-only and never re-encodes; the storyboard frame count is capped and the source must be admitted by the session attachment authority. Requires ffprobe.",
     ToolKind::InspectVideo,
     ToolEffect::ReadOnly
 );
 media_tool!(
     ExtractVideoClipTool,
     "extract_video_clip",
-    "Create a bounded MP4 clip derivative from one authorized video attachment.",
-    "Create one bounded MP4 clip derivative from a single video attachment you are already authorized to access, covering only the interval you request. Use it after inspect_video has confirmed the stream and timing. This is a mutating operation: it writes a new derivative but never overwrites the original, and it refuses any source the session attachment authority has not admitted. Output resolution, frame rate, and duration are all bounded. Requires ffmpeg and ffprobe.",
+    "Create a bounded MP4 clip derivative from one authorized video source. First call uses source: {attachment_id|path|url}; later calls reuse source: {attachment_id}.",
+    "Create one bounded MP4 clip derivative from a single video source, covering only the interval you request. First call uses source: {attachment_id|path|url} and immediately creates a typed session attachment; later calls reuse source: {attachment_id}. Use it after inspect_video has confirmed the stream and timing. This is a mutating operation: it writes a new derivative but never overwrites the original, and it refuses any source the session attachment authority has not admitted. Output resolution, frame rate, and duration are all bounded. Requires ffmpeg and ffprobe.",
     ToolKind::ExtractVideoClip,
     ToolEffect::Mutating
 );
 media_tool!(
     ExtractAudioTool,
     "extract_audio",
-    "Create a bounded WAV derivative from one authorized audio or video attachment.",
-    "Create one bounded WAV derivative from a single authorized audio or video attachment, capturing only the interval and stream you request. Use it after inspecting the source to confirm its streams. This is a mutating operation: it writes a new derivative, never replaces the original, and rejects any source the session attachment authority has not admitted. Sample rate, channel count, and duration are all bounded. Requires ffmpeg and ffprobe.",
+    "Create a bounded WAV derivative from one authorized audio or video source. First call uses source: {attachment_id|path|url}; later calls reuse source: {attachment_id}.",
+    "Create one bounded WAV derivative from a single authorized audio or video source, capturing only the interval and stream you request. First call uses source: {attachment_id|path|url} and immediately creates a typed session attachment; later calls reuse source: {attachment_id}. Use it after inspecting the source to confirm its streams. This is a mutating operation: it writes a new derivative, never replaces the original, and rejects any source the session attachment authority has not admitted. Sample rate, channel count, and duration are all bounded. Requires ffmpeg and ffprobe.",
     ToolKind::ExtractAudio,
     ToolEffect::Mutating
 );
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn audio_video_storyboard_timestamps_are_exact_and_end_exclusive() {
-        let interval = Interval::checked(Milliseconds(1_000), Milliseconds(2_001)).unwrap();
-        assert_eq!(
-            storyboard_timestamps(&interval, StoryboardMode::Every(Milliseconds(500))).unwrap(),
-            vec![
-                Milliseconds(1_000),
-                Milliseconds(1_500),
-                Milliseconds(2_000)
-            ]
-        );
-        assert_eq!(
-            storyboard_timestamps(&interval, StoryboardMode::MaxFrames(3)).unwrap(),
-            vec![
-                Milliseconds(1_000),
-                Milliseconds(1_500),
-                Milliseconds(2_000)
-            ]
-        );
-    }
-
-    #[test]
-    fn audio_video_stream_matrix_uses_default_then_lowest() {
-        let streams = vec![
-            StreamCandidate {
-                index: 1,
-                disposition_default: false,
-                allowed: true,
-            },
-            StreamCandidate {
-                index: 3,
-                disposition_default: true,
-                allowed: true,
-            },
-            StreamCandidate {
-                index: 2,
-                disposition_default: true,
-                allowed: true,
-            },
-        ];
-        assert_eq!(select_stream(&streams, None).unwrap(), 2);
-        assert_eq!(select_stream(&streams, Some(1)).unwrap(), 1);
-    }
-
-    #[test]
-    fn audio_video_storyboard_deduplicates_and_applies_dynamic_tolerance() {
-        let selected = select_storyboard_frames(
-            &[Milliseconds(0), Milliseconds(5), Milliseconds(400)],
-            &[Milliseconds(90), Milliseconds(550)],
-            Some(240),
-        );
-        assert_eq!(
-            selected.frames,
-            vec![StoryboardFrame {
-                requested_ms: 0,
-                actual_pts_ms: 90
-            }]
-        );
-        assert_eq!(selected.omitted_duplicates.len(), 1);
-        assert_eq!(selected.sample_unavailable_ms, vec![400]);
-        assert_eq!(frame_tolerance_ms(Some(2_000)), 500);
-    }
-
-    #[test]
-    fn audio_video_process_specs_are_argv_only_and_capped() {
-        let spec = probe_process("name; touch nope");
-        assert_eq!(spec.program, "ffprobe");
-        assert_eq!(spec.argv.last().unwrap(), "name; touch nope");
-        assert!(spec.stdin_closed);
-        assert_eq!(spec.environment.len(), 2);
-        assert!(spec.stdout_limit > spec.stderr_limit);
-    }
-}
+mod tests;

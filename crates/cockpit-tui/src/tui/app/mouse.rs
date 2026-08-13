@@ -17,7 +17,7 @@ fn resolve_inner_scroll_target(
 }
 
 /// True when `(col, row)` falls inside `rect` (absolute coords).
-fn point_in(rect: Rect, col: u16, row: u16) -> bool {
+pub(super) fn point_in(rect: Rect, col: u16, row: u16) -> bool {
     col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
 }
 
@@ -370,6 +370,10 @@ impl App {
         // lands on the divider or inside the pane so the chat handlers
         // below don't also see it.
         if self.pane.is_some() && self.handle_pane_mouse(&mouse) {
+            return;
+        }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Middle)) {
+            self.handle_primary_paste_middle_down(&mouse);
             return;
         }
         if self.mouse_capture
@@ -1288,6 +1292,7 @@ impl App {
         };
         self.reduce_mouse_gesture(input);
         self.abort_pending_mouse_copies();
+        self.invalidate_primary_paste();
     }
 
     pub(super) fn cancel_mouse_gesture(&mut self, now: std::time::Duration) {

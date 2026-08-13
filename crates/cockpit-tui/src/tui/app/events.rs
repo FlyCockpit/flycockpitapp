@@ -1628,6 +1628,7 @@ impl App {
                         self.rehydrated_dialog_lockout()
                     }
                 };
+                self.invalidate_primary_paste();
                 self.question_dialog = Some(
                     crate::tui::dialog::question::QuestionDialog::new(
                         interrupt_id,

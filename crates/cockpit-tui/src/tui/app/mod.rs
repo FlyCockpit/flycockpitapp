@@ -37,6 +37,7 @@ mod overlay_actions;
 mod panes;
 mod pins;
 mod prediction;
+mod primary_paste;
 mod render;
 mod resume;
 mod scrollback_page_in;
@@ -752,6 +753,8 @@ fn new_external_editor_tempfile() -> std::io::Result<tempfile::NamedTempFile> {
 
 #[cfg(test)]
 mod mouse_gesture_app_tests;
+#[cfg(test)]
+mod primary_paste_tests;
 #[cfg(test)]
 mod selection_copy_state_tests;
 
@@ -2051,6 +2054,7 @@ pub struct App {
         std::collections::HashMap<uuid::Uuid, DeferredFenceDispatch>,
     pub(super) next_paste_generation: u64,
     pub(super) paste_correlations: crate::tui::structured_paste::PasteCorrelationCache,
+    pub(super) primary_paste: crate::tui::primary_paste::PrimaryPasteController,
     pub(super) pending_session_switch_order: Option<(u64, uuid::Uuid)>,
     pub(super) pending_session_switch_reconcile_started_at: Option<std::time::Duration>,
     /// Latest injected TerminalInput clock sample used by App-owned deadline
@@ -3378,6 +3382,7 @@ impl App {
             deferred_fence_dispatches: Default::default(),
             next_paste_generation: 0,
             paste_correlations: Default::default(),
+            primary_paste: crate::tui::primary_paste::PrimaryPasteController::production(),
             pending_session_switch_order: None,
             pending_session_switch_reconcile_started_at: None,
             event_loop_monotonic_now: std::time::Duration::ZERO,

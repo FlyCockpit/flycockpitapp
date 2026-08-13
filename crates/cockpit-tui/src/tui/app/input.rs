@@ -748,6 +748,7 @@ impl App {
                 // mode, thinking display, markdown) are also reloaded
                 // so they apply without a restart.
                 self.dialog = Dialog::None;
+                self.invalidate_primary_paste();
                 self.sync_mouse_capture_from_dialog();
                 // The daemon re-resolves and pushes a fresh snapshot; the UI
                 // updates when it arrives (no optimistic render of the written
@@ -1541,11 +1542,13 @@ impl App {
             let idx = self.prompt_history.len() - 1;
             self.composer.set(self.prompt_history[idx].clone());
             self.paste_registry.clear();
+            self.invalidate_primary_paste();
         } else if self.prompt_history_cursor < self.prompt_history.len() {
             self.prompt_history_cursor += 1;
             let idx = self.prompt_history.len() - self.prompt_history_cursor;
             self.composer.set(self.prompt_history[idx].clone());
             self.paste_registry.clear();
+            self.invalidate_primary_paste();
         }
     }
 

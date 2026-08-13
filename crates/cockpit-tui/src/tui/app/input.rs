@@ -12,8 +12,8 @@ use crate::tui::textfield::normalize_shift_char;
 
 use super::{
     App, ControlApplied, DispatchOutcome, FirstRunFlow, LocalChoiceSelection,
-    OptimisticSubmissionState, Overlay, PendingSessionSwitchSubmission, StartupModal,
-    TranscriptFind,
+    MouseGestureInvalidation, OptimisticSubmissionState, Overlay, PendingSessionSwitchSubmission,
+    StartupModal, TranscriptFind,
 };
 use crate::tui::agent_runner;
 use crate::tui::async_action::{AsyncActionKey, AsyncActionPayload, AsyncActionPolicy};
@@ -26,7 +26,7 @@ impl App {
     /// it at intake, without allowing a subsequently opened pane/modal to
     /// steal those buffered keys.
     pub(super) fn handle_frozen_composer_key(&mut self, key: KeyEvent) -> bool {
-        self.selection = None;
+        self.cancel_mouse_gesture(self.event_loop_monotonic_now);
         let before = self.composer.text().to_string();
         let exit = if self.composer.vim_enabled() {
             match self.composer.vim_mode() {
@@ -615,7 +615,7 @@ impl App {
         // dialog handlers; behind the Ctrl+C quit because the user
         // expects Ctrl+C to always exit regardless of selection.
         if matches!(key.code, KeyCode::Esc) && self.selection.is_some() {
-            self.selection = None;
+            self.cancel_mouse_gesture(self.event_loop_monotonic_now);
             return false;
         }
 
@@ -704,7 +704,10 @@ impl App {
             && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
         {
             let page = self.chat_visible_lines.saturating_sub(1).max(1);
-            self.selection = None;
+            self.invalidate_mouse_gesture(
+                MouseGestureInvalidation::ViewChange,
+                self.event_loop_monotonic_now,
+            );
             match key.code {
                 KeyCode::PageUp => self.scroll_chat_up(page),
                 KeyCode::PageDown => self.scroll_chat_down(page),
@@ -1067,7 +1070,7 @@ impl App {
         // skipped so just *holding* Shift doesn't clear the selection
         // mid-drag-extend-by-keyboard.
         if self.selection.is_some() && !is_modifier_only(&key) {
-            self.selection = None;
+            self.cancel_mouse_gesture(self.event_loop_monotonic_now);
         }
 
         // Shift+Tab (`BackTab`) cycles the active primary agent
@@ -2959,7 +2962,7 @@ impl App {
     }
 
     fn open_transcript_find(&mut self) {
-        self.selection = None;
+        self.cancel_mouse_gesture(self.event_loop_monotonic_now);
         self.transcript_find = Some(TranscriptFind {
             saved_offset: self.chat_scroll_offset,
             ..TranscriptFind::default()

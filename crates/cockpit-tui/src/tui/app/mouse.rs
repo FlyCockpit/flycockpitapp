@@ -45,6 +45,12 @@ impl App {
             match mouse.kind {
                 MouseEventKind::ScrollUp => overlay.scroll_up(),
                 MouseEventKind::ScrollDown => overlay.scroll_down(),
+                MouseEventKind::Down(_) => {
+                    self.invalidate_mouse_gesture(
+                        MouseGestureInvalidation::Cancel,
+                        self.event_loop_monotonic_now,
+                    );
+                }
                 _ => {}
             }
             return;
@@ -54,6 +60,10 @@ impl App {
         if let Some(menu) = self.context_menu.clone() {
             match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
+                    self.invalidate_mouse_gesture(
+                        MouseGestureInvalidation::Cancel,
+                        self.event_loop_monotonic_now,
+                    );
                     let full = ratatui::layout::Rect::new(0, 0, u16::MAX, u16::MAX);
                     if let Some(action) = menu.hit_test(mouse.column, mouse.row, full) {
                         self.context_menu = None;
@@ -63,6 +73,10 @@ impl App {
                     }
                 }
                 MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    self.invalidate_mouse_gesture(
+                        MouseGestureInvalidation::Cancel,
+                        self.event_loop_monotonic_now,
+                    );
                     self.context_menu = None;
                 }
                 _ => {}
@@ -123,21 +137,12 @@ impl App {
         if matches!(
             link_outcome,
             crate::tui::links::LinkGestureOutcome::Consumed
+                | crate::tui::links::LinkGestureOutcome::SelectUrl(_)
         ) {
-            return;
-        }
-        // Double-click on the same semantic link: cancel activation and
-        // select the URL. This is an explicit selection — no copy here
-        // (the copy-on-release path handles that if enabled).
-        if let crate::tui::links::LinkGestureOutcome::SelectUrl(_url) = &link_outcome {
-            // Create a word selection at the click point. The host's
-            // semantic extraction will resolve the URL text from the
-            // selection.
-            self.selection = Some(Selection {
-                anchor: (mouse.column, mouse.row),
-                focus: (mouse.column, mouse.row),
-                active: false,
-            });
+            self.invalidate_mouse_gesture(
+                MouseGestureInvalidation::Cancel,
+                self.event_loop_monotonic_now,
+            );
             return;
         }
         // Scheduled activation: the host starts a timer; the actual
@@ -369,14 +374,18 @@ impl App {
         }
         if self.mouse_capture
             && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            && let Some(hit) = self.footer_hit_areas.iter().find(|hit| {
-                mouse.row >= hit.rect.y
-                    && mouse.row < hit.rect.y + hit.rect.height
-                    && mouse.column >= hit.rect.x
-                    && mouse.column < hit.rect.x + hit.rect.width
-            })
+            && let Some(hit) = self
+                .footer_hit_areas
+                .iter()
+                .find(|hit| {
+                    mouse.row >= hit.rect.y
+                        && mouse.row < hit.rect.y + hit.rect.height
+                        && mouse.column >= hit.rect.x
+                        && mouse.column < hit.rect.x + hit.rect.width
+                })
+                .cloned()
         {
-            self.selection = None;
+            self.cancel_mouse_gesture(self.event_loop_monotonic_now);
             let already_selected = self.footer_selection == Some(hit.control);
             self.footer_selection = Some(hit.control);
             self.footer_agent_picker = None;
@@ -395,6 +404,10 @@ impl App {
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
             && self.mouse_in_chat_area(&mouse)
         {
+            self.invalidate_mouse_gesture(
+                MouseGestureInvalidation::Cancel,
+                self.event_loop_monotonic_now,
+            );
             let chat_row = self
                 .chat_area
                 .map(|a| (mouse.row.saturating_sub(a.y)) as usize)
@@ -426,7 +439,10 @@ impl App {
                 if let Some(area) = self.chat_area
                     && self.mouse_in_chat_area(&mouse)
                 {
-                    self.selection = None;
+                    self.invalidate_mouse_gesture(
+                        MouseGestureInvalidation::ViewChange,
+                        self.event_loop_monotonic_now,
+                    );
                     // A collapsed tool box under the cursor captures the
                     // wheel until it hits its top; then the transcript
                     // scrolls.
@@ -441,7 +457,10 @@ impl App {
                 if let Some(area) = self.chat_area
                     && self.mouse_in_chat_area(&mouse)
                 {
-                    self.selection = None;
+                    self.invalidate_mouse_gesture(
+                        MouseGestureInvalidation::ViewChange,
+                        self.event_loop_monotonic_now,
+                    );
                     let rel = (mouse.row - area.y) as usize;
                     if !self.scroll_inner_region_at_row(rel, false) {
                         self.scroll_chat_down(3);
@@ -452,31 +471,17 @@ impl App {
             _ => {}
         }
 
-        // Drag extends an in-flight selection. We only follow Left
-        // drags; other button drags are ignored.
+        // Drag/release belong to the gesture reducer once a press is live.
         if matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left)) {
-            let clamped = self.clamp_to_chat_area(mouse.column, mouse.row);
-            if let Some(sel) = self.selection.as_mut()
-                && sel.active
-            {
-                sel.focus = clamped;
+            if self.mouse_gesture_state.pending_press.is_some() {
+                self.dispatch_chat_gesture(mouse);
             }
             return;
         }
-
-        // Release finalizes the selection. It persists in
-        // `self.selection` until cleared (Esc, new click outside chat,
-        // wheel scroll). When `copy_on_release` is enabled and the
-        // selection was an active drag, schedule a copy through the
-        // centralized clipboard service. Auto-copy retains the
-        // highlight for every CopyOutcome.
         if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
-            let was_active_drag = self.selection.is_some_and(|sel| sel.active);
-            if let Some(sel) = self.selection.as_mut() {
-                sel.active = false;
-            }
-            if was_active_drag && self.copy_on_release {
-                self.copy_selection_plaintext_auto();
+            if self.mouse_gesture_state.pending_press.is_some() || self.mouse_gesture_state.dragging
+            {
+                self.dispatch_chat_gesture(mouse);
             }
             return;
         }
@@ -495,7 +500,7 @@ impl App {
         {
             // Clicking into the composer dismisses any chat
             // selection — the user has switched contexts.
-            self.selection = None;
+            self.cancel_mouse_gesture(self.event_loop_monotonic_now);
             self.composer.set_cursor_from_visual_position(
                 line,
                 col,
@@ -512,17 +517,17 @@ impl App {
         }
 
         let Some(area) = self.chat_area else {
-            self.selection = None;
+            self.cancel_mouse_gesture(self.event_loop_monotonic_now);
             return;
         };
         // crossterm reports row/column as 0-indexed absolute terminal
         // coordinates. Translate to chat-area relative.
         if mouse.row < area.y || mouse.row >= area.y + area.height {
-            self.selection = None;
+            self.cancel_mouse_gesture(self.event_loop_monotonic_now);
             return;
         }
         if mouse.column < area.x || mouse.column >= area.x + area.width {
-            self.selection = None;
+            self.cancel_mouse_gesture(self.event_loop_monotonic_now);
             return;
         }
         let rel = (mouse.row - area.y) as usize;
@@ -535,7 +540,7 @@ impl App {
         if self.mouse_capture
             && let Some(chip) = self.control_chip_at(rel, rel_col)
         {
-            self.selection = None;
+            self.cancel_mouse_gesture(self.event_loop_monotonic_now);
             match chip {
                 super::render::ControlChip::Fork { seq } => self.fork_for_seq(seq),
                 super::render::ControlChip::Pin { seq } => self.toggle_pin_for_seq(seq),
@@ -547,7 +552,7 @@ impl App {
             .get(rel)
             .and_then(|meta| meta.subagent_target)
         {
-            self.selection = None;
+            self.cancel_mouse_gesture(self.event_loop_monotonic_now);
             if self.open_subagent_view_for_history_index(entry_idx) {
                 return;
             }
@@ -560,7 +565,7 @@ impl App {
             .get(rel)
             .and_then(|meta| meta.chip_target)
         {
-            self.selection = None;
+            self.cancel_mouse_gesture(self.event_loop_monotonic_now);
             match self.history.get_mut(entry_idx) {
                 Some(HistoryEntry::Agent {
                     expanded,
@@ -607,18 +612,11 @@ impl App {
             .and_then(|meta| meta.tool_call_target)
             .is_some()
         {
-            self.selection = None;
+            self.cancel_mouse_gesture(self.event_loop_monotonic_now);
             self.toggle_tool_call_at_row(rel);
             return;
         }
-        // Non-chip chat row + left-down: start a fresh drag-select.
-        // Anchor = focus = click point; mouse-drag will extend the
-        // focus from here.
-        self.selection = Some(Selection {
-            anchor: (mouse.column, mouse.row),
-            focus: (mouse.column, mouse.row),
-            active: true,
-        });
+        self.dispatch_chat_gesture(mouse);
     }
 
     fn update_hovered_footer_control(&mut self, column: u16, row: u16) {
@@ -867,7 +865,7 @@ impl App {
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(target) = self.suggestion_target_at_mouse(mouse) {
-                    self.selection = None;
+                    self.cancel_mouse_gesture(self.event_loop_monotonic_now);
                     self.accept_suggestion_target(target);
                     self.hovered_suggestion = None;
                 }
@@ -1239,6 +1237,792 @@ impl App {
         let col_rel = (mouse.column - inner_left) as usize;
         Some((row_rel, col_rel))
     }
+
+    pub(super) fn next_mouse_gesture_deadline(&self) -> Option<std::time::Duration> {
+        self.mouse_gesture_state.next_deadline()
+    }
+
+    pub(super) async fn drain_ready_terminal_input_before_gesture_timer(
+        &mut self,
+        terminal_input: &mut crate::tui::input_source::TerminalInput,
+    ) -> anyhow::Result<bool> {
+        terminal_input
+            .drain_ready(crate::tui::input_source::MAX_DRAIN_PER_PASS, |item| {
+                self.handle_event_stream_item(item)
+            })
+            .await
+    }
+
+    pub(super) fn service_due_mouse_gesture_timers(&mut self, now: std::time::Duration) {
+        self.event_loop_monotonic_now = now;
+        let Some(deadline) = self.mouse_gesture_state.pending_copy_deadline else {
+            return;
+        };
+        if now < deadline {
+            return;
+        }
+        let Some(token) = self.mouse_gesture_state.copy_token else {
+            return;
+        };
+        let Some(press_generation) = self.mouse_gesture_state.copy_press_generation else {
+            return;
+        };
+        self.reduce_mouse_gesture(mouse_gesture::GestureInput::CopyTimerFired {
+            token,
+            press_generation,
+            now,
+        });
+    }
+
+    pub(super) fn invalidate_mouse_gesture(
+        &mut self,
+        reason: MouseGestureInvalidation,
+        now: std::time::Duration,
+    ) {
+        let input = match reason {
+            MouseGestureInvalidation::Cancel => mouse_gesture::GestureInput::Cancel { now },
+            MouseGestureInvalidation::ViewChange => mouse_gesture::GestureInput::ViewChange { now },
+            MouseGestureInvalidation::TerminalChange => {
+                mouse_gesture::GestureInput::TerminalChange { now }
+            }
+        };
+        self.reduce_mouse_gesture(input);
+        self.abort_pending_mouse_copies();
+    }
+
+    pub(super) fn cancel_mouse_gesture(&mut self, now: std::time::Duration) {
+        self.invalidate_mouse_gesture(MouseGestureInvalidation::Cancel, now);
+    }
+
+    pub(super) fn abort_pending_mouse_copies(&mut self) {
+        let ids: Vec<_> = self
+            .pending_mouse_copies
+            .drain()
+            .map(|(id, _)| id)
+            .collect();
+        for id in ids {
+            self.async_actions.abort_id(id);
+        }
+    }
+
+    pub(super) fn drop_mouse_copy_ui_ownership(&mut self) {
+        self.pending_mouse_copies.clear();
+        self.mouse_gesture_state.invalidate_copy();
+    }
+
+    pub(super) fn tombstone_cancelled_mouse_copies(&mut self, cancelled: &[AsyncActionResult]) {
+        for result in cancelled {
+            if matches!(
+                result.kind,
+                crate::tui::async_action::AsyncActionKind::Blocking("mouse.copy")
+            ) {
+                self.pending_mouse_copies.remove(&result.id);
+            }
+        }
+    }
+
+    pub(super) fn chat_semantic_target_at(
+        &self,
+        cell: mouse_gesture::Cell,
+    ) -> mouse_gesture::SemanticTarget {
+        let Some(area) = self.chat_area else {
+            return mouse_gesture::SemanticTarget::NonSelectable;
+        };
+        if cell.0 < area.x
+            || cell.0 >= area.x.saturating_add(area.width)
+            || cell.1 < area.y
+            || cell.1 >= area.y.saturating_add(area.height)
+        {
+            return mouse_gesture::SemanticTarget::NonSelectable;
+        }
+        let rel_row = cell.1.saturating_sub(area.y) as usize;
+        let rel_col = cell.0.saturating_sub(area.x) as usize;
+        let Some(meta) = self.chat_row_meta.get(rel_row) else {
+            return mouse_gesture::SemanticTarget::NonSelectable;
+        };
+        if !meta.selectable
+            || matches!(
+                meta.row_kind,
+                super::render::ChatRowKind::Padding
+                    | super::render::ChatRowKind::Banner
+                    | super::render::ChatRowKind::Chip
+            )
+        {
+            return mouse_gesture::SemanticTarget::NonSelectable;
+        }
+        if let Some(frag_id) = meta.copy_cells.get(rel_col).copied().flatten() {
+            if let Some(frag) = meta.copy_fragments.get(frag_id as usize)
+                && frag.table_cell.is_some()
+            {
+                return mouse_gesture::SemanticTarget::TableCell {
+                    cell,
+                    fragment_id: frag_id,
+                };
+            }
+            return mouse_gesture::SemanticTarget::PlainCell(cell);
+        }
+        if !meta.copy_cells.is_empty() {
+            return mouse_gesture::SemanticTarget::NonSelectable;
+        }
+        mouse_gesture::SemanticTarget::PlainCell(cell)
+    }
+
+    fn materialize_gesture_selection(
+        &mut self,
+        request: mouse_gesture::SelectionRequest,
+    ) -> Option<Selection> {
+        match request.kind {
+            mouse_gesture::SelectionKind::Drag => {
+                self.selection_spans = None;
+                Some(Selection {
+                    anchor: request.anchor,
+                    focus: request.focus,
+                    active: request.active,
+                })
+            }
+            mouse_gesture::SelectionKind::Word => {
+                let spans = self.word_spans_at(request.anchor);
+                self.selection_spans = (!spans.is_empty()).then_some(spans.clone());
+                Some(selection_from_spans(&spans, request.anchor, false))
+            }
+            mouse_gesture::SelectionKind::Line => {
+                let spans = self.line_spans_at(request.anchor);
+                self.selection_spans = (!spans.is_empty()).then_some(spans.clone());
+                Some(selection_from_spans(&spans, request.anchor, false))
+            }
+            mouse_gesture::SelectionKind::TableCell => {
+                let spans = self.table_cell_spans_at(request.anchor);
+                self.selection_spans = (!spans.is_empty()).then_some(spans.clone());
+                Some(selection_from_spans(&spans, request.anchor, false))
+            }
+        }
+    }
+
+    fn word_spans_at(&self, cell: (u16, u16)) -> Vec<SelectionSpan> {
+        let Some(area) = self.chat_area else {
+            return vec![SelectionSpan {
+                row: cell.1,
+                start_col: cell.0,
+                end_col: cell.0,
+            }];
+        };
+        let rel_row = cell.1.saturating_sub(area.y) as usize;
+        let rel_col = cell.0.saturating_sub(area.x) as usize;
+        let Some(row) = self.chat_text_grid.get(rel_row) else {
+            return vec![SelectionSpan {
+                row: cell.1,
+                start_col: cell.0,
+                end_col: cell.0,
+            }];
+        };
+        if row.is_empty() {
+            return Vec::new();
+        }
+        let col = rel_col.min(row.len().saturating_sub(1));
+        let wordy = row.get(col).is_some_and(|cell| is_word_cell(cell));
+        let mut start = col;
+        let mut end = col;
+        while start > 0
+            && row
+                .get(start - 1)
+                .is_some_and(|c| is_word_cell(c) == wordy && !c.chars().all(char::is_whitespace))
+        {
+            start -= 1;
+        }
+        while end + 1 < row.len()
+            && row
+                .get(end + 1)
+                .is_some_and(|c| is_word_cell(c) == wordy && !c.chars().all(char::is_whitespace))
+        {
+            end += 1;
+        }
+        if row
+            .get(col)
+            .is_some_and(|c| c.chars().all(char::is_whitespace))
+        {
+            return Vec::new();
+        }
+        vec![SelectionSpan {
+            row: cell.1,
+            start_col: area.x.saturating_add(start as u16),
+            end_col: area.x.saturating_add(end as u16),
+        }]
+    }
+
+    fn line_spans_at(&self, cell: (u16, u16)) -> Vec<SelectionSpan> {
+        let Some(area) = self.chat_area else {
+            return Vec::new();
+        };
+        let rel_row = cell.1.saturating_sub(area.y) as usize;
+        if rel_row >= self.chat_row_meta.len() {
+            return Vec::new();
+        }
+        let mut first = rel_row;
+        while first > 0
+            && self
+                .chat_row_meta
+                .get(first)
+                .is_some_and(|meta| meta.continuation)
+        {
+            first -= 1;
+        }
+        let mut last = rel_row;
+        while last + 1 < self.chat_row_meta.len()
+            && self
+                .chat_row_meta
+                .get(last + 1)
+                .is_some_and(|meta| meta.continuation)
+        {
+            last += 1;
+        }
+        (first..=last)
+            .filter_map(|row| {
+                let grid = self.chat_text_grid.get(row)?;
+                let (start, end) = content_col_bounds(grid)?;
+                Some(SelectionSpan {
+                    row: area.y.saturating_add(row as u16),
+                    start_col: area.x.saturating_add(start as u16),
+                    end_col: area.x.saturating_add(end as u16),
+                })
+            })
+            .collect()
+    }
+
+    fn table_cell_spans_at(&self, cell: (u16, u16)) -> Vec<SelectionSpan> {
+        let Some(area) = self.chat_area else {
+            return Vec::new();
+        };
+        let rel_row = cell.1.saturating_sub(area.y) as usize;
+        let rel_col = cell.0.saturating_sub(area.x) as usize;
+        let Some(meta) = self.chat_row_meta.get(rel_row) else {
+            return Vec::new();
+        };
+        let Some(frag_id) = meta.copy_cells.get(rel_col).copied().flatten() else {
+            return self.word_spans_at(cell);
+        };
+        let Some(fragment) = meta.copy_fragments.get(frag_id as usize) else {
+            return self.word_spans_at(cell);
+        };
+        let Some(table_cell) = fragment.table_cell else {
+            return self.word_spans_at(cell);
+        };
+        let history_index = meta.history_index;
+        let mut spans = Vec::new();
+        for (row_i, row_meta) in self.chat_row_meta.iter().enumerate() {
+            if row_meta.history_index != history_index {
+                continue;
+            }
+            let mut start = None;
+            let mut end = None;
+            let flush =
+                |spans: &mut Vec<SelectionSpan>, start: Option<usize>, end: Option<usize>| {
+                    if let (Some(start), Some(end)) = (start, end) {
+                        spans.push(SelectionSpan {
+                            row: area.y.saturating_add(row_i as u16),
+                            start_col: area.x.saturating_add(start as u16),
+                            end_col: area.x.saturating_add(end as u16),
+                        });
+                    }
+                };
+            for (col_i, cell_frag) in row_meta.copy_cells.iter().enumerate() {
+                let matches_cell = cell_frag
+                    .and_then(|id| row_meta.copy_fragments.get(id as usize))
+                    .is_some_and(|frag| frag.table_cell == Some(table_cell));
+                if matches_cell {
+                    if start.is_none() {
+                        start = Some(col_i);
+                    }
+                    end = Some(col_i);
+                } else if start.is_some() {
+                    flush(&mut spans, start, end);
+                    start = None;
+                    end = None;
+                }
+            }
+            flush(&mut spans, start, end);
+        }
+        spans
+    }
+
+    fn dispatch_chat_gesture(&mut self, mouse: MouseEvent) {
+        let now = self.event_loop_monotonic_now;
+        let cell = self.clamp_to_chat_area(mouse.column, mouse.row);
+        let target = self.chat_semantic_target_at(cell);
+        let input = match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => mouse_gesture::GestureInput::Press {
+                button: mouse_gesture::ClickButton::Primary,
+                cell,
+                target,
+                now,
+            },
+            MouseEventKind::Down(_) => mouse_gesture::GestureInput::Press {
+                button: mouse_gesture::ClickButton::Other,
+                cell,
+                target,
+                now,
+            },
+            MouseEventKind::Drag(MouseButton::Left) => {
+                mouse_gesture::GestureInput::Move { cell, target, now }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                mouse_gesture::GestureInput::Release { cell, now }
+            }
+            _ => return,
+        };
+        self.reduce_mouse_gesture(input);
+    }
+
+    fn reduce_mouse_gesture(
+        &mut self,
+        input: mouse_gesture::GestureInput,
+    ) -> Vec<mouse_gesture::GestureEffect> {
+        let cfg = mouse_gesture::GestureConfig {
+            copy_on_release: self.copy_on_release,
+        };
+        let state = std::mem::replace(
+            &mut self.mouse_gesture_state,
+            mouse_gesture::GestureState::new(),
+        );
+        let (next, effects) = mouse_gesture::reduce(state, &cfg, &input);
+        self.mouse_gesture_state = next;
+        self.apply_gesture_effects(&effects);
+        effects
+    }
+
+    fn apply_gesture_effects(&mut self, effects: &[mouse_gesture::GestureEffect]) {
+        for effect in effects {
+            match effect {
+                mouse_gesture::GestureEffect::None
+                | mouse_gesture::GestureEffect::ScheduleActivation { .. }
+                | mouse_gesture::GestureEffect::CancelActivation { .. }
+                | mouse_gesture::GestureEffect::Activate { .. }
+                | mouse_gesture::GestureEffect::Notify { .. }
+                | mouse_gesture::GestureEffect::ScheduleCopyTimer { .. } => {}
+                mouse_gesture::GestureEffect::Select(request) => {
+                    self.selection = self.materialize_gesture_selection(*request);
+                }
+                mouse_gesture::GestureEffect::ClearSelection => {
+                    self.selection = None;
+                    self.selection_spans = None;
+                }
+                mouse_gesture::GestureEffect::ScheduleCopy {
+                    token,
+                    press_generation,
+                    ..
+                } => {
+                    self.schedule_mouse_copy(*token, *press_generation);
+                }
+            }
+        }
+    }
+
+    pub(super) fn snapshot_selection_text(&self) -> String {
+        let Some(sel) = self.selection else {
+            return String::new();
+        };
+        let Some(area) = self.chat_area else {
+            return String::new();
+        };
+        if self.chat_text_grid.len() != area.height as usize
+            || self
+                .chat_text_grid
+                .iter()
+                .any(|row| row.len() != area.width as usize)
+        {
+            return String::new();
+        }
+        extract_selection_semantic_shaped(
+            &self.chat_row_meta,
+            area,
+            sel,
+            self.selection_spans.as_deref(),
+        )
+        .unwrap_or_else(|| {
+            extract_selection_plaintext_shaped(
+                &self.chat_text_grid,
+                &self.chat_row_meta,
+                area,
+                sel,
+                self.selection_spans.as_deref(),
+            )
+        })
+    }
+
+    fn schedule_mouse_copy(&mut self, token: u64, press_generation: u64) {
+        let text = self.snapshot_selection_text();
+        let char_count = text.chars().count();
+        #[cfg(test)]
+        if self.arm_controllable_mouse_copy {
+            self.start_controllable_mouse_copy(token, press_generation, char_count);
+            return;
+        }
+        let start = if text.is_empty() {
+            self.async_actions.start(
+                crate::tui::async_action::AsyncActionKind::Blocking("mouse.copy"),
+                crate::tui::async_action::AsyncActionPolicy::Dedupe(
+                    crate::tui::async_action::AsyncActionKey::new("mouse.copy"),
+                ),
+                async move {
+                    Ok(crate::tui::async_action::AsyncActionPayload::MouseCopy(
+                        crate::tui::async_action::MouseCopyResult::Empty,
+                    ))
+                },
+            )
+        } else {
+            let recovery = self.clipboard_recovery;
+            self.async_actions.start_blocking(
+                crate::tui::async_action::AsyncActionKind::Blocking("mouse.copy"),
+                crate::tui::async_action::AsyncActionPolicy::Dedupe(
+                    crate::tui::async_action::AsyncActionKey::new("mouse.copy"),
+                ),
+                move || {
+                    Ok(crate::tui::async_action::AsyncActionPayload::MouseCopy(
+                        map_delivery_to_mouse_copy(&text, recovery),
+                    ))
+                },
+            )
+        };
+        self.own_started_mouse_copy(start, token, press_generation, char_count);
+    }
+
+    fn own_started_mouse_copy(
+        &mut self,
+        start: crate::tui::async_action::AsyncActionStart,
+        token: u64,
+        press_generation: u64,
+        char_count: usize,
+    ) {
+        match start {
+            crate::tui::async_action::AsyncActionStart::Started(id) => {
+                self.pending_mouse_copies.insert(
+                    id,
+                    PendingMouseCopy {
+                        token,
+                        press_generation,
+                        char_count,
+                    },
+                );
+            }
+            crate::tui::async_action::AsyncActionStart::Existing(_) => {
+                let effects =
+                    self.reduce_mouse_gesture(mouse_gesture::GestureInput::CopyRejected {
+                        token,
+                        press_generation,
+                        now: self.event_loop_monotonic_now,
+                    });
+                if effects
+                    .iter()
+                    .any(|effect| matches!(effect, mouse_gesture::GestureEffect::Notify { .. }))
+                {
+                    self.show_mouse_copy_toast(
+                        crate::tui::async_action::MouseCopyResult::Failed,
+                        char_count,
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn start_controllable_mouse_copy(
+        &mut self,
+        token: u64,
+        press_generation: u64,
+        char_count: usize,
+    ) -> Option<crate::tui::async_action::AsyncActionId> {
+        let (start, runner) = self.async_actions.start_controllable_mouse_copy();
+        match start {
+            crate::tui::async_action::AsyncActionStart::Started(id) => {
+                self.pending_mouse_copies.insert(
+                    id,
+                    PendingMouseCopy {
+                        token,
+                        press_generation,
+                        char_count,
+                    },
+                );
+                self.controllable_mouse_copy = Some(runner);
+                Some(id)
+            }
+            crate::tui::async_action::AsyncActionStart::Existing(_) => {
+                self.reduce_mouse_gesture(mouse_gesture::GestureInput::CopyRejected {
+                    token,
+                    press_generation,
+                    now: self.event_loop_monotonic_now,
+                });
+                None
+            }
+        }
+    }
+
+    pub(super) fn apply_mouse_copy_action_result(&mut self, result: AsyncActionResult) {
+        let Some(pending) = self.pending_mouse_copies.remove(&result.id) else {
+            return;
+        };
+        let now = self.event_loop_monotonic_now;
+        match result.payload {
+            Ok(crate::tui::async_action::AsyncActionPayload::MouseCopy(copy_result)) => {
+                let outcome = match copy_result {
+                    crate::tui::async_action::MouseCopyResult::Confirmed => {
+                        mouse_gesture::CopyOutcome::Confirmed
+                    }
+                    crate::tui::async_action::MouseCopyResult::Unverified => {
+                        mouse_gesture::CopyOutcome::Unverified
+                    }
+                    crate::tui::async_action::MouseCopyResult::TooLarge => {
+                        mouse_gesture::CopyOutcome::TooLarge
+                    }
+                    crate::tui::async_action::MouseCopyResult::Failed => {
+                        mouse_gesture::CopyOutcome::Failed
+                    }
+                    crate::tui::async_action::MouseCopyResult::Empty => {
+                        mouse_gesture::CopyOutcome::Empty
+                    }
+                };
+                let effects =
+                    self.reduce_mouse_gesture(mouse_gesture::GestureInput::CopyCompleted {
+                        token: pending.token,
+                        press_generation: pending.press_generation,
+                        outcome,
+                        now,
+                    });
+                if effects
+                    .iter()
+                    .any(|effect| matches!(effect, mouse_gesture::GestureEffect::Notify { .. }))
+                {
+                    self.show_mouse_copy_toast(copy_result, pending.char_count);
+                }
+            }
+            Ok(_) | Err(_) => {
+                let effects =
+                    self.reduce_mouse_gesture(mouse_gesture::GestureInput::CopyRejected {
+                        token: pending.token,
+                        press_generation: pending.press_generation,
+                        now,
+                    });
+                if effects
+                    .iter()
+                    .any(|effect| matches!(effect, mouse_gesture::GestureEffect::Notify { .. }))
+                {
+                    self.show_mouse_copy_toast(
+                        crate::tui::async_action::MouseCopyResult::Failed,
+                        pending.char_count,
+                    );
+                }
+            }
+        }
+    }
+
+    fn show_mouse_copy_toast(
+        &mut self,
+        result: crate::tui::async_action::MouseCopyResult,
+        char_count: usize,
+    ) {
+        match result {
+            crate::tui::async_action::MouseCopyResult::Confirmed => self.show_toast(
+                format!("Copied {char_count} chars to clipboard."),
+                ToastKind::Success,
+            ),
+            crate::tui::async_action::MouseCopyResult::Unverified => self.show_toast(
+                format!(
+                    "Copied {char_count} chars to clipboard. (unverified — could not confirm delivery)"
+                ),
+                ToastKind::Warning,
+            ),
+            crate::tui::async_action::MouseCopyResult::TooLarge => self.show_toast(
+                "Selection too large to copy (max sequence size) — copy a smaller range.",
+                ToastKind::Error,
+            ),
+            crate::tui::async_action::MouseCopyResult::Failed => {
+                self.show_toast("Copy failed.", ToastKind::Error)
+            }
+            crate::tui::async_action::MouseCopyResult::Empty => {}
+        }
+    }
+}
+
+fn map_delivery_to_mouse_copy(
+    text: &str,
+    recovery: crate::clipboard::ClipboardRecovery,
+) -> crate::tui::async_action::MouseCopyResult {
+    match crate::clipboard::copy_plain(text, recovery) {
+        Ok(result) => match result.confidence {
+            crate::clipboard::Confidence::Confirmed => {
+                crate::tui::async_action::MouseCopyResult::Confirmed
+            }
+            crate::clipboard::Confidence::Unverified => {
+                crate::tui::async_action::MouseCopyResult::Unverified
+            }
+            crate::clipboard::Confidence::Failed => {
+                crate::tui::async_action::MouseCopyResult::Failed
+            }
+        },
+        Err(crate::clipboard::CopyError::TooLarge { .. }) => {
+            crate::tui::async_action::MouseCopyResult::TooLarge
+        }
+        Err(crate::clipboard::CopyError::Empty) => crate::tui::async_action::MouseCopyResult::Empty,
+        Err(_) => crate::tui::async_action::MouseCopyResult::Failed,
+    }
+}
+
+fn is_word_cell(cell: &str) -> bool {
+    cell.chars()
+        .any(|ch| ch.is_alphanumeric() || ch == '_' || ch == '-')
+}
+
+fn content_col_bounds(row: &[String]) -> Option<(usize, usize)> {
+    let first = row
+        .iter()
+        .position(|c| !c.chars().all(|ch| ch.is_whitespace()))?;
+    let last = row
+        .iter()
+        .rposition(|c| !c.chars().all(|ch| ch.is_whitespace()))?;
+    Some((first, last))
+}
+
+fn selection_from_spans(spans: &[SelectionSpan], fallback: (u16, u16), active: bool) -> Selection {
+    match (spans.first(), spans.last()) {
+        (Some(first), Some(last)) => Selection {
+            anchor: (first.start_col, first.row),
+            focus: (last.end_col, last.row),
+            active,
+        },
+        _ => Selection {
+            anchor: fallback,
+            focus: fallback,
+            active,
+        },
+    }
+}
+
+pub(super) fn extract_selection_plaintext_shaped(
+    grid: &[Vec<String>],
+    row_meta: &[super::render::ChatRowMeta],
+    area: Rect,
+    sel: Selection,
+    spans: Option<&[SelectionSpan]>,
+) -> String {
+    if let Some(spans) = spans.filter(|spans| !spans.is_empty()) {
+        return extract_selection_plaintext_from_spans(grid, row_meta, area, spans);
+    }
+    extract_selection_plaintext(grid, row_meta, area, sel)
+}
+
+fn extract_selection_plaintext_from_spans(
+    grid: &[Vec<String>],
+    row_meta: &[super::render::ChatRowMeta],
+    area: Rect,
+    spans: &[SelectionSpan],
+) -> String {
+    use crate::tui::history::AGENT_INDENT;
+    let mut out = String::new();
+    let mut first_emitted = true;
+    for span in spans {
+        let grid_row = span.row.saturating_sub(area.y) as usize;
+        let Some(meta) = row_meta.get(grid_row) else {
+            continue;
+        };
+        if !meta.selectable {
+            continue;
+        }
+        let Some(row) = grid.get(grid_row) else {
+            continue;
+        };
+        let first_col = span.start_col.saturating_sub(area.x) as usize;
+        let last_col = span.end_col.saturating_sub(area.x) as usize;
+        let mut line = String::new();
+        for col in first_col..=last_col.min(row.len().saturating_sub(1)) {
+            if let Some(symbol) = row.get(col) {
+                line.push_str(symbol);
+            }
+        }
+        let trimmed = line.trim_end_matches(' ').to_string();
+        let leading_spaces = trimmed.chars().take_while(|c| *c == ' ').count();
+        let strip = leading_spaces.min(AGENT_INDENT);
+        let stripped: String = trimmed.chars().skip(strip).collect();
+        if first_emitted {
+            first_emitted = false;
+        } else {
+            out.push(if meta.continuation { ' ' } else { '\n' });
+        }
+        out.push_str(&stripped);
+    }
+    out
+}
+
+pub(super) fn extract_selection_semantic_shaped(
+    row_meta: &[super::render::ChatRowMeta],
+    area: Rect,
+    sel: Selection,
+    spans: Option<&[SelectionSpan]>,
+) -> Option<String> {
+    if let Some(spans) = spans.filter(|spans| !spans.is_empty()) {
+        return extract_selection_semantic_from_spans(row_meta, area, spans);
+    }
+    extract_selection_semantic(row_meta, area, sel)
+}
+
+fn extract_selection_semantic_from_spans(
+    row_meta: &[super::render::ChatRowMeta],
+    area: Rect,
+    spans: &[SelectionSpan],
+) -> Option<String> {
+    let mut out = String::new();
+    let mut last_identity: Option<(Option<usize>, usize)> = None;
+    let mut last_message = None;
+    let mut emitted_row = false;
+    let mut saw_semantic_row = false;
+    for span in spans {
+        let row_index = span.row.saturating_sub(area.y) as usize;
+        let meta = row_meta.get(row_index)?;
+        if meta.copy_target.is_some() {
+            if !meta.copy_provenance_present {
+                return None;
+            }
+            saw_semantic_row = true;
+        } else if meta.selectable {
+            return None;
+        }
+        let first_col = span.start_col.saturating_sub(area.x) as usize;
+        let last_col = span.end_col.saturating_sub(area.x) as usize;
+        let mut row_emitted = false;
+        let mut row_table_cell = None;
+        for fragment_id in meta
+            .copy_cells
+            .get(first_col..=last_col.min(meta.copy_cells.len().saturating_sub(1)))
+            .unwrap_or_default()
+            .iter()
+            .flatten()
+        {
+            let fragment = meta.copy_fragments.get(*fragment_id as usize)?;
+            let identity = (meta.history_index, fragment.id);
+            if last_identity == Some(identity) {
+                continue;
+            }
+            if !row_emitted && emitted_row {
+                let cross_message = usize::from(last_message != meta.history_index);
+                for _ in 0..meta.copy_newlines_before.max(cross_message) {
+                    out.push('\n');
+                }
+            }
+            if row_emitted
+                && let (Some(previous), Some(current)) = (row_table_cell, fragment.table_cell)
+                && previous != current
+            {
+                out.push('\t');
+            }
+            out.push_str(&fragment.text);
+            last_identity = Some(identity);
+            row_emitted = true;
+            emitted_row = true;
+            last_message = meta.history_index;
+            row_table_cell = fragment.table_cell.or(row_table_cell);
+        }
+        if meta.copy_fallback_if_unmapped {
+            return None;
+        }
+    }
+    saw_semantic_row.then_some(out)
 }
 
 #[cfg(test)]

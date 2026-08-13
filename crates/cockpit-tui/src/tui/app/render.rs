@@ -39,8 +39,9 @@ use crate::tui::theme::{
 
 use super::{
     AUTOCOMPLETE_ROWS, AffordanceTarget, App, DirtyScan, HistoryEntryId, HistoryRenderCacheEntry,
-    PaneSide, PrewrappedEntry, ScrollAnchor, Selection, StartupModal, SuggestionBoxKind,
-    SuggestionBoxRowHit, SuggestionBoxTarget, Toast, ToastKind, TranscriptFind, WORKING_MESSAGES,
+    PaneSide, PrewrappedEntry, ScrollAnchor, Selection, SelectionSpan, StartupModal,
+    SuggestionBoxKind, SuggestionBoxRowHit, SuggestionBoxTarget, Toast, ToastKind, TranscriptFind,
+    WORKING_MESSAGES,
 };
 
 /// Startup grace before the working indicator first appears — prevents
@@ -2908,6 +2909,7 @@ impl App {
                 frame.buffer_mut(),
                 area,
                 sel,
+                self.selection_spans.as_deref(),
                 &chip_row_mask,
                 &self.chat_text_grid,
             );
@@ -4700,9 +4702,36 @@ fn apply_selection_highlight(
     buf: &mut ratatui::buffer::Buffer,
     area: Rect,
     sel: Selection,
+    spans: Option<&[SelectionSpan]>,
     chip_row_mask: &[bool],
     chat_text_grid: &[Vec<String>],
 ) {
+    if let Some(spans) = spans.filter(|spans| !spans.is_empty()) {
+        for span in spans {
+            if span.row < area.y || span.row >= area.y.saturating_add(area.height) {
+                continue;
+            }
+            let chat_rel = span.row.saturating_sub(area.y) as usize;
+            if chip_row_mask.get(chat_rel).copied().unwrap_or(false) {
+                continue;
+            }
+            let first = span.start_col.max(area.x);
+            let last = span
+                .end_col
+                .min(area.x.saturating_add(area.width.saturating_sub(1)));
+            if first > last {
+                continue;
+            }
+            for col in first..=last {
+                if let Some(cell) = buf.cell_mut((col, span.row)) {
+                    let mut style = cell.style();
+                    style = style.add_modifier(ratatui::style::Modifier::REVERSED);
+                    cell.set_style(style);
+                }
+            }
+        }
+        return;
+    }
     let (start, end) = sel.ordered();
     let left = area.x;
     let right = area.x + area.width.saturating_sub(1);

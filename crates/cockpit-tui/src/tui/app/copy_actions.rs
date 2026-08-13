@@ -174,6 +174,8 @@ impl App {
     }
 
     pub(super) fn copy_selection_plaintext(&mut self) {
+        self.abort_pending_mouse_copies();
+        self.mouse_gesture_state.invalidate_copy();
         let recovery = self.clipboard_recovery;
         self.copy_selection_plaintext_with(move |text| {
             crate::clipboard::copy_plain(text, recovery)
@@ -185,13 +187,7 @@ impl App {
     /// empty). This is the copy-on-release path; the explicit
     /// `/copy`-keybind path uses [`copy_selection_plaintext`] which
     /// clears the selection after an accepted copy.
-    pub(super) fn copy_selection_plaintext_auto(&mut self) {
-        let recovery = self.clipboard_recovery;
-        self.copy_selection_plaintext_auto_with(move |text| {
-            crate::clipboard::copy_plain(text, recovery)
-        });
-    }
-
+    #[cfg(test)]
     pub(super) fn copy_selection_plaintext_auto_with(
         &mut self,
         copy_plain: impl FnOnce(
@@ -211,7 +207,7 @@ impl App {
             || start.0 < area.x
             || end.0 >= area.x + area.width
         {
-            self.selection = None;
+            self.cancel_mouse_gesture(self.event_loop_monotonic_now);
             return;
         }
         if self.chat_text_grid.len() != area.height as usize
@@ -222,10 +218,21 @@ impl App {
         {
             return;
         }
-        let text_to_copy = extract_selection_semantic(&self.chat_row_meta, area, sel)
-            .unwrap_or_else(|| {
-                extract_selection_plaintext(&self.chat_text_grid, &self.chat_row_meta, area, sel)
-            });
+        let text_to_copy = extract_selection_semantic_shaped(
+            &self.chat_row_meta,
+            area,
+            sel,
+            self.selection_spans.as_deref(),
+        )
+        .unwrap_or_else(|| {
+            extract_selection_plaintext_shaped(
+                &self.chat_text_grid,
+                &self.chat_row_meta,
+                area,
+                sel,
+                self.selection_spans.as_deref(),
+            )
+        });
         if text_to_copy.is_empty() {
             return;
         }
@@ -280,7 +287,7 @@ impl App {
             || start.0 < area.x
             || end.0 >= area.x + area.width
         {
-            self.selection = None;
+            self.cancel_mouse_gesture(self.event_loop_monotonic_now);
             return;
         }
         if self.chat_text_grid.len() != area.height as usize
@@ -291,10 +298,21 @@ impl App {
         {
             return;
         }
-        let text_to_copy = extract_selection_semantic(&self.chat_row_meta, area, sel)
-            .unwrap_or_else(|| {
-                extract_selection_plaintext(&self.chat_text_grid, &self.chat_row_meta, area, sel)
-            });
+        let text_to_copy = extract_selection_semantic_shaped(
+            &self.chat_row_meta,
+            area,
+            sel,
+            self.selection_spans.as_deref(),
+        )
+        .unwrap_or_else(|| {
+            extract_selection_plaintext_shaped(
+                &self.chat_text_grid,
+                &self.chat_row_meta,
+                area,
+                sel,
+                self.selection_spans.as_deref(),
+            )
+        });
         if text_to_copy.is_empty() {
             return;
         }
@@ -316,6 +334,7 @@ impl App {
                 // what they wanted; leaving it highlighted just gets in the
                 // way of the next interaction.
                 self.selection = None;
+                self.selection_spans = None;
             }
             Err(crate::clipboard::CopyError::TooLarge { .. }) => {
                 self.show_toast(

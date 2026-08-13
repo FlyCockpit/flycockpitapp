@@ -65,6 +65,7 @@ use events::{
     tool_invocation,
 };
 use input::accepts_key;
+use mouse::{extract_selection_plaintext_shaped, extract_selection_semantic_shaped};
 use render::{extract_selection_plaintext, extract_selection_semantic, is_edit_tool};
 #[cfg(test)]
 use slash::{
@@ -105,7 +106,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::tui::agent_runner::{self, AgentRunner};
 use crate::tui::app::btw_pane::BtwPane;
 use crate::tui::async_action::{
-    AsyncActionCancellation, AsyncActionKey, AsyncActionKind, AsyncActionPayload,
+    AsyncActionCancellation, AsyncActionId, AsyncActionKey, AsyncActionKind, AsyncActionPayload,
     AsyncActionPolicy, AsyncActionResult, AsyncActionRunner, AsyncActionStart,
 };
 use crate::tui::composer::{Composer, VimMode, input_prefix_width};
@@ -749,6 +750,8 @@ fn new_external_editor_tempfile() -> std::io::Result<tempfile::NamedTempFile> {
     builder.tempfile()
 }
 
+#[cfg(test)]
+mod mouse_gesture_app_tests;
 #[cfg(test)]
 mod selection_copy_state_tests;
 
@@ -1945,10 +1948,17 @@ pub struct App {
     /// Pure gesture reducer state for explicit mouse selection and
     /// copy-on-release. Carries press/activation generations and tokens
     /// so late timer/clipboard results cannot overwrite newer state.
-    /// The pure reducer is unit-tested independently; production mouse
-    /// routing uses the `LinkPointerGesture` and existing handlers.
-    #[allow(dead_code)]
     pub(super) mouse_gesture_state: mouse_gesture::GestureState,
+    /// Highlight/extract spans for word/line/table selections that must
+    /// exclude adjacent cells. `None` means the rectangular `selection`.
+    pub(super) selection_spans: Option<Vec<SelectionSpan>>,
+    /// In-flight auto-copy actions keyed by the runner's `AsyncActionId`.
+    pub(super) pending_mouse_copies: HashMap<AsyncActionId, PendingMouseCopy>,
+    #[cfg(test)]
+    pub(super) arm_controllable_mouse_copy: bool,
+    #[cfg(test)]
+    pub(super) controllable_mouse_copy:
+        Option<crate::tui::async_action::ControllableMouseCopyRunner>,
     /// Pending delayed link activation, set when a single link click
     /// release schedules activation through the 500 ms multi-click
     /// window. The event loop checks this on each tick; if the deadline
@@ -2861,6 +2871,28 @@ struct PendingEditArgs {
     new: String,
 }
 
+/// Inclusive highlight span in absolute terminal coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SelectionSpan {
+    pub row: u16,
+    pub start_col: u16,
+    pub end_col: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MouseGestureInvalidation {
+    Cancel,
+    ViewChange,
+    TerminalChange,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PendingMouseCopy {
+    pub token: u64,
+    pub press_generation: u64,
+    pub char_count: usize,
+}
+
 /// Drag-select state for the chat area (plan.md T8.f). Coordinates
 /// are absolute terminal cells; we re-derive chat-relative positions
 /// at render time so resize / scroll changes don't desync.
@@ -2872,6 +2904,7 @@ struct Selection {
     focus: (u16, u16),
     /// True while the left button is still held. False once released
     /// (selection persists for copy until Esc or a new selection).
+    #[allow(dead_code)]
     active: bool,
 }
 
@@ -3410,6 +3443,12 @@ impl App {
             link_registry: crate::tui::links::LinkRegistry::default(),
             link_pointer_gesture: crate::tui::links::LinkPointerGesture::default(),
             mouse_gesture_state: mouse_gesture::GestureState::new(),
+            selection_spans: None,
+            pending_mouse_copies: HashMap::new(),
+            #[cfg(test)]
+            arm_controllable_mouse_copy: false,
+            #[cfg(test)]
+            controllable_mouse_copy: None,
             pending_link_activation: None,
             exit_tail_lines,
             rich_text_copy,
@@ -3624,6 +3663,7 @@ impl App {
         }) {
             self.close_btw_pane();
         }
+        self.drop_mouse_copy_ui_ownership();
         let async_shutdown = self.async_actions.shutdown_and_reap().await;
         if async_shutdown.export_cleanup_failed > 0 || async_shutdown.export_cleanup_timed_out > 0 {
             eprintln!(
@@ -3745,6 +3785,9 @@ impl App {
                 .values()
                 .map(|probe| probe.deadline.saturating_sub(terminal_input.now()))
                 .min();
+            let mouse_gesture_wait = self
+                .next_mouse_gesture_deadline()
+                .map(|deadline| deadline.saturating_sub(terminal_input.now()));
 
             if self.animation_tick_active() {
                 let animation = tokio::time::sleep(ANIMATION_TICK);
@@ -3780,6 +3823,18 @@ impl App {
                         needs_redraw = true;
                     }
                     _ = wait_optional_duration(paste_probe_wait) => {
+                        needs_redraw = true;
+                    }
+                    _ = wait_optional_duration(mouse_gesture_wait) => {
+                        if self
+                            .drain_ready_terminal_input_before_gesture_timer(&mut terminal_input)
+                            .await?
+                        {
+                            break;
+                        }
+                        let now = terminal_input.now();
+                        self.event_loop_monotonic_now = now;
+                        self.service_due_mouse_gesture_timers(now);
                         needs_redraw = true;
                     }
                     _ = &mut animation => {
@@ -3818,6 +3873,18 @@ impl App {
                         needs_redraw = true;
                     }
                     _ = wait_optional_duration(paste_probe_wait) => {
+                        needs_redraw = true;
+                    }
+                    _ = wait_optional_duration(mouse_gesture_wait) => {
+                        if self
+                            .drain_ready_terminal_input_before_gesture_timer(&mut terminal_input)
+                            .await?
+                        {
+                            break;
+                        }
+                        let now = terminal_input.now();
+                        self.event_loop_monotonic_now = now;
+                        self.service_due_mouse_gesture_timers(now);
                         needs_redraw = true;
                     }
                 }
@@ -3877,13 +3944,16 @@ impl App {
     fn handle_event_stream_item(&mut self, item: Option<ObservedTerminalEvent>) -> Result<bool> {
         match item {
             Some(observed) => match observed.event {
-                Ok(event) => Ok(self.handle_observed_terminal_event(
-                    event,
-                    observed.observed_at,
-                    observed.terminal_generation,
-                    observed.paste_source,
-                    observed.paste_correlation_id,
-                )),
+                Ok(event) => {
+                    self.event_loop_monotonic_now = observed.observed_at;
+                    Ok(self.handle_observed_terminal_event(
+                        event,
+                        observed.observed_at,
+                        observed.terminal_generation,
+                        observed.paste_source,
+                        observed.paste_correlation_id,
+                    ))
+                }
                 Err(error) => Err(error.into()),
             },
             None => Ok(true),
@@ -3906,6 +3976,10 @@ impl App {
                 self.link_registry.invalidate_pointer_generation();
                 self.pending_link_activation = None;
                 self.dialog.cancel_settings_pointer_transients();
+                self.invalidate_mouse_gesture(
+                    MouseGestureInvalidation::ViewChange,
+                    self.event_loop_monotonic_now,
+                );
                 false
             }
             _ => false,
@@ -3943,6 +4017,7 @@ impl App {
             if had_unowned || had_cancelled_fence {
                 self.show_toast("Paste unavailable", ToastKind::Error);
             }
+            self.invalidate_mouse_gesture(MouseGestureInvalidation::TerminalChange, observed_at);
             self.terminal_input_generation = Some(terminal_generation);
             for key in replay {
                 if self.handle_frozen_composer_key(key) {

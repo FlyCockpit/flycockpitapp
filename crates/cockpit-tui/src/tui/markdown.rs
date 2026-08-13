@@ -29,7 +29,8 @@ pub(crate) struct CopyFragment {
     #[allow(dead_code)]
     pub(crate) source: Option<std::ops::Range<usize>>,
     pub(crate) logical_line: usize,
-    pub(crate) table_cell: Option<(usize, usize)>,
+    /// `(table_id, row, col)` so two tables in one message never collide.
+    pub(crate) table_cell: Option<(u32, usize, usize)>,
 }
 
 /// Markdown presentation and semantic-copy data produced by one parser pass.
@@ -427,6 +428,7 @@ struct Emitter {
     copy_newlines_before: Vec<usize>,
     copy_fragments: Vec<CopyFragment>,
     next_fragment_id: usize,
+    next_table_id: u32,
     logical_line: usize,
     pending_copy_newlines: usize,
     event_source: Option<std::ops::Range<usize>>,
@@ -450,6 +452,7 @@ struct ListState {
 
 #[derive(Default)]
 struct TableState {
+    id: u32,
     alignments: Vec<Alignment>,
     rows: Vec<TableRow>,
     current_row: Option<TableRow>,
@@ -598,9 +601,15 @@ impl Emitter {
             }
             Tag::Table(alignments) => {
                 self.flush_line();
+                let id = self.next_table_id;
+                self.next_table_id = self.next_table_id.saturating_add(1);
                 self.table = Some(TableState {
+                    id,
                     alignments,
-                    ..TableState::default()
+                    rows: Vec::new(),
+                    current_row: None,
+                    current_cell: None,
+                    in_head: false,
                 });
             }
             Tag::TableHead => {
@@ -850,9 +859,13 @@ impl Emitter {
         self.table.as_mut()?.current_cell.as_mut()
     }
 
-    fn current_table_coordinates(&self) -> Option<(usize, usize)> {
+    fn current_table_coordinates(&self) -> Option<(u32, usize, usize)> {
         let table = self.table.as_ref()?;
-        Some((table.rows.len(), table.current_row.as_ref()?.cells.len()))
+        Some((
+            table.id,
+            table.rows.len(),
+            table.current_row.as_ref()?.cells.len(),
+        ))
     }
 
     fn push_semantic_text(&mut self, text: String, style: Style) {
@@ -1189,7 +1202,7 @@ fn make_copy_fragments(
     text: &str,
     next_id: &mut usize,
     logical_line: usize,
-    table_cell: Option<(usize, usize)>,
+    table_cell: Option<(u32, usize, usize)>,
     source: Option<std::ops::Range<usize>>,
 ) -> (Vec<CopyFragment>, Vec<Option<u32>>) {
     let mut fragments = Vec::new();
@@ -1215,7 +1228,7 @@ fn make_copy_fragments_with_tabs(
     start_col: usize,
     next_id: &mut usize,
     logical_line: usize,
-    table_cell: Option<(usize, usize)>,
+    table_cell: Option<(u32, usize, usize)>,
     source: Option<std::ops::Range<usize>>,
 ) -> (Vec<CopyFragment>, Vec<Option<u32>>) {
     let mut fragments = Vec::new();
@@ -1678,7 +1691,7 @@ mod tests {
             .iter()
             .filter_map(|fragment| fragment.table_cell)
             .collect::<Vec<_>>();
-        assert!(cells.contains(&(0, 0)) && cells.iter().any(|cell| cell.0 >= 1));
+        assert!(cells.contains(&(0, 0, 0)) && cells.iter().any(|cell| cell.1 >= 1));
         assert_eq!(copied("| A | B |\n|---|---|\n| x | y |"), "AB\nxy");
         assert_eq!(
             copied("| math |\n|---|\n| $$\\frac{a}{b}$$ |"),
@@ -1689,7 +1702,7 @@ mod tests {
             inline_math
                 .copy_fragments
                 .iter()
-                .any(|fragment| fragment.text == "a" && fragment.table_cell == Some((0, 0)))
+                .any(|fragment| fragment.text == "a" && fragment.table_cell == Some((0, 0, 0)))
         );
     }
 

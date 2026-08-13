@@ -14,6 +14,20 @@ use std::time::{Duration, Instant};
 use assert_cmd::cargo::CommandCargoExt;
 use cockpit_cli::integration::{DaemonClient, DaemonStatus};
 
+#[cfg(unix)]
+mod hermetic;
+#[cfg(unix)]
+mod osc52_observer;
+#[cfg(unix)]
+mod tui_pty;
+
+#[cfg(unix)]
+pub use hermetic::*;
+#[cfg(unix)]
+pub use osc52_observer::*;
+#[cfg(unix)]
+pub use tui_pty::*;
+
 pub struct IsolatedHome {
     _root: tempfile::TempDir,
     config_home: PathBuf,
@@ -89,6 +103,30 @@ impl IsolatedHome {
 
     pub fn project_path(&self) -> &std::path::Path {
         &self.project
+    }
+
+    pub fn home_dir(&self) -> &std::path::Path {
+        self._root.path()
+    }
+
+    pub fn xdg_config_home(&self) -> &std::path::Path {
+        &self.config_home
+    }
+
+    pub fn xdg_data_home(&self) -> &std::path::Path {
+        &self.data_home
+    }
+
+    pub fn xdg_state_home(&self) -> &std::path::Path {
+        &self.state_home
+    }
+
+    pub fn xdg_runtime_dir(&self) -> &std::path::Path {
+        &self.runtime_dir
+    }
+
+    pub fn xdg_cache_home(&self) -> &std::path::Path {
+        &self.cache_home
     }
 
     pub fn write_local_provider_config(&self, base_url: &str) {
@@ -415,7 +453,7 @@ fn tail_file(path: PathBuf, max_bytes: usize) -> Option<String> {
 }
 
 #[cfg(unix)]
-fn pid_is_live(pid: u32) -> bool {
+pub(crate) fn pid_is_live(pid: u32) -> bool {
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
     if rc == 0 {
         return true;
@@ -424,7 +462,7 @@ fn pid_is_live(pid: u32) -> bool {
 }
 
 #[cfg(unix)]
-fn wait_for_pid_exit_blocking(pid: u32, timeout: Duration) -> bool {
+pub(crate) fn wait_for_pid_exit_blocking(pid: u32, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if !pid_is_live(pid) {

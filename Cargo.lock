@@ -1229,6 +1229,7 @@ dependencies = [
  "unicode-width",
  "urlencoding",
  "uuid",
+ "vt100",
  "walkdir",
  "which",
  "zbus",

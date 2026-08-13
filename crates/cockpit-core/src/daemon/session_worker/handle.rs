@@ -1659,6 +1659,13 @@ pub fn spawn(
             redact
         }
     };
+    // H1: this initial persist needs no redaction-table write lock. It runs
+    // during session-worker construction, strictly BEFORE the shared live table
+    // (`redaction`, below) and the per-session `InterruptHub` that owns the write
+    // lock exist and before the worker task is spawned — so no sealed adoption,
+    // approved-secret-file registration, or per-turn refresh can be in flight.
+    // It happens-before every locked writer, so it can neither read a stale table
+    // nor be clobbered by one.
     if let Err(error) = session.persist_redaction_table(&redact) {
         tracing::warn!(error = %error, %session_id, "persisting initial redaction table failed");
     }

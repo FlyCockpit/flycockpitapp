@@ -434,9 +434,13 @@ mod tests {
                 )
             })
             .unwrap();
-        let session = crate::session::Session::resume(db.clone(), session_row.session_id)
-            .unwrap()
-            .unwrap();
+        let session = crate::session::Session::resume(
+            db.clone(),
+            session_row.session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .unwrap();
         session.set_sandbox_enabled(false);
         let locks = Arc::new(crate::locks::LockManager::in_memory(db.clone()));
         let redact = Arc::new(

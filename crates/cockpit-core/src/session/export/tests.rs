@@ -182,7 +182,13 @@ async fn export_redaction_helper_scrubs_with_no_bypass() {
 
 async fn responses_session_with_intro() -> Session {
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(db, PathBuf::from("/proj"), "Build").unwrap();
+    let session = Session::create(
+        db,
+        PathBuf::from("/proj"),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
     session.set_active_model("codex-oauth", "gpt-5.4").unwrap();
     session
         .record_event(
@@ -207,7 +213,13 @@ async fn responses_session_with_intro() -> Session {
 
 fn transcript_session() -> Session {
     let db = Db::open_in_memory().unwrap();
-    Session::create(db, PathBuf::from("/proj"), "Build").unwrap()
+    Session::create(
+        db,
+        PathBuf::from("/proj"),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap()
 }
 
 async fn set_event_ts(db: &Db, seq: i64, ts_ms: i64) {
@@ -1307,7 +1319,13 @@ async fn export_responses_interactive_subagent_has_provider_identity_without_res
 #[tokio::test]
 async fn export_rejects_invalid_responses_provider_identity() {
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(db, PathBuf::from("/proj"), "Build").unwrap();
+    let session = Session::create(
+        db,
+        PathBuf::from("/proj"),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
     session.set_active_model("codex-oauth", "gpt-5.4").unwrap();
     session
         .record_event(
@@ -1442,7 +1460,13 @@ async fn export_sanitizes_inference_request_call_id_filename_segment() {
 async fn export_includes_context_pruned_before_next_inference_request() {
     use crate::session::Session;
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(db.clone(), PathBuf::from("/proj"), "builder").unwrap();
+    let session = Session::create(
+        db.clone(),
+        PathBuf::from("/proj"),
+        "builder",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
     let sid = session.id;
 
     // Recorder API (Part C): synthetic prune, then a request — the
@@ -1510,7 +1534,13 @@ async fn export_includes_context_pruned_before_next_inference_request() {
 async fn export_includes_goal_progress_diagnostic() {
     use crate::session::Session;
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(db.clone(), PathBuf::from("/proj"), "builder").unwrap();
+    let session = Session::create(
+        db.clone(),
+        PathBuf::from("/proj"),
+        "builder",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
     let sid = session.id;
 
     session
@@ -1542,7 +1572,13 @@ async fn export_includes_goal_progress_diagnostic() {
 async fn export_includes_queued_user_fold_metadata() {
     use crate::session::Session;
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(db.clone(), PathBuf::from("/proj"), "builder").unwrap();
+    let session = Session::create(
+        db.clone(),
+        PathBuf::from("/proj"),
+        "builder",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
     let sid = session.id;
     let queue_id = uuid::Uuid::from_u128(7);
 
@@ -1588,7 +1624,13 @@ async fn export_includes_queued_user_fold_metadata() {
 async fn export_of_hung_turn_has_inference_record_and_failure_event() {
     use crate::session::Session;
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(db.clone(), PathBuf::from("/proj"), "builder").unwrap();
+    let session = Session::create(
+        db.clone(),
+        PathBuf::from("/proj"),
+        "builder",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
     let sid = session.id;
     let call = Uuid::new_v4();
 
@@ -1652,9 +1694,21 @@ async fn export_of_hung_turn_has_inference_record_and_failure_event() {
 async fn export_follows_session_compacted_successor() {
     use crate::session::Session;
     let db = Db::open_in_memory().unwrap();
-    let pred = Session::create(db.clone(), PathBuf::from("/proj"), "builder").unwrap();
+    let pred = Session::create(
+        db.clone(),
+        PathBuf::from("/proj"),
+        "builder",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
     // The successor is a fresh session (NOT a fork — no parent link).
-    let succ = Session::create(db.clone(), PathBuf::from("/proj"), "builder").unwrap();
+    let succ = Session::create(
+        db.clone(),
+        PathBuf::from("/proj"),
+        "builder",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
     pred.record_session_compacted("builder", succ.id, &succ.short_id, 3, "handoff brief")
         .await
         .unwrap();
@@ -1813,7 +1867,13 @@ async fn export_includes_persisted_approval_grants_snapshot() {
 async fn export_includes_tool_rejected_event() {
     use crate::session::Session;
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(db.clone(), PathBuf::from("/proj"), "Build").unwrap();
+    let session = Session::create(
+        db.clone(),
+        PathBuf::from("/proj"),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
     let sid = session.id;
 
     session
@@ -1879,7 +1939,13 @@ async fn export_includes_tool_rejected_event() {
 async fn export_includes_primary_swap_event_both_halves() {
     use crate::session::Session;
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(db.clone(), PathBuf::from("/proj"), "Auto").unwrap();
+    let session = Session::create(
+        db.clone(),
+        PathBuf::from("/proj"),
+        "Auto",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
     let sid = session.id;
 
     // Handoff swap: both display and kickoff present.
@@ -1944,7 +2010,13 @@ async fn build_model_switch_zip(
     error: Option<&str>,
 ) -> Vec<u8> {
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(db.clone(), PathBuf::from("/proj"), "Build").unwrap();
+    let session = Session::create(
+        db.clone(),
+        PathBuf::from("/proj"),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
     session.set_active_model("provider-a", "model-a").unwrap();
     session
         .record_model_switch(crate::session::ModelSwitchAudit {
@@ -2065,7 +2137,13 @@ async fn export_includes_model_switch_noop_event() {
 #[tokio::test]
 async fn export_model_switch_event_records_all_triggers() {
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(db.clone(), PathBuf::from("/proj"), "Build").unwrap();
+    let session = Session::create(
+        db.clone(),
+        PathBuf::from("/proj"),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
     session.set_active_model("provider-a", "model-a").unwrap();
     for trigger in [
         crate::session::ModelSwitchTrigger::Picker,
@@ -2233,7 +2311,13 @@ async fn export_tool_lifecycle_events_distinguish_start_and_completion() {
 #[tokio::test]
 async fn export_includes_notice_events() {
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(db.clone(), PathBuf::from("/proj"), "Build").unwrap();
+    let session = Session::create(
+        db.clone(),
+        PathBuf::from("/proj"),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
     session
         .record_event(
             SessionEventKind::UserMessage,
@@ -3680,7 +3764,13 @@ async fn export_manifest_includes_session_and_config_active_model() {
     let active_model = manifest_active_model("provider-a", "model-a");
     write_manifest_active_model_config(tmp.path(), &active_model);
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+    let session = Session::create(
+        db.clone(),
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
     session.set_active_model_ref(active_model.clone()).unwrap();
 
     let target = get_test_session(&db, session.id).await;
@@ -3721,7 +3811,13 @@ async fn export_manifest_flags_active_model_divergence() {
     config_active_model.thinking_mode = Some(crate::config::providers::ThinkingMode::Low);
     write_manifest_active_model_config(tmp.path(), &config_active_model);
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+    let session = Session::create(
+        db.clone(),
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
     session
         .set_active_model_ref(session_active_model.clone())
         .unwrap();
@@ -3753,7 +3849,13 @@ async fn export_manifest_flags_active_model_divergence() {
 async fn export_manifest_active_model_without_config_is_divergent() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+    let session = Session::create(
+        db.clone(),
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
     let active_model = manifest_active_model("provider-a", "model-a");
     session.set_active_model_ref(active_model.clone()).unwrap();
 
@@ -3781,7 +3883,13 @@ async fn export_manifest_active_model_without_config_is_divergent() {
 async fn export_rejects_provider_model_only_session_rows() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+    let session = Session::create(
+        db.clone(),
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
     let session_id = session.id;
     session.persist_if_needed().unwrap();
     db.write(move |conn| {

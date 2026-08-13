@@ -802,9 +802,13 @@ async fn ephemeral_session_writes_no_rows() {
         .await
         .unwrap();
     let session = Arc::new(
-        Session::resume(parent.session.db.clone(), row.session_id)
-            .unwrap()
-            .unwrap(),
+        Session::resume(
+            parent.session.db.clone(),
+            row.session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .unwrap(),
     );
     let mut driver = Driver::new(
         session.clone(),
@@ -2257,9 +2261,13 @@ async fn sealed_value_survives_compaction_and_resume() {
     drop(tx);
     while rx.recv().await.is_some() {}
 
-    let resumed = Session::resume(db, session_id)
-        .unwrap()
-        .expect("session must resume after compaction");
+    let resumed = Session::resume(
+        db,
+        session_id,
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap()
+    .expect("session must resume after compaction");
     assert!(
         resumed
             .sealed_value_exists(crate::sealed::OwnerAuthority::for_test(), "resume_keep")

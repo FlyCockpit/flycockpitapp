@@ -64,13 +64,18 @@ impl SealedProjectTrustSource for FixedProjectTrust {
     }
 }
 
+#[async_trait::async_trait]
 pub trait SealedRedactionSink: Send + Sync {
     /// Register `literal` under its canonical typed `identity`. Classification
     /// is carried by the typed [`SealedRedactionIdentity`] end-to-end — the sink
     /// never serializes to and reparses a diagnostic origin string to recover
     /// sealedness. Returning `Err` aborts the use — a literal is never used if it
     /// could not be redacted first.
-    fn register_before_use(
+    ///
+    /// Async because the production sink journals the adoption into protected
+    /// redaction history (an async key load + AEAD prepare, then a DB
+    /// transaction) atomically with registering the literal.
+    async fn register_before_use(
         &self,
         literal: &SealedLiteral,
         identity: &SealedRedactionIdentity,
@@ -194,11 +199,6 @@ impl SealedRuntime {
         }
 
         // ---- 4. resolve the literal (the single secret read) ------------
-        // The deadline is anchored here, not at the invocation: resolving the
-        // literal and registering it for redaction are both O(literal length),
-        // so they are literal-dependent timing too and must sit inside the
-        // constant window.
-        let started = std::time::Instant::now();
         let literal = self.resolve_literal(&claimed).await?;
 
         // ---- 5. redaction before use ------------------------------------
@@ -218,9 +218,32 @@ impl SealedRuntime {
         };
         redaction
             .register_before_use(&literal, &identity)
+            .await
             .map_err(|_| SealedUseDenied)?;
 
         // ---- 6. invoke, then answer at the declared fixed deadline ------
+        // The fixed-response window is anchored HERE, after resolution and
+        // registration, not before them. Registration now awaits an async key
+        // load, an AEAD encrypt, and a DB transaction (the adoption is journaled
+        // into protected redaction history atomically with the table persist).
+        // That work is variable and dominated by DB latency, so folding it into
+        // the timed window would let it consume — and overrun — the descriptor's
+        // `response_after` budget: the `saturating_sub` below would collapse the
+        // action's own timeout to zero and the response would land late by
+        // however long the transaction took, leaking secret-adoption/DB timing
+        // and breaking the fixed-deadline contract. Anchoring after registration
+        // keeps registration off the caller-visible window: the response lands a
+        // fixed `response_after` after `started` regardless of key-load, encrypt,
+        // or DB time. Registration still precedes any use of the literal, so
+        // redaction-before-use is unchanged.
+        //
+        // Residual: resolution and registration are O(literal length) and now
+        // sit before the anchor, so their duration is not padded away. This is
+        // the same class of pre-window variability as the metadata reads and the
+        // claim above (all decided before the window), and it is our own code,
+        // not the untrusted action; the padding's purpose — bounding the action
+        // the caller can adversarially time to encode literal bits — is intact.
+        let started = std::time::Instant::now();
         // The action's return value — including its error — is discarded
         // without inspection. It cannot select what the caller sees, so it
         // cannot encode a bit of the literal in the response or in the
@@ -325,8 +348,9 @@ impl RecordingRedactionSink {
     }
 }
 
+#[async_trait::async_trait]
 impl SealedRedactionSink for RecordingRedactionSink {
-    fn register_before_use(
+    async fn register_before_use(
         &self,
         _literal: &SealedLiteral,
         identity: &SealedRedactionIdentity,
@@ -361,8 +385,9 @@ impl SessionRedactionSink {
     }
 }
 
+#[async_trait::async_trait]
 impl SealedRedactionSink for SessionRedactionSink {
-    fn register_before_use(
+    async fn register_before_use(
         &self,
         literal: &SealedLiteral,
         identity: &SealedRedactionIdentity,
@@ -373,11 +398,14 @@ impl SealedRedactionSink for SessionRedactionSink {
         // action with egress unscrubbed — exactly the stored-but-unredacted
         // window this ordering exists to prevent. The typed identity is passed
         // straight through; no origin string is parsed to recover sealedness.
-        let registered = self.interrupts.seal_redaction_with_identity(
-            &self.session,
-            literal.expose_for_redaction().to_string(),
-            identity.clone(),
-        )?;
+        let registered = self
+            .interrupts
+            .seal_redaction_with_identity(
+                &self.session,
+                literal.expose_for_redaction().to_string(),
+                identity.clone(),
+            )
+            .await?;
         if registered.is_none() {
             anyhow::bail!("sealed value cannot be used without a live redaction table");
         }

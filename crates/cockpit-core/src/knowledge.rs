@@ -1665,7 +1665,13 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
             })
             .await
             .unwrap();
-        Session::resume(db, row.session_id).unwrap().unwrap()
+        Session::resume(
+            db,
+            row.session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .unwrap()
     }
 
     fn trust_root(root: &Path) -> crate::config::trust::TrustRoot {

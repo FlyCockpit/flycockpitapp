@@ -349,9 +349,13 @@ mod tests {
             })
             .await
             .unwrap();
-        let session = crate::session::Session::resume(db.clone(), session_row.session_id)
-            .unwrap()
-            .unwrap();
+        let session = crate::session::Session::resume(
+            db.clone(),
+            session_row.session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .unwrap();
         let locks = Arc::new(crate::locks::LockManager::in_memory(db.clone()));
         let redact = Arc::new(
             crate::redact::RedactionTable::build(
@@ -1252,9 +1256,13 @@ mod tests {
         let mut ctx_b = ctx_a.clone();
         ctx_b.lock_identity = "writer-b".to_string();
         ctx_b.session = Arc::new(
-            crate::session::Session::resume(db.clone(), s_b.session_id)
-                .unwrap()
-                .unwrap(),
+            crate::session::Session::resume(
+                db.clone(),
+                s_b.session_id,
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap()
+            .unwrap(),
         );
 
         ctx_a

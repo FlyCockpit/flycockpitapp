@@ -206,8 +206,15 @@ mod tests {
         )
         .await
         .unwrap();
-        let session =
-            Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
+        let session = Arc::new(
+            Session::create(
+                db.clone(),
+                tmp.path().to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
         let locks = Arc::new(LockManager::from_db(db.clone()).await.unwrap());
         let (handle, mut work_rx) = SessionWorkerHandle::test_handle_with_receiver(session, locks);
         let responder = tokio::spawn(async move {
@@ -256,8 +263,15 @@ mod tests {
             .await
             .unwrap();
 
-        let live =
-            Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
+        let live = Arc::new(
+            Session::create(
+                db.clone(),
+                tmp.path().to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
         let locks = Arc::new(LockManager::from_db(db.clone()).await.unwrap());
         let (handle, mut work_rx) = SessionWorkerHandle::test_handle_with_receiver(live, locks);
         let responder = tokio::spawn(async move {
@@ -312,8 +326,15 @@ mod tests {
         )
         .await
         .unwrap();
-        let session =
-            Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
+        let session = Arc::new(
+            Session::create(
+                db.clone(),
+                tmp.path().to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
         let locks = Arc::new(LockManager::from_db(db.clone()).await.unwrap());
         let (handle, _work_rx) = SessionWorkerHandle::test_handle_with_receiver(session, locks);
         let mut events = handle.subscribe();
@@ -362,7 +383,15 @@ mod tests {
         )
         .await
         .unwrap();
-        let session = Arc::new(Session::create(db.clone(), project, "Build").unwrap());
+        let session = Arc::new(
+            Session::create(
+                db.clone(),
+                project,
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
         let locks = Arc::new(LockManager::from_db(db.clone()).await.unwrap());
         let (handle, _work_rx) = SessionWorkerHandle::test_handle_with_receiver(session, locks);
         let source = ConfigSource::production();

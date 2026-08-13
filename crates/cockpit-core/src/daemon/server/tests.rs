@@ -7460,9 +7460,13 @@ async fn attached_state_with_worker_receiver(
         .await
         .unwrap();
     let session = Arc::new(
-        Session::resume(ctx.db.clone(), session_row.session_id)
-            .unwrap()
-            .unwrap(),
+        Session::resume(
+            ctx.db.clone(),
+            session_row.session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .unwrap(),
     );
     let locks = Arc::new(LockManager::in_memory(ctx.db.clone()));
     let (handle, work_rx) = SessionWorkerHandle::test_handle_with_receiver(session, locks);
@@ -11415,9 +11419,13 @@ async fn live_worker_with_receiver(
         .await
         .unwrap();
     let session = Arc::new(
-        Session::resume(ctx.db.clone(), row.session_id)
-            .unwrap()
-            .expect("session row"),
+        Session::resume(
+            ctx.db.clone(),
+            row.session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .expect("session row"),
     );
     let (handle, work_rx) =
         SessionWorkerHandle::test_handle_with_receiver(session, ctx.registry.locks());
@@ -17970,9 +17978,13 @@ async fn peer_uid_rejects_mismatched_uid() {
 
 fn insert_hung_worker(ctx: &Arc<DaemonContext>, session_id: Uuid) {
     let session = Arc::new(
-        Session::resume(ctx.db.clone(), session_id)
-            .unwrap()
-            .expect("session row"),
+        Session::resume(
+            ctx.db.clone(),
+            session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .expect("session row"),
     );
     let locks = Arc::new(LockManager::in_memory(ctx.db.clone()));
     let handle = SessionWorkerHandle::test_handle(session, locks);
@@ -19266,9 +19278,13 @@ async fn serialized_requests_apply_in_receipt_order() {
         .await
         .unwrap();
     let live_session = Arc::new(
-        Session::resume(ctx.db.clone(), session.session_id)
-            .unwrap()
-            .unwrap(),
+        Session::resume(
+            ctx.db.clone(),
+            session.session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .unwrap(),
     );
     let (handle, mut work_rx) =
         SessionWorkerHandle::test_handle_with_receiver(live_session, ctx.registry.locks());
@@ -19801,9 +19817,13 @@ async fn attach_replay_precedes_live_events_under_task_split() {
         .await
         .unwrap();
     let live_session = Arc::new(
-        Session::resume(ctx.db.clone(), session.session_id)
-            .unwrap()
-            .unwrap(),
+        Session::resume(
+            ctx.db.clone(),
+            session.session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .unwrap(),
     );
     let (handle, _work_rx) =
         SessionWorkerHandle::test_handle_with_receiver(live_session, ctx.registry.locks());
@@ -19892,9 +19912,13 @@ async fn attach_replay_precedes_live_events_under_concurrency() {
         .await
         .unwrap();
     let live_session = Arc::new(
-        Session::resume(ctx.db.clone(), session.session_id)
-            .unwrap()
-            .unwrap(),
+        Session::resume(
+            ctx.db.clone(),
+            session.session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .unwrap(),
     );
     let (handle, _work_rx) =
         SessionWorkerHandle::test_handle_with_receiver(live_session, ctx.registry.locks());
@@ -20140,6 +20164,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         media_ledger: base.media_ledger.clone(),
         media_admission_open: base.media_admission_open.clone(),
         registry: base.registry.clone(),
+        redaction_key_resolver: base.redaction_key_resolver.clone(),
         paths: base.paths.clone(),
         canonical_cwd: base.canonical_cwd.clone(),
         fcor_resolver_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -20218,6 +20243,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         media_ledger: base.media_ledger.clone(),
         media_admission_open: base.media_admission_open.clone(),
         registry: base.registry.clone(),
+        redaction_key_resolver: base.redaction_key_resolver.clone(),
         paths: base.paths.clone(),
         canonical_cwd: base.canonical_cwd.clone(),
         fcor_resolver_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -20447,9 +20473,13 @@ async fn btw_concurrent_with_parent_turn() {
         .await
         .unwrap();
     let parent_session = Arc::new(
-        Session::resume(ctx.db.clone(), parent_row.session_id)
-            .unwrap()
-            .expect("parent session"),
+        Session::resume(
+            ctx.db.clone(),
+            parent_row.session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .expect("parent session"),
     );
     let (parent_handle, mut parent_rx) =
         SessionWorkerHandle::test_handle_with_receiver(parent_session, ctx.registry.locks());
@@ -20506,9 +20536,13 @@ async fn btw_concurrent_with_parent_turn() {
         .await
         .unwrap();
     let btw_session = Arc::new(
-        Session::resume(ctx.db.clone(), created.info.session_id)
-            .unwrap()
-            .expect("btw session"),
+        Session::resume(
+            ctx.db.clone(),
+            created.info.session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .expect("btw session"),
     );
     let (btw_handle, mut btw_rx) =
         SessionWorkerHandle::test_handle_with_receiver(btw_session, ctx.registry.locks());
@@ -20641,9 +20675,13 @@ async fn btw_rehydrate_reports_live_fork() {
         .await
         .unwrap();
     let live_session = Arc::new(
-        Session::resume(ctx.db.clone(), parent.session_id)
-            .unwrap()
-            .expect("session row"),
+        Session::resume(
+            ctx.db.clone(),
+            parent.session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .expect("session row"),
     );
     let (handle, _work_rx) =
         SessionWorkerHandle::test_handle_with_receiver(live_session, ctx.registry.locks());
@@ -20785,9 +20823,13 @@ async fn insert_busy_test_worker(ctx: &Arc<DaemonContext>) {
         .await
         .expect("create session");
     let live_session = Arc::new(
-        Session::resume(ctx.db.clone(), session.session_id)
-            .expect("resume session")
-            .expect("session exists"),
+        Session::resume(
+            ctx.db.clone(),
+            session.session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .expect("resume session")
+        .expect("session exists"),
     );
     let (handle, _work_rx) =
         SessionWorkerHandle::test_handle_with_receiver(live_session, ctx.registry.locks());
@@ -21009,9 +21051,13 @@ async fn attach_replays_drain_state_after_attached_response() {
         .await
         .unwrap();
     let live_session = Arc::new(
-        Session::resume(ctx.db.clone(), session.session_id)
-            .unwrap()
-            .expect("session row"),
+        Session::resume(
+            ctx.db.clone(),
+            session.session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .expect("session row"),
     );
     let (handle, _work_rx) =
         SessionWorkerHandle::test_handle_with_receiver(live_session, ctx.registry.locks());
@@ -21119,9 +21165,13 @@ async fn attach_since_seq_queues_history_replay_and_leaves_attached_history_empt
         .await
         .unwrap();
     let live_session = Arc::new(
-        Session::resume(ctx.db.clone(), session.session_id)
-            .unwrap()
-            .expect("session row"),
+        Session::resume(
+            ctx.db.clone(),
+            session.session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .expect("session row"),
     );
     let (handle, _work_rx) =
         SessionWorkerHandle::test_handle_with_receiver(live_session, ctx.registry.locks());

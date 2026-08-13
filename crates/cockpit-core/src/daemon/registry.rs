@@ -35,6 +35,7 @@ use crate::engine::model::Model;
 use crate::env_snapshot::EnvSnapshot;
 use crate::locks::LockManager;
 use crate::redact::RedactionTable;
+use crate::redact::protected_redaction_history::RedactionKeyResolver;
 use crate::session::Session;
 
 #[cfg(not(test))]
@@ -64,6 +65,12 @@ struct Inner {
     /// coordinator is built in `boot_with_db`, after this registry exists.
     write_scope: crate::write_scope::WriteScopeSource,
     external_journal: Arc<Mutex<Option<Arc<crate::external_journal::ExternalJournal>>>>,
+    /// Required protected redaction-history key resolver installed on every
+    /// `Session` this registry builds (decision 16). Late-installed at daemon
+    /// boot after the secure-key actor attaches — the same seam that installs
+    /// `external_journal` — but unlike the journal it is a **required**
+    /// construction dependency: a session build fails closed if it is absent.
+    redaction_key_resolver: Arc<Mutex<Option<Arc<dyn RedactionKeyResolver>>>>,
     workers: Mutex<WorkerState>,
     /// Live `JoinHandle` per worker, so a graceful drain can *await* the
     /// in-flight turn finishing (and `abort()` it past the deadline).
@@ -356,6 +363,7 @@ impl SessionRegistry {
                 lsp: Arc::new(crate::daemon::lsp::LspManager::new()),
                 write_scope: Arc::new(Mutex::new(None)),
                 external_journal: Arc::new(Mutex::new(None)),
+                redaction_key_resolver: Arc::new(Mutex::new(None)),
                 resource_scheduler,
                 scheduler: Arc::new(Mutex::new(None)),
                 workers: Mutex::new(WorkerState {
@@ -407,6 +415,21 @@ impl SessionRegistry {
 
     fn external_journal(&self) -> Option<Arc<crate::external_journal::ExternalJournal>> {
         crate::sync::lock_or_recover(&self.inner.external_journal).clone()
+    }
+
+    /// Install the daemon's shared protected redaction-history key resolver.
+    /// Called once at boot after the secure-key actor attaches; every session
+    /// built afterwards shares this one cache.
+    pub fn set_redaction_key_resolver(&self, resolver: Arc<dyn RedactionKeyResolver>) {
+        *crate::sync::lock_or_recover(&self.inner.redaction_key_resolver) = Some(resolver);
+    }
+
+    /// The installed resolver, or a fail-closed error. A session build must not
+    /// proceed without a resolver (decision 16); production installs it at boot.
+    fn redaction_key_resolver(&self) -> Result<Arc<dyn RedactionKeyResolver>> {
+        crate::sync::lock_or_recover(&self.inner.redaction_key_resolver)
+            .clone()
+            .context("protected redaction-history key resolver not installed on registry")
     }
 
     pub fn scheduler(&self) -> Option<crate::daemon::scheduler::DaemonSchedulerHandle> {
@@ -503,8 +526,13 @@ impl SessionRegistry {
         // Lazy persistence (session-id-display-and-lazy-persist): hold the
         // new session in memory with its id assigned but its `sessions` row
         // un-written. The worker persists it on the first user message.
-        let session = Session::create_deferred(self.inner.db.clone(), project_root, &initial_agent)
-            .context("creating session")?;
+        let session = Session::create_deferred(
+            self.inner.db.clone(),
+            project_root,
+            &initial_agent,
+            self.redaction_key_resolver()?,
+        )
+        .context("creating session")?;
         session
             .set_active_model_ref(active)
             .context("setting active model on new session")?;
@@ -559,6 +587,7 @@ impl SessionRegistry {
             project_root,
             assistant_name,
             assistant_name,
+            self.redaction_key_resolver()?,
         )
         .context("creating assistant session")?;
         session
@@ -590,7 +619,7 @@ impl SessionRegistry {
         env_snapshot: EnvSnapshot,
         generation: WorkerGeneration,
     ) -> Result<SessionWorkerHandle> {
-        let session = Session::resume(self.inner.db.clone(), id)
+        let session = Session::resume(self.inner.db.clone(), id, self.redaction_key_resolver()?)
             .context("resuming session")?
             .ok_or_else(|| anyhow::anyhow!("unknown session {id}"))?;
         let trust_policy =
@@ -1343,20 +1372,35 @@ mod tests {
         // a throwaway in-memory DB so construction never hits user state.
         let db = Db::open_in_memory().expect("in-memory db");
         let locks = Arc::new(LockManager::in_memory(db.clone()));
-        SessionRegistry::new(db, locks, ShutdownSignal::new(), None, config_source)
+        let reg = SessionRegistry::new(db, locks, ShutdownSignal::new(), None, config_source);
+        reg.set_redaction_key_resolver(crate::session::test_redaction_key_resolver());
+        reg
     }
 
     fn test_session(reg: &SessionRegistry) -> Arc<Session> {
         let tmp = tempfile::tempdir().expect("tempdir");
         Arc::new(
-            Session::create_deferred(reg.inner.db.clone(), tmp.keep(), "Build")
-                .expect("deferred session"),
+            Session::create_deferred(
+                reg.inner.db.clone(),
+                tmp.keep(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .expect("deferred session"),
         )
     }
 
     fn persisted_test_session(reg: &SessionRegistry) -> Arc<Session> {
         let tmp = tempfile::tempdir().expect("tempdir");
-        Arc::new(Session::create(reg.inner.db.clone(), tmp.keep(), "Build").expect("session"))
+        Arc::new(
+            Session::create(
+                reg.inner.db.clone(),
+                tmp.keep(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .expect("session"),
+        )
     }
 
     fn test_handle(reg: &SessionRegistry, session: Arc<Session>) -> SessionWorkerHandle {
@@ -1662,8 +1706,13 @@ mod tests {
     async fn btw_model_knob_resolution() {
         let reg = test_registry();
         let tmp = tempfile::tempdir().expect("tempdir");
-        let parent =
-            Session::create(reg.inner.db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+        let parent = Session::create(
+            reg.inner.db.clone(),
+            tmp.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         parent.set_active_model("lmstudio", "parent-model").unwrap();
         let fork = reg
             .inner
@@ -1672,9 +1721,13 @@ mod tests {
             .await
             .expect("btw fork")
             .info;
-        let fork_session = Session::resume(reg.inner.db.clone(), fork.session_id)
-            .unwrap()
-            .expect("fork session");
+        let fork_session = Session::resume(
+            reg.inner.db.clone(),
+            fork.session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .expect("fork session");
         let providers = providers_for_btw_model_tests();
         let env_snapshot = EnvSnapshot::new(proto::EnvSnapshotSource::ExplicitCli, HashMap::new());
         let redact = Arc::new(RedactionTable::empty());
@@ -1769,9 +1822,13 @@ mod tests {
         let session_id = handle.session_id;
         reg.forget(session_id);
 
-        let resumed = Session::resume(reg.inner.db.clone(), session_id)
-            .unwrap()
-            .expect("persisted session resumes");
+        let resumed = Session::resume(
+            reg.inner.db.clone(),
+            session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .expect("persisted session resumes");
         assert_eq!(resumed.active_model_ref(), Some(selection.clone()));
 
         let config_with_different_default = providers_for_btw_model_tests();
@@ -1789,8 +1846,13 @@ mod tests {
 
         // A picker recovering an existing model-less session must retain its
         // identity and durably seed it, not create a replacement session.
-        let legacy =
-            Session::create(reg.inner.db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+        let legacy = Session::create(
+            reg.inner.db.clone(),
+            tmp.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let legacy_id = legacy.id;
         let recovered = reg
             .attach(
@@ -1809,13 +1871,22 @@ mod tests {
         assert_eq!(recovered.session_id, legacy_id);
         assert_eq!(recovered.active_model_selection(), Some(selection.clone()));
         reg.forget(legacy_id);
-        let durable = Session::resume(reg.inner.db.clone(), legacy_id)
-            .unwrap()
-            .expect("recovered session remains durable");
+        let durable = Session::resume(
+            reg.inner.db.clone(),
+            legacy_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .expect("recovered session remains durable");
         assert_eq!(durable.active_model_ref(), Some(selection.clone()));
 
-        let invalid =
-            Session::create(reg.inner.db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+        let invalid = Session::create(
+            reg.inner.db.clone(),
+            tmp.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let invalid_id = invalid.id;
         drop(invalid);
         let mut unconfigured = selection.clone();
@@ -1868,10 +1939,14 @@ mod tests {
         let pinned_id = pinned.session_id;
         reg.forget(pinned_id);
         assert_eq!(
-            Session::resume(reg.inner.db.clone(), pinned_id)
-                .unwrap()
-                .expect("pinned session persists")
-                .active_model_ref(),
+            Session::resume(
+                reg.inner.db.clone(),
+                pinned_id,
+                crate::session::test_redaction_key_resolver()
+            )
+            .unwrap()
+            .expect("pinned session persists")
+            .active_model_ref(),
             Some(selection.clone())
         );
 
@@ -2716,6 +2791,7 @@ mod tests {
                 ExtendedConfig::default(),
             ),
         );
+        reg.set_redaction_key_resolver(crate::session::test_redaction_key_resolver());
 
         let tmp = tempfile::TempDir::new().unwrap();
         let keep = tmp.path().join("keep.rs");

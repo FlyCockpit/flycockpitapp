@@ -1,20 +1,24 @@
 //! Durable protected redaction-history store: SQLite coordination only.
 //!
 //! This module owns the durable half of protected redaction history. It stores
-//! **encrypted literal material** (ciphertext + nonce) keyed by an opaque
-//! history ID and the local key-store key version. No plaintext, prefix,
-//! length, ciphertext, nonce, or key version ever appears in a generic,
-//! protocol, diagnostics, or export query surface — those columns are consumed
-//! solely by the local Owner-sensitive rehydration frame in `cockpit-core`.
+//! **AEAD ciphertext + nonce** (ChaCha20-Poly1305; crypto lives in
+//! `cockpit-core`) keyed by an opaque history ID and the local key-store key
+//! version. The ciphertext length is bucket-padded, so it reveals only a coarse
+//! bucket, never the literal length. No plaintext, prefix, exact length,
+//! ciphertext, nonce, key version, or fingerprint ever appears in the
+//! export/diagnostics projection ([`ProtectedRedactionHistoryRef`]) — the
+//! encrypted columns are consumed solely by the local Owner-sensitive
+//! rehydration frame in `cockpit-core`.
 //!
 //! Two properties are load-bearing and enforced here rather than left to
 //! callers:
 //!
-//! * **No literal leakage.** Every row type exposed by this module
-//!   ([`ProtectedRedactionHistoryRow`], [`ProtectedRedactionArtifactRef`])
-//!   carries only opaque IDs, safe source/fingerprint metadata, and encrypted
-//!   blobs. There is no plaintext field, no prefix, no length, and no
-//!   unencrypted literal anywhere in the generic row shape.
+//! * **No literal leakage.** The export projection
+//!   ([`ProtectedRedactionHistoryRef`]) carries only opaque IDs, source,
+//!   ref-count, and timestamps — no fingerprint, ciphertext, nonce, or key
+//!   version. The full row ([`ProtectedRedactionHistoryRow`]) and
+//!   ([`ProtectedRedactionArtifactRef`]) never carry a plaintext field, prefix,
+//!   exact length, or unencrypted literal.
 //! * **Atomic attach.** [`append_history_conn`] and [`attach_artifact_ref_conn`]
 //!   are connection-scoped so callers compose them inside one
 //!   [`crate::db::Db::transaction`] closure alongside the raw artifact write.
@@ -109,24 +113,56 @@ impl std::fmt::Display for ProtectedRedactionArtifactKind {
 /// The `ciphertext` and `nonce` blobs are consumed solely by the local
 /// Owner-sensitive rehydration frame in `cockpit-core`. They must never be
 /// serialized into a generic, protocol, diagnostics, or export payload.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProtectedRedactionHistoryRow {
     pub history_id: String,
     pub session_id: String,
     pub sealed_record_id: Option<String>,
     pub sealed_version: Option<i64>,
     pub source: ProtectedRedactionSource,
-    /// SHA-256 fingerprint of the literal (safe deduplication key).
+    /// Keyed-MAC fingerprint of the literal (`HMAC-SHA-256` under a store-derived
+    /// subkey). Safe same-session deduplication key; not an offline guessing
+    /// oracle and never exported. Zeroed to 64 `'0'` chars on retirement.
     pub fingerprint: String,
-    /// Encrypted literal material (local rehydration frame only).
+    /// AEAD ciphertext (ChaCha20-Poly1305 over the bucket-padded frame, with the
+    /// 16-byte tag appended). Length reveals only a coarse bucket, never the
+    /// literal length. Local rehydration frame only; zeroed on retirement.
     pub ciphertext: Vec<u8>,
-    /// AEAD nonce (local rehydration frame only).
+    /// AEAD nonce (local rehydration frame only; zeroed on retirement).
     pub nonce: Vec<u8>,
     /// Local key-store key version that encrypted this row.
     pub key_version: i64,
     pub ref_count: i64,
     pub created_at_ms: i64,
     pub retired_at_ms: Option<i64>,
+}
+
+impl std::fmt::Debug for ProtectedRedactionHistoryRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never expose the keyed-MAC fingerprint or encrypted material in a
+        // diagnostics projection (decision 6/14): redact the fingerprint and
+        // reduce ciphertext/nonce to lengths.
+        f.debug_struct("ProtectedRedactionHistoryRow")
+            .field("history_id", &self.history_id)
+            .field("session_id", &self.session_id)
+            .field("sealed_record_id", &self.sealed_record_id)
+            .field("sealed_version", &self.sealed_version)
+            .field("source", &self.source)
+            .field(
+                "fingerprint",
+                &format_args!("[REDACTED MAC; len {}]", self.fingerprint.len()),
+            )
+            .field(
+                "ciphertext",
+                &format_args!("[{} bytes]", self.ciphertext.len()),
+            )
+            .field("nonce", &format_args!("[{} bytes]", self.nonce.len()))
+            .field("key_version", &self.key_version)
+            .field("ref_count", &self.ref_count)
+            .field("created_at_ms", &self.created_at_ms)
+            .field("retired_at_ms", &self.retired_at_ms)
+            .finish()
+    }
 }
 
 /// One opaque artifact-to-history reference. Carries no literal, ciphertext,
@@ -140,14 +176,15 @@ pub struct ProtectedRedactionArtifactRef {
 }
 
 /// Safe metadata projection for export/diagnostics: no literal, prefix,
-/// length, ciphertext, nonce, or key version. Only opaque IDs and safe
-/// source/fingerprint metadata.
+/// length, ciphertext, nonce, key version, or fingerprint. Only opaque IDs and
+/// safe source/ref-count/timestamp metadata. The keyed-MAC fingerprint is
+/// deliberately **not** exported — even a keyed MAC does not belong in
+/// export/diagnostics; `history_id` is the correlation key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProtectedRedactionHistoryRef {
     pub history_id: String,
     pub session_id: String,
     pub source: ProtectedRedactionSource,
-    pub fingerprint: String,
     pub ref_count: i64,
     pub created_at_ms: i64,
     pub retired_at_ms: Option<i64>,
@@ -155,13 +192,13 @@ pub struct ProtectedRedactionHistoryRef {
 
 impl ProtectedRedactionHistoryRef {
     /// Project a full row into the safe export/diagnostics reference.
-    /// This strips ciphertext, nonce, key version, sealed record/version.
+    /// This strips ciphertext, nonce, key version, sealed record/version, and
+    /// the keyed-MAC fingerprint.
     pub fn from_row(row: &ProtectedRedactionHistoryRow) -> Self {
         Self {
             history_id: row.history_id.clone(),
             session_id: row.session_id.clone(),
             source: row.source,
-            fingerprint: row.fingerprint.clone(),
             ref_count: row.ref_count,
             created_at_ms: row.created_at_ms,
             retired_at_ms: row.retired_at_ms,
@@ -172,7 +209,7 @@ impl ProtectedRedactionHistoryRef {
 /// Append-input: the encrypted literal material and safe metadata for one
 /// history row. Built by `cockpit-core` from the closed-writer classification;
 /// no plaintext enters this struct.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProtectedRedactionHistoryAppend {
     pub session_id: String,
     pub sealed_record_id: Option<String>,
@@ -182,6 +219,31 @@ pub struct ProtectedRedactionHistoryAppend {
     pub ciphertext: Vec<u8>,
     pub nonce: Vec<u8>,
     pub key_version: i64,
+}
+
+impl std::fmt::Debug for ProtectedRedactionHistoryAppend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The keyed MAC (`fingerprint`) is session-scoped sensitive metadata that
+        // is never surfaced in any diagnostics projection; the derived Debug
+        // emitted it verbatim, so redact it (and reduce ciphertext/nonce to
+        // lengths) here — the DB-layer twin of `PreparedProtectedAppend` (G4d).
+        f.debug_struct("ProtectedRedactionHistoryAppend")
+            .field("session_id", &self.session_id)
+            .field("sealed_record_id", &self.sealed_record_id)
+            .field("sealed_version", &self.sealed_version)
+            .field("source", &self.source)
+            .field(
+                "fingerprint",
+                &format_args!("[REDACTED; {}]", self.fingerprint.len()),
+            )
+            .field(
+                "ciphertext",
+                &format_args!("[{} bytes]", self.ciphertext.len()),
+            )
+            .field("nonce", &format_args!("[{} bytes]", self.nonce.len()))
+            .field("key_version", &self.key_version)
+            .finish()
+    }
 }
 
 /// Result of [`append_history_conn`]: either a newly created row or an
@@ -286,6 +348,39 @@ pub fn append_history_conn(
     if let Some(existing) =
         get_history_by_fingerprint_conn(conn, &input.session_id, &input.fingerprint)?
     {
+        // Sealed rotation-to-same-literal advance (r9-6). A sealed record rotated
+        // to a NEW version but the SAME literal MACs to the SAME fingerprint under
+        // the same key version, so dedup returns this existing live row. Without
+        // this, the journal row would keep its OLD `sealed_version` while the
+        // sealed record has advanced — a stale version tag on an otherwise-correct,
+        // still-protected row. When the incoming append carries a strictly-newer
+        // sealed version, advance the row's sealed identity to the current
+        // adoption. Guarded and monotonic, so dedup semantics for every caller are
+        // preserved:
+        //   - non-sealed sources (Environment/Credential/ContainedLeak) pass
+        //     `sealed_version = None`, so this never fires — their dedup is
+        //     unchanged;
+        //   - a Sealed literal later matched under a non-sealed source never
+        //     downgrades the row's sealed identity (None fails the guard);
+        //   - an out-of-order OLDER sealed version never overwrites a newer one;
+        //   - `sealed_record_id` advances only when the incoming value is present
+        //     (COALESCE keeps the stored id otherwise — a rotation keeps the same
+        //     record id, so this is normally a no-op).
+        // The dedup key `(session_id, fingerprint)`, the `Existing` return
+        // contract, and `ref_count` are all untouched — only the sealed-version /
+        // record-id metadata advances.
+        if let Some(new_version) = input.sealed_version
+            && existing.sealed_version.is_none_or(|cur| new_version > cur)
+        {
+            conn.execute(
+                "UPDATE protected_redaction_history
+                    SET sealed_version = ?1,
+                        sealed_record_id = COALESCE(?2, sealed_record_id)
+                  WHERE history_id = ?3",
+                params![new_version, input.sealed_record_id, existing.history_id],
+            )
+            .context("advancing sealed_version on deduplicated protected redaction history row")?;
+        }
         return Ok(AppendHistoryResult::Existing {
             history_id: existing.history_id,
         });
@@ -391,6 +486,13 @@ pub fn detach_artifact_ref_conn(
 }
 
 /// Retire a specific history row. Fails if artifact references remain.
+///
+/// Retirement is **forget**: the same UPDATE that stamps `retired_at_ms`
+/// overwrites `ciphertext` with `zeroblob(length(ciphertext))` (length
+/// preserved so the bucket CHECK holds; lengths are bucketed so nothing new
+/// leaks), `nonce` with 12 zero bytes, and `fingerprint` with 64 `'0'` chars.
+/// A retired row can no longer be decrypted, and its zeroed fingerprint sits
+/// outside the partial unique index so the same literal can be re-journaled.
 pub fn retire_history_conn(conn: &Connection, history_id: &str) -> Result<()> {
     let refs = count_artifact_refs_conn(conn, history_id)?;
     if refs > 0 {
@@ -399,9 +501,13 @@ pub fn retire_history_conn(conn: &Connection, history_id: &str) -> Result<()> {
     let now = now_ms();
     let n = conn
         .execute(
-            "UPDATE protected_redaction_history SET retired_at_ms = ?1
+            "UPDATE protected_redaction_history
+         SET retired_at_ms = ?1,
+             ciphertext = zeroblob(length(ciphertext)),
+             nonce = zeroblob(12),
+             fingerprint = ?3
          WHERE history_id = ?2 AND retired_at_ms IS NULL",
-            params![now, history_id],
+            params![now, history_id, ZEROED_FINGERPRINT],
         )
         .context("retiring protected redaction history row")?;
     if n == 0 {
@@ -418,13 +524,19 @@ pub fn retire_history_conn(conn: &Connection, history_id: &str) -> Result<()> {
 }
 
 /// Retire all zero-ref history rows for a session. Returns the count retired.
+/// Zeroizes ciphertext, nonce, and fingerprint in the same UPDATE (see
+/// [`retire_history_conn`]).
 pub fn retire_zero_ref_conn(conn: &Connection, session_id: &str) -> Result<i64> {
     let now = now_ms();
     let n = conn
         .execute(
-            "UPDATE protected_redaction_history SET retired_at_ms = ?1
+            "UPDATE protected_redaction_history
+         SET retired_at_ms = ?1,
+             ciphertext = zeroblob(length(ciphertext)),
+             nonce = zeroblob(12),
+             fingerprint = ?3
          WHERE session_id = ?2 AND retired_at_ms IS NULL AND ref_count = 0",
-            params![now, session_id],
+            params![now, session_id, ZEROED_FINGERPRINT],
         )
         .context("retiring zero-ref protected redaction history rows")?;
     Ok(n as i64)
@@ -450,7 +562,10 @@ pub fn get_history_conn(
     .context("loading protected redaction history row")
 }
 
-/// Load one history row by `(session_id, fingerprint)` (deduplication lookup).
+/// Load one live (non-retired) history row by `(session_id, fingerprint)`
+/// (deduplication lookup). Retired rows are excluded so a retired row never
+/// blocks or aliases a fresh append of the same literal — its fingerprint slot
+/// was zeroed on retirement and it sits outside the partial unique index.
 pub fn get_history_by_fingerprint_conn(
     conn: &Connection,
     session_id: &str,
@@ -461,7 +576,7 @@ pub fn get_history_by_fingerprint_conn(
                 fingerprint, ciphertext, nonce, key_version, ref_count,
                 created_at_ms, retired_at_ms
          FROM protected_redaction_history
-         WHERE session_id = ?1 AND fingerprint = ?2
+         WHERE session_id = ?1 AND fingerprint = ?2 AND retired_at_ms IS NULL
          ORDER BY created_at_ms ASC LIMIT 1",
         params![session_id, fingerprint],
         map_history_row,
@@ -469,6 +584,10 @@ pub fn get_history_by_fingerprint_conn(
     .optional()
     .context("loading protected redaction history by fingerprint")
 }
+
+/// The zeroed-fingerprint sentinel written on retirement: 64 `'0'` characters,
+/// length-preserving so the schema `CHECK (length(fingerprint) = 64)` holds.
+const ZEROED_FINGERPRINT: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// List all history rows for a session (full rows, encrypted material).
 /// Owner-sensitive read only.
@@ -635,7 +754,7 @@ mod tests {
             sealed_version: None,
             source: ProtectedRedactionSource::Environment,
             fingerprint: fp.to_owned(),
-            ciphertext: vec![0u8; 32],
+            ciphertext: vec![0u8; 272],
             nonce: vec![0u8; 12],
             key_version: 1,
         };
@@ -657,7 +776,7 @@ mod tests {
             sealed_version: None,
             source: ProtectedRedactionSource::Environment,
             fingerprint: fp.to_owned(),
-            ciphertext: vec![0u8; 32],
+            ciphertext: vec![0u8; 272],
             nonce: vec![0u8; 12],
             key_version: 1,
         };
@@ -733,7 +852,7 @@ mod tests {
             source: ProtectedRedactionSource::Credential,
             fingerprint: "d1e2f3a4b5c6d1e2f3a4b5c6d1e2f3a4b5c6d1e2f3a4b5c6d1e2f3a4b5c6d1e2"
                 .to_owned(),
-            ciphertext: vec![1u8; 32],
+            ciphertext: vec![1u8; 272],
             nonce: vec![2u8; 12],
             key_version: 1,
         };
@@ -756,12 +875,20 @@ mod tests {
         let r = &refs[0];
         assert_eq!(r.history_id, id);
         assert_eq!(r.source, ProtectedRedactionSource::Credential);
-        assert_eq!(
-            r.fingerprint,
-            "d1e2f3a4b5c6d1e2f3a4b5c6d1e2f3a4b5c6d1e2f3a4b5c6d1e2f3a4b5c6d1e2"
-        );
-        // The safe ref type has no ciphertext/nonce/key_version fields.
-        // (Compile-time guarantee: ProtectedRedactionHistoryRef has no such fields.)
+        // The safe ref type has no ciphertext/nonce/key_version/fingerprint
+        // fields. This is a compile-time guarantee: ProtectedRedactionHistoryRef
+        // no longer carries the keyed-MAC fingerprint (or any encrypted
+        // material), so even a keyed MAC never reaches export/diagnostics. The
+        // struct-literal below would fail to compile if a `fingerprint` field
+        // were ever re-added to the export projection.
+        let _shape = ProtectedRedactionHistoryRef {
+            history_id: r.history_id.clone(),
+            session_id: r.session_id.clone(),
+            source: r.source,
+            ref_count: r.ref_count,
+            created_at_ms: r.created_at_ms,
+            retired_at_ms: r.retired_at_ms,
+        };
     }
 
     #[tokio::test]
@@ -776,7 +903,7 @@ mod tests {
             source: ProtectedRedactionSource::Sealed,
             fingerprint: "g1h2i3j4k5l6g1h2i3j4k5l6g1h2i3j4k5l6g1h2i3j4k5l6g1h2i3j4k5l6g1h2"
                 .to_owned(),
-            ciphertext: vec![3u8; 32],
+            ciphertext: vec![3u8; 272],
             nonce: vec![4u8; 12],
             key_version: 1,
         };
@@ -822,7 +949,7 @@ mod tests {
             source: ProtectedRedactionSource::ContainedLeak,
             fingerprint: "j1k2l3m4n5o6j1k2l3m4n5o6j1k2l3m4n5o6j1k2l3m4n5o6j1k2l3m4n5o6j1k2"
                 .to_owned(),
-            ciphertext: vec![5u8; 32],
+            ciphertext: vec![5u8; 272],
             nonce: vec![6u8; 12],
             key_version: 1,
         };
@@ -844,6 +971,286 @@ mod tests {
         assert!(
             rows.is_empty(),
             "history row should not persist after crash"
+        );
+    }
+
+    // 64-char valid hex fingerprint fixture.
+    fn fp(seed: char) -> String {
+        std::iter::repeat_n(seed, 64).collect()
+    }
+
+    fn bucketed_append(session_id: &str, fingerprint: &str) -> ProtectedRedactionHistoryAppend {
+        ProtectedRedactionHistoryAppend {
+            session_id: session_id.to_owned(),
+            sealed_record_id: None,
+            sealed_version: None,
+            source: ProtectedRedactionSource::Environment,
+            fingerprint: fingerprint.to_owned(),
+            // 272 = smallest bucket (256) + 16-byte tag.
+            ciphertext: vec![7u8; 272],
+            nonce: vec![9u8; 12],
+            key_version: 1,
+        }
+    }
+
+    /// AC3 (db half): the schema CHECK rejects an off-bucket ciphertext length.
+    #[tokio::test]
+    async fn ciphertext_length_is_bucketed_by_schema_check() {
+        let db = Db::open_in_memory().unwrap();
+        let session_id = "55555555-5555-5555-1111-111111111111";
+        seed_session(&db, session_id).await;
+
+        // Every valid bucket length inserts.
+        for (i, &len) in [272usize, 1040, 4112, 16404].iter().enumerate() {
+            let mut input = bucketed_append(session_id, &fp(char::from(b'a' + i as u8)));
+            input.ciphertext = vec![1u8; len];
+            let r = db
+                .write(move |conn| append_history_conn(conn, &input))
+                .await;
+            assert!(r.is_ok(), "bucket length {len} should insert: {r:?}");
+        }
+
+        // An off-bucket length (256, i.e. no tag / not a bucket) is rejected.
+        for &bad in &[256usize, 271, 273, 1024, 16388] {
+            let mut input = bucketed_append(session_id, &fp('z'));
+            input.ciphertext = vec![1u8; bad];
+            let err = db
+                .write(move |conn| append_history_conn(conn, &input))
+                .await
+                .unwrap_err();
+            // The rejection is the SQLite CHECK (append_history_conn does no
+            // Rust-side length check); the CHECK message lives in the error
+            // source chain, so inspect the Debug chain, not just the top context.
+            let msg = format!("{err:?}").to_lowercase();
+            assert!(
+                msg.contains("constraint") || msg.contains("check"),
+                "off-bucket length {bad} must be rejected by the schema CHECK, got: {err:?}"
+            );
+        }
+    }
+
+    /// AC6: retirement zeroizes ciphertext, nonce, and fingerprint in the same
+    /// transaction that stamps retired_at_ms, and a failure after the retire
+    /// UPDATE rolls back both the stamp and the zeroing.
+    #[tokio::test]
+    async fn retire_zeroizes_ciphertext_nonce_and_fingerprint_in_same_transaction() {
+        let db = Db::open_in_memory().unwrap();
+        let session_id = "66666666-6666-6666-1111-111111111111";
+        seed_session(&db, session_id).await;
+        let input = bucketed_append(session_id, &fp('c'));
+        let id = db
+            .write(move |conn| {
+                let r = append_history_conn(conn, &input)?;
+                Ok(match r {
+                    AppendHistoryResult::Created { history_id } => history_id,
+                    AppendHistoryResult::Existing { history_id } => history_id,
+                })
+            })
+            .await
+            .unwrap();
+
+        // A transaction that retires then fails must roll BOTH the stamp and the
+        // zeroing back: the row keeps its original ciphertext/nonce/fingerprint.
+        let id_rb = id.clone();
+        let rolled: Result<()> = db
+            .transaction(move |conn| {
+                retire_history_conn(conn, &id_rb)?;
+                bail!("simulated failure after retire UPDATE");
+            })
+            .await;
+        assert!(rolled.is_err());
+        let id_read = id.clone();
+        let row = db
+            .read(move |conn| get_history_conn(conn, &id_read))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.retired_at_ms.is_none(), "retire must have rolled back");
+        assert_eq!(row.ciphertext, vec![7u8; 272], "ciphertext must be intact");
+        assert_eq!(row.fingerprint, fp('c'), "fingerprint must be intact");
+
+        // Now retire for real and read raw columns on the same connection.
+        let id_retire = id.clone();
+        db.write(move |conn| retire_history_conn(conn, &id_retire))
+            .await
+            .unwrap();
+        let id_read2 = id.clone();
+        let row = db
+            .read(move |conn| get_history_conn(conn, &id_read2))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.retired_at_ms.is_some(), "retired_at_ms must be set");
+        assert_eq!(row.ciphertext.len(), 272, "ciphertext length preserved");
+        assert!(
+            row.ciphertext.iter().all(|&b| b == 0),
+            "ciphertext bytes must be all zero after retire"
+        );
+        assert_eq!(row.nonce, vec![0u8; 12], "nonce must be 12 zero bytes");
+        assert_eq!(
+            row.fingerprint,
+            "0".repeat(64),
+            "fingerprint must be 64 '0' chars"
+        );
+    }
+
+    /// AC6: after retirement, appending the same literal (same session +
+    /// fingerprint) creates a fresh non-retired row via the partial unique
+    /// index, and the dedup lookup never returns retired rows.
+    #[tokio::test]
+    async fn retired_fingerprint_slot_allows_new_append() {
+        let db = Db::open_in_memory().unwrap();
+        let session_id = "77777777-7777-7777-1111-111111111111";
+        seed_session(&db, session_id).await;
+        let fingerprint = fp('d');
+
+        let input = bucketed_append(session_id, &fingerprint);
+        let id1 = db
+            .write(move |conn| {
+                let r = append_history_conn(conn, &input)?;
+                Ok(match r {
+                    AppendHistoryResult::Created { history_id } => history_id,
+                    AppendHistoryResult::Existing { history_id } => history_id,
+                })
+            })
+            .await
+            .unwrap();
+
+        // Retire it (zeroing the fingerprint slot).
+        let id_retire = id1.clone();
+        db.write(move |conn| retire_history_conn(conn, &id_retire))
+            .await
+            .unwrap();
+
+        // The dedup lookup must not return the retired row.
+        let sess = session_id.to_owned();
+        let fp_lookup = fingerprint.clone();
+        let found = db
+            .read(move |conn| get_history_by_fingerprint_conn(conn, &sess, &fp_lookup))
+            .await
+            .unwrap();
+        assert!(found.is_none(), "dedup lookup must skip retired rows");
+
+        // Appending the same literal creates a fresh, distinct, non-retired row.
+        let input2 = bucketed_append(session_id, &fingerprint);
+        let result2 = db
+            .write(move |conn| append_history_conn(conn, &input2))
+            .await
+            .unwrap();
+        let id2 = match result2 {
+            AppendHistoryResult::Created { history_id } => history_id,
+            AppendHistoryResult::Existing { history_id } => {
+                panic!("expected a fresh Created row, got Existing {history_id}")
+            }
+        };
+        assert_ne!(id1, id2, "fresh append must be a new row");
+        let id_read = id2.clone();
+        let row = db
+            .read(move |conn| get_history_conn(conn, &id_read))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.retired_at_ms.is_none());
+        assert_eq!(row.fingerprint, fingerprint);
+    }
+
+    /// r9-6: a sealed record rotated to a NEW version but the SAME literal MACs
+    /// to the same fingerprint, so dedup returns the existing live row. The
+    /// append must ADVANCE that row's `sealed_version`/`sealed_record_id` to the
+    /// current rotation so the journal reflects the current adoption — while
+    /// preserving dedup semantics for every other caller (no downgrade on a
+    /// non-sealed or older-version re-append).
+    #[tokio::test]
+    async fn sealed_rotation_to_same_literal_advances_sealed_version_on_dedup() {
+        let db = Db::open_in_memory().unwrap();
+        let session_id = "88888888-8888-8888-1111-111111111111";
+        seed_session(&db, session_id).await;
+        let fingerprint = fp('e');
+
+        // Initial sealed adoption at version 1.
+        let mut v1 = bucketed_append(session_id, &fingerprint);
+        v1.source = ProtectedRedactionSource::Sealed;
+        v1.sealed_record_id = Some("rec-1".to_owned());
+        v1.sealed_version = Some(1);
+        let id = db
+            .write(move |conn| {
+                let r = append_history_conn(conn, &v1)?;
+                Ok(match r {
+                    AppendHistoryResult::Created { history_id } => history_id,
+                    AppendHistoryResult::Existing { history_id } => history_id,
+                })
+            })
+            .await
+            .unwrap();
+
+        // Rotation to the SAME literal at version 2 dedups to the existing row
+        // and advances its sealed identity.
+        let mut v2 = bucketed_append(session_id, &fingerprint);
+        v2.source = ProtectedRedactionSource::Sealed;
+        v2.sealed_record_id = Some("rec-1".to_owned());
+        v2.sealed_version = Some(2);
+        let r2 = db
+            .write(move |conn| append_history_conn(conn, &v2))
+            .await
+            .unwrap();
+        assert!(
+            matches!(r2, AppendHistoryResult::Existing { .. }),
+            "rotation to the same literal must dedup, not create a new row"
+        );
+        let id_read = id.clone();
+        let row = db
+            .read(move |conn| get_history_conn(conn, &id_read))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.sealed_version,
+            Some(2),
+            "the journal row's sealed_version must advance to the current rotation"
+        );
+        assert_eq!(row.sealed_record_id.as_deref(), Some("rec-1"));
+
+        // A later NON-sealed match of the same literal (sealed_version None) must
+        // NOT downgrade the row's sealed identity.
+        let mut env_hit = bucketed_append(session_id, &fingerprint);
+        env_hit.source = ProtectedRedactionSource::Environment;
+        let r3 = db
+            .write(move |conn| append_history_conn(conn, &env_hit))
+            .await
+            .unwrap();
+        assert!(matches!(r3, AppendHistoryResult::Existing { .. }));
+        let id_read = id.clone();
+        let row = db
+            .read(move |conn| get_history_conn(conn, &id_read))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.sealed_version,
+            Some(2),
+            "a non-sealed re-append must not clear the sealed version"
+        );
+        assert_eq!(row.sealed_record_id.as_deref(), Some("rec-1"));
+
+        // An OLDER sealed version arriving out of order must not overwrite the
+        // newer one (monotonic advance only).
+        let mut stale = bucketed_append(session_id, &fingerprint);
+        stale.source = ProtectedRedactionSource::Sealed;
+        stale.sealed_record_id = Some("rec-1".to_owned());
+        stale.sealed_version = Some(1);
+        db.write(move |conn| append_history_conn(conn, &stale))
+            .await
+            .unwrap();
+        let id_read = id.clone();
+        let row = db
+            .read(move |conn| get_history_conn(conn, &id_read))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.sealed_version,
+            Some(2),
+            "an out-of-order older sealed version must not overwrite the newer one"
         );
     }
 }

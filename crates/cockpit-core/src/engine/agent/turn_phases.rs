@@ -687,11 +687,31 @@ pub(crate) async fn phase_10_dispatch_one_call(
                             tc.call_id.as_deref(),
                         );
                     let routing = agent.model.routing_metadata_json(None);
+                    // This event embeds the parent model's task `prompt`
+                    // (model-authored free text that can carry a session-table
+                    // literal), so route it through the frame-carrying journaling
+                    // path with the SPAWNING model's trust + pre-policy session
+                    // table (mirrors the SubagentReport fix and this turn's
+                    // inference journaling above). The spawning model is
+                    // `agent.model`; its pre-policy table is
+                    // `agent.model.session_redact_table()` (the same table used
+                    // for this turn's inference journaling). A frame-less
+                    // `record_event` skips trusted journaling, so a session-table
+                    // literal in a trusted parent's prompt would persist raw with
+                    // no history row; an untrusted spawning model journals
+                    // nothing (payload already post-redaction).
+                    let spawn_session_table = agent.model.session_redact_table();
                     if let Err(e) = session
-                        .record_event(
+                        .record_event_with_model_frame(
                             crate::db::session_log::SessionEventKind::SubagentSpawned,
                             Some(&agent.name),
                             Some(&tc.id),
+                            crate::session::SessionEventModelFrame {
+                                provider_id: agent.model.provider_id(),
+                                model_id: agent.model.model_id_ref(),
+                                config,
+                                session_table: spawn_session_table.as_ref(),
+                            },
                             &serde_json::json!({
                                 "child_agent": child,
                                 "task_call_id": tc.id,
@@ -1116,6 +1136,10 @@ pub(crate) async fn run_turn(
     };
     let mut journal_attempt =
         prepare_inference_journal(&session, model, &dispatch_payload, call_id).await?;
+    // Pre-policy session table + target trust for protected-history journaling
+    // (decision 10.2). Journaling scans the PRE-policy table, never the
+    // trusted-empty effective table, and only journals for a trusted target.
+    let session_redact_table = model.session_redact_table();
     let pending_write_failed = session
         .insert_inference_attempt(
             call_id,
@@ -1123,6 +1147,8 @@ pub(crate) async fn run_turn(
             &dispatch_payload,
             attempt_meta,
             goal_provenance,
+            session_redact_table.as_ref(),
+            model.is_trusted(),
         )
         .await
         .is_err();
@@ -1242,6 +1268,7 @@ pub(crate) async fn run_turn(
                 provider_id: model.provider_id(),
                 model_id: model.model_id_ref(),
                 config: &config,
+                session_table: session_redact_table.as_ref(),
             },
             &serde_json::json!({
                 "usage": usage_json,
@@ -1616,6 +1643,7 @@ pub(crate) async fn run_turn(
                 event_data["original_text"] = serde_json::json!(original);
             }
         }
+        let assistant_session_table = model.session_redact_table();
         let seq = match session
             .record_event_with_model_frame(
                 crate::db::session_log::SessionEventKind::AssistantMessage,
@@ -1625,6 +1653,7 @@ pub(crate) async fn run_turn(
                     provider_id: model.provider_id(),
                     model_id: model.model_id_ref(),
                     config: &config,
+                    session_table: assistant_session_table.as_ref(),
                 },
                 &event_data,
             )
@@ -1876,7 +1905,15 @@ mod tests {
 
     fn test_session(root: &std::path::Path) -> Arc<Session> {
         let db = crate::db::Db::open_in_memory().unwrap();
-        Arc::new(Session::create(db, root.to_path_buf(), "Build").unwrap())
+        Arc::new(
+            Session::create(
+                db,
+                root.to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        )
     }
 
     fn tool_call(name: &str, args: Value) -> ToolCall {

@@ -231,7 +231,6 @@ pub enum SensitiveFrameKind {
 /// The outcome of a sensitive frame: either the literal was contained (write
 /// succeeded, no literal returned) or revealed (recover succeeded, literal
 /// available in an ephemeral zeroizing frame).
-#[derive(Debug)]
 pub enum SensitiveFrameOutcome {
     /// The write/replace/rotate succeeded. No literal is returned. Carries
     /// the updated safe summary.
@@ -239,6 +238,24 @@ pub enum SensitiveFrameOutcome {
     /// The recover succeeded. The literal is available in an ephemeral
     /// zeroizing frame that is zeroized on drop. Never terminal output.
     Revealed { literal: Zeroizing<String> },
+}
+
+impl std::fmt::Debug for SensitiveFrameOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Contained { summary } => f
+                .debug_struct("Contained")
+                .field("summary", summary)
+                .finish(),
+            // The revealed literal is ephemeral plaintext; never print it. Mirror
+            // `ProtectedLiteral`'s redacting Debug (`[REDACTED; len]`) so a stray
+            // `{:?}` cannot defeat the zeroizing frame (K8).
+            Self::Revealed { literal } => f
+                .debug_struct("Revealed")
+                .field("literal", &format_args!("[REDACTED; {}]", literal.len()))
+                .finish(),
+        }
+    }
 }
 
 /// The sensitive frame: carries a capability plus an optional literal into a

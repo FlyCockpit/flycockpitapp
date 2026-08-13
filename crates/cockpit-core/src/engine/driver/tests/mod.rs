@@ -56,7 +56,15 @@ fn test_driver_with_url(max_schedules: usize, provider_url: String) -> (Driver, 
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let db = crate::db::Db::open_in_memory().unwrap();
-    let session = Arc::new(Session::create(db.clone(), root.clone(), "Build").unwrap());
+    let session = Arc::new(
+        Session::create(
+            db.clone(),
+            root.clone(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap(),
+    );
     let locks = Arc::new(crate::locks::LockManager::in_memory(db));
     let rcfg = crate::config::extended::RedactConfig::default();
     let redact = Arc::new(RedactionTable::build(&rcfg, &root).unwrap());
@@ -248,7 +256,15 @@ fn learn_driver(
         env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
     });
     let db = crate::db::Db::open_in_memory().unwrap();
-    let session = Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
+    let session = Arc::new(
+        Session::create(
+            db.clone(),
+            tmp.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap(),
+    );
     let locks = Arc::new(crate::locks::LockManager::in_memory(db));
     let redact = Arc::new(RedactionTable::empty());
     let mut driver =

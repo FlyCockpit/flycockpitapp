@@ -65,26 +65,30 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
 
     // Branch a fork from main as of registration (tail snapshot). The fork
     // shares the parent's project/agent/model/provider config.
-    let fork_session =
-        match crate::session::Session::create_fork(ctx.session.db.clone(), ctx.session.id, None) {
-            Ok(s) => {
-                s.set_external_journal(ctx.session.external_journal());
-                Arc::new(s)
-            }
-            Err(e) => {
-                let _ = event_tx
-                    .send(ScheduleEvent::Completed {
-                        job_id,
-                        label,
-                        kind: args.kind(),
-                        result: format!("loop fork failed: {e:#}"),
-                        failed: true,
-                        requests: Vec::new(),
-                    })
-                    .await;
-                return;
-            }
-        };
+    let fork_session = match crate::session::Session::create_fork(
+        ctx.session.db.clone(),
+        ctx.session.id,
+        None,
+        ctx.session.redaction_key_resolver().clone(),
+    ) {
+        Ok(s) => {
+            s.set_external_journal(ctx.session.external_journal());
+            Arc::new(s)
+        }
+        Err(e) => {
+            let _ = event_tx
+                .send(ScheduleEvent::Completed {
+                    job_id,
+                    label,
+                    kind: args.kind(),
+                    result: format!("loop fork failed: {e:#}"),
+                    failed: true,
+                    requests: Vec::new(),
+                })
+                .await;
+            return;
+        }
+    };
 
     // Shared state the fork's `note` / re-routed create-actions write into.
     let state = Arc::new(ForkScheduleState::new(job_id.clone()));

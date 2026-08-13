@@ -2041,7 +2041,13 @@ mod tests {
 
     fn root_session() -> Session {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db, PathBuf::from("/x"), "Build").unwrap();
+        let s = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         s.set_active_model("anthropic", "opus").unwrap();
         s
     }
@@ -4544,9 +4550,13 @@ mod tests {
             .create_btw_fork(parent.id, true)
             .await
             .expect("btw fork");
-        let btw_session = Session::resume(parent.db.clone(), btw.info.session_id)
-            .unwrap()
-            .expect("btw session");
+        let btw_session = Session::resume(
+            parent.db.clone(),
+            btw.info.session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .expect("btw session");
         record_user(&btw_session, "btw-only prompt").await;
         record_assistant(&btw_session, "btw-call", "btw-only answer").await;
 
@@ -5007,6 +5017,7 @@ mod tests {
                 tail_trimmed: 1,
                 tail_messages: &tail,
             },
+            None,
         )
         .await
         .unwrap();
@@ -5113,6 +5124,7 @@ mod tests {
                     tail_trimmed: 0,
                     tail_messages: &[],
                 },
+                None,
             )
             .await
             .unwrap();
@@ -5163,6 +5175,7 @@ mod tests {
                 tail_trimmed: 0,
                 tail_messages: &tail,
             },
+            None,
         )
         .await
         .unwrap();

@@ -869,7 +869,13 @@ mod tests {
 
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = Arc::new(
-            crate::session::Session::create(db, tmp.path().to_path_buf(), "Swarm").unwrap(),
+            crate::session::Session::create(
+                db,
+                tmp.path().to_path_buf(),
+                "Swarm",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
         );
         let locks = Arc::new(crate::locks::LockManager::in_memory(
             crate::db::Db::open_in_memory().unwrap(),

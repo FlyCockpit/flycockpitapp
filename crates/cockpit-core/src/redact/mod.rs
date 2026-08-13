@@ -46,10 +46,58 @@ use crate::config::extended::RedactConfig;
 
 mod dotenv;
 mod protected;
-#[allow(dead_code)]
 pub(crate) mod protected_redaction_history;
+// The production key resolver is wired into the daemon / registry / Session
+// (required resolver, decision 16) and every item in the module is reachable
+// from production or the FakeNativeStore-backed resolver tests, so no dead-code
+// allow is needed.
+pub(crate) mod secure_key_resolver;
 mod ssh;
 mod structured;
+
+/// The protected redaction-history key resolver trait, re-exported so the
+/// required `Session` resolver parameter (decision 16) is publicly nameable at
+/// the daemon-less crate boundary (e.g. `apps/cli`).
+pub use protected_redaction_history::RedactionKeyResolver;
+
+/// Start a standalone production key resolver for a daemon-less entry point that
+/// still must satisfy the required `Session` resolver (decision 16) — e.g. the
+/// read-only `cockpit ask` docs pipeline, which never journals but constructs a
+/// `Session`. Returns the owning [`crate::secure_key::SecureKeyActor`] (the
+/// caller keeps it alive for the session's lifetime; dropping it drains the
+/// actor) alongside the shared resolver.
+pub fn start_standalone_redaction_key_resolver(
+    db: &crate::db::Db,
+) -> anyhow::Result<(
+    crate::secure_key::SecureKeyActor,
+    std::sync::Arc<dyn RedactionKeyResolver>,
+)> {
+    let actor = crate::secure_key::SecureKeyActor::start_production(db.clone())
+        .map_err(|e| anyhow::anyhow!("starting standalone secure-key actor: {e}"))?;
+    let resolver = std::sync::Arc::new(secure_key_resolver::SecureKeyResolver::new(actor.handle()));
+    Ok((actor, resolver))
+}
+
+/// [`FakeNativeStore`](crate::secure_key::fake::FakeNativeStore)-backed standalone
+/// resolver for daemon-less **tests** in dependent crates (e.g. `apps/cli`),
+/// which cannot reach cockpit-core's `#[cfg(test)]` `MapKeyResolver` helper and
+/// must never touch the OS keyring. Returns the owning actor alongside the
+/// resolver; the caller keeps the actor alive for the session's lifetime.
+pub fn start_fake_redaction_key_resolver(
+    db: &crate::db::Db,
+) -> anyhow::Result<(
+    crate::secure_key::SecureKeyActor,
+    std::sync::Arc<dyn RedactionKeyResolver>,
+)> {
+    let actor = crate::secure_key::SecureKeyActor::start_with_store(
+        db.clone(),
+        Box::new(crate::secure_key::fake::FakeNativeStore::new()),
+        std::sync::Arc::new(crate::secure_key::FailClosedReconciler),
+    )
+    .map_err(|e| anyhow::anyhow!("starting fake secure-key actor: {e}"))?;
+    let resolver = std::sync::Arc::new(secure_key_resolver::SecureKeyResolver::new(actor.handle()));
+    Ok((actor, resolver))
+}
 
 /// The exact actionable marker rendered for a sealed value on untrusted
 /// interactive inference egress with an active exact grant.
@@ -111,6 +159,52 @@ impl Replacement {
     }
 }
 
+/// The typed provenance of an ordinary (non-sealed) redaction entry, attached
+/// at the `build*` collector sites where each candidate's origin is known. This
+/// is the classification the production journaling chokepoint reads — it never
+/// re-parses the diagnostic-origin string. Sealed entries carry their own typed
+/// identity ([`EntryClass::Sealed`]) and are summarized as
+/// [`SourceClass::Sealed`] instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OrdinarySource {
+    /// A value collected from the OS/session environment-variable scan.
+    Environment,
+    /// A value collected from a credential-bearing source: a dotenv/env-file, a
+    /// private SSH key, a stored named/provider credential, the flycockpit
+    /// instance token, or the configured deny-list (all forced secret
+    /// inclusions or credential-shaped file values).
+    #[default]
+    Credential,
+    /// A forced contained-leak literal registered via
+    /// [`RedactionTable::with_forced_literal`] (the leak-containment adoption
+    /// seam on the table side).
+    ContainedLeak,
+}
+
+/// The typed source class exposed for one matched literal by
+/// [`match_sensitive_literals`]. This is the closed classification the
+/// journaling chokepoint records; there is no free-form "unknown secret"
+/// variant, because journaling is table-match-only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SourceClass {
+    /// Environment-variable scan value.
+    Environment,
+    /// Credential-bearing value (dotenv/env-file, SSH key, stored credential,
+    /// instance token, or deny-list).
+    Credential,
+    /// A sealed literal. `record_id`/`version` are read directly from the typed
+    /// [`crate::sealed::identity::SealedRedactionIdentity`] — never parsed from a
+    /// diagnostic-origin string. `record_id` is `None` for a legacy (pre-scoping)
+    /// session entry keyed by name alone.
+    Sealed {
+        record_id: Option<crate::sealed::identity::SealedRecordId>,
+        version: u32,
+    },
+    /// A forced contained-leak literal (the `with_forced_literal` path).
+    ContainedLeak,
+}
+
 /// The classification carried by one redaction-table entry. Typed identity
 /// lives on the entry itself — there is no parallel origins/replacements vector
 /// to drift out of sync, and egress reads the classification directly instead
@@ -119,8 +213,13 @@ impl Replacement {
 pub(crate) enum EntryClass {
     /// An ordinary secret (environment, credential, deny-list, file, or
     /// approved-secret-file value). `origin` is the diagnostic label
-    /// (`$VAR`, `$denylist`, `$ssh:…`) shown by `cockpit debug redact`.
-    Ordinary { origin: String },
+    /// (`$VAR`, `$denylist`, `$ssh:…`) shown by `cockpit debug redact` and is a
+    /// display artifact only; `source` is the typed provenance the journaling
+    /// chokepoint reads.
+    Ordinary {
+        origin: String,
+        source: OrdinarySource,
+    },
     /// A sealed value, carrying its canonical typed identity. The actionable
     /// sealed marker is an ephemeral per-target decision resolved by
     /// [`RedactionTable::with_sealed_replacements`] from this identity; it is
@@ -134,8 +233,27 @@ impl EntryClass {
     /// display artifact, never re-parsed to recover sealedness.
     fn origin_display(&self) -> String {
         match self {
-            EntryClass::Ordinary { origin } => origin.clone(),
+            EntryClass::Ordinary { origin, .. } => origin.clone(),
             EntryClass::Sealed(identity) => sealed_identity_origin(identity),
+        }
+    }
+
+    /// The typed source class for this entry, read directly from the typed
+    /// classification (never from the origin string). A sealed entry summarizes
+    /// its typed identity's `record_id`/`version` into
+    /// [`SourceClass::Sealed`]; every ordinary entry maps its
+    /// [`OrdinarySource`] one-to-one.
+    fn source_class(&self) -> SourceClass {
+        match self {
+            EntryClass::Ordinary { source, .. } => match source {
+                OrdinarySource::Environment => SourceClass::Environment,
+                OrdinarySource::Credential => SourceClass::Credential,
+                OrdinarySource::ContainedLeak => SourceClass::ContainedLeak,
+            },
+            EntryClass::Sealed(identity) => SourceClass::Sealed {
+                record_id: identity.record_id,
+                version: identity.version,
+            },
         }
     }
 }
@@ -192,10 +310,10 @@ pub(crate) struct RedactionEntry {
 }
 
 impl RedactionEntry {
-    fn ordinary(value: String, origin: String) -> Self {
+    fn ordinary(value: String, origin: String, source: OrdinarySource) -> Self {
         Self {
             value,
-            class: EntryClass::Ordinary { origin },
+            class: EntryClass::Ordinary { origin, source },
             replacement: Replacement::Generic,
         }
     }
@@ -464,6 +582,14 @@ struct Candidate {
     length_exempt: bool,
     register_variants: bool,
     register_case_variants: bool,
+    /// Typed provenance carried to the built entry. Defaults to
+    /// [`OrdinarySource::Credential`] because every non-environment collector
+    /// (dotenv/env-file, structured env files, SSH keys, stored credentials,
+    /// the instance token, and the deny-list) is credential-bearing. The
+    /// environment-variable scan overrides this to
+    /// [`OrdinarySource::Environment`] at its collector site in
+    /// [`RedactionTable::build_with_env_and_secrets`].
+    source: OrdinarySource,
 }
 
 impl Candidate {
@@ -475,6 +601,7 @@ impl Candidate {
             length_exempt,
             register_variants: true,
             register_case_variants: length_exempt,
+            source: OrdinarySource::Credential,
         }
     }
 
@@ -486,6 +613,7 @@ impl Candidate {
             length_exempt: true,
             register_variants,
             register_case_variants: false,
+            source: OrdinarySource::Credential,
         }
     }
 }
@@ -601,6 +729,13 @@ struct PersistedEntry {
 enum PersistedEntryClass {
     Ordinary {
         origin: String,
+        /// Typed provenance carried across persistence so the journaling
+        /// chokepoint never has to re-derive it from the origin string. Defaults
+        /// to `Credential` for robustness against any entry serialized before the
+        /// field existed (pre-release: databases are recreated, so this default
+        /// only guards in-run round-trips).
+        #[serde(default)]
+        source: OrdinarySource,
     },
     Sealed {
         scope: String,
@@ -614,8 +749,9 @@ enum PersistedEntryClass {
 impl PersistedEntry {
     fn from_entry(entry: &RedactionEntry) -> Self {
         let class = match &entry.class {
-            EntryClass::Ordinary { origin } => PersistedEntryClass::Ordinary {
+            EntryClass::Ordinary { origin, source } => PersistedEntryClass::Ordinary {
                 origin: origin.clone(),
+                source: *source,
             },
             EntryClass::Sealed(identity) => PersistedEntryClass::Sealed {
                 scope: identity.scope.as_str().to_string(),
@@ -632,7 +768,9 @@ impl PersistedEntry {
 
     fn into_entry(self) -> Result<RedactionEntry> {
         let class = match self.class {
-            PersistedEntryClass::Ordinary { origin } => EntryClass::Ordinary { origin },
+            PersistedEntryClass::Ordinary { origin, source } => {
+                EntryClass::Ordinary { origin, source }
+            }
             PersistedEntryClass::Sealed {
                 scope,
                 record_id,
@@ -665,7 +803,7 @@ impl PersistedEntry {
 
     fn origin_display(&self) -> String {
         match &self.class {
-            PersistedEntryClass::Ordinary { origin } => origin.clone(),
+            PersistedEntryClass::Ordinary { origin, .. } => origin.clone(),
             // A sealed entry is never disk-derived, so its exact origin string
             // only needs to be non-disk-derived; derive the legacy/scoped form.
             PersistedEntryClass::Sealed {
@@ -751,7 +889,6 @@ impl RedactionTable {
     /// Build a table from the provided session env + the env files matched
     /// under `cwd`. Daemon sessions use this so redaction tracks the immutable
     /// session snapshot instead of the daemon process environment.
-    #[allow(dead_code)]
     pub fn build_with_env(
         cfg: &RedactConfig,
         cwd: &Path,
@@ -811,11 +948,13 @@ impl RedactionTable {
                     continue;
                 }
                 let length_exempt = credential_shaped_key(name);
-                candidates.push(Candidate::prunable(
-                    value.clone(),
-                    format!("${name}"),
-                    length_exempt,
-                ));
+                let mut candidate =
+                    Candidate::prunable(value.clone(), format!("${name}"), length_exempt);
+                // Environment-variable scan is the one collector whose source is
+                // not credential-bearing; override the Candidate default here at
+                // the collector site (decision 11).
+                candidate.source = OrdinarySource::Environment;
+                candidates.push(candidate);
             }
         }
 
@@ -859,8 +998,9 @@ impl RedactionTable {
         }
 
         // (3) Prune: drop candidates that aren't plausibly secrets. The
-        // denylist (added below) bypasses this — it's forced inclusion.
-        let mut entries: Vec<(String, String)> = Vec::new();
+        // denylist (added below) bypasses this — it's forced inclusion. Each
+        // built entry carries its collector's typed source (decision 11).
+        let mut entries: Vec<(String, String, OrdinarySource)> = Vec::new();
         for candidate in candidates {
             if candidate.prunable
                 && is_pruned_candidate(
@@ -873,28 +1013,29 @@ impl RedactionTable {
             }
             if candidate.register_variants {
                 for variant in encoded_secret_variants(&candidate.value) {
-                    entries.push((variant, candidate.origin.clone()));
+                    entries.push((variant, candidate.origin.clone(), candidate.source));
                 }
             }
             if candidate.register_case_variants {
                 for variant in case_secret_variants(&candidate.value) {
-                    entries.push((variant, candidate.origin.clone()));
+                    entries.push((variant, candidate.origin.clone(), candidate.source));
                 }
             }
-            entries.push((candidate.value, candidate.origin));
+            entries.push((candidate.value, candidate.origin, candidate.source));
         }
 
         // Denylist: forced inclusion even for short / pruned / allowlisted
-        // values.
+        // values. A deny-list literal is a configured secret with no other
+        // provenance, so it classifies as `Credential`.
         for v in &cfg.denylist {
             if v.is_empty() {
                 continue;
             }
             let candidate = Candidate::forced(v.clone(), "$denylist".to_string(), true);
             for variant in encoded_secret_variants(&candidate.value) {
-                entries.push((variant, candidate.origin.clone()));
+                entries.push((variant, candidate.origin.clone(), candidate.source));
             }
-            entries.push((candidate.value, candidate.origin));
+            entries.push((candidate.value, candidate.origin, candidate.source));
         }
 
         Self::from_entries(
@@ -906,11 +1047,12 @@ impl RedactionTable {
         )
     }
 
-    /// Build a table from `(value, origin)` pairs. Every pair becomes an
-    /// [`EntryClass::Ordinary`] entry; sealed entries enter through
-    /// [`Self::with_forced_sealed_literal`], never here.
+    /// Build a table from `(value, origin, source)` triples. Every triple
+    /// becomes an [`EntryClass::Ordinary`] entry carrying its typed source;
+    /// sealed entries enter through [`Self::with_forced_sealed_literal`], never
+    /// here.
     fn from_entries(
-        entries: Vec<(String, String)>,
+        entries: Vec<(String, String, OrdinarySource)>,
         placeholder: String,
         disabled: bool,
         unsupported_files: Vec<PathBuf>,
@@ -918,7 +1060,7 @@ impl RedactionTable {
     ) -> Result<Self> {
         let typed = entries
             .into_iter()
-            .map(|(value, origin)| RedactionEntry::ordinary(value, origin))
+            .map(|(value, origin, source)| RedactionEntry::ordinary(value, origin, source))
             .collect();
         Self::from_redaction_entries(typed, placeholder, disabled, unsupported_files, protected)
     }
@@ -1049,7 +1191,13 @@ impl RedactionTable {
     /// carries typed identity; this remains for ordinary forced literals.
     pub fn with_forced_literal(&self, value: String, origin: String) -> Result<Self> {
         let mut entries = self.entries.clone();
-        entries.push(RedactionEntry::ordinary(value, origin));
+        // The `with_forced_literal` seam is the leak-containment adoption path
+        // (decision 11): its literals classify as `ContainedLeak`.
+        entries.push(RedactionEntry::ordinary(
+            value,
+            origin,
+            OrdinarySource::ContainedLeak,
+        ));
         Self::from_redaction_entries(
             entries,
             self.placeholder.clone(),
@@ -1165,7 +1313,7 @@ impl RedactionTable {
                 self.protected.clone(),
             )?);
         };
-        let mut entries = Vec::new();
+        let mut entries: Vec<(String, String, OrdinarySource)> = Vec::new();
         for candidate in candidates {
             if candidate.prunable
                 && is_pruned_candidate(
@@ -1178,15 +1326,15 @@ impl RedactionTable {
             }
             if candidate.register_variants {
                 for variant in encoded_secret_variants(&candidate.value) {
-                    entries.push((variant, candidate.origin.clone()));
+                    entries.push((variant, candidate.origin.clone(), candidate.source));
                 }
             }
             if candidate.register_case_variants {
                 for variant in case_secret_variants(&candidate.value) {
-                    entries.push((variant, candidate.origin.clone()));
+                    entries.push((variant, candidate.origin.clone(), candidate.source));
                 }
             }
-            entries.push((candidate.value, candidate.origin));
+            entries.push((candidate.value, candidate.origin, candidate.source));
         }
         let addition = Self::from_entries(
             entries,
@@ -1328,7 +1476,6 @@ impl RedactionTable {
     /// `true` when there's nothing to redact and `scrub` will pass
     /// through. Useful for the debug command.
     // Retained for `cockpit debug redact` introspection.
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.disabled || self.matcher.is_none()
     }
@@ -1395,7 +1542,6 @@ impl RedactionTable {
     }
 
     // Retained for `cockpit debug redact` introspection.
-    #[allow(dead_code)]
     pub fn disabled(&self) -> bool {
         self.disabled
     }
@@ -1412,7 +1558,6 @@ impl RedactionTable {
     /// redact` after the user has explicitly asked. Sealed origins are derived
     /// from the typed identity for display only.
     // Retained for `cockpit debug redact` introspection.
-    #[allow(dead_code)]
     pub fn entries_for_debug(&self) -> Vec<String> {
         self.entries
             .iter()
@@ -1434,10 +1579,88 @@ impl RedactionTable {
     }
 
     /// Forced-secret origins that matched protected filesystem paths.
-    #[allow(dead_code)]
     pub fn protected_path_conflicts(&self) -> &[String] {
         &self.protected_path_conflicts
     }
+}
+
+/// One distinct redaction-table entry that matched a haystack, carried by
+/// [`match_sensitive_literals`]. This is the exact unit the production
+/// journaling chokepoint records — no more, no less.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct MatchedLiteral {
+    /// The matched literal bytes, taken verbatim from the table entry's stored
+    /// `value` (not sliced out of the haystack), so the journaled literal is the
+    /// canonical secret the table registered.
+    pub literal: String,
+    /// The typed source class of the matched entry.
+    pub source: SourceClass,
+    /// The full typed sealed identity when the matched entry is sealed; `None`
+    /// for ordinary entries. This is the same identity that
+    /// [`SourceClass::Sealed`] summarizes as `record_id`/`version`, exposed
+    /// whole for callers that journal the sealed record and version.
+    pub sealed_identity: Option<crate::sealed::identity::SealedRedactionIdentity>,
+}
+
+impl std::fmt::Debug for MatchedLiteral {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the matched secret literal in a diagnostics projection.
+        f.debug_struct("MatchedLiteral")
+            .field(
+                "literal",
+                &format_args!("[REDACTED; len {}]", self.literal.len()),
+            )
+            .field("source", &self.source)
+            .field("sealed_identity", &self.sealed_identity)
+            .finish()
+    }
+}
+
+/// Find every DISTINCT redaction-table entry that occurs in `haystack`.
+///
+/// This is the production, table-match-only journaling primitive (decision 11):
+/// the set it returns is *exactly* what downstream layers journal — nothing is
+/// classified free-form. It uses the table's existing Aho-Corasick matcher (the
+/// same one [`RedactionTable::scrub_cow`] uses), so a match here is a literal the
+/// table would also scrub. It performs **no** encryption and **no** DB I/O.
+///
+/// Each matched entry appears at most once (dedup is by entry, not by
+/// occurrence): a literal that occurs many times in `haystack` yields a single
+/// [`MatchedLiteral`]. An entry that never occurs yields nothing — a
+/// high-entropy string absent from the table is not "classified" here. A table
+/// with no matcher (empty or disabled-with-no-entries) yields an empty vector.
+///
+/// Note: the `disabled` opt-out is intentionally NOT consulted. Journaling runs
+/// regardless of `redact.enabled` (that flag opts trusted egress out of live
+/// scrubbing only); a caller wanting scrub semantics uses `scrub`/`scrub_cow`.
+pub(crate) fn match_sensitive_literals(
+    table: &RedactionTable,
+    haystack: &str,
+) -> Vec<MatchedLiteral> {
+    let Some(matcher) = table.matcher.as_ref() else {
+        return Vec::new();
+    };
+    // The matcher's pattern list is 1:1 with `table.entries` by construction
+    // (see `from_redaction_entries`), so a `PatternID` indexes `entries`
+    // directly. Dedup by that index to return each entry at most once.
+    let mut seen = vec![false; table.entries.len()];
+    let mut matched = Vec::new();
+    for m in matcher.find_iter(haystack) {
+        let idx = m.pattern().as_usize();
+        if std::mem::replace(&mut seen[idx], true) {
+            continue;
+        }
+        let entry = &table.entries[idx];
+        matched.push(MatchedLiteral {
+            literal: entry.value.clone(),
+            source: entry.class.source_class(),
+            sealed_identity: match &entry.class {
+                EntryClass::Sealed(identity) => Some(identity.clone()),
+                EntryClass::Ordinary { .. } => None,
+            },
+        });
+    }
+    matched
 }
 
 /// Outcome of scanning one matched env file (§4).
@@ -1449,6 +1672,145 @@ enum EnvFileScan {
     Unsupported,
     /// Couldn't even read the file (missing / permission). Silent skip.
     Unreadable,
+}
+
+#[cfg(test)]
+mod match_helper_tests {
+    use super::*;
+    use crate::sealed::identity::{
+        SealedName, SealedRecordId, SealedRedactionIdentity, SealedScopeKind,
+    };
+
+    // Distinct, non-substring literals so leftmost-longest matching is
+    // unambiguous and no literal's encoded variant collides with the haystack.
+    const ENV_LITERAL: &str = "env-scan-secret-abc123456";
+    const CREDENTIAL_LITERAL: &str = "stored-credential-secret-xyz789";
+    const SEALED_LITERAL: &str = "sealed-deploy-token-literal-000";
+    const LEAK_LITERAL: &str = "contained-leak-literal-value-999";
+    const UNMATCHED_HIGH_ENTROPY: &str = "Zq7UnregisteredHighEntropyString42Kv";
+
+    const SEALED_VERSION: u32 = 4;
+
+    /// Build a real table through the production seams with one entry of each
+    /// source class: `Environment` (env scan), `Credential` (stored secret),
+    /// `Sealed` (typed sealed identity), and `ContainedLeak` (forced literal).
+    fn build_table() -> (RedactionTable, SealedRecordId) {
+        let cfg = RedactConfig {
+            enabled: true,
+            scan_environment: true,
+            scan_dotenv: false,
+            scan_ssh_keys: false,
+            min_secret_length: 4,
+            placeholder: "[redacted]".to_string(),
+            ..RedactConfig::default()
+        };
+        let env = HashMap::from([("DEPLOY_TOKEN".to_string(), ENV_LITERAL.to_string())]);
+        // A stored named secret classifies as `Credential` (forced inclusion).
+        let base = RedactionTable::build_with_env_and_secrets(
+            &cfg,
+            Path::new("."),
+            &env,
+            [("stored_api".to_string(), CREDENTIAL_LITERAL.to_string())],
+        )
+        .unwrap();
+
+        let record_id = SealedRecordId::generate();
+        let identity = SealedRedactionIdentity {
+            scope: SealedScopeKind::Project,
+            record_id: Some(record_id),
+            name: SealedName::canonical("deploy_token").unwrap(),
+            version: SEALED_VERSION,
+        };
+        let table = base
+            .with_forced_sealed_literal(SEALED_LITERAL.to_string(), identity)
+            .unwrap()
+            .with_forced_literal(LEAK_LITERAL.to_string(), "$leak:test".to_string())
+            .unwrap();
+        (table, record_id)
+    }
+
+    fn find<'a>(matched: &'a [MatchedLiteral], literal: &str) -> Option<&'a MatchedLiteral> {
+        matched.iter().find(|m| m.literal == literal)
+    }
+
+    #[test]
+    fn returns_distinct_matched_entries_with_typed_source_and_sealed_identity() {
+        let (table, record_id) = build_table();
+        // Haystack contains some-but-not-all literals (no CREDENTIAL_LITERAL),
+        // includes an unregistered high-entropy string, and repeats one literal
+        // to prove dedup-by-entry.
+        let haystack = format!(
+            "start {ENV_LITERAL} then {SEALED_LITERAL} and again {ENV_LITERAL} \
+             plus {LEAK_LITERAL} noise {UNMATCHED_HIGH_ENTROPY} end"
+        );
+
+        let matched = match_sensitive_literals(&table, &haystack);
+
+        // Exactly the three present entries, each once (env repeated ⇒ still one).
+        assert_eq!(matched.len(), 3, "{matched:#?}");
+
+        let env = find(&matched, ENV_LITERAL).expect("env literal matched");
+        assert_eq!(env.source, SourceClass::Environment);
+        assert_eq!(env.sealed_identity, None);
+
+        let leak = find(&matched, LEAK_LITERAL).expect("leak literal matched");
+        assert_eq!(leak.source, SourceClass::ContainedLeak);
+        assert_eq!(leak.sealed_identity, None);
+
+        let sealed = find(&matched, SEALED_LITERAL).expect("sealed literal matched");
+        assert_eq!(
+            sealed.source,
+            SourceClass::Sealed {
+                record_id: Some(record_id),
+                version: SEALED_VERSION
+            }
+        );
+        let identity = sealed
+            .sealed_identity
+            .as_ref()
+            .expect("sealed match carries typed identity");
+        assert_eq!(identity.record_id, Some(record_id));
+        assert_eq!(identity.version, SEALED_VERSION);
+        assert_eq!(identity.name.as_str(), "deploy_token");
+        assert_eq!(identity.scope, SealedScopeKind::Project);
+
+        // The credential literal is in the table but absent from the haystack:
+        // table-match-only means it is NOT returned.
+        assert!(find(&matched, CREDENTIAL_LITERAL).is_none());
+        // The high-entropy string is not a table entry: no free-form classification.
+        assert!(matched.iter().all(|m| m.literal != UNMATCHED_HIGH_ENTROPY));
+    }
+
+    #[test]
+    fn credential_literal_is_classified_when_present() {
+        let (table, _record_id) = build_table();
+        let haystack = format!("only the credential {CREDENTIAL_LITERAL} appears here");
+
+        let matched = match_sensitive_literals(&table, &haystack);
+
+        assert_eq!(matched.len(), 1, "{matched:#?}");
+        let cred = &matched[0];
+        assert_eq!(cred.literal, CREDENTIAL_LITERAL);
+        assert_eq!(cred.source, SourceClass::Credential);
+        assert_eq!(cred.sealed_identity, None);
+    }
+
+    #[test]
+    fn unmatched_high_entropy_string_yields_nothing() {
+        let (table, _record_id) = build_table();
+        let haystack = format!("noise only {UNMATCHED_HIGH_ENTROPY} here");
+
+        let matched = match_sensitive_literals(&table, &haystack);
+
+        assert!(matched.is_empty(), "{matched:#?}");
+    }
+
+    #[test]
+    fn empty_table_yields_no_matches() {
+        let table = RedactionTable::empty();
+        let matched = match_sensitive_literals(&table, "anything at all here");
+        assert!(matched.is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -1765,6 +2127,7 @@ mod scrub_inventory_tests {
         "crates/cockpit-core/src/mcp/builtin.rs",
         "crates/cockpit-core/src/redact/mod.rs",
         "crates/cockpit-core/src/session/export/mod.rs",
+        "crates/cockpit-core/src/session/recording.rs",
         "crates/cockpit-core/src/skills/auto_select/mod.rs",
         "crates/cockpit-core/src/tools/read.rs",
         "crates/cockpit-core/src/tools/skill.rs",

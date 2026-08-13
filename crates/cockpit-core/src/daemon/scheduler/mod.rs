@@ -1673,13 +1673,15 @@ mod tests {
 
     fn production_registry(db: Db) -> SessionRegistry {
         let locks = Arc::new(LockManager::in_memory(db.clone()));
-        SessionRegistry::new(
+        let reg = SessionRegistry::new(
             db,
             locks,
             ShutdownSignal::new(),
             None,
             ConfigSource::fixed(ProvidersConfig::default(), ExtendedConfig::default()),
-        )
+        );
+        reg.set_redaction_key_resolver(crate::session::test_redaction_key_resolver());
+        reg
     }
 
     struct PromptRunnerFixture {
@@ -1695,8 +1697,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let registry = production_registry(db.clone());
-        let session =
-            Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
+        let session = Arc::new(
+            Session::create(
+                db.clone(),
+                tmp.path().to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
         let locks = Arc::new(LockManager::in_memory(db.clone()));
         let (handle, work_rx) =
             SessionWorkerHandle::test_handle_with_receiver(session.clone(), locks);

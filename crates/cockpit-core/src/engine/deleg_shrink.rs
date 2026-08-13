@@ -392,7 +392,13 @@ mod tests {
     fn child_note_send_does_not_mask_parent_cold() {
         use crate::session::Session;
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = Session::create(db, std::path::PathBuf::from("/tmp"), "builder").unwrap();
+        let session = Session::create(
+            db,
+            std::path::PathBuf::from("/tmp"),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
 
         // Parent delegated 200s ago with a 100s TTL → its prefix is cold.
         let start = Instant::now() - Duration::from_secs(200);

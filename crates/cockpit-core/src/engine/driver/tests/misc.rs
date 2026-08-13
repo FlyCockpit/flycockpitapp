@@ -25,6 +25,118 @@ async fn turn_boundary_refresh_picks_up_new_dotenv_secret_for_driver_model_and_s
     }
 }
 
+// J2 regression: a driver's per-turn redaction refresh must never overwrite the
+// durable table with its own stale `self.redact` copy and thereby drop a sealed
+// literal that was adopted mid-session into the HUB's shared table (decision
+// 10.1 adopted-table invariant). The refresh now routes through the hub's
+// serialized read→union→persist→swap, so it unions the disk scan onto the LATEST
+// shared table (which holds the committed sealed literal) instead of the stale
+// copy.
+#[tokio::test]
+async fn driver_refresh_does_not_drop_a_committed_sealed_adoption() {
+    use crate::engine::interrupt::InterruptHub;
+    use crate::sealed::compartment::SealedLiteral;
+    use crate::sealed::identity::{
+        SealedName, SealedRecordId, SealedRedactionIdentity, SealedScopeKind,
+    };
+    use crate::sealed::runtime::{SealedRedactionSink, SessionRedactionSink};
+
+    let (mut driver, tmp) = test_driver(1);
+    let session = driver.session.clone();
+
+    // A real (non-detached) hub sharing the driver's session + db, with a live
+    // shared table starting empty — the same shape the daemon wires onto the
+    // driver and the tool context's `SessionRedactionSink`.
+    let redaction: crate::daemon::SharedRedactionTable = std::sync::Arc::new(
+        std::sync::RwLock::new(std::sync::Arc::new(RedactionTable::empty())),
+    );
+    let (events, _events_rx) = tokio::sync::broadcast::channel(16);
+    let hub = std::sync::Arc::new(InterruptHub::new(
+        events,
+        redaction.clone(),
+        std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+        session.db.clone(),
+        session.id,
+    ));
+
+    // Adopt a sealed literal into the hub's shared table + durable store. The
+    // driver's own `self.redact` is never told about this adoption.
+    const SEALED_LIT: &str = "driver-refresh-sealed-literal-do-not-drop-000";
+    let sink = SessionRedactionSink::new(hub.clone(), session.clone());
+    sink.register_before_use(
+        &SealedLiteral::new(SEALED_LIT),
+        &SealedRedactionIdentity {
+            scope: SealedScopeKind::Project,
+            record_id: Some(SealedRecordId::generate()),
+            name: SealedName::canonical("deploy_token").unwrap(),
+            version: 1,
+        },
+    )
+    .await
+    .unwrap();
+
+    // The adoption is durable, but the driver's stale copy does not scrub it.
+    assert!(
+        !session
+            .persisted_redaction_table()
+            .unwrap()
+            .unwrap()
+            .scrub(SEALED_LIT)
+            .contains(SEALED_LIT),
+        "sealed literal is durable immediately after adoption"
+    );
+    assert!(
+        driver.redact.scrub(SEALED_LIT).contains(SEALED_LIT),
+        "driver's own copy is stale and does not yet scrub the sealed literal"
+    );
+
+    // Wire the same hub onto the driver and add a fresh on-disk secret so the
+    // refresh has a real disk delta to union + persist.
+    driver.set_interrupt_hub(hub);
+    std::fs::write(
+        tmp.path().join(".env"),
+        "DISK_SECRET=driver-refresh-disk-secret\n",
+    )
+    .unwrap();
+
+    let (tx, _turn_rx) = mpsc::channel(8);
+    driver.refresh_redaction_table_for_turn(&tx).await;
+
+    // Core J2 property: the refresh unioned onto the LATEST shared table under
+    // the write lock, so the DURABLE table still scrubs the committed sealed
+    // literal. Under the pre-fix code the driver persisted its stale `self.redact`
+    // copy (which never saw the mid-session adoption), clobbering the sealed
+    // literal out of the durable table — this assertion is what catches that.
+    let durable = session.persisted_redaction_table().unwrap().unwrap();
+    assert!(
+        !durable.scrub(SEALED_LIT).contains(SEALED_LIT),
+        "the driver refresh must not clobber the durable sealed adoption"
+    );
+
+    // The refresh genuinely unioned the disk delta onto the committed table
+    // (it is not a no-op). Disk-derived (dotenv) VALUES are intentionally
+    // excluded from the persisted table — `RedactionTable::to_persisted_json`
+    // keeps only their origin marker and they are re-scanned on resume — so the
+    // disk secret lands in the LIVE egress tables, not the durable one. Both the
+    // driver's live copy AND the hub's shared table must now carry BOTH the
+    // preserved sealed literal and the freshly discovered disk secret, proving
+    // the driver merged the disk scan onto the committed adoption rather than
+    // replacing it and that it now participates in the shared-table path.
+    let shared = redaction.read().unwrap().clone();
+    for live in [&driver.redact, &shared] {
+        assert!(
+            !live.scrub(SEALED_LIT).contains(SEALED_LIT),
+            "live table keeps the sealed literal"
+        );
+        assert!(
+            !live
+                .scrub("driver-refresh-disk-secret")
+                .contains("driver-refresh-disk-secret"),
+            "live table gains the freshly discovered disk secret"
+        );
+    }
+}
+
 #[tokio::test]
 async fn stale_child_watermark_does_not_suppress_sibling_auto_prune() {
     let (mut driver, _tmp) = test_driver(8);

@@ -1541,6 +1541,7 @@ pub(super) async fn run_worker(
                         &redaction_overrides,
                         &mut unsupported_redaction_notified,
                         &redaction,
+                        &interrupts,
                         &event_tx,
                         &driver_control_tx,
                         &session_env,
@@ -2728,17 +2729,49 @@ pub(super) async fn run_worker(
                         &session_env,
                     ) {
                         Ok(new_table) => {
-                            let table = match current_redaction(&redaction).union(&new_table) {
-                                Ok(table) => Arc::new(table),
-                                Err(error) => {
-                                    tracing::warn!(error = %error, "unioning redaction table failed");
-                                    Arc::new(new_table)
+                            // H1: read the LATEST table, union, persist, and swap
+                            // under the per-session redaction-table write lock so
+                            // this `/toggle-redaction` refresh serializes with
+                            // sealed adoption / approved-secret-file registration
+                            // and cannot clobber a concurrently-committed adoption.
+                            // The guard is released before the driver `.await`.
+                            let table = {
+                                let _redaction_guard =
+                                    interrupts.lock_redaction_table_write().await;
+                                let base = current_redaction(&redaction);
+                                match base.union(&new_table) {
+                                    Ok(unioned) => {
+                                        let unioned = Arc::new(unioned);
+                                        // J3: persist BEFORE swapping the live table
+                                        // so a persist failure never leaves the live
+                                        // table advanced ahead of the durable one (a
+                                        // restart would lose the accumulated entry).
+                                        // On failure keep the previously-committed
+                                        // table live and surface the error.
+                                        match session.persist_redaction_table(&unioned) {
+                                            Ok(()) => {
+                                                set_current_redaction(&redaction, unioned.clone());
+                                                unioned
+                                            }
+                                            Err(error) => {
+                                                tracing::warn!(error = %error, %session_id, "persisting redaction table failed; keeping previously committed redaction table live");
+                                                base
+                                            }
+                                        }
+                                    }
+                                    Err(error) => {
+                                        // K6: never overwrite the committed table
+                                        // (which may hold a sealed literal adopted this
+                                        // turn) with a bare disk scan on a union error.
+                                        // Keep the committed `base` live and durable and
+                                        // defer the disk delta to the next refresh,
+                                        // mirroring
+                                        // `InterruptHub::refresh_union_redaction`.
+                                        tracing::warn!(error = %error, %session_id, "unioning redaction table failed; keeping committed redaction table live");
+                                        base
+                                    }
                                 }
                             };
-                            set_current_redaction(&redaction, table.clone());
-                            if let Err(error) = session.persist_redaction_table(&table) {
-                                tracing::warn!(error = %error, %session_id, "persisting redaction table failed");
-                            }
                             for path in table.unsupported_files() {
                                 if unsupported_redaction_notified.insert(path.clone()) {
                                     send_current_session_event(

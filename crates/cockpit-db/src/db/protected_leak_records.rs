@@ -800,7 +800,8 @@ mod tests {
             sealed_version: None,
             source: ProtectedRedactionSource::ContainedLeak,
             fingerprint: fp.to_owned(),
-            ciphertext: vec![0u8; 32],
+            // 272 = smallest ciphertext bucket (256-byte padded frame + 16 tag).
+            ciphertext: vec![0u8; 272],
             nonce: vec![0u8; 12],
             key_version: 1,
         };

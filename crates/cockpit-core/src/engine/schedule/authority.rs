@@ -910,8 +910,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session =
-            Arc::new(crate::session::Session::create(db.clone(), root.clone(), "builder").unwrap());
+        let session = Arc::new(
+            crate::session::Session::create(
+                db.clone(),
+                root.clone(),
+                "builder",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
         let locks = Arc::new(crate::locks::LockManager::in_memory(db));
         let cfg = crate::config::extended::RedactConfig::default();
         let redact = Arc::new(RedactionTable::build(&cfg, &root).unwrap());

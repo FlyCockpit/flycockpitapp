@@ -8,7 +8,7 @@ This inventory classifies every production `RedactionTable::scrub` boundary and 
 - Dispatch: `crates/cockpit-core/src/engine/model/dispatch.rs`, `crates/cockpit-core/src/engine/model/mod.rs`, `crates/cockpit-core/src/engine/model/redact.rs`, `crates/cockpit-core/src/engine/model/outbound_guard.rs`, `crates/cockpit-core/src/engine/model_roles.rs`, `crates/cockpit-core/src/embeddings.rs`, `crates/cockpit-core/src/harness/run.rs`, `crates/cockpit-core/src/knowledge.rs`, `crates/cockpit-core/src/mcp/builtin.rs`, `crates/cockpit-core/src/skills/auto_select/mod.rs`, `crates/cockpit-core/src/tools/skill.rs`, `crates/cockpit-core/src/tools/read.rs`
 - Client boundary: `apps/cli/src/commands/debug.rs`, `crates/cockpit-core/src/daemon/server/mod.rs`, `crates/cockpit-core/src/daemon/server/dispatch.rs`, `crates/cockpit-core/src/engine/driver/reports.rs`
 - Off machine: `crates/cockpit-core/src/session/export/mod.rs`, `crates/cockpit-core/src/daemon/org_sync.rs`, `crates/cockpit-core/src/daemon/remote_audit_upload.rs`
-- Session-worker persist path: `crates/cockpit-core/src/daemon/session_worker/mod.rs`, `crates/cockpit-core/src/daemon/session_worker/run.rs`, `crates/cockpit-core/src/engine/driver/mod.rs`
+- Session-worker persist path: `crates/cockpit-core/src/daemon/session_worker/mod.rs`, `crates/cockpit-core/src/daemon/session_worker/run.rs`, `crates/cockpit-core/src/engine/driver/mod.rs`, `crates/cockpit-core/src/session/recording.rs`
 - Core scrub entry points: `crates/cockpit-core/src/redact/mod.rs`
 <!-- scrub-inventory:end -->
 
@@ -46,6 +46,7 @@ This inventory classifies every production `RedactionTable::scrub` boundary and 
 - `crates/cockpit-core/src/daemon/session_worker/mod.rs`: durable notice events are scrubbed through the current session redaction table before they are stored.
 - `crates/cockpit-core/src/daemon/session_worker/run.rs`: persisted worker result data is scrubbed through the current session redaction table before it is stored.
 - `crates/cockpit-core/src/engine/driver/mod.rs`: the recent root-turn transcript captured as goal "worker evidence" is scrubbed through the session redaction table before it is persisted as durable goal-root-turn evidence.
+- `crates/cockpit-core/src/session/recording.rs`: the fail-closed JSON scrub (`scrub_matched_literals_in_json`/`scrub_scalar_leaf`) walks parsed event JSON leaves through an enforcing redaction table before a recorded session event is persisted, keeping the scrub JSON-escape-safe and never copying matched secret bytes into its output.
 
 ## Core scrub entry points
 

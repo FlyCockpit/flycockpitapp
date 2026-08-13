@@ -291,6 +291,264 @@ async fn schedule_dispatch_emits_tool_call_session_event() {
     assert_eq!(tool_call.data["original_input"]["action"], "list");
 }
 
+/// Redact config that scans the injected environment for the test literal,
+/// mirroring the recording-layer journaling tests.
+fn schedule_redact_cfg() -> crate::config::extended::RedactConfig {
+    crate::config::extended::RedactConfig {
+        enabled: true,
+        scan_environment: true,
+        scan_dotenv: false,
+        scan_ssh_keys: false,
+        min_secret_length: 4,
+        placeholder: "[redacted]".to_string(),
+        ..crate::config::extended::RedactConfig::default()
+    }
+}
+
+/// A provider on disk carrying a TRUSTED `openai:gpt-5` and an UNTRUSTED
+/// `openai:gpt-untrusted`, so a driver config handle and a `Model::for_provider`
+/// resolve the trust the caller asks for.
+fn write_schedule_trust_provider(root: &std::path::Path) {
+    let cockpit = root.join(".cockpit");
+    let providers = cockpit.join("providers");
+    std::fs::create_dir_all(&providers).unwrap();
+    std::fs::write(cockpit.join("config.json"), r#"{"llm_mode":"defensive"}"#).unwrap();
+    std::fs::write(
+        providers.join("openai.json"),
+        serde_json::json!({
+            "url": "https://example.test/v1",
+            "models": [
+                {"id": "gpt-5", "trust": "trusted", "mode": "frontier"},
+                {"id": "gpt-untrusted", "trust": "untrusted", "mode": "frontier"},
+            ],
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+/// Build a driver whose foreground `Build` agent runs an `openai` model (trusted
+/// `gpt-5` or untrusted `gpt-untrusted`) whose session redaction table carries
+/// `lit`, and whose config handle resolves that provider from disk. This is the
+/// exact `self.stack.last().agent.model` + `self.config` shape
+/// `record_schedule_tool_call` reads to journal a schedule tool_call's
+/// model-authored args. `resolver` is the session's protected-history key
+/// resolver (a working `MapKeyResolver` journals; an empty one fails closed).
+fn schedule_journaling_driver(
+    lit: &str,
+    trusted: bool,
+    resolver: Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
+) -> (Driver, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    write_schedule_trust_provider(&root);
+    let db = crate::db::Db::open_in_memory().unwrap();
+    let session = Arc::new(Session::create(db.clone(), root.clone(), "Build", resolver).unwrap());
+    let locks = Arc::new(crate::locks::LockManager::in_memory(db));
+
+    let env = std::collections::HashMap::from([("DEPLOY_TOKEN".to_string(), lit.to_string())]);
+    let table =
+        Arc::new(RedactionTable::build_with_env(&schedule_redact_cfg(), &root, &env).unwrap());
+
+    let config = crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(&root);
+    let (_extended, providers) = config.configs();
+    let model_id = if trusted { "gpt-5" } else { "gpt-untrusted" };
+    let model = Arc::new(
+        crate::engine::model::Model::for_provider(&providers, "openai", model_id, table.clone())
+            .unwrap(),
+    );
+    let agent = Arc::new(Agent {
+        name: "Build".into(),
+        system: String::new(),
+        role_prompt: String::new(),
+        tools: crate::engine::tool::ToolBox::new(),
+        model,
+        params: crate::engine::model::ModelParams::default(),
+        scan_tool_results: true,
+        llm_mode: crate::config::extended::LlmMode::default(),
+        lock_identity: "Build".to_string(),
+        write_scope: None,
+        delegated: false,
+        delegation_recursion: crate::engine::builtin::DelegationRecursionContext::default(),
+        env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+    });
+    let mut driver = Driver::with_max_schedules(session, locks, table, root, agent, 8);
+    // Install the from-disk trusted config so the frame `record_schedule_tool_call`
+    // builds resolves trust exactly as a real worker would.
+    driver.set_config_handle(config);
+    (driver, tmp)
+}
+
+/// The `schedule` tool_call payload carries the scheduling model's own arguments
+/// (`original_input`/`wire_input`), so a session-table literal the model placed
+/// in a schedule arg must journal to protected redaction history rather than
+/// persist raw — the same frame-carrying path every other tool_call uses. A
+/// trusted author journals + attaches a `Tool` artifact ref keyed by the
+/// committed event `seq`.
+#[tokio::test]
+async fn schedule_tool_call_journals_matched_literal_for_trusted_author() {
+    const LIT: &str = "schedule-arg-secret-abc123456";
+    let (driver, _tmp) =
+        schedule_journaling_driver(LIT, true, crate::session::test_redaction_key_resolver());
+
+    driver
+        .record_schedule_tool_call(ScheduleToolCallRecord {
+            agent: "Build".to_string(),
+            llm_mode: crate::config::extended::LlmMode::default(),
+            call_id: "call-sched-journal".to_string(),
+            original_input_json: serde_json::json!({
+                "action": "note",
+                "args": { "text": format!("remember {LIT}") },
+            }),
+            wire_input_json: serde_json::json!({
+                "action": "note",
+                "args": { "text": format!("remember {LIT}") },
+            }),
+            recovery: crate::db::tool_calls::Recovery::Clean,
+            hard_fail: false,
+            output: "ok".to_string(),
+            duration_ms: 2,
+        })
+        .await;
+
+    let sid = driver.session.id.to_string();
+    let rows = driver
+        .session
+        .db
+        .protected_redaction_history_list(&sid)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "trusted schedule tool_call must journal its arg literal: {rows:#?}"
+    );
+
+    let events = driver
+        .session
+        .db
+        .list_session_events(driver.session.id)
+        .await
+        .unwrap();
+    let seq = events
+        .iter()
+        .find(|e| e.kind == "tool_call" && e.call_id.as_deref() == Some("call-sched-journal"))
+        .expect("schedule tool_call session event")
+        .seq;
+    let refs = driver
+        .session
+        .db
+        .protected_redaction_artifact_refs_for_artifact(
+            crate::redact::protected_redaction_history::RedactionArtifactKind::Tool,
+            &seq.to_string(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refs.len(), 1, "one Tool ref for the schedule event seq");
+    assert_eq!(refs[0].history_id, rows[0].history_id);
+}
+
+/// An UNTRUSTED scheduling author journals nothing: its payload is already
+/// post-redaction for egress, so the schedule tool_call event persists with no
+/// protected-history row.
+#[tokio::test]
+async fn schedule_tool_call_journals_nothing_for_untrusted_author() {
+    const LIT: &str = "schedule-arg-secret-untrusted-xyz789";
+    let (driver, _tmp) =
+        schedule_journaling_driver(LIT, false, crate::session::test_redaction_key_resolver());
+
+    driver
+        .record_schedule_tool_call(ScheduleToolCallRecord {
+            agent: "Build".to_string(),
+            llm_mode: crate::config::extended::LlmMode::default(),
+            call_id: "call-sched-untrusted".to_string(),
+            original_input_json: serde_json::json!({
+                "action": "note",
+                "args": { "text": format!("remember {LIT}") },
+            }),
+            wire_input_json: serde_json::json!({
+                "action": "note",
+                "args": { "text": format!("remember {LIT}") },
+            }),
+            recovery: crate::db::tool_calls::Recovery::Clean,
+            hard_fail: false,
+            output: "ok".to_string(),
+            duration_ms: 2,
+        })
+        .await;
+
+    let sid = driver.session.id.to_string();
+    assert!(
+        driver
+            .session
+            .db
+            .protected_redaction_history_list(&sid)
+            .await
+            .unwrap()
+            .is_empty(),
+        "an untrusted scheduling author must journal nothing"
+    );
+}
+
+/// When journaling fails (key resolver down), the trusted schedule tool_call
+/// fails closed (decision 12): no history row commits and the persisted event
+/// body scrubs the matched literal to the generic placeholder instead of
+/// storing it raw.
+#[tokio::test]
+async fn schedule_tool_call_fails_closed_on_journal_failure() {
+    const LIT: &str = "schedule-arg-secret-failclosed-qrs456";
+    // An empty MapKeyResolver has no active version, so `ensure_active` (and thus
+    // `prepare_append`) fails closed the moment journaling is attempted.
+    let empty_resolver: Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver> =
+        Arc::new(crate::redact::protected_redaction_history::MapKeyResolver::new());
+    let (driver, _tmp) = schedule_journaling_driver(LIT, true, empty_resolver);
+
+    driver
+        .record_schedule_tool_call(ScheduleToolCallRecord {
+            agent: "Build".to_string(),
+            llm_mode: crate::config::extended::LlmMode::default(),
+            call_id: "call-sched-failclosed".to_string(),
+            original_input_json: serde_json::json!({
+                "action": "note",
+                "args": { "text": format!("remember {LIT}") },
+            }),
+            wire_input_json: serde_json::json!({
+                "action": "note",
+                "args": { "text": format!("remember {LIT}") },
+            }),
+            recovery: crate::db::tool_calls::Recovery::Clean,
+            hard_fail: false,
+            output: "ok".to_string(),
+            duration_ms: 2,
+        })
+        .await;
+
+    let sid = driver.session.id.to_string();
+    assert!(
+        driver
+            .session
+            .db
+            .protected_redaction_history_list(&sid)
+            .await
+            .unwrap()
+            .is_empty(),
+        "journal failure leaves no history row"
+    );
+    let events = driver
+        .session
+        .db
+        .list_session_events(driver.session.id)
+        .await
+        .unwrap();
+    let event = events
+        .iter()
+        .find(|e| e.kind == "tool_call" && e.call_id.as_deref() == Some("call-sched-failclosed"))
+        .expect("scrubbed schedule tool_call event persisted");
+    let body = serde_json::to_string(&event.data).unwrap();
+    assert!(!body.contains(LIT), "matched literal must be scrubbed");
+    assert!(body.contains("[redacted]"), "generic placeholder present");
+}
+
 #[tokio::test]
 async fn dispatch_background_tail_unknown_id() {
     let (mut driver, _tmp) = test_driver(8);

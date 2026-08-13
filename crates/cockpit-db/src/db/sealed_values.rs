@@ -3,10 +3,58 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::params;
+use rusqlite::{Connection, params};
 use uuid::Uuid;
 
 use crate::db::Db;
+
+/// Connection-scoped legacy sealed-value upsert, so a caller can compose it with
+/// other writes (a redaction-table persist and a protected-history journal
+/// append) inside one [`Db::transaction`] — either all commit or none do. Mirrors
+/// [`Db::upsert_sealed_value`], including its refusal to overwrite a scoped
+/// value's literal, checked in the same transaction so a concurrent create
+/// cannot slip between.
+pub fn upsert_sealed_value_conn(
+    conn: &Connection,
+    session_id: Uuid,
+    value_id: &str,
+    value: &str,
+    reason: &str,
+    origin: &str,
+) -> Result<SealedValueMetadata> {
+    let now = Utc::now().timestamp();
+    let scoped: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sealed_value_records
+              WHERE scope = 'session' AND scope_key = ?1 AND name = ?2",
+            params![session_id.to_string(), value_id],
+            |row| row.get(0),
+        )
+        .context("checking for a scoped record before a legacy upsert")?;
+    if scoped > 0 {
+        anyhow::bail!(
+            "sealed value `{value_id}` is a scoped value; rotate it through \
+             the scoped path so its version is bumped and grants fenced, \
+             rather than overwriting the literal underneath them"
+        );
+    }
+    conn.execute(
+        "INSERT INTO sealed_values (session_id, value_id, value, reason, origin, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(session_id, value_id) DO UPDATE SET
+           value = excluded.value, reason = excluded.reason, origin = excluded.origin,
+           created_at = excluded.created_at",
+        params![session_id.to_string(), value_id, value, reason, origin, now],
+    )
+    .context("upserting sealed value")?;
+    Ok(SealedValueMetadata {
+        value_id: value_id.to_owned(),
+        reason: reason.to_owned(),
+        origin: origin.to_owned(),
+        created_at: now,
+        origin_session_id: session_id,
+    })
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct SealedValueMetadata {
@@ -44,43 +92,12 @@ impl Db {
         reason: &str,
         origin: &str,
     ) -> Result<SealedValueMetadata> {
-        let now = Utc::now().timestamp();
         let value_id = value_id.to_owned();
         let value = value.to_owned();
         let reason = reason.to_owned();
         let origin = origin.to_owned();
         self.transaction(move |conn| {
-            let scoped: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sealed_value_records
-                      WHERE scope = 'session' AND scope_key = ?1 AND name = ?2",
-                    params![session_id.to_string(), value_id],
-                    |row| row.get(0),
-                )
-                .context("checking for a scoped record before a legacy upsert")?;
-            if scoped > 0 {
-                anyhow::bail!(
-                    "sealed value `{value_id}` is a scoped value; rotate it through \
-                     the scoped path so its version is bumped and grants fenced, \
-                     rather than overwriting the literal underneath them"
-                );
-            }
-            conn.execute(
-                "INSERT INTO sealed_values (session_id, value_id, value, reason, origin, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(session_id, value_id) DO UPDATE SET
-                   value = excluded.value, reason = excluded.reason, origin = excluded.origin,
-                   created_at = excluded.created_at",
-                params![session_id.to_string(), value_id, value, reason, origin, now],
-            )
-            .context("upserting sealed value")?;
-            Ok(SealedValueMetadata {
-                value_id,
-                reason,
-                origin,
-                created_at: now,
-                origin_session_id: session_id,
-            })
+            upsert_sealed_value_conn(conn, session_id, &value_id, &value, &reason, &origin)
         })
         .await
     }

@@ -394,6 +394,15 @@ impl Driver {
         {
             tracing::warn!(error = %e, "persisting skill-slash tool_call failed");
         }
+        // Host skill-seed, not a model-authored call: `args` is the host-synthesized
+        // `{ "name": skill_name }` (built at the top of this fn from the user/host
+        // slash-command target, never model free text), and `body`/`output` is the
+        // rendered skill package instructions loaded from disk — host content, not
+        // model output. `wire == original` because nothing was model-emitted to
+        // repair. So this ToolCall payload carries no model-authored session-table
+        // literal; frame-less `record_event` is correct (unlike a real agent-emitted
+        // tool_call, which tool_dispatch.rs frames). This is the deliberate
+        // exception the schedule tool_call is NOT (see schedule_dispatch.rs).
         if let Err(e) = self
             .session
             .record_event(

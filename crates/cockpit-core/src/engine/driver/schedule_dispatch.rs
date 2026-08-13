@@ -374,23 +374,50 @@ impl Driver {
         // `tool_call_events` row (`/stats`, history) AND a `tool_call`
         // `session_events` row (the export's dispatch record).
         let (recovery_kind, recovery_stage) = row.recovery.db_fields();
+        // The `schedule` tool_call payload carries MODEL-AUTHORED free text —
+        // `original_input`/`wire_input` are the scheduling model's own tool
+        // arguments (and `output` can echo them back), so a session-table literal
+        // the model placed in a schedule arg would otherwise persist raw with no
+        // history row. Route it through the frame-carrying journaling path exactly
+        // like every ordinary tool_call (engine/agent/tool_dispatch.rs) does, using
+        // the authoring (foreground) agent's model identity + pre-policy session
+        // table: a trusted author journals its matched literals (or fail-closed
+        // scrubs), an untrusted author journals nothing (payload already
+        // post-redaction). The foreground stack top is the agent that emitted this
+        // `schedule` call — the same agent captured in `row.agent` — because a
+        // schedule action dispatches background work without popping the caller's
+        // frame.
+        let active_model = &self
+            .stack
+            .last()
+            .expect("driver stack is never empty")
+            .agent
+            .model;
+        let schedule_session_table = active_model.session_redact_table();
+        let schedule_event_data = serde_json::json!({
+            "tool": "schedule",
+            "original_input": row.original_input_json,
+            "wire_input": row.wire_input_json,
+            "recovery_kind": recovery_kind,
+            "recovery_stage": recovery_stage,
+            "hard_fail": row.hard_fail,
+            "output": row.output,
+            "truncated": false,
+            "duration_ms": row.duration_ms,
+        });
         if let Err(e) = self
             .session
-            .record_event(
+            .record_event_with_model_frame(
                 crate::db::session_log::SessionEventKind::ToolCall,
                 Some(&row.agent),
                 Some(&row.call_id),
-                &serde_json::json!({
-                    "tool": "schedule",
-                    "original_input": row.original_input_json,
-                    "wire_input": row.wire_input_json,
-                    "recovery_kind": recovery_kind,
-                    "recovery_stage": recovery_stage,
-                    "hard_fail": row.hard_fail,
-                    "output": row.output,
-                    "truncated": false,
-                    "duration_ms": row.duration_ms,
-                }),
+                crate::session::SessionEventModelFrame {
+                    provider_id: active_model.provider_id(),
+                    model_id: active_model.model_id_ref(),
+                    config: &self.config,
+                    session_table: schedule_session_table.as_ref(),
+                },
+                &schedule_event_data,
             )
             .await
         {

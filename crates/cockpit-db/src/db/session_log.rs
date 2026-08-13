@@ -675,20 +675,34 @@ impl Db {
     ) -> Result<()> {
         let payload_json = payload_json.to_string();
         self.write(move |conn| {
-            conn.execute(
-                "INSERT INTO compaction_handoffs (handoff_id, session_id, payload_json, created_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    handoff_id.to_string(),
-                    session_id.to_string(),
-                    payload_json,
-                    now_ms(),
-                ],
-            )
-            .context("storing compaction payload")?;
-            Ok(())
+            Self::store_compaction_payload_conn(conn, handoff_id, session_id, &payload_json)
         })
         .await
+    }
+
+    /// Connection-scoped compaction-payload insert, so a trusted compaction
+    /// record can compose the offloaded-payload write with its protected
+    /// redaction-history journal in one transaction (K1). No crypto here — the
+    /// blob is stored opaque; the caller in `cockpit-core` owns matching /
+    /// encryption.
+    pub fn store_compaction_payload_conn(
+        conn: &Connection,
+        handoff_id: Uuid,
+        session_id: Uuid,
+        payload_json: &str,
+    ) -> Result<()> {
+        conn.execute(
+            "INSERT INTO compaction_handoffs (handoff_id, session_id, payload_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+            params![
+                handoff_id.to_string(),
+                session_id.to_string(),
+                payload_json,
+                now_ms(),
+            ],
+        )
+        .context("storing compaction payload")?;
+        Ok(())
     }
 
     pub fn compaction_payload_conn(
@@ -839,13 +853,55 @@ impl Db {
         goal_provenance: Option<(Uuid, i64)>,
     ) -> Result<()> {
         let payload_json = serde_json::to_string(payload).context("serializing request payload")?;
-        let ts_ms = now_ms();
         let call_id = call_id.to_owned();
         let provider = meta.provider.map(str::to_owned);
         let model = meta.model.map(str::to_owned);
         let trust = meta.trust.map(str::to_owned);
         self.write(move |conn| {
-            conn.execute(
+            let meta = InferenceAttemptMeta {
+                provider: provider.as_deref(),
+                model: model.as_deref(),
+                trust: trust.as_deref(),
+            };
+            Self::insert_inference_attempt_body_conn(
+                conn,
+                &call_id,
+                ordinal,
+                session_id,
+                &payload_json,
+                meta,
+                goal_provenance,
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Connection-scoped form of the production dispatch insert
+    /// ([`Self::insert_inference_request`]): write the IMMUTABLE post-render
+    /// request body for one attempt keyed `(call_id, ordinal)` with initial
+    /// status `pending` and the per-attempt provider/model/trust metadata.
+    ///
+    /// This is INSERT-ONLY (a plain `INSERT`, no `ON CONFLICT`): a second body
+    /// write to an existing `(call_id, ordinal)` raises a UNIQUE constraint
+    /// error rather than rewriting the audited body, so a success unambiguously
+    /// means this call is the one that FIRST persisted the payload for that
+    /// attempt. Returns the number of rows inserted (always `1` on success).
+    /// Callers that must compose the payload write with protected-history
+    /// journal rows in one transaction use this instead of the async
+    /// [`Self::insert_inference_request`], keying "journal on first insert" off
+    /// the returned count. `payload_json` is the already-serialized body.
+    pub fn insert_inference_attempt_body_conn(
+        conn: &Connection,
+        call_id: &str,
+        ordinal: i64,
+        session_id: Uuid,
+        payload_json: &str,
+        meta: InferenceAttemptMeta<'_>,
+        goal_provenance: Option<(Uuid, i64)>,
+    ) -> Result<usize> {
+        let affected = conn
+            .execute(
                 "INSERT INTO inference_requests
                    (call_id, ordinal, session_id, ts_ms, payload_json, status,
                     provider, model, trust, goal_id, goal_attempt_generation)
@@ -854,19 +910,17 @@ impl Db {
                     call_id,
                     ordinal,
                     session_id.to_string(),
-                    ts_ms,
+                    now_ms(),
                     payload_json,
-                    provider,
-                    model,
-                    trust,
+                    meta.provider,
+                    meta.model,
+                    meta.trust,
                     goal_provenance.map(|(goal_id, _)| goal_id.to_string()),
                     goal_provenance.map(|(_, generation)| generation),
                 ],
             )
             .context("inserting inference_request")?;
-            Ok(())
-        })
-        .await
+        Ok(affected)
     }
 
     /// Advance one attempt's lifecycle: set `status` (monotonically) and fill

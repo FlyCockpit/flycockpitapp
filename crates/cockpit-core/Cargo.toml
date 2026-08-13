@@ -114,6 +114,12 @@ zeroize = { workspace = true }
 # Sealed-state HMAC: direct pin on this member only (not workspace.dependencies).
 # native-secure-sealed-state-store requires exactly 0.13.0 + zeroize feature.
 hmac = { version = "=0.13.0", default-features = false, features = ["zeroize"] }
+# Protected redaction-history AEAD (`harden-and-wire-protected-redaction-history`).
+# ChaCha20-Poly1305, constant-time pure Rust, no CPU-feature variance. Exact
+# version already present transitively in Cargo.lock (via `snow`/`dimpl`), so no
+# new lockfile entries appear. `alloc` only: enables the one-shot Aead trait for
+# encrypt while AeadInPlace covers zeroizing in-place decrypt.
+chacha20poly1305 = { version = "=0.10.1", default-features = false, features = ["alloc"] }
 # WebRTC sans-I/O endpoint: exact str0m 0.21.0 with defaults off and
 # rust-crypto only (remote-webrtc-daemon-endpoint). No AWS-LC, OpenSSL,
 # platform TLS, or alternate WebRTC stack. The RustCrypto provider is

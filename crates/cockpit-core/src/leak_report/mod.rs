@@ -67,7 +67,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -78,13 +78,10 @@ use crate::db::protected_leak_records::{
     InsertLeakRecordInput, InsertLeakResult, LeakCategory, LeakProvenance, LeakRecordStatus,
     LeakSource, insert_leak_record_conn, transition_leak_status_conn,
 };
-use crate::db::protected_redaction_history::{
-    AppendHistoryResult, ProtectedRedactionHistoryAppend, ProtectedRedactionSource,
-    append_history_conn,
-};
 use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input};
 use crate::redact::protected_redaction_history::{
-    MAX_LITERAL_LEN, ProtectedLiteral, RedactionHistorySource, RedactionKeyResolver,
+    MAX_LITERAL_LEN, ProtectedLiteral, ProtectedRedactionHistory, RedactionHistorySource,
+    RedactionKeyResolver, append_and_attach_conn,
 };
 
 /// The model-facing name of the leak report containment tool.
@@ -248,14 +245,28 @@ impl<'a> LeakReportHandler<'a> {
     /// Contain one leak report. This is the sole writer path from a
     /// [`ReportLeakAuthority`] to a committed protected leak record.
     ///
-    /// Steps, all inside one [`Db::transaction`]:
+    /// Not all steps run inside the transaction. The async
+    /// `prepare_append` — key-store resolve, subkey derivation, keyed-MAC
+    /// fingerprint, pad, and AEAD encryption — runs BEFORE the transaction (it
+    /// cannot touch the connection), as do source validation, the rate-limit
+    /// check, and the keyed leak fingerprint. Only the connection-scoped
+    /// dedup/insert/attach is inside one [`Db::transaction`], so the history
+    /// row and the leak record commit together or not at all.
+    ///
+    /// Before the transaction:
     /// 1. Validate the authority's closed source.
     /// 2. Check the rate limit (32 accepted reports/session/hour).
-    /// 3. Compute the keyed fingerprint: SHA-256(session_id || source || literal_fingerprint).
-    /// 4. Encrypt the literal and append it to protected-redaction-history
-    ///    (source = `ContainedLeak`), deduplicating on fingerprint.
-    /// 5. Insert (or deduplicate) the protected leak record as `pending`.
-    /// 6. Transition the record to `contained`.
+    /// 3. `prepare_append`: resolve key material, derive subkeys, compute the
+    ///    keyed-MAC literal fingerprint, pad, and AEAD-encrypt the literal
+    ///    (source = `ContainedLeak`). Fails closed on any key-store/crypto error.
+    /// 4. Derive the record's keyed leak fingerprint from the prepared literal's
+    ///    keyed MAC (SHA-256(session_id || source || literal_fingerprint)).
+    ///
+    /// Inside the transaction:
+    /// 5. Append the prepared (already-encrypted) row to
+    ///    protected-redaction-history, deduplicating on fingerprint.
+    /// 6. Insert (or deduplicate) the protected leak record as `pending`, then
+    ///    transition it to `contained`.
     ///
     /// The literal is consumed into a [`Zeroizing`] frame and zeroized after
     /// the transaction commits or errors. The model receives only `contained`
@@ -289,66 +300,53 @@ impl<'a> LeakReportHandler<'a> {
             return Ok(LeakReportOutcome::RateLimited);
         }
 
-        // 3. Compute the keyed fingerprint and the literal fingerprint.
-        let literal_fingerprint = sha256_hex(secret.as_bytes());
-        let keyed_fingerprint = keyed_leak_fingerprint(&session_id, source, &literal_fingerprint);
-
-        // 4. Build the protected literal for the redaction-history append.
-        //    The literal is consumed into a Zeroizing frame; we clone the
-        //    bytes for the ProtectedLiteral (which itself zeroizes on drop).
-        let protected_literal = ProtectedLiteral::new(
-            secret.as_str().to_owned(),
+        // 3. Prepare the protected append off the DB thread: load key material
+        //    from the secure key store, derive subkeys, compute the keyed MAC
+        //    fingerprint, pad, and AEAD-encrypt. This is the shared sole-writer
+        //    crypto path — no local cipher. The literal is consumed and zeroized.
+        let protected_literal = match ProtectedLiteral::from_zeroizing(
+            secret,
             RedactionHistorySource::ContainedLeak,
             None,
             None,
-        )?;
-
-        let key_version = 1; // matches ProtectedRedactionHistory::current_key_version
-        let key = match self.key_resolver.resolve(key_version) {
-            Ok(k) => k,
+        ) {
+            Ok(l) => l,
+            Err(_) => return Ok(LeakReportOutcome::Failed),
+        };
+        let history = ProtectedRedactionHistory::new(self.db, self.key_resolver);
+        let prepared = match history.prepare_append(&session_id, protected_literal).await {
+            Ok(p) => p,
+            // Fail closed on any key-store / encryption failure (decision 12).
             Err(_) => return Ok(LeakReportOutcome::Failed),
         };
 
-        // Encrypt the literal (mirrors ProtectedRedactionHistory::append_and_attach
-        // but we run it inside our own transaction so the leak record and the
-        // history row commit atomically).
-        let nonce = generate_nonce();
-        let ciphertext = match encrypt_literal_local(&key, &nonce, protected_literal.as_bytes()) {
-            Ok(c) => c,
-            Err(_) => return Ok(LeakReportOutcome::Failed),
-        };
+        // 4. The leak record's dedup fingerprint is keyed: it is derived from
+        //    the prepared literal's keyed MAC (not an unkeyed SHA-256 of the
+        //    literal). Restructuring `keyed_leak_fingerprint` itself is left to
+        //    `implement-report-leak-provider-ingress-barrier`.
+        let keyed_fingerprint = keyed_leak_fingerprint(&session_id, source, prepared.fingerprint());
 
         let provenance = authority.provenance().clone();
-        let append_input = ProtectedRedactionHistoryAppend {
-            session_id: session_id.clone(),
-            sealed_record_id: None,
-            sealed_version: None,
-            source: ProtectedRedactionSource::ContainedLeak,
-            fingerprint: literal_fingerprint.clone(),
-            ciphertext,
-            nonce,
-            key_version,
-        };
-
         let now_ms = self.now_ms;
         let keyed_fp = keyed_fingerprint.clone();
         let src = source;
         let prov = provenance.clone();
+        let sess = session_id.clone();
 
-        // 5 + 6. Atomically append history, insert leak record as pending,
-        //        then transition to contained.
+        // 5 + 6. Atomically append the encrypted history row via the shared
+        //        connection-scoped sole writer, insert the leak record as
+        //        pending, then transition to contained — all in one transaction
+        //        so the leak record and history row commit together.
         let outcome = self
             .db
             .transaction(move |conn| {
-                let history_result = append_history_conn(conn, &append_input)?;
-                let history_id = match history_result {
-                    AppendHistoryResult::Created { history_id } => history_id,
-                    AppendHistoryResult::Existing { history_id } => history_id,
-                };
+                // The leak record references the history row by history_id; no
+                // artifact refs are attached here.
+                let history_id = append_and_attach_conn(conn, &prepared, &[])?;
 
                 let insert_input = InsertLeakRecordInput {
                     report_id: String::new(),
-                    session_id: session_id.clone(),
+                    session_id: sess.clone(),
                     history_id: history_id.clone(),
                     leak_fingerprint: keyed_fp.clone(),
                     source: src,
@@ -520,11 +518,24 @@ impl Tool for ReportLeakTool {
 }
 
 /// The parsed `report_leak` request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ReportLeakRequest {
     pub secret: String,
     pub source: LeakSource,
     pub category: LeakCategory,
+}
+
+impl std::fmt::Debug for ReportLeakRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `secret` is raw model-supplied plaintext; never print it. Mirror
+        // `ProtectedLiteral`'s redacting Debug (`[REDACTED; len]`) so a stray
+        // `{:?}` cannot defeat the zeroizing/containment guarantees (K8).
+        f.debug_struct("ReportLeakRequest")
+            .field("secret", &format_args!("[REDACTED; {}]", self.secret.len()))
+            .field("source", &self.source)
+            .field("category", &self.category)
+            .finish()
+    }
 }
 
 /// The exact JSON argument schema of `report_leak`.
@@ -638,48 +649,6 @@ pub fn keyed_leak_fingerprint(
     h.update(literal_fingerprint.as_bytes());
     let digest = h.finalize();
     digest.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Generate a random 12-byte nonce. Mirrors the protected-redaction-history
-/// implementation so the two encryption paths are consistent.
-fn generate_nonce() -> Vec<u8> {
-    use rand::Rng;
-    let mut nonce = vec![0u8; 12];
-    rand::rng().fill_bytes(&mut nonce);
-    nonce
-}
-
-/// Local copy of the protected-redaction-history encryption. This keeps the
-/// leak report handler self-contained: it encrypts the literal inside its own
-/// transaction so the history row and the leak record commit atomically.
-fn encrypt_literal_local(
-    key: &crate::redact::protected_redaction_history::RedactionHistoryKey,
-    nonce: &[u8],
-    literal: &[u8],
-) -> Result<Vec<u8>> {
-    if nonce.len() != 12 {
-        bail!("nonce length must be 12");
-    }
-    let mut h = Sha256::new();
-    h.update(key.as_bytes());
-    h.update(nonce);
-    let seed = h.finalize();
-    let mut keystream = Vec::with_capacity(literal.len());
-    let mut counter: u32 = 0;
-    while keystream.len() < literal.len() {
-        let mut block_hash = Sha256::new();
-        block_hash.update(seed);
-        block_hash.update(counter.to_be_bytes());
-        let block = block_hash.finalize();
-        keystream.extend_from_slice(&block);
-        counter += 1;
-    }
-    let ciphertext: Vec<u8> = literal
-        .iter()
-        .zip(keystream.iter())
-        .map(|(l, k)| l ^ k)
-        .collect();
-    Ok(ciphertext)
 }
 
 #[cfg(test)]

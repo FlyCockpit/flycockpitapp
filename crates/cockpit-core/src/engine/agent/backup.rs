@@ -424,6 +424,13 @@ pub(super) async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, er
 
     // Failure event (Part B): lands in the export's events.json, keyed by this
     // attempt's call_id. Data/export only — never enters model context.
+    //
+    // Host/provider-authored, not model-authored: every field is failure
+    // telemetry the host computed or the provider returned (provider status /
+    // body snippet, host classification rationale, recommended action, timings).
+    // The session model produced no output on this failed attempt, so this payload
+    // carries no model-authored session-table literal. Frame-less `record_event`
+    // is correct; nothing to journal.
     if session
         .record_event(
             SessionEventKind::InferenceFailure,
@@ -518,7 +525,15 @@ mod inference_outcome_tests {
 
     fn in_memory_session(root: &std::path::Path) -> Arc<Session> {
         let db = crate::db::Db::open_in_memory().unwrap();
-        Arc::new(crate::session::Session::create(db, root.to_path_buf(), "builder").unwrap())
+        Arc::new(
+            crate::session::Session::create(
+                db,
+                root.to_path_buf(),
+                "builder",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        )
     }
 
     async fn emitted_auth_failure(
@@ -530,7 +545,13 @@ mod inference_outcome_tests {
         let call_id = Uuid::new_v4();
         let payload = serde_json::json!({ "model": "mock-model" });
         session
-            .record_inference_request(call_id, &payload, InferenceRequestStatus::Pending)
+            .record_inference_request(
+                call_id,
+                &payload,
+                InferenceRequestStatus::Pending,
+                &crate::redact::RedactionTable::empty(),
+                false,
+            )
             .await
             .unwrap();
         let err = anyhow::Error::new(InferenceFailure {
@@ -594,7 +615,13 @@ mod inference_outcome_tests {
         // Dispatch-time write (status pending) — exactly what `turn()` does
         // before the call.
         session
-            .record_inference_request(call_id, &payload, InferenceRequestStatus::Pending)
+            .record_inference_request(
+                call_id,
+                &payload,
+                InferenceRequestStatus::Pending,
+                &crate::redact::RedactionTable::empty(),
+                false,
+            )
             .await
             .unwrap();
         let status = session
@@ -697,7 +724,13 @@ mod inference_outcome_tests {
         let call_id = Uuid::new_v4();
         let payload = serde_json::json!({ "model": "mock-model" });
         session
-            .record_inference_request(call_id, &payload, InferenceRequestStatus::Pending)
+            .record_inference_request(
+                call_id,
+                &payload,
+                InferenceRequestStatus::Pending,
+                &crate::redact::RedactionTable::empty(),
+                false,
+            )
             .await
             .unwrap();
         let err = anyhow::Error::new(InferenceFailure {
@@ -744,7 +777,13 @@ mod inference_outcome_tests {
         let call_id = Uuid::new_v4();
         let payload = serde_json::json!({ "model": "m" });
         session
-            .record_inference_request(call_id, &payload, InferenceRequestStatus::Pending)
+            .record_inference_request(
+                call_id,
+                &payload,
+                InferenceRequestStatus::Pending,
+                &crate::redact::RedactionTable::empty(),
+                false,
+            )
             .await
             .unwrap();
 
@@ -910,7 +949,15 @@ mod backup_fallback_tests {
 
     fn in_memory_session(root: &std::path::Path) -> Arc<Session> {
         let db = crate::db::Db::open_in_memory().unwrap();
-        Arc::new(crate::session::Session::create(db, root.to_path_buf(), "Build").unwrap())
+        Arc::new(
+            crate::session::Session::create(
+                db,
+                root.to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        )
     }
 
     fn ctx() -> (

@@ -2323,8 +2323,13 @@ mod tests {
         // the first user message has. This is what the (suspected) lingering
         // bug pinned on; it must NOT keep the owned daemon alive.
         {
-            let session = Session::create(harness.db.clone(), std::env::temp_dir(), "Build")
-                .expect("persist a session row");
+            let session = Session::create(
+                harness.db.clone(),
+                std::env::temp_dir(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .expect("persist a session row");
             assert!(session.is_persisted(), "row is persisted");
         }
 

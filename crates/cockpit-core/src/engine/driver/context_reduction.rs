@@ -112,6 +112,26 @@ pub struct PreparedCompaction {
     pub seed_tags: Vec<String>,
     pub seed_tool_tokens: u64,
     pub compressed_entries: Vec<crate::db::compressed_results::CompressedToolResultEntry>,
+    /// Identity of the model that AUTHORED the brief/handoff text, so the
+    /// `session_compacted` record journals through the frame-carrying path
+    /// against that model's trust (decision 10.3 / K1). Threaded from the
+    /// compaction drafting model (`compact_model` when configured, else the
+    /// active agent's model). `#[serde(default)]` keeps a shadow written before
+    /// this field loadable; an empty id then resolves no trust frame and
+    /// journals nothing (fail-safe).
+    #[serde(default)]
+    pub authoring_provider_id: String,
+    #[serde(default)]
+    pub authoring_model_id: String,
+}
+
+/// Identity of the model that authored a compaction brief, captured from the
+/// drafting model so [`Session::record_session_compacted_with_source`] can build
+/// a trust frame for the `session_compacted` record (K1).
+#[derive(Clone)]
+pub(in crate::engine::driver) struct CompactAuthoringModel {
+    pub(in crate::engine::driver) provider_id: String,
+    pub(in crate::engine::driver) model_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -692,6 +712,10 @@ impl Driver {
             "plan_reason": classify_prune_reason(plan),
             "watermark_advanced": watermark_advanced,
         });
+        // Host-generated auto-prune telemetry (skip reason, token counts, plan
+        // classification) — no model-authored free text, so no session-table
+        // literal can appear. Frame-less `record_event` is correct; nothing to
+        // journal.
         if let Err(e) = self
             .session
             .record_event(
@@ -1223,9 +1247,10 @@ impl Driver {
         let mut keep = initial_tail_kept;
         let mut tail_positions = candidate_tail.tail_message_positions;
         let draft_quota = Arc::new(std::sync::Mutex::new(CompactPreparationQuota::default()));
+        let mut authoring_model: Option<CompactAuthoringModel> = None;
         let (brief, handoff, mut plan) = loop {
             let tail_message_seqs = self.compact_tail_message_seqs(keep).await;
-            let brief = if let Some(ready) = shadow.as_ref() {
+            let (brief, authoring) = if let Some(ready) = shadow.as_ref() {
                 let revision_history = compact::shadow_revision_history(
                     &ready.snapshot_history,
                     &filtered_history,
@@ -1248,6 +1273,7 @@ impl Driver {
                 )
                 .await?
             };
+            authoring_model = Some(authoring);
             let handoff =
                 compact::assemble_handoff(&brief, &appendix, &seed_tags, history_agent_available);
             let plan = match compact::plan_compacted_history(
@@ -1266,6 +1292,7 @@ impl Driver {
             keep = plan.tail_kept;
             tail_positions = plan.tail_message_positions;
         };
+        let authoring_model = authoring_model.expect("draft ran at least one iteration");
         plan.tail_trimmed = initial_tail_trimmed + initial_tail_kept.saturating_sub(plan.tail_kept);
 
         // Persist every recoverable original for the private prune transform
@@ -1308,6 +1335,8 @@ impl Driver {
             seed_tool_tokens,
             seed_tags,
             compressed_entries,
+            authoring_provider_id: authoring_model.provider_id,
+            authoring_model_id: authoring_model.model_id,
         })
     }
 
@@ -1359,7 +1388,25 @@ impl Driver {
         #[cfg(test)]
         self.trace_compaction_apply("live_history_swapped");
 
-        // Timeline boundary: `/compact` reset this session in place.
+        // Timeline boundary: `/compact` reset this session in place. The record
+        // embeds the drafting model's brief/handoff text and the retained tail,
+        // so journal it through the frame-carrying path against the AUTHORING
+        // model's trust (K1, decision 10.3): a trusted author's session-table
+        // literal journals (or fail-closed scrubs) rather than persisting raw.
+        // A shadow written before the authoring id existed leaves both ids empty
+        // (`#[serde(default)]`); `resolve_trust` of an empty pair falls to the
+        // default (untrusted) so the frame journals nothing — the record still
+        // persists. `self.config` is the turn-pinned snapshot; `self.redact` is
+        // the session's pre-policy table (same shape the SubagentReport finalizer
+        // uses).
+        let compaction_frame = (!prepared.authoring_provider_id.is_empty()
+            && !prepared.authoring_model_id.is_empty())
+        .then_some(crate::session::SessionEventModelFrame {
+            provider_id: &prepared.authoring_provider_id,
+            model_id: &prepared.authoring_model_id,
+            config: &self.config,
+            session_table: self.redact.as_ref(),
+        });
         if let Err(e) = self
             .session
             .record_session_compacted_with_source(
@@ -1379,6 +1426,7 @@ impl Driver {
                     tail_trimmed: prepared.tail_trimmed,
                     tail_messages: &prepared.history[1..],
                 },
+                compaction_frame,
             )
             .await
         {
@@ -1500,8 +1548,15 @@ impl Driver {
         tail_message_seqs: &[i64],
         history: Vec<Message>,
         quota: Arc<std::sync::Mutex<CompactPreparationQuota>>,
-    ) -> Result<String, PrepareCompactionError> {
+    ) -> Result<(String, CompactAuthoringModel), PrepareCompactionError> {
         let draft = self.compact_brief_draft(tx, history.clone(), quota).await;
+        // The authoring model's identity — the drafting model resolved above —
+        // is threaded onto the prepared compaction so the `session_compacted`
+        // record journals against its trust (K1).
+        let authoring = CompactAuthoringModel {
+            provider_id: draft.model.provider_id().to_string(),
+            model_id: draft.model.model_id_ref().to_string(),
+        };
         let mut prompt_text =
             crate::engine::compact::brief_prompt(draft.prompt_override.as_deref());
         prompt_text.push_str(&crate::engine::compact::tail_anti_duplication_instruction(
@@ -1519,7 +1574,7 @@ impl Driver {
                 if success.input_coverage
                     == crate::engine::compact_draft::CompactInputCoverage::Full =>
             {
-                return Ok(success.brief);
+                return Ok((success.brief, authoring));
             }
             crate::engine::compact_draft::CompactDraftOutcome::Success(_)
             | crate::engine::compact_draft::CompactDraftOutcome::ContextOverflow { .. } => {}
@@ -1653,7 +1708,7 @@ impl Driver {
                     == crate::engine::compact_draft::CompactInputCoverage::Full =>
             {
                 success.fit_rung = crate::engine::compact_draft::CompactFitRung::ChunkedSynthesis;
-                Ok(success.brief)
+                Ok((success.brief, authoring))
             }
             crate::engine::compact_draft::CompactDraftOutcome::Success(_) => {
                 Err(PrepareCompactionError::Draft(
@@ -1674,10 +1729,14 @@ impl Driver {
         shadow_brief: &str,
         revision_history: Vec<Message>,
         quota: Arc<std::sync::Mutex<CompactPreparationQuota>>,
-    ) -> Result<String, PrepareCompactionError> {
+    ) -> Result<(String, CompactAuthoringModel), PrepareCompactionError> {
         let draft = self
             .compact_brief_draft(tx, revision_history.clone(), quota.clone())
             .await;
+        let authoring = CompactAuthoringModel {
+            provider_id: draft.model.provider_id().to_string(),
+            model_id: draft.model.model_id_ref().to_string(),
+        };
         let prompt_text = crate::engine::compact::shadow_delta_prompt(
             draft.prompt_override.as_deref(),
             shadow_brief,
@@ -1695,7 +1754,7 @@ impl Driver {
                 if success.input_coverage
                     == crate::engine::compact_draft::CompactInputCoverage::Full =>
             {
-                Ok(success.brief)
+                Ok((success.brief, authoring))
             }
             crate::engine::compact_draft::CompactDraftOutcome::Success(_)
             | crate::engine::compact_draft::CompactDraftOutcome::ContextOverflow { .. } => {
@@ -1893,12 +1952,15 @@ pub(in crate::engine::driver) async fn execute_compact_brief(
             .await;
         match sampled {
             Ok(((_, choice, usage), captured, _timing)) if !cancel.is_cancelled() => {
+                let compact_session_table = draft.model.session_redact_table();
                 if let Err(e) = draft
                     .session
                     .record_inference_request(
                         call_id,
                         &captured,
                         crate::db::session_log::InferenceRequestStatus::Completed,
+                        compact_session_table.as_ref(),
+                        draft.model.is_trusted(),
                     )
                     .await
                 {
@@ -1916,6 +1978,12 @@ pub(in crate::engine::driver) async fn execute_compact_brief(
                         "cached_input_tokens": u.cached_input_tokens,
                     })
                 });
+                // Host-generated compact-brief inference metadata (token usage,
+                // purpose, attempt, host-computed fit_rung/classification). The
+                // model's drafted brief TEXT is not carried here — `choice` is only
+                // read to classify degenerate-vs-success — so this InferenceRequest
+                // payload holds no model-authored free text and no session-table
+                // literal. Frame-less `record_event` is correct; nothing to journal.
                 if let Err(e) = draft
                     .session
                     .record_event(
@@ -2037,6 +2105,11 @@ async fn record_compact_sample_observation(
     diagnostic: Option<&str>,
 ) {
     let diagnostic = diagnostic.map(crate::engine::compact_draft::bounded_diagnostic);
+    // Host-generated compact-sample observation: purpose/attempt/fit_rung/
+    // classification are host constants and `diagnostic` is a host/provider
+    // failure diagnostic (bounded), never the model's drafted brief text — so this
+    // InferenceRequest payload carries no model-authored session-table literal.
+    // Frame-less `record_event` is correct; nothing to journal.
     if let Err(error) = draft
         .session
         .record_event(

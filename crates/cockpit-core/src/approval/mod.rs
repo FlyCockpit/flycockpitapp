@@ -1154,8 +1154,13 @@ mod tests {
 
     fn approver(cwd: &std::path::Path) -> (Approver, uuid::Uuid) {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session =
-            crate::session::Session::create(db.clone(), cwd.to_path_buf(), "builder").unwrap();
+        let session = crate::session::Session::create(
+            db.clone(),
+            cwd.to_path_buf(),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let sid = session.id;
         let store = GrantStore::new(
             db.clone(),
@@ -1181,8 +1186,13 @@ mod tests {
         policy: crate::config::extended::ApprovalPolicyConfig,
     ) -> Approver {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session =
-            crate::session::Session::create(db.clone(), cwd.to_path_buf(), "builder").unwrap();
+        let session = crate::session::Session::create(
+            db.clone(),
+            cwd.to_path_buf(),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let extended = crate::config::extended::ExtendedConfig {
             approval_policy: policy,
             ..Default::default()

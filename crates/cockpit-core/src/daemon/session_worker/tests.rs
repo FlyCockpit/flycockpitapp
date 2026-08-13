@@ -54,7 +54,13 @@ fn remote_queue_receipt_is_closed_secret_free_and_consistent() {
 async fn remote_queue_receipt_and_terminal_disposition_commit_and_replay_together() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+    let session = Session::create(
+        db.clone(),
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
     let session_id = session.id;
     let submission_id = Uuid::new_v4();
     let operation = || crate::db::remote_attachment_operations::ReserveRemoteOperation {
@@ -258,7 +264,15 @@ fn reasoning_delta(agent: &str, delta: &str) -> proto::Event {
 fn test_session_handle() -> SessionWorkerHandle {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let session = Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
+    let session = Arc::new(
+        Session::create(
+            db.clone(),
+            tmp.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap(),
+    );
     let locks = Arc::new(LockManager::in_memory(db));
     SessionWorkerHandle::test_handle(session, locks)
 }
@@ -267,7 +281,13 @@ fn test_session_handle() -> SessionWorkerHandle {
 async fn terminal_receipt_write_failure_returns_promptly_and_holds_the_exact_queue_item() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+    let session = Session::create(
+        db.clone(),
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
     db.write(|conn| {
         conn.execute_batch(
             "CREATE TRIGGER fail_terminal_receipt
@@ -414,8 +434,15 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
     crate::test_env::run_async_with_large_stack(|| async {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
-        let session =
-            Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
+        let session = Arc::new(
+            Session::create(
+                db.clone(),
+                tmp.path().to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
         session
             .set_active_model("lmstudio", "session-model")
             .unwrap();
@@ -735,7 +762,15 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
 async fn worker_delete_removes_the_scoped_sealed_value_completely() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let session = Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
+    let session = Arc::new(
+        Session::create(
+            db.clone(),
+            tmp.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap(),
+    );
     let scope_key = session.id.to_string();
 
     db.create_session_sealed_value(
@@ -1077,7 +1112,13 @@ async fn stream_delta_coalescer_timer_flushes_after_window() {
 async fn steer_side_channel_stores_raw_and_stamps_origin() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+    let session = Session::create(
+        db.clone(),
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
     session
         .db
         .upsert_task_delegation_job(
@@ -1131,7 +1172,13 @@ async fn steer_side_channel_stores_raw_and_stamps_origin() {
 async fn steer_side_channel_rejects_non_running_child_without_enqueue() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+    let session = Session::create(
+        db.clone(),
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
     session
         .db
         .upsert_task_delegation_job(
@@ -1192,6 +1239,7 @@ async fn turn_refresh_sends_rebuilt_redaction_table_to_driver() {
         Db::open_in_memory().unwrap(),
         tmp.path().to_path_buf(),
         "Build",
+        crate::session::test_redaction_key_resolver(),
     )
     .unwrap();
     let (event_tx, _event_rx) = broadcast::channel(8);
@@ -1209,6 +1257,7 @@ async fn turn_refresh_sends_rebuilt_redaction_table_to_driver() {
             &RedactionSourceOverrides::default(),
             &mut notified,
             &redaction,
+            &crate::engine::interrupt::InterruptHub::detached(),
             &event_tx,
             &driver_tx,
             &HashMap::new(),
@@ -1253,6 +1302,7 @@ async fn engine_notice_is_recorded_as_durable_session_event() {
         Db::open_in_memory().unwrap(),
         PathBuf::from("/proj"),
         "Build",
+        crate::session::test_redaction_key_resolver(),
     )
     .unwrap();
     let (event_tx, _event_rx) = broadcast::channel(8);
@@ -1287,6 +1337,7 @@ async fn notice_is_recorded_exactly_once_across_both_paths() {
         Db::open_in_memory().unwrap(),
         PathBuf::from("/proj"),
         "Build",
+        crate::session::test_redaction_key_resolver(),
     )
     .unwrap();
     let (event_tx, _event_rx) = broadcast::channel(8);
@@ -1314,6 +1365,7 @@ async fn daemon_direct_notice_is_recorded_as_durable_session_event() {
         Db::open_in_memory().unwrap(),
         PathBuf::from("/proj"),
         "Build",
+        crate::session::test_redaction_key_resolver(),
     )
     .unwrap();
     let (event_tx, _event_rx) = broadcast::channel(8);
@@ -1365,6 +1417,7 @@ async fn recorded_notice_text_is_redacted() {
         Db::open_in_memory().unwrap(),
         tmp.path().to_path_buf(),
         "Build",
+        crate::session::test_redaction_key_resolver(),
     )
     .unwrap();
     let (event_tx, _event_rx) = broadcast::channel(8);
@@ -1450,7 +1503,15 @@ async fn absent_scheduler_is_not_an_error() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
     let locks = Arc::new(LockManager::in_memory(db.clone()));
-    let session = Arc::new(Session::create(db, tmp.path().to_path_buf(), "Build").unwrap());
+    let session = Arc::new(
+        Session::create(
+            db,
+            tmp.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap(),
+    );
     let providers = lmstudio_test_providers();
     let redact = Arc::new(RedactionTable::empty());
     let model =
@@ -1541,7 +1602,15 @@ async fn worker_driver_respects_attached_ignore_config_policy() {
     };
 
     let db = Db::open_in_memory().unwrap();
-    let session = Arc::new(Session::create(db.clone(), project.clone(), "Build").unwrap());
+    let session = Arc::new(
+        Session::create(
+            db.clone(),
+            project.clone(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap(),
+    );
     session
         .set_active_model("lmstudio", "session-model")
         .unwrap();
@@ -1673,7 +1742,15 @@ async fn worker_driver_respects_attached_ignore_config_policy() {
 async fn resumed_worker_rederives_disk_redaction_markers_and_warns_when_source_disappears() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let session = Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
+    let session = Arc::new(
+        Session::create(
+            db.clone(),
+            tmp.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap(),
+    );
     let env_path = tmp.path().join(".env");
     let secret = "worker-resume-dotenv-secret-123456";
     std::fs::write(&env_path, format!("TOKEN={secret}\n")).unwrap();
@@ -1736,7 +1813,15 @@ async fn resumed_worker_rederives_disk_redaction_markers_and_warns_when_source_d
         )
     };
 
-    let resumed = Arc::new(Session::resume(db.clone(), session.id).unwrap().unwrap());
+    let resumed = Arc::new(
+        Session::resume(
+            db.clone(),
+            session.id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .unwrap(),
+    );
     let rederived =
         Arc::new(RedactionTable::build_with_env(&redaction_cfg, tmp.path(), &env).unwrap());
     let ((handle, join), success_log) = capture_warn_log(|| start_worker(resumed, rederived));
@@ -1754,7 +1839,15 @@ async fn resumed_worker_rederives_disk_redaction_markers_and_warns_when_source_d
         .unwrap();
 
     std::fs::remove_file(&env_path).unwrap();
-    let resumed = Arc::new(Session::resume(db.clone(), session.id).unwrap().unwrap());
+    let resumed = Arc::new(
+        Session::resume(
+            db.clone(),
+            session.id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .unwrap(),
+    );
     let empty_rederive =
         Arc::new(RedactionTable::build_with_env(&redaction_cfg, tmp.path(), &env).unwrap());
     let ((handle, join), warning_log) = capture_warn_log(|| start_worker(resumed, empty_rederive));
@@ -2533,7 +2626,13 @@ async fn command_capability_unavailable_maps_to_broadcast_with_fix_command() {
 async fn sandbox_unavailable_hydration_rebroadcasts_remembered_notice() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+    let session = Session::create(
+        db.clone(),
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
     session.set_sandbox_mode(crate::tools::sandbox_mode::SandboxMode::Sandbox);
     let locks = Arc::new(LockManager::in_memory(db));
     let handle = SessionWorkerHandle::test_handle(Arc::new(session), locks);
@@ -2572,7 +2671,13 @@ async fn sandbox_unavailable_hydration_rebroadcasts_remembered_notice() {
 async fn active_interrupt_hydration_rebroadcasts_with_rehydration_reason() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+    let session = Session::create(
+        db.clone(),
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
     let session_id = session.id;
     let set = proto::InterruptQuestionSet {
         questions: vec![proto::InterruptQuestion::Single {
@@ -2631,7 +2736,13 @@ async fn active_interrupt_hydration_rebroadcasts_with_rehydration_reason() {
 async fn shutdown_activity_snapshot_counts_open_and_parked_interrupts_as_pending_paused_work() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+    let session = Session::create(
+        db.clone(),
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
     let session_id = session.id;
     let set = proto::InterruptQuestionSet {
         questions: vec![proto::InterruptQuestion::Single {
@@ -3370,6 +3481,7 @@ async fn llm_mode_reads_are_consistent_within_a_generation() {
         Db::open_in_memory().unwrap(),
         tmp.path().to_path_buf(),
         "Build",
+        crate::session::test_redaction_key_resolver(),
     )
     .unwrap();
     session.set_active_model("openai", "gpt-test").unwrap();
@@ -3408,10 +3520,22 @@ async fn stored_session_llm_mode_restores_before_startup_resolution() {
 
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let created = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+    let created = Session::create(
+        db.clone(),
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
     created.set_session_llm_mode(LlmMode::Frontier).unwrap();
 
-    let resumed = Session::resume(db, created.id).unwrap().unwrap();
+    let resumed = Session::resume(
+        db,
+        created.id,
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(stored_session_llm_mode(&resumed), Some(LlmMode::Frontier));
 }
 
@@ -3419,7 +3543,13 @@ async fn stored_session_llm_mode_restores_before_startup_resolution() {
 async fn invalid_stored_session_llm_mode_is_rejected_by_the_database() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let created = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+    let created = Session::create(
+        db.clone(),
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
 
     let error = db
         .set_session_llm_mode(created.id, Some("turbo"))
@@ -3434,7 +3564,13 @@ async fn invalid_stored_session_llm_mode_is_rejected_by_the_database() {
 async fn stored_tool_surface_override_decodes_for_startup() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(db, tmp.path().to_path_buf(), "Build").unwrap();
+    let session = Session::create(
+        db,
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
     session
         .set_tool_surface_override_json(Some(
             r#"{"tools":["read","mcp","session_search"],"toolTiers":{"session_search":"discoverable"}}"#
@@ -3461,7 +3597,13 @@ async fn stored_tool_surface_override_decodes_for_startup() {
 async fn invalid_stored_tool_surface_override_falls_back() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(db, tmp.path().to_path_buf(), "Build").unwrap();
+    let session = Session::create(
+        db,
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
     session
         .set_tool_surface_override_json(Some("not json".to_string()))
         .unwrap();
@@ -3473,14 +3615,26 @@ async fn invalid_stored_tool_surface_override_falls_back() {
 async fn resume_reapplies_goal_settings_override() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let created = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+    let created = Session::create(
+        db.clone(),
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
     created
         .set_goal_settings_override_json(Some(
             r#"{"enabled":false,"coldSkepticCount":2,"maxVerificationAttempts":1}"#.to_string(),
         ))
         .unwrap();
 
-    let resumed = Session::resume(db, created.id).unwrap().unwrap();
+    let resumed = Session::resume(
+        db,
+        created.id,
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap()
+    .unwrap();
     let override_ = stored_goal_settings_override(&resumed).unwrap();
 
     assert_eq!(override_.cold_skeptic_count, Some(2));
@@ -3491,12 +3645,24 @@ async fn resume_reapplies_goal_settings_override() {
 async fn resume_ignores_invalid_goal_settings_override() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let created = Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+    let created = Session::create(
+        db.clone(),
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
     created
         .set_goal_settings_override_json(Some(r#"{"coldSkepticCount":0}"#.to_string()))
         .unwrap();
 
-    let resumed = Session::resume(db, created.id).unwrap().unwrap();
+    let resumed = Session::resume(
+        db,
+        created.id,
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap()
+    .unwrap();
 
     assert_eq!(stored_goal_settings_override(&resumed), None);
 }
@@ -3509,6 +3675,7 @@ async fn worker_uses_registry_resolved_config_snapshot() {
         Db::open_in_memory().unwrap(),
         tmp.path().to_path_buf(),
         "Build",
+        crate::session::test_redaction_key_resolver(),
     )
     .unwrap();
     session.set_active_model("openai", "gpt-test").unwrap();
@@ -3521,7 +3688,15 @@ async fn worker_uses_registry_resolved_config_snapshot() {
 async fn worker_broadcast_delivers_config_snapshot_to_subscriber() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let session = Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
+    let session = Arc::new(
+        Session::create(
+            db.clone(),
+            tmp.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap(),
+    );
     let locks = Arc::new(LockManager::in_memory(db));
     let (handle, _rx) = SessionWorkerHandle::test_handle_with_receiver(session, locks);
     replace_config_snapshot(
@@ -3561,7 +3736,15 @@ async fn replace_config_snapshot_no_change_emits_no_config_snapshot_event() {
 async fn dispatch_reresolve_fans_out_to_all_attached_clients() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let session = Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap());
+    let session = Arc::new(
+        Session::create(
+            db.clone(),
+            tmp.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap(),
+    );
     let locks = Arc::new(LockManager::in_memory(db));
     let (handle, _rx) = SessionWorkerHandle::test_handle_with_receiver(session, locks);
     let mut a = handle.subscribe();

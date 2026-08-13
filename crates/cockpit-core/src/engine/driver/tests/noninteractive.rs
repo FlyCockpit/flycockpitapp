@@ -2299,3 +2299,282 @@ async fn delivery_event_data_carries_job_id_round_trip() {
         1,
     );
 }
+
+// J4 behavioral (AC15): a docs-pipeline finalizer must journal its report
+// through the frame the DocsPipelineReport's authoring model yields — NOT a
+// source grep. These tests build a real `DocsPipelineReport`, derive the
+// finalizer's `DelegationChildOutcome` + `ChildRoutingMetadata::from_model`
+// EXACTLY as the single/batch finalizers do, then drive the resulting
+// `SessionEventModelFrame` through the production chokepoint and assert the
+// protected-redaction-history outcome. A regression that drops `report_model`
+// (frame-less `record_event`) leaves the literal unjournaled and fails the
+// positive assertion; a broken frame fails the fail-closed assertion.
+
+fn docs_report_redact_cfg() -> crate::config::extended::RedactConfig {
+    crate::config::extended::RedactConfig {
+        enabled: true,
+        scan_environment: true,
+        scan_dotenv: false,
+        scan_ssh_keys: false,
+        min_secret_length: 4,
+        placeholder: "[redacted]".to_string(),
+        ..crate::config::extended::RedactConfig::default()
+    }
+}
+
+/// A pre-policy session table carrying a single `Environment` literal `lit`.
+fn docs_report_env_table(lit: &str) -> RedactionTable {
+    let env = std::collections::HashMap::from([("DEPLOY_TOKEN".to_string(), lit.to_string())]);
+    RedactionTable::build_with_env(&docs_report_redact_cfg(), std::path::Path::new("."), &env)
+        .unwrap()
+}
+
+/// Providers config with a trusted `openai:gpt-5`, so a `Model` built for it
+/// resolves a trusted journaling frame.
+fn write_docs_report_trusted_provider(root: &std::path::Path) {
+    let cockpit = root.join(".cockpit");
+    let providers = cockpit.join("providers");
+    std::fs::create_dir_all(&providers).unwrap();
+    std::fs::write(cockpit.join("config.json"), r#"{"llm_mode":"defensive"}"#).unwrap();
+    std::fs::write(
+        providers.join("openai.json"),
+        serde_json::json!({
+            "url": "https://example.test/v1",
+            "models": [{"id": "gpt-5", "trust": "trusted", "mode": "frontier"}],
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+/// Build the exact `DelegationChildOutcome` a docs finalizer produces from the
+/// pipeline report — `DelegationChildOutcome::ok(report.report)` +
+/// `with_child_routing(ChildRoutingMetadata::from_model(report.report_model.as_ref()))`
+/// — from a real trusted `DocsPipelineReport`. Returns the outcome plus the
+/// event data the finalizer journals.
+fn docs_finalizer_outcome_and_data(
+    providers: &crate::config::providers::ProvidersConfig,
+    report_text: &str,
+) -> (DelegationChildOutcome, serde_json::Value) {
+    let report_model = Arc::new(
+        crate::engine::model::Model::for_provider(
+            providers,
+            "openai",
+            "gpt-5",
+            Arc::new(RedactionTable::empty()),
+        )
+        .unwrap(),
+    );
+    let report = crate::engine::docs_pipeline::DocsPipelineReport {
+        report: report_text.to_string(),
+        report_model,
+    };
+    // Mirror the single/batch docs `Ok` arm verbatim.
+    let outcome = DelegationChildOutcome::ok(report.report).with_child_routing(
+        ChildRoutingMetadata::from_model(report.report_model.as_ref()),
+    );
+    let routing = outcome
+        .child_routing
+        .as_ref()
+        .expect("docs finalizer attaches child routing");
+    let report_data = with_child_routing_metadata(
+        subagent_report_event_data(
+            "docs",
+            Some("task-docs"),
+            None,
+            "default",
+            &outcome.report,
+            None,
+        ),
+        routing,
+    );
+    (outcome, report_data)
+}
+
+#[tokio::test]
+async fn docs_finalizer_report_model_frame_journals_table_literal() {
+    const LIT: &str = "docs-report-frame-secret-abc123456";
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_docs_report_trusted_provider(tmp.path());
+    let db = crate::db::Db::open_in_memory().unwrap();
+    let session = Session::create(
+        db.clone(),
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    let config =
+        crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path());
+    let (_extended, providers) = config.configs();
+    let table = docs_report_env_table(LIT);
+
+    let (outcome, report_data) =
+        docs_finalizer_outcome_and_data(&providers, &format!("docs answer cites {LIT}"));
+    let routing = outcome.child_routing.as_ref().unwrap();
+
+    // Drive the SAME frame the finalizer builds from the report's authoring
+    // model through the production chokepoint.
+    let seq = session
+        .record_event_with_model_frame(
+            crate::db::session_log::SessionEventKind::SubagentReport,
+            Some("docs"),
+            Some("task-docs"),
+            crate::session::SessionEventModelFrame {
+                provider_id: &routing.provider,
+                model_id: &routing.model,
+                config: &config,
+                session_table: &table,
+            },
+            &report_data,
+        )
+        .await
+        .unwrap();
+
+    // Behavioral proof: the docs report's table literal journaled to one
+    // history row, referenced by this event's committed `seq` as an Event
+    // artifact.
+    let sid = session.id.to_string();
+    let rows = db.protected_redaction_history_list(&sid).await.unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "the docs-report frame must journal the table literal: {rows:#?}"
+    );
+    let refs = db
+        .protected_redaction_artifact_refs_for_artifact(
+            crate::redact::protected_redaction_history::RedactionArtifactKind::Event,
+            &seq.to_string(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refs.len(), 1, "one Event ref for the docs report seq");
+    assert_eq!(refs[0].history_id, rows[0].history_id);
+}
+
+#[tokio::test]
+async fn docs_finalizer_report_model_frame_fails_closed_on_journal_failure() {
+    const LIT: &str = "docs-report-frame-secret-xyz987654";
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_docs_report_trusted_provider(tmp.path());
+    let db = crate::db::Db::open_in_memory().unwrap();
+    // A faulted store-backed resolver: journaling is attempted (the frame is
+    // trusted) and its first `prepare_append` fails, driving the real
+    // decision-12 event fallback that scrubs the persisted body.
+    let (session, actor) = docs_faulted_journaling_session(&db).await;
+    let config =
+        crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path());
+    let (_extended, providers) = config.configs();
+    let table = docs_report_env_table(LIT);
+
+    let (outcome, report_data) =
+        docs_finalizer_outcome_and_data(&providers, &format!("docs answer cites {LIT}"));
+    let routing = outcome.child_routing.as_ref().unwrap();
+
+    let seq = session
+        .record_event_with_model_frame(
+            crate::db::session_log::SessionEventKind::SubagentReport,
+            Some("docs"),
+            Some("task-docs"),
+            crate::session::SessionEventModelFrame {
+                provider_id: &routing.provider,
+                model_id: &routing.model,
+                config: &config,
+                session_table: &table,
+            },
+            &report_data,
+        )
+        .await
+        .expect("journal failure must fail closed, not abort the turn");
+
+    // No history row committed, and the persisted event body carries the
+    // generic placeholder in place of the raw literal.
+    assert!(
+        db.protected_redaction_history_list(&session.id.to_string())
+            .await
+            .unwrap()
+            .is_empty(),
+        "journal failure leaves no history row"
+    );
+    let events = db.list_session_events(session.id).await.unwrap();
+    let event = events
+        .iter()
+        .find(|e| e.seq == seq)
+        .expect("scrubbed docs report event persisted");
+    let stored = serde_json::to_string(&event.data).unwrap();
+    assert!(!stored.contains(LIT), "matched literal must be scrubbed");
+    assert!(stored.contains("[redacted]"), "generic placeholder present");
+
+    docs_shutdown_fake_secure_key_actor(actor).await;
+}
+
+/// Boot the production secure-key actor over a caller-held FakeNativeStore off
+/// the runtime (the `start_with_store` handshake blocks). Mirrors the recording
+/// tests' AC15 pattern — `MapKeyResolver` is for pure-crypto unit tests only.
+async fn docs_boot_fake_secure_key_actor(
+    db: &crate::db::Db,
+    store: &crate::secure_key::fake::FakeNativeStore,
+) -> crate::secure_key::SecureKeyActor {
+    let db = db.clone();
+    let store = store.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("docs-test-secure-key-boot".into())
+        .spawn(move || {
+            let _ = tx.send(crate::secure_key::SecureKeyActor::start_with_store(
+                db,
+                Box::new(store),
+                std::sync::Arc::new(crate::secure_key::FailClosedReconciler),
+            ));
+        })
+        .expect("spawn secure key boot thread");
+    rx.await
+        .expect("secure key boot channel")
+        .expect("secure key actor")
+}
+
+async fn docs_shutdown_fake_secure_key_actor(actor: crate::secure_key::SecureKeyActor) {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("docs-test-secure-key-shutdown".into())
+        .spawn(move || {
+            drop(actor);
+            let _ = tx.send(());
+        })
+        .expect("spawn secure key shutdown thread");
+    rx.await.expect("secure key shutdown channel");
+}
+
+/// A session whose journaling resolver is backed by a `FaultKind::Unavailable`
+/// FakeNativeStore, so the first `prepare_append` a trusted journal attempts
+/// fails and drives the real decision-12 fallback.
+async fn docs_faulted_journaling_session(
+    db: &crate::db::Db,
+) -> (Session, crate::secure_key::SecureKeyActor) {
+    use crate::secure_key::fake::{FakeNativeStore, FaultKind, FaultPoint, InjectedFault};
+    let store = FakeNativeStore::new();
+    let actor = docs_boot_fake_secure_key_actor(db, &store).await;
+    store.inject(
+        FaultPoint::BeforeGet,
+        InjectedFault::Error(FaultKind::Unavailable),
+    );
+    store.inject(
+        FaultPoint::BeforeSet,
+        InjectedFault::Error(FaultKind::Unavailable),
+    );
+    let resolver: std::sync::Arc<
+        dyn crate::redact::protected_redaction_history::RedactionKeyResolver,
+    > = std::sync::Arc::new(crate::redact::secure_key_resolver::SecureKeyResolver::new(
+        actor.handle(),
+    ));
+    let session = Session::create(
+        db.clone(),
+        std::path::PathBuf::from("/proj"),
+        "Build",
+        resolver,
+    )
+    .unwrap();
+    (session, actor)
+}

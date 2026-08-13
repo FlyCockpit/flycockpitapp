@@ -5624,6 +5624,7 @@ mod tests {
             crate::db::Db::open_in_memory().unwrap(),
             tmp.path().to_path_buf(),
             "Build",
+            crate::session::test_redaction_key_resolver(),
         )
         .unwrap();
 
@@ -5649,6 +5650,7 @@ mod tests {
             crate::db::Db::open_in_memory().unwrap(),
             tmp.path().to_path_buf(),
             "Build",
+            crate::session::test_redaction_key_resolver(),
         )
         .unwrap();
 
@@ -5677,6 +5679,7 @@ mod tests {
             crate::db::Db::open_in_memory().unwrap(),
             tmp.path().to_path_buf(),
             "bee",
+            crate::session::test_redaction_key_resolver(),
         )
         .unwrap();
 

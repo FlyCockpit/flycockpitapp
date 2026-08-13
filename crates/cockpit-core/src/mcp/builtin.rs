@@ -71,6 +71,8 @@ impl HostContext {
                 parent_call_id.clone(),
                 ctx.llm_mode,
                 DEFAULT_CHILD_EVENT_CAP,
+                ctx.config.clone(),
+                ctx.redact.clone(),
             )
         });
         Self {
@@ -256,6 +258,14 @@ pub struct McpChildEventRecorder {
     parent_call_id: String,
     llm_mode: crate::config::extended::LlmMode,
     cap: usize,
+    /// Turn-pinned config snapshot of the DISPATCHING model, so the recorded
+    /// ToolCall/ToolCallStarted events (which embed the model-supplied MCP
+    /// `original_input`/`wire_input` args) journal through the frame-carrying
+    /// path against that model's trust (K2, decision 10.3).
+    config: crate::daemon::session_worker::SessionConfigHandle,
+    /// The dispatching model's PRE-POLICY session redaction table — the table
+    /// scanned to journal a trusted route's table-matched literals in the args.
+    session_table: Arc<crate::redact::RedactionTable>,
     state: Arc<Mutex<McpChildEventState>>,
     #[cfg(test)]
     fail_persistence: bool,
@@ -269,6 +279,7 @@ struct McpChildEventState {
 }
 
 impl McpChildEventRecorder {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         session: Arc<Session>,
         events: Option<mpsc::Sender<TurnEvent>>,
@@ -276,6 +287,8 @@ impl McpChildEventRecorder {
         parent_call_id: String,
         llm_mode: crate::config::extended::LlmMode,
         cap: usize,
+        config: crate::daemon::session_worker::SessionConfigHandle,
+        session_table: Arc<crate::redact::RedactionTable>,
     ) -> Self {
         Self {
             session,
@@ -284,9 +297,45 @@ impl McpChildEventRecorder {
             parent_call_id,
             llm_mode,
             cap,
+            config,
+            session_table,
             state: Arc::new(Mutex::new(McpChildEventState::default())),
             #[cfg(test)]
             fail_persistence: false,
+        }
+    }
+
+    /// Record one model-authored MCP child event (ToolCallStarted / ToolCall).
+    /// Its payload embeds the model-supplied MCP args (`original_input` /
+    /// `wire_input`), so route it through the frame-carrying journaling path
+    /// (K2, decision 10.3): a trusted dispatching model's session-table literal
+    /// in the args journals (or fail-closed scrubs) instead of persisting raw.
+    /// The dispatching model is the session's active model; trust and
+    /// provider/model resolve from the pinned config snapshot. A context with no
+    /// active model (headless / tests) has no trust frame and journals nothing,
+    /// so it keeps the plain insert — the pre-K2 behavior — avoiding the
+    /// `record_event_with_config` "no provider frame" error there.
+    async fn record_child_event(
+        &self,
+        kind: SessionEventKind,
+        call_id: &str,
+        data: &Value,
+    ) -> Result<i64> {
+        if self.session.active_provider().is_some() && self.session.active_model().is_some() {
+            self.session
+                .record_event_with_config(
+                    kind,
+                    Some(&self.agent),
+                    Some(call_id),
+                    &self.config,
+                    self.session_table.as_ref(),
+                    data,
+                )
+                .await
+        } else {
+            self.session
+                .record_event(kind, Some(&self.agent), Some(call_id), data)
+                .await
         }
     }
 
@@ -308,11 +357,9 @@ impl McpChildEventRecorder {
 
         let start_data = self.event_data(&span, None, None, 0);
         if let Err(e) = self
-            .session
-            .record_event(
+            .record_child_event(
                 SessionEventKind::ToolCallStarted,
-                Some(&self.agent),
-                Some(&span.call_id),
+                &span.call_id,
                 &start_data,
             )
             .await
@@ -375,13 +422,7 @@ impl McpChildEventRecorder {
         }
 
         let seq = match self
-            .session
-            .record_event(
-                SessionEventKind::ToolCall,
-                Some(&self.agent),
-                Some(&span.call_id),
-                &event_data,
-            )
+            .record_child_event(SessionEventKind::ToolCall, &span.call_id, &event_data)
             .await
         {
             Ok(seq) => Some(seq),
@@ -460,11 +501,9 @@ impl McpChildEventRecorder {
     async fn emit_start(&self, span: &McpChildSpan) {
         let start_data = self.event_data(span, None, None, 0);
         if let Err(e) = self
-            .session
-            .record_event(
+            .record_child_event(
                 SessionEventKind::ToolCallStarted,
-                Some(&self.agent),
-                Some(&span.call_id),
+                &span.call_id,
                 &start_data,
             )
             .await
@@ -2734,13 +2773,22 @@ mod tests {
         assert!(err.to_string().contains("manually named"), "{err}");
 
         let db = crate::db::Db::open_in_memory().unwrap();
-        let parent =
-            crate::session::Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+        let parent = crate::session::Session::create(
+            db.clone(),
+            tmp.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let side = db.create_ephemeral_fork(parent.id, None).await.unwrap();
         let session = Arc::new(
-            crate::session::Session::resume(db, side.session_id)
-                .unwrap()
-                .unwrap(),
+            crate::session::Session::resume(
+                db,
+                side.session_id,
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap()
+            .unwrap(),
         );
         advance_title_turns(&session, 8);
         let host = HostContext {
@@ -2824,13 +2872,22 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), r#"{ "utility_model": "openai:gpt-4.1-mini" }"#);
         let db = crate::db::Db::open_in_memory().unwrap();
-        let parent =
-            crate::session::Session::create(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+        let parent = crate::session::Session::create(
+            db.clone(),
+            tmp.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let side = db.create_ephemeral_fork(parent.id, None).await.unwrap();
         let session = Arc::new(
-            crate::session::Session::resume(db, side.session_id)
-                .unwrap()
-                .unwrap(),
+            crate::session::Session::resume(
+                db,
+                side.session_id,
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap()
+            .unwrap(),
         );
         let host = HostContext {
             db: Some(session.db.clone()),

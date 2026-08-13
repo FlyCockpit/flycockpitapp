@@ -72,6 +72,7 @@ pub fn spawn_review(
     cwd: std::path::PathBuf,
     config: crate::daemon::session_worker::SessionConfigHandle,
     redact: Arc<crate::redact::RedactionTable>,
+    resolver: Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
     tx: mpsc::Sender<TurnEvent>,
 ) -> Option<RunningReview> {
     let digest = recent_history_digest(&recent_history);
@@ -79,7 +80,18 @@ pub fn spawn_review(
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
     let handle = tokio::spawn(async move {
-        match run_review_turn(root_agent, cwd, config, redact, prompt, task_cancel, &tx).await {
+        match run_review_turn(
+            root_agent,
+            cwd,
+            config,
+            redact,
+            resolver,
+            prompt,
+            task_cancel,
+            &tx,
+        )
+        .await
+        {
             Ok(Some(summary)) => {
                 let _ = tx
                     .send(TurnEvent::Notice {
@@ -146,16 +158,18 @@ pub fn should_skip_capture(digest: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_review_turn(
     root_agent: Agent,
     cwd: std::path::PathBuf,
     config: crate::daemon::session_worker::SessionConfigHandle,
     redact: Arc<crate::redact::RedactionTable>,
+    resolver: Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
     prompt: String,
     cancel: CancellationToken,
     tx: &mpsc::Sender<TurnEvent>,
 ) -> Result<Option<String>> {
-    let session = scratch_session(&cwd)?;
+    let session = scratch_session(&cwd, resolver)?;
     // This caged background utility intentionally retains its isolated
     // in-memory database; a daemon journal is bound to a different DB and
     // cannot safely be attached.
@@ -300,12 +314,16 @@ fn last_assistant_summary(history: &[Message]) -> Option<String> {
     })
 }
 
-fn scratch_session(cwd: &std::path::Path) -> Result<Arc<crate::session::Session>> {
+fn scratch_session(
+    cwd: &std::path::Path,
+    resolver: Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
+) -> Result<Arc<crate::session::Session>> {
     let db = crate::db::Db::open_in_memory()?;
     Ok(Arc::new(crate::session::Session::create(
         db,
         cwd.to_path_buf(),
         "background_review",
+        resolver,
     )?))
 }
 
@@ -338,10 +356,15 @@ mod tests {
     async fn review_scratch_not_persisted() {
         let tmp = tempfile::tempdir().unwrap();
         let real_db = crate::db::Db::open_in_memory().unwrap();
-        let real =
-            crate::session::Session::create(real_db.clone(), tmp.path().to_path_buf(), "helper")
-                .unwrap();
-        let scratch = scratch_session(tmp.path()).unwrap();
+        let real = crate::session::Session::create(
+            real_db.clone(),
+            tmp.path().to_path_buf(),
+            "helper",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let scratch =
+            scratch_session(tmp.path(), crate::session::test_redaction_key_resolver()).unwrap();
 
         assert_ne!(real.id, scratch.id);
         scratch

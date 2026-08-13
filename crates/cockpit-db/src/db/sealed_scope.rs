@@ -404,6 +404,91 @@ fn name_tombstoned_conn(
     Ok(hit.is_some())
 }
 
+/// Connection-scoped body of [`Db::create_session_sealed_value`]. Exposed so a
+/// caller (the sealed-adoption journaling seam in `cockpit-core`) can compose
+/// the session sealed-row write with a protected-history append in one
+/// transaction; a failure of either rolls back both.
+pub fn create_session_sealed_value_conn(
+    conn: &Connection,
+    record: &NewSealedValueRecord,
+    literal: &str,
+    reason: &str,
+    origin: &str,
+) -> Result<SealedValueRecordRow> {
+    if record.scope != SealedScopeKind::Session {
+        bail!("create_session_sealed_value is only for session scope");
+    }
+    if name_tombstoned_conn(conn, record.scope, &record.scope_key, &record.name)? {
+        bail!("sealed value name was retired and is never reused");
+    }
+    conn.execute(
+        "INSERT INTO sealed_value_records
+             (record_id, scope, scope_key, name, description, owner_principal,
+              active_version, compartment_key, created_at_ms, updated_at_ms, deleted_at_ms)
+         VALUES (?1, 'session', ?2, ?3, ?4, ?5, 1, NULL, ?6, ?6, NULL)",
+        params![
+            record.record_id,
+            record.scope_key,
+            record.name,
+            record.description,
+            record.owner_principal,
+            record.created_at_ms,
+        ],
+    )
+    .context("creating session sealed value record")?;
+    conn.execute(
+        "INSERT INTO sealed_values (session_id, value_id, value, reason, origin, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(session_id, value_id) DO UPDATE SET
+           value = excluded.value, reason = excluded.reason,
+           origin = excluded.origin, created_at = excluded.created_at",
+        params![
+            record.scope_key,
+            record.name,
+            literal,
+            reason,
+            origin,
+            record.created_at_ms / 1_000,
+        ],
+    )
+    .context("writing session sealed literal")?;
+    record_conn(conn, &record.record_id)?.context("created session sealed value record vanished")
+}
+
+/// Connection-scoped body of [`Db::rotate_session_sealed_value`]. See
+/// [`create_session_sealed_value_conn`] for why the conn-scoped form exists.
+pub fn rotate_session_sealed_value_conn(
+    conn: &Connection,
+    record_id: &str,
+    literal: &str,
+    now_ms: i64,
+) -> Result<SealedValueRecordRow> {
+    let existing = record_conn(conn, record_id)?.context("sealed value record no longer exists")?;
+    if existing.scope != SealedScopeKind::Session {
+        bail!("rotate_session_sealed_value is only for session scope");
+    }
+    if !existing.is_resolvable() {
+        bail!("sealed value record is not resolvable and cannot rotate");
+    }
+    conn.execute(
+        "UPDATE sealed_values SET value = ?3, created_at = ?4
+          WHERE session_id = ?1 AND value_id = ?2",
+        params![existing.scope_key, existing.name, literal, now_ms / 1_000],
+    )
+    .context("rotating session sealed literal")?;
+    conn.execute(
+        "UPDATE sealed_value_records
+            SET active_version = active_version + 1, updated_at_ms = ?2
+          WHERE record_id = ?1",
+        params![record_id, now_ms],
+    )
+    .context("bumping session sealed value version")?;
+    // Fence in the same transaction that bumped the version, so a use holding a
+    // v1 grant can never be handed the v2 literal.
+    revoke_grants_for_record_conn(conn, record_id, now_ms)?;
+    record_conn(conn, record_id)?.context("rotated session sealed value record vanished")
+}
+
 impl Db {
     /// Stage a new record. The record is inserted at `active_version = 0`, so
     /// it is not resolvable until its create saga commits.
@@ -513,46 +598,8 @@ impl Db {
         reason: String,
         origin: String,
     ) -> Result<SealedValueRecordRow> {
-        if record.scope != SealedScopeKind::Session {
-            bail!("create_session_sealed_value is only for session scope");
-        }
         self.transaction(move |conn| {
-            if name_tombstoned_conn(conn, record.scope, &record.scope_key, &record.name)? {
-                bail!("sealed value name was retired and is never reused");
-            }
-            conn.execute(
-                "INSERT INTO sealed_value_records
-                     (record_id, scope, scope_key, name, description, owner_principal,
-                      active_version, compartment_key, created_at_ms, updated_at_ms, deleted_at_ms)
-                 VALUES (?1, 'session', ?2, ?3, ?4, ?5, 1, NULL, ?6, ?6, NULL)",
-                params![
-                    record.record_id,
-                    record.scope_key,
-                    record.name,
-                    record.description,
-                    record.owner_principal,
-                    record.created_at_ms,
-                ],
-            )
-            .context("creating session sealed value record")?;
-            conn.execute(
-                "INSERT INTO sealed_values (session_id, value_id, value, reason, origin, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(session_id, value_id) DO UPDATE SET
-                   value = excluded.value, reason = excluded.reason,
-                   origin = excluded.origin, created_at = excluded.created_at",
-                params![
-                    record.scope_key,
-                    record.name,
-                    literal,
-                    reason,
-                    origin,
-                    record.created_at_ms / 1_000,
-                ],
-            )
-            .context("writing session sealed literal")?;
-            record_conn(conn, &record.record_id)?
-                .context("created session sealed value record vanished")
+            create_session_sealed_value_conn(conn, &record, &literal, &reason, &origin)
         })
         .await
     }
@@ -565,31 +612,7 @@ impl Db {
         now_ms: i64,
     ) -> Result<SealedValueRecordRow> {
         self.transaction(move |conn| {
-            let existing =
-                record_conn(conn, &record_id)?.context("sealed value record no longer exists")?;
-            if existing.scope != SealedScopeKind::Session {
-                bail!("rotate_session_sealed_value is only for session scope");
-            }
-            if !existing.is_resolvable() {
-                bail!("sealed value record is not resolvable and cannot rotate");
-            }
-            conn.execute(
-                "UPDATE sealed_values SET value = ?3, created_at = ?4
-                  WHERE session_id = ?1 AND value_id = ?2",
-                params![existing.scope_key, existing.name, literal, now_ms / 1_000],
-            )
-            .context("rotating session sealed literal")?;
-            conn.execute(
-                "UPDATE sealed_value_records
-                    SET active_version = active_version + 1, updated_at_ms = ?2
-                  WHERE record_id = ?1",
-                params![record_id, now_ms],
-            )
-            .context("bumping session sealed value version")?;
-            // Fence in the same transaction that bumped the version, so a use
-            // holding a v1 grant can never be handed the v2 literal.
-            revoke_grants_for_record_conn(conn, &record_id, now_ms)?;
-            record_conn(conn, &record_id)?.context("rotated session sealed value record vanished")
+            rotate_session_sealed_value_conn(conn, &record_id, &literal, now_ms)
         })
         .await
     }

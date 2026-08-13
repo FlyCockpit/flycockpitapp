@@ -564,7 +564,15 @@ mod tests {
     #[tokio::test]
     async fn eager_titles_first_short_message_no_token_gate() {
         let db = Db::open_in_memory().unwrap();
-        let session = Arc::new(Session::create(db, PathBuf::from("/x"), "a").unwrap());
+        let session = Arc::new(
+            Session::create(
+                db,
+                PathBuf::from("/x"),
+                "a",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
         // A ~short message — far under the 500-token refine threshold.
         let msg = "Hi! Can you do a deep dive on my harness?";
         let action = session.note_user_content(msg);
@@ -598,7 +606,15 @@ mod tests {
         // nothing slug-worthy, so the title stays unset and the next
         // scheduled slot gets the next chance (no failure Notice).
         let db = Db::open_in_memory().unwrap();
-        let session = Arc::new(Session::create(db, PathBuf::from("/x"), "a").unwrap());
+        let session = Arc::new(
+            Session::create(
+                db,
+                PathBuf::from("/x"),
+                "a",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
         let action = session.note_user_content("/help");
         assert_eq!(action, TitleAction::Eager);
 
@@ -625,7 +641,15 @@ mod tests {
     #[tokio::test]
     async fn refine_overwrites_eager_title() {
         let db = Db::open_in_memory().unwrap();
-        let session = Arc::new(Session::create(db, PathBuf::from("/x"), "a").unwrap());
+        let session = Arc::new(
+            Session::create(
+                db,
+                PathBuf::from("/x"),
+                "a",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
         // An eager title is already in place.
         assert!(session.set_auto_title("eager-title").unwrap());
         session.mark_eager_titled();
@@ -654,7 +678,15 @@ mod tests {
     #[tokio::test]
     async fn refine_does_not_overwrite_user_set_title() {
         let db = Db::open_in_memory().unwrap();
-        let session = Arc::new(Session::create(db, PathBuf::from("/x"), "a").unwrap());
+        let session = Arc::new(
+            Session::create(
+                db,
+                PathBuf::from("/x"),
+                "a",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
         session.rename("user-chosen").unwrap();
 
         let url = stub_model_server(Some("Refined Title".to_string())).await;
@@ -681,7 +713,15 @@ mod tests {
     #[tokio::test]
     async fn explicit_generated_title_replaces_manual_title_as_auto() {
         let db = Db::open_in_memory().unwrap();
-        let session = Arc::new(Session::create(db, PathBuf::from("/x"), "a").unwrap());
+        let session = Arc::new(
+            Session::create(
+                db,
+                PathBuf::from("/x"),
+                "a",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
         session
             .record_event(
                 crate::db::session_log::SessionEventKind::UserMessage,
@@ -720,7 +760,15 @@ mod tests {
     #[tokio::test]
     async fn reasoning_output_is_think_stripped_before_slugify() {
         let db = Db::open_in_memory().unwrap();
-        let session = Arc::new(Session::create(db, PathBuf::from("/x"), "a").unwrap());
+        let session = Arc::new(
+            Session::create(
+                db,
+                PathBuf::from("/x"),
+                "a",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
         let action = session.note_user_content("title me");
         // The model emits a leading <think> block then the real title.
         let url = stub_model_server(Some(
@@ -750,7 +798,15 @@ mod tests {
     #[tokio::test]
     async fn missing_utility_model_emits_setup_notice_once() {
         let db = Db::open_in_memory().unwrap();
-        let session = Arc::new(Session::create(db, PathBuf::from("/x"), "a").unwrap());
+        let session = Arc::new(
+            Session::create(
+                db,
+                PathBuf::from("/x"),
+                "a",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
         let action = session.note_user_content("title me");
         let (tx, mut rx) = mpsc::channel(8);
 
@@ -778,7 +834,15 @@ mod tests {
     #[tokio::test]
     async fn configured_model_failure_emits_generic_notice_once_without_raw_error() {
         let db = Db::open_in_memory().unwrap();
-        let session = Arc::new(Session::create(db, PathBuf::from("/x"), "a").unwrap());
+        let session = Arc::new(
+            Session::create(
+                db,
+                PathBuf::from("/x"),
+                "a",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
         let action = session.note_user_content("title me");
 
         // Erroring model (500s).
@@ -832,7 +896,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn configured_model_timeout_emits_timeout_notice_once() {
         let db = Db::open_in_memory().unwrap();
-        let session = Arc::new(Session::create(db, PathBuf::from("/x"), "a").unwrap());
+        let session = Arc::new(
+            Session::create(
+                db,
+                PathBuf::from("/x"),
+                "a",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
         let action = session.note_user_content("title me");
         let url = hanging_model_server().await;
         let (ext, prov, redact) = stub_configs(&url);

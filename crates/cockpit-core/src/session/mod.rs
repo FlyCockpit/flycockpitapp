@@ -126,6 +126,13 @@ pub struct Session {
     /// Daemon-owned external side-effect journal. Installed by the registry
     /// before the worker starts; absent in isolated unit sessions.
     external_journal: Mutex<Option<Arc<crate::external_journal::ExternalJournal>>>,
+    /// Required key resolver for protected redaction-history journaling.
+    /// Installed at construction by the registry / daemon (production) or the
+    /// shared test helper (tests) — never `Option`, never lazily set (decision
+    /// 16). Read-only after construction. Consumed by the trusted
+    /// inference-request / event journaling chokepoints in `recording.rs`.
+    redaction_key_resolver:
+        Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
     allow_unjournaled_inference: std::sync::atomic::AtomicBool,
     /// Private per-session tmp dir under the system temp location
     /// (sandboxing part 2). Read+write inside the sandboxed shell and
@@ -341,6 +348,19 @@ struct LastRecoverableToolCall {
     message: String,
 }
 
+/// Shared test-only redaction key resolver for constructing `Session`s in unit
+/// tests. Returns a real [`crate::redact::protected_redaction_history::RedactionKeyResolver`]
+/// (a `MapKeyResolver` with a fixed version-1 key) — never `None`, per decision
+/// 16. Importable across the crate's test modules so no test inlines a resolver.
+#[cfg(test)]
+pub(crate) fn test_redaction_key_resolver()
+-> Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver> {
+    Arc::new(
+        crate::redact::protected_redaction_history::MapKeyResolver::new()
+            .with_version(1, [7u8; 32]),
+    )
+}
+
 impl Session {
     pub(crate) fn set_external_journal(
         &self,
@@ -351,6 +371,15 @@ impl Session {
 
     pub(crate) fn external_journal(&self) -> Option<Arc<crate::external_journal::ExternalJournal>> {
         self.external_journal.lock().unwrap().clone()
+    }
+
+    /// The session's protected redaction-history key resolver. Required and
+    /// installed at construction (decision 16). Consumed by the journaling
+    /// chokepoints landed in Layer C.
+    pub(crate) fn redaction_key_resolver(
+        &self,
+    ) -> &Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver> {
+        &self.redaction_key_resolver
     }
 
     pub fn allow_unjournaled_inference(&self) {
@@ -1134,11 +1163,19 @@ mod tests {
     #[tokio::test]
     async fn create_and_resume_round_trip() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db.clone(), PathBuf::from("/x"), "Build").unwrap();
+        let s = Session::create(
+            db.clone(),
+            PathBuf::from("/x"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let id = s.id;
         let short = s.short_id.clone();
         drop(s);
-        let s2 = Session::resume(db, id).unwrap().unwrap();
+        let s2 = Session::resume(db, id, crate::session::test_redaction_key_resolver())
+            .unwrap()
+            .unwrap();
         assert_eq!(s2.id, id);
         assert_eq!(s2.short_id, short);
         assert!(s2.parent_session_id.is_none());
@@ -1149,7 +1186,13 @@ mod tests {
     #[tokio::test]
     async fn fork_inherits_parent_metadata() {
         let db = Db::open_in_memory().unwrap();
-        let parent = Session::create(db.clone(), PathBuf::from("/x"), "Build").unwrap();
+        let parent = Session::create(
+            db.clone(),
+            PathBuf::from("/x"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         parent.set_active_model("anthropic", "opus-4-7").unwrap();
         let fork_point = parent
             .record_event(
@@ -1160,8 +1203,13 @@ mod tests {
             )
             .await
             .unwrap();
-        let fork =
-            Session::create_fork(db.clone(), parent.id, Some(fork_point.to_string())).unwrap();
+        let fork = Session::create_fork(
+            db.clone(),
+            parent.id,
+            Some(fork_point.to_string()),
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         assert_eq!(fork.parent_session_id, Some(parent.id));
         let fork_point = fork_point.to_string();
         assert_eq!(
@@ -1178,7 +1226,13 @@ mod tests {
     #[tokio::test]
     async fn rename_persists_and_blocks_auto_title() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db.clone(), PathBuf::from("/x"), "a").unwrap();
+        let s = Session::create(
+            db.clone(),
+            PathBuf::from("/x"),
+            "a",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         s.rename("hand-picked").unwrap();
         assert!(s.user_renamed());
         assert_eq!(s.title().as_deref(), Some("hand-picked"));
@@ -1189,7 +1243,13 @@ mod tests {
     #[tokio::test]
     async fn time_prelude_fires_on_first_call() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
+        let s = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "a",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let prelude = s.take_time_prelude(5);
         assert!(prelude.is_some());
         let body = prelude.unwrap();
@@ -1200,7 +1260,13 @@ mod tests {
     #[tokio::test]
     async fn time_prelude_suppressed_within_interval() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
+        let s = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "a",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         assert!(s.take_time_prelude(5).is_some(), "first call should fire");
         assert!(
             s.take_time_prelude(5).is_none(),
@@ -1213,7 +1279,13 @@ mod tests {
         // A 0-minute interval is the "always inject" config, mainly for
         // tests. Two back-to-back calls both fire.
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
+        let s = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "a",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         assert!(s.take_time_prelude(0).is_some());
         assert!(s.take_time_prelude(0).is_some());
     }
@@ -1234,7 +1306,13 @@ mod tests {
     #[tokio::test]
     async fn note_user_content_eager_fires_on_first_short_message() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
+        let s = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "a",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let msg = "a short message";
         assert_eq!(s.note_user_content(msg), TitleAction::Eager);
         assert_eq!(s.user_content_tokens(), crate::tokens::count(msg));
@@ -1245,7 +1323,13 @@ mod tests {
     #[tokio::test]
     async fn note_user_content_uses_bounded_turn_slots() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
+        let s = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "a",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let observed: Vec<_> = (1..=17)
             .filter_map(|turn| {
                 let action = s.note_user_content(&format!("turn {turn}"));
@@ -1269,7 +1353,13 @@ mod tests {
     #[tokio::test]
     async fn scheduled_slot_is_consumed_even_without_title_success() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
+        let s = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "a",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         assert_eq!(s.note_user_content("first"), TitleAction::Eager);
         assert!(s.title().is_none(), "utility task has not landed a title");
         assert_eq!(
@@ -1282,7 +1372,13 @@ mod tests {
     #[tokio::test]
     async fn nudge_fires_at_slot_8_and_16_only_when_untitled() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
+        let s = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "a",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let observed: Vec<_> = (1..=17)
             .filter_map(|turn| {
                 let _ = s.note_user_content(&format!("turn {turn}"));
@@ -1301,7 +1397,13 @@ mod tests {
     #[tokio::test]
     async fn nudge_does_not_fire_once_titled() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
+        let s = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "a",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let observed: Vec<_> = (1..=17)
             .filter_map(|turn| {
                 let _ = s.note_user_content(&format!("turn {turn}"));
@@ -1319,7 +1421,13 @@ mod tests {
     #[tokio::test]
     async fn resumed_session_does_not_renudge_a_passed_slot() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db.clone(), PathBuf::from("/x"), "a").unwrap();
+        let s = Session::create(
+            db.clone(),
+            PathBuf::from("/x"),
+            "a",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let id = s.id;
         for turn in 1..=8 {
             s.record_event(
@@ -1335,7 +1443,9 @@ mod tests {
         assert_eq!(s.title_stage(), 8);
         drop(s);
 
-        let resumed = Session::resume(db, id).unwrap().unwrap();
+        let resumed = Session::resume(db, id, crate::session::test_redaction_key_resolver())
+            .unwrap()
+            .unwrap();
         assert_eq!(resumed.user_content_turns(), 8);
         assert_eq!(resumed.title_stage(), 8);
         assert!(
@@ -1358,7 +1468,13 @@ mod tests {
     #[tokio::test]
     async fn compact_self_nudge_two_shot_latch() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
+        let s = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "a",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
 
         let first = s
             .compact_self_nudge(Some(62.0), 60, 80, true, true)
@@ -1394,7 +1510,13 @@ mod tests {
     #[tokio::test]
     async fn compact_self_nudge_suppressed_when_unactionable() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
+        let s = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "a",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
 
         assert!(
             s.compact_self_nudge(Some(62.0), 60, 80, true, false)
@@ -1414,7 +1536,13 @@ mod tests {
     #[tokio::test]
     async fn compact_self_nudge_latch_reset_only_on_compaction() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
+        let s = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "a",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
 
         assert!(
             s.compact_self_nudge(Some(62.0), 60, 80, true, true)
@@ -1438,7 +1566,13 @@ mod tests {
     #[tokio::test]
     async fn note_user_content_skips_when_user_renamed() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
+        let s = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "a",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         s.rename("user-set").unwrap();
         // No scheduled slot fires once the user has renamed — not even eager.
         assert_eq!(s.note_user_content("hello"), TitleAction::None);
@@ -1449,7 +1583,13 @@ mod tests {
     #[tokio::test]
     async fn note_user_content_empty_is_noop() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
+        let s = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "a",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         assert_eq!(s.note_user_content(""), TitleAction::None);
         assert_eq!(s.user_content_tokens(), 0);
         assert_eq!(s.user_content_turns(), 0);
@@ -1458,7 +1598,13 @@ mod tests {
     #[tokio::test]
     async fn non_slot_turns_do_not_fire_even_with_large_content() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
+        let s = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "a",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let big = text_of_at_least(crate::auto_title::TITLE_TOKEN_THRESHOLD * 2);
         assert_eq!(s.note_user_content("one"), TitleAction::Eager);
         assert_eq!(s.note_user_content("two"), TitleAction::Refine);
@@ -1468,7 +1614,13 @@ mod tests {
     #[tokio::test]
     async fn title_progress_survives_resume() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db.clone(), PathBuf::from("/x"), "a").unwrap();
+        let s = Session::create(
+            db.clone(),
+            PathBuf::from("/x"),
+            "a",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let id = s.id;
         s.record_event(
             crate::db::session_log::SessionEventKind::UserMessage,
@@ -1483,7 +1635,9 @@ mod tests {
         assert_eq!(s.title_stage(), 1);
         drop(s);
 
-        let resumed = Session::resume(db, id).unwrap().unwrap();
+        let resumed = Session::resume(db, id, crate::session::test_redaction_key_resolver())
+            .unwrap()
+            .unwrap();
         assert_eq!(
             resumed.user_content_tokens(),
             carried,
@@ -1502,7 +1656,13 @@ mod tests {
     async fn note_user_content_refine_skips_when_user_renamed_after_eager() {
         // A /rename after an eager title wins and blocks later scheduled slots.
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
+        let s = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "a",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         assert!(s.set_auto_title("eager-title").unwrap());
         s.mark_eager_titled();
         s.rename("user-chosen").unwrap();
@@ -1513,7 +1673,13 @@ mod tests {
     #[tokio::test]
     async fn title_failure_notice_is_one_per_session() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
+        let s = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "a",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         assert!(s.claim_title_failure_notice(), "first claim wins");
         assert!(
             !s.claim_title_failure_notice(),
@@ -1524,7 +1690,13 @@ mod tests {
     #[tokio::test]
     async fn redaction_placeholder_notice_is_one_per_session() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
+        let s = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "a",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         assert!(s.claim_redaction_placeholder_notice(), "first claim wins");
         assert!(
             !s.claim_redaction_placeholder_notice(),
@@ -1535,9 +1707,21 @@ mod tests {
     #[tokio::test]
     async fn fork_inherits_user_content_counter() {
         let db = Db::open_in_memory().unwrap();
-        let parent = Session::create(db.clone(), PathBuf::from("/x"), "a").unwrap();
+        let parent = Session::create(
+            db.clone(),
+            PathBuf::from("/x"),
+            "a",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let _ = parent.note_user_content(&"x".repeat(1000));
-        let fork = Session::create_fork(db, parent.id, None).unwrap();
+        let fork = Session::create_fork(
+            db,
+            parent.id,
+            None,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         assert_eq!(fork.user_content_tokens(), parent.user_content_tokens());
     }
 
@@ -1546,8 +1730,20 @@ mod tests {
         // Two sessions get distinct private tmp dirs (sandboxing part 2),
         // so neither can read the other's scratch.
         let db = Db::open_in_memory().unwrap();
-        let a = Session::create(db.clone(), PathBuf::from("/x"), "builder").unwrap();
-        let b = Session::create(db, PathBuf::from("/x"), "builder").unwrap();
+        let a = Session::create(
+            db.clone(),
+            PathBuf::from("/x"),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let b = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let da = a.tmp_dir().unwrap();
         let db_ = b.tmp_dir().unwrap();
         assert_ne!(da, db_, "sessions must not share a tmp dir");
@@ -1560,7 +1756,13 @@ mod tests {
     #[tokio::test]
     async fn tmp_dir_removed_on_end() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db, PathBuf::from("/x"), "builder").unwrap();
+        let s = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let dir = s.tmp_dir().unwrap();
         std::fs::write(dir.join("scratch"), "x").unwrap();
         assert!(dir.exists());
@@ -1589,7 +1791,13 @@ mod tests {
     async fn host_shim_dir_removed_on_end() {
         let temp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db, PathBuf::from("/x"), "builder").unwrap();
+        let s = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let dir = temp.path().join("data/cockpit/session-shims/session/bin");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("jq"), "shim").unwrap();
@@ -1607,7 +1815,13 @@ mod tests {
     async fn tmp_dir_removed_on_drop() {
         let db = Db::open_in_memory().unwrap();
         let dir = {
-            let s = Session::create(db, PathBuf::from("/x"), "builder").unwrap();
+            let s = Session::create(
+                db,
+                PathBuf::from("/x"),
+                "builder",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap();
             let d = s.tmp_dir().unwrap();
             assert!(d.exists());
             d
@@ -1618,7 +1832,13 @@ mod tests {
     #[tokio::test]
     async fn sandbox_flag_defaults_on_and_toggles() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db, PathBuf::from("/x"), "builder").unwrap();
+        let s = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         // Sandboxing-enabled (sandboxing part 2): defaults ON.
         assert!(s.sandbox_enabled());
         // Explicit set.
@@ -1636,7 +1856,13 @@ mod tests {
     async fn approval_mode_defaults_manual_and_round_trips() {
         use crate::config::extended::ApprovalMode;
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db, PathBuf::from("/x"), "builder").unwrap();
+        let s = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         // Fail-safe default until the spawn path applies the config default.
         assert_eq!(s.approval_mode(), ApprovalMode::Manual);
         // Each mode round-trips through the atomic encode/decode.
@@ -1650,7 +1876,13 @@ mod tests {
     async fn session_mode_unchanged() {
         use crate::config::extended::ApprovalMode;
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db, PathBuf::from("/x"), "builder").unwrap();
+        let s = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         s.set_approval_mode(ApprovalMode::Manual);
         let before = s.session_approval_mode();
         assert_eq!(before, ApprovalMode::Manual);
@@ -1692,7 +1924,15 @@ mod tests {
         use std::sync::Arc;
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
-        let s = Arc::new(Session::create(db.clone(), tmp.path().to_path_buf(), "builder").unwrap());
+        let s = Arc::new(
+            Session::create(
+                db.clone(),
+                tmp.path().to_path_buf(),
+                "builder",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
         // Session stays Manual; run override is Auto without a guard model.
         s.set_approval_mode(ApprovalMode::Manual);
         let run_id = Uuid::new_v4();
@@ -1729,7 +1969,13 @@ mod tests {
     async fn yolo_hard_gates() {
         use crate::config::extended::ApprovalMode;
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db, PathBuf::from("/x"), "builder").unwrap();
+        let s = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         s.set_approval_mode(ApprovalMode::Manual);
         // Sandbox remains the gate under Yolo invocation override.
         assert!(s.sandbox_enabled());
@@ -1754,7 +2000,13 @@ mod tests {
     #[tokio::test]
     async fn bump_consecutive_counts_back_to_back_repeats() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db, PathBuf::from("/x"), "builder").unwrap();
+        let s = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         // First call of a signature → count 1.
         assert_eq!(s.bump_consecutive_call("sig-a"), 1);
         // Immediate repeat → count 2 (the first exact repeat).
@@ -1766,7 +2018,13 @@ mod tests {
     #[tokio::test]
     async fn bump_consecutive_resets_on_a_different_call() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db, PathBuf::from("/x"), "builder").unwrap();
+        let s = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         assert_eq!(s.bump_consecutive_call("sig-a"), 1);
         assert_eq!(s.bump_consecutive_call("sig-a"), 2);
         // A different call breaks the chain — count resets to 1.
@@ -1780,7 +2038,13 @@ mod tests {
     #[tokio::test]
     async fn repeated_recoverable_tool_call_message_matches_and_clears_on_difference() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db, PathBuf::from("/x"), "builder").unwrap();
+        let s = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
 
         s.remember_recoverable_tool_call("sig-a".to_string(), "use tree without path".to_string());
         assert_eq!(
@@ -1798,7 +2062,13 @@ mod tests {
     #[tokio::test]
     async fn clear_recoverable_tool_call_drops_memory() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db, PathBuf::from("/x"), "builder").unwrap();
+        let s = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
 
         s.remember_recoverable_tool_call("sig-a".to_string(), "msg".to_string());
         s.clear_recoverable_tool_call();
@@ -1812,7 +2082,13 @@ mod tests {
         // and short_id in memory but no `sessions` row, and never appears in
         // listings until persisted.
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create_deferred(db.clone(), PathBuf::from("/x"), "Build").unwrap();
+        let s = Session::create_deferred(
+            db.clone(),
+            PathBuf::from("/x"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         // Id + short_id exist immediately (for the startup graphic).
         assert!(!s.short_id.is_empty());
         assert!(!s.is_persisted());
@@ -1840,7 +2116,13 @@ mod tests {
         // A model picked before the first message survives the deferred
         // write as one atomic value, including inference preferences.
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create_deferred(db.clone(), PathBuf::from("/x"), "Build").unwrap();
+        let s = Session::create_deferred(
+            db.clone(),
+            PathBuf::from("/x"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let selection = crate::config::providers::ActiveModelRef {
             provider: "anthropic".to_string(),
             model: "claude-opus-4-7".to_string(),
@@ -1881,10 +2163,14 @@ mod tests {
         );
         let row = db.insert_session_row(&row).await.unwrap();
 
-        let error = Session::resume(db, row.session_id)
-            .err()
-            .expect("divergent projections must not hydrate ambiguous model state")
-            .to_string();
+        let error = Session::resume(
+            db,
+            row.session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .err()
+        .expect("divergent projections must not hydrate ambiguous model state")
+        .to_string();
         assert!(error.contains("projections disagree"), "{error}");
     }
 
@@ -1896,17 +2182,27 @@ mod tests {
         row.model = Some("projection-model".to_string());
         let row = db.insert_session_row(&row).await.unwrap();
 
-        let error = Session::resume(db, row.session_id)
-            .err()
-            .expect("projection-only state must not synthesize empty preferences")
-            .to_string();
+        let error = Session::resume(
+            db,
+            row.session_id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .err()
+        .expect("projection-only state must not synthesize empty preferences")
+        .to_string();
         assert!(error.contains("require model_selection_json"), "{error}");
     }
 
     #[tokio::test]
     async fn deferred_persist_carries_session_overrides() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create_deferred(db.clone(), PathBuf::from("/x"), "Build").unwrap();
+        let s = Session::create_deferred(
+            db.clone(),
+            PathBuf::from("/x"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let override_json = r#"{"tools":["read","bash"],"toolTiers":{"bash":"disabled"}}"#;
 
         s.set_session_llm_mode(crate::config::extended::LlmMode::Frontier)
@@ -1934,7 +2230,13 @@ mod tests {
     #[tokio::test]
     async fn deferred_persist_carries_agent_touch_and_viewed() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create_deferred(db.clone(), PathBuf::from("/x"), "Build").unwrap();
+        let s = Session::create_deferred(
+            db.clone(),
+            PathBuf::from("/x"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let original_last_active = {
             let row = s.pending_row.lock().unwrap();
             row.as_ref().unwrap().last_active_at
@@ -1957,7 +2259,13 @@ mod tests {
         // The non-deferred constructor writes the row up front, so
         // persist_if_needed is a no-op and is_persisted is true.
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db.clone(), PathBuf::from("/x"), "builder").unwrap();
+        let s = Session::create(
+            db.clone(),
+            PathBuf::from("/x"),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         assert!(s.is_persisted());
         assert!(!s.persist_if_needed().unwrap());
         assert!(db.get_session(s.id).await.unwrap().is_some());
@@ -1966,7 +2274,13 @@ mod tests {
     #[tokio::test]
     async fn record_tool_call_writes_row() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db.clone(), PathBuf::from("/x"), "builder").unwrap();
+        let s = Session::create(
+            db.clone(),
+            PathBuf::from("/x"),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         s.set_active_model("anthropic", "claude-opus-4-7").unwrap();
         s.record_tool_call(ToolCallRow {
             event_id: Uuid::new_v4(),
@@ -2005,7 +2319,13 @@ mod tests {
     #[tokio::test]
     async fn record_tool_call_persists_provider_identity_separately() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db.clone(), PathBuf::from("/x"), "builder").unwrap();
+        let s = Session::create(
+            db.clone(),
+            PathBuf::from("/x"),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         s.set_active_model("codex-oauth", "gpt-5.5").unwrap();
         let providers = providers_config([(
             "codex-oauth",
@@ -2071,7 +2391,13 @@ mod tests {
         let path = tmp.path().join("AGENTS.md");
         std::fs::write(&path, body).unwrap();
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db, tmp.path().to_path_buf(), "Build").unwrap();
+        let s = Session::create(
+            db,
+            tmp.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         (s, tmp, path)
     }
 
@@ -2101,7 +2427,13 @@ mod tests {
         let path = tmp.path().join("AGENTS.md");
         std::fs::write(&path, "RULE A\nRULE B\n").unwrap();
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create_deferred(db.clone(), tmp.path().to_path_buf(), "Build").unwrap();
+        let s = Session::create_deferred(
+            db.clone(),
+            tmp.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
 
         s.snapshot_guidance_baseline(tmp.path()).await;
         assert!(db.get_session(s.id).await.unwrap().is_none());
@@ -2125,7 +2457,13 @@ mod tests {
         let path = tmp.path().join("AGENTS.md");
         std::fs::write(&path, "line one\nline two\nline three\n").unwrap();
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create_deferred(db, tmp.path().to_path_buf(), "Build").unwrap();
+        let s = Session::create_deferred(
+            db,
+            tmp.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
 
         s.snapshot_guidance_baseline(tmp.path()).await;
         s.persist_if_needed().unwrap();
@@ -2147,9 +2485,13 @@ mod tests {
     async fn resumed_session_guidance_baseline_still_updates() {
         let (s, tmp, path) = guidance_session("v1\n");
         s.snapshot_guidance_baseline(tmp.path()).await;
-        let resumed = Session::resume(s.db.clone(), s.id)
-            .unwrap()
-            .expect("session should resume");
+        let resumed = Session::resume(
+            s.db.clone(),
+            s.id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .expect("session should resume");
 
         std::fs::write(&path, "v2\n").unwrap();
         resumed.snapshot_guidance_baseline(tmp.path()).await;
@@ -2172,7 +2514,13 @@ mod tests {
     async fn snapshot_with_no_guidance_file_leaves_null_baseline() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db, tmp.path().to_path_buf(), "Build").unwrap();
+        let s = Session::create(
+            db,
+            tmp.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         s.snapshot_guidance_baseline(tmp.path()).await;
         assert_eq!(s.db.guidance_baseline(s.id).await.unwrap(), None);
         // And no injection ever fires for such a session.

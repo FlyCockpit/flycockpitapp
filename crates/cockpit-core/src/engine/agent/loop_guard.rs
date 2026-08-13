@@ -306,8 +306,13 @@ mod loop_collapse_tests {
     async fn db_rows_kept_one_per_attempt() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session =
-            crate::session::Session::create(db, tmp.path().to_path_buf(), "Build").unwrap();
+        let session = crate::session::Session::create(
+            db,
+            tmp.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let args = serde_json::json!({"command": "cargo build"});
 
         // Each rejected attempt persists its own audit row (wire-vs-user split,
@@ -364,8 +369,13 @@ mod loop_collapse_tests {
     async fn repeated_recoverable_tree_call_is_short_circuited_before_dispatch() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session =
-            crate::session::Session::create(db, tmp.path().to_path_buf(), "Build").unwrap();
+        let session = crate::session::Session::create(
+            db,
+            tmp.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let args = serde_json::json!({"kind": "tree", "path": "src/nope"});
         let signature = crate::approval::store::GrantStore::loop_signature("code", &args);
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));

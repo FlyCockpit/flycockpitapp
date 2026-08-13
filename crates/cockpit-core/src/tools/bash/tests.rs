@@ -545,7 +545,13 @@ use crate::daemon::proto::ResolveResponse;
 fn ctx_with_store(cwd: &std::path::Path) -> ToolCtx {
     let db = crate::db::Db::open_in_memory().unwrap();
     let session = Arc::new(
-        crate::session::Session::create(db.clone(), cwd.to_path_buf(), "builder").unwrap(),
+        crate::session::Session::create(
+            db.clone(),
+            cwd.to_path_buf(),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap(),
     );
     session.set_sandbox_enabled(true);
     let sid = session.id;

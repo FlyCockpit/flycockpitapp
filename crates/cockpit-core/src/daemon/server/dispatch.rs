@@ -1108,12 +1108,16 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 let redact = if let Some(handle) = ctx.registry.live_handle(session_id) {
                     handle.redaction_table()
                 } else {
-                    let session = crate::session::Session::resume(ctx.db.clone(), session_id)
-                        .map_err(internal)?
-                        .ok_or_else(|| ErrorPayload {
-                            code: ErrorCode::UnknownSession,
-                            message: format!("unknown session {session_id}"),
-                        })?;
+                    let session = crate::session::Session::resume(
+                        ctx.db.clone(),
+                        session_id,
+                        ctx.redaction_key_resolver().map_err(internal)?,
+                    )
+                    .map_err(internal)?
+                    .ok_or_else(|| ErrorPayload {
+                        code: ErrorCode::UnknownSession,
+                        message: format!("unknown session {session_id}"),
+                    })?;
                     std::sync::Arc::new(
                         session
                             .persisted_redaction_table()
@@ -5494,12 +5498,16 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
                 let redact = if let Some(handle) = ctx.registry.live_handle(session_id) {
                     handle.redaction_table()
                 } else {
-                    let session = crate::session::Session::resume(ctx.db.clone(), session_id)
-                        .map_err(internal)?
-                        .ok_or_else(|| ErrorPayload {
-                            code: ErrorCode::UnknownSession,
-                            message: format!("unknown session {session_id}"),
-                        })?;
+                    let session = crate::session::Session::resume(
+                        ctx.db.clone(),
+                        session_id,
+                        ctx.redaction_key_resolver().map_err(internal)?,
+                    )
+                    .map_err(internal)?
+                    .ok_or_else(|| ErrorPayload {
+                        code: ErrorCode::UnknownSession,
+                        message: format!("unknown session {session_id}"),
+                    })?;
                     std::sync::Arc::new(
                         session
                             .persisted_redaction_table()
@@ -7077,12 +7085,16 @@ pub(super) async fn auto_title_request(
         handle.session()
     } else {
         std::sync::Arc::new(
-            crate::session::Session::resume(ctx.db.clone(), session_id)
-                .map_err(internal)?
-                .ok_or_else(|| ErrorPayload {
-                    code: ErrorCode::UnknownSession,
-                    message: format!("unknown session {session_id}"),
-                })?,
+            crate::session::Session::resume(
+                ctx.db.clone(),
+                session_id,
+                ctx.redaction_key_resolver().map_err(internal)?,
+            )
+            .map_err(internal)?
+            .ok_or_else(|| ErrorPayload {
+                code: ErrorCode::UnknownSession,
+                message: format!("unknown session {session_id}"),
+            })?,
         )
     };
 

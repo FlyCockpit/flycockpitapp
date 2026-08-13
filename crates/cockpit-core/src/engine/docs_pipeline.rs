@@ -58,8 +58,26 @@ struct DocsInput {
     question: String,
 }
 
+/// The docs pipeline's model-authored result: the answerer's text (or the
+/// resolver's failure answer) plus the resolved [`crate::engine::model::Model`]
+/// that authored it. The driver's finalizer needs the authoring model's
+/// identity/trust to journal the report through the frame-carrying path
+/// (decision 10.3): a `docs` delegation bypasses `builtin::load`, so there is
+/// no resolved child model at the finalizer otherwise — it is threaded from
+/// here. Both stages run under the SAME delegated `SpawnArgs` model, so this is
+/// the model of whichever stage produced `report` (answerer on success, the
+/// resolver on a resolution failure).
+pub struct DocsPipelineReport {
+    /// The text surfaced to the caller (model-authored).
+    pub report: String,
+    /// The resolved model that authored `report` — its provider/model id +
+    /// trust class drive the report's journaling frame.
+    pub report_model: Arc<crate::engine::model::Model>,
+}
+
 /// Run the docs pipeline. `brief` is the raw `task` prompt the caller
-/// emitted. Returns the answerer's text (or a clear failure answer).
+/// emitted. Returns the answerer's text (or a clear failure answer) plus the
+/// authoring model (see [`DocsPipelineReport`]).
 ///
 /// `approver` + `interrupts` are the driver's real approval channel. They
 /// are **not** wired into the two stages' agent loops (those stay
@@ -86,7 +104,7 @@ pub async fn run(
     tandem: Option<crate::engine::schedule::TandemSet>,
     event_tx: Option<mpsc::Sender<TurnEvent>>,
     steer_target: Option<NoninteractiveSteerTarget>,
-) -> Result<String> {
+) -> Result<DocsPipelineReport> {
     let input = parse_input(brief);
 
     // The docs pipeline's two stages are leaf agents (`docs-resolver` /
@@ -107,6 +125,10 @@ pub async fn run(
         approver,
         Some(package_add_interrupts),
     );
+    // Capture the resolver's resolved model before `run_noninteractive`
+    // consumes the agent: on a resolution failure the resolver authors the
+    // returned text, so its model identity/trust drives that report's frame.
+    let resolver_model = resolver.model.clone();
     // The resolver's brief is ONLY the package name — the question is
     // withheld from its context per the token-economy split.
     let resolver_brief = format!("Package: {}", input.package);
@@ -138,11 +160,16 @@ pub async fn run(
     // Did the resolver land a usable, on-disk package?
     let Some(resolved) = resolution.take() else {
         // No package located — return the resolver's own explanation
-        // (it already phrases the failure), never spawn Docs.2.
-        return Ok(if resolver_report.trim().is_empty() {
+        // (it already phrases the failure), never spawn Docs.2. The resolver
+        // authored this text, so its model drives the journaling frame.
+        let report = if resolver_report.trim().is_empty() {
             format!("Could not resolve a source repo for `{}`.", input.package)
         } else {
             resolver_report
+        };
+        return Ok(DocsPipelineReport {
+            report,
+            report_model: resolver_model,
         });
     };
 
@@ -154,6 +181,9 @@ pub async fn run(
         ..spawn_args.clone()
     };
     let answerer = docs_answerer(&answerer_args);
+    // Capture the answerer's resolved model before dispatch: it authors the
+    // returned answer text, so its identity/trust drives the report frame.
+    let answerer_model = answerer.model.clone();
     let answerer_brief = format!(
         "Dependency: {} (cwd is its source root)\n\nQuestion: {}",
         resolved.identifier, input.question
@@ -180,7 +210,10 @@ pub async fn run(
         steer_target,
     )
     .await?;
-    Ok(answer)
+    Ok(DocsPipelineReport {
+        report: answer,
+        report_model: answerer_model,
+    })
 }
 
 /// Parse the structured `{package, question}` input. Falls back to a

@@ -263,7 +263,13 @@ pub(crate) fn test_ctx_with_db(root: &Path) -> (ToolCtx, crate::db::Db) {
 
     let db = crate::db::Db::open_in_memory().unwrap();
     let session = Arc::new(
-        crate::session::Session::create(db.clone(), root.to_path_buf(), "builder").unwrap(),
+        crate::session::Session::create(
+            db.clone(),
+            root.to_path_buf(),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap(),
     );
     // Test ctx has no daemon and no zerobox Linux helper installed, so
     // the shell sandbox cannot run here (sandboxing part 2). Default the

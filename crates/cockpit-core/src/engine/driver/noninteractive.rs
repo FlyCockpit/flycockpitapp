@@ -790,6 +790,7 @@ impl Driver {
             self.session.db.clone(),
             self.session.id,
             fork_point,
+            self.session.redaction_key_resolver().clone(),
         )
         .context("creating forked task session")?;
         session.set_external_journal(self.session.external_journal());
@@ -1099,12 +1100,28 @@ impl Driver {
             &task_call_id,
             task_function_call_id.as_deref(),
         );
+        // This event embeds the parent model's task `prompt` (model-authored
+        // free text that can carry a session-table literal), so route it through
+        // the frame-carrying journaling path with the SPAWNING model's trust +
+        // pre-policy session table (mirrors the SubagentReport fix). A frame-less
+        // `record_event` skips the trusted journaling branch entirely, so a
+        // session-table literal in a trusted parent's prompt would persist raw
+        // with no history row; an untrusted spawning model journals nothing (its
+        // payload is already post-redaction). The spawning model is
+        // `self.stack.last().unwrap().agent.model`; `self.redact` is the
+        // session's pre-policy table (as the SubagentReport fix used).
         if let Err(e) = self
             .session
-            .record_event(
+            .record_event_with_model_frame(
                 crate::db::session_log::SessionEventKind::SubagentSpawned,
                 Some(&self.stack.last().unwrap().agent.name),
                 Some(&task_call_id),
+                crate::session::SessionEventModelFrame {
+                    provider_id: self.stack.last().unwrap().agent.model.provider_id(),
+                    model_id: self.stack.last().unwrap().agent.model.model_id_ref(),
+                    config: &self.config,
+                    session_table: self.redact.as_ref(),
+                },
                 &serde_json::json!({
                     "child_agent": child_agent.clone(),
                     "task_call_id": task_call_id,
@@ -1219,7 +1236,13 @@ impl Driver {
 
         let outcome = if child_agent == "docs" {
             // The docs pipeline is not a built-in child agent load, so there is
-            // no resolved child model to amend onto the earlier spawn event.
+            // no resolved child model to amend onto the earlier spawn event (no
+            // routing amend is emitted). The pipeline DOES return the model that
+            // authored the report, which we attach as `child_routing` below so
+            // the finalizer journals the report through the frame-carrying path
+            // (decision 10.3) instead of the frame-less `record_event` — a
+            // trusted docs report with a session-table literal must journal /
+            // fail-closed scrub, not persist raw.
             if resume_handle.is_some() {
                 DelegationChildOutcome::failed(stale_handle_error(&child_agent))
             } else {
@@ -1248,7 +1271,9 @@ impl Driver {
                 )
                 .await
                 {
-                    Ok(text) => DelegationChildOutcome::ok(text),
+                    Ok(report) => DelegationChildOutcome::ok(report.report).with_child_routing(
+                        ChildRoutingMetadata::from_model(report.report_model.as_ref()),
+                    ),
                     Err(e) => DelegationChildOutcome::failed(format!("Error: {e:#}")),
                 }
             }
@@ -1329,6 +1354,10 @@ impl Driver {
                     }
                     if resume_handle.is_some() {
                         let reuse = self.followup_reuse_decision();
+                        // Metadata-only SubagentSpawned: this payload carries no
+                        // model-authored free text (only `followup_resume`,
+                        // `reuse_decision`, and `write_capable`), so it needs no
+                        // model frame — plain `record_event` is correct here.
                         if let Err(e) = self
                             .session
                             .record_event(
@@ -1592,16 +1621,45 @@ impl Driver {
                 with_model_routing_metadata(report_data, &self.stack.last().unwrap().agent.model)
             }
         };
-        if let Err(e) = self
-            .session
-            .record_event(
-                crate::db::session_log::SessionEventKind::SubagentReport,
-                Some(&child_agent),
-                Some(&task_call_id),
-                &report_data,
-            )
-            .await
-        {
+        // The subagent report is authored by the CHILD model, so route it through
+        // the frame-carrying journaling path with the child's trust + pre-policy
+        // session table (H2; mirrors the interactive success pop). A frame-less
+        // `record_event` skips the trusted journaling branch entirely, so a
+        // session-table literal in a trusted child's report would persist raw
+        // with no history row. When the child model is untrusted the frame path
+        // journals nothing (its report is already post-redaction). `self.redact`
+        // is the session's pre-policy table (what the driver hands
+        // `Model::for_provider` as the session table). When child routing is
+        // unknown, fall back to the plain path (today's semantics).
+        let record_result = match child_routing.as_ref() {
+            Some(routing) => {
+                self.session
+                    .record_event_with_model_frame(
+                        crate::db::session_log::SessionEventKind::SubagentReport,
+                        Some(&child_agent),
+                        Some(&task_call_id),
+                        crate::session::SessionEventModelFrame {
+                            provider_id: &routing.provider,
+                            model_id: &routing.model,
+                            config: &self.config,
+                            session_table: self.redact.as_ref(),
+                        },
+                        &report_data,
+                    )
+                    .await
+            }
+            None => {
+                self.session
+                    .record_event(
+                        crate::db::session_log::SessionEventKind::SubagentReport,
+                        Some(&child_agent),
+                        Some(&task_call_id),
+                        &report_data,
+                    )
+                    .await
+            }
+        };
+        if let Err(e) = record_result {
             tracing::warn!(error = %e, "record subagent_report event failed");
         }
         let fallback_routing =
@@ -2898,12 +2956,28 @@ impl Driver {
                 &task_call_id,
                 task_function_call_id.as_deref(),
             );
+            // This event embeds the parent model's task `prompt` (model-authored
+            // free text that can carry a session-table literal), so route it
+            // through the frame-carrying journaling path with the SPAWNING
+            // model's trust + pre-policy session table (mirrors the
+            // SubagentReport fix). A frame-less `record_event` skips trusted
+            // journaling, so a session-table literal in a trusted parent's prompt
+            // would persist raw with no history row; an untrusted spawning model
+            // journals nothing (payload already post-redaction). The spawning
+            // model is `self.stack.last().unwrap().agent.model`; `self.redact`
+            // is the session's pre-policy table.
             if let Err(e) = self
                 .session
-                .record_event(
+                .record_event_with_model_frame(
                     crate::db::session_log::SessionEventKind::SubagentSpawned,
                     Some(&self.stack.last().unwrap().agent.name),
                     Some(&task_call_id),
+                    crate::session::SessionEventModelFrame {
+                        provider_id: self.stack.last().unwrap().agent.model.provider_id(),
+                        model_id: self.stack.last().unwrap().agent.model.model_id_ref(),
+                        config: &self.config,
+                        session_table: self.redact.as_ref(),
+                    },
                     &serde_json::json!({
                         "child_agent": entry.child_agent.clone(),
                         "task_call_id": task_call_id,
@@ -2948,8 +3022,12 @@ impl Driver {
                     DelegationChildOutcome::failed(err)
                 } else if entry.child_agent == "docs" {
                     // The docs pipeline bypasses `builtin::load`, so it has
-                    // no resolved child model and intentionally emits no
-                    // routing amend.
+                    // no resolved child model at spawn time and intentionally
+                    // emits no routing amend. The pipeline DOES return the model
+                    // that authored the report, attached as `child_routing`
+                    // below so the finalizer journals it through the
+                    // frame-carrying path (decision 10.3) rather than frame-less
+                    // `record_event`.
                     if entry.resume_handle.is_some() {
                         DelegationChildOutcome::failed(stale_handle_error(&entry.child_agent))
                     } else {
@@ -2978,7 +3056,10 @@ impl Driver {
                         )
                         .await
                         {
-                            Ok(text) => DelegationChildOutcome::ok(text),
+                            Ok(report) => DelegationChildOutcome::ok(report.report)
+                                .with_child_routing(ChildRoutingMetadata::from_model(
+                                    report.report_model.as_ref(),
+                                )),
                             Err(e) => DelegationChildOutcome::failed(format!("Error: {e:#}")),
                         }
                     }
@@ -3190,16 +3271,40 @@ impl Driver {
                     &self.stack.last().unwrap().agent.model,
                 ),
             };
-            if let Err(e) = self
-                .session
-                .record_event(
-                    crate::db::session_log::SessionEventKind::SubagentReport,
-                    Some(&entry.child_agent),
-                    Some(&task_call_id),
-                    &report_data,
-                )
-                .await
-            {
+            // Child-authored report: route through the frame-carrying journaling
+            // path with the child's trust + pre-policy session table (H2), so a
+            // trusted child's table literal journals (or fail-closed scrubs)
+            // rather than persisting raw. Untrusted → journals nothing (already
+            // post-redaction). Unknown routing → plain path (today's semantics).
+            let record_result = match outcome.child_routing.as_ref() {
+                Some(routing) => {
+                    self.session
+                        .record_event_with_model_frame(
+                            crate::db::session_log::SessionEventKind::SubagentReport,
+                            Some(&entry.child_agent),
+                            Some(&task_call_id),
+                            crate::session::SessionEventModelFrame {
+                                provider_id: &routing.provider,
+                                model_id: &routing.model,
+                                config: &self.config,
+                                session_table: self.redact.as_ref(),
+                            },
+                            &report_data,
+                        )
+                        .await
+                }
+                None => {
+                    self.session
+                        .record_event(
+                            crate::db::session_log::SessionEventKind::SubagentReport,
+                            Some(&entry.child_agent),
+                            Some(&task_call_id),
+                            &report_data,
+                        )
+                        .await
+                }
+            };
+            if let Err(e) = record_result {
                 tracing::warn!(error = %e, "record batch subagent_report event failed");
             }
             let routing = outcome.child_routing.as_ref().cloned().unwrap_or_else(|| {

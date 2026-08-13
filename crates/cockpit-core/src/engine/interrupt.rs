@@ -295,6 +295,27 @@ pub struct InterruptHub {
     /// decide headless behavior: 0 means "no human to prompt → don't
     /// block, auto-reject the repeat."
     interactive_clients: Arc<AtomicUsize>,
+    /// Serializes EVERY read-modify-write of the live redaction table for this
+    /// session (H1) — sealed adoption ([`Self::seal_redaction_with_identity`]),
+    /// approved-secret-file registration ([`Self::register_approved_secret_file`]),
+    /// and the per-turn refresh union (the driver's refresh via
+    /// [`Self::refresh_union_redaction`]; the session-worker refresh, which owns
+    /// the [`SharedRedactionTable`] directly, via [`Self::lock_redaction_table_write`]).
+    /// A sealed
+    /// adoption snapshots the current table, then `await`s key load + AEAD + the
+    /// journal transaction before swapping in `snapshot + literal`. Any writer
+    /// that reads the table, unions its delta, persists, and swaps OUTSIDE this
+    /// lock could snapshot the pre-adoption table and swap its stale union AFTER
+    /// the sealed transaction commits — dropping the just-adopted sealed literal
+    /// from both the live and the durable table while its history row stays
+    /// committed, so a later egress of that literal bypasses live redaction
+    /// (decision 10.1 adopted-table invariant). Holding this async mutex across
+    /// each writer's whole read→union→persist→swap makes every writer union onto
+    /// the previous one's committed result, so no committed union is ever lost.
+    /// Every critical section reads the LATEST table under the lock; no `.await`
+    /// that could touch the table happens outside it. All writers are async, so
+    /// they all serialize on this one `tokio` mutex without a sync/async split.
+    redaction_table_write_lock: tokio::sync::Mutex<()>,
 }
 
 impl InterruptHub {
@@ -318,6 +339,7 @@ impl InterruptHub {
             db: Some(db),
             session_id: Some(session_id),
             interactive_clients,
+            redaction_table_write_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -332,6 +354,7 @@ impl InterruptHub {
             db: None,
             session_id: None,
             interactive_clients: Arc::new(AtomicUsize::new(0)),
+            redaction_table_write_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -343,8 +366,9 @@ impl InterruptHub {
         self.interactive_clients.load(Ordering::SeqCst) > 0
     }
 
-    /// Register a sealed literal in the worker's live egress redaction table
-    /// and persist that table, under its TYPED canonical identity.
+    /// Register a sealed literal in the worker's live egress redaction table,
+    /// persist that table, and journal the adoption into protected redaction
+    /// history — all under the literal's TYPED canonical identity.
     ///
     /// Sealedness is carried by the typed [`SealedRedactionIdentity`] the whole
     /// way through — it is registered directly via `with_forced_sealed_literal`,
@@ -354,7 +378,21 @@ impl InterruptHub {
     /// place where a sealed literal becomes redacted; the legacy
     /// `sealed:<value_id>` wrapper is gone along with the agent-facing sealed
     /// write paths that were its only callers.
-    pub fn seal_redaction_with_identity(
+    ///
+    /// This is the LIVE production sealed-adoption route (via
+    /// [`crate::sealed::runtime::SessionRedactionSink`]). Adoption journals a
+    /// `Sealed` protected-history row **atomically** with the redaction-table
+    /// persist (decision 10.1): the encrypted append is prepared off the DB
+    /// thread, then the table persist and the journal append commit in one
+    /// transaction. If either the prepare or the transaction fails, the whole
+    /// adoption rolls back and the live table is left untouched — a sealed
+    /// literal is never adopted half-journaled. Re-adopting the same literal
+    /// dedups to an attach (no duplicate row). Sessions carrying the
+    /// unjournaled-inference opt-out (scratch / daemon-less) skip journaling.
+    ///
+    /// The protected-history key resolver is reached from the `Session` this
+    /// method already holds ([`crate::session::Session::redaction_key_resolver`]).
+    pub async fn seal_redaction_with_identity(
         &self,
         session: &crate::session::Session,
         value: String,
@@ -363,10 +401,37 @@ impl InterruptHub {
         let Some(redaction) = &self.redaction else {
             return Ok(None);
         };
+        // H1: serialize the read-modify-write below against ALL redaction-table
+        // writers for this session (other sealed adoptions, approved-secret-file
+        // registration, the per-turn refresh union). The snapshot→await→swap
+        // spans a `.await` (key load + AEAD + journal transaction), so any writer
+        // that reads the same `base` and swaps its own union afterwards would drop
+        // this adoption's literal from the live and durable table even though the
+        // history row committed. Holding the async mutex across
+        // read→prepare→persist→swap makes each writer see the previous one's
+        // committed table as its `base`, so every committed union survives.
+        let _adopt_guard = self.redaction_table_write_lock.lock().await;
+        // Take the sealed identity ids from the TYPED identity, never from a
+        // parsed origin display string. A legacy/unversioned session entry has
+        // no record id, so both the record id and the version are `None`.
+        let sealed_record_id = identity.record_id.map(|record| record.to_string());
+        let sealed_version = identity.record_id.map(|_| i64::from(identity.version));
+
         let base = current_redaction(redaction);
-        let table = base.with_forced_sealed_literal(value, identity)?;
-        let table = Arc::new(table);
-        session.persist_redaction_table(&table)?;
+        let table = Arc::new(base.with_forced_sealed_literal(value.clone(), identity)?);
+
+        if session.unjournaled_inference_allowed() {
+            // Opt-out: scratch / daemon-less sessions persist the table without
+            // journaling (fail-safe, mirrors the inference path).
+            session.persist_redaction_table(&table)?;
+        } else {
+            // Journal the adoption atomically with the table persist. On any
+            // failure this returns Err having persisted nothing, so the live
+            // table below is only swapped once the adoption is durable.
+            session
+                .adopt_sealed_literal_journaled(&table, value, sealed_record_id, sealed_version)
+                .await?;
+        }
         set_current_redaction(redaction, table.clone());
         Ok(Some(table))
     }
@@ -374,7 +439,16 @@ impl InterruptHub {
     /// Register parsed values from an approved secret-bearing file in the
     /// worker's live redaction table before its contents return to a model.
     /// Detached hubs return `None`; callers then retain a local table.
-    pub fn register_approved_secret_file(
+    ///
+    /// H1: async so it serializes on the same [`Self::redaction_table_write_lock`]
+    /// as sealed adoption — a plain sync writer here could snapshot the
+    /// pre-adoption table and swap its stale union after a concurrent sealed
+    /// adoption commits, dropping the sealed literal from the live+durable table.
+    /// Taking the lock and re-reading the LATEST table under it makes this
+    /// registration union onto any concurrently-committed adoption instead of
+    /// clobbering it. Fail-closed: a failed persist returns `Err` before the
+    /// live table is swapped.
+    pub async fn register_approved_secret_file(
         &self,
         session: &crate::session::Session,
         cfg: &crate::config::extended::RedactConfig,
@@ -383,11 +457,78 @@ impl InterruptHub {
         let Some(redaction) = &self.redaction else {
             return Ok(None);
         };
+        let _guard = self.redaction_table_write_lock.lock().await;
         let table = current_redaction(redaction).with_approved_secret_file(cfg, path)?;
         let table = Arc::new(table);
         session.persist_redaction_table(&table)?;
         set_current_redaction(redaction, table.clone());
         Ok(Some(table))
+    }
+
+    /// Union a freshly-built disk-scan table onto the session's LIVE redaction
+    /// table under the serialized write lock, persisting the result BEFORE it is
+    /// swapped live, and return the committed table.
+    ///
+    /// This is the per-turn refresh route for a caller that does NOT own the
+    /// [`SharedRedactionTable`] directly — namely the engine driver, whose own
+    /// `self.redact` is a COPY that a mid-turn sealed adoption never updates.
+    /// Routing the driver's refresh through here makes it read the LATEST shared
+    /// table (which may already hold a sealed literal adopted this turn via
+    /// [`Self::seal_redaction_with_identity`]) under the SAME
+    /// [`Self::redaction_table_write_lock`], so the driver can neither read a
+    /// stale table nor persist a union that drops a committed adoption from the
+    /// durable table (decision 10.1 adopted-table invariant).
+    ///
+    /// H1 ordering, identical to sealed adoption: read the latest table, union,
+    /// **persist, then swap**. A persist failure returns `Err` with the
+    /// previously-committed table still live — the live table is never advanced
+    /// ahead of the durable one. A union failure keeps the committed table live
+    /// unchanged (deferring the disk delta to the next refresh) rather than
+    /// clobbering a committed adoption with a bare disk scan.
+    ///
+    /// Returns `Ok(None)` for a detached hub (tests / standalone shim) that owns
+    /// no shared table; the caller then unions onto its own local copy.
+    pub async fn refresh_union_redaction(
+        &self,
+        session: &crate::session::Session,
+        new_table: &crate::redact::RedactionTable,
+    ) -> anyhow::Result<Option<Arc<crate::redact::RedactionTable>>> {
+        let Some(redaction) = &self.redaction else {
+            return Ok(None);
+        };
+        let _guard = self.redaction_table_write_lock.lock().await;
+        let base = current_redaction(redaction);
+        let table = match base.union(new_table) {
+            Ok(table) => Arc::new(table),
+            Err(error) => {
+                // Never overwrite the committed table (which may hold a sealed
+                // literal) with a bare disk scan on a union error: keep the
+                // committed table live and defer the disk delta to the next
+                // refresh.
+                tracing::warn!(error = %error, "unioning redaction table failed; keeping committed table");
+                return Ok(Some(base));
+            }
+        };
+        // Persist BEFORE swapping the live table: a persist failure must not
+        // leave the live table advanced ahead of the durable one (a restart
+        // would then lose the accumulated entry). `?` surfaces the failure with
+        // the previously-committed table still live and durable.
+        session.persist_redaction_table(&table)?;
+        set_current_redaction(redaction, table.clone());
+        Ok(Some(table))
+    }
+
+    /// Acquire the per-session redaction-table write lock for a caller that owns
+    /// the read→union→persist→swap itself (the session-worker per-turn refresh,
+    /// which holds the [`SharedRedactionTable`] directly rather than through this
+    /// hub). Holding this guard across that whole sequence serializes the refresh
+    /// against sealed adoption and approved-secret-file registration on the SAME
+    /// lock, so a refresh can neither read a stale table nor swap over a
+    /// concurrently-committed adoption. The caller must, under this guard, read
+    /// the LATEST table via `current_redaction`, union its delta, persist, then
+    /// swap — see [`Self::redaction_table_write_lock`] for the full invariant.
+    pub async fn lock_redaction_table_write(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.redaction_table_write_lock.lock().await
     }
 
     /// Register a wakeup for `interrupt_id` and return the guard the

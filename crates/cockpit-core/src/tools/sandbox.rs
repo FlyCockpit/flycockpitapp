@@ -524,8 +524,13 @@ mod tests {
     /// resolved from a sibling task.
     fn sandboxed_ctx(cwd: &std::path::Path) -> ToolCtx {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session =
-            crate::session::Session::create(db.clone(), cwd.to_path_buf(), "builder").unwrap();
+        let session = crate::session::Session::create(
+            db.clone(),
+            cwd.to_path_buf(),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         session.set_sandbox_enabled(true);
         let sid = session.id;
         let locks = Arc::new(crate::locks::LockManager::in_memory(db.clone()));

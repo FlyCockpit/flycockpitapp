@@ -93,6 +93,11 @@ impl Driver {
         )
         .await;
         if !diagnostics.is_empty() {
+            // Host-generated: `rejections` are the auto-selector's own structured
+            // reject reasons (skill name + host classification), not model-authored
+            // free text, so this SkillAutoSelect payload can carry no session-table
+            // literal from the model. Frame-less `record_event` is correct — there
+            // is nothing trusted-authored to journal.
             let data = serde_json::json!({ "rejections": diagnostics.rejections });
             if let Err(e) = self
                 .session

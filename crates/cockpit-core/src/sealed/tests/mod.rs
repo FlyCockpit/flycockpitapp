@@ -10,6 +10,7 @@ mod marker_predicate;
 mod non_enumeration;
 mod non_oracular_use;
 mod orthogonality;
+mod redaction_history_adoption;
 mod reference_matrix;
 
 use std::collections::BTreeMap;
@@ -70,7 +71,15 @@ impl SealedFixture {
     }
 
     pub fn directory(&self) -> SealedValueDirectory {
+        // Install a redaction-history resolver so session-scoped create/rotate
+        // journal the adoption (decision 10.1). Session-scope create/rotate now
+        // fail closed without one; project/global (compartment-backed) lifecycle
+        // journals nothing regardless.
         SealedValueDirectory::new(self.db.clone(), self.compartment.clone())
+            .with_redaction_resolver(std::sync::Arc::new(
+                crate::redact::protected_redaction_history::MapKeyResolver::new()
+                    .with_version(1, [7u8; 32]),
+            ))
     }
 
     pub fn owner() -> OwnerAuthority {

@@ -1238,8 +1238,13 @@ mod redaction_placeholder_guard_tests {
 
     fn ctx_with_redaction(root: &Path, redact: RedactionTable) -> ToolCtx {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session =
-            crate::session::Session::create(db.clone(), root.to_path_buf(), "builder").unwrap();
+        let session = crate::session::Session::create(
+            db.clone(),
+            root.to_path_buf(),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         session.set_sandbox_enabled(false);
         ToolCtx {
             agent_id: "builder".to_string(),
@@ -1471,9 +1476,13 @@ mod redaction_placeholder_guard_tests {
         .unwrap_err();
 
         let resumed = Arc::new(
-            crate::session::Session::resume(ctx.session.db.clone(), ctx.session.id)
-                .unwrap()
-                .unwrap(),
+            crate::session::Session::resume(
+                ctx.session.db.clone(),
+                ctx.session.id,
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap()
+            .unwrap(),
         );
         let mut resumed_ctx = ctx.clone();
         resumed_ctx.session = resumed;
@@ -1654,7 +1663,13 @@ mod compressed_tool_result_tests {
     #[tokio::test]
     async fn retrieval_tool_advertisement_is_sticky_after_store() {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = Session::create(db, PathBuf::from("/x"), "Build").unwrap();
+        let session = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         session.set_sandbox_escalation_enabled(false);
         let tools = ToolBox::new().with(Arc::new(crate::tools::bash::BashTool::new()));
         assert!(
@@ -1692,7 +1707,13 @@ mod compressed_tool_result_tests {
     #[tokio::test]
     async fn truncate_only_store_leaves_compressed_len_none() {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = Session::create(db, PathBuf::from("/x"), "Build").unwrap();
+        let session = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let retained = crate::engine::tool::RetainedTruncatedOutput {
             content: "visible\nhidden\n".to_string(),
             original_byte_len: "visible\nhidden\n".len(),
@@ -1718,7 +1739,13 @@ mod compressed_tool_result_tests {
     #[tokio::test]
     async fn retrieval_advertisement_suppressed_when_retrieval_adds_nothing() {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = Session::create(db, PathBuf::from("/x"), "Build").unwrap();
+        let session = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         session.set_sandbox_escalation_enabled(false);
         let tools = ToolBox::new().with(Arc::new(crate::tools::bash::BashTool::new()));
         let mut delivered = "already delivered".to_string();
@@ -1757,7 +1784,13 @@ mod compressed_tool_result_tests {
     #[tokio::test]
     async fn truncated_marker_reports_line_count() {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = Session::create(db, PathBuf::from("/x"), "Build").unwrap();
+        let session = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let mut delivered = "visible line\n[truncated]\n".to_string();
         let retained = crate::engine::tool::RetainedTruncatedOutput {
             content: "visible line\nhidden line\nlast line\n".to_string(),
@@ -1805,7 +1838,13 @@ mod compressed_tool_result_tests {
     #[tokio::test]
     async fn sandbox_escalate_tool_is_conditional_and_notice_is_debounced() {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = Session::create(db, PathBuf::from("/x"), "Build").unwrap();
+        let session = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let tools = ToolBox::new()
             .with(Arc::new(crate::tools::bash::BashTool::new()))
             .with(Arc::new(crate::tools::escalate::EscalateTool));
@@ -1872,7 +1911,13 @@ mod compressed_tool_result_tests {
     #[tokio::test]
     async fn escalate_is_absent_from_a_defensive_toolbox() {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = Session::create(db, PathBuf::from("/x"), "Build").unwrap();
+        let session = Session::create(
+            db,
+            PathBuf::from("/x"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         session.set_sandbox_escalation_enabled(true);
         let tools = ToolBox::new()
             .with(Arc::new(crate::tools::bash::BashTool::new()))

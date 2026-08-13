@@ -111,7 +111,17 @@ async fn persistent_sealed_values_non_enumerable_to_agents() {
     // Accessors and the staged-literal writer are exempt: the first return
     // handles the caller already owns, and the second requires a ticket that
     // only an owner-gated `prepare_*` can mint.
-    const OWNERLESS_BY_DESIGN: &[&str] = &["new", "db", "compartment", "stage_literal", "is_empty"];
+    // `with_redaction_resolver` is a construction-time builder (installs the
+    // protected-history key resolver at wiring time); it is not an agent-facing
+    // operation, so like `new` it carries no Owner authority.
+    const OWNERLESS_BY_DESIGN: &[&str] = &[
+        "new",
+        "db",
+        "compartment",
+        "stage_literal",
+        "is_empty",
+        "with_redaction_resolver",
+    ];
     let store_lines: Vec<&str> = store_source.lines().collect();
     let mut checked_entry_points = 0usize;
     for (index, line) in store_lines.iter().enumerate() {

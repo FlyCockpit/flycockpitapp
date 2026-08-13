@@ -1273,6 +1273,7 @@ dependencies = [
  "block2",
  "brush-parser",
  "bytes",
+ "chacha20poly1305",
  "chrono",
  "cockpit-config",
  "cockpit-db",

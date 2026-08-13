@@ -14,13 +14,21 @@
 //! action-instance administration belong to `sealed-value-owner-management`.
 //! This module exposes safe metadata and exact lifecycle operations only.
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result, bail};
 use cockpit_db::db::Db;
 use cockpit_db::db::sealed_scope::{
     NewSealedActionGrant, NewSealedValueRecord, SealedSagaKind, SealedSagaPhase, SealedSagaRow,
-    SealedScopeKind, SealedValueRecordRow,
+    SealedScopeKind, SealedValueRecordRow, create_session_sealed_value_conn,
+    rotate_session_sealed_value_conn,
 };
 use uuid::Uuid;
+
+use crate::redact::protected_redaction_history::{
+    ProtectedLiteral, ProtectedRedactionHistory, RedactionHistorySource, RedactionKeyResolver,
+    append_and_attach_conn,
+};
 
 use super::action::{OwnerAuthority, SealedActionId, SealedActionRevision};
 use super::compartment::{SealedCompartment, SealedCompartmentKey, SealedLiteral};
@@ -114,15 +122,64 @@ impl SealedRecoveryReport {
 }
 
 /// The Owner-facing sealed-value store.
-#[derive(Debug, Clone)]
+///
+/// This store persists sealed-value **rows** and drives the cross-store saga.
+/// A **session-scope** create/rotate owns a real `session_id` and adopts the
+/// literal into that session (the sealed row is itself the durability event),
+/// so it journals a `Sealed` protected-history row on adoption — in the same
+/// transaction that persists the sealed row, with zero artifact refs (decision
+/// 10.1). Zero refs is explicitly allowed here precisely because the adoption
+/// is the durability event; the orphan-row prohibition applies only to the
+/// **compartment-backed** `commit_create` / `commit_rotate`, which have no
+/// session and therefore journal nothing.
+///
+/// The protected-history key resolver is installed by the session-facing caller
+/// that owns the session ([`Self::with_redaction_resolver`]). Because a
+/// session-scope adoption must never regress to an unjournaled persist under
+/// partial wiring, session-scope create/rotate **fail closed** when no resolver
+/// is installed (decision 16), rather than silently skipping the journal.
+#[derive(Clone)]
 pub struct SealedValueDirectory {
     db: Db,
     compartment: SealedCompartment,
+    /// Protected redaction-history key resolver, installed by the session-facing
+    /// caller that owns the session (decision 10.1). The session-scoped
+    /// create/rotate paths journal the adopted sealed literal into protected
+    /// history in the same transaction that persists the sealed row. `None` only
+    /// in fixtures that never introduce a literal into a live session; a
+    /// session-scope create/rotate with `None` fails closed rather than persist
+    /// unjournaled (decision 16).
+    redaction_resolver: Option<Arc<dyn RedactionKeyResolver>>,
+}
+
+impl std::fmt::Debug for SealedValueDirectory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealedValueDirectory")
+            .field("compartment", &self.compartment)
+            .field(
+                "redaction_resolver",
+                &self.redaction_resolver.as_ref().map(|_| "<resolver>"),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl SealedValueDirectory {
     pub fn new(db: Db, compartment: SealedCompartment) -> Self {
-        Self { db, compartment }
+        Self {
+            db,
+            compartment,
+            redaction_resolver: None,
+        }
+    }
+
+    /// Install the protected redaction-history key resolver so session-scoped
+    /// create/rotate journal the adopted sealed literal on session adoption
+    /// (decision 10.1). The session-facing caller that owns the session's
+    /// resolver threads it here.
+    pub fn with_redaction_resolver(mut self, resolver: Arc<dyn RedactionKeyResolver>) -> Self {
+        self.redaction_resolver = Some(resolver);
+        self
     }
 
     pub fn db(&self) -> &Db {
@@ -193,6 +250,15 @@ impl SealedValueDirectory {
     }
 
     /// Session scope: one store, one transaction, no saga.
+    ///
+    /// This session-OWNING path adopts the literal into a live session (the
+    /// sealed row is itself the durability event), so it journals a `Sealed`
+    /// protected-history row on adoption in the SAME transaction that persists
+    /// the sealed row, carrying the typed identity (new `record_id`, version 1)
+    /// and zero artifact refs (decision 10.1). A failure of the prepare or the
+    /// transaction rolls the whole create back, so a sealed value never persists
+    /// half-journaled. Fails closed when no resolver is installed rather than
+    /// regress to an unjournaled persist (decision 16).
     async fn create_session_scoped(
         &self,
         _owner: OwnerAuthority,
@@ -201,14 +267,52 @@ impl SealedValueDirectory {
         now_ms: i64,
     ) -> Result<SealedValueSummary> {
         let record = self.new_record(&request, now_ms);
+        let reason = request.description.as_str().to_string();
+        let origin = "owner".to_string();
+        let literal_str = literal.expose_for_redaction().to_string();
+
+        // A session-scope create adopts the literal into a live session, so it
+        // MUST journal. Fail closed if no resolver is installed rather than
+        // persist a sealed literal unjournaled (decision 16 — no "skip when
+        // missing" fork).
+        let resolver = self.redaction_resolver.as_ref().context(
+            "session-scoped sealed create requires an installed redaction-history resolver to \
+             journal the adoption (decision 10.1); refusing to persist a sealed literal \
+             unjournaled",
+        )?;
+
+        // Session-scope create installs the sealed literal into a live session at
+        // version 1; journal it on adoption. `scope_key` is the session id
+        // string. Prepare off the DB thread (async key load + AEAD): a failure
+        // here rolls nothing back because nothing has persisted yet (fail
+        // closed).
+        let session_id = record.scope_key.clone();
+        let protected = ProtectedLiteral::new(
+            literal_str.clone(),
+            RedactionHistorySource::Sealed,
+            Some(record.record_id.clone()),
+            Some(1),
+        )?;
+        let history = ProtectedRedactionHistory::new(&self.db, resolver.as_ref());
+        let prepared = history.prepare_append(&session_id, protected).await?;
+
+        // Persist the sealed row and journal the append in one transaction: a
+        // failure of either rolls back both, so a sealed value never persists
+        // half-journaled. Zero artifact refs — the session-scope adoption is
+        // itself the durability event.
         let row = self
             .db
-            .create_session_sealed_value(
-                record,
-                literal.expose_for_redaction().to_string(),
-                request.description.as_str().to_string(),
-                "owner".to_string(),
-            )
+            .transaction(move |conn| {
+                let row = create_session_sealed_value_conn(
+                    conn,
+                    &record,
+                    &literal_str,
+                    &reason,
+                    &origin,
+                )?;
+                append_and_attach_conn(conn, &prepared, &[])?;
+                Ok(row)
+            })
             .await?;
         SealedValueSummary::from_row(&row)
     }
@@ -297,13 +401,69 @@ impl SealedValueDirectory {
             .await?
             .context("sealed value record does not exist")?;
         if row.scope == SealedScopeKind::Session {
+            // A session rotate adopts a new literal into a live session, so it
+            // MUST journal the adoption in the same transaction that persists the
+            // rotated sealed row (decision 10.1). Fail closed if no resolver is
+            // installed rather than persist an unjournaled rotation (decision 16).
+            let literal_str = literal.expose_for_redaction().to_string();
+
+            let resolver = self.redaction_resolver.as_ref().context(
+                "session-scoped sealed rotate requires an installed redaction-history resolver to \
+                 journal the adoption (decision 10.1); refusing to persist a rotated sealed \
+                 literal unjournaled",
+            )?;
+
+            // `new_version` here is a *prediction* from a read taken before the
+            // write lock: the pre-`prepare_append` `active_version + 1`. The AEAD
+            // binds only session id / source / key version, not the sealed
+            // version, so the prediction only decides the `sealed_version` column
+            // — which the transaction below re-validates against the authoritative
+            // committed version (F8).
+            let session_id = row.scope_key.clone();
+            let new_version = row.active_version + 1;
+            let protected = ProtectedLiteral::new(
+                literal_str.clone(),
+                RedactionHistorySource::Sealed,
+                Some(record_id.to_string()),
+                Some(new_version),
+            )?;
+            let history = ProtectedRedactionHistory::new(&self.db, resolver.as_ref());
+            let prepared = history.prepare_append(&session_id, protected).await?;
+
+            // One transaction: the rotate and the journal append commit together
+            // or roll back together. Zero artifact refs — the adoption is the
+            // durability event.
+            //
+            // F8 — concurrent-rotation version race. `rotate_session_sealed_value_conn`
+            // derives the new `active_version` authoritatively INSIDE this
+            // transaction (SQLite serializes writers), so two concurrent rotations
+            // that both predicted v2 cannot both commit v2: the loser's committed
+            // row advances to v3 while its prepared journal still carries v2.
+            // Assert the committed version equals the journaled `new_version` and
+            // fail closed (roll back the whole rotation) on any mismatch, so the
+            // history row can never carry a stale version. The loser retries
+            // against the advanced row.
+            let record_id_str = record_id.to_string();
             let rotated = self
                 .db
-                .rotate_session_sealed_value(
-                    record_id.to_string(),
-                    literal.expose_for_redaction().to_string(),
-                    now_ms,
-                )
+                .transaction(move |conn| {
+                    let rotated = rotate_session_sealed_value_conn(
+                        conn,
+                        &record_id_str,
+                        &literal_str,
+                        now_ms,
+                    )?;
+                    if rotated.active_version != new_version {
+                        bail!(
+                            "concurrent sealed rotation: journaled version {new_version} does \
+                             not match the committed version {}; rolling back so protected \
+                             history never carries a stale sealed version",
+                            rotated.active_version
+                        );
+                    }
+                    append_and_attach_conn(conn, &prepared, &[])?;
+                    Ok(rotated)
+                })
                 .await?;
             return SealedValueSummary::from_row(&rotated);
         }

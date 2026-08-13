@@ -525,8 +525,13 @@ mod safety_gate_tests {
     /// (no approver, or modes that skip the gate).
     fn gate_ctx(root: &std::path::Path, mode: ApprovalMode, with_approver: bool) -> ToolCtx {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session =
-            crate::session::Session::create(db.clone(), root.to_path_buf(), "builder").unwrap();
+        let session = crate::session::Session::create(
+            db.clone(),
+            root.to_path_buf(),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         session.set_sandbox_enabled(false);
         session.set_approval_mode(mode);
         let sid = session.id;

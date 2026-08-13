@@ -3,9 +3,19 @@
 
 use std::fmt;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use super::Session;
+
+/// A legacy `sealed_values` row to upsert inside the sealed-adoption
+/// transaction (F7), so the sealed row, the redaction-table union, and the
+/// protected-history journal append are one atomic unit.
+pub(crate) struct LegacySealedUpsert {
+    pub value_id: String,
+    pub value: String,
+    pub reason: String,
+    pub origin: String,
+}
 
 pub const MIN_SEALED_VALUE_LENGTH: usize = 12;
 const REJECTED_LITERALS: &[&str] = &[
@@ -92,11 +102,149 @@ impl Session {
             name: crate::sealed::identity::SealedName::canonical(value_id)?,
             version: 0,
         };
+        // Take the sealed identity ids from the typed identity, never from a
+        // parsed origin display string. A legacy session entry has no record id
+        // and is unversioned, so both are `None`.
+        let sealed_record_id = identity.record_id.map(|record| record.to_string());
+        let sealed_version = identity.record_id.map(|_| i64::from(identity.version));
         let unioned = redaction.with_forced_sealed_literal(value.to_owned(), identity)?;
-        self.persist_redaction_table(&unioned)?;
-        self.db
-            .upsert_sealed_value(self.id, value_id, value, reason, origin)
-            .await
+
+        // Journal the sealed literal on session adoption (decision 10.1). The
+        // union of the redaction table is the durability event, so the journal
+        // append carries zero artifact refs and commits in the same transaction
+        // that persists the union. Honor the unjournaled-inference opt-out.
+        if self.unjournaled_inference_allowed() {
+            self.persist_redaction_table(&unioned)?;
+            return self
+                .db
+                .upsert_sealed_value(self.id, value_id, value, reason, origin)
+                .await;
+        }
+
+        let protected = crate::redact::protected_redaction_history::ProtectedLiteral::new(
+            value.to_owned(),
+            crate::redact::protected_redaction_history::RedactionHistorySource::Sealed,
+            sealed_record_id,
+            sealed_version,
+        )?;
+        let history = crate::redact::protected_redaction_history::ProtectedRedactionHistory::new(
+            &self.db,
+            self.redaction_key_resolver().as_ref(),
+        );
+        // Prepare off the DB thread (async key load + AEAD). A failure here rolls
+        // nothing back because nothing has persisted yet (fail closed): the union
+        // is not persisted and the sealed row is not written.
+        let prepared = history
+            .prepare_append(&self.id.to_string(), protected)
+            .await?;
+        // F7: compose the legacy sealed-row upsert INTO the same transaction as
+        // the redaction-table union and the journal append, so a failure of any
+        // one leaves none of them (no half-adopted sealed value).
+        self.persist_redaction_table_with_sealed_journal(
+            &unioned,
+            prepared,
+            Some(LegacySealedUpsert {
+                value_id: value_id.to_owned(),
+                value: value.to_owned(),
+                reason: reason.to_owned(),
+                origin: origin.to_owned(),
+            }),
+        )
+        .await?
+        .context("legacy sealed upsert metadata missing from composed transaction")
+    }
+
+    /// Adopt a sealed literal into the session redaction table and journal it to
+    /// protected history atomically (decision 10.1). Prepares the encrypted
+    /// append off the DB thread (async key load + AEAD), then persists the
+    /// unioned `table` and the journal row in one transaction. A failure of
+    /// either the prepare or the transaction rolls the whole adoption back, so a
+    /// sealed literal is never adopted half-journaled. Zero artifact refs — the
+    /// session-table union is itself the durability event.
+    ///
+    /// Callers that hold the unjournaled-inference opt-out must skip this and
+    /// persist the table directly; this is the journaling seam.
+    pub(crate) async fn adopt_sealed_literal_journaled(
+        &self,
+        table: &crate::redact::RedactionTable,
+        literal: String,
+        sealed_record_id: Option<String>,
+        sealed_version: Option<i64>,
+    ) -> Result<()> {
+        let protected = crate::redact::protected_redaction_history::ProtectedLiteral::new(
+            literal,
+            crate::redact::protected_redaction_history::RedactionHistorySource::Sealed,
+            sealed_record_id,
+            sealed_version,
+        )?;
+        let history = crate::redact::protected_redaction_history::ProtectedRedactionHistory::new(
+            &self.db,
+            self.redaction_key_resolver().as_ref(),
+        );
+        let prepared = history
+            .prepare_append(&self.id.to_string(), protected)
+            .await?;
+        self.persist_redaction_table_with_sealed_journal(table, prepared, None)
+            .await?;
+        Ok(())
+    }
+
+    /// Persist the unioned session redaction table and journal a prepared sealed
+    /// adoption append in one transaction. Either both commit or both roll back,
+    /// so a sealed value never persists half-journaled (decision 10.1). The
+    /// journal carries zero artifact refs because the session-table union is
+    /// itself the durability event.
+    ///
+    /// When `legacy_upsert` is `Some`, the legacy `sealed_values` row is written
+    /// inside the *same* transaction (F7), so the sealed row, the table union,
+    /// and the journal append are one atomic unit; the resulting metadata is
+    /// returned. When `None` (the F6 live adoption path), only the table and the
+    /// journal commit and `Ok(None)` is returned.
+    pub(crate) async fn persist_redaction_table_with_sealed_journal(
+        &self,
+        table: &crate::redact::RedactionTable,
+        prepared: crate::redact::protected_redaction_history::PreparedProtectedAppend,
+        legacy_upsert: Option<LegacySealedUpsert>,
+    ) -> Result<Option<crate::db::sealed_values::SealedValueMetadata>> {
+        use crate::redact::protected_redaction_history::append_and_attach_conn;
+
+        let json = table.to_persisted_json()?;
+        let session_id = self.id;
+        let write_json = json.clone();
+        let metadata = self
+            .db
+            .transaction(move |conn| {
+                let updated = conn.execute(
+                    "UPDATE sessions SET redaction_table_json = ?1 WHERE session_id = ?2",
+                    rusqlite::params![Some(write_json), session_id.to_string()],
+                )?;
+                if updated == 0 {
+                    // A sealed adoption requires a persisted session row: the
+                    // history row's FK targets `sessions(session_id)`. Fail
+                    // closed rather than journal an orphan.
+                    anyhow::bail!(
+                        "cannot journal sealed adoption: session {session_id} is not persisted"
+                    );
+                }
+                append_and_attach_conn(conn, &prepared, &[])?;
+                let metadata = match &legacy_upsert {
+                    Some(upsert) => Some(crate::db::sealed_values::upsert_sealed_value_conn(
+                        conn,
+                        session_id,
+                        &upsert.value_id,
+                        &upsert.value,
+                        &upsert.reason,
+                        &upsert.origin,
+                    )?),
+                    None => None,
+                };
+                Ok(metadata)
+            })
+            .await?;
+        // Mirror the durable write into the in-memory cache only after the
+        // transaction commits, so a rollback never leaves a stale table.
+        *self.redaction_table_json.lock().unwrap() = Some(json);
+        Ok(metadata)
     }
 
     /// Owner-only inventory. See [`Session::set_sealed_value`].
@@ -172,7 +320,13 @@ mod tests {
     #[tokio::test]
     async fn create_overwrite_delete_and_resume_keep_redaction_union_only() {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = Session::create(db.clone(), PathBuf::from("/repo"), "Build").unwrap();
+        let session = Session::create(
+            db.clone(),
+            PathBuf::from("/repo"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let initial = crate::redact::RedactionTable::empty();
         session
             .set_sealed_value(
@@ -224,7 +378,13 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let resumed = Session::resume(db, session.id).unwrap().unwrap();
+        let resumed = Session::resume(
+            db,
+            session.id,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap()
+        .unwrap();
         assert!(
             !resumed
                 .persisted_redaction_table()
@@ -238,7 +398,13 @@ mod tests {
     #[tokio::test]
     async fn fork_inherits_preexisting_value_but_not_later_parent_value() {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let parent = Session::create(db.clone(), PathBuf::from("/repo"), "Build").unwrap();
+        let parent = Session::create(
+            db.clone(),
+            PathBuf::from("/repo"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let table = crate::redact::RedactionTable::empty();
         parent
             .set_sealed_value(
@@ -251,7 +417,13 @@ mod tests {
             )
             .await
             .unwrap();
-        let child = Session::create_fork(db, parent.id, None).unwrap();
+        let child = Session::create_fork(
+            db,
+            parent.id,
+            None,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         assert!(
             child
                 .sealed_value_exists(crate::sealed::OwnerAuthority::for_test(), "before")

@@ -504,8 +504,13 @@ mod file_write_grant_tests {
 
     fn approver(cwd: &std::path::Path) -> Arc<Approver> {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session =
-            crate::session::Session::create(db.clone(), cwd.to_path_buf(), "builder").unwrap();
+        let session = crate::session::Session::create(
+            db.clone(),
+            cwd.to_path_buf(),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let store = GrantStore::new(
             db.clone(),
             session.id,

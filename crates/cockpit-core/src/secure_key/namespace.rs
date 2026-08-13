@@ -13,6 +13,10 @@ pub const NAMESPACE_MAX_LEN: usize = 64;
 /// Caller-owned stable namespace for leak reports.
 pub const LEAK_REPORT_V1_NAMESPACE: &str = "leak-report/v1";
 
+/// Caller-owned stable namespace for protected redaction-history encryption
+/// keys (`harden-and-wire-protected-redaction-history`).
+pub const REDACTION_HISTORY_V1_NAMESPACE: &str = "redaction-history/v1";
+
 /// Max encoded length for any single account component before joining.
 /// Sized for a full 64-char namespace with worst-case percent-encoding (×3).
 pub const ACCOUNT_COMPONENT_MAX_ENCODED: usize = 192;

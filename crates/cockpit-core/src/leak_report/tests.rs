@@ -741,3 +741,56 @@ fn report_leak_tool_name_is_exact() {
     let tool = ReportLeakTool::new();
     assert_eq!(tool.name(), "report_leak");
 }
+
+// ---------------------------------------------------------------------------
+// AC12: leak containment uses the shared sole-writer AEAD path (not a local
+// cipher), and the stored fingerprint is the keyed MAC (never plain SHA-256).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn leak_containment_uses_sole_writer_api() {
+    let db = test_db().await;
+    let resolver = test_resolver();
+    let handler = LeakReportHandler::new(&db, &resolver, 1_000_000);
+
+    let secret = "sole-writer-contained-secret";
+    let authority = ReportLeakAuthority::new(
+        LeakSource::ModelOutput,
+        provenance(),
+        session_id().to_owned(),
+    );
+    let outcome = handler
+        .report(
+            &authority,
+            Zeroizing::new(secret.to_owned()),
+            LeakCategory::Secret,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, LeakReportOutcome::Contained { .. }));
+
+    // Exactly one encrypted history row, written by the shared sole writer.
+    let history = db
+        .protected_redaction_history_list(session_id())
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 1);
+    let row = &history[0];
+    assert_eq!(row.source, ProtectedRedactionSource::ContainedLeak);
+
+    // The row decrypts through the production rehydrate path — proving the
+    // shared AEAD path, not a local cipher (which no longer exists).
+    let history_api = ProtectedRedactionHistory::new(&db, &resolver);
+    let rehydrated = history_api
+        .rehydrate_by_history_id(&row.history_id)
+        .await
+        .expect("shared AEAD rehydrate must succeed");
+    assert_eq!(rehydrated.as_str().unwrap().as_str(), secret);
+
+    // The stored fingerprint is the keyed MAC, never the unkeyed SHA-256 of the
+    // literal, and is what rehydrate reports back.
+    assert_eq!(rehydrated.fingerprint(), row.fingerprint);
+    assert_ne!(row.fingerprint, sha256_hex(secret.as_bytes()));
+    assert_eq!(row.fingerprint.len(), 64);
+    assert!(row.fingerprint.chars().all(|c| c.is_ascii_hexdigit()));
+}

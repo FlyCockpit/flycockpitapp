@@ -530,7 +530,19 @@ mod tests {
 
     async fn single_row() -> (Db, Uuid, Uuid) {
         let db = Db::open_in_memory().unwrap();
-        let session = Session::create(db.clone(), std::env::temp_dir(), "Build").unwrap();
+        // Run the actor startup off the async worker: it blocks on the
+        // secure-key readiness channel (`blocking_recv`), which panics on a
+        // Tokio worker thread.
+        let (secure_key_actor, resolver) = {
+            let db = db.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::redact::start_fake_redaction_key_resolver(&db)
+            })
+            .await
+            .unwrap()
+            .unwrap()
+        };
+        let session = Session::create(db.clone(), std::env::temp_dir(), "Build", resolver).unwrap();
         let set = InterruptQuestionSet {
             questions: vec![InterruptQuestion::Single {
                 prompt: "Pick".into(),
@@ -546,7 +558,13 @@ mod tests {
             .raise_interrupt_questions(session.id, "Build", "Pick", &set)
             .await
             .unwrap();
-        (db, session.id, interrupt_id)
+        let session_id = session.id;
+        // The actor's Drop blocks on its worker channel (`blocking_recv`), which
+        // panics on a Tokio worker thread; drain it off the async worker.
+        tokio::task::spawn_blocking(move || drop(secure_key_actor))
+            .await
+            .unwrap();
+        (db, session_id, interrupt_id)
     }
 
     #[test]

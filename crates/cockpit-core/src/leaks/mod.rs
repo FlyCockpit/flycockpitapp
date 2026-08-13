@@ -83,7 +83,8 @@ use crate::redact::protected_redaction_history::{
     ProtectedRedactionHistory, RedactionKeyResolver, RehydratedLiteral,
 };
 
-pub mod tests;
+#[cfg(test)]
+mod tests;
 
 /// Minimum page size for the leak list.
 pub const LEAK_LIST_MIN_LIMIT: i64 = 1;

@@ -4,6 +4,12 @@ use std::path::Path;
 
 use super::*;
 
+/// Required protected redaction-history key resolver threaded into every
+/// `Session` constructor (decision 16). Production installs the daemon's
+/// `SecureKeyResolver`; tests pass [`super::test_redaction_key_resolver`].
+type RedactionKeyResolverArc =
+    Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>;
+
 fn capture_model_system_prompt_snapshot_json(project_root: &std::path::Path) -> String {
     let (_, providers) = crate::auto_title::load_configs_for(project_root);
     ModelSystemPromptSnapshot::capture(&providers).to_json_string()
@@ -12,7 +18,12 @@ fn capture_model_system_prompt_snapshot_json(project_root: &std::path::Path) -> 
 impl Session {
     /// Create a brand-new session, inserting its row in the DB.
     #[allow(dead_code)]
-    pub fn create(db: Db, project_root: PathBuf, active_agent: &str) -> Result<Self> {
+    pub fn create(
+        db: Db,
+        project_root: PathBuf,
+        active_agent: &str,
+        resolver: RedactionKeyResolverArc,
+    ) -> Result<Self> {
         let project_id = project_id_for(&project_root);
         let project_root_str = project_root.to_string_lossy().into_owned();
         let project_id_for_db = project_id.clone();
@@ -34,7 +45,7 @@ impl Session {
                 crate::db::Db::insert_session_row_conn(conn, &row_for_db)
             })
             .context("creating session row")?;
-        Self::from_row(db, project_root, row)
+        Self::from_row(db, project_root, row, resolver)
     }
 
     /// Create a brand-new session held **in memory only** — its `sessions`
@@ -43,7 +54,12 @@ impl Session {
     /// startup), but the row lands in the DB only on the first user message
     /// via [`Self::persist_if_needed`]. A session created this way and never
     /// persisted leaves no DB trace and never appears in `session list`.
-    pub fn create_deferred(db: Db, project_root: PathBuf, active_agent: &str) -> Result<Self> {
+    pub fn create_deferred(
+        db: Db,
+        project_root: PathBuf,
+        active_agent: &str,
+        resolver: RedactionKeyResolverArc,
+    ) -> Result<Self> {
         let project_id = project_id_for(&project_root);
         let project_root_str = project_root.to_string_lossy().into_owned();
         let project_id_for_db = project_id.clone();
@@ -61,7 +77,7 @@ impl Session {
             .context("building deferred session row")?;
         row.model_system_prompt_snapshot_json =
             capture_model_system_prompt_snapshot_json(&project_root);
-        let session = Self::from_row(db, project_root, row.clone())?;
+        let session = Self::from_row(db, project_root, row.clone(), resolver)?;
         *session.pending_row.lock().unwrap() = Some(row);
         Ok(session)
     }
@@ -75,6 +91,7 @@ impl Session {
         project_root: PathBuf,
         active_agent: &str,
         assistant_name: &str,
+        resolver: RedactionKeyResolverArc,
     ) -> Result<Self> {
         let project_id = project_id_for(&project_root);
         let project_root_str = project_root.to_string_lossy().into_owned();
@@ -95,7 +112,7 @@ impl Session {
             .context("building deferred assistant session row")?;
         row.model_system_prompt_snapshot_json =
             capture_model_system_prompt_snapshot_json(&project_root);
-        let session = Self::from_row(db, project_root, row.clone())?;
+        let session = Self::from_row(db, project_root, row.clone(), resolver)?;
         *session.pending_row.lock().unwrap() = Some(row);
         Ok(session)
     }
@@ -195,6 +212,7 @@ impl Session {
         db: Db,
         parent_session_id: Uuid,
         fork_point_turn_id: Option<String>,
+        resolver: RedactionKeyResolverArc,
     ) -> Result<Self> {
         let row = db
             .blocking_write_for_sync_maintenance(move |conn| {
@@ -209,12 +227,16 @@ impl Session {
             })
             .context("creating fork session row")?;
         let project_root = PathBuf::from(&row.project_root);
-        Self::from_row(db, project_root, row)
+        Self::from_row(db, project_root, row, resolver)
     }
 
     /// Resume an existing session. Returns `None` if the id is unknown.
     /// Backfills `short_id` if missing (lazy migration from pre-§17 rows).
-    pub fn resume(db: Db, session_id: Uuid) -> Result<Option<Self>> {
+    pub fn resume(
+        db: Db,
+        session_id: Uuid,
+        resolver: RedactionKeyResolverArc,
+    ) -> Result<Option<Self>> {
         let Some(row) = db
             .blocking_write_for_sync_maintenance(move |conn| {
                 crate::db::Db::get_session_conn(conn, session_id)
@@ -224,10 +246,15 @@ impl Session {
             return Ok(None);
         };
         let project_root = PathBuf::from(&row.project_root);
-        Ok(Some(Self::from_row(db, project_root, row)?))
+        Ok(Some(Self::from_row(db, project_root, row, resolver)?))
     }
 
-    fn from_row(db: Db, project_root: PathBuf, row: SessionRow) -> Result<Self> {
+    fn from_row(
+        db: Db,
+        project_root: PathBuf,
+        row: SessionRow,
+        resolver: RedactionKeyResolverArc,
+    ) -> Result<Self> {
         let started_at =
             DateTime::<Utc>::from_timestamp(row.started_at, 0).unwrap_or_else(Utc::now);
         let user_content_turns = count_user_turns_for_title(&db, row.session_id);
@@ -274,6 +301,7 @@ impl Session {
             started_at,
             db,
             external_journal: Mutex::new(None),
+            redaction_key_resolver: resolver,
             allow_unjournaled_inference: std::sync::atomic::AtomicBool::new(false),
             short_id,
             parent_session_id: row.parent_session_id,

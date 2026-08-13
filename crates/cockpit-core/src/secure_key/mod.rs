@@ -36,7 +36,10 @@ pub use consumer::{
 };
 pub use error::SecureKeyError;
 pub use key_material::{KEY_BYTE_LEN, SecureKeyBytes, generate_key_bytes, key_digest};
-pub use namespace::{LEAK_REPORT_V1_NAMESPACE, NAMESPACE_MAX_LEN, Namespace, SECURE_KEY_SERVICE};
+pub use namespace::{
+    LEAK_REPORT_V1_NAMESPACE, NAMESPACE_MAX_LEN, Namespace, REDACTION_HISTORY_V1_NAMESPACE,
+    SECURE_KEY_SERVICE,
+};
 // set_default / unset_default are actor-owned only (`pub(crate)` in platform.rs).
 pub use platform::{
     PlatformStoreKind, RegistrationOrderSnapshot, platform_link_token, platform_store_kind,

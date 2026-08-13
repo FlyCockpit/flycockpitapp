@@ -3489,28 +3489,45 @@ END;
 
 -- ---- protected redaction history -------------------------------------------
 --
--- Durable encrypted literal store for redacting historical trusted-provider
--- artifacts. Each row holds the literal ONLY as ciphertext + nonce, keyed by
--- an opaque history ID (UUID) and the local key-store key version. No
--- plaintext, prefix, length, ciphertext, nonce, or key version ever appears
--- in a generic, protocol, diagnostics, or export query surface — those
--- columns are consumed solely by the local Owner-sensitive rehydration frame
--- in `cockpit-core`.
+-- Durable AEAD-encrypted literal store for redacting historical
+-- trusted-provider artifacts. Each row holds the literal ONLY as
+-- ChaCha20-Poly1305 ciphertext + nonce, keyed by an opaque history ID (UUID)
+-- and the local key-store key version. The plaintext is bucket-padded before
+-- encryption, so the stored ciphertext length reveals only a coarse bucket
+-- (one of 272 / 1040 / 4112 / 16404 = padded plaintext {256,1024,4096,16388}
+-- plus the 16-byte tag), never the literal length. No plaintext, prefix, exact
+-- length, ciphertext, nonce, key version, or fingerprint ever appears in the
+-- export/diagnostics projection — those columns are consumed solely by the
+-- local Owner-sensitive rehydration frame in `cockpit-core`.
+--
+-- The `fingerprint` is a keyed MAC (`HMAC-SHA-256` under a store-derived
+-- subkey), not an unkeyed digest, so it is not an offline guessing oracle.
 --
 -- `source` is a closed set: Sealed | Environment | Credential | ContainedLeak.
--- A row is retired (retired_at_ms set) only after no artifact reference
--- remains. Deduplication is on (session_id, fingerprint): the same literal
--- in the same session reuses one encrypted row and increments its ref_count.
+-- Retirement is **forget**: `retire`-ing a row (only after no artifact
+-- reference remains) zeroes ciphertext, nonce, and fingerprint in the same
+-- UPDATE that stamps retired_at_ms. Deduplication is on (session_id,
+-- fingerprint) among LIVE rows only (partial unique index below): the same
+-- literal in the same session reuses one encrypted row *while the current key
+-- version produces the same keyed MAC* (attaching an artifact reference bumps
+-- its ref_count; adoption-only journaling attaches no ref and leaves ref_count 0).
+-- The fingerprint is keyed by a store-derived subkey (decision 5), so after a
+-- key rotation the identical literal MACs to a DIFFERENT fingerprint and a
+-- second live row is created — dedup collapses only rows sharing the current
+-- key/MAC, not across rotations. A retired row's zeroed fingerprint never
+-- blocks or aliases a fresh append.
 CREATE TABLE protected_redaction_history (
     history_id       TEXT    PRIMARY KEY,
     session_id       TEXT    NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
     sealed_record_id TEXT,
     sealed_version   INTEGER,
     source           TEXT    NOT NULL CHECK (source IN ('Sealed', 'Environment', 'Credential', 'ContainedLeak')),
-    -- SHA-256 fingerprint of the literal (safe deduplication key; never the
-    -- literal, prefix, or length).
+    -- Keyed-MAC fingerprint of the literal (HMAC-SHA-256 under a store-derived
+    -- subkey; never the literal, prefix, or length). Zeroed to 64 '0' chars on
+    -- retirement.
     fingerprint      TEXT    NOT NULL,
-    -- Encrypted literal material (local rehydration frame only).
+    -- AEAD ciphertext with appended 16-byte tag (local rehydration frame only).
+    -- Length is bucketed so it reveals only a coarse bucket. Zeroed on retire.
     ciphertext       BLOB    NOT NULL,
     nonce            BLOB    NOT NULL,
     key_version      INTEGER NOT NULL CHECK (key_version >= 1),
@@ -3520,13 +3537,22 @@ CREATE TABLE protected_redaction_history (
     CHECK (length(history_id) = 36),
     CHECK (length(fingerprint) = 64),
     CHECK (length(nonce) = 12),
+    -- Ciphertext length is one of the four bucket lengths (padded plaintext
+    -- bucket + 16-byte tag). Length-preserving retire-zeroing keeps this true.
+    CHECK (length(ciphertext) IN (272, 1040, 4112, 16404)),
     -- A retired row may never be re-attached, so its ref_count must be 0.
-    CHECK ((retired_at_ms IS NULL) OR (ref_count = 0)),
-    UNIQUE (session_id, fingerprint)
+    CHECK ((retired_at_ms IS NULL) OR (ref_count = 0))
 );
 
 CREATE INDEX idx_protected_redaction_history_session
     ON protected_redaction_history (session_id, created_at_ms);
+
+-- Deduplicate the same literal within a session among LIVE rows only. A
+-- retired row (retired_at_ms set, fingerprint zeroed) is excluded, so it never
+-- blocks re-journaling the same literal.
+CREATE UNIQUE INDEX idx_protected_redaction_history_dedup
+    ON protected_redaction_history (session_id, fingerprint)
+    WHERE retired_at_ms IS NULL;
 
 -- Opaque artifact-to-history references. Carries no literal, ciphertext,
 -- nonce, or key version — only opaque IDs and the artifact kind. The

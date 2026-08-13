@@ -1797,6 +1797,14 @@ pub struct DaemonContext {
     pub secure_key: Option<crate::secure_key::SecureKeyHandle>,
     /// Owns the actor thread; kept so Drop drains before unset_default_store.
     _secure_key_actor: Option<crate::secure_key::SecureKeyActor>,
+    /// Shared production protected redaction-history key resolver, built from
+    /// [`Self::secure_key`] when the actor attaches and also installed on the
+    /// registry so every session shares one cache. `None` in production until
+    /// the actor attaches; unit tests (which never start the native actor) seed
+    /// a real test resolver in [`Self::new`]. Consumers that require it fail
+    /// closed via [`Self::redaction_key_resolver`].
+    redaction_key_resolver:
+        Option<Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>>,
     /// Generic durable journal for ambiguous external side effects
     /// (`external-side-effect-journal`). `None` until startup recovery has run
     /// and revalidated recovery capacity; every consumer must treat `None` as
@@ -1881,6 +1889,23 @@ impl DaemonContext {
             resource_scheduler,
             config_source.clone(),
         );
+        // Production installs the real resolver when the secure-key actor
+        // attaches (`attach_secure_key_actor`), which tests skip. Give the
+        // registry and this context a real test resolver so session builds and
+        // resume fallbacks succeed in tests without the native actor (decision
+        // 16 — never absent, never `Option` at the point of use).
+        #[cfg(test)]
+        let redaction_key_resolver: Option<
+            Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
+        > = {
+            let resolver = crate::session::test_redaction_key_resolver();
+            registry.set_redaction_key_resolver(resolver.clone());
+            Some(resolver)
+        };
+        #[cfg(not(test))]
+        let redaction_key_resolver: Option<
+            Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
+        > = None;
         let (client_count, _) = tokio::sync::watch::channel(0usize);
         let (connector_wake, _) = watch::channel(0u64);
         let (global_events, _) = broadcast::channel(GLOBAL_EVENT_CAPACITY);
@@ -1962,6 +1987,7 @@ impl DaemonContext {
             config_source,
             secure_key: None,
             _secure_key_actor: None,
+            redaction_key_resolver,
             external_journal: None,
             media_storage_recovery,
             process_containment: None,
@@ -1976,8 +2002,32 @@ impl DaemonContext {
     /// boot (typed Unavailable on later use); headless CI may lack Secret Service.
     #[cfg_attr(test, allow(dead_code))] // production boot only; tests skip native actor start
     pub(crate) fn attach_secure_key_actor(&mut self, actor: crate::secure_key::SecureKeyActor) {
-        self.secure_key = Some(actor.handle());
+        let handle = actor.handle();
+        // Build the one shared protected redaction-history key resolver over the
+        // daemon's secure-key handle (decision 9.5.1) and install it on the
+        // registry so every session it builds shares this cache. LeaksService /
+        // LeakReportToolRuntime have no production call sites yet; when they land
+        // they pull the same resolver from here.
+        let resolver: Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver> =
+            Arc::new(crate::redact::secure_key_resolver::SecureKeyResolver::new(
+                handle.clone(),
+            ));
+        self.registry.set_redaction_key_resolver(resolver.clone());
+        self.redaction_key_resolver = Some(resolver);
+        self.secure_key = Some(handle);
         self._secure_key_actor = Some(actor);
+    }
+
+    /// The shared production redaction key resolver, or a fail-closed error when
+    /// the secure-key actor never attached (decision 16 — required, never
+    /// `Option` at the point of use).
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn redaction_key_resolver(
+        &self,
+    ) -> Result<Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>> {
+        self.redaction_key_resolver.clone().context(
+            "protected redaction-history key resolver unavailable (secure-key actor not started)",
+        )
     }
     #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn attach_process_containment_actor(

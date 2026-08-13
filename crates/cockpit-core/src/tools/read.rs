@@ -110,11 +110,11 @@ impl Tool for ReadTool {
                 .is_secret_path(&checked)
             {
                 let cfg = &ctx.config.extended().redact;
-                let updated = match ctx.interrupts.register_approved_secret_file(
-                    &ctx.session,
-                    cfg,
-                    &checked,
-                )? {
+                let updated = match ctx
+                    .interrupts
+                    .register_approved_secret_file(&ctx.session, cfg, &checked)
+                    .await?
+                {
                     Some(table) => table,
                     None => {
                         let table = ctx.redact.with_approved_secret_file(cfg, &checked)?;

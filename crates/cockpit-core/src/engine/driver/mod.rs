@@ -1172,6 +1172,11 @@ impl Driver {
                 Some(child_agent),
                 Some(task_call_id),
                 &self.config,
+                // `self.redact` is the session's PRE-POLICY table (it is what the
+                // driver hands `Model::for_provider` as the session table), so a
+                // routing label / task-id carrying a session-table literal
+                // journals when the routed child model is trusted (F3).
+                self.redact.as_ref(),
                 &subagent_routing_event_data(child_agent, task_call_id, label, routing),
             )
             .await
@@ -1901,16 +1906,46 @@ impl Driver {
         .await
         {
             Ok(Ok(new_table)) => {
-                let table = match self.redact.union(&new_table) {
-                    Ok(table) => Arc::new(table),
+                // J2: route the per-turn refresh through the hub so it unions the
+                // disk scan onto the LATEST shared table under the same
+                // `redaction_table_write_lock` as sealed adoption. `self.redact`
+                // is only a COPY that a mid-turn `seal_redaction_with_identity`
+                // never updates; unioning onto it and persisting here (the old
+                // behavior) could overwrite the durable adopted table without a
+                // sealed literal committed this turn (decision 10.1). The hub
+                // persists-before-swap and returns the committed table.
+                let table = match self
+                    .interrupts
+                    .refresh_union_redaction(&self.session, &new_table)
+                    .await
+                {
+                    Ok(Some(table)) => table,
+                    Ok(None) => {
+                        // Detached hub (standalone shim / tests): no shared table
+                        // to serialize against, so union onto the driver's own
+                        // copy and persist directly — still persist-before-swap.
+                        let table = match self.redact.union(&new_table) {
+                            Ok(table) => Arc::new(table),
+                            Err(error) => {
+                                tracing::warn!(error = %error, "unioning redaction table failed");
+                                Arc::new(new_table)
+                            }
+                        };
+                        if let Err(error) = self.session.persist_redaction_table(&table) {
+                            // Fail-closed: do not advance `self.redact` ahead of
+                            // the durable table when the persist did not commit.
+                            tracing::warn!(error = %error, "persisting redaction table failed");
+                            return;
+                        }
+                        table
+                    }
                     Err(error) => {
-                        tracing::warn!(error = %error, "unioning redaction table failed");
-                        Arc::new(new_table)
+                        // The committed table is left live under the hub lock;
+                        // skip this refresh rather than clobber it.
+                        tracing::warn!(error = %error, "refreshing redaction table under hub lock failed");
+                        return;
                     }
                 };
-                if let Err(error) = self.session.persist_redaction_table(&table) {
-                    tracing::warn!(error = %error, "persisting redaction table failed");
-                }
                 for path in table.unsupported_files() {
                     if self.redaction_unsupported_notified.insert(path.clone()) {
                         let _ = tx
@@ -2970,6 +3005,7 @@ impl Driver {
             self.cwd.clone(),
             self.config.clone(),
             self.redact.clone(),
+            self.session.redaction_key_resolver().clone(),
             tx.clone(),
         ) else {
             return false;
@@ -3883,6 +3919,9 @@ impl Driver {
             "tokens_used": goal.tokens_used,
             "token_budget": goal.token_budget,
         });
+        // Host-generated goal telemetry (goal id, host-tracked turn counters, token
+        // usage/budget) — no model-authored free text, so no session-table literal.
+        // Frame-less `record_event` is correct; nothing to journal.
         if let Err(e) = self
             .session
             .record_event(
@@ -4224,6 +4263,10 @@ impl Driver {
         recovery_id: &str,
         tx: &mpsc::Sender<TurnEvent>,
     ) {
+        // Host-generated recovery record: fixed status/trigger strings and the
+        // host-minted recovery_id / recommended-action shape — no model-authored
+        // free text, so no session-table literal. Frame-less `record_event` is
+        // correct; nothing to journal.
         if let Err(e) = self
             .session
             .record_event(
@@ -4330,6 +4373,13 @@ impl Driver {
                 "dirty_files": progress.dirty_owned_changes,
             },
         });
+        // Host-observed progress snapshot: every field is derived from the host's
+        // own tool-call history (files read/edited, commands run, worktree dirty
+        // set — `dirty_files_source: host_tool_history`), not from model-authored
+        // free text. Any secret a model placed in a tool argument was already
+        // journaled at that originating tool_call (tool_dispatch.rs frames it), so
+        // this recovery summary carries no un-journaled session-table literal.
+        // Frame-less `record_event` is correct.
         if let Err(e) = self
             .session
             .record_event(
@@ -4396,6 +4446,9 @@ impl Driver {
             "anchor_seq": anchor_seq,
             "reason": "completed_inference_without_visible_progress",
         });
+        // Host-generated goal diagnostic (fixed kind/reason strings + host anchor
+        // seq) — no model-authored free text, so no session-table literal.
+        // Frame-less `record_event` is correct; nothing to journal.
         if let Err(e) = self
             .session
             .record_event(
@@ -6030,12 +6083,26 @@ impl Driver {
             &child.agent.model,
             child.fallback_decision.as_ref(),
         );
+        // The subagent report is authored by the CHILD model, so route it through
+        // the frame-carrying journaling path with the child's trust + pre-policy
+        // session table (F4). A frame-less `record_event` skips the trusted
+        // journaling branch entirely, so a session-table literal in a trusted
+        // child's report would never journal. When the child model is untrusted
+        // the frame path journals nothing (its report is already post-redaction),
+        // preserving today's semantics.
+        let child_session_table = child.agent.model.session_redact_table();
         if let Err(e) = self
             .session
-            .record_event(
+            .record_event_with_model_frame(
                 crate::db::session_log::SessionEventKind::SubagentReport,
                 Some(&child.agent.name),
                 task_call_id,
+                crate::session::SessionEventModelFrame {
+                    provider_id: child.agent.model.provider_id(),
+                    model_id: child.agent.model.model_id_ref(),
+                    config: &self.config,
+                    session_table: child_session_table.as_ref(),
+                },
                 &with_child_routing_metadata(
                     subagent_report_event_data(
                         &child.agent.name,
@@ -6147,6 +6214,14 @@ impl Driver {
                 &child.agent.model,
                 child.fallback_decision.as_ref(),
             );
+            // Unlike the two success-pop SubagentReport sites, this abort report is
+            // NOT model-authored: `report` is `reason.abort_report()`, a fixed
+            // host-generated string (cancelled / draining / a provider+class+phase
+            // failure summary), so it can carry no session-table literal from the
+            // child model. A frame-less `record_event` is correct here — there is
+            // nothing trusted-authored to journal (H2 verified). The child's own
+            // history/report (which could carry a literal) is discarded on unwind
+            // and never persisted through this path.
             if let Err(e) = self
                 .session
                 .record_event(

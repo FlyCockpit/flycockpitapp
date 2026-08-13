@@ -1761,8 +1761,13 @@ mod tests {
     /// approval dirs pointed at temp dirs so scopes are exercised hermetically.
     pub(super) fn test_store(project: &Path, global: PathBuf) -> (GrantStore, uuid::Uuid) {
         let db = Db::open_in_memory().unwrap();
-        let session =
-            crate::session::Session::create(db.clone(), project.to_path_buf(), "builder").unwrap();
+        let session = crate::session::Session::create(
+            db.clone(),
+            project.to_path_buf(),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let sid = session.id;
         let mut store = GrantStore::new(
             db,
@@ -2015,6 +2020,7 @@ mod tests {
                 db.clone(),
                 project.path().to_path_buf(),
                 "builder",
+                crate::session::test_redaction_key_resolver(),
             )
             .unwrap();
             let store = GrantStore::new(
@@ -2128,9 +2134,13 @@ mod tests {
         .unwrap();
 
         let db = Db::open_in_memory().unwrap();
-        let session =
-            crate::session::Session::create(db.clone(), tmp.path().to_path_buf(), "builder")
-                .unwrap();
+        let session = crate::session::Session::create(
+            db.clone(),
+            tmp.path().to_path_buf(),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let global = tempfile::tempdir().unwrap();
         let mut store = GrantStore::new(
             db,
@@ -2977,9 +2987,13 @@ mod tests {
         // Seed one of each bucket through the normal store write paths so
         // the file shape is exactly what production records.
         let db = Db::open_in_memory().unwrap();
-        let session =
-            crate::session::Session::create(db.clone(), dir.path().to_path_buf(), "builder")
-                .unwrap();
+        let session = crate::session::Session::create(
+            db.clone(),
+            dir.path().to_path_buf(),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let mut store = GrantStore::new(
             db,
             session.id,
@@ -3042,9 +3056,13 @@ mod tests {
     async fn managed_grants_expose_command_tier() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
-        let session =
-            crate::session::Session::create(db.clone(), dir.path().to_path_buf(), "builder")
-                .unwrap();
+        let session = crate::session::Session::create(
+            db.clone(),
+            dir.path().to_path_buf(),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let mut store = GrantStore::new(
             db,
             session.id,
@@ -3080,9 +3098,13 @@ mod tests {
     async fn delete_managed_grant_removes_one_leaves_others() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
-        let session =
-            crate::session::Session::create(db.clone(), dir.path().to_path_buf(), "builder")
-                .unwrap();
+        let session = crate::session::Session::create(
+            db.clone(),
+            dir.path().to_path_buf(),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let mut store = GrantStore::new(
             db,
             session.id,
@@ -3150,9 +3172,13 @@ mod tests {
     async fn delete_managed_grant_handles_each_kind() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
-        let session =
-            crate::session::Session::create(db.clone(), dir.path().to_path_buf(), "builder")
-                .unwrap();
+        let session = crate::session::Session::create(
+            db.clone(),
+            dir.path().to_path_buf(),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let mut store = GrantStore::new(
             db,
             session.id,
@@ -3276,8 +3302,13 @@ mod tests {
         initial: ApprovalPolicyConfig,
     ) -> (GrantStore, Arc<RwLock<SessionConfigSnapshot>>) {
         let db = Db::open_in_memory().unwrap();
-        let session =
-            crate::session::Session::create(db.clone(), tmp.to_path_buf(), "builder").unwrap();
+        let session = crate::session::Session::create(
+            db.clone(),
+            tmp.to_path_buf(),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let cell = Arc::new(RwLock::new(snapshot_with_policy(1, initial)));
         let store = GrantStore::new(
             db,

@@ -478,6 +478,7 @@ pub(crate) async fn execute_ordinary_call(
             "recovery_kind": start_recovery_kind,
             "recovery_stage": start_recovery_stage,
         });
+        let started_session_table = env.model.session_redact_table();
         match env
             .session
             .record_event_with_model_frame(
@@ -488,6 +489,7 @@ pub(crate) async fn execute_ordinary_call(
                     provider_id: env.model.provider_id(),
                     model_id: env.model.model_id_ref(),
                     config: &env.ctx.config,
+                    session_table: started_session_table.as_ref(),
                 },
                 &start_data,
             )
@@ -1022,26 +1024,30 @@ pub(crate) async fn execute_ordinary_call(
     // failures. The `tool_call` row still records the diagnostic the model
     // saw; this names *why* it never dispatched.
     if let Some(reason) = rejection_reason
-        && let Err(e) = env
-            .session
-            .record_event_with_model_frame(
-                crate::db::session_log::SessionEventKind::ToolRejected,
-                Some(&env.agent.name),
-                Some(&tc.id),
-                crate::session::SessionEventModelFrame {
-                    provider_id: env.model.provider_id(),
-                    model_id: env.model.model_id_ref(),
-                    config: &env.ctx.config,
-                },
-                &serde_json::json!({
-                    "tool": resolved_name,
-                    "reason": reason,
-                }),
-            )
-            .await
+        && let Err(e) = {
+            let rejected_session_table = env.model.session_redact_table();
+            env.session
+                .record_event_with_model_frame(
+                    crate::db::session_log::SessionEventKind::ToolRejected,
+                    Some(&env.agent.name),
+                    Some(&tc.id),
+                    crate::session::SessionEventModelFrame {
+                        provider_id: env.model.provider_id(),
+                        model_id: env.model.model_id_ref(),
+                        config: &env.ctx.config,
+                        session_table: rejected_session_table.as_ref(),
+                    },
+                    &serde_json::json!({
+                        "tool": resolved_name,
+                        "reason": reason,
+                    }),
+                )
+                .await
+        }
     {
         tracing::warn!(error = %e, tool = %resolved_name, "record tool_rejected event failed");
     }
+    let tool_call_session_table = env.model.session_redact_table();
     let tool_call_seq = match env
         .session
         .record_event_with_model_frame(
@@ -1052,6 +1058,7 @@ pub(crate) async fn execute_ordinary_call(
                 provider_id: env.model.provider_id(),
                 model_id: env.model.model_id_ref(),
                 config: &env.ctx.config,
+                session_table: tool_call_session_table.as_ref(),
             },
             &event_data,
         )
@@ -1132,6 +1139,7 @@ pub(crate) async fn execute_ordinary_call(
         if let Some(hint) = &hint_value {
             completed_data["hint"] = hint.clone();
         }
+        let completed_session_table = env.model.session_redact_table();
         if let Err(e) = env
             .session
             .record_event_with_model_frame(
@@ -1142,6 +1150,7 @@ pub(crate) async fn execute_ordinary_call(
                     provider_id: env.model.provider_id(),
                     model_id: env.model.model_id_ref(),
                     config: &env.ctx.config,
+                    session_table: completed_session_table.as_ref(),
                 },
                 &completed_data,
             )
@@ -1869,7 +1878,15 @@ mod tests {
 
     fn test_session(root: &std::path::Path) -> Arc<Session> {
         let db = crate::db::Db::open_in_memory().unwrap();
-        Arc::new(Session::create(db, root.to_path_buf(), "Build").unwrap())
+        Arc::new(
+            Session::create(
+                db,
+                root.to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        )
     }
 
     fn redaction_table(root: &std::path::Path, placeholder: &str) -> RedactionTable {
@@ -1892,16 +1909,26 @@ mod tests {
 
     async fn test_btw_session(root: &std::path::Path) -> Arc<Session> {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let parent = Session::create(db.clone(), root.to_path_buf(), "Build").unwrap();
+        let parent = Session::create(
+            db.clone(),
+            root.to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let fork = db
             .create_btw_fork(parent.id, false)
             .await
             .expect("btw fork")
             .info;
         Arc::new(
-            Session::resume(db, fork.session_id)
-                .expect("resume btw fork")
-                .expect("btw fork row"),
+            Session::resume(
+                db,
+                fork.session_id,
+                crate::session::test_redaction_key_resolver(),
+            )
+            .expect("resume btw fork")
+            .expect("btw fork row"),
         )
     }
 
@@ -3541,7 +3568,13 @@ mod tests {
     #[tokio::test]
     async fn recheck_modified_output_does_not_store_unrechecked_body() {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = Session::create(db, std::path::PathBuf::from("/x"), "Build").unwrap();
+        let session = Session::create(
+            db,
+            std::path::PathBuf::from("/x"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
         let mut delivered = "[tool result withheld]".to_string();
         let retained = crate::engine::tool::RetainedTruncatedOutput {
             content: "raw content removed by recheck".to_string(),

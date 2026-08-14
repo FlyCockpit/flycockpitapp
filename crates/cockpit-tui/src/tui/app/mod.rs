@@ -2204,6 +2204,10 @@ pub struct App {
     pub(super) hovered_footer_control: Option<crate::tui::chrome::FooterControl>,
     /// Absolute hit rectangles recorded by the last status render.
     pub(super) footer_hit_areas: Vec<FooterHitArea>,
+    pub(super) button_registry: crate::tui::button::ButtonRegistry,
+    pub(super) row_registry: crate::tui::button::RowControlRegistry,
+    pub(super) button_surface_generation: u64,
+    pub(super) last_button_frame_key: Option<(u16, u16, bool, bool)>,
     /// Agent picker opened from the footer agent segment.
     pub(super) footer_agent_picker: Option<FooterAgentPicker>,
     /// Mode picker opened from the footer mode segment.
@@ -3423,6 +3427,10 @@ impl App {
             footer_selection: None,
             hovered_footer_control: None,
             footer_hit_areas: Vec::new(),
+            button_registry: crate::tui::button::ButtonRegistry::default(),
+            row_registry: crate::tui::button::RowControlRegistry::default(),
+            button_surface_generation: 0,
+            last_button_frame_key: None,
             footer_agent_picker: None,
             footer_mode_picker: None,
             footer_picker_row_hits: Vec::new(),

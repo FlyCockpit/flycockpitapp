@@ -82,6 +82,10 @@ impl ResourcesPane {
         }
     }
 
+    pub(crate) fn pointer_promote(&mut self, index: usize) {
+        self.list.set_cursor(index);
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<ResourcesOutcome> {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => Some(ResourcesOutcome::Close),

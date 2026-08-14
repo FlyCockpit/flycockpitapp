@@ -2653,16 +2653,16 @@ pub(super) mod tests {
             confirm.rect.x,
             confirm.rect.y,
         ));
-        let operation = page(&dialog)
-            .pending_external_edit
-            .as_ref()
-            .expect("confirmed activation submits effect")
-            .id;
         dialog.handle_pointer(super::super::tests::settings_mouse(
             crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
             confirm.rect.x,
             confirm.rect.y,
         ));
+        let operation = page(&dialog)
+            .pending_external_edit
+            .as_ref()
+            .expect("confirmed activation submits effect")
+            .id;
         assert_eq!(
             page(&dialog)
                 .pending_external_edit

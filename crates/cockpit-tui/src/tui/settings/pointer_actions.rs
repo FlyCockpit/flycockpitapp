@@ -41,7 +41,7 @@ pub(super) type SettingId = super::category::SettingId;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct UtilityModelId(pub String);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) enum RootNodeId {
+pub(crate) enum RootNodeId {
     DefaultModel,
     Providers,
     Dependencies,
@@ -270,7 +270,7 @@ pub(super) enum ModelLifecycleAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) enum SettingsPointerAction {
+pub(crate) enum SettingsPointerAction {
     Root(RootAction),
     Category(CategoryAction),
     Agents(AgentsAction),
@@ -299,7 +299,7 @@ impl From<McpAction> for SettingsPointerAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) enum RootAction {
+pub(crate) enum RootAction {
     Open(RootNodeId),
 }
 
@@ -505,7 +505,7 @@ pub(super) enum UtilityModelAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) enum DefaultModelAction {
+pub(crate) enum DefaultModelAction {
     Choose,
     Clear,
 }
@@ -554,5 +554,189 @@ pub(super) enum GenerationAction {
 impl From<GenerationAction> for SettingsPointerAction {
     fn from(action: GenerationAction) -> Self {
         Self::Generation(action)
+    }
+}
+
+impl SettingsPointerAction {
+    pub(crate) fn is_button(&self) -> bool {
+        !self.is_row_control()
+    }
+
+    pub(crate) fn is_row_control(&self) -> bool {
+        match self {
+            Self::Root(RootAction::Open(_)) => true,
+            Self::Category(action) => matches!(
+                action,
+                CategoryAction::DescriptorActivate(_)
+                    | CategoryAction::InlineEditBegin(_)
+                    | CategoryAction::PathEditBegin(_)
+                    | CategoryAction::SuggestionSelect(_, _)
+                    | CategoryAction::PickerSelect(_, _)
+            ),
+            Self::Agents(action) => matches!(
+                action,
+                AgentsAction::Open(_)
+                    | AgentsAction::ToggleTool(_, _)
+                    | AgentsAction::CycleTier(_, _)
+            ),
+            Self::Tools(action) => matches!(
+                action,
+                ToolsAction::ReadOnlyBuiltin(_) | ToolsAction::ReadOnlyMcpTool(_, _)
+            ),
+            Self::Harnesses(action) => {
+                matches!(
+                    action,
+                    HarnessesAction::Open(_) | HarnessesAction::EditField(_)
+                )
+            }
+            Self::Skills(action) => matches!(action, SkillsAction::EditScanDirectory(_)),
+            Self::Mcp(action) => matches!(
+                action,
+                McpAction::Open(_)
+                    | McpAction::ToggleEnabled(_)
+                    | McpAction::EditName
+                    | McpAction::ToggleEditorEnabled
+                    | McpAction::CycleTransport
+                    | McpAction::EditEndpoint
+                    | McpAction::EditCommand
+                    | McpAction::EditArgs
+                    | McpAction::EditBaseEnv
+                    | McpAction::CycleAuth
+                    | McpAction::EditHeaderName
+                    | McpAction::EditHeaderValue
+                    | McpAction::EditAuthEnv
+                    | McpAction::EditOauthAuthorizeUrl
+                    | McpAction::EditOauthTokenUrl
+                    | McpAction::EditOauthClientId
+                    | McpAction::EditOauthScopes
+                    | McpAction::EditCacheTtl
+                    | McpAction::EditConnectTimeout
+                    | McpAction::EditRequestTimeout
+            ),
+            Self::Providers(action) => matches!(
+                action,
+                ProvidersAction::Open(_)
+                    | ProvidersAction::EditField(_, _)
+                    | ProvidersAction::OAuthOption(_, _)
+                    | ProvidersAction::WizardControl(_, _)
+                    | ProvidersAction::FetchAllConfirm(_)
+                    | ProvidersAction::FetchOneConfirm(_, _)
+                    | ProvidersAction::FetchFallbackConfirm(_, _)
+                    | ProvidersAction::DeepFetchChoice(_, _)
+                    | ProvidersAction::RowEditor(
+                        ProviderRowEditorAction::HeaderOpen(_)
+                            | ProviderRowEditorAction::ModelOpen(_)
+                            | ProviderRowEditorAction::SettingEdit(_),
+                    )
+            ),
+            Self::Lsp(action) => matches!(
+                action,
+                LspAction::ToggleEnabled
+                    | LspAction::CycleAutoInstall
+                    | LspAction::ToggleDiagnostics
+                    | LspAction::Edit(_)
+            ),
+            Self::List(action) => matches!(action, ListAction::Edit(_)),
+            Self::UtilityModel(action) => matches!(action, UtilityModelAction::Select(_)),
+            Self::DefaultModel(_) => false,
+            Self::Generation(action) => matches!(
+                action,
+                GenerationAction::OpenNode(_)
+                    | GenerationAction::EditEndpoint(_)
+                    | GenerationAction::EditTarget(_)
+            ),
+        }
+    }
+
+    pub(crate) fn button_label(&self) -> Option<&'static str> {
+        if !self.is_button() {
+            return None;
+        }
+        Some(match self {
+            Self::DefaultModel(DefaultModelAction::Choose) => "Choose default model",
+            Self::DefaultModel(DefaultModelAction::Clear) => "Clear default for this scope",
+            Self::Category(CategoryAction::InlineEditCommit(_))
+            | Self::Category(CategoryAction::PathEditCommit(_))
+            | Self::Category(CategoryAction::TextEditorSave(_)) => "Save",
+            Self::Category(CategoryAction::InlineEditCancel(_))
+            | Self::Category(CategoryAction::PathEditCancel(_))
+            | Self::Category(CategoryAction::TextEditorCancel(_)) => "Cancel",
+            Self::Category(CategoryAction::Reset) => "reset to defaults",
+            Self::Category(CategoryAction::Confirm(_, ConfirmationChoice::Confirm)) => "confirm",
+            Self::Category(CategoryAction::Confirm(_, ConfirmationChoice::Cancel)) => "Cancel",
+            Self::Category(CategoryAction::ExternalEditBegin(_, _)) => "Open in $EDITOR",
+            Self::Agents(AgentsAction::Edit(_)) => "Edit",
+            Self::Agents(AgentsAction::Delete(_)) => "Delete",
+            Self::Agents(AgentsAction::Reset(_)) => "Reset",
+            Self::Agents(AgentsAction::ResetAll) => "Reset all",
+            Self::Agents(AgentsAction::Save(_)) => "Save",
+            Self::Agents(AgentsAction::Cancel(_)) => "Cancel",
+            Self::Agents(AgentsAction::OpenRawEditor(_)) => "Edit raw file",
+            Self::Agents(AgentsAction::ExternalEditBegin(_)) => "Open in $EDITOR",
+            Self::Tools(ToolsAction::AddUserTool) => "Add",
+            Self::Tools(ToolsAction::Reset) => "reset to defaults",
+            Self::Tools(ToolsAction::McpJump) => "MCP",
+            Self::Harnesses(HarnessesAction::Add) => "Add",
+            Self::Harnesses(HarnessesAction::Save) => "Save",
+            Self::Harnesses(HarnessesAction::Cancel) => "Cancel",
+            Self::Skills(SkillsAction::AddScanDirectory) => "Add",
+            Self::Skills(SkillsAction::Reset) => "reset to defaults",
+            Self::Mcp(McpAction::Add) => "Add",
+            Self::Mcp(McpAction::Save) => "save",
+            Self::Mcp(McpAction::Cancel) => "Cancel",
+            Self::Providers(ProvidersAction::Add) => "Add",
+            Self::Providers(ProvidersAction::SaveProvider(_)) => "save changes",
+            Self::Providers(ProvidersAction::LocalBack) => "Back",
+            Self::Providers(ProvidersAction::AddModel(_)) => "Add model",
+            Self::Lsp(LspAction::SaveEdit(_)) => "Save",
+            Self::Lsp(LspAction::CancelEdit(_)) => "Cancel",
+            Self::Lsp(LspAction::Reset) => "reset to defaults",
+            Self::List(ListAction::Add) => "Add",
+            Self::List(ListAction::Save) => "Save",
+            Self::List(ListAction::Cancel) => "Cancel",
+            Self::List(ListAction::Delete(_)) => "Delete",
+            Self::UtilityModel(UtilityModelAction::Clear) => "clear — unset",
+            Self::UtilityModel(UtilityModelAction::Back) => "Back",
+            Self::UtilityModel(UtilityModelAction::CommitCustom) => "Save custom",
+            Self::UtilityModel(UtilityModelAction::CancelCustom) => "Cancel",
+            Self::Generation(GenerationAction::Cancel) => "Cancel",
+            Self::Generation(GenerationAction::SaveBudget) => "Save",
+            Self::Generation(GenerationAction::RefreshHealth) => "refresh health",
+            Self::Generation(GenerationAction::CreateEndpoint) => "create endpoint",
+            Self::Generation(GenerationAction::DeleteEndpoint(_)) => "delete endpoint",
+            Self::Generation(GenerationAction::CreateTarget) => "create target",
+            Self::Generation(GenerationAction::DeleteTarget(_)) => "delete target",
+            Self::Generation(GenerationAction::SetDefaultTarget(_)) => "set default",
+            Self::Generation(GenerationAction::UploadWorkflow) => "upload workflow",
+            Self::Generation(GenerationAction::BindWorkflow(_)) => "bind workflow",
+            Self::Generation(GenerationAction::DeleteWorkflow(_)) => "delete workflow",
+            Self::Generation(GenerationAction::RevokeGrant(_)) => "revoke grant",
+            Self::Generation(GenerationAction::CancelJob(_)) => "cancel job",
+            Self::Generation(GenerationAction::PublishLateResult(_)) => "publish late result",
+            Self::Generation(GenerationAction::DiscardLateResult(_)) => "discard late result",
+            Self::Generation(GenerationAction::ConfirmCancelJob(
+                _,
+                ConfirmationChoice::Confirm,
+            )) => "Cancel job",
+            Self::Generation(GenerationAction::ConfirmRevokeGrant(
+                _,
+                ConfirmationChoice::Confirm,
+            )) => "Revoke grant",
+            Self::Generation(GenerationAction::ConfirmPublishLateResult(
+                _,
+                ConfirmationChoice::Confirm,
+            )) => "Publish",
+            Self::Generation(GenerationAction::ConfirmDiscardLateResult(
+                _,
+                ConfirmationChoice::Confirm,
+            )) => "Discard",
+            Self::Generation(
+                GenerationAction::ConfirmCancelJob(_, ConfirmationChoice::Cancel)
+                | GenerationAction::ConfirmRevokeGrant(_, ConfirmationChoice::Cancel)
+                | GenerationAction::ConfirmPublishLateResult(_, ConfirmationChoice::Cancel)
+                | GenerationAction::ConfirmDiscardLateResult(_, ConfirmationChoice::Cancel),
+            ) => "Cancel",
+            _ => "action",
+        })
     }
 }

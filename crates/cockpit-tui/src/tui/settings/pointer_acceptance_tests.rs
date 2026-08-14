@@ -253,6 +253,147 @@ fn settings_text_click_places_grapheme_safe_caret() {
 }
 
 #[test]
+fn settings_button_hover_is_glyph_scoped() {
+    settings_hover_exact_button_style();
+}
+
+#[test]
+fn settings_hover_exact_button_style() {
+    let tmp = TempDir::new().unwrap();
+    let mut dialog = fresh_dialog(&tmp);
+    dialog.extended.tui.mouse_capture = true;
+    let (buffer, close) = render_settings_buffer(&dialog, 72, 16);
+    let close = close.expect("close button");
+    for col in close.x..close.right() {
+        assert_ne!(
+            buffer[(col, close.y)].style().bg,
+            Some(crate::tui::theme::BUTTON_HOVER_BG),
+            "idle close button is not hovered"
+        );
+    }
+    dialog.handle_pointer(settings_mouse(MouseEventKind::Moved, close.x, close.y));
+    let (buffer, close) = render_settings_buffer(&dialog, 72, 16);
+    let close = close.expect("close button after hover");
+    for col in close.x..close.right() {
+        assert_eq!(
+            buffer[(col, close.y)].style().bg,
+            Some(crate::tui::theme::BUTTON_HOVER_BG),
+            "close button cell {col} uses hover token"
+        );
+        assert!(
+            !buffer[(col, close.y)]
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::UNDERLINED)
+        );
+    }
+    if close.x > 0 {
+        assert_ne!(
+            buffer[(close.x - 1, close.y)].style().bg,
+            Some(crate::tui::theme::BUTTON_HOVER_BG)
+        );
+    }
+    if close.right() < 72 {
+        assert_ne!(
+            buffer[(close.right(), close.y)].style().bg,
+            Some(crate::tui::theme::BUTTON_HOVER_BG),
+            "cells after the button stay unhovered"
+        );
+    }
+    dialog.handle_pointer(settings_mouse(MouseEventKind::Moved, 0, 15));
+    let (buffer, close) = render_settings_buffer(&dialog, 72, 16);
+    let close = close.expect("close button after leave");
+    for col in close.x..close.right() {
+        assert_ne!(
+            buffer[(col, close.y)].style().bg,
+            Some(crate::tui::theme::BUTTON_HOVER_BG)
+        );
+    }
+}
+
+fn render_settings_buffer(
+    dialog: &super::SettingsDialog,
+    width: u16,
+    height: u16,
+) -> (ratatui::buffer::Buffer, Option<ratatui::layout::Rect>) {
+    let backend = ratatui::backend::TestBackend::new(width, height);
+    let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+    let mut links = crate::tui::links::LinkRegistry::default();
+    terminal
+        .draw(|frame| dialog.render(frame, Rect::new(0, 0, width, height), &mut links))
+        .expect("draw");
+    let close = dialog
+        .pointer_surface
+        .buttons
+        .borrow()
+        .targets()
+        .iter()
+        .find(|target| {
+            matches!(
+                target.id,
+                crate::tui::button::ButtonId::SettingsHeader(SettingsHeaderAction::Close)
+            )
+        })
+        .map(|target| target.rect);
+    (terminal.backend().buffer().clone(), close)
+}
+
+#[test]
+fn settings_button_dispatch_precedence() {
+    let tmp = TempDir::new().unwrap();
+    let mut dialog = fresh_dialog(&tmp);
+    dialog.extended.tui.mouse_capture = true;
+    super::tests::enter_root_node(&mut dialog, "Default model for new sessions");
+    let _ = render_settings_rows(&dialog, 80, 20);
+    let choose = dialog
+        .pointer_surface
+        .buttons
+        .borrow()
+        .targets()
+        .iter()
+        .find(|target| {
+            matches!(
+                target.dispatch,
+                crate::tui::button::ButtonDispatch::Settings(SettingsPointerAction::DefaultModel(
+                    DefaultModelAction::Choose
+                ))
+            )
+        })
+        .cloned()
+        .expect("choose button");
+    assert!(
+        choose.rect.width < 80,
+        "choose button is label cells only, not the full row"
+    );
+    dialog.handle_pointer(settings_mouse(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        choose.rect.right(),
+        choose.rect.y,
+    ));
+    dialog.handle_pointer(settings_mouse(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        choose.rect.right(),
+        choose.rect.y,
+    ));
+    assert!(
+        !dialog.pending_default_model_picker,
+        "blank/clipped cells do not activate"
+    );
+    dialog.handle_pointer(settings_mouse(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        choose.rect.x,
+        choose.rect.y,
+    ));
+    let outcome = dialog.handle_pointer(settings_mouse(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        choose.rect.x,
+        choose.rect.y,
+    ));
+    assert_eq!(outcome, SettingsPointerOutcome::Close);
+    assert!(dialog.pending_default_model_picker);
+}
+
+#[test]
 fn settings_pointer_picker_and_suggestion_actions_match_enter() {
     super::tests::run_pointer_picker_suggestion_matrix();
 }
@@ -418,9 +559,15 @@ fn settings_pointer_hover_and_help_are_truthful() {
         "capture-off render has no pointer affordances"
     );
     let rendered = rows.join("\n");
-    assert!(!rendered.contains("[Close settings]"));
-    assert!(!rendered.contains("[Back]"));
-    assert!(!rendered.contains("[Back to config picker]"));
+    assert!(
+        rendered.contains("[Close settings]"),
+        "capture-off still paints header buttons: {rendered}"
+    );
+    assert!(
+        dialog.pointer_surface.buttons.borrow().targets().is_empty(),
+        "capture-off publishes no button pointer targets"
+    );
+    assert!(dialog.pointer_surface.buttons.borrow().hover().is_none());
 }
 
 #[test]

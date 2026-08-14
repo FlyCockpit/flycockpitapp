@@ -85,6 +85,7 @@ impl App {
         }
         if matches!(mouse.kind, MouseEventKind::Moved) {
             if self.mouse_capture {
+                let _ = self.button_registry.handle_mouse(mouse);
                 let _link_hover_changed = self.link_registry.update_hover(mouse.column, mouse.row);
             } else {
                 self.link_registry.clear_hover();
@@ -179,42 +180,42 @@ impl App {
             return;
         }
         if self.mouse_capture
+            && let Some(outcome) = self.button_registry.handle_mouse(mouse)
+        {
+            let consumed = matches!(
+                &outcome,
+                crate::tui::button::ButtonPointerOutcome::Activated(_)
+                    | crate::tui::button::ButtonPointerOutcome::Pressed(_)
+                    | crate::tui::button::ButtonPointerOutcome::Cancelled
+            ) || self.button_registry.hit(mouse.column, mouse.row).is_some();
+            if let crate::tui::button::ButtonPointerOutcome::Activated(dispatch) = outcome {
+                self.dispatch_button(dispatch);
+            }
+            if consumed {
+                return;
+            }
+        }
+        if self.mouse_capture
             && let Some(outcome) = self.dialog.handle_settings_pointer(mouse)
         {
             if matches!(outcome, crate::tui::settings::SettingsPointerOutcome::Close) {
-                self.dialog = crate::tui::settings::Dialog::None;
-                self.sync_mouse_capture_from_dialog();
-                self.resync_config_after_local_write();
+                let open_default_model_picker = self.dialog.take_pending_default_model_picker();
+                if let Some(provider) = self.reopen_model_picker_after_settings.take() {
+                    self.dialog = crate::tui::settings::Dialog::None;
+                    self.invalidate_primary_paste();
+                    self.sync_mouse_capture_from_dialog();
+                    self.resync_config_after_local_write();
+                    self.open_model_picker_for_provider(&provider);
+                } else {
+                    self.dialog = crate::tui::settings::Dialog::None;
+                    self.invalidate_primary_paste();
+                    self.sync_mouse_capture_from_dialog();
+                    self.resync_config_after_local_write();
+                }
+                if open_default_model_picker {
+                    self.open_default_model_picker_from_settings();
+                }
             }
-            return;
-        }
-        if self.mouse_capture
-            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            && self
-                .sandbox_notice_copy_rect
-                .is_some_and(|rect| point_in(rect, mouse.column, mouse.row))
-        {
-            self.copy_persistent_notice_fix_command();
-            return;
-        }
-        if self.mouse_capture
-            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            && self.auth_failure_notice.is_some()
-            && self
-                .auth_notice_switch_rect
-                .is_some_and(|rect| point_in(rect, mouse.column, mouse.row))
-        {
-            self.open_model_picker();
-            return;
-        }
-        if self.mouse_capture
-            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            && self.auth_failure_notice.is_some()
-            && self
-                .auth_notice_fix_rect
-                .is_some_and(|rect| point_in(rect, mouse.column, mouse.row))
-        {
-            self.open_auth_failure_provider();
             return;
         }
         if self.mouse_capture
@@ -266,12 +267,15 @@ impl App {
             let Overlay::Sessions(mut pane) = overlay else {
                 unreachable!();
             };
-            let click = matches!(mouse.kind, MouseEventKind::Down(_));
+            let pointer = matches!(
+                mouse.kind,
+                MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Moved
+            );
             let wheel = matches!(
                 mouse.kind,
                 MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
             );
-            let outcome = if wheel || (self.mouse_capture && click) {
+            let outcome = if wheel || (self.mouse_capture && pointer) {
                 pane.handle_mouse(mouse)
             } else {
                 None
@@ -535,22 +539,6 @@ impl App {
             return;
         }
         let rel = (mouse.row - area.y) as usize;
-        let rel_col = mouse.column - area.x;
-        // Mouse control chips win (`pinned-messages` / fork-chip): the
-        // `[fork]` and `[pin]`/`[unpin]` controls ride the message's own first
-        // content line or top-right user-bubble border. Hit regions are exact
-        // recorded column ranges, so fork, pin, and reasoning-chip clicks stay
-        // distinct on a shared row.
-        if self.mouse_capture
-            && let Some(chip) = self.control_chip_at(rel, rel_col)
-        {
-            self.cancel_mouse_gesture(self.event_loop_monotonic_now);
-            match chip {
-                super::render::ControlChip::Fork { seq } => self.fork_for_seq(seq),
-                super::render::ControlChip::Pin { seq } => self.toggle_pin_for_seq(seq),
-            }
-            return;
-        }
         if let Some(entry_idx) = self
             .chat_row_meta
             .get(rel)
@@ -621,6 +609,72 @@ impl App {
             return;
         }
         self.dispatch_chat_gesture(mouse);
+    }
+
+    fn dispatch_button(&mut self, dispatch: crate::tui::button::ButtonDispatch) {
+        match dispatch {
+            crate::tui::button::ButtonDispatch::Footer(control) => {
+                self.cancel_mouse_gesture(self.event_loop_monotonic_now);
+                let already_selected = self.footer_selection == Some(control);
+                self.footer_selection = Some(control);
+                self.footer_agent_picker = None;
+                self.footer_mode_picker = None;
+                if already_selected {
+                    match control {
+                        crate::tui::chrome::FooterControl::Agent => self.open_footer_agent_picker(),
+                        crate::tui::chrome::FooterControl::Model => self.open_model_picker(),
+                        crate::tui::chrome::FooterControl::Mode => self.open_footer_mode_picker(),
+                    }
+                }
+            }
+            crate::tui::button::ButtonDispatch::PersistentNoticeCopy => {
+                self.copy_persistent_notice_fix_command();
+            }
+            crate::tui::button::ButtonDispatch::PersistentNoticeSwitchModel => {
+                self.open_model_picker();
+            }
+            crate::tui::button::ButtonDispatch::PersistentNoticeFixProvider => {
+                self.open_auth_failure_provider();
+            }
+            crate::tui::button::ButtonDispatch::TranscriptPin { seq }
+            | crate::tui::button::ButtonDispatch::TranscriptUnpin { seq } => {
+                self.toggle_pin_for_seq(seq);
+            }
+            crate::tui::button::ButtonDispatch::TranscriptFork { seq } => {
+                self.fork_for_seq(seq);
+            }
+            crate::tui::button::ButtonDispatch::SessionsConfirmArchive
+            | crate::tui::button::ButtonDispatch::SessionsConfirmDelete
+            | crate::tui::button::ButtonDispatch::SessionsConfirmCancel => {
+                if let Overlay::Sessions(pane) = &mut self.overlay {
+                    pane.pointer_activate_confirm(dispatch);
+                }
+            }
+            crate::tui::button::ButtonDispatch::ResourcePromote { index } => {
+                if let Overlay::Resources(pane) = &mut self.overlay {
+                    pane.pointer_promote(index);
+                }
+            }
+            crate::tui::button::ButtonDispatch::NoteNew => {
+                if let Overlay::Notes(pane) = &mut self.overlay {
+                    pane.pointer_new_note();
+                }
+            }
+            crate::tui::button::ButtonDispatch::DaemonPrompt { index } => {
+                if let Some(prompt) = self.daemon_prompt.as_mut() {
+                    prompt.pointer_select(index);
+                }
+            }
+            crate::tui::button::ButtonDispatch::QuestionAction { index } => {
+                if let Some(dialog) = self.question_dialog.as_mut() {
+                    let _ = (dialog, index);
+                }
+            }
+            crate::tui::button::ButtonDispatch::OverlayAction { .. }
+            | crate::tui::button::ButtonDispatch::DialogAction { .. }
+            | crate::tui::button::ButtonDispatch::SettingsHeader(_)
+            | crate::tui::button::ButtonDispatch::Settings(_) => {}
+        }
     }
 
     fn update_hovered_footer_control(&mut self, column: u16, row: u16) {

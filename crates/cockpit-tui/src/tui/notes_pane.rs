@@ -371,6 +371,11 @@ impl NotesPane {
     }
 
     /// Handle a key. Returns the outcome (stay / close).
+    pub(crate) fn pointer_new_note(&mut self) {
+        self.selected = self.notes.len();
+        self.start_create();
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> NotesOutcome {
         match &self.mode {
             Mode::Naming { .. } => self.handle_naming_key(key),
@@ -609,9 +614,7 @@ impl NotesPane {
         let help_area = layout[1];
 
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-        let sel = Style::default()
-            .fg(Color::Black)
-            .bg(Color::Indexed(crate::tui::theme::ACCENT_BLUE_INDEX));
+        let sel = crate::tui::theme::row_selection_style();
         let mut lines: Vec<Line<'static>> = Vec::new();
         if self.notes.is_empty() {
             lines.push(Line::from(Span::styled("(no notes yet)", muted)));

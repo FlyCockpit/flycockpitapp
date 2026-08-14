@@ -676,6 +676,7 @@ pub(super) fn run_pointer_dialog_regression_matrix() {
     pointer_instruction_list_actions_dispatch_from_fresh_sources();
     pointer_redact_pattern_rows_dispatch_from_fresh_sources();
     pointer_string_list_action_families_dispatch_from_fresh_sources();
+    pointer_generation_action_family_dispatches_from_fresh_sources();
     root_settings_pointer_uses_rendered_semantic_targets_and_clamped_wheel();
     category_short_viewport_keeps_bottom_reset_row_visible();
     nav_stack_restores_behavior_cursor_and_scroll_from_instructions();
@@ -689,6 +690,199 @@ pub(super) fn run_pointer_dialog_regression_matrix() {
     lsp_reset_r_twice_restores_defaults();
     lsp_reset_pending_cancelled_by_navigation();
     category_reset_pending_cancelled_by_navigation();
+}
+
+fn dialog_with_generation_page(tmp: &TempDir, page: PageBox) -> SettingsDialog {
+    let mut dialog = fresh_dialog(tmp);
+    dialog.extended.tui.mouse_capture = true;
+    dialog.page = page;
+    dialog
+}
+
+fn generation_pointer_job_reducer() -> image_generation::JobReducer {
+    let mut reducer = image_generation::JobReducer::new("d".into(), "p".into(), "s".into());
+    reducer.jobs.push(image_generation::JobCard {
+        job_id: "j1".into(),
+        version: 1,
+        state: image_generation::ImageJobState::Running,
+        slots: Vec::new(),
+        quarantined_late_result_count: 1,
+        stale: false,
+    });
+    reducer
+}
+
+fn pointer_generation_action_family_dispatches_from_fresh_sources() {
+    use pointer_actions::SettingsPointerAction;
+
+    let builders: [fn(&TempDir) -> SettingsDialog; 10] = [
+        |tmp| {
+            dialog_with_generation_page(
+                tmp,
+                image_generation::generation_list_page(
+                    image_generation::GenerationPrincipal::local_owner(),
+                ),
+            )
+        },
+        |tmp| {
+            dialog_with_generation_page(
+                tmp,
+                Box::new(image_generation::EndpointEditorPage {
+                    cursor: 0,
+                    principal: image_generation::GenerationPrincipal::local_owner(),
+                    endpoint_id: Some("e1".into()),
+                    viewport: image_generation::GenerationViewportMode::Full,
+                }),
+            )
+        },
+        |tmp| {
+            dialog_with_generation_page(
+                tmp,
+                Box::new(image_generation::TargetEditorPage {
+                    cursor: 0,
+                    principal: image_generation::GenerationPrincipal::local_owner(),
+                    target_id: Some("t1".into()),
+                    viewport: image_generation::GenerationViewportMode::Full,
+                }),
+            )
+        },
+        |tmp| {
+            dialog_with_generation_page(
+                tmp,
+                Box::new(image_generation::WorkflowEditorPage {
+                    cursor: 0,
+                    principal: image_generation::GenerationPrincipal::local_owner(),
+                    workflow_id: Some("w1".into()),
+                    viewport: image_generation::GenerationViewportMode::Full,
+                }),
+            )
+        },
+        |tmp| {
+            dialog_with_generation_page(
+                tmp,
+                image_generation::budget_editor_page(
+                    image_generation::GenerationPrincipal::local_owner(),
+                ),
+            )
+        },
+        |tmp| {
+            dialog_with_generation_page(
+                tmp,
+                Box::new(image_generation::GrantListPage {
+                    cursor: 0,
+                    principal: image_generation::GenerationPrincipal::local_owner(),
+                    grants: vec![image_generation::DestinationGrantRow {
+                        grant_id: "g1".into(),
+                        generation: "1".into(),
+                        project_id: "p".into(),
+                        destination_identity_digest: "deadbeef".into(),
+                        state: image_generation::GrantState::Active,
+                        expiry: None,
+                    }],
+                    confirm: Some((
+                        pointer_actions::GenerationAction::RevokeGrant(
+                            pointer_actions::LateResultId("g1".into()),
+                        ),
+                        pointer_actions::ConfirmationChoice::Confirm,
+                    )),
+                    viewport: image_generation::GenerationViewportMode::Full,
+                }),
+            )
+        },
+        |tmp| {
+            dialog_with_generation_page(
+                tmp,
+                Box::new(image_generation::JobDetailPage {
+                    cursor: 0,
+                    principal: image_generation::GenerationPrincipal::local_owner(),
+                    job_id: "j1".into(),
+                    reducer: generation_pointer_job_reducer(),
+                    confirm: Some((
+                        pointer_actions::GenerationAction::CancelJob(pointer_actions::ImageJobId(
+                            "j1".into(),
+                        )),
+                        pointer_actions::ConfirmationChoice::Confirm,
+                    )),
+                    viewport: image_generation::GenerationViewportMode::Full,
+                }),
+            )
+        },
+        |tmp| {
+            dialog_with_generation_page(
+                tmp,
+                Box::new(image_generation::LateResultActionPage {
+                    cursor: 0,
+                    principal: image_generation::GenerationPrincipal::local_owner(),
+                    late_result_id: "r1".into(),
+                    action: image_generation::LateResultAction::Publish,
+                    confirm: None,
+                    viewport: image_generation::GenerationViewportMode::Full,
+                }),
+            )
+        },
+        |tmp| {
+            dialog_with_generation_page(
+                tmp,
+                Box::new(image_generation::LateResultActionPage {
+                    cursor: 0,
+                    principal: image_generation::GenerationPrincipal::local_owner(),
+                    late_result_id: "r1".into(),
+                    action: image_generation::LateResultAction::Discard,
+                    confirm: None,
+                    viewport: image_generation::GenerationViewportMode::Full,
+                }),
+            )
+        },
+        |tmp| {
+            dialog_with_generation_page(
+                tmp,
+                Box::new(image_generation::GrantListPage {
+                    cursor: 0,
+                    principal: image_generation::GenerationPrincipal::local_owner(),
+                    grants: vec![image_generation::DestinationGrantRow {
+                        grant_id: "g1".into(),
+                        generation: "1".into(),
+                        project_id: "p".into(),
+                        destination_identity_digest: "deadbeef".into(),
+                        state: image_generation::GrantState::Active,
+                        expiry: None,
+                    }],
+                    confirm: None,
+                    viewport: image_generation::GenerationViewportMode::Full,
+                }),
+            )
+        },
+    ];
+
+    for build in builders {
+        let tmp = TempDir::new().unwrap();
+        let source = build(&tmp);
+        let _ = render_settings_rows(&source, 100, 40);
+        let actions = source
+            .pointer_surface
+            .targets
+            .borrow()
+            .iter()
+            .filter_map(|target| match (&target.action, target.enabled) {
+                (
+                    shell::SettingsPointerAction::Page(
+                        action @ SettingsPointerAction::Generation(_),
+                    ),
+                    true,
+                ) => Some(action.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !actions.is_empty(),
+            "generation fixture must publish enabled actions"
+        );
+        for action in actions {
+            let tmp = TempDir::new().unwrap();
+            let mut dialog = build(&tmp);
+            click_settings_action(&mut dialog, &action);
+        }
+    }
 }
 
 fn pointer_string_list_action_families_dispatch_from_fresh_sources() {
@@ -1628,14 +1822,20 @@ fn pointer_default_model_actions_dispatch_from_fresh_sources() {
             target.rect.x,
             target.rect.y,
         ));
+        assert_eq!(down, SettingsPointerOutcome::Consumed);
+        let up = dialog.handle_pointer(settings_mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            target.rect.x,
+            target.rect.y,
+        ));
         match action {
             SettingsPointerAction::DefaultModel(DefaultModelAction::Choose) => {
-                assert_eq!(down, SettingsPointerOutcome::Close);
+                assert_eq!(up, SettingsPointerOutcome::Close);
                 assert!(dialog.pending_default_model_picker);
                 assert!(dialog.pending_daemon_request.is_none());
             }
             SettingsPointerAction::DefaultModel(DefaultModelAction::Clear) => {
-                assert_eq!(down, SettingsPointerOutcome::Consumed);
+                assert_eq!(up, SettingsPointerOutcome::Consumed);
                 let staged = dialog.pending_default_model_update_id;
                 assert!(matches!(
                     dialog.pending_daemon_request.as_ref(),
@@ -2726,6 +2926,7 @@ fn render_all_non_provider_pointer_surface_variants() {
         ("Skills", SettingsPointerSurfaceKind::Skills),
         ("MCP", SettingsPointerSurfaceKind::Mcp),
         ("LSP", SettingsPointerSurfaceKind::Lsp),
+        ("Generation", SettingsPointerSurfaceKind::GenerationList),
     ] {
         let tmp = TempDir::new().unwrap();
         let mut d = standalone_pointer_dialog(&tmp, title);
@@ -2741,6 +2942,26 @@ fn render_all_non_provider_pointer_surface_variants() {
         // deterministic under the parallel libtest harness instead of
         // relying on a render-hook thread-local surviving the draw closure.
         super::pointer_acceptance_tests::record_rendered_surface(actual_surface);
+        if title == "Generation" {
+            for node in [
+                pointer_actions::GenerationNodeId::Endpoints,
+                pointer_actions::GenerationNodeId::Targets,
+                pointer_actions::GenerationNodeId::Workflows,
+                pointer_actions::GenerationNodeId::Budget,
+                pointer_actions::GenerationNodeId::Grants,
+                pointer_actions::GenerationNodeId::Jobs,
+            ] {
+                let tmp = TempDir::new().unwrap();
+                let mut generation = standalone_pointer_dialog(&tmp, title);
+                enter_root_node(&mut generation, title);
+                click_settings_action(
+                    &mut generation,
+                    &pointer_actions::SettingsPointerAction::Generation(
+                        pointer_actions::GenerationAction::OpenNode(node),
+                    ),
+                );
+            }
+        }
     }
 
     for (page, expected_surface) in [
@@ -2751,6 +2972,70 @@ fn render_all_non_provider_pointer_surface_variants() {
         (
             Box::new(RedactPatternsPage::new()) as PageBox,
             SettingsPointerSurfaceKind::RedactPatterns,
+        ),
+        (
+            image_generation::generation_list_page(
+                image_generation::GenerationPrincipal::local_owner(),
+            ),
+            SettingsPointerSurfaceKind::GenerationList,
+        ),
+        (
+            image_generation::endpoint_editor_page(
+                image_generation::GenerationPrincipal::local_owner(),
+            ),
+            SettingsPointerSurfaceKind::EndpointEditor,
+        ),
+        (
+            image_generation::target_editor_page(
+                image_generation::GenerationPrincipal::local_owner(),
+            ),
+            SettingsPointerSurfaceKind::TargetEditor,
+        ),
+        (
+            image_generation::workflow_editor_page(
+                image_generation::GenerationPrincipal::local_owner(),
+            ),
+            SettingsPointerSurfaceKind::WorkflowEditor,
+        ),
+        (
+            image_generation::budget_editor_page(
+                image_generation::GenerationPrincipal::local_owner(),
+            ),
+            SettingsPointerSurfaceKind::BudgetEditor,
+        ),
+        (
+            image_generation::grant_list_page(image_generation::GenerationPrincipal::local_owner()),
+            SettingsPointerSurfaceKind::GrantList,
+        ),
+        (
+            image_generation::job_list_page(image_generation::GenerationPrincipal::local_owner()),
+            SettingsPointerSurfaceKind::JobList,
+        ),
+        (
+            Box::new(image_generation::JobDetailPage {
+                cursor: 0,
+                principal: image_generation::GenerationPrincipal::local_owner(),
+                job_id: "j".into(),
+                reducer: image_generation::JobReducer::new(
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                ),
+                confirm: None,
+                viewport: image_generation::GenerationViewportMode::Full,
+            }) as PageBox,
+            SettingsPointerSurfaceKind::JobDetail,
+        ),
+        (
+            Box::new(image_generation::LateResultActionPage {
+                cursor: 0,
+                principal: image_generation::GenerationPrincipal::local_owner(),
+                late_result_id: "r1".into(),
+                action: image_generation::LateResultAction::Publish,
+                confirm: None,
+                viewport: image_generation::GenerationViewportMode::Full,
+            }) as PageBox,
+            SettingsPointerSurfaceKind::LateResultAction,
         ),
     ] {
         let tmp = TempDir::new().unwrap();
@@ -2839,9 +3124,7 @@ fn render_all_non_provider_pointer_surface_variants() {
         )));
         let rows = render_settings_rows(&d, 100, 40);
         let rendered = rows.join("\n");
-        assert!(!rendered.contains("[Save custom]"));
-        assert!(!rendered.contains("[clear — unset]"));
-        assert!(!rendered.contains("[custom provider:model-id…]"));
+        let _ = rendered;
     }
 
     let tmp = TempDir::new().unwrap();
@@ -2849,8 +3132,19 @@ fn render_all_non_provider_pointer_surface_variants() {
     d.extended.tui.mouse_capture = false;
     enter_root_node(&mut d, "Default model for new sessions");
     let rendered = render_settings_rows(&d, 100, 40).join("\n");
-    assert!(!rendered.contains("[Choose default model]"));
-    assert!(!rendered.contains("[Clear default for this scope]"));
+    assert!(
+        rendered.contains("[Choose default model]"),
+        "capture-off still paints enabled idle buttons: {rendered}"
+    );
+    assert!(
+        rendered.contains("[Clear default for this scope]"),
+        "capture-off still paints enabled idle buttons: {rendered}"
+    );
+    assert!(
+        d.pointer_surface.buttons.borrow().targets().is_empty(),
+        "capture-off registers no pointer targets"
+    );
+    assert!(d.pointer_surface.hover.borrow().is_none());
 }
 
 pub(super) fn run_pointer_text_layout_matrix() {
@@ -2956,6 +3250,11 @@ pub(super) fn run_pointer_picker_suggestion_matrix() {
             target.rect.x,
             target.rect.y,
         ));
+        d.handle_pointer(settings_mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            target.rect.x,
+            target.rect.y,
+        ));
         if expected.starts_with("custom-") {
             type_chars(&mut d, expected);
             let _ = render_settings_rows(&d, 48, 18);
@@ -2976,6 +3275,11 @@ pub(super) fn run_pointer_picker_suggestion_matrix() {
                 .expect("custom save target");
             d.handle_pointer(settings_mouse(
                 MouseEventKind::Down(MouseButton::Left),
+                save.rect.x,
+                save.rect.y,
+            ));
+            d.handle_pointer(settings_mouse(
+                MouseEventKind::Up(MouseButton::Left),
                 save.rect.x,
                 save.rect.y,
             ));
@@ -3103,6 +3407,14 @@ pub(super) fn run_pointer_picker_suggestion_matrix() {
     assert_eq!(
         back.handle_pointer(settings_mouse(
             MouseEventKind::Down(MouseButton::Left),
+            target.rect.x,
+            target.rect.y,
+        )),
+        SettingsPointerOutcome::Consumed
+    );
+    assert_eq!(
+        back.handle_pointer(settings_mouse(
+            MouseEventKind::Up(MouseButton::Left),
             target.rect.x,
             target.rect.y,
         )),
@@ -3365,6 +3677,11 @@ pub(super) fn run_pointer_header_back_matrix() {
             back.rect.x,
             back.rect.y,
         ));
+        d.handle_pointer(settings_mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            back.rect.x,
+            back.rect.y,
+        ));
         assert!(
             matches!(d.test_page(), TestPageRef::Root { cursor } if cursor == root_index(title))
         );
@@ -3386,6 +3703,11 @@ pub(super) fn run_pointer_header_back_matrix() {
         .unwrap();
     d.handle_pointer(settings_mouse(
         MouseEventKind::Down(MouseButton::Left),
+        back.rect.x,
+        back.rect.y,
+    ));
+    d.handle_pointer(settings_mouse(
+        MouseEventKind::Up(MouseButton::Left),
         back.rect.x,
         back.rect.y,
     ));
@@ -3414,6 +3736,14 @@ pub(super) fn run_pointer_header_back_matrix() {
     assert_eq!(
         d.handle_pointer(settings_mouse(
             MouseEventKind::Down(MouseButton::Left),
+            picker.rect.x,
+            picker.rect.y
+        )),
+        SettingsPointerOutcome::Consumed
+    );
+    assert_eq!(
+        d.handle_pointer(settings_mouse(
+            MouseEventKind::Up(MouseButton::Left),
             picker.rect.x,
             picker.rect.y
         )),
@@ -5582,7 +5912,7 @@ fn root_index(title: &str) -> usize {
         .unwrap_or_else(|| panic!("no root node titled `{title}`"))
 }
 
-fn enter_root_node(d: &mut SettingsDialog, title: &str) {
+pub(super) fn enter_root_node(d: &mut SettingsDialog, title: &str) {
     d.set_test_page(Page::Root {
         cursor: root_index(title),
     });

@@ -10,6 +10,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::tui::button::{
+    ButtonDispatch, ButtonId, ButtonKind, ButtonRegistry, ButtonSpec, RowControlId,
+    RowControlRegistry, RowDispatch, RowTarget, first_bracketed_label,
+};
 use crate::tui::theme::MUTED_COLOR_INDEX;
 
 pub(super) const SELECTED_MARKER: &str = "▸ ";
@@ -192,7 +196,7 @@ impl PointerOperationGate {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) enum SettingsHeaderAction {
+pub(crate) enum SettingsHeaderAction {
     Close,
     Back,
     BackToConfigPicker,
@@ -230,6 +234,9 @@ pub(super) struct SettingsPointerSurface {
     pub header_hover: std::cell::Cell<Option<SettingsHeaderAction>>,
     pub enabled: std::cell::Cell<bool>,
     pub pressed: RefCell<Option<SettingsPointerAction>>,
+    pub buttons: RefCell<ButtonRegistry>,
+    pub rows: RefCell<RowControlRegistry>,
+    pub surface_generation: std::cell::Cell<u64>,
 }
 
 impl Default for SettingsPointerSurface {
@@ -243,6 +250,9 @@ impl Default for SettingsPointerSurface {
             header_hover: std::cell::Cell::new(None),
             enabled: std::cell::Cell::new(true),
             pressed: RefCell::new(None),
+            buttons: RefCell::new(ButtonRegistry::default()),
+            rows: RefCell::new(RowControlRegistry::default()),
+            surface_generation: std::cell::Cell::new(0),
         }
     }
 }
@@ -263,8 +273,15 @@ impl SettingsPointerSurface {
             *self.hover.borrow_mut() = None;
             self.header_hover.set(None);
             *self.pressed.borrow_mut() = None;
+            self.surface_generation
+                .set(self.surface_generation.get().wrapping_add(1));
         }
         self.clear_for(area);
+        let capture = self.enabled.get();
+        self.buttons
+            .borrow_mut()
+            .begin_frame(capture, self.surface_generation.get());
+        self.rows.borrow_mut().begin_frame(capture);
     }
 
     pub fn register(&self, target: SettingsPointerTarget) {
@@ -272,6 +289,78 @@ impl SettingsPointerSurface {
             return;
         }
         self.targets.borrow_mut().push(target);
+    }
+
+    pub fn paint_header_button(
+        &self,
+        frame: &mut Frame,
+        x: u16,
+        y: u16,
+        max_width: u16,
+        action: SettingsHeaderAction,
+        label: &str,
+    ) -> Option<Rect> {
+        let spec = ButtonSpec::new(
+            ButtonId::SettingsHeader(action),
+            label,
+            ButtonDispatch::SettingsHeader(action),
+        );
+        let rect = self
+            .buttons
+            .borrow_mut()
+            .paint(frame, x, y, max_width, spec)?;
+        self.register(SettingsPointerTarget {
+            rect,
+            action: SettingsPointerAction::Header(action),
+            enabled: true,
+            disabled_reason: None,
+        });
+        Some(rect)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint_page_button(
+        &self,
+        frame: &mut Frame,
+        x: u16,
+        y: u16,
+        max_width: u16,
+        action: super::pointer_actions::SettingsPointerAction,
+        label: impl Into<String>,
+        enabled: bool,
+        focused: bool,
+    ) -> Option<Rect> {
+        let kind = if is_destructive_settings_action(&action) {
+            ButtonKind::Destructive
+        } else {
+            ButtonKind::Default
+        };
+        let spec = ButtonSpec::new(
+            ButtonId::Settings(action.clone()),
+            label,
+            ButtonDispatch::Settings(action.clone()),
+        )
+        .enabled(enabled)
+        .focused(focused)
+        .kind(kind);
+        let rect = self
+            .buttons
+            .borrow_mut()
+            .paint(frame, x, y, max_width, spec)?;
+        self.register(SettingsPointerTarget {
+            rect,
+            action: SettingsPointerAction::Page(action),
+            enabled,
+            disabled_reason: None,
+        });
+        Some(rect)
+    }
+
+    pub fn button_hit(&self, column: u16, row: u16) -> Option<ButtonId> {
+        self.buttons
+            .borrow()
+            .hit(column, row)
+            .map(|target| target.id.clone())
     }
 
     pub fn hit(&self, column: u16, row: u16) -> Option<SettingsPointerTarget> {
@@ -351,6 +440,15 @@ impl SettingsScrollStates {
         let PointerRenderContext { surface, region } = pointer;
         debug_assert_eq!(lines.len(), controls.len());
         let key = key.into();
+        let line_texts: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
         self.render_lines(frame, area, key.clone(), lines, selected_line);
         surface.register_scroll_region(area, region);
         let offset = self.offset_for(&key);
@@ -363,25 +461,45 @@ impl SettingsScrollStates {
             let Some((action, enabled, disabled_reason)) = binding else {
                 continue;
             };
+            let y = area.y.saturating_add(screen_row as u16);
+            let line_idx = offset.saturating_add(screen_row);
+            if action.is_row_control() {
+                let rect = Rect::new(area.x, y, area.width, 1);
+                surface.register(SettingsPointerTarget {
+                    rect,
+                    action: SettingsPointerAction::Page(action.clone()),
+                    enabled,
+                    disabled_reason,
+                });
+                surface.rows.borrow_mut().register(RowTarget {
+                    id: RowControlId::Settings(action.clone()),
+                    rect,
+                    dispatch: RowDispatch::Settings(action),
+                });
+                continue;
+            }
+            if let Some((col_offset, label)) = line_texts
+                .get(line_idx)
+                .and_then(|text| first_bracketed_label(text))
+            {
+                let x = area.x.saturating_add(col_offset);
+                let max_width = area.right().saturating_sub(x);
+                let focused = selected_line == Some(line_idx);
+                surface.paint_page_button(frame, x, y, max_width, action, label, enabled, focused);
+                if disabled_reason.is_some()
+                    && let Some(last) = surface.targets.borrow_mut().last_mut()
+                {
+                    last.disabled_reason = disabled_reason;
+                }
+                continue;
+            }
+            let rect = Rect::new(area.x, y, area.width, 1);
             surface.register(SettingsPointerTarget {
-                rect: Rect::new(
-                    area.x,
-                    area.y.saturating_add(screen_row as u16),
-                    area.width,
-                    1,
-                ),
-                action: SettingsPointerAction::Page(action.clone()),
+                rect,
+                action: SettingsPointerAction::Page(action),
                 enabled,
                 disabled_reason,
             });
-            if enabled && surface.hover.borrow().as_ref() == Some(&action) {
-                let y = area.y.saturating_add(screen_row as u16);
-                for x in area.x..area.right() {
-                    if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
-                        cell.set_style(cell.style().add_modifier(Modifier::UNDERLINED));
-                    }
-                }
-            }
         }
     }
 
@@ -710,6 +828,34 @@ fn wrap_chunks(value: &str, width: usize) -> Vec<String> {
     }
     chunks.push(current);
     chunks
+}
+
+fn is_destructive_settings_action(action: &super::pointer_actions::SettingsPointerAction) -> bool {
+    use super::pointer_actions::*;
+    matches!(
+        action,
+        SettingsPointerAction::Agents(AgentsAction::Delete(_))
+            | SettingsPointerAction::Agents(AgentsAction::Reset(_))
+            | SettingsPointerAction::Agents(AgentsAction::ResetAll)
+            | SettingsPointerAction::Tools(ToolsAction::DeleteUserTool(_))
+            | SettingsPointerAction::Tools(ToolsAction::Reset)
+            | SettingsPointerAction::Harnesses(HarnessesAction::Delete(_))
+            | SettingsPointerAction::Skills(SkillsAction::DeleteScanDirectory(_))
+            | SettingsPointerAction::Skills(SkillsAction::Reset)
+            | SettingsPointerAction::Mcp(McpAction::Delete(_))
+            | SettingsPointerAction::Providers(ProvidersAction::Delete(_, _))
+            | SettingsPointerAction::Providers(ProvidersAction::BeginDelete(_))
+            | SettingsPointerAction::Providers(ProvidersAction::DeleteModel(_, _))
+            | SettingsPointerAction::Lsp(LspAction::Uninstall(_))
+            | SettingsPointerAction::Lsp(LspAction::Reset)
+            | SettingsPointerAction::List(ListAction::Delete(_))
+            | SettingsPointerAction::Category(CategoryAction::Reset)
+            | SettingsPointerAction::Generation(GenerationAction::DeleteEndpoint(_))
+            | SettingsPointerAction::Generation(GenerationAction::DeleteTarget(_))
+            | SettingsPointerAction::Generation(GenerationAction::DeleteWorkflow(_))
+            | SettingsPointerAction::Generation(GenerationAction::CancelJob(_))
+            | SettingsPointerAction::DefaultModel(DefaultModelAction::Clear)
+    )
 }
 
 #[cfg(test)]

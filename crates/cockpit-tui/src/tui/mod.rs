@@ -18,6 +18,7 @@ pub mod async_action;
 pub mod attention;
 pub mod auth_failure;
 pub mod banner_box;
+pub(crate) mod button;
 pub mod chat;
 pub mod chrome;
 pub mod composer;

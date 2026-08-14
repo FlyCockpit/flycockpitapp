@@ -65,6 +65,15 @@ impl DaemonPromptDialog {
 
     /// Returns true if the dialog wants to close (caller should drain
     /// the chosen action via `take_choice` and act on it).
+    pub(crate) fn pointer_select(&mut self, index: usize) {
+        self.cursor = index.min(2);
+        self.chosen = Some(match self.cursor {
+            0 => DaemonChoice::StartAndConnect,
+            1 => DaemonChoice::ContinueWithout,
+            _ => DaemonChoice::Exit,
+        });
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Esc => {

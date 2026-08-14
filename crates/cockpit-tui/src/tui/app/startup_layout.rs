@@ -269,7 +269,7 @@ impl App {
             sandbox_down_notice_text(
                 &notice.remedy,
                 notice.fix_command.as_deref(),
-                self.mouse_capture && notice.fix_command.is_some(),
+                notice.fix_command.is_some(),
             )
         })
     }
@@ -279,7 +279,7 @@ impl App {
             command_capability_notice_text(
                 &notice.text,
                 notice.fix_command.as_deref(),
-                self.mouse_capture && notice.fix_command.is_some(),
+                notice.fix_command.is_some(),
             )
         })
     }
@@ -304,7 +304,7 @@ impl App {
             .or_else(|| {
                 self.auth_failure_notice
                     .as_ref()
-                    .map(|notice| crate::tui::auth_failure::notice_text(notice, self.mouse_capture))
+                    .map(|notice| crate::tui::auth_failure::notice_text(notice, true))
             })
     }
 

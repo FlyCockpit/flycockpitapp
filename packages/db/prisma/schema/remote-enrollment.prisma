@@ -1,0 +1,309 @@
+// Durable Postgres state for remote device identity, enrollment ceremonies,
+// certificate lifecycle, and mutation receipts. Kept split from
+// `remote-authority.prisma` (control-plane authority journals) the same way
+// `remote-protocol.prisma` isolates protocol-identifier aliases.
+//
+// Wire discipline:
+// - Protocol IDs, device/certificate/enrollment IDs, and digests are raw bytes
+//   (`Bytes @db.ByteA`) — 16-byte protocol IDs, 32-byte SHA-256 digests — never
+//   base64url strings in the DB.
+// - Generations are `Decimal(20, 0)`, matching `remote-authority.prisma`.
+// - Enum string values are the exact wire `name()` spellings from the Rust
+//   protocol enums in `crates/cockpit-proto` so API code needs no second map.
+// - Secrets (discovery capabilities, continuations, nonces, raw public-key
+//   material) are stored only as `SHA-256(...)` digest columns, and the sensitive
+//   columns are nullable so abandoned reservations can erase them while retaining
+//   the never-reusable device/certificate IDs.
+
+// Subject kind — `SubjectKind` (crates/cockpit-proto/src/remote_identity_protocol.rs).
+enum RemoteSubjectKind {
+  client
+  daemon
+}
+
+// Foundation custody class — `CustodyClass`
+// (crates/cockpit-proto/src/remote_identity_protocol.rs, wire names confirmed by
+// remote_connection_metadata fixtures).
+enum RemoteCustodyClass {
+  origin_protected
+  os_protected
+  hardware_or_external
+}
+
+// Foundation presence mode — `PresenceMode`
+// (crates/cockpit-proto/src/remote_identity_protocol.rs).
+enum RemotePresenceMode {
+  unattended
+  unattended_after_first_unlock
+  unattended_unlocked_device
+  user_presence_required
+}
+
+// Enrolled device lifecycle — `RemoteDeviceLifecycle::name`
+// (crates/cockpit-proto/src/remote_device_identity_enrollment.rs).
+enum RemoteDeviceLifecycle {
+  reserved
+  pending
+  active
+  rotation_pending
+  revoked
+  deleted
+  abandoned
+}
+
+// Certificate-lifecycle action — `CertificateLifecycleAction::name`.
+enum RemoteCertificateAction {
+  enroll
+  renew
+  rotate
+}
+
+// Durable certificate-row state (distinct from the renew/rotate operation state
+// machine below): `reserved | pending | active | superseded | revoked | abandoned`.
+enum RemoteCertificateState {
+  reserved
+  pending
+  active
+  superseded
+  revoked
+  abandoned
+}
+
+// Authorizer role — the two authorizing variants of `EnrollmentRole::name`
+// (`proposed_subject` is the subject itself, never the authorizer).
+enum RemoteAuthorizerRole {
+  enrolled_counterpart
+  control_plane_authorizer
+}
+
+// Enrollment ceremony state — `EnrollmentState::name` plus a DB-only `abandoned`
+// terminal used for reservations whose sensitive material has been erased.
+enum RemoteEnrollmentState {
+  reserved
+  awaiting_redemption
+  awaiting_contributions
+  code_ready
+  awaiting_confirmations
+  authorization_pending
+  issuance_pending
+  issued
+  rejected
+  expired
+  cancelled
+  superseded
+  abandoned
+}
+
+// Certificate-operation (renew/rotate) state — `CertificateOperationState::name`.
+enum RemoteCertificateOperationState {
+  reserved
+  proof_pending
+  signer_pending
+  issued
+  denied
+  expired
+  cancelled
+}
+
+// Revocation-operation state — `RevocationState::name`.
+enum RemoteRevocationState {
+  proof_pending
+  approval_pending
+  signer_pending
+  pending_reconciliation
+  revoked
+  denied
+  expired
+  cancelled
+}
+
+// Revocation actor mode — `RevocationActorMode::name`.
+enum RemoteRevocationActorMode {
+  public_self_account
+  public_instance_owner
+  self_client
+  security_admin
+}
+
+/// Durable enrolled-device row. `deviceId` is a random nonzero 16-byte
+/// `RemoteDeviceId`, unique forever in the deployment and never reassigned after
+/// abandon/revoke/delete. Device history is never cascade-deleted (`onDelete:
+/// Restrict` on the instance link); lifecycle transitions are owned by the API.
+model RemoteEnrolledDevice {
+  deviceId             Bytes                 @id @db.ByteA
+  tenantProtocolId     Bytes?                @db.ByteA
+  accountProtocolId    Bytes?                @db.ByteA
+  instanceProtocolId   Bytes                 @db.ByteA
+  instanceSourceId     String
+  subjectKind          RemoteSubjectKind
+  lifecycle            RemoteDeviceLifecycle
+  generation           Decimal?              @db.Decimal(20, 0)
+  custodyClass         RemoteCustodyClass
+  presenceMode         RemotePresenceMode
+  currentCertificateId Bytes?                @db.ByteA
+  currentThumbprint    Bytes?                @db.ByteA
+  createdAt            DateTime              @default(now())
+  revokedAt            DateTime?
+  deletedAt            DateTime?
+  abandonedAt          DateTime?
+
+  Instance     CockpitInstance           @relation(fields: [instanceSourceId], references: [id], onDelete: Restrict)
+  Certificates RemoteDeviceCertificate[]
+
+  @@index([instanceProtocolId, lifecycle])
+  @@index([accountProtocolId, lifecycle])
+  @@index([instanceSourceId, lifecycle])
+  @@map("remote_enrolled_devices")
+}
+
+/// Immutable-except-status certificate record. Prefers the complete compact ES256
+/// certificate JWS (`certificateJws`) plus digest columns over reconstructible
+/// partials; crypto material (thumbprint, public-key coordinates, FCIP digest)
+/// is frozen at reservation while `certificateJws`/validity clocks are populated
+/// on issuance. DB uniqueness is on `certificateId`; the
+/// one-active-per-`(deviceId, generation)` rule is enforced by API reducers.
+model RemoteDeviceCertificate {
+  certificateId  Bytes                   @id @db.ByteA
+  deviceId       Bytes                   @db.ByteA
+  generation     Decimal                 @db.Decimal(20, 0)
+  action         RemoteCertificateAction
+  state          RemoteCertificateState
+  thumbprint     Bytes                   @db.ByteA
+  publicKeyX     Bytes                   @db.ByteA
+  publicKeyY     Bytes                   @db.ByteA
+  fcipDigest     Bytes                   @db.ByteA
+  certificateJws String?
+  notBefore      DateTime?
+  notAfter       DateTime?
+  issuedAt       DateTime?
+  revokedAt      DateTime?
+  createdAt      DateTime                @default(now())
+
+  Device RemoteEnrolledDevice @relation(fields: [deviceId], references: [deviceId], onDelete: Restrict)
+
+  @@index([deviceId, generation])
+  @@map("remote_device_certificates")
+}
+
+/// Pre-transcript / ceremony reservation. Postgres is the durable authority;
+/// Redis holds the ephemeral ceremony. `deviceId`/`certificateId` are the
+/// reserved never-reusable IDs (modeled as indexed bytes, not FKs, so the API
+/// controls same-transaction insert ordering). Sensitive material — discovery
+/// capability, continuation, public-key, and raw authorizer bindings — is stored
+/// only as digests / typed columns and is nullable so an abandoned reservation
+/// can erase it while retaining device/cert IDs, times, role, resume digest, and
+/// safe terminal projection fields.
+model RemoteEnrollmentReservation {
+  enrollmentId                      Bytes                 @id @db.ByteA
+  enrollmentRequestId               Bytes                 @unique @db.ByteA
+  deviceId                          Bytes                 @unique @db.ByteA
+  certificateId                     Bytes                 @unique @db.ByteA
+  instanceSourceId                  String
+  tenantProtocolId                  Bytes?                @db.ByteA
+  accountProtocolId                 Bytes?                @db.ByteA
+  instanceProtocolId                Bytes                 @db.ByteA
+  subjectKind                       RemoteSubjectKind
+  authorizerRole                    RemoteAuthorizerRole
+  publicKeyThumbprint               Bytes?                @db.ByteA
+  publicKeyX                        Bytes?                @db.ByteA
+  publicKeyY                        Bytes?                @db.ByteA
+  discoveryCapabilityDigest         Bytes?                @db.ByteA
+  proposedSubjectContinuationDigest Bytes?                @db.ByteA
+  authorizerResumeDigest            Bytes?                @db.ByteA
+  continuationDeadline              DateTime?
+  authorizerResumeDeadline          DateTime?
+  state                             RemoteEnrollmentState
+  terminalReason                    String?
+  mismatchCount                     Int                   @default(0)
+  transcriptDigest                  Bytes?                @db.ByteA
+  fcipDigest                        Bytes?                @db.ByteA
+  issuerStatusDigest                Bytes?                @db.ByteA
+  handoffId                         Bytes?                @db.ByteA
+  issuanceAuthorizedAt              DateTime?
+  authorizerPrincipalKind           String?
+  authorizerTenantProtocolId        Bytes?                @db.ByteA
+  authorizerAccountProtocolId       Bytes?                @db.ByteA
+  authorizerDeviceId                Bytes?                @db.ByteA
+  authorizerTenantGeneration        Decimal?              @db.Decimal(20, 0)
+  authorizerAccountGeneration       Decimal?              @db.Decimal(20, 0)
+  authorizerDeviceGeneration        Decimal?              @db.Decimal(20, 0)
+  createdAt                         DateTime              @default(now())
+  expiresAt                         DateTime
+  abandonedAt                       DateTime?
+  terminalAt                        DateTime?
+
+  @@index([instanceSourceId, state])
+  @@index([state, expiresAt])
+  @@map("remote_enrollment_reservations")
+}
+
+/// Deployment-wide mutation receipt for byte-identical enrollment (and later
+/// certificate-lifecycle) retry. `responseBytes` is the exact response body,
+/// bounded by the 256 KiB API response cap. Lookup is by `requestId` (the id).
+model RemoteIdentityMutationReceipt {
+  requestId            Bytes    @id @db.ByteA
+  method               String
+  canonicalPath        String
+  role                 String?
+  actorPrincipalDigest Bytes    @db.ByteA
+  actorGeneration      Decimal  @db.Decimal(20, 0)
+  requestDigest        Bytes    @db.ByteA
+  outcomeCode          String
+  responseBytes        Bytes    @db.ByteA
+  createdAt            DateTime @default(now())
+
+  @@map("remote_identity_mutation_receipts")
+}
+
+/// Certificate renew/rotate operation reservation. `requestId` is the operation
+/// id; frozen current certificate/FCIP/FCPC digests support eligibility
+/// revalidation, and the proposed certificate ID/generation are reserved for the
+/// signer. Terminal reason follows `CertificateOperationTerminalReason` at the
+/// API layer.
+model RemoteCertificateOperation {
+  requestId             Bytes                           @id @db.ByteA
+  deviceId              Bytes                           @db.ByteA
+  action                RemoteCertificateAction
+  state                 RemoteCertificateOperationState
+  currentCertificateId  Bytes?                          @db.ByteA
+  currentThumbprint     Bytes?                          @db.ByteA
+  currentFcipDigest     Bytes?                          @db.ByteA
+  currentFcpcDigest     Bytes?                          @db.ByteA
+  proposedCertificateId Bytes                           @unique @db.ByteA
+  proposedGeneration    Decimal                         @db.Decimal(20, 0)
+  proposedThumbprint    Bytes?                          @db.ByteA
+  proposedPublicKeyX    Bytes?                          @db.ByteA
+  proposedPublicKeyY    Bytes?                          @db.ByteA
+  terminalReason        String?
+  createdAt             DateTime                        @default(now())
+  expiresAt             DateTime
+  terminalAt            DateTime?
+
+  @@index([deviceId, state])
+  @@map("remote_certificate_operations")
+}
+
+/// Device revocation operation. `revocationRequestId` is server-generated and
+/// distinct from a mutation `requestId`. `expectedGeneration` guards the target
+/// certificate generation; `actorMode` follows `RevocationActorMode`; `reason`
+/// is the caller-supplied revocation reason and `terminalReason` follows
+/// `RevocationTerminalReason` at the API layer.
+model RemoteIdentityRevocationOperation {
+  revocationRequestId  Bytes                     @id @db.ByteA
+  deviceId             Bytes                     @db.ByteA
+  expectedGeneration   Decimal                   @db.Decimal(20, 0)
+  actorMode            RemoteRevocationActorMode
+  reason               String?
+  state                RemoteRevocationState
+  currentCertificateId Bytes?                    @db.ByteA
+  currentThumbprint    Bytes?                    @db.ByteA
+  evidenceDigest       Bytes?                    @db.ByteA
+  approvalDigest       Bytes?                    @db.ByteA
+  terminalReason       String?
+  createdAt            DateTime                  @default(now())
+  expiresAt            DateTime
+  terminalAt           DateTime?
+
+  @@index([deviceId, state])
+  @@map("remote_identity_revocation_operations")
+}

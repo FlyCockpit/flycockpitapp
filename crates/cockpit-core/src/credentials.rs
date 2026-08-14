@@ -320,18 +320,23 @@ fn lock_credential_file(path: &Path) -> Result<std::fs::File> {
 
 #[cfg(unix)]
 fn open_private_lock_file(path: &Path) -> Result<std::fs::File> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(path)
-        .with_context(|| format!("opening credential lock {}", path.display()))?;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("chmod 0600 {}", path.display()))?;
+    // Route through the no-follow funnel: the lock file is opened via `openat`
+    // (O_NOFOLLOW, no O_TRUNC) anchored to the held, verified 0700 parent fd,
+    // then fchmod'ed 0600 and re-verified through that fd — not a path-following
+    // open + path chmod that a planted symlink could redirect.
+    let parent = path.parent().ok_or_else(|| {
+        anyhow::anyhow!("credential lock {} has no parent directory", path.display())
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        anyhow::anyhow!("credential lock {} has no file name", path.display())
+    })?;
+    let file = crate::private_fs::open_private_file_at(
+        parent,
+        name,
+        crate::private_fs::PrivateFileAccess::ReadWrite,
+        "credential lock",
+    )
+    .with_context(|| format!("opening credential lock {}", path.display()))?;
     Ok(file)
 }
 

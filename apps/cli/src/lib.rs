@@ -856,12 +856,86 @@ fn open_log_file_at(dir: PathBuf) -> Option<RotatingLog> {
 }
 fn rotate_log_state(state: &mut RotatingLogState) -> std::io::Result<()> {
     state.file.flush()?;
-    rotate_log_files(&state.dir)?;
-    let path = state.dir.join("cockpit.log");
-    state.file = open_private_append(&path)?;
+    #[cfg(unix)]
+    {
+        // Hold the log directory ONCE through the no-follow component walk, then
+        // do the entire rotation (unlinkat/renameat) AND the re-open through that
+        // single held fd. An attacker who swaps the log-directory entry with a
+        // symlink between steps cannot redirect the deletes/renames/open into an
+        // attacker-selected directory, because nothing is re-resolved by name.
+        let dir_fd = cockpit_core::private_fs::open_private_dir_handle(&state.dir)
+            .map_err(std::io::Error::other)?;
+        rotate_log_files_fd(&dir_fd)?;
+        state.file = cockpit_core::private_fs::open_private_file_in_dir_fd(
+            &dir_fd,
+            std::ffi::OsStr::new("cockpit.log"),
+            cockpit_core::private_fs::PrivateFileAccess::Append,
+            "cockpit log",
+        )
+        .map_err(std::io::Error::other)?;
+    }
+    #[cfg(not(unix))]
+    {
+        rotate_log_files(&state.dir)?;
+        let path = state.dir.join("cockpit.log");
+        state.file = open_private_append(&path)?;
+    }
     state.len = 0;
     Ok(())
 }
+
+/// Fd-anchored rotation: unlink the oldest backup and shift each remaining
+/// backup up by one, all via `unlinkat`/`renameat` relative to the held log
+/// directory fd. A missing entry (`ENOENT`) is tolerated; any other error
+/// propagates. No pathname is resolved, so an entry-swap cannot redirect it.
+#[cfg(unix)]
+fn rotate_log_files_fd(dir_fd: &std::fs::File) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+
+    let tolerate_enoent = |result: i32| -> std::io::Result<()> {
+        if result == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    };
+    let cname = |name: String| -> std::io::Result<CString> {
+        CString::new(name).map_err(|_| std::io::Error::other("log entry name contains NUL"))
+    };
+
+    let oldest = cname(format!("cockpit.log.{LOG_BACKUP_COUNT}"))?;
+    tolerate_enoent(unsafe { libc::unlinkat(dir_fd.as_raw_fd(), oldest.as_ptr(), 0) })?;
+    for index in (1..LOG_BACKUP_COUNT).rev() {
+        let from = cname(format!("cockpit.log.{index}"))?;
+        let to = cname(format!("cockpit.log.{}", index + 1))?;
+        tolerate_enoent(unsafe {
+            libc::renameat(
+                dir_fd.as_raw_fd(),
+                from.as_ptr(),
+                dir_fd.as_raw_fd(),
+                to.as_ptr(),
+            )
+        })?;
+    }
+    let current = cname("cockpit.log".to_string())?;
+    let first = cname("cockpit.log.1".to_string())?;
+    tolerate_enoent(unsafe {
+        libc::renameat(
+            dir_fd.as_raw_fd(),
+            current.as_ptr(),
+            dir_fd.as_raw_fd(),
+            first.as_ptr(),
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
 fn rotate_log_files(dir: &Path) -> std::io::Result<()> {
     let oldest = dir.join(format!("cockpit.log.{}", LOG_BACKUP_COUNT));
     if oldest.exists() {
@@ -881,12 +955,20 @@ fn rotate_log_files(dir: &Path) -> std::io::Result<()> {
 }
 #[cfg(unix)]
 fn open_private_append(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).append(true).mode(0o600);
-    let file = options.open(path)?;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    Ok(file)
+    // No-follow funnel: openat(O_APPEND|O_NOFOLLOW, no O_TRUNC) anchored to the
+    // held, verified 0700 log directory fd + held-fd fchmod 0600, instead of a
+    // path-following open + path chmod a planted symlink could redirect.
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("log path has no file name"))?;
+    cockpit_core::private_fs::open_private_file_at(
+        parent,
+        name,
+        cockpit_core::private_fs::PrivateFileAccess::Append,
+        "cockpit log",
+    )
+    .map_err(std::io::Error::other)
 }
 #[cfg(not(unix))]
 fn open_private_append(path: &Path) -> std::io::Result<std::fs::File> {
@@ -1014,5 +1096,69 @@ mod tests {
             })
             .sum();
         assert!(total <= LOG_FILE_MAX_BYTES * (LOG_BACKUP_COUNT as u64 + 1));
+    }
+
+    // FINDING B: rotation is fd-anchored. Given a held directory fd, the shift
+    // happens via unlinkat/renameat relative to that fd (no pathname lookup).
+    #[cfg(unix)]
+    #[test]
+    fn log_rotation_is_fd_anchored() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("cockpit");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(log_dir.join("cockpit.log"), b"CURRENT").unwrap();
+        std::fs::write(log_dir.join("cockpit.log.1"), b"BACKUP-1").unwrap();
+
+        let dir_fd = cockpit_core::private_fs::open_private_dir_handle(&log_dir).unwrap();
+        rotate_log_files_fd(&dir_fd).unwrap();
+
+        assert_eq!(
+            std::fs::read(log_dir.join("cockpit.log.1")).unwrap(),
+            b"CURRENT",
+            "current log must shift to .1"
+        );
+        assert_eq!(
+            std::fs::read(log_dir.join("cockpit.log.2")).unwrap(),
+            b"BACKUP-1",
+            ".1 must shift to .2"
+        );
+        assert!(
+            !log_dir.join("cockpit.log").exists(),
+            "the current log name must be free for the fresh re-open"
+        );
+    }
+
+    // FINDING B: an attacker who swaps the log-directory entry with a symlink
+    // must not get rotation/logging to operate inside the symlink's target. The
+    // no-follow directory resolution refuses it, so log setup returns None
+    // (logging disabled) and the victim directory is left untouched.
+    #[cfg(unix)]
+    #[test]
+    fn log_setup_refuses_symlinked_log_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let victim = root.path().join("victim-logs");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(victim.join("cockpit.log.1"), b"VICTIM-BACKUP").unwrap();
+
+        // The path cockpit is told to use is a symlink to the victim directory.
+        let link = root.path().join("cockpit");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+        assert!(
+            open_log_file_at(link).is_none(),
+            "a symlinked log directory must disable logging, not follow the swap"
+        );
+        assert_eq!(
+            std::fs::read(victim.join("cockpit.log.1")).unwrap(),
+            b"VICTIM-BACKUP",
+            "the victim directory must be untouched"
+        );
+        assert!(
+            !victim.join("cockpit.log").exists(),
+            "no log file may be created inside the victim"
+        );
     }
 }

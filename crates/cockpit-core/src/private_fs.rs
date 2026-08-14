@@ -272,38 +272,306 @@ fn verify_and_repair_dir(dir: &std::fs::File, label: &Path) -> Result<(), Privat
     )
 }
 
+/// Whether a symlink component may be followed, decided **from the held parent
+/// directory fd's own metadata** (never the symlink entry's). Following is
+/// permitted only when the parent directory is owned by root (uid 0) *and* has
+/// no group/world write bit (`mode & 0o022 == 0`): a directory a non-root
+/// attacker cannot create, rename, or unlink entries in, so the symlink entry is
+/// immutable to the attacker and cannot have been planted or relocated there.
+///
+/// Gating on the parent (not the symlink) closes two holes in an inode-owner
+/// check: the symlink entry — not its inode — is what an attacker who controls a
+/// writable parent can swap or relocate, and the parent fd is already held so the
+/// decision is TOCTOU-free. The one legitimate case still works: Fedora's
+/// `/home` -> `/var/home` lives directly in `/`, which is root-owned `0755`.
+#[cfg(unix)]
+fn parent_permits_symlink_follow(parent_uid: u32, parent_mode: u32) -> bool {
+    parent_uid == 0 && (parent_mode & 0o022) == 0
+}
+
+/// Resolve `path` to a held directory fd via a **no-follow component walk** from
+/// a trusted root, optionally creating each missing component.
+///
+/// This is the confused-deputy defence: the directory is never resolved by
+/// following an attacker-influenceable symlink. Every component is opened
+/// `O_DIRECTORY|O_NOFOLLOW` from the held parent fd; a symlink component is
+/// refused with `Containment` **unless the held parent directory is root-owned
+/// and not group/world-writable** (see [`parent_permits_symlink_follow`]) — the
+/// only place a symlink an attacker cannot have planted can live (e.g. Fedora
+/// `/home` -> `/var/home` in `/`) — in which case it is followed once and the
+/// walk continues no-follow beneath it. No component reachable in an
+/// attacker-writable directory is ever resolved by following a symlink.
+///
+/// With `create`, a missing component is made with `mkdirat` (then re-opened
+/// no-follow — a symlink raced into the name after `mkdirat` is still refused)
+/// and `fchmod`'ed to exactly `0700` through its held fd. Without `create`, a
+/// missing component surfaces the underlying `NotFound` so callers can branch.
+#[cfg(unix)]
+fn walk_private_dir(path: &Path, create: bool) -> Result<std::fs::File, PrivateFsError> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Component;
+
+    // Decompose into a trusted anchor plus the ordered normal components.
+    let mut absolute = false;
+    let mut names: Vec<&std::ffi::OsStr> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => absolute = true,
+            Component::CurDir => {}
+            Component::Normal(name) => names.push(name),
+            Component::ParentDir => {
+                return Err(PrivateFsError::Containment(format!(
+                    "{}: refused, path contains `..`",
+                    path.display()
+                )));
+            }
+            Component::Prefix(_) => {
+                return Err(PrivateFsError::Containment(format!(
+                    "{}: refused, unexpected path prefix",
+                    path.display()
+                )));
+            }
+        }
+    }
+
+    // The anchor is either the filesystem root (`/` can never be a symlink) or,
+    // for a relative path, the current directory. Both are trusted starting
+    // points; only the components below are attacker-influenceable.
+    let anchor = if absolute {
+        unsafe {
+            libc::open(
+                c"/".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        }
+    } else {
+        unsafe {
+            libc::open(
+                c".".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        }
+    };
+    if anchor < 0 {
+        return Err(PrivateFsError::io(
+            format!("opening filesystem anchor for {}", path.display()),
+            std::io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `anchor` was just returned by open and is uniquely owned.
+    let mut dir = unsafe { std::fs::File::from_raw_fd(anchor) };
+
+    for name in names {
+        let cname = CString::new(name.as_bytes()).map_err(|_| {
+            PrivateFsError::Containment(format!(
+                "{}: path component {name:?} contains NUL",
+                path.display()
+            ))
+        })?;
+
+        // First try the component as an existing no-follow directory.
+        let existing = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                cname.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if existing >= 0 {
+            // SAFETY: `existing` was just returned by openat and is uniquely owned.
+            dir = unsafe { std::fs::File::from_raw_fd(existing) };
+            continue;
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            // A symlink component. Decide whether it may be followed from the
+            // HELD PARENT fd's metadata (TOCTOU-free) — never from the symlink
+            // entry. Follow once only when the parent is a directory a non-root
+            // attacker cannot write entries into (root-owned, no group/world
+            // write), so the symlink could not have been planted or relocated
+            // there. Otherwise refuse every symlink component.
+            // A symlink component surfaces as ELOOP, or — on Linux, opening a
+            // symlink with O_DIRECTORY|O_NOFOLLOW — as ENOTDIR (errno 20), which
+            // also covers a genuine non-directory. Decide follow/refuse from the
+            // HELD PARENT fd's metadata (TOCTOU-free) — never from the entry.
+            // Follow once only when the parent is a directory a non-root attacker
+            // cannot write entries into (root-owned, no group/world write), so the
+            // symlink could not have been planted, relocated, or swapped there.
+            Some(code) if code == libc::ELOOP || code == libc::ENOTDIR => {
+                use std::os::unix::fs::MetadataExt;
+                let pmeta = dir.metadata().map_err(|e| {
+                    PrivateFsError::io(
+                        format!(
+                            "stat parent of component {name:?} under {}",
+                            path.display()
+                        ),
+                        e,
+                    )
+                })?;
+                if !parent_permits_symlink_follow(pmeta.uid(), pmeta.mode()) {
+                    return Err(PrivateFsError::Containment(format!(
+                        "component {name:?} under {} is a symlink or non-directory in an \
+                         attacker-writable or non-root-owned directory",
+                        path.display()
+                    )));
+                }
+                // The parent is root-owned and not group/world-writable, so a
+                // non-root attacker cannot modify the entry — it is immutable to
+                // them. `fstatat` no-follow distinguishes a (followable, trusted
+                // system) symlink such as Fedora `/home`->`/var/home` from a
+                // genuine non-directory; TOCTOU-free because the parent cannot
+                // change under a non-root attacker.
+                let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+                let rc = unsafe {
+                    libc::fstatat(
+                        dir.as_raw_fd(),
+                        cname.as_ptr(),
+                        stat.as_mut_ptr(),
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                };
+                if rc != 0 {
+                    return Err(PrivateFsError::io(
+                        format!("stat component {name:?} under {}", path.display()),
+                        std::io::Error::last_os_error(),
+                    ));
+                }
+                // SAFETY: `fstatat` returned 0, so `stat` is initialised.
+                let stat = unsafe { stat.assume_init() };
+                if u32::from(stat.st_mode) & u32::from(libc::S_IFMT)
+                    != u32::from(libc::S_IFLNK)
+                {
+                    return Err(PrivateFsError::Containment(format!(
+                        "component {name:?} under {} is not a directory",
+                        path.display()
+                    )));
+                }
+                // Follow the trusted-parent system symlink once; the walk resumes
+                // no-follow beneath it. Safe: the parent is immutable to a
+                // non-root attacker, so there is no swap window.
+                let followed = unsafe {
+                    libc::openat(
+                        dir.as_raw_fd(),
+                        cname.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                    )
+                };
+                if followed < 0 {
+                    return Err(PrivateFsError::io(
+                        format!(
+                            "following trusted-parent symlink component {name:?} under {}",
+                            path.display()
+                        ),
+                        std::io::Error::last_os_error(),
+                    ));
+                }
+                // SAFETY: `followed` was just returned by openat and is uniquely owned.
+                dir = unsafe { std::fs::File::from_raw_fd(followed) };
+            }
+            Some(code) if code == libc::ENOENT => {
+                if !create {
+                    return Err(PrivateFsError::io(
+                        format!("opening directory {}", path.display()),
+                        error,
+                    ));
+                }
+                // Create the missing component, then re-open it no-follow so a
+                // symlink raced into the name after `mkdirat` is still refused.
+                let made = unsafe { libc::mkdirat(dir.as_raw_fd(), cname.as_ptr(), 0o700) };
+                let created = if made == 0 {
+                    true
+                } else {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        false
+                    } else {
+                        return Err(PrivateFsError::io(
+                            format!(
+                                "creating directory component {name:?} under {}",
+                                path.display()
+                            ),
+                            error,
+                        ));
+                    }
+                };
+                let fd = unsafe {
+                    libc::openat(
+                        dir.as_raw_fd(),
+                        cname.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if fd < 0 {
+                    let error = std::io::Error::last_os_error();
+                    return Err(match error.raw_os_error() {
+                        Some(code) if code == libc::ELOOP || code == libc::ENOTDIR => {
+                            PrivateFsError::Containment(format!(
+                                "component {name:?} under {} is a symlink or non-directory",
+                                path.display()
+                            ))
+                        }
+                        _ => PrivateFsError::io(
+                            format!(
+                                "opening directory component {name:?} under {}",
+                                path.display()
+                            ),
+                            error,
+                        ),
+                    });
+                }
+                // SAFETY: `fd` was just returned by openat and is uniquely owned.
+                dir = unsafe { std::fs::File::from_raw_fd(fd) };
+                if created {
+                    // `File::set_permissions` is `fchmod` on the held fd.
+                    dir.set_permissions(std::fs::Permissions::from_mode(0o700))
+                        .map_err(|e| {
+                            PrivateFsError::io(
+                                format!("chmod 0700 component {name:?} under {}", path.display()),
+                                e,
+                            )
+                        })?;
+                }
+            }
+            _ => {
+                return Err(classify_dir_open_error(path, error));
+            }
+        }
+    }
+    Ok(dir)
+}
+
 // ------------------------------------------------------------------------
 // ensure_private_dir
 // ------------------------------------------------------------------------
 
 /// Ensure `path` is an owner-only (`0700`) directory, creating it if absent and
-/// repairing a self-owned wide directory. A symlinked leaf, a foreign owner, or
-/// a non-directory is refused. Symlinked *ancestors* stay legitimate (macOS
-/// resolves `/var` to `/private/var`): only the final component is opened
-/// no-follow and mode-enforced.
+/// repairing a self-owned wide directory. Resolution is a no-follow component
+/// walk from a trusted root ([`walk_private_dir`]): a symlinked leaf, a
+/// symlinked *intermediate component* (whether pre-existing or raced in), a
+/// foreign owner, or a non-directory is refused. A symlink component is followed
+/// only when its held parent directory is root-owned and not group/world-writable
+/// (so an attacker could not have placed it) — any symlink reachable in an
+/// attacker-writable directory is `Containment`, closing the confused-deputy
+/// window an attacker-controlled ancestor would otherwise open.
 #[cfg(unix)]
 pub fn ensure_private_dir(path: &Path) -> Result<(), PrivateFsError> {
-    match open_dir_nofollow(path) {
-        Ok(dir) => verify_and_repair_dir(&dir, path),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if let Some(parent) = path.parent()
-                && !parent.as_os_str().is_empty()
-            {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| PrivateFsError::io(format!("creating {}", parent.display()), e))?;
-            }
-            match std::fs::create_dir(path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => {
-                    return Err(PrivateFsError::io(format!("creating {}", path.display()), e));
-                }
-            }
-            let dir = open_dir_nofollow(path).map_err(|e| classify_dir_open_error(path, e))?;
-            verify_and_repair_dir(&dir, path)
-        }
-        Err(error) => Err(classify_dir_open_error(path, error)),
-    }
+    let dir = walk_private_dir(path, true)?;
+    verify_and_repair_dir(&dir, path)
+}
+
+/// Open an **existing** private directory to a held fd via the same no-follow
+/// component walk, then verify/repair it to `0700`/self-owned. Public so a
+/// caller performing several effects in one directory (e.g. log rotation plus a
+/// re-open) can anchor them all to a single held fd rather than re-resolving the
+/// path between steps.
+#[cfg(unix)]
+pub fn open_private_dir_handle(dir: &Path) -> Result<std::fs::File, PrivateFsError> {
+    let handle = walk_private_dir(dir, false)?;
+    verify_and_repair_dir(&handle, dir)?;
+    Ok(handle)
 }
 
 #[cfg(not(unix))]
@@ -544,54 +812,350 @@ fn atomic_write_dir(path: &Path) -> &Path {
     }
 }
 
+/// Create a fresh `O_EXCL` temp entry moded `0600`, anchored to the held
+/// destination-directory fd. `O_EXCL` guarantees a brand-new name (never an
+/// attacker's pre-existing symlink) and `O_NOFOLLOW` is belt-and-suspenders;
+/// `0600` is set at create time so no byte is ever written through a wider mode.
+#[cfg(unix)]
+fn openat_create_private_excl(
+    dir: &std::fs::File,
+    name: &std::ffi::CStr,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            // Variadic `openat` mode: promote to `c_uint` (`mode_t` is `u16` on
+            // Apple targets, which cannot be passed to a C variadic directly).
+            0o600 as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just returned by openat and is uniquely owned.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// Create a uniquely-named temp entry beneath the held directory fd, retrying a
+/// bounded number of times on the (vanishing) chance an `O_EXCL` name collides.
+#[cfg(unix)]
+fn create_temp_in(
+    dir: &std::fs::File,
+    target: &Path,
+) -> Result<(std::fs::File, std::ffi::CString)> {
+    use rand::Rng as _;
+    for _ in 0..32 {
+        let mut raw = [0u8; 16];
+        rand::rng().fill_bytes(&mut raw);
+        let name = format!(".tmp-{}", crate::intel::hex_lower(&raw));
+        let cname = std::ffi::CString::new(name).expect("hex temp name has no NUL");
+        match openat_create_private_excl(dir, &cname) {
+            Ok(file) => return Ok((file, cname)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(anyhow::Error::from(error))
+                    .with_context(|| format!("creating temp file for {}", target.display()));
+            }
+        }
+    }
+    anyhow::bail!("could not create a unique temp file for {}", target.display())
+}
+
+/// Best-effort `unlinkat` cleanup of a temp entry beneath the held fd. Errors
+/// are ignored: the temp is already unreachable to callers, and the failure
+/// path that triggers cleanup carries its own error.
+#[cfg(unix)]
+fn unlinkat_best_effort(dir: &std::fs::File, name: &std::ffi::CStr) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `dir` is a live directory fd and `name` lives across the call.
+    unsafe {
+        libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0);
+    }
+}
+
+/// Refuse a hostile pre-existing write target, probed no-follow through the
+/// held directory fd (`fstatat` + `AT_SYMLINK_NOFOLLOW`). A symlink, a
+/// directory, a non-regular file, or a hard-linked (`nlink != 1`) target is
+/// refused so the atomic rename never silently replaces an attacker-planted
+/// object nor lets a secret become visible through a second hard link. An
+/// absent target (fresh create) and an owner's own singly-linked regular file
+/// (the intentional credential-overwrite case) are permitted.
+#[cfg(unix)]
+fn refuse_hostile_target(
+    dir: &std::fs::File,
+    name: &std::ffi::CStr,
+    label: &Path,
+) -> Result<(), PrivateFsError> {
+    use std::os::fd::AsRawFd;
+
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        return Err(PrivateFsError::io(
+            format!("probing write target {}", label.display()),
+            error,
+        ));
+    }
+    // SAFETY: `fstatat` returned 0, so `stat` is initialised.
+    let stat = unsafe { stat.assume_init() };
+    let kind = u32::from(stat.st_mode) & u32::from(libc::S_IFMT);
+    if kind == u32::from(libc::S_IFLNK) {
+        return Err(PrivateFsError::Containment(format!(
+            "{}: write target is a symlink",
+            label.display()
+        )));
+    }
+    if kind != u32::from(libc::S_IFREG) {
+        return Err(PrivateFsError::Containment(format!(
+            "{}: write target is not a regular file",
+            label.display()
+        )));
+    }
+    if u64::from(stat.st_nlink) != 1 {
+        return Err(PrivateFsError::MultiplyLinked(format!(
+            "{}: write target has {} hard links",
+            label.display(),
+            stat.st_nlink
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
 
     let dir = atomic_write_dir(path);
+    let final_name = path.file_name().ok_or_else(|| {
+        anyhow::anyhow!("write target {} has no final path component", path.display())
+    })?;
+    let final_c = std::ffi::CString::new(final_name.as_bytes())
+        .with_context(|| format!("write target {} name contains NUL", path.display()))?;
 
-    // Hold the destination directory's descriptor before the write so the
-    // post-rename fsync is issued against an opened handle rather than a fresh
-    // path lookup. NOTE: the temp create and `persist` below still resolve
-    // `dir`/`path` by name, so a *same-uid* rename of `dir` between this open and
-    // the rename could still redirect the write; that residual window is out of
-    // the cross-user threat model (the parent is a 0700 owner-only directory
-    // verified through its own held fd, so only the owner can race it). Fully
-    // handle-anchored writes (openat/renameat relative to this fd) land with the
-    // `private-fs-primitive-consolidation` follow-up.
-    let dir_handle = std::fs::File::open(dir)
-        .with_context(|| format!("opening {} for the durability barrier", dir.display()))?;
+    // Hold the destination directory through a no-follow component walk from a
+    // trusted root (`walk_private_dir`): no ancestor is resolved by following a
+    // symlink reachable in an attacker-writable directory, so an attacker who
+    // controls an ancestor of a user-chosen export directory cannot redirect the
+    // write elsewhere (a symlink is followed only when its held parent is
+    // root-owned and not group/world-writable). Every subsequent effect — temp
+    // create, target probe, rename, durability fsync — is then anchored to THIS
+    // fd via openat/fstatat/renameat, so there is no path re-resolution between
+    // the open and the use. The directory's own mode/ownership is not enforced
+    // here because this shared funnel also backs user-chosen session exports,
+    // whose destination is legitimately a shared (non-0700, possibly not
+    // self-owned) directory; the secret's confidentiality is carried by the 0600
+    // O_EXCL temp, the non-following renameat, and the hostile-target refusal
+    // below, and the credential path establishes its 0700 parent through
+    // `ensure_parent_dir_private` before ever reaching this funnel.
+    let dir_handle = walk_private_dir(dir, false)?;
 
-    // Crash-safe atomic replacement: write the full payload into a fresh temp
-    // entry in the SAME directory, fsync it, rename it over the target, then
-    // fsync the held directory descriptor so the rename itself is durable. A
-    // crash at any point leaves either the previous file intact or the complete
-    // new file, never a truncated or half-written secret. The temp entry is
-    // created O_EXCL and moded to 0600 *before* any bytes are written, and
-    // `NamedTempFile` removes it on every error path — so a failed write never
-    // leaves a partial file at the target and never widens permissions.
-    let mut temp = tempfile::NamedTempFile::new_in(dir)
-        .with_context(|| format!("creating temp file for {}", path.display()))?;
-    temp.as_file()
-        .set_permissions(std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("chmod 0600 temp file for {}", path.display()))?;
-    temp.write_all(bytes)
-        .with_context(|| format!("writing temp file for {}", path.display()))?;
-    temp.as_file_mut()
-        .flush()
-        .with_context(|| format!("flushing temp file for {}", path.display()))?;
-    temp.as_file()
-        .sync_all()
-        .with_context(|| format!("fsync temp file for {}", path.display()))?;
-    temp.persist(path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("atomically replacing {}", path.display()))?;
+    // Refuse a hostile pre-existing target (symlink / directory / hard-linked)
+    // before writing; the rename below is non-following regardless, so a secret
+    // is never disclosed through a planted link even under a race.
+    refuse_hostile_target(&dir_handle, &final_c, path)?;
+
+    // Crash-safe atomic replacement, fully fd-anchored: write the payload into a
+    // fresh O_EXCL temp entry (moded 0600 at create) beneath the held dir fd,
+    // fsync it, renameat it over the target relative to the SAME fd, then fsync
+    // the held directory fd so the rename itself is durable. A crash at any
+    // point leaves either the previous file intact or the complete new file.
+    let (mut temp, temp_c) = create_temp_in(&dir_handle, path)?;
+    let staged = (|| -> Result<()> {
+        temp.write_all(bytes)
+            .with_context(|| format!("writing temp file for {}", path.display()))?;
+        temp.flush()
+            .with_context(|| format!("flushing temp file for {}", path.display()))?;
+        temp.sync_all()
+            .with_context(|| format!("fsync temp file for {}", path.display()))?;
+        Ok(())
+    })();
+    if let Err(error) = staged {
+        unlinkat_best_effort(&dir_handle, &temp_c);
+        return Err(error);
+    }
+
+    // Integrity guard against a source-substitution race in an attacker-writable
+    // export directory: the renameat below re-looks-up the temp by NAME, so a
+    // different-uid attacker with write access to the directory could unlink our
+    // `.tmp-<rand>` entry and replace it (with their own file or a symlink)
+    // between the O_EXCL create and this rename, causing us to publish THEIR
+    // inode under the final name. Confidentiality is unaffected — the secret
+    // bytes live only in our held 0600 inode, never written through the name —
+    // but to also preserve integrity we re-`fstatat` the name no-follow and
+    // require it to still be our held inode (matching st_dev/st_ino from the
+    // held fd's fstat), aborting the publish on mismatch. This is best-effort:
+    // the fstatat→renameat pair is itself a window, so a fully race-free publish
+    // would need O_TMPFILE + linkat(AT_EMPTY_PATH), which is not portable here;
+    // the residual is an integrity-only substitution possible solely in a
+    // user-chosen, attacker-writable export directory, never for credentials
+    // (whose parent is a self-owned 0700 directory no other user can write).
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let held = temp
+            .metadata()
+            .with_context(|| format!("fstat temp file for {}", path.display()))?;
+        let mut named = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let stat_ok = unsafe {
+            libc::fstatat(
+                dir_handle.as_raw_fd(),
+                temp_c.as_ptr(),
+                named.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } == 0;
+        // SAFETY: only read `named` when fstatat succeeded.
+        let matches = stat_ok && {
+            let named = unsafe { named.assume_init() };
+            // `as u64`: `dev_t`/`ino_t` widths differ across Unix targets.
+            named.st_dev as u64 == held.dev() && named.st_ino as u64 == held.ino()
+        };
+        if !matches {
+            unlinkat_best_effort(&dir_handle, &temp_c);
+            anyhow::bail!(
+                "aborting write of {}: staged temp entry was substituted before publish",
+                path.display()
+            );
+        }
+    }
+
+    // renameat within the held directory fd: atomic, and it replaces the target
+    // NAME without following a symlink at that name.
+    let renamed = unsafe {
+        libc::renameat(
+            dir_handle.as_raw_fd(),
+            temp_c.as_ptr(),
+            dir_handle.as_raw_fd(),
+            final_c.as_ptr(),
+        )
+    };
+    if renamed != 0 {
+        let error = std::io::Error::last_os_error();
+        unlinkat_best_effort(&dir_handle, &temp_c);
+        return Err(anyhow::Error::from(error))
+            .with_context(|| format!("atomically replacing {}", path.display()));
+    }
 
     dir_handle
         .sync_all()
         .with_context(|| format!("fsync directory {}", dir.display()))?;
     Ok(())
+}
+
+/// Access pattern for [`open_private_file_at`], keeping libc flags off the call
+/// sites. `ReadWrite` is `O_RDWR` (lock files); `Append` is `O_WRONLY|O_APPEND`
+/// (rotating logs). Both add `O_CREAT` and never `O_TRUNC`.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivateFileAccess {
+    ReadWrite,
+    Append,
+}
+
+/// Open (creating if absent) a `0600` owner-only file `name` inside an
+/// **already-held, verified** private directory fd `dir_fd`. The file is opened
+/// via `openat` with `O_NOFOLLOW` (a symlink at the name is refused with
+/// `Containment`, never followed into an attacker's file), then `fchmod`'ed to
+/// `0600` through the held fd and re-verified (self-owned, singly-linked,
+/// regular, exactly `0600`) via `fstat` on the fd. Never uses `O_TRUNC`, so an
+/// existing lock file or log survives. Callers holding a directory fd across
+/// several effects (e.g. log rotation + re-open) use this so every operation is
+/// anchored to the SAME fd with no path re-resolution between steps.
+#[cfg(unix)]
+pub fn open_private_file_in_dir_fd(
+    dir_fd: &std::fs::File,
+    name: &std::ffi::OsStr,
+    access: PrivateFileAccess,
+    label: &str,
+) -> Result<std::fs::File, PrivateFsError> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let cname = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+        PrivateFsError::Containment(format!("{label}: file name {name:?} contains NUL"))
+    })?;
+    let access_flags = match access {
+        PrivateFileAccess::ReadWrite => libc::O_RDWR,
+        PrivateFileAccess::Append => libc::O_WRONLY | libc::O_APPEND,
+    };
+    let fd = unsafe {
+        libc::openat(
+            dir_fd.as_raw_fd(),
+            cname.as_ptr(),
+            access_flags | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600 as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        return Err(match error.raw_os_error() {
+            Some(code) if code == libc::ELOOP => {
+                PrivateFsError::Containment(format!("{label}: {name:?} is a symlink"))
+            }
+            _ => PrivateFsError::io(format!("opening {label} file {name:?}"), error),
+        });
+    }
+    // SAFETY: `fd` was just returned by openat and is uniquely owned.
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+
+    // Enforce 0600 through the held fd (fchmod, not a path chmod) then verify.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| PrivateFsError::io(format!("chmod 0600 {label} file"), e))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| PrivateFsError::io(format!("stat {label} file"), e))?;
+    let actual = if meta.is_file() {
+        EntryKind::File
+    } else {
+        EntryKind::Directory
+    };
+    let permission = if meta.mode() & 0o777 == 0o600 {
+        PermissionOutcome::Private
+    } else {
+        PermissionOutcome::Insecure
+    };
+    private_object_verdict(
+        &format!("{label} file"),
+        u64::from(meta.uid()),
+        effective_uid(),
+        meta.nlink(),
+        EntryKind::File,
+        actual,
+        permission,
+    )?;
+    Ok(file)
+}
+
+/// Open (creating if absent) a `0600` owner-only file `name` inside the private
+/// directory `parent`. `parent` is resolved to a held fd by the no-follow
+/// component walk ([`open_private_dir_handle`]) — so no ancestor is reached by
+/// following a user/attacker-owned symlink — then the file is opened through
+/// that fd by [`open_private_file_in_dir_fd`].
+#[cfg(unix)]
+pub fn open_private_file_at(
+    parent: &Path,
+    name: &std::ffi::OsStr,
+    access: PrivateFileAccess,
+    label: &str,
+) -> Result<std::fs::File, PrivateFsError> {
+    let dir_fd = open_private_dir_handle(parent)?;
+    open_private_file_in_dir_fd(&dir_fd, name, access, label)
 }
 
 #[cfg(not(unix))]
@@ -1086,5 +1650,252 @@ mod tests {
             !after.windows(b"NEW-SECRET-PAYLOAD".len()).any(|w| w == b"NEW-SECRET-PAYLOAD"),
             "the new secret must never be written into the victim on a failed write"
         );
+    }
+
+    // -- handle-anchored write refuses a symlinked target (Unix, AC5) -----
+
+    // A symlink planted at the write target must be refused (`Containment`) and
+    // the victim it points to must be byte-identical and never observe the
+    // secret. The predecessor's path-based `persist` silently *replaced* the
+    // symlink and returned `Ok(())`; the fd-anchored funnel refuses the
+    // hostile pre-existing target explicitly via an `fstatat` no-follow probe.
+    #[cfg(unix)]
+    #[test]
+    fn private_fs_security_write_refuses_symlinked_target_without_disclosing_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        // Victim with a known sentinel, OUTSIDE the write directory.
+        let victim = root.path().join("victim-secret");
+        std::fs::write(&victim, b"VICTIM-SENTINEL").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // A private 0700 write directory with a symlink planted at the target.
+        let dir = root.path().join("store");
+        ensure_private_dir(&dir).expect("ensure private dir");
+        let target = dir.join("creds.json");
+        std::os::unix::fs::symlink(&victim, &target).unwrap();
+
+        let error = write_private_file(&target, b"TOP-SECRET-PAYLOAD").unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<PrivateFsError>(),
+                Some(PrivateFsError::Containment(_))
+            ),
+            "a symlinked write target must be refused with Containment, got {error:?}"
+        );
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"VICTIM-SENTINEL",
+            "the symlink victim must be byte-identical"
+        );
+        assert!(
+            !std::fs::read(&victim)
+                .unwrap()
+                .windows(b"TOP-SECRET-PAYLOAD".len())
+                .any(|w| w == b"TOP-SECRET-PAYLOAD"),
+            "the secret must never reach the victim"
+        );
+    }
+
+    // -- handle-anchored write refuses a hard-linked target (Unix, AC6) ---
+
+    // A hard link to the write target (nlink != 1) must be refused
+    // (`MultiplyLinked`) so a secret is never placed at an inode an attacker
+    // still aliases. The predecessor's `persist` returned `Ok(())` here.
+    #[cfg(unix)]
+    #[test]
+    fn private_fs_security_write_refuses_hard_linked_target() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let target = dir.path().join("creds.json");
+        std::fs::write(&target, b"OLD").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let alias = dir.path().join("attacker-alias");
+        std::fs::hard_link(&target, &alias).unwrap();
+
+        let error = write_private_file(&target, b"NEW-SECRET-PAYLOAD").unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<PrivateFsError>(),
+                Some(PrivateFsError::MultiplyLinked(_))
+            ),
+            "a hard-linked write target must be refused with MultiplyLinked, got {error:?}"
+        );
+        assert!(
+            !std::fs::read(&alias)
+                .unwrap()
+                .windows(b"NEW-SECRET-PAYLOAD".len())
+                .any(|w| w == b"NEW-SECRET-PAYLOAD"),
+            "the attacker alias must never observe the secret"
+        );
+    }
+
+    // -- write funnel still serves a shared (export) parent (Unix) --------
+
+    // The funnel also backs user-chosen session exports, whose destination is a
+    // legitimately shared, non-0700 directory the user may not own. Writing into
+    // a self-owned 0755 directory must still succeed and still produce a 0600
+    // file — a regression guard against re-imposing a 0700/owned parent check.
+    #[cfg(unix)]
+    #[test]
+    fn private_fs_security_write_succeeds_into_shared_parent_for_exports() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let shared = root.path().join("shared-export-dir");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let target = shared.join("export.json");
+        write_private_file(&target, b"EXPORTED-BYTES").expect("write into a 0755 shared parent");
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"EXPORTED-BYTES");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the exported secret file must still be 0600"
+        );
+        assert_eq!(
+            std::fs::metadata(&shared).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "the shared parent must not be tightened"
+        );
+    }
+
+    // -- ensure refuses a symlinked intermediate component (Unix, AC4) ----
+
+    // A symlink planted at an intermediate component that `ensure_private_dir`
+    // must create is refused (`Containment`) and no directory is created beneath
+    // the symlink's (dangling) target — the fix for `create_dir_all` following
+    // symlinks at each component. The component-wise `mkdirat` fails `EEXIST` on
+    // the planted symlink and the no-follow `openat` then rejects it with ELOOP.
+    #[cfg(unix)]
+    #[test]
+    fn private_fs_security_ensure_dir_refuses_symlinked_intermediate_component() {
+        let root = tempfile::tempdir().expect("tempdir");
+        // A dangling symlink at the intermediate component `mid`, pointing where
+        // `create_dir_all` would have created the victim tree.
+        let victim = root.path().join("victim-tree");
+        let mid = root.path().join("mid");
+        std::os::unix::fs::symlink(&victim, &mid).unwrap();
+
+        let target = mid.join("leaf");
+        let result = ensure_private_dir(&target);
+
+        assert!(
+            matches!(result, Err(PrivateFsError::Containment(_))),
+            "a symlinked intermediate component must be refused, got {result:?}"
+        );
+        assert!(
+            !victim.exists(),
+            "no directory may be created through the intermediate symlink"
+        );
+        assert!(
+            !target.exists(),
+            "the leaf must not be created beneath the victim"
+        );
+    }
+
+    // -- ensure refuses an intermediate symlink to a REAL dir (Unix, A) ---
+
+    // The confused-deputy regression for FINDING A: an attacker who controls an
+    // ancestor plants an intermediate symlink pointing at a REAL directory they
+    // own. The previous following-resolution (canonicalize / `O_DIRECTORY`
+    // without `O_NOFOLLOW`) would have resolved THROUGH it and created the leaf
+    // inside the attacker's directory. The no-follow component walk refuses the
+    // symlink component (its parent — a user tempdir — is not a trusted,
+    // root-owned, non-writable directory) with `Containment` and creates nothing.
+    #[cfg(unix)]
+    #[test]
+    fn private_fs_security_ensure_dir_refuses_intermediate_symlink_to_real_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        // A REAL attacker-controlled directory the symlink points into.
+        let victim = root.path().join("attacker-dir");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        // The intermediate component `mid` is a (user-owned) symlink to victim.
+        let mid = root.path().join("mid");
+        std::os::unix::fs::symlink(&victim, &mid).unwrap();
+
+        let target = mid.join("state").join("cockpit");
+        let result = ensure_private_dir(&target);
+
+        assert!(
+            matches!(result, Err(PrivateFsError::Containment(_))),
+            "an intermediate symlink to a real dir must be refused, got {result:?}"
+        );
+        assert!(
+            !victim.join("state").exists(),
+            "nothing may be created inside the attacker's real directory"
+        );
+    }
+
+    // -- open_private_dir_handle refuses a swapped directory symlink (B) --
+
+    // FINDING B rests on this primitive: log rotation opens the directory once
+    // through `open_private_dir_handle` and does every unlinkat/renameat/open
+    // relative to that fd. If the directory entry is swapped for a symlink, the
+    // no-follow walk refuses it (`Containment`) rather than operating inside the
+    // attacker's target — so rotation can never delete/rename in a redirected
+    // directory. The victim's contents are left untouched.
+    #[cfg(unix)]
+    #[test]
+    fn private_fs_security_open_private_dir_handle_refuses_symlinked_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let victim = root.path().join("victim-logs");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(victim.join("cockpit.log.1"), b"VICTIM-BACKUP").unwrap();
+
+        let link = root.path().join("logdir");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+        let result = open_private_dir_handle(&link);
+        assert!(
+            matches!(result, Err(PrivateFsError::Containment(_))),
+            "a symlinked directory must be refused, got {result:?}"
+        );
+        assert_eq!(
+            std::fs::read(victim.join("cockpit.log.1")).unwrap(),
+            b"VICTIM-BACKUP",
+            "the victim directory's contents must be untouched"
+        );
+    }
+
+    // -- symlink-follow gate decides on the PARENT dir, not the symlink (A) --
+
+    // The follow decision must depend only on the held parent directory being one
+    // a non-root attacker cannot write entries into. A root-owned symlink sitting
+    // in a NON-root or writable directory must be REFUSED (the old inode-owner
+    // exception would have followed it); only a root-owned, non-group/world-
+    // writable parent (e.g. `/` at 0755, where Fedora's `/home` symlink lives)
+    // permits the single follow.
+    #[cfg(unix)]
+    #[test]
+    fn private_fs_security_symlink_follow_gate_is_parent_based() {
+        // Legitimate system case: root-owned 0755 parent (e.g. `/`) -> follow.
+        assert!(parent_permits_symlink_follow(0, 0o40755));
+        assert!(parent_permits_symlink_follow(0, 0o755));
+        assert!(parent_permits_symlink_follow(0, 0o700));
+
+        // Root-owned but group- or world-writable parent -> REFUSE (an attacker
+        // in the writable group/world could have planted the symlink entry).
+        assert!(!parent_permits_symlink_follow(0, 0o775)); // group-writable
+        assert!(!parent_permits_symlink_follow(0, 0o757)); // world-writable
+        assert!(!parent_permits_symlink_follow(0, 0o1777)); // sticky /tmp-like
+
+        // Non-root-owned parent -> REFUSE regardless of mode, even for a symlink
+        // whose own inode is root-owned: the entry lives in a dir the user (a
+        // would-be attacker) controls and can relocate a root-owned symlink into.
+        assert!(!parent_permits_symlink_follow(1000, 0o755));
+        assert!(!parent_permits_symlink_follow(1000, 0o700));
     }
 }

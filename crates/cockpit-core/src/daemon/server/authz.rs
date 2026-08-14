@@ -933,6 +933,326 @@ pub(super) async fn authorize_session_row_reader(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Attempt-grant ceiling authorization
+// ---------------------------------------------------------------------------
+//
+// A `RemoteAuthorization::AttemptGrant` principal is authorized *exclusively*
+// against its verified permission ceiling — never through the legacy
+// `PrincipalScope` helpers, which fail closed for attempt grants and must never
+// widen a grant. The mapping from the generated request-authorization category
+// (the exhaustive `read_only_without_project | attachment_capability |
+// project_capability` table proven by `remote_attempt_request_authz_table_exhaustive`)
+// onto a ceiling capability query is:
+//
+//   authz tag          | request category           | ceiling requirement
+//   -------------------|----------------------------|----------------------------------
+//   public_read        | read_only_without_project  | allow (admission is the gate)
+//   owner_only         | read_only_without_project  | deny (requires the local owner)
+//   session_writer     | attachment_capability*     | project SessionWrite(8) on the
+//                      |                            |   attached session's resolved root
+//   session_row_writer | attachment_capability*     | project SessionWrite(8) on the
+//                      |                            |   target session's resolved root
+//   session_row_reader | attachment_capability*     | project SessionRead(7) on the
+//                      |                            |   target session's resolved root
+//   project_files      | project_capability         | project FilesystemWrite(4) when the
+//                      |                            |   row is mutating, else FilesystemRead(3),
+//                      |                            |   on the resolved project root
+//   project_read       | project_capability         | project FilesystemRead(3) on the
+//                      |                            |   resolved project root
+//   terminal           | attachment_capability      | attachment AttachmentManageChildren(2)
+//   custom             | project_capability         | deny (per-handler mapping owned by the
+//                      |                            |   transport-wiring follow-ups)
+//
+// * The AC-mandated refinement: `session_writer` / `session_row_*` are enforced
+//   as *project* capabilities on the resolver-resolved session root, not as a
+//   coarse attachment capability. Every project-capability query resolves the
+//   canonical root through the deny-closed `RemoteProjectResolver` on
+//   `DaemonContext`; a resolver miss is a hard authorization failure, never a
+//   best-effort id. Any authz tag not mapped above (and every `custom` handler)
+//   fails closed. A read-only ceiling therefore denies every write category.
+
+use cockpit_proto::remote_public_service_policy::{
+    RemoteAttachmentCapabilityV1, RemoteProjectCapabilityV1,
+};
+
+/// Resolve a raw project-root string to its 16-byte control-plane project id
+/// through the injected deny-closed resolver. A canonicalization failure or a
+/// resolver miss is a hard authorization failure (fail closed).
+fn attempt_grant_resolve_project_id(
+    ctx: &DaemonContext,
+    raw_root: &str,
+) -> std::result::Result<[u8; 16], ErrorPayload> {
+    let canonical = crate::daemon::fs_api::canonical_project_root(raw_root)?;
+    ctx.remote_project_resolver
+        .resolve_project_id(&canonical)
+        .ok_or_else(|| {
+            authorization_error("attempt-grant principal has no capability for this project")
+        })
+}
+
+/// Require a project capability on the resolver-resolved control-plane project
+/// id for `raw_root`. Deny-closed on resolver miss or absent capability.
+fn attempt_grant_require_project_capability(
+    auth: &crate::daemon::principal::AttemptGrantAuthorization,
+    ctx: &DaemonContext,
+    raw_root: &str,
+    capability: RemoteProjectCapabilityV1,
+) -> std::result::Result<(), ErrorPayload> {
+    let project_id = attempt_grant_resolve_project_id(ctx, raw_root)?;
+    if auth.ceiling.project_has_capability(&project_id, capability) {
+        Ok(())
+    } else {
+        Err(authorization_error(
+            "attempt-grant ceiling does not grant this project capability",
+        ))
+    }
+}
+
+/// Require an attachment capability in the verified ceiling. Deny-closed on
+/// absence.
+fn attempt_grant_require_attachment_capability(
+    auth: &crate::daemon::principal::AttemptGrantAuthorization,
+    capability: RemoteAttachmentCapabilityV1,
+) -> std::result::Result<(), ErrorPayload> {
+    if auth.ceiling.has_attachment_capability(capability) {
+        Ok(())
+    } else {
+        Err(authorization_error(
+            "attempt-grant ceiling does not grant this attachment capability",
+        ))
+    }
+}
+
+/// Require a project capability on the *attached* session's resolved project
+/// root. Not attached → fail closed; resolver miss / absent capability → deny.
+async fn attempt_grant_require_attached_session_capability(
+    auth: &crate::daemon::principal::AttemptGrantAuthorization,
+    state: &MutableClientState,
+    ctx: &DaemonContext,
+    capability: RemoteProjectCapabilityV1,
+) -> std::result::Result<(), ErrorPayload> {
+    let att = require_attached(state)?;
+    let raw_root = match ctx.db.get_session(att.handle.session_id).await {
+        Ok(Some(row)) => row.project_root,
+        // Fail closed if the attached session row is gone: never authorize against
+        // the stale cached attachment root (a deleted session must not remain
+        // writable via a lingering attachment).
+        Ok(None) => {
+            return Err(ErrorPayload {
+                code: ErrorCode::UnknownSession,
+                message: format!("unknown session {}", att.handle.session_id),
+            });
+        }
+        Err(e) => return Err(internal(e)),
+    };
+    attempt_grant_require_project_capability(auth, ctx, &raw_root, capability)
+}
+
+/// Shared-snapshot variant of [`attempt_grant_require_attached_session_capability`].
+async fn attempt_grant_require_shared_session_capability(
+    auth: &crate::daemon::principal::AttemptGrantAuthorization,
+    shared: &SharedClientState,
+    ctx: &DaemonContext,
+    capability: RemoteProjectCapabilityV1,
+) -> std::result::Result<(), ErrorPayload> {
+    let Some(att) = shared.attached.as_ref() else {
+        return Err(ErrorPayload {
+            code: ErrorCode::NotAttached,
+            message: "client has not attached to a session".into(),
+        });
+    };
+    let raw_root = match ctx.db.get_session(att.session_id()).await {
+        Ok(Some(row)) => row.project_root,
+        // Fail closed on a deleted attached session (see the mutable variant).
+        Ok(None) => {
+            return Err(ErrorPayload {
+                code: ErrorCode::UnknownSession,
+                message: format!("unknown session {}", att.session_id()),
+            });
+        }
+        Err(e) => return Err(internal(e)),
+    };
+    attempt_grant_require_project_capability(auth, ctx, &raw_root, capability)
+}
+
+/// Require a project capability on a specific target session's resolved project
+/// root. Unknown session → typed error; resolver miss / absent capability → deny.
+async fn attempt_grant_require_session_row_capability(
+    auth: &crate::daemon::principal::AttemptGrantAuthorization,
+    ctx: &DaemonContext,
+    session_id: Uuid,
+    capability: RemoteProjectCapabilityV1,
+) -> std::result::Result<(), ErrorPayload> {
+    match ctx.db.get_session(session_id).await {
+        Ok(Some(row)) => {
+            attempt_grant_require_project_capability(auth, ctx, &row.project_root, capability)
+        }
+        Ok(None) => Err(ErrorPayload {
+            code: ErrorCode::UnknownSession,
+            message: format!("unknown session {session_id}"),
+        }),
+        Err(e) => Err(internal(e)),
+    }
+}
+
+/// Map one command-table row's authz tag onto a verified-ceiling capability
+/// query for a `MutableClientState` (serialized executor path). Every unmapped
+/// tag and every `custom` handler fails closed.
+macro_rules! command_authorize_attempt_grant_value {
+    ($auth:expr, $state:expr, $ctx:expr, $request:expr, $mutating:literal, owner_only) => {
+        Err(authorization_error("request requires the local owner"))
+    };
+    ($auth:expr, $state:expr, $ctx:expr, $request:expr, $mutating:literal, public_read) => {
+        // Read-only public commands are allowed (admission is the gate); a
+        // *mutating* public_read command (e.g. cancelling an invocation) has no
+        // project/session scope to check against a ceiling capability, so an
+        // attempt-grant principal is denied it — fail closed, never let a
+        // scopeless mutation bypass the ceiling.
+        if $mutating {
+            Err(authorization_error(
+                "attempt-grant principal cannot perform this mutating request",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    ($auth:expr, $state:expr, $ctx:expr, $request:expr, $mutating:literal, session_writer) => {
+        attempt_grant_require_attached_session_capability(
+            $auth,
+            $state,
+            $ctx,
+            RemoteProjectCapabilityV1::SessionWrite,
+        )
+        .await
+    };
+    ($auth:expr, $state:expr, $ctx:expr, $request:expr, $mutating:literal, terminal) => {
+        attempt_grant_require_attachment_capability(
+            $auth,
+            RemoteAttachmentCapabilityV1::AttachmentManageChildren,
+        )
+    };
+    ($auth:expr, $state:expr, $ctx:expr, $request:expr, $mutating:literal, project_files($project_root:ident)) => {
+        attempt_grant_require_project_capability(
+            $auth,
+            $ctx,
+            $project_root,
+            if $mutating {
+                RemoteProjectCapabilityV1::FilesystemWrite
+            } else {
+                RemoteProjectCapabilityV1::FilesystemRead
+            },
+        )
+    };
+    ($auth:expr, $state:expr, $ctx:expr, $request:expr, $mutating:literal, project_read($project_root:ident)) => {
+        attempt_grant_require_project_capability(
+            $auth,
+            $ctx,
+            $project_root,
+            RemoteProjectCapabilityV1::FilesystemRead,
+        )
+    };
+    ($auth:expr, $state:expr, $ctx:expr, $request:expr, $mutating:literal, session_row_writer($session_id:ident)) => {
+        attempt_grant_require_session_row_capability(
+            $auth,
+            $ctx,
+            *$session_id,
+            RemoteProjectCapabilityV1::SessionWrite,
+        )
+        .await
+    };
+    ($auth:expr, $state:expr, $ctx:expr, $request:expr, $mutating:literal, session_row_reader($session_id:ident)) => {
+        attempt_grant_require_session_row_capability(
+            $auth,
+            $ctx,
+            *$session_id,
+            RemoteProjectCapabilityV1::SessionRead,
+        )
+        .await
+    };
+    ($auth:expr, $state:expr, $ctx:expr, $request:expr, $mutating:literal, custom($handler:ident)) => {
+        Err(authorization_error(
+            "attempt-grant principal cannot perform this request",
+        ))
+    };
+}
+
+/// Shared-snapshot analogue of [`command_authorize_attempt_grant_value`].
+macro_rules! command_authorize_attempt_grant_shared_value {
+    ($auth:expr, $shared:expr, $ctx:expr, $request:expr, $mutating:literal, owner_only) => {
+        Err(authorization_error("request requires the local owner"))
+    };
+    ($auth:expr, $shared:expr, $ctx:expr, $request:expr, $mutating:literal, public_read) => {
+        // Mirror the mutable path: mutating public_read is denied for attempt
+        // grants (scopeless mutation must not bypass the ceiling).
+        if $mutating {
+            Err(authorization_error(
+                "attempt-grant principal cannot perform this mutating request",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    ($auth:expr, $shared:expr, $ctx:expr, $request:expr, $mutating:literal, session_writer) => {
+        attempt_grant_require_shared_session_capability(
+            $auth,
+            $shared,
+            $ctx,
+            RemoteProjectCapabilityV1::SessionWrite,
+        )
+        .await
+    };
+    ($auth:expr, $shared:expr, $ctx:expr, $request:expr, $mutating:literal, terminal) => {
+        attempt_grant_require_attachment_capability(
+            $auth,
+            RemoteAttachmentCapabilityV1::AttachmentManageChildren,
+        )
+    };
+    ($auth:expr, $shared:expr, $ctx:expr, $request:expr, $mutating:literal, project_files($project_root:ident)) => {
+        attempt_grant_require_project_capability(
+            $auth,
+            $ctx,
+            $project_root,
+            if $mutating {
+                RemoteProjectCapabilityV1::FilesystemWrite
+            } else {
+                RemoteProjectCapabilityV1::FilesystemRead
+            },
+        )
+    };
+    ($auth:expr, $shared:expr, $ctx:expr, $request:expr, $mutating:literal, project_read($project_root:ident)) => {
+        attempt_grant_require_project_capability(
+            $auth,
+            $ctx,
+            $project_root,
+            RemoteProjectCapabilityV1::FilesystemRead,
+        )
+    };
+    ($auth:expr, $shared:expr, $ctx:expr, $request:expr, $mutating:literal, session_row_writer($session_id:ident)) => {
+        attempt_grant_require_session_row_capability(
+            $auth,
+            $ctx,
+            *$session_id,
+            RemoteProjectCapabilityV1::SessionWrite,
+        )
+        .await
+    };
+    ($auth:expr, $shared:expr, $ctx:expr, $request:expr, $mutating:literal, session_row_reader($session_id:ident)) => {
+        attempt_grant_require_session_row_capability(
+            $auth,
+            $ctx,
+            *$session_id,
+            RemoteProjectCapabilityV1::SessionRead,
+        )
+        .await
+    };
+    ($auth:expr, $shared:expr, $ctx:expr, $request:expr, $mutating:literal, custom($handler:ident)) => {
+        Err(authorization_error(
+            "attempt-grant principal cannot perform this request",
+        ))
+    };
+}
+
 macro_rules! command_authorize_value {
     ($principal:expr, $state:expr, $ctx:expr, $request:expr, owner_only) => {
         Err(authorization_error("request requires the local owner"))
@@ -991,6 +1311,14 @@ macro_rules! command_authorize_request_match {
     }};
 }
 
+macro_rules! command_authorize_attempt_grant_request_match {
+    (($request:ident, $state:ident, $ctx:ident, $auth:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+        match $request {
+            $($pattern => command_authorize_attempt_grant_value!($auth, $state, $ctx, $request, $mutating, $authz $(($authz_arg))?),)+
+        }
+    }};
+}
+
 #[allow(unused_variables)]
 pub(super) async fn authorize_request(
     request: &Request,
@@ -1000,6 +1328,19 @@ pub(super) async fn authorize_request(
     let principal = &state.principal;
     if principal.is_owner() {
         return Ok(());
+    }
+
+    // An attempt-grant principal is authorized only against its verified
+    // ceiling — never through the legacy `PrincipalScope` helpers. Fail-closed
+    // on any unmapped category or resolver miss.
+    if let Some(auth) = principal.attempt_grant_authorization() {
+        return proto::command!(
+            command_authorize_attempt_grant_request_match,
+            request,
+            state,
+            ctx,
+            auth
+        );
     }
 
     proto::command!(
@@ -1069,6 +1410,14 @@ macro_rules! command_authorize_shared_request_match {
     }};
 }
 
+macro_rules! command_authorize_attempt_grant_shared_request_match {
+    (($request:ident, $shared:ident, $ctx:ident, $auth:ident) [$(($pattern:pat, $kind:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
+        match $request {
+            $($pattern => command_authorize_attempt_grant_shared_value!($auth, $shared, $ctx, $request, $mutating, $authz $(($authz_arg))?),)+
+        }
+    }};
+}
+
 #[allow(unused_variables)]
 pub(super) async fn authorize_request_shared(
     request: &Request,
@@ -1078,6 +1427,17 @@ pub(super) async fn authorize_request_shared(
     let principal = &shared.principal;
     if principal.is_owner() {
         return Ok(());
+    }
+
+    // Attempt-grant principals: ceiling-only enforcement on the shared path too.
+    if let Some(auth) = principal.attempt_grant_authorization() {
+        return proto::command!(
+            command_authorize_attempt_grant_shared_request_match,
+            request,
+            shared,
+            ctx,
+            auth
+        );
     }
 
     proto::command!(

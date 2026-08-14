@@ -1825,6 +1825,15 @@ pub struct DaemonContext {
     /// Per-daemon-boot random 32-byte HMAC key for the leak-list cursor. Rotated
     /// on restart, so stale cursors fail closed into a fresh snapshot.
     pub(crate) leak_cursor_key: [u8; 32],
+    /// Deny-closed resolver mapping a canonical local project root to the
+    /// 16-byte control-plane project id an attempt-grant permission ceiling is
+    /// keyed by. Consulted only on the `RemoteAuthorization::AttemptGrant`
+    /// authorization path; an unmapped root fails closed (never a best-effort
+    /// root hash). The default is an empty deny-all resolver; production wiring
+    /// against attachment/operation-ledger state is owned by the
+    /// transport-wiring prompts.
+    pub remote_project_resolver:
+        Arc<dyn crate::daemon::remote_project_resolver::RemoteProjectResolver>,
 }
 
 #[cfg(test)]
@@ -1999,7 +2008,26 @@ impl DaemonContext {
             write_scope: None,
             leak_reveal_state: Arc::new(StdMutex::new(crate::leaks::LeakRevealState::new())),
             leak_cursor_key: crate::leaks::random_cursor_key(),
+            // Deny-all default: an empty resolver maps no root, so the
+            // attempt-grant authorization path fails closed until the
+            // transport-wiring prompts install the real resolver.
+            remote_project_resolver: Arc::new(
+                crate::daemon::remote_project_resolver::StaticRemoteProjectResolver::new(),
+            ),
         }
+    }
+
+    /// Install the deny-closed remote project resolver consulted by the
+    /// attempt-grant authorization path. Production transport-wiring installs a
+    /// resolver backed by attachment/operation-ledger state; tests inject a
+    /// deterministic static mapping. The resolver never widens authority: an
+    /// unmapped root fails closed.
+    pub fn with_remote_project_resolver(
+        mut self,
+        resolver: Arc<dyn crate::daemon::remote_project_resolver::RemoteProjectResolver>,
+    ) -> Self {
+        self.remote_project_resolver = resolver;
+        self
     }
 
     /// Install the secure-key actor after identity creation. Production calls

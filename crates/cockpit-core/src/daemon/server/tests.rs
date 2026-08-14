@@ -20202,6 +20202,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         _process_containment_actor: None,
         leak_reveal_state: base.leak_reveal_state.clone(),
         leak_cursor_key: base.leak_cursor_key,
+        remote_project_resolver: base.remote_project_resolver.clone(),
     });
     let client = crate::daemon::client::DaemonClient::from_in_process(ctx.clone());
 
@@ -20283,6 +20284,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         _process_containment_actor: None,
         leak_reveal_state: base.leak_reveal_state.clone(),
         leak_cursor_key: base.leak_cursor_key,
+        remote_project_resolver: base.remote_project_resolver.clone(),
     });
     let client = crate::daemon::client::DaemonClient::from_in_process(ctx.clone());
 
@@ -22145,4 +22147,189 @@ async fn history_redaction_scrubs_display_text_and_tag_expansions() {
         assert!(!encoded.contains("fci_history_secret_12345"), "{encoded}");
         assert!(encoded.contains("REDACT"), "{encoded}");
     });
+}
+
+// ---------------------------------------------------------------------------
+// Attempt-grant ceiling authorization (AC7 / AC3a)
+// ---------------------------------------------------------------------------
+
+fn attempt_grant_test_ctx(
+    resolver: Arc<dyn crate::daemon::remote_project_resolver::RemoteProjectResolver>,
+) -> Arc<DaemonContext> {
+    let db = Db::open_in_memory().expect("in-memory db");
+    let locks = Arc::new(LockManager::in_memory(db.clone()));
+    let paths = DaemonPaths {
+        socket: std::path::PathBuf::from("/tmp/cockpit-attempt-grant-test.sock"),
+        pid_file: std::path::PathBuf::from("/tmp/cockpit-attempt-grant-test.pid"),
+        ephemeral: true,
+    };
+    Arc::new(
+        DaemonContext::new(
+            db,
+            locks,
+            paths,
+            crate::daemon::terminal::test_host_factory(),
+            stub_config_source(),
+        )
+        .with_remote_project_resolver(resolver),
+    )
+}
+
+fn attempt_grant_principal(
+    ceiling: cockpit_proto::remote_public_service_policy::RemotePermissionCeilingV1,
+) -> ClientPrincipal {
+    use crate::daemon::principal::{
+        AttemptGrantAuthorization, GrantDeviceBinding, RemoteCeilingAuthorization,
+    };
+    ClientPrincipal::from_attempt_grant(
+        "attempt-grant-alias".to_string(),
+        AttemptGrantAuthorization {
+            account_alias: "attempt-grant-alias".to_string(),
+            ceiling: RemoteCeilingAuthorization {
+                attachment_capabilities: ceiling.attachment_capabilities,
+                projects: ceiling.projects,
+            },
+            device_binding: GrantDeviceBinding {
+                client_device_id: [1u8; 16],
+                client_certificate_id: [2u8; 16],
+                client_generation: 1,
+                logical_attachment_id: [3u8; 16],
+                child_attempt_id: [4u8; 16],
+            },
+        },
+        None,
+    )
+}
+
+/// AC7 / AC3a — a read-only attempt-grant ceiling denies every write category
+/// through the production `authorize_request` entry point, while a write-capable
+/// ceiling permits the same requests; a resolver miss fails closed.
+#[tokio::test]
+async fn remote_attempt_readonly_ceiling_denies_write() {
+    use cockpit_proto::remote_public_service_policy::{
+        RemoteAttachmentCapabilityV1 as Att, RemotePermissionCeilingV1,
+        RemoteProjectCapabilityV1 as Proj,
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let canonical_root = tmp.path().canonicalize().unwrap();
+    let project_id = [0x11u8; 16];
+    let resolver = Arc::new(
+        crate::daemon::remote_project_resolver::StaticRemoteProjectResolver::new()
+            .with_mapping(canonical_root.clone(), project_id),
+    );
+    let ctx = attempt_grant_test_ctx(resolver);
+
+    // Attach to a session rooted at the mapped project so `session_writer`
+    // resolves the session's project root through the resolver.
+    let (mut state, _session_id) = attached_state(&ctx, tmp.path()).await;
+    let root_text = tmp.path().to_string_lossy().into_owned();
+
+    let fs_read = || Request::FsRead {
+        project_root: root_text.clone(),
+        path: "readme.md".into(),
+        base64: false,
+    };
+    let fs_write = || Request::FsWrite {
+        project_root: root_text.clone(),
+        path: "readme.md".into(),
+        content: "next".into(),
+        base_hash: None,
+    };
+    let open_terminal = || Request::OpenTerminal {
+        cwd: Some(root_text.clone()),
+        cols: 80,
+        rows: 24,
+    };
+
+    // --- Read-only ceiling: only read capabilities present. -----------------
+    let readonly = RemotePermissionCeilingV1 {
+        attachment_capabilities: vec![Att::AttachmentRead],
+        projects: vec![(
+            project_id,
+            vec![Proj::ProjectRead, Proj::FilesystemRead, Proj::SessionRead],
+        )],
+    };
+    state.principal = attempt_grant_principal(readonly);
+
+    // read_only_without_project is always permitted (admission is the gate).
+    authorize_request(&Request::DaemonStatus, &state, &ctx)
+        .await
+        .expect("read_only_without_project request is permitted");
+
+    // A read-capability project request (fs_read → FilesystemRead) is permitted.
+    authorize_request(&fs_read(), &state, &ctx)
+        .await
+        .expect("read-only ceiling permits FilesystemRead");
+
+    // session_writer (cancel_turn → project SessionWrite=8) is DENIED.
+    let err = authorize_request(&Request::CancelTurn, &state, &ctx)
+        .await
+        .expect_err("read-only ceiling denies SessionWrite-class request");
+    assert_eq!(err.code, ErrorCode::Authorization);
+
+    // project_capability write (fs_write → FilesystemWrite=4) is DENIED.
+    let err = authorize_request(&fs_write(), &state, &ctx)
+        .await
+        .expect_err("read-only ceiling denies FilesystemWrite");
+    assert_eq!(err.code, ErrorCode::Authorization);
+
+    // attachment_capability request (open_terminal → AttachmentManageChildren)
+    // is DENIED when the mapped attachment ordinal is absent.
+    let err = authorize_request(&open_terminal(), &state, &ctx)
+        .await
+        .expect_err("read-only ceiling denies attachment-capability request");
+    assert_eq!(err.code, ErrorCode::Authorization);
+
+    // --- Write-capable ceiling: the same writes are now permitted. ----------
+    let writable = RemotePermissionCeilingV1 {
+        attachment_capabilities: vec![Att::AttachmentRead, Att::AttachmentManageChildren],
+        projects: vec![(
+            project_id,
+            vec![
+                Proj::FilesystemRead,
+                Proj::FilesystemWrite,
+                Proj::SessionRead,
+                Proj::SessionWrite,
+            ],
+        )],
+    };
+    state.principal = attempt_grant_principal(writable);
+
+    authorize_request(&Request::CancelTurn, &state, &ctx)
+        .await
+        .expect("SessionWrite ceiling permits session_writer request");
+    authorize_request(&fs_write(), &state, &ctx)
+        .await
+        .expect("FilesystemWrite ceiling permits fs_write");
+    authorize_request(&open_terminal(), &state, &ctx)
+        .await
+        .expect("AttachmentManageChildren ceiling permits terminal request");
+
+    // A *mutating* public_read command (cancel_run_invocation) is scopeless, so
+    // it maps to no ceiling capability and is denied even under this fully
+    // write-capable ceiling — a scopeless mutation must never bypass the ceiling.
+    let cancel_invocation = Request::CancelRunInvocation {
+        client_submission_id: Uuid::new_v4(),
+    };
+    let err = authorize_request(&cancel_invocation, &state, &ctx)
+        .await
+        .expect_err("mutating public_read is denied for attempt grants");
+    assert_eq!(err.code, ErrorCode::Authorization);
+
+    // --- Resolver miss fails closed even with a fully-capable ceiling. ------
+    let unmapped_root = tempfile::tempdir().unwrap();
+    let unmapped_write = Request::FsWrite {
+        project_root: unmapped_root.path().to_string_lossy().into_owned(),
+        path: "x.txt".into(),
+        content: "y".into(),
+        base_hash: None,
+    };
+    let err = authorize_request(&unmapped_write, &state, &ctx)
+        .await
+        .expect_err("resolver miss must fail closed");
+    assert_eq!(err.code, ErrorCode::Authorization);
+
+    // An attempt-grant principal is never Owner.
+    assert!(!state.principal.is_owner());
 }

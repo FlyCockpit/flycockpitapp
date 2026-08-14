@@ -2583,3 +2583,44 @@ fn untrusted_inference_keeps_mandatory_sensitive_baseline_when_redaction_is_disa
     assert!(scrubbed_sealed.contains("***REDACT***"));
     assert!(scrubbed_ordinary.contains("***REDACT***"));
 }
+
+// ---- Redacting Debug over sensitive-content structs ------------------------
+
+#[test]
+fn redaction_entry_debug_redacts_literal() {
+    let secret = "super-secret-redaction-entry-value-123";
+    let entry = RedactionEntry::ordinary(
+        secret.to_string(),
+        "$SECRET".to_string(),
+        OrdinarySource::Credential,
+    );
+    let rendered = format!("{entry:?}");
+    assert!(!rendered.contains(secret), "leaked literal: {rendered}");
+    assert!(rendered.contains("REDACTED"), "missing marker: {rendered}");
+    // Non-secret structural fields stay visible for diagnostics.
+    assert!(rendered.contains("$SECRET"), "dropped class: {rendered}");
+}
+
+#[test]
+fn candidate_debug_redacts_value() {
+    let secret = "candidate-secret-value-abcdef-456";
+    let candidate = Candidate::prunable(secret.to_string(), "$VAR".to_string(), false);
+    let rendered = format!("{candidate:?}");
+    assert!(!rendered.contains(secret), "leaked value: {rendered}");
+    assert!(rendered.contains("REDACTED"), "missing marker: {rendered}");
+    assert!(rendered.contains("$VAR"), "dropped origin: {rendered}");
+}
+
+#[test]
+fn persisted_entry_debug_redacts_value() {
+    let secret = "persisted-entry-secret-value-xyz-789";
+    let entry = RedactionEntry::ordinary(
+        secret.to_string(),
+        "$SECRET".to_string(),
+        OrdinarySource::Credential,
+    );
+    let persisted = PersistedEntry::from_entry(&entry);
+    let rendered = format!("{persisted:?}");
+    assert!(!rendered.contains(secret), "leaked value: {rendered}");
+    assert!(rendered.contains("REDACTED"), "missing marker: {rendered}");
+}

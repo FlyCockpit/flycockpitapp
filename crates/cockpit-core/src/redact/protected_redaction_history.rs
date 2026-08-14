@@ -259,10 +259,22 @@ pub trait RedactionKeyResolver: Send + Sync {
 /// `cfg(test)` so the workspace clippy gate does not flag it as dead in a
 /// production build and so no production path can depend on it.
 #[cfg(test)]
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct MapKeyResolver {
     keys: std::collections::HashMap<i64, [u8; REDACTION_KEY_LEN]>,
     active: Option<i64>,
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for MapKeyResolver {
+    /// Redact the raw redaction-history root keys; show only their count and the
+    /// active version so `{:?}`/panic diagnostics never print key material.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MapKeyResolver")
+            .field("keys", &format_args!("[REDACTED; {} keys]", self.keys.len()))
+            .field("active", &self.active)
+            .finish()
+    }
 }
 
 #[cfg(test)]

@@ -28,6 +28,23 @@ use crate::db::Db;
 const READ_SESSION_MESSAGES_MAX_LIMIT: u32 = 200;
 const LIST_SESSION_EVENTS_MAX_LIMIT: u32 = 500;
 
+/// Structural, content-free redaction descriptor for a trusted-body JSON
+/// [`Value`]. Used by every manual `Debug` over a raw request / response /
+/// payload body so `{:?}`/`tracing`/panic paths never print the verbatim
+/// trusted artifact. Emits the JSON kind plus a coarse size (key/element count
+/// or string length) — never a key name or value — behind the shared
+/// `[REDACTED; …]` marker.
+pub(crate) fn redacted_json_debug(value: &Value) -> String {
+    match value {
+        Value::Null => "[REDACTED; null]".to_string(),
+        Value::Bool(_) => "[REDACTED; bool]".to_string(),
+        Value::Number(_) => "[REDACTED; number]".to_string(),
+        Value::String(s) => format!("[REDACTED; string; len {}]", s.len()),
+        Value::Array(a) => format!("[REDACTED; array; {} items]", a.len()),
+        Value::Object(o) => format!("[REDACTED; object; {} keys]", o.len()),
+    }
+}
+
 /// Event-type discriminants for the session log. The string forms are
 /// the stable on-disk + `events.json` values; keep them aligned with the
 /// engine `TurnEvent` vocabulary.
@@ -438,7 +455,7 @@ pub struct InferencePhaseTimings {
 /// `(call_id, ordinal)`. `payload` is the immutable post-render request body;
 /// lifecycle metadata (`status` + phase columns) lives beside it, never inside
 /// it. (`serde_json::Value` is not `Eq`, so this derives `PartialEq` only.)
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct InferenceRequestRow {
     pub call_id: String,
     pub ordinal: i64,
@@ -454,11 +471,32 @@ pub struct InferenceRequestRow {
     pub failed_ms: Option<i64>,
 }
 
+impl std::fmt::Debug for InferenceRequestRow {
+    /// `payload` is the raw trusted request body; never print it verbatim. Show
+    /// its structural descriptor plus the (non-body) lifecycle metadata.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InferenceRequestRow")
+            .field("call_id", &self.call_id)
+            .field("ordinal", &self.ordinal)
+            .field("session_id", &self.session_id)
+            .field("ts_ms", &self.ts_ms)
+            .field("payload", &format_args!("{}", redacted_json_debug(&self.payload)))
+            .field("status", &self.status)
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("trust", &self.trust)
+            .field("first_token_ms", &self.first_token_ms)
+            .field("completed_ms", &self.completed_ms)
+            .field("failed_ms", &self.failed_ms)
+            .finish()
+    }
+}
+
 /// A full inference-attempt row restored by the import path. Unlike live
 /// dispatch (body insert then monotonic status-advance), a restore writes the
 /// already-terminal row — body, status, phases, and per-attempt metadata — in
 /// one authoritative insert.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ImportedInferenceRequest<'a> {
     pub call_id: &'a str,
     pub ordinal: i64,
@@ -470,6 +508,25 @@ pub struct ImportedInferenceRequest<'a> {
     pub model: Option<&'a str>,
     pub trust: Option<&'a str>,
     pub phases: InferencePhaseTimings,
+}
+
+impl std::fmt::Debug for ImportedInferenceRequest<'_> {
+    /// `payload` is the raw trusted request body carried by the import path;
+    /// never print it verbatim. Show its structural descriptor plus metadata.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImportedInferenceRequest")
+            .field("call_id", &self.call_id)
+            .field("ordinal", &self.ordinal)
+            .field("session_id", &self.session_id)
+            .field("ts_ms", &self.ts_ms)
+            .field("payload", &format_args!("{}", redacted_json_debug(self.payload)))
+            .field("status", &self.status)
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("trust", &self.trust)
+            .field("phases", &self.phases)
+            .finish()
+    }
 }
 
 /// Columns of `inference_requests` in canonical read order.
@@ -544,7 +601,7 @@ pub struct SessionEventContext<'a> {
 }
 
 /// A row read back from `session_events`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SessionEventRow {
     pub seq: i64,
     pub session_id: Uuid,
@@ -560,6 +617,30 @@ pub struct SessionEventRow {
     pub llm_mode: Option<String>,
     pub model_trust: Option<String>,
     pub data: Value,
+}
+
+impl std::fmt::Debug for SessionEventRow {
+    /// `data` is the raw trusted per-event JSON payload; never print it
+    /// verbatim. Show its structural descriptor plus the (non-body) event
+    /// metadata.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionEventRow")
+            .field("seq", &self.seq)
+            .field("session_id", &self.session_id)
+            .field("ts_ms", &self.ts_ms)
+            .field("kind", &self.kind)
+            .field("agent", &self.agent)
+            .field("call_id", &self.call_id)
+            .field("task_call_id", &self.task_call_id)
+            .field("label", &self.label)
+            .field("origin_principal", &self.origin_principal)
+            .field("provider_id", &self.provider_id)
+            .field("model_id", &self.model_id)
+            .field("llm_mode", &self.llm_mode)
+            .field("model_trust", &self.model_trust)
+            .field("data", &format_args!("{}", redacted_json_debug(&self.data)))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3811,5 +3892,83 @@ mod tests {
             .remove(0);
         assert_eq!(after.last_viewed_at, before.last_viewed_at);
         assert_eq!(after.latest_activity_at, before.latest_activity_at);
+    }
+
+    // ---- Redacting Debug over trusted request/event bodies -----------------
+
+    #[test]
+    fn inference_request_row_debug_redacts_payload() {
+        let secret = "TRUSTED-BODY-SECRET-inference-payload-987";
+        let row = InferenceRequestRow {
+            call_id: "call-1".to_string(),
+            ordinal: 0,
+            session_id: "sess-1".to_string(),
+            ts_ms: 123,
+            payload: json!({ "system": secret, "history": [1, 2, 3] }),
+            status: "completed".to_string(),
+            provider: Some("anthropic".to_string()),
+            model: Some("claude".to_string()),
+            trust: Some("trusted".to_string()),
+            first_token_ms: Some(10),
+            completed_ms: Some(20),
+            failed_ms: None,
+        };
+        let rendered = format!("{row:?}");
+        assert!(!rendered.contains(secret), "leaked payload: {rendered}");
+        assert!(rendered.contains("REDACTED"), "missing marker: {rendered}");
+        // Non-body metadata stays visible.
+        assert!(rendered.contains("call-1"), "dropped call_id: {rendered}");
+        assert!(rendered.contains("anthropic"), "dropped provider: {rendered}");
+    }
+
+    #[test]
+    fn imported_inference_request_debug_redacts_payload() {
+        let secret = "TRUSTED-BODY-SECRET-imported-payload-654";
+        let payload = json!({ "prompt": secret });
+        let session_id = Uuid::nil();
+        let imported = ImportedInferenceRequest {
+            call_id: "call-2",
+            ordinal: 1,
+            session_id,
+            ts_ms: 456,
+            payload: &payload,
+            status: "completed",
+            provider: Some("openai"),
+            model: Some("gpt"),
+            trust: Some("trusted"),
+            phases: InferencePhaseTimings::default(),
+        };
+        let rendered = format!("{imported:?}");
+        assert!(!rendered.contains(secret), "leaked payload: {rendered}");
+        assert!(rendered.contains("REDACTED"), "missing marker: {rendered}");
+        assert!(rendered.contains("call-2"), "dropped call_id: {rendered}");
+    }
+
+    #[test]
+    fn session_event_row_debug_redacts_data() {
+        let secret = "TRUSTED-BODY-SECRET-event-data-321";
+        let row = SessionEventRow {
+            seq: 7,
+            session_id: Uuid::nil(),
+            ts_ms: 789,
+            kind: "assistant_message".to_string(),
+            agent: Some("primary".to_string()),
+            call_id: None,
+            task_call_id: None,
+            label: None,
+            origin_principal: None,
+            provider_id: None,
+            model_id: None,
+            llm_mode: None,
+            model_trust: None,
+            data: json!({ "text": secret }),
+        };
+        let rendered = format!("{row:?}");
+        assert!(!rendered.contains(secret), "leaked data: {rendered}");
+        assert!(rendered.contains("REDACTED"), "missing marker: {rendered}");
+        assert!(
+            rendered.contains("assistant_message"),
+            "dropped kind: {rendered}"
+        );
     }
 }

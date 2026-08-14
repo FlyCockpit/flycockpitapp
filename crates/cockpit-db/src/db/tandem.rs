@@ -18,11 +18,11 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::db::Db;
-use crate::db::session_log::{InferenceRequestStatus, now_ms};
+use crate::db::session_log::{InferenceRequestStatus, now_ms, redacted_json_debug};
 
 /// One captured tandem (shadow) inference record, read back for `/export
 /// debug`'s `inference_requests_tandem/` sibling directory.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TandemRecord {
     pub session_id: Uuid,
     /// The main inference call this tandem shadows (== `inference_calls` /
@@ -45,6 +45,43 @@ pub struct TandemRecord {
     /// Lifecycle status string (`pending`/`completed`/`errored`/
     /// `timed_out`/`cancelled`).
     pub status: String,
+}
+
+impl std::fmt::Debug for TandemRecord {
+    /// `request` / `response` (and `usage`) are the raw trusted tandem bodies;
+    /// never print them verbatim. Show each field's structural descriptor plus
+    /// the (non-body) routing/lifecycle metadata.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TandemRecord")
+            .field("session_id", &self.session_id)
+            .field("parent_call_id", &self.parent_call_id)
+            .field("parent_seq", &self.parent_seq)
+            .field("agent", &self.agent)
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("ts_ms", &self.ts_ms)
+            .field("request", &format_args!("{}", redacted_json_debug(&self.request)))
+            .field(
+                "response",
+                &format_args!(
+                    "{}",
+                    self.response
+                        .as_ref()
+                        .map_or_else(|| "None".to_string(), redacted_json_debug)
+                ),
+            )
+            .field(
+                "usage",
+                &format_args!(
+                    "{}",
+                    self.usage
+                        .as_ref()
+                        .map_or_else(|| "None".to_string(), redacted_json_debug)
+                ),
+            )
+            .field("status", &self.status)
+            .finish()
+    }
 }
 
 impl Db {
@@ -316,5 +353,37 @@ mod tests {
         assert_eq!(rows[0].status, "pending");
         assert!(rows[0].response.is_none());
         assert!(rows[0].usage.is_none());
+    }
+
+    #[test]
+    fn tandem_record_debug_redacts_request_and_response() {
+        let req_secret = "TRUSTED-TANDEM-REQUEST-SECRET-111";
+        let resp_secret = "TRUSTED-TANDEM-RESPONSE-SECRET-222";
+        let record = TandemRecord {
+            session_id: Uuid::nil(),
+            parent_call_id: "parent-call".to_string(),
+            parent_seq: Some(3),
+            agent: Some("builder".to_string()),
+            provider: "openrouter".to_string(),
+            model: "glm-4.6".to_string(),
+            ts_ms: 555,
+            request: json!({ "prompt": req_secret }),
+            response: Some(json!({ "text": resp_secret })),
+            usage: Some(json!({ "input_tokens": 10 })),
+            status: "completed".to_string(),
+        };
+        let rendered = format!("{record:?}");
+        assert!(!rendered.contains(req_secret), "leaked request: {rendered}");
+        assert!(
+            !rendered.contains(resp_secret),
+            "leaked response: {rendered}"
+        );
+        assert!(rendered.contains("REDACTED"), "missing marker: {rendered}");
+        // Non-body routing metadata stays visible.
+        assert!(
+            rendered.contains("parent-call"),
+            "dropped parent_call_id: {rendered}"
+        );
+        assert!(rendered.contains("openrouter"), "dropped provider: {rendered}");
     }
 }

@@ -302,11 +302,24 @@ fn sealed_active_key(identity: &crate::sealed::identity::SealedRedactionIdentity
 /// classification, and the replacement descriptor resolved for the current
 /// egress target (always [`Replacement::Generic`] except on a table derived by
 /// [`RedactionTable::with_sealed_replacements`]).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct RedactionEntry {
     value: String,
     class: EntryClass,
     replacement: Replacement,
+}
+
+impl std::fmt::Debug for RedactionEntry {
+    /// `value` is the raw secret literal this entry exists to scrub; never print
+    /// it. Show its length plus the (non-secret) typed class and replacement so
+    /// diagnostics stay useful.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedactionEntry")
+            .field("value", &format_args!("[REDACTED; {}]", self.value.len()))
+            .field("class", &self.class)
+            .field("replacement", &self.replacement)
+            .finish()
+    }
 }
 
 impl RedactionEntry {
@@ -574,7 +587,6 @@ fn is_pruned_candidate(value: &str, min_len: usize, length_exempt: bool) -> bool
         .any(|lit| value.eq_ignore_ascii_case(lit))
 }
 
-#[derive(Debug)]
 struct Candidate {
     value: String,
     origin: String,
@@ -615,6 +627,23 @@ impl Candidate {
             register_case_variants: false,
             source: OrdinarySource::Credential,
         }
+    }
+}
+
+impl std::fmt::Debug for Candidate {
+    /// `value` is the raw secret literal collected for the redaction table;
+    /// never print it. Show its length plus the (non-secret) structural fields
+    /// so diagnostics stay useful.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Candidate")
+            .field("value", &format_args!("[REDACTED; {}]", self.value.len()))
+            .field("origin", &self.origin)
+            .field("prunable", &self.prunable)
+            .field("length_exempt", &self.length_exempt)
+            .field("register_variants", &self.register_variants)
+            .field("register_case_variants", &self.register_case_variants)
+            .field("source", &self.source)
+            .finish()
     }
 }
 
@@ -714,11 +743,22 @@ struct PersistedRedactionTable {
 
 /// One serialized redaction entry: the literal plus its explicit typed
 /// classification.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct PersistedEntry {
     value: String,
     #[serde(flatten)]
     class: PersistedEntryClass,
+}
+
+impl std::fmt::Debug for PersistedEntry {
+    /// `value` is the raw secret literal serialized into the persisted table;
+    /// never print it. Show its length plus the (non-secret) typed class.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PersistedEntry")
+            .field("value", &format_args!("[REDACTED; {}]", self.value.len()))
+            .field("class", &self.class)
+            .finish()
+    }
 }
 
 /// The persisted classification. `Ordinary` carries its diagnostic origin;

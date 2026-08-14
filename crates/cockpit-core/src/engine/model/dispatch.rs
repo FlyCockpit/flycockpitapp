@@ -1852,7 +1852,7 @@ pub(super) fn tandem_failure_response(
 /// The captured outcome of one tandem (shadow) completion
 /// (implementation note). The caller persists every
 /// field to the session DB; nothing here ever enters an agent's history.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TandemOutcome {
     /// The exact post-redaction request body sent (identical assembly to the
     /// main call's captured body).
@@ -1864,6 +1864,51 @@ pub struct TandemOutcome {
     pub usage: Option<serde_json::Value>,
     /// Terminal lifecycle status.
     pub status: InferenceRequestStatus,
+}
+
+/// Structural, content-free redaction descriptor for a trusted-body JSON
+/// [`serde_json::Value`]. Emits the JSON kind plus a coarse size — never a key
+/// name or value — behind the shared `[REDACTED; …]` marker, so a `{:?}` /
+/// `tracing` / panic over a [`TandemOutcome`] never prints the verbatim body.
+fn redacted_json_debug(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "[REDACTED; null]".to_string(),
+        serde_json::Value::Bool(_) => "[REDACTED; bool]".to_string(),
+        serde_json::Value::Number(_) => "[REDACTED; number]".to_string(),
+        serde_json::Value::String(s) => format!("[REDACTED; string; len {}]", s.len()),
+        serde_json::Value::Array(a) => format!("[REDACTED; array; {} items]", a.len()),
+        serde_json::Value::Object(o) => format!("[REDACTED; object; {} keys]", o.len()),
+    }
+}
+
+impl std::fmt::Debug for TandemOutcome {
+    /// `request` / `response` (and `usage`) are the raw trusted tandem bodies;
+    /// never print them verbatim. Show each field's structural descriptor plus
+    /// the (non-body) terminal status.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TandemOutcome")
+            .field("request", &format_args!("{}", redacted_json_debug(&self.request)))
+            .field(
+                "response",
+                &format_args!(
+                    "{}",
+                    self.response
+                        .as_ref()
+                        .map_or_else(|| "None".to_string(), redacted_json_debug)
+                ),
+            )
+            .field(
+                "usage",
+                &format_args!(
+                    "{}",
+                    self.usage
+                        .as_ref()
+                        .map_or_else(|| "None".to_string(), redacted_json_debug)
+                ),
+            )
+            .field("status", &self.status)
+            .finish()
+    }
 }
 
 /// Drain one streaming completion attempt from a configured raw Rig request,
@@ -2111,5 +2156,31 @@ where
             // post-loop reads pick them up.
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod redact_debug_tests {
+    use super::*;
+
+    #[test]
+    fn tandem_outcome_debug_redacts_request_and_response() {
+        let req_secret = "TRUSTED-OUTCOME-REQUEST-SECRET-aaa";
+        let resp_secret = "TRUSTED-OUTCOME-RESPONSE-SECRET-bbb";
+        let outcome = TandemOutcome {
+            request: serde_json::json!({ "prompt": req_secret }),
+            response: Some(serde_json::json!({ "text": resp_secret })),
+            usage: Some(serde_json::json!({ "input_tokens": 10 })),
+            status: InferenceRequestStatus::Completed,
+        };
+        let rendered = format!("{outcome:?}");
+        assert!(!rendered.contains(req_secret), "leaked request: {rendered}");
+        assert!(
+            !rendered.contains(resp_secret),
+            "leaked response: {rendered}"
+        );
+        assert!(rendered.contains("REDACTED"), "missing marker: {rendered}");
+        // The non-body terminal status stays visible for diagnostics.
+        assert!(rendered.contains("Completed"), "dropped status: {rendered}");
     }
 }

@@ -243,25 +243,25 @@ fn copy_selection_unmapped_row_falls_back_to_plaintext() {
     assert_eq!(copied.as_deref(), Some("hello\ntool"));
 }
 
+fn mouse_at(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::empty(),
+    }
+}
+
 #[test]
 fn left_mouse_release_finalizes_selection_without_copy_feedback() {
     let mut app = app_with_selection();
     app.mouse_capture = true;
-    // Disable copy_on_release so the release only finalizes the
-    // selection without scheduling a clipboard copy or toast.
     app.copy_on_release = false;
-    app.selection = Some(Selection {
-        anchor: (0, 0),
-        focus: (4, 0),
-        active: true,
-    });
+    app.selection = None;
 
-    app.handle_mouse(MouseEvent {
-        kind: MouseEventKind::Up(MouseButton::Left),
-        column: 4,
-        row: 0,
-        modifiers: KeyModifiers::empty(),
-    });
+    app.handle_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 0, 0));
+    app.handle_mouse(mouse_at(MouseEventKind::Drag(MouseButton::Left), 4, 0));
+    app.handle_mouse(mouse_at(MouseEventKind::Up(MouseButton::Left), 4, 0));
 
     assert!(matches!(
         app.selection,
@@ -347,31 +347,43 @@ fn auto_copy_with_empty_text_is_noop() {
     assert!(app.selection.is_some());
 }
 
-#[test]
-fn auto_copy_release_with_copy_on_release_copies_and_retains() {
+#[tokio::test]
+async fn auto_copy_release_with_copy_on_release_copies_and_retains() {
     let mut app = app_with_selection();
     app.mouse_capture = true;
     app.copy_on_release = true;
-    app.selection = Some(Selection {
-        anchor: (0, 0),
-        focus: (4, 0),
-        active: true,
-    });
+    app.arm_controllable_mouse_copy = true;
+    app.selection = None;
 
-    app.handle_mouse(MouseEvent {
-        kind: MouseEventKind::Up(MouseButton::Left),
-        column: 4,
-        row: 0,
-        modifiers: KeyModifiers::empty(),
-    });
+    app.handle_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 0, 0));
+    app.handle_mouse(mouse_at(MouseEventKind::Drag(MouseButton::Left), 4, 0));
+    app.handle_mouse(mouse_at(MouseEventKind::Up(MouseButton::Left), 4, 0));
 
-    // The selection is finalized (active=false) and retained (not cleared).
     assert!(matches!(
         app.selection,
         Some(Selection { active: false, .. })
     ));
-    // A toast was shown because copy_on_release triggered the copy.
-    assert!(app.toast.is_some());
+    assert!(
+        app.toast.is_none(),
+        "completed drag has no toast while copy is unresolved"
+    );
+    assert_eq!(app.pending_mouse_copies.len(), 1);
+    let runner = app
+        .controllable_mouse_copy
+        .take()
+        .expect("controllable mouse.copy runner");
+    runner.release(crate::tui::async_action::MouseCopyResult::Confirmed);
+    tokio::task::yield_now().await;
+    app.drain_async_actions();
+
+    assert_eq!(app.pending_mouse_copies.len(), 0);
+    let toast = app.toast.as_ref().expect("exactly one matching toast");
+    assert_eq!(toast.kind, ToastKind::Success);
+    assert_eq!(toast.text, "Copied 5 chars to clipboard.");
+    assert!(matches!(
+        app.selection,
+        Some(Selection { active: false, .. })
+    ));
 }
 
 #[test]
@@ -379,20 +391,12 @@ fn auto_copy_release_with_copy_on_release_disabled_no_copy() {
     let mut app = app_with_selection();
     app.mouse_capture = true;
     app.copy_on_release = false;
-    app.selection = Some(Selection {
-        anchor: (0, 0),
-        focus: (4, 0),
-        active: true,
-    });
+    app.selection = None;
 
-    app.handle_mouse(MouseEvent {
-        kind: MouseEventKind::Up(MouseButton::Left),
-        column: 4,
-        row: 0,
-        modifiers: KeyModifiers::empty(),
-    });
+    app.handle_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), 0, 0));
+    app.handle_mouse(mouse_at(MouseEventKind::Drag(MouseButton::Left), 4, 0));
+    app.handle_mouse(mouse_at(MouseEventKind::Up(MouseButton::Left), 4, 0));
 
-    // Selection finalized but no copy (copy_on_release disabled).
     assert!(matches!(
         app.selection,
         Some(Selection { active: false, .. })
@@ -401,4 +405,5 @@ fn auto_copy_release_with_copy_on_release_disabled_no_copy() {
         app.toast.is_none(),
         "no toast when copy_on_release is false"
     );
+    assert!(app.pending_mouse_copies.is_empty());
 }

@@ -260,6 +260,11 @@ zbus = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
+[target.'cfg(unix)'.dev-dependencies]
+# Already locked and used by cockpit-tui; the CLI E2E PTY observer needs it
+# as a direct dependency of the test target.
+vt100 = "0.16"
+
 [dev-dependencies]
 assert_cmd = { workspace = true }
 cockpit-config = { path = "../../crates/cockpit-config" }

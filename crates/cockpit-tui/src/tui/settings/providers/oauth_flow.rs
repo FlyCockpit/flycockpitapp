@@ -415,6 +415,8 @@ impl OAuthFlowState {
     pub(crate) fn new_without_acknowledgement_for_test(provider: OAuthProvider) -> Self {
         let mut state = Self::new(provider);
         state.acknowledgement_required = false;
+        state.logged_in = false;
+        state.ssh = false;
         state
     }
 
@@ -432,6 +434,8 @@ impl OAuthFlowState {
     ) -> Self {
         let mut state = Self::new_with_effects(provider, effects);
         state.acknowledgement_required = false;
+        state.logged_in = false;
+        state.ssh = false;
         state
     }
 

@@ -21,3 +21,15 @@ mod mangen;
 mod multi_client_queue;
 #[cfg(unix)]
 mod run_noninteractive;
+#[cfg(unix)]
+mod tui_mouse_gesture_pty;
+#[cfg(unix)]
+mod tui_pty_fixture;
+#[cfg(unix)]
+mod tui_pty_mouse;
+#[cfg(unix)]
+mod tui_pty_osc52;
+#[cfg(unix)]
+mod tui_pty_paste;
+#[cfg(unix)]
+mod tui_pty_settings_button;

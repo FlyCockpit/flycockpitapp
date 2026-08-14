@@ -366,6 +366,7 @@ impl App {
                 self.pane_side = side;
                 self.pane_focused = true;
                 self.dragging_divider = false;
+                self.invalidate_primary_paste();
             }
             Err(e) => {
                 self.history.push(HistoryEntry::CommandError {
@@ -388,6 +389,7 @@ impl App {
         }
         self.pane_focused = false;
         self.dragging_divider = false;
+        self.invalidate_primary_paste();
         self.pane_rect = None;
         self.divider = None;
     }

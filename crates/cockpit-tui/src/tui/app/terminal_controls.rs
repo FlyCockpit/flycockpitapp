@@ -95,6 +95,7 @@ impl App {
         };
         if exec_ok {
             self.mouse_capture = new_value;
+            self.invalidate_primary_paste();
             if !new_value {
                 self.hovered_affordance = None;
             }
@@ -133,6 +134,7 @@ impl App {
         };
         if res.is_ok() {
             self.mouse_capture = want;
+            self.invalidate_primary_paste();
             if !want {
                 self.link_pointer_gesture.cancel();
                 self.hovered_affordance = None;

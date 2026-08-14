@@ -373,6 +373,8 @@ pub struct SessionsPane {
     last_preview_reached_top: bool,
     preview_clock_ms: fn() -> i64,
     last_card_click: Option<(usize, std::time::Instant)>,
+    confirm_buttons: crate::tui::button::ButtonRegistry,
+    pointer_capture: bool,
 }
 
 impl SessionsPane {
@@ -465,6 +467,8 @@ impl SessionsPane {
             last_preview_reached_top: false,
             preview_clock_ms: || chrono::Utc::now().timestamp_millis(),
             last_card_click: None,
+            confirm_buttons: crate::tui::button::ButtonRegistry::default(),
+            pointer_capture: false,
         };
         if daemon_connected {
             pane.loading = Some("Loading sessions...");
@@ -1160,7 +1164,40 @@ impl SessionsPane {
         }
     }
 
+    pub(crate) fn pointer_activate_confirm(
+        &mut self,
+        dispatch: crate::tui::button::ButtonDispatch,
+    ) {
+        let choice = match dispatch {
+            crate::tui::button::ButtonDispatch::SessionsConfirmArchive => ConfirmChoice::Archive,
+            crate::tui::button::ButtonDispatch::SessionsConfirmDelete => ConfirmChoice::Delete,
+            crate::tui::button::ButtonDispatch::SessionsConfirmCancel => ConfirmChoice::Cancel,
+            _ => return,
+        };
+        if let Step::Confirm { session_id, .. } = self.step {
+            let _ = self.apply_confirm(session_id, choice);
+        }
+    }
+
+    pub(crate) fn set_pointer_capture(&mut self, capture: bool) {
+        self.pointer_capture = capture;
+    }
+
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<SessionsOutcome> {
+        if matches!(self.step, Step::Confirm { .. })
+            && matches!(
+                mouse.kind,
+                MouseEventKind::Moved
+                    | MouseEventKind::Down(MouseButton::Left)
+                    | MouseEventKind::Up(MouseButton::Left)
+            )
+            && let Some(outcome) = self.confirm_buttons.handle_mouse(mouse)
+        {
+            if let crate::tui::button::ButtonPointerOutcome::Activated(dispatch) = outcome {
+                self.pointer_activate_confirm(dispatch);
+            }
+            return None;
+        }
         match mouse.kind {
             MouseEventKind::ScrollUp => {
                 if self
@@ -1222,7 +1259,17 @@ impl SessionsPane {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+        self.render_with_buttons(frame, area, None);
+    }
+
+    pub(crate) fn render_with_buttons(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        extra: Option<&mut crate::tui::button::ButtonRegistry>,
+    ) {
         self.card_hits.clear();
+        self.confirm_buttons.begin_frame(self.pointer_capture, 1);
         self.list_area = None;
         self.preview_area = None;
         let title = self.title();
@@ -1281,7 +1328,9 @@ impl SessionsPane {
 
         // The confirm sub-dialog draws over the bottom of the body.
         if let Step::Confirm { .. } = &self.step {
-            self.render_confirm(frame, body);
+            self.render_confirm(frame, body, extra);
+        } else {
+            self.confirm_buttons.end_frame();
         }
     }
 
@@ -1609,7 +1658,12 @@ impl SessionsPane {
         lines.into_iter().skip(from_top).take(height).collect()
     }
 
-    fn render_confirm(&self, frame: &mut Frame, body: Rect) {
+    fn render_confirm(
+        &mut self,
+        frame: &mut Frame,
+        body: Rect,
+        extra: Option<&mut crate::tui::button::ButtonRegistry>,
+    ) {
         let Step::Confirm {
             label,
             descendants,
@@ -1652,8 +1706,69 @@ impl SessionsPane {
                 Style::default().fg(Color::Yellow),
             )));
         }
-        lines.push(button_row(*choice));
+        let button_y = inner.y.saturating_add(lines.len() as u16);
+        let choice = *choice;
         frame.render_widget(Paragraph::new(lines), inner);
+        self.paint_confirm_buttons(frame, inner, button_y, choice);
+        self.confirm_buttons.end_frame();
+        if let Some(extra) = extra {
+            paint_confirm_buttons_into(extra, frame, inner, button_y, choice);
+        }
+    }
+
+    fn paint_confirm_buttons(
+        &mut self,
+        frame: &mut Frame,
+        inner: Rect,
+        y: u16,
+        choice: ConfirmChoice,
+    ) {
+        paint_confirm_buttons_into(&mut self.confirm_buttons, frame, inner, y, choice);
+    }
+}
+
+fn paint_confirm_buttons_into(
+    buttons: &mut crate::tui::button::ButtonRegistry,
+    frame: &mut Frame,
+    inner: Rect,
+    y: u16,
+    choice: ConfirmChoice,
+) {
+    if y >= inner.bottom() {
+        return;
+    }
+    let mut x = inner.x;
+    for (label, this) in [
+        ("Archive", ConfirmChoice::Archive),
+        ("Delete", ConfirmChoice::Delete),
+        ("Cancel", ConfirmChoice::Cancel),
+    ] {
+        let kind = if this == ConfirmChoice::Delete {
+            crate::tui::button::ButtonKind::Destructive
+        } else {
+            crate::tui::button::ButtonKind::Default
+        };
+        let spec = crate::tui::button::ButtonSpec::new(
+            match this {
+                ConfirmChoice::Archive => crate::tui::button::ButtonId::SessionsConfirmArchive,
+                ConfirmChoice::Delete => crate::tui::button::ButtonId::SessionsConfirmDelete,
+                ConfirmChoice::Cancel => crate::tui::button::ButtonId::SessionsConfirmCancel,
+            },
+            label,
+            match this {
+                ConfirmChoice::Archive => {
+                    crate::tui::button::ButtonDispatch::SessionsConfirmArchive
+                }
+                ConfirmChoice::Delete => crate::tui::button::ButtonDispatch::SessionsConfirmDelete,
+                ConfirmChoice::Cancel => crate::tui::button::ButtonDispatch::SessionsConfirmCancel,
+            },
+        )
+        .focused(this == choice)
+        .kind(kind);
+        let max_width = inner.right().saturating_sub(x);
+        if let Some(rect) = buttons.paint(frame, x, y, max_width, spec) {
+            x = rect.right().saturating_add(1);
+        }
     }
 }
 
@@ -1793,19 +1908,35 @@ impl Pane for SessionsPane {
 }
 
 /// The Archive / Delete / Cancel button row, highlighting the selection.
+#[cfg(test)]
 fn button_row(choice: ConfirmChoice) -> Line<'static> {
     let mk = |label: &str, this: ConfirmChoice| {
-        if this == choice {
-            Span::styled(
-                format!("[ {label} ]"),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            )
+        let kind = if this == ConfirmChoice::Delete {
+            crate::tui::button::ButtonKind::Destructive
         } else {
-            Span::styled(format!("  {label}  "), Style::default().fg(Color::White))
-        }
+            crate::tui::button::ButtonKind::Default
+        };
+        let spec = crate::tui::button::ButtonSpec::new(
+            match this {
+                ConfirmChoice::Archive => crate::tui::button::ButtonId::SessionsConfirmArchive,
+                ConfirmChoice::Delete => crate::tui::button::ButtonId::SessionsConfirmDelete,
+                ConfirmChoice::Cancel => crate::tui::button::ButtonId::SessionsConfirmCancel,
+            },
+            label,
+            match this {
+                ConfirmChoice::Archive => {
+                    crate::tui::button::ButtonDispatch::SessionsConfirmArchive
+                }
+                ConfirmChoice::Delete => crate::tui::button::ButtonDispatch::SessionsConfirmDelete,
+                ConfirmChoice::Cancel => crate::tui::button::ButtonDispatch::SessionsConfirmCancel,
+            },
+        )
+        .focused(this == choice)
+        .kind(kind);
+        Span::styled(
+            crate::tui::button::bracketed_label(label),
+            crate::tui::button::button_style(&spec, false, false),
+        )
     };
     Line::from(vec![
         mk("Archive", ConfirmChoice::Archive),
@@ -2734,9 +2865,81 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(row.contains("[ Archive ]"));
-        assert!(row.contains("Delete"));
-        assert!(row.contains("Cancel"));
+        assert_eq!(row, "[Archive] [Delete] [Cancel]");
+        let selected_row = button_row(ConfirmChoice::Archive);
+        let selected = selected_row
+            .spans
+            .iter()
+            .find(|span| span.content == "[Archive]")
+            .expect("archive button");
+        assert_eq!(selected.style.bg, Some(crate::tui::theme::BUTTON_FOCUS_BG));
+        assert_ne!(selected.style.fg, Some(Color::Black));
+        assert_ne!(selected.style.bg, Some(Color::White));
+    }
+
+    #[test]
+    fn session_confirmation_button_style() {
+        confirm_dialog_states_cascade_count_and_live_warning();
+    }
+
+    #[test]
+    fn session_confirmation_pointer_activates_on_up() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut pane = test_pane(vec![]);
+        pane.set_pointer_capture(true);
+        pane.step = Step::Confirm {
+            session_id: Uuid::new_v4(),
+            label: "task".into(),
+            descendants: 0,
+            live: false,
+            choice: ConfirmChoice::Cancel,
+        };
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| pane.render(frame, Rect::new(0, 0, 80, 24)))
+            .expect("draw");
+        let cancel = pane
+            .confirm_buttons
+            .targets()
+            .iter()
+            .find(|target| {
+                matches!(
+                    target.id,
+                    crate::tui::button::ButtonId::SessionsConfirmCancel
+                )
+            })
+            .cloned()
+            .expect("cancel button registered");
+        let mouse = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(
+            pane.handle_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                cancel.rect.x,
+                cancel.rect.y
+            ))
+            .is_none()
+        );
+        assert!(
+            matches!(pane.step, Step::Confirm { .. }),
+            "confirm must not activate on Down"
+        );
+        assert!(
+            pane.handle_mouse(mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                cancel.rect.x,
+                cancel.rect.y
+            ))
+            .is_none()
+        );
+        assert_eq!(pane.step, Step::Browse);
     }
 
     /// Build a pane with a fixed root level and no daemon interaction.
@@ -3023,6 +3226,8 @@ mod tests {
             last_preview_reached_top: false,
             preview_clock_ms: || 1_700_000_000_000,
             last_card_click: None,
+            confirm_buttons: crate::tui::button::ButtonRegistry::default(),
+            pointer_capture: false,
         }
     }
 

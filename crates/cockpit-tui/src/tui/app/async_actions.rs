@@ -77,7 +77,8 @@ impl App {
     pub(super) fn drain_async_actions(&mut self) -> bool {
         // Cancellation is a terminal runner outcome, but ownership ended, so
         // it is intentionally acknowledged without applying UI mutations.
-        let _cancelled = self.async_actions.drain_cancelled();
+        let cancelled = self.async_actions.drain_cancelled();
+        self.tombstone_cancelled_mouse_copies(&cancelled);
         let mut results = self.async_actions.expire_blocking(
             self.async_action_clock_origin + self.event_loop_monotonic_now,
             std::time::Duration::from_secs(30),
@@ -1008,6 +1009,9 @@ impl App {
                 Ok(_) => self.push_plain("local command: unexpected async response".to_string()),
                 Err(e) => self.push_plain(format!("local command: {e}")),
             },
+            AsyncActionKind::Blocking("mouse.copy") => {
+                self.apply_mouse_copy_action_result(result);
+            }
             AsyncActionKind::Blocking("copy.file") => match result.payload {
                 Ok(AsyncActionPayload::CopyToFile {
                     path,

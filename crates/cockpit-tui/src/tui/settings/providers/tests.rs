@@ -1569,6 +1569,7 @@ fn pointer_grok_oauth_sources_render_and_dispatch_from_fresh_state() {
             OAuthProvider::Grok,
             fake_oauth_effects(),
         );
+        state.logged_in = false;
         match kind {
             0 => {}
             1 => {
@@ -1792,6 +1793,7 @@ fn pointer_codex_oauth_sources_render_and_dispatch_from_fresh_state() {
             OAuthProvider::Codex,
             fake_oauth_effects(),
         );
+        state.logged_in = false;
         match kind {
             0 => {}
             1 => state.set_device_login_for_test(
@@ -2708,7 +2710,8 @@ fn pointer_add_grok_login_renders_and_dispatches_from_fresh_state() {
 
     fn fixture() -> (tempfile::TempDir, SettingsDialog) {
         let (tmp, mut dialog) = dialog_with_config(ProvidersConfig::default());
-        let oauth = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
+        let mut oauth = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
+        oauth.logged_in = false;
         dialog.page = super::super::providers_page(ProvidersPage::Add(add_state_for_oauth(
             "grok-oauth",
             oauth,
@@ -3623,6 +3626,11 @@ pub(crate) fn pointer_delete_confirmation_is_rendered_and_reduced() {
         .expect("rendered provider delete cancellation target");
     dialog.handle_pointer(super::super::tests::settings_mouse(
         crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        cancel.rect.x,
+        cancel.rect.y,
+    ));
+    dialog.handle_pointer(super::super::tests::settings_mouse(
+        crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
         cancel.rect.x,
         cancel.rect.y,
     ));

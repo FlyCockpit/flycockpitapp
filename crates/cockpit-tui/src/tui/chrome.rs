@@ -8,11 +8,12 @@
 //! Other slots (active agent, model, token count, …) compose around
 //! these two.
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 
 use crate::tui::theme::{
     FAVORITE_MODEL, MUTED_COLOR_INDEX, PLAN_YELLOW, STATUS_BRANCH_BADGE, WARNING_TEXT,
+    button_focus_style, button_hover_style, button_idle_style,
 };
 use cockpit_config::{extended::LlmMode, sandbox_mode::SandboxMode};
 use cockpit_core::daemon::proto::ConnectorDisclosure;
@@ -45,7 +46,7 @@ pub fn status_line_spans(info: &LaunchInfo) -> Vec<Span<'static>> {
     spans
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FooterControl {
     Agent,
     Model,
@@ -106,23 +107,23 @@ pub fn left_status(
     } else {
         agent_path.to_vec()
     };
+    let agent_label = path
+        .iter()
+        .map(|name| crate::tui::history::agent_display_label(name).to_string())
+        .collect::<Vec<_>>()
+        .join(" › ");
     let agent_start = col;
-    for (idx, name) in path.iter().enumerate() {
-        if idx > 0 {
-            push_span(&mut spans, &mut col, Span::styled(" › ".to_string(), muted));
-        }
-        push_span(
-            &mut spans,
-            &mut col,
-            Span::styled(
-                crate::tui::history::agent_display_label(name).to_string(),
-                selected_style(
-                    crate::tui::history::subagent_child_name_style(name),
-                    selected == Some(FooterControl::Agent),
-                ),
+    push_span(
+        &mut spans,
+        &mut col,
+        Span::styled(
+            format!("[{agent_label}]"),
+            footer_button_style(
+                crate::tui::history::subagent_child_name_style(path.last().unwrap_or(&path[0])),
+                selected == Some(FooterControl::Agent),
             ),
-        );
-    }
+        ),
+    );
     hits.push(FooterHit {
         control: FooterControl::Agent,
         start: agent_start,
@@ -146,8 +147,8 @@ pub fn left_status(
             &mut spans,
             &mut col,
             Span::styled(
-                format!("{provider}/{model}"),
-                selected_style(model_style, selected == Some(FooterControl::Model)),
+                format!("[{provider}/{model}]"),
+                footer_button_style(model_style, selected == Some(FooterControl::Model)),
             ),
         );
         hits.push(FooterHit {
@@ -163,8 +164,8 @@ pub fn left_status(
         &mut spans,
         &mut col,
         Span::styled(
-            llm_mode.as_str().to_string(),
-            selected_style(muted, selected == Some(FooterControl::Mode)),
+            format!("[{}]", llm_mode.as_str()),
+            footer_button_style(muted, selected == Some(FooterControl::Mode)),
         ),
     );
     hits.push(FooterHit {
@@ -215,14 +216,16 @@ fn push_span(spans: &mut Vec<Span<'static>>, col: &mut u16, span: Span<'static>)
     spans.push(span);
 }
 
-fn selected_style(style: Style, selected: bool) -> Style {
+fn footer_button_style(idle: Style, selected: bool) -> Style {
     if selected {
-        style
-            .fg(style.fg.unwrap_or(Color::White))
-            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        button_focus_style()
     } else {
-        style
+        idle.patch(button_idle_style())
     }
+}
+
+pub fn footer_hover_style() -> Style {
+    button_hover_style()
 }
 
 /// Transient async-schedule strip (GOALS §22). Rendered **only** when ≥1
@@ -455,7 +458,7 @@ mod tests {
         .spans;
         let model = spans
             .iter()
-            .find(|span| span.content == "openai/gpt-test")
+            .find(|span| span.content == "[openai/gpt-test]")
             .expect("active model span present");
         assert_eq!(model.style.fg, Some(Color::Green));
     }
@@ -502,7 +505,7 @@ mod tests {
 
         assert_eq!(
             text,
-            "Build › explore · openai/gpt-test · frontier · sandbox"
+            "[Build › explore] · [openai/gpt-test] · [frontier] · sandbox"
         );
         assert_eq!(
             status
@@ -519,13 +522,37 @@ mod tests {
         let mode = status
             .spans
             .iter()
-            .find(|span| span.content == "frontier")
+            .find(|span| span.content == "[frontier]")
             .expect("mode segment present");
         assert!(
-            mode.style
+            !mode
+                .style
                 .add_modifier
                 .contains(ratatui::style::Modifier::UNDERLINED)
         );
+        assert_eq!(mode.style.bg, Some(crate::tui::theme::BUTTON_FOCUS_BG));
+        for hit in &status.hits {
+            let fragment: String = status
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .chars()
+                .skip(hit.start as usize)
+                .take((hit.end - hit.start) as usize)
+                .collect();
+            assert!(
+                fragment.starts_with('[') && fragment.ends_with(']'),
+                "hit {hit:?} must span its bracket pair, got {fragment:?}"
+            );
+        }
+        assert!(text.contains(" · sandbox"));
+        assert!(!text.contains("[sandbox]"));
+    }
+
+    #[test]
+    fn footer_control_selected_style() {
+        left_status_renders_agent_path_model_and_mode_with_hits();
     }
 
     #[test]

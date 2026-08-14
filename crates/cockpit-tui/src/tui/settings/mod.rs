@@ -60,7 +60,7 @@ mod providers;
 mod reset;
 pub(crate) mod secret_display;
 mod settings_editor;
-mod shell;
+pub(crate) mod shell;
 mod skills_page;
 mod string_list;
 mod tools_page;
@@ -731,19 +731,10 @@ impl SettingsPage for DefaultModelPage {
         }
         lines.push(Line::from(format!("Scope: {scope}")));
         lines.push(Line::from(""));
-        let pointer_enabled = cx.pointer_surface.enabled.get();
         let choose_line = lines.len();
-        lines.push(Line::from(if pointer_enabled {
-            "[Choose default model]"
-        } else {
-            "Choose default model"
-        }));
+        lines.push(Line::default());
         let clear_line = lines.len();
-        lines.push(Line::from(if pointer_enabled {
-            "[Clear default for this scope]"
-        } else {
-            "Clear default for this scope"
-        }));
+        lines.push(Line::default());
         lines.push(Line::from("Applies to newly created sessions only."));
         lines.push(Line::from(
             "Reopening an existing session keeps its own saved model.",
@@ -754,14 +745,14 @@ impl SettingsPage for DefaultModelPage {
         }
         let para = Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
         frame.render_widget(para, area);
-        for (line, action, enabled, reason) in [
+        for (line, action, enabled, label) in [
             (
                 choose_line,
                 pointer_actions::SettingsPointerAction::DefaultModel(
                     pointer_actions::DefaultModelAction::Choose,
                 ),
                 true,
-                None,
+                "Choose default model",
             ),
             (
                 clear_line,
@@ -769,15 +760,19 @@ impl SettingsPage for DefaultModelPage {
                     pointer_actions::DefaultModelAction::Clear,
                 ),
                 self.effective_default.is_some(),
-                Some("no effective default is set"),
+                "Clear default for this scope",
             ),
         ] {
-            cx.pointer_surface.register(shell::SettingsPointerTarget {
-                rect: Rect::new(area.x, area.y.saturating_add(line as u16), area.width, 1),
-                action: shell::SettingsPointerAction::Page(action),
+            cx.pointer_surface.paint_page_button(
+                frame,
+                area.x,
+                area.y.saturating_add(line as u16),
+                area.width,
+                action,
+                label,
                 enabled,
-                disabled_reason: if enabled { None } else { reason },
-            });
+                false,
+            );
         }
     }
 
@@ -1737,6 +1732,29 @@ impl Dialog {
 
 // ── SettingsDialog ───────────────────────────────────────────────────────
 
+fn settings_action_from_button_id(
+    id: crate::tui::button::ButtonId,
+) -> Option<SettingsPointerAction> {
+    match id {
+        crate::tui::button::ButtonId::SettingsHeader(action) => {
+            Some(SettingsPointerAction::Header(action))
+        }
+        crate::tui::button::ButtonId::Settings(action) => Some(SettingsPointerAction::Page(action)),
+        _ => None,
+    }
+}
+
+fn dispatch_from_settings_action(
+    action: SettingsPointerAction,
+) -> crate::tui::button::ButtonDispatch {
+    match action {
+        SettingsPointerAction::Header(action) => {
+            crate::tui::button::ButtonDispatch::SettingsHeader(action)
+        }
+        SettingsPointerAction::Page(action) => crate::tui::button::ButtonDispatch::Settings(action),
+    }
+}
+
 impl SettingsDialog {
     #[cfg(test)]
     pub(crate) fn pointer_test_target_rects(&self) -> Vec<Rect> {
@@ -1752,6 +1770,21 @@ impl SettingsDialog {
     #[cfg(test)]
     pub(crate) fn pointer_test_hover_is_none(&self) -> bool {
         self.cx.pointer_surface.hover.borrow().is_none()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pointer_test_button_targets(&self) -> Vec<crate::tui::button::RegisteredButton> {
+        self.cx.pointer_surface.buttons.borrow().targets().to_vec()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pointer_test_row_targets(&self) -> Vec<crate::tui::button::RowTarget> {
+        self.cx.pointer_surface.rows.borrow().targets().to_vec()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_enter_root_node(&mut self, title: &str) {
+        tests::enter_root_node(self, title);
     }
 
     #[cfg(test)]
@@ -2422,11 +2455,25 @@ impl SettingsDialog {
         }
         match mouse.kind {
             MouseEventKind::Moved => {
-                let action = self
+                let button_outcome = self
                     .pointer_surface
-                    .hit(mouse.column, mouse.row)
-                    .filter(|target| target.enabled)
-                    .map(|target| target.action);
+                    .buttons
+                    .borrow_mut()
+                    .handle_mouse(mouse);
+                let action = match button_outcome {
+                    Some(_) => self
+                        .pointer_surface
+                        .buttons
+                        .borrow()
+                        .hover()
+                        .cloned()
+                        .and_then(settings_action_from_button_id),
+                    None => self
+                        .pointer_surface
+                        .hit(mouse.column, mouse.row)
+                        .filter(|target| target.enabled)
+                        .map(|target| target.action),
+                };
                 *self.pointer_surface.hover.borrow_mut() = match &action {
                     Some(SettingsPointerAction::Page(action)) => Some(action.clone()),
                     _ => None,
@@ -2439,6 +2486,10 @@ impl SettingsDialog {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 *self.pointer_surface.hover.borrow_mut() = None;
                 self.pointer_surface.header_hover.set(None);
+                self.pointer_surface
+                    .buttons
+                    .borrow_mut()
+                    .clear_hover_and_pressed();
                 if let Some(region) = self
                     .pointer_surface
                     .scroll_region_at(mouse.column, mouse.row)
@@ -2452,11 +2503,58 @@ impl SettingsDialog {
                     let _ = self.apply_nav(nav);
                 }
             }
-            MouseEventKind::Down(MouseButton::Left) => {
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
+                let button_outcome = self
+                    .pointer_surface
+                    .buttons
+                    .borrow_mut()
+                    .handle_mouse(mouse);
+                if let Some(outcome) = button_outcome {
+                    match outcome {
+                        crate::tui::button::ButtonPointerOutcome::Activated(dispatch) => {
+                            *self.pointer_surface.pressed.borrow_mut() = None;
+                            return self.dispatch_button(dispatch, mouse.column, mouse.row);
+                        }
+                        crate::tui::button::ButtonPointerOutcome::Pressed(id) => {
+                            if let Some(action) = settings_action_from_button_id(id) {
+                                *self.pointer_surface.pressed.borrow_mut() = Some(action);
+                            }
+                            return SettingsPointerOutcome::Consumed;
+                        }
+                        crate::tui::button::ButtonPointerOutcome::Cancelled
+                        | crate::tui::button::ButtonPointerOutcome::Consumed
+                        | crate::tui::button::ButtonPointerOutcome::HoverChanged => {}
+                    }
+                }
+                if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+                    let pressed = self.pointer_surface.pressed.borrow_mut().take();
+                    if let Some(action) = pressed {
+                        let is_button = matches!(action, SettingsPointerAction::Header(_))
+                            || matches!(&action, SettingsPointerAction::Page(page) if page.is_button());
+                        let still_over = self
+                            .pointer_surface
+                            .hit(mouse.column, mouse.row)
+                            .is_some_and(|target| target.enabled && target.action == action);
+                        if is_button && still_over {
+                            return self.dispatch_button(
+                                dispatch_from_settings_action(action),
+                                mouse.column,
+                                mouse.row,
+                            );
+                        }
+                    }
+                    return SettingsPointerOutcome::Consumed;
+                }
                 let Some(target) = self.pointer_surface.hit(mouse.column, mouse.row) else {
                     return SettingsPointerOutcome::Consumed;
                 };
                 if !target.enabled {
+                    return SettingsPointerOutcome::Consumed;
+                }
+                let is_button_target = matches!(target.action, SettingsPointerAction::Header(_))
+                    || matches!(&target.action, SettingsPointerAction::Page(action) if action.is_button());
+                if is_button_target {
+                    *self.pointer_surface.pressed.borrow_mut() = Some(target.action);
                     return SettingsPointerOutcome::Consumed;
                 }
                 if self
@@ -2468,46 +2566,68 @@ impl SettingsDialog {
                 {
                     return SettingsPointerOutcome::Consumed;
                 }
-                match target.action {
-                    SettingsPointerAction::Header(SettingsHeaderAction::Close) => {
+                if let SettingsPointerAction::Page(action) = target.action {
+                    let nav = self.page.handle_pointer_control_at(
+                        &mut self.cx,
+                        action.clone(),
+                        mouse.column,
+                        mouse.row,
+                    );
+                    let close = self.apply_nav(nav);
+                    #[cfg(test)]
+                    pointer_acceptance_tests::record_dispatched_action(&action);
+                    if close {
                         return SettingsPointerOutcome::Close;
-                    }
-                    SettingsPointerAction::Header(SettingsHeaderAction::BackToConfigPicker) => {
-                        self.back_to_picker = true;
-                        return SettingsPointerOutcome::Close;
-                    }
-                    SettingsPointerAction::Header(SettingsHeaderAction::Back) => {
-                        let nav = match self.page.resolve_header_back() {
-                            SettingsLocalBack::LocalBack => self.page.handle_key(
-                                &mut self.cx,
-                                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-                            ),
-                            SettingsLocalBack::NoLocalBack => Nav::Back,
-                        };
-                        let _ = self.apply_nav(nav);
-                    }
-                    SettingsPointerAction::Page(action) => {
-                        let nav = self.page.handle_pointer_control_at(
-                            &mut self.cx,
-                            action.clone(),
-                            mouse.column,
-                            mouse.row,
-                        );
-                        let close = self.apply_nav(nav);
-                        #[cfg(test)]
-                        pointer_acceptance_tests::record_dispatched_action(&action);
-                        if close {
-                            return SettingsPointerOutcome::Close;
-                        }
                     }
                 }
-            }
-            MouseEventKind::Up(MouseButton::Left) => {
-                *self.pointer_surface.pressed.borrow_mut() = None;
             }
             _ => {}
         }
         SettingsPointerOutcome::Consumed
+    }
+
+    fn dispatch_button(
+        &mut self,
+        dispatch: crate::tui::button::ButtonDispatch,
+        column: u16,
+        row: u16,
+    ) -> SettingsPointerOutcome {
+        match dispatch {
+            crate::tui::button::ButtonDispatch::SettingsHeader(SettingsHeaderAction::Close) => {
+                SettingsPointerOutcome::Close
+            }
+            crate::tui::button::ButtonDispatch::SettingsHeader(
+                SettingsHeaderAction::BackToConfigPicker,
+            ) => {
+                self.back_to_picker = true;
+                SettingsPointerOutcome::Close
+            }
+            crate::tui::button::ButtonDispatch::SettingsHeader(SettingsHeaderAction::Back) => {
+                let nav = match self.page.resolve_header_back() {
+                    SettingsLocalBack::LocalBack => self.page.handle_key(
+                        &mut self.cx,
+                        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                    ),
+                    SettingsLocalBack::NoLocalBack => Nav::Back,
+                };
+                let _ = self.apply_nav(nav);
+                SettingsPointerOutcome::Consumed
+            }
+            crate::tui::button::ButtonDispatch::Settings(action) => {
+                let nav =
+                    self.page
+                        .handle_pointer_control_at(&mut self.cx, action.clone(), column, row);
+                let close = self.apply_nav(nav);
+                #[cfg(test)]
+                pointer_acceptance_tests::record_dispatched_action(&action);
+                if close {
+                    SettingsPointerOutcome::Close
+                } else {
+                    SettingsPointerOutcome::Consumed
+                }
+            }
+            _ => SettingsPointerOutcome::Consumed,
+        }
     }
 
     fn enter_mcp(&mut self) {
@@ -2590,68 +2710,42 @@ impl SettingsDialog {
             Constraint::Length(1),
         ])
         .split(inner);
-        let pointer_enabled = self.extended.tui.mouse_capture;
-        let header_style = |action| {
-            if pointer_enabled && self.pointer_surface.header_hover.get() == Some(action) {
-                Style::default().add_modifier(Modifier::UNDERLINED)
-            } else {
-                Style::default()
-            }
-        };
-        let close_label = if pointer_enabled {
-            "[Close settings]"
-        } else {
-            "Close settings"
-        };
-        let mut header = vec![Span::styled(
-            close_label,
-            header_style(SettingsHeaderAction::Close),
-        )];
-        if pointer_enabled {
-            self.pointer_surface.register(SettingsPointerTarget {
-                rect: Rect::new(layout[0].x, layout[0].y, 16.min(layout[0].width), 1),
-                action: SettingsPointerAction::Header(SettingsHeaderAction::Close),
-                enabled: true,
-                disabled_reason: None,
-            });
-        }
+        let close_rect = self.pointer_surface.paint_header_button(
+            frame,
+            layout[0].x,
+            layout[0].y,
+            layout[0].width,
+            SettingsHeaderAction::Close,
+            "Close settings",
+        );
         let root = self.page.as_any().is::<RootPage>();
         if !root || !self.stack.is_empty() {
-            header.push(Span::styled(
-                if pointer_enabled {
-                    "  [Back]"
-                } else {
-                    "  Back"
-                },
-                header_style(SettingsHeaderAction::Back),
-            ));
-            if pointer_enabled {
-                self.pointer_surface.register(SettingsPointerTarget {
-                    rect: Rect::new(layout[0].x.saturating_add(18), layout[0].y, 6, 1),
-                    action: SettingsPointerAction::Header(SettingsHeaderAction::Back),
-                    enabled: true,
-                    disabled_reason: None,
-                });
-            }
+            let x = close_rect
+                .map(|rect| rect.right().saturating_add(2))
+                .unwrap_or(layout[0].x.saturating_add(18));
+            let max_width = layout[0].right().saturating_sub(x);
+            self.pointer_surface.paint_header_button(
+                frame,
+                x,
+                layout[0].y,
+                max_width,
+                SettingsHeaderAction::Back,
+                "Back",
+            );
         } else if self.picker_cwd.is_some() {
-            header.push(Span::styled(
-                if pointer_enabled {
-                    "  [Back to config picker]"
-                } else {
-                    "  Back to config picker"
-                },
-                header_style(SettingsHeaderAction::BackToConfigPicker),
-            ));
-            if pointer_enabled {
-                self.pointer_surface.register(SettingsPointerTarget {
-                    rect: Rect::new(layout[0].x.saturating_add(18), layout[0].y, 23, 1),
-                    action: SettingsPointerAction::Header(SettingsHeaderAction::BackToConfigPicker),
-                    enabled: true,
-                    disabled_reason: None,
-                });
-            }
+            let x = close_rect
+                .map(|rect| rect.right().saturating_add(2))
+                .unwrap_or(layout[0].x.saturating_add(18));
+            let max_width = layout[0].right().saturating_sub(x);
+            self.pointer_surface.paint_header_button(
+                frame,
+                x,
+                layout[0].y,
+                max_width,
+                SettingsHeaderAction::BackToConfigPicker,
+                "Back to config picker",
+            );
         }
-        frame.render_widget(Paragraph::new(Line::from(header)), layout[0]);
         self.page
             .render_with_links(&self.cx, frame, layout[1], links);
         #[cfg(test)]
@@ -2660,6 +2754,7 @@ impl SettingsDialog {
                 pointer_acceptance_tests::record_rendered_action(action, target.enabled);
             }
         }
+        self.pointer_surface.buttons.borrow_mut().end_frame();
         if let Some(cursor) = shell::park_cursor_from_markers(frame, layout[1]) {
             frame.set_cursor_position(cursor);
         }
@@ -2973,17 +3068,25 @@ pub(super) fn save_status(r: Result<(), String>) -> Option<String> {
     }
 }
 
-/// A bottom-of-list `[label]` save-button row, styled exactly like MCP
-/// Add's `[ save ]` row: reverse-video when the cursor is on it, plain
-/// otherwise. Shared so every manual-save page renders an identical
-/// affordance (MCP Add uses `[ save ]`, Providers uses `[save changes]`).
+/// A bottom-of-list `[label]` save-button row. The glyphs are a placeholder;
+/// `render_control_lines` paints the exact `[label]` cells through
+/// `ButtonRegistry` so the hit rect is the painted label, not the list row.
 pub(super) fn save_button_line(label: &str, selected: bool) -> Line<'static> {
-    let style = if selected {
-        Style::default().add_modifier(Modifier::REVERSED)
-    } else {
-        Style::default()
-    };
-    Line::from(Span::styled(label.to_string(), style))
+    let text = label.trim_start_matches('[').trim_end_matches(']');
+    let spec = crate::tui::button::ButtonSpec::new(
+        crate::tui::button::ButtonId::Settings(pointer_actions::SettingsPointerAction::Mcp(
+            pointer_actions::McpAction::Save,
+        )),
+        text,
+        crate::tui::button::ButtonDispatch::Settings(pointer_actions::SettingsPointerAction::Mcp(
+            pointer_actions::McpAction::Save,
+        )),
+    )
+    .focused(selected);
+    Line::from(Span::styled(
+        crate::tui::button::bracketed_label(text),
+        crate::tui::button::button_style(&spec, false, false),
+    ))
 }
 
 fn render_root(frame: &mut Frame, area: Rect, cursor: usize, cx: &SettingsCx) {

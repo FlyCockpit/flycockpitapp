@@ -451,7 +451,10 @@ impl App {
         self.transcript_find = None;
         self.chat_text_grid.clear();
         self.chat_cont_rows.clear();
-        self.selection = None;
+        self.invalidate_mouse_gesture(
+            MouseGestureInvalidation::TerminalChange,
+            self.event_loop_monotonic_now,
+        );
 
         // The next attach supplies the authoritative config and usage
         // snapshots; clearing additive tallies prevents double-counting.
@@ -594,6 +597,10 @@ impl App {
         // replacement state is installed. Blocking results from the previous
         // view are cancelled and cannot mutate the new transcript or chrome.
         self.async_actions.advance_view_generation();
+        self.invalidate_mouse_gesture(
+            MouseGestureInvalidation::ViewChange,
+            self.event_loop_monotonic_now,
+        );
         self.at_suggestions_loading = false;
         self.at_suggestions_error = None;
         self.drain_agent_events();

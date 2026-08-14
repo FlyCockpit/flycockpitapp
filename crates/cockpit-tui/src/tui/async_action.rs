@@ -13,6 +13,13 @@ use tokio::task::JoinHandle;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AsyncActionId(u64);
 
+#[cfg(test)]
+impl AsyncActionId {
+    pub fn from_raw_for_test(id: u64) -> Self {
+        Self(id)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AsyncActionKind {
     #[allow(dead_code)]
@@ -20,6 +27,30 @@ pub enum AsyncActionKind {
     Blocking(&'static str),
     Refresh(&'static str),
     Internal(&'static str),
+}
+
+/// Classified auto-copy delivery. Never carries plaintext or OS error detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseCopyResult {
+    Confirmed,
+    Unverified,
+    TooLarge,
+    Failed,
+    Empty,
+}
+
+/// Test-only seam: starts the production `mouse.copy` action path and
+/// releases a typed result through the completed-action channel.
+#[cfg(test)]
+pub struct ControllableMouseCopyRunner {
+    tx: tokio::sync::oneshot::Sender<MouseCopyResult>,
+}
+
+#[cfg(test)]
+impl ControllableMouseCopyRunner {
+    pub fn release(self, result: MouseCopyResult) {
+        let _ = self.tx.send(result);
+    }
 }
 
 #[derive(Debug)]
@@ -227,6 +258,7 @@ pub enum AsyncActionPayload {
         question: Option<String>,
         error: Option<String>,
     },
+    MouseCopy(MouseCopyResult),
 }
 
 #[derive(Debug)]
@@ -1146,6 +1178,24 @@ impl AsyncActionRunner {
 
     pub fn abort_id(&mut self, id: AsyncActionId) -> bool {
         self.abort_id_inner(id, true)
+    }
+
+    #[cfg(test)]
+    pub fn start_controllable_mouse_copy(
+        &mut self,
+    ) -> (AsyncActionStart, ControllableMouseCopyRunner) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let start = self.start(
+            AsyncActionKind::Blocking("mouse.copy"),
+            AsyncActionPolicy::Dedupe(AsyncActionKey::new("mouse.copy")),
+            async move {
+                match rx.await {
+                    Ok(result) => Ok(AsyncActionPayload::MouseCopy(result)),
+                    Err(_) => Err("mouse copy dropped".to_string()),
+                }
+            },
+        );
+        (start, ControllableMouseCopyRunner { tx })
     }
 
     fn abort_id_inner(&mut self, id: AsyncActionId, record_cancelled: bool) -> bool {

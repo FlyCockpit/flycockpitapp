@@ -4,7 +4,7 @@
 //! `.cockpit/themes/` on the discovered config path. Built-ins to ship
 //! initially: `system`, `tokyonight`, `gruvbox`.
 
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier, Style};
 
 /// Foreground color index used for muted/secondary text across the TUI
 /// (status line, popup descriptions, help text).
@@ -48,6 +48,69 @@ pub const WARNING_TEXT: Color = Color::Yellow;
 pub const SUCCESS_TEXT: Color = Color::Green;
 pub const ERROR_TEXT: Color = Color::Red;
 pub const INFO_TEXT: Color = METADATA_TEXT;
+
+/// Interaction tokens. Explicit sRGB pairs are the source of truth; the
+/// `_ANSI` colors are the nearest 256-color fallbacks and must never be
+/// `Reset` / terminal-default for these states.
+pub const BUTTON_HOVER_FG: Color = Color::Rgb(0xFF, 0xFF, 0xFF);
+pub const BUTTON_HOVER_BG: Color = Color::Rgb(0x2D, 0x5D, 0x8C);
+pub const BUTTON_HOVER_BG_ANSI: Color = Color::Indexed(25);
+pub const BUTTON_FOCUS_FG: Color = Color::Rgb(0xFF, 0xFF, 0xFF);
+pub const BUTTON_FOCUS_BG: Color = Color::Rgb(0x37, 0x6C, 0x9A);
+pub const BUTTON_FOCUS_BG_ANSI: Color = Color::Indexed(31);
+pub const BUTTON_PRESSED_FG: Color = Color::Rgb(0xFF, 0xFF, 0xFF);
+pub const BUTTON_PRESSED_BG: Color = Color::Rgb(0x21, 0x4A, 0x70);
+pub const BUTTON_PRESSED_BG_ANSI: Color = Color::Indexed(18);
+pub const BUTTON_DESTRUCTIVE_FG: Color = Color::Rgb(0xFF, 0xFF, 0xFF);
+pub const BUTTON_DESTRUCTIVE_BG: Color = Color::Rgb(0x8B, 0x2E, 0x3B);
+pub const BUTTON_DESTRUCTIVE_BG_ANSI: Color = Color::Indexed(88);
+pub const BUTTON_DISABLED_FG: Color = Color::Indexed(244);
+pub const ROW_SELECTION_FG: Color = Color::White;
+pub const ROW_SELECTION_BG: Color = Color::Indexed(ACCENT_BLUE_INDEX);
+pub const LINK_BASE_FG: Color = Color::Cyan;
+pub const LINK_HOVER_FG: Color = Color::Cyan;
+
+pub fn button_idle_style() -> Style {
+    Style::default().add_modifier(Modifier::BOLD)
+}
+
+pub fn button_hover_style() -> Style {
+    Style::default()
+        .fg(BUTTON_HOVER_FG)
+        .bg(BUTTON_HOVER_BG)
+        .add_modifier(Modifier::BOLD)
+}
+
+pub fn button_focus_style() -> Style {
+    Style::default()
+        .fg(BUTTON_FOCUS_FG)
+        .bg(BUTTON_FOCUS_BG)
+        .add_modifier(Modifier::BOLD)
+}
+
+pub fn button_pressed_style() -> Style {
+    Style::default()
+        .fg(BUTTON_PRESSED_FG)
+        .bg(BUTTON_PRESSED_BG)
+        .add_modifier(Modifier::BOLD)
+}
+
+pub fn button_disabled_style() -> Style {
+    Style::default()
+        .fg(BUTTON_DISABLED_FG)
+        .add_modifier(Modifier::DIM)
+}
+
+pub fn button_destructive_style() -> Style {
+    Style::default()
+        .fg(BUTTON_DESTRUCTIVE_FG)
+        .bg(BUTTON_DESTRUCTIVE_BG)
+        .add_modifier(Modifier::BOLD)
+}
+
+pub fn row_selection_style() -> Style {
+    Style::default().fg(ROW_SELECTION_FG).bg(ROW_SELECTION_BG)
+}
 
 /// Plan-yellow (`#f8d749`) used for plan/status affordances. Terminals
 /// without truecolor support should downgrade this to [`WARNING_TEXT`].

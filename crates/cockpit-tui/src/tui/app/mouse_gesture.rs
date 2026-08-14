@@ -44,16 +44,10 @@
 //! selection similarly invalidate the token. Late timer/clipboard results
 //! cannot activate, notify, clear, or overwrite newer state.
 
-#![allow(dead_code)]
-
 use std::time::Duration;
 
 /// The 500 ms multi-click / delayed-activation window.
 pub(super) const MULTI_CLICK_WINDOW: Duration = Duration::from_millis(500);
-
-/// Monotonic timestamp injected by the caller. Using `u64` milliseconds
-/// keeps the reducer fully deterministic and free of real-time sources.
-pub(super) type MonoMs = u64;
 
 /// A selectable cell coordinate (absolute terminal column/row).
 pub(super) type Cell = (u16, u16);
@@ -63,25 +57,26 @@ pub(super) type Cell = (u16, u16);
 /// multi-click recognition.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) enum SemanticTarget {
-    /// No selectable content under the pointer (chrome, padding, etc.).
-    None,
-    /// A plain selectable cell at `(col, row)` — no link, no semantic
-    /// mapping.
+    /// Padding, chrome, or a non-selectable row under the pointer.
+    NonSelectable,
+    /// A plain selectable cell at `(col, row)` — no link, no table cell.
     PlainCell(Cell),
     /// A registered Markdown/OSC8 link identified by its URL.
+    /// Dormant until chat-link registration exists.
+    #[allow(dead_code)]
     Link { url: String, cell: Cell },
-    /// A semantically mapped selectable cell (Markdown word/line/table).
-    Mapped { cell: Cell, fragment_id: u32 },
+    /// A proven Markdown table cell (logical cell across visual wraps).
+    TableCell { cell: Cell, fragment_id: u32 },
 }
 
 impl SemanticTarget {
     /// The cell coordinate under this target, if any.
     pub(super) fn cell(&self) -> Option<Cell> {
         match self {
-            SemanticTarget::None => None,
+            SemanticTarget::NonSelectable => None,
             SemanticTarget::PlainCell(c)
             | SemanticTarget::Link { cell: c, .. }
-            | SemanticTarget::Mapped { cell: c, .. } => Some(*c),
+            | SemanticTarget::TableCell { cell: c, .. } => Some(*c),
         }
     }
 
@@ -114,33 +109,49 @@ pub(super) enum GestureInput {
         button: ClickButton,
         cell: Cell,
         target: SemanticTarget,
-        now: MonoMs,
+        now: Duration,
     },
     /// Pointer moved to `cell` with `target` at `now` while a button is held.
     Move {
         cell: Cell,
         target: SemanticTarget,
-        now: MonoMs,
+        now: Duration,
     },
     /// Primary button released at `cell` at `now`.
-    Release { cell: Cell, now: MonoMs },
+    Release { cell: Cell, now: Duration },
     /// View generation changed (scroll/resize/re-render invalidated the
     /// coordinate space). All in-flight tokens are tombstoned.
-    ViewChange { now: MonoMs },
+    ViewChange { now: Duration },
     /// Terminal generation changed (the underlying buffer was replaced).
-    TerminalChange { now: MonoMs },
+    TerminalChange { now: Duration },
     /// Explicit cancellation (Esc, focus loss, context menu, etc.).
-    Cancel { now: MonoMs },
+    Cancel { now: Duration },
     /// A delayed activation timer fired at `now` carrying the token it was
     /// scheduled with. The reducer checks it against the current token and
     /// generation; a mismatch makes it inert.
-    ActivationTimerFired { token: u64, now: MonoMs },
-    /// A scheduled copy completed with `outcome` carrying the token and
-    /// generation it was scheduled with.
+    #[allow(dead_code)]
+    ActivationTimerFired { token: u64, now: Duration },
+    /// The multi-click copy timer fired. A match emits `ScheduleCopy`; a
+    /// tombstoned or early timer is inert.
+    CopyTimerFired {
+        token: u64,
+        press_generation: u64,
+        now: Duration,
+    },
+    /// A scheduled copy completed with a classified `outcome`. A match
+    /// emits one `Notify`; stale/duplicate results are inert.
     CopyCompleted {
         token: u64,
         press_generation: u64,
-        now: MonoMs,
+        outcome: CopyOutcome,
+        now: Duration,
+    },
+    /// A scheduled copy was rejected (dedupe, runner error, expiry). A
+    /// match emits one content-free failed-copy `Notify`.
+    CopyRejected {
+        token: u64,
+        press_generation: u64,
+        now: Duration,
     },
 }
 
@@ -170,12 +181,17 @@ pub(super) struct SelectionRequest {
 }
 
 /// The outcome of a clipboard copy attempt, injected by the host so the
-/// reducer stays pure.
+/// reducer stays pure. Classes match `MouseCopyResult` and never carry
+/// plaintext or OS error detail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CopyOutcome {
-    /// Copy succeeded (confirmed or unverified delivery).
-    Delivered,
-    /// Copy failed.
+    /// Native/acknowledged delivery.
+    Confirmed,
+    /// Emitted without delivery confirmation.
+    Unverified,
+    /// Selection exceeded the clipboard size limit.
+    TooLarge,
+    /// Copy failed (dedupe, runner, backend).
     Failed,
     /// Nothing to copy (empty/chrome-only selection).
     Empty,
@@ -187,6 +203,7 @@ pub(super) enum CopyOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum GestureEffect {
     /// Do nothing.
+    #[allow(dead_code)]
     None,
     /// Start or extend a drag selection.
     Select(SelectionRequest),
@@ -201,15 +218,24 @@ pub(super) enum GestureEffect {
         press_generation: u64,
         retain_highlight: bool,
     },
+    /// Arm the multi-click copy timer. The matching `CopyTimerFired` emits
+    /// `ScheduleCopy`. Double/triple-click auto-copy uses this instead of
+    /// an immediate `ScheduleCopy`.
+    ScheduleCopyTimer {
+        token: u64,
+        press_generation: u64,
+        deadline: Duration,
+    },
     /// Schedule link activation after the multi-click window. The host must
     /// check `token` and generations before activating.
     ScheduleActivation {
         url: String,
         token: u64,
         press_generation: u64,
-        deadline: MonoMs,
+        deadline: Duration,
     },
     /// Cancel a previously scheduled activation (the token is tombstoned).
+    #[allow(dead_code)]
     CancelActivation { token: u64 },
     /// Activate a link now (the token and generations were verified current).
     Activate { url: String },
@@ -229,8 +255,8 @@ pub(super) struct GestureState {
     /// The current activation token, or the tombstoned token a late timer
     /// will mismatch against. `None` means no activation is pending.
     pub activation_token: Option<u64>,
-    /// The deadline (ms) at which the pending activation fires.
-    pub activation_deadline: Option<MonoMs>,
+    /// The deadline at which the pending activation fires.
+    pub activation_deadline: Option<Duration>,
     /// The URL of the pending activation.
     pub activation_url: Option<String>,
     /// The pending press, if the button is currently held.
@@ -240,11 +266,16 @@ pub(super) struct GestureState {
     /// The semantic target of the first click in the current sequence.
     pub sequence_target: Option<SemanticTarget>,
     /// The timestamp of the first click in the current sequence.
-    pub sequence_started: Option<MonoMs>,
+    pub sequence_started: Option<Duration>,
     /// Whether a drag has begun (movement created selection).
     pub dragging: bool,
     /// The copy token currently in flight, if any.
     pub copy_token: Option<u64>,
+    /// Press generation captured when the current copy token was issued.
+    pub copy_press_generation: Option<u64>,
+    /// Deadline for a delayed double/triple-click copy. `None` when no
+    /// copy timer is armed (drag copy schedules immediately).
+    pub pending_copy_deadline: Option<Duration>,
     /// Next token value to hand out.
     next_token: u64,
 }
@@ -254,8 +285,7 @@ pub(super) struct GestureState {
 pub(super) struct PendingPress {
     pub cell: Cell,
     pub target: SemanticTarget,
-    #[allow(dead_code)]
-    pub pressed_at: MonoMs,
+    pub pressed_at: Duration,
     pub press_generation: u64,
     pub view_generation: u64,
     pub terminal_generation: u64,
@@ -282,7 +312,18 @@ impl GestureState {
             sequence_started: None,
             dragging: false,
             copy_token: None,
+            copy_press_generation: None,
+            pending_copy_deadline: None,
             next_token: 1,
+        }
+    }
+
+    /// Earliest armed mouse-gesture deadline (copy timer or activation).
+    pub(super) fn next_deadline(&self) -> Option<Duration> {
+        match (self.pending_copy_deadline, self.activation_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
         }
     }
 
@@ -294,11 +335,10 @@ impl GestureState {
 
     /// True when a new sequence should start: the target changed or the
     /// window elapsed since the first click.
-    fn sequence_expired_or_changed(&self, target: &SemanticTarget, now: MonoMs) -> bool {
+    fn sequence_expired_or_changed(&self, target: &SemanticTarget, now: Duration) -> bool {
         match (&self.sequence_target, self.sequence_started) {
             (Some(prev), Some(started)) => {
-                prev != target
-                    || now.saturating_sub(started) > MULTI_CLICK_WINDOW.as_millis() as u64
+                prev != target || now.saturating_sub(started) > MULTI_CLICK_WINDOW
             }
             _ => true,
         }
@@ -324,11 +364,29 @@ impl GestureState {
 
     /// Invalidate any in-flight copy by incrementing the press generation,
     /// so a late CopyCompleted with the old generation is inert.
-    fn invalidate_copy(&mut self) {
-        if self.copy_token.is_some() {
+    pub(super) fn invalidate_copy(&mut self) {
+        if self.copy_token.is_some() || self.pending_copy_deadline.is_some() {
             self.press_generation = self.press_generation.wrapping_add(1);
             self.copy_token = None;
+            self.copy_press_generation = None;
+            self.pending_copy_deadline = None;
         }
+    }
+
+    fn arm_copy_timer(&mut self, press_generation: u64, deadline: Duration) -> u64 {
+        let token = self.fresh_token();
+        self.copy_token = Some(token);
+        self.copy_press_generation = Some(press_generation);
+        self.pending_copy_deadline = Some(deadline);
+        token
+    }
+
+    fn arm_immediate_copy(&mut self, press_generation: u64) -> u64 {
+        let token = self.fresh_token();
+        self.copy_token = Some(token);
+        self.copy_press_generation = Some(press_generation);
+        self.pending_copy_deadline = None;
+        token
     }
 }
 
@@ -464,8 +522,7 @@ pub(super) fn reduce(
                 effects.push(GestureEffect::Select(sel));
 
                 if config.copy_on_release {
-                    let token = s.fresh_token();
-                    s.copy_token = Some(token);
+                    let token = s.arm_immediate_copy(press.press_generation);
                     effects.push(GestureEffect::ScheduleCopy {
                         token,
                         press_generation: press.press_generation,
@@ -489,7 +546,7 @@ pub(super) fn reduce(
                         // window. It fires only after the window if its
                         // token/generations remain current.
                         let token = s.fresh_token();
-                        let deadline = now + MULTI_CLICK_WINDOW.as_millis() as u64;
+                        let deadline = now.saturating_add(MULTI_CLICK_WINDOW);
                         let url = target.link_url().unwrap_or("").to_string();
                         s.activation_token = Some(token);
                         s.activation_deadline = Some(deadline);
@@ -515,7 +572,7 @@ pub(super) fn reduce(
                             focus: press.cell,
                             active: false,
                         }));
-                    } else if matches!(target, SemanticTarget::Mapped { .. }) {
+                    } else if matches!(target, SemanticTarget::TableCell { .. }) {
                         // Double-click inside a Markdown table selects the
                         // logical cell across visual wraps.
                         effects.push(GestureEffect::Select(SelectionRequest {
@@ -536,16 +593,18 @@ pub(super) fn reduce(
                     }
 
                     if config.copy_on_release && target.cell().is_some() {
-                        // Double-click copy waits within the window so a
-                        // third click can replace it. Schedule the copy
-                        // but the host should defer it until the window
-                        // passes or a third click supersedes it.
-                        let token = s.fresh_token();
-                        s.copy_token = Some(token);
-                        effects.push(GestureEffect::ScheduleCopy {
+                        // Double-click copy waits for the existing multi-click
+                        // deadline so a third click can replace it. Emit only
+                        // a timer; the matching CopyTimerFired schedules copy.
+                        let deadline = s
+                            .sequence_started
+                            .unwrap_or(*now)
+                            .saturating_add(MULTI_CLICK_WINDOW);
+                        let token = s.arm_copy_timer(press.press_generation, deadline);
+                        effects.push(GestureEffect::ScheduleCopyTimer {
                             token,
                             press_generation: press.press_generation,
-                            retain_highlight: true,
+                            deadline,
                         });
                     }
                 }
@@ -553,10 +612,8 @@ pub(super) fn reduce(
                 3 => {
                     s.tombstone_activation();
                     // A third click replaces the pending word copy with one
-                    // line-selection copy and one notification.
-                    // Tombstone the previous copy token so its late result
-                    // is inert.
-                    s.copy_token = None;
+                    // line-selection copy and one notification. The third
+                    // press already tombstoned the word token/deadline.
 
                     effects.push(GestureEffect::Select(SelectionRequest {
                         kind: SelectionKind::Line,
@@ -566,12 +623,12 @@ pub(super) fn reduce(
                     }));
 
                     if config.copy_on_release && target.cell().is_some() {
-                        let token = s.fresh_token();
-                        s.copy_token = Some(token);
-                        effects.push(GestureEffect::ScheduleCopy {
+                        let deadline = now.saturating_add(MULTI_CLICK_WINDOW);
+                        let token = s.arm_copy_timer(press.press_generation, deadline);
+                        effects.push(GestureEffect::ScheduleCopyTimer {
                             token,
                             press_generation: press.press_generation,
-                            retain_highlight: true,
+                            deadline,
                         });
                     }
                     // Reset sequence after triple — a fourth click is a new
@@ -648,20 +705,61 @@ pub(super) fn reduce(
             (s, effects)
         }
 
+        GestureInput::CopyTimerFired {
+            token,
+            press_generation,
+            now,
+        } => {
+            if s.copy_token == Some(*token)
+                && s.copy_press_generation == Some(*press_generation)
+                && s.press_generation == *press_generation
+                && s.pending_copy_deadline
+                    .is_some_and(|deadline| *now >= deadline)
+            {
+                s.pending_copy_deadline = None;
+                effects.push(GestureEffect::ScheduleCopy {
+                    token: *token,
+                    press_generation: *press_generation,
+                    retain_highlight: true,
+                });
+            }
+            (s, effects)
+        }
+
         GestureInput::CopyCompleted {
+            token,
+            press_generation,
+            outcome,
+            now: _,
+        } => {
+            if s.copy_token == Some(*token)
+                && s.copy_press_generation == Some(*press_generation)
+                && s.press_generation == *press_generation
+            {
+                s.copy_token = None;
+                s.copy_press_generation = None;
+                s.pending_copy_deadline = None;
+                effects.push(GestureEffect::Notify { outcome: *outcome });
+            }
+            (s, effects)
+        }
+
+        GestureInput::CopyRejected {
             token,
             press_generation,
             now: _,
         } => {
-            // Only accept the copy result if the token and generation match.
-            if s.copy_token == Some(*token) && s.press_generation == *press_generation {
+            if s.copy_token == Some(*token)
+                && s.copy_press_generation == Some(*press_generation)
+                && s.press_generation == *press_generation
+            {
                 s.copy_token = None;
-                // The host injects the outcome via the effect it chose; the
-                // reducer just clears the in-flight token. The Notify effect
-                // is driven by the host based on the actual delivery result.
+                s.copy_press_generation = None;
+                s.pending_copy_deadline = None;
+                effects.push(GestureEffect::Notify {
+                    outcome: CopyOutcome::Failed,
+                });
             }
-            // Mismatched token/generation — inert. Late copy result cannot
-            // overwrite newer state.
             (s, effects)
         }
     }
@@ -671,11 +769,15 @@ pub(super) fn reduce(
 mod tests {
     use super::*;
 
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
     /// Convenience: press primary at a plain selectable cell.
     fn press_plain(
         cfg: &GestureConfig,
         state: GestureState,
-        now: MonoMs,
+        now: Duration,
         cell: Cell,
     ) -> (GestureState, Vec<GestureEffect>) {
         reduce(
@@ -693,7 +795,7 @@ mod tests {
     fn press_link(
         cfg: &GestureConfig,
         state: GestureState,
-        now: MonoMs,
+        now: Duration,
         cell: Cell,
         url: &str,
     ) -> (GestureState, Vec<GestureEffect>) {
@@ -715,7 +817,7 @@ mod tests {
     fn release(
         cfg: &GestureConfig,
         state: GestureState,
-        now: MonoMs,
+        now: Duration,
         cell: Cell,
     ) -> (GestureState, Vec<GestureEffect>) {
         reduce(state, cfg, &GestureInput::Release { cell, now })
@@ -724,7 +826,7 @@ mod tests {
     fn move_to(
         cfg: &GestureConfig,
         state: GestureState,
-        now: MonoMs,
+        now: Duration,
         cell: Cell,
     ) -> (GestureState, Vec<GestureEffect>) {
         reduce(
@@ -750,6 +852,20 @@ mod tests {
         effects
             .iter()
             .filter(|e| matches!(e, GestureEffect::ScheduleCopy { .. }))
+            .count()
+    }
+
+    fn count_copy_timer(effects: &[GestureEffect]) -> usize {
+        effects
+            .iter()
+            .filter(|e| matches!(e, GestureEffect::ScheduleCopyTimer { .. }))
+            .count()
+    }
+
+    fn count_notify(effects: &[GestureEffect]) -> usize {
+        effects
+            .iter()
+            .filter(|e| matches!(e, GestureEffect::Notify { .. }))
             .count()
     }
 
@@ -784,7 +900,7 @@ mod tests {
                 button: ClickButton::Primary,
                 cell: (5, 10),
                 target: SemanticTarget::PlainCell((5, 10)),
-                now: 0,
+                now: ms(0),
             },
         )
         .0;
@@ -796,7 +912,7 @@ mod tests {
             &GestureInput::Move {
                 cell: (10, 12),
                 target: SemanticTarget::PlainCell((10, 12)),
-                now: 50,
+                now: ms(50),
             },
         );
         s = s2;
@@ -809,7 +925,7 @@ mod tests {
             &cfg,
             &GestureInput::Release {
                 cell: (10, 12),
-                now: 100,
+                now: ms(100),
             },
         );
         assert_eq!(count_select(&e3), 1);
@@ -832,7 +948,7 @@ mod tests {
                 button: ClickButton::Primary,
                 cell: (5, 10),
                 target: SemanticTarget::PlainCell((5, 10)),
-                now: 0,
+                now: ms(0),
             },
         )
         .0;
@@ -843,7 +959,7 @@ mod tests {
             &GestureInput::Move {
                 cell: (10, 12),
                 target: SemanticTarget::PlainCell((10, 12)),
-                now: 50,
+                now: ms(50),
             },
         );
         s = s2;
@@ -853,7 +969,7 @@ mod tests {
             &cfg,
             &GestureInput::Release {
                 cell: (10, 12),
-                now: 100,
+                now: ms(100),
             },
         );
         assert_eq!(count_select(&e3), 1);
@@ -877,7 +993,7 @@ mod tests {
                 button: ClickButton::Primary,
                 cell: (5, 10),
                 target: SemanticTarget::PlainCell((5, 10)),
-                now: 0,
+                now: ms(0),
             },
         )
         .0;
@@ -886,7 +1002,7 @@ mod tests {
             &cfg_on,
             &GestureInput::Release {
                 cell: (5, 10),
-                now: 10,
+                now: ms(10),
             },
         );
         assert_eq!(count_select(&e2), 0, "single click never selects (enabled)");
@@ -904,7 +1020,7 @@ mod tests {
                 button: ClickButton::Primary,
                 cell: (5, 10),
                 target: SemanticTarget::PlainCell((5, 10)),
-                now: 0,
+                now: ms(0),
             },
         )
         .0;
@@ -913,7 +1029,7 @@ mod tests {
             &cfg_off,
             &GestureInput::Release {
                 cell: (5, 10),
-                now: 10,
+                now: ms(10),
             },
         );
         assert_eq!(
@@ -932,7 +1048,7 @@ mod tests {
                 button: ClickButton::Primary,
                 cell: (3, 3),
                 target: SemanticTarget::PlainCell((3, 3)),
-                now: 0,
+                now: ms(0),
             },
         );
         let (_, e3) = reduce(
@@ -940,7 +1056,7 @@ mod tests {
             &cfg_on,
             &GestureInput::Release {
                 cell: (3, 3),
-                now: 10,
+                now: ms(10),
             },
         );
         assert_eq!(count_select(&e3), 0);
@@ -966,7 +1082,7 @@ mod tests {
                     url: "https://x.test".to_string(),
                     cell: (4, 7),
                 },
-                now: 0,
+                now: ms(0),
             },
         );
         assert_eq!(
@@ -986,7 +1102,7 @@ mod tests {
             &cfg,
             &GestureInput::Release {
                 cell: (4, 7),
-                now: 10,
+                now: ms(10),
             },
         );
         assert_eq!(
@@ -1000,7 +1116,7 @@ mod tests {
             "release schedules activation"
         );
         assert!(s2.activation_token.is_some());
-        assert_eq!(s2.activation_deadline, Some(510)); // 10 + 500ms
+        assert_eq!(s2.activation_deadline, Some(ms(510))); // 10 + 500ms
     }
 
     // ── Acceptance criterion 4: single link click activates after window
@@ -1022,7 +1138,7 @@ mod tests {
                     url: "https://x.test".to_string(),
                     cell: (4, 7),
                 },
-                now: 0,
+                now: ms(0),
             },
         );
         let (s, e_rel) = reduce(
@@ -1030,7 +1146,7 @@ mod tests {
             &cfg,
             &GestureInput::Release {
                 cell: (4, 7),
-                now: 10,
+                now: ms(10),
             },
         );
         let token = s.activation_token.unwrap();
@@ -1040,7 +1156,10 @@ mod tests {
         let (s_early, e_early) = reduce(
             s.clone(),
             &cfg,
-            &GestureInput::ActivationTimerFired { token, now: 509 },
+            &GestureInput::ActivationTimerFired {
+                token,
+                now: ms(509),
+            },
         );
         assert_eq!(
             count_activate(&e_early),
@@ -1056,7 +1175,10 @@ mod tests {
         let (s_at, e_at) = reduce(
             s.clone(),
             &cfg,
-            &GestureInput::ActivationTimerFired { token, now: 510 },
+            &GestureInput::ActivationTimerFired {
+                token,
+                now: ms(510),
+            },
         );
         assert_eq!(count_activate(&e_at), 1, "timer at deadline activates");
         assert!(
@@ -1068,7 +1190,10 @@ mod tests {
         let (s_late, e_late) = reduce(
             s,
             &cfg,
-            &GestureInput::ActivationTimerFired { token, now: 511 },
+            &GestureInput::ActivationTimerFired {
+                token,
+                now: ms(511),
+            },
         );
         assert_eq!(count_activate(&e_late), 1, "timer after deadline activates");
         assert!(s_late.activation_token.is_none());
@@ -1094,14 +1219,14 @@ mod tests {
 
         // First press + release on the link.
         let s = GestureState::new();
-        let (s, _) = press_link(&cfg, s, 0, (4, 7), url);
-        let (s, e1) = release(&cfg, s, 10, (4, 7));
+        let (s, _) = press_link(&cfg, s, ms(0), (4, 7), url);
+        let (s, e1) = release(&cfg, s, ms(10), (4, 7));
         assert_eq!(count_schedule_activation(&e1), 1);
         let first_token = s.activation_token.unwrap();
 
         // Second press on the same link (within the window) — tombstones
         // the activation token.
-        let (s2, e2) = press_link(&cfg, s, 200, (4, 7), url);
+        let (s2, e2) = press_link(&cfg, s, ms(200), (4, 7), url);
         assert_eq!(count_activate(&e2), 0, "second press does not activate");
         // The press_generation was incremented by tombstone_activation.
         assert!(s2.press_generation > 0);
@@ -1109,7 +1234,7 @@ mod tests {
         assert!(s2.activation_token.is_none(), "old activation tombstoned");
 
         // Second release — double-click selects the URL.
-        let (s3, e3) = release(&cfg, s2, 210, (4, 7));
+        let (s3, e3) = release(&cfg, s2, ms(210), (4, 7));
         assert_eq!(count_activate(&e3), 0, "no activation on double-click");
         assert_eq!(count_select(&e3), 1, "double-click selects URL");
         // The selection is a Word (URL) selection.
@@ -1127,7 +1252,7 @@ mod tests {
             &cfg,
             &GestureInput::ActivationTimerFired {
                 token: first_token,
-                now: 600,
+                now: ms(600),
             },
         );
         assert_eq!(
@@ -1147,14 +1272,14 @@ mod tests {
 
         // Press + release at t=0..10 → deadline = 510.
         let s = GestureState::new();
-        let (s, _) = press_link(&cfg, s, 0, (4, 7), url);
-        let (s, _) = release(&cfg, s, 10, (4, 7));
+        let (s, _) = press_link(&cfg, s, ms(0), (4, 7), url);
+        let (s, _) = release(&cfg, s, ms(10), (4, 7));
         let token = s.activation_token.unwrap();
 
         // At exactly t=510 (the deadline), a second press arrives at the
         // same timestamp. Input reduction has priority: the press first
         // tombstones the token, then the timer is inert.
-        let (s_press, e_press) = press_link(&cfg, s.clone(), 510, (4, 7), url);
+        let (s_press, e_press) = press_link(&cfg, s.clone(), ms(510), (4, 7), url);
         assert_eq!(
             count_activate(&e_press),
             0,
@@ -1170,7 +1295,10 @@ mod tests {
         let (s_timer, e_timer) = reduce(
             s_press,
             &cfg,
-            &GestureInput::ActivationTimerFired { token, now: 510 },
+            &GestureInput::ActivationTimerFired {
+                token,
+                now: ms(510),
+            },
         );
         assert_eq!(
             count_activate(&e_timer),
@@ -1183,14 +1311,17 @@ mod tests {
         let (s_timer2, e_timer2) = reduce(
             s.clone(),
             &cfg,
-            &GestureInput::ActivationTimerFired { token, now: 510 },
+            &GestureInput::ActivationTimerFired {
+                token,
+                now: ms(510),
+            },
         );
         assert_eq!(
             count_activate(&e_timer2),
             1,
             "timer at deadline activates if no press"
         );
-        let (_s_press2, e_press2) = press_link(&cfg, s_timer2, 510, (4, 7), url);
+        let (_s_press2, e_press2) = press_link(&cfg, s_timer2, ms(510), (4, 7), url);
         assert_eq!(
             count_activate(&e_press2),
             0,
@@ -1208,15 +1339,15 @@ mod tests {
 
         // Press on a link.
         let s = GestureState::new();
-        let (s, _) = press_link(&cfg, s, 0, (4, 7), url);
+        let (s, _) = press_link(&cfg, s, ms(0), (4, 7), url);
         // Release schedules activation.
-        let (s, e_rel) = release(&cfg, s, 10, (4, 7));
+        let (s, e_rel) = release(&cfg, s, ms(10), (4, 7));
         assert_eq!(count_schedule_activation(&e_rel), 1);
         let token = s.activation_token.unwrap();
 
         // Now press again and move to a different selectable cell.
-        let (s, _) = press_link(&cfg, s, 20, (4, 7), url);
-        let (s2, e_move) = move_to(&cfg, s, 30, (8, 9));
+        let (s, _) = press_link(&cfg, s, ms(20), (4, 7), url);
+        let (s2, e_move) = move_to(&cfg, s, ms(30), (8, 9));
         assert_eq!(count_select(&e_move), 1, "movement begins selection");
         assert!(s2.dragging);
         assert!(s2.activation_token.is_none(), "movement cancels activation");
@@ -1225,7 +1356,10 @@ mod tests {
         let (_, e_timer) = reduce(
             s2,
             &cfg,
-            &GestureInput::ActivationTimerFired { token, now: 600 },
+            &GestureInput::ActivationTimerFired {
+                token,
+                now: ms(600),
+            },
         );
         assert_eq!(count_activate(&e_timer), 0);
     }
@@ -1239,13 +1373,13 @@ mod tests {
         let s = GestureState::new();
 
         // Press and hold for a long time without movement.
-        let (s, e_press) = press_plain(&cfg, s, 0, (5, 10));
+        let (s, e_press) = press_plain(&cfg, s, ms(0), (5, 10));
         assert_eq!(count_select(&e_press), 0);
         assert_eq!(count_copy(&e_press), 0);
 
         // Release after 5 seconds — no movement means no drag, single
         // click on a plain cell → no selection, no copy.
-        let (s2, e_rel) = release(&cfg, s, 5000, (5, 10));
+        let (s2, e_rel) = release(&cfg, s, ms(5000), (5, 10));
         assert_eq!(
             count_select(&e_rel),
             0,
@@ -1267,10 +1401,10 @@ mod tests {
 
         // Double-click on a link → selects URL (Word kind).
         let s = GestureState::new();
-        let (s, _) = press_link(&cfg, s, 0, (4, 7), "https://x.test");
-        let (s, _) = release(&cfg, s, 10, (4, 7));
-        let (s, _) = press_link(&cfg, s, 20, (4, 7), "https://x.test");
-        let (_, e) = release(&cfg, s, 30, (4, 7));
+        let (s, _) = press_link(&cfg, s, ms(0), (4, 7), "https://x.test");
+        let (s, _) = release(&cfg, s, ms(10), (4, 7));
+        let (s, _) = press_link(&cfg, s, ms(20), (4, 7), "https://x.test");
+        let (_, e) = release(&cfg, s, ms(30), (4, 7));
         assert_eq!(count_select(&e), 1);
         assert!(e.iter().any(|ef| matches!(
             ef,
@@ -1282,10 +1416,10 @@ mod tests {
 
         // Double-click on a plain cell → selects word.
         let s = GestureState::new();
-        let (s, _) = press_plain(&cfg, s, 0, (5, 10));
-        let (s, _) = release(&cfg, s, 10, (5, 10));
-        let (s, _) = press_plain(&cfg, s, 20, (5, 10));
-        let (_, e) = release(&cfg, s, 30, (5, 10));
+        let (s, _) = press_plain(&cfg, s, ms(0), (5, 10));
+        let (s, _) = release(&cfg, s, ms(10), (5, 10));
+        let (s, _) = press_plain(&cfg, s, ms(20), (5, 10));
+        let (_, e) = release(&cfg, s, ms(30), (5, 10));
         assert_eq!(count_select(&e), 1);
         assert!(e.iter().any(|ef| matches!(
             ef,
@@ -1301,10 +1435,10 @@ mod tests {
         let cfg = GestureConfig::default();
         // A link that is also selectable — double-click chooses URL.
         let s = GestureState::new();
-        let (s, _) = press_link(&cfg, s, 0, (4, 7), "https://docs.test/guide");
-        let (s, _) = release(&cfg, s, 10, (4, 7));
-        let (s, _) = press_link(&cfg, s, 20, (4, 7), "https://docs.test/guide");
-        let (_, e) = release(&cfg, s, 30, (4, 7));
+        let (s, _) = press_link(&cfg, s, ms(0), (4, 7), "https://docs.test/guide");
+        let (s, _) = release(&cfg, s, ms(10), (4, 7));
+        let (s, _) = press_link(&cfg, s, ms(20), (4, 7), "https://docs.test/guide");
+        let (_, e) = release(&cfg, s, ms(30), (4, 7));
         // The selection is Word kind (URL is treated as a word selection).
         assert!(e.iter().any(|ef| matches!(
             ef,
@@ -1325,7 +1459,7 @@ mod tests {
         let cfg = GestureConfig::default();
         let s = GestureState::new();
         let cell = (6, 10);
-        let target = SemanticTarget::Mapped {
+        let target = SemanticTarget::TableCell {
             cell,
             fragment_id: 5,
         };
@@ -1338,10 +1472,10 @@ mod tests {
                 button: ClickButton::Primary,
                 cell,
                 target: target.clone(),
-                now: 0,
+                now: ms(0),
             },
         );
-        let (s, _) = reduce(s, &cfg, &GestureInput::Release { cell, now: 10 });
+        let (s, _) = reduce(s, &cfg, &GestureInput::Release { cell, now: ms(10) });
         let (s, _) = reduce(
             s,
             &cfg,
@@ -1349,10 +1483,10 @@ mod tests {
                 button: ClickButton::Primary,
                 cell,
                 target: target.clone(),
-                now: 20,
+                now: ms(20),
             },
         );
-        let (_, e) = reduce(s, &cfg, &GestureInput::Release { cell, now: 30 });
+        let (_, e) = reduce(s, &cfg, &GestureInput::Release { cell, now: ms(30) });
         assert_eq!(count_select(&e), 1);
         assert!(
             e.iter().any(|ef| matches!(
@@ -1375,12 +1509,12 @@ mod tests {
         let cell = (5, 10);
 
         // Triple-click on a plain cell → Line selection.
-        let (s, _) = press_plain(&cfg, s, 0, cell);
-        let (s, _) = release(&cfg, s, 10, cell);
-        let (s, _) = press_plain(&cfg, s, 20, cell);
-        let (s, _) = release(&cfg, s, 30, cell);
-        let (s, _) = press_plain(&cfg, s, 40, cell);
-        let (_, e) = release(&cfg, s, 50, cell);
+        let (s, _) = press_plain(&cfg, s, ms(0), cell);
+        let (s, _) = release(&cfg, s, ms(10), cell);
+        let (s, _) = press_plain(&cfg, s, ms(20), cell);
+        let (s, _) = release(&cfg, s, ms(30), cell);
+        let (s, _) = press_plain(&cfg, s, ms(40), cell);
+        let (_, e) = release(&cfg, s, ms(50), cell);
 
         assert_eq!(count_select(&e), 1);
         assert!(e.iter().any(|ef| matches!(
@@ -1404,41 +1538,43 @@ mod tests {
         let cell = (5, 10);
 
         // Double-click → word selection + scheduled copy.
-        let (s, _) = press_plain(&cfg, s, 0, cell);
-        let (s, e1) = release(&cfg, s, 10, cell);
+        let (s, _) = press_plain(&cfg, s, ms(0), cell);
+        let (s, e1) = release(&cfg, s, ms(10), cell);
         assert_eq!(count_select(&e1), 0); // single click — no selection
-        let (s, _) = press_plain(&cfg, s, 20, cell);
-        let (s, e2) = release(&cfg, s, 30, cell);
+        let (s, _) = press_plain(&cfg, s, ms(20), cell);
+        let (s, e2) = release(&cfg, s, ms(30), cell);
         assert_eq!(count_select(&e2), 1); // double-click — word
-        assert_eq!(count_copy(&e2), 1); // copy scheduled
+        assert_eq!(count_copy(&e2), 0, "double-click waits for copy timer");
+        assert_eq!(count_copy_timer(&e2), 1);
         let word_copy_token = s.copy_token.unwrap();
 
-        // Triple-click → line selection + exactly one copy (replaces word copy).
-        let (s, _) = press_plain(&cfg, s, 40, cell);
-        let (s3, e3) = release(&cfg, s, 50, cell);
+        // Triple-click → line selection + one line copy timer (replaces word).
+        let (s, _) = press_plain(&cfg, s, ms(40), cell);
+        let (s3, e3) = release(&cfg, s, ms(50), cell);
         assert_eq!(count_select(&e3), 1, "triple-click selects line");
+        assert_eq!(count_copy(&e3), 0, "triple-click waits for its own timer");
         assert_eq!(
-            count_copy(&e3),
+            count_copy_timer(&e3),
             1,
-            "triple-click schedules exactly one copy"
+            "triple-click arms exactly one copy timer"
         );
+        let line_token = s3.copy_token.unwrap();
+        assert_ne!(line_token, word_copy_token);
 
         // The word copy token was superseded — a late CopyCompleted with
         // the old token is inert.
-        let (s4, _) = reduce(
+        let (s4, e4) = reduce(
             s3.clone(),
             &cfg,
             &GestureInput::CopyCompleted {
                 token: word_copy_token,
                 press_generation: 0,
-                now: 55,
+                outcome: CopyOutcome::Confirmed,
+                now: ms(55),
             },
         );
-        // The current copy_token should not be cleared by the stale result.
-        // (It was set by the triple-click; the stale word-copy completion
-        //  must not clear it.)
-        let _ = s4; // state is valid; the key assertion is no panic and
-        // copy_token remains from the triple-click.
+        assert_eq!(count_notify(&e4), 0, "stale word completion is inert");
+        assert_eq!(s4.copy_token, Some(line_token));
     }
 
     #[test]
@@ -1448,23 +1584,23 @@ mod tests {
         let cell = (5, 10);
 
         // First click at t=0.
-        let (s, _) = press_plain(&cfg, s, 0, cell);
-        let (s, _) = release(&cfg, s, 10, cell);
+        let (s, _) = press_plain(&cfg, s, ms(0), cell);
+        let (s, _) = release(&cfg, s, ms(10), cell);
         assert_eq!(s.click_count, 1);
 
         // Second click after the window (t=600 > 10 + 500 = 510) → new
         // sequence starts at click_count=1.
-        let (s, _) = press_plain(&cfg, s, 600, cell);
+        let (s, _) = press_plain(&cfg, s, ms(600), cell);
         assert_eq!(s.click_count, 1, "click after window resets sequence");
-        let (s, e) = release(&cfg, s, 610, cell);
+        let (s, e) = release(&cfg, s, ms(610), cell);
         // Single click → no selection.
         assert_eq!(count_select(&e), 0);
 
         // Now a quick double-click within the new sequence window.
-        let (s, _) = press_plain(&cfg, s, 620, cell);
-        let (s, _) = release(&cfg, s, 630, cell);
-        let (s, _) = press_plain(&cfg, s, 640, cell);
-        let (_, e2) = release(&cfg, s, 650, cell);
+        let (s, _) = press_plain(&cfg, s, ms(620), cell);
+        let (s, _) = release(&cfg, s, ms(630), cell);
+        let (s, _) = press_plain(&cfg, s, ms(640), cell);
+        let (_, e2) = release(&cfg, s, ms(650), cell);
         assert_eq!(
             count_select(&e2),
             1,
@@ -1482,15 +1618,15 @@ mod tests {
 
         // Drag-select and release → copy scheduled.
         let s = GestureState::new();
-        let (s, _) = press_plain(&cfg, s, 0, (5, 10));
-        let (s, _) = move_to(&cfg, s, 50, (10, 12));
-        let (s, e_rel) = release(&cfg, s, 100, (10, 12));
+        let (s, _) = press_plain(&cfg, s, ms(0), (5, 10));
+        let (s, _) = move_to(&cfg, s, ms(50), (10, 12));
+        let (s, e_rel) = release(&cfg, s, ms(100), (10, 12));
         let copy_token = s.copy_token.unwrap();
         let press_gen = s.press_generation;
         assert_eq!(count_copy(&e_rel), 1);
 
         // New press increments generation → stale copy completion is inert.
-        let (s2, _) = press_plain(&cfg, s.clone(), 200, (20, 20));
+        let (s2, _) = press_plain(&cfg, s.clone(), ms(200), (20, 20));
         assert!(s2.press_generation > press_gen);
 
         // Late CopyCompleted with the old press_generation is inert —
@@ -1501,26 +1637,31 @@ mod tests {
             &GestureInput::CopyCompleted {
                 token: copy_token,
                 press_generation: press_gen,
-                now: 250,
+                outcome: CopyOutcome::Confirmed,
+                now: ms(250),
             },
         );
         // The stale completion did not crash and the state is consistent.
         let _ = s3;
 
         // View change invalidates everything.
-        let (s4, e_vc) = reduce(s.clone(), &cfg, &GestureInput::ViewChange { now: 300 });
+        let (s4, e_vc) = reduce(s.clone(), &cfg, &GestureInput::ViewChange { now: ms(300) });
         assert!(matches!(e_vc.as_slice(), [GestureEffect::ClearSelection]));
         assert!(s4.view_generation > 0);
         assert!(s4.activation_token.is_none());
         assert!(s4.pending_press.is_none());
 
         // Terminal change invalidates everything.
-        let (s5, e_tc) = reduce(s.clone(), &cfg, &GestureInput::TerminalChange { now: 300 });
+        let (s5, e_tc) = reduce(
+            s.clone(),
+            &cfg,
+            &GestureInput::TerminalChange { now: ms(300) },
+        );
         assert!(matches!(e_tc.as_slice(), [GestureEffect::ClearSelection]));
         assert!(s5.terminal_generation > 0);
 
         // Cancellation invalidates everything.
-        let (s6, e_c) = reduce(s.clone(), &cfg, &GestureInput::Cancel { now: 300 });
+        let (s6, e_c) = reduce(s.clone(), &cfg, &GestureInput::Cancel { now: ms(300) });
         assert!(matches!(e_c.as_slice(), [GestureEffect::ClearSelection]));
         assert!(s6.activation_token.is_none());
 
@@ -1531,7 +1672,8 @@ mod tests {
             &GestureInput::CopyCompleted {
                 token: 999, // wrong token
                 press_generation: press_gen,
-                now: 400,
+                outcome: CopyOutcome::Confirmed,
+                now: ms(400),
             },
         );
         // copy_token still set (not cleared by wrong token).
@@ -1544,7 +1686,8 @@ mod tests {
             &GestureInput::CopyCompleted {
                 token: copy_token,
                 press_generation: press_gen,
-                now: 500,
+                outcome: CopyOutcome::Confirmed,
+                now: ms(500),
             },
         );
         assert_eq!(s8.copy_token, None);
@@ -1555,7 +1698,8 @@ mod tests {
             &GestureInput::CopyCompleted {
                 token: copy_token,
                 press_generation: press_gen,
-                now: 510,
+                outcome: CopyOutcome::Confirmed,
+                now: ms(510),
             },
         );
         assert_eq!(s9.copy_token, None);
@@ -1578,7 +1722,7 @@ mod tests {
                 button: ClickButton::Other,
                 cell: (5, 10),
                 target: SemanticTarget::PlainCell((5, 10)),
-                now: 0,
+                now: ms(0),
             },
         );
         assert_eq!(count_select(&e), 0, "non-primary press does not select");
@@ -1594,7 +1738,7 @@ mod tests {
             &GestureInput::Move {
                 cell: (10, 12),
                 target: SemanticTarget::PlainCell((10, 12)),
-                now: 50,
+                now: ms(50),
             },
         );
         assert_eq!(count_select(&e2), 0, "non-primary move does not select");
@@ -1614,8 +1758,8 @@ mod tests {
             &GestureInput::Press {
                 button: ClickButton::Primary,
                 cell: (5, 10),
-                target: SemanticTarget::None,
-                now: 0,
+                target: SemanticTarget::NonSelectable,
+                now: ms(0),
             },
         );
         assert_eq!(count_select(&e), 0);
@@ -1626,7 +1770,7 @@ mod tests {
             &cfg,
             &GestureInput::Release {
                 cell: (5, 10),
-                now: 10,
+                now: ms(10),
             },
         );
         assert_eq!(count_select(&e2), 0, "chrome release does not select");
@@ -1644,7 +1788,7 @@ mod tests {
             copy_on_release: true,
         };
         let s = GestureState::new();
-        let (s, _) = press_plain(&cfg, s, 0, (5, 10));
+        let (s, _) = press_plain(&cfg, s, ms(0), (5, 10));
         // Move to a very far cell.
         let (s, e) = reduce(
             s,
@@ -1652,7 +1796,7 @@ mod tests {
             &GestureInput::Move {
                 cell: (1000, 500),
                 target: SemanticTarget::PlainCell((1000, 500)),
-                now: 50,
+                now: ms(50),
             },
         );
         assert_eq!(count_select(&e), 1, "drag extends to far cell");
@@ -1675,7 +1819,7 @@ mod tests {
         };
         let s = GestureState::new();
         let cell = (5, 10);
-        let target = SemanticTarget::Mapped {
+        let target = SemanticTarget::TableCell {
             cell,
             fragment_id: 42,
         };
@@ -1688,10 +1832,10 @@ mod tests {
                 button: ClickButton::Primary,
                 cell,
                 target: target.clone(),
-                now: 0,
+                now: ms(0),
             },
         );
-        let (s, _) = reduce(s, &cfg, &GestureInput::Release { cell, now: 10 });
+        let (s, _) = reduce(s, &cfg, &GestureInput::Release { cell, now: ms(10) });
         let (s, _) = reduce(
             s,
             &cfg,
@@ -1699,10 +1843,10 @@ mod tests {
                 button: ClickButton::Primary,
                 cell,
                 target: target.clone(),
-                now: 20,
+                now: ms(20),
             },
         );
-        let (_, e) = reduce(s, &cfg, &GestureInput::Release { cell, now: 30 });
+        let (_, e) = reduce(s, &cfg, &GestureInput::Release { cell, now: ms(30) });
         assert_eq!(count_select(&e), 1);
     }
 
@@ -1716,9 +1860,9 @@ mod tests {
         let s = GestureState::new();
 
         // Drag-select and release.
-        let (s, _) = press_plain(&cfg, s, 0, (5, 10));
-        let (s, _) = move_to(&cfg, s, 50, (10, 12));
-        let (_, e) = release(&cfg, s, 100, (10, 12));
+        let (s, _) = press_plain(&cfg, s, ms(0), (5, 10));
+        let (s, _) = move_to(&cfg, s, ms(50), (10, 12));
+        let (_, e) = release(&cfg, s, ms(100), (10, 12));
 
         // The ScheduleCopy effect must have retain_highlight = true.
         let copy_effect = e.iter().find_map(|ef| match ef {
@@ -1738,15 +1882,15 @@ mod tests {
         let s = GestureState::new();
 
         // First click on cell A.
-        let (s, _) = press_plain(&cfg, s, 0, (5, 10));
-        let (s, _) = release(&cfg, s, 10, (5, 10));
+        let (s, _) = press_plain(&cfg, s, ms(0), (5, 10));
+        let (s, _) = release(&cfg, s, ms(10), (5, 10));
         assert_eq!(s.click_count, 1);
 
         // Second click on a different cell B (different target) → new
         // sequence, not a double-click.
-        let (s, _) = press_plain(&cfg, s, 20, (8, 12));
+        let (s, _) = press_plain(&cfg, s, ms(20), (8, 12));
         assert_eq!(s.click_count, 1, "target change resets sequence");
-        let (_, e) = release(&cfg, s, 30, (8, 12));
+        let (_, e) = release(&cfg, s, ms(30), (8, 12));
         assert_eq!(
             count_select(&e),
             0,
@@ -1766,7 +1910,7 @@ mod tests {
                 button: ClickButton::Other,
                 cell: (5, 10),
                 target: SemanticTarget::PlainCell((5, 10)),
-                now: 0,
+                now: ms(0),
             },
         );
         let (s2, e) = reduce(
@@ -1774,7 +1918,7 @@ mod tests {
             &cfg,
             &GestureInput::Release {
                 cell: (5, 10),
-                now: 10,
+                now: ms(10),
             },
         );
         assert_eq!(count_select(&e), 0);
@@ -1786,7 +1930,7 @@ mod tests {
     fn release_without_press_is_inert() {
         let cfg = GestureConfig::default();
         let s = GestureState::new();
-        let (s2, e) = release(&cfg, s, 100, (5, 10));
+        let (s2, e) = release(&cfg, s, ms(100), (5, 10));
         assert_eq!(count_select(&e), 0);
         assert_eq!(count_copy(&e), 0);
         assert!(!s2.dragging);
@@ -1797,7 +1941,7 @@ mod tests {
     fn move_without_press_is_inert() {
         let cfg = GestureConfig::default();
         let s = GestureState::new();
-        let (s2, e) = move_to(&cfg, s, 50, (10, 12));
+        let (s2, e) = move_to(&cfg, s, ms(50), (10, 12));
         assert_eq!(count_select(&e), 0);
         assert!(!s2.dragging);
     }
@@ -1807,11 +1951,11 @@ mod tests {
         let cfg = GestureConfig::default();
         let s = GestureState::new();
         // Set up a pending activation.
-        let (s, _) = press_link(&cfg, s, 0, (4, 7), "https://x.test");
-        let (s, _) = release(&cfg, s, 10, (4, 7));
+        let (s, _) = press_link(&cfg, s, ms(0), (4, 7), "https://x.test");
+        let (s, _) = release(&cfg, s, ms(10), (4, 7));
         assert!(s.activation_token.is_some());
 
-        let (s2, e) = reduce(s, &cfg, &GestureInput::ViewChange { now: 100 });
+        let (s2, e) = reduce(s, &cfg, &GestureInput::ViewChange { now: ms(100) });
         assert!(matches!(e.as_slice(), [GestureEffect::ClearSelection]));
         assert!(s2.activation_token.is_none());
         assert!(s2.pending_press.is_none());
@@ -1822,11 +1966,11 @@ mod tests {
     fn terminal_change_clears_selection_and_activations() {
         let cfg = GestureConfig::default();
         let s = GestureState::new();
-        let (s, _) = press_link(&cfg, s, 0, (4, 7), "https://x.test");
-        let (s, _) = release(&cfg, s, 10, (4, 7));
+        let (s, _) = press_link(&cfg, s, ms(0), (4, 7), "https://x.test");
+        let (s, _) = release(&cfg, s, ms(10), (4, 7));
         let token = s.activation_token.unwrap();
 
-        let (s2, e) = reduce(s, &cfg, &GestureInput::TerminalChange { now: 100 });
+        let (s2, e) = reduce(s, &cfg, &GestureInput::TerminalChange { now: ms(100) });
         assert!(matches!(e.as_slice(), [GestureEffect::ClearSelection]));
         assert!(s2.activation_token.is_none());
         assert!(s2.terminal_generation > 0);
@@ -1835,7 +1979,10 @@ mod tests {
         let (_, e2) = reduce(
             s2,
             &cfg,
-            &GestureInput::ActivationTimerFired { token, now: 600 },
+            &GestureInput::ActivationTimerFired {
+                token,
+                now: ms(600),
+            },
         );
         assert_eq!(count_activate(&e2), 0);
     }
@@ -1844,13 +1991,227 @@ mod tests {
     fn cancel_clears_everything() {
         let cfg = GestureConfig::default();
         let s = GestureState::new();
-        let (s, _) = press_link(&cfg, s, 0, (4, 7), "https://x.test");
-        let (s, _) = release(&cfg, s, 10, (4, 7));
-        let (s2, e) = reduce(s, &cfg, &GestureInput::Cancel { now: 100 });
+        let (s, _) = press_link(&cfg, s, ms(0), (4, 7), "https://x.test");
+        let (s, _) = release(&cfg, s, ms(10), (4, 7));
+        let (s2, e) = reduce(s, &cfg, &GestureInput::Cancel { now: ms(100) });
         assert!(matches!(e.as_slice(), [GestureEffect::ClearSelection]));
         assert!(s2.activation_token.is_none());
         assert!(s2.pending_press.is_none());
         assert!(!s2.dragging);
         assert_eq!(s2.click_count, 0);
+    }
+
+    #[test]
+    fn double_click_copy_waits_for_matching_timer() {
+        let cfg = GestureConfig {
+            copy_on_release: true,
+        };
+        let s = GestureState::new();
+        let cell = (5, 10);
+        let (s, _) = press_plain(&cfg, s, ms(0), cell);
+        let (s, _) = release(&cfg, s, ms(10), cell);
+        let (s, _) = press_plain(&cfg, s, ms(20), cell);
+        let (s, e) = release(&cfg, s, ms(30), cell);
+        assert_eq!(count_select(&e), 1);
+        assert_eq!(count_copy(&e), 0, "double-click must not copy immediately");
+        assert_eq!(count_copy_timer(&e), 1);
+        let token = s.copy_token.unwrap();
+        let press_generation = s.copy_press_generation.unwrap();
+        let deadline = s.pending_copy_deadline.unwrap();
+        assert_eq!(deadline, ms(500));
+
+        let (_, early) = reduce(
+            s.clone(),
+            &cfg,
+            &GestureInput::CopyTimerFired {
+                token,
+                press_generation,
+                now: ms(499),
+            },
+        );
+        assert_eq!(count_copy(&early), 0, "timer before deadline is inert");
+
+        let (s_due, due) = reduce(
+            s,
+            &cfg,
+            &GestureInput::CopyTimerFired {
+                token,
+                press_generation,
+                now: deadline,
+            },
+        );
+        assert_eq!(count_copy(&due), 1, "matching timer schedules one copy");
+        assert_eq!(count_copy_timer(&due), 0);
+        assert_eq!(s_due.copy_token, Some(token));
+        assert!(s_due.pending_copy_deadline.is_none());
+    }
+
+    #[test]
+    fn triple_click_tombstones_word_copy_timer() {
+        let cfg = GestureConfig {
+            copy_on_release: true,
+        };
+        let s = GestureState::new();
+        let cell = (5, 10);
+        let (s, _) = press_plain(&cfg, s, ms(0), cell);
+        let (s, _) = release(&cfg, s, ms(10), cell);
+        let (s, _) = press_plain(&cfg, s, ms(20), cell);
+        let (s, e2) = release(&cfg, s, ms(30), cell);
+        assert_eq!(count_copy_timer(&e2), 1);
+        let word_token = s.copy_token.unwrap();
+        let word_gen = s.copy_press_generation.unwrap();
+        let word_deadline = s.pending_copy_deadline.unwrap();
+
+        let (s, e_press) = press_plain(&cfg, s, ms(40), cell);
+        assert!(s.copy_token.is_none(), "third press tombstones word token");
+        assert!(s.pending_copy_deadline.is_none());
+        assert_eq!(count_copy(&e_press), 0);
+
+        let (_, stale) = reduce(
+            s.clone(),
+            &cfg,
+            &GestureInput::CopyTimerFired {
+                token: word_token,
+                press_generation: word_gen,
+                now: word_deadline,
+            },
+        );
+        assert_eq!(count_copy(&stale), 0, "tombstoned word timer is inert");
+
+        let (s3, e3) = release(&cfg, s, ms(50), cell);
+        assert_eq!(count_copy(&e3), 0);
+        assert_eq!(count_copy_timer(&e3), 1);
+        let line_token = s3.copy_token.unwrap();
+        assert_ne!(line_token, word_token);
+        assert_eq!(s3.pending_copy_deadline, Some(ms(550)));
+    }
+
+    #[test]
+    fn stale_copy_timer_and_completion_are_inert() {
+        let cfg = GestureConfig {
+            copy_on_release: true,
+        };
+        let s = GestureState::new();
+        let cell = (5, 10);
+        let (s, _) = press_plain(&cfg, s, ms(0), cell);
+        let (s, _) = release(&cfg, s, ms(10), cell);
+        let (s, _) = press_plain(&cfg, s, ms(20), cell);
+        let (s, _) = release(&cfg, s, ms(30), cell);
+        let token = s.copy_token.unwrap();
+        let press_generation = s.copy_press_generation.unwrap();
+
+        let (s, _) = reduce(s, &cfg, &GestureInput::Cancel { now: ms(40) });
+        let (_, timer) = reduce(
+            s.clone(),
+            &cfg,
+            &GestureInput::CopyTimerFired {
+                token,
+                press_generation,
+                now: ms(530),
+            },
+        );
+        assert_eq!(count_copy(&timer), 0);
+        let (_, done) = reduce(
+            s.clone(),
+            &cfg,
+            &GestureInput::CopyCompleted {
+                token,
+                press_generation,
+                outcome: CopyOutcome::Confirmed,
+                now: ms(540),
+            },
+        );
+        assert_eq!(count_notify(&done), 0);
+        let (_, rejected) = reduce(
+            s,
+            &cfg,
+            &GestureInput::CopyRejected {
+                token,
+                press_generation,
+                now: ms(550),
+            },
+        );
+        assert_eq!(count_notify(&rejected), 0);
+    }
+
+    #[test]
+    fn copy_rejected_notifies_once() {
+        let cfg = GestureConfig {
+            copy_on_release: true,
+        };
+        let s = GestureState::new();
+        let (s, _) = press_plain(&cfg, s, ms(0), (5, 10));
+        let (s, _) = move_to(&cfg, s, ms(50), (10, 12));
+        let (s, e) = release(&cfg, s, ms(100), (10, 12));
+        assert_eq!(count_copy(&e), 1);
+        let token = s.copy_token.unwrap();
+        let press_generation = s.copy_press_generation.unwrap();
+
+        let (s, first) = reduce(
+            s,
+            &cfg,
+            &GestureInput::CopyRejected {
+                token,
+                press_generation,
+                now: ms(110),
+            },
+        );
+        assert_eq!(count_notify(&first), 1);
+        assert!(first.iter().any(|effect| matches!(
+            effect,
+            GestureEffect::Notify {
+                outcome: CopyOutcome::Failed
+            }
+        )));
+        assert!(s.copy_token.is_none());
+
+        let (_, second) = reduce(
+            s,
+            &cfg,
+            &GestureInput::CopyRejected {
+                token,
+                press_generation,
+                now: ms(120),
+            },
+        );
+        assert_eq!(count_notify(&second), 0, "duplicate reject is inert");
+    }
+
+    #[test]
+    fn simultaneous_input_precedes_due_copy_timer() {
+        let cfg = GestureConfig {
+            copy_on_release: true,
+        };
+        let s = GestureState::new();
+        let cell = (5, 10);
+        let (s, _) = press_plain(&cfg, s, ms(0), cell);
+        let (s, _) = release(&cfg, s, ms(10), cell);
+        let (s, _) = press_plain(&cfg, s, ms(20), cell);
+        let (s, _) = release(&cfg, s, ms(30), cell);
+        let word_token = s.copy_token.unwrap();
+        let word_gen = s.copy_press_generation.unwrap();
+        let deadline = s.pending_copy_deadline.unwrap();
+
+        let (s_press, _) = press_plain(&cfg, s, deadline, cell);
+        assert!(s_press.copy_token.is_none());
+        let (_, timer) = reduce(
+            s_press.clone(),
+            &cfg,
+            &GestureInput::CopyTimerFired {
+                token: word_token,
+                press_generation: word_gen,
+                now: deadline,
+            },
+        );
+        assert_eq!(
+            count_copy(&timer),
+            0,
+            "third press at the deadline wins over the word timer"
+        );
+
+        let (s_line, e_line) = release(&cfg, s_press, deadline, cell);
+        assert_eq!(count_copy(&e_line), 0);
+        assert_eq!(count_copy_timer(&e_line), 1);
+        assert_ne!(s_line.copy_token, Some(word_token));
     }
 }

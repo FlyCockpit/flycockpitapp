@@ -39,8 +39,9 @@ use crate::tui::theme::{
 
 use super::{
     AUTOCOMPLETE_ROWS, AffordanceTarget, App, DirtyScan, HistoryEntryId, HistoryRenderCacheEntry,
-    PaneSide, PrewrappedEntry, ScrollAnchor, Selection, StartupModal, SuggestionBoxKind,
-    SuggestionBoxRowHit, SuggestionBoxTarget, Toast, ToastKind, TranscriptFind, WORKING_MESSAGES,
+    PaneSide, PrewrappedEntry, ScrollAnchor, Selection, SelectionSpan, StartupModal,
+    SuggestionBoxKind, SuggestionBoxRowHit, SuggestionBoxTarget, Toast, ToastKind, TranscriptFind,
+    WORKING_MESSAGES,
 };
 
 /// Startup grace before the working indicator first appears — prevents
@@ -1277,6 +1278,20 @@ impl App {
 
     pub(super) fn render(&mut self, frame: &mut ratatui::Frame) {
         let geom = self.geometry();
+        let frame_key = (
+            frame.area().width,
+            frame.area().height,
+            self.overlay.is_open(),
+            self.dialog.is_active(),
+        );
+        let last_key = self.last_button_frame_key;
+        if last_key != Some(frame_key) {
+            self.button_surface_generation = self.button_surface_generation.wrapping_add(1);
+            self.last_button_frame_key = Some(frame_key);
+        }
+        self.button_registry
+            .begin_frame(self.mouse_capture, self.button_surface_generation);
+        self.row_registry.begin_frame(self.mouse_capture);
         let rects = geom.layout(frame.area());
         if self.footer_agent_picker.is_none() && self.footer_mode_picker.is_none() {
             self.footer_picker_row_hits.clear();
@@ -1296,6 +1311,7 @@ impl App {
             // and the dialog into the `compact` slot. The dialog owns the
             // cursor while it's open.
             self.render_history(frame, rects.body);
+            self.paint_transcript_control_buttons(frame);
             if let Some(dialog) = self.question_dialog.as_mut() {
                 // Sync both body regions' scroll viewports to the real
                 // overlay geometry so a long prompt and a long option list
@@ -1335,7 +1351,8 @@ impl App {
                     self.overlay = Overlay::Usage(pane);
                 }
                 Overlay::Sessions(mut pane) => {
-                    pane.render(frame, rects.body);
+                    pane.set_pointer_capture(self.mouse_capture);
+                    pane.render_with_buttons(frame, rects.body, Some(&mut self.button_registry));
                     let preview_request = if pane.needs_preview_for_selection() {
                         match pane.ensure_preview_for_selection() {
                             Some(crate::tui::sessions_pane::SessionsOutcome::LoadPreview {
@@ -1408,7 +1425,10 @@ impl App {
                     // fullscreen). Returns the chat rect, or `None` if hidden.
                     let chat_rect = self.render_pane(frame, rects.body);
                     match chat_rect {
-                        Some(chat) => self.render_history(frame, chat),
+                        Some(chat) => {
+                            self.render_history(frame, chat);
+                            self.paint_transcript_control_buttons(frame);
+                        }
                         None => self.chat_area = None,
                     }
                     if geom.indicator > 0 {
@@ -1488,6 +1508,7 @@ impl App {
             }
             self.keys_overlay = overlay;
         }
+        self.button_registry.end_frame();
     }
 
     /// Render the below-input pin-count indicator (`pinned-messages`):
@@ -1523,55 +1544,113 @@ impl App {
         let Some(text) = self.persistent_notice_text() else {
             return;
         };
+        let para = Paragraph::new(Line::from(Span::styled(
+            super::sandbox_notice_render_text(&text),
+            Style::default().fg(ERROR_TEXT),
+        )))
+        .wrap(ratatui::widgets::Wrap { trim: true });
+        frame.render_widget(para, area);
+
+        use crate::tui::button::{ButtonDispatch, ButtonId, ButtonSpec};
+        let y = area.y;
         if self.auth_failure_notice.is_some()
-            && self.mouse_capture
-            && text.starts_with("[switch model] [fix provider] ")
+            && text.starts_with("[switch model] [fix provider]")
             && area.width >= 31
         {
-            self.auth_notice_switch_rect = Some(Rect::new(area.x.saturating_add(1), area.y, 14, 1));
-            self.auth_notice_fix_rect = Some(Rect::new(area.x.saturating_add(16), area.y, 14, 1));
-            let rest = text
-                .strip_prefix("[switch model] [fix provider]")
-                .unwrap_or(&text);
-            let line = Line::from(vec![
-                Span::styled(" ", Style::default().fg(ERROR_TEXT)),
-                Span::styled(
-                    "[switch model]",
-                    Style::default().fg(Color::Black).bg(ERROR_TEXT),
+            self.auth_notice_switch_rect = self.button_registry.paint(
+                frame,
+                area.x.saturating_add(1),
+                y,
+                14,
+                ButtonSpec::new(
+                    ButtonId::PersistentNoticeSwitchModel,
+                    "switch model",
+                    ButtonDispatch::PersistentNoticeSwitchModel,
                 ),
-                Span::raw(" "),
-                Span::styled(
-                    "[fix provider]",
-                    Style::default().fg(Color::Black).bg(ERROR_TEXT),
+            );
+            self.auth_notice_fix_rect = self.button_registry.paint(
+                frame,
+                area.x.saturating_add(16),
+                y,
+                14,
+                ButtonSpec::new(
+                    ButtonId::PersistentNoticeFixProvider,
+                    "fix provider",
+                    ButtonDispatch::PersistentNoticeFixProvider,
                 ),
-                Span::styled(rest.to_string(), Style::default().fg(ERROR_TEXT)),
-            ]);
-            frame.render_widget(
-                Paragraph::new(line).wrap(ratatui::widgets::Wrap { trim: true }),
-                area,
             );
             return;
         }
-        let has_copy_chip = self.persistent_notice_fix_command().is_some()
-            && self.mouse_capture
-            && text.starts_with("[copy] ")
-            && area.width >= 7;
-        let line = if has_copy_chip {
-            self.sandbox_notice_copy_rect = Some(Rect::new(area.x.saturating_add(1), area.y, 6, 1));
-            let rest = text.strip_prefix("[copy]").unwrap_or(&text);
-            Line::from(vec![
-                Span::styled(" ", Style::default().fg(ERROR_TEXT)),
-                Span::styled("[copy]", Style::default().fg(Color::Black).bg(ERROR_TEXT)),
-                Span::styled(rest.to_string(), Style::default().fg(ERROR_TEXT)),
-            ])
-        } else {
-            Line::from(vec![Span::styled(
-                super::sandbox_notice_render_text(&text),
-                Style::default().fg(ERROR_TEXT),
-            )])
+        if self.persistent_notice_fix_command().is_some()
+            && text.starts_with("[copy]")
+            && area.width >= 7
+        {
+            self.sandbox_notice_copy_rect = self.button_registry.paint(
+                frame,
+                area.x.saturating_add(1),
+                y,
+                6,
+                ButtonSpec::new(
+                    ButtonId::PersistentNoticeCopy,
+                    "copy",
+                    ButtonDispatch::PersistentNoticeCopy,
+                ),
+            );
+        }
+    }
+
+    fn paint_transcript_control_buttons(&mut self, frame: &mut ratatui::Frame) {
+        use crate::tui::button::{ButtonDispatch, ButtonId, ButtonSpec};
+        let Some(area) = self.chat_area else {
+            return;
         };
-        let para = Paragraph::new(line).wrap(ratatui::widgets::Wrap { trim: true });
-        frame.render_widget(para, area);
+        let mut chips = Vec::new();
+        for (row, meta) in self.chat_row_meta.iter().enumerate() {
+            let y = area.y.saturating_add(row as u16);
+            if let Some(hit) = meta.fork_hit {
+                chips.push((
+                    area.x.saturating_add(hit.col_start),
+                    y,
+                    hit.col_end.saturating_sub(hit.col_start),
+                    hit.seq,
+                    true,
+                ));
+            }
+            if let Some(hit) = meta.pin_hit {
+                chips.push((
+                    area.x.saturating_add(hit.col_start),
+                    y,
+                    hit.col_end.saturating_sub(hit.col_start),
+                    hit.seq,
+                    false,
+                ));
+            }
+        }
+        for (x, y, width, seq, is_fork) in chips {
+            if width == 0 {
+                continue;
+            }
+            let spec = if is_fork {
+                ButtonSpec::new(
+                    ButtonId::TranscriptFork { seq },
+                    "fork",
+                    ButtonDispatch::TranscriptFork { seq },
+                )
+            } else if self.is_seq_pinned_for_render(seq) {
+                ButtonSpec::new(
+                    ButtonId::TranscriptUnpin { seq },
+                    "unpin",
+                    ButtonDispatch::TranscriptUnpin { seq },
+                )
+            } else {
+                ButtonSpec::new(
+                    ButtonId::TranscriptPin { seq },
+                    "pin",
+                    ButtonDispatch::TranscriptPin { seq },
+                )
+            };
+            let _ = self.button_registry.paint(frame, x, y, width, spec);
+        }
     }
 
     /// Render the `/pins` review checklist as a bottom-anchored overlay box
@@ -2917,6 +2996,7 @@ impl App {
                 frame.buffer_mut(),
                 area,
                 sel,
+                self.selection_spans.as_deref(),
                 &chip_row_mask,
                 &self.chat_text_grid,
             );
@@ -4164,6 +4244,53 @@ impl App {
             .collect();
         frame.render_widget(Paragraph::new(Line::from(left)), bottom[0]);
         frame.render_widget(Paragraph::new(Line::from(right)), bottom[1]);
+        self.paint_footer_buttons(frame);
+    }
+
+    fn paint_footer_buttons(&mut self, frame: &mut ratatui::Frame<'_>) {
+        use crate::tui::button::{ButtonDispatch, ButtonId, ButtonSpec};
+        let hits = self.footer_hit_areas.clone();
+        let focused = self.footer_selection;
+        for hit in hits {
+            let (id, dispatch, label) = match hit.control {
+                crate::tui::chrome::FooterControl::Agent => {
+                    let path = if self.agent_path.is_empty() {
+                        vec![self.launch.agent_name.clone()]
+                    } else {
+                        self.agent_path.clone()
+                    };
+                    let label = path
+                        .iter()
+                        .map(|name| crate::tui::history::agent_display_label(name).to_string())
+                        .collect::<Vec<_>>()
+                        .join(" › ");
+                    (
+                        ButtonId::Footer(crate::tui::chrome::FooterControl::Agent),
+                        ButtonDispatch::Footer(crate::tui::chrome::FooterControl::Agent),
+                        label,
+                    )
+                }
+                crate::tui::chrome::FooterControl::Model => {
+                    let Some((provider, model)) = &self.launch.active_model else {
+                        continue;
+                    };
+                    (
+                        ButtonId::Footer(crate::tui::chrome::FooterControl::Model),
+                        ButtonDispatch::Footer(crate::tui::chrome::FooterControl::Model),
+                        format!("{provider}/{model}"),
+                    )
+                }
+                crate::tui::chrome::FooterControl::Mode => (
+                    ButtonId::Footer(crate::tui::chrome::FooterControl::Mode),
+                    ButtonDispatch::Footer(crate::tui::chrome::FooterControl::Mode),
+                    self.llm_mode.as_str().to_string(),
+                ),
+            };
+            let spec = ButtonSpec::new(id, label, dispatch).focused(focused == Some(hit.control));
+            let _ = self
+                .button_registry
+                .paint(frame, hit.rect.x, hit.rect.y, hit.rect.width, spec);
+        }
     }
 }
 
@@ -4709,9 +4836,36 @@ fn apply_selection_highlight(
     buf: &mut ratatui::buffer::Buffer,
     area: Rect,
     sel: Selection,
+    spans: Option<&[SelectionSpan]>,
     chip_row_mask: &[bool],
     chat_text_grid: &[Vec<String>],
 ) {
+    if let Some(spans) = spans.filter(|spans| !spans.is_empty()) {
+        for span in spans {
+            if span.row < area.y || span.row >= area.y.saturating_add(area.height) {
+                continue;
+            }
+            let chat_rel = span.row.saturating_sub(area.y) as usize;
+            if chip_row_mask.get(chat_rel).copied().unwrap_or(false) {
+                continue;
+            }
+            let first = span.start_col.max(area.x);
+            let last = span
+                .end_col
+                .min(area.x.saturating_add(area.width.saturating_sub(1)));
+            if first > last {
+                continue;
+            }
+            for col in first..=last {
+                if let Some(cell) = buf.cell_mut((col, span.row)) {
+                    let mut style = cell.style();
+                    style = style.add_modifier(ratatui::style::Modifier::REVERSED);
+                    cell.set_style(style);
+                }
+            }
+        }
+        return;
+    }
     let (start, end) = sel.ordered();
     let left = area.x;
     let right = area.x + area.width.saturating_sub(1);

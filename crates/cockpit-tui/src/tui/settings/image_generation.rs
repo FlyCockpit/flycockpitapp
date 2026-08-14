@@ -31,9 +31,10 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use super::pointer_actions::{
-    ConfirmationChoice, GenerationAction, GenerationNodeId, ImageEndpointId, ImageJobId,
-    ImageTargetId, ImageWorkflowId, LateResultId,
+    ConfirmationChoice, GenerationAction, ImageEndpointId, ImageJobId, ImageTargetId,
+    ImageWorkflowId, LateResultId, SettingsPointerAction,
 };
+use super::shell::SettingsScrollRegionId;
 use super::{Nav, PageBox, SettingsCx, SettingsPage, SettingsPointerSurfaceKind};
 
 // ---------------------------------------------------------------------------
@@ -737,6 +738,53 @@ fn boxed<P: SettingsPage + 'static>(page: P) -> PageBox {
     Box::new(page)
 }
 
+type GenerationBinding = Option<(GenerationAction, bool, Option<&'static str>)>;
+
+fn render_generation_page(
+    cx: &SettingsCx,
+    frame: &mut Frame,
+    area: Rect,
+    key: &'static str,
+    title: &str,
+    rows: Vec<(String, GenerationBinding)>,
+    selected: Option<usize>,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {title} "));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let mut lines = Vec::with_capacity(rows.len());
+    let mut controls = Vec::with_capacity(rows.len());
+    for (text, binding) in rows {
+        lines.push(Line::from(text));
+        controls.push(binding.map(|(action, enabled, reason)| {
+            (SettingsPointerAction::Generation(action), enabled, reason)
+        }));
+    }
+    cx.scroll_states.render_control_lines(
+        frame,
+        inner,
+        key,
+        (lines, selected),
+        controls,
+        (&cx.pointer_surface, SettingsScrollRegionId(key)).into(),
+    );
+}
+
+fn accept_or_back(action: SettingsPointerAction, accepted: bool) -> Nav {
+    if accepted {
+        return Nav::Stay;
+    }
+    if matches!(
+        action,
+        SettingsPointerAction::Generation(GenerationAction::Cancel)
+    ) {
+        return Nav::Back;
+    }
+    Nav::Stay
+}
+
 /// The Generation settings node list items.
 pub(super) const GENERATION_NODE_TITLES: &[&str] = &[
     "Endpoints",
@@ -798,6 +846,27 @@ impl SettingsPage for GenerationListPage {
     fn pointer_surface_kind(&self) -> SettingsPointerSurfaceKind {
         SettingsPointerSurfaceKind::GenerationList
     }
+    fn handle_pointer_control(
+        &mut self,
+        _cx: &mut SettingsCx,
+        action: super::pointer_actions::SettingsPointerAction,
+    ) -> Nav {
+        let super::pointer_actions::SettingsPointerAction::Generation(
+            super::pointer_actions::GenerationAction::OpenNode(node),
+        ) = action
+        else {
+            return Nav::Stay;
+        };
+        self.cursor = match node {
+            super::pointer_actions::GenerationNodeId::Endpoints => 0,
+            super::pointer_actions::GenerationNodeId::Targets => 1,
+            super::pointer_actions::GenerationNodeId::Workflows => 2,
+            super::pointer_actions::GenerationNodeId::Budget => 3,
+            super::pointer_actions::GenerationNodeId::Grants => 4,
+            super::pointer_actions::GenerationNodeId::Jobs => 5,
+        };
+        open_generation_node(self.cursor, self.principal).map_or(Nav::Stay, Nav::Push)
+    }
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         // While the resize blocker is showing, list navigation is inert; only
         // the back/quit keys remain live so the user can leave the surface.
@@ -809,21 +878,44 @@ impl SettingsPage for GenerationListPage {
         }
         self.handle_node_key(cx, key)
     }
-    fn render(&self, _cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         if self.viewport == GenerationViewportMode::Blocked {
             render_resize_blocker(frame, area);
             return;
         }
         let mut lines = Vec::new();
+        let mut controls = Vec::new();
         for (i, title) in GENERATION_NODE_TITLES.iter().enumerate() {
             let marker = if i == self.cursor { "▸ " } else { "  " };
             lines.push(Line::from(format!("{marker}{title}")));
+            let node = match i {
+                0 => super::pointer_actions::GenerationNodeId::Endpoints,
+                1 => super::pointer_actions::GenerationNodeId::Targets,
+                2 => super::pointer_actions::GenerationNodeId::Workflows,
+                3 => super::pointer_actions::GenerationNodeId::Budget,
+                4 => super::pointer_actions::GenerationNodeId::Grants,
+                _ => super::pointer_actions::GenerationNodeId::Jobs,
+            };
+            controls.push(Some((
+                super::pointer_actions::SettingsPointerAction::Generation(
+                    super::pointer_actions::GenerationAction::OpenNode(node),
+                ),
+                true,
+                None,
+            )));
         }
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(Block::default().borders(Borders::ALL).title(" Generation "))
-                .wrap(Wrap { trim: false }),
+        let selected_line = Some(self.cursor);
+        cx.scroll_states.render_control_lines(
+            frame,
             area,
+            "generation:list",
+            (lines, selected_line),
+            controls,
+            (
+                &cx.pointer_surface,
+                super::shell::SettingsScrollRegionId("generation:list"),
+            )
+                .into(),
         );
     }
     fn title(&self, _cx: &SettingsCx) -> String {
@@ -854,26 +946,70 @@ impl SettingsPage for EndpointEditorPage {
             _ => Nav::Stay,
         }
     }
-    fn render(&self, _cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+    fn handle_pointer_control(
+        &mut self,
+        _cx: &mut SettingsCx,
+        action: SettingsPointerAction,
+    ) -> Nav {
+        accept_or_back(
+            action.clone(),
+            matches!(
+                &action,
+                SettingsPointerAction::Generation(
+                    GenerationAction::CreateEndpoint
+                        | GenerationAction::EditEndpoint(_)
+                        | GenerationAction::DeleteEndpoint(_)
+                        | GenerationAction::Cancel
+                )
+            ),
+        )
+    }
+    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         if self.viewport == GenerationViewportMode::Blocked {
             render_resize_blocker(frame, area);
             return;
         }
-        let mut lines = Vec::new();
+        let mut rows: Vec<(String, GenerationBinding)> = Vec::new();
         if let Some(reason) = self.principal.config_section_reason() {
-            lines.push(Line::from(format!("Disabled: {reason}")));
-            lines.push(Line::from("No endpoint data visible."));
+            rows.push((format!("Disabled: {reason}"), None));
+            rows.push(("No endpoint data visible.".into(), None));
         } else {
-            lines.push(Line::from("Endpoints (config section, admin-gated)"));
-            lines.push(Line::from("  [create endpoint]"));
-            lines.push(Line::from("  [edit endpoint]"));
-            lines.push(Line::from("  [delete endpoint]"));
+            rows.push(("Endpoints (config section, admin-gated)".into(), None));
+            rows.push((
+                "[create endpoint]".into(),
+                Some((GenerationAction::CreateEndpoint, true, None)),
+            ));
+            if let Some(id) = &self.endpoint_id {
+                rows.push((
+                    "[edit endpoint]".into(),
+                    Some((
+                        GenerationAction::EditEndpoint(ImageEndpointId(id.clone())),
+                        true,
+                        None,
+                    )),
+                ));
+                rows.push((
+                    "[delete endpoint]".into(),
+                    Some((
+                        GenerationAction::DeleteEndpoint(ImageEndpointId(id.clone())),
+                        true,
+                        None,
+                    )),
+                ));
+            }
+            rows.push((
+                "[Cancel]".into(),
+                Some((GenerationAction::Cancel, true, None)),
+            ));
         }
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(Block::default().borders(Borders::ALL).title(" Endpoints "))
-                .wrap(Wrap { trim: false }),
+        render_generation_page(
+            cx,
+            frame,
             area,
+            "generation:endpoints",
+            "Endpoints",
+            rows,
+            Some(self.cursor),
         );
     }
     fn title(&self, _cx: &SettingsCx) -> String {
@@ -904,26 +1040,84 @@ impl SettingsPage for TargetEditorPage {
             _ => Nav::Stay,
         }
     }
-    fn render(&self, _cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+    fn handle_pointer_control(
+        &mut self,
+        _cx: &mut SettingsCx,
+        action: SettingsPointerAction,
+    ) -> Nav {
+        accept_or_back(
+            action.clone(),
+            matches!(
+                &action,
+                SettingsPointerAction::Generation(
+                    GenerationAction::CreateTarget
+                        | GenerationAction::EditTarget(_)
+                        | GenerationAction::DeleteTarget(_)
+                        | GenerationAction::SetDefaultTarget(_)
+                        | GenerationAction::RefreshHealth
+                        | GenerationAction::Cancel
+                )
+            ),
+        )
+    }
+    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         if self.viewport == GenerationViewportMode::Blocked {
             render_resize_blocker(frame, area);
             return;
         }
-        let mut lines = Vec::new();
+        let mut rows: Vec<(String, GenerationBinding)> = Vec::new();
         if let Some(reason) = self.principal.targets_section_reason() {
-            lines.push(Line::from(format!("Disabled: {reason}")));
-            lines.push(Line::from("No target data visible."));
+            rows.push((format!("Disabled: {reason}"), None));
+            rows.push(("No target data visible.".into(), None));
         } else {
-            lines.push(Line::from("Targets (project_read=1)"));
-            lines.push(Line::from("  [create target]"));
-            lines.push(Line::from("  [set default]"));
-            lines.push(Line::from("  [refresh health]"));
+            rows.push(("Targets (project_read=1)".into(), None));
+            rows.push((
+                "[create target]".into(),
+                Some((GenerationAction::CreateTarget, true, None)),
+            ));
+            if let Some(id) = &self.target_id {
+                rows.push((
+                    "[edit target]".into(),
+                    Some((
+                        GenerationAction::EditTarget(ImageTargetId(id.clone())),
+                        true,
+                        None,
+                    )),
+                ));
+                rows.push((
+                    "[delete target]".into(),
+                    Some((
+                        GenerationAction::DeleteTarget(ImageTargetId(id.clone())),
+                        true,
+                        None,
+                    )),
+                ));
+                rows.push((
+                    "[set default]".into(),
+                    Some((
+                        GenerationAction::SetDefaultTarget(ImageTargetId(id.clone())),
+                        true,
+                        None,
+                    )),
+                ));
+            }
+            rows.push((
+                "[refresh health]".into(),
+                Some((GenerationAction::RefreshHealth, true, None)),
+            ));
+            rows.push((
+                "[Cancel]".into(),
+                Some((GenerationAction::Cancel, true, None)),
+            ));
         }
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(Block::default().borders(Borders::ALL).title(" Targets "))
-                .wrap(Wrap { trim: false }),
+        render_generation_page(
+            cx,
+            frame,
             area,
+            "generation:targets",
+            "Targets",
+            rows,
+            Some(self.cursor),
         );
     }
     fn title(&self, _cx: &SettingsCx) -> String {
@@ -954,26 +1148,70 @@ impl SettingsPage for WorkflowEditorPage {
             _ => Nav::Stay,
         }
     }
-    fn render(&self, _cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+    fn handle_pointer_control(
+        &mut self,
+        _cx: &mut SettingsCx,
+        action: SettingsPointerAction,
+    ) -> Nav {
+        accept_or_back(
+            action.clone(),
+            matches!(
+                &action,
+                SettingsPointerAction::Generation(
+                    GenerationAction::UploadWorkflow
+                        | GenerationAction::BindWorkflow(_)
+                        | GenerationAction::DeleteWorkflow(_)
+                        | GenerationAction::Cancel
+                )
+            ),
+        )
+    }
+    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         if self.viewport == GenerationViewportMode::Blocked {
             render_resize_blocker(frame, area);
             return;
         }
-        let mut lines = Vec::new();
+        let mut rows: Vec<(String, GenerationBinding)> = Vec::new();
         if let Some(reason) = self.principal.config_section_reason() {
-            lines.push(Line::from(format!("Disabled: {reason}")));
-            lines.push(Line::from("No workflow data visible."));
+            rows.push((format!("Disabled: {reason}"), None));
+            rows.push(("No workflow data visible.".into(), None));
         } else {
-            lines.push(Line::from("Workflows (config section, admin-gated)"));
-            lines.push(Line::from("  [upload workflow]"));
-            lines.push(Line::from("  [bind workflow]"));
-            lines.push(Line::from("  [delete workflow]"));
+            rows.push(("Workflows (config section, admin-gated)".into(), None));
+            rows.push((
+                "[upload workflow]".into(),
+                Some((GenerationAction::UploadWorkflow, true, None)),
+            ));
+            if let Some(id) = &self.workflow_id {
+                rows.push((
+                    "[bind workflow]".into(),
+                    Some((
+                        GenerationAction::BindWorkflow(ImageWorkflowId(id.clone())),
+                        true,
+                        None,
+                    )),
+                ));
+                rows.push((
+                    "[delete workflow]".into(),
+                    Some((
+                        GenerationAction::DeleteWorkflow(ImageWorkflowId(id.clone())),
+                        true,
+                        None,
+                    )),
+                ));
+            }
+            rows.push((
+                "[Cancel]".into(),
+                Some((GenerationAction::Cancel, true, None)),
+            ));
         }
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(Block::default().borders(Borders::ALL).title(" Workflows "))
-                .wrap(Wrap { trim: false }),
+        render_generation_page(
+            cx,
+            frame,
             area,
+            "generation:workflows",
+            "Workflows",
+            rows,
+            Some(self.cursor),
         );
     }
     fn title(&self, _cx: &SettingsCx) -> String {
@@ -1005,15 +1243,30 @@ impl SettingsPage for BudgetEditorPage {
             _ => Nav::Stay,
         }
     }
-    fn render(&self, _cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+    fn handle_pointer_control(
+        &mut self,
+        _cx: &mut SettingsCx,
+        action: SettingsPointerAction,
+    ) -> Nav {
+        accept_or_back(
+            action.clone(),
+            matches!(
+                &action,
+                SettingsPointerAction::Generation(
+                    GenerationAction::SaveBudget | GenerationAction::Cancel
+                )
+            ),
+        )
+    }
+    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         if self.viewport == GenerationViewportMode::Blocked {
             render_resize_blocker(frame, area);
             return;
         }
-        let mut lines = Vec::new();
+        let mut rows: Vec<(String, GenerationBinding)> = Vec::new();
         if let Some(reason) = self.principal.config_section_reason() {
-            lines.push(Line::from(format!("Disabled: {reason}")));
-            lines.push(Line::from("No budget data visible."));
+            rows.push((format!("Disabled: {reason}"), None));
+            rows.push(("No budget data visible.".into(), None));
         } else {
             let session_label = match self.state.session.policy {
                 cockpit_core::image_generation_control_plane::BudgetPolicy::Unconfigured => {
@@ -1033,29 +1286,45 @@ impl SettingsPage for BudgetEditorPage {
                     "Unlimited"
                 }
             };
-            lines.push(Line::from(format!("Session scope: {session_label}")));
-            lines.push(Line::from(format!("Project scope: {project_label}")));
+            rows.push((format!("Session scope: {session_label}"), None));
+            rows.push((format!("Project scope: {project_label}"), None));
             if self.state.request_scope_editable() {
-                lines.push(Line::from("Request scope: editable (live plan)"));
+                rows.push(("Request scope: editable (live plan)".into(), None));
             } else {
-                lines.push(Line::from(format!(
-                    "Request scope: disabled ({REASON_REQUEST_SCOPE_REQUIRES_PLAN})"
-                )));
+                rows.push((
+                    format!("Request scope: disabled ({REASON_REQUEST_SCOPE_REQUIRES_PLAN})"),
+                    None,
+                ));
             }
             if self.state.blocks_paid_generation {
-                lines.push(Line::from("Status: Unconfigured — paid generation blocked"));
+                rows.push((
+                    "Status: Unconfigured — paid generation blocked".into(),
+                    None,
+                ));
             }
-            lines.push(Line::from(""));
-            lines.push(Line::from("Suggestions (editable, non-authoritative):"));
-            lines.push(Line::from(format!(
-                "  USD 1/request, USD 10/session, USD 100/project-month"
-            )));
+            rows.push((String::new(), None));
+            rows.push(("Suggestions (editable, non-authoritative):".into(), None));
+            rows.push((
+                "  USD 1/request, USD 10/session, USD 100/project-month".into(),
+                None,
+            ));
+            rows.push((
+                "[Save]".into(),
+                Some((GenerationAction::SaveBudget, true, None)),
+            ));
+            rows.push((
+                "[Cancel]".into(),
+                Some((GenerationAction::Cancel, true, None)),
+            ));
         }
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(Block::default().borders(Borders::ALL).title(" Budget "))
-                .wrap(Wrap { trim: false }),
+        render_generation_page(
+            cx,
+            frame,
             area,
+            "generation:budget",
+            "Budget",
+            rows,
+            Some(self.cursor),
         );
     }
     fn title(&self, _cx: &SettingsCx) -> String {
@@ -1094,46 +1363,95 @@ impl SettingsPage for GrantListPage {
             _ => Nav::Stay,
         }
     }
-    fn render(&self, _cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+    fn handle_pointer_control(
+        &mut self,
+        _cx: &mut SettingsCx,
+        action: SettingsPointerAction,
+    ) -> Nav {
+        match action {
+            SettingsPointerAction::Generation(GenerationAction::RevokeGrant(id)) => {
+                self.confirm = Some((
+                    GenerationAction::RevokeGrant(id),
+                    ConfirmationChoice::Confirm,
+                ));
+                Nav::Stay
+            }
+            SettingsPointerAction::Generation(GenerationAction::ConfirmRevokeGrant(_, _)) => {
+                self.confirm = None;
+                Nav::Stay
+            }
+            _ => Nav::Stay,
+        }
+    }
+    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         if self.viewport == GenerationViewportMode::Blocked {
             render_resize_blocker(frame, area);
             return;
         }
-        let mut lines = Vec::new();
+        let mut rows: Vec<(String, GenerationBinding)> = Vec::new();
         if let Some(reason) = self.principal.config_section_reason() {
-            lines.push(Line::from(format!("Disabled: {reason}")));
-            lines.push(Line::from("No grant data visible."));
+            rows.push((format!("Disabled: {reason}"), None));
+            rows.push(("No grant data visible.".into(), None));
         } else if self.grants.is_empty() {
-            lines.push(Line::from("No destination grants."));
+            rows.push(("No destination grants.".into(), None));
         } else {
             for grant in &self.grants {
-                lines.push(Line::from(format!(
-                    "  {} | {} | {} | {} | {}{}",
-                    grant.grant_id,
-                    grant.generation,
-                    grant.project_id,
-                    grant.destination_identity_digest,
-                    grant.state.label(),
-                    grant
-                        .expiry
-                        .as_ref()
-                        .map(|e| format!(" | expires {e}"))
-                        .unwrap_or_default(),
-                )));
+                rows.push((
+                    format!(
+                        "  {} | {} | {} | {} | {}{}",
+                        grant.grant_id,
+                        grant.generation,
+                        grant.project_id,
+                        grant.destination_identity_digest,
+                        grant.state.label(),
+                        grant
+                            .expiry
+                            .as_ref()
+                            .map(|e| format!(" | expires {e}"))
+                            .unwrap_or_default(),
+                    ),
+                    None,
+                ));
             }
-            lines.push(Line::from(""));
-            lines.push(Line::from("  [revoke grant]"));
+            rows.push((String::new(), None));
+            if let Some(grant) = self.grants.first() {
+                rows.push((
+                    "[revoke grant]".into(),
+                    Some((
+                        GenerationAction::RevokeGrant(LateResultId(grant.grant_id.clone())),
+                        true,
+                        None,
+                    )),
+                ));
+            }
         }
-        // Never offer global. No GrantEditor/create-grant surface.
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" Destination grants "),
-                )
-                .wrap(Wrap { trim: false }),
+        if let Some((GenerationAction::RevokeGrant(id), _)) = &self.confirm {
+            rows.push(("Revoke grant?".into(), None));
+            rows.push((
+                "[Revoke grant]".into(),
+                Some((
+                    GenerationAction::ConfirmRevokeGrant(id.clone(), ConfirmationChoice::Confirm),
+                    true,
+                    None,
+                )),
+            ));
+            rows.push((
+                "[Cancel]".into(),
+                Some((
+                    GenerationAction::ConfirmRevokeGrant(id.clone(), ConfirmationChoice::Cancel),
+                    true,
+                    None,
+                )),
+            ));
+        }
+        render_generation_page(
+            cx,
+            frame,
             area,
+            "generation:grants",
+            "Destination grants",
+            rows,
+            Some(self.cursor),
         );
     }
     fn title(&self, _cx: &SettingsCx) -> String {
@@ -1186,36 +1504,42 @@ impl SettingsPage for JobListPage {
             _ => Nav::Stay,
         }
     }
-    fn render(&self, _cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         if self.viewport == GenerationViewportMode::Blocked {
             render_resize_blocker(frame, area);
             return;
         }
-        let mut lines = Vec::new();
+        let mut rows: Vec<(String, GenerationBinding)> = Vec::new();
         if let Some(reason) = self.principal.jobs_section_reason() {
-            lines.push(Line::from(format!("Disabled: {reason}")));
-            lines.push(Line::from("No job data visible."));
+            rows.push((format!("Disabled: {reason}"), None));
+            rows.push(("No job data visible.".into(), None));
         } else if self.reducer.jobs.is_empty() {
-            lines.push(Line::from("No jobs."));
+            rows.push(("No jobs.".into(), None));
         } else {
             for (i, job) in self.reducer.jobs.iter().enumerate() {
                 let marker = if i == self.cursor { "▸ " } else { "  " };
                 let stale = if job.stale { " (stale)" } else { "" };
-                lines.push(Line::from(format!(
-                    "{marker}{} v{} {} [{} slots]{}",
-                    job.job_id,
-                    job.version,
-                    job.state.label(),
-                    job.slots.len(),
-                    stale,
-                )));
+                rows.push((
+                    format!(
+                        "{marker}{} v{} {} [{} slots]{}",
+                        job.job_id,
+                        job.version,
+                        job.state.label(),
+                        job.slots.len(),
+                        stale,
+                    ),
+                    None,
+                ));
             }
         }
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(Block::default().borders(Borders::ALL).title(" Jobs "))
-                .wrap(Wrap { trim: false }),
+        render_generation_page(
+            cx,
+            frame,
             area,
+            "generation:jobs",
+            "Jobs",
+            rows,
+            Some(self.cursor),
         );
     }
     fn title(&self, _cx: &SettingsCx) -> String {
@@ -1257,60 +1581,150 @@ impl SettingsPage for JobDetailPage {
             _ => Nav::Stay,
         }
     }
-    fn render(&self, _cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+    fn handle_pointer_control(
+        &mut self,
+        _cx: &mut SettingsCx,
+        action: SettingsPointerAction,
+    ) -> Nav {
+        match action {
+            SettingsPointerAction::Generation(GenerationAction::CancelJob(id)) => {
+                self.confirm = Some((GenerationAction::CancelJob(id), ConfirmationChoice::Confirm));
+                Nav::Stay
+            }
+            SettingsPointerAction::Generation(GenerationAction::PublishLateResult(id)) => {
+                Nav::Push(boxed(LateResultActionPage {
+                    cursor: 0,
+                    principal: self.principal,
+                    late_result_id: id.0,
+                    action: LateResultAction::Publish,
+                    confirm: None,
+                    viewport: self.viewport,
+                }))
+            }
+            SettingsPointerAction::Generation(GenerationAction::DiscardLateResult(id)) => {
+                Nav::Push(boxed(LateResultActionPage {
+                    cursor: 0,
+                    principal: self.principal,
+                    late_result_id: id.0,
+                    action: LateResultAction::Discard,
+                    confirm: None,
+                    viewport: self.viewport,
+                }))
+            }
+            SettingsPointerAction::Generation(GenerationAction::ConfirmCancelJob(_, _)) => {
+                self.confirm = None;
+                Nav::Stay
+            }
+            _ => Nav::Stay,
+        }
+    }
+    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         if self.viewport == GenerationViewportMode::Blocked {
             render_resize_blocker(frame, area);
             return;
         }
-        let mut lines = Vec::new();
+        let mut rows: Vec<(String, GenerationBinding)> = Vec::new();
         if let Some(reason) = self.principal.jobs_section_reason() {
-            lines.push(Line::from(format!("Disabled: {reason}")));
-            lines.push(Line::from("No job data visible."));
+            rows.push((format!("Disabled: {reason}"), None));
+            rows.push(("No job data visible.".into(), None));
         } else if let Some(job) = self.reducer.jobs.iter().find(|j| j.job_id == self.job_id) {
             let stale = if job.stale { " (stale)" } else { "" };
-            lines.push(Line::from(format!(
-                "Job {} v{} {}{}",
-                job.job_id,
-                job.version,
-                job.state.label(),
-                stale,
-            )));
+            rows.push((
+                format!(
+                    "Job {} v{} {}{}",
+                    job.job_id,
+                    job.version,
+                    job.state.label(),
+                    stale,
+                ),
+                None,
+            ));
             for slot in &job.slots {
-                lines.push(Line::from(format!(
-                    "  target {} | {} | {} published, {} quarantined",
-                    slot.target_id,
-                    slot.state.label(),
-                    slot.published_artifacts,
-                    slot.quarantined_late_results,
-                )));
+                rows.push((
+                    format!(
+                        "  target {} | {} | {} published, {} quarantined",
+                        slot.target_id,
+                        slot.state.label(),
+                        slot.published_artifacts,
+                        slot.quarantined_late_results,
+                    ),
+                    None,
+                ));
             }
             if job.quarantined_late_result_count > 0 {
-                lines.push(Line::from(format!(
-                    "  Quarantined late results: {}",
-                    job.quarantined_late_result_count
-                )));
-                lines.push(Line::from("  [publish late result]"));
-                lines.push(Line::from("  [discard late result]"));
+                rows.push((
+                    format!(
+                        "  Quarantined late results: {}",
+                        job.quarantined_late_result_count
+                    ),
+                    None,
+                ));
+                let late_id = LateResultId(format!("{}-late", job.job_id));
+                rows.push((
+                    "[publish late result]".into(),
+                    Some((
+                        GenerationAction::PublishLateResult(late_id.clone()),
+                        true,
+                        None,
+                    )),
+                ));
+                rows.push((
+                    "[discard late result]".into(),
+                    Some((GenerationAction::DiscardLateResult(late_id), true, None)),
+                ));
             }
             if job.cancellable() && self.principal.can_cancel_job() {
-                lines.push(Line::from("  [cancel job]  (press c)"));
+                rows.push((
+                    "[cancel job]".into(),
+                    Some((
+                        GenerationAction::CancelJob(ImageJobId(self.job_id.clone())),
+                        true,
+                        None,
+                    )),
+                ));
             }
         } else {
-            lines.push(Line::from("Job not found."));
+            rows.push(("Job not found.".into(), None));
         }
-        if let Some((action, choice)) = &self.confirm {
+        if let Some((action, _)) = &self.confirm {
             if let Some(text) = confirmation_text(action.clone()) {
                 let (confirm_label, _) = confirmation_buttons(action.clone()).unwrap();
-                lines.push(Line::from(""));
-                lines.push(Line::from(format!("{text} [{confirm_label}] [Cancel]")));
-                let _ = choice;
+                rows.push((String::new(), None));
+                rows.push((format!("{text} [{confirm_label}] [Cancel]"), None));
+                if let GenerationAction::CancelJob(id) = action {
+                    rows.push((
+                        format!("[{confirm_label}]"),
+                        Some((
+                            GenerationAction::ConfirmCancelJob(
+                                id.clone(),
+                                ConfirmationChoice::Confirm,
+                            ),
+                            true,
+                            None,
+                        )),
+                    ));
+                    rows.push((
+                        "[Cancel]".into(),
+                        Some((
+                            GenerationAction::ConfirmCancelJob(
+                                id.clone(),
+                                ConfirmationChoice::Cancel,
+                            ),
+                            true,
+                            None,
+                        )),
+                    ));
+                }
             }
         }
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(Block::default().borders(Borders::ALL).title(" Job detail "))
-                .wrap(Wrap { trim: false }),
+        render_generation_page(
+            cx,
+            frame,
             area,
+            "generation:job-detail",
+            "Job detail",
+            rows,
+            Some(self.cursor),
         );
     }
     fn title(&self, _cx: &SettingsCx) -> String {
@@ -1345,31 +1759,65 @@ impl SettingsPage for LateResultActionPage {
             _ => Nav::Stay,
         }
     }
-    fn render(&self, _cx: &SettingsCx, frame: &mut Frame, area: Rect) {
+    fn handle_pointer_control(
+        &mut self,
+        _cx: &mut SettingsCx,
+        action: SettingsPointerAction,
+    ) -> Nav {
+        match action {
+            SettingsPointerAction::Generation(
+                GenerationAction::ConfirmPublishLateResult(_, choice)
+                | GenerationAction::ConfirmDiscardLateResult(_, choice),
+            ) => {
+                self.confirm = Some(choice);
+                Nav::Stay
+            }
+            _ => Nav::Stay,
+        }
+    }
+    fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
         if self.viewport == GenerationViewportMode::Blocked {
             render_resize_blocker(frame, area);
             return;
         }
         let text = self.action.label();
         let confirm_label = self.action.confirm_label();
-        let mut lines = Vec::new();
+        let mut rows: Vec<(String, GenerationBinding)> = Vec::new();
         if let Some(reason) = self.principal.config_section_reason() {
-            lines.push(Line::from(format!("Disabled: {reason}")));
+            rows.push((format!("Disabled: {reason}"), None));
         } else {
-            lines.push(Line::from(format!("{text} [{confirm_label}] [Cancel]")));
-            lines.push(Line::from(""));
-            lines.push(Line::from("Late result bytes are never exposed."));
-            lines.push(Line::from("Artifact actions use only opaque handles."));
+            let id = LateResultId(self.late_result_id.clone());
+            let (confirm, cancel) = match self.action {
+                LateResultAction::Publish => (
+                    GenerationAction::ConfirmPublishLateResult(
+                        id.clone(),
+                        ConfirmationChoice::Confirm,
+                    ),
+                    GenerationAction::ConfirmPublishLateResult(id, ConfirmationChoice::Cancel),
+                ),
+                LateResultAction::Discard => (
+                    GenerationAction::ConfirmDiscardLateResult(
+                        id.clone(),
+                        ConfirmationChoice::Confirm,
+                    ),
+                    GenerationAction::ConfirmDiscardLateResult(id, ConfirmationChoice::Cancel),
+                ),
+            };
+            rows.push((format!("{text} [{confirm_label}] [Cancel]"), None));
+            rows.push((format!("[{confirm_label}]"), Some((confirm, true, None))));
+            rows.push(("[Cancel]".into(), Some((cancel, true, None))));
+            rows.push((String::new(), None));
+            rows.push(("Late result bytes are never exposed.".into(), None));
+            rows.push(("Artifact actions use only opaque handles.".into(), None));
         }
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" Late result action "),
-                )
-                .wrap(Wrap { trim: false }),
+        render_generation_page(
+            cx,
+            frame,
             area,
+            "generation:late-result",
+            "Late result action",
+            rows,
+            Some(self.cursor),
         );
     }
     fn title(&self, _cx: &SettingsCx) -> String {

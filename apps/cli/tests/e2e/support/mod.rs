@@ -14,6 +14,24 @@ use std::time::{Duration, Instant};
 use assert_cmd::cargo::CommandCargoExt;
 use cockpit_cli::integration::{DaemonClient, DaemonStatus};
 
+#[cfg(unix)]
+mod hermetic;
+#[cfg(target_os = "linux")]
+mod mock_secret_service;
+#[cfg(unix)]
+mod osc52_observer;
+#[cfg(unix)]
+mod tui_pty;
+
+#[cfg(unix)]
+pub use hermetic::*;
+#[cfg(target_os = "linux")]
+pub use mock_secret_service::*;
+#[cfg(unix)]
+pub use osc52_observer::*;
+#[cfg(unix)]
+pub use tui_pty::*;
+
 pub struct IsolatedHome {
     _root: tempfile::TempDir,
     config_home: PathBuf,
@@ -91,6 +109,30 @@ impl IsolatedHome {
         &self.project
     }
 
+    pub fn home_dir(&self) -> &std::path::Path {
+        self._root.path()
+    }
+
+    pub fn xdg_config_home(&self) -> &std::path::Path {
+        &self.config_home
+    }
+
+    pub fn xdg_data_home(&self) -> &std::path::Path {
+        &self.data_home
+    }
+
+    pub fn xdg_state_home(&self) -> &std::path::Path {
+        &self.state_home
+    }
+
+    pub fn xdg_runtime_dir(&self) -> &std::path::Path {
+        &self.runtime_dir
+    }
+
+    pub fn xdg_cache_home(&self) -> &std::path::Path {
+        &self.cache_home
+    }
+
     pub fn write_local_provider_config(&self, base_url: &str) {
         let config_dir = self.config_dir();
         let providers_dir = config_dir.join("providers");
@@ -117,6 +159,38 @@ impl IsolatedHome {
             ),
         )
         .expect("write integration provider config");
+    }
+
+    /// Merge mouse-copy TUI flags into the isolated `config.json` written by
+    /// [`Self::write_local_provider_config`]. Call after pointing the local
+    /// provider at a loopback scripted listener.
+    pub fn merge_tui_mouse_copy_config(&self) {
+        let path = self.config_dir().join("config.json");
+        let raw = std::fs::read_to_string(&path).expect("read isolated config.json");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&raw).expect("parse isolated config.json");
+        let object = value
+            .as_object_mut()
+            .expect("isolated config.json must be an object");
+        object.insert(
+            "tui".into(),
+            serde_json::json!({
+                "mouse_capture": true,
+                "copy_on_release": true
+            }),
+        );
+        std::fs::write(
+            &path,
+            serde_json::to_string(&value).expect("serialize merged config.json"),
+        )
+        .expect("write merged isolated config.json");
+    }
+
+    /// Rewrite the dummy local provider to `base_url` and enable mouse capture
+    /// plus copy-on-release in `HOME/.config/cockpit/config.json`.
+    pub fn write_scripted_provider_with_tui_mouse(&self, base_url: &str) {
+        self.write_local_provider_config(base_url);
+        self.merge_tui_mouse_copy_config();
     }
 
     pub fn trust_project(&self) {
@@ -415,7 +489,7 @@ fn tail_file(path: PathBuf, max_bytes: usize) -> Option<String> {
 }
 
 #[cfg(unix)]
-fn pid_is_live(pid: u32) -> bool {
+pub(crate) fn pid_is_live(pid: u32) -> bool {
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
     if rc == 0 {
         return true;
@@ -424,7 +498,7 @@ fn pid_is_live(pid: u32) -> bool {
 }
 
 #[cfg(unix)]
-fn wait_for_pid_exit_blocking(pid: u32, timeout: Duration) -> bool {
+pub(crate) fn wait_for_pid_exit_blocking(pid: u32, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if !pid_is_live(pid) {

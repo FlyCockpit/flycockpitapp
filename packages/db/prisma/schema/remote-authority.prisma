@@ -158,3 +158,48 @@ model RemoteAuthorityControlOutbox {
   @@index([deploymentId, deliveredAt, generation])
   @@map("remote_authority_control_outbox")
 }
+
+/// The current connection-lease pointer. Exactly one lease is current per
+/// `logicalAttachmentId`; reserve→sign→finalize atomically replaces this
+/// pointer and appends the `lease_refresh` control event. `leaseGeneration`
+/// is strictly monotonic; the replaced lease is invalid for new admissions
+/// immediately even if its `validUntil` is in the future.
+model RemoteConnectionLeaseCurrent {
+  logicalAttachmentId   String   @id
+  leaseId               String
+  leaseGeneration       Decimal  @db.Decimal(20, 0)
+  leaseJwsDigest        String
+  refreshRequestId      String
+  requestSnapshotDigest String
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  @@unique([logicalAttachmentId, leaseGeneration])
+  @@index([refreshRequestId])
+  @@map("remote_connection_lease_current")
+}
+
+/// The per-instance daemon control outbox. Sequence scope is exactly
+/// `(daemonInstanceProtocolId, daemonCertificateGeneration)`, distinct from the
+/// deployment-scoped `RemoteAuthorityControlOutbox`. The durable payload is the
+/// exact compact ES256 control-event JWS
+/// (`typ:"flycockpit-remote-control-event+jws"`) whose payload is the FCRC
+/// binary event; delivery re-emits `controlEventJws` byte-for-byte with no
+/// re-signing. `payloadDigest` mirrors the FCRC header field for index/debug
+/// only — authenticity is the JWS.
+model RemoteDaemonControlOutbox {
+  eventId                     String    @id
+  daemonInstanceProtocolId    String
+  daemonCertificateGeneration Decimal   @db.Decimal(20, 0)
+  controlSeq                  Decimal   @db.Decimal(20, 0)
+  eventType                   String
+  controlEventJws             String
+  payloadDigest               String
+  createdAt                   DateTime  @default(now())
+  deliveredAt                 DateTime?
+
+  @@unique([daemonInstanceProtocolId, daemonCertificateGeneration, controlSeq], map: "remote_daemon_control_outbox_controlseq_key")
+  @@unique([daemonInstanceProtocolId, daemonCertificateGeneration, eventId], map: "remote_daemon_control_outbox_eventid_key")
+  @@index([daemonInstanceProtocolId, daemonCertificateGeneration, deliveredAt])
+  @@map("remote_daemon_control_outbox")
+}

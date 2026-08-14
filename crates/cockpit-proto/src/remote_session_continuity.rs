@@ -40,6 +40,8 @@
 //! - SQLite/Postgres storage wiring.
 //! - Transport adapter implementation.
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -58,6 +60,14 @@ pub const REMOTE_SESSION_CONTINUITY_SCHEMA_VERSION: u8 = 1;
 /// bilateral proofs, DTLS/Noise transcript, tuple, and random
 /// `transportEpoch` before sending this. Old grant/ticket/proof/nonce/traffic
 /// key/attempt/epoch never authorizes 0-RTT.
+// NOTE: `RemoteReattachRequestV1` intentionally does NOT carry serde
+// `deny_unknown_fields`: the repo-wide `forward_open_guard_no_deny_unknown_fields_in_proto_src`
+// invariant keeps every cockpit-proto wire struct forward-open for additive
+// compatibility. Strict unknown-field rejection for the reattach REQUEST is
+// enforced on the TypeScript side (the zod codec in `remote-reattach.ts`); a
+// Rust custom-deserializer variant (mirroring the connection-metadata pattern)
+// would be required to reject unknown fields in Rust without tripping that
+// guard. See the report's deferred-work notes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteReattachRequestV1 {
@@ -835,116 +845,153 @@ pub enum PayloadKeyError {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Control event — RemoteControlEventV1 (98-byte header)
+// Control event — RemoteControlEventV1 (FCRC, 98-byte header + payload)
 // ─────────────────────────────────────────────────────────────────────────
+//
+// This is the byte-exact Rust mirror of the gateway-owned durable control
+// contract implemented in `apps/server/src/remote-signaling-gateway/
+// binary-codecs.ts`. The gateway is the single owner of the format; Rust never
+// redefines it. Cross-language compatibility is proven by TS-encoder-produced
+// golden vectors (`packages/cockpit-protocol/fixtures/remote-control-event-v1.json`)
+// decoded by BOTH the Rust and TS decoders — a Rust round-trip alone is never
+// the evidence.
+//
+// Header layout (big-endian, exactly 98 bytes):
+// ```text
+// offset  0..4  : magic "FCRC"
+// offset  4     : version (1)
+// offset  5..13 : controlSeq (u64)
+// offset 13..29 : eventId (16 bytes, nonzero)
+// offset 29     : kind (u8, 1..=8)
+// offset 30..38 : serviceVersion (u64)
+// offset 38..46 : policyEpoch (u64)
+// offset 46..54 : authorityEpoch (u64)
+// offset 54..62 : issuedAt (i64)
+// offset 62..66 : payloadLength (u32)
+// offset 66..98 : payloadDigest (32 bytes, SHA-256 of payload)
+// ```
 
-/// The 98-byte header magic for `RemoteControlEventV1`.
-pub const REMOTE_CONTROL_EVENT_MAGIC: [u8; 4] = *b"RCEV";
-/// The 98-byte header schema version.
-pub const REMOTE_CONTROL_EVENT_SCHEMA_VERSION: u8 = 1;
+/// The 98-byte header magic for `RemoteControlEventV1` (FCRC).
+pub const REMOTE_CONTROL_EVENT_MAGIC: [u8; 4] = *b"FCRC";
+/// The header version byte.
+pub const REMOTE_CONTROL_EVENT_VERSION: u8 = 1;
 /// The exact header size.
 pub const REMOTE_CONTROL_EVENT_HEADER_BYTES: usize = 98;
+/// Maximum payload size (bytes).
+pub const REMOTE_CONTROL_EVENT_MAX_PAYLOAD: usize = 65_536;
+/// Maximum whole binary event size (header + payload).
+pub const REMOTE_CONTROL_EVENT_MAX_BYTES: usize = 65_634;
+/// Maximum compact ES256 JWS wrapping the binary event (96 KiB).
+pub const REMOTE_CONTROL_EVENT_MAX_COMPACT_JWS: usize = 96 * 1024;
+/// Maximum embedded lease/status JWS length inside a payload.
+pub const REMOTE_CONTROL_EVENT_MAX_EMBEDDED_JWS: usize = 16_384;
 /// Maximum replay events per page (64).
 pub const REMOTE_CONTROL_EVENT_REPLAY_MAX_EVENTS: usize = 64;
 /// Maximum replay bytes per page (512 KiB).
 pub const REMOTE_CONTROL_EVENT_REPLAY_MAX_BYTES: usize = 512 * 1024;
 
-/// Control event kinds.
+/// The eight closed control-event kinds with the gateway's exact ordinals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteControlEventKind {
-    Revocation,
-    PolicyNarrowing,
-    LeaseRevocation,
-    AuthorityRotation,
+    LeaseRefresh,
+    PolicyNarrowed,
+    DeviceRevoked,
+    InstanceRevoked,
+    TenantAuthorityChanged,
+    AttachmentRevoked,
+    Drain,
+    AuthorityStatus,
 }
 
 impl RemoteControlEventKind {
-    /// Decode a kind from a byte ordinal.
+    /// Decode a kind from its wire ordinal (gateway-owned mapping).
     pub fn from_byte(byte: u8) -> Option<Self> {
         match byte {
-            1 => Some(Self::Revocation),
-            2 => Some(Self::PolicyNarrowing),
-            3 => Some(Self::LeaseRevocation),
-            4 => Some(Self::AuthorityRotation),
+            1 => Some(Self::LeaseRefresh),
+            2 => Some(Self::PolicyNarrowed),
+            3 => Some(Self::DeviceRevoked),
+            4 => Some(Self::InstanceRevoked),
+            5 => Some(Self::TenantAuthorityChanged),
+            6 => Some(Self::AttachmentRevoked),
+            7 => Some(Self::Drain),
+            8 => Some(Self::AuthorityStatus),
             _ => None,
         }
     }
 
-    /// Encode a kind to a byte ordinal.
+    /// Encode a kind to its wire ordinal.
     pub fn to_byte(self) -> u8 {
         match self {
-            Self::Revocation => 1,
-            Self::PolicyNarrowing => 2,
-            Self::LeaseRevocation => 3,
-            Self::AuthorityRotation => 4,
+            Self::LeaseRefresh => 1,
+            Self::PolicyNarrowed => 2,
+            Self::DeviceRevoked => 3,
+            Self::InstanceRevoked => 4,
+            Self::TenantAuthorityChanged => 5,
+            Self::AttachmentRevoked => 6,
+            Self::Drain => 7,
+            Self::AuthorityStatus => 8,
         }
     }
 }
 
 /// A decoded `RemoteControlEventV1` 98-byte header.
-///
-/// Layout (big-endian):
-/// ```text
-/// offset 0..4   : magic "RCEV"
-/// offset 4      : schemaVersion (1)
-/// offset 5      : kind (1=revocation, 2=policy_narrowing, 3=lease_revocation, 4=authority_rotation)
-/// offset 6..22  : eventId (16 bytes)
-/// offset 22..38 : tenantId (16 bytes)
-/// offset 38..54 : authorityKeyId (16 bytes)
-/// offset 54..70 : affectedLeaseId (16 bytes, zeroed if none)
-/// offset 70..78 : controlSeq (u64)
-/// offset 78..86 : policyEpoch (u64)
-/// offset 86..94 : authorityEpoch (u64)
-/// offset 94     : flags (0)
-/// offset 95..98 : reserved (3 bytes, zeroed)
-/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteControlEventHeaderV1 {
-    pub kind: RemoteControlEventKind,
-    pub event_id: [u8; 16],
-    pub tenant_id: [u8; 16],
-    pub authority_key_id: [u8; 16],
-    pub affected_lease_id: [u8; 16],
     pub control_seq: u64,
+    pub event_id: [u8; 16],
+    pub kind: RemoteControlEventKind,
+    pub service_version: u64,
     pub policy_epoch: u64,
     pub authority_epoch: u64,
+    pub issued_at: i64,
+    pub payload_length: u32,
+    pub payload_digest: [u8; 32],
 }
 
 impl RemoteControlEventHeaderV1 {
-    /// Decode a 98-byte header.
+    /// Decode a 98-byte header. Fails on wrong length, magic/version, a zero
+    /// event id, a zero control sequence, an unknown kind, or a payload length
+    /// over the cap — before any state mutation.
     pub fn decode(bytes: &[u8]) -> Result<Self, ControlEventError> {
-        if bytes.len() < REMOTE_CONTROL_EVENT_HEADER_BYTES {
+        if bytes.len() != REMOTE_CONTROL_EVENT_HEADER_BYTES {
             return Err(ControlEventError::Length);
         }
         if bytes[0..4] != REMOTE_CONTROL_EVENT_MAGIC {
             return Err(ControlEventError::Magic);
         }
-        if bytes[4] != REMOTE_CONTROL_EVENT_SCHEMA_VERSION {
-            return Err(ControlEventError::SchemaVersion);
+        if bytes[4] != REMOTE_CONTROL_EVENT_VERSION {
+            return Err(ControlEventError::Version);
+        }
+        let control_seq = u64::from_be_bytes(bytes[5..13].try_into().unwrap());
+        if control_seq < 1 {
+            return Err(ControlEventError::ControlSeqZero);
+        }
+        let event_id: [u8; 16] = bytes[13..29].try_into().unwrap();
+        if event_id.iter().all(|&b| b == 0) {
+            return Err(ControlEventError::EventIdZero);
         }
         let kind =
-            RemoteControlEventKind::from_byte(bytes[5]).ok_or(ControlEventError::UnknownKind)?;
-        let event_id = bytes[6..22].try_into().unwrap();
-        let tenant_id = bytes[22..38].try_into().unwrap();
-        let authority_key_id = bytes[38..54].try_into().unwrap();
-        let affected_lease_id = bytes[54..70].try_into().unwrap();
-        let control_seq = u64::from_be_bytes(bytes[70..78].try_into().unwrap());
-        let policy_epoch = u64::from_be_bytes(bytes[78..86].try_into().unwrap());
-        let authority_epoch = u64::from_be_bytes(bytes[86..94].try_into().unwrap());
-        // flags at 94, reserved at 95..98 — must be zero.
-        if bytes[94] != 0 || bytes[95] != 0 || bytes[96] != 0 || bytes[97] != 0 {
-            return Err(ControlEventError::Reserved);
+            RemoteControlEventKind::from_byte(bytes[29]).ok_or(ControlEventError::UnknownKind)?;
+        let service_version = u64::from_be_bytes(bytes[30..38].try_into().unwrap());
+        let policy_epoch = u64::from_be_bytes(bytes[38..46].try_into().unwrap());
+        let authority_epoch = u64::from_be_bytes(bytes[46..54].try_into().unwrap());
+        let issued_at = i64::from_be_bytes(bytes[54..62].try_into().unwrap());
+        let payload_length = u32::from_be_bytes(bytes[62..66].try_into().unwrap());
+        if payload_length as usize > REMOTE_CONTROL_EVENT_MAX_PAYLOAD {
+            return Err(ControlEventError::PayloadCap);
         }
+        let payload_digest: [u8; 32] = bytes[66..98].try_into().unwrap();
         Ok(Self {
-            kind,
-            event_id,
-            tenant_id,
-            authority_key_id,
-            affected_lease_id,
             control_seq,
+            event_id,
+            kind,
+            service_version,
             policy_epoch,
             authority_epoch,
+            issued_at,
+            payload_length,
+            payload_digest,
         })
     }
 
@@ -952,41 +999,358 @@ impl RemoteControlEventHeaderV1 {
     pub fn encode(&self) -> [u8; REMOTE_CONTROL_EVENT_HEADER_BYTES] {
         let mut bytes = [0u8; REMOTE_CONTROL_EVENT_HEADER_BYTES];
         bytes[0..4].copy_from_slice(&REMOTE_CONTROL_EVENT_MAGIC);
-        bytes[4] = REMOTE_CONTROL_EVENT_SCHEMA_VERSION;
-        bytes[5] = self.kind.to_byte();
-        bytes[6..22].copy_from_slice(&self.event_id);
-        bytes[22..38].copy_from_slice(&self.tenant_id);
-        bytes[38..54].copy_from_slice(&self.authority_key_id);
-        bytes[54..70].copy_from_slice(&self.affected_lease_id);
-        bytes[70..78].copy_from_slice(&self.control_seq.to_be_bytes());
-        bytes[78..86].copy_from_slice(&self.policy_epoch.to_be_bytes());
-        bytes[86..94].copy_from_slice(&self.authority_epoch.to_be_bytes());
-        // flags at 94 = 0, reserved 95..98 = 0 (already zeroed)
+        bytes[4] = REMOTE_CONTROL_EVENT_VERSION;
+        bytes[5..13].copy_from_slice(&self.control_seq.to_be_bytes());
+        bytes[13..29].copy_from_slice(&self.event_id);
+        bytes[29] = self.kind.to_byte();
+        bytes[30..38].copy_from_slice(&self.service_version.to_be_bytes());
+        bytes[38..46].copy_from_slice(&self.policy_epoch.to_be_bytes());
+        bytes[46..54].copy_from_slice(&self.authority_epoch.to_be_bytes());
+        bytes[54..62].copy_from_slice(&self.issued_at.to_be_bytes());
+        bytes[62..66].copy_from_slice(&self.payload_length.to_be_bytes());
+        bytes[66..98].copy_from_slice(&self.payload_digest);
         bytes
     }
 }
 
-/// Control event decode error.
+/// A decoded, exact-length control-event payload, one variant per kind. Every
+/// per-kind decode is exact-length: a byte too many or too few is rejected
+/// before any state mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteControlEventPayload {
+    /// `lease_refresh=1 {leaseJwsLength:u16, leaseJws}` (JWS 1..=16,384 bytes).
+    LeaseRefresh { lease_jws: Vec<u8> },
+    /// `policy_narrowed=2 {previousDigest:[32], newDigest:[32], affectedFieldBits:u64}`.
+    PolicyNarrowed {
+        previous_digest: [u8; 32],
+        new_digest: [u8; 32],
+        affected_field_bits: u64,
+    },
+    /// `device_revoked=3 {deviceId:[16], generation:u64}`.
+    DeviceRevoked {
+        device_id: [u8; 16],
+        generation: u64,
+    },
+    /// `instance_revoked=4 {instanceId:[16], generation:u64}`.
+    InstanceRevoked {
+        instance_id: [u8; 16],
+        generation: u64,
+    },
+    /// `tenant_authority_changed=5 {previousEpoch:u64, newEpoch:u64, ringDigest:[32]}`.
+    TenantAuthorityChanged {
+        previous_epoch: u64,
+        new_epoch: u64,
+        ring_digest: [u8; 32],
+    },
+    /// `attachment_revoked=6 {logicalAttachmentId:[16], reason:u8}`.
+    AttachmentRevoked {
+        logical_attachment_id: [u8; 16],
+        reason: u8,
+    },
+    /// `drain=7 {deadline:i64, reason:u8}`.
+    Drain { deadline: i64, reason: u8 },
+    /// `authority_status=8 {statusGeneration:u64, statusJwsLength:u16, statusJws}`
+    /// (JWS 1..=16,384 bytes).
+    AuthorityStatus {
+        status_generation: u64,
+        status_jws: Vec<u8>,
+    },
+}
+
+impl RemoteControlEventPayload {
+    /// The kind ordinal of this payload.
+    pub fn kind(&self) -> RemoteControlEventKind {
+        match self {
+            Self::LeaseRefresh { .. } => RemoteControlEventKind::LeaseRefresh,
+            Self::PolicyNarrowed { .. } => RemoteControlEventKind::PolicyNarrowed,
+            Self::DeviceRevoked { .. } => RemoteControlEventKind::DeviceRevoked,
+            Self::InstanceRevoked { .. } => RemoteControlEventKind::InstanceRevoked,
+            Self::TenantAuthorityChanged { .. } => RemoteControlEventKind::TenantAuthorityChanged,
+            Self::AttachmentRevoked { .. } => RemoteControlEventKind::AttachmentRevoked,
+            Self::Drain { .. } => RemoteControlEventKind::Drain,
+            Self::AuthorityStatus { .. } => RemoteControlEventKind::AuthorityStatus,
+        }
+    }
+
+    /// Encode this payload to its exact-length network-byte-order bytes.
+    pub fn encode(&self) -> Vec<u8> {
+        match self {
+            Self::LeaseRefresh { lease_jws } => {
+                let mut out = Vec::with_capacity(2 + lease_jws.len());
+                out.extend_from_slice(&(lease_jws.len() as u16).to_be_bytes());
+                out.extend_from_slice(lease_jws);
+                out
+            }
+            Self::PolicyNarrowed {
+                previous_digest,
+                new_digest,
+                affected_field_bits,
+            } => {
+                let mut out = Vec::with_capacity(72);
+                out.extend_from_slice(previous_digest);
+                out.extend_from_slice(new_digest);
+                out.extend_from_slice(&affected_field_bits.to_be_bytes());
+                out
+            }
+            Self::DeviceRevoked {
+                device_id,
+                generation,
+            } => {
+                let mut out = Vec::with_capacity(24);
+                out.extend_from_slice(device_id);
+                out.extend_from_slice(&generation.to_be_bytes());
+                out
+            }
+            Self::InstanceRevoked {
+                instance_id,
+                generation,
+            } => {
+                let mut out = Vec::with_capacity(24);
+                out.extend_from_slice(instance_id);
+                out.extend_from_slice(&generation.to_be_bytes());
+                out
+            }
+            Self::TenantAuthorityChanged {
+                previous_epoch,
+                new_epoch,
+                ring_digest,
+            } => {
+                let mut out = Vec::with_capacity(48);
+                out.extend_from_slice(&previous_epoch.to_be_bytes());
+                out.extend_from_slice(&new_epoch.to_be_bytes());
+                out.extend_from_slice(ring_digest);
+                out
+            }
+            Self::AttachmentRevoked {
+                logical_attachment_id,
+                reason,
+            } => {
+                let mut out = Vec::with_capacity(17);
+                out.extend_from_slice(logical_attachment_id);
+                out.push(*reason);
+                out
+            }
+            Self::Drain { deadline, reason } => {
+                let mut out = Vec::with_capacity(9);
+                out.extend_from_slice(&deadline.to_be_bytes());
+                out.push(*reason);
+                out
+            }
+            Self::AuthorityStatus {
+                status_generation,
+                status_jws,
+            } => {
+                let mut out = Vec::with_capacity(10 + status_jws.len());
+                out.extend_from_slice(&status_generation.to_be_bytes());
+                out.extend_from_slice(&(status_jws.len() as u16).to_be_bytes());
+                out.extend_from_slice(status_jws);
+                out
+            }
+        }
+    }
+
+    /// Decode an exact-length payload for `kind`. Any trailing byte, short
+    /// read, or out-of-range embedded length is rejected.
+    pub fn decode(kind: RemoteControlEventKind, bytes: &[u8]) -> Result<Self, ControlEventError> {
+        match kind {
+            RemoteControlEventKind::LeaseRefresh => {
+                let jws = decode_length_prefixed_jws(bytes)?;
+                Ok(Self::LeaseRefresh { lease_jws: jws })
+            }
+            RemoteControlEventKind::PolicyNarrowed => {
+                if bytes.len() != 72 {
+                    return Err(ControlEventError::PayloadLength);
+                }
+                Ok(Self::PolicyNarrowed {
+                    previous_digest: bytes[0..32].try_into().unwrap(),
+                    new_digest: bytes[32..64].try_into().unwrap(),
+                    affected_field_bits: u64::from_be_bytes(bytes[64..72].try_into().unwrap()),
+                })
+            }
+            RemoteControlEventKind::DeviceRevoked => {
+                if bytes.len() != 24 {
+                    return Err(ControlEventError::PayloadLength);
+                }
+                Ok(Self::DeviceRevoked {
+                    device_id: bytes[0..16].try_into().unwrap(),
+                    generation: u64::from_be_bytes(bytes[16..24].try_into().unwrap()),
+                })
+            }
+            RemoteControlEventKind::InstanceRevoked => {
+                if bytes.len() != 24 {
+                    return Err(ControlEventError::PayloadLength);
+                }
+                Ok(Self::InstanceRevoked {
+                    instance_id: bytes[0..16].try_into().unwrap(),
+                    generation: u64::from_be_bytes(bytes[16..24].try_into().unwrap()),
+                })
+            }
+            RemoteControlEventKind::TenantAuthorityChanged => {
+                if bytes.len() != 48 {
+                    return Err(ControlEventError::PayloadLength);
+                }
+                Ok(Self::TenantAuthorityChanged {
+                    previous_epoch: u64::from_be_bytes(bytes[0..8].try_into().unwrap()),
+                    new_epoch: u64::from_be_bytes(bytes[8..16].try_into().unwrap()),
+                    ring_digest: bytes[16..48].try_into().unwrap(),
+                })
+            }
+            RemoteControlEventKind::AttachmentRevoked => {
+                if bytes.len() != 17 {
+                    return Err(ControlEventError::PayloadLength);
+                }
+                Ok(Self::AttachmentRevoked {
+                    logical_attachment_id: bytes[0..16].try_into().unwrap(),
+                    reason: bytes[16],
+                })
+            }
+            RemoteControlEventKind::Drain => {
+                if bytes.len() != 9 {
+                    return Err(ControlEventError::PayloadLength);
+                }
+                Ok(Self::Drain {
+                    deadline: i64::from_be_bytes(bytes[0..8].try_into().unwrap()),
+                    reason: bytes[8],
+                })
+            }
+            RemoteControlEventKind::AuthorityStatus => {
+                if bytes.len() < 10 {
+                    return Err(ControlEventError::PayloadLength);
+                }
+                let status_generation = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
+                let jws = decode_length_prefixed_jws(&bytes[8..])?;
+                Ok(Self::AuthorityStatus {
+                    status_generation,
+                    status_jws: jws,
+                })
+            }
+        }
+    }
+}
+
+/// Decode a `{length:u16, bytes}` embedded JWS, enforcing 1..=16,384 length and
+/// no trailing bytes.
+fn decode_length_prefixed_jws(bytes: &[u8]) -> Result<Vec<u8>, ControlEventError> {
+    if bytes.len() < 2 {
+        return Err(ControlEventError::PayloadLength);
+    }
+    let len = u16::from_be_bytes(bytes[0..2].try_into().unwrap()) as usize;
+    if len == 0 || len > REMOTE_CONTROL_EVENT_MAX_EMBEDDED_JWS {
+        return Err(ControlEventError::EmbeddedJwsLength);
+    }
+    if bytes.len() != 2 + len {
+        return Err(ControlEventError::PayloadLength);
+    }
+    Ok(bytes[2..].to_vec())
+}
+
+/// A whole decoded `RemoteControlEventV1`: verified 98-byte header plus an
+/// exact-length, digest-checked payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteControlEventV1 {
+    pub header: RemoteControlEventHeaderV1,
+    pub payload: RemoteControlEventPayload,
+}
+
+impl RemoteControlEventV1 {
+    /// Build a control event, computing `payloadLength` and `payloadDigest`
+    /// from the encoded payload. The header's `payload_length`/`payload_digest`
+    /// are derived here and cannot drift from the payload.
+    pub fn seal(
+        control_seq: u64,
+        event_id: [u8; 16],
+        service_version: u64,
+        policy_epoch: u64,
+        authority_epoch: u64,
+        issued_at: i64,
+        payload: RemoteControlEventPayload,
+    ) -> Self {
+        let payload_bytes = payload.encode();
+        let mut hasher = Sha256::new();
+        hasher.update(&payload_bytes);
+        let payload_digest: [u8; 32] = hasher.finalize().into();
+        Self {
+            header: RemoteControlEventHeaderV1 {
+                control_seq,
+                event_id,
+                kind: payload.kind(),
+                service_version,
+                policy_epoch,
+                authority_epoch,
+                issued_at,
+                payload_length: payload_bytes.len() as u32,
+                payload_digest,
+            },
+            payload,
+        }
+    }
+
+    /// Encode the whole binary event (header followed by the exact payload).
+    pub fn encode(&self) -> Vec<u8> {
+        let payload_bytes = self.payload.encode();
+        let mut header = self.header.clone();
+        header.payload_length = payload_bytes.len() as u32;
+        let mut hasher = Sha256::new();
+        hasher.update(&payload_bytes);
+        header.payload_digest = hasher.finalize().into();
+        let mut out = Vec::with_capacity(REMOTE_CONTROL_EVENT_HEADER_BYTES + payload_bytes.len());
+        out.extend_from_slice(&header.encode());
+        out.extend_from_slice(&payload_bytes);
+        out
+    }
+
+    /// Decode and fully validate a whole binary control event: header, exact
+    /// `payloadLength`, SHA-256 `payloadDigest`, and exact-length per-kind
+    /// payload. Every failure precedes any state mutation.
+    pub fn decode(bytes: &[u8]) -> Result<Self, ControlEventError> {
+        if bytes.len() < REMOTE_CONTROL_EVENT_HEADER_BYTES
+            || bytes.len() > REMOTE_CONTROL_EVENT_MAX_BYTES
+        {
+            return Err(ControlEventError::Length);
+        }
+        let header =
+            RemoteControlEventHeaderV1::decode(&bytes[0..REMOTE_CONTROL_EVENT_HEADER_BYTES])?;
+        let payload_bytes = &bytes[REMOTE_CONTROL_EVENT_HEADER_BYTES..];
+        // Exact declared length — no trailing/truncated bytes.
+        if payload_bytes.len() != header.payload_length as usize {
+            return Err(ControlEventError::PayloadLength);
+        }
+        // Payload digest binds the header to the payload.
+        let mut hasher = Sha256::new();
+        hasher.update(payload_bytes);
+        let digest: [u8; 32] = hasher.finalize().into();
+        if digest != header.payload_digest {
+            return Err(ControlEventError::DigestMismatch);
+        }
+        let payload = RemoteControlEventPayload::decode(header.kind, payload_bytes)?;
+        Ok(Self { header, payload })
+    }
+}
+
+/// Control event decode error. Every variant is a hard rejection performed
+/// before any state mutation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ControlEventError {
-    #[error("control event too short")]
+    #[error("control event has wrong length")]
     Length,
     #[error("control event magic mismatch")]
     Magic,
-    #[error("control event schema version mismatch")]
-    SchemaVersion,
+    #[error("control event version mismatch")]
+    Version,
+    #[error("control event event id is zero")]
+    EventIdZero,
+    #[error("control event control sequence is zero")]
+    ControlSeqZero,
     #[error("control event unknown kind")]
     UnknownKind,
-    #[error("control event reserved bytes nonzero")]
-    Reserved,
-    #[error("control event signature invalid")]
-    Signature,
-    #[error("control event sequence gap")]
-    SequenceGap,
-    #[error("control event epoch regression")]
-    EpochRegression,
-    #[error("control event duplicate conflict")]
-    DuplicateConflict,
+    #[error("control event payload exceeds cap")]
+    PayloadCap,
+    #[error("control event payload has wrong exact length")]
+    PayloadLength,
+    #[error("control event embedded JWS length out of range")]
+    EmbeddedJwsLength,
+    #[error("control event payload digest mismatch")]
+    DigestMismatch,
 }
 
 /// Compute the byte hash of a control event (header + payload). The daemon
@@ -1088,101 +1452,79 @@ pub fn validate_exact_retry(
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// PostProofLeaseGate (fallback-owned production adapter)
+// No-widening comparison (refresh may only retain or narrow authority)
 // ─────────────────────────────────────────────────────────────────────────
+//
+// The Rust daemon and gateway only ever VERIFY leases; they never mint. Lease
+// minting is the control-plane TypeScript `PostProofLeaseGate` adapter in
+// `packages/api` (reserve→sign→finalize against the Postgres current-lease
+// pointer and the per-instance control outbox). The former all-zero-tuple Rust
+// stub gate is deleted.
 
-/// The fallback-owned `PostProofLeaseGate` production adapter. It accepts
-/// only the store-committed agreeing `finalProofSetDigest` for the exact
-/// child/epoch and current pair authorization, intersects current policy/
-/// revocation/refresh authorization, and reserve→sign→finalizes the sole
-/// connection lease before returning its exact tuple. Neither fallback nor
-/// gateway can call a generic signer or mint a lease.
+/// A decoded permission ceiling for the no-widening comparison. A lease refresh
+/// may only retain or narrow authority: the new ceiling must be a subset of the
+/// old across scope, project, transport, and custody-requirement sets, and
+/// child membership may only be retained or narrowed. Equal digests are an
+/// unchanged ceiling.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PostProofLeaseGateInput {
-    /// The store-committed agreeing final-proof-set digest for the exact
-    /// child/epoch.
-    pub final_proof_set_digest: [u8; 32],
-    /// The current refresh authorization JWS digest.
-    pub refresh_authorization_digest: [u8; 32],
-    /// The current permission ceiling digest (may only retain/narrow).
-    pub permission_ceiling_digest: [u8; 32],
-    /// The current daemon-local policy digest.
-    pub daemon_local_policy_digest: [u8; 32],
-    /// The active children with their final-proof-set digests.
-    pub active_children: Vec<RemoteLeaseActiveChildV1>,
+pub struct RefreshCeiling {
+    /// Digest of the full ceiling; equal digests short-circuit as unchanged.
+    pub ceiling_digest: [u8; 32],
+    pub scopes: BTreeSet<String>,
+    pub projects: BTreeSet<String>,
+    pub transports: BTreeSet<String>,
+    pub custody_requirements: BTreeSet<String>,
+    /// Authorized child membership.
+    pub children: BTreeSet<String>,
 }
 
-/// The result of the PostProofLeaseGate: the exact lease tuple stored by
-/// every child route/pair, daemon authorization barrier, and gateway
-/// delivery lease.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PostProofLeaseGateOutput {
-    pub lease_id: [u8; 16],
-    pub lease_generation: u64,
-    pub lease_jws_digest: [u8; 32],
-}
-
-/// The PostProofLeaseGate is cycle-free: it reserve→sign→finalizes in one
-/// atomic step. This function validates the gate inputs and returns the
-/// output tuple. Denial/indeterminate signing yields no active fallback pair.
-pub fn post_proof_lease_gate(
-    input: &PostProofLeaseGateInput,
-    current_lease_generation: u64,
-) -> Result<PostProofLeaseGateOutput, PostProofLeaseGateError> {
-    // Validate that every active child has a final-proof-set digest matching
-    // the store-committed agreeing digest for its child/epoch.
-    for child in &input.active_children {
-        if child.final_proof_set_digest.is_empty() {
-            return Err(PostProofLeaseGateError::MissingFinalProofSetDigest);
-        }
-    }
-
-    // The gate is cycle-free: it intersects inputs and produces one lease.
-    // The new generation must be strictly monotonic.
-    let new_generation = current_lease_generation + 1;
-
-    // In production, the authority signs the lease JWS here. This pure
-    // function validates the inputs and returns the tuple. The actual
-    // signing is done by the remote authority adapter.
-    let lease_id = [0u8; 16]; // In practice, random 16 bytes.
-    let jws_digest = [0u8; 32]; // In practice, SHA-256 of the signed JWS.
-
-    Ok(PostProofLeaseGateOutput {
-        lease_id,
-        lease_generation: new_generation,
-        lease_jws_digest: jws_digest,
-    })
-}
-
-/// PostProofLeaseGate error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum PostProofLeaseGateError {
-    #[error("active child missing final proof set digest")]
-    MissingFinalProofSetDigest,
-    #[error("denial: refresh authorization expired")]
-    RefreshAuthorizationExpired,
-    #[error("denial: policy cannot widen")]
-    PolicyWidening,
-}
-
-/// Verify that a refresh can only retain/narrow existing ceilings and child
-/// membership. Widening requires a new attempt.
+/// Verify that a refresh only retains or narrows the ceiling and child
+/// membership. The new ceiling must be a subset of the old across every set;
+/// widening any set — or adding a child — is rejected. Widening requires a
+/// fresh attempt grant, never a refresh.
 pub fn validate_refresh_narrows(
-    old_ceiling_digest: &[u8; 32],
-    new_ceiling_digest: &[u8; 32],
-    old_child_count: usize,
-    new_child_count: usize,
-) -> Result<(), PostProofLeaseGateError> {
-    // Ceiling digest must not change to a wider set. In practice this
-    // compares the decoded ceiling, but the digest comparison is a proxy:
-    // the authority ensures the new ceiling is a subset of the old.
-    // Here we validate that the child count does not increase (no new
-    // children via refresh).
-    if new_child_count > old_child_count {
-        return Err(PostProofLeaseGateError::PolicyWidening);
+    old: &RefreshCeiling,
+    new: &RefreshCeiling,
+) -> Result<(), RefreshWidenError> {
+    // Equal digests short-circuit as unchanged (identical ceiling).
+    if old.ceiling_digest == new.ceiling_digest {
+        return Ok(());
     }
-    let _ = (old_ceiling_digest, new_ceiling_digest);
+    if !new.scopes.is_subset(&old.scopes) {
+        return Err(RefreshWidenError::ScopeWidened);
+    }
+    if !new.projects.is_subset(&old.projects) {
+        return Err(RefreshWidenError::ProjectWidened);
+    }
+    if !new.transports.is_subset(&old.transports) {
+        return Err(RefreshWidenError::TransportWidened);
+    }
+    if !new
+        .custody_requirements
+        .is_subset(&old.custody_requirements)
+    {
+        return Err(RefreshWidenError::CustodyWidened);
+    }
+    if !new.children.is_subset(&old.children) {
+        return Err(RefreshWidenError::ChildAdded);
+    }
     Ok(())
+}
+
+/// A refresh that would widen daemon authority, rejected by
+/// [`validate_refresh_narrows`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RefreshWidenError {
+    #[error("refresh would widen the scope set")]
+    ScopeWidened,
+    #[error("refresh would widen the project set")]
+    ProjectWidened,
+    #[error("refresh would widen the transport set")]
+    TransportWidened,
+    #[error("refresh would widen the custody-requirement set")]
+    CustodyWidened,
+    #[error("refresh would add a child to the membership set")]
+    ChildAdded,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1792,85 +2134,294 @@ mod tests {
         assert_eq!(bad.validate(), Err(RefreshAuthValidationError::TimeOrder));
     }
 
-    // ── Control event wire replay ───────────────────────────────────────
+    // ── Control event wire replay (FCRC) ────────────────────────────────
 
-    #[test]
-    fn remote_control_event_header_round_trip() {
-        let header = RemoteControlEventHeaderV1 {
-            kind: RemoteControlEventKind::Revocation,
-            event_id: [1; 16],
-            tenant_id: [2; 16],
-            authority_key_id: [3; 16],
-            affected_lease_id: [4; 16],
-            control_seq: 42,
-            policy_epoch: 10,
-            authority_epoch: 5,
-        };
-        let encoded = header.encode();
-        assert_eq!(encoded.len(), REMOTE_CONTROL_EVENT_HEADER_BYTES);
-        // Verify exact offsets.
-        assert_eq!(&encoded[0..4], &REMOTE_CONTROL_EVENT_MAGIC);
-        assert_eq!(encoded[4], REMOTE_CONTROL_EVENT_SCHEMA_VERSION);
-        assert_eq!(encoded[5], RemoteControlEventKind::Revocation.to_byte());
-        assert_eq!(&encoded[6..22], &[1u8; 16]);
-        assert_eq!(&encoded[22..38], &[2u8; 16]);
-        assert_eq!(&encoded[38..54], &[3u8; 16]);
-        assert_eq!(&encoded[54..70], &[4u8; 16]);
-        assert_eq!(u64::from_be_bytes(encoded[70..78].try_into().unwrap()), 42);
-        assert_eq!(u64::from_be_bytes(encoded[78..86].try_into().unwrap()), 10);
-        assert_eq!(u64::from_be_bytes(encoded[86..94].try_into().unwrap()), 5);
+    /// The named, fixed-input control-event corpus. Both the committed golden
+    /// fixture and the wire-replay test are derived from exactly this corpus,
+    /// so the fixture cannot drift from the codec silently. The TS encoder must
+    /// reproduce these exact bytes for every entry at the cross-language gate.
+    fn control_event_fixture_corpus() -> Vec<(&'static str, RemoteControlEventV1)> {
+        let seal = RemoteControlEventV1::seal;
+        vec![
+            (
+                "lease_refresh_min",
+                seal(
+                    1,
+                    [0x11; 16],
+                    7,
+                    3,
+                    2,
+                    1_700_000_000,
+                    RemoteControlEventPayload::LeaseRefresh {
+                        lease_jws: b"lease.jws.min".to_vec(),
+                    },
+                ),
+            ),
+            (
+                "lease_refresh_max",
+                seal(
+                    2,
+                    [0x12; 16],
+                    7,
+                    3,
+                    2,
+                    1_700_000_001,
+                    RemoteControlEventPayload::LeaseRefresh {
+                        lease_jws: vec![0xAB; REMOTE_CONTROL_EVENT_MAX_EMBEDDED_JWS],
+                    },
+                ),
+            ),
+            (
+                "policy_narrowed",
+                seal(
+                    3,
+                    [0x22; 16],
+                    8,
+                    4,
+                    2,
+                    1_700_000_002,
+                    RemoteControlEventPayload::PolicyNarrowed {
+                        previous_digest: [0xA0; 32],
+                        new_digest: [0xB0; 32],
+                        affected_field_bits: 0x0102_0304_0506_0708,
+                    },
+                ),
+            ),
+            (
+                "device_revoked",
+                seal(
+                    4,
+                    [0x33; 16],
+                    8,
+                    4,
+                    2,
+                    1_700_000_003,
+                    RemoteControlEventPayload::DeviceRevoked {
+                        device_id: [0xD0; 16],
+                        generation: 99,
+                    },
+                ),
+            ),
+            (
+                "instance_revoked",
+                seal(
+                    5,
+                    [0x44; 16],
+                    8,
+                    4,
+                    2,
+                    1_700_000_004,
+                    RemoteControlEventPayload::InstanceRevoked {
+                        instance_id: [0xE0; 16],
+                        generation: 5,
+                    },
+                ),
+            ),
+            (
+                "tenant_authority_changed",
+                seal(
+                    6,
+                    [0x55; 16],
+                    8,
+                    4,
+                    3,
+                    1_700_000_005,
+                    RemoteControlEventPayload::TenantAuthorityChanged {
+                        previous_epoch: 2,
+                        new_epoch: 3,
+                        ring_digest: [0xC0; 32],
+                    },
+                ),
+            ),
+            (
+                "attachment_revoked",
+                seal(
+                    7,
+                    [0x66; 16],
+                    8,
+                    4,
+                    3,
+                    1_700_000_006,
+                    RemoteControlEventPayload::AttachmentRevoked {
+                        logical_attachment_id: [0xF0; 16],
+                        reason: 2,
+                    },
+                ),
+            ),
+            (
+                "drain",
+                seal(
+                    8,
+                    [0x77; 16],
+                    8,
+                    4,
+                    3,
+                    1_700_000_007,
+                    RemoteControlEventPayload::Drain {
+                        deadline: 1_700_000_500,
+                        reason: 1,
+                    },
+                ),
+            ),
+            (
+                "authority_status",
+                seal(
+                    9,
+                    [0x88; 16],
+                    8,
+                    4,
+                    3,
+                    1_700_000_008,
+                    RemoteControlEventPayload::AuthorityStatus {
+                        status_generation: 42,
+                        status_jws: b"status.jws.min".to_vec(),
+                    },
+                ),
+            ),
+        ]
+    }
 
-        let decoded = RemoteControlEventHeaderV1::decode(&encoded).unwrap();
-        assert_eq!(decoded, header);
+    #[derive(serde::Deserialize)]
+    struct ControlEventFixtureEntry {
+        name: String,
+        kind: String,
+        #[serde(rename = "kindByte")]
+        kind_byte: u8,
+        #[serde(rename = "eventHex")]
+        event_hex: String,
+    }
+
+    fn hex_decode(s: &str) -> Vec<u8> {
+        assert!(s.len().is_multiple_of(2), "hex must be even length");
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("valid hex"))
+            .collect()
     }
 
     #[test]
-    fn remote_control_event_decode_errors() {
-        // Too short.
-        assert_eq!(
-            RemoteControlEventHeaderV1::decode(&[0u8; 10]),
-            Err(ControlEventError::Length)
+    fn remote_control_event_wire_replay() {
+        let fixture_json = include_str!(
+            "../../../packages/cockpit-protocol/fixtures/remote-control-event-v1.json"
         );
-        // Bad magic.
-        let mut bad = RemoteControlEventHeaderV1 {
-            kind: RemoteControlEventKind::Revocation,
-            event_id: [0; 16],
-            tenant_id: [0; 16],
-            authority_key_id: [0; 16],
-            affected_lease_id: [0; 16],
-            control_seq: 0,
-            policy_epoch: 0,
-            authority_epoch: 0,
-        }
-        .encode();
-        bad[0..4].copy_from_slice(b"XXXX");
+        let entries: Vec<ControlEventFixtureEntry> =
+            serde_json::from_str(fixture_json).expect("golden control-event fixture parses");
+        let corpus = control_event_fixture_corpus();
         assert_eq!(
-            RemoteControlEventHeaderV1::decode(&bad),
-            Err(ControlEventError::Magic)
+            entries.len(),
+            corpus.len(),
+            "fixture entry count must match the corpus"
         );
-        // Unknown kind.
-        let mut bad = RemoteControlEventHeaderV1 {
-            kind: RemoteControlEventKind::Revocation,
-            event_id: [0; 16],
-            tenant_id: [0; 16],
-            authority_key_id: [0; 16],
-            affected_lease_id: [0; 16],
-            control_seq: 0,
-            policy_epoch: 0,
-            authority_epoch: 0,
+
+        for ((name, expected), entry) in corpus.iter().zip(entries.iter()) {
+            assert_eq!(&entry.name, name, "fixture order must match corpus");
+            assert_eq!(
+                entry.kind_byte,
+                expected.header.kind.to_byte(),
+                "{name}: kind byte"
+            );
+
+            let bytes = hex_decode(&entry.event_hex);
+            // The committed golden bytes decode to exactly the sealed event.
+            let decoded = RemoteControlEventV1::decode(&bytes)
+                .unwrap_or_else(|e| panic!("{name}: golden vector must decode: {e:?}"));
+            assert_eq!(&decoded, expected, "{name}: decoded event");
+            // And re-encode byte-for-byte to the committed bytes.
+            assert_eq!(decoded.encode(), bytes, "{name}: re-encode identity");
+
+            // Independent structural anchors (catch layout drift without the
+            // encoder): magic, version, kind byte offset, and payload start.
+            assert_eq!(&bytes[0..4], b"FCRC", "{name}: magic");
+            assert_eq!(bytes[4], 1, "{name}: version");
+            assert_eq!(bytes[29], entry.kind_byte, "{name}: kind at offset 29");
+            assert_eq!(
+                &bytes[13..29],
+                &expected.header.event_id,
+                "{name}: eventId at 13..29"
+            );
+            assert_eq!(
+                bytes.len(),
+                REMOTE_CONTROL_EVENT_HEADER_BYTES + expected.header.payload_length as usize,
+                "{name}: total length = 98 + payloadLength"
+            );
+            assert_eq!(&entry.kind, &control_event_kind_name(expected.header.kind));
         }
-        .encode();
-        bad[5] = 99;
+    }
+
+    fn control_event_kind_name(kind: RemoteControlEventKind) -> String {
+        serde_json::to_value(kind)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn remote_control_event_rejects_tampered_and_rcev() {
+        let (_, event) = &control_event_fixture_corpus()[3]; // device_revoked
+        let good = event.encode();
+
+        // Trailing byte → wrong exact payload length.
+        let mut trailing = good.clone();
+        trailing.push(0);
         assert_eq!(
-            RemoteControlEventHeaderV1::decode(&bad),
+            RemoteControlEventV1::decode(&trailing),
+            Err(ControlEventError::PayloadLength)
+        );
+
+        // Flip a payload byte without updating the digest → digest mismatch.
+        let mut tampered = good.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xFF;
+        assert_eq!(
+            RemoteControlEventV1::decode(&tampered),
+            Err(ControlEventError::DigestMismatch)
+        );
+
+        // Unknown kind ordinal (0 and 9 are outside 1..=8).
+        let mut unknown = good.clone();
+        unknown[29] = 9;
+        assert_eq!(
+            RemoteControlEventV1::decode(&unknown),
             Err(ControlEventError::UnknownKind)
         );
+
+        // A valid RCEV-era blob (old magic "RCEV") is rejected on magic.
+        let mut rcev = good.clone();
+        rcev[0..4].copy_from_slice(b"RCEV");
+        assert_eq!(
+            RemoteControlEventV1::decode(&rcev),
+            Err(ControlEventError::Magic)
+        );
+
+        // Zero event id and zero control seq are rejected at header decode.
+        let mut zero_id = good.clone();
+        zero_id[13..29].fill(0);
+        assert_eq!(
+            RemoteControlEventV1::decode(&zero_id),
+            Err(ControlEventError::EventIdZero)
+        );
     }
 
     #[test]
-    fn remote_control_event_replay_page_bounds() {
-        assert_eq!(REMOTE_CONTROL_EVENT_REPLAY_MAX_EVENTS, 64);
-        assert_eq!(REMOTE_CONTROL_EVENT_REPLAY_MAX_BYTES, 512 * 1024);
+    fn remote_control_event_embedded_jws_bounds() {
+        // A lease_refresh whose declared inner length exceeds 16,384 is
+        // rejected before any mutation.
+        let event = RemoteControlEventV1::seal(
+            1,
+            [0x11; 16],
+            1,
+            1,
+            1,
+            0,
+            RemoteControlEventPayload::LeaseRefresh {
+                lease_jws: vec![0x01; REMOTE_CONTROL_EVENT_MAX_EMBEDDED_JWS + 1],
+            },
+        );
+        assert_eq!(
+            RemoteControlEventV1::decode(&event.encode()),
+            Err(ControlEventError::EmbeddedJwsLength)
+        );
     }
 
     // ── Revocation operation barrier ────────────────────────────────────
@@ -1974,15 +2525,103 @@ mod tests {
         );
     }
 
-    // ── Policy cannot widen ──────────────────────────────────────────────
+    // ── Policy cannot widen (AC-7 / AC-8) ────────────────────────────────
+
+    fn ceiling(
+        digest: u8,
+        scopes: &[&str],
+        projects: &[&str],
+        transports: &[&str],
+        custody: &[&str],
+        children: &[&str],
+    ) -> RefreshCeiling {
+        let set = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
+        RefreshCeiling {
+            ceiling_digest: [digest; 32],
+            scopes: set(scopes),
+            projects: set(projects),
+            transports: set(transports),
+            custody_requirements: set(custody),
+            children: set(children),
+        }
+    }
 
     #[test]
-    fn remote_policy_cannot_widen() {
-        // Refresh cannot add children.
-        assert!(validate_refresh_narrows(&[1; 32], &[2; 32], 2, 2).is_ok());
+    fn remote_policy_cannot_widen_daemon_authority() {
+        let old = ceiling(
+            1,
+            &["read", "write"],
+            &["p1", "p2"],
+            &["webrtc", "websocket"],
+            &["passkey"],
+            &["c1", "c2"],
+        );
+
+        // Equal digests short-circuit as unchanged even if the sets differ.
+        let mut same_digest = ceiling(1, &["read", "write", "admin"], &[], &[], &[], &[]);
+        same_digest.ceiling_digest = old.ceiling_digest;
+        assert!(validate_refresh_narrows(&old, &same_digest).is_ok());
+
+        // A genuine narrow (subset across every set, a dropped child) is
+        // accepted.
+        let narrowed = ceiling(2, &["read"], &["p1"], &["webrtc"], &["passkey"], &["c1"]);
+        assert!(validate_refresh_narrows(&old, &narrowed).is_ok());
+
+        // Widening any one set is rejected with the specific error; each case
+        // fails against the old count-only implementation (which ignored the
+        // sets entirely).
+        let widen_scope = ceiling(
+            2,
+            &["read", "write", "admin"],
+            &["p1"],
+            &["webrtc"],
+            &[],
+            &["c1"],
+        );
         assert_eq!(
-            validate_refresh_narrows(&[1; 32], &[2; 32], 1, 2),
-            Err(PostProofLeaseGateError::PolicyWidening)
+            validate_refresh_narrows(&old, &widen_scope),
+            Err(RefreshWidenError::ScopeWidened)
+        );
+        let widen_project = ceiling(2, &["read"], &["p1", "p3"], &["webrtc"], &[], &["c1"]);
+        assert_eq!(
+            validate_refresh_narrows(&old, &widen_project),
+            Err(RefreshWidenError::ProjectWidened)
+        );
+        let widen_transport = ceiling(
+            2,
+            &["read"],
+            &["p1"],
+            &["webrtc", "quic"],
+            &["passkey"],
+            &["c1"],
+        );
+        assert_eq!(
+            validate_refresh_narrows(&old, &widen_transport),
+            Err(RefreshWidenError::TransportWidened)
+        );
+        let widen_custody = ceiling(
+            2,
+            &["read"],
+            &["p1"],
+            &["webrtc"],
+            &["passkey", "hardware-key"],
+            &["c1"],
+        );
+        assert_eq!(
+            validate_refresh_narrows(&old, &widen_custody),
+            Err(RefreshWidenError::CustodyWidened)
+        );
+        let add_child = ceiling(
+            2,
+            &["read"],
+            &["p1"],
+            &["webrtc"],
+            &["passkey"],
+            &["c1", "c2", "c3"],
+        );
+        assert_eq!(
+            validate_refresh_narrows(&old, &add_child),
+            Err(RefreshWidenError::ChildAdded)
         );
     }
 
@@ -2014,27 +2653,6 @@ mod tests {
             validate_exact_retry(1, &digest, 1, &other),
             Err(LeaseReplacementError::DigestMismatch)
         );
-    }
-
-    // ── PostProofLeaseGate ───────────────────────────────────────────────
-
-    #[test]
-    fn remote_post_proof_lease_gate_cycle_free() {
-        let input = PostProofLeaseGateInput {
-            final_proof_set_digest: [1; 32],
-            refresh_authorization_digest: [2; 32],
-            permission_ceiling_digest: [3; 32],
-            daemon_local_policy_digest: [4; 32],
-            active_children: vec![RemoteLeaseActiveChildV1 {
-                child_attempt_id: "c-1".into(),
-                transport_epoch: "e-1".into(),
-                transport: RemoteLeaseTransport::WebRtc,
-                lifecycle: RemoteLeaseChildLifecycle::Current,
-                final_proof_set_digest: "d".into(),
-            }],
-        };
-        let output = post_proof_lease_gate(&input, 0).unwrap();
-        assert_eq!(output.lease_generation, 1);
     }
 
     // ── Event delivery dedupe ────────────────────────────────────────────

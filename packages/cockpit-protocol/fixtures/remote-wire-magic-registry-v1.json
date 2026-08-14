@@ -193,7 +193,7 @@
   },
   {
     "magic": "FCRC",
-    "symbolicType": "RemoteRelationshipConsentV1",
+    "symbolicType": "RemoteControlEventV1",
     "owningPackage": "@flycockpit/cockpit-protocol",
     "owningVersion": 1
   },

@@ -29,6 +29,7 @@ pub(crate) mod config_refresh;
 pub mod config_source;
 pub(crate) mod config_watch;
 pub mod connector;
+pub mod control_replay;
 pub mod effective_default_recovery;
 pub mod egress;
 pub mod ephemeral_guard;

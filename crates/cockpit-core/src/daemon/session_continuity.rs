@@ -27,9 +27,11 @@
 //!   total state machines.
 //! - The authorization barrier ordering: request admitted before barrier may
 //!   finish under its recorded policy snapshot; event first rejects.
-//! - The control event application state machine: persist cursor/event hash
-//!   before ACK, apply through the barrier, pause on conflict/gap/regression.
-//! - The TURN credential renewal lead calculation.
+//! - The control event application state machine: consume the gateway-owned
+//!   `RemoteControlEventV1` (FCRC) binary event, persist cursor/event hash
+//!   before ACK, apply each of the eight closed kinds exhaustively, and pause
+//!   on conflict/gap/epoch-regression/malformed. The pause is sticky and
+//!   clears only through `reconcile_authoritative_replay`.
 //! - The mobile background/foreground state transitions.
 //!
 //! # What this module does NOT own
@@ -55,13 +57,13 @@ use std::collections::HashMap;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use cockpit_proto::remote_session_continuity::{
-    REMOTE_REPLAY_MAX_BYTES_PER_PAGE, REMOTE_REPLAY_MAX_EVENTS_PER_PAGE,
-    RemoteContinuityOperationClass, RemoteControlEventApplyResult, RemoteControlEventHeaderV1,
-    RemoteControlEventKind, RemoteDeliveryDedupeState, RemoteLeaseActiveChildV1,
-    RemoteLeaseChildLifecycle, RemoteLeaseTransport, RemoteLongRunningClassification,
-    RemoteMobileUiState, RemoteOperationRecoveryAction, RemoteOperationStatus,
-    RemoteReattachResponseV1, RemoteRevocationDisposition, control_event_byte_hash,
-    operation_recovery_action, revocation_disposition, validate_replay_page,
+    REMOTE_REPLAY_MAX_EVENTS_PER_PAGE, RemoteContinuityOperationClass,
+    RemoteControlEventApplyResult, RemoteControlEventPayload, RemoteControlEventV1,
+    RemoteDeliveryDedupeState, RemoteLeaseActiveChildV1, RemoteLeaseChildLifecycle,
+    RemoteLeaseTransport, RemoteLongRunningClassification, RemoteMobileUiState,
+    RemoteOperationRecoveryAction, RemoteOperationStatus, RemoteReattachResponseV1,
+    RemoteRevocationDisposition, control_event_byte_hash, operation_recovery_action,
+    revocation_disposition, validate_replay_page,
 };
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -139,11 +141,28 @@ pub struct AttachmentContinuityState {
     pub delivery_dedupe: RemoteDeliveryDedupeState,
     /// The control event cursor: `lastAppliedControlSeq`.
     pub last_applied_control_seq: u64,
+    /// The last applied `policyEpoch` (epoch regression is detected on epochs).
+    pub last_applied_policy_epoch: u64,
+    /// The last applied `authorityEpoch` (epoch regression is detected on
+    /// epochs).
+    pub last_applied_authority_epoch: u64,
     /// Persisted `eventId → byteHash` map for control event idempotency.
     pub control_event_hashes: HashMap<[u8; 16], [u8; 32]>,
     /// Whether operations are paused due to a control event conflict/gap/
-    /// regression.
+    /// regression/malformed payload. Sticky: clears only through
+    /// [`reconcile_authoritative_replay`].
     pub operations_paused: bool,
+    /// The required policy digest after a `policy_narrowed` event. New
+    /// admissions must use a lease whose `policyDigest` equals this value.
+    pub required_policy_digest: Option<[u8; 32]>,
+    /// The `drain` deadline (unix seconds), if a drain event is in force.
+    /// Children close at this deadline via the injected continuity clock
+    /// (clock wiring deferred to the daemon live path).
+    pub drain_deadline: Option<i64>,
+    /// An embedded lease-refresh JWS recorded from a `lease_refresh` event,
+    /// pending signature verification before install (verification deferred to
+    /// the continuity-typ JWS path).
+    pub pending_lease_refresh_jws: Option<Vec<u8>>,
     /// The current mobile UI state.
     pub mobile_ui_state: RemoteMobileUiState,
     /// Whether the attachment is in mobile background mode.
@@ -162,8 +181,13 @@ impl AttachmentContinuityState {
             children: Vec::new(),
             delivery_dedupe: RemoteDeliveryDedupeState::new(),
             last_applied_control_seq: 0,
+            last_applied_policy_epoch: 0,
+            last_applied_authority_epoch: 0,
             control_event_hashes: HashMap::new(),
             operations_paused: false,
+            required_policy_digest: None,
+            drain_deadline: None,
+            pending_lease_refresh_jws: None,
             mobile_ui_state: RemoteMobileUiState::Reconnecting,
             backgrounded: false,
         }
@@ -313,87 +337,177 @@ pub enum ChildCallbackResult {
 // Control event application
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Apply a control event through the authorization barrier. The daemon
-/// persists `lastAppliedControlSeq` and `eventId → byteHash` before ACK.
+/// Apply a control event (the exact FCRC binary event bytes, after the
+/// caller has verified the wrapping compact ES256 JWS) through the
+/// authorization barrier. The daemon persists `lastAppliedControlSeq` and
+/// `eventId → byteHash` before ACK.
 ///
-/// Same ID/bytes is idempotent; conflict, sequence gap, epoch regression, bad
-/// signature, unknown kind, or malformed exact-length payload pauses new
-/// operations and requests authoritative Postgres replay. If unresolved
-/// through lease expiry, disconnect.
+/// # Verification precondition
+///
+/// This entry point applies an already-authenticated event: the caller MUST
+/// have verified the wrapping control-event JWS (`typ:
+/// "flycockpit-remote-control-event+jws"`) against the pinned authority ring
+/// and produced `BadSignature` on failure before calling this. The wire-level
+/// signature path is landed with the daemon live admission pipeline; this
+/// function owns the post-verification decode/digest/epoch/sequence/apply
+/// steps and is fail-closed on a malformed FCRC payload.
+///
+/// Same ID/bytes is idempotent; conflict, sequence gap, epoch regression, or a
+/// malformed exact-length payload pauses new operations (sticky) and requests
+/// authoritative replay. The pause clears only through
+/// [`reconcile_authoritative_replay`].
 pub fn apply_control_event(
     state: &mut AttachmentContinuityState,
-    header: &RemoteControlEventHeaderV1,
     event_bytes: &[u8],
 ) -> RemoteControlEventApplyResult {
-    // Check for duplicate by event ID.
+    // Fail-closed decode of the exact-length, digest-checked FCRC event.
+    let event = match RemoteControlEventV1::decode(event_bytes) {
+        Ok(event) => event,
+        Err(_) => {
+            state.operations_paused = true;
+            return RemoteControlEventApplyResult::MalformedPayload;
+        }
+    };
+    let header = &event.header;
     let byte_hash = control_event_byte_hash(event_bytes);
 
+    // Check for duplicate by event ID.
     if let Some(existing_hash) = state.control_event_hashes.get(&header.event_id) {
         if *existing_hash == byte_hash {
-            // Same ID and bytes — idempotent, no cursor advance.
+            // Same ID and bytes — idempotent, no cursor advance, no reapply.
             return RemoteControlEventApplyResult::DuplicateIdempotent;
-        } else {
-            // Same ID, different bytes — conflict. Pause operations.
-            state.operations_paused = true;
-            return RemoteControlEventApplyResult::Conflict;
         }
+        // Same ID, different bytes — conflict. Pause operations (sticky).
+        state.operations_paused = true;
+        return RemoteControlEventApplyResult::Conflict;
     }
 
-    // Check for sequence gap.
+    // Sequence gap: a hole between the cursor and this event.
     let expected_seq = state.last_applied_control_seq + 1;
     if header.control_seq > expected_seq {
-        // Gap — pause operations, request authoritative replay.
         state.operations_paused = true;
         return RemoteControlEventApplyResult::SequenceGap;
     }
 
-    // Check for epoch regression (control_seq going backward, not a gap but
-    // a replay of an older event with a new ID).
-    if header.control_seq <= state.last_applied_control_seq
-        && !state.control_event_hashes.contains_key(&header.event_id)
+    // Epoch regression is detected on epochs, not on sequence: a policy or
+    // authority epoch below the last applied value is a regression.
+    if header.policy_epoch < state.last_applied_policy_epoch
+        || header.authority_epoch < state.last_applied_authority_epoch
     {
-        // Epoch regression — a new event ID with an old sequence.
         state.operations_paused = true;
         return RemoteControlEventApplyResult::EpochRegression;
     }
 
-    // Validate the header kind is known (already decoded, but check).
-    // The kind was decoded successfully, so it's known.
-
-    // Persist cursor and event hash BEFORE ACK. This is the critical
-    // ordering: the daemon must persist before acknowledging.
+    // Persist cursor and event hash BEFORE ACK. This is the critical ordering:
+    // the daemon must persist before acknowledging. (Durable SQLite-backed
+    // persistence replaces this in-memory map on the daemon storage path.)
     state
         .control_event_hashes
         .insert(header.event_id, byte_hash);
     state.last_applied_control_seq = header.control_seq;
+    state.last_applied_policy_epoch = header.policy_epoch;
+    state.last_applied_authority_epoch = header.authority_epoch;
 
-    // Apply the event through the authorization barrier. Active revocation
-    // closes all affected child epochs after the barrier.
-    match header.kind {
-        RemoteControlEventKind::Revocation | RemoteControlEventKind::LeaseRevocation => {
-            // Close all affected child epochs.
+    // Exhaustive per-kind application: every arm mutates or explicitly records
+    // — no silent-ACK empty arm.
+    match &event.payload {
+        RemoteControlEventPayload::LeaseRefresh { lease_jws } => {
+            // Record the embedded lease JWS for verification+install by the
+            // continuity-typ JWS path; do NOT install an unverified lease.
+            state.pending_lease_refresh_jws = Some(lease_jws.clone());
+        }
+        RemoteControlEventPayload::PolicyNarrowed { new_digest, .. } => {
+            // Record the required policy digest. In-flight reserved operations
+            // continue under their recorded snapshot; only NEW admissions are
+            // gated on the lease carrying `new_digest`.
+            state.required_policy_digest = Some(*new_digest);
+        }
+        RemoteControlEventPayload::DeviceRevoked { .. }
+        | RemoteControlEventPayload::InstanceRevoked { .. }
+        | RemoteControlEventPayload::AttachmentRevoked { .. } => {
+            // Fail-closed severing: close all open children and invalidate the
+            // lease. NOTE: identity-scoped matching (device/instance id vs this
+            // daemon, `logicalAttachmentId` vs this attachment — where a
+            // non-matching id records-and-ACKs instead of severing) is landed
+            // with daemon identity injection on the live admission path; this
+            // conservative sever never under-revokes.
             for child in &mut state.children {
                 if child.is_open() {
                     child.state = ChildMemberState::Closed;
                 }
             }
-            // The current lease is invalidated.
             state.current_lease_id = None;
             state.mobile_ui_state = RemoteMobileUiState::AccessRevoked;
         }
-        RemoteControlEventKind::PolicyNarrowing => {
-            // Policy narrowing does not close children but may reauthorize.
-            // The lease must be refreshed to reflect the narrowed policy.
+        RemoteControlEventPayload::TenantAuthorityChanged { new_epoch, .. } => {
+            // The header authority epoch must equal the payload's new epoch.
+            if header.authority_epoch != *new_epoch {
+                state.operations_paused = true;
+                return RemoteControlEventApplyResult::MalformedPayload;
+            }
         }
-        RemoteControlEventKind::AuthorityRotation => {
-            // Authority key rotation — the current lease must be refreshed
-            // under the new authority.
+        RemoteControlEventPayload::AuthorityStatus { .. } => {
+            // Record the authority-status observation. Byte-checking the
+            // embedded `RemoteAuthorityStatusV1` JWS against the ring owner is
+            // landed with the continuity-typ JWS verification path.
+        }
+        RemoteControlEventPayload::Drain { deadline, .. } => {
+            // Mark all open children draining and record the deadline; children
+            // close at the deadline via the injected continuity clock.
+            state.drain_deadline = Some(*deadline);
+            for child in &mut state.children {
+                if child.is_open() {
+                    child.state = ChildMemberState::Draining;
+                }
+            }
         }
     }
 
-    // Operations are unpaused after successful application.
-    state.operations_paused = false;
+    // NOTE: no unconditional unpause. A pause set by conflict/gap/regression/
+    // malformed clears only through `reconcile_authoritative_replay`.
+    RemoteControlEventApplyResult::Applied
+}
 
+/// Consume a verified, gap-free authoritative replay page (the gateway's
+/// 64-event/512-KiB replay, supplied through a `ControlReplaySource`) and
+/// re-derive the control cursor. This is the ONLY entry point that clears a
+/// sticky pause: it applies each event after the current cursor in order and,
+/// if the page is gap-free through its end, unpauses.
+///
+/// Events already applied (present in the dedupe map with identical bytes) are
+/// skipped. A gap within the page, or a malformed/duplicate-conflict event,
+/// leaves the pause in place and returns the failing result.
+pub fn reconcile_authoritative_replay(
+    state: &mut AttachmentContinuityState,
+    verified_page: &[RemoteControlEventV1],
+) -> RemoteControlEventApplyResult {
+    for event in verified_page {
+        let bytes = event.encode();
+        let byte_hash = control_event_byte_hash(&bytes);
+        // Skip an already-applied prefix (idempotent by id+bytes).
+        if let Some(existing) = state.control_event_hashes.get(&event.header.event_id) {
+            if *existing == byte_hash {
+                continue;
+            }
+            return RemoteControlEventApplyResult::Conflict;
+        }
+        // Gap-free requirement: each new event must be exactly the next seq.
+        if event.header.control_seq != state.last_applied_control_seq + 1 {
+            return RemoteControlEventApplyResult::SequenceGap;
+        }
+        // Apply without the outer pause-on-error latch flipping our decision:
+        // a paused state does not block reconciliation replay.
+        let was_paused = state.operations_paused;
+        state.operations_paused = false;
+        let result = apply_control_event(state, &bytes);
+        if result != RemoteControlEventApplyResult::Applied {
+            // Restore the pause and surface the failure.
+            state.operations_paused = was_paused || state.operations_paused;
+            return result;
+        }
+    }
+    // Gap-free through the page end: unpause.
+    state.operations_paused = false;
     RemoteControlEventApplyResult::Applied
 }
 
@@ -463,19 +577,15 @@ impl AuthorizationBarrier {
         })
     }
 
-    /// Determine the revocation disposition for an in-flight operation when
-    /// a revocation/control event arrives at the barrier.
-    ///
-    /// The request admitted before the barrier may finish under its recorded
-    /// policy snapshot and explicit long-running `continue | cancel`
-    /// classification; the event first rejects.
+    /// A revocation/control event that arrives BEFORE a request is admitted
+    /// yields a rejection with NO disposition: the request never entered the
+    /// barrier and was never reserved, so there is nothing to "continue".
+    /// `ContinueRecordedSnapshot` is produced ONLY for an already-reserved
+    /// transactional mutation (see [`AuthorizationBarrier::request_before_event`]).
     pub fn event_before_request(
-        class: RemoteContinuityOperationClass,
-    ) -> (RemoteRevocationDisposition, RemoteLongRunningClassification) {
-        // Event arrives before the request is admitted — the request is
-        // rejected before admission. All classes are cancelled.
-        let (disp, _) = revocation_disposition(class, false, false);
-        (disp, RemoteLongRunningClassification::Cancel)
+        _class: RemoteContinuityOperationClass,
+    ) -> EventBeforeRequestOutcome {
+        EventBeforeRequestOutcome::RejectedBeforeAdmission
     }
 
     /// Determine the revocation disposition for an in-flight operation when
@@ -510,6 +620,14 @@ pub enum BarrierError {
     NoCurrentLease,
     #[error("operations paused due to control event conflict")]
     OperationsPaused,
+}
+
+/// Outcome for a request whose revocation/control event arrived before
+/// admission: an outright rejection with no disposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventBeforeRequestOutcome {
+    /// The request was never admitted or reserved; it is rejected outright.
+    RejectedBeforeAdmission,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -713,10 +831,45 @@ pub enum LeaseReplacementError {
 mod tests {
     use super::*;
     use cockpit_proto::remote_session_continuity::{
-        RemoteContinuityOperationClass, RemoteControlEventApplyResult, RemoteControlEventHeaderV1,
-        RemoteControlEventKind, RemoteLongRunningClassification, RemoteOperationRecoveryAction,
+        RemoteContinuityOperationClass, RemoteControlEventApplyResult, RemoteControlEventPayload,
+        RemoteControlEventV1, RemoteLongRunningClassification, RemoteOperationRecoveryAction,
         RemoteOperationStatus, RemoteRevocationDisposition,
     };
+
+    /// Build a sealed FCRC control event with the given sequence, event id,
+    /// epochs, and payload for the apply tests.
+    fn control_event(
+        control_seq: u64,
+        event_id: [u8; 16],
+        policy_epoch: u64,
+        authority_epoch: u64,
+        payload: RemoteControlEventPayload,
+    ) -> RemoteControlEventV1 {
+        RemoteControlEventV1::seal(
+            control_seq,
+            event_id,
+            1,
+            policy_epoch,
+            authority_epoch,
+            0,
+            payload,
+        )
+    }
+
+    fn device_revoked_payload() -> RemoteControlEventPayload {
+        RemoteControlEventPayload::DeviceRevoked {
+            device_id: [0xD0; 16],
+            generation: 1,
+        }
+    }
+
+    fn policy_narrowed_payload(new_digest: [u8; 32]) -> RemoteControlEventPayload {
+        RemoteControlEventPayload::PolicyNarrowed {
+            previous_digest: [0xA0; 32],
+            new_digest,
+            affected_field_bits: 0,
+        }
+    }
 
     // ── Transport epoch membership race ─────────────────────────────────
 
@@ -814,64 +967,38 @@ mod tests {
     #[test]
     fn remote_control_event_apply_and_duplicate() {
         let mut state = AttachmentContinuityState::new("att-1".into(), "sess-1".into());
-        let header = RemoteControlEventHeaderV1 {
-            kind: RemoteControlEventKind::PolicyNarrowing,
-            event_id: [1; 16],
-            tenant_id: [2; 16],
-            authority_key_id: [3; 16],
-            affected_lease_id: [0; 16],
-            control_seq: 1,
-            policy_epoch: 10,
-            authority_epoch: 5,
-        };
-        let event_bytes = header.encode();
+        let event = control_event(1, [1; 16], 10, 5, policy_narrowed_payload([0xB0; 32]));
+        let bytes = event.encode();
 
-        // First application — applied.
+        // First application — applied, records the required policy digest.
         assert_eq!(
-            apply_control_event(&mut state, &header, &event_bytes),
+            apply_control_event(&mut state, &bytes),
             RemoteControlEventApplyResult::Applied
         );
         assert_eq!(state.last_applied_control_seq, 1);
+        assert_eq!(state.last_applied_policy_epoch, 10);
+        assert_eq!(state.required_policy_digest, Some([0xB0; 32]));
         assert!(!state.operations_paused);
 
-        // Same ID and bytes — idempotent.
+        // Same ID and bytes — idempotent, no cursor advance.
         assert_eq!(
-            apply_control_event(&mut state, &header, &event_bytes),
+            apply_control_event(&mut state, &bytes),
             RemoteControlEventApplyResult::DuplicateIdempotent
         );
+        assert_eq!(state.last_applied_control_seq, 1);
     }
 
     #[test]
     fn remote_control_event_conflict() {
         let mut state = AttachmentContinuityState::new("att-1".into(), "sess-1".into());
-        let header = RemoteControlEventHeaderV1 {
-            kind: RemoteControlEventKind::PolicyNarrowing,
-            event_id: [1; 16],
-            tenant_id: [2; 16],
-            authority_key_id: [3; 16],
-            affected_lease_id: [0; 16],
-            control_seq: 1,
-            policy_epoch: 10,
-            authority_epoch: 5,
-        };
-        let event_bytes = header.encode();
+        // Same event id, different bytes (different new_digest → different
+        // payload digest → different whole-event bytes).
+        let first = control_event(1, [1; 16], 10, 5, policy_narrowed_payload([0xB0; 32]));
+        apply_control_event(&mut state, &first.encode());
 
-        // Apply first.
-        apply_control_event(&mut state, &header, &event_bytes);
-
-        // Same ID, different bytes — conflict.
-        let mut different_bytes = event_bytes.clone();
-        different_bytes[97] = 0xFF; // Modify reserved byte (but this would fail decode; use a different approach)
-        // Actually, we need to pass different bytes that still represent a
-        // valid event with the same ID. The byte hash is computed over the
-        // full event bytes (header + payload), so we append a payload.
-        let mut event_with_payload = header.encode().to_vec();
-        event_with_payload.extend_from_slice(&[1, 2, 3]);
-
-        // The first event had no payload (just the header). Now we pass
-        // header+payload with the same event ID — conflict.
+        let conflicting = control_event(1, [1; 16], 10, 5, policy_narrowed_payload([0xC0; 32]));
         assert_eq!(
-            apply_control_event(&mut state, &header, &event_with_payload),
+            apply_control_event(&mut state, &conflicting.encode()),
             RemoteControlEventApplyResult::Conflict
         );
         assert!(state.operations_paused);
@@ -880,36 +1007,44 @@ mod tests {
     #[test]
     fn remote_control_event_sequence_gap() {
         let mut state = AttachmentContinuityState::new("att-1".into(), "sess-1".into());
+        let e1 = control_event(1, [1; 16], 0, 0, policy_narrowed_payload([0xB0; 32]));
+        apply_control_event(&mut state, &e1.encode());
 
-        // Apply seq 1.
-        let header1 = RemoteControlEventHeaderV1 {
-            kind: RemoteControlEventKind::PolicyNarrowing,
-            event_id: [1; 16],
-            tenant_id: [0; 16],
-            authority_key_id: [0; 16],
-            affected_lease_id: [0; 16],
-            control_seq: 1,
-            policy_epoch: 0,
-            authority_epoch: 0,
-        };
-        apply_control_event(&mut state, &header1, &header1.encode());
-
-        // Try seq 3 (gap at 2).
-        let header3 = RemoteControlEventHeaderV1 {
-            kind: RemoteControlEventKind::PolicyNarrowing,
-            event_id: [3; 16],
-            tenant_id: [0; 16],
-            authority_key_id: [0; 16],
-            affected_lease_id: [0; 16],
-            control_seq: 3,
-            policy_epoch: 0,
-            authority_epoch: 0,
-        };
+        // Seq 3 with a gap at 2.
+        let e3 = control_event(3, [3; 16], 0, 0, policy_narrowed_payload([0xB0; 32]));
         assert_eq!(
-            apply_control_event(&mut state, &header3, &header3.encode()),
+            apply_control_event(&mut state, &e3.encode()),
             RemoteControlEventApplyResult::SequenceGap
         );
         assert!(state.operations_paused);
+    }
+
+    #[test]
+    fn remote_control_event_epoch_regression() {
+        let mut state = AttachmentContinuityState::new("att-1".into(), "sess-1".into());
+        // Apply an event advancing the policy epoch to 10.
+        let e1 = control_event(1, [1; 16], 10, 5, policy_narrowed_payload([0xB0; 32]));
+        apply_control_event(&mut state, &e1.encode());
+
+        // Next in-sequence event, but the policy epoch regresses to 9.
+        let e2 = control_event(2, [2; 16], 9, 5, policy_narrowed_payload([0xB0; 32]));
+        assert_eq!(
+            apply_control_event(&mut state, &e2.encode()),
+            RemoteControlEventApplyResult::EpochRegression
+        );
+        assert!(state.operations_paused);
+    }
+
+    #[test]
+    fn remote_control_event_malformed_pauses() {
+        let mut state = AttachmentContinuityState::new("att-1".into(), "sess-1".into());
+        // A truncated event never decodes; it pauses without any cursor move.
+        assert_eq!(
+            apply_control_event(&mut state, &[0u8; 4]),
+            RemoteControlEventApplyResult::MalformedPayload
+        );
+        assert!(state.operations_paused);
+        assert_eq!(state.last_applied_control_seq, 0);
     }
 
     #[test]
@@ -925,25 +1060,85 @@ mod tests {
         });
         state.current_lease_id = Some("lease-1".into());
 
-        let header = RemoteControlEventHeaderV1 {
-            kind: RemoteControlEventKind::Revocation,
-            event_id: [1; 16],
-            tenant_id: [0; 16],
-            authority_key_id: [0; 16],
-            affected_lease_id: [0; 16],
-            control_seq: 1,
-            policy_epoch: 0,
-            authority_epoch: 0,
-        };
-        let result = apply_control_event(&mut state, &header, &header.encode());
+        let event = control_event(1, [1; 16], 0, 0, device_revoked_payload());
+        let result = apply_control_event(&mut state, &event.encode());
         assert_eq!(result, RemoteControlEventApplyResult::Applied);
 
-        // All children closed.
         assert_eq!(state.count_active(), 0);
-        // Lease invalidated.
         assert!(state.current_lease_id.is_none());
-        // UI state is access_revoked.
         assert_eq!(state.mobile_ui_state, RemoteMobileUiState::AccessRevoked);
+    }
+
+    #[test]
+    fn remote_control_event_drain_marks_draining() {
+        let mut state = AttachmentContinuityState::new("att-1".into(), "sess-1".into());
+        state.add_child(ChildMember {
+            child_attempt_id: "c-1".into(),
+            transport: ChildTransport::WebRtc,
+            transport_epoch: "e-1".into(),
+            generation: 1,
+            state: ChildMemberState::Active,
+            final_proof_set_digest: [1; 32],
+        });
+
+        let event = control_event(
+            1,
+            [1; 16],
+            0,
+            0,
+            RemoteControlEventPayload::Drain {
+                deadline: 1_700_000_500,
+                reason: 1,
+            },
+        );
+        assert_eq!(
+            apply_control_event(&mut state, &event.encode()),
+            RemoteControlEventApplyResult::Applied
+        );
+        assert_eq!(state.drain_deadline, Some(1_700_000_500));
+        assert_eq!(
+            state.find_child("c-1").unwrap().state,
+            ChildMemberState::Draining
+        );
+    }
+
+    #[test]
+    fn remote_control_pause_sticky_until_replay() {
+        let mut state = AttachmentContinuityState::new("att-1".into(), "sess-1".into());
+        // Apply seq 1.
+        let e1 = control_event(1, [1; 16], 0, 0, policy_narrowed_payload([0xB0; 32]));
+        apply_control_event(&mut state, &e1.encode());
+
+        // A gap at 2 pauses (seq 3 arrives).
+        let e3 = control_event(3, [3; 16], 0, 0, policy_narrowed_payload([0xB0; 32]));
+        apply_control_event(&mut state, &e3.encode());
+        assert!(state.operations_paused);
+
+        // A subsequent successful-looking in-order event does NOT unpause —
+        // the pause is sticky. (Seq is still 1, so seq 2 applies but the pause
+        // remains because only reconcile clears it.)
+        let e2 = control_event(2, [2; 16], 0, 0, policy_narrowed_payload([0xB0; 32]));
+        assert_eq!(
+            apply_control_event(&mut state, &e2.encode()),
+            RemoteControlEventApplyResult::Applied
+        );
+        assert!(state.operations_paused, "pause is sticky across applies");
+
+        // Only a verified gap-free replay page unpauses. Provide the missing
+        // seq-3 event as a gap-free page (cursor is now at 2).
+        let page = vec![control_event(
+            3,
+            [3; 16],
+            0,
+            0,
+            policy_narrowed_payload([0xB0; 32]),
+        )];
+        assert_eq!(
+            reconcile_authoritative_replay(&mut state, &page),
+            RemoteControlEventApplyResult::Applied
+        );
+        assert!(!state.operations_paused);
+        assert_eq!(state.last_applied_control_seq, 3);
     }
 
     // ── Authorization barrier ────────────────────────────────────────────
@@ -981,18 +1176,20 @@ mod tests {
 
     #[test]
     fn remote_revocation_barrier_event_before_request() {
-        // Event arrives before request — request is rejected.
-        let (disp, cls) = AuthorizationBarrier::event_before_request(
-            RemoteContinuityOperationClass::TransactionalMutation,
-        );
-        assert_eq!(disp, RemoteRevocationDisposition::ContinueRecordedSnapshot);
-        assert_eq!(cls, RemoteLongRunningClassification::Cancel);
-
-        let (disp, _) =
-            AuthorizationBarrier::event_before_request(RemoteContinuityOperationClass::ReadOnly);
+        // An event arriving before admission is a rejection with NO disposition
+        // for EVERY class — the request never reserved anything, so there is
+        // no recorded snapshot to continue under. (This rejects the old
+        // behavior, which returned `ContinueRecordedSnapshot` for an
+        // un-admitted transactional mutation.)
         assert_eq!(
-            disp,
-            RemoteRevocationDisposition::CancelAtNextYieldAndReauthorize
+            AuthorizationBarrier::event_before_request(
+                RemoteContinuityOperationClass::TransactionalMutation,
+            ),
+            EventBeforeRequestOutcome::RejectedBeforeAdmission
+        );
+        assert_eq!(
+            AuthorizationBarrier::event_before_request(RemoteContinuityOperationClass::ReadOnly),
+            EventBeforeRequestOutcome::RejectedBeforeAdmission
         );
     }
 

@@ -468,6 +468,24 @@ pub(crate) async fn execute_ordinary_call(
         };
     let lifecycle_started = (placeholder_blocked || repair_outcome.valid)
         && env.active_tools.get(resolved_name).is_some();
+    // Pin the AUTHORING model's frame inputs ONCE — its `(provider, model)`, the
+    // config handle, and the pre-policy session table (captured as one Arc) — at
+    // the authoring point, and reuse them for EVERY model-authored event AND the
+    // co-persisted audit row below. This is the single source of truth for this
+    // dispatch's journal-vs-scrub classification, so the audit row and its
+    // ToolCall event (and the started/rejected/completed events) can never be
+    // classified against different frames across the execution/persistence awaits
+    // (TOCTOU; mirrors the MCP recorder's construction-time pin and schedule's
+    // one-frame pass). `env.model` is `&Model`, immutable for this call.
+    let tool_provider = env.model.provider_id().to_string();
+    let tool_model = env.model.model_id_ref().to_string();
+    let tool_session_table = env.model.session_redact_table();
+    let tool_frame = || crate::session::SessionEventModelFrame {
+        provider_id: &tool_provider,
+        model_id: &tool_model,
+        config: &env.ctx.config,
+        session_table: tool_session_table.as_ref(),
+    };
     let mut assistant_seq = None;
     if lifecycle_started {
         let (start_recovery_kind, start_recovery_stage) = recovery.db_fields();
@@ -478,19 +496,13 @@ pub(crate) async fn execute_ordinary_call(
             "recovery_kind": start_recovery_kind,
             "recovery_stage": start_recovery_stage,
         });
-        let started_session_table = env.model.session_redact_table();
         match env
             .session
             .record_event_with_model_frame(
                 crate::db::session_log::SessionEventKind::ToolCallStarted,
                 Some(&env.agent.name),
                 Some(&tc.id),
-                crate::session::SessionEventModelFrame {
-                    provider_id: env.model.provider_id(),
-                    model_id: env.model.model_id_ref(),
-                    config: &env.ctx.config,
-                    session_table: started_session_table.as_ref(),
-                },
+                tool_frame(),
                 &start_data,
             )
             .await
@@ -919,9 +931,15 @@ pub(crate) async fn execute_ordinary_call(
     let providers = env.ctx.config.providers();
     let active_provider = env.session.active_provider();
     let active_model = env.session.active_model();
+    // Journal (or fail-closed scrub) the co-persisted audit row against the SAME
+    // pinned `tool_frame()` the timeline events use — one frame drives both the
+    // ToolCall event and this audit row, so they classify against identical
+    // trust + table and can never disagree across the intervening awaits (finding
+    // 7 TOCTOU / finding r11-3 / decision 12).
+    let audit_target_trusted = tool_frame().resolved_trusted();
     if let Err(e) = env
         .session
-        .record_tool_call(ToolCallRow {
+        .record_tool_call_journaled(ToolCallRow {
             event_id: Uuid::new_v4(),
             timestamp: Utc::now(),
             agent: env.agent.name.clone(),
@@ -955,7 +973,7 @@ pub(crate) async fn execute_ordinary_call(
             llm_mode: env.agent.llm_mode,
             shape_fingerprint: repair_fingerprint.clone(),
             hint: hint_value.clone(),
-        })
+        }, tool_session_table.as_ref(), audit_target_trusted)
         .await
     {
         // Auditing must not break the live conversation. Log and
@@ -1025,18 +1043,12 @@ pub(crate) async fn execute_ordinary_call(
     // saw; this names *why* it never dispatched.
     if let Some(reason) = rejection_reason
         && let Err(e) = {
-            let rejected_session_table = env.model.session_redact_table();
             env.session
                 .record_event_with_model_frame(
                     crate::db::session_log::SessionEventKind::ToolRejected,
                     Some(&env.agent.name),
                     Some(&tc.id),
-                    crate::session::SessionEventModelFrame {
-                        provider_id: env.model.provider_id(),
-                        model_id: env.model.model_id_ref(),
-                        config: &env.ctx.config,
-                        session_table: rejected_session_table.as_ref(),
-                    },
+                    tool_frame(),
                     &serde_json::json!({
                         "tool": resolved_name,
                         "reason": reason,
@@ -1047,19 +1059,13 @@ pub(crate) async fn execute_ordinary_call(
     {
         tracing::warn!(error = %e, tool = %resolved_name, "record tool_rejected event failed");
     }
-    let tool_call_session_table = env.model.session_redact_table();
     let tool_call_seq = match env
         .session
         .record_event_with_model_frame(
             crate::db::session_log::SessionEventKind::ToolCall,
             Some(&env.agent.name),
             Some(&tc.id),
-            crate::session::SessionEventModelFrame {
-                provider_id: env.model.provider_id(),
-                model_id: env.model.model_id_ref(),
-                config: &env.ctx.config,
-                session_table: tool_call_session_table.as_ref(),
-            },
+            tool_frame(),
             &event_data,
         )
         .await
@@ -1139,19 +1145,13 @@ pub(crate) async fn execute_ordinary_call(
         if let Some(hint) = &hint_value {
             completed_data["hint"] = hint.clone();
         }
-        let completed_session_table = env.model.session_redact_table();
         if let Err(e) = env
             .session
             .record_event_with_model_frame(
                 crate::db::session_log::SessionEventKind::ToolCallCompleted,
                 Some(&env.agent.name),
                 Some(&tc.id),
-                crate::session::SessionEventModelFrame {
-                    provider_id: env.model.provider_id(),
-                    model_id: env.model.model_id_ref(),
-                    config: &env.ctx.config,
-                    session_table: completed_session_table.as_ref(),
-                },
+                tool_frame(),
                 &completed_data,
             )
             .await
@@ -2393,6 +2393,144 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tool, "echo");
         assert_eq!(rows[0].output, "hello");
+    }
+
+    /// Finding 7 (ordinary-path one-frame): the co-persisted audit row and the
+    /// ToolCall session event are classified against ONE pinned authoring frame
+    /// (`tool_frame()` = `env.model`), never the session's live/after-turn active
+    /// model. Here the AUTHORING model (`env.model`) is TRUSTED and carries a
+    /// secret-bearing table, while the session's active model is switched to an
+    /// UNTRUSTED primary before the call. Both rows must still journal the secret
+    /// and retain it RAW (consistent) — a regression to reading the session's
+    /// active model (or building two frames that could diverge) would scrub one
+    /// side while the other kept it raw.
+    #[tokio::test]
+    async fn execute_ordinary_call_audit_and_event_share_one_authoring_frame() {
+        const SECRET: &str = "ordinary-path-secret-abc123456";
+        let tmp = tempfile::tempdir().unwrap();
+        // On-disk config: a TRUSTED authoring model (openai/gpt-5) and an
+        // UNTRUSTED model (root/root-model) to switch the session's active model
+        // to.
+        let providers_dir = tmp.path().join(".cockpit").join("providers");
+        std::fs::create_dir_all(&providers_dir).unwrap();
+        std::fs::write(
+            tmp.path().join(".cockpit").join("config.json"),
+            r#"{"llm_mode":"defensive"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            providers_dir.join("openai.json"),
+            serde_json::json!({
+                "url": "https://example.test/v1",
+                "models": [{"id": "gpt-5", "trust": "trusted", "mode": "frontier"}],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            providers_dir.join("root.json"),
+            serde_json::json!({
+                "url": "https://example.test/v1",
+                "models": [{"id": "root-model", "trust": "untrusted", "mode": "defensive"}],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // env.model = the TRUSTED authoring model, carrying a pre-policy session
+        // table that contains SECRET.
+        let redact_cfg = crate::config::extended::RedactConfig {
+            enabled: true,
+            scan_environment: true,
+            scan_dotenv: false,
+            scan_ssh_keys: false,
+            min_secret_length: 4,
+            placeholder: "[redacted]".to_string(),
+            ..crate::config::extended::RedactConfig::default()
+        };
+        let env_map = HashMap::from([("DEPLOY_TOKEN".to_string(), SECRET.to_string())]);
+        let secret_table = RedactionTable::build_with_env_and_secrets(
+            &redact_cfg,
+            tmp.path(),
+            &env_map,
+            Vec::<(String, String)>::new(),
+        )
+        .unwrap();
+        let config =
+            crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path());
+        let providers = config.snapshot().providers.clone();
+        let model = Model::for_provider_with_env(
+            &providers,
+            "openai",
+            "gpt-5",
+            Arc::new(secret_table),
+            |_| None,
+        )
+        .expect("trusted authoring model builds");
+
+        let tools = ToolBox::new().with(Arc::new(EchoTool));
+        let agent = test_agent(tools.clone());
+        let session = test_session(tmp.path());
+        // Switch the session's active model to the UNTRUSTED primary BEFORE the
+        // call — the classification must still come from env.model, not this.
+        session.set_active_model("root", "root-model").unwrap();
+        let (tx, _rx) = mpsc::channel(8);
+        let ctx = tool_ctx(session.clone(), tmp.path(), &tx);
+        let env = DispatchEnv {
+            agent: &agent,
+            session: &session,
+            model: &model,
+            active_tools: &tools,
+            ctx: &ctx,
+            tx: &tx,
+            hint_corrections: false,
+            loop_guard_threshold: 10,
+            hooks: &crate::config::extended::hooks::HookRegistry::default(),
+            cwd: tmp.path(),
+        };
+        let call = tool_call("echo", serde_json::json!({ "text": format!("deploy {SECRET}") }));
+        let mut history = Vec::new();
+        push_assistant_call(&mut history, &call);
+
+        execute_ordinary_call(&env, &mut history, &call, "echo", Recovery::Clean, None)
+            .await
+            .unwrap();
+
+        // One pinned frame classified BOTH rows trusted, so BOTH journal the
+        // literal and retain it raw — despite the untrusted session active model.
+        let sid = session.id.to_string();
+        assert!(
+            !session
+                .db
+                .protected_redaction_history_list(&sid)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the trusted authoring frame journals the arg literal"
+        );
+        let rows = session
+            .db
+            .list_tool_calls_for_session(session.id)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let audit_raw = serde_json::to_string(&rows[0].original_input_json).unwrap();
+        assert!(
+            audit_raw.contains(SECRET),
+            "the audit row retains the raw arg (classified trusted via env.model, not the untrusted primary)"
+        );
+        // The co-persisted ToolCall session event is classified the SAME (raw
+        // retained) — proving both used the one pinned authoring frame.
+        let events = session.db.list_session_events(session.id).await.unwrap();
+        let tool_call_event = events
+            .iter()
+            .find(|e| e.kind == "tool_call")
+            .expect("a ToolCall session event was recorded");
+        let event_body = serde_json::to_string(&tool_call_event.data).unwrap();
+        assert!(
+            event_body.contains(SECRET),
+            "the ToolCall event retains the raw arg — consistent with the audit row (one frame)"
+        );
     }
 
     #[tokio::test]

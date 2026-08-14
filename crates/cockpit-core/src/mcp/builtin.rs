@@ -266,6 +266,15 @@ pub struct McpChildEventRecorder {
     /// The dispatching model's PRE-POLICY session redaction table — the table
     /// scanned to journal a trusted route's table-matched literals in the args.
     session_table: Arc<crate::redact::RedactionTable>,
+    /// The dispatching model's `(provider, model)` captured ONCE at recorder
+    /// construction — the authoring identity for every child event in this
+    /// record. Pinning it here (rather than re-reading the session's active model
+    /// on each event/audit write) makes the child session event and its
+    /// co-persisted audit row resolve trust + table from ONE frame
+    /// ([`Self::authoring_frame`]), so a concurrent model switch mid-record can
+    /// never split them (no TOCTOU; finding 5).
+    authoring_provider: Option<String>,
+    authoring_model: Option<String>,
     state: Arc<Mutex<McpChildEventState>>,
     #[cfg(test)]
     fail_persistence: bool,
@@ -290,6 +299,10 @@ impl McpChildEventRecorder {
         config: crate::daemon::session_worker::SessionConfigHandle,
         session_table: Arc<crate::redact::RedactionTable>,
     ) -> Self {
+        // Capture the dispatching (authoring) model ONCE, now, so every child
+        // event and its audit row in this record share one frame (finding 5).
+        let authoring_provider = session.active_provider();
+        let authoring_model = session.active_model();
         Self {
             session,
             events,
@@ -299,10 +312,31 @@ impl McpChildEventRecorder {
             cap,
             config,
             session_table,
+            authoring_provider,
+            authoring_model,
             state: Arc::new(Mutex::new(McpChildEventState::default())),
             #[cfg(test)]
             fail_persistence: false,
         }
+    }
+
+    /// The single authoring frame for this record, built from the `(provider,
+    /// model)` captured ONCE at construction plus the pinned config + session
+    /// table. Both the child session event ([`Self::record_child_event`]) and the
+    /// co-persisted audit row ([`Self::persist_row`]) derive their trust/table
+    /// from THIS one frame, so they can never diverge under a concurrent model
+    /// switch (finding 5). `None` when no model was active at construction
+    /// (headless / tests) — the event and audit row both then take their
+    /// plain/no-journal branch, still consistent.
+    fn authoring_frame(&self) -> Option<crate::session::SessionEventModelFrame<'_>> {
+        let provider = self.authoring_provider.as_deref()?;
+        let model = self.authoring_model.as_deref()?;
+        Some(crate::session::SessionEventModelFrame {
+            provider_id: provider,
+            model_id: model,
+            config: &self.config,
+            session_table: self.session_table.as_ref(),
+        })
     }
 
     /// Record one model-authored MCP child event (ToolCallStarted / ToolCall).
@@ -310,32 +344,33 @@ impl McpChildEventRecorder {
     /// `wire_input`), so route it through the frame-carrying journaling path
     /// (K2, decision 10.3): a trusted dispatching model's session-table literal
     /// in the args journals (or fail-closed scrubs) instead of persisting raw.
-    /// The dispatching model is the session's active model; trust and
-    /// provider/model resolve from the pinned config snapshot. A context with no
-    /// active model (headless / tests) has no trust frame and journals nothing,
-    /// so it keeps the plain insert — the pre-K2 behavior — avoiding the
-    /// `record_event_with_config` "no provider frame" error there.
+    /// Uses the record's ONE pinned [`Self::authoring_frame`] — the SAME frame
+    /// the audit row uses — so their trust decisions are one source of truth. A
+    /// record with no pinned model (headless / tests) has no trust frame and
+    /// journals nothing, keeping the plain insert (pre-K2 behavior).
     async fn record_child_event(
         &self,
         kind: SessionEventKind,
         call_id: &str,
         data: &Value,
     ) -> Result<i64> {
-        if self.session.active_provider().is_some() && self.session.active_model().is_some() {
-            self.session
-                .record_event_with_config(
-                    kind,
-                    Some(&self.agent),
-                    Some(call_id),
-                    &self.config,
-                    self.session_table.as_ref(),
-                    data,
-                )
-                .await
-        } else {
-            self.session
-                .record_event(kind, Some(&self.agent), Some(call_id), data)
-                .await
+        match self.authoring_frame() {
+            Some(frame) => {
+                self.session
+                    .record_event_with_model_frame(
+                        kind,
+                        Some(&self.agent),
+                        Some(call_id),
+                        frame,
+                        data,
+                    )
+                    .await
+            }
+            None => {
+                self.session
+                    .record_event(kind, Some(&self.agent), Some(call_id), data)
+                    .await
+            }
         }
     }
 
@@ -566,8 +601,18 @@ impl McpChildEventRecorder {
         hard_fail: bool,
         duration_ms: u64,
     ) -> Result<()> {
+        // Journal (or fail-closed scrub) the co-persisted audit row against the
+        // record's ONE pinned authoring frame — the SAME frame the child ToolCall
+        // event uses — so a trusted route's matched literal in the MCP args never
+        // persists raw in `tool_call_events` with no protected-history row, and
+        // the audit row and the event never split under a concurrent model switch
+        // (finding 5 / finding r11-3 / decision 12). The frame's table IS
+        // `self.session_table`, so it is passed directly.
+        let target_trusted = self
+            .authoring_frame()
+            .is_some_and(|frame| frame.resolved_trusted());
         self.session
-            .record_tool_call(ToolCallRow {
+            .record_tool_call_journaled(ToolCallRow {
                 event_id: Uuid::new_v4(),
                 timestamp: Utc::now(),
                 agent: self.agent.clone(),
@@ -592,7 +637,7 @@ impl McpChildEventRecorder {
                 llm_mode: self.llm_mode,
                 shape_fingerprint: None,
                 hint: None,
-            })
+            }, self.session_table.as_ref(), target_trusted)
             .await
     }
 }
@@ -3002,5 +3047,231 @@ mod tests {
             .unwrap();
         assert!(unavailable["compact_nudge_pct"].is_null());
         assert!(unavailable["auto_compact_pct"].is_null());
+    }
+
+    // -- MCP child audit-row trust source (finding r11-3 follow-up) -----------
+
+    fn write_trusted_openai_provider(root: &std::path::Path, trust: &str) {
+        let providers = root.join(".cockpit").join("providers");
+        std::fs::create_dir_all(&providers).unwrap();
+        std::fs::write(
+            root.join(".cockpit").join("config.json"),
+            r#"{"llm_mode":"defensive"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            providers.join("openai.json"),
+            serde_json::json!({
+                "url": "https://example.test/v1",
+                "models": [{"id": "gpt-5", "trust": trust, "mode": "frontier"}],
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    fn secret_env_table(secret: &str) -> Arc<crate::redact::RedactionTable> {
+        let cfg = crate::config::extended::RedactConfig {
+            enabled: true,
+            scan_environment: true,
+            min_secret_length: 4,
+            placeholder: "[redacted]".to_string(),
+            ..Default::default()
+        };
+        let env =
+            std::collections::HashMap::from([("DEPLOY_TOKEN".to_string(), secret.to_string())]);
+        Arc::new(
+            crate::redact::RedactionTable::build_with_env(&cfg, std::path::Path::new("."), &env)
+                .unwrap(),
+        )
+    }
+
+    /// The MCP child audit row and its ToolCall session event derive trust from
+    /// ONE pinned authoring frame (`McpChildEventRecorder::authoring_frame`). With
+    /// a TRUSTED authoring model the arg literal must be JOURNALED on BOTH sides
+    /// (a shared history row + a `Tool` artifact ref for the raw audit row), never
+    /// misclassified untrusted and persisted raw with no history.
+    #[tokio::test]
+    async fn mcp_child_audit_row_trust_matches_child_event() {
+        const MCP_LIT: &str = "mcp-env-secret-abc123456";
+        let tmp = tempfile::tempdir().unwrap();
+        write_trusted_openai_provider(tmp.path(), "trusted");
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Arc::new(
+            crate::session::Session::create(
+                db.clone(),
+                tmp.path().to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        session.set_active_model("openai", "gpt-5").unwrap();
+        let config =
+            crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path());
+        let table = secret_env_table(MCP_LIT);
+
+        let recorder = McpChildEventRecorder::new(
+            session.clone(),
+            None,
+            "Build".to_string(),
+            "parent-call-1".to_string(),
+            LlmMode::Normal,
+            DEFAULT_CHILD_EVENT_CAP,
+            config,
+            table,
+        );
+        let dispatch = McpChildDispatch::new(
+            "invoke",
+            Some("srv".to_string()),
+            "some_tool",
+            Some(false),
+            serde_json::json!({ "query": format!("deploy {MCP_LIT}") }),
+        );
+        let span = recorder.start(dispatch).await.expect("child span");
+        recorder
+            .finish(span, Ok(serde_json::json!({ "result": "ok" })), 5)
+            .await;
+
+        // The session event journaled the arg literal (shared history row).
+        let sid = session.id.to_string();
+        assert!(
+            !db.protected_redaction_history_list(&sid)
+                .await
+                .unwrap()
+                .is_empty(),
+            "trusted MCP child event journals the arg literal"
+        );
+
+        // The single co-persisted audit row kept the RAW arg AND carries its own
+        // `Tool` artifact ref — consistent with the event, not misclassified.
+        let (event_id, original): (String, String) = db
+            .read(|conn| {
+                let row = conn.query_row(
+                    "SELECT event_id, original_input_json FROM tool_call_events LIMIT 1",
+                    [],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                )?;
+                Ok(row)
+            })
+            .await
+            .unwrap();
+        assert!(
+            original.contains(MCP_LIT),
+            "the trusted audit row retains the raw arg locally (export redacts via history)"
+        );
+        assert!(
+            !db.protected_redaction_artifact_refs_for_artifact(
+                crate::redact::protected_redaction_history::RedactionArtifactKind::Tool,
+                &event_id,
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "the audit row journaled a Tool ref (trust read from the active model, not misclassified)"
+        );
+    }
+
+    /// Finding 5 (MCP TOCTOU): the authoring frame is captured ONCE at recorder
+    /// construction, so the child event and its co-persisted audit row observe
+    /// the SAME trust even if the session's active model is switched between the
+    /// two writes. Here a TRUSTED model is active at construction, then the active
+    /// model is switched to an UNTRUSTED primary BEFORE `start`/`finish`. Both the
+    /// event and the audit row must still JOURNAL (using the pinned trusted
+    /// frame). A live per-write re-resolution would see the untrusted primary and
+    /// skip journaling — this test fails under that (pre-fix) behavior.
+    #[tokio::test]
+    async fn mcp_child_frame_pinned_at_construction_survives_model_switch() {
+        const MCP_LIT: &str = "mcp-toctou-secret-abc123456";
+        let tmp = tempfile::tempdir().unwrap();
+        // A TRUSTED authoring model (openai) and an UNTRUSTED model (root) to
+        // switch to mid-record.
+        write_trusted_openai_provider(tmp.path(), "trusted");
+        let providers = tmp.path().join(".cockpit").join("providers");
+        std::fs::write(
+            providers.join("root.json"),
+            serde_json::json!({
+                "url": "https://example.test/v1",
+                "models": [{"id": "root-model", "trust": "untrusted", "mode": "defensive"}],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Arc::new(
+            crate::session::Session::create(
+                db.clone(),
+                tmp.path().to_path_buf(),
+                "Build",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        // TRUSTED authoring model active at construction time.
+        session.set_active_model("openai", "gpt-5").unwrap();
+        let config =
+            crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path());
+        let table = secret_env_table(MCP_LIT);
+        let recorder = McpChildEventRecorder::new(
+            session.clone(),
+            None,
+            "Build".to_string(),
+            "parent-call-1".to_string(),
+            LlmMode::Normal,
+            DEFAULT_CHILD_EVENT_CAP,
+            config,
+            table,
+        );
+
+        // A concurrent model switch to an UNTRUSTED primary BEFORE any write.
+        session.set_active_model("root", "root-model").unwrap();
+
+        let dispatch = McpChildDispatch::new(
+            "invoke",
+            Some("srv".to_string()),
+            "some_tool",
+            Some(false),
+            serde_json::json!({ "query": format!("deploy {MCP_LIT}") }),
+        );
+        let span = recorder.start(dispatch).await.expect("child span");
+        recorder
+            .finish(span, Ok(serde_json::json!({ "result": "ok" })), 5)
+            .await;
+
+        // Both sides used the PINNED trusted frame, so the arg literal is
+        // journaled — not misclassified untrusted by the switched-to primary.
+        let sid = session.id.to_string();
+        assert!(
+            !db.protected_redaction_history_list(&sid)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the pinned trusted frame journals despite a mid-record switch to an untrusted primary"
+        );
+        let (event_id, original): (String, String) = db
+            .read(|conn| {
+                let row = conn.query_row(
+                    "SELECT event_id, original_input_json FROM tool_call_events LIMIT 1",
+                    [],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                )?;
+                Ok(row)
+            })
+            .await
+            .unwrap();
+        assert!(
+            original.contains(MCP_LIT),
+            "the audit row retained the raw arg (journaled via the pinned frame), not scrubbed"
+        );
+        assert!(
+            !db.protected_redaction_artifact_refs_for_artifact(
+                crate::redact::protected_redaction_history::RedactionArtifactKind::Tool,
+                &event_id,
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "the audit row carries a Tool ref, consistent with the event, despite the switch"
+        );
     }
 }

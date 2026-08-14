@@ -394,6 +394,21 @@ impl Driver {
             .agent
             .model;
         let schedule_session_table = active_model.session_redact_table();
+        // ONE authoring frame drives BOTH the timeline event and the co-persisted
+        // audit row, so their journal-vs-scrub decisions come from a single
+        // source: the AUTHORING (stack-top) model's `(provider, model)` + config +
+        // pre-policy table — never the session's after-turn primary. Trust is read
+        // via `frame.resolved_trusted()` (config-snapshot `resolve_trust`), the
+        // exact expression the session event resolves internally, so an
+        // untrusted-primary→trusted-failover author is classified by the author
+        // and the audit row stays consistent with its event (finding r11-3).
+        let schedule_frame = crate::session::SessionEventModelFrame {
+            provider_id: active_model.provider_id(),
+            model_id: active_model.model_id_ref(),
+            config: &self.config,
+            session_table: schedule_session_table.as_ref(),
+        };
+        let schedule_target_trusted = schedule_frame.resolved_trusted();
         let schedule_event_data = serde_json::json!({
             "tool": "schedule",
             "original_input": row.original_input_json,
@@ -411,12 +426,7 @@ impl Driver {
                 crate::db::session_log::SessionEventKind::ToolCall,
                 Some(&row.agent),
                 Some(&row.call_id),
-                crate::session::SessionEventModelFrame {
-                    provider_id: active_model.provider_id(),
-                    model_id: active_model.model_id_ref(),
-                    config: &self.config,
-                    session_table: schedule_session_table.as_ref(),
-                },
+                schedule_frame,
                 &schedule_event_data,
             )
             .await
@@ -425,7 +435,7 @@ impl Driver {
         }
         if let Err(e) = self
             .session
-            .record_tool_call(crate::session::ToolCallRow {
+            .record_tool_call_journaled(crate::session::ToolCallRow {
                 event_id: uuid::Uuid::new_v4(),
                 timestamp: chrono::Utc::now(),
                 agent: row.agent,
@@ -454,7 +464,7 @@ impl Driver {
                 shape_fingerprint: None,
                 // The hint layer is `bash`-only; a `schedule` call never carries one.
                 hint: None,
-            })
+            }, schedule_frame.session_table, schedule_target_trusted)
             .await
         {
             tracing::warn!(error = %e, "persisting schedule tool_call_event failed");

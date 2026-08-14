@@ -57,6 +57,34 @@ pub struct SessionEventModelFrame<'a> {
     pub session_table: &'a crate::redact::RedactionTable,
 }
 
+impl SessionEventModelFrame<'_> {
+    /// The trust class this frame's AUTHORING `(provider, model)` resolves to
+    /// under the frame's pinned config snapshot. This is the SINGLE source of
+    /// truth for the journal-vs-scrub decision: the model-authored session event
+    /// resolves its trust from exactly this expression (see
+    /// [`Session::session_event_provenance_for`], which reads
+    /// `frame.config.snapshot().providers.resolve_trust(frame.provider_id,
+    /// frame.model_id)`), so a co-persisted `tool_call_events` audit row that
+    /// derives `target_trusted` from THIS method can never disagree with its
+    /// session event — both journal, or both scrub — regardless of which model
+    /// the session's PRIMARY happens to be (a primary→failover author is
+    /// classified by the authoring frame, not the after-turn primary).
+    pub fn resolved_model_trust(&self) -> crate::config::providers::ModelTrust {
+        self.config
+            .snapshot()
+            .providers
+            .resolve_trust(self.provider_id, self.model_id)
+    }
+
+    /// `true` iff [`Self::resolved_model_trust`] is trusted.
+    pub fn resolved_trusted(&self) -> bool {
+        matches!(
+            self.resolved_model_trust(),
+            crate::config::providers::ModelTrust::Trusted
+        )
+    }
+}
+
 impl SessionEventProvenance {
     fn context_fields(&self) -> (&str, &str, &str, &str) {
         (
@@ -190,6 +218,95 @@ fn push_string_matches(
         if seen.insert(m.literal.clone()) {
             out.push(m);
         }
+    }
+}
+
+/// Visit every JSON-value secret-bearing column of a `tool_call_events` row —
+/// the model-supplied args (`original_input_json` / `wire_input_json`) and the
+/// post-result `hint`. This is the SINGLE source of truth for those columns:
+/// both the match/journal side ([`match_literals_in_tool_row`]) and the
+/// fail-closed scrub side ([`Session::persist_redacted_tool_call`]) drive
+/// through it, so a column added here is covered on BOTH sides — or on neither —
+/// never silently half-covered (the drift that let `path`/`parent_call_id` slip
+/// when the two sides kept separate hand-maintained lists).
+fn for_each_tool_row_json_secret_column<F: FnMut(&mut Value)>(
+    event: &mut crate::db::tool_calls::ToolCallEvent,
+    mut visit: F,
+) {
+    visit(&mut event.original_input_json);
+    visit(&mut event.wire_input_json);
+    if let Some(hint) = event.hint.as_mut() {
+        visit(hint);
+    }
+}
+
+/// Visit every scalar (String) secret-bearing column of a `tool_call_events` row
+/// that can carry a model/provider-derived literal — everything except the JSON
+/// columns above and the structural id/enum/numeric columns we control
+/// (`event_id`, `session_id`, `parent_child_index`, timestamps, `recovery_*`,
+/// `exit_code`, booleans, `shape_fingerprint`, `llm_mode`, `provider`/`model`
+/// names, `project_id`/`project_root`, `provider_call_id_source`, `wire_api`,
+/// `provider_family`). SINGLE source of truth: both the match/journal side and
+/// the fail-closed scrub side drive through it, so match==scrub is structurally
+/// guaranteed — adding a column here covers both sides, omitting it covers
+/// neither, and there is no second hand-maintained list to drift (the root cause
+/// that previously left `path` and `parent_call_id` un-scrubbed).
+fn for_each_tool_row_scalar_secret_column<F: FnMut(&mut String)>(
+    event: &mut crate::db::tool_calls::ToolCallEvent,
+    mut visit: F,
+) {
+    visit(&mut event.output);
+    visit(&mut event.call_id);
+    if let Some(parent_call_id) = event.parent_call_id.as_mut() {
+        visit(parent_call_id);
+    }
+    visit(&mut event.agent);
+    visit(&mut event.tool);
+    if let Some(path) = event.path.as_mut() {
+        visit(path);
+    }
+    if let Some(mcp_server) = event.mcp_server.as_mut() {
+        visit(mcp_server);
+    }
+    if let Some(provider_item_id) = event.provider_item_id.as_mut() {
+        visit(provider_item_id);
+    }
+    if let Some(provider_call_id) = event.provider_call_id.as_mut() {
+        visit(provider_call_id);
+    }
+}
+
+/// Match the DISTINCT redaction-table literals across EVERY secret-bearing
+/// column of one `tool_call_events` audit row, driving through the SAME
+/// [`for_each_tool_row_json_secret_column`] / [`for_each_tool_row_scalar_secret_column`]
+/// enumerations the fail-closed scrub uses — so what journals on success is
+/// exactly what scrubs on failure (decision 12). Takes `&mut` only to share
+/// those one-source-of-truth visitors; it reads and never mutates. Distinct-by-
+/// literal across all columns so each table entry journals once for the row.
+fn match_literals_in_tool_row(
+    table: &crate::redact::RedactionTable,
+    event: &mut crate::db::tool_calls::ToolCallEvent,
+) -> Vec<crate::redact::MatchedLiteral> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for_each_tool_row_json_secret_column(event, |value| {
+        collect_json_matches(table, value, &mut seen, &mut out);
+    });
+    for_each_tool_row_scalar_secret_column(event, |column| {
+        push_string_matches(table, column.as_str(), &mut seen, &mut out);
+    });
+    out
+}
+
+/// Fail-closed scrub of a plain string (the audit row's `output`) against
+/// `table` (decision 12): the string analog of [`scrub_body_fail_closed`],
+/// forcing enforcement so the `redact.enabled = false` opt-out cannot leave a
+/// matched secret in a persisted fallback body.
+fn scrub_string_fail_closed(s: &str, table: &crate::redact::RedactionTable) -> String {
+    if table.disabled() {
+        table.enforced().scrub(s)
+    } else {
+        table.scrub(s)
     }
 }
 
@@ -357,7 +474,16 @@ impl Session {
             snapshot
                 .providers
                 .resolve_mode(&provider_id, &model_id, snapshot.extended.llm_mode);
-        let model_trust = snapshot.providers.resolve_trust(&provider_id, &model_id);
+        // Resolve trust through the SAME frame method a co-persisted tool_call
+        // audit row uses (`SessionEventModelFrame::resolved_model_trust`), so the
+        // event's journal-vs-scrub decision and the audit row's are ONE source of
+        // truth and can never diverge (finding r11-3 follow-up). `frame` is
+        // guaranteed `Some` here — the `snapshot` bind above returns early
+        // otherwise — and when present `provider_id`/`model_id` equal its fields,
+        // so the fallback computes the identical value and never actually runs.
+        let model_trust = frame
+            .map(|frame| frame.resolved_model_trust())
+            .unwrap_or_else(|| snapshot.providers.resolve_trust(&provider_id, &model_id));
         Some(SessionEventProvenance {
             provider_id,
             model_id,
@@ -421,12 +547,13 @@ impl Session {
         .await
     }
 
-    /// Append one tool-call audit row to the §15b table.
-    pub async fn record_tool_call(&self, row: ToolCallRow) -> Result<()> {
+    /// Convert an in-memory [`ToolCallRow`] to the persisted [`ToolCallEvent`],
+    /// stamping session/project/model provenance and the cockpit version.
+    fn tool_call_event_from_row(&self, row: ToolCallRow) -> ToolCallEvent {
         let provider = self.active_provider().unwrap_or_default();
         let model = self.active_model().unwrap_or_default();
         let project_root = self.project_root.to_string_lossy().into_owned();
-        let event = ToolCallEvent {
+        ToolCallEvent {
             event_id: row.event_id,
             session_id: self.id,
             call_id: row.call_id,
@@ -461,11 +588,194 @@ impl Session {
             llm_mode: Some(row.llm_mode.as_str().to_string()),
             shape_fingerprint: row.shape_fingerprint,
             hint: row.hint,
-        };
+        }
+    }
+
+    /// Append one tool-call audit row to the §15b table (plain insert). The row
+    /// is persisted verbatim. Used by replay/rehydrate and driver-synthesized
+    /// paths whose args are not a fresh model-authored payload. The three live
+    /// tool-call dispatch paths that co-persist raw model args alongside a
+    /// journaled session event use [`Self::record_tool_call_journaled`] instead.
+    pub async fn record_tool_call(&self, row: ToolCallRow) -> Result<()> {
+        let event = self.tool_call_event_from_row(row);
         self.db
             .insert_tool_call(&event)
             .await
             .context("inserting tool_call_event")
+    }
+
+    /// Like [`Self::record_tool_call`] but for the three live tool-call dispatch
+    /// paths (ordinary tool call, `schedule` meta-tool, MCP child) that
+    /// co-persist the model-supplied args RAW into `tool_call_events` alongside
+    /// the model-authored session event (decision 12 / finding r11-3).
+    ///
+    /// `session_table` is the caller's PRE-POLICY session redaction table (never
+    /// the trusted-empty effective table) and `target_trusted` is the authoring
+    /// model's trust bit — the SAME frame used to journal the co-persisted
+    /// session event. For a TRUSTED author (and a journaling session) the row's
+    /// table-matched literals (across the args AND the co-persisted output) are
+    /// journaled to protected redaction history — artifact kind `Tool`,
+    /// `artifact_id = event_id` — in the SAME transaction as the row insert, so
+    /// on success the audit row carries its own history ref (export redacts) and
+    /// on any journaling failure the stored args/output are fail-closed scrubbed
+    /// with no history row: the audit row never persists a matched literal that
+    /// has no protected-history row, and no ref points at a non-existent row.
+    ///
+    /// An UNTRUSTED author (args already post-redaction) and a scratch session
+    /// ([`Self::allow_unjournaled_inference`]) keep the plain insert — the
+    /// pre-existing behavior — journaling nothing.
+    pub async fn record_tool_call_journaled(
+        &self,
+        row: ToolCallRow,
+        session_table: &crate::redact::RedactionTable,
+        target_trusted: bool,
+    ) -> Result<()> {
+        let event = self.tool_call_event_from_row(row);
+        // Untrusted author or scratch/daemon-less session: today's plain insert,
+        // journal nothing. Untrusted args are already post-redaction and must
+        // never create history rows.
+        if !target_trusted || self.unjournaled_inference_allowed() {
+            return self
+                .db
+                .insert_tool_call(&event)
+                .await
+                .context("inserting tool_call_event");
+        }
+        self.journal_trusted_tool_call(event, session_table).await
+    }
+
+    /// Journal the table-matched literals of a TRUSTED tool-call audit row
+    /// atomically with the row insert (decision 10.3 + 12), mirroring
+    /// [`Self::journal_trusted_inference_attempt`].
+    ///
+    /// Off the DB thread we scan the args + output against the pre-policy session
+    /// table and `prepare_append` each match. If ANY prepare fails we fail closed
+    /// (decision 12): the matched literals are scrubbed from the args/output with
+    /// the table's generic placeholder, the redacted row is persisted via the
+    /// normal insert, no history row is written, and a warning is surfaced — the
+    /// turn is NOT aborted. Otherwise the row insert and every prepared append +
+    /// artifact ref (`Tool`, `event_id`) commit in one transaction; any error
+    /// rolls them all back together and then falls closed to the scrubbed row.
+    async fn journal_trusted_tool_call(
+        &self,
+        mut event: ToolCallEvent,
+        session_table: &crate::redact::RedactionTable,
+    ) -> Result<()> {
+        // JSON-value-aware match (F2) over EVERY secret-bearing column (args,
+        // hint, output, and the scalar columns incl. `path`): scan each DECODED
+        // string, not the escaped serialized blob. `&mut` only shares the
+        // one-source-of-truth column visitors; the match does not mutate.
+        let matches = match_literals_in_tool_row(session_table, &mut event);
+        if matches.is_empty() {
+            // No table-matched literals: nothing to journal, plain insert.
+            return self
+                .db
+                .insert_tool_call(&event)
+                .await
+                .context("inserting tool_call_event");
+        }
+
+        let resolver = self.redaction_key_resolver().clone();
+        let history = crate::redact::protected_redaction_history::ProtectedRedactionHistory::new(
+            &self.db,
+            resolver.as_ref(),
+        );
+        let session_id_str = self.id.to_string();
+        let mut prepared = Vec::with_capacity(matches.len());
+        for m in &matches {
+            let literal = match matched_to_protected_literal(m) {
+                Ok(literal) => literal,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "trusted tool-call journaling: literal rejected; persisting redacted row"
+                    );
+                    return self.persist_redacted_tool_call(event, session_table).await;
+                }
+            };
+            match history.prepare_append(&session_id_str, literal).await {
+                Ok(p) => prepared.push(p),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "trusted tool-call journaling: prepare_append failed; persisting redacted row"
+                    );
+                    return self.persist_redacted_tool_call(event, session_table).await;
+                }
+            }
+        }
+
+        // The single artifact this row is: the immutable audit row keyed by its
+        // `event_id` (artifact kind `Tool`).
+        let artifact_id = event.event_id.to_string();
+        // Clone for the move-closure; keep `event` for the decision-12 fallback.
+        let event_for_txn = event.clone();
+        let journal_result = self
+            .db
+            .transaction(move |conn| {
+                Db::insert_tool_call_conn(conn, &event_for_txn)?;
+                // Mid-transaction failure seam (AC9): force an error AFTER the
+                // audit-row write and BEFORE the journal attach to prove neither
+                // side can commit alone.
+                #[cfg(test)]
+                if journal_fault::should_fail_after_artifact_row() {
+                    anyhow::bail!("injected mid-transaction tool_call journal fault (test seam)");
+                }
+                let refs = [crate::redact::protected_redaction_history::ArtifactRef::new(
+                    crate::redact::protected_redaction_history::RedactionArtifactKind::Tool,
+                    artifact_id,
+                )];
+                for prepared in &prepared {
+                    crate::redact::protected_redaction_history::append_and_attach_conn(
+                        conn, prepared, &refs,
+                    )?;
+                }
+                Ok(())
+            })
+            .await;
+
+        // Decision-12 fail-closed for a journal-TRANSACTION failure (F1): the
+        // audit row + history/refs roll back together ATOMICALLY (AC9), THEN the
+        // matched-literal-scrubbed row is persisted via a separate non-journaling
+        // insert (no history); the turn is not aborted.
+        if let Err(e) = journal_result {
+            tracing::warn!(
+                error = %e,
+                "trusted tool-call journaling: transaction failed; persisting redacted row"
+            );
+            return self.persist_redacted_tool_call(event, session_table).await;
+        }
+        Ok(())
+    }
+
+    /// Fail-closed audit-row persistence (decision 12): scrub every table literal
+    /// from EVERY secret-bearing column by driving through the SAME
+    /// [`for_each_tool_row_json_secret_column`] / [`for_each_tool_row_scalar_secret_column`]
+    /// visitors the match/journal side uses — so the scrub set is structurally
+    /// identical to the journal set (no second hand-maintained list to drift; the
+    /// root cause that previously left `path` and `parent_call_id` un-scrubbed).
+    /// Then persist the row through the normal insert with NO history rows. A
+    /// scrub is a no-op on any column that carries no table literal, so ordinary
+    /// ids/names/paths are untouched in normal operation. Columns NOT in those two
+    /// visitors are intentionally excluded (per their doc comments): the
+    /// structural id columns we mint, the config/host identity columns, the closed
+    /// enum/label columns, and the derived/constant columns — none carry model
+    /// text.
+    async fn persist_redacted_tool_call(
+        &self,
+        mut event: ToolCallEvent,
+        session_table: &crate::redact::RedactionTable,
+    ) -> Result<()> {
+        for_each_tool_row_json_secret_column(&mut event, |value| {
+            *value = scrub_body_fail_closed(value, session_table);
+        });
+        for_each_tool_row_scalar_secret_column(&mut event, |column| {
+            *column = scrub_string_fail_closed(column.as_str(), session_table);
+        });
+        self.db
+            .insert_tool_call(&event)
+            .await
+            .context("inserting redacted tool_call_event")
     }
 
     /// Record provider-reported token usage for a round-trip: persist
@@ -3626,5 +3936,494 @@ mod trusted_journaling_tests {
             "fallback event carries the placeholder"
         );
         shutdown_fake_secure_key_actor(actor).await;
+    }
+
+    // -- tool_call_events audit-row fail-closed (finding r11-3, decision 12) ---
+    //
+    // All three live tool-call dispatch paths (ordinary tool call, `schedule`
+    // meta-tool, MCP child) co-persist their raw model-supplied args into
+    // `tool_call_events` and funnel that write through
+    // `record_tool_call_journaled`. These drive that shared chokepoint directly
+    // — the security-critical journal/scrub logic the three paths share.
+
+    /// Build a `ToolCallRow` carrying an ENVIRONMENT literal in its args
+    /// (`original`/`wire`) and a CREDENTIAL literal in its `output`, so the
+    /// journal/scrub covers both secret-bearing fields and both source classes.
+    fn audit_row_with_literals(tool: &str, call_id: &str) -> ToolCallRow {
+        ToolCallRow {
+            event_id: Uuid::new_v4(),
+            timestamp: chrono::Utc::now(),
+            agent: "Build".to_string(),
+            call_id: call_id.to_string(),
+            parent_call_id: None,
+            parent_child_index: None,
+            identity: crate::session::ToolCallProviderIdentity::default(),
+            tool: tool.to_string(),
+            mcp_server: None,
+            path: None,
+            original_input_json: serde_json::json!({ "command": format!("deploy {ENV_LIT}") }),
+            wire_input_json: serde_json::json!({ "command": format!("deploy {ENV_LIT}") }),
+            recovery: crate::db::tool_calls::Recovery::Clean,
+            hard_fail: false,
+            exit_code: None,
+            sandbox_enabled: false,
+            sandboxed: false,
+            sandbox_unavailable_reason: None,
+            output: format!("tool echoed {CRED_LIT}"),
+            truncated: false,
+            duration_ms: 5,
+            llm_mode: crate::config::extended::LlmMode::default(),
+            shape_fingerprint: None,
+            hint: None,
+        }
+    }
+
+    /// Read back the raw `tool_call_events` column bytes for one audit row so a
+    /// test can assert directly on the stored (original/wire/output) forms.
+    async fn stored_tool_call_columns(db: &Db, event_id: Uuid) -> (String, String, String) {
+        let eid = event_id.to_string();
+        db.read(move |conn| {
+            let row = conn.query_row(
+                "SELECT original_input_json, wire_input_json, output \
+                 FROM tool_call_events WHERE event_id = ?1",
+                [eid],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )?;
+            Ok(row)
+        })
+        .await
+        .unwrap()
+    }
+
+    /// AC1: a TRUSTED author with a matched literal in its args (and output),
+    /// under a FAULTED store-backed resolver (AC15), leaves NO raw matched
+    /// literal in `tool_call_events` (scrubbed) and NO orphan artifact ref — for
+    /// a row shaped like EACH of the three tool-call paths.
+    #[tokio::test]
+    async fn trusted_tool_call_audit_row_fails_closed_for_all_three_paths() {
+        for (tool, call_id) in [
+            ("bash", "call-ordinary"),
+            ("schedule", "call-schedule"),
+            ("mcp_child", "call-mcp"),
+        ] {
+            let db = Db::open_in_memory().unwrap();
+            let (session, actor) = faulted_journaling_session(&db).await;
+            let table = env_credential_table();
+            let row = audit_row_with_literals(tool, call_id);
+            let event_id = row.event_id;
+
+            // The turn is not aborted: the redacted row persists.
+            session
+                .record_tool_call_journaled(row, &table, true)
+                .await
+                .unwrap();
+
+            let sid = session.id.to_string();
+            assert!(
+                db.protected_redaction_history_list(&sid)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "{tool}: a faulted journal leaves no history row"
+            );
+            assert!(
+                db.protected_redaction_artifact_refs_for_artifact(
+                    RedactionArtifactKind::Tool,
+                    &event_id.to_string(),
+                )
+                .await
+                .unwrap()
+                .is_empty(),
+                "{tool}: no orphan Tool ref points at the scrubbed audit row"
+            );
+
+            let (orig, wire, output) = stored_tool_call_columns(&db, event_id).await;
+            for (label, col) in [("original", &orig), ("wire", &wire), ("output", &output)] {
+                assert!(
+                    !col.contains(ENV_LIT),
+                    "{tool}: {label} column must not carry the env literal"
+                );
+                assert!(
+                    !col.contains(CRED_LIT),
+                    "{tool}: {label} column must not carry the credential literal"
+                );
+                assert!(
+                    col.contains("[redacted]"),
+                    "{tool}: {label} column carries the generic placeholder"
+                );
+            }
+            shutdown_fake_secure_key_actor(actor).await;
+        }
+    }
+
+    /// AC2: on the SUCCESS path the raw args/output are retained locally and the
+    /// audit row carries its OWN protected-history ref (kind `Tool`, keyed by
+    /// `event_id`) per journaled literal — export redacts via that shared row.
+    #[tokio::test]
+    async fn trusted_tool_call_audit_row_journals_and_retains_raw_on_success() {
+        let db = Db::open_in_memory().unwrap();
+        let session = new_session(db.clone());
+        let table = env_credential_table();
+        let row = audit_row_with_literals("bash", "call-ok");
+        let event_id = row.event_id;
+
+        session
+            .record_tool_call_journaled(row, &table, true)
+            .await
+            .unwrap();
+
+        let sid = session.id.to_string();
+        assert_eq!(
+            db.protected_redaction_history_list(&sid)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "the distinct env-arg and cred-output literals journal one row each"
+        );
+        let refs = db
+            .protected_redaction_artifact_refs_for_artifact(
+                RedactionArtifactKind::Tool,
+                &event_id.to_string(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            refs.len(),
+            2,
+            "the audit row carries one Tool ref per journaled literal"
+        );
+
+        // Owner retention: the stored row keeps the raw literals (export redacts
+        // them via the shared history rows above).
+        let (orig, wire, output) = stored_tool_call_columns(&db, event_id).await;
+        assert!(
+            orig.contains(ENV_LIT) && wire.contains(ENV_LIT),
+            "success retains the raw args locally"
+        );
+        assert!(
+            output.contains(CRED_LIT),
+            "success retains the raw output locally"
+        );
+    }
+
+    /// AC3: an UNTRUSTED author is unaffected — even under a faulted resolver the
+    /// plain insert is taken (no journaling, no scrub); the args are already
+    /// post-redaction upstream and this path never rewrites them.
+    #[tokio::test]
+    async fn untrusted_tool_call_audit_row_is_unaffected() {
+        let db = Db::open_in_memory().unwrap();
+        let (session, actor) = faulted_journaling_session(&db).await;
+        let table = env_credential_table();
+        let row = audit_row_with_literals("bash", "call-untrusted");
+        let event_id = row.event_id;
+
+        session
+            .record_tool_call_journaled(row, &table, false)
+            .await
+            .unwrap();
+
+        let sid = session.id.to_string();
+        assert!(
+            db.protected_redaction_history_list(&sid)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an untrusted author journals nothing"
+        );
+        let (orig, _wire, output) = stored_tool_call_columns(&db, event_id).await;
+        assert!(
+            orig.contains(ENV_LIT),
+            "the untrusted path leaves the args unchanged (no scrub)"
+        );
+        assert!(
+            output.contains(CRED_LIT),
+            "the untrusted path leaves the output unchanged (no scrub)"
+        );
+        shutdown_fake_secure_key_actor(actor).await;
+    }
+
+    /// AC9 parity / no-orphan: a mid-transaction fault (after the audit-row write,
+    /// before the journal attach) rolls the whole transaction back ATOMICALLY —
+    /// no history row, no orphan ref — THEN the decision-12 fallback persists a
+    /// SCRUBBED row via a separate non-journaling insert; the turn continues.
+    #[tokio::test]
+    async fn trusted_tool_call_audit_row_seam_fault_rolls_back_and_scrubs() {
+        let db = Db::open_in_memory().unwrap();
+        let session = new_session(db.clone());
+        let table = env_credential_table();
+        let row = audit_row_with_literals("bash", "call-seam");
+        let event_id = row.event_id;
+
+        journal_fault::set_fail_after_artifact_row(true);
+        session
+            .record_tool_call_journaled(row, &table, true)
+            .await
+            .expect("a tool_call journal-txn fault must fail closed, not abort the turn");
+        journal_fault::set_fail_after_artifact_row(false);
+
+        let sid = session.id.to_string();
+        assert!(
+            db.protected_redaction_history_list(&sid)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the rolled-back tool_call journal txn commits no history row"
+        );
+        assert!(
+            db.protected_redaction_artifact_refs_for_artifact(
+                RedactionArtifactKind::Tool,
+                &event_id.to_string(),
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "no orphan Tool ref survives the atomic rollback"
+        );
+        let (orig, wire, output) = stored_tool_call_columns(&db, event_id).await;
+        for col in [&orig, &wire, &output] {
+            assert!(
+                !col.contains(ENV_LIT) && !col.contains(CRED_LIT),
+                "the seam fallback scrubs every raw literal from the row"
+            );
+        }
+    }
+
+    /// Finding r11-3 (path leak): the journal-failure fallback must scrub EVERY
+    /// model/provider-derived column, not just the args/output. Here the secret
+    /// lives ONLY in `path` (env), `call_id` (credential), and `parent_call_id`
+    /// (env) — the args/output are clean — so the prior fallback (args+output
+    /// only) would have left all three raw.
+    #[tokio::test]
+    async fn trusted_tool_call_audit_row_scrubs_path_and_scalar_columns_on_journal_failure() {
+        let db = Db::open_in_memory().unwrap();
+        let (session, actor) = faulted_journaling_session(&db).await;
+        let table = env_credential_table();
+        let event_id = Uuid::new_v4();
+        let row = ToolCallRow {
+            event_id,
+            timestamp: chrono::Utc::now(),
+            agent: "Build".to_string(),
+            call_id: format!("call-{CRED_LIT}"),
+            parent_call_id: Some(format!("parent-{ENV_LIT}")),
+            parent_child_index: None,
+            identity: crate::session::ToolCallProviderIdentity::default(),
+            tool: "read".to_string(),
+            mcp_server: None,
+            path: Some(format!("/repo/{ENV_LIT}/main.rs")),
+            original_input_json: serde_json::json!({ "path": "clean.rs" }),
+            wire_input_json: serde_json::json!({ "path": "clean.rs" }),
+            recovery: crate::db::tool_calls::Recovery::Clean,
+            hard_fail: false,
+            exit_code: None,
+            sandbox_enabled: false,
+            sandboxed: false,
+            sandbox_unavailable_reason: None,
+            output: "clean output".to_string(),
+            truncated: false,
+            duration_ms: 5,
+            llm_mode: crate::config::extended::LlmMode::default(),
+            shape_fingerprint: None,
+            hint: None,
+        };
+
+        session
+            .record_tool_call_journaled(row, &table, true)
+            .await
+            .unwrap();
+
+        let sid = session.id.to_string();
+        assert!(
+            db.protected_redaction_history_list(&sid)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a faulted journal leaves no history row"
+        );
+        assert!(
+            db.protected_redaction_artifact_refs_for_artifact(
+                RedactionArtifactKind::Tool,
+                &event_id.to_string(),
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "no orphan Tool ref points at the scrubbed audit row"
+        );
+
+        let eid = event_id.to_string();
+        let (path, call_id, parent_call_id): (Option<String>, String, Option<String>) = db
+            .read(move |conn| {
+                let row = conn.query_row(
+                    "SELECT path, call_id, parent_call_id FROM tool_call_events WHERE event_id = ?1",
+                    [eid],
+                    |r| {
+                        Ok((
+                            r.get::<_, Option<String>>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )?;
+                Ok(row)
+            })
+            .await
+            .unwrap();
+        let path = path.expect("path column persisted");
+        assert!(
+            !path.contains(ENV_LIT),
+            "the `path` column must be scrubbed on journal-failure (finding r11-3)"
+        );
+        assert!(
+            path.contains("[redacted]"),
+            "the scrubbed `path` carries the generic placeholder"
+        );
+        assert!(
+            !call_id.contains(CRED_LIT),
+            "the `call_id` scalar column must be scrubbed on journal-failure"
+        );
+        let parent_call_id = parent_call_id.expect("parent_call_id column persisted");
+        assert!(
+            !parent_call_id.contains(ENV_LIT),
+            "the `parent_call_id` column must be scrubbed on journal-failure (finding 4)"
+        );
+        assert!(
+            parent_call_id.contains("[redacted]"),
+            "the scrubbed `parent_call_id` carries the generic placeholder"
+        );
+        shutdown_fake_secure_key_actor(actor).await;
+    }
+
+    /// Finding r11-3 (trust source): the audit row's trust MUST come from the
+    /// AUTHORING frame (like its co-persisted session event), not the session's
+    /// after-turn PRIMARY. Here a TRUSTED model authors the call while the active
+    /// PRIMARY is untrusted; both `schedule_dispatch` and `tool_dispatch` derive
+    /// `target_trusted` from `SessionEventModelFrame::resolved_trusted()` — the
+    /// exact expression the session event resolves — so the event and audit row
+    /// stay consistent (both journal), never misclassified by the primary.
+    #[tokio::test]
+    async fn tool_call_audit_row_trust_reads_authoring_frame_not_after_turn_primary() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Two providers: an UNTRUSTED primary (`root`) and a TRUSTED authoring /
+        // failover model (`openai`).
+        let providers = tmp.path().join(".cockpit").join("providers");
+        std::fs::create_dir_all(&providers).unwrap();
+        std::fs::write(
+            tmp.path().join(".cockpit").join("config.json"),
+            r#"{"llm_mode":"defensive"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            providers.join("root.json"),
+            serde_json::json!({
+                "url": "https://example.test/v1",
+                "models": [{"id": "root-model", "trust": "untrusted", "mode": "defensive"}],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            providers.join("openai.json"),
+            serde_json::json!({
+                "url": "https://example.test/v1",
+                "models": [{"id": "gpt-5", "trust": "trusted", "mode": "frontier"}],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let session = Session::create(
+            db.clone(),
+            tmp.path().to_path_buf(),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        // The session's active PRIMARY is UNTRUSTED.
+        session.set_active_model("root", "root-model").unwrap();
+        let config =
+            crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(tmp.path());
+        let table = env_credential_table();
+
+        // The authoring frame is the TRUSTED (failover) model; the primary frame
+        // is the untrusted active model.
+        let authoring = SessionEventModelFrame {
+            provider_id: "openai",
+            model_id: "gpt-5",
+            config: &config,
+            session_table: &table,
+        };
+        let primary = SessionEventModelFrame {
+            provider_id: "root",
+            model_id: "root-model",
+            config: &config,
+            session_table: &table,
+        };
+        assert!(
+            authoring.resolved_trusted(),
+            "trust reads the trusted AUTHORING model"
+        );
+        assert!(
+            !primary.resolved_trusted(),
+            "the untrusted primary resolves untrusted — reading it would misclassify"
+        );
+
+        // The session event journals under the authoring frame.
+        let event_data = serde_json::json!({
+            "tool": "bash",
+            "original_input": { "command": format!("deploy {ENV_LIT}") },
+            "wire_input": { "command": format!("deploy {ENV_LIT}") },
+            "output": "ok",
+        });
+        session
+            .record_event_with_model_frame(
+                SessionEventKind::ToolCall,
+                Some("Build"),
+                Some("call-x"),
+                authoring,
+                &event_data,
+            )
+            .await
+            .unwrap();
+
+        // The audit row, derived from the SAME authoring frame's trust + table,
+        // ALSO journals — consistent. Reading the untrusted primary would have
+        // plain-inserted the raw arg with no history ref.
+        let row = audit_row_with_literals("bash", "call-x");
+        let event_id = row.event_id;
+        session
+            .record_tool_call_journaled(row, authoring.session_table, authoring.resolved_trusted())
+            .await
+            .unwrap();
+
+        let sid = session.id.to_string();
+        assert!(
+            !db.protected_redaction_history_list(&sid)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an authoring-trusted call journals (event + audit consistent)"
+        );
+        assert!(
+            !db.protected_redaction_artifact_refs_for_artifact(
+                RedactionArtifactKind::Tool,
+                &event_id.to_string(),
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "the audit row journaled a Tool ref — not misclassified by the untrusted primary"
+        );
+        let (orig, _wire, _output) = stored_tool_call_columns(&db, event_id).await;
+        assert!(
+            orig.contains(ENV_LIT),
+            "the trusted authoring path retains the raw arg locally"
+        );
     }
 }

@@ -10,7 +10,11 @@ export {
   resetRedisConnectionForTests,
 } from "./connection.js";
 export {
+  ACTIVATE_DUE_POLICIES_REPEAT_EVERY_MS,
+  ACTIVATE_DUE_POLICIES_REPEAT_KEY,
+  type ActivateDuePoliciesJobData,
   type AnalyzeAssetJobData,
+  activateDuePoliciesJobSchema,
   analyzeAssetJobSchema,
   CLEANUP_ASSETS_CRON_KEY,
   CLEANUP_ASSETS_CRON_PATTERN,
@@ -140,5 +144,17 @@ export const enterpriseLogExportQueue = lazyQueue(QUEUE_NAMES.enterpriseLogExpor
     ...defaultJobOptions,
     attempts: 1,
     removeOnComplete: { age: 86400, count: 1000 },
+  },
+});
+
+/**
+ * Wakes up the public-service-policy activation state machine. A DB-time
+ * state machine, so a single attempt is enough — the next firing resumes from
+ * durable row state. Concurrency is pinned to 1 in the worker.
+ */
+export const activateDuePoliciesQueue = lazyQueue(QUEUE_NAMES.activateDuePolicies, {
+  defaultJobOptions: {
+    ...defaultJobOptions,
+    attempts: 1,
   },
 });

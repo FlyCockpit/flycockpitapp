@@ -191,13 +191,15 @@ impl RemoteAttemptGrantV1 {
         Ok(())
     }
 
-    /// Validate the compatible tuple set against the foundation codec.
-    pub fn validate_tuple_set(&self) -> Result<(), AttemptGrantError> {
+    /// Validate the compatible tuple set against the foundation codec. The
+    /// policy revocation set is caller-supplied (never hardcoded here): a
+    /// tuple ID that is registry-absent or present in `revoked` is rejected.
+    pub fn validate_tuple_set(&self, revoked: &[u16]) -> Result<(), AttemptGrantError> {
         let tuple_set = RemoteAuthorizedTupleSetV1 {
             tuple_ids: self.compatible_tuple_ids.clone(),
         };
         tuple_set
-            .encode()
+            .encode(revoked)
             .map_err(|e| AttemptGrantError::TupleSet(e.to_string()))?;
         Ok(())
     }
@@ -224,8 +226,10 @@ impl RemoteAttemptGrantV1 {
 
     /// Perform all semantic claim validation (time, transport, tuple,
     /// ceiling). This is called before expensive certificate/JWKS
-    /// verification.
-    pub fn validate_claims(&self, now: i64) -> Result<(), AttemptGrantError> {
+    /// verification. `revoked` is the policy-owned revocation set threaded from
+    /// the enclosing public API; the outermost caller that owns no policy
+    /// context yet passes an explicit empty slice.
+    pub fn validate_claims(&self, now: i64, revoked: &[u16]) -> Result<(), AttemptGrantError> {
         if self.schema_version != GRANT_SCHEMA_VERSION {
             return Err(AttemptGrantError::Claims(format!(
                 "schemaVersion must be {}, got {}",
@@ -234,7 +238,7 @@ impl RemoteAttemptGrantV1 {
         }
         self.validate_time(now)?;
         self.validate_transport_bits()?;
-        self.validate_tuple_set()?;
+        self.validate_tuple_set(revoked)?;
         self.validate_permission_ceiling()?;
         Ok(())
     }
@@ -568,70 +572,70 @@ mod tests {
         let now = 1_700_000_000i64;
         let base = test_grant();
         // Base grant validates.
-        base.validate_claims(now).unwrap();
+        base.validate_claims(now, &[]).unwrap();
 
         // Mutate child attempt ID -> fail.
         let mut g = base.clone();
         g.child_attempt_id = [99; 16];
         // Still validates structurally (different child), but proves binding.
-        g.validate_claims(now).unwrap();
+        g.validate_claims(now, &[]).unwrap();
         // The binding matrix proves that each claim is independently checked.
 
         // Mutate transport bits to invalid.
         let mut g = base.clone();
         g.authorized_transports = 0;
-        assert!(g.validate_claims(now).is_err());
+        assert!(g.validate_claims(now, &[]).is_err());
 
         // Mutate transport bits to 4.
         let mut g = base.clone();
         g.authorized_transports = 4;
-        assert!(g.validate_claims(now).is_err());
+        assert!(g.validate_claims(now, &[]).is_err());
 
         // Mutate tuple set to empty.
         let mut g = base.clone();
         g.compatible_tuple_ids = vec![];
-        assert!(g.validate_claims(now).is_err());
+        assert!(g.validate_claims(now, &[]).is_err());
 
         // Mutate tuple set to a non-strictly-increasing list. The enabled
         // registry holds a single tuple, so a duplicate is the ordering
         // violation available with in-registry ids.
         let mut g = base.clone();
         g.compatible_tuple_ids = vec![1, 1];
-        assert!(g.validate_claims(now).is_err());
+        assert!(g.validate_claims(now, &[]).is_err());
 
         // Mutate permission ceiling digest to wrong value.
         let mut g = base.clone();
         g.permission_ceiling_digest = [0; 32];
-        assert!(g.validate_claims(now).is_err());
+        assert!(g.validate_claims(now, &[]).is_err());
 
         // Mutate time: exp before iat.
         let mut g = base.clone();
         g.exp = g.iat - 1;
-        assert!(g.validate_claims(now).is_err());
+        assert!(g.validate_claims(now, &[]).is_err());
 
         // Mutate time: lifetime exceeds 300s.
         let mut g = base.clone();
         g.exp = g.iat + 301;
-        assert!(g.validate_claims(now).is_err());
+        assert!(g.validate_claims(now, &[]).is_err());
 
         // Mutate time: expired.
         let mut g = base.clone();
         g.iat = now - 400;
         g.nbf = now - 400;
         g.exp = now - 100;
-        assert!(g.validate_claims(now).is_err());
+        assert!(g.validate_claims(now, &[]).is_err());
 
         // Mutate time: not yet valid beyond skew.
         let mut g = base.clone();
         g.iat = now + 120;
         g.nbf = now + 120;
         g.exp = now + 420;
-        assert!(g.validate_claims(now).is_err());
+        assert!(g.validate_claims(now, &[]).is_err());
 
         // Mutate schema version.
         let mut g = base.clone();
         g.schema_version = 2;
-        assert!(g.validate_claims(now).is_err());
+        assert!(g.validate_claims(now, &[]).is_err());
     }
 
     #[test]
@@ -663,12 +667,14 @@ mod tests {
         // Tuple set ordering and registry check. The enabled registry holds a
         // single tuple (id 1), so the valid set contains exactly that id.
         let ts = RemoteAuthorizedTupleSetV1 { tuple_ids: vec![1] };
-        ts.encode().unwrap();
+        ts.encode(&[]).unwrap();
+        // The same set is rejected once the sole registry tuple is revoked.
+        assert!(ts.encode(&[1]).is_err());
         // A non-strictly-increasing list fails ordering validation.
         let bad_ts = RemoteAuthorizedTupleSetV1 {
             tuple_ids: vec![1, 1],
         };
-        assert!(bad_ts.encode().is_err());
+        assert!(bad_ts.encode(&[]).is_err());
 
         // 512-byte aggregate cap.
         let mut large_projects = Vec::new();
@@ -748,7 +754,7 @@ mod tests {
         let mut g4 = test_grant();
         g4.jti = [7; 16];
         // The grant still validates but is a distinct grant.
-        g4.validate_claims(1_700_000_000).unwrap();
+        g4.validate_claims(1_700_000_000, &[]).unwrap();
     }
 
     #[test]
@@ -1022,12 +1028,12 @@ mod tests {
         // Forged grant with wrong schema version fails.
         let mut forged = test_grant();
         forged.schema_version = 99;
-        assert!(forged.validate_claims(1_700_000_000).is_err());
+        assert!(forged.validate_claims(1_700_000_000, &[]).is_err());
 
         // Forged grant with wrong transport bits fails.
         let mut forged = test_grant();
         forged.authorized_transports = 0;
-        assert!(forged.validate_claims(1_700_000_000).is_err());
+        assert!(forged.validate_claims(1_700_000_000, &[]).is_err());
     }
 
     #[test]
@@ -1041,13 +1047,13 @@ mod tests {
         let mut enterprise = test_grant();
         enterprise.tenant_authorization_digest = Some([0xf0; 32]);
         // Still validates structurally.
-        enterprise.validate_claims(1_700_000_000).unwrap();
+        enterprise.validate_claims(1_700_000_000, &[]).unwrap();
 
         // Unexpected/cross-tenant issuers: different issuer is a different
         // grant. The daemon verifies the issuer against authority JWKS.
         let mut cross_tenant = test_grant();
         cross_tenant.issuer = "unexpected-issuer".into();
-        cross_tenant.validate_claims(1_700_000_000).unwrap();
+        cross_tenant.validate_claims(1_700_000_000, &[]).unwrap();
         // The structural validation passes; signature/authority verification
         // is performed separately by the daemon.
     }
@@ -1060,13 +1066,13 @@ mod tests {
         let now = 1_700_000_000i64;
 
         // Before revocation: grant validates.
-        grant.validate_claims(now).unwrap();
+        grant.validate_claims(now, &[]).unwrap();
 
         // After revocation (simulated by expired time): grant fails.
         let revoked_time = now + 400;
         let mut expired = grant.clone();
         expired.exp = now + 300;
-        assert!(expired.validate_claims(revoked_time).is_err());
+        assert!(expired.validate_claims(revoked_time, &[]).is_err());
     }
 
     #[test]
@@ -1089,8 +1095,8 @@ mod tests {
         assert_ne!(child1.authorized_transports, child2.authorized_transports);
 
         // Both validate.
-        child1.validate_claims(1_700_000_000).unwrap();
-        child2.validate_claims(1_700_000_000).unwrap();
+        child1.validate_claims(1_700_000_000, &[]).unwrap();
+        child2.validate_claims(1_700_000_000, &[]).unwrap();
 
         // Shared logical attachment.
         assert_eq!(child1.logical_attachment_id, child2.logical_attachment_id);

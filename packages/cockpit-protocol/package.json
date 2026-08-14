@@ -14,6 +14,7 @@
   },
   "scripts": {
     "generate:remote-identity-fixtures": "tsx scripts/generate-remote-identity-fixtures.ts",
+    "generate:public-service-policy-fixtures": "tsx scripts/generate-public-service-policy-fixtures.ts",
     "check-types": "tsc --noEmit",
     "test": "vitest run --passWithNoTests"
   },

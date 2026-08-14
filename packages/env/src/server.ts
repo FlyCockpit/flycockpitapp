@@ -42,6 +42,7 @@ export const env = createEnv({
     BETTER_AUTH_SECRET: z.string().min(32),
     BETTER_AUTH_URL: originUrl("BETTER_AUTH_URL"),
     REMOTE_GRANT_SIGNING_KEY_FILE: z.string().optional(),
+    REMOTE_PUBLIC_SERVICE_POLICY_JWKS: z.string().optional(),
     REMOTE_AUTHORITY_DEPLOYMENT_ID: z
       .string()
       .regex(/^[A-Za-z0-9_-]{1,64}$/)

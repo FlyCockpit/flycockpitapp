@@ -6,6 +6,7 @@ export * from "./remote-connection-metadata";
 export * from "./remote-identity-custody-provider";
 export * from "./remote-identity-protocol";
 export * from "./remote-noise-binding";
+export * from "./remote-public-service-policy";
 export * from "./remote-tenant-authority-protocol";
 export * from "./remote-transport-selection";
 export * from "./remote-websocket-fallback";

@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::es256::{Es256PublicKey, verify_es256_p1363};
 use crate::remote_protocol_id::{CanonicalU64DecimalStringV1, RemotePublicPolicyId};
 use crate::remote_version::registry_tuple;
 
@@ -544,15 +545,28 @@ pub fn encode_transport_bits(bits: u8) -> Result<u8> {
 // ---------------------------------------------------------------------------
 
 /// `RemoteAuthorizedTupleSetV1`: `count:u8 | tupleIds:u16be[count]`, count
-/// `1..16`, strictly increasing and unique. Every ID is nonzero and must
-/// exist and be enabled/nonrevoked in the registry.
+/// `1..16`, strictly increasing and unique. Every ID is nonzero and must exist
+/// in the enabled registry. Revocation is a policy-driven input, not registry
+/// state: `encode`/`decode` take the caller's `revoked` set and reject any ID
+/// that is present in it (a registry-absent ID is reported first, then a
+/// revoked ID). A zero in `revoked` is rejected before any membership check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteAuthorizedTupleSetV1 {
     pub tuple_ids: Vec<u16>,
 }
 
+/// Reject a `revoked` set that contains a zero id (consistent with
+/// `remote_version::select`'s zero-revoked rejection).
+fn check_revoked_set(revoked: &[u16]) -> Result<()> {
+    if revoked.contains(&0) {
+        return invalid("revoked tuple id must be nonzero");
+    }
+    Ok(())
+}
+
 impl RemoteAuthorizedTupleSetV1 {
-    pub fn encode(&self) -> Result<Vec<u8>> {
+    pub fn encode(&self, revoked: &[u16]) -> Result<Vec<u8>> {
+        check_revoked_set(revoked)?;
         if !(TUPLE_SET_MIN..=TUPLE_SET_MAX).contains(&self.tuple_ids.len()) {
             return invalid(format!(
                 "tuple set count must be {}..={}",
@@ -571,6 +585,9 @@ impl RemoteAuthorizedTupleSetV1 {
             if registry_tuple(id).is_none() {
                 return invalid(format!("tuple id {id} not in enabled registry"));
             }
+            if revoked.contains(&id) {
+                return invalid(format!("tuple id {id} is revoked"));
+            }
         }
         let mut buf = Vec::with_capacity(1 + self.tuple_ids.len() * 2);
         buf.push(self.tuple_ids.len() as u8);
@@ -580,7 +597,8 @@ impl RemoteAuthorizedTupleSetV1 {
         Ok(buf)
     }
 
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
+    pub fn decode(bytes: &[u8], revoked: &[u16]) -> Result<Self> {
+        check_revoked_set(revoked)?;
         if bytes.is_empty() {
             return invalid("tuple set is empty");
         }
@@ -609,11 +627,14 @@ impl RemoteAuthorizedTupleSetV1 {
             if registry_tuple(id).is_none() {
                 return invalid(format!("tuple id {id} not in enabled registry"));
             }
+            if revoked.contains(&id) {
+                return invalid(format!("tuple id {id} is revoked"));
+            }
             ids.push(id);
         }
         let set = Self { tuple_ids: ids };
         // Re-encode to confirm canonical round-trip.
-        let re = set.encode()?;
+        let re = set.encode(revoked)?;
         if re != bytes {
             return invalid("tuple set noncanonical re-encoding");
         }
@@ -1051,20 +1072,27 @@ impl RemotePublicServicePolicyV1 {
     /// - `notBefore <= issuedAt + 2,592,000` (30 days)
     pub fn validate_for_import(&self, import_time: i64) -> Result<()> {
         self.validate()?;
-        let issued = self.issued_at.value() as i64;
-        let not_before = self.not_before.value() as i64;
+        // Compare in i128 so a canonical u64 timestamp near `u64::MAX` stays a
+        // large POSITIVE value (a wrap to a negative i64 would let a far-future
+        // policy slip past the skew/window checks). This matches the TypeScript
+        // pair, which compares as arbitrary-precision bigint.
+        let issued = self.issued_at.value() as i128;
+        let not_before = self.not_before.value() as i128;
+        let import_time = import_time as i128;
+        let skew = IMPORT_CLOCK_SKEW_SECONDS as i128;
+        let offset = NOT_BEFORE_MAX_OFFSET_SECONDS as i128;
 
-        if issued > import_time + IMPORT_CLOCK_SKEW_SECONDS {
+        if issued > import_time + skew {
             return invalid(format!(
                 "issuedAt {issued} exceeds importTime {import_time} + {IMPORT_CLOCK_SKEW_SECONDS}s skew"
             ));
         }
-        if not_before < issued - IMPORT_CLOCK_SKEW_SECONDS {
+        if not_before < issued - skew {
             return invalid(format!(
                 "notBefore {not_before} is before issuedAt {issued} - {IMPORT_CLOCK_SKEW_SECONDS}s skew"
             ));
         }
-        if not_before > issued + NOT_BEFORE_MAX_OFFSET_SECONDS {
+        if not_before > issued + offset {
             return invalid(format!(
                 "notBefore {not_before} exceeds issuedAt {issued} + {NOT_BEFORE_MAX_OFFSET_SECONDS}s (30 days)"
             ));
@@ -1539,6 +1567,245 @@ fn rfc7638_thumbprint(x: &[u8], y: &[u8]) -> Result<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Policy JWS verification (ES256 against the JWKS ring, fail-closed)
+// ---------------------------------------------------------------------------
+
+/// Why a policy JWS is being verified, which selects the allowed signing role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyKeyUsage {
+    /// A fresh operator import. Only the `current`-role key verifies.
+    Import,
+    /// Re-verification of an already-imported/scheduled row. `current` or
+    /// `previous` verify; `next` never does.
+    VerifyImported,
+}
+
+/// Decode a 32-byte JWK affine coordinate from unpadded base64url.
+fn decode_jwk_coordinate(s: &str) -> Result<[u8; 32]> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(s)
+        .map_err(|_| RemotePublicPolicyError::Jwks("JWK coordinate decode failed".into()))?;
+    if bytes.len() != 32 {
+        return Err(RemotePublicPolicyError::Jwks(format!(
+            "JWK coordinate must be 32 bytes; got {}",
+            bytes.len()
+        )));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+/// Verify a compact ES256 policy JWS against the rotation ring, fail-closed.
+///
+/// Parses the compact JWS (strict header), resolves the header `kid` in the
+/// ring, enforces the role rule for `usage`, and verifies the exact
+/// `signing_input` bytes with the shared [`crate::es256`] verifier (SHA-256,
+/// 64-byte raw `r||s`, low-S enforced, off-curve/identity keys rejected). Any
+/// failure — unknown kid, role mismatch, malformed coordinates, non-64-byte or
+/// high-S signature, or a signature that does not verify — is a hard error;
+/// there is no success-with-warning path.
+pub fn verify_policy_jws(
+    compact: &str,
+    ring: &PolicyJwksRing,
+    usage: PolicyKeyUsage,
+) -> Result<ParsedPolicyJws> {
+    let parsed = parse_policy_jws(compact)?;
+    let kid = parsed
+        .protected_header
+        .get("kid")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RemotePublicPolicyError::Jws("header missing kid".into()))?;
+
+    let jwk = ring
+        .keys
+        .iter()
+        .find(|k| k.kid == kid)
+        .ok_or_else(|| RemotePublicPolicyError::Jwks(format!("no ring JWK for kid {kid}")))?;
+
+    // Role gate: closed match over (usage, role) — a `next` key never verifies
+    // anything, and only `current` may authorize a fresh import.
+    match (usage, jwk.flycockpit_role) {
+        (PolicyKeyUsage::Import, JwkRole::Current) => {}
+        (PolicyKeyUsage::Import, JwkRole::Previous) => {
+            return Err(RemotePublicPolicyError::Jwks(
+                "import requires the current key; the previous role cannot import".into(),
+            ));
+        }
+        (PolicyKeyUsage::Import, JwkRole::Next) => {
+            return Err(RemotePublicPolicyError::Jwks(
+                "import requires the current key; the next role cannot import".into(),
+            ));
+        }
+        (PolicyKeyUsage::VerifyImported, JwkRole::Current | JwkRole::Previous) => {}
+        (PolicyKeyUsage::VerifyImported, JwkRole::Next) => {
+            return Err(RemotePublicPolicyError::Jwks(
+                "the next role never verifies imported policy".into(),
+            ));
+        }
+    }
+
+    // Signature must be exactly 64 bytes raw r||s (JOSE format). DER or any
+    // other length is rejected here and again inside the es256 verifier.
+    if parsed.signature.len() != 64 {
+        return Err(RemotePublicPolicyError::Jws(format!(
+            "policy JWS signature must be 64-byte raw r||s; got {} bytes",
+            parsed.signature.len()
+        )));
+    }
+
+    let key = Es256PublicKey {
+        x: decode_jwk_coordinate(&jwk.x)?,
+        y: decode_jwk_coordinate(&jwk.y)?,
+    };
+    verify_es256_p1363(&key, &parsed.signing_input, &parsed.signature)
+        .map_err(|e| RemotePublicPolicyError::Jws(format!("policy JWS signature invalid: {e}")))?;
+
+    Ok(parsed)
+}
+
+// ---------------------------------------------------------------------------
+// Three-valued change classification (foundation-owned)
+// ---------------------------------------------------------------------------
+
+/// Three-valued policy change classification. Unlike the enterprise
+/// `classify_revision` (which folds a mixed revision into `Widening`), a
+/// revision that both widens one dimension and narrows another is `Mixed` and
+/// is import-fatal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyChangeClassification {
+    NarrowingOrEqual,
+    Widening,
+    Mixed,
+}
+
+/// Classify `next` relative to `previous`, fieldwise, three-valued.
+///
+/// Widening/narrowing directions mirror the enterprise classifier dimension
+/// list exactly (`remote_enterprise_connection_policy::classify_revision`), but
+/// any-widening AND any-narrowing yields `Mixed`.
+pub fn classify_policy_change(
+    previous: &RemoteConnectionPolicyV1,
+    next: &RemoteConnectionPolicyV1,
+) -> PolicyChangeClassification {
+    // Transports / regions: set membership deltas in each direction.
+    let transport_widening = next
+        .allowed_transports
+        .iter()
+        .any(|t| !previous.allowed_transports.contains(t));
+    let transport_narrowing = previous
+        .allowed_transports
+        .iter()
+        .any(|t| !next.allowed_transports.contains(t));
+    let region_widening = next
+        .allowed_turn_regions
+        .iter()
+        .any(|r| !previous.allowed_turn_regions.contains(r));
+    let region_narrowing = previous
+        .allowed_turn_regions
+        .iter()
+        .any(|r| !next.allowed_turn_regions.contains(r));
+
+    // Booleans: true is more permissive than false.
+    let websocket_fallback_widening = next.websocket_fallback && !previous.websocket_fallback;
+    let websocket_fallback_narrowing = previous.websocket_fallback && !next.websocket_fallback;
+    let sharing_widening = next.sharing_enabled && !previous.sharing_enabled;
+    let sharing_narrowing = previous.sharing_enabled && !next.sharing_enabled;
+
+    // Numeric limits: greater is more permissive, lesser is narrower.
+    let limit_pairs: [(u64, u64); 8] = [
+        (
+            previous.limits.registered_daemons.value(),
+            next.limits.registered_daemons.value(),
+        ),
+        (
+            previous.limits.concurrent_attachments.value(),
+            next.limits.concurrent_attachments.value(),
+        ),
+        (
+            previous.limits.concurrent_children_per_attachment.value(),
+            next.limits.concurrent_children_per_attachment.value(),
+        ),
+        (
+            previous.limits.concurrent_participants_per_session.value(),
+            next.limits.concurrent_participants_per_session.value(),
+        ),
+        (
+            previous.limits.turn_bytes_per_attachment.value(),
+            next.limits.turn_bytes_per_attachment.value(),
+        ),
+        (
+            previous.limits.turn_duration_seconds.value(),
+            next.limits.turn_duration_seconds.value(),
+        ),
+        (
+            previous.limits.websocket_bytes_per_attachment.value(),
+            next.limits.websocket_bytes_per_attachment.value(),
+        ),
+        (
+            previous.limits.websocket_duration_seconds.value(),
+            next.limits.websocket_duration_seconds.value(),
+        ),
+    ];
+    let limits_widening = limit_pairs.iter().any(|(p, n)| n > p);
+    let limits_narrowing = limit_pairs.iter().any(|(p, n)| n < p);
+
+    // Custody: lower rank is less strict (widening), higher rank is narrower.
+    let daemon_custody_widening =
+        next.minimum_daemon_custody.rank() < previous.minimum_daemon_custody.rank();
+    let daemon_custody_narrowing =
+        next.minimum_daemon_custody.rank() > previous.minimum_daemon_custody.rank();
+    let client_custody_widening =
+        next.minimum_client_custody.rank() < previous.minimum_client_custody.rank();
+    let client_custody_narrowing =
+        next.minimum_client_custody.rank() > previous.minimum_client_custody.rank();
+
+    // Ordered enums: higher rank is more permissive.
+    let direct_ip_widening = next.direct_ip_mode.rank() > previous.direct_ip_mode.rank();
+    let direct_ip_narrowing = next.direct_ip_mode.rank() < previous.direct_ip_mode.rank();
+    let route_widening = next.shared_session_route.rank() > previous.shared_session_route.rank();
+    let route_narrowing = next.shared_session_route.rank() < previous.shared_session_route.rank();
+    let auth_widening = next.tenant_authorization.rank() > previous.tenant_authorization.rank();
+    let auth_narrowing = next.tenant_authorization.rank() < previous.tenant_authorization.rank();
+
+    // metadataRetentionDays: greater is more permissive (mirrors enterprise).
+    let retention_widening =
+        next.metadata_retention_days.value() > previous.metadata_retention_days.value();
+    let retention_narrowing =
+        next.metadata_retention_days.value() < previous.metadata_retention_days.value();
+
+    let any_widening = transport_widening
+        || region_widening
+        || websocket_fallback_widening
+        || sharing_widening
+        || limits_widening
+        || daemon_custody_widening
+        || client_custody_widening
+        || direct_ip_widening
+        || route_widening
+        || auth_widening
+        || retention_widening;
+    let any_narrowing = transport_narrowing
+        || region_narrowing
+        || websocket_fallback_narrowing
+        || sharing_narrowing
+        || limits_narrowing
+        || daemon_custody_narrowing
+        || client_custody_narrowing
+        || direct_ip_narrowing
+        || route_narrowing
+        || auth_narrowing
+        || retention_narrowing;
+
+    match (any_widening, any_narrowing) {
+        (true, true) => PolicyChangeClassification::Mixed,
+        (true, false) => PolicyChangeClassification::Widening,
+        (false, _) => PolicyChangeClassification::NarrowingOrEqual,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Initial service version 1 baseline
 // ---------------------------------------------------------------------------
 
@@ -1608,59 +1875,10 @@ pub enum ReplicaLeaseState {
     Stale,
 }
 
-/// Result of an activation attempt for a narrowing-or-equal version.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NarrowingActivation {
-    pub new_state: PolicyRowState,
-    pub outbox: Option<&'static str>,
-}
-
-/// At `notBefore`, an equal/narrowing version atomically becomes
-/// issuance-authoritative, supersedes the prior pointer, enters
-/// `active_converging`, and appends `remote_public_service_policy_activated`.
-pub fn activate_narrowing_at_not_before(
-    current_time: i64,
-    not_before: i64,
-) -> Result<NarrowingActivation> {
-    if current_time < not_before {
-        return invalid("scheduled policy is not effective before notBefore");
-    }
-    Ok(NarrowingActivation {
-        new_state: PolicyRowState::ActiveConverging,
-        outbox: Some("remote_public_service_policy_activated"),
-    })
-}
-
-/// After all registered critical consumers ACK, narrowing state becomes
-/// `active`.
-pub fn narrowing_all_consumers_acked() -> PolicyRowState {
-    PolicyRowState::Active
-}
-
-/// After a 300-second timeout, narrowing remains authoritative in
-/// `active_convergence_failed`; readiness is false, issuance stays narrowed,
-/// and it never rolls back.
-pub fn narrowing_convergence_timeout() -> PolicyRowState {
-    PolicyRowState::ActiveConvergenceFailed
-}
-
-/// Widening enters `preparing`.
-pub fn widening_prepare() -> PolicyRowState {
-    PolicyRowState::Preparing
-}
-
-/// Widening advances the pointer and returns activation success only after
-/// every registered critical consumer ACKs exact evaluator readiness in a
-/// second transaction.
-pub fn widening_all_consumers_acked() -> PolicyRowState {
-    PolicyRowState::Active
-}
-
-/// Timeout/failure leaves widening `scheduled_failed` and old policy
-/// authoritative.
-pub fn widening_timeout_or_failure() -> PolicyRowState {
-    PolicyRowState::ScheduledFailed
-}
+// The durable activation state machine lives in the TypeScript control plane
+// (Postgres is the durability authority). Rust keeps only the shared state
+// vocabulary, `ImportAcknowledgement`, and the timing constants below, all
+// pinned cross-language by the fixture corpus.
 
 /// The 300-second lease refresh window for narrowing convergence.
 pub const CONVERGENCE_TIMEOUT_SECONDS: i64 = 300;
@@ -2043,19 +2261,20 @@ mod tests {
 
     #[test]
     fn tuple_set_valid_and_reject() {
-        // V1 registry has exactly tuple 0x0001.
+        // V1 registry has exactly tuple 0x0001. Empty revocation set.
+        let none: [u16; 0] = [];
         let s = RemoteAuthorizedTupleSetV1 {
             tuple_ids: vec![V1_TUPLE_ID],
         };
-        let bytes = s.encode().unwrap();
+        let bytes = s.encode(&none).unwrap();
         assert_eq!(bytes, vec![1, 0x00, 0x01]);
-        let back = RemoteAuthorizedTupleSetV1::decode(&bytes).unwrap();
+        let back = RemoteAuthorizedTupleSetV1::decode(&bytes, &none).unwrap();
         assert_eq!(back, s);
 
         // Reject zero count.
         assert!(
             RemoteAuthorizedTupleSetV1 { tuple_ids: vec![] }
-                .encode()
+                .encode(&none)
                 .is_err()
         );
         // Reject unknown tuple.
@@ -2063,7 +2282,7 @@ mod tests {
             RemoteAuthorizedTupleSetV1 {
                 tuple_ids: vec![0x0002]
             }
-            .encode()
+            .encode(&none)
             .is_err()
         );
         // Reject zero id.
@@ -2071,7 +2290,7 @@ mod tests {
             RemoteAuthorizedTupleSetV1 {
                 tuple_ids: vec![0x0000]
             }
-            .encode()
+            .encode(&none)
             .is_err()
         );
         // Reject unsorted.
@@ -2079,7 +2298,7 @@ mod tests {
             RemoteAuthorizedTupleSetV1 {
                 tuple_ids: vec![0x0001, 0x0001]
             }
-            .encode()
+            .encode(&none)
             .is_err()
         );
         // Reject >16.
@@ -2088,11 +2307,54 @@ mod tests {
             RemoteAuthorizedTupleSetV1 {
                 tuple_ids: too_many
             }
-            .encode()
+            .encode(&none)
             .is_err()
         );
         // Reject trailing bytes.
-        assert!(RemoteAuthorizedTupleSetV1::decode(&[1, 0x00, 0x01, 0x00]).is_err());
+        assert!(RemoteAuthorizedTupleSetV1::decode(&[1, 0x00, 0x01, 0x00], &none).is_err());
+        // A registry member that is revoked is rejected on encode AND decode —
+        // the old codec (no `revoked` parameter) accepted these bytes.
+        let revoked = [V1_TUPLE_ID];
+        assert!(s.encode(&revoked).is_err());
+        assert!(RemoteAuthorizedTupleSetV1::decode(&bytes, &revoked).is_err());
+    }
+
+    #[test]
+    fn tuple_set_rejects_revoked_ids() {
+        // A registry-enabled ID (V1) is accepted with an empty revocation set
+        // but rejected once it appears in `revoked`, on both encode and decode.
+        let s = RemoteAuthorizedTupleSetV1 {
+            tuple_ids: vec![V1_TUPLE_ID],
+        };
+        let none: [u16; 0] = [];
+        let bytes = s.encode(&none).expect("V1 encodes with no revocation");
+
+        let revoked = [V1_TUPLE_ID];
+        let enc = s.encode(&revoked);
+        assert!(enc.is_err(), "revoked registry member must fail to encode");
+        assert!(
+            format!("{}", enc.unwrap_err()).contains("revoked"),
+            "encode error names revocation, not registry absence"
+        );
+
+        let dec = RemoteAuthorizedTupleSetV1::decode(&bytes, &revoked);
+        assert!(dec.is_err(), "revoked registry member must fail to decode");
+        assert!(format!("{}", dec.unwrap_err()).contains("revoked"));
+
+        // A registry-absent id reports the registry error first (checked before
+        // revocation), even when it is also listed as revoked.
+        let absent = RemoteAuthorizedTupleSetV1 {
+            tuple_ids: vec![0x0002],
+        };
+        let err = absent.encode(&[0x0002]).unwrap_err();
+        assert!(
+            format!("{err}").contains("not in enabled registry"),
+            "registry-absence is reported before revocation"
+        );
+
+        // A zero in the revocation set is rejected before any membership check.
+        assert!(s.encode(&[0]).is_err());
+        assert!(RemoteAuthorizedTupleSetV1::decode(&bytes, &[0]).is_err());
     }
 
     // --- JWS header validation ---
@@ -2362,34 +2624,26 @@ mod tests {
         assert!(p.validate_for_import(1_000_000).is_err());
     }
 
-    // --- Activation state machine ---
+    // --- State vocabulary (the durable state machine is control-plane owned) ---
 
     #[test]
-    fn narrowing_activation_transitions() {
-        let not_before = 1_000_000;
-        // Before notBefore: reject.
-        assert!(activate_narrowing_at_not_before(999_999, not_before).is_err());
-        // At notBefore: active_converging + outbox.
-        let r = activate_narrowing_at_not_before(not_before, not_before).unwrap();
-        assert_eq!(r.new_state, PolicyRowState::ActiveConverging);
-        assert_eq!(r.outbox, Some("remote_public_service_policy_activated"));
-        // All ACKed -> active.
-        assert_eq!(narrowing_all_consumers_acked(), PolicyRowState::Active);
-        // Timeout -> active_convergence_failed (no rollback).
+    fn policy_row_states_serialize_to_pinned_names() {
+        // These serialized names are pinned cross-language by the fixture
+        // corpus; the durable transitions themselves live in the control plane.
+        let name = |s: PolicyRowState| serde_json::to_string(&s).unwrap();
+        assert_eq!(name(PolicyRowState::Scheduled), "\"scheduled\"");
+        assert_eq!(name(PolicyRowState::Preparing), "\"preparing\"");
+        assert_eq!(name(PolicyRowState::ActiveConverging), "\"active_converging\"");
+        assert_eq!(name(PolicyRowState::Active), "\"active\"");
         assert_eq!(
-            narrowing_convergence_timeout(),
-            PolicyRowState::ActiveConvergenceFailed
+            name(PolicyRowState::ActiveConvergenceFailed),
+            "\"active_convergence_failed\""
         );
-    }
-
-    #[test]
-    fn widening_activation_transitions() {
-        assert_eq!(widening_prepare(), PolicyRowState::Preparing);
-        assert_eq!(widening_all_consumers_acked(), PolicyRowState::Active);
-        assert_eq!(
-            widening_timeout_or_failure(),
-            PolicyRowState::ScheduledFailed
-        );
+        assert_eq!(name(PolicyRowState::ScheduledFailed), "\"scheduled_failed\"");
+        assert_eq!(CONVERGENCE_TIMEOUT_SECONDS, 300);
+        assert_eq!(REPLICA_LEASE_RENEW_SECONDS, 15);
+        assert_eq!(REPLICA_LEASE_TTL_SECONDS, 45);
+        assert_eq!(STALE_REAP_GRACE_SECONDS, 90);
     }
 
     // --- Critical consumer IDs ---
@@ -2563,57 +2817,351 @@ mod tests {
         assert!(serde_json::from_str::<Wrap>(bad).is_err());
     }
 
-    // --- Ownership guard (non-vacuous) ---
+    // --- Three-valued change classification ---
 
     #[test]
-    fn ownership_guard_capability_enums_sole_definition() {
-        // The capability enums are defined exactly once in this module.
-        // This test is non-vacuous: it confirms the ordinal sets are the
-        // closed, foundation-owned sets and that no extension is possible
-        // without editing this source.
-        assert_eq!(RemoteProjectCapabilityV1::all().len(), 15);
-        assert_eq!(RemoteAttachmentCapabilityV1::all().len(), 13);
-        // image_generation_admin=15 is foundation-owned.
+    fn classify_policy_change_narrowing_widening_mixed() {
+        let base = initial_service_version_1_policy();
+
+        // Equal -> narrowing_or_equal.
         assert_eq!(
-            RemoteProjectCapabilityV1::ImageGenerationAdmin.ordinal(),
-            15
+            classify_policy_change(&base, &base),
+            PolicyChangeClassification::NarrowingOrEqual
         );
-        // Ordinals 1..13 overlap by design.
-        for i in 1..=13u8 {
-            let p = RemoteProjectCapabilityV1::from_ordinal(i).unwrap();
-            let a = RemoteAttachmentCapabilityV1::from_ordinal(i).unwrap();
-            assert_eq!(p.ordinal(), a.ordinal());
-            assert_eq!(p.ordinal(), i);
+
+        // Pure narrowing: raise the client custody minimum (stricter).
+        let mut narrower = base.clone();
+        narrower.minimum_client_custody = ClientCustodyPolicy::Hardware;
+        assert_eq!(
+            classify_policy_change(&base, &narrower),
+            PolicyChangeClassification::NarrowingOrEqual
+        );
+
+        // Pure widening: raise a numeric limit.
+        let mut wider = base.clone();
+        wider.limits.registered_daemons = CanonicalU64DecimalStringV1::from_u64(20);
+        assert_eq!(
+            classify_policy_change(&base, &wider),
+            PolicyChangeClassification::Widening
+        );
+
+        // Mixed: one dimension widened (limit up) AND one narrowed (custody up).
+        let mut mixed = base.clone();
+        mixed.limits.registered_daemons = CanonicalU64DecimalStringV1::from_u64(20);
+        mixed.minimum_client_custody = ClientCustodyPolicy::Hardware;
+        assert_eq!(
+            classify_policy_change(&base, &mixed),
+            PolicyChangeClassification::Mixed
+        );
+
+        // Widening is not symmetric: reversing a pure-widening pair narrows.
+        assert_eq!(
+            classify_policy_change(&wider, &base),
+            PolicyChangeClassification::NarrowingOrEqual
+        );
+    }
+
+    // --- Policy JWS signature verification (ES256 via the shared es256 module) ---
+
+    fn signed_parts(
+        seed: u8,
+        kid: &str,
+        role: JwkRole,
+        payload: &Value,
+    ) -> (
+        p256::ecdsa::SigningKey,
+        String,
+        String,
+        PolicyJwk,
+    ) {
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        let sk = p256::ecdsa::SigningKey::from_slice(&[seed | 0x01; 32]).expect("valid scalar");
+        let vk = sk.verifying_key();
+        let point = vk.to_encoded_point(false);
+        let x_b64 = URL_SAFE_NO_PAD.encode(point.x().unwrap().as_slice());
+        let y_b64 = URL_SAFE_NO_PAD.encode(point.y().unwrap().as_slice());
+        let header = serde_json::json!({"alg": "ES256", "kid": kid, "typ": POLICY_JWS_TYP});
+        let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_string(&header).unwrap());
+        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_string(payload).unwrap());
+        let jwk = PolicyJwk {
+            kid: kid.to_string(),
+            kty: "EC".to_string(),
+            crv: "P-256".to_string(),
+            x: x_b64,
+            y: y_b64,
+            r#use: "sig".to_string(),
+            key_ops: vec!["verify".to_string()],
+            flycockpit_role: role,
+        };
+        (sk, header_b64, payload_b64, jwk)
+    }
+
+    fn low_s_sig_b64(sk: &p256::ecdsa::SigningKey, signing_input: &str) -> String {
+        use p256::ecdsa::signature::Signer;
+        let sig: p256::ecdsa::Signature = sk.sign(signing_input.as_bytes());
+        let low = sig.normalize_s().unwrap_or(sig);
+        URL_SAFE_NO_PAD.encode(low.to_bytes().as_slice())
+    }
+
+    fn assemble(header_b64: &str, payload_b64: &str, sig_b64: &str) -> String {
+        format!("{header_b64}.{payload_b64}.{sig_b64}")
+    }
+
+    #[test]
+    fn verify_policy_jws_accepts_current_key() {
+        let payload = serde_json::json!({"policy": "v1"});
+        let (sk, h, p, jwk) = signed_parts(0x11, "k-current", JwkRole::Current, &payload);
+        let sig = low_s_sig_b64(&sk, &format!("{h}.{p}"));
+        let compact = assemble(&h, &p, &sig);
+        let ring = PolicyJwksRing { keys: vec![jwk] };
+        // Only the current key exists; both usages verify it.
+        assert!(verify_policy_jws(&compact, &ring, PolicyKeyUsage::Import).is_ok());
+        assert!(verify_policy_jws(&compact, &ring, PolicyKeyUsage::VerifyImported).is_ok());
+    }
+
+    #[test]
+    fn verify_policy_jws_previous_key_reverify_only() {
+        let payload = serde_json::json!({"policy": "v1"});
+        let (_csk, _ch, _cp, current) =
+            signed_parts(0x22, "k-current", JwkRole::Current, &payload);
+        let (psk, h, p, previous) =
+            signed_parts(0x33, "k-previous", JwkRole::Previous, &payload);
+        let sig = low_s_sig_b64(&psk, &format!("{h}.{p}"));
+        let compact = assemble(&h, &p, &sig);
+        let ring = PolicyJwksRing {
+            keys: vec![current, previous],
+        };
+        // The previous key cannot authorize a fresh import, but re-verify of an
+        // already-imported row succeeds.
+        assert!(verify_policy_jws(&compact, &ring, PolicyKeyUsage::Import).is_err());
+        assert!(verify_policy_jws(&compact, &ring, PolicyKeyUsage::VerifyImported).is_ok());
+    }
+
+    #[test]
+    fn verify_policy_jws_next_key_never_verifies() {
+        let payload = serde_json::json!({"policy": "v1"});
+        let (_csk, _ch, _cp, current) =
+            signed_parts(0x44, "k-current", JwkRole::Current, &payload);
+        let (nsk, h, p, next) = signed_parts(0x55, "k-next", JwkRole::Next, &payload);
+        let sig = low_s_sig_b64(&nsk, &format!("{h}.{p}"));
+        let compact = assemble(&h, &p, &sig);
+        let ring = PolicyJwksRing {
+            keys: vec![current, next],
+        };
+        // The next key never verifies anything, under either usage.
+        assert!(verify_policy_jws(&compact, &ring, PolicyKeyUsage::Import).is_err());
+        assert!(verify_policy_jws(&compact, &ring, PolicyKeyUsage::VerifyImported).is_err());
+    }
+
+    #[test]
+    fn verify_policy_jws_rejects_unknown_kid() {
+        let payload = serde_json::json!({"policy": "v1"});
+        // Sign with a key whose kid is not present in the ring.
+        let (sk, h, p, _absent) = signed_parts(0x66, "k-absent", JwkRole::Current, &payload);
+        let (_rk, _rh, _rp, ring_key) =
+            signed_parts(0x77, "k-ring", JwkRole::Current, &payload);
+        let sig = low_s_sig_b64(&sk, &format!("{h}.{p}"));
+        let compact = assemble(&h, &p, &sig);
+        let ring = PolicyJwksRing {
+            keys: vec![ring_key],
+        };
+        assert!(verify_policy_jws(&compact, &ring, PolicyKeyUsage::Import).is_err());
+    }
+
+    #[test]
+    fn verify_policy_jws_rejects_tampered_payload_and_signature() {
+        let payload = serde_json::json!({"policy": "v1"});
+        let (sk, h, p, jwk) = signed_parts(0x88, "k-current", JwkRole::Current, &payload);
+        let sig = low_s_sig_b64(&sk, &format!("{h}.{p}"));
+        let ring = PolicyJwksRing {
+            keys: vec![jwk],
+        };
+
+        // Tampered payload: re-encode a different payload but keep the old sig.
+        let other = serde_json::json!({"policy": "v2"});
+        let p2 = URL_SAFE_NO_PAD.encode(serde_json::to_string(&other).unwrap());
+        let tampered_payload = assemble(&h, &p2, &sig);
+        assert!(verify_policy_jws(&tampered_payload, &ring, PolicyKeyUsage::Import).is_err());
+
+        // Tampered signature: flip one signature byte, re-encode canonically.
+        let mut sig_bytes = URL_SAFE_NO_PAD.decode(&sig).unwrap();
+        sig_bytes[10] ^= 0xff;
+        let sig2 = URL_SAFE_NO_PAD.encode(&sig_bytes);
+        let tampered_sig = assemble(&h, &p, &sig2);
+        assert!(verify_policy_jws(&tampered_sig, &ring, PolicyKeyUsage::Import).is_err());
+    }
+
+    #[test]
+    fn verify_policy_jws_rejects_non_64_byte_der_zero_and_high_s() {
+        use p256::ecdsa::signature::Signer;
+        let payload = serde_json::json!({"policy": "v1"});
+        let (sk, h, p, jwk) = signed_parts(0x99, "k-current", JwkRole::Current, &payload);
+        let signing_input = format!("{h}.{p}");
+        let ring = PolicyJwksRing {
+            keys: vec![jwk],
+        };
+
+        // DER-encoded signature (not 64 raw bytes) is rejected.
+        let raw: p256::ecdsa::Signature = sk.sign(signing_input.as_bytes());
+        let sig = raw.normalize_s().unwrap_or(raw);
+        let der_b64 = URL_SAFE_NO_PAD.encode(sig.to_der().as_bytes());
+        assert!(verify_policy_jws(&assemble(&h, &p, &der_b64), &ring, PolicyKeyUsage::Import).is_err());
+
+        // 64 zero bytes (r=0, s=0) is rejected.
+        let zero_b64 = URL_SAFE_NO_PAD.encode([0u8; 64]);
+        assert!(
+            verify_policy_jws(&assemble(&h, &p, &zero_b64), &ring, PolicyKeyUsage::Import).is_err()
+        );
+
+        // High-S counterpart of the valid low-S signature is rejected.
+        const N_BE: [u8; 32] = [
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2,
+            0xfc, 0x63, 0x25, 0x51,
+        ];
+        let low = sig.to_bytes();
+        let mut high = [0u8; 64];
+        high[0..32].copy_from_slice(&low[0..32]);
+        // high_s = n - s via big-endian subtraction.
+        let mut borrow: i16 = 0;
+        for i in (0..32).rev() {
+            let d = N_BE[i] as i16 - low[32 + i] as i16 - borrow;
+            if d < 0 {
+                high[32 + i] = (d + 256) as u8;
+                borrow = 1;
+            } else {
+                high[32 + i] = d as u8;
+                borrow = 0;
+            }
+        }
+        let high_b64 = URL_SAFE_NO_PAD.encode(high);
+        assert!(
+            verify_policy_jws(&assemble(&h, &p, &high_b64), &ring, PolicyKeyUsage::Import).is_err()
+        );
+    }
+
+    #[test]
+    fn verify_policy_jws_rejects_off_curve_key() {
+        let payload = serde_json::json!({"policy": "v1"});
+        let (sk, h, p, mut jwk) = signed_parts(0xAB, "k-current", JwkRole::Current, &payload);
+        let sig = low_s_sig_b64(&sk, &format!("{h}.{p}"));
+        let compact = assemble(&h, &p, &sig);
+        // Replace the ring key coordinates with a 32-byte nonzero pair that is
+        // not on P-256. The header/kid still resolve and the role gate passes;
+        // the point import at verification time fails closed.
+        jwk.x = URL_SAFE_NO_PAD.encode([0x01u8; 32]);
+        jwk.y = URL_SAFE_NO_PAD.encode([0x01u8; 32]);
+        let ring = PolicyJwksRing {
+            keys: vec![jwk],
+        };
+        assert!(verify_policy_jws(&compact, &ring, PolicyKeyUsage::Import).is_err());
+    }
+
+    // --- Ownership guard (non-vacuous source scan) ---
+
+    /// Structural detector: returns `Some(reason)` when `source` contains a
+    /// second *definition* of a foundation-owned capability ordinal set,
+    /// transport-bit assignment, tuple-set binary layout, or the
+    /// encoder-to-SHA-256 ceiling-digest derivation. Usages (calls, `::`
+    /// references) are deliberately not matched.
+    fn scan_for_guarded_definition(source: &str) -> Option<&'static str> {
+        if source.contains("enum RemoteProjectCapabilityV1")
+            || source.contains("enum RemoteAttachmentCapabilityV1")
+        {
+            return Some("capability ordinal enum definition");
+        }
+        if source.contains("TRANSPORT_BIT_WEBRTC: u8") {
+            return Some("transport-bit assignment");
+        }
+        if source.contains("struct RemoteAuthorizedTupleSetV1") {
+            return Some("tuple-set binary layout");
+        }
+        if source.contains("fn permission_ceiling_digest") {
+            return Some("ceiling digest derivation");
+        }
+        None
+    }
+
+    fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().and_then(|n| n.to_str()) == Some("target") {
+                    continue;
+                }
+                collect_rs_files(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
         }
     }
 
     #[test]
-    fn ownership_guard_permission_ceiling_digest_sole_derivation() {
-        // The digest helper is the sole encoder-to-SHA-256 derivation.
-        // Confirm it matches a manual computation and there is no alternative.
-        let c = RemotePermissionCeilingV1::empty();
-        let digest = permission_ceiling_digest(&c).unwrap();
-        let manual = Sha256::digest(c.encode().unwrap());
-        assert_eq!(digest.as_bytes(), manual.as_slice());
-        // Non-null: empty ceiling has a real digest.
-        assert_ne!(digest.as_bytes(), &[0u8; 32]);
-    }
+    fn remote_public_service_policy_ownership_guard() {
+        // (b) Non-vacuity proof: the detector flags a planted duplicate of each
+        // guarded structural definition (planted samples live only here, in
+        // test data, never in the source tree).
+        assert!(
+            scan_for_guarded_definition(
+                "pub enum RemoteProjectCapabilityV1 { ProjectRead = 1, ImageGenerationAdmin = 15 }"
+            )
+            .is_some()
+        );
+        assert!(
+            scan_for_guarded_definition("pub const TRANSPORT_BIT_WEBRTC: u8 = 0x01;").is_some()
+        );
+        assert!(
+            scan_for_guarded_definition("pub struct RemoteAuthorizedTupleSetV1 { ids: Vec<u16> }")
+                .is_some()
+        );
+        assert!(
+            scan_for_guarded_definition("pub fn permission_ceiling_digest() -> u8 { 0 }").is_some()
+        );
+        // Usages must NOT be flagged (the detector matches definitions only).
+        assert!(scan_for_guarded_definition("permission_ceiling_digest(&ceiling)?;").is_none());
+        assert!(
+            scan_for_guarded_definition("let c = RemoteProjectCapabilityV1::ProjectRead;")
+                .is_none()
+        );
 
-    #[test]
-    fn ownership_guard_transport_bits_sole_definition() {
-        // The transport bit assignments are sole and closed.
-        assert_eq!(TRANSPORT_BIT_WEBRTC, 0x01);
-        assert_eq!(TRANSPORT_BIT_WEBSOCKET_DATA, 0x02);
-        assert_eq!(TRANSPORT_BITS_VALID, [0x01, 0x02, 0x03]);
-    }
+        // (a) The real tree carries no second definition anywhere in `crates/`
+        // or `apps/cli/src`, except this foundation module itself.
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = manifest
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("repo root");
+        let mut files = Vec::new();
+        collect_rs_files(&repo_root.join("crates"), &mut files);
+        collect_rs_files(&repo_root.join("apps").join("cli").join("src"), &mut files);
+        assert!(!files.is_empty(), "ownership scan found no source files");
+        for file in &files {
+            if file.file_name().and_then(|n| n.to_str()) == Some("remote_public_service_policy.rs") {
+                continue; // the sole definition site
+            }
+            let content = std::fs::read_to_string(file).unwrap_or_default();
+            if let Some(reason) = scan_for_guarded_definition(&content) {
+                panic!("duplicate {reason} found in {}", file.display());
+            }
+        }
 
-    #[test]
-    fn ownership_guard_consumer_registry_closed() {
-        // A future consumer cannot affect a policy field until a reviewed
-        // schema version adds its stable ID. The registry is closed at V1.
-        assert_eq!(CRITICAL_CONSUMER_IDS.len(), 8);
-        // No consumer named "future_consumer" exists.
-        assert!(!CRITICAL_CONSUMER_IDS.contains(&"future_consumer"));
+        // (c) Production consumers import the foundation definitions rather than
+        // redefining them.
+        let tenant = std::fs::read_to_string(
+            repo_root
+                .join("crates")
+                .join("cockpit-proto")
+                .join("src")
+                .join("remote_tenant_authority_protocol.rs"),
+        )
+        .expect("tenant protocol source");
+        assert!(
+            tenant.contains("remote_public_service_policy::"),
+            "tenant authority protocol must import foundation definitions"
+        );
     }
 
     // --- Constant-time digest comparison note ---

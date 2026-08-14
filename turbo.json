@@ -33,6 +33,7 @@
         "RELAY_*",
         "REMOTE_AUTHORITY_*",
         "REMOTE_GRANT_SIGNING_KEY_*",
+        "REMOTE_PUBLIC_SERVICE_*",
         "NODE_ENV",
         "PORT",
         "HOST",

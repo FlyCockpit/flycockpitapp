@@ -90,6 +90,12 @@
     "./lib/remote-authority-storage": {
       "default": "./src/lib/remote-authority-storage.ts"
     },
+    "./lib/remote-public-policy": {
+      "default": "./src/lib/remote-public-policy.ts"
+    },
+    "./lib/remote-public-policy-storage": {
+      "default": "./src/lib/remote-public-policy-storage.ts"
+    },
     "./lib/remote-signaling-store": {
       "default": "./src/lib/remote-signaling-store.ts"
     },

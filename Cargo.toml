@@ -59,6 +59,12 @@ libc = "0.2"
 lsp-types = "0.97"
 monty = { git = "https://github.com/pydantic/monty.git", rev = "4cae0789864668b6b642a02c1b06d352f5a67313" }
 notify = "8"
+# ES256 (ECDSA/P-256) verification for signed public service policy / attempt
+# grants. Exact-pinned, pure Rust, MSRV 1.95-compatible, no C toolchain; already
+# vendored in Cargo.lock transitively (dimpl, str0m-rust-crypto) and as a
+# cockpit-proto dev-dependency. The single workspace pin for direct consumers —
+# no other crate may introduce a second p256 version pin.
+p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa", "arithmetic", "digest"] }
 predicates = "3"
 rand = "0.10"
 rayon = "1"

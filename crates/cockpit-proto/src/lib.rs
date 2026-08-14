@@ -24,6 +24,7 @@
 //! can be detected on a per-line basis without buffering. Clients
 //! refuse envelopes whose `v` is outside the supported range.
 
+pub mod es256;
 pub mod remote_connection_metadata;
 pub mod remote_device_identity_enrollment;
 pub mod remote_enterprise_connection_policy;

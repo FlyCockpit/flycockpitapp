@@ -1,6 +1,7 @@
 import { storage } from "@flycockpit/api/lib/storage";
 import { env } from "@flycockpit/env/shared";
 import type {
+  ActivateDuePoliciesJobData,
   AnalyzeAssetJobData,
   CleanupAssetsJobData,
   CleanupVideosJobData,
@@ -11,6 +12,9 @@ import type {
   TranscodeVideoJobData,
 } from "@flycockpit/queue";
 import {
+  ACTIVATE_DUE_POLICIES_REPEAT_EVERY_MS,
+  ACTIVATE_DUE_POLICIES_REPEAT_KEY,
+  activateDuePoliciesQueue,
   CLEANUP_ASSETS_CRON_KEY,
   CLEANUP_ASSETS_CRON_PATTERN,
   CLEANUP_VIDEOS_CRON_KEY,
@@ -22,6 +26,7 @@ import {
 } from "@flycockpit/queue";
 import { Worker } from "bullmq";
 
+import { handleActivateDuePoliciesJob } from "./handlers/activate-due-policies.js";
 import { handleAnalyzeAssetJob } from "./handlers/analyze-asset.js";
 import { handleCleanupAssetsJob } from "./handlers/cleanup-assets.js";
 import { handleCleanupVideosJob } from "./handlers/cleanup-videos.js";
@@ -176,6 +181,24 @@ cleanupVideosWorker.on("failed", (job, err) => {
   void reportJobFailure("cleanup-videos", job, err);
 });
 
+// Public-service-policy activation — a DB-time state machine woken by BullMQ.
+// Concurrency 1: the scan supersedes pointers and appends outbox rows, and two
+// overlapping scans would race the same rows for no gain.
+const activateDuePoliciesWorker = new Worker<ActivateDuePoliciesJobData>(
+  QUEUE_NAMES.activateDuePolicies,
+  handleActivateDuePoliciesJob,
+  { connection, concurrency: 1 },
+);
+
+activateDuePoliciesWorker.on("completed", (job) => {
+  console.log(`[activate-due-policies] Job ${job.id} completed`);
+});
+
+activateDuePoliciesWorker.on("failed", (job, err) => {
+  console.error(`[activate-due-policies] Job ${job?.id} failed:`, err.message);
+  void reportJobFailure("activate-due-policies", job, err);
+});
+
 // Database seed — on-demand only (no cron). Concurrency 1: never run two seeds
 // at once. Single-attempt; a failed author-written seed surfaces to the admin.
 const seedWorker = new Worker<SeedJobData>(QUEUE_NAMES.seed, handleSeedJob, {
@@ -252,6 +275,25 @@ if (storage) {
   console.log("[cleanup] Object storage is not configured; cleanup crons not registered.");
 }
 
+// Register the activation wakeup. `repeatJobKey` + `jobId` keep it idempotent
+// across restarts. Correctness is DB-time, so the cadence only bounds latency.
+try {
+  await activateDuePoliciesQueue.add(
+    "activate-due-policies",
+    { reason: "cron" },
+    {
+      repeat: {
+        every: ACTIVATE_DUE_POLICIES_REPEAT_EVERY_MS,
+        key: ACTIVATE_DUE_POLICIES_REPEAT_KEY,
+      },
+      jobId: ACTIVATE_DUE_POLICIES_REPEAT_KEY,
+    },
+  );
+  console.log("[activate-due-policies] Registered wakeup.");
+} catch (err) {
+  console.error("[activate-due-policies] Failed to register wakeup:", err);
+}
+
 console.log("Worker started — listening for jobs…");
 
 // ---------------------------------------------------------------------------
@@ -274,6 +316,7 @@ async function shutdown(signal: string) {
       transcodeAudioTrackWorker.close(),
       cleanupVideosWorker.close(),
       seedWorker.close(),
+      activateDuePoliciesWorker.close(),
       ...(enterpriseLogExportWorker ? [enterpriseLogExportWorker.close()] : []),
     ]);
     console.log("[worker] BullMQ workers closed.");

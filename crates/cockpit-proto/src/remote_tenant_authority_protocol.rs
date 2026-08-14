@@ -1368,7 +1368,9 @@ pub struct FcarAttemptRequest {
     pub requested_at: i64,
 }
 impl FcarAttemptRequest {
-    pub fn encode(&self) -> Result<Vec<u8>> {
+    /// Encode the FCAR request. `revoked` is the policy-owned tuple revocation
+    /// set threaded from the caller; it is not hardcoded here.
+    pub fn encode(&self, revoked: &[u16]) -> Result<Vec<u8>> {
         validate_nonzero_id(&self.logical_attachment_id)?;
         validate_nonzero_id(&self.child_attempt_id)?;
         validate_nonzero_id(&self.daemon_instance_id)?;
@@ -1378,7 +1380,7 @@ impl FcarAttemptRequest {
             tuple_ids: self.tuple_ids.clone(),
         };
         let tuple_bytes = tuple_set
-            .encode()
+            .encode(revoked)
             .map_err(|e| TenantAuthorityProtocolError::Evidence(e.to_string()))?;
         let ceiling = RemotePermissionCeilingV1::decode(&self.permission_ceiling)
             .map_err(|e| TenantAuthorityProtocolError::Evidence(e.to_string()))?;

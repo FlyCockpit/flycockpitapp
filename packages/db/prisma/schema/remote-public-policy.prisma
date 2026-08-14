@@ -1,0 +1,128 @@
+// Signed public SaaS remote service-policy control plane.
+//
+// The immutable policy rows, the eight closed consumer groups, the replica
+// leases, the per-activation membership snapshots, and the append-only outbox
+// that back `packages/api/src/lib/remote-public-policy-storage.ts`. The three
+// enums mirror the cross-language `PolicyRowState`, `ConsumerGroupState`, and
+// `ReplicaLeaseState` string vocabularies pinned by the fixture corpus. There
+// is no datasource/generator block here — they live in `schema.prisma`.
+//
+// BigInt-style counters are `Decimal @db.Decimal(20, 0)` (matching the
+// remote-authority schema); timestamps are database-issued `DateTime`.
+
+enum RemotePolicyRowState {
+  scheduled
+  preparing
+  active_converging
+  active
+  active_convergence_failed
+  scheduled_failed
+}
+
+enum RemoteConsumerGroupState {
+  disabled
+  required
+  draining
+  retired
+}
+
+enum RemoteReplicaLeaseState {
+  starting
+  ready
+  draining
+  stale
+}
+
+model RemotePublicServicePolicy {
+  policyId           String               @id
+  serviceVersion     Decimal              @unique @db.Decimal(20, 0)
+  changeClass        String
+  compactJws         String
+  payloadDigest      String               @unique
+  previousDigest     String?
+  issuedAt           DateTime
+  notBefore          DateTime
+  state              RemotePolicyRowState
+  verifiedKid        String
+  verifiedJwk        String
+  thumbprint         String
+  ringDigest         String
+  supersedesPolicyId String?
+  createdAt          DateTime             @default(now())
+  updatedAt          DateTime             @updatedAt
+
+  @@index([state, notBefore])
+  @@map("remote_public_service_policies")
+}
+
+model RemotePolicyConsumerGroup {
+  consumerId           String                   @id
+  state                RemoteConsumerGroupState
+  membershipGeneration Decimal                  @db.Decimal(20, 0)
+  evaluatorDigest      String
+  createdAt            DateTime                 @default(now())
+  updatedAt            DateTime                 @updatedAt
+
+  @@map("remote_policy_consumer_groups")
+}
+
+model RemotePolicyConsumerReplicaLease {
+  replicaId            String                  @id
+  consumerId           String
+  replicaGeneration    Decimal                 @db.Decimal(20, 0)
+  membershipGeneration Decimal                 @db.Decimal(20, 0)
+  evaluatorDigest      String
+  serviceVersion       Decimal                 @db.Decimal(20, 0)
+  policyDigest         String
+  state                RemoteReplicaLeaseState
+  observedAt           DateTime
+  expiresAt            DateTime
+  createdAt            DateTime                @default(now())
+  updatedAt            DateTime                @updatedAt
+
+  @@index([consumerId])
+  @@map("remote_policy_consumer_replica_leases")
+}
+
+model RemotePolicyActivationSnapshot {
+  id                   String   @id
+  policyId             String
+  consumerId           String
+  membershipGeneration Decimal  @db.Decimal(20, 0)
+  replicaId            String
+  replicaGeneration    Decimal  @db.Decimal(20, 0)
+  createdAt            DateTime @default(now())
+
+  @@index([policyId])
+  @@map("remote_policy_activation_snapshots")
+}
+
+model RemotePublicServicePolicyOutbox {
+  eventId        String    @id
+  policyId       String
+  serviceVersion Decimal   @db.Decimal(20, 0)
+  eventType      String
+  payload        String
+  createdAt      DateTime  @default(now())
+  deliveredAt    DateTime?
+
+  @@unique([policyId, eventType])
+  @@index([policyId, deliveredAt])
+  @@map("remote_public_service_policy_outbox")
+}
+
+// Durable audit of every authenticated stale-lease reap. A reap shrinks a
+// required-member set, so the operator evidence string is recorded here in the
+// SAME transaction as the lease delete — an authenticated reap always leaves an
+// auditable record of why membership changed.
+model RemotePolicyLeaseReapAudit {
+  auditId              String   @id
+  replicaId            String
+  consumerId           String
+  membershipGeneration Decimal  @db.Decimal(20, 0)
+  evidence             String
+  reapedAt             DateTime @default(now())
+
+  @@index([consumerId])
+  @@map("remote_policy_lease_reap_audits")
+}

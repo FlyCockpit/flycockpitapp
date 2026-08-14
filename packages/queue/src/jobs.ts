@@ -120,6 +120,18 @@ export const enterpriseLogExportJobSchema = z.object({
 export type EnterpriseLogExportJobData = z.infer<typeof enterpriseLogExportJobSchema>;
 
 /**
+ * Wake up the public-service-policy activation state machine. The job is a
+ * pure wakeup — it carries no correctness payload. Every activation predicate
+ * (notBefore, convergence, lease expiry/reap) is a DB-time check inside the
+ * store, so a missed or late firing changes only latency, never the outcome.
+ */
+export const activateDuePoliciesJobSchema = z.object({
+  reason: z.enum(["wakeup", "cron"]).default("wakeup"),
+});
+
+export type ActivateDuePoliciesJobData = z.infer<typeof activateDuePoliciesJobSchema>;
+
+/**
  * Queue names — use these constants instead of string literals.
  */
 export const QUEUE_NAMES = {
@@ -131,7 +143,14 @@ export const QUEUE_NAMES = {
   cleanupVideos: "cleanup-videos",
   seed: "seed",
   enterpriseLogExport: "enterprise-log-export",
+  activateDuePolicies: "activate-due-policies",
 } as const;
+
+/** Repeat key for the public-service-policy activation wakeup. */
+export const ACTIVATE_DUE_POLICIES_REPEAT_KEY = "activate-due-policies-wakeup";
+
+/** Wakeup cadence (ms) for the activation state machine — DB time is authoritative. */
+export const ACTIVATE_DUE_POLICIES_REPEAT_EVERY_MS = 60_000;
 
 /** Repeat key for the 24h video-cleanup cron. */
 export const CLEANUP_VIDEOS_CRON_KEY = "cleanup-videos-daily";

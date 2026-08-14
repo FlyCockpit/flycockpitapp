@@ -624,6 +624,31 @@ pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Write a secret-bearing session-export artifact, failing closed on any build
+/// whose platform cannot enforce the private-file security discipline.
+///
+/// A session export (redacted or, via the explicit local opt-in, raw) always
+/// contains material that must never land world-readable — API keys, tokens,
+/// SSH material, and prompt/response bodies. On a platform where
+/// [`PRIVATE_FS_POLICY`] does not report `enforced()` (every field `false` on
+/// non-Unix until `private-fs-windows-parity` lands), we refuse to write the
+/// export rather than emit a file without the 0600 / ownership / no-follow
+/// guarantees. Callers on such platforms surface the error and produce no
+/// output file. On an enforcing platform this is exactly
+/// [`write_private_file`]; the gate is additive and consumes the single
+/// policy witness rather than re-deciding `cfg!(unix)`.
+pub fn write_private_export_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    if !PRIVATE_FS_POLICY.enforced() {
+        anyhow::bail!(
+            "refusing to write export `{}`: this build does not enforce private-file \
+             security (0600 permissions, ownership, and no-follow); \
+             `private-fs-windows-parity` closes this gap",
+            path.display()
+        );
+    }
+    write_private_file(path, bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

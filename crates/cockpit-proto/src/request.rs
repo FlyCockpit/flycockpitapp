@@ -433,10 +433,13 @@ pub enum Request {
     },
 
     /// Return export-ready session data while leaving user-path file writing
-    /// to the client. Every export is a permanently redacted, portable
-    /// artifact; there is no `include_sensitive` bypass. Provider trust may
-    /// let raw values reach a trusted model at inference time, but that
-    /// runtime custody decision never relaxes export redaction.
+    /// to the client. Every RPC export is a permanently redacted, portable
+    /// artifact: this request carries no raw/bypass field, and the daemon
+    /// always assembles it through the enforced redaction path, so
+    /// `redact.enabled = false` and provider trust never relax export
+    /// redaction. The single unredacted export is the explicit local
+    /// `cockpit export --include-sensitive` CLI flag, which never travels over
+    /// this RPC.
     ExportSessionData {
         session_id: Uuid,
         kind: ExportSessionKind,

@@ -1050,6 +1050,14 @@ pub struct ExportArgs {
     /// Include generated/cache/prior-export artifacts from raw config layer copies.
     #[arg(long)]
     pub include_generated: bool,
+
+    /// EXPLICIT LOCAL RAW EXPORT. Write the archive WITHOUT redaction — it will
+    /// contain raw secrets (API keys, tokens, credentials, SSH material). This
+    /// is the single unredacted export path and is local + CLI-only: the daemon
+    /// RPC and the TUI export stay invariantly redacted. A stderr warning is
+    /// printed on every use and `manifest.json` records `"redacted": false`.
+    #[arg(long)]
+    pub include_sensitive: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -1448,11 +1456,38 @@ mod tests {
     }
 
     #[test]
-    fn export_has_no_include_sensitive_flag() {
-        // `--include-sensitive` was removed: every export is a permanently
-        // redacted, portable artifact. The flag must not parse.
-        let result = Cli::try_parse_from(["cockpit", "export", "abc123", "--include-sensitive"]);
-        assert!(result.is_err(), "--include-sensitive must not be accepted");
+    fn export_include_sensitive_flag_parses() {
+        // `--include-sensitive` is the explicit LOCAL raw-export opt-in: it
+        // parses on `cockpit export` and sets the typed flag; a default export
+        // leaves it false.
+        let cli =
+            Cli::try_parse_from(["cockpit", "export", "abc123", "--include-sensitive"]).unwrap();
+        match cli.command {
+            Some(Command::Export(args)) => {
+                assert_eq!(args.session_id.as_deref(), Some("abc123"));
+                assert!(
+                    args.include_sensitive,
+                    "--include-sensitive must set the flag"
+                );
+            }
+            other => panic!("expected export command, got {other:?}"),
+        }
+
+        // Absent by default: the non-bypassable redacted path.
+        let cli = Cli::try_parse_from(["cockpit", "export", "abc123"]).unwrap();
+        match cli.command {
+            Some(Command::Export(args)) => assert!(
+                !args.include_sensitive,
+                "the default export must leave include_sensitive false"
+            ),
+            other => panic!("expected export command, got {other:?}"),
+        }
+
+        // No other subcommand accepts the raw opt-in — it is export-local.
+        assert!(
+            Cli::try_parse_from(["cockpit", "import", "some.zip", "--include-sensitive"]).is_err(),
+            "`--include-sensitive` must be rejected outside `cockpit export`"
+        );
     }
 
     #[test]

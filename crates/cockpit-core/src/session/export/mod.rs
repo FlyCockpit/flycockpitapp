@@ -373,6 +373,18 @@ fn fs_safe(s: &str) -> String {
         .collect()
 }
 
+/// `fs_safe` applied to a session-derived path component **after** it has been
+/// scrubbed through the export redaction table. Every ZIP member path built
+/// from session data (call ids, provider/model names, delegation labels) is
+/// routed through here so a secret embedded in an identifier is redacted before
+/// `fs_safe` sanitization and before `start_file` — never written raw into an
+/// archive entry name. Scrub first, then `fs_safe`, so the placeholder's spaces
+/// and `*` collapse to `_`. The corresponding event `"file"`/`"output_file"`
+/// values are always set from the same emitted path, so references never dangle.
+fn fs_safe_scrubbed(s: &str, redactor: &RedactionTable) -> String {
+    fs_safe(&redactor.scrub(s))
+}
+
 /// What a completed bundle write produced — surfaced so callers (CLI
 /// and the TUI debug export) can report identical stats.
 #[derive(Debug)]
@@ -388,10 +400,16 @@ pub struct BundleBytes {
 }
 
 /// Assemble the full debug bundle for `target` and return the zip bytes
-/// instead of writing them to a caller-selected path. The archive is always
-/// redacted: there is no `include_sensitive` bypass. Provider trust may let
-/// raw values reach a trusted model during inference, but that custody
-/// decision never relaxes export redaction.
+/// instead of writing them to a caller-selected path.
+///
+/// This is the **default, non-bypassable** path: every member is scrubbed
+/// through the enforced export redaction table, so `redact.enabled = false`
+/// cannot disable export scrubbing, and provider trust — which may let raw
+/// values reach a trusted model during inference — never relaxes export
+/// redaction. The daemon RPC and TUI export exclusively through this path. The
+/// only unredacted export is the explicit local
+/// [`build_bundle_zip_bytes_raw_local`] (`cockpit export --include-sensitive`),
+/// which is never reachable over the RPC or the TUI.
 pub async fn build_bundle_zip_bytes(
     db: &Db,
     target: &SessionRow,
@@ -407,6 +425,43 @@ pub async fn build_bundle_zip_bytes(
             target_id,
             ExportBundleOptions {
                 include_generated_artifacts,
+                redacted: true,
+            },
+            &env,
+        )
+    })
+    .await
+}
+
+/// EXPLICIT LOCAL RAW EXPORT — the single unredacted export path (user-settled
+/// exception).
+///
+/// This emits every stored artifact **as-is**, with no scrubbing: it builds an
+/// empty redaction table (a no-op matcher), performs **no**
+/// `protected_redaction_history` rehydration, and starts **no** secure-key
+/// actor / key resolver. `manifest.json` records `"redacted": false`.
+///
+/// It is a distinct entry point rather than a boolean threaded onto the
+/// redacted path precisely so a future RPC/TUI caller cannot reach raw output
+/// by omission: only the local `cockpit export --include-sensitive` command
+/// surface calls this. The daemon RPC (`Request::ExportSessionData`) and the
+/// TUI have no raw option and stay invariantly redacted.
+pub async fn build_bundle_zip_bytes_raw_local(
+    db: &Db,
+    target: &SessionRow,
+    include_generated_artifacts: bool,
+) -> Result<BundleBytes> {
+    let db_for_files = db.clone();
+    let target_id = target.session_id;
+    db.read(move |conn| {
+        let env = process_env_map();
+        assemble_bundle_snapshot_conn(
+            &db_for_files,
+            conn,
+            target_id,
+            ExportBundleOptions {
+                include_generated_artifacts,
+                redacted: false,
             },
             &env,
         )
@@ -446,7 +501,7 @@ pub async fn write_bundle_zip(
         crate::private_fs::ensure_output_parent_private(parent)
             .with_context(|| format!("securing export directory `{}`", parent.display()))?;
     }
-    crate::private_fs::write_private_file(out_path, &bundle.bytes)
+    crate::private_fs::write_private_export_file(out_path, &bundle.bytes)
         .with_context(|| format!("writing private export to `{}`", out_path.display()))?;
 
     Ok(bundle.summary)
@@ -476,6 +531,7 @@ pub fn write_bundle_zip_blocking_for_sync_cli(
             target_id,
             ExportBundleOptions {
                 include_generated_artifacts,
+                redacted: true,
             },
             &env,
         )
@@ -487,7 +543,42 @@ pub fn write_bundle_zip_blocking_for_sync_cli(
         crate::private_fs::ensure_output_parent_private(parent)
             .with_context(|| format!("securing export directory `{}`", parent.display()))?;
     }
-    crate::private_fs::write_private_file(out_path, &bundle.bytes)
+    crate::private_fs::write_private_export_file(out_path, &bundle.bytes)
+        .with_context(|| format!("writing private export to `{}`", out_path.display()))?;
+
+    Ok(bundle.summary)
+}
+
+/// EXPLICIT LOCAL RAW EXPORT twin of [`write_bundle_zip`] for the
+/// `cockpit export --include-sensitive` command. Assembles the **unredacted**
+/// archive via [`build_bundle_zip_bytes_raw_local`] and writes it through the
+/// same fail-closed private-file gate and `overwrite`/`--force` clobber policy
+/// as the redacted path. It starts no secure-key actor and rehydrates nothing.
+/// The stderr "raw secrets" warning is emitted by the CLI command surface, not
+/// here.
+pub async fn write_bundle_zip_raw_local(
+    db: &Db,
+    target: &SessionRow,
+    out_path: &std::path::Path,
+    overwrite: bool,
+    include_generated_artifacts: bool,
+) -> Result<BundleSummary> {
+    if out_path.exists() && !overwrite {
+        anyhow::bail!(
+            "output path `{}` already exists — pass `--force` to overwrite",
+            out_path.display()
+        );
+    }
+
+    let bundle = build_bundle_zip_bytes_raw_local(db, target, include_generated_artifacts).await?;
+
+    if let Some(parent) = out_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        crate::private_fs::ensure_output_parent_private(parent)
+            .with_context(|| format!("securing export directory `{}`", parent.display()))?;
+    }
+    crate::private_fs::write_private_export_file(out_path, &bundle.bytes)
         .with_context(|| format!("writing private export to `{}`", out_path.display()))?;
 
     Ok(bundle.summary)
@@ -625,12 +716,37 @@ async fn collect_bundle(db: &Db, target_id: Uuid) -> Result<Vec<SessionRow>> {
 
 /// Assemble the `.zip` bytes in memory: `manifest.json`, the unified
 /// `events.json`, and one `inference_requests/` file per inference call
-/// across every session in the bundle. The archive is always redacted:
-/// there is no `include_sensitive` escape hatch. Provider trust controls
-/// inference custody only; it never relaxes export redaction.
-#[derive(Debug, Clone, Copy, Default)]
+/// across every session in the bundle.
+///
+/// `redacted` selects the export policy. The default (`true`) is the
+/// non-bypassable path: every member body **and** every session-derived member
+/// path is scrubbed through the enforced export redaction table
+/// (`redact.enabled = false` cannot disable it) and `manifest.json` records
+/// `"redacted": true`. The only `false` producer is the explicit local
+/// `cockpit export --include-sensitive` opt-in
+/// ([`build_bundle_zip_bytes_raw_local`]); it emits stored artifacts as-is via
+/// an empty (no-op) table and is never reachable over the daemon RPC or the
+/// TUI. Provider trust controls inference custody only; it never relaxes export
+/// redaction.
+#[derive(Debug, Clone, Copy)]
 struct ExportBundleOptions {
     include_generated_artifacts: bool,
+    /// Whether this export scrubs through the enforced redaction table. `true`
+    /// for every default path (CLI, TUI, RPC); `false` only for the explicit
+    /// local raw opt-in.
+    redacted: bool,
+}
+
+impl Default for ExportBundleOptions {
+    fn default() -> Self {
+        Self {
+            include_generated_artifacts: false,
+            // Default to the non-bypassable redacted policy: a raw export is
+            // only ever produced by the explicit local opt-in, never by
+            // omission.
+            redacted: true,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -694,7 +810,17 @@ fn build_zip_with_options_and_env_conn(
     options: ExportBundleOptions,
     env: &HashMap<String, String>,
 ) -> Result<Vec<u8>> {
-    let export_redactor = export_redaction_table_with_env(target, env)?;
+    let export_redactor = if options.redacted {
+        // Non-bypassable default: the enforced table unioned across every
+        // bundled session's persisted redaction-table union. Fails closed if a
+        // persisted table cannot be parsed.
+        export_redaction_table_for_bundle(target, bundle, env)?
+    } else {
+        // Explicit local raw export: a no-op table so every member body and
+        // member path is emitted exactly as stored. No journal rehydration and
+        // no key resolver are involved.
+        RedactionTable::empty()
+    };
     build_zip_with_options_and_env_conn_with_redactor(
         db,
         conn,
@@ -882,8 +1008,8 @@ fn build_zip_with_options_and_env_conn_with_redactor(
             let file = format!(
                 "{DELEGATION_PAYLOADS_DIR}/{}_{}_{}_{}.txt",
                 short,
-                fs_safe(&row.task_call_id),
-                fs_safe(&row.label),
+                fs_safe_scrubbed(&row.task_call_id, export_redactor),
+                fs_safe_scrubbed(&row.label, export_redactor),
                 fs_safe(&row.payload_hash)
             );
             let loaded = load_task_delegation_payload_from_row(db, &row);
@@ -975,7 +1101,7 @@ fn build_zip_with_options_and_env_conn_with_redactor(
                 "{TOOL_OUTPUT_DIR}/{:05}_{}_{}.json",
                 ev.seq,
                 short,
-                fs_safe(call_id)
+                fs_safe_scrubbed(call_id, export_redactor)
             );
             value["output_file"] = json!(path);
             if let Some(data) = value["data"].as_object_mut() {
@@ -1013,7 +1139,7 @@ fn build_zip_with_options_and_env_conn_with_redactor(
                 "{dir}/{:05}_{}_{}_o{}.json",
                 ev.seq,
                 short,
-                fs_safe(call_id),
+                fs_safe_scrubbed(call_id, export_redactor),
                 ordinal
             );
             // Surface the file reference on the event itself — pointing at
@@ -1065,9 +1191,9 @@ fn build_zip_with_options_and_env_conn_with_redactor(
                 "{REQ_DIR_TANDEM}/{:05}_{}_{}__{}_{}.json",
                 parent_seq,
                 short,
-                fs_safe(&rec.parent_call_id),
-                fs_safe(&rec.provider),
-                fs_safe(&rec.model),
+                fs_safe_scrubbed(&rec.parent_call_id, export_redactor),
+                fs_safe_scrubbed(&rec.provider, export_redactor),
+                fs_safe_scrubbed(&rec.model, export_redactor),
             );
             let tool_call_validation = tandem_validation::validate_tandem_tool_calls(
                 &rec.request,
@@ -1372,7 +1498,9 @@ fn build_manifest_conn(
         "session_count": bundle.len(),
         "excluded_generated_artifacts": !options.include_generated_artifacts,
         "include_generated_artifacts": options.include_generated_artifacts,
-        "redacted": true,
+        // `true` for every default (non-bypassable) export; `false` only for
+        // the explicit local `--include-sensitive` raw opt-in.
+        "redacted": options.redacted,
         "sessions": sessions,
     });
     if let Some(repair) = export_resume_repair_state_conn(conn, target)
@@ -1581,12 +1709,24 @@ pub fn process_env_map_for_conn() -> HashMap<String, String> {
     process_env_map()
 }
 
-/// Build the export redaction table for a session inside a read connection.
-/// This is the same non-bypassable redactor used by the debug ZIP path; the
-/// transcript JSON export shares it so both artifacts consume one portable
-/// redaction policy. The redactor is built from the target session's project
-/// root and the durable credential/environment journals — never from the
-/// inference-time provider-trust decision.
+/// Build the export redaction table for a single session inside a read
+/// connection. This is the same non-bypassable redactor used by the debug ZIP
+/// path; the transcript JSON export shares it so both artifacts consume one
+/// portable redaction policy.
+///
+/// The table is built from the target session's project root (its live
+/// dotenv / SSH-key / stored-credential scan) and the environment map passed
+/// in, unioned with the session's own persisted redaction-table union
+/// (`SessionRow::redaction_table_json`), and returned as the **enforced** view
+/// so `redact.enabled = false` never disables export scrubbing and the
+/// inference-time provider-trust decision never relaxes it. Fails closed if the
+/// persisted table JSON cannot be parsed.
+///
+/// NOTE: `protected_redaction_history` journal rows are not yet folded in here.
+/// Doing so requires threading a `RedactionKeyResolver` through the export read
+/// transaction (and, for the RPC path, moving transcript assembly out of
+/// dispatch); that journal-backed inventory is a follow-up. Rotated/deleted
+/// secrets are covered here only insofar as they remain in the persisted union.
 pub fn redaction_table_for_session_conn(
     _conn: &Connection,
     target: &SessionRow,
@@ -1607,10 +1747,52 @@ fn export_redaction_table_with_env(
     target: &SessionRow,
     env: &HashMap<String, String>,
 ) -> Result<RedactionTable> {
+    export_redaction_table_for_sessions(target, std::slice::from_ref(target), env)
+}
+
+/// The non-bypassable export redactor for a whole bundle: the target project's
+/// live scan unioned with **every** bundled session's persisted redaction-table
+/// union, forced enforced. Every bundled session's historically-persisted
+/// entries are included, so a secret the bundle's sessions saw is scrubbed even
+/// if it has since been rotated out of the live environment. Fails closed on
+/// any unparseable persisted table.
+fn export_redaction_table_for_bundle(
+    target: &SessionRow,
+    bundle: &[SessionRow],
+    env: &HashMap<String, String>,
+) -> Result<RedactionTable> {
+    export_redaction_table_for_sessions(target, bundle, env)
+}
+
+fn export_redaction_table_for_sessions(
+    target: &SessionRow,
+    sessions: &[SessionRow],
+    env: &HashMap<String, String>,
+) -> Result<RedactionTable> {
     let cwd = PathBuf::from(&target.project_root);
     let extended = crate::config::extended::load_for_cwd(&cwd);
-    RedactionTable::build_with_env_and_store(&extended.redact, &cwd, env)
-        .context("building export redaction table")
+    let mut table = RedactionTable::build_with_env_and_store(&extended.redact, &cwd, env)
+        .context("building export redaction table")?;
+    for session in sessions {
+        let Some(json) = session.redaction_table_json.as_deref() else {
+            continue;
+        };
+        // Fail closed: a persisted table that cannot be parsed aborts the
+        // export rather than silently dropping historically-classified secrets.
+        let persisted = RedactionTable::from_persisted_json(json).with_context(|| {
+            format!(
+                "parsing persisted redaction table for session {}",
+                session.session_id
+            )
+        })?;
+        table = table
+            .union(&persisted)
+            .context("unioning persisted redaction table into export table")?;
+    }
+    // Always the enforced view: `redact.enabled = false` never affects export
+    // output. Config still supplies the placeholder, denylist, allowlist, and
+    // dotenv patterns via the live build above.
+    Ok(table.enforced())
 }
 
 fn redact_value_for_export(value: &mut Value, redactor: &RedactionTable) {
@@ -1627,8 +1809,35 @@ fn redact_value_for_export(value: &mut Value, redactor: &RedactionTable) {
             }
         }
         Value::Object(map) => {
+            // Scrub every value first (in place), then scrub the object's KEYS.
+            // A secret can hide in a key just as readily as a value (a captured
+            // header map, an env dump, a tool-args object keyed by a token), so
+            // both sides of every entry are covered uniformly.
             for item in map.values_mut() {
                 redact_value_for_export(item, redactor);
+            }
+            // Rebuild the map with scrubbed keys. When two scrubbed keys render
+            // to the SAME text, we cannot keep either entry without arbitrarily
+            // dropping or overwriting one (which could resurrect or mis-attach a
+            // value), so the entire containing object is replaced by the uniform
+            // terminal collision object `{"<placeholder>": "<placeholder>"}` — a
+            // valid JSON shape that carries no colliding data.
+            let mut rebuilt = serde_json::Map::with_capacity(map.len());
+            let mut collided = false;
+            for (key, item) in std::mem::take(map) {
+                let scrubbed_key = redactor.scrub(&key);
+                if rebuilt.insert(scrubbed_key, item).is_some() {
+                    collided = true;
+                    break;
+                }
+            }
+            if collided {
+                let placeholder = redactor.placeholder().to_string();
+                let mut terminal = serde_json::Map::with_capacity(1);
+                terminal.insert(placeholder.clone(), Value::String(placeholder));
+                *map = terminal;
+            } else {
+                *map = rebuilt;
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}

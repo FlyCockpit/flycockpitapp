@@ -3064,6 +3064,7 @@ async fn bundle_export_is_one_wal_snapshot_across_all_query_phases() {
                 session_id,
                 ExportBundleOptions {
                     include_generated_artifacts: false,
+                    redacted: true,
                 },
                 &test_export_env(),
                 move || {
@@ -3703,6 +3704,7 @@ async fn manifest_has_version_and_session_date() {
         &bundle,
         ExportBundleOptions {
             include_generated_artifacts: true,
+            redacted: true,
         },
         &test_export_env(),
     )
@@ -4331,97 +4333,280 @@ async fn portable_export_stays_redacted_across_every_trust_mode_combination() {
     }
 }
 
-/// Acceptance criterion 1: no Rust source surface accepts, serializes,
-/// defaults, or honors `include_sensitive`, `--include-sensitive`, or an
-/// equivalent bypass. This is a structural grep over the crate sources so a
-/// future reintroduction (a new field, flag, or branching on a boolean
-/// bypass) is caught at test time rather than becoming a secret-delivery
-/// channel.
-#[test]
-fn export_has_no_include_sensitive_escape_hatch() {
-    use std::path::Path;
+/// RAII guard clearing the process-global runtime trust policy on drop (even on
+/// panic), so a test that trusts a tempdir root never leaks that policy into a
+/// sibling test when the binary runs in one process.
+struct RuntimeTrustGuard;
+impl Drop for RuntimeTrustGuard {
+    fn drop(&mut self) {
+        crate::config::trust::clear_runtime_policy_for_tests();
+    }
+}
 
-    // The crate root for `cockpit-core`.
-    let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    // The repository root (parent of the crate directory).
-    let repo_root = crate_root.parent().unwrap().parent().unwrap();
+/// Trust `root` at process-global scope so the project `.cockpit/config.json`
+/// layer is honored on the DB read-pool thread (where the export builds its
+/// redactor). `set_runtime_policy` is the mechanism production uses; task- and
+/// thread-local trust scopes do not cross into blocking DB workers.
+fn trust_export_root(root: &std::path::Path) -> RuntimeTrustGuard {
+    crate::config::trust::clear_runtime_policy_for_tests();
+    crate::config::trust::set_runtime_policy(
+        crate::config::trust::resolve_trust_root(root).unwrap(),
+        crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+    );
+    RuntimeTrustGuard
+}
 
-    // Source roots scanned for a bypass surface. The protocol, core, CLI, and
-    // TUI are the Rust surfaces that previously carried the field.
-    let scan_roots = [
-        crate_root.join("src"),
-        repo_root.join("crates/cockpit-proto/src"),
-        repo_root.join("apps/cli/src"),
-        repo_root.join("crates/cockpit-tui/src"),
-    ];
+/// AC2: `redact.enabled = false` must NOT disable export scrubbing. A portable
+/// archive can leave the machine, so the default export always uses the
+/// enforced view. The SAME sentinel the default export scrubs is emitted raw by
+/// the explicit `--include-sensitive` entry point — proving the default path
+/// did the scrubbing and that the old (unenforced, disabled-table) behavior
+/// would have leaked it.
+#[tokio::test]
+async fn export_redaction_ignores_config_opt_out() {
+    const SECRET: &str = "OPTOUT_EXPORT_SENTINEL_ABCDEF1234567";
 
-    // Substrings that indicate a bypass surface. The doc-comment phrase
-    // "there is no `include_sensitive` bypass" is permitted (it documents the
-    // invariant); an actual field, flag, struct member, or argument is not.
-    let forbidden = [
-        "include_sensitive: bool",
-        "include_sensitive: false",
-        "include_sensitive: true",
-        "--include-sensitive",
-        "include_sensitive,",
-        "include_sensitive)",
-        ".include_sensitive",
-    ];
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path().to_string_lossy().to_string();
+    std::fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
+    std::fs::write(
+        tmp.path().join(".cockpit/config.json"),
+        format!(
+            r#"{{"redact":{{"enabled":false,"scan_environment":false,"scan_dotenv":false,"denylist":["{SECRET}"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let _trust = trust_export_root(tmp.path());
 
-    let allow_phrase = "there is no `include_sensitive` bypass";
+    let db = Db::open_in_memory().unwrap();
+    let s = create_test_session(&db, "p", &root, "Build").await;
+    let sid = s.session_id;
+    db.insert_session_event(
+        sid,
+        SessionEventKind::UserMessage,
+        Some("Build"),
+        None,
+        &json!({ "text": format!("deploy {SECRET} now") }),
+    )
+    .await
+    .unwrap();
 
-    let mut hits = Vec::new();
-    for root in &scan_roots {
-        let walker = walkdir::WalkDir::new(root);
-        for entry in walker {
-            let entry = entry.unwrap();
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path();
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if ext != "rs" {
-                continue;
-            }
-            let source = std::fs::read_to_string(path).unwrap();
-            for (lineno, line) in source.lines().enumerate() {
-                let trimmed = line.trim();
-                // Permit the documenting comment.
-                if trimmed.contains(allow_phrase) {
-                    continue;
-                }
-                // Comment lines never carry an executable bypass surface. This
-                // also covers this test's own doc comment, which names the
-                // removed flag while describing the invariant it enforces.
-                if trimmed.starts_with("//") {
-                    continue;
-                }
-                for needle in forbidden {
-                    let Some(idx) = line.find(needle) else {
-                        continue;
-                    };
-                    // A match inside a double-quoted string literal is not a
-                    // code surface: it is either this test's own pattern list
-                    // or a test asserting the removed flag is rejected. Only an
-                    // unquoted code token (a real field, argument, or field
-                    // access) constitutes an actual bypass surface.
-                    let quotes_before = line[..idx].matches('"').count();
-                    if quotes_before % 2 == 1 {
-                        continue;
-                    }
-                    hits.push(format!(
-                        "{}:{}: {}",
-                        path.display(),
-                        lineno + 1,
-                        line.trim_end()
-                    ));
-                }
-            }
+    let target = get_test_session(&db, sid).await;
+
+    // Default (non-bypassable) export: sentinel scrubbed from every member even
+    // though `redact.enabled = false`.
+    let redacted = build_bundle_zip_bytes(&db, &target, false).await.unwrap();
+    let mut saw_member = false;
+    for name in entry_names(&redacted.bytes) {
+        if let Some(body) = read_zip_entry(&redacted.bytes, &name) {
+            saw_member = true;
+            assert!(
+                !body.contains(SECRET),
+                "redacted export leaked the sentinel in `{name}` despite redact.enabled=false",
+            );
         }
     }
+    assert!(saw_member, "the export produced no readable members");
+    let manifest = read_zip_entry(&redacted.bytes, "manifest.json").unwrap();
     assert!(
-        hits.is_empty(),
-        "found `include_sensitive` bypass surface(s) that must be removed:\n{}",
-        hits.join("\n")
+        manifest.contains("\"redacted\": true"),
+        "default export must mark manifest redacted:true",
+    );
+
+    // Explicit raw export of the SAME fixture: the sentinel is present. This is
+    // both the precondition proof (the sentinel really reached the artifact) and
+    // the distinguishing input (the enforced path had something to scrub).
+    let raw = build_bundle_zip_bytes_raw_local(&db, &target, false)
+        .await
+        .unwrap();
+    let events_raw = read_zip_entry(&raw.bytes, "events.json").unwrap();
+    assert!(
+        events_raw.contains(SECRET),
+        "raw export must emit the sentinel unredacted",
+    );
+    let raw_manifest = read_zip_entry(&raw.bytes, "manifest.json").unwrap();
+    assert!(
+        raw_manifest.contains("\"redacted\": false"),
+        "raw export must mark manifest redacted:false",
+    );
+}
+
+/// AC5: a sentinel appearing as a JSON object KEY is scrubbed. Two keys that
+/// scrub to the same placeholder replace their whole containing object with the
+/// uniform terminal collision object `{"<placeholder>": "<placeholder>"}`; a
+/// single secret key scrubs to the placeholder while its value is preserved.
+#[tokio::test]
+async fn export_json_key_collision_is_terminal_and_uniform() {
+    const SEC_A: &str = "KEYSENTINEL_ALPHA_0001XYZ";
+    const SEC_B: &str = "KEYSENTINEL_BRAVO_0002XYZ";
+    const PLACEHOLDER: &str = "**REDACTED BY COCKPIT - DO NOT TRY TO OBTAIN BY WORKAROUND**";
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path().to_string_lossy().to_string();
+    std::fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
+    std::fs::write(
+        tmp.path().join(".cockpit/config.json"),
+        format!(
+            r#"{{"redact":{{"scan_environment":false,"scan_dotenv":false,"denylist":["{SEC_A}","{SEC_B}"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let _trust = trust_export_root(tmp.path());
+
+    let db = Db::open_in_memory().unwrap();
+    let s = create_test_session(&db, "p", &root, "Build").await;
+    let sid = s.session_id;
+
+    // Build the event payload with the secrets as OBJECT KEYS (json! only takes
+    // literal keys, so construct the maps explicitly).
+    let mut collide = serde_json::Map::new();
+    collide.insert(SEC_A.to_string(), json!(1));
+    collide.insert(SEC_B.to_string(), json!(2));
+    let mut single = serde_json::Map::new();
+    single.insert(SEC_A.to_string(), json!("KEEPVALUE"));
+    let mut data = serde_json::Map::new();
+    data.insert("collide".to_string(), Value::Object(collide));
+    data.insert("single".to_string(), Value::Object(single));
+
+    db.insert_session_event(
+        sid,
+        SessionEventKind::UserMessage,
+        Some("Build"),
+        None,
+        &Value::Object(data),
+    )
+    .await
+    .unwrap();
+
+    let target = get_test_session(&db, sid).await;
+    let bundle = build_bundle_zip_bytes(&db, &target, false).await.unwrap();
+    let events = read_zip_entry(&bundle.bytes, "events.json").unwrap();
+
+    assert!(
+        !events.contains(SEC_A),
+        "sentinel A survived as an object key"
+    );
+    assert!(
+        !events.contains(SEC_B),
+        "sentinel B survived as an object key"
+    );
+
+    // Walk the parsed events for the exact shapes.
+    let parsed: Value = serde_json::from_str(&events).unwrap();
+    let mut objects: Vec<&serde_json::Map<String, Value>> = Vec::new();
+    fn collect<'a>(v: &'a Value, out: &mut Vec<&'a serde_json::Map<String, Value>>) {
+        match v {
+            Value::Object(m) => {
+                out.push(m);
+                for x in m.values() {
+                    collect(x, out);
+                }
+            }
+            Value::Array(a) => {
+                for x in a {
+                    collect(x, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    collect(&parsed, &mut objects);
+
+    // The two-secret-key object collapsed to EXACTLY the terminal object.
+    let terminal_present = objects.iter().any(|m| {
+        m.len() == 1 && m.get(PLACEHOLDER) == Some(&Value::String(PLACEHOLDER.to_string()))
+    });
+    assert!(
+        terminal_present,
+        "colliding keys did not collapse to the terminal collision object",
+    );
+
+    // The single-secret-key object scrubbed its KEY to the placeholder but kept
+    // its VALUE (distinguishes correct key-scrub from wholesale replacement).
+    let single_preserved = objects.iter().any(|m| {
+        m.len() == 1 && m.get(PLACEHOLDER) == Some(&Value::String("KEEPVALUE".to_string()))
+    });
+    assert!(
+        single_preserved,
+        "a single scrubbed key must keep its value (found no {{placeholder: KEEPVALUE}})",
+    );
+}
+
+/// AC11: the explicit local raw entry point emits planted sentinels raw and
+/// marks `manifest.json` redacted:false; the default entry point on the same
+/// fixture scrubs the sentinel and marks redacted:true. Both write to their
+/// destination through `private_fs::write_private_export_file`
+/// (`write_bundle_zip*`), and the raw path constructs no key resolver / actor.
+#[tokio::test]
+async fn include_sensitive_export_is_explicit_raw_local_and_marked() {
+    const SECRET: &str = "RAWLOCAL_EXPORT_SENTINEL_7654321FEDCBA";
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path().to_string_lossy().to_string();
+    std::fs::create_dir_all(tmp.path().join(".cockpit")).unwrap();
+    std::fs::write(
+        tmp.path().join(".cockpit/config.json"),
+        format!(
+            r#"{{"redact":{{"scan_environment":false,"scan_dotenv":false,"denylist":["{SECRET}"]}}}}"#
+        ),
+    )
+    .unwrap();
+    let _trust = trust_export_root(tmp.path());
+
+    let db = Db::open_in_memory().unwrap();
+    let s = create_test_session(&db, "p", &root, "Build").await;
+    let sid = s.session_id;
+    db.insert_session_event(
+        sid,
+        SessionEventKind::UserMessage,
+        Some("Build"),
+        None,
+        &json!({ "text": format!("token {SECRET} here") }),
+    )
+    .await
+    .unwrap();
+    let target = get_test_session(&db, sid).await;
+
+    // Raw path: writes an UNREDACTED archive to the destination.
+    let raw_out = tmp.path().join("raw-export.zip");
+    write_bundle_zip_raw_local(&db, &target, &raw_out, false, false)
+        .await
+        .unwrap();
+    assert!(
+        raw_out.exists(),
+        "raw export file must land at the destination"
+    );
+    let raw_bytes = std::fs::read(&raw_out).unwrap();
+    let raw_manifest = read_zip_entry(&raw_bytes, "manifest.json").unwrap();
+    assert!(raw_manifest.contains("\"redacted\": false"));
+    let raw_events = read_zip_entry(&raw_bytes, "events.json").unwrap();
+    assert!(
+        raw_events.contains(SECRET),
+        "raw export must contain the sentinel unredacted",
+    );
+
+    // Default path on the same fixture: redacted archive, marked true.
+    let red_out = tmp.path().join("redacted-export.zip");
+    write_bundle_zip(&db, &target, &red_out, false, false)
+        .await
+        .unwrap();
+    let red_bytes = std::fs::read(&red_out).unwrap();
+    let red_manifest = read_zip_entry(&red_bytes, "manifest.json").unwrap();
+    assert!(red_manifest.contains("\"redacted\": true"));
+    for name in entry_names(&red_bytes) {
+        if let Some(body) = read_zip_entry(&red_bytes, &name) {
+            assert!(
+                !body.contains(SECRET),
+                "redacted export leaked the sentinel in `{name}`",
+            );
+        }
+    }
+
+    // No-clobber without force is preserved on the raw path.
+    assert!(
+        write_bundle_zip_raw_local(&db, &target, &raw_out, false, false)
+            .await
+            .is_err(),
+        "raw export must refuse to overwrite without force",
     );
 }

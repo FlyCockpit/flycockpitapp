@@ -988,19 +988,34 @@ impl Db {
         record_id: String,
         claimed_version: i64,
     ) -> Result<Option<String>> {
+        // Version fence and literal fetch MUST be one atomic operation. A
+        // `read` closure runs on a connection without an open transaction, so a
+        // separate version read followed by a separate value read leaves a
+        // window in which a concurrent session rotate (which advances
+        // `active_version` and overwrites `sealed_values.value` in one write
+        // transaction) can commit between them and hand a v1 claim the v2
+        // plaintext. A single `SELECT` that joins the record to its literal and
+        // predicates on `active_version = claimed` closes that window: SQLite
+        // evaluates the statement against one consistent snapshot, and the
+        // rotate is atomic, so the query sees either the pre-rotate `(v1, v1)`
+        // pair or the post-rotate `(v2, v2)` pair — never a torn read — and a
+        // claim that no longer matches the live version yields no row.
         self.read(move |conn| {
-            let Some(record) = record_conn(conn, &record_id)? else {
-                return Ok(None);
-            };
-            if record.scope != SealedScopeKind::Session
-                || !record.is_resolvable()
-                || record.active_version != claimed_version
-            {
-                return Ok(None);
-            }
             conn.query_row(
-                "SELECT value FROM sealed_values WHERE session_id = ?1 AND value_id = ?2",
-                params![record.scope_key, record.name],
+                "SELECT sv.value
+                   FROM sealed_value_records r
+                   JOIN sealed_values sv
+                     ON sv.session_id = r.scope_key AND sv.value_id = r.name
+                  WHERE r.record_id = ?1
+                    AND r.scope = ?2
+                    AND r.deleted_at_ms IS NULL
+                    AND r.active_version >= 1
+                    AND r.active_version = ?3",
+                params![
+                    record_id,
+                    SealedScopeKind::Session.as_str(),
+                    claimed_version
+                ],
                 |row| row.get::<_, String>(0),
             )
             .optional()

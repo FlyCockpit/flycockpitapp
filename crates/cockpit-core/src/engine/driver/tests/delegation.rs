@@ -314,7 +314,7 @@ async fn sealed_subagent_inherits_parent_value_before_fork_point() {
     driver
         .session
         .set_sealed_value(
-            crate::sealed::OwnerAuthority::for_test(),
+            crate::sealed::OwnerAuthority::for_test("owner"),
             &crate::redact::RedactionTable::empty(),
             "parent_pre",
             literal,
@@ -344,7 +344,10 @@ async fn sealed_subagent_inherits_parent_value_before_fork_point() {
 
     assert!(
         child
-            .sealed_value_exists(crate::sealed::OwnerAuthority::for_test(), "parent_pre")
+            .sealed_value_exists(
+                crate::sealed::OwnerAuthority::for_test("owner"),
+                "parent_pre"
+            )
             .await
             .unwrap(),
         "subagent must inherit parent value sealed before fork point"
@@ -362,7 +365,7 @@ async fn sealed_subagent_inherits_parent_value_before_fork_point() {
     );
 
     let child_meta = child
-        .list_sealed_value_metadata(crate::sealed::OwnerAuthority::for_test())
+        .list_sealed_value_metadata(crate::sealed::OwnerAuthority::for_test("owner"))
         .await
         .unwrap();
     assert!(
@@ -383,7 +386,7 @@ async fn sealed_subagent_inherits_parent_value_before_fork_point() {
     }
     let parent_meta = driver
         .session
-        .list_sealed_value_metadata(crate::sealed::OwnerAuthority::for_test())
+        .list_sealed_value_metadata(crate::sealed::OwnerAuthority::for_test("owner"))
         .await
         .unwrap();
     for row in &parent_meta {
@@ -415,7 +418,7 @@ async fn sealed_subagent_does_not_inherit_late_parent_value() {
     driver
         .session
         .set_sealed_value(
-            crate::sealed::OwnerAuthority::for_test(),
+            crate::sealed::OwnerAuthority::for_test("owner"),
             &crate::redact::RedactionTable::empty(),
             "early_token",
             early,
@@ -438,7 +441,10 @@ async fn sealed_subagent_does_not_inherit_late_parent_value() {
     let (child, _history) = driver.prepare_fork_task_context().await.unwrap();
     assert!(
         child
-            .sealed_value_exists(crate::sealed::OwnerAuthority::for_test(), "early_token")
+            .sealed_value_exists(
+                crate::sealed::OwnerAuthority::for_test("owner"),
+                "early_token"
+            )
             .await
             .unwrap(),
         "value sealed before fork remains injectable on the child"
@@ -448,7 +454,7 @@ async fn sealed_subagent_does_not_inherit_late_parent_value() {
     driver
         .session
         .set_sealed_value(
-            crate::sealed::OwnerAuthority::for_test(),
+            crate::sealed::OwnerAuthority::for_test("owner"),
             &parent_table,
             "late_token",
             late,
@@ -461,20 +467,26 @@ async fn sealed_subagent_does_not_inherit_late_parent_value() {
     assert!(
         driver
             .session
-            .sealed_value_exists(crate::sealed::OwnerAuthority::for_test(), "late_token")
+            .sealed_value_exists(
+                crate::sealed::OwnerAuthority::for_test("owner"),
+                "late_token"
+            )
             .await
             .unwrap(),
         "parent must resolve its own late value"
     );
     assert!(
         !child
-            .sealed_value_exists(crate::sealed::OwnerAuthority::for_test(), "late_token")
+            .sealed_value_exists(
+                crate::sealed::OwnerAuthority::for_test("owner"),
+                "late_token"
+            )
             .await
             .unwrap(),
         "subagent must not see parent values written after the fork point"
     );
     let child_meta = child
-        .list_sealed_value_metadata(crate::sealed::OwnerAuthority::for_test())
+        .list_sealed_value_metadata(crate::sealed::OwnerAuthority::for_test("owner"))
         .await
         .unwrap();
     assert!(

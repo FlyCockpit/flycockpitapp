@@ -515,18 +515,40 @@ pub trait SealedHostAction: Send + Sync {
     async fn invoke(&self, literal: SealedLiteralHandle<'_>, params: &SealedParams) -> Result<()>;
 }
 
-/// Proof that a caller is the local Owner.
+/// The fixed local Owner principal string.
+///
+/// This is the sealed-owner identity *everywhere* in production — the capability
+/// stamp, the stored `owner_principal`, and the authority-comparison value are
+/// all this constant. It is deliberately **not** derived from
+/// `local_principal_name()` / `$USER`; the sealed channel has exactly one local
+/// Owner identity.
+pub const OWNER_PRINCIPAL: &str = "owner";
+
+/// Proof that a caller is the local Owner, carrying that Owner's verified
+/// principal identity.
 ///
 /// The only ways to obtain one are a genuine Owner principal and (in tests) an
 /// explicit constructor. Agents and remote clients cannot forge it, which is
 /// what keeps action compilation and value lifecycle out of their reach.
+///
+/// The carried principal is what makes wrong-owner rejection expressible: a
+/// capability minted under one authority records that authority's principal,
+/// and an apply under a different authority is rejected before any literal is
+/// touched. Production identity is always [`OWNER_PRINCIPAL`]; a synthetic
+/// mismatched principal can be minted only through the `#[cfg(test)]`
+/// constructor.
 #[derive(Debug, Clone, Copy)]
-pub struct OwnerAuthority(());
+pub struct OwnerAuthority {
+    principal: &'static str,
+}
 
 impl OwnerAuthority {
-    /// `Some` only for the local Owner principal.
+    /// `Some` only for the local Owner principal. The carried identity is
+    /// always the fixed [`OWNER_PRINCIPAL`] string, never `$USER`.
     pub fn from_principal(principal: &crate::daemon::principal::ClientPrincipal) -> Option<Self> {
-        principal.is_owner().then_some(Self(()))
+        principal.is_owner().then_some(Self {
+            principal: OWNER_PRINCIPAL,
+        })
     }
 
     /// Authority for a daemon request the command table already declared
@@ -535,15 +557,25 @@ impl OwnerAuthority {
     /// The transport check happens before dispatch, so by the time a handler
     /// runs the caller is known to be the Owner; this names that fact instead
     /// of re-deriving it. Restricted to the daemon so no agent-reachable code
-    /// can reach for it.
+    /// can reach for it. The carried principal is the fixed [`OWNER_PRINCIPAL`].
     pub(crate) fn for_owner_request() -> Self {
-        Self(())
+        Self {
+            principal: OWNER_PRINCIPAL,
+        }
     }
 
-    /// Test-only constructor. Never compiled into a shipping binary.
+    /// The verified Owner principal this authority carries. Safe to compare and
+    /// to store; it is never a secret.
+    pub fn principal(&self) -> &'static str {
+        self.principal
+    }
+
+    /// Test-only constructor. Never compiled into a shipping binary. Pass
+    /// `"owner"` for happy-path coverage, or a synthetic string (e.g. `"alice"`)
+    /// to exercise wrong-owner rejection in unit tests.
     #[cfg(test)]
-    pub fn for_test() -> Self {
-        Self(())
+    pub fn for_test(principal: &'static str) -> Self {
+        Self { principal }
     }
 }
 

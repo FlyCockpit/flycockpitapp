@@ -83,7 +83,7 @@ impl SealedFixture {
     }
 
     pub fn owner() -> OwnerAuthority {
-        OwnerAuthority::for_test()
+        OwnerAuthority::for_test("owner")
     }
 
     /// Create a resolvable sealed value in `scope` holding [`TEST_LITERAL`].
@@ -262,7 +262,7 @@ impl SealedHostAction for SignallingAction {
 
 /// A registry holding exactly the supplied actions.
 pub(super) fn registry_with(actions: Vec<Arc<dyn SealedHostAction>>) -> Arc<SealedActionRegistry> {
-    let mut builder = SealedActionRegistry::builder(OwnerAuthority::for_test());
+    let mut builder = SealedActionRegistry::builder(OwnerAuthority::for_test("owner"));
     for action in actions {
         builder = builder.with_action(action).expect("compiled action");
     }

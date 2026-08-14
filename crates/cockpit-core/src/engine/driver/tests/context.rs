@@ -2175,7 +2175,7 @@ async fn sealed_value_survives_completed_compaction() {
     driver
         .session
         .set_sealed_value(
-            crate::sealed::OwnerAuthority::for_test(),
+            crate::sealed::OwnerAuthority::for_test("owner"),
             driver.redact.as_ref(),
             "compact_keep",
             literal,
@@ -2210,7 +2210,10 @@ async fn sealed_value_survives_completed_compaction() {
     assert!(
         driver
             .session
-            .sealed_value_exists(crate::sealed::OwnerAuthority::for_test(), "compact_keep")
+            .sealed_value_exists(
+                crate::sealed::OwnerAuthority::for_test("owner"),
+                "compact_keep"
+            )
             .await
             .unwrap(),
         "sealed value must remain injectable after completed compaction"
@@ -2241,7 +2244,7 @@ async fn sealed_value_survives_compaction_and_resume() {
     driver
         .session
         .set_sealed_value(
-            crate::sealed::OwnerAuthority::for_test(),
+            crate::sealed::OwnerAuthority::for_test("owner"),
             driver.redact.as_ref(),
             "resume_keep",
             literal,
@@ -2271,7 +2274,10 @@ async fn sealed_value_survives_compaction_and_resume() {
     .expect("session must resume after compaction");
     assert!(
         resumed
-            .sealed_value_exists(crate::sealed::OwnerAuthority::for_test(), "resume_keep")
+            .sealed_value_exists(
+                crate::sealed::OwnerAuthority::for_test("owner"),
+                "resume_keep"
+            )
             .await
             .unwrap(),
         "resumed session must inject the pre-compaction sealed value"
@@ -2298,7 +2304,7 @@ async fn failed_compaction_does_not_change_sealed_state() {
     driver
         .session
         .set_sealed_value(
-            crate::sealed::OwnerAuthority::for_test(),
+            crate::sealed::OwnerAuthority::for_test("owner"),
             &crate::redact::RedactionTable::empty(),
             "fail_keep",
             literal,
@@ -2309,7 +2315,7 @@ async fn failed_compaction_does_not_change_sealed_state() {
         .unwrap();
     let before_meta = driver
         .session
-        .list_sealed_value_metadata(crate::sealed::OwnerAuthority::for_test())
+        .list_sealed_value_metadata(crate::sealed::OwnerAuthority::for_test("owner"))
         .await
         .unwrap();
     let before_table_json = driver
@@ -2349,14 +2355,17 @@ async fn failed_compaction_does_not_change_sealed_state() {
     assert!(
         driver
             .session
-            .sealed_value_exists(crate::sealed::OwnerAuthority::for_test(), "fail_keep")
+            .sealed_value_exists(
+                crate::sealed::OwnerAuthority::for_test("owner"),
+                "fail_keep"
+            )
             .await
             .unwrap(),
         "failed compaction must keep the pre-attempt sealed value injectable"
     );
     let after_meta = driver
         .session
-        .list_sealed_value_metadata(crate::sealed::OwnerAuthority::for_test())
+        .list_sealed_value_metadata(crate::sealed::OwnerAuthority::for_test("owner"))
         .await
         .unwrap();
     assert_eq!(

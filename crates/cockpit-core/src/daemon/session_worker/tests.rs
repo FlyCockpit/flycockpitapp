@@ -790,7 +790,7 @@ async fn worker_delete_removes_the_scoped_sealed_value_completely() {
     .await
     .unwrap();
 
-    let owner = crate::sealed::OwnerAuthority::for_test();
+    let owner = crate::sealed::OwnerAuthority::for_test("owner");
     let inventory = |db: Db, key: String| async move {
         db.sealed_value_inventory(cockpit_db::db::sealed_scope::SealedScopeKind::Session, key)
             .await

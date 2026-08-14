@@ -23,7 +23,7 @@ use crate::sealed::action::OwnerAuthority;
 use crate::sealed::identity::{SealedDescription, SealedProjectKey};
 
 fn owner() -> OwnerAuthority {
-    OwnerAuthority::for_test()
+    OwnerAuthority::for_test("owner")
 }
 
 fn project_key() -> SealedProjectKey {

@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use rand::Rng;
+use zeroize::Zeroizing;
 
 /// Opaque exact key length in bytes.
 pub const SEALED_COMPARTMENT_KEY_BYTES: usize = 32;
@@ -79,15 +80,35 @@ impl fmt::Debug for SealedCompartmentKey {
 /// the duration of a compiled host action's `invoke` call.
 pub struct SealedLiteral {
     /// Held as bytes rather than a `String` so `Drop` can zero the buffer in
-    /// place without `unsafe`. The source `String`'s allocation is moved in,
-    /// so no unscrubbed copy is left behind.
-    bytes: Box<[u8]>,
+    /// place without `unsafe`. Held as a `Vec` (not a boxed slice) so the source
+    /// `String`'s allocation moves in *unchanged*: `String::into_bytes` reuses
+    /// the allocation, whereas an `into_boxed_slice` may reallocate when the
+    /// capacity exceeds the length and free the original buffer — with the
+    /// plaintext still in it — without zeroing. `Drop` zeroes the whole
+    /// capacity, not just the initialized length, so no fragment survives even
+    /// when the source was over-allocated.
+    bytes: Vec<u8>,
 }
 
 impl SealedLiteral {
     pub fn new(value: impl Into<String>) -> Self {
         Self {
-            bytes: value.into().into_bytes().into_boxed_slice(),
+            bytes: value.into().into_bytes(),
+        }
+    }
+
+    /// Take ownership of a [`Zeroizing<String>`](zeroize::Zeroizing), moving the
+    /// allocation into the sealed buffer with no copy and no reallocation.
+    ///
+    /// The `String` is moved out of the zeroizing wrapper (which is left holding
+    /// an empty allocation it then zeroizes harmlessly) and its buffer becomes
+    /// the sealed buffer verbatim via `into_bytes` — no realloc, so the
+    /// plaintext lives in exactly one place, which `Drop` zeroes over its full
+    /// capacity. No unscrubbed copy is left behind at the frame boundary.
+    pub fn from_zeroizing(mut value: zeroize::Zeroizing<String>) -> Self {
+        let owned = std::mem::take(&mut *value);
+        Self {
+            bytes: owned.into_bytes(),
         }
     }
 
@@ -118,9 +139,13 @@ impl fmt::Debug for SealedLiteral {
 
 impl Drop for SealedLiteral {
     fn drop(&mut self) {
-        // Best-effort scrub so a freed allocation does not linger in the heap
-        // still holding a live literal.
-        self.bytes.fill(0);
+        // Scrub the initialized bytes AND the spare capacity, so no fragment of
+        // the literal survives in the freed allocation even when the source
+        // buffer was over-allocated (capacity > length).
+        self.bytes.as_mut_slice().fill(0);
+        for slot in self.bytes.spare_capacity_mut() {
+            slot.write(0);
+        }
     }
 }
 
@@ -192,7 +217,7 @@ impl SealedCompartment {
         let mut entries = self.load()?;
         entries.insert(
             key.as_str().to_string(),
-            literal.expose_for_redaction().to_string(),
+            Zeroizing::new(literal.expose_for_redaction().to_string()),
         );
         self.store(&entries)
     }
@@ -204,7 +229,29 @@ impl SealedCompartment {
     pub(crate) fn get_exact(&self, key: &SealedCompartmentKey) -> Result<Option<SealedLiteral>> {
         let _guard = self.lock_exclusive()?;
         let entries = self.load()?;
-        Ok(entries.get(key.as_str()).map(SealedLiteral::new))
+        // `SealedLiteral::new` takes ownership of a fresh `String` that it holds
+        // in its own zeroizing buffer, so this borrow-then-construct introduces
+        // no un-wiped plain copy.
+        Ok(entries
+            .get(key.as_str())
+            .map(|value| SealedLiteral::new(value.as_str())))
+    }
+
+    /// Exact-key read that yields the plaintext directly in [`Zeroizing`]
+    /// custody, moving it out of the freshly-loaded map with no extra copy.
+    ///
+    /// Used by the Owner recover path, which needs the literal as a
+    /// `Zeroizing<String>` and must not make a second plaintext allocation
+    /// (`SealedLiteral` + a `to_string`) that would outlive the move.
+    pub(crate) fn get_exact_zeroizing(
+        &self,
+        key: &SealedCompartmentKey,
+    ) -> Result<Option<zeroize::Zeroizing<String>>> {
+        let _guard = self.lock_exclusive()?;
+        let mut entries = self.load()?;
+        // Every loaded value is already in zeroizing custody; `remove` moves the
+        // requested one out (no clone) and drops the rest, wiping them.
+        Ok(entries.remove(key.as_str()))
     }
 
     /// Reclaim one locator. Idempotent, so saga cleanup may re-run it.
@@ -358,18 +405,36 @@ impl SealedCompartment {
         Ok(self.path.with_extension("lock"))
     }
 
-    fn load(&self) -> Result<BTreeMap<String, String>> {
+    /// Load the compartment map with **every** value under zeroizing custody.
+    ///
+    /// A compartment holds many sealed literals; recovering one must not leave
+    /// the siblings' plaintext in freed heap. Both the raw file buffer and every
+    /// parsed value are wiped on drop, so no plaintext fragment survives a load.
+    fn load(&self) -> Result<BTreeMap<String, Zeroizing<String>>> {
         match std::fs::read(&self.path) {
             Ok(bytes) if bytes.is_empty() => Ok(BTreeMap::new()),
             Ok(bytes) => {
-                serde_json::from_slice(&bytes).context("parsing sealed compartment contents")
+                // The raw file bytes hold every sealed literal in plaintext.
+                // Wrap them in `Zeroizing` so the read buffer is wiped when it
+                // drops at the end of this parse.
+                let bytes = Zeroizing::new(bytes);
+                // Parse into plain strings, then MOVE each value into
+                // `Zeroizing` (no copy — the parsed `String`'s buffer moves in),
+                // so every value — the requested one and its siblings — is
+                // wiped when the returned map drops.
+                let plain: BTreeMap<String, String> = serde_json::from_slice(&bytes)
+                    .context("parsing sealed compartment contents")?;
+                Ok(plain
+                    .into_iter()
+                    .map(|(key, value)| (key, Zeroizing::new(value)))
+                    .collect())
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
             Err(error) => Err(error).context("reading sealed compartment"),
         }
     }
 
-    fn store(&self, entries: &BTreeMap<String, String>) -> Result<()> {
+    fn store(&self, entries: &BTreeMap<String, Zeroizing<String>>) -> Result<()> {
         let parent = self
             .path
             .parent()
@@ -380,8 +445,17 @@ impl SealedCompartment {
         // We hold the lock, so any temp present now is a crashed writer's.
         self.sweep_temporaries()?;
 
-        let serialized =
-            serde_json::to_vec_pretty(entries).context("serializing sealed compartment")?;
+        // Serialize through a borrowed `&str` view (no plaintext copy of the
+        // values) and hold the serialized JSON — which is plaintext — in
+        // zeroizing custody so the write buffer is wiped when it drops. The
+        // on-disk format is byte-identical to a `BTreeMap<String, String>`.
+        let view: BTreeMap<&str, &str> = entries
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        let serialized = Zeroizing::new(
+            serde_json::to_vec_pretty(&view).context("serializing sealed compartment")?,
+        );
         // A per-writer temp name created with `create_new`, so one writer can
         // never publish another's half-written bytes and a stale temp from a
         // crashed process is never adopted.

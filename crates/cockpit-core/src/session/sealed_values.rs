@@ -330,7 +330,7 @@ mod tests {
         let initial = crate::redact::RedactionTable::empty();
         session
             .set_sealed_value(
-                crate::sealed::OwnerAuthority::for_test(),
+                crate::sealed::OwnerAuthority::for_test("owner"),
                 &initial,
                 "prod_token",
                 "first-high-entropy-token",
@@ -347,7 +347,7 @@ mod tests {
         );
         session
             .set_sealed_value(
-                crate::sealed::OwnerAuthority::for_test(),
+                crate::sealed::OwnerAuthority::for_test("owner"),
                 &first_table,
                 "prod_token",
                 "second-high-entropy-token",
@@ -364,17 +364,26 @@ mod tests {
         );
         assert!(
             session
-                .sealed_value_exists(crate::sealed::OwnerAuthority::for_test(), "prod_token")
+                .sealed_value_exists(
+                    crate::sealed::OwnerAuthority::for_test("owner"),
+                    "prod_token"
+                )
                 .await
                 .unwrap()
         );
         session
-            .delete_sealed_value(crate::sealed::OwnerAuthority::for_test(), "prod_token")
+            .delete_sealed_value(
+                crate::sealed::OwnerAuthority::for_test("owner"),
+                "prod_token",
+            )
             .await
             .unwrap();
         assert!(
             !session
-                .sealed_value_exists(crate::sealed::OwnerAuthority::for_test(), "prod_token")
+                .sealed_value_exists(
+                    crate::sealed::OwnerAuthority::for_test("owner"),
+                    "prod_token"
+                )
                 .await
                 .unwrap()
         );
@@ -408,7 +417,7 @@ mod tests {
         let table = crate::redact::RedactionTable::empty();
         parent
             .set_sealed_value(
-                crate::sealed::OwnerAuthority::for_test(),
+                crate::sealed::OwnerAuthority::for_test("owner"),
                 &table,
                 "before",
                 "before-high-entropy-token",
@@ -426,14 +435,14 @@ mod tests {
         .unwrap();
         assert!(
             child
-                .sealed_value_exists(crate::sealed::OwnerAuthority::for_test(), "before")
+                .sealed_value_exists(crate::sealed::OwnerAuthority::for_test("owner"), "before")
                 .await
                 .unwrap()
         );
         let parent_table = parent.persisted_redaction_table().unwrap().unwrap();
         parent
             .set_sealed_value(
-                crate::sealed::OwnerAuthority::for_test(),
+                crate::sealed::OwnerAuthority::for_test("owner"),
                 &parent_table,
                 "after",
                 "after-high-entropy-token",
@@ -444,7 +453,7 @@ mod tests {
             .unwrap();
         assert!(
             !child
-                .sealed_value_exists(crate::sealed::OwnerAuthority::for_test(), "after")
+                .sealed_value_exists(crate::sealed::OwnerAuthority::for_test("owner"), "after")
                 .await
                 .unwrap()
         );

@@ -1161,7 +1161,7 @@ async fn sealed_child_injection_is_absent() {
     grant_command(&ctx, command, Scope::Session).await;
     ctx.session
         .set_sealed_value(
-            crate::sealed::OwnerAuthority::for_test(),
+            crate::sealed::OwnerAuthority::for_test("owner"),
             &ctx.redact,
             "prod-token",
             "very-secret-literal",
@@ -1213,7 +1213,7 @@ async fn sealed_shell_injection_removed() {
     grant_command(&ctx, &command, Scope::Session).await;
     ctx.session
         .set_sealed_value(
-            crate::sealed::OwnerAuthority::for_test(),
+            crate::sealed::OwnerAuthority::for_test("owner"),
             &ctx.redact,
             "prod-token",
             "very-secret-literal",

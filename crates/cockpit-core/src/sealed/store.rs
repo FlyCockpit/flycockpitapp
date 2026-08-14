@@ -477,6 +477,107 @@ impl SealedValueDirectory {
         Ok(summary)
     }
 
+    /// Rotate a sealed value, fencing the operation on an exact expected
+    /// version so the version check is **atomic with the mutation**.
+    ///
+    /// This is the Owner-channel write path: a capability minted at version `N`
+    /// must overwrite exactly version `N`. If a concurrent rotation advanced the
+    /// record past `N` between mint and apply, this returns `Err` and performs
+    /// no write — the version fence lives inside the authoritative store
+    /// operation, not in a separate read-then-act, so no interleaving can slip a
+    /// post-race version under the capability.
+    ///
+    /// * Session scope: the version bump happens inside one transaction; the
+    ///   committed `active_version` is required to equal `expected + 1` (i.e. we
+    ///   rotated *from* `expected`), else the whole transaction rolls back.
+    /// * Compartment scope: `prepare_rotate` reads `active_version` and inserts
+    ///   the lifecycle saga in one transaction, and the saga-in-flight guard
+    ///   blocks any other rotation until this one finishes — so `active_version`
+    ///   cannot move between prepare and commit. The staged `target` therefore
+    ///   fixes the live version at prepare time; if it is not `expected + 1` we
+    ///   abort the (nothing-staged-yet) saga and fail closed.
+    pub async fn rotate_at_version(
+        &self,
+        owner: OwnerAuthority,
+        record_id: SealedRecordId,
+        literal: SealedLiteral,
+        now_ms: i64,
+        expected_version: u32,
+    ) -> Result<SealedValueSummary> {
+        let row = self
+            .db
+            .sealed_value_record(record_id.to_string())
+            .await?
+            .context("sealed value record does not exist")?;
+        if row.scope == SealedScopeKind::Session {
+            let literal_str = literal.expose_for_redaction().to_string();
+            let resolver = self.redaction_resolver.as_ref().context(
+                "session-scoped sealed rotate requires an installed redaction-history resolver to \
+                 journal the adoption (decision 10.1); refusing to persist a rotated sealed \
+                 literal unjournaled",
+            )?;
+            let session_id = row.scope_key.clone();
+            // Predict the journaled version from the CAPABILITY's bound version,
+            // not a pre-transaction read; the transaction re-validates it
+            // authoritatively below.
+            let new_version = i64::from(expected_version) + 1;
+            let protected = ProtectedLiteral::new(
+                literal_str.clone(),
+                RedactionHistorySource::Sealed,
+                Some(record_id.to_string()),
+                Some(new_version),
+            )?;
+            let history = ProtectedRedactionHistory::new(&self.db, resolver.as_ref());
+            let prepared = history.prepare_append(&session_id, protected).await?;
+
+            let record_id_str = record_id.to_string();
+            let rotated = self
+                .db
+                .transaction(move |conn| {
+                    let rotated = rotate_session_sealed_value_conn(
+                        conn,
+                        &record_id_str,
+                        &literal_str,
+                        now_ms,
+                    )?;
+                    // Atomic version fence: the committed version must be exactly
+                    // one past the bound version, i.e. we rotated *from*
+                    // `expected_version`. If a concurrent rotation moved the row
+                    // first, the committed version is higher and the whole
+                    // rotation (bump + grant revocation + journal) rolls back.
+                    if rotated.active_version != new_version {
+                        bail!(
+                            "version mismatch: capability bound to version {expected_version} but \
+                             the live record is at version {}",
+                            rotated.active_version.saturating_sub(1)
+                        );
+                    }
+                    append_and_attach_conn(conn, &prepared, &[])?;
+                    Ok(rotated)
+                })
+                .await?;
+            return SealedValueSummary::from_row(&rotated);
+        }
+
+        // Compartment scope. `prepare_rotate` fixes the live version under the
+        // saga-in-flight lock; nothing is staged yet, so a mismatch aborts by
+        // simply removing the saga row.
+        let ticket = self.prepare_rotate(owner, record_id, now_ms).await?;
+        if ticket.target_version.checked_sub(1) != Some(expected_version) {
+            let live = ticket.target_version.saturating_sub(1);
+            self.finish_saga(owner, &ticket).await?;
+            bail!(
+                "version mismatch: capability bound to version {expected_version} but the live \
+                 record is at version {live}"
+            );
+        }
+        self.stage_literal(&ticket, literal)?;
+        let summary = self.commit_rotate(owner, &ticket, now_ms).await?;
+        self.reclaim_superseded(&ticket.op_id).await?;
+        self.finish_saga(owner, &ticket).await?;
+        Ok(summary)
+    }
+
     /// Stage a rotation. The previous version stays live until commit.
     pub async fn prepare_rotate(
         &self,

@@ -54,7 +54,7 @@ pub mod store;
 mod tests;
 
 pub use action::{
-    OwnerAuthority, SealedActionDescriptor, SealedActionId, SealedActionRegistry,
+    OWNER_PRINCIPAL, OwnerAuthority, SealedActionDescriptor, SealedActionId, SealedActionRegistry,
     SealedActionRegistryBuilder, SealedActionResult, SealedActionRevision, SealedCompletion,
     SealedHostAction, SealedParamSpec, SealedParamValue, SealedParams, SealedSafeValue,
 };
@@ -84,9 +84,9 @@ pub use marker::{
     historical_redaction_inventory,
 };
 pub use owner::{
-    BeginResult, BeginSensitiveOwnerOperation, CAPABILITY_TTL, MAX_SENSITIVE_FRAME_BYTES,
-    OneUseCapability, SensitiveFrameKind, SensitiveFrameOutcome, SensitiveOwnerFrame,
-    SensitiveOwnerOperation,
+    BeginResult, BeginSensitiveInput, BeginSensitiveOwnerOperation, CAPABILITY_TTL_MS,
+    MAX_SENSITIVE_FRAME_BYTES, OneUseCapability, SensitiveFrameKind, SensitiveFrameOutcome,
+    SensitiveOwnerDisposition, SensitiveOwnerFrame, SensitiveOwnerOperation, VersionBinding,
 };
 pub use runtime::{SealedRedactionSink, SealedRuntime, SessionRedactionSink};
 pub use store::{

@@ -55,7 +55,7 @@ async fn sealed_session_adoption_journals_protected_history() {
 
         let created = dir
             .create(
-                OwnerAuthority::for_test(),
+                OwnerAuthority::for_test("owner"),
                 CreateSealedValue {
                     scope: SealedScopeRef::Session(fx.session_id),
                     name: SealedName::canonical("deploy_token").unwrap(),
@@ -90,7 +90,7 @@ async fn sealed_session_adoption_journals_protected_history() {
 
         // Rotate journals a second Sealed row at version 2 under the same record.
         dir.rotate(
-            OwnerAuthority::for_test(),
+            OwnerAuthority::for_test("owner"),
             created.record_id,
             SealedLiteral::new("sealed-session-adopt-literal-two-xyz"),
             2_000,
@@ -156,7 +156,7 @@ async fn sealed_session_adoption_journals_protected_history() {
 
         let create_result = dir
             .create(
-                OwnerAuthority::for_test(),
+                OwnerAuthority::for_test("owner"),
                 CreateSealedValue {
                     scope: SealedScopeRef::Session(fx.session_id),
                     name: SealedName::canonical("faulted_token").unwrap(),
@@ -189,7 +189,7 @@ async fn sealed_session_adoption_journals_protected_history() {
         let seeded = fx
             .directory()
             .create(
-                OwnerAuthority::for_test(),
+                OwnerAuthority::for_test("owner"),
                 CreateSealedValue {
                     scope: SealedScopeRef::Session(fx.session_id),
                     name: SealedName::canonical("rotate_token").unwrap(),
@@ -205,7 +205,7 @@ async fn sealed_session_adoption_journals_protected_history() {
 
         let rotate_result = dir
             .rotate(
-                OwnerAuthority::for_test(),
+                OwnerAuthority::for_test("owner"),
                 seeded.record_id,
                 SealedLiteral::new("sealed-session-faulted-rotate-literal-xyz"),
                 2_000,
@@ -246,7 +246,7 @@ async fn sealed_session_adoption_journals_protected_history() {
         let table = RedactionTable::empty();
         session
             .set_sealed_value(
-                OwnerAuthority::for_test(),
+                OwnerAuthority::for_test("owner"),
                 &table,
                 "prod_token",
                 "high-entropy-sealed-session-value-123",
@@ -327,7 +327,7 @@ async fn sealed_session_adoption_journals_protected_history() {
         let fx = SealedFixture::new().await;
         let dir = directory(&fx);
         dir.create(
-            OwnerAuthority::for_test(),
+            OwnerAuthority::for_test("owner"),
             CreateSealedValue {
                 scope: SealedScopeRef::Project(fx.project_key.clone()),
                 name: SealedName::canonical("proj_secret").unwrap(),
@@ -353,7 +353,7 @@ async fn sealed_session_adoption_journals_protected_history() {
         let dir = directory(&fx);
         let ticket = dir
             .prepare_create(
-                OwnerAuthority::for_test(),
+                OwnerAuthority::for_test("owner"),
                 CreateSealedValue {
                     scope: SealedScopeRef::Project(fx.project_key.clone()),
                     name: SealedName::canonical("proj_secret_2").unwrap(),

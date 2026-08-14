@@ -12,8 +12,13 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  runners:
+    name: Select CI runners
+    uses: ./.github/workflows/ci-runners.yml
+
   checks:
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    needs: runners
+    runs-on: ${{ needs.runners.outputs.ubuntu_large }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1

@@ -17,8 +17,13 @@ permissions:
   contents: read
 
 jobs:
+  runners:
+    name: Select CI runners
+    uses: ./.github/workflows/ci-runners.yml
+
   build:
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    needs: runners
+    runs-on: ${{ needs.runners.outputs.ubuntu_large }}
     timeout-minutes: 30
     strategy:
       fail-fast: false

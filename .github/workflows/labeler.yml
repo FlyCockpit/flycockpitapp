@@ -9,9 +9,14 @@ permissions:
   pull-requests: write
 
 jobs:
+  runners:
+    name: Select CI runners
+    uses: ./.github/workflows/ci-runners.yml
+
   label:
     name: Label PR
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    needs: runners
+    runs-on: ${{ needs.runners.outputs.ubuntu_small }}
     timeout-minutes: 5
     steps:
       - name: Label PR

@@ -557,6 +557,11 @@ pub enum Response {
         result: RunInvocationCancelResultV1,
     },
 
+    /// Answer to [`Request::GetHostCapabilities`] / [`Request::RefreshHostCapabilities`].
+    HostCapabilities {
+        snapshot: crate::HostCapabilitySnapshot,
+    },
+
     #[serde(other)]
     Unknown,
 }
@@ -864,6 +869,7 @@ macro_rules! response_variants {
             (Response::RunInvocationStatus { .. }, "run_invocation_status");
             (Response::RemoteOperationStatus { .. }, "remote_operation_status");
             (Response::RunInvocationCancelResult { .. }, "run_invocation_cancel_result");
+            (Response::HostCapabilities { .. }, "host_capabilities");
             (Response::Unknown, "__unknown");
         ] }
     };

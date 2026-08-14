@@ -115,6 +115,55 @@ fn dependency_headless_schema_and_shared_reason_are_stable() {
 }
 
 #[test]
+fn host_capabilities_doctor_schema_v1_still_validates() {
+    let fixture: DependencyProjection = serde_json::from_str(include_str!(
+        "../../../../packages/cockpit-protocol/fixtures/dependency-health-v1.json"
+    ))
+    .unwrap();
+    assert_eq!(fixture.schema_version, DEPENDENCY_HEADLESS_SCHEMA_VERSION);
+    assert_eq!(
+        DEPENDENCY_HEADLESS_SCHEMA_VERSION, 1,
+        "doctor JSON schema stays at v1 unless this prompt grows the wire"
+    );
+}
+
+#[test]
+fn host_capabilities_security_keyring_is_catalog_descriptor() {
+    assert!(known_safety_adapter_ids().contains(&ID_KEYRING));
+    assert!(known_global_safety_adapter_ids().contains(&ID_KEYRING));
+    let descriptors = safety_adapter_descriptors().unwrap();
+    let keyring = descriptors
+        .iter()
+        .find(|descriptor| descriptor.id.as_str() == ID_KEYRING)
+        .expect("security.keyring descriptor");
+    assert_eq!(keyring.owner.feature, "secret_store.keyring");
+    assert_eq!(
+        keyring.importance,
+        DependencyImportance::RequiredWhenFeatureSelected
+    );
+}
+
+#[test]
+fn host_capabilities_linux_keyring_row_not_available_without_secret_service() {
+    crate::secure_key::reset_keyring_probe_cache_for_test();
+    let probe = crate::secure_key::probe_platform_keyring_with(
+        || {
+            Err(crate::secure_key::SecureKeyError::Unavailable(
+                "DBUS_SESSION_BUS_ADDRESS unset; secret service unavailable".into(),
+            ))
+        },
+        false,
+    );
+    assert_ne!(
+        probe.state,
+        crate::daemon::proto::FeatureCapabilityState::Available
+    );
+    let entry = keyring_health_entry(&probe, HostPlatform::GenericLinux);
+    assert!(!entry.state.is_available());
+    crate::secure_key::reset_keyring_probe_cache_for_test();
+}
+
+#[test]
 fn dependency_headless_fixture_matches_rust_schema() {
     let fixture: DependencyProjection = serde_json::from_str(include_str!(
         "../../../../packages/cockpit-protocol/fixtures/dependency-health-v1.json"

@@ -813,6 +813,11 @@ fn compose_settings_doctor_health_internal(
     )?);
     descriptors.sort_by(|left, right| left.id.cmp(&right.id));
     let ctx = super::probe::EvaluationContext::new(platform).with_features(features);
+    let eval_descriptors: Vec<_> = base_descriptors
+        .iter()
+        .filter(|descriptor| descriptor.id.as_str() != super::safety_adapters::ID_KEYRING)
+        .cloned()
+        .collect();
     let store = global_health_store();
     let generation = if let Some(generation) = scope.generation {
         generation
@@ -827,7 +832,7 @@ fn compose_settings_doctor_health_internal(
     let cancel = scope.cancel.unwrap_or(&local_cancel);
     let mut snapshot = super::probe::refresh_snapshot_with_observer(
         generation,
-        &base_descriptors,
+        &eval_descriptors,
         executor,
         path_env,
         cwd,
@@ -835,6 +840,11 @@ fn compose_settings_doctor_health_internal(
         super::probe::ProbeDeadlines::default(),
         cancel,
         &mut observer,
+    );
+    let keyring_probe = crate::secure_key::probe_platform_keyring();
+    snapshot.entries.insert(
+        super::safety_adapters::ID_KEYRING.to_string(),
+        super::safety_adapters::keyring_health_entry(&keyring_probe, platform),
     );
     snapshot.groups.insert(
         "computer-use".to_owned(),

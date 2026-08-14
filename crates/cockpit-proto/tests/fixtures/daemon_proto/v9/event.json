@@ -519,6 +519,37 @@
     },
     "event": "history_replay"
   },
+  "host_capabilities_changed": {
+    "data": {
+      "snapshot": {
+        "dependencies": [
+          {
+            "id": "security.keyring",
+            "importance": "required_when_feature_selected",
+            "reason": "missing",
+            "state": "missing",
+            "target": "host"
+          }
+        ],
+        "features": [
+          {
+            "dependency_ids": ["security.keyring"],
+            "id": "secret_store.keyring",
+            "reason": "missing",
+            "state": "missing"
+          }
+        ],
+        "generation": 1,
+        "secretStore": {
+          "effective_placement": "unavailable",
+          "fail_closed_reason": null,
+          "fix_command": null,
+          "intent": "unconfigured"
+        }
+      }
+    },
+    "event": "host_capabilities_changed"
+  },
   "inference_failed": {
     "data": {
       "agent": "agent-fixture",

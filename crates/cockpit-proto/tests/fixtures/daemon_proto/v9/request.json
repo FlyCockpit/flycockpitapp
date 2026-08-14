@@ -342,6 +342,9 @@
     },
     "request": "fs_write"
   },
+  "get_host_capabilities": {
+    "request": "get_host_capabilities"
+  },
   "get_inventory_bundle": {
     "params": {
       "project_root": "project_root-fixture",
@@ -550,6 +553,9 @@
   },
   "refresh_config": {
     "request": "refresh_config"
+  },
+  "refresh_host_capabilities": {
+    "request": "refresh_host_capabilities"
   },
   "refresh_env": {
     "params": {

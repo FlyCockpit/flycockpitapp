@@ -1150,6 +1150,13 @@ pub enum Request {
     /// Atomically request daemon restart only if no session worker is busy.
     RestartIfIdle,
 
+    /// Return the last daemon-owned [`HostCapabilitySnapshot`].
+    GetHostCapabilities,
+
+    /// Re-run the shared host-capability probes and publish a new snapshot
+    /// when the reserved generation is still current.
+    RefreshHostCapabilities,
+
     #[serde(other)]
     Unknown,
 }
@@ -1441,6 +1448,8 @@ macro_rules! request_variants {
             (Request::FinalizeMediaUpload(..), "finalize_media_upload");
             (Request::StopDaemon { .. }, "stop_daemon");
             (Request::RestartIfIdle, "restart_if_idle");
+            (Request::GetHostCapabilities, "get_host_capabilities");
+            (Request::RefreshHostCapabilities, "refresh_host_capabilities");
             (Request::Unknown, "__unknown");
         ] }
     };
@@ -1622,6 +1631,8 @@ macro_rules! command {
             (Request::FinalizeMediaUpload(..), "finalize_media_upload", public_read, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "-", []);
             (Request::StopDaemon { grace_secs }, "stop_daemon", owner_only, none, true, local_only, none, serialized, none, "grace_secs:Option<u64>", [grace_secs: Option<u64> => param]);
             (Request::RestartIfIdle, "restart_if_idle", owner_only, none, true, local_only, none, serialized, none, "-", []);
+            (Request::GetHostCapabilities, "get_host_capabilities", public_read, none, false, read_only, none, concurrent, none, "-", []);
+            (Request::RefreshHostCapabilities, "refresh_host_capabilities", public_read, none, true, local_only, none, serialized, none, "-", []);
             (Request::Unknown, "unknown", owner_only, none, false, rejected, rejected_before_dispatch, serialized, none, "-", []);
         ] }
     };

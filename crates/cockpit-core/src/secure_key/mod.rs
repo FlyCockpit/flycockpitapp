@@ -42,8 +42,14 @@ pub use namespace::{
 };
 // set_default / unset_default are actor-owned only (`pub(crate)` in platform.rs).
 pub use platform::{
-    PlatformStoreKind, RegistrationOrderSnapshot, platform_link_token, platform_store_kind,
-    reachable_native_store_crate, registration_order_snapshot, reset_registration_order_for_test,
-    set_test_skip_real_default_store,
+    KeyringProbeResult, PlatformStoreKind, RegistrationOrderSnapshot, platform_link_token,
+    platform_store_kind, probe_platform_keyring, probe_platform_keyring_refresh,
+    probe_platform_keyring_with, reachable_native_store_crate, registration_order_snapshot,
+    reset_registration_order_for_test, set_test_skip_real_default_store,
+};
+#[cfg(test)]
+pub use platform::{
+    default_platform_store_is_registered, keyring_probe_construct_count,
+    reset_keyring_probe_cache_for_test,
 };
 pub use worker::{NamespaceMetadata, VersionMetadata};

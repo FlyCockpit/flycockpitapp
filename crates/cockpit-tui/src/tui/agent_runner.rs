@@ -1761,6 +1761,7 @@ fn is_global_event(event: &proto::Event) -> bool {
             | proto::Event::InterruptRaised { .. }
             | proto::Event::InterruptResolved { .. }
             | proto::Event::InterruptQueueChanged { .. }
+            | proto::Event::HostCapabilitiesChanged { .. }
     )
 }
 
@@ -2709,7 +2710,9 @@ pub fn daemon_reveal_leak_blocking(
 > {
     let runtime = match tokio::runtime::Handle::try_current() {
         Ok(runtime) => runtime,
-        Err(_) => return Err(cockpit_core::daemon::leak_reveal::LeakRevealDenied::UnavailablePlatform),
+        Err(_) => {
+            return Err(cockpit_core::daemon::leak_reveal::LeakRevealDenied::UnavailablePlatform);
+        }
     };
     let socket = control_socket.to_path_buf();
     let capability = capability.to_owned();
@@ -3073,6 +3076,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | TerminalViewers { .. }
         | TerminalClosed { .. }
         | Osc52ProtocolViolation { .. }
+        | HostCapabilitiesChanged { .. }
         | LspNotice { .. }
         | EventStreamLagged {
             session_id: None, ..
@@ -3962,6 +3966,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         | TerminalViewers { .. }
         | TerminalClosed { .. }
         | Osc52ProtocolViolation { .. }
+        | HostCapabilitiesChanged { .. }
         | Unknown => return None,
         // The chrome's active-agent slot is updated directly in
         // `update_active_agent`; the swap needs no history-stream entry.

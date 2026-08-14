@@ -520,6 +520,9 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         proto::Response::RunInvocationStatus { .. }
         | proto::Response::RunInvocationCancelResult { .. }
         | proto::Response::RemoteOperationStatus { .. } => {}
+        proto::Response::HostCapabilities { snapshot } => {
+            scrub_host_capability_snapshot(snapshot, redact);
+        }
         proto::Response::Unknown => {}
     }
 }
@@ -1006,7 +1009,34 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             holder_agent: _,
             waiting: _,
         } => scrub_string(path, redact),
+        proto::Event::HostCapabilitiesChanged { snapshot } => {
+            scrub_host_capability_snapshot(snapshot, redact);
+        }
         proto::Event::Unknown => {}
+    }
+}
+
+fn scrub_host_capability_snapshot(
+    snapshot: &mut proto::HostCapabilitySnapshot,
+    redact: &RedactionTable,
+) {
+    for row in &mut snapshot.features {
+        scrub_string(&mut row.reason, redact);
+        if let Some(fix) = &mut row.fix_command {
+            scrub_string(fix, redact);
+        }
+        if let Some(remedy) = &mut row.remedy_text {
+            scrub_string(remedy, redact);
+        }
+    }
+    for row in &mut snapshot.dependencies {
+        scrub_string(&mut row.reason, redact);
+    }
+    if let Some(reason) = &mut snapshot.secret_store.fail_closed_reason {
+        scrub_string(reason, redact);
+    }
+    if let Some(fix) = &mut snapshot.secret_store.fix_command {
+        scrub_string(fix, redact);
     }
 }
 
@@ -1834,6 +1864,11 @@ pub struct DaemonContext {
     /// transport-wiring prompts.
     pub remote_project_resolver:
         Arc<dyn crate::daemon::remote_project_resolver::RemoteProjectResolver>,
+    /// Daemon-owned host capability snapshot. Authority for feature gating.
+    /// The TUI in-process doctor compose is not this store.
+    pub(crate) host_capabilities: crate::host_capabilities::HostCapabilitySnapshotStore,
+    /// Probe sources used by boot and `RefreshHostCapabilities`.
+    pub(crate) host_capability_probes: crate::host_capabilities::HostCapabilityProbeInputs,
 }
 
 #[cfg(test)]
@@ -1978,7 +2013,7 @@ impl DaemonContext {
             media_admission_open: Arc::new(std::sync::atomic::AtomicBool::new(cfg!(test))),
             registry,
             paths,
-            canonical_cwd,
+            canonical_cwd: canonical_cwd.clone(),
             #[cfg(test)]
             fcor_resolver_calls: std::sync::atomic::AtomicUsize::new(0),
             started_at,
@@ -2013,6 +2048,10 @@ impl DaemonContext {
             // transport-wiring prompts install the real resolver.
             remote_project_resolver: Arc::new(
                 crate::daemon::remote_project_resolver::StaticRemoteProjectResolver::new(),
+            ),
+            host_capabilities: crate::host_capabilities::HostCapabilitySnapshotStore::new(),
+            host_capability_probes: crate::host_capabilities::HostCapabilityProbeInputs::production(
+                canonical_cwd.clone(),
             ),
         }
     }
@@ -2084,6 +2123,15 @@ impl DaemonContext {
     #[cfg(test)]
     pub(crate) fn with_credential_store_path(mut self, path: PathBuf) -> Self {
         self.credential_store_path = Some(path);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_host_capability_probes(
+        mut self,
+        probes: crate::host_capabilities::HostCapabilityProbeInputs,
+    ) -> Self {
+        self.host_capability_probes = probes;
         self
     }
 
@@ -2266,6 +2314,25 @@ pub(crate) async fn boot_with_db(
             .context("reconciling media cleanup intents")?;
     }
     timer.phase("media_upload_reconcile");
+    // Shared host-capability probes run once here. The TUI in-process doctor
+    // snapshot is not the daemon's capability authority.
+    //
+    // `probe_platform_keyring()` is the only keyring construct on this
+    // prompt's boot path. Do not call `set_default_platform_store` as a
+    // second independent probe after this snapshot. Later
+    // `sqlite-native-key-store` consumes that probe result and inserts KEK
+    // resolution + vault start in the seam below; it must not construct
+    // the platform store a second time.
+    crate::host_capabilities::publish_initial_host_capabilities(
+        &ctx.host_capabilities,
+        &ctx.host_capability_probes,
+    )
+    .await;
+    timer.phase("host_capabilities");
+    // SEAM: sqlite-native-key-store inserts KEK resolution + vault start here.
+    // Until then, the snapshot is published after probes with
+    // secretStore.intent = unconfigured and effective_placement = unavailable.
+    //
     // Installation identity + secure-key actor: under single-instance lock
     // (caller already holds pid/socket). Registration + keyring I/O stay on the
     // dedicated actor OS thread. Boot handshake runs on a short-lived std thread
@@ -2273,6 +2340,8 @@ pub(crate) async fn boot_with_db(
     //
     // Unit tests skip production native registration (no real OS keyring; avoids
     // D-Bus hangs that stall ephemeral idle-reap tests after the socket is bound).
+    // That actor start is not a capability probe; this prompt's boot path
+    // already ran `probe_platform_keyring()` above.
     #[cfg(not(test))]
     {
         let db_for_keys = db.clone();
@@ -4406,12 +4475,14 @@ pub use run_invocation::{
     remaining_after_restart as run_invocation_remaining_after_restart,
     wall_ms_now as run_invocation_wall_ms_now,
 };
+#[cfg(test)]
+mod host_capabilities_tests;
 pub(crate) mod inventory;
+#[cfg(test)]
+mod leaks_tests;
 mod sessions;
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
-mod leaks_tests;
 
 pub use attachments::validate_png_attachment_blocking;
 pub use dispatch::request_shutdown;

@@ -567,8 +567,8 @@ pub(crate) fn bind_private_socket(socket: &std::path::Path) -> Result<UnixListen
     // closed rather than being followed. A residual same-uid swap of the path
     // between bind and this stat is out of the cross-user threat model (only the
     // owner can create entries in the 0700-verified parent).
-    let meta = std::fs::symlink_metadata(socket)
-        .with_context(|| format!("stat {}", socket.display()))?;
+    let meta =
+        std::fs::symlink_metadata(socket).with_context(|| format!("stat {}", socket.display()))?;
     let file_type = meta.file_type();
     let mode = meta.mode() & 0o777;
     let owner = meta.uid();
@@ -2219,9 +2219,18 @@ mod tests {
     #[test]
     fn leak_reveal_socket_path_derivation() {
         let cases = [
-            ("/run/user/1000/cockpit/cockpit.sock", "/run/user/1000/cockpit/cockpit-leak-reveal.sock"),
-            ("/home/u/.local/state/cockpit/daemon.sock", "/home/u/.local/state/cockpit/daemon-leak-reveal.sock"),
-            ("/run/user/1000/cockpit/cockpit-eph-1-aaa.sock", "/run/user/1000/cockpit/cockpit-eph-1-aaa-leak-reveal.sock"),
+            (
+                "/run/user/1000/cockpit/cockpit.sock",
+                "/run/user/1000/cockpit/cockpit-leak-reveal.sock",
+            ),
+            (
+                "/home/u/.local/state/cockpit/daemon.sock",
+                "/home/u/.local/state/cockpit/daemon-leak-reveal.sock",
+            ),
+            (
+                "/run/user/1000/cockpit/cockpit-eph-1-aaa.sock",
+                "/run/user/1000/cockpit/cockpit-eph-1-aaa-leak-reveal.sock",
+            ),
         ];
         for (control, expected) in cases {
             assert_eq!(

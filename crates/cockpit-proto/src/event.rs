@@ -1555,6 +1555,12 @@ pub enum Event {
         waiting: bool,
     },
 
+    /// Daemon-owned host capability snapshot replaced after a successful
+    /// refresh. **Daemon-global**: carries no `session_id`.
+    HostCapabilitiesChanged {
+        snapshot: crate::HostCapabilitySnapshot,
+    },
+
     #[serde(other)]
     Unknown,
 }
@@ -1638,6 +1644,7 @@ macro_rules! event_variants {
             (Event::DaemonDraining { .. }, "daemon_draining");
             (Event::PausedWorkAvailable { .. }, "paused_work_available");
             (Event::WaitingForLock { .. }, "waiting_for_lock");
+            (Event::HostCapabilitiesChanged { .. }, "host_capabilities_changed");
             (Event::Unknown, "__unknown");
         ] }
     };

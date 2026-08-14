@@ -152,6 +152,10 @@ impl App {
             },
         );
 
+        // Pre-daemon / in-process doctor snapshot for Settings before attach.
+        // This is not the daemon capability authority. After the daemon is
+        // up, clients must consult `GetHostCapabilities` /
+        // `HostCapabilitySnapshot` instead of this TUI-process compose.
         let dependency_cwd = self.launch.cwd.clone();
         let sandbox_enabled = !self.no_sandbox;
         self.async_actions.start_blocking(

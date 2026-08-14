@@ -4422,6 +4422,8 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             effects.shutdown_after_response = true;
             Ok(Response::Ack)
         }
+        Request::GetHostCapabilities => get_host_capabilities(ctx),
+        Request::RefreshHostCapabilities => refresh_host_capabilities_request(ctx).await,
         Request::RestartIfIdle => {
             tracing::info!("RestartIfIdle requested via client");
             let _decision = crate::sync::lock_or_recover(&ctx.restart_decision);
@@ -5207,9 +5209,7 @@ fn leak_rotation_filter(
     rotation: Option<proto::LeakRotationState>,
 ) -> Option<crate::db::protected_leak_records::LeakRotation> {
     rotation.map(|r| match r {
-        proto::LeakRotationState::None => {
-            crate::db::protected_leak_records::LeakRotation::None
-        }
+        proto::LeakRotationState::None => crate::db::protected_leak_records::LeakRotation::None,
         proto::LeakRotationState::PendingUser => {
             crate::db::protected_leak_records::LeakRotation::PendingUser
         }
@@ -5261,11 +5261,16 @@ pub(super) async fn list_leak_reports(
         project_root,
         rotation: leak_rotation_filter(rotation),
     };
-    let page = crate::leaks::list_leak_reports(&ctx.db, &ctx.leak_cursor_key, filters, limit, cursor.as_deref())
-        .await
-        .map_err(leak_list_error)?;
-    let reports: Vec<proto::LeakReportMetadata> =
-        page.refs.iter().map(leak_ref_to_proto).collect();
+    let page = crate::leaks::list_leak_reports(
+        &ctx.db,
+        &ctx.leak_cursor_key,
+        filters,
+        limit,
+        cursor.as_deref(),
+    )
+    .await
+    .map_err(leak_list_error)?;
+    let reports: Vec<proto::LeakReportMetadata> = page.refs.iter().map(leak_ref_to_proto).collect();
     Ok(Response::LeakReports {
         page: proto::LeakReportsPage {
             reports,
@@ -5754,6 +5759,7 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
                 .unwrap_or_else(|| "<in-memory>".to_string()),
             schema_version: ctx.db.schema_version().await.map_err(internal)?,
         }),
+        Request::GetHostCapabilities => get_host_capabilities(&ctx),
         Request::GetUsageCounts { project_id } => {
             let since = chrono::Utc::now().timestamp() - crate::db::usage_events::USAGE_WINDOW_SECS;
             let models = ctx
@@ -5805,6 +5811,36 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
             message: format!("request `{request_kind}` is not marked concurrent"),
         }),
     }
+}
+
+fn get_host_capabilities(ctx: &DaemonContext) -> std::result::Result<Response, ErrorPayload> {
+    let snapshot = ctx
+        .host_capabilities
+        .current()
+        .ok_or_else(|| ErrorPayload {
+            code: ErrorCode::Internal,
+            message: "host capability snapshot has not been published".to_string(),
+        })?;
+    Ok(Response::HostCapabilities {
+        snapshot: (*snapshot).clone(),
+    })
+}
+
+async fn refresh_host_capabilities_request(
+    ctx: &Arc<DaemonContext>,
+) -> std::result::Result<Response, ErrorPayload> {
+    let (snapshot, published) = crate::host_capabilities::refresh_host_capabilities(
+        &ctx.host_capabilities,
+        &ctx.host_capability_probes,
+    )
+    .await
+    .map_err(internal)?;
+    if published {
+        ctx.broadcast_global(proto::Event::HostCapabilitiesChanged {
+            snapshot: snapshot.clone(),
+        });
+    }
+    Ok(Response::HostCapabilities { snapshot })
 }
 
 fn validate_request_semantics(request: &Request) -> std::result::Result<(), ErrorPayload> {

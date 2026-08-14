@@ -592,7 +592,7 @@ const server = serve(
 // Install the remote signaling WebSocket gateway on the HTTP server's `upgrade`
 // event. Fails closed at startup when remote authority is enabled but the daemon
 // identity-CA ring is missing; a no-op (feature off) when neither is configured.
-remoteSignalingGateway = createServerRemoteSignalingGateway({ env, server });
+remoteSignalingGateway = createServerRemoteSignalingGateway({ env, server, prisma });
 remoteSignalingGatewayReady = true;
 
 // ---------------------------------------------------------------------------

@@ -17,10 +17,17 @@ import {
   parseAuthorityConfig,
   parseAuthorityRingFile,
 } from "@flycockpit/api/lib/remote-authority";
+import type { SqlClient } from "@flycockpit/api/lib/remote-authority-storage";
+import {
+  PostgresRemoteDaemonControlOutboxStore,
+  REMOTE_DAEMON_CONTROL_OUTBOX_WAKE_PREFIX,
+  type RemoteDaemonControlOutboxStore,
+} from "@flycockpit/api/lib/remote-daemon-control-outbox";
 import {
   RedisRemoteSignalingAttemptStore,
   type RemoteSignalingAttemptStore,
 } from "@flycockpit/api/lib/remote-signaling-store";
+import type prismaType from "@flycockpit/db";
 import type { env as envType } from "@flycockpit/env/server";
 import { createRedisConnection } from "@flycockpit/queue/connection";
 import { resolveClientIpFromParts } from "./client-ip.js";
@@ -38,7 +45,10 @@ import {
   type MonotonicClock,
   UnauthUpgradeRateLimiter,
 } from "./remote-signaling-gateway/rate-limiters";
-import type { RemoteSignalingWakeSubscription } from "./remote-signaling-gateway/wake-subscription";
+import {
+  controlOutboxWakeKey,
+  type RemoteSignalingWakeSubscription,
+} from "./remote-signaling-gateway/wake-subscription";
 
 type Redis = ReturnType<typeof createRedisConnection>;
 
@@ -58,6 +68,7 @@ const systemMonotonicClock: MonotonicClock = { nowMs: () => performance.now() };
 export interface InstallRemoteSignalingGatewayDeps {
   configuredOrigin: string;
   store: RemoteSignalingAttemptStore;
+  controlOutbox: RemoteDaemonControlOutboxStore;
   daemonCertificateVerifier: DaemonCertificateVerifier;
   wake: RemoteSignalingWakeSubscription;
   clock?: MonotonicClock;
@@ -89,6 +100,7 @@ export function installRemoteSignalingGateway(
   const gateway = new RemoteSignalingGateway({
     configuredOrigin: deps.configuredOrigin,
     store: deps.store,
+    controlOutbox: deps.controlOutbox,
     clock,
     unauthUpgradeLimiter: deps.unauthUpgradeLimiter ?? new UnauthUpgradeRateLimiter(clock),
     daemonCertificateVerifier: deps.daemonCertificateVerifier,
@@ -171,8 +183,10 @@ export function loadDaemonIdentityCaVerifier(
 export class RedisRemoteSignalingWakeSubscription implements RemoteSignalingWakeSubscription {
   private readonly attemptHandlers = new Map<string, Set<() => void>>();
   private readonly instanceHandlers = new Map<string, Set<() => void>>();
+  private readonly controlOutboxHandlers = new Map<string, Set<() => void>>();
   private static readonly ATTEMPT_PREFIX = "flycockpit:remote-signaling:attempt-wake:";
   private static readonly INSTANCE_PREFIX = "flycockpit:remote-signaling:instance-wake:";
+  private static readonly CONTROL_OUTBOX_PREFIX = REMOTE_DAEMON_CONTROL_OUTBOX_WAKE_PREFIX;
   private ready: Promise<void> | undefined;
 
   constructor(private readonly conn: Redis) {}
@@ -186,11 +200,17 @@ export class RedisRemoteSignalingWakeSubscription implements RemoteSignalingWake
         } else if (channel.startsWith(RedisRemoteSignalingWakeSubscription.INSTANCE_PREFIX)) {
           const key = channel.slice(RedisRemoteSignalingWakeSubscription.INSTANCE_PREFIX.length);
           for (const handler of this.instanceHandlers.get(key) ?? []) handler();
+        } else if (channel.startsWith(RedisRemoteSignalingWakeSubscription.CONTROL_OUTBOX_PREFIX)) {
+          const key = channel.slice(
+            RedisRemoteSignalingWakeSubscription.CONTROL_OUTBOX_PREFIX.length,
+          );
+          for (const handler of this.controlOutboxHandlers.get(key) ?? []) handler();
         }
       });
       await this.conn.psubscribe(
         `${RedisRemoteSignalingWakeSubscription.ATTEMPT_PREFIX}*`,
         `${RedisRemoteSignalingWakeSubscription.INSTANCE_PREFIX}*`,
+        `${RedisRemoteSignalingWakeSubscription.CONTROL_OUTBOX_PREFIX}*`,
       );
     })();
     return this.ready;
@@ -222,6 +242,17 @@ export class RedisRemoteSignalingWakeSubscription implements RemoteSignalingWake
   subscribeInstance(routeId: Uint8Array, handler: () => void): () => void {
     return this.subscribe(this.instanceHandlers, Buffer.from(routeId).toString("hex"), handler);
   }
+  subscribeControlOutbox(
+    daemonInstanceProtocolId: string,
+    daemonCertificateGeneration: bigint,
+    handler: () => void,
+  ): () => void {
+    return this.subscribe(
+      this.controlOutboxHandlers,
+      controlOutboxWakeKey(daemonInstanceProtocolId, daemonCertificateGeneration),
+      handler,
+    );
+  }
   async close(): Promise<void> {
     await this.conn.quit().catch(() => {});
   }
@@ -230,6 +261,8 @@ export class RedisRemoteSignalingWakeSubscription implements RemoteSignalingWake
 export interface CreateServerRemoteSignalingGatewayDeps {
   env: typeof envType;
   server: UpgradableServer;
+  /** Prisma client for the Postgres daemon control-outbox page reader. */
+  prisma: typeof prismaType;
   /** Injected connection factory (tests). Defaults to `createRedisConnection`. */
   redisFactory?: () => Redis;
   logger?: SafeLogger;
@@ -258,6 +291,9 @@ export function createServerRemoteSignalingGateway(
 
   const makeRedis = deps.redisFactory ?? (() => createRedisConnection({ maxRetriesPerRequest: 3 }));
   const store = new RedisRemoteSignalingAttemptStore(makeRedis());
+  const controlOutbox = new PostgresRemoteDaemonControlOutboxStore(
+    deps.prisma as unknown as SqlClient,
+  );
   const wake = new RedisRemoteSignalingWakeSubscription(
     deps.redisFactory ? deps.redisFactory() : createRedisConnection({ maxRetriesPerRequest: null }),
   );
@@ -266,6 +302,7 @@ export function createServerRemoteSignalingGateway(
   return installRemoteSignalingGateway(deps.server, {
     configuredOrigin,
     store,
+    controlOutbox,
     daemonCertificateVerifier: verifier,
     wake,
     logger: deps.logger,

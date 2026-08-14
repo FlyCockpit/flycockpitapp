@@ -1,10 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
+  decodeControlReplayPageTrailer,
+  decodeControlReplayRequest,
   decodeFcdaFrame,
   decodeFcdcFrame,
   decodeFcsaFrame,
   decodeGatewayAck,
   decodeRemoteControlEventHeader,
+  encodeControlReplayPageTrailer,
+  encodeControlReplayRequest,
   encodeFcdaFrame,
   encodeFcdcFrame,
   encodeFcsaFrame,
@@ -15,11 +19,16 @@ import {
   FCDC_BYTES,
   FCDC_MAGIC,
   FCRC_MAGIC,
+  FCRP_BYTES,
+  FCRP_MAGIC,
+  FCRQ_BYTES,
+  FCRQ_MAGIC,
   FCSA_MAGIC,
   REMOTE_CONTROL_EVENT_HEADER_BYTES,
   REMOTE_CONTROL_EVENT_MAX_BYTES,
   REMOTE_CONTROL_EVENT_MAX_PAYLOAD,
   RemoteControlEventKind,
+  RemoteGatewayAckKind,
   RemoteGatewayCodecError,
 } from "./binary-codecs";
 import {
@@ -319,6 +328,111 @@ describe("remote_gateway_binary_codec: gateway ACK", () => {
     const ack = encodeGatewayAck({ kind: 1, commandId: randomId(), committedSequence: 1n });
     ack[0] = 2;
     expect(() => decodeGatewayAck(ack)).toThrow(RemoteGatewayCodecError);
+  });
+});
+
+describe("remote_gateway_binary_codec: gateway ACK kind enum", () => {
+  it("documents the closed control-delivery ACK kinds", () => {
+    expect(RemoteGatewayAckKind.signaling_store_command).toBe(1);
+    expect(RemoteGatewayAckKind.control_event_delivery).toBe(2);
+    const ack = encodeGatewayAck({
+      kind: RemoteGatewayAckKind.control_event_delivery,
+      commandId: randomId(),
+      committedSequence: 12n,
+    });
+    expect(decodeGatewayAck(ack).kind).toBe(2);
+  });
+});
+
+describe("remote_gateway_binary_codec: FCRQ control replay request", () => {
+  it("encodes and decodes an exact 13-byte FCRQ frame", () => {
+    const frame = encodeControlReplayRequest({ afterControlSeq: 42n });
+    expect(frame.length).toBe(FCRQ_BYTES);
+    expect(String.fromCharCode(...frame.slice(0, 4))).toBe(FCRQ_MAGIC);
+    expect(frame[4]).toBe(1);
+    expect(decodeControlReplayRequest(frame).afterControlSeq).toBe(42n);
+  });
+
+  it("round-trips afterControlSeq=0", () => {
+    const frame = encodeControlReplayRequest({ afterControlSeq: 0n });
+    expect(decodeControlReplayRequest(frame)).toEqual({ afterControlSeq: 0n });
+  });
+
+  it("rejects wrong length / trailing bytes", () => {
+    expect(() => decodeControlReplayRequest(new Uint8Array(12))).toThrow(RemoteGatewayCodecError);
+    const padded = new Uint8Array(FCRQ_BYTES + 1);
+    padded.set(encodeControlReplayRequest({ afterControlSeq: 1n }));
+    expect(() => decodeControlReplayRequest(padded)).toThrow(RemoteGatewayCodecError);
+  });
+
+  it("rejects wrong magic/version", () => {
+    const frame = encodeControlReplayRequest({ afterControlSeq: 1n });
+    frame[0] = 0x58;
+    expect(() => decodeControlReplayRequest(frame)).toThrow(RemoteGatewayCodecError);
+  });
+});
+
+describe("remote_gateway_binary_codec: FCRP control replay page trailer", () => {
+  it("encodes and decodes an exact 16-byte FCRP trailer", () => {
+    const frame = encodeControlReplayPageTrailer({
+      highWaterSeq: 9n,
+      truncated: true,
+      eventCount: 3,
+    });
+    expect(frame.length).toBe(FCRP_BYTES);
+    expect(String.fromCharCode(...frame.slice(0, 4))).toBe(FCRP_MAGIC);
+    expect(frame[4]).toBe(1);
+    expect(decodeControlReplayPageTrailer(frame)).toEqual({
+      highWaterSeq: 9n,
+      truncated: true,
+      eventCount: 3,
+    });
+  });
+
+  it("round-trips an empty page (eventCount 0, not truncated)", () => {
+    const frame = encodeControlReplayPageTrailer({
+      highWaterSeq: 0n,
+      truncated: false,
+      eventCount: 0,
+    });
+    expect(decodeControlReplayPageTrailer(frame)).toEqual({
+      highWaterSeq: 0n,
+      truncated: false,
+      eventCount: 0,
+    });
+  });
+
+  it("rejects a truncated byte outside {0,1}", () => {
+    const frame = encodeControlReplayPageTrailer({
+      highWaterSeq: 1n,
+      truncated: false,
+      eventCount: 1,
+    });
+    frame[13] = 2;
+    expect(() => decodeControlReplayPageTrailer(frame)).toThrow(RemoteGatewayCodecError);
+  });
+
+  it("rejects wrong length / trailing bytes", () => {
+    const short = new Uint8Array(15);
+    expect(() => decodeControlReplayPageTrailer(short)).toThrow(RemoteGatewayCodecError);
+    const frame = encodeControlReplayPageTrailer({
+      highWaterSeq: 1n,
+      truncated: false,
+      eventCount: 1,
+    });
+    const padded = new Uint8Array(FCRP_BYTES + 1);
+    padded.set(frame);
+    expect(() => decodeControlReplayPageTrailer(padded)).toThrow(RemoteGatewayCodecError);
+  });
+
+  it("rejects wrong magic/version", () => {
+    const frame = encodeControlReplayPageTrailer({
+      highWaterSeq: 1n,
+      truncated: false,
+      eventCount: 1,
+    });
+    frame[0] = 0x58;
+    expect(() => decodeControlReplayPageTrailer(frame)).toThrow(RemoteGatewayCodecError);
   });
 });
 

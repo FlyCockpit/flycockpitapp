@@ -310,8 +310,24 @@ export function decodeRemoteControlEventHeader(bytes: Uint8Array): {
 // ---------------------------------------------------------------------------
 // Gateway command ACK — exact 26 bytes
 //   version:u8(1) | kind:u8 | commandId:[16] | committedSequence:u64
+//
+// Closed ACK kind enum (USER-SETTLED 2026-08-11):
+//   1 = signaling_store_command — signaling-store commit/command ACKs (FCAK
+//       codec tests use kind 1; never repurposed).
+//   2 = control_event_delivery — daemon→gateway progress ACK sent after the
+//       daemon applies+persists a control-event JWS. `commandId = eventId`,
+//       `committedSequence = controlSeq`. Missing ACK is still safe: the gateway
+//       redelivers on reconnect and the daemon dedupes by eventId/bytes.
+// An unknown kind is never treated as a successful control-event ACK.
 // ---------------------------------------------------------------------------
 export const REMOTE_GATEWAY_ACK_BYTES = 26;
+
+export const RemoteGatewayAckKind = {
+  signaling_store_command: 1,
+  control_event_delivery: 2,
+} as const;
+export type RemoteGatewayAckKindV1 =
+  (typeof RemoteGatewayAckKind)[keyof typeof RemoteGatewayAckKind];
 
 export function encodeGatewayAck(value: {
   kind: number;
@@ -343,5 +359,85 @@ export function decodeGatewayAck(bytes: Uint8Array): {
     kind: bytes[1]!,
     commandId,
     committedSequence: new DataView(bytes.buffer, bytes.byteOffset).getBigUint64(18),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// FCRQ — control-outbox replay request (daemon → gateway), exact 13 bytes
+//   magic="FCRQ"[4] | version:u8(1) | afterControlSeq:u64
+// Scope is only the authenticated control-socket binding — never a
+// client-declared instance/generation on the wire. Trailing bytes → reject.
+// ---------------------------------------------------------------------------
+export const FCRQ_MAGIC = "FCRQ";
+export const FCRQ_BYTES = 13;
+
+export function encodeControlReplayRequest(value: { afterControlSeq: bigint }): Uint8Array {
+  if (value.afterControlSeq < 0n || value.afterControlSeq > 0xffffffffffffffffn)
+    fail("FCRQ afterControlSeq");
+  const out = new Uint8Array(FCRQ_BYTES);
+  out.set(te.encode(FCRQ_MAGIC));
+  out[4] = 1;
+  new DataView(out.buffer).setBigUint64(5, value.afterControlSeq);
+  return out;
+}
+
+export function decodeControlReplayRequest(bytes: Uint8Array): { afterControlSeq: bigint } {
+  if (bytes.length !== FCRQ_BYTES) fail("FCRQ length");
+  if (String.fromCharCode(...bytes.slice(0, 4)) !== FCRQ_MAGIC || bytes[4] !== 1)
+    fail("FCRQ magic/version");
+  return {
+    afterControlSeq: new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getBigUint64(5),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// FCRP — control-outbox replay page trailer (gateway → daemon), exact 16 bytes
+//   magic="FCRP"[4] | version:u8(1) | highWaterSeq:u64 | truncated:u8 | eventCount:u16
+// Sent once after the N JWS body frames of an FCRQ-solicited replay page.
+// `truncated` is 0/1 only; `eventCount` must equal N. Trailing bytes → reject.
+// ---------------------------------------------------------------------------
+export const FCRP_MAGIC = "FCRP";
+export const FCRP_BYTES = 16;
+export const REMOTE_GATEWAY_REPLAY_MAX_EVENT_COUNT = 0xffff;
+
+export function encodeControlReplayPageTrailer(value: {
+  highWaterSeq: bigint;
+  truncated: boolean;
+  eventCount: number;
+}): Uint8Array {
+  if (value.highWaterSeq < 0n || value.highWaterSeq > 0xffffffffffffffffn)
+    fail("FCRP highWaterSeq");
+  if (
+    !Number.isInteger(value.eventCount) ||
+    value.eventCount < 0 ||
+    value.eventCount > REMOTE_GATEWAY_REPLAY_MAX_EVENT_COUNT
+  )
+    fail("FCRP eventCount");
+  const out = new Uint8Array(FCRP_BYTES);
+  out.set(te.encode(FCRP_MAGIC));
+  out[4] = 1;
+  const view = new DataView(out.buffer);
+  view.setBigUint64(5, value.highWaterSeq);
+  out[13] = value.truncated ? 1 : 0;
+  view.setUint16(14, value.eventCount);
+  return out;
+}
+
+export function decodeControlReplayPageTrailer(bytes: Uint8Array): {
+  highWaterSeq: bigint;
+  truncated: boolean;
+  eventCount: number;
+} {
+  if (bytes.length !== FCRP_BYTES) fail("FCRP length");
+  if (String.fromCharCode(...bytes.slice(0, 4)) !== FCRP_MAGIC || bytes[4] !== 1)
+    fail("FCRP magic/version");
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const highWaterSeq = view.getBigUint64(5);
+  const truncatedByte = bytes[13]!;
+  if (truncatedByte !== 0 && truncatedByte !== 1) fail("FCRP truncated must be 0 or 1");
+  return {
+    highWaterSeq,
+    truncated: truncatedByte === 1,
+    eventCount: view.getUint16(14),
   };
 }

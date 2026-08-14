@@ -213,6 +213,7 @@ export interface SignFcdaInput {
   certificateGeneration: bigint;
   configuredOrigin?: string;
   lastDiscoverySeq?: bigint;
+  lastControlSeq?: bigint;
 }
 
 /** Build and sign a complete FCDA frame answering the FCDC challenge. */
@@ -222,7 +223,7 @@ export function signFcda(input: SignFcdaInput): Uint8Array {
     certificateJws: new TextEncoder().encode(input.certJws),
     connectionNonce: new Uint8Array(32).fill(7),
     lastDiscoverySeq: input.lastDiscoverySeq ?? 0n,
-    lastControlSeq: 0n,
+    lastControlSeq: input.lastControlSeq ?? 0n,
     signature: new Uint8Array(64).fill(1),
   });
   const before = frame.slice(0, frame.length - 64);

@@ -10,6 +10,7 @@
 import { randomBytes } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { MemoryRemoteDaemonControlOutboxStore } from "@flycockpit/api/lib/remote-daemon-control-outbox";
 import {
   RedisRemoteSignalingAttemptStore,
   type RemoteSignalingAttemptStore,
@@ -66,6 +67,7 @@ async function startRedisReplica(ring: TestIdentityRing): Promise<RedisReplica> 
   const installed = installRemoteSignalingGateway(server, {
     configuredOrigin: CONFIGURED_ORIGIN,
     store,
+    controlOutbox: new MemoryRemoteDaemonControlOutboxStore(),
     daemonCertificateVerifier: buildRingVerifier(ring.ring),
     wake,
     logger: new NoopLogger(),

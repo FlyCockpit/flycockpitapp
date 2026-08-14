@@ -222,6 +222,18 @@
     "owningVersion": 1
   },
   {
+    "magic": "FCRP",
+    "symbolicType": "RemoteControlReplayPageV1",
+    "owningPackage": "@flycockpit/cockpit-protocol",
+    "owningVersion": 1
+  },
+  {
+    "magic": "FCRQ",
+    "symbolicType": "RemoteControlReplayRequestV1",
+    "owningPackage": "@flycockpit/cockpit-protocol",
+    "owningVersion": 1
+  },
+  {
     "magic": "FCRS",
     "symbolicType": "RemoteIpConsentStatusV1",
     "owningPackage": "@flycockpit/cockpit-protocol",

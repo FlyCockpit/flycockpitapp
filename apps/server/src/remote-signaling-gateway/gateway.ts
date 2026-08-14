@@ -16,13 +16,25 @@
  * Daemon control authentication verifies a real identity-CA-signed certificate
  * plus a P-256 signature over the domain-separated control-auth preimage; client
  * authentication consumes a single-use Redis ticket atomically with the store's
- * `client_admission_proof` transition. Durable FCRC control delivery (Postgres
- * outbox, server→daemon control JWS, 26-byte ACK, FCRQ replay) is owned by
- * `signaling-gateway-control-outbox-delivery`, not this module.
+ * `client_admission_proof` transition.
+ *
+ * Durable server→daemon control delivery is implemented here: after control
+ * auth, the socket streams the per-instance `RemoteDaemonControlOutbox`
+ * (`RemoteDaemonControlOutboxStore`, Postgres-authoritative) as the exact
+ * compact control-event JWS UTF-8 bytes in binary frames — no re-sign, no FCRC
+ * wrap — advancing a socket-local cursor from the daemon-reported FCDA
+ * `lastControlSeq`, woken on append by the dedicated control-outbox Redis
+ * channel. The deployment-scoped `RemoteAuthorityControlOutbox` is NOT the
+ * daemon stream. Post-auth control-socket inbound frames demux to FCSE
+ * (signaling), the 26-byte kind-2 control-delivery ACK, and FCRQ replay (served
+ * from the same Postgres page reader as N JWS + terminal FCRP); inbound FCRC and
+ * unknown magics close 4400 and never append.
  */
 import { createHash, randomBytes } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
+import type { RemoteDaemonControlOutboxStore } from "@flycockpit/api/lib/remote-daemon-control-outbox";
+import { RemoteDaemonControlOutboxError } from "@flycockpit/api/lib/remote-daemon-control-outbox";
 import type {
   RemoteInstanceWakeLeaseV1,
   RemoteSignalingActorBindingV1,
@@ -36,7 +48,16 @@ import {
   remoteChildAuthenticationDigests,
 } from "@flycockpit/cockpit-protocol";
 import { WebSocket, WebSocketServer } from "ws";
-import { decodeFcdaFrame, decodeFcsaFrame, encodeFcdcFrame } from "./binary-codecs";
+import {
+  decodeControlReplayRequest,
+  decodeFcdaFrame,
+  decodeFcsaFrame,
+  decodeGatewayAck,
+  encodeControlReplayPageTrailer,
+  encodeFcdcFrame,
+  REMOTE_GATEWAY_ACK_BYTES,
+  RemoteGatewayAckKind,
+} from "./binary-codecs";
 import {
   REMOTE_GATEWAY_CLOSE_CODE,
   REMOTE_GATEWAY_CLOSE_REASON,
@@ -71,6 +92,8 @@ export interface RemoteSignalingGatewayConfig {
   configuredOrigin: string;
   /** The signaling attempt store (Redis-authoritative or memory). */
   store: RemoteSignalingAttemptStore;
+  /** The per-instance daemon control-outbox page reader (Postgres or memory). */
+  controlOutbox: RemoteDaemonControlOutboxStore;
   /** Injected monotonic clock for deterministic rate limiting. */
   clock: MonotonicClock;
   /** Per-IP unauthenticated upgrade rate limiter. */
@@ -153,6 +176,19 @@ interface ControlSocketState {
   discoveryCursor: bigint;
   childCursors: Map<string, bigint>;
   childUnsubs: Map<string, () => void>;
+  /**
+   * Socket-local exclusive lower bound for live control-outbox delivery. Seeded
+   * from the daemon-reported FCDA `lastControlSeq`; advances only for frames
+   * handed to `ws.send`, so a 4429 close never drops an unsent committed event.
+   */
+  controlCursor: bigint;
+  controlWakeUnsub?: () => void;
+  /**
+   * Monotonic token for the at-most-one in-flight FCRQ replay per socket. A
+   * second FCRQ arriving before its FCRP supersedes the prior request
+   * (cancel-and-replace): the stale replay observes a newer token and stops.
+   */
+  controlReplayToken: number;
 }
 
 type GatewaySocket = SignalSocketState | ControlSocketState;
@@ -192,8 +228,19 @@ function toUint8Array(data: WebSocket.RawData): Uint8Array {
   return new Uint8Array(Buffer.concat(data as readonly Buffer[]));
 }
 
+const controlJwsEncoder = new TextEncoder();
+
 function magicOf(bytes: Uint8Array): string {
   return String.fromCharCode(bytes[0]!, bytes[1]!, bytes[2]!, bytes[3]!);
+}
+
+/**
+ * A control-outbox read failure — Postgres unavailable or a corrupt oversized
+ * JWS — closes the socket 4503 (dependency_unavailable). Both fail closed: an
+ * oversized row is never skipped (skipping would brick the sequence).
+ */
+function isControlOutboxError(error: unknown): error is RemoteDaemonControlOutboxError {
+  return error instanceof RemoteDaemonControlOutboxError;
 }
 
 function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
@@ -387,6 +434,8 @@ export class RemoteSignalingGateway {
         discoveryCursor: 0n,
         childCursors: new Map(),
         childUnsubs: new Map(),
+        controlCursor: 0n,
+        controlReplayToken: 0,
       };
     } else {
       sock = {
@@ -485,17 +534,55 @@ export class RemoteSignalingGateway {
       return;
     }
 
+    // Post-auth inbound demux.
+    //   FCSE                     -> signaling/discovery commit path (both kinds).
+    //   26-byte ACK (control)    -> kind-2 control-delivery progress (observability
+    //                               only; at-least-once redelivery ignores it).
+    //   FCRQ (control)           -> serve N JWS + terminal FCRP from readPage.
+    //   inbound FCRC             -> 4400; never a client->server outbox append.
+    //   unknown magic            -> 4400.
+    // The ACK/FCRQ kinds are legal only on an authenticated control socket.
+    // An ACK carries no magic: its first byte is the version (1), never an ASCII
+    // magic byte, so a magic frame that happens to be 26 bytes still demuxes by
+    // magic below.
+    if (
+      sock.kind === "control" &&
+      frameBytes.length === REMOTE_GATEWAY_ACK_BYTES &&
+      frameBytes[0] === 1
+    ) {
+      this.handleControlDeliveryAck(sock, frameBytes);
+      return;
+    }
     const magic = magicOf(frameBytes);
-    // Post-auth inbound demux. FCSE is the only kind this landing accepts.
-    // Inbound FCRC is never a client->server durable-control append -> 4400.
-    // The 26-byte control-delivery ACK and FCRQ replay-request kinds are RESERVED
-    // for `signaling-gateway-control-outbox-delivery`, which extends this demux to
-    // accept them on control sockets; they are not yet legal inbound here.
     if (magic === "FCSE") {
       await this.handleSignalingEvent(sock, frameBytes);
       return;
     }
+    if (sock.kind === "control" && magic === "FCRQ") {
+      await this.serveControlReplay(sock, frameBytes);
+      return;
+    }
     this.closeSocket(sock, REMOTE_GATEWAY_CLOSE_CODE.protocol_invalid);
+  }
+
+  /**
+   * Accept a 26-byte control-delivery ACK on an authenticated control socket. A
+   * structurally valid kind-2 ACK advances observability only; it never gates
+   * mint, outbox durability, or the socket-local cursor (a missing ACK is
+   * redelivered on reconnect and deduped by the daemon). A malformed ACK is a
+   * protocol error (4400); a well-formed but non-kind-2 ACK is ignored for
+   * durability — an unknown kind is never treated as a successful control ACK.
+   */
+  private handleControlDeliveryAck(sock: ControlSocketState, frameBytes: Uint8Array) {
+    let ack: ReturnType<typeof decodeGatewayAck>;
+    try {
+      ack = decodeGatewayAck(frameBytes);
+    } catch {
+      this.closeSocket(sock, REMOTE_GATEWAY_CLOSE_CODE.protocol_invalid);
+      return;
+    }
+    if (ack.kind === RemoteGatewayAckKind.control_event_delivery)
+      this.config.logger?.info("[gateway] control delivery ack kind=2");
   }
 
   // ---- Daemon control authentication (FCDA) -------------------------------
@@ -560,11 +647,21 @@ export class RemoteSignalingGateway {
     sock.socketGeneration = socketGeneration;
     sock.lease = lease;
     sock.discoveryCursor = highWater;
+    // Resume durable control delivery from the daemon-reported cursor. A claim
+    // above the outbox high-water is detected as a 4409 conflict on first read.
+    sock.controlCursor = fcda.lastControlSeq;
     sock.preAuth = null;
 
     sock.instanceWakeUnsub = this.config.wake.subscribeInstance(lease.instanceWakeRouteId, () => {
       this.enqueue(sock, () => this.deliverControlDiscovery(sock));
     });
+    sock.controlWakeUnsub = this.config.wake.subscribeControlOutbox(
+      identity.instanceId,
+      identity.certificateGeneration,
+      () => {
+        this.enqueue(sock, () => this.deliverControlOutbox(sock));
+      },
+    );
     sock.presenceTimer = setInterval(() => {
       this.enqueue(sock, () => this.renewPresence(sock));
     }, REMOTE_GATEWAY_PRESENCE_RENEWAL_MS);
@@ -574,6 +671,7 @@ export class RemoteSignalingGateway {
       `[gateway] control authenticated generation=${socketGeneration.toString()}`,
     );
     this.enqueue(sock, () => this.deliverControlDiscovery(sock));
+    this.enqueue(sock, () => this.deliverControlOutbox(sock));
   }
 
   private async renewPresence(sock: ControlSocketState) {
@@ -950,6 +1048,108 @@ export class RemoteSignalingGateway {
     }
   }
 
+  // ---- Durable control-outbox delivery (server -> daemon) ------------------
+
+  /**
+   * Drain the per-instance control outbox to the daemon as exact
+   * `controlEventJws` UTF-8 bytes (no re-sign, no FCRC wrap, no FCRP trailer for
+   * live delivery), in `controlSeq` order, from the socket-local cursor. The
+   * cursor advances only for a frame handed to `ws.send`, so a 4429 close never
+   * drops an unsent committed event — reconnect re-reads from Postgres. A daemon
+   * claiming a control cursor above the outbox high-water closes 4409.
+   */
+  private async deliverControlOutbox(sock: ControlSocketState) {
+    const instanceId = sock.instanceId;
+    const certificateGeneration = sock.certificateGeneration;
+    if (sock.closed || !instanceId || certificateGeneration === undefined) return;
+    for (;;) {
+      let page: Awaited<ReturnType<RemoteDaemonControlOutboxStore["readDaemonControlOutboxPage"]>>;
+      try {
+        page = await this.config.controlOutbox.readDaemonControlOutboxPage({
+          daemonInstanceProtocolId: instanceId,
+          daemonCertificateGeneration: certificateGeneration,
+          afterControlSeq: sock.controlCursor,
+        });
+      } catch (error) {
+        if (isControlOutboxError(error))
+          this.config.logger?.warn(`[gateway] control outbox read code=${error.code}`);
+        this.closeSocket(sock, REMOTE_GATEWAY_CLOSE_CODE.dependency_unavailable);
+        return;
+      }
+      if (sock.controlCursor > page.highWaterSeq) {
+        this.closeSocket(sock, REMOTE_GATEWAY_CLOSE_CODE.conflict_or_superseded);
+        return;
+      }
+      if (page.events.length === 0) return;
+      for (const event of page.events) {
+        if (sock.closed) return;
+        if (!this.trySend(sock, controlJwsEncoder.encode(event.controlEventJws))) {
+          this.closeSocket(sock, REMOTE_GATEWAY_CLOSE_CODE.rate_or_backpressure);
+          return;
+        }
+        sock.controlCursor = event.controlSeq;
+      }
+      if (!page.truncated) return;
+    }
+  }
+
+  /**
+   * Serve an FCRQ replay page for gap recovery: N exact `controlEventJws` frames
+   * (`controlSeq > afterControlSeq`, same wire form as live delivery) followed by
+   * exactly one terminal FCRP trailer whose `eventCount` equals N. Replay is
+   * independent of the live cursor. Inbound frames are processed sequentially per
+   * socket (they chain on `sock.queue`), so at most one replay runs at a time: a
+   * second FCRQ waits for the prior FCRP rather than interleaving. `token` is a
+   * forward guard that abandons an in-flight page if a newer FCRQ ever begins
+   * before this one finishes (e.g. if inbound handling becomes concurrent).
+   */
+  private async serveControlReplay(sock: ControlSocketState, frameBytes: Uint8Array) {
+    const instanceId = sock.instanceId;
+    const certificateGeneration = sock.certificateGeneration;
+    if (sock.closed || !instanceId || certificateGeneration === undefined) {
+      this.closeSocket(sock, REMOTE_GATEWAY_CLOSE_CODE.protocol_invalid);
+      return;
+    }
+    let request: ReturnType<typeof decodeControlReplayRequest>;
+    try {
+      request = decodeControlReplayRequest(frameBytes);
+    } catch {
+      this.closeSocket(sock, REMOTE_GATEWAY_CLOSE_CODE.protocol_invalid);
+      return;
+    }
+    const token = ++sock.controlReplayToken;
+    let page: Awaited<ReturnType<RemoteDaemonControlOutboxStore["readDaemonControlOutboxPage"]>>;
+    try {
+      page = await this.config.controlOutbox.readDaemonControlOutboxPage({
+        daemonInstanceProtocolId: instanceId,
+        daemonCertificateGeneration: certificateGeneration,
+        afterControlSeq: request.afterControlSeq,
+      });
+    } catch (error) {
+      if (isControlOutboxError(error))
+        this.config.logger?.warn(`[gateway] control replay read code=${error.code}`);
+      this.closeSocket(sock, REMOTE_GATEWAY_CLOSE_CODE.dependency_unavailable);
+      return;
+    }
+    // Superseded by a newer FCRQ while reading: drop this torn page silently.
+    if (sock.closed || token !== sock.controlReplayToken) return;
+    for (const event of page.events) {
+      if (sock.closed || token !== sock.controlReplayToken) return;
+      if (!this.trySend(sock, controlJwsEncoder.encode(event.controlEventJws))) {
+        this.closeSocket(sock, REMOTE_GATEWAY_CLOSE_CODE.rate_or_backpressure);
+        return;
+      }
+    }
+    if (sock.closed || token !== sock.controlReplayToken) return;
+    const trailer = encodeControlReplayPageTrailer({
+      highWaterSeq: page.highWaterSeq,
+      truncated: page.truncated,
+      eventCount: page.events.length,
+    });
+    if (!this.trySend(sock, trailer))
+      this.closeSocket(sock, REMOTE_GATEWAY_CLOSE_CODE.rate_or_backpressure);
+  }
+
   // ---- Lifecycle -----------------------------------------------------------
 
   private handlePreAuthTimeout(socketId: string) {
@@ -965,6 +1165,7 @@ export class RemoteSignalingGateway {
     if (sock.kind === "control") {
       if (sock.presenceTimer) clearInterval(sock.presenceTimer);
       sock.instanceWakeUnsub?.();
+      sock.controlWakeUnsub?.();
       for (const unsub of sock.childUnsubs.values()) unsub();
       sock.childUnsubs.clear();
       if (sock.instanceId && sock.certificateGeneration !== undefined && sock.lease) {

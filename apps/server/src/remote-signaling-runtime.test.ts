@@ -9,6 +9,7 @@
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { Duplex } from "node:stream";
+import { MemoryRemoteDaemonControlOutboxStore } from "@flycockpit/api/lib/remote-daemon-control-outbox";
 import { MemoryRemoteSignalingAttemptStore } from "@flycockpit/api/lib/remote-signaling-store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
@@ -56,6 +57,9 @@ async function setup(
     daemonCertificateVerifier: rejectingDaemonVerifier,
     additionalUpgrade: overrides.additionalUpgrade,
     store,
+    controlOutbox:
+      (overrides.controlOutbox as MemoryRemoteDaemonControlOutboxStore | undefined) ??
+      new MemoryRemoteDaemonControlOutboxStore(),
     wake,
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));

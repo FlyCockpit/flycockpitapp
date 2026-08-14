@@ -13,9 +13,25 @@ export interface RemoteSignalingWakeSubscription {
   subscribeAttempt(routeId: Uint8Array, handler: () => void): () => void;
   /** Subscribe to an instance discovery wake route. Returns an unsubscribe function. */
   subscribeInstance(routeId: Uint8Array, handler: () => void): () => void;
+  /**
+   * Subscribe to the dedicated control-outbox wake channel for one instance
+   * generation. The wake is a signal + high-water hint only; the woken handler
+   * re-reads every control-event JWS from Postgres. Returns an unsubscribe.
+   */
+  subscribeControlOutbox(
+    daemonInstanceProtocolId: string,
+    daemonCertificateGeneration: bigint,
+    handler: () => void,
+  ): () => void;
   /** Release any underlying resources (e.g. the Redis subscription connection). */
   close(): Promise<void>;
 }
+
+/** The per-instance-generation key both wake sides agree on. */
+export const controlOutboxWakeKey = (
+  daemonInstanceProtocolId: string,
+  daemonCertificateGeneration: bigint,
+): string => `${daemonInstanceProtocolId}:${daemonCertificateGeneration}`;
 
 const routeHex = (routeId: Uint8Array) => Buffer.from(routeId).toString("hex");
 
@@ -23,6 +39,7 @@ const routeHex = (routeId: Uint8Array) => Buffer.from(routeId).toString("hex");
 export class InMemoryRemoteSignalingWakeSubscription implements RemoteSignalingWakeSubscription {
   private readonly attemptHandlers = new Map<string, Set<() => void>>();
   private readonly instanceHandlers = new Map<string, Set<() => void>>();
+  private readonly controlOutboxHandlers = new Map<string, Set<() => void>>();
 
   private subscribe(
     map: Map<string, Set<() => void>>,
@@ -49,6 +66,17 @@ export class InMemoryRemoteSignalingWakeSubscription implements RemoteSignalingW
   subscribeInstance(routeId: Uint8Array, handler: () => void): () => void {
     return this.subscribe(this.instanceHandlers, routeHex(routeId), handler);
   }
+  subscribeControlOutbox(
+    daemonInstanceProtocolId: string,
+    daemonCertificateGeneration: bigint,
+    handler: () => void,
+  ): () => void {
+    return this.subscribe(
+      this.controlOutboxHandlers,
+      controlOutboxWakeKey(daemonInstanceProtocolId, daemonCertificateGeneration),
+      handler,
+    );
+  }
 
   /** Deliver an attempt wake to all subscribers (call from the memory store's `wake`). */
   publishAttempt(routeId: Uint8Array): void {
@@ -58,9 +86,18 @@ export class InMemoryRemoteSignalingWakeSubscription implements RemoteSignalingW
   publishInstance(routeId: Uint8Array): void {
     for (const handler of this.instanceHandlers.get(routeHex(routeId)) ?? []) handler();
   }
+  /** Deliver a control-outbox wake to all subscribers for one instance generation. */
+  publishControlOutbox(
+    daemonInstanceProtocolId: string,
+    daemonCertificateGeneration: bigint,
+  ): void {
+    const key = controlOutboxWakeKey(daemonInstanceProtocolId, daemonCertificateGeneration);
+    for (const handler of this.controlOutboxHandlers.get(key) ?? []) handler();
+  }
 
   async close(): Promise<void> {
     this.attemptHandlers.clear();
     this.instanceHandlers.clear();
+    this.controlOutboxHandlers.clear();
   }
 }

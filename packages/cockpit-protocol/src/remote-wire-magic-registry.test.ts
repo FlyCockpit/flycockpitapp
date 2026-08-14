@@ -24,6 +24,8 @@ describe("remote_wire_magic_registry_cross_language_vectors", () => {
       { magic: "FCCP", symbolicType: "ClientAdmissionProofV1" },
       { magic: "FCFP", symbolicType: "RemoteEndpointFinalProofV1" },
       { magic: "FCSE", symbolicType: "RemoteSignalingEventRequestV1" },
+      { magic: "FCRQ", symbolicType: "RemoteControlReplayRequestV1" },
+      { magic: "FCRP", symbolicType: "RemoteControlReplayPageV1" },
       { magic: "FCWO", symbolicType: "RemoteWebRtcOfferV1" },
       { magic: "FCWN", symbolicType: "RemoteWebRtcAnswerV1" },
       { magic: "FCWC", symbolicType: "RemoteWebRtcCandidateV1" },

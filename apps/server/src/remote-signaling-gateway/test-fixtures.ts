@@ -6,6 +6,7 @@
  */
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { MemoryRemoteDaemonControlOutboxStore } from "@flycockpit/api/lib/remote-daemon-control-outbox";
 import { MemoryRemoteSignalingAttemptStore } from "@flycockpit/api/lib/remote-signaling-store";
 import WebSocket from "ws";
 import { REMOTE_GATEWAY_WS_PATH } from "./close-codes";
@@ -49,6 +50,7 @@ export interface GatewayTestEnv {
   server: Server;
   gateway: RemoteSignalingGateway;
   store: MemoryRemoteSignalingAttemptStore;
+  controlOutbox: MemoryRemoteDaemonControlOutboxStore;
   wake: InMemoryRemoteSignalingWakeSubscription;
   url: string;
   close: () => Promise<void>;
@@ -64,10 +66,12 @@ export async function startGatewayServer(
     (out) => out.set(crypto.getRandomValues(new Uint8Array(out.length))),
     (route) => wake.publishAttempt(route),
   );
+  const controlOutbox = new MemoryRemoteDaemonControlOutboxStore();
   const server = createServer();
   const gateway = new RemoteSignalingGateway({
     configuredOrigin: "https://app.example.test",
     store,
+    controlOutbox,
     clock,
     unauthUpgradeLimiter: new UnauthUpgradeRateLimiter(clock),
     daemonCertificateVerifier: rejectingDaemonVerifier,
@@ -91,6 +95,7 @@ export async function startGatewayServer(
     server,
     gateway,
     store,
+    controlOutbox,
     wake,
     url,
     close: async () => {

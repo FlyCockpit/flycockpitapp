@@ -848,7 +848,10 @@ pub enum PreHookOutcome {
 /// than an explicit parseable deny are recorded as failed hook runs and allow
 /// existing agent execution to continue. The first explicit deny
 /// short-circuits later pre hooks.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_pre_tool_hooks(
+    runner: &dyn CommandRunner,
+    process_env: &dyn ProcessEnv,
     registry: &HookRegistry,
     tool_name: &str,
     tool_input: &Value,
@@ -863,8 +866,6 @@ pub(crate) async fn run_pre_tool_hooks(
         return PreHookOutcome::Allow;
     }
 
-    let runner = TokioCommandRunner::new();
-    let process_env = DefaultProcessEnv;
     let timestamp = chrono::Utc::now().to_rfc3339();
     let envelope = HookEnvelope::for_pre_tool_use(
         event,
@@ -878,7 +879,7 @@ pub(crate) async fn run_pre_tool_hooks(
     let stdin = envelope.to_json_string();
 
     for hook in hooks {
-        let executable = match resolve_hook_executable(hook, &process_env as &dyn ProcessEnv) {
+        let executable = match resolve_hook_executable(hook, process_env) {
             Some(path) => path,
             None => {
                 // Spawn failure: fail-open, record failed run.
@@ -902,7 +903,7 @@ pub(crate) async fn run_pre_tool_hooks(
         };
         let env_result = build_child_env(
             hook,
-            &process_env as &dyn ProcessEnv,
+            process_env,
             event,
             session_id,
             workspace_root,
@@ -984,6 +985,8 @@ pub(crate) async fn run_pre_tool_hooks(
 /// observer fails. Post hooks are observe-only (fail-open).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_post_tool_hooks(
+    runner: &dyn CommandRunner,
+    process_env: &dyn ProcessEnv,
     registry: &HookRegistry,
     event: HookEvent,
     tool_name: &str,
@@ -999,8 +1002,6 @@ pub(crate) async fn run_post_tool_hooks(
         return;
     }
 
-    let runner = TokioCommandRunner::new();
-    let process_env = DefaultProcessEnv;
     let timestamp = chrono::Utc::now().to_rfc3339();
 
     let (tool_result, tool_error) = match result {
@@ -1024,7 +1025,7 @@ pub(crate) async fn run_post_tool_hooks(
     let stdin = envelope.to_json_string();
 
     for hook in hooks {
-        let executable = match resolve_hook_executable(hook, &process_env as &dyn ProcessEnv) {
+        let executable = match resolve_hook_executable(hook, process_env) {
             Some(path) => path,
             None => {
                 record_hook_run(
@@ -1047,7 +1048,7 @@ pub(crate) async fn run_post_tool_hooks(
         };
         let env_result = build_child_env(
             hook,
-            &process_env as &dyn ProcessEnv,
+            process_env,
             event,
             session_id,
             workspace_root,
@@ -1240,6 +1241,8 @@ pub enum StopHookOutcome {
 /// stop hooks.
 #[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) async fn run_stop_hooks(
+    runner: &dyn CommandRunner,
+    process_env: &dyn ProcessEnv,
     registry: &HookRegistry,
     event: HookEvent,
     match_value: &str,
@@ -1258,8 +1261,6 @@ pub(crate) async fn run_stop_hooks(
         return StopHookOutcome::End;
     }
 
-    let runner = TokioCommandRunner::new();
-    let process_env = DefaultProcessEnv;
     let timestamp = chrono::Utc::now().to_rfc3339();
     let envelope = HookEnvelope::for_observe(
         event,
@@ -1278,7 +1279,7 @@ pub(crate) async fn run_stop_hooks(
     let mut feedback = StopGateFeedback::default();
 
     for hook in hooks {
-        let executable = match resolve_hook_executable(hook, &process_env as &dyn ProcessEnv) {
+        let executable = match resolve_hook_executable(hook, process_env) {
             Some(path) => path,
             None => {
                 record_hook_run(
@@ -1301,7 +1302,7 @@ pub(crate) async fn run_stop_hooks(
         };
         let env_result = build_child_env(
             hook,
-            &process_env as &dyn ProcessEnv,
+            process_env,
             event,
             session_id,
             workspace_root,
@@ -1416,6 +1417,8 @@ pub(crate) async fn run_stop_hooks(
 /// produces no row.
 #[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) async fn run_observe_hooks(
+    runner: &dyn CommandRunner,
+    process_env: &dyn ProcessEnv,
     registry: &HookRegistry,
     event: HookEvent,
     match_value: &str,
@@ -1432,8 +1435,6 @@ pub(crate) async fn run_observe_hooks(
         return;
     }
 
-    let runner = TokioCommandRunner::new();
-    let process_env = DefaultProcessEnv;
     let timestamp = chrono::Utc::now().to_rfc3339();
     let envelope = HookEnvelope::for_observe(
         event,
@@ -1450,7 +1451,7 @@ pub(crate) async fn run_observe_hooks(
     let stdin = envelope.to_json_string();
 
     for hook in hooks {
-        let executable = match resolve_hook_executable(hook, &process_env as &dyn ProcessEnv) {
+        let executable = match resolve_hook_executable(hook, process_env) {
             Some(path) => path,
             None => {
                 record_hook_run(
@@ -1473,7 +1474,7 @@ pub(crate) async fn run_observe_hooks(
         };
         let env_result = build_child_env(
             hook,
-            &process_env as &dyn ProcessEnv,
+            process_env,
             event,
             session_id,
             workspace_root,

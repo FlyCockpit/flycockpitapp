@@ -494,16 +494,31 @@ fn restore_archive_conn(
                 },
             )?;
         }
-        let restored_seq = Db::insert_session_event_json_conn(
-            conn,
-            id_map[&event.source_session_id],
-            event.kind,
-            event.agent.as_deref(),
-            event.call_id.as_deref(),
-            SessionEventContext::default(),
-            event.ts_ms,
-            &event.data_json,
-        )?;
+        // `HookRun` is a sole-writer, data-only audit kind: the generic writer
+        // rejects it (`reject_generic_hook_run`). Restore it through the typed
+        // import writer, which re-validates the closed audit projection via
+        // `HookRunAudit::from_json` (rejecting unknown/sensitive fields) before
+        // it can enter the ledger. Unknown event kinds still hard-error in
+        // `parse_event_kind` above.
+        let restored_seq = if event.kind == SessionEventKind::HookRun {
+            Db::insert_imported_hook_run_conn(
+                conn,
+                id_map[&event.source_session_id],
+                event.ts_ms,
+                &event_data,
+            )?
+        } else {
+            Db::insert_session_event_json_conn(
+                conn,
+                id_map[&event.source_session_id],
+                event.kind,
+                event.agent.as_deref(),
+                event.call_id.as_deref(),
+                SessionEventContext::default(),
+                event.ts_ms,
+                &event.data_json,
+            )?
+        };
         event_seq_map.insert((event.source_session_id, event.seq), restored_seq);
         if let Some(sidecar) = event_data.get("tandem_inference_sidecar") {
             tandem_sidecars.push((event, sidecar.clone()));
@@ -1295,6 +1310,7 @@ fn parse_event_kind(raw: String) -> Result<SessionEventKind> {
         "resource_promotion" => ResourcePromotion,
         "notice" => Notice,
         "model_switch" => ModelSwitch,
+        "hook_run" => HookRun,
         _ => bail!("unsupported import event type `{raw}`"),
     };
     Ok(kind)
@@ -1447,6 +1463,98 @@ mod tests {
             events
                 .iter()
                 .any(|event| event.kind == "user_message" && event.ts_ms == 1_234_567)
+        );
+    }
+
+    /// The complete closed hook-run audit projection an export emits for a
+    /// live `hook_run` ledger row.
+    fn hook_run_audit() -> Value {
+        json!({
+            "event": "postToolUse",
+            "hook": "project:abcdef0123456789:0",
+            "origin": "project:abcdef0123456789:0",
+            "status": "success",
+            "duration_ms": 12,
+            "tool_name": "bash",
+            "tool_call_id": "call-1",
+            "turn_id": "turn-9",
+        })
+    }
+
+    fn hook_run_event(session_id: Uuid, ts_ms: i64, data: Value) -> Value {
+        json!({
+            "seq": 1,
+            "ts_ms": ts_ms,
+            "type": "hook_run",
+            "session_id": session_id,
+            "short_id": "export",
+            "agent": null,
+            "call_id": null,
+            "data": data,
+        })
+    }
+
+    #[tokio::test]
+    async fn hook_run_event_import_and_rehydration() {
+        // A valid `hook_run` ledger entry exported as a data-only row imports
+        // through the typed writer and rehydrates identically.
+        let db = Db::open_in_memory().unwrap();
+        let id = Uuid::new_v4();
+        let audit = hook_run_audit();
+        let archive = read_archive_bytes(&archive_bytes(
+            vec![session(id, None)],
+            vec![hook_run_event(id, 4242, audit.clone())],
+            false,
+        ))
+        .unwrap();
+        let imported = import_archive(&db, archive, false).await.unwrap();
+        let events = db.list_session_events(imported.imported[0]).await.unwrap();
+        let hook_rows: Vec<_> = events.iter().filter(|e| e.kind == "hook_run").collect();
+        assert_eq!(hook_rows.len(), 1, "exactly one hook_run row restored");
+        let row = hook_rows[0];
+        assert_eq!(row.ts_ms, 4242, "exported hook_run timestamp preserved");
+        // The closed audit projection round-trips byte-for-byte as data (the
+        // typed import writer re-serializes the same validated projection).
+        assert_eq!(row.data, audit, "hook_run audit rehydrated identically");
+
+        // A hook_run carrying a field outside the closed projection is rejected
+        // by the typed import writer (`HookRunAudit::from_json`), so the whole
+        // import fails atomically rather than admitting a sensitive field.
+        let db_forbidden = Db::open_in_memory().unwrap();
+        let forbidden_id = Uuid::new_v4();
+        let mut forbidden = hook_run_audit();
+        forbidden["payload"] = json!("secret command output");
+        let archive = read_archive_bytes(&archive_bytes(
+            vec![session(forbidden_id, None)],
+            vec![hook_run_event(forbidden_id, 5, forbidden)],
+            false,
+        ))
+        .unwrap();
+        assert!(
+            import_archive(&db_forbidden, archive, false).await.is_err(),
+            "hook_run with a field outside the closed audit projection must be rejected"
+        );
+        assert!(
+            db_forbidden.get_session(forbidden_id).await.unwrap().is_none(),
+            "a rejected hook_run import leaves no partial session"
+        );
+
+        // Unknown event kinds remain a hard error (the parser gate is intact),
+        // whether it surfaces during archive hydration or the restore itself.
+        let db_unknown = Db::open_in_memory().unwrap();
+        let unknown_id = Uuid::new_v4();
+        let mut unknown = hook_run_event(unknown_id, 7, hook_run_audit());
+        unknown["type"] = json!("totally_unknown_kind");
+        let bytes = archive_bytes(vec![session(unknown_id, None)], vec![unknown], false);
+        let error = match read_archive_bytes(&bytes) {
+            Err(error) => error,
+            Ok(archive) => import_archive(&db_unknown, archive, false)
+                .await
+                .unwrap_err(),
+        };
+        assert!(
+            error.to_string().contains("unsupported import event type"),
+            "unknown event kinds must still be rejected: {error}"
         );
     }
 

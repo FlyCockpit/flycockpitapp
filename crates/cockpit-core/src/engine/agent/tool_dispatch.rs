@@ -599,6 +599,8 @@ pub(crate) async fn execute_ordinary_call(
         // explicit deny short-circuits later pre hooks and the tool is not
         // executed. Pre-hook failures are fail-open.
         let pre_hook_decision = super::hooks::run_pre_tool_hooks(
+            &super::hooks::TokioCommandRunner::new(),
+            &super::hooks::DefaultProcessEnv,
             env.hooks,
             resolved_name,
             &args,
@@ -670,6 +672,8 @@ pub(crate) async fn execute_ordinary_call(
             crate::config::extended::hooks::HookEvent::PostToolUseFailure
         };
         super::hooks::run_post_tool_hooks(
+            &super::hooks::TokioCommandRunner::new(),
+            &super::hooks::DefaultProcessEnv,
             env.hooks,
             post_event,
             resolved_name,

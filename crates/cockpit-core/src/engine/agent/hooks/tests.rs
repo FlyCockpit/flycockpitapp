@@ -1183,6 +1183,596 @@ async fn fake_command_runner_captures_invocation() {
 }
 
 // ---------------------------------------------------------------------------
+// Dispatch/observe/stop function behavior tests
+//
+// These drive the real dispatch functions (`run_pre_tool_hooks`,
+// `run_post_tool_hooks`, `run_observe_hooks`, `run_stop_hooks`) against a real
+// in-memory ledger with an injected fake command runner and process env, so no
+// external executable is spawned, no wall-clock sleep runs, and no `std::env`
+// is mutated. They prove the fail-open, deny short-circuit, matcher/ordering,
+// and stop-continuation contracts against non-vacuous ledger state.
+//
+// The containment-owned parts of these acceptance tests (the
+// `descendant_containment_unsupported` fail-open reason, proven-empty timeout
+// settlement) are deferred with the process-containment runner integration
+// (increment 2) and are not covered here.
+// ---------------------------------------------------------------------------
+
+use uuid::Uuid;
+
+async fn db_session() -> (crate::db::Db, Uuid) {
+    let db = crate::db::Db::open_in_memory().unwrap();
+    let session = db
+        .create_session("hooks-proj", "/tmp/hooks-test", "Build")
+        .await
+        .unwrap();
+    (db, session.session_id)
+}
+
+/// The `(event, status)` of every recorded `hook_run` row for a session, in
+/// insertion order.
+async fn hook_run_events(db: &crate::db::Db, session_id: Uuid) -> Vec<(String, String)> {
+    db.list_session_events(session_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "hook_run")
+        .map(|event| {
+            (
+                event.data["event"].as_str().unwrap().to_string(),
+                event.data["status"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Just the recorded `hook_run` statuses, in insertion order.
+async fn hook_run_statuses(db: &crate::db::Db, session_id: Uuid) -> Vec<String> {
+    hook_run_events(db, session_id)
+        .await
+        .into_iter()
+        .map(|(_, status)| status)
+        .collect()
+}
+
+fn workspace() -> &'static Path {
+    Path::new("/tmp/hooks-test")
+}
+
+#[tokio::test]
+async fn pre_tool_hook_explicit_deny_blocks_dispatch() {
+    let (db, sid) = db_session().await;
+    let reg = registry(vec![test_hook(
+        HookEvent::PreToolUse,
+        vec!["deny-hook".to_string()],
+        Some(vec!["bash".to_string()]),
+        BTreeMap::new(),
+        5,
+    )]);
+    let runner =
+        FakeCommandRunner::new(successful_output(r#"{"decision":"deny","reason":"too risky"}"#));
+    let env = FakeProcessEnv::with_default_resolution();
+
+    let outcome = run_pre_tool_hooks(
+        &runner,
+        &env,
+        &reg,
+        "bash",
+        &json!({ "cmd": "rm -rf /" }),
+        "call-1",
+        sid,
+        workspace(),
+        &db,
+    )
+    .await;
+
+    // The parseable deny short-circuits: the caller (`tool_dispatch`) returns
+    // the deterministic model-visible error and never dispatches the tool.
+    assert_eq!(
+        outcome,
+        PreHookOutcome::Deny {
+            reason: "too risky".to_string()
+        }
+    );
+    // Exactly one durable `denied` ledger row is recorded for the pre event.
+    assert_eq!(
+        hook_run_events(&db, sid).await,
+        vec![("preToolUse".to_string(), "denied".to_string())]
+    );
+    // The hook was actually invoked (real dispatch, not a lookalike).
+    assert_eq!(runner.invocations().len(), 1);
+    // The recorded audit is the closed projection — never any process output.
+    let rows = db.list_session_events(sid).await.unwrap();
+    let data = rows[0].data.as_object().unwrap();
+    for forbidden in ["payload", "stdout", "stderr", "output", "argv", "cwd"] {
+        assert!(!data.contains_key(forbidden), "audit leaked `{forbidden}`");
+    }
+}
+
+#[tokio::test]
+async fn pre_tool_hook_failures_are_fail_open() {
+    // Run one pre-hook scenario and return `(outcome, recorded statuses)`.
+    async fn run_case(
+        process_env: &dyn ProcessEnv,
+        output: HookRawOutput,
+    ) -> (PreHookOutcome, Vec<String>) {
+        let (db, sid) = db_session().await;
+        let reg = registry(vec![test_hook(
+            HookEvent::PreToolUse,
+            vec!["h".to_string()],
+            Some(vec!["bash".to_string()]),
+            BTreeMap::new(),
+            5,
+        )]);
+        let runner = FakeCommandRunner::new(output);
+        let outcome = run_pre_tool_hooks(
+            &runner,
+            process_env,
+            &reg,
+            "bash",
+            &json!({}),
+            "call-1",
+            sid,
+            workspace(),
+            &db,
+        )
+        .await;
+        (outcome, hook_run_statuses(&db, sid).await)
+    }
+
+    let resolves = FakeProcessEnv::with_default_resolution();
+
+    // Every failure mode below is fail-open: the pre gate returns `Allow` (so
+    // the ordinary tool dispatch proceeds) and records exactly one bounded row.
+    let big_malformed = "x".repeat(200 * 1024);
+    let failure_cases: Vec<(&str, HookRawOutput)> = vec![
+        ("timeout", timeout_output()),
+        ("spawn failure", spawn_failed_output()),
+        ("nonzero exit / child crash", failed_output()),
+        ("malformed JSON", successful_output("not json at all")),
+        ("unknown decision", successful_output(r#"{"decision":"maybe"}"#)),
+        ("oversized malformed stdout", successful_output(&big_malformed)),
+    ];
+    for (label, output) in failure_cases {
+        let (outcome, statuses) = run_case(&resolves, output).await;
+        assert_eq!(outcome, PreHookOutcome::Allow, "{label} must fail open");
+        assert_eq!(
+            statuses,
+            vec!["failed".to_string()],
+            "{label} must record one failed row"
+        );
+    }
+
+    // Valid non-deny (allow) JSON: success row, dispatch still proceeds.
+    let (outcome, statuses) =
+        run_case(&resolves, successful_output(r#"{"decision":"allow"}"#)).await;
+    assert_eq!(outcome, PreHookOutcome::Allow);
+    assert_eq!(statuses, vec!["success".to_string()]);
+
+    // Missing executable: resolution fails before the runner is consulted, so
+    // even a would-be deny payload cannot deny — fail-open failed row.
+    let missing = FakeProcessEnv::default();
+    let (outcome, statuses) =
+        run_case(&missing, successful_output(r#"{"decision":"deny"}"#)).await;
+    assert_eq!(outcome, PreHookOutcome::Allow);
+    assert_eq!(statuses, vec!["failed".to_string()]);
+}
+
+#[tokio::test]
+async fn tool_hooks_run_in_canonical_lifecycle_order() {
+    let (db, sid) = db_session().await;
+    let env = FakeProcessEnv::with_default_resolution();
+    let allow_runner = FakeCommandRunner::new(successful_output(r#"{"decision":"allow"}"#));
+
+    // Pre runs first and allows dispatch.
+    let pre_reg = registry(vec![test_hook(
+        HookEvent::PreToolUse,
+        vec!["pre".to_string()],
+        Some(vec!["bash".to_string()]),
+        BTreeMap::new(),
+        5,
+    )]);
+    let pre = run_pre_tool_hooks(
+        &allow_runner,
+        &env,
+        &pre_reg,
+        "bash",
+        &json!({}),
+        "c1",
+        sid,
+        workspace(),
+        &db,
+    )
+    .await;
+    assert_eq!(pre, PreHookOutcome::Allow);
+
+    // Then exactly one matching post event after a successful dispatch.
+    let post_reg = registry(vec![
+        test_hook(
+            HookEvent::PostToolUse,
+            vec!["post".to_string()],
+            Some(vec!["bash".to_string()]),
+            BTreeMap::new(),
+            5,
+        ),
+        test_hook(
+            HookEvent::PostToolUseFailure,
+            vec!["postfail".to_string()],
+            Some(vec!["bash".to_string()]),
+            BTreeMap::new(),
+            5,
+        ),
+    ]);
+    let ok: anyhow::Result<crate::engine::tool::ToolOutput> =
+        Ok(crate::engine::tool::ToolOutput::text("done"));
+    run_post_tool_hooks(
+        &allow_runner,
+        &env,
+        &post_reg,
+        HookEvent::PostToolUse,
+        "bash",
+        &json!({}),
+        "c1",
+        &ok,
+        sid,
+        workspace(),
+        &db,
+    )
+    .await;
+
+    // Canonical order: pre before post; only the success post event fired (the
+    // `postToolUseFailure` handler did not, because the dispatch succeeded).
+    assert_eq!(
+        hook_run_events(&db, sid).await,
+        vec![
+            ("preToolUse".to_string(), "success".to_string()),
+            ("postToolUse".to_string(), "success".to_string()),
+        ]
+    );
+
+    // A failed dispatch fires `postToolUseFailure` exactly once.
+    let (db2, sid2) = db_session().await;
+    let err: anyhow::Result<crate::engine::tool::ToolOutput> = Err(anyhow::anyhow!("boom"));
+    run_post_tool_hooks(
+        &allow_runner,
+        &env,
+        &post_reg,
+        HookEvent::PostToolUseFailure,
+        "bash",
+        &json!({}),
+        "c1",
+        &err,
+        sid2,
+        workspace(),
+        &db2,
+    )
+    .await;
+    assert_eq!(
+        hook_run_events(&db2, sid2).await,
+        vec![("postToolUseFailure".to_string(), "success".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn tool_hook_matcher_and_ordering() {
+    let env = FakeProcessEnv::with_default_resolution();
+
+    // Exact matcher selects only its tool; a `None` matcher matches all tools.
+    let exact = test_hook(
+        HookEvent::PreToolUse,
+        vec!["exact".to_string()],
+        Some(vec!["bash".to_string()]),
+        BTreeMap::new(),
+        5,
+    );
+    let wildcard = test_hook(
+        HookEvent::PreToolUse,
+        vec!["wild".to_string()],
+        None,
+        BTreeMap::new(),
+        5,
+    );
+    let reg = registry(vec![exact, wildcard]);
+    assert_eq!(matching_hooks(&reg, HookEvent::PreToolUse, "bash").len(), 2);
+    assert_eq!(matching_hooks(&reg, HookEvent::PreToolUse, "read").len(), 1);
+    assert_eq!(matching_hooks(&reg, HookEvent::PostToolUse, "bash").len(), 0);
+
+    // Pre first-deny short-circuits later pre hooks.
+    {
+        let (db, sid) = db_session().await;
+        let two = registry(vec![
+            test_hook(
+                HookEvent::PreToolUse,
+                vec!["a".to_string()],
+                Some(vec!["bash".to_string()]),
+                BTreeMap::new(),
+                5,
+            ),
+            test_hook(
+                HookEvent::PreToolUse,
+                vec!["b".to_string()],
+                Some(vec!["bash".to_string()]),
+                BTreeMap::new(),
+                5,
+            ),
+        ]);
+        let runner = FakeCommandRunner::new(successful_output(r#"{"decision":"deny","reason":"no"}"#));
+        let outcome = run_pre_tool_hooks(
+            &runner,
+            &env,
+            &two,
+            "bash",
+            &json!({}),
+            "c1",
+            sid,
+            workspace(),
+            &db,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            PreHookOutcome::Deny {
+                reason: "no".to_string()
+            }
+        );
+        assert_eq!(
+            runner.invocations().len(),
+            1,
+            "first deny must short-circuit later pre hooks"
+        );
+        assert_eq!(hook_run_statuses(&db, sid).await, vec!["denied".to_string()]);
+    }
+
+    // All matching observer hooks run sequentially despite an earlier failure.
+    {
+        let (db, sid) = db_session().await;
+        let two = registry(vec![
+            test_hook(
+                HookEvent::SessionStart,
+                vec!["a".to_string()],
+                None,
+                BTreeMap::new(),
+                5,
+            ),
+            test_hook(
+                HookEvent::SessionStart,
+                vec!["b".to_string()],
+                None,
+                BTreeMap::new(),
+                5,
+            ),
+        ]);
+        let runner = FakeCommandRunner::new(failed_output());
+        run_observe_hooks(
+            &runner,
+            &env,
+            &two,
+            HookEvent::SessionStart,
+            "fresh",
+            sid,
+            workspace(),
+            &db,
+            Some("fresh"),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            runner.invocations().len(),
+            2,
+            "every matching observer runs even after an earlier failure"
+        );
+        assert_eq!(
+            hook_run_statuses(&db, sid).await,
+            vec!["failed".to_string(), "failed".to_string()]
+        );
+    }
+}
+
+#[tokio::test]
+async fn stop_hook_continuation_state_machine() {
+    let env = FakeProcessEnv::with_default_resolution();
+    let stop_hook = || {
+        test_hook(
+            HookEvent::Stop,
+            vec!["s".to_string()],
+            Some(vec!["end_turn".to_string()]),
+            BTreeMap::new(),
+            5,
+        )
+    };
+
+    // No matching hooks → End, state untouched.
+    {
+        let (db, sid) = db_session().await;
+        let runner = FakeCommandRunner::new(successful_output(""));
+        let mut state = StopGateState::default();
+        let outcome = run_stop_hooks(
+            &runner,
+            &env,
+            &registry(vec![]),
+            HookEvent::Stop,
+            "end_turn",
+            sid,
+            workspace(),
+            &db,
+            &mut state,
+        )
+        .await;
+        assert_eq!(outcome, StopHookOutcome::End);
+        assert_eq!(state.continuation_count, 0);
+        assert!(hook_run_statuses(&db, sid).await.is_empty());
+    }
+
+    // A `block` + `additionalContext` aggregates into a continuation round and
+    // increments the per-frame continuation count.
+    {
+        let (db, sid) = db_session().await;
+        let runner = FakeCommandRunner::new(successful_output(
+            r#"{"decision":"block","reason":"keep going","hookSpecificOutput":{"additionalContext":"more work"}}"#,
+        ));
+        let mut state = StopGateState::default();
+        let outcome = run_stop_hooks(
+            &runner,
+            &env,
+            &registry(vec![stop_hook()]),
+            HookEvent::Stop,
+            "end_turn",
+            sid,
+            workspace(),
+            &db,
+            &mut state,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            StopHookOutcome::Continue {
+                reason: "keep going".to_string(),
+                additional_context: Some("more work".to_string()),
+            }
+        );
+        assert_eq!(state.continuation_count, 1);
+        assert!(state.stop_hook_active);
+        assert_eq!(hook_run_statuses(&db, sid).await, vec!["blocked".to_string()]);
+    }
+
+    // `{"continue":false}` wins over aggregation → ForcedEnd.
+    {
+        let (db, sid) = db_session().await;
+        let runner = FakeCommandRunner::new(successful_output(
+            r#"{"continue":false,"stopReason":"all done"}"#,
+        ));
+        let mut state = StopGateState::default();
+        let outcome = run_stop_hooks(
+            &runner,
+            &env,
+            &registry(vec![stop_hook()]),
+            HookEvent::Stop,
+            "end_turn",
+            sid,
+            workspace(),
+            &db,
+            &mut state,
+        )
+        .await;
+        assert_eq!(outcome, StopHookOutcome::ForcedEnd);
+    }
+
+    // At the continuation cap → ForcedEnd WITHOUT reconsulting the hooks and
+    // without recording a new ledger row.
+    {
+        let (db, sid) = db_session().await;
+        let runner = FakeCommandRunner::new(successful_output(r#"{"decision":"block","reason":"x"}"#));
+        let mut state = StopGateState {
+            continuation_count: STOP_HOOK_MAX_CONTINUATIONS,
+            stop_hook_active: false,
+        };
+        let outcome = run_stop_hooks(
+            &runner,
+            &env,
+            &registry(vec![stop_hook()]),
+            HookEvent::Stop,
+            "end_turn",
+            sid,
+            workspace(),
+            &db,
+            &mut state,
+        )
+        .await;
+        assert_eq!(outcome, StopHookOutcome::ForcedEnd);
+        assert_eq!(
+            runner.invocations().len(),
+            0,
+            "a capped stop gate must not reconsult its hooks"
+        );
+        assert!(hook_run_statuses(&db, sid).await.is_empty());
+    }
+
+    // A failed stop hook is fail-open: it neither blocks nor continues.
+    {
+        let (db, sid) = db_session().await;
+        let runner = FakeCommandRunner::new(failed_output());
+        let mut state = StopGateState::default();
+        let outcome = run_stop_hooks(
+            &runner,
+            &env,
+            &registry(vec![stop_hook()]),
+            HookEvent::Stop,
+            "end_turn",
+            sid,
+            workspace(),
+            &db,
+            &mut state,
+        )
+        .await;
+        assert_eq!(outcome, StopHookOutcome::End);
+        assert_eq!(state.continuation_count, 0);
+        assert_eq!(hook_run_statuses(&db, sid).await, vec!["failed".to_string()]);
+    }
+}
+
+#[test]
+fn tool_hook_session_config_snapshot_is_turn_stable() {
+    use crate::daemon::session_worker::{SessionConfigHandle, SessionConfigSnapshot};
+
+    let gen1 = SessionConfigSnapshot::with_hooks(
+        1,
+        crate::config::providers::ProvidersConfig::default(),
+        crate::config::extended::ExtendedConfig::default(),
+        registry(vec![test_hook(
+            HookEvent::PreToolUse,
+            vec!["one".to_string()],
+            Some(vec!["bash".to_string()]),
+            BTreeMap::new(),
+            5,
+        )]),
+    );
+    let gen2 = SessionConfigSnapshot::with_hooks(
+        2,
+        crate::config::providers::ProvidersConfig::default(),
+        crate::config::extended::ExtendedConfig::default(),
+        registry(vec![
+            test_hook(
+                HookEvent::PreToolUse,
+                vec!["one".to_string()],
+                Some(vec!["bash".to_string()]),
+                BTreeMap::new(),
+                5,
+            ),
+            test_hook(
+                HookEvent::PostToolUse,
+                vec!["two".to_string()],
+                Some(vec!["bash".to_string()]),
+                BTreeMap::new(),
+                5,
+            ),
+        ]),
+    );
+
+    let shared = std::sync::Arc::new(std::sync::RwLock::new(gen1));
+    let live = SessionConfigHandle::new(shared.clone());
+
+    // Turn boundary: the driver pins the turn's config view (generation 1).
+    let turn = live.repin();
+    assert_eq!(turn.generation(), 1);
+    assert_eq!(turn.snapshot().hooks().hooks.len(), 1);
+
+    // A config reload lands mid-turn, bumping the generation and the hook set.
+    *shared.write().unwrap() = gen2;
+
+    // The in-flight turn's pre and post hooks read the SAME pinned registry;
+    // the reload does not change the active turn.
+    assert_eq!(turn.generation(), 1);
+    assert_eq!(turn.snapshot().hooks().hooks.len(), 1);
+
+    // The reload only takes effect at the next turn's repin.
+    let next_turn = live.repin();
+    assert_eq!(next_turn.generation(), 2);
+    assert_eq!(next_turn.snapshot().hooks().hooks.len(), 2);
+}
+
+// ---------------------------------------------------------------------------
 // Hook decision status mapping tests
 // ---------------------------------------------------------------------------
 

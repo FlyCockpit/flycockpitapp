@@ -611,3 +611,32 @@ fn cargo_dist_monorepo_configuration() {
     assert!(!WORKFLOW.contains("working-directory: apps/cli"));
     assert!(WORKFLOW.contains("path: target/distrib/"));
 }
+
+#[test]
+fn cargo_dist_artifact_runners_remap_from_ci_runners() {
+    assert!(WORKFLOW.contains("Remap artifacts_matrix.runner from ci-runners.yml"));
+    assert!(WORKFLOW.contains("needs.runners.outputs.ubuntu_2204_large"));
+    assert!(WORKFLOW.contains("needs.runners.outputs.ubuntu_2204_arm"));
+    assert!(WORKFLOW.contains("needs.runners.outputs.macos_large"));
+    assert!(WORKFLOW.contains("needs.runners.outputs.macos_intel"));
+    assert!(WORKFLOW.contains("needs.runners.outputs.windows"));
+    for target in [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "x86_64-pc-windows-msvc",
+    ] {
+        assert!(
+            WORKFLOW.contains(target),
+            "plan-job remap must mention {target}"
+        );
+    }
+    assert!(DIST.contains("[dist.github-custom-runners]"));
+    assert!(DIST.contains("global = \"ubuntu-22.04\""));
+    assert!(DIST.contains("x86_64-unknown-linux-gnu = \"ubuntu-22.04\""));
+    assert!(DIST.contains("aarch64-unknown-linux-gnu = \"ubuntu-22.04-arm\""));
+    assert!(DIST.contains("aarch64-apple-darwin = \"macos-latest\""));
+    assert!(DIST.contains("x86_64-apple-darwin = \"macos-15-intel\""));
+    assert!(DIST.contains("x86_64-pc-windows-msvc = \"windows-latest\""));
+}

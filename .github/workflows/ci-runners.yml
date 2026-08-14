@@ -1,0 +1,114 @@
+# CI runner labels. Toggle GitHub-hosted vs Blacksmith in one place:
+#   1. Repo variable CI_RUNNER_PROVIDER=github|blacksmith (wins when set)
+#   2. The default below (used when the variable is unset)
+# This selector always runs on GitHub ubuntu-latest so it still works when
+# Blacksmith quota is exhausted.
+#
+# cargo-dist source labels live in dist-workspace.toml; release.yml remaps
+# artifacts_matrix.runner from these outputs at plan time.
+
+name: CI runner labels
+
+on:
+  workflow_call:
+    outputs:
+      ubuntu:
+        description: Typical Ubuntu runner
+        value: ${{ jobs.select.outputs.ubuntu }}
+      ubuntu_small:
+        description: Light Ubuntu runner
+        value: ${{ jobs.select.outputs.ubuntu_small }}
+      ubuntu_large:
+        description: Heavy Ubuntu runner
+        value: ${{ jobs.select.outputs.ubuntu_large }}
+      ubuntu_2204:
+        description: Typical Ubuntu 22.04 runner
+        value: ${{ jobs.select.outputs.ubuntu_2204 }}
+      ubuntu_2204_small:
+        description: Light Ubuntu 22.04 runner
+        value: ${{ jobs.select.outputs.ubuntu_2204_small }}
+      ubuntu_2204_large:
+        description: Heavy Ubuntu 22.04 runner
+        value: ${{ jobs.select.outputs.ubuntu_2204_large }}
+      ubuntu_2204_arm:
+        description: Ubuntu 22.04 ARM runner
+        value: ${{ jobs.select.outputs.ubuntu_2204_arm }}
+      macos:
+        description: Typical macOS runner
+        value: ${{ jobs.select.outputs.macos }}
+      macos_large:
+        description: Heavy macOS runner
+        value: ${{ jobs.select.outputs.macos_large }}
+      macos_intel:
+        description: Intel macOS runner
+        value: ${{ jobs.select.outputs.macos_intel }}
+      windows:
+        description: Typical Windows runner
+        value: ${{ jobs.select.outputs.windows }}
+
+permissions:
+  contents: read
+
+jobs:
+  select:
+    name: Select CI runners
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      ubuntu: ${{ steps.map.outputs.ubuntu }}
+      ubuntu_small: ${{ steps.map.outputs.ubuntu_small }}
+      ubuntu_large: ${{ steps.map.outputs.ubuntu_large }}
+      ubuntu_2204: ${{ steps.map.outputs.ubuntu_2204 }}
+      ubuntu_2204_small: ${{ steps.map.outputs.ubuntu_2204_small }}
+      ubuntu_2204_large: ${{ steps.map.outputs.ubuntu_2204_large }}
+      ubuntu_2204_arm: ${{ steps.map.outputs.ubuntu_2204_arm }}
+      macos: ${{ steps.map.outputs.macos }}
+      macos_large: ${{ steps.map.outputs.macos_large }}
+      macos_intel: ${{ steps.map.outputs.macos_intel }}
+      windows: ${{ steps.map.outputs.windows }}
+    steps:
+      - id: map
+        name: Map provider to runner labels
+        env:
+          # Default when vars.CI_RUNNER_PROVIDER is unset. Flip to blacksmith
+          # here, or set the repo variable to github|blacksmith.
+          CI_RUNNER_PROVIDER: ${{ vars.CI_RUNNER_PROVIDER || 'github' }}
+        run: |
+          set -euo pipefail
+          provider="$(printf '%s' "$CI_RUNNER_PROVIDER" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+          case "$provider" in
+            github)
+              {
+                echo "ubuntu=ubuntu-latest"
+                echo "ubuntu_small=ubuntu-latest"
+                echo "ubuntu_large=ubuntu-latest"
+                echo "ubuntu_2204=ubuntu-22.04"
+                echo "ubuntu_2204_small=ubuntu-22.04"
+                echo "ubuntu_2204_large=ubuntu-22.04"
+                echo "ubuntu_2204_arm=ubuntu-22.04-arm"
+                echo "macos=macos-latest"
+                echo "macos_large=macos-latest"
+                echo "macos_intel=macos-15-intel"
+                echo "windows=windows-latest"
+              } >> "$GITHUB_OUTPUT"
+              ;;
+            blacksmith)
+              {
+                echo "ubuntu=blacksmith-4vcpu-ubuntu-2404"
+                echo "ubuntu_small=blacksmith-2vcpu-ubuntu-2404"
+                echo "ubuntu_large=blacksmith-8vcpu-ubuntu-2404"
+                echo "ubuntu_2204=blacksmith-4vcpu-ubuntu-2204"
+                echo "ubuntu_2204_small=blacksmith-2vcpu-ubuntu-2204"
+                echo "ubuntu_2204_large=blacksmith-8vcpu-ubuntu-2204"
+                echo "ubuntu_2204_arm=blacksmith-8vcpu-ubuntu-2204-arm"
+                echo "macos=blacksmith-6vcpu-macos-latest"
+                echo "macos_large=blacksmith-12vcpu-macos-latest"
+                echo "macos_intel=macos-15-intel"
+                echo "windows=blacksmith-8vcpu-windows-2025"
+              } >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::Unknown CI_RUNNER_PROVIDER '${CI_RUNNER_PROVIDER}'. Use github or blacksmith."
+              exit 1
+              ;;
+          esac

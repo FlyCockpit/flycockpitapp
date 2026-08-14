@@ -26,10 +26,15 @@ permissions:
   contents: read
 
 jobs:
+  runners:
+    name: Select CI runners
+    uses: ./.github/workflows/ci-runners.yml
+
   # Shared setup: install dependencies once and cache for downstream jobs.
   setup:
     name: Install dependencies
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    needs: runners
+    runs-on: ${{ needs.runners.outputs.ubuntu }}
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -61,8 +66,10 @@ jobs:
 
   lint:
     name: Lint & format
-    needs: setup
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    needs:
+      - runners
+      - setup
+    runs-on: ${{ needs.runners.outputs.ubuntu }}
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -91,8 +98,10 @@ jobs:
 
   typecheck:
     name: Type check
-    needs: setup
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    needs:
+      - runners
+      - setup
+    runs-on: ${{ needs.runners.outputs.ubuntu }}
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -121,8 +130,10 @@ jobs:
 
   build:
     name: Build
-    needs: setup
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    needs:
+      - runners
+      - setup
+    runs-on: ${{ needs.runners.outputs.ubuntu }}
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -151,8 +162,10 @@ jobs:
 
   test:
     name: Test
-    needs: setup
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    needs:
+      - runners
+      - setup
+    runs-on: ${{ needs.runners.outputs.ubuntu }}
     timeout-minutes: 10
     services:
       redis:
@@ -203,7 +216,8 @@ jobs:
 
   policy-checks:
     name: Policy checks
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    needs: runners
+    runs-on: ${{ needs.runners.outputs.ubuntu_small }}
     timeout-minutes: 5
     steps:
       - name: Checkout
@@ -337,8 +351,10 @@ jobs:
 
   prisma-validate:
     name: Prisma validate
-    needs: setup
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    needs:
+      - runners
+      - setup
+    runs-on: ${{ needs.runners.outputs.ubuntu }}
     timeout-minutes: 5
     steps:
       - name: Checkout
@@ -372,8 +388,10 @@ jobs:
 
   knip:
     name: Unused code check
-    needs: setup
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    needs:
+      - runners
+      - setup
+    runs-on: ${{ needs.runners.outputs.ubuntu }}
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -404,7 +422,8 @@ jobs:
 
   pnpm-audit:
     name: pnpm audit
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    needs: runners
+    runs-on: ${{ needs.runners.outputs.ubuntu_small }}
     timeout-minutes: 5
     steps:
       - name: Checkout
@@ -430,7 +449,8 @@ jobs:
 
   secret-scan:
     name: Secret scan
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    needs: runners
+    runs-on: ${{ needs.runners.outputs.ubuntu_small }}
     timeout-minutes: 5
     steps:
       - name: Checkout
@@ -466,7 +486,8 @@ jobs:
 
   docker:
     name: Docker image build
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    needs: runners
+    runs-on: ${{ needs.runners.outputs.ubuntu_large }}
     timeout-minutes: 30
     strategy:
       fail-fast: false

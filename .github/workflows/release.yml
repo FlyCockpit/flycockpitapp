@@ -16,9 +16,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  runners:
+    name: Select CI runners
+    uses: ./.github/workflows/ci-runners.yml
+
   validate:
     name: Validate release request
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    needs: runners
+    runs-on: ${{ needs.runners.outputs.ubuntu_small }}
     outputs:
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
@@ -67,9 +72,10 @@ jobs:
   plan-cli-release:
     name: Plan CLI release
     needs:
+      - runners
       - validate
       - release-preflight
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: ${{ needs.runners.outputs.ubuntu_2204 }}
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
       tag: ${{ needs.validate.outputs.tag }}
@@ -99,10 +105,63 @@ jobs:
 
       - id: plan
         name: Plan dist release
+        env:
+          RUNNER_X86_64_UNKNOWN_LINUX_GNU: ${{ needs.runners.outputs.ubuntu_2204_large }}
+          RUNNER_AARCH64_UNKNOWN_LINUX_GNU: ${{ needs.runners.outputs.ubuntu_2204_arm }}
+          RUNNER_AARCH64_APPLE_DARWIN: ${{ needs.runners.outputs.macos_large }}
+          RUNNER_X86_64_APPLE_DARWIN: ${{ needs.runners.outputs.macos_intel }}
+          RUNNER_X86_64_PC_WINDOWS_MSVC: ${{ needs.runners.outputs.windows }}
         run: |
+          set -euo pipefail
           mkdir -p target/distrib
           dist host --steps=create --tag=${{ needs.validate.outputs.tag }} --allow-dirty --output-format=json > target/distrib/plan-dist-manifest.json
           echo "dist ran successfully"
+
+          : "${RUNNER_X86_64_UNKNOWN_LINUX_GNU:?missing ubuntu_2204_large}"
+          : "${RUNNER_AARCH64_UNKNOWN_LINUX_GNU:?missing ubuntu_2204_arm}"
+          : "${RUNNER_AARCH64_APPLE_DARWIN:?missing macos_large}"
+          : "${RUNNER_X86_64_APPLE_DARWIN:?missing macos_intel}"
+          : "${RUNNER_X86_64_PC_WINDOWS_MSVC:?missing windows}"
+
+          # Remap artifacts_matrix.runner from ci-runners.yml before the plan is consumed.
+          # Map by target: global and linux-x64 both emit ubuntu-22.04 from dist host.
+          jq \
+            --arg x86_64_unknown_linux_gnu "$RUNNER_X86_64_UNKNOWN_LINUX_GNU" \
+            --arg aarch64_unknown_linux_gnu "$RUNNER_AARCH64_UNKNOWN_LINUX_GNU" \
+            --arg aarch64_apple_darwin "$RUNNER_AARCH64_APPLE_DARWIN" \
+            --arg x86_64_apple_darwin "$RUNNER_X86_64_APPLE_DARWIN" \
+            --arg x86_64_pc_windows_msvc "$RUNNER_X86_64_PC_WINDOWS_MSVC" \
+            '
+            def runner_for($target):
+              if $target == "x86_64-unknown-linux-gnu" then $x86_64_unknown_linux_gnu
+              elif $target == "aarch64-unknown-linux-gnu" then $aarch64_unknown_linux_gnu
+              elif $target == "aarch64-apple-darwin" then $aarch64_apple_darwin
+              elif $target == "x86_64-apple-darwin" then $x86_64_apple_darwin
+              elif $target == "x86_64-pc-windows-msvc" then $x86_64_pc_windows_msvc
+              else error("unknown cargo-dist artifact target: \($target)")
+              end;
+            if (.ci.github.artifacts_matrix.include | type) == "array" then
+              .ci.github.artifacts_matrix.include |= map(
+                (.targets // []) as $targets |
+                if ($targets | length) == 0 then
+                  error("artifacts_matrix include entry has no targets")
+                else
+                  ([ $targets[] | runner_for(.) ] | unique) as $mapped |
+                  if ($mapped | length) != 1 then
+                    error("artifacts_matrix include targets map to different runners: \($targets)")
+                  else
+                    .runner = $mapped[0]
+                  end
+                end
+              )
+            elif (.ci.github.artifacts_matrix.include == null) then
+              .
+            else
+              error("ci.github.artifacts_matrix.include must be an array or null")
+            end
+            ' target/distrib/plan-dist-manifest.json > target/distrib/plan-dist-manifest.remapped.json
+          mv target/distrib/plan-dist-manifest.remapped.json target/distrib/plan-dist-manifest.json
+
           cat target/distrib/plan-dist-manifest.json
           echo "manifest=$(jq -c "." target/distrib/plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
 
@@ -190,9 +249,10 @@ jobs:
   build-cli-global-artifacts:
     name: build-cli-global-artifacts
     needs:
+      - runners
       - plan-cli-release
       - build-cli-local-artifacts
-    runs-on: blacksmith-8vcpu-ubuntu-2204
+    runs-on: ${{ needs.runners.outputs.ubuntu_2204_large }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       CARGO_TARGET_DIR: target
@@ -250,6 +310,7 @@ jobs:
   publish-cli-release:
     name: Publish CLI GitHub Release
     needs:
+      - runners
       - plan-cli-release
       - build-cli-local-artifacts
       - build-cli-global-artifacts
@@ -257,7 +318,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       CARGO_TARGET_DIR: target
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: ${{ needs.runners.outputs.ubuntu_2204 }}
     outputs:
       val: ${{ steps.host.outputs.manifest }}
     steps:
@@ -339,9 +400,10 @@ jobs:
   publish-homebrew-formula:
     name: Publish Homebrew formula
     needs:
+      - runners
       - validate
       - publish-cli-release
-    runs-on: blacksmith-2vcpu-ubuntu-2204
+    runs-on: ${{ needs.runners.outputs.ubuntu_2204_small }}
     environment: release
     steps:
       - name: Validate tap token
@@ -409,11 +471,12 @@ jobs:
   release-summary:
     name: Release summary
     needs:
+      - runners
       - validate
       - publish-cli-release
       - publish-homebrew-formula
     if: ${{ always() && needs.publish-cli-release.result == 'success' && needs.publish-homebrew-formula.result == 'success' }}
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ${{ needs.runners.outputs.ubuntu_small }}
     steps:
       - name: Write summary
         shell: bash

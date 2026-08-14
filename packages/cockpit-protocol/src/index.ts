@@ -3,6 +3,7 @@ import { canonicalU64DecimalStringSchema, decodeProtocolIdBase64Url } from "./re
 
 export * from "./dependency-health";
 export * from "./remote-connection-metadata";
+export * from "./remote-device-identity-enrollment";
 export * from "./remote-identity-custody-provider";
 export * from "./remote-identity-protocol";
 export * from "./remote-noise-binding";

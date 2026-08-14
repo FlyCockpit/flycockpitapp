@@ -40,8 +40,6 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
-use crate::remote_identity_protocol as identity;
-
 /// Wire/constants reused from the foundation identity protocol.
 pub use crate::remote_identity_protocol::{
     CustodyClass as RemoteIdentityCustodyClassV1,
@@ -1155,40 +1153,13 @@ impl RemoteDeviceLifecycle {
 // Foundation consumption and closed-surface guards
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Foundation consumption guard.
-///
-/// Statically references every foundation identity codec/enum so a second local
-/// identity schema, enum, challenge, or signature-input definition fails to
-/// link when this module is the sole consumer. This workflow owns no alternate
-/// identity wire format.
-pub fn remote_identity_protocol_consumption_guard() {
-    let _ = identity::FCIP;
-    let _ = identity::FCEN;
-    let _ = identity::FCCE;
-    let _ = identity::FCPC;
-    let _ = identity::FCPP;
-    let _ = identity::FCCF;
-    let _ = identity::SubjectKind::Client;
-    let _ = identity::SubjectKind::Daemon;
-    let _ = identity::CustodyClass::OriginProtected;
-    let _ = identity::PresenceMode::Unattended;
-    let _ = identity::EnrollmentRole::ProposedSubject;
-    let _ = identity::PossessionPurpose::EnrollProposed;
-    let _ = identity::PossessionPurpose::RenewCurrent;
-    let _ = identity::PossessionPurpose::RotateCurrent;
-    let _ = identity::PossessionPurpose::RotateProposed;
-    let _ = identity::PossessionPurpose::RevokeCurrent;
-    let _ = identity::Proposal::decode as fn(&[u8]) -> _;
-    let _ = identity::EnrollmentTranscript::decode as fn(&[u8]) -> _;
-    let _ = identity::CustodyEvidence::decode as fn(&[u8]) -> _;
-    let _ = identity::PossessionContext::decode as fn(&[u8]) -> _;
-    let _ = identity::PossessionProof::decode as fn(&[u8]) -> _;
-    let _ = identity::EnrollmentConfirmation::decode as fn(&[u8]) -> _;
-    let _ = identity::parse_remote_identity_certificate_jws as fn(&str) -> _;
-    let _ = identity::derive_possession_challenge as fn(_, _, _, _) -> _;
-    let _ = identity::possession_proof_signing_digest as fn(&[u8], _) -> _;
-    let _ = identity::enrollment_confirmation_signing_digest as fn(&[u8], _) -> _;
-}
+// The foundation-consumption guard is no longer a public no-op `pub fn` of
+// unused `let _ = …` statements. It is a real static source-scan test named
+// `remote_identity_protocol_consumption_guard` (see the `#[cfg(test)]` module
+// below and the `tests/` conformance twin) that parses this module with
+// `syn::parse_file` and fails if a second local identity schema/enum/challenge/
+// signature-input definition is introduced here, while still exercising the
+// production foundation codecs on nonzero valid+reject inputs.
 
 /// Closed-surface guard. Asserts the exact cardinality of every enum this
 /// module owns so an accidental addition or removal fails loudly.
@@ -1466,10 +1437,161 @@ mod tests {
         assert!(build_discovery_link(origin, enrollment_id, [0; 32]).is_err());
     }
 
+    /// Static detector: returns a reason when `source` *defines* (not merely
+    /// uses or imports) a second local copy of a foundation-owned identity
+    /// schema/enum, an alternate FCIP/FCEN/FCCE/FCPC/FCPP/FCCF magic, or a
+    /// foundation challenge/signature-input function. Usages and imports are
+    /// deliberately not matched.
+    fn scan_for_second_identity_definition(source: &str) -> Option<String> {
+        const FORBIDDEN_TYPES: &[&str] = &[
+            "EnrollmentTranscript",
+            "Proposal",
+            "CustodyEvidence",
+            "PossessionContext",
+            "PossessionProof",
+            "EnrollmentConfirmation",
+            "PossessionPurpose",
+            "SubjectKind",
+            "CustodyClass",
+            "PresenceMode",
+            "EnrollmentRole",
+        ];
+        const FORBIDDEN_MAGICS: &[&str] = &["FCIP", "FCEN", "FCCE", "FCPC", "FCPP", "FCCF"];
+        const FORBIDDEN_FNS: &[&str] = &[
+            "parse_remote_identity_certificate_jws",
+            "derive_possession_challenge",
+            "possession_proof_signing_digest",
+            "enrollment_confirmation_signing_digest",
+        ];
+        // A magic can be re-defined under ANY identifier, so match the literal
+        // VALUE (`b"FCEN"` / `"FCEN"`) as well as the name — a name-only scan is
+        // trivially bypassed by `const ALT: &[u8] = b"FCEN";`.
+        fn lit_matches_magic(expr: &syn::Expr, magics: &[&str]) -> bool {
+            let bytes: Vec<u8> = match expr {
+                syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::ByteStr(bs),
+                    ..
+                }) => bs.value(),
+                syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(s),
+                    ..
+                }) => s.value().into_bytes(),
+                syn::Expr::Reference(r) => return lit_matches_magic(&r.expr, magics),
+                _ => return false,
+            };
+            magics.iter().any(|m| m.as_bytes() == bytes.as_slice())
+        }
+        let file = syn::parse_file(source).expect("scanned source parses");
+        for item in &file.items {
+            let flagged = match item {
+                syn::Item::Struct(item)
+                    if FORBIDDEN_TYPES.contains(&item.ident.to_string().as_str()) =>
+                {
+                    Some(format!("second local identity struct `{}`", item.ident))
+                }
+                syn::Item::Enum(item)
+                    if FORBIDDEN_TYPES.contains(&item.ident.to_string().as_str()) =>
+                {
+                    Some(format!("second local identity enum `{}`", item.ident))
+                }
+                syn::Item::Const(item)
+                    if FORBIDDEN_MAGICS.contains(&item.ident.to_string().as_str())
+                        || lit_matches_magic(&item.expr, FORBIDDEN_MAGICS) =>
+                {
+                    Some(format!("second local identity magic `{}`", item.ident))
+                }
+                syn::Item::Static(item)
+                    if FORBIDDEN_MAGICS.contains(&item.ident.to_string().as_str())
+                        || lit_matches_magic(&item.expr, FORBIDDEN_MAGICS) =>
+                {
+                    Some(format!("second local identity magic `{}`", item.ident))
+                }
+                syn::Item::Fn(item)
+                    if FORBIDDEN_FNS.contains(&item.sig.ident.to_string().as_str()) =>
+                {
+                    Some(format!(
+                        "second local identity signature-input fn `{}`",
+                        item.sig.ident
+                    ))
+                }
+                _ => None,
+            };
+            if flagged.is_some() {
+                return flagged;
+            }
+        }
+        None
+    }
+
     #[test]
-    fn closed_surface_and_foundation_consumption_guards_pass() {
+    fn remote_identity_protocol_consumption_guard() {
+        use crate::remote_identity_protocol as identity;
+
+        // Closed-surface cardinality still holds.
         closed_surface_guard();
-        remote_identity_protocol_consumption_guard();
+
+        // Foundation consumption: this module is the sole local consumer of the
+        // foundation identity codecs/enums/challenge/signature-inputs. Reference
+        // them and exercise the production decoders on nonzero reject inputs.
+        let _ = (
+            identity::FCIP,
+            identity::FCEN,
+            identity::FCCE,
+            identity::FCPC,
+            identity::FCPP,
+            identity::FCCF,
+        );
+        let _ = identity::SubjectKind::Client;
+        let _ = identity::CustodyClass::OriginProtected;
+        let _ = identity::PresenceMode::Unattended;
+        let _ = identity::EnrollmentRole::ProposedSubject;
+        let _ = identity::PossessionPurpose::EnrollProposed;
+        assert!(identity::Proposal::decode(&[]).is_err());
+        assert!(identity::EnrollmentTranscript::decode(&[]).is_err());
+        assert!(identity::CustodyEvidence::decode(&[]).is_err());
+        assert!(identity::PossessionContext::decode(&[]).is_err());
+        assert!(identity::PossessionProof::decode(&[]).is_err());
+        assert!(identity::EnrollmentConfirmation::decode(&[]).is_err());
+        assert!(identity::parse_remote_identity_certificate_jws("not-a-jws").is_err());
+        let _ = identity::derive_possession_challenge as fn(_, _, _, _) -> _;
+        let _ = identity::possession_proof_signing_digest as fn(&[u8], _) -> _;
+        let _ = identity::enrollment_confirmation_signing_digest as fn(&[u8], _) -> _;
+
+        // Static source scan: no second local identity schema/enum/challenge/
+        // signature-input definition may exist in this module.
+        let source = include_str!("remote_device_identity_enrollment.rs");
+        assert_eq!(
+            scan_for_second_identity_definition(source),
+            None,
+            "enrollment module must not redefine a foundation identity schema"
+        );
+
+        // Non-vacuity: a planted second `EnrollmentTranscript` struct, an
+        // alternate magic, or an alternate possession-purpose enum is caught,
+        // while a mere usage/import is not.
+        assert!(
+            scan_for_second_identity_definition(
+                "pub struct EnrollmentTranscript { pub id: [u8; 16] }"
+            )
+            .is_some()
+        );
+        assert!(scan_for_second_identity_definition("const FCEN: &[u8] = b\"FCEN\";").is_some());
+        // A magic re-defined under a different identifier (same bytes) is caught
+        // by value, not just by name — the name-only scan was bypassable.
+        assert!(
+            scan_for_second_identity_definition("const ALT_MAGIC: &[u8] = b\"FCEN\";").is_some()
+        );
+        assert!(scan_for_second_identity_definition("static ALT2: &str = \"FCCF\";").is_some());
+        assert!(
+            scan_for_second_identity_definition("pub enum PossessionPurpose { EnrollProposed }")
+                .is_some()
+        );
+        assert!(
+            scan_for_second_identity_definition(
+                "use crate::remote_identity_protocol::EnrollmentTranscript;"
+            )
+            .is_none()
+        );
     }
 
     #[test]

@@ -171,10 +171,117 @@ fn remote_device_identity_enrollment_sas_v1_vectors() {
     assert_eq!(first, second);
 }
 
+/// Static detector: returns a reason when `source` *defines* (not merely uses
+/// or imports) a second local copy of a foundation-owned identity schema/enum,
+/// an alternate FCIP/FCEN/FCCE/FCPC/FCPP/FCCF magic, or a foundation
+/// challenge/signature-input function. Only top-level items are inspected, so
+/// example patterns inside function bodies are not matched.
+fn scan_for_second_identity_definition(source: &str) -> Option<String> {
+    const FORBIDDEN_TYPES: &[&str] = &[
+        "EnrollmentTranscript",
+        "Proposal",
+        "CustodyEvidence",
+        "PossessionContext",
+        "PossessionProof",
+        "EnrollmentConfirmation",
+        "PossessionPurpose",
+        "SubjectKind",
+        "CustodyClass",
+        "PresenceMode",
+        "EnrollmentRole",
+    ];
+    const FORBIDDEN_MAGICS: &[&str] = &["FCIP", "FCEN", "FCCE", "FCPC", "FCPP", "FCCF"];
+    const FORBIDDEN_FNS: &[&str] = &[
+        "parse_remote_identity_certificate_jws",
+        "derive_possession_challenge",
+        "possession_proof_signing_digest",
+        "enrollment_confirmation_signing_digest",
+    ];
+    // Match a magic by literal VALUE (`b"FCEN"`/`"FCEN"`) as well as by name, so a
+    // rename like `const ALT: &[u8] = b"FCEN";` cannot bypass the guard.
+    fn lit_matches_magic(expr: &syn::Expr, magics: &[&str]) -> bool {
+        let bytes: Vec<u8> = match expr {
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::ByteStr(bs),
+                ..
+            }) => bs.value(),
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(s),
+                ..
+            }) => s.value().into_bytes(),
+            syn::Expr::Reference(r) => return lit_matches_magic(&r.expr, magics),
+            _ => return false,
+        };
+        magics.iter().any(|m| m.as_bytes() == bytes.as_slice())
+    }
+    let file = syn::parse_file(source).expect("scanned source parses");
+    for item in &file.items {
+        let flagged = match item {
+            syn::Item::Struct(item)
+                if FORBIDDEN_TYPES.contains(&item.ident.to_string().as_str()) =>
+            {
+                Some(format!("second local identity struct `{}`", item.ident))
+            }
+            syn::Item::Enum(item) if FORBIDDEN_TYPES.contains(&item.ident.to_string().as_str()) => {
+                Some(format!("second local identity enum `{}`", item.ident))
+            }
+            syn::Item::Const(item)
+                if FORBIDDEN_MAGICS.contains(&item.ident.to_string().as_str())
+                    || lit_matches_magic(&item.expr, FORBIDDEN_MAGICS) =>
+            {
+                Some(format!("second local identity magic `{}`", item.ident))
+            }
+            syn::Item::Static(item)
+                if FORBIDDEN_MAGICS.contains(&item.ident.to_string().as_str())
+                    || lit_matches_magic(&item.expr, FORBIDDEN_MAGICS) =>
+            {
+                Some(format!("second local identity magic `{}`", item.ident))
+            }
+            syn::Item::Fn(item) if FORBIDDEN_FNS.contains(&item.sig.ident.to_string().as_str()) => {
+                Some(format!(
+                    "second local identity signature-input fn `{}`",
+                    item.sig.ident
+                ))
+            }
+            _ => None,
+        };
+        if flagged.is_some() {
+            return flagged;
+        }
+    }
+    None
+}
+
 #[test]
-fn remote_device_identity_enrollment_consumption_guard() {
-    remote_identity_protocol_consumption_guard();
+fn remote_identity_protocol_consumption_guard() {
+    // Closed-surface cardinality still holds.
     closed_surface_guard();
+
+    // Static source scan: the enrollment module must not redefine any
+    // foundation identity schema/enum/challenge/signature-input.
+    let source = include_str!("../src/remote_device_identity_enrollment.rs");
+    assert_eq!(
+        scan_for_second_identity_definition(source),
+        None,
+        "enrollment module must not redefine a foundation identity schema"
+    );
+
+    // Non-vacuity: planted second definitions are caught; a usage/import is not.
+    assert!(
+        scan_for_second_identity_definition("pub struct EnrollmentTranscript { pub id: [u8; 16] }")
+            .is_some()
+    );
+    assert!(scan_for_second_identity_definition("const FCEN: &[u8] = b\"FCEN\";").is_some());
+    assert!(
+        scan_for_second_identity_definition("pub enum PossessionPurpose { EnrollProposed }")
+            .is_some()
+    );
+    assert!(
+        scan_for_second_identity_definition(
+            "use crate::remote_identity_protocol::EnrollmentTranscript;"
+        )
+        .is_none()
+    );
 }
 
 #[test]

@@ -220,10 +220,22 @@ fn run_keyring_construct(
     // never leaves the actor pointing at an unset or probe-owned default.
     let previous = keyring_core::get_default_store();
     let outcome = construct();
-    if let Some(previous) = previous {
-        keyring_core::set_default_store(previous);
-    } else {
-        unset_default_platform_store();
+    match &outcome {
+        Ok(()) => {
+            // Keep a successful first construct registered so later KEK use
+            // does not construct the platform store a second time. Restore a
+            // previously registered actor store if one existed.
+            if let Some(previous) = previous {
+                keyring_core::set_default_store(previous);
+            }
+        }
+        Err(_) => {
+            if let Some(previous) = previous {
+                keyring_core::set_default_store(previous);
+            } else {
+                unset_default_platform_store();
+            }
+        }
     }
     match outcome {
         Ok(()) => KeyringProbeResult {

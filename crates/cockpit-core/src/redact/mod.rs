@@ -72,8 +72,38 @@ pub fn start_standalone_redaction_key_resolver(
     crate::secure_key::SecureKeyActor,
     std::sync::Arc<dyn RedactionKeyResolver>,
 )> {
-    let actor = crate::secure_key::SecureKeyActor::start_production(db.clone())
-        .map_err(|e| anyhow::anyhow!("starting standalone secure-key actor: {e}"))?;
+    let probe = crate::secure_key::probe_platform_keyring();
+    let actor = crate::secure_key::SecureKeyActor::start_production_resolved(
+        db.clone(),
+        std::sync::Arc::new(crate::secure_key::FailClosedReconciler),
+        &probe,
+        None,
+        crate::secure_key::SecretStoreInjected::default(),
+    )
+    .map_err(|e| anyhow::anyhow!("starting standalone secure-key actor: {e}"))?;
+    let resolver = std::sync::Arc::new(secure_key_resolver::SecureKeyResolver::new(actor.handle()));
+    Ok((actor, resolver))
+}
+
+/// Same as [`start_standalone_redaction_key_resolver`] with an injected probe
+/// and KEK directory. Tests must not open the real OS keyring.
+pub fn start_standalone_redaction_key_resolver_with(
+    db: &crate::db::Db,
+    probe: &crate::secure_key::KeyringProbeResult,
+    kek_dir: Option<std::path::PathBuf>,
+    injected: crate::secure_key::SecretStoreInjected,
+) -> anyhow::Result<(
+    crate::secure_key::SecureKeyActor,
+    std::sync::Arc<dyn RedactionKeyResolver>,
+)> {
+    let actor = crate::secure_key::SecureKeyActor::start_production_resolved(
+        db.clone(),
+        std::sync::Arc::new(crate::secure_key::FailClosedReconciler),
+        probe,
+        kek_dir,
+        injected,
+    )
+    .map_err(|e| anyhow::anyhow!("starting standalone secure-key actor: {e}"))?;
     let resolver = std::sync::Arc::new(secure_key_resolver::SecureKeyResolver::new(actor.handle()));
     Ok((actor, resolver))
 }

@@ -2094,6 +2094,16 @@ pub(crate) fn strip_remote_image_generation(raw: &mut Value) {
     }
 }
 
+/// Installation-scoped KEK placement is never a layered config key. Strip
+/// `secretStore` / `secret_store` from every layer so project and remote
+/// documents cannot select, promote, or persist it.
+pub(crate) fn strip_secret_store_key(raw: &mut Value) {
+    if let Some(obj) = raw.as_object_mut() {
+        obj.remove("secretStore");
+        obj.remove("secret_store");
+    }
+}
+
 /// Stable, secret-free warning for a malformed `image_generation` value.
 /// Deliberately omits BOTH the deserialization/validation error (whose `{:?}`
 /// rendering can embed attacker-supplied credential-like strings) AND the
@@ -2134,12 +2144,13 @@ impl ExtendedConfigDoc {
             serde_json::from_str(&raw_str)
                 .with_context(|| format!("parsing config.json at {}", path.display()))?
         };
-        let raw = match raw {
+        let mut raw = match raw {
             Value::Object(_) => raw,
             other => {
                 anyhow::bail!("expected config.json root to be an object, found {other:?}")
             }
         };
+        strip_secret_store_key(&mut raw);
         Ok(Self {
             path: path.to_path_buf(),
             raw,
@@ -2167,6 +2178,7 @@ impl ExtendedConfigDoc {
     /// remote source with no per-parse-path guard to forget.
     pub fn from_remote_layer(mut raw: Value) -> Self {
         strip_remote_image_generation(&mut raw);
+        strip_secret_store_key(&mut raw);
         Self {
             path: PathBuf::from("<remote .well-known/cockpit>"),
             raw,
@@ -2348,6 +2360,7 @@ impl ExtendedConfigDoc {
             // layer.
             strip_remote_image_generation(&mut raw);
         }
+        strip_secret_store_key(&mut raw);
         let Some(obj) = raw.as_object_mut() else {
             return raw;
         };
@@ -2461,7 +2474,9 @@ impl ExtendedConfigDoc {
     }
 
     fn persist_raw_unlocked(&self) -> Result<()> {
-        let pretty = serde_json::to_string_pretty(&self.raw).context("serializing config.json")?;
+        let mut raw = self.raw.clone();
+        strip_secret_store_key(&mut raw);
+        let pretty = serde_json::to_string_pretty(&raw).context("serializing config.json")?;
         crate::config::files::atomic_write(&self.path, format!("{pretty}\n").as_bytes())
             .with_context(|| format!("writing {}", self.path.display()))?;
         Ok(())

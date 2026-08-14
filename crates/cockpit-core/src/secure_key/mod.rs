@@ -1,8 +1,10 @@
 //! Daemon-owned versioned native secure key store.
 //!
-//! One actor thread serializes create/rotate/retire against OS native items
-//! and SQLite coordination. Tests inject [`fake::FakeNativeStore`] and never
-//! touch real OS keyrings or mutate the process-global default store.
+//! One actor thread serializes create/rotate/retire against the wrap-key vault
+//! (and, for tests, an injected [`fake::FakeNativeStore`]). Production KEK
+//! placement is a `private_fs` file on first-run, or the OS keyring after an
+//! explicit Settings migrate. Tests never touch real OS keyrings or mutate
+//! the process-global default store.
 //!
 //! Consumer ciphertext tables integrate via transaction-scoped hooks
 //! [`activate_ref_in_tx`] / [`begin_release_in_tx`] on the same connection.
@@ -11,13 +13,18 @@ mod actor;
 mod consumer;
 mod error;
 pub mod fake;
+mod kek_store;
 mod key_material;
 mod manifest;
+mod migrate;
 mod namespace;
 mod native_store;
 mod platform;
+mod resolve;
 mod sealed_ops;
 mod sealed_state;
+mod vault;
+mod vault_store;
 mod worker;
 
 pub use sealed_state::{
@@ -28,6 +35,8 @@ pub use sealed_state::{
 mod sealed_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod vault_tests;
 
 pub use actor::{SECURE_KEY_QUEUE_CAPACITY, SecureKeyActor, SecureKeyHandle};
 pub use consumer::{
@@ -35,11 +44,24 @@ pub use consumer::{
     begin_release_in_tx,
 };
 pub use error::SecureKeyError;
+pub use kek_store::{
+    FileKekStore, KekStore, KeyringKekStore, MemoryKekStore, file_kek_supported, kek_file_path,
+};
 pub use key_material::{KEY_BYTE_LEN, SecureKeyBytes, generate_key_bytes, key_digest};
+pub use migrate::{
+    VaultFault, VaultFaultPoint, migrate_kek_placement, reject_keyring_if_unavailable,
+    resume_kek_migrate,
+};
 pub use namespace::{
     LEAK_REPORT_V1_NAMESPACE, NAMESPACE_MAX_LEN, Namespace, REDACTION_HISTORY_V1_NAMESPACE,
     SECURE_KEY_SERVICE,
 };
+pub use resolve::{
+    DEFAULT_FIX_COMMAND, EffectiveSecretStore, KekUnavailable, SecretStoreInjected,
+    ensure_secret_vault, kek_dir_for_db, project_secret_store_snapshot, resolve_secret_store,
+};
+pub use vault::SecretVault;
+pub use vault_store::VaultNativeStore;
 // set_default / unset_default are actor-owned only (`pub(crate)` in platform.rs).
 pub use platform::{
     KeyringProbeResult, PlatformStoreKind, RegistrationOrderSnapshot, platform_link_token,

@@ -1470,6 +1470,73 @@ pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Unlink a private file. Missing is success. Follows the same no-follow /
+/// reparse refusal as the writers; does not print secret bytes.
+#[cfg(unix)]
+pub fn delete_private_file(path: &Path) -> Result<(), PrivateFsError> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let Some(name) = path.file_name() else {
+        return Err(PrivateFsError::Containment(format!(
+            "{}: delete target has no file name",
+            path.display()
+        )));
+    };
+    let dir = match walk_private_dir(parent, false) {
+        Ok(dir) => dir,
+        Err(PrivateFsError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let cname = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+        PrivateFsError::Containment(format!("{}: file name contains NUL", path.display()))
+    })?;
+    let rc = unsafe { libc::unlinkat(dir.as_raw_fd(), cname.as_ptr(), 0) };
+    if rc != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        return Err(PrivateFsError::io(
+            format!("unlinking {}", path.display()),
+            error,
+        ));
+    }
+    let _ = dir.sync_all();
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn delete_private_file(path: &Path) -> Result<(), PrivateFsError> {
+    refuse_windows_reparse_components(path)?;
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(PrivateFsError::io(
+            format!("unlinking {}", path.display()),
+            error,
+        )),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn delete_private_file(path: &Path) -> Result<(), PrivateFsError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(PrivateFsError::io(
+            format!("unlinking {}", path.display()),
+            error,
+        )),
+    }
+}
+
 // ------------------------------------------------------------------------
 // Windows KEK-file DACL / reparse / link-count (fail-closed)
 // ------------------------------------------------------------------------

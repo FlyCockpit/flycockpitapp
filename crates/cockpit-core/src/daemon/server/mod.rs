@@ -2069,10 +2069,10 @@ impl DaemonContext {
         self
     }
 
-    /// Install the secure-key actor after identity creation. Production calls
-    /// [`crate::secure_key::SecureKeyActor::start_production`] which registers
-    /// the platform store before intake. Failures are non-fatal for daemon
-    /// boot (typed Unavailable on later use); headless CI may lack Secret Service.
+    /// Install the secure-key actor after identity creation. Production always
+    /// resolves KEK placement and attaches the actor when placement can be
+    /// established. Keyring-down after `active_placement=keyring` is
+    /// `KekUnavailable` (no file-KEK fallback).
     #[cfg_attr(test, allow(dead_code))] // production boot only; tests skip native actor start
     pub(crate) fn attach_secure_key_actor(&mut self, actor: crate::secure_key::SecureKeyActor) {
         let handle = actor.handle();
@@ -2317,49 +2317,34 @@ pub(crate) async fn boot_with_db(
     // Shared host-capability probes run once here. The TUI in-process doctor
     // snapshot is not the daemon's capability authority.
     //
-    // `probe_platform_keyring()` is the only keyring construct on this
-    // prompt's boot path. Do not call `set_default_platform_store` as a
-    // second independent probe after this snapshot. Later
-    // `sqlite-native-key-store` consumes that probe result and inserts KEK
-    // resolution + vault start in the seam below; it must not construct
-    // the platform store a second time.
-    crate::host_capabilities::publish_initial_host_capabilities(
-        &ctx.host_capabilities,
-        &ctx.host_capability_probes,
-    )
-    .await;
-    timer.phase("host_capabilities");
-    // SEAM: sqlite-native-key-store inserts KEK resolution + vault start here.
-    // Until then, the snapshot is published after probes with
-    // secretStore.intent = unconfigured and effective_placement = unavailable.
-    //
-    // Installation identity + secure-key actor: under single-instance lock
-    // (caller already holds pid/socket). Registration + keyring I/O stay on the
-    // dedicated actor OS thread. Boot handshake runs on a short-lived std thread
-    // (not Tokio blocking/core pool) so `blocking_recv` never pins a runtime worker.
-    //
-    // Unit tests skip production native registration (no real OS keyring; avoids
-    // D-Bus hangs that stall ephemeral idle-reap tests after the socket is bound).
-    // That actor start is not a capability probe; this prompt's boot path
-    // already ran `probe_platform_keyring()` above.
+    // `probe_platform_keyring()` is the only keyring construct on this boot
+    // path. Vault start consumes that probe and must not construct the
+    // platform store a second time. Snapshot publish waits until after vault
+    // start so `secretStore` is filled from the authority row.
     #[cfg(not(test))]
     {
+        let probes = crate::host_capabilities::collect_shared_host_probes(
+            &ctx.host_capability_probes,
+            false,
+        )
+        .await;
         let db_for_keys = db.clone();
+        let keyring_probe = probes.keyring.clone();
         let (boot_tx, boot_rx) = tokio::sync::oneshot::channel();
         match std::thread::Builder::new()
             .name("cockpit-secure-key-boot".into())
             .spawn(move || {
-                // The journal is the first real secure-key consumer, so the
-                // actor gets a reconciler that resolves its kind against the
-                // capsule ledger instead of failing closed on it.
                 let reconciler = std::sync::Arc::new(
                     crate::external_journal::keys::ExternalJournalSpoolReconciler::new(
                         db_for_keys.clone(),
                     ),
                 );
-                let result = crate::secure_key::SecureKeyActor::start_production_with_reconciler(
+                let result = crate::secure_key::SecureKeyActor::start_production_resolved(
                     db_for_keys,
                     reconciler,
+                    &keyring_probe,
+                    None,
+                    crate::secure_key::SecretStoreInjected::default(),
                 );
                 let _ = boot_tx.send(result);
             }) {
@@ -2367,33 +2352,68 @@ pub(crate) async fn boot_with_db(
                 Ok(Ok(actor)) => {
                     ctx.attach_secure_key_actor(actor);
                     timer.phase("secure_key_actor");
+                    let generation = ctx.host_capabilities.begin_refresh();
+                    let authority = db
+                        .blocking_write_for_sync_maintenance(
+                            crate::db::secret_vault::load_authority_conn,
+                        )
+                        .ok()
+                        .flatten();
+                    let secret_store = crate::secure_key::project_secret_store_snapshot(
+                        authority.as_ref(),
+                        &probes.keyring,
+                    );
+                    let snapshot = crate::host_capabilities::build_host_capability_snapshot(
+                        generation,
+                        &probes,
+                        secret_store,
+                    );
+                    let _ = ctx.host_capabilities.publish(snapshot);
+                    timer.phase("host_capabilities");
                 }
                 Ok(Err(error)) => {
-                    tracing::warn!(
-                        error = %error,
-                        "secure key actor not started; native secure keys unavailable"
+                    let generation = ctx.host_capabilities.begin_refresh();
+                    let secret_store = match &error {
+                        crate::secure_key::SecureKeyError::KekUnavailable {
+                            reason,
+                            fix_command,
+                        } => cockpit_proto::SecretStoreSnapshot {
+                            intent: cockpit_proto::SecretStoreIntent::Keyring,
+                            effective_placement: cockpit_proto::SecretStorePlacement::Unavailable,
+                            fail_closed_reason: Some(reason.clone()),
+                            fix_command: fix_command.clone(),
+                        },
+                        _ => cockpit_proto::SecretStoreSnapshot::unconfigured_placeholder(),
+                    };
+                    let snapshot = crate::host_capabilities::build_host_capability_snapshot(
+                        generation,
+                        &probes,
+                        secret_store,
                     );
-                    timer.phase("secure_key_actor_skipped");
+                    let _ = ctx.host_capabilities.publish(snapshot);
+                    timer.phase("host_capabilities");
+                    return Err(anyhow::anyhow!("secure key vault: {error}"));
                 }
                 Err(_) => {
-                    tracing::warn!(
-                        "secure key actor boot channel dropped; native secure keys unavailable"
-                    );
-                    timer.phase("secure_key_actor_skipped");
+                    return Err(anyhow::anyhow!("secure key actor boot channel dropped"));
                 }
             },
             Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "secure key actor boot thread spawn failed; native secure keys unavailable"
-                );
-                timer.phase("secure_key_actor_skipped");
+                return Err(anyhow::anyhow!(
+                    "secure key actor boot thread spawn failed: {error}"
+                ));
             }
         }
     }
     #[cfg(test)]
     {
-        let _ = db;
+        let _ = &db;
+        crate::host_capabilities::publish_initial_host_capabilities(
+            &ctx.host_capabilities,
+            &ctx.host_capability_probes,
+        )
+        .await;
+        timer.phase("host_capabilities");
         timer.phase("secure_key_actor_skipped");
     }
     // Process containment actor: durable generation-bound descendant groups.
@@ -4480,6 +4500,8 @@ mod host_capabilities_tests;
 pub(crate) mod inventory;
 #[cfg(test)]
 mod leaks_tests;
+#[cfg(test)]
+mod secret_store_boot_tests;
 mod sessions;
 #[cfg(test)]
 mod tests;

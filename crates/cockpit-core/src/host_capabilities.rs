@@ -154,20 +154,30 @@ impl HostCapabilitySnapshotStore {
 
 /// Run shared probes once and publish the unconfigured secret-store placeholder.
 ///
-/// SEAM: `sqlite-native-key-store` inserts KEK resolution + vault start
-/// immediately after [`collect_shared_host_probes`] and before publish.
+/// Production boot uses [`publish_host_capabilities_with_secret_store`] after
+/// vault start so `secretStore` is filled from the authority row.
 pub async fn publish_initial_host_capabilities(
     store: &HostCapabilitySnapshotStore,
     inputs: &HostCapabilityProbeInputs,
 ) {
+    publish_host_capabilities_with_secret_store(
+        store,
+        inputs,
+        SecretStoreSnapshot::unconfigured_placeholder(),
+    )
+    .await;
+}
+
+/// Collect shared probes and publish a snapshot with the given secret-store
+/// projection. Call after vault start (or with a fail-closed snapshot).
+pub async fn publish_host_capabilities_with_secret_store(
+    store: &HostCapabilitySnapshotStore,
+    inputs: &HostCapabilityProbeInputs,
+    secret_store: SecretStoreSnapshot,
+) {
     let generation = store.begin_refresh();
     let probes = collect_shared_host_probes(inputs, false).await;
-    // SEAM: resolve KEK placement + start vault here in sqlite-native-key-store.
-    let snapshot = build_host_capability_snapshot(
-        generation,
-        &probes,
-        SecretStoreSnapshot::unconfigured_placeholder(),
-    );
+    let snapshot = build_host_capability_snapshot(generation, &probes, secret_store);
     let _ = store.publish(snapshot);
 }
 
@@ -179,11 +189,12 @@ pub async fn refresh_host_capabilities(
     let generation = store.begin_refresh();
     let inputs = inputs.for_refresh();
     let probes = collect_shared_host_probes(&inputs, true).await;
-    let snapshot = build_host_capability_snapshot(
-        generation,
-        &probes,
-        SecretStoreSnapshot::unconfigured_placeholder(),
-    );
+    let previous = store
+        .current()
+        .map(|current| current.secret_store.clone())
+        .unwrap_or_else(SecretStoreSnapshot::unconfigured_placeholder);
+    let secret_store = reconcile_secret_store_with_probe(previous, &probes.keyring);
+    let snapshot = build_host_capability_snapshot(generation, &probes, secret_store);
     if store.publish(snapshot.clone()) {
         Ok((snapshot, true))
     } else {
@@ -297,6 +308,34 @@ fn evaluate_daemon_catalog(
         &CancelToken::new(),
     );
     (snapshot, descriptors)
+}
+
+fn reconcile_secret_store_with_probe(
+    previous: SecretStoreSnapshot,
+    probe: &KeyringProbeResult,
+) -> SecretStoreSnapshot {
+    match previous.intent {
+        cockpit_proto::SecretStoreIntent::Keyring if !probe.state.is_available() => {
+            SecretStoreSnapshot {
+                intent: cockpit_proto::SecretStoreIntent::Keyring,
+                effective_placement: cockpit_proto::SecretStorePlacement::Unavailable,
+                fail_closed_reason: Some(probe.reason.clone()),
+                fix_command: probe
+                    .fix_command
+                    .clone()
+                    .or_else(|| Some(crate::secure_key::DEFAULT_FIX_COMMAND.to_string())),
+            }
+        }
+        cockpit_proto::SecretStoreIntent::Keyring if probe.state.is_available() => {
+            SecretStoreSnapshot {
+                intent: cockpit_proto::SecretStoreIntent::Keyring,
+                effective_placement: cockpit_proto::SecretStorePlacement::Keyring,
+                fail_closed_reason: None,
+                fix_command: None,
+            }
+        }
+        _ => previous,
+    }
 }
 
 pub fn build_host_capability_snapshot(

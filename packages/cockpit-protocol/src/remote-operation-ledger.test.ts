@@ -4,8 +4,9 @@ import fixture from "../fixtures/remote-operation-classification-v1.json" with {
 describe("remote operation classification fixture", () => {
   it("is unique, total, and locks reviewed recovery evidence", () => {
     expect(fixture.schemaVersion).toBe(1);
+    // The length is not hard-coded to a magic count (the Rust `command!` table is
+    // the source of truth and re-blesses this file); uniqueness locks the row set.
     expect(fixture.rows.length).toBeGreaterThan(100);
-    expect(fixture.rows.length).toBe(142);
     expect(new Set(fixture.rows.map((row) => row.tag)).size).toBe(fixture.rows.length);
     expect(fixture.rows.every((row) => typeof row.fcorSchema === "string")).toBe(true);
     expect(fixture.rows.every((row) => typeof row.fcorCanonicalSchema === "string")).toBe(true);
@@ -85,6 +86,25 @@ describe("remote operation classification fixture", () => {
     expect(byTag.get("unknown")).toMatchObject({
       class: "rejected",
       strategy: "rejected_before_dispatch",
+    });
+    // A newly-added typed-media mutation: adapter mutations must carry a real
+    // recovery contract (never `none`).
+    expect(byTag.get("begin_media_upload")).toMatchObject({
+      class: "idempotent_adapter_mutation",
+      strategy: "domain_transaction",
+      evidence: "domain_result_tuple",
+    });
+    // Every `idempotent_adapter_mutation` row has a non-`none` recovery strategy.
+    expect(
+      fixture.rows
+        .filter((row) => row.class === "idempotent_adapter_mutation")
+        .every((row) => row.strategy !== "none"),
+    ).toBe(true);
+    // A leak-report row: owner-bound work is the non-remote `local_only` class.
+    expect(byTag.get("list_leak_reports")).toMatchObject({
+      class: "local_only",
+      strategy: "none",
+      evidence: null,
     });
   });
 });

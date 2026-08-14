@@ -1441,12 +1441,12 @@
         {
           "field": "binding",
           "role": "param",
-          "type": "terminal::TerminalBinding"
+          "type": "crate::terminal::TerminalBinding"
         },
         {
           "field": "metadata",
           "role": "param",
-          "type": "terminal::TerminalIngressMetadata"
+          "type": "crate::terminal::TerminalIngressMetadata"
         }
       ],
       "fcorSchema": "terminal_id:Uuid|binding:crate::terminal::TerminalBinding|metadata:crate::terminal::TerminalIngressMetadata",
@@ -1466,7 +1466,7 @@
         {
           "field": "binding",
           "role": "param",
-          "type": "terminal::TerminalBinding"
+          "type": "crate::terminal::TerminalBinding"
         },
         {
           "field": "operation_id",
@@ -1501,7 +1501,7 @@
         {
           "field": "binding",
           "role": "param",
-          "type": "terminal::TerminalBinding"
+          "type": "crate::terminal::TerminalBinding"
         },
         {
           "field": "operation_id",
@@ -1526,7 +1526,7 @@
         {
           "field": "binding",
           "role": "param",
-          "type": "terminal::TerminalBinding"
+          "type": "crate::terminal::TerminalBinding"
         },
         {
           "field": "operation_id",

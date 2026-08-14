@@ -1,3 +1,4 @@
+import { generateRemoteOperationUuidV7 } from "@flycockpit/cockpit-protocol";
 import {
   CHUNK_SIZE,
   type DraftKey,
@@ -11,19 +12,15 @@ import {
 // ---------------------------------------------------------------------------
 
 /**
- * Generates a UUIDv7 string using Web Crypto.
- * The timestamp-based UUIDv7 ensures rough chronological ordering.
+ * Generates an RFC 9562 UUIDv7 operation identity via the shared
+ * `@flycockpit/cockpit-protocol` generator, so web and Rust encode
+ * byte-identical operation identities from the same wall clock + CSPRNG.
  */
 export function createUuidV7(): string {
-  const bytes = new Uint8Array(16);
-  crypto.getRandomValues(bytes);
-
-  // Set version (7) and variant (RFC 4122).
-  bytes[6] = (bytes[6]! & 0x0f) | 0x70;
-  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
-
-  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  return generateRemoteOperationUuidV7({
+    nowMs: Date.now(),
+    getRandomValues: (bytes) => crypto.getRandomValues(bytes),
+  });
 }
 
 /**

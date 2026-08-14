@@ -151,6 +151,73 @@ const clientSubmissionIdSchema = uuidSchema.refine(
 export function createClientSubmissionId() {
   return globalThis.crypto.randomUUID();
 }
+
+/**
+ * Largest 48-bit Unix-millisecond timestamp representable in an RFC 9562
+ * UUIDv7 (2^48 - 1). Timestamps outside `[0, MAX_UUID_V7_UNIX_MS]` cannot be
+ * encoded and are rejected.
+ */
+export const MAX_UUID_V7_UNIX_MS = 0xffff_ffff_ffff;
+
+export interface GenerateRemoteOperationUuidV7Options {
+  /** Wall-clock time in Unix milliseconds. Integer in `[0, MAX_UUID_V7_UNIX_MS]`. */
+  nowMs: number;
+  /**
+   * CSPRNG fill, e.g. `(bytes) => crypto.getRandomValues(bytes)`. The buffer is
+   * always a fresh `ArrayBuffer`-backed `Uint8Array` (typed as such so it
+   * satisfies `crypto.getRandomValues`, which rejects a generic `ArrayBufferLike`).
+   */
+  getRandomValues: (bytes: Uint8Array<ArrayBuffer>) => void;
+  /**
+   * Already-issued identities. A collision re-rolls the random bits before the
+   * first submission. This provides no cross-process monotonic ordering.
+   */
+  seen?: { has(id: string): boolean };
+  /** Maximum re-rolls on collision before failing closed. Defaults to 8. */
+  maxAttempts?: number;
+}
+
+/**
+ * Pure RFC 9562 UUIDv7 operation-identity generator over an injected wall clock
+ * and CSPRNG. The 48-bit big-endian `nowMs` fills bytes 0-5, version `7` goes in
+ * the high nibble of byte 6, the RFC 4122 variant (`0b10`) in the top two bits
+ * of byte 8, and every remaining bit comes from `getRandomValues`. Rust builds
+ * the same layout; the shared vectors in
+ * `fixtures/remote-operation-uuidv7-v1.json` lock byte-identity across languages.
+ */
+export function generateRemoteOperationUuidV7(
+  options: GenerateRemoteOperationUuidV7Options,
+): string {
+  const { nowMs, getRandomValues, seen, maxAttempts = 8 } = options;
+  if (!Number.isInteger(nowMs) || nowMs < 0 || nowMs > MAX_UUID_V7_UNIX_MS) {
+    throw new RangeError(
+      `UUIDv7 timestamp must be an integer in [0, ${MAX_UUID_V7_UNIX_MS}], got ${nowMs}`,
+    );
+  }
+  const attempts = Math.max(1, maxAttempts);
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const bytes = new Uint8Array(16);
+    getRandomValues(bytes);
+    // 48-bit big-endian Unix millisecond timestamp. Division avoids the 32-bit
+    // truncation of the bitwise operators for the high-order bytes.
+    bytes[0] = Math.floor(nowMs / 2 ** 40) & 0xff;
+    bytes[1] = Math.floor(nowMs / 2 ** 32) & 0xff;
+    bytes[2] = Math.floor(nowMs / 2 ** 24) & 0xff;
+    bytes[3] = Math.floor(nowMs / 2 ** 16) & 0xff;
+    bytes[4] = Math.floor(nowMs / 2 ** 8) & 0xff;
+    bytes[5] = nowMs & 0xff;
+    // Version 7 in the high nibble of byte 6; keep the four random low bits.
+    bytes[6] = 0x70 | (bytes[6]! & 0x0f);
+    // RFC 4122 variant (0b10) in the top two bits of byte 8; keep six random bits.
+    bytes[8] = 0x80 | (bytes[8]! & 0x3f);
+    const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+    const id = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    if (!seen?.has(id)) {
+      return id;
+    }
+  }
+  throw new Error("could not generate a collision-free UUIDv7 operation identity");
+}
 export const requestIdSchema = uuidSchema;
 export const thinkingModeSchema = z.enum(["off", "low", "medium", "high"]);
 export type ThinkingMode = z.infer<typeof thinkingModeSchema>;

@@ -566,13 +566,13 @@ pub enum Request {
 
     TerminalIngressBegin {
         terminal_id: Uuid,
-        binding: terminal::TerminalBinding,
-        metadata: terminal::TerminalIngressMetadata,
+        binding: crate::terminal::TerminalBinding,
+        metadata: crate::terminal::TerminalIngressMetadata,
     },
 
     TerminalIngressChunk {
         terminal_id: Uuid,
-        binding: terminal::TerminalBinding,
+        binding: crate::terminal::TerminalBinding,
         operation_id: Uuid,
         offset: u64,
         data_base64: String,
@@ -580,13 +580,13 @@ pub enum Request {
 
     TerminalIngressFinish {
         terminal_id: Uuid,
-        binding: terminal::TerminalBinding,
+        binding: crate::terminal::TerminalBinding,
         operation_id: Uuid,
     },
 
     TerminalIngressStatus {
         terminal_id: Uuid,
-        binding: terminal::TerminalBinding,
+        binding: crate::terminal::TerminalBinding,
         operation_id: Uuid,
     },
 
@@ -1546,10 +1546,10 @@ macro_rules! command {
             (Request::TerminalInput { terminal_id, bytes }, "terminal_input", terminal, none, false, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "terminal_id:Uuid|bytes:Vec<u8>", [terminal_id: Uuid => terminal, bytes: Vec<u8> => param]);
             (Request::TerminalResize { terminal_id, cols, rows }, "terminal_resize", terminal, none, false, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "terminal_id:Uuid|cols:u16|rows:u16", [terminal_id: Uuid => terminal, cols: u16 => param, rows: u16 => param]);
             (Request::CloseTerminal { terminal_id }, "close_terminal", terminal, none, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "terminal_id:Uuid", [terminal_id: Uuid => terminal]);
-            (Request::TerminalIngressBegin { terminal_id, binding, metadata }, "terminal_ingress_begin", terminal, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "terminal_id:Uuid|binding:crate::terminal::TerminalBinding|metadata:crate::terminal::TerminalIngressMetadata", [terminal_id: Uuid => terminal, binding: terminal::TerminalBinding => param, metadata: terminal::TerminalIngressMetadata => param]);
-            (Request::TerminalIngressChunk { terminal_id, binding, operation_id, offset, data_base64 }, "terminal_ingress_chunk", terminal, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "terminal_id:Uuid|binding:crate::terminal::TerminalBinding|operation_id:Uuid|offset:u64|data_base64:String", [terminal_id: Uuid => terminal, binding: terminal::TerminalBinding => param, operation_id: Uuid => param, offset: u64 => param, data_base64: String => param]);
-            (Request::TerminalIngressFinish { terminal_id, binding, operation_id }, "terminal_ingress_finish", terminal, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "terminal_id:Uuid|binding:crate::terminal::TerminalBinding|operation_id:Uuid", [terminal_id: Uuid => terminal, binding: terminal::TerminalBinding => param, operation_id: Uuid => param]);
-            (Request::TerminalIngressStatus { terminal_id, binding, operation_id }, "terminal_ingress_status", terminal, none, false, read_only, none, concurrent, none, "terminal_id:Uuid|binding:crate::terminal::TerminalBinding|operation_id:Uuid", [terminal_id: Uuid => terminal, binding: terminal::TerminalBinding => param, operation_id: Uuid => param]);
+            (Request::TerminalIngressBegin { terminal_id, binding, metadata }, "terminal_ingress_begin", terminal, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "terminal_id:Uuid|binding:crate::terminal::TerminalBinding|metadata:crate::terminal::TerminalIngressMetadata", [terminal_id: Uuid => terminal, binding: $crate::terminal::TerminalBinding => param, metadata: $crate::terminal::TerminalIngressMetadata => param]);
+            (Request::TerminalIngressChunk { terminal_id, binding, operation_id, offset, data_base64 }, "terminal_ingress_chunk", terminal, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "terminal_id:Uuid|binding:crate::terminal::TerminalBinding|operation_id:Uuid|offset:u64|data_base64:String", [terminal_id: Uuid => terminal, binding: $crate::terminal::TerminalBinding => param, operation_id: Uuid => param, offset: u64 => param, data_base64: String => param]);
+            (Request::TerminalIngressFinish { terminal_id, binding, operation_id }, "terminal_ingress_finish", terminal, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "terminal_id:Uuid|binding:crate::terminal::TerminalBinding|operation_id:Uuid", [terminal_id: Uuid => terminal, binding: $crate::terminal::TerminalBinding => param, operation_id: Uuid => param]);
+            (Request::TerminalIngressStatus { terminal_id, binding, operation_id }, "terminal_ingress_status", terminal, none, false, read_only, none, concurrent, none, "terminal_id:Uuid|binding:crate::terminal::TerminalBinding|operation_id:Uuid", [terminal_id: Uuid => terminal, binding: $crate::terminal::TerminalBinding => param, operation_id: Uuid => param]);
             (Request::LspControl { project_root, server_id, action }, "lsp_control", custom(authorize_lsp_control), attached, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "project_root:String|server_id:String|action:LspControlAction", [project_root: String => project_root, server_id: String => param, action: LspControlAction => param]);
             (Request::ResolveInterrupt { interrupt_id, response }, "resolve_interrupt", session_writer, attached, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "interrupt_id:Uuid|response:ResolveResponse", [interrupt_id: Uuid => interrupt, response: ResolveResponse => param]);
             (Request::ListSessions { project_id, parent_session_id }, "list_sessions", public_read, none, false, read_only, none, concurrent, none, "project_id:Option<String>|parent_session_id:Option<Uuid>", [project_id: Option<String> => project, parent_session_id: Option<Uuid> => param]);
@@ -1659,7 +1659,16 @@ pub enum AttachmentPurpose {
     UserMessageImage,
 }
 
-/// Cross-transport retry semantics assigned to every known request tag.
+/// Cross-transport retry semantics for request tags that are reachable as
+/// remote ledger operations. These are the only four *remote* classes.
+///
+/// The `command!` table (and the shared classification fixture) additionally
+/// carry two non-remote class tokens, `local_only` and `rejected`, which
+/// [`remote_class_value!`] maps to `None`: they never reserve a remote
+/// operation. `owner_only` tags are always one of those two (see
+/// `remote_operation_classification_is_exhaustive`), so a remote principal can
+/// never obtain `Some(RemoteOperationClass)` for owner-bound work — authz stays
+/// the barrier, class alone is not sufficient.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteOperationClass {
@@ -1714,6 +1723,10 @@ macro_rules! remote_class_value {
     (nonrepeatable_mutation) => {
         Some(RemoteOperationClass::NonrepeatableMutation)
     };
+    // `local_only` and `rejected` are first-class table/fixture class strings
+    // that are NOT remote ledger classes: they resolve to `None`, so the tag
+    // never reserves a remote operation. `local_only` is owner-bound local work
+    // gated by authz; `rejected` is the `unknown` catch-all.
     (local_only) => {
         None
     };
@@ -1983,6 +1996,41 @@ pub fn remote_adapter_recovery_strategy_for_tag(
     remote_adapter_recovery_contract_for_tag(tag).map(|contract| contract.strategy)
 }
 
+/// Largest 48-bit Unix-millisecond timestamp an RFC 9562 UUIDv7 can encode
+/// (`2^48 - 1`). Timestamps beyond this range cannot be represented and are
+/// rejected by [`remote_operation_uuid_v7_from_parts`].
+pub const MAX_UUID_V7_UNIX_MS: u64 = 0xffff_ffff_ffff;
+
+/// Build an RFC 9562 UUIDv7 operation identity from an injected wall clock and
+/// 16 random bytes, using the exact byte layout the TypeScript
+/// `generateRemoteOperationUuidV7` reproduces so both languages emit
+/// byte-identical operation identities. The 48-bit big-endian `unix_ms` fills
+/// bytes 0-5, version `7` occupies the high nibble of byte 6, the RFC 4122
+/// variant (`0b10`) the top two bits of byte 8, and every other bit is random.
+/// The shared vectors in `remote-operation-uuidv7-v1.json` lock this contract
+/// across languages. This is a pure constructor; it makes no claim of
+/// process-global monotonic ordering.
+pub fn remote_operation_uuid_v7_from_parts(
+    unix_ms: u64,
+    mut bytes: [u8; 16],
+) -> anyhow::Result<Uuid> {
+    anyhow::ensure!(
+        unix_ms <= MAX_UUID_V7_UNIX_MS,
+        "UUIDv7 timestamp {unix_ms} exceeds the 48-bit range"
+    );
+    bytes[0] = (unix_ms >> 40) as u8;
+    bytes[1] = (unix_ms >> 32) as u8;
+    bytes[2] = (unix_ms >> 24) as u8;
+    bytes[3] = (unix_ms >> 16) as u8;
+    bytes[4] = (unix_ms >> 8) as u8;
+    bytes[5] = unix_ms as u8;
+    // Version 7 in the high nibble of byte 6; keep the four random low bits.
+    bytes[6] = 0x70 | (bytes[6] & 0x0f);
+    // RFC 4122 variant (0b10) in the top two bits of byte 8; keep six random bits.
+    bytes[8] = 0x80 | (bytes[8] & 0x3f);
+    Ok(Uuid::from_bytes(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2249,11 +2297,15 @@ mod tests {
                 schema == "-" || !pattern.contains(".."),
                 "FCOR pattern conceals fields: {pattern}"
             );
+            // `(` terminates the variant name for newtype patterns
+            // (`RecoverSecurityBlockedMedia(..)`), just as `{` does for
+            // named-field patterns; otherwise the `(..)` would be carried into
+            // the lookup key and never match the declared variant ident.
             let variant = pattern
                 .strip_prefix("Request :: ")
                 .or_else(|| pattern.strip_prefix("Request::"))
                 .unwrap_or(pattern)
-                .split([' ', '\t', '\n', '\r', '{'])
+                .split([' ', '\t', '\n', '\r', '{', '('])
                 .next()
                 .unwrap();
             assert!(
@@ -2446,6 +2498,59 @@ mod tests {
             fixture["rows"], rows,
             "the shared Rust/TypeScript classification fixture must match every command column exactly"
         );
+    }
+
+    #[test]
+    fn remote_operation_uuidv7_vectors() {
+        // Byte-identity with the TypeScript `generateRemoteOperationUuidV7`:
+        // both languages consume this same fixture and must reproduce every
+        // `expected` identity from the injected timestamp and random bytes.
+        let raw = include_str!(
+            "../../../packages/cockpit-protocol/fixtures/remote-operation-uuidv7-v1.json"
+        );
+        let fixture: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(fixture["schemaVersion"], 1);
+        let vectors = fixture["vectors"].as_array().expect("vectors array");
+        assert!(!vectors.is_empty(), "fixture must carry vectors");
+        for vector in vectors {
+            let unix_ms = vector["unixMs"].as_u64().expect("unixMs u64");
+            let random_hex = vector["randomHex"].as_str().expect("randomHex string");
+            let expected = vector["expected"].as_str().expect("expected string");
+            assert_eq!(random_hex.len(), 32, "randomHex must be 16 bytes");
+            let mut bytes = [0u8; 16];
+            for (index, byte) in bytes.iter_mut().enumerate() {
+                *byte = u8::from_str_radix(&random_hex[index * 2..index * 2 + 2], 16)
+                    .expect("hex byte");
+            }
+            let id = remote_operation_uuid_v7_from_parts(unix_ms, bytes)
+                .unwrap_or_else(|error| panic!("vector {} failed: {error}", vector["name"]));
+            assert_eq!(id.to_string(), expected, "vector {}", vector["name"]);
+            // Strict version-7 identity, independent of the random low bits.
+            assert_eq!(id.get_version_num(), 7, "vector {}", vector["name"]);
+            assert_eq!(
+                Uuid::parse_str(expected).unwrap(),
+                id,
+                "canonical parse mismatch for {}",
+                vector["name"]
+            );
+        }
+        let rejected = fixture["rejectedUnixMs"]
+            .as_array()
+            .expect("rejectedUnixMs array");
+        assert!(
+            !rejected.is_empty(),
+            "fixture must carry rejected timestamps"
+        );
+        for entry in rejected {
+            let unix_ms = entry["unixMs"].as_u64().expect("rejected unixMs u64");
+            assert!(
+                remote_operation_uuid_v7_from_parts(unix_ms, [0u8; 16]).is_err(),
+                "timestamp {unix_ms} must be rejected as out of range"
+            );
+        }
+        // The 48-bit boundary is accepted; one past it is not.
+        assert!(remote_operation_uuid_v7_from_parts(MAX_UUID_V7_UNIX_MS, [0u8; 16]).is_ok());
+        assert!(remote_operation_uuid_v7_from_parts(MAX_UUID_V7_UNIX_MS + 1, [0u8; 16]).is_err());
     }
 
     #[test]

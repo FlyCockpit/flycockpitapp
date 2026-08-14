@@ -16,14 +16,23 @@
 //!
 //! # Platform honesty
 //!
-//! On non-Unix this build enforces **none** of the security properties above:
-//! no no-follow / reparse-point refusal at any component, no handle-anchored
-//! verification, no ownership verification, no link-count refusal, no
-//! owner-only DACL, and no directory durability barrier. Only the crash-atomic
-//! replacement carries over, and it is a durability guarantee, not a security
-//! claim. `private-fs-windows-parity` closes that gap; until it lands,
-//! [`PRIVATE_FS_POLICY`] reports every security field as `false` there, which
-//! is the truth.
+//! On Windows the KEK-file slice is fail-closed: [`write_private_file`],
+//! [`read_private_file`], [`repair_private_file`], and [`ensure_private_dir`]
+//! refuse a reparse point (junction / symlink / mount-point) at every existing
+//! path component of the file and its parent, apply and re-read a protected
+//! owner-only DACL (`D:P(A;;FA;;;OW)(A;;FA;;;SY)` — owner + SYSTEM full
+//! access, no Everyone / Users / Authenticated Users / inherited extra
+//! principal), refuse a hard-linked secret, and treat every failure as a typed
+//! [`PrivateFsError`]. Verification is through the written object; a verify
+//! failure deletes-or-refuses the file. [`PRIVATE_FS_POLICY.windows_dacl_enforced`]
+//! is `true` on Windows because that apply/verify path is live, not a stub.
+//!
+//! Full no-follow / directory-fsync parity (`private-fs-windows-parity`) is
+//! still later: [`PRIVATE_FS_POLICY.enforced()`] stays Unix-only until a real
+//! directory `fsync` and the rest of the Unix discipline exist on Windows.
+//! Other non-Unix, non-Windows builds still enforce none of the security
+//! properties — only crash-atomic replacement, which is durability, not a
+//! security claim.
 
 use std::path::Path;
 
@@ -37,10 +46,10 @@ pub(crate) mod held_directory;
 
 /// A private-filesystem guarantee that could not be established.
 ///
-/// Declared complete and uncfg'd, including the variants only the Windows arm
-/// will produce once `private-fs-windows-parity` lands, so no caller has to
-/// re-match when it does. On non-Unix the security variants are simply never
-/// constructed yet.
+/// Declared complete and uncfg'd, including the variants the Windows KEK-file
+/// arm already produces (`InsecurePermissions`, `Containment`,
+/// `MultiplyLinked`, `NotOwned`) so no caller has to re-match as
+/// `private-fs-windows-parity` fills in the remaining Unix-parity fields.
 #[derive(Debug, thiserror::Error)]
 pub enum PrivateFsError {
     /// The object exists but its mode/DACL is wrong and could not be corrected.
@@ -148,7 +157,8 @@ pub struct PrivateFsPolicy {
     /// Whether Unix modes are enforced on this build.
     pub unix_mode_enforced: bool,
     /// Whether an explicit owner-only DACL is written and verified on Windows.
-    /// `false` in this prompt; `private-fs-windows-parity` flips it.
+    /// `true` on Windows: apply/verify is live (`D:P(A;;FA;;;OW)(A;;FA;;;SY)`).
+    /// Must stay in lock-step with real on-disk behaviour — never a no-op.
     pub windows_dacl_enforced: bool,
     /// Whether a symlink/reparse point is refused at every guarded component.
     pub reparse_rejected: bool,
@@ -174,18 +184,206 @@ impl PrivateFsPolicy {
     }
 }
 
-/// The protection this build actually applies. Every security field is `false`
-/// on non-Unix, which is the truth until `private-fs-windows-parity` lands.
+/// The protection this build actually applies. Unix mode/ownership/link-count
+/// /directory-fsync fields stay Unix-only. `windows_dacl_enforced` is the
+/// truthful KEK-file DACL witness (`cfg!(windows)`), not an aspiration.
 pub const PRIVATE_FS_POLICY: PrivateFsPolicy = PrivateFsPolicy {
     unix_dir_mode: 0o700,
     unix_file_mode: 0o600,
     unix_mode_enforced: cfg!(unix),
-    windows_dacl_enforced: false,
-    reparse_rejected: cfg!(unix),
-    ownership_verified: cfg!(unix),
-    link_count_verified: cfg!(unix),
+    windows_dacl_enforced: cfg!(windows),
+    reparse_rejected: cfg!(unix) || cfg!(windows),
+    ownership_verified: cfg!(unix) || cfg!(windows),
+    link_count_verified: cfg!(unix) || cfg!(windows),
     directory_fsync_available: cfg!(unix),
 };
+
+// ------------------------------------------------------------------------
+// Windows DACL / reparse policy seam (platform-independent)
+// ------------------------------------------------------------------------
+
+/// Audited owner-only DACL applied to the Windows KEK file and its parent.
+/// Protected DACL, owner + SYSTEM full access only. Reviewed equivalent of
+/// goal-scratch's descriptor; do not weaken.
+pub const WINDOWS_OWNER_ONLY_SDDL: &str = "D:P(A;;FA;;;OW)(A;;FA;;;SY)";
+
+/// A well-known Windows principal the KEK DACL policy distinguishes.
+///
+/// Injected into [`windows_dacl_permission_outcome`] so the ACE verdict can
+/// be unit-tested on every CI host without a Windows runner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsDaclPrincipal {
+    /// Object owner (`OW`) or the creating user's SID.
+    Owner,
+    /// Local SYSTEM (`SY` / `S-1-5-18`).
+    System,
+    /// Everyone / World (`WD` / `S-1-1-0`).
+    Everyone,
+    /// Builtin Users (`BU` / `S-1-5-32-545`).
+    Users,
+    /// Authenticated Users (`AU` / `S-1-5-11`).
+    AuthenticatedUsers,
+    /// Any other SID. Never owner-only.
+    Other,
+}
+
+/// One ACE in an injected Windows DACL, used by the policy seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowsDaclAce {
+    pub principal: WindowsDaclPrincipal,
+    pub allow_full_access: bool,
+}
+
+/// Owner-only DACL verdict over an injected ACE list.
+///
+/// A private descriptor is a **protected** DACL whose allow-full-access ACEs
+/// are exactly owner + SYSTEM. Everyone / Users / Authenticated Users / any
+/// other principal, a missing owner or SYSTEM ACE, an unprotected DACL, or a
+/// non-full-access ACE is [`PermissionOutcome::Insecure`].
+pub fn windows_dacl_permission_outcome(
+    protected: bool,
+    aces: &[WindowsDaclAce],
+) -> PermissionOutcome {
+    if !protected {
+        return PermissionOutcome::Insecure;
+    }
+    let mut saw_owner = false;
+    let mut saw_system = false;
+    for ace in aces {
+        if !ace.allow_full_access {
+            return PermissionOutcome::Insecure;
+        }
+        match ace.principal {
+            WindowsDaclPrincipal::Owner => saw_owner = true,
+            WindowsDaclPrincipal::System => saw_system = true,
+            WindowsDaclPrincipal::Everyone
+            | WindowsDaclPrincipal::Users
+            | WindowsDaclPrincipal::AuthenticatedUsers
+            | WindowsDaclPrincipal::Other => return PermissionOutcome::Insecure,
+        }
+    }
+    if saw_owner && saw_system {
+        PermissionOutcome::Private
+    } else {
+        PermissionOutcome::Insecure
+    }
+}
+
+/// Parse a Windows SDDL DACL into the same ACE verdict the policy seam uses.
+///
+/// Recognises `OW`/`SY`/`WD`/`BU`/`AU` and the well-known SID forms those
+/// aliases expand to. The unit seam injects strings; the Windows KEK-file
+/// verify path re-reads the on-disk descriptor and runs it through this
+/// same function (with the SDDL owner SID so `OW` expansions still count
+/// as [`WindowsDaclPrincipal::Owner`]).
+pub fn windows_dacl_permission_from_sddl(sddl: &str) -> PermissionOutcome {
+    windows_dacl_permission_from_sddl_with_owner(sddl, sddl_owner(sddl))
+}
+
+fn windows_dacl_permission_from_sddl_with_owner(
+    sddl: &str,
+    owner_sid: Option<&str>,
+) -> PermissionOutcome {
+    let Some(dacl) = sddl_dacl_body(sddl) else {
+        return PermissionOutcome::Insecure;
+    };
+    let protected = dacl.starts_with('P');
+    let aces = parse_sddl_aces(dacl, owner_sid);
+    windows_dacl_permission_outcome(protected, &aces)
+}
+
+fn sddl_dacl_body(sddl: &str) -> Option<&str> {
+    let start = sddl.find("D:")?;
+    let rest = &sddl[start + 2..];
+    let end = rest.find("S:").unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+/// Owner SID/alias from an `O:` SDDL prefix (`O:SYD:P…`, `O:S-1-5-21-…G:…D:…`).
+fn sddl_owner(sddl: &str) -> Option<&str> {
+    let rest = sddl.strip_prefix("O:")?;
+    let end = ["G:", "D:", "S:"]
+        .iter()
+        .filter_map(|marker| rest.find(marker))
+        .min()
+        .unwrap_or(rest.len());
+    let owner = &rest[..end];
+    if owner.is_empty() { None } else { Some(owner) }
+}
+
+fn parse_sddl_aces(dacl: &str, owner_sid: Option<&str>) -> Vec<WindowsDaclAce> {
+    let mut aces = Vec::new();
+    let mut rest = dacl;
+    while let Some(open) = rest.find('(') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find(')') else {
+            break;
+        };
+        let body = &after[..close];
+        rest = &after[close + 1..];
+        let parts: Vec<&str> = body.split(';').collect();
+        if parts.len() < 6 {
+            aces.push(WindowsDaclAce {
+                principal: WindowsDaclPrincipal::Other,
+                allow_full_access: false,
+            });
+            continue;
+        }
+        let allow_full_access = parts[0] == "A" && parts[2].contains("FA");
+        let sid = parts[5];
+        let principal = windows_dacl_principal_from_sid(sid, owner_sid);
+        aces.push(WindowsDaclAce {
+            principal,
+            allow_full_access,
+        });
+    }
+    aces
+}
+
+fn windows_dacl_principal_from_sid(sid: &str, owner_sid: Option<&str>) -> WindowsDaclPrincipal {
+    if sid.eq_ignore_ascii_case("OW") {
+        return WindowsDaclPrincipal::Owner;
+    }
+    if sid.eq_ignore_ascii_case("SY") || sid.eq_ignore_ascii_case("S-1-5-18") {
+        return WindowsDaclPrincipal::System;
+    }
+    if sid.eq_ignore_ascii_case("WD") || sid.eq_ignore_ascii_case("S-1-1-0") {
+        return WindowsDaclPrincipal::Everyone;
+    }
+    if sid.eq_ignore_ascii_case("BU") || sid.eq_ignore_ascii_case("S-1-5-32-545") {
+        return WindowsDaclPrincipal::Users;
+    }
+    if sid.eq_ignore_ascii_case("AU") || sid.eq_ignore_ascii_case("S-1-5-11") {
+        return WindowsDaclPrincipal::AuthenticatedUsers;
+    }
+    if owner_sid.is_some_and(|owner| owner.eq_ignore_ascii_case(sid)) {
+        return WindowsDaclPrincipal::Owner;
+    }
+    WindowsDaclPrincipal::Other
+}
+
+/// Observed facts for one path component, injected into the reparse seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathComponentFact {
+    pub exists: bool,
+    pub is_reparse: bool,
+}
+
+/// Refuse any existing reparse/junction/symlink component. Missing components
+/// (a file that has not been created yet) are not reparses.
+pub fn private_path_reparse_verdict(
+    label: &str,
+    components: &[PathComponentFact],
+) -> Result<(), PrivateFsError> {
+    for (index, component) in components.iter().enumerate() {
+        if component.exists && component.is_reparse {
+            return Err(PrivateFsError::Containment(format!(
+                "{label}: path component {index} is a reparse point"
+            )));
+        }
+    }
+    Ok(())
+}
 
 // ------------------------------------------------------------------------
 // Unix held-descriptor primitives
@@ -404,10 +602,7 @@ fn walk_private_dir(path: &Path, create: bool) -> Result<std::fs::File, PrivateF
                 use std::os::unix::fs::MetadataExt;
                 let pmeta = dir.metadata().map_err(|e| {
                     PrivateFsError::io(
-                        format!(
-                            "stat parent of component {name:?} under {}",
-                            path.display()
-                        ),
+                        format!("stat parent of component {name:?} under {}", path.display()),
                         e,
                     )
                 })?;
@@ -441,9 +636,7 @@ fn walk_private_dir(path: &Path, create: bool) -> Result<std::fs::File, PrivateF
                 }
                 // SAFETY: `fstatat` returned 0, so `stat` is initialised.
                 let stat = unsafe { stat.assume_init() };
-                if u32::from(stat.st_mode) & u32::from(libc::S_IFMT)
-                    != u32::from(libc::S_IFLNK)
-                {
+                if u32::from(stat.st_mode) & u32::from(libc::S_IFMT) != u32::from(libc::S_IFLNK) {
                     return Err(PrivateFsError::Containment(format!(
                         "component {name:?} under {} is not a directory",
                         path.display()
@@ -574,10 +767,15 @@ pub fn open_private_dir_handle(dir: &Path) -> Result<std::fs::File, PrivateFsErr
     Ok(handle)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 pub fn ensure_private_dir(path: &Path) -> Result<(), PrivateFsError> {
-    // Non-Unix: no security enforcement (see the module docs and
-    // `PRIVATE_FS_POLICY`). `private-fs-windows-parity` supplies the real arm.
+    ensure_windows_private_dir(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn ensure_private_dir(path: &Path) -> Result<(), PrivateFsError> {
+    // Other non-Unix: no security enforcement (see the module docs and
+    // `PRIVATE_FS_POLICY`).
     std::fs::create_dir_all(path)
         .map_err(|e| PrivateFsError::io(format!("creating {}", path.display()), e))
 }
@@ -618,13 +816,6 @@ pub fn ensure_output_parent_private(path: &Path) -> Result<(), PrivateFsError> {
 // repair_private_file (fail-closed)
 // ------------------------------------------------------------------------
 
-/// Bring an existing secret file to exactly `0600`, refusing rather than
-/// warning. The file is opened no-follow (a symlink is `Containment`); a
-/// foreign owner is `NotOwned`; a hard-linked file is `MultiplyLinked` (its
-/// alias may live in an attacker-controlled directory); the mode is repaired
-/// through the held descriptor and re-verified, yielding `InsecurePermissions`
-/// if it is not `0600` afterwards. Unlike the previous implementation, no
-/// branch returns `Ok(())` while leaving the file insecure.
 // Test seam: fires once, between the initial stat and the authoritative
 // post-chmod re-verify of `repair_private_file`, so a test can inject a hard
 // link (or ownership change) in exactly that window and prove the re-verify
@@ -645,6 +836,13 @@ fn run_repair_after_stat_hook() {
 #[cfg(all(unix, not(test)))]
 fn run_repair_after_stat_hook() {}
 
+/// Bring an existing secret file to exactly `0600`, refusing rather than
+/// warning. The file is opened no-follow (a symlink is `Containment`); a
+/// foreign owner is `NotOwned`; a hard-linked file is `MultiplyLinked` (its
+/// alias may live in an attacker-controlled directory); the mode is repaired
+/// through the held descriptor and re-verified, yielding `InsecurePermissions`
+/// if it is not `0600` afterwards. Unlike the previous implementation, no
+/// branch returns `Ok(())` while leaving the file insecure.
 #[cfg(unix)]
 pub fn repair_private_file(path: &Path, label: &str) -> Result<(), PrivateFsError> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -779,21 +977,52 @@ pub fn read_private_file(path: &Path, label: &str) -> Result<Option<Vec<u8>>, Pr
     Ok(Some(bytes))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub fn read_private_file(path: &Path, label: &str) -> Result<Option<Vec<u8>>, PrivateFsError> {
+    use std::io::Read;
+    let Some(mut file) = open_windows_private_file(path, label)? else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|e| PrivateFsError::io(format!("reading {label} file {}", path.display()), e))?;
+    Ok(Some(bytes))
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn read_private_file(path: &Path, _label: &str) -> Result<Option<Vec<u8>>, PrivateFsError> {
-    // Non-Unix: no security enforcement (see the module docs and
-    // `PRIVATE_FS_POLICY`). `private-fs-windows-parity` supplies the real arm.
+    // Other non-Unix: no security enforcement (see the module docs and
+    // `PRIVATE_FS_POLICY`).
     match std::fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(PrivateFsError::io(format!("reading {}", path.display()), error)),
+        Err(error) => Err(PrivateFsError::io(
+            format!("reading {}", path.display()),
+            error,
+        )),
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub fn repair_private_file(path: &Path, label: &str) -> Result<(), PrivateFsError> {
+    refuse_windows_reparse_components(path)?;
+    match verify_windows_private_path(path, label) {
+        Ok(()) => Ok(()),
+        Err(PrivateFsError::InsecurePermissions(_)) => {
+            // Repair-and-reverify only when the object is self-owned and the
+            // resulting DACL verifies. `set_private` fails closed if we cannot
+            // write an owner-only descriptor (including a foreign owner).
+            apply_windows_owner_only_dacl(path)?;
+            verify_windows_private_path(path, label)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn repair_private_file(_path: &Path, _label: &str) -> Result<(), PrivateFsError> {
-    // Non-Unix: no security enforcement (see the module docs and
-    // `PRIVATE_FS_POLICY`). `private-fs-windows-parity` supplies the real arm.
+    // Other non-Unix: no security enforcement (see the module docs and
+    // `PRIVATE_FS_POLICY`).
     Ok(())
 }
 
@@ -861,7 +1090,10 @@ fn create_temp_in(
             }
         }
     }
-    anyhow::bail!("could not create a unique temp file for {}", target.display())
+    anyhow::bail!(
+        "could not create a unique temp file for {}",
+        target.display()
+    )
 }
 
 /// Best-effort `unlinkat` cleanup of a temp entry beneath the held fd. Errors
@@ -943,7 +1175,10 @@ pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
 
     let dir = atomic_write_dir(path);
     let final_name = path.file_name().ok_or_else(|| {
-        anyhow::anyhow!("write target {} has no final path component", path.display())
+        anyhow::anyhow!(
+            "write target {} has no final path component",
+            path.display()
+        )
     })?;
     let final_c = std::ffi::CString::new(final_name.as_bytes())
         .with_context(|| format!("write target {} name contains NUL", path.display()))?;
@@ -1158,7 +1393,57 @@ pub fn open_private_file_at(
     open_private_file_in_dir_fd(&dir_fd, name, access, label)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    refuse_windows_reparse_components(path)?;
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && parent != Path::new(".")
+    {
+        ensure_private_dir(parent)?;
+    }
+    refuse_windows_hostile_target(path)?;
+
+    let dir = atomic_write_dir(path);
+    let mut temp = tempfile::NamedTempFile::new_in(dir)
+        .with_context(|| format!("creating temp file for {}", path.display()))?;
+    let staged = (|| -> Result<()> {
+        temp.write_all(bytes)
+            .with_context(|| format!("writing temp file for {}", path.display()))?;
+        temp.as_file_mut()
+            .flush()
+            .with_context(|| format!("flushing temp file for {}", path.display()))?;
+        temp.as_file()
+            .sync_all()
+            .with_context(|| format!("fsync temp file for {}", path.display()))?;
+        apply_windows_owner_only_dacl(temp.path())?;
+        Ok(())
+    })();
+    if let Err(error) = staged {
+        return Err(error);
+    }
+    temp.persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("atomically replacing {}", path.display()))?;
+    // Persist is path-based. Finalize re-walks every component, re-opens the
+    // written object nofollow, and re-verifies DACL/links through that handle.
+    // A swap after the preflight walk is fail-closed here, not a warning.
+    if let Err(error) = finalize_windows_private_file(path) {
+        if let Err(cleanup) = std::fs::remove_file(path) {
+            return Err(PrivateFsError::InsecurePermissions(format!(
+                "{}: post-write verify failed ({error}); leftover KEK could not be deleted ({cleanup})",
+                path.display()
+            ))
+            .into());
+        }
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
 
@@ -1167,11 +1452,8 @@ pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     // Crash-safe atomic replacement is orchestrated above the platform layer and
     // needs no platform security primitive, so it applies here too: temp-create
     // in the same directory, write, fsync the file, then rename over the target.
-    // This is a DURABILITY guarantee only. This build enforces none of the
-    // private_fs security properties on non-Unix — no no-follow/reparse refusal,
-    // no handle-anchored verification, no ownership check, no link-count refusal,
-    // no owner-only DACL, and no directory fsync barrier; `private-fs-windows-parity`
-    // closes that gap.
+    // This is a DURABILITY guarantee only. Non-Windows, non-Unix builds enforce
+    // none of the private_fs security properties.
     let mut temp = tempfile::NamedTempFile::new_in(dir)
         .with_context(|| format!("creating temp file for {}", path.display()))?;
     temp.write_all(bytes)
@@ -1188,19 +1470,396 @@ pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+// ------------------------------------------------------------------------
+// Windows KEK-file DACL / reparse / link-count (fail-closed)
+// ------------------------------------------------------------------------
+
+#[cfg(windows)]
+fn windows_metadata_is_reparse(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(windows)]
+fn refuse_windows_reparse_components(path: &Path) -> Result<(), PrivateFsError> {
+    use std::path::{Component, PathBuf};
+
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(PrivateFsError::Containment(format!(
+            "{}: refused, path contains `..`",
+            path.display()
+        )));
+    }
+    let mut current = PathBuf::new();
+    let mut facts = Vec::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if matches!(
+            component,
+            Component::Prefix(_) | Component::RootDir | Component::CurDir
+        ) {
+            facts.push(PathComponentFact {
+                exists: true,
+                is_reparse: false,
+            });
+            continue;
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) => facts.push(PathComponentFact {
+                exists: true,
+                is_reparse: windows_metadata_is_reparse(&meta),
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                facts.push(PathComponentFact {
+                    exists: false,
+                    is_reparse: false,
+                });
+                break;
+            }
+            Err(error) => {
+                return Err(PrivateFsError::io(
+                    format!("stat {}", current.display()),
+                    error,
+                ));
+            }
+        }
+    }
+    private_path_reparse_verdict(&path.display().to_string(), &facts)
+}
+
+#[cfg(windows)]
+fn windows_hard_link_count(file: &std::fs::File) -> Result<u64, PrivateFsError> {
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        attributes: u32,
+        creation_low: u32,
+        creation_high: u32,
+        access_low: u32,
+        access_high: u32,
+        write_low: u32,
+        write_high: u32,
+        volume_serial: u32,
+        size_high: u32,
+        size_low: u32,
+        links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(
+            file: *mut core::ffi::c_void,
+            information: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+    let mut info = std::mem::MaybeUninit::<ByHandleFileInformation>::uninit();
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) };
+    if ok == 0 {
+        return Err(PrivateFsError::io(
+            "GetFileInformationByHandle",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: GetFileInformationByHandle returned success, so `info` is written.
+    Ok(u64::from(unsafe { info.assume_init() }.links))
+}
+
+#[cfg(windows)]
+fn map_windows_dacl_error(path: &Path, err: anyhow::Error) -> PrivateFsError {
+    PrivateFsError::InsecurePermissions(format!("{}: {err}", path.display()))
+}
+
+#[cfg(windows)]
+fn apply_windows_owner_only_dacl(path: &Path) -> Result<(), PrivateFsError> {
+    crate::goal_scratch::set_private(path).map_err(|err| map_windows_dacl_error(path, err))
+}
+
+/// Open an existing path without following a final-component reparse.
+#[cfg(windows)]
+fn open_windows_file_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+/// Re-read the security descriptor through the held object, not the apply call.
+#[cfg(windows)]
+fn windows_sddl_from_handle(file: &std::fs::File) -> Result<String, PrivateFsError> {
+    use std::os::windows::io::AsRawHandle as _;
+    use std::ptr;
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn GetSecurityInfo(
+            handle: *mut core::ffi::c_void,
+            object_type: u32,
+            security_information: u32,
+            owner: *mut *mut core::ffi::c_void,
+            group: *mut *mut core::ffi::c_void,
+            dacl: *mut *mut core::ffi::c_void,
+            sacl: *mut *mut core::ffi::c_void,
+            descriptor: *mut *mut core::ffi::c_void,
+        ) -> u32;
+        fn ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor: *mut core::ffi::c_void,
+            revision: u32,
+            security_information: u32,
+            string_descriptor: *mut *mut u16,
+            string_length: *mut u32,
+        ) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LocalFree(memory: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    }
+    const SE_FILE_OBJECT: u32 = 1;
+    const OWNER_SECURITY_INFORMATION: u32 = 1;
+    const DACL_SECURITY_INFORMATION: u32 = 4;
+    let information = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+    let mut descriptor = ptr::null_mut();
+    let result = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            information,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if result != 0 || descriptor.is_null() {
+        return Err(PrivateFsError::InsecurePermissions(format!(
+            "could not re-read DACL through the written object (GetSecurityInfo {result})"
+        )));
+    }
+    let mut sddl = ptr::null_mut();
+    let mut length = 0_u32;
+    let converted = unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor,
+            1,
+            information,
+            &mut sddl,
+            &mut length,
+        )
+    };
+    unsafe { LocalFree(descriptor) };
+    if converted == 0 || sddl.is_null() {
+        return Err(PrivateFsError::InsecurePermissions(
+            "could not convert the re-read DACL to SDDL for verification".into(),
+        ));
+    }
+    let value = String::from_utf16_lossy(unsafe {
+        std::slice::from_raw_parts(sddl, usize::try_from(length).unwrap_or(0))
+    });
+    unsafe { LocalFree(sddl.cast()) };
+    Ok(value)
+}
+
+#[cfg(windows)]
+fn verify_windows_open_file(
+    file: &std::fs::File,
+    path: &Path,
+    label: &str,
+) -> Result<(), PrivateFsError> {
+    let meta = file
+        .metadata()
+        .map_err(|e| PrivateFsError::io(format!("stat {label} file {}", path.display()), e))?;
+    if windows_metadata_is_reparse(&meta) {
+        return Err(PrivateFsError::Containment(format!(
+            "{label} file {}: is a reparse point",
+            path.display()
+        )));
+    }
+    if !meta.is_file() {
+        return Err(PrivateFsError::Containment(format!(
+            "{label} file {}: not a regular file",
+            path.display()
+        )));
+    }
+    let links = windows_hard_link_count(file)?;
+    if links != 1 {
+        return Err(PrivateFsError::MultiplyLinked(format!(
+            "{label} file {}: has {links} hard links",
+            path.display()
+        )));
+    }
+    // Policy-seam verdict over the re-read descriptor (not the apply call).
+    let sddl = windows_sddl_from_handle(file)?;
+    if windows_dacl_permission_from_sddl(&sddl) != PermissionOutcome::Private {
+        return Err(PrivateFsError::InsecurePermissions(format!(
+            "{label} {}: DACL is not owner+SYSTEM only",
+            path.display()
+        )));
+    }
+    // Current-user ownership: a foreign-owned object with an owner-only DACL
+    // is still `NotOwned`. `set_private` / `verify_private_dacl_handle` refuse
+    // to treat another user's SID as cockpit-owned.
+    crate::goal_scratch::verify_private_dacl_handle(file)
+        .map_err(|err| PrivateFsError::NotOwned(format!("{label} {}: {err}", path.display())))
+}
+
+#[cfg(windows)]
+fn verify_windows_private_path(path: &Path, label: &str) -> Result<(), PrivateFsError> {
+    refuse_windows_reparse_components(path)?;
+    let file = open_windows_file_nofollow(path).map_err(|error| {
+        PrivateFsError::io(format!("opening {label} file {}", path.display()), error)
+    })?;
+    verify_windows_open_file(&file, path, label)
+}
+
+#[cfg(windows)]
+fn open_windows_private_file(
+    path: &Path,
+    label: &str,
+) -> Result<Option<std::fs::File>, PrivateFsError> {
+    refuse_windows_reparse_components(path)?;
+    let file = match open_windows_file_nofollow(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(PrivateFsError::io(
+                format!("opening {label} file {}", path.display()),
+                error,
+            ));
+        }
+    };
+    verify_windows_open_file(&file, path, label)?;
+    Ok(Some(file))
+}
+
+#[cfg(windows)]
+fn finalize_windows_private_file(path: &Path) -> Result<(), PrivateFsError> {
+    refuse_windows_reparse_components(path)?;
+    apply_windows_owner_only_dacl(path)?;
+    verify_windows_private_path(path, "private file")
+}
+
+#[cfg(windows)]
+fn refuse_windows_hostile_target(path: &Path) -> Result<(), PrivateFsError> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(PrivateFsError::io(
+                format!("probing write target {}", path.display()),
+                error,
+            ));
+        }
+    };
+    if windows_metadata_is_reparse(&meta) {
+        return Err(PrivateFsError::Containment(format!(
+            "{}: write target is a reparse point",
+            path.display()
+        )));
+    }
+    if !meta.is_file() {
+        return Err(PrivateFsError::Containment(format!(
+            "{}: write target is not a regular file",
+            path.display()
+        )));
+    }
+    let file = open_windows_file_nofollow(path).map_err(|error| {
+        PrivateFsError::io(format!("opening write target {}", path.display()), error)
+    })?;
+    let links = windows_hard_link_count(&file)?;
+    if links != 1 {
+        return Err(PrivateFsError::MultiplyLinked(format!(
+            "{}: write target has {links} hard links",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn ensure_windows_private_dir(path: &Path) -> Result<(), PrivateFsError> {
+    use std::path::{Component, PathBuf};
+
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(PrivateFsError::Containment(format!(
+            "{}: refused, path contains `..`",
+            path.display()
+        )));
+    }
+    let mut current = PathBuf::new();
+    let components: Vec<_> = path.components().collect();
+    for (index, component) in components.iter().enumerate() {
+        current.push(component.as_os_str());
+        let is_leaf = index + 1 == components.len();
+        if matches!(
+            component,
+            Component::Prefix(_) | Component::RootDir | Component::CurDir
+        ) {
+            continue;
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) => {
+                if windows_metadata_is_reparse(&meta) {
+                    return Err(PrivateFsError::Containment(format!(
+                        "directory {}: is a reparse point",
+                        current.display()
+                    )));
+                }
+                if !meta.is_dir() {
+                    return Err(PrivateFsError::Containment(format!(
+                        "directory {}: not a real directory",
+                        current.display()
+                    )));
+                }
+                if is_leaf {
+                    apply_windows_owner_only_dacl(&current)?;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current).map_err(|e| {
+                    PrivateFsError::io(format!("creating {}", current.display()), e)
+                })?;
+                apply_windows_owner_only_dacl(&current)?;
+            }
+            Err(error) => {
+                return Err(PrivateFsError::io(
+                    format!("stat {}", current.display()),
+                    error,
+                ));
+            }
+        }
+    }
+    // Fail-closed: a path that contains a real directory component must
+    // re-read as owner-only. A stub apply would leave the tempfile default
+    // DACL and this verify returns InsecurePermissions.
+    if components
+        .iter()
+        .any(|component| matches!(component, Component::Normal(_)))
+    {
+        crate::goal_scratch::verify_private_dacl(path)
+            .map_err(|err| map_windows_dacl_error(path, err))?;
+    }
+    Ok(())
+}
+
 /// Write a secret-bearing session-export artifact, failing closed on any build
 /// whose platform cannot enforce the private-file security discipline.
 ///
 /// A session export (redacted or, via the explicit local opt-in, raw) always
 /// contains material that must never land world-readable — API keys, tokens,
 /// SSH material, and prompt/response bodies. On a platform where
-/// [`PRIVATE_FS_POLICY`] does not report `enforced()` (every field `false` on
-/// non-Unix until `private-fs-windows-parity` lands), we refuse to write the
-/// export rather than emit a file without the 0600 / ownership / no-follow
-/// guarantees. Callers on such platforms surface the error and produce no
-/// output file. On an enforcing platform this is exactly
-/// [`write_private_file`]; the gate is additive and consumes the single
-/// policy witness rather than re-deciding `cfg!(unix)`.
+/// [`PRIVATE_FS_POLICY`] does not report `enforced()` (the full Unix
+/// discipline, including directory fsync; Windows DACL is a separate
+/// `windows_dacl_enforced` witness), we refuse to write the export rather than
+/// emit a file without the 0600 / ownership / no-follow guarantees. Callers on
+/// such platforms surface the error and produce no output file. On an
+/// enforcing platform this is exactly [`write_private_file`]; the gate is
+/// additive and consumes the single policy witness rather than re-deciding
+/// `cfg!(unix)`. Do not weaken this gate when the Windows DACL witness flips.
 pub fn write_private_export_file(path: &Path, bytes: &[u8]) -> Result<()> {
     if !PRIVATE_FS_POLICY.enforced() {
         anyhow::bail!(
@@ -1325,12 +1984,27 @@ mod tests {
         write_private_file(&file, b"payload").expect("write private file");
 
         assert_eq!(PRIVATE_FS_POLICY.unix_mode_enforced, cfg!(unix));
-        assert_eq!(PRIVATE_FS_POLICY.reparse_rejected, cfg!(unix));
-        assert_eq!(PRIVATE_FS_POLICY.ownership_verified, cfg!(unix));
-        assert_eq!(PRIVATE_FS_POLICY.link_count_verified, cfg!(unix));
+        assert_eq!(
+            PRIVATE_FS_POLICY.reparse_rejected,
+            cfg!(unix) || cfg!(windows)
+        );
+        assert_eq!(
+            PRIVATE_FS_POLICY.ownership_verified,
+            cfg!(unix) || cfg!(windows)
+        );
+        assert_eq!(
+            PRIVATE_FS_POLICY.link_count_verified,
+            cfg!(unix) || cfg!(windows)
+        );
         assert_eq!(PRIVATE_FS_POLICY.directory_fsync_available, cfg!(unix));
-        // Not implemented in this prompt; `private-fs-windows-parity` flips it.
-        assert!(!PRIVATE_FS_POLICY.windows_dacl_enforced);
+        // Honest by construction: the flag tracks the live apply/verify arm,
+        // never a stub. A no-op apply/verify with this true fails below.
+        const { assert!(PRIVATE_FS_POLICY.windows_dacl_enforced == cfg!(windows)) };
+        assert_eq!(PRIVATE_FS_POLICY.windows_dacl_enforced, cfg!(windows));
+        assert_eq!(
+            PRIVATE_FS_POLICY.windows_dacl_enforced,
+            windows_dacl_is_actually_enforced(&file)
+        );
         assert_eq!(PRIVATE_FS_POLICY.enforced(), cfg!(unix));
 
         #[cfg(unix)]
@@ -1351,6 +2025,320 @@ mod tests {
                 Err(PrivateFsError::Containment(_))
             ));
         }
+    }
+
+    /// Compare `windows_dacl_enforced` to real apply/verify, not the constant.
+    ///
+    /// If the flag is true while verify is a no-op, applying a world-readable
+    /// DACL would still "verify" and this returns false — failing the policy
+    /// test. On non-Windows there is no apply/verify, so the answer is false.
+    fn windows_dacl_is_actually_enforced(path: &std::path::Path) -> bool {
+        #[cfg(windows)]
+        {
+            if crate::goal_scratch::verify_private_dacl(path).is_err() {
+                return false;
+            }
+            crate::goal_scratch::apply_test_windows_dacl(path, "D:P(A;;FA;;;WD)")
+                .expect("test helper must be able to apply a world-readable DACL");
+            let rejected = matches!(
+                verify_windows_private_path(path, "policy-probe"),
+                Err(PrivateFsError::InsecurePermissions(_))
+            );
+            let _ = crate::goal_scratch::set_private(path);
+            rejected
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = path;
+            false
+        }
+    }
+
+    fn owner_only_aces() -> [WindowsDaclAce; 2] {
+        [
+            WindowsDaclAce {
+                principal: WindowsDaclPrincipal::Owner,
+                allow_full_access: true,
+            },
+            WindowsDaclAce {
+                principal: WindowsDaclPrincipal::System,
+                allow_full_access: true,
+            },
+        ]
+    }
+
+    fn ace(principal: WindowsDaclPrincipal) -> WindowsDaclAce {
+        WindowsDaclAce {
+            principal,
+            allow_full_access: true,
+        }
+    }
+
+    #[test]
+    fn private_fs_windows_dacl_policy_seam() {
+        assert_eq!(
+            windows_dacl_permission_outcome(true, &owner_only_aces()),
+            PermissionOutcome::Private
+        );
+        assert_eq!(
+            windows_dacl_permission_from_sddl(WINDOWS_OWNER_ONLY_SDDL),
+            PermissionOutcome::Private
+        );
+
+        for forbidden in [
+            WindowsDaclPrincipal::Everyone,
+            WindowsDaclPrincipal::Users,
+            WindowsDaclPrincipal::AuthenticatedUsers,
+        ] {
+            assert_eq!(
+                windows_dacl_permission_outcome(true, &[ace(forbidden)]),
+                PermissionOutcome::Insecure,
+                "{forbidden:?} alone must fail"
+            );
+            assert_eq!(
+                windows_dacl_permission_outcome(
+                    true,
+                    &[
+                        ace(WindowsDaclPrincipal::Owner),
+                        ace(WindowsDaclPrincipal::System),
+                        ace(forbidden),
+                    ]
+                ),
+                PermissionOutcome::Insecure,
+                "owner+SYSTEM plus {forbidden:?} must fail"
+            );
+        }
+
+        assert_eq!(
+            windows_dacl_permission_from_sddl("D:P(A;;FA;;;WD)"),
+            PermissionOutcome::Insecure
+        );
+        assert_eq!(
+            windows_dacl_permission_from_sddl("D:P(A;;FA;;;BU)"),
+            PermissionOutcome::Insecure
+        );
+        assert_eq!(
+            windows_dacl_permission_from_sddl("D:P(A;;FA;;;AU)"),
+            PermissionOutcome::Insecure
+        );
+        assert_eq!(
+            windows_dacl_permission_from_sddl("D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;WD)"),
+            PermissionOutcome::Insecure
+        );
+        assert_eq!(
+            windows_dacl_permission_from_sddl("D:(A;;FA;;;OW)(A;;FA;;;SY)"),
+            PermissionOutcome::Insecure,
+            "unprotected DACL must fail"
+        );
+        assert_eq!(
+            windows_dacl_permission_outcome(false, &owner_only_aces()),
+            PermissionOutcome::Insecure
+        );
+        assert_eq!(
+            windows_dacl_permission_outcome(
+                true,
+                &[WindowsDaclAce {
+                    principal: WindowsDaclPrincipal::Owner,
+                    allow_full_access: false,
+                }]
+            ),
+            PermissionOutcome::Insecure
+        );
+
+        // Expanded well-known SIDs (what ConvertSecurityDescriptor… emits).
+        assert_eq!(
+            windows_dacl_permission_from_sddl("D:P(A;;FA;;;S-1-1-0)"),
+            PermissionOutcome::Insecure
+        );
+        assert_eq!(
+            windows_dacl_permission_from_sddl("D:P(A;;FA;;;S-1-5-32-545)"),
+            PermissionOutcome::Insecure
+        );
+        assert_eq!(
+            windows_dacl_permission_from_sddl("D:P(A;;FA;;;S-1-5-11)"),
+            PermissionOutcome::Insecure
+        );
+        assert_eq!(
+            windows_dacl_permission_from_sddl(
+                "O:S-1-5-21-1D:P(A;;FA;;;S-1-5-21-1)(A;;FA;;;S-1-5-18)"
+            ),
+            PermissionOutcome::Private,
+            "re-read SDDL must treat the owner SID plus SYSTEM as private"
+        );
+        assert_eq!(
+            windows_dacl_permission_from_sddl_with_owner(
+                "D:P(A;;FA;;;S-1-5-21-1)(A;;FA;;;SY)",
+                Some("S-1-5-21-1")
+            ),
+            PermissionOutcome::Private
+        );
+        assert_eq!(
+            windows_dacl_permission_from_sddl(
+                "O:S-1-5-21-1D:P(A;;FA;;;S-1-5-21-1)(A;;FA;;;SY)(A;;FA;;;WD)"
+            ),
+            PermissionOutcome::Insecure
+        );
+    }
+
+    #[test]
+    fn vault_windows_kek_file_refuses_reparse() {
+        assert!(
+            private_path_reparse_verdict(
+                "kek",
+                &[
+                    PathComponentFact {
+                        exists: true,
+                        is_reparse: false,
+                    },
+                    PathComponentFact {
+                        exists: true,
+                        is_reparse: true,
+                    },
+                ]
+            )
+            .is_err_and(|e| matches!(e, PrivateFsError::Containment(_))),
+            "a reparse parent component must be Containment"
+        );
+        assert!(
+            private_path_reparse_verdict(
+                "kek",
+                &[
+                    PathComponentFact {
+                        exists: true,
+                        is_reparse: false,
+                    },
+                    PathComponentFact {
+                        exists: true,
+                        is_reparse: false,
+                    },
+                    PathComponentFact {
+                        exists: true,
+                        is_reparse: true,
+                    },
+                ]
+            )
+            .is_err_and(|e| matches!(e, PrivateFsError::Containment(_))),
+            "a reparse final component must be Containment"
+        );
+        assert!(
+            private_path_reparse_verdict(
+                "kek",
+                &[
+                    PathComponentFact {
+                        exists: true,
+                        is_reparse: false,
+                    },
+                    PathComponentFact {
+                        exists: false,
+                        is_reparse: false,
+                    },
+                ]
+            )
+            .is_ok(),
+            "a missing final component is not a reparse"
+        );
+
+        #[cfg(windows)]
+        {
+            let root = tempfile::tempdir().expect("tempdir");
+            let real = root.path().join("real");
+            std::fs::create_dir(&real).unwrap();
+            let junction = root.path().join("junc");
+            create_windows_junction(&junction, &real);
+            let kek = junction.join("wrap.key");
+            let error = write_private_file(&kek, b"kek-bytes").expect_err("reparse parent");
+            assert!(
+                matches!(
+                    error.downcast_ref::<PrivateFsError>(),
+                    Some(PrivateFsError::Containment(_))
+                ),
+                "reparse parent must be Containment, got {error:?}"
+            );
+
+            let store = root.path().join("store");
+            ensure_private_dir(&store).expect("private store");
+            let link_name = store.join("wrap.key");
+            create_windows_junction(&link_name, &real);
+            let error =
+                write_private_file(&link_name, b"kek-bytes").expect_err("reparse final component");
+            assert!(
+                matches!(
+                    error.downcast_ref::<PrivateFsError>(),
+                    Some(PrivateFsError::Containment(_))
+                ),
+                "reparse final component must be Containment, got {error:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    fn create_windows_junction(link: &std::path::Path, target: &std::path::Path) {
+        let status = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .status()
+            .expect("run mklink");
+        assert!(
+            status.success(),
+            "mklink /J {} -> {} failed",
+            link.display(),
+            target.display()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn vault_windows_kek_file_owner_only_dacl() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let kek = dir.path().join("wrap.key");
+        write_private_file(&kek, b"kek-bytes-32................").expect("write KEK");
+        crate::goal_scratch::verify_private_dacl(&kek)
+            .expect("write_private_file must leave an owner-only DACL");
+        crate::goal_scratch::verify_private_dacl(kek.parent().expect("parent"))
+            .expect("KEK parent must have the same owner-only DACL");
+
+        crate::goal_scratch::apply_test_windows_dacl(&kek, "D:P(A;;FA;;;WD)")
+            .expect("inject world-readable DACL");
+        assert!(
+            matches!(
+                verify_windows_private_path(&kek, "kek"),
+                Err(PrivateFsError::InsecurePermissions(_))
+            ),
+            "verify must refuse a world-readable KEK DACL"
+        );
+        assert!(
+            matches!(
+                read_private_file(&kek, "kek"),
+                Err(PrivateFsError::InsecurePermissions(_))
+            ),
+            "subsequent KEK open must refuse a world-readable DACL"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn vault_windows_kek_file_refuses_hard_link() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let kek = dir.path().join("wrap.key");
+        write_private_file(&kek, b"kek-bytes-32................").expect("write KEK");
+        let alias = dir.path().join("wrap.key.alias");
+        std::fs::hard_link(&kek, &alias).expect("create hard link");
+        let error = write_private_file(&kek, b"replacement-kek.............").expect_err("nlink>1");
+        assert!(
+            matches!(
+                error.downcast_ref::<PrivateFsError>(),
+                Some(PrivateFsError::MultiplyLinked(_))
+            ),
+            "hard-linked KEK must be MultiplyLinked, got {error:?}"
+        );
+        assert!(
+            matches!(
+                read_private_file(&kek, "kek"),
+                Err(PrivateFsError::MultiplyLinked(_))
+            ),
+            "subsequent open of a hard-linked KEK must refuse"
+        );
     }
 
     // -- ensure_private_dir refuses a symlinked leaf (Unix) ---------------
@@ -1647,7 +2635,9 @@ mod tests {
             "the pre-existing secret must be byte-identical after a failed write"
         );
         assert!(
-            !after.windows(b"NEW-SECRET-PAYLOAD".len()).any(|w| w == b"NEW-SECRET-PAYLOAD"),
+            !after
+                .windows(b"NEW-SECRET-PAYLOAD".len())
+                .any(|w| w == b"NEW-SECRET-PAYLOAD"),
             "the new secret must never be written into the victim on a failed write"
         );
     }

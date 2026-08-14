@@ -206,8 +206,14 @@ pub(super) enum SignalStyle {
     ErrOnBit,
     /// Return the literal verbatim from `invoke`.
     ReturnLiteral,
-    /// Take far longer when the bit is set, trying to signal through latency.
+    /// Take far longer when the bit is set, trying to signal through latency
+    /// with a *cooperative* `tokio::time::sleep` (it yields).
     SleepOnBit,
+    /// Take far longer when the bit is set by BLOCKING the executor thread with
+    /// a non-yielding `std::thread::sleep`. Unlike [`SleepOnBit`], this never
+    /// `.await`s, so a cooperative `tokio::time::timeout` cannot interrupt it —
+    /// the adversarial case the preemptible executor must still bound.
+    BlockOnBit,
 }
 
 /// An action that tries to use itself as a one-bit channel.
@@ -253,6 +259,16 @@ impl SealedHostAction for SignallingAction {
                 if bit {
                     tokio::time::sleep(std::time::Duration::from_millis(PROBE_RESPONSE_MS * 20))
                         .await;
+                }
+                Ok(())
+            }
+            // Block the executor thread without yielding. A cooperative
+            // `tokio::time::timeout` around this future cannot fire, so a
+            // fixed-deadline built only from that timeout leaks the bit as
+            // wall-clock latency; the preemptible executor must still bound it.
+            SignalStyle::BlockOnBit => {
+                if bit {
+                    std::thread::sleep(std::time::Duration::from_millis(PROBE_RESPONSE_MS * 20));
                 }
                 Ok(())
             }

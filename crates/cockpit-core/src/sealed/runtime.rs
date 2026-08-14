@@ -82,6 +82,57 @@ pub trait SealedRedactionSink: Send + Sync {
     ) -> anyhow::Result<()>;
 }
 
+/// Upper bound on sealed-action threads alive at once (running **or**
+/// abandoned-past-deadline). A CPU-bound or infinite untrusted action cannot be
+/// killed in safe Rust, so an abandoned one keeps a dedicated thread + a core
+/// until its blocking call returns; this cap bounds how many such runaways can
+/// accumulate, so a burst of adversarial spinners cannot exhaust process
+/// threads. Sealed use is Owner-gated and rare, so a small cap is generous.
+const MAX_INFLIGHT_SEALED_ACTIONS: usize = 32;
+
+/// Count of live sealed-action threads, gated by [`MAX_INFLIGHT_SEALED_ACTIONS`].
+static INFLIGHT_SEALED_ACTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// An RAII slot in the sealed-action thread budget.
+///
+/// Acquired before a dedicated action thread is spawned and moved *into* that
+/// thread, so the slot is held for the thread's entire life — including after
+/// the caller abandons it at the deadline — and released only when the action's
+/// blocking call finally returns and the thread exits. That is exactly the
+/// window during which a runaway action ties up a thread, so the count reflects
+/// real resource pressure rather than merely in-flight calls.
+struct SealedActionSlot;
+
+impl SealedActionSlot {
+    /// Take a slot, or `None` if the budget is full. Never blocks: waiting for a
+    /// slot would make one call's completion depend on other calls' abandoned
+    /// spinners, reopening the cross-call timing channel this cap exists to
+    /// close. A full budget instead fails the use closed (see the call site).
+    fn try_acquire() -> Option<Self> {
+        let mut current = INFLIGHT_SEALED_ACTIONS.load(Ordering::Acquire);
+        loop {
+            if current >= MAX_INFLIGHT_SEALED_ACTIONS {
+                return None;
+            }
+            match INFLIGHT_SEALED_ACTIONS.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+impl Drop for SealedActionSlot {
+    fn drop(&mut self) {
+        INFLIGHT_SEALED_ACTIONS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// The runtime half of sealed values: closed registry + durable stores.
 pub struct SealedRuntime {
     db: Db,
@@ -228,14 +279,14 @@ impl SealedRuntime {
         // into protected redaction history atomically with the table persist).
         // That work is variable and dominated by DB latency, so folding it into
         // the timed window would let it consume — and overrun — the descriptor's
-        // `response_after` budget: the `saturating_sub` below would collapse the
-        // action's own timeout to zero and the response would land late by
-        // however long the transaction took, leaking secret-adoption/DB timing
-        // and breaking the fixed-deadline contract. Anchoring after registration
-        // keeps registration off the caller-visible window: the response lands a
-        // fixed `response_after` after `started` regardless of key-load, encrypt,
-        // or DB time. Registration still precedes any use of the literal, so
-        // redaction-before-use is unchanged.
+        // `response_after` budget: it would eat the action's share of the window
+        // and push the response out past the fixed deadline by however long the
+        // transaction took, leaking secret-adoption/DB timing and breaking the
+        // fixed-deadline contract. Anchoring after registration keeps
+        // registration off the caller-visible window: the response lands a fixed
+        // `response_after` after the anchor below regardless of key-load,
+        // encrypt, or DB time. Registration still precedes any use of the
+        // literal, so redaction-before-use is unchanged.
         //
         // Residual: resolution and registration are O(literal length) and now
         // sit before the anchor, so their duration is not padded away. This is
@@ -243,7 +294,6 @@ impl SealedRuntime {
         // claim above (all decided before the window), and it is our own code,
         // not the untrusted action; the padding's purpose — bounding the action
         // the caller can adversarially time to encode literal bits — is intact.
-        let started = std::time::Instant::now();
         // The action's return value — including its error — is discarded
         // without inspection. It cannot select what the caller sees, so it
         // cannot encode a bit of the literal in the response or in the
@@ -256,33 +306,146 @@ impl SealedRuntime {
         //   compiled descriptor. Neither takes the literal, the parameters,
         //   nor the action's behaviour as an input.
         //
-        // Duration is held to that by two halves that must both be present: a
-        // hard deadline, so a slow or hanging action cannot push the response
-        // out; and a wait to that same deadline, so a fast action cannot pull
-        // it in. A floor alone gives only the second half, which is why 30ms
-        // and 1s were still distinguishable before this change.
+        // Duration is held to that by a HARD, non-cooperative deadline. A prior
+        // implementation wrapped the action in `tokio::time::timeout` and padded
+        // with a floor `sleep`. That timeout is *cooperative*: it shares the
+        // caller's async task, so an action that never yields — a
+        // `std::thread::sleep`, a CPU-bound loop, any non-`.await`ing work —
+        // blocks the very task the timeout lives on. The timeout branch is then
+        // never polled, the action returns late, and the extra wall-clock time
+        // encodes a bit of the literal (branch on a literal bit, then block),
+        // defeating the padding. A floor alone is the second half only, which is
+        // why 30ms and 1s were still distinguishable before this change.
+        //
+        // Executor/runtime choice (NO new dependency — a `std::thread`, a
+        // `std::sync::mpsc` start gate, a `tokio::sync::oneshot`, and an
+        // `AtomicUsize`, all already available):
+        // run the untrusted action on a DEDICATED `std::thread`, OFF both the
+        // caller's async task and Tokio's shared blocking pool, then have the
+        // caller race the action's completion signal against
+        // `sleep_until(deadline)`. Because the action no longer runs on the
+        // caller's task, the deadline timer is serviced and CAN win even while
+        // the action is still blocking — enforcement stops depending on the
+        // action cooperating. A dedicated thread (rather than
+        // `spawn_blocking`) means a runaway action cannot consume the shared
+        // blocking pool the rest of the app depends on. The action's async
+        // `invoke` future is driven to completion inside the thread on a private
+        // current-thread runtime, independent of the caller's runtime flavour,
+        // which also supplies the timer/IO context an action may need.
         let deadline = authorized.action.descriptor().response_after();
-        let _ = tokio::time::timeout(
-            deadline.saturating_sub(started.elapsed()),
-            authorized
-                .action
-                .invoke(literal.handle(), &authorized.params),
-        )
-        .await;
-        drop(literal);
 
-        // Wait out the remainder. Together with the timeout above, every call
-        // to this action occupies the same wall time.
+        // Bound the number of concurrently-live action threads. Fail closed if
+        // the budget is full: this denial depends on OTHER calls' abandoned
+        // spinners, never on THIS literal, so it leaks no bit — it is the same
+        // content-free denial as every other, and the literal is dropped
+        // (zeroized) here without being handed to any action.
+        let Some(slot) = SealedActionSlot::try_acquire() else {
+            drop(literal);
+            return Err(SealedUseDenied);
+        };
+
+        let action = Arc::clone(&authorized.action);
+        let params = authorized.params.clone();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        // Start gate. `std::thread::spawn` starts the thread running at once, so
+        // without this the action could begin its literal-dependent work in the
+        // gap between spawn and the anchor below and contend for CPU/scheduler
+        // with the caller — making the pre-anchor interval literal-dependent and
+        // caller-visible. The thread parks on this gate and does NO work (not
+        // even building its runtime) until the caller opens it, immediately
+        // after anchoring. The rendezvous is literal-independent: it happens
+        // before the action runs. A plain `std::sync::mpsc` parks the thread
+        // without needing the private runtime (which is built only after the
+        // gate opens), so the wait needs no async context.
+        let (start_tx, start_rx) = std::sync::mpsc::channel::<()>();
+        // Move the owned literal AND the budget slot onto the dedicated thread.
+        // The literal is a self-zeroizing `SealedLiteral`: whenever the action
+        // returns — before OR after the deadline — the closure drops it and its
+        // buffer is wiped, and the slot is released, so abandonment does not
+        // change the zeroization guarantee, only its timing. We never join the
+        // thread, so an abandoned action is detached and runs to completion on
+        // its own thread. If the OS refuses the thread, the closure (and thus
+        // the literal + slot) drops immediately, `done_tx` drops unsent, and the
+        // race below still pads to the fixed deadline — fail-closed, no leak.
+        let spawned = std::thread::Builder::new()
+            .name("sealed-action".to_string())
+            .spawn(move || {
+                let _slot = slot;
+                // Park until the caller opens the gate (strictly after the
+                // anchor). Do no action work — not even build the runtime —
+                // before this. A dropped `start_tx` (caller gone) also releases
+                // this to a clean shutdown that still zeroizes the literal.
+                let _ = start_rx.recv();
+                if let Ok(local) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    local.block_on(async move {
+                        let _ = action.invoke(literal.handle(), &params).await;
+                    });
+                }
+                // Signal completion. If the action panicked, `done_tx` drops
+                // without sending; the race below treats that identically to a
+                // normal finish (it still only pads to the fixed deadline), so a
+                // panic cannot leak a bit either.
+                let _ = done_tx.send(());
+            });
+        // Detach: the `JoinHandle` is dropped, never joined, so the action is
+        // abandoned rather than awaited when the deadline wins.
+        drop(spawned);
+
+        // Anchor the padded window HERE — after every fallible/variable setup
+        // step above (slot acquire, params clone, channel allocation, thread
+        // spawn) and BEFORE the action is allowed to start. Thread-spawn latency
+        // stays outside the window; opening the gate on the next line lets the
+        // action begin only after this anchor, so the window contains ALL of the
+        // action's literal-dependent execution and NONE of it precedes the
+        // anchor. The only thing between this anchor and the race is opening the
+        // gate — a single literal-independent send.
+        let deadline_at = tokio::time::Instant::now() + deadline;
+        // Open the start gate: the action begins now, strictly after the anchor.
+        let _ = start_tx.send(());
+
+        // Race the action's completion against the fixed deadline. The deadline
+        // branch can win even against a non-yielding action, because the action
+        // is on another thread — this is the whole point.
+        tokio::select! {
+            _ = done_rx => {
+                // Well-behaved: the action finished at or before the deadline.
+                // Keep the floor so the response still emerges at exactly
+                // `response_after` — a fast action must not pull the response in.
+                tokio::time::sleep_until(deadline_at).await;
+            }
+            () = tokio::time::sleep_until(deadline_at) => {
+                // Deadline won while the action was still blocking. Return the
+                // constant completion NOW and do not await the action.
+                //
+                // Residual (unkillable in safe Rust): a CPU-bound or infinite
+                // untrusted action holds its one dedicated thread + one core
+                // until its blocking call returns; it is detached, not
+                // cancelled. `MAX_INFLIGHT_SEALED_ACTIONS` bounds how many such
+                // runaways can accumulate so they cannot exhaust process threads
+                // or starve the whole app, and running off the shared blocking
+                // pool keeps the blast radius off unrelated Tokio work. The
+                // SINGLE-call caller-visible completion time is unaffected: it is
+                // exactly `response_after` regardless of the action. Abandoning
+                // exposes NO additional literal material — the action already
+                // held it — it only removes the wall-clock channel; the literal
+                // still zeroizes when the action thread finishes.
+            }
+        }
+
+        // The caller-visible completion time is now `deadline_at` on BOTH paths
+        // (padded-up on the fast path, cut-off on the overrun path), a constant
+        // function of `response_after` alone — never of the action's runtime or
+        // the literal. The response body is the descriptor's fixed completion,
+        // byte-identical on every path.
         //
         // Residual, stated plainly: the host scheduler can still add jitter,
         // and an action's *side effect* on a fixed destination remains visible
         // to whoever watches that destination. Neither is a function of the
         // literal that the caller controls. Closing the second needs an egress
         // proxy, which belongs to `sealed-value-owner-management`.
-        if let Some(remaining) = deadline.checked_sub(started.elapsed()) {
-            tokio::time::sleep(remaining).await;
-        }
-
         Ok(authorized.action.descriptor().completion_response())
     }
 

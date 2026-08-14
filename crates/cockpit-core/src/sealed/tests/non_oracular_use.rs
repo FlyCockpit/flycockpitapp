@@ -331,6 +331,103 @@ async fn an_action_cannot_signal_through_latency() {
     }
 }
 
+/// AC1: an action cannot signal a bit by BLOCKING its executor thread.
+///
+/// This is the decisive case the cooperative `tokio::time::timeout` could not
+/// cover. The action does a non-yielding `std::thread::sleep` (20x the
+/// deadline) when a bit of the literal is set. A timeout that shares the
+/// caller's task can never fire against it, so the pre-fix runtime lets the
+/// blocking action push the caller-visible completion out to ~20x the deadline
+/// — encoding the bit. The preemptible executor runs the action off the
+/// caller's async worker threads, so the fixed deadline still wins and both the
+/// bit-set and bit-clear uses complete within a tight window of `response_after`
+/// and of each other.
+///
+/// Multi-thread flavour so the blocking action and the caller's deadline timer
+/// have independent threads to make progress on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blocking_action_cannot_signal_through_latency() {
+    let mut observed = Vec::new();
+    for literal in [
+        "secret-alpha-high-entropy-0001", // bit set   -> action BLOCKS long
+        "0xdeadbeef-high-entropy-000002", // bit clear -> action returns at once
+    ] {
+        // Sanity: the two literals really do differ in the signalled bit.
+        assert_ne!(
+            SignallingAction::literal_bit("secret-alpha-high-entropy-0001"),
+            SignallingAction::literal_bit("0xdeadbeef-high-entropy-000002")
+        );
+
+        let fixture = SealedFixture::new().await;
+        let seeded = fixture
+            .directory()
+            .create(
+                SealedFixture::owner(),
+                crate::sealed::CreateSealedValue {
+                    scope: SealedScopeRef::Project(fixture.project_key.clone()),
+                    name: SealedName::canonical("blocking_probe").expect("name"),
+                    description: SealedDescription::parse("credential").expect("description"),
+                    owner_principal: "owner".to_string(),
+                },
+                SealedLiteral::new(literal),
+                1_000,
+            )
+            .await
+            .expect("seeded");
+        grant_for(&fixture, seeded.record_id).await;
+
+        let action = Arc::new(SignallingAction::new(SignalStyle::BlockOnBit));
+        let runtime = SealedRuntime::new(
+            fixture.db.clone(),
+            fixture.compartment.clone(),
+            registry_with(vec![action as Arc<dyn SealedHostAction>]),
+        );
+        let sink = RecordingRedactionSink::new();
+        // Monotonic clock; measure only the padded use window.
+        let started = std::time::Instant::now();
+        let projection = runtime
+            .use_sealed_value(
+                &request(seeded.record_id),
+                &use_context(&fixture, GENERATION, NOW),
+                &sink,
+                &crate::sealed::runtime::FixedProjectTrust(SealedProjectTrust::Trusted),
+            )
+            .await
+            .expect("completes");
+        // The response is still the descriptor's fixed completion on both paths.
+        assert_eq!(
+            projection.get("outcome").map(|value| value.as_str()),
+            Some("accepted")
+        );
+        observed.push(started.elapsed());
+    }
+
+    let deadline = std::time::Duration::from_millis(PROBE_RESPONSE_MS);
+    // Each use both waits for the floor and is bounded by the ceiling. The
+    // ceiling is the property under test: the 20x BLOCK (1200ms) must not show
+    // up. A generous 10x window absorbs host scheduler jitter and the private
+    // runtime spin-up while still being far below the 20x a leak would need.
+    for elapsed in &observed {
+        assert!(
+            *elapsed >= deadline,
+            "a use must not return before the declared deadline: {elapsed:?}"
+        );
+        assert!(
+            *elapsed < deadline * 10,
+            "a blocking action must not extend the caller-visible duration: {elapsed:?}"
+        );
+    }
+    // Decisively: the bit-set (blocking) and bit-clear uses are within a tight
+    // bound of each other, so the completion time carries no bit of the literal.
+    let (a, b) = (observed[0], observed[1]);
+    let spread = a.max(b) - a.min(b);
+    assert!(
+        spread < deadline * 4,
+        "blocking-vs-nonblocking completion times must not encode the bit: \
+         bit_set={a:?} bit_clear={b:?} spread={spread:?}"
+    );
+}
+
 /// Trust withdrawn between authorization and release denies, and reads no
 /// secret. A snapshot taken at authorization time is not good enough.
 #[tokio::test]

@@ -322,6 +322,8 @@ async fn goal_usage_limit_failure_pauses_goal_and_arms_backoff() {
         elapsed_ms: 42,
         retry_attempts: 1,
         detail: "rate limited".to_string(),
+        observed_status: Some(429),
+        recovery: crate::engine::model::ProviderRecoverySignal::None,
     };
 
     assert!(driver.handle_goal_usage_limit_failure(&failure, &tx).await);
@@ -422,6 +424,8 @@ async fn persistent_goal_usage_limit_requires_manual_resume_after_bound() {
         elapsed_ms: 7,
         retry_attempts: 1,
         detail: "quota exhausted".to_string(),
+        observed_status: None,
+        recovery: crate::engine::model::ProviderRecoverySignal::None,
     };
 
     assert!(driver.handle_goal_usage_limit_failure(&failure, &tx).await);
@@ -633,6 +637,8 @@ async fn failed_turn_recovery_records_retry_context_and_progress() {
         elapsed_ms: 42_000,
         retry_attempts: 1,
         detail: "HTTP 503 Service Unavailable".into(),
+        observed_status: None,
+        recovery: crate::engine::model::ProviderRecoverySignal::None,
     };
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
 

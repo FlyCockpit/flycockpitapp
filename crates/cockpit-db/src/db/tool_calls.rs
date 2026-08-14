@@ -116,6 +116,7 @@ pub const SHAPE_REPAIR_STAGES: &[&str] = &[
     "wrap_bare_string",
     "markdown_autolink_unwrap",
     "absolute_prefix_rewrite",
+    "path_trailing_garbage_strip",
 ];
 
 #[derive(Debug, Clone)]

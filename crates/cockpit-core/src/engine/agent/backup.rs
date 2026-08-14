@@ -65,13 +65,16 @@ pub fn suggested_action_for_failure_class(
         crate::engine::model::InferenceErrorClass::Http(status) if (400..=499).contains(status) => {
             "check_configuration_or_credentials"
         }
+        // Billing/account-quota exhaustion: the same provider's account is out of
+        // balance/quota, so the actionable recovery is to top up or switch
+        // provider — never to retry the same model.
+        crate::engine::model::InferenceErrorClass::BillingOrQuotaExhausted => {
+            "top_up_balance_or_switch_provider"
+        }
         crate::engine::model::InferenceErrorClass::UtilityTimeout
         | crate::engine::model::InferenceErrorClass::ResponsesToolIdentity
         | crate::engine::model::InferenceErrorClass::ProviderNotConfigured
         | crate::engine::model::InferenceErrorClass::ProviderRateLimit
-        // Treated like its ProviderRateLimit/quota sibling pending
-        // harness-reliability-remediation's final policy.
-        | crate::engine::model::InferenceErrorClass::BillingOrQuotaExhausted
         | crate::engine::model::InferenceErrorClass::UnrenderableWireField
         | crate::engine::model::InferenceErrorClass::Http(_)
         | crate::engine::model::InferenceErrorClass::Other(_) => "inspect_failure",
@@ -178,12 +181,31 @@ pub async fn turn_with_backup(
 
     let mut fallback_tried = Vec::new();
     let mut first_failure: Option<(String, crate::engine::model::InferenceErrorClass)> = None;
-    let mut attempt_index = 0usize;
+    // Failover state (issue #23). `current` is None for the primary and `Some(i)`
+    // for candidate `i`; `tried` records dispatched candidate indices so the
+    // recovery-aware selector never repeats one. `strategy` is fixed by the FIRST
+    // (primary) failure's recovery signal and governs every subsequent candidate
+    // choice; `billing_backup_used` enforces the single-different-provider-backup
+    // cap for billing.
+    let primary_provider = agent.model.provider_id().to_string();
+    let candidate_providers: Vec<&str> =
+        candidates.iter().map(|c| c.provider_id()).collect();
+    let mut current: Option<usize> = None;
+    let mut tried: Vec<usize> = Vec::new();
+    let mut strategy = crate::engine::model::ProviderRecoverySignal::None;
+    let mut strategy_set = false;
+    let mut billing_backup_used = false;
+    let mut attempt_ordinal = 0i64;
+    // The primary attempt suppresses its own red inline error whenever a backup
+    // MIGHT run (any candidate configured) or a custody block must append its
+    // reason; the terminal branch below re-emits exactly once when advancement
+    // finally stops. Only a no-candidate, no-custody primary emits its UI
+    // directly. Loop-invariant by construction.
+    let emit_failure_ui = candidates.is_empty() && custody_block.is_none();
     loop {
-        let current_model: &Model = if attempt_index == 0 {
-            &agent.model
-        } else {
-            candidates[attempt_index - 1].as_ref()
+        let current_model: &Model = match current {
+            None => &agent.model,
+            Some(i) => candidates[i].as_ref(),
         };
         // Every dispatched target renders ITS OWN effective posture AND its own
         // model-specific system context. The primary (attempt 0) already carries
@@ -193,10 +215,8 @@ pub async fn turn_with_backup(
         // tool schemas/descriptions + `llm_mode`) for the candidate before the
         // turn. The toolbox (and any grants) is preserved intact — only its
         // rendering switches.
-        let repostured: Option<Agent> = if attempt_index == 0 {
-            None
-        } else {
-            let candidate_arc: &Arc<Model> = candidates[attempt_index - 1];
+        let repostured: Option<Agent> = if let Some(i) = current {
+            let candidate_arc: &Arc<Model> = candidates[i];
             let candidate_mode = config.providers().resolve_mode(
                 candidate_arc.provider_id(),
                 candidate_arc.model_id_ref(),
@@ -221,21 +241,16 @@ pub async fn turn_with_backup(
                 // candidate).
                 Err(err) => return Err(err),
             }
+        } else {
+            None
         };
         let dispatch_agent: &Agent = repostured.as_ref().unwrap_or(agent);
-        let has_later_candidate = attempt_index < candidates.len();
-        // Suppress `turn`'s own red inline error when a custody block exists so
-        // this function can emit the same event with the custody reason
-        // appended. Without this the two paths are mutually exclusive and the
-        // reason is dropped.
-        let emit_failure_ui = !has_later_candidate && custody_block.is_none();
         // Every attempt of one logical call SHARES the `call_id` and takes the
         // next ordinal (primary 0, each failover +1), so the immutable
         // per-attempt inference log keeps them as distinct `(call_id, ordinal)`
         // rows that are still correlatable to one logical call. (This reverts
         // the fresh-`Uuid::new_v4()`-per-attempt workaround, which decorrelated
         // failover attempts from their primary.)
-        let attempt_ordinal = attempt_index as i64;
         let attempt_result = turn(
             dispatch_agent,
             current_model,
@@ -260,7 +275,7 @@ pub async fn turn_with_backup(
             emit_failure_ui,
             call_id,
             attempt_ordinal,
-            if attempt_index == 0 { tandem } else { None },
+            if current.is_none() { tandem } else { None },
             goal_provenance,
             turn_id.clone(),
             tx,
@@ -269,7 +284,7 @@ pub async fn turn_with_backup(
 
         match attempt_result {
             Ok(outcome) => {
-                if attempt_index > 0 {
+                if current.is_some() {
                     fallback_tried.push(FailoverAttempt::succeeded(current_model));
                     if let Some(metadata) = turn_metadata.as_deref_mut() {
                         metadata.fallback_tried = fallback_tried.clone();
@@ -294,9 +309,29 @@ pub async fn turn_with_backup(
                 if first_failure.is_none() {
                     first_failure = Some((failure.model.clone(), class.clone()));
                 }
-                let can_advance = crate::engine::model::failure_engages_backup(&class)
-                    && attempt_index < candidates.len();
-                if !can_advance {
+                // The failover STRATEGY is fixed by the first (primary) failure's
+                // recovery signal (issue #23): billing routes to exactly one
+                // different-provider backup; overload prefers a different provider;
+                // an ordinary failure keeps the configured order.
+                if !strategy_set {
+                    strategy = failure.recovery;
+                    strategy_set = true;
+                }
+                if let Some(i) = current {
+                    tried.push(i);
+                }
+                let next = if crate::engine::model::failure_engages_backup(&class) {
+                    select_next_backup_candidate(
+                        &candidate_providers,
+                        &tried,
+                        &primary_provider,
+                        strategy,
+                        billing_backup_used,
+                    )
+                } else {
+                    None
+                };
+                if next.is_none() {
                     // The block only explains a failure that *would* have
                     // engaged failover; an unrelated hard error keeps its own
                     // message.
@@ -324,7 +359,7 @@ pub async fn turn_with_backup(
                     }
                     if let Some(metadata) = turn_metadata.as_deref_mut() {
                         metadata.fallback_tried = fallback_tried.clone();
-                        if attempt_index > 0
+                        if current.is_some()
                             && let Some((primary_model, error_class)) = first_failure
                         {
                             metadata.fallback_decision = Some(BackupFallbackDecision {
@@ -345,7 +380,8 @@ pub async fn turn_with_backup(
                     };
                 }
 
-                let next_model = candidates[attempt_index].as_ref();
+                let next_idx = next.expect("next is Some in the advance branch");
+                let next_model = candidates[next_idx].as_ref();
                 let _ = tx
                     .send(TurnEvent::BackupUsed {
                         agent: agent.name.clone(),
@@ -354,8 +390,48 @@ pub async fn turn_with_backup(
                         backup_model: next_model.model_id_ref().to_string(),
                     })
                     .await;
-                attempt_index += 1;
+                // A billing failover consumes its single allowed different-provider
+                // backup; a second billing failure then has no candidate and is
+                // terminal.
+                if strategy == crate::engine::model::ProviderRecoverySignal::BillingExhausted {
+                    billing_backup_used = true;
+                }
+                current = Some(next_idx);
+                attempt_ordinal += 1;
             }
+        }
+    }
+}
+
+/// Select the next backup candidate index given the failover `strategy` fixed by
+/// the FIRST (primary) failure and the `primary_provider` we route away from.
+/// `candidate_providers[i]` is candidate `i`'s provider id. Billing tries exactly
+/// one different-provider candidate; overload prefers a different provider,
+/// falling back to a same-provider one only when no different-provider candidate
+/// remains; an ordinary failure keeps the configured order. Returns `None` when
+/// no eligible candidate is left.
+pub(crate) fn select_next_backup_candidate(
+    candidate_providers: &[&str],
+    tried: &[usize],
+    primary_provider: &str,
+    strategy: crate::engine::model::ProviderRecoverySignal,
+    billing_backup_used: bool,
+) -> Option<usize> {
+    let untried = |i: &usize| !tried.contains(i);
+    let different_provider = |i: &usize| candidate_providers[*i] != primary_provider;
+    match strategy {
+        crate::engine::model::ProviderRecoverySignal::BillingExhausted => {
+            if billing_backup_used {
+                None
+            } else {
+                (0..candidate_providers.len()).find(|i| untried(i) && different_provider(i))
+            }
+        }
+        crate::engine::model::ProviderRecoverySignal::Overloaded => (0..candidate_providers.len())
+            .find(|i| untried(i) && different_provider(i))
+            .or_else(|| (0..candidate_providers.len()).find(|i| untried(i))),
+        crate::engine::model::ProviderRecoverySignal::None => {
+            (0..candidate_providers.len()).find(|i| untried(i))
         }
     }
 }
@@ -537,12 +613,16 @@ fn inference_failure_diagnostics(
     failure: &crate::engine::model::InferenceFailure,
     _wire_api: &str,
 ) -> InferenceFailureDiagnostics {
-    let provider_status = failure.class.provider_status();
+    // The ROUTING/rationale decision stays class-based; the DIAGNOSTIC status
+    // uses the retained observed status so a billing failure reclassified to
+    // `BillingOrQuotaExhausted` still reports its observed 429 (issue #23, B4).
+    let class_status = failure.class.provider_status();
+    let observed_status = failure.observed_status.or(class_status);
     let provider_body_snippet = crate::text::bounded_snippet(&failure.detail, 800);
     let (retry_final_decision, classification_rationale) =
-        crate::engine::retry::failure_retry_decision_and_rationale(&failure.class, provider_status);
+        crate::engine::retry::failure_retry_decision_and_rationale(&failure.class, class_status);
     InferenceFailureDiagnostics {
-        provider_status,
+        provider_status: observed_status,
         provider_body_snippet,
         retry_attempts: serde_json::json!({
             "known": true,
@@ -603,6 +683,8 @@ mod inference_outcome_tests {
             elapsed_ms: 1,
             retry_attempts: 1,
             detail: detail.into(),
+            observed_status: None,
+            recovery: crate::engine::model::ProviderRecoverySignal::None,
         });
         let (tx, mut rx) = mpsc::channel::<TurnEvent>(4);
         record_inference_outcome(
@@ -683,6 +765,8 @@ mod inference_outcome_tests {
             elapsed_ms: 120_000,
             retry_attempts: 1,
             detail: String::new(),
+            observed_status: None,
+            recovery: crate::engine::model::ProviderRecoverySignal::None,
         })
         .context("completion call for agent `builder`");
 
@@ -782,6 +866,8 @@ mod inference_outcome_tests {
             elapsed_ms: 42,
             retry_attempts: 3,
             detail: "connection refused".into(),
+            observed_status: None,
+            recovery: crate::engine::model::ProviderRecoverySignal::None,
         });
         let (tx, _rx) = mpsc::channel::<TurnEvent>(4);
         record_inference_outcome(
@@ -2295,5 +2381,250 @@ mod backup_fallback_tests {
         assert!(fallbacks.iter().any(|model| {
             model.provider_id() == "candidate" && model.model_id_ref() == "untrusted"
         }));
+    }
+}
+
+#[cfg(test)]
+mod billing_overload_policy_tests {
+    use super::*;
+    use crate::engine::model::rig_boundary::{
+        classify_terminal_failure, provider_recovery_signal_from_text,
+    };
+    use crate::engine::model::{InferenceErrorClass, ProviderRecoverySignal, failure_engages_backup};
+    use crate::engine::retry::{RetryDecision, classify, wait_for_decision};
+    use rig::completion::CompletionError;
+
+    fn provider_err(msg: &str) -> CompletionError {
+        CompletionError::ProviderError(msg.to_string())
+    }
+
+    fn http_status(code: u16) -> CompletionError {
+        CompletionError::HttpError(rig::http_client::Error::InvalidStatusCode(
+            reqwest::StatusCode::from_u16(code).unwrap(),
+        ))
+    }
+
+    #[test]
+    fn billing_quota_is_fail_fast_and_cross_provider_only() {
+        // (a) Code 1113 + every named billing phrase → BillingExhausted →
+        //     BillingOrQuotaExhausted, and the retry layer fails fast (0 same-
+        //     model retries).
+        let billing_bodies = [
+            "code 1113: account error",
+            "insufficient balance to complete request",
+            "no resource package available",
+            "please recharge your account",
+            "you have exceeded your current quota",
+            "billing hard limit reached",
+            "INSUFFICIENT BALANCE", // case-insensitive
+        ];
+        for body in billing_bodies {
+            assert_eq!(
+                provider_recovery_signal_from_text(body),
+                ProviderRecoverySignal::BillingExhausted,
+                "billing signal for {body:?}"
+            );
+            let classified = classify_terminal_failure(&provider_err(body));
+            assert_eq!(
+                classified.class,
+                InferenceErrorClass::BillingOrQuotaExhausted,
+                "{body:?}"
+            );
+            assert_eq!(classified.recovery, ProviderRecoverySignal::BillingExhausted);
+            assert_eq!(
+                classify(&provider_err(body)),
+                RetryDecision::FailFast,
+                "billing does zero same-model retries: {body:?}"
+            );
+        }
+
+        // `1113` inside a longer number is NOT the structured code; fuzzy `quota`
+        // prose is not a billing phrase.
+        assert_eq!(
+            provider_recovery_signal_from_text("request id 211137 completed"),
+            ProviderRecoverySignal::None
+        );
+        // `1113` glued to an adjacent WORD (letter neighbor) is not a standalone
+        // token either — only a genuinely delimited code counts as billing.
+        assert_eq!(
+            provider_recovery_signal_from_text("unexpected error1113 in stream"),
+            ProviderRecoverySignal::None
+        );
+        assert_eq!(
+            provider_recovery_signal_from_text("trace 1113abc dropped"),
+            ProviderRecoverySignal::None
+        );
+        assert_eq!(
+            provider_recovery_signal_from_text("your quota looks fine"),
+            ProviderRecoverySignal::None
+        );
+
+        // (b) The observed 429 is preserved in diagnostics, separately from the
+        //     class (billing observed as HTTP 429 with a billing body).
+        let http_429_billing = CompletionError::HttpError(
+            rig::http_client::Error::InvalidStatusCodeWithMessage(
+                reqwest::StatusCode::from_u16(429).unwrap(),
+                "insufficient balance".into(),
+            ),
+        );
+        let classified = classify_terminal_failure(&http_429_billing);
+        assert_eq!(classified.class, InferenceErrorClass::BillingOrQuotaExhausted);
+        assert_eq!(
+            classified.observed_status,
+            Some(429),
+            "observed 429 retained separately from the class"
+        );
+        assert_eq!(classified.recovery, ProviderRecoverySignal::BillingExhausted);
+
+        // (c) Backup engages; the action is top-up-or-switch-provider.
+        assert!(failure_engages_backup(
+            &InferenceErrorClass::BillingOrQuotaExhausted
+        ));
+        assert_eq!(
+            suggested_action_for_failure_class(&InferenceErrorClass::BillingOrQuotaExhausted),
+            "top_up_balance_or_switch_provider"
+        );
+
+        // (d) Cross-provider ONLY, exactly once. Primary provider `openai`;
+        //     candidates [openai(same), anthropic(diff), groq(diff)].
+        let providers = ["openai", "anthropic", "groq"];
+        assert_eq!(
+            select_next_backup_candidate(
+                &providers,
+                &[],
+                "openai",
+                ProviderRecoverySignal::BillingExhausted,
+                false
+            ),
+            Some(1),
+            "billing skips the same-provider candidate → first DIFFERENT provider"
+        );
+        assert_eq!(
+            select_next_backup_candidate(
+                &providers,
+                &[1],
+                "openai",
+                ProviderRecoverySignal::BillingExhausted,
+                true, // one billing backup already used
+            ),
+            None,
+            "billing uses a different-provider backup EXACTLY once"
+        );
+        assert_eq!(
+            select_next_backup_candidate(
+                &["openai", "openai"],
+                &[],
+                "openai",
+                ProviderRecoverySignal::BillingExhausted,
+                false
+            ),
+            None,
+            "billing NEVER uses a same-provider backup"
+        );
+
+        // (e) A true rate limit is not billing: Http(429) stays generic-retryable
+        //     and does not engage the backup seam.
+        assert_eq!(
+            provider_recovery_signal_from_text("HTTP 429 rate limit exceeded"),
+            ProviderRecoverySignal::None
+        );
+        assert_eq!(classify(&http_status(429)), RetryDecision::RetryAfter(None));
+        assert!(!failure_engages_backup(&InferenceErrorClass::Http(429)));
+
+        // (f) The DIAGNOSTIC status reports the RETAINED observed 429 even though
+        // the billing class embeds no status, and the recommended action is
+        // top-up-or-switch-provider (B4).
+        let billing_failure = crate::engine::model::InferenceFailure {
+            provider: "minimax".into(),
+            model: "m".into(),
+            phase: "dispatched".into(),
+            class: InferenceErrorClass::BillingOrQuotaExhausted,
+            elapsed_ms: 1,
+            retry_attempts: 1,
+            detail: "insufficient balance".into(),
+            observed_status: Some(429),
+            recovery: ProviderRecoverySignal::BillingExhausted,
+        };
+        let diag = inference_failure_diagnostics(&billing_failure, "completions");
+        assert_eq!(
+            diag.provider_status,
+            Some(429),
+            "the billing diagnostic reports the retained observed 429"
+        );
+        assert_eq!(diag.recommended_action, "top_up_balance_or_switch_provider");
+    }
+
+    #[test]
+    fn overload_retries_once_then_prefers_cross_provider() {
+        // Only the named overload tokens are overload; each takes exactly one
+        // same-model retry.
+        for body in ["server_is_overloaded", "service_unavailable_error"] {
+            assert_eq!(
+                provider_recovery_signal_from_text(body),
+                ProviderRecoverySignal::Overloaded,
+                "{body:?}"
+            );
+            assert_eq!(
+                classify(&provider_err(body)),
+                RetryDecision::RetryOnce,
+                "overload takes one same-model retry: {body:?}"
+            );
+        }
+        // RetryOnce yields EXACTLY one same-model retry, keyed on whether the
+        // overload retry has been SPENT (not the total failure count): an unused
+        // overload retries; once spent, the next overload fails over to backup.
+        assert!(wait_for_decision(RetryDecision::RetryOnce, 0, false).is_some());
+        assert!(wait_for_decision(RetryDecision::RetryOnce, 1, true).is_none());
+        // An overload that is NOT the first failure (a generic retry happened
+        // first, so `failures == 1`) still gets its one same-model retry.
+        assert!(wait_for_decision(RetryDecision::RetryOnce, 1, false).is_some());
+        // After an overload retry is spent, an ordinary retryable failure fails
+        // over to backup rather than continuing same-model retries.
+        assert!(wait_for_decision(RetryDecision::Retry, 1, true).is_none());
+        assert!(wait_for_decision(RetryDecision::Retry, 0, false).is_some());
+
+        // A status-only 503 stays generic (retryable, not one-shot, recovery None).
+        assert_eq!(
+            provider_recovery_signal_from_text("HTTP 503 Service Unavailable"),
+            ProviderRecoverySignal::None
+        );
+        assert_eq!(classify(&http_status(503)), RetryDecision::RetryAfter(None));
+
+        // After the retry, prefer a DIFFERENT provider ahead of a same-provider
+        // candidate. Primary `openai`; candidates [openai(same), anthropic(diff)].
+        let providers = ["openai", "anthropic"];
+        assert_eq!(
+            select_next_backup_candidate(
+                &providers,
+                &[],
+                "openai",
+                ProviderRecoverySignal::Overloaded,
+                false
+            ),
+            Some(1),
+            "overload prefers a different provider"
+        );
+        assert_eq!(
+            select_next_backup_candidate(
+                &providers,
+                &[1],
+                "openai",
+                ProviderRecoverySignal::Overloaded,
+                false
+            ),
+            Some(0),
+            "overload uses a same-provider candidate ONLY when no different remains"
+        );
+        assert_eq!(
+            select_next_backup_candidate(
+                &["openai"],
+                &[],
+                "openai",
+                ProviderRecoverySignal::Overloaded,
+                false
+            ),
+            Some(0),
+            "a lone same-provider candidate is used when no different exists"
+        );
     }
 }

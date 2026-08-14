@@ -3950,7 +3950,13 @@ impl Driver {
     fn inference_failure_provider_status(
         failure: &crate::engine::model::InferenceFailure,
     ) -> Option<u16> {
-        failure.class.provider_status()
+        // Prefer the retained observed HTTP status. A billing-body HTTP 429 is
+        // reclassified to `BillingOrQuotaExhausted` (whose class carries no
+        // status), but `observed_status` retains the real 429 so this recovery
+        // helper still sees it; fall back to the class-derived status otherwise.
+        failure
+            .observed_status
+            .or_else(|| failure.class.provider_status())
     }
 
     async fn handle_goal_usage_limit_failure(
@@ -4325,11 +4331,16 @@ impl Driver {
                     "blocked_attempts": goal.blocked_attempts,
                 })
             });
-        let provider_status = failure.class.provider_status();
+        // The rationale/routing stays class-based; the DIAGNOSTIC `provider_status`
+        // below uses the retained observed status so a billing failure
+        // reclassified to `BillingOrQuotaExhausted` still reports its observed 429
+        // (issue #23, B4).
+        let class_status = failure.class.provider_status();
+        let provider_status = failure.observed_status.or(class_status);
         let (retry_final_decision, classification_rationale) =
             crate::engine::retry::failure_retry_decision_and_rationale(
                 &failure.class,
-                provider_status,
+                class_status,
             );
         let provider_body_snippet =
             redacted_bounded_snippet(&failure.detail, self.redact.as_ref(), 800);

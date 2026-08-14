@@ -424,14 +424,12 @@ impl Session {
     pub fn rename(&self, new_title: &str) -> Result<()> {
         let title = new_title.to_string();
         let session_id = self.id;
+        // Route through the shared latch-clearing helper so a manual user rename
+        // clears any pending title-recovery nudge (issue #23) — an already-named
+        // session must never be nudged to name itself.
         self.db
             .blocking_write_for_sync_maintenance(move |conn| {
-                conn.execute(
-                    "UPDATE sessions SET title = ?1, user_renamed = 1 WHERE session_id = ?2",
-                    params![title, session_id.to_string()],
-                )
-                .context("renaming session")?;
-                Ok(())
+                crate::db::Db::rename_session_conn(conn, session_id, &title)
             })
             .context("renaming session")?;
         *self.title.lock().unwrap() = Some(new_title.to_string());

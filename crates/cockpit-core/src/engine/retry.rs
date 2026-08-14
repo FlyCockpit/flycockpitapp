@@ -79,6 +79,11 @@ pub enum RetryDecision {
     /// provider's `Retry-After` when present. `None` means the header
     /// was absent/unparseable, so fall back to normal backoff.
     RetryAfter(Option<Duration>),
+    /// Explicit provider-overload signal (issue #23): retry the SAME model
+    /// exactly once (a brief same-model backoff), then fail fast so the
+    /// backup layer routes to a cross-provider candidate. The second overload
+    /// failure gives up here rather than looping the same overloaded endpoint.
+    RetryOnce,
     /// Non-transient failure (4xx auth/bad-request, serialization, URL,
     /// malformed response, or a status we deliberately don't retry).
     /// Surface it immediately.
@@ -100,6 +105,15 @@ pub(crate) fn failure_retry_decision_and_rationale(
         | InferenceErrorClass::ClientSideToolsUnsupported => {
             ("fail_fast", "client_side_capability_block")
         }
+        // Billing/account-quota exhaustion is terminal for the SAME model
+        // regardless of the observed HTTP status (often 429): retrying cannot
+        // restore balance/quota. Placed before the status guards so a preserved
+        // 429 does not mis-route it onto the retryable-rate-limit path. The
+        // recovery action is to top up or switch provider; the backup layer
+        // routes to a different provider.
+        InferenceErrorClass::BillingOrQuotaExhausted => {
+            ("fail_fast", "billing_or_quota_exhausted_top_up_or_switch_provider")
+        }
         _ if provider_status.is_some_and(|status| status == 429 || status == 503) => (
             "terminal_after_retry_layer",
             "retryable_http_status_terminal",
@@ -114,10 +128,6 @@ pub(crate) fn failure_retry_decision_and_rationale(
         | InferenceErrorClass::ResponsesToolIdentity
         | InferenceErrorClass::ProviderNotConfigured
         | InferenceErrorClass::ProviderRateLimit
-        // Treated like its ProviderRateLimit/quota sibling pending
-        // harness-reliability-remediation's final policy: retrying cannot
-        // restore an exhausted balance/quota, so it fails fast here.
-        | InferenceErrorClass::BillingOrQuotaExhausted
         | InferenceErrorClass::UnrenderableWireField
         | InferenceErrorClass::Http(_)
         | InferenceErrorClass::Other(_) => ("fail_fast", "non_retryable_or_unclassified_failure"),
@@ -186,6 +196,20 @@ pub(crate) fn is_usage_limit_failure(
 /// surfaces the header (e.g. a future Anthropic variant), wiring it is a
 /// one-liner with no taxonomy change.
 pub fn classify(err: &CompletionError) -> RetryDecision {
+    // Typed provider-recovery signals (issue #23) decide first, from the closed
+    // billing/overload sets recognized once at the model boundary. Billing is
+    // terminal for the same model (no top-up happens by retrying); overload gets
+    // exactly one same-model retry before the backup layer takes over. A
+    // status-only 429/503 with no such signal keeps the generic behavior below.
+    match crate::engine::model::rig_boundary::provider_recovery_signal(err) {
+        crate::engine::model::ProviderRecoverySignal::BillingExhausted => {
+            return RetryDecision::FailFast;
+        }
+        crate::engine::model::ProviderRecoverySignal::Overloaded => {
+            return RetryDecision::RetryOnce;
+        }
+        crate::engine::model::ProviderRecoverySignal::None => {}
+    }
     match err {
         CompletionError::HttpError(http_err) => classify_http(http_err),
         // Serialization, bad URL, request-build, malformed response body:
@@ -327,12 +351,33 @@ pub fn backoff_for(attempt: u32, jitter: f64) -> Duration {
     Duration::from_millis(jittered)
 }
 
-fn wait_for_decision(decision: RetryDecision, failures: u32) -> Option<Duration> {
+pub(crate) fn wait_for_decision(
+    decision: RetryDecision,
+    failures: u32,
+    overload_retry_used: bool,
+) -> Option<Duration> {
     match decision {
         RetryDecision::FailFast => None,
-        RetryDecision::Retry => Some(backoff_for(failures, jitter_factor())),
-        RetryDecision::RetryAfter(Some(d)) => Some(d.min(BACKOFF_CAP)),
-        RetryDecision::RetryAfter(None) => Some(backoff_for(failures, jitter_factor())),
+        // Overload grants EXACTLY ONE same-model retry across the whole chain,
+        // keyed on `overload_retry_used` rather than the total failure count: an
+        // overload that is not the first failure still gets its one retry, and a
+        // second overload (or any failure after that retry is spent) does not.
+        RetryDecision::RetryOnce => {
+            (!overload_retry_used).then(|| backoff_for(failures, jitter_factor()))
+        }
+        // Ordinary retryable errors keep retrying UNTIL an overload has spent its
+        // one same-model retry; after that the chain is in overload-recovery mode,
+        // so any further failure fails over to the backup layer (cross-provider
+        // preferred) instead of continuing same-model retries.
+        RetryDecision::Retry => {
+            (!overload_retry_used).then(|| backoff_for(failures, jitter_factor()))
+        }
+        RetryDecision::RetryAfter(Some(d)) => {
+            (!overload_retry_used).then(|| d.min(BACKOFF_CAP))
+        }
+        RetryDecision::RetryAfter(None) => {
+            (!overload_retry_used).then(|| backoff_for(failures, jitter_factor()))
+        }
     }
 }
 
@@ -504,6 +549,7 @@ pub async fn with_retry<T, F, Fut, P>(
     event_tx: Option<&mpsc::Sender<TurnEvent>>,
     cancel: &CancellationToken,
     probe: Option<&P>,
+    recovery_out: Option<&std::sync::atomic::AtomicU8>,
     attempt_fn: F,
 ) -> Result<T, CompletionError>
 where
@@ -518,11 +564,13 @@ where
         cancel,
         probe,
         Some(DEFAULT_MAX_ATTEMPTS),
+        recovery_out,
         attempt_fn,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn with_retry_max<T, F, Fut, P>(
     agent_name: &str,
     target: &ReconnectTarget,
@@ -530,6 +578,7 @@ pub async fn with_retry_max<T, F, Fut, P>(
     cancel: &CancellationToken,
     probe: Option<&P>,
     max_attempts: u32,
+    recovery_out: Option<&std::sync::atomic::AtomicU8>,
     attempt_fn: F,
 ) -> Result<T, CompletionError>
 where
@@ -544,11 +593,13 @@ where
         cancel,
         probe,
         Some(max_attempts.max(1)),
+        recovery_out,
         attempt_fn,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn with_retry_inner<T, F, Fut, P>(
     agent_name: &str,
     target: &ReconnectTarget,
@@ -556,6 +607,7 @@ async fn with_retry_inner<T, F, Fut, P>(
     cancel: &CancellationToken,
     probe: Option<&P>,
     max_attempts: Option<u32>,
+    recovery_out: Option<&std::sync::atomic::AtomicU8>,
     mut attempt_fn: F,
 ) -> Result<T, CompletionError>
 where
@@ -566,17 +618,43 @@ where
     // 0-based count of failures so far (drives the backoff exponent and
     // the user-facing 1-based attempt number).
     let mut failures: u32 = 0;
+    // Latched once an overload spends its single same-model retry: from then on
+    // the chain is in overload-recovery mode and any further failure fails over
+    // to the backup layer instead of continuing same-model retries.
+    let mut overload_retry_used = false;
     loop {
         match attempt_fn().await {
             Ok(value) => return Ok(value),
             Err(err) => {
-                if max_attempts.is_some_and(|max| failures.saturating_add(1) >= max) {
-                    return Err(err);
+                // Accumulate the STRONGEST provider-recovery signal seen across
+                // the WHOLE chain (billing > overload > none) so a later generic
+                // error cannot mask an earlier billing/overload signal — the
+                // terminal `InferenceFailure.recovery` reflects the chain, not
+                // just the last attempt (issue #23).
+                if let Some(acc) = recovery_out {
+                    let rank = crate::engine::model::rig_boundary::provider_recovery_signal(&err)
+                        .rank();
+                    acc.fetch_max(rank, std::sync::atomic::Ordering::SeqCst);
                 }
                 let decision = classify(&err);
-                let Some(wait) = wait_for_decision(decision, failures) else {
+                let Some(wait) = wait_for_decision(decision, failures, overload_retry_used) else {
                     return Err(err);
                 };
+                // Latch the overload's single same-model retry as it is spent, so a
+                // later overload — or any later failure — fails over to backup
+                // instead of retrying same-model again.
+                if matches!(decision, RetryDecision::RetryOnce) {
+                    overload_retry_used = true;
+                }
+                // The attempt cap applies to ordinary retries; an overload
+                // `RetryOnce` gets its single same-model retry EVEN in one-attempt
+                // mode (`single_handoff`/`compact_utility`) — it self-limits via the
+                // `overload_retry_used` latch above.
+                if !matches!(decision, RetryDecision::RetryOnce)
+                    && max_attempts.is_some_and(|max| failures.saturating_add(1) >= max)
+                {
+                    return Err(err);
+                }
 
                 failures = failures.saturating_add(1);
                 // Recurring, attempt-numbered log line so a headless `run`
@@ -697,14 +775,29 @@ mod tests {
             failure_retry_decision_and_rationale(&InferenceErrorClass::Other("weird".into()), None),
             ("fail_fast", "non_retryable_or_unclassified_failure")
         );
-        // Billing/quota exhaustion is terminal: retrying cannot restore quota,
-        // so it fails fast (grouped with its ProviderRateLimit sibling).
+        // Billing/quota exhaustion is terminal for the same model with its OWN
+        // rationale — even when a 429 was observed, it is not the retryable
+        // rate-limit path.
         assert_eq!(
             failure_retry_decision_and_rationale(
                 &InferenceErrorClass::BillingOrQuotaExhausted,
                 None
             ),
-            ("fail_fast", "non_retryable_or_unclassified_failure")
+            (
+                "fail_fast",
+                "billing_or_quota_exhausted_top_up_or_switch_provider"
+            )
+        );
+        assert_eq!(
+            failure_retry_decision_and_rationale(
+                &InferenceErrorClass::BillingOrQuotaExhausted,
+                Some(429)
+            ),
+            (
+                "fail_fast",
+                "billing_or_quota_exhausted_top_up_or_switch_provider"
+            ),
+            "a preserved observed 429 must not re-route billing onto the retryable path"
         );
     }
 
@@ -944,6 +1037,7 @@ mod tests {
             Some(&tx),
             &cancel,
             Some(&probe),
+            None,
             move || {
                 let n = calls_c.fetch_add(1, Ordering::SeqCst);
                 async move {
@@ -998,6 +1092,7 @@ mod tests {
             Some(&tx),
             &cancel,
             None::<&FakeProbe>,
+            None,
             move || {
                 calls_c.fetch_add(1, Ordering::SeqCst);
                 async { Err(CompletionError::ResponseError("bad request".into())) }
@@ -1028,6 +1123,7 @@ mod tests {
             Some(&tx),
             &cancel,
             Some(&probe),
+            None,
             move || {
                 calls_c.fetch_add(1, Ordering::SeqCst);
                 async { Err(http_status(500)) }
@@ -1042,7 +1138,11 @@ mod tests {
     #[tokio::test]
     async fn retry_after_wait_is_capped_at_thirty_seconds() {
         assert_eq!(
-            wait_for_decision(RetryDecision::RetryAfter(Some(Duration::from_secs(120))), 0,),
+            wait_for_decision(
+                RetryDecision::RetryAfter(Some(Duration::from_secs(120))),
+                0,
+                false,
+            ),
             Some(BACKOFF_CAP)
         );
     }
@@ -1065,6 +1165,7 @@ mod tests {
             Some(&tx),
             &cancel,
             None::<&FakeProbe>,
+            None,
             move || {
                 calls_c.fetch_add(1, Ordering::SeqCst);
                 async {
@@ -1079,5 +1180,107 @@ mod tests {
         assert!(result.is_err());
         // One attempt, then the (pre-cancelled) wait aborts the loop.
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn overload_err() -> CompletionError {
+        CompletionError::ProviderError("server_is_overloaded".into())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overload_retries_once_even_in_one_attempt_mode() {
+        // `single_handoff`/`compact_utility` use max_attempts == 1. An explicit
+        // overload must STILL get its single same-model retry (issue #23, B6-b).
+        let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
+        let cancel = CancellationToken::new();
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_c = calls.clone();
+        let target = test_target();
+        let result: Result<u32, _> = with_retry_max(
+            "builder",
+            &target,
+            Some(&tx),
+            &cancel,
+            None::<&FakeProbe>,
+            1,
+            None,
+            move || {
+                calls_c.fetch_add(1, Ordering::SeqCst);
+                async { Err(overload_err()) }
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        // Exactly two calls: the initial attempt + one overload retry, then the
+        // second overload gives up (RetryOnce self-limits).
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_attempt_mode_gives_ordinary_error_no_retry() {
+        // Contrast: an ordinary retryable error (500) in one-attempt mode gets
+        // ZERO retries — the RetryOnce exemption is overload-specific.
+        let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
+        let cancel = CancellationToken::new();
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_c = calls.clone();
+        let target = test_target();
+        let result: Result<u32, _> = with_retry_max(
+            "builder",
+            &target,
+            Some(&tx),
+            &cancel,
+            None::<&FakeProbe>,
+            1,
+            None,
+            move || {
+                calls_c.fetch_add(1, Ordering::SeqCst);
+                async { Err(http_status(500)) }
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_signal_accumulates_strongest_across_chain() {
+        // Attempt 1 is an overload (retries once); attempt 2 is a generic 400
+        // (fails fast). The terminal recovery signal must reflect the EARLIER
+        // overload, not the later generic error (issue #23, B6-a). A last-writer
+        // accumulator would record None and fail this test.
+        let (tx, _rx) = mpsc::channel::<TurnEvent>(16);
+        let cancel = CancellationToken::new();
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_c = calls.clone();
+        let recovery = std::sync::atomic::AtomicU8::new(0);
+        let target = test_target();
+        let result: Result<u32, _> = with_retry(
+            "builder",
+            &target,
+            Some(&tx),
+            &cancel,
+            None::<&FakeProbe>,
+            Some(&recovery),
+            move || {
+                let n = calls_c.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n == 0 {
+                        Err(overload_err())
+                    } else {
+                        Err(http_status(400))
+                    }
+                }
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "overload retried once, then 400");
+        assert_eq!(
+            crate::engine::model::ProviderRecoverySignal::from_rank(
+                recovery.load(Ordering::SeqCst)
+            ),
+            crate::engine::model::ProviderRecoverySignal::Overloaded,
+            "an overload at any attempt wins over a later generic error"
+        );
     }
 }

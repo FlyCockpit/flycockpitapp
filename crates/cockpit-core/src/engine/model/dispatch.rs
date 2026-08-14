@@ -345,6 +345,8 @@ impl Model {
                     site.timeout().as_millis(),
                     site.budget_class()
                 ),
+                observed_status: None,
+                recovery: crate::engine::model::ProviderRecoverySignal::None,
             })),
         }
     }
@@ -629,6 +631,11 @@ impl Model {
         // records `first_token`.
         let phase = std::sync::atomic::AtomicU8::new(InferencePhase::Prep.rank());
         let retry_attempts = std::sync::atomic::AtomicU32::new(0);
+        // Strongest provider-recovery signal (billing > overload > none) observed
+        // across the WHOLE retry chain, accumulated by the retry loop so the
+        // terminal `InferenceFailure.recovery` reflects an earlier billing/overload
+        // signal even if a later attempt failed generically (issue #23).
+        let recovery_signal = std::sync::atomic::AtomicU8::new(0);
         // Time-to-first-token (ms from dispatch), recorded by the drain on
         // the attempt that ultimately succeeds; `0` means no token arrived.
         let first_token_ms = std::sync::atomic::AtomicU64::new(0);
@@ -767,6 +774,7 @@ impl Model {
                             cancel,
                             probe.as_ref(),
                             1,
+                            Some(&recovery_signal),
                             attempt,
                         )
                         .await
@@ -778,6 +786,7 @@ impl Model {
                             cancel,
                             probe.as_ref(),
                             5,
+                            Some(&recovery_signal),
                             attempt,
                         )
                         .await
@@ -788,6 +797,7 @@ impl Model {
                             event_tx,
                             cancel,
                             probe.as_ref(),
+                            Some(&recovery_signal),
                             attempt,
                         )
                         .await
@@ -955,6 +965,7 @@ impl Model {
                         cancel,
                         probe.as_ref(),
                         1,
+                        Some(&recovery_signal),
                         attempt,
                     )
                     .await
@@ -965,6 +976,7 @@ impl Model {
                         event_tx,
                         cancel,
                         probe.as_ref(),
+                        Some(&recovery_signal),
                         attempt,
                     )
                     .await
@@ -1014,6 +1026,7 @@ impl Model {
                         cancel,
                         probe.as_ref(),
                         1,
+                        Some(&recovery_signal),
                         attempt,
                     )
                     .await
@@ -1024,6 +1037,7 @@ impl Model {
                         event_tx,
                         cancel,
                         probe.as_ref(),
+                        Some(&recovery_signal),
                         attempt,
                     )
                     .await
@@ -1070,7 +1084,21 @@ impl Model {
                 let elapsed_ms = dispatched_at.elapsed().as_millis() as u64;
                 let phase =
                     InferencePhase::from_rank(phase.load(std::sync::atomic::Ordering::SeqCst));
-                let class = classify_inference_failure(&err);
+                // Classify ONCE at the model boundary into (class, observed
+                // status, recovery signal). Billing overrides the class to
+                // `BillingOrQuotaExhausted` with its observed status (often 429)
+                // retained separately; overload keeps its natural class and is
+                // distinguished by the recovery signal for the retry/failover
+                // policy. The floor carries the strongest signal seen across the
+                // whole retry chain so a later generic error cannot mask it.
+                let recovery_floor = crate::engine::model::ProviderRecoverySignal::from_rank(
+                    recovery_signal.load(std::sync::atomic::Ordering::SeqCst),
+                );
+                let rig_boundary::ClassifiedFailure {
+                    class,
+                    observed_status,
+                    recovery,
+                } = rig_boundary::classify_terminal_failure_with_floor(&err, recovery_floor);
                 let mut detail = failure_detail(&err, &class);
                 if !tools.is_empty()
                     && self.xai_multi_agent_tools_entitlement_enabled()
@@ -1088,6 +1116,8 @@ impl Model {
                         .load(std::sync::atomic::Ordering::SeqCst)
                         .max(1),
                     detail,
+                    observed_status,
+                    recovery,
                 }))
             }
         }
@@ -1144,6 +1174,8 @@ impl Model {
                     detail: format!(
                         "client-side tools require entitlement `{entitlement}`; primary model was blocked before network dispatch. Enable the entitlement in provider/model settings or choose a non-multi-agent model."
                     ),
+                    observed_status: None,
+                    recovery: crate::engine::model::ProviderRecoverySignal::None,
                 }))
             }
             CapabilityStatus::Unsupported => Err(anyhow::Error::new(InferenceFailure {
@@ -1155,6 +1187,8 @@ impl Model {
                 retry_attempts: 1,
                 detail: "client-side tools are unsupported for this model; primary model was blocked before network dispatch. Choose a tool-compatible model or configure a compatible backup model."
                     .to_string(),
+                observed_status: None,
+                recovery: crate::engine::model::ProviderRecoverySignal::None,
             })),
             CapabilityStatus::Supported | CapabilityStatus::Unknown => Ok(()),
         }
@@ -1208,6 +1242,8 @@ impl Model {
             elapsed_ms: started.elapsed().as_millis() as u64,
             retry_attempts: 1,
             detail: field.detail(),
+            observed_status: None,
+            recovery: crate::engine::model::ProviderRecoverySignal::None,
         })
     }
 
@@ -1276,6 +1312,8 @@ impl Model {
                             elapsed_ms: prep_started.elapsed().as_millis() as u64,
                             retry_attempts: 1,
                             detail: err.to_string(),
+                            observed_status: None,
+                            recovery: crate::engine::model::ProviderRecoverySignal::None,
                         }));
                     }
                 }

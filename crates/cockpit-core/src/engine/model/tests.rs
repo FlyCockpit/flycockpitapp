@@ -2210,11 +2210,13 @@ fn captured_request_carries_prompt_cache_retention() {
     assert_eq!(anthropic["additional_params"], serde_json::Value::Null);
 }
 
-/// The backup-fallback trigger set (implementation note):
-/// timeouts / connection errors / non-retryable 5xx engage the backup;
-/// every 4xx (and any other class) hard-fails with no fallback. 429/503 are
-/// retried on the *same* model upstream and so never reach this seam as a
-/// failure — the function only sees terminal classes.
+/// The backup-fallback trigger set (implementation note + issue #23):
+/// timeouts / connection errors / non-retryable 5xx engage the backup, AND
+/// billing/account-quota exhaustion now engages a DIFFERENT-provider backup
+/// (`turn_with_backup` filters candidates to a different provider). A true
+/// rate-limit `429`/`ProviderRateLimit` still does NOT engage this seam — the
+/// retry layer handles it by retrying the *same* provider. Every 4xx (and any
+/// other class) hard-fails with no fallback.
 #[test]
 fn failure_engages_backup_trigger_set() {
     // Timeouts → fall back.
@@ -2235,6 +2237,14 @@ fn failure_engages_backup_trigger_set() {
     assert!(failure_engages_backup(&InferenceErrorClass::Http(500)));
     assert!(failure_engages_backup(&InferenceErrorClass::Http(502)));
     assert!(failure_engages_backup(&InferenceErrorClass::Http(599)));
+    // Issue #23: billing/account-quota exhaustion ENGAGES backup — a different
+    // provider can answer once the account is exhausted. (Old design-neutral
+    // default returned false here; this line fails against it.)
+    assert!(failure_engages_backup(
+        &InferenceErrorClass::BillingOrQuotaExhausted
+    ));
+    // A true rate limit stays on the same provider (retry layer), never this seam.
+    assert!(!failure_engages_backup(&InferenceErrorClass::ProviderRateLimit));
     // 4xx → hard-fail, no fallback (request/auth/config errors).
     assert!(!failure_engages_backup(&InferenceErrorClass::Http(400)));
     assert!(!failure_engages_backup(&InferenceErrorClass::Http(401)));

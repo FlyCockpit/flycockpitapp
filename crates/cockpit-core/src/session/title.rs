@@ -11,14 +11,7 @@ impl Session {
         let updated = self
             .db
             .blocking_write_for_sync_maintenance(move |conn| {
-                let affected = conn
-                    .execute(
-                        "UPDATE sessions SET title = ?1
-                 WHERE session_id = ?2 AND user_renamed = 0 AND ephemeral = 0",
-                        params![title_for_db, session_id.to_string()],
-                    )
-                    .context("setting auto title")?;
-                Ok(affected > 0)
+                crate::db::Db::set_auto_title_conn(conn, session_id, &title_for_db)
             })
             .context("setting auto title")?;
         if updated {
@@ -37,14 +30,7 @@ impl Session {
         let updated = self
             .db
             .blocking_write_for_sync_maintenance(move |conn| {
-                let affected = conn
-                    .execute(
-                        "UPDATE sessions SET title = ?1, user_renamed = 0
-                 WHERE session_id = ?2 AND ephemeral = 0",
-                        params![title_for_db, session_id.to_string()],
-                    )
-                    .context("setting explicit auto title")?;
-                Ok(affected > 0)
+                crate::db::Db::set_explicit_auto_title_conn(conn, session_id, &title_for_db)
             })
             .context("setting explicit auto title")?;
         if updated {
@@ -63,14 +49,11 @@ impl Session {
         let updated = self
             .db
             .blocking_write_for_sync_maintenance(move |conn| {
-                let affected = conn
-                    .execute(
-                        "UPDATE sessions SET title = ?1, user_renamed = 0
-                 WHERE session_id = ?2 AND ephemeral = 0 AND title IS NULL",
-                        params![title_for_db, session_id.to_string()],
-                    )
-                    .context("setting explicit auto title if untitled")?;
-                Ok(affected > 0)
+                crate::db::Db::set_explicit_auto_title_if_untitled_conn(
+                    conn,
+                    session_id,
+                    &title_for_db,
+                )
             })
             .context("setting explicit auto title if untitled")?;
         if updated {
@@ -78,6 +61,46 @@ impl Session {
             *self.user_renamed.lock().unwrap() = false;
         }
         Ok(updated)
+    }
+
+    /// Arm the durable one-shot title-recovery nudge (issue #23) after a genuine
+    /// automatic-title failure or an unusable generated slug. Eligibility
+    /// (untitled, not user-renamed, not ephemeral) is enforced atomically by the
+    /// DB transition helper — an ineligible session arms nothing. Best-effort: a
+    /// DB error is logged and dropped so a title pass never fails the turn.
+    pub(crate) async fn arm_title_recovery_nudge(&self) {
+        if let Err(e) = self.db.arm_title_recovery_nudge(self.id).await {
+            tracing::warn!(error = %e, "auto_title: arming title recovery nudge failed");
+        }
+    }
+
+    /// Claim and render the durable title-recovery Monty nudge when one is
+    /// pending and this frame is eligible to deliver it: only a root frame that
+    /// carries the `mcp` tool (Monty present) may nudge. The claim is atomic and
+    /// once-only (`pending → consumed`), so a duplicate turn or a concurrent
+    /// frame never re-injects. Never consumes the latch for a subagent or a
+    /// no-Monty frame (it returns before claiming). A session titled or renamed
+    /// after arming already cleared the latch, so the claim fails closed. Returns
+    /// the system-message text to inject, or `None`.
+    pub(crate) async fn title_recovery_nudge(
+        &self,
+        mcp_present: bool,
+        root_agent_frame: bool,
+    ) -> Option<String> {
+        if !root_agent_frame || !mcp_present {
+            return None;
+        }
+        match self.db.claim_title_recovery_nudge(self.id).await {
+            Ok(true) => Some(
+                "Automatic titling didn't produce a name for this session. Name it now with mcp.invoke(\"cockpit\", \"rename_session\", {\"name\": \"short-title\"})."
+                    .to_string(),
+            ),
+            Ok(false) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, "title recovery nudge: claim failed");
+                None
+            }
+        }
     }
 
     pub fn title(&self) -> Option<String> {
@@ -98,6 +121,13 @@ impl Session {
         if row.user_renamed || row.ephemeral {
             return false;
         }
+        // An active title-recovery nudge (issue #23) makes rename available
+        // regardless of the ordinary slot threshold — an armed recovery nudge
+        // must be actionable. The arm predicate already required an untitled
+        // session, so recovery-active implies `title.is_none()`.
+        if row.title_recovery_nudge_state != crate::db::sessions::TitleRecoveryNudgeState::None {
+            return true;
+        }
         if !auto_title_configured {
             return true;
         }
@@ -113,6 +143,12 @@ impl Session {
         };
         if row.user_renamed || row.ephemeral {
             return false;
+        }
+        // An active title-recovery nudge makes rename invocable even before the
+        // ordinary threshold, so the injected recovery nudge instructs an action
+        // the harness actually accepts (issue #23, B8-c).
+        if row.title_recovery_nudge_state != crate::db::sessions::TitleRecoveryNudgeState::None {
+            return true;
         }
         !auto_title_configured || self.title_nudge_threshold_reached()
     }

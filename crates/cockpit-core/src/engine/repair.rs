@@ -1393,7 +1393,24 @@ pub fn normalize_paths(args: &mut Value, schema: &Value, root: &Path) -> PathNor
         }
         let may_create = schema_field_may_create_path(schema, &key);
         match normalize_one_abs_path(&current, root, may_create) {
-            AbsPathVerdict::Untouched => {}
+            AbsPathVerdict::Untouched => {
+                // A schema-declared *relative* path is anchored on the tool CWD
+                // downstream. If the original does not exist under that CWD it may
+                // carry trailing garbage (a `#fragment`, an ` INVALID` marker, or
+                // outer whitespace); recover it to the single existing, confined
+                // path when exactly one non-compositional candidate qualifies.
+                // May-create targets and existing originals are never rewritten.
+                // Runs after schema repair and before sandbox confinement.
+                if !may_create
+                    && Path::new(&current).is_relative()
+                    && let Some(stripped) = strip_relative_trailing_garbage(&current, root)
+                {
+                    map.insert(key.clone(), Value::String(stripped));
+                    if recovery.is_none() {
+                        recovery = Some((PATH_TRAILING_GARBAGE_STRIP, key.clone(), None));
+                    }
+                }
+            }
             AbsPathVerdict::Rewrite(tail) => {
                 map.insert(key.clone(), Value::String(tail));
                 if recovery.is_none() {
@@ -1558,6 +1575,138 @@ fn salvage_tail(abs: &Path, root: &Path) -> Option<String> {
         }
     }
     None
+}
+
+/// Stage name for the relative-path trailing-garbage strip. Kept in
+/// [`SHAPE_REPAIR_STAGES`] so the audit reader round-trips it.
+const PATH_TRAILING_GARBAGE_STRIP: &str = "path_trailing_garbage_strip";
+
+/// Upper bound (in Unicode scalars) on a raw relative-path value considered for
+/// trailing-garbage recovery. A larger value is left untouched — recovery is a
+/// convenience for hallucinated suffixes, never a scan of arbitrary text.
+const PATH_TRAILING_GARBAGE_MAX_SCALARS: usize = 256;
+
+/// Recover a schema-declared *relative* path that does not exist under the tool
+/// CWD by stripping trailing garbage. The original wins first: a relative value
+/// that already resolves to an existing, confined file is left untouched
+/// (returns `None`) even when it contains a literal `#`, ` INVALID`, or
+/// whitespace.
+///
+/// Otherwise, for a raw value of at most [`PATH_TRAILING_GARBAGE_MAX_SCALARS`]
+/// Unicode scalars, four candidates are generated *independently* (never
+/// compositionally): (a) an outer Unicode-whitespace trim; (b) the prefix before
+/// the first literal `#`; (c) deletion of one final Unicode-whitespace run
+/// immediately followed by the ASCII-uppercase token `INVALID`; (d) deletion of
+/// one final Unicode-whitespace run, `INVALID`, and the single immediately
+/// following maximal run of non-ASCII, non-whitespace scalars. Each candidate is
+/// resolved against `root`; it is kept only when it contains no `..`, exists, and
+/// confines. Deduplicated by canonical path, the repair fires only when exactly
+/// one distinct candidate remains, and returns that candidate's relative string.
+/// Path-internal Unicode is never altered, `..` is never interpreted, may-create
+/// targets are never repaired, and confinement is never weakened.
+fn strip_relative_trailing_garbage(value: &str, root: &Path) -> Option<String> {
+    let canonical_root = std::fs::canonicalize(root).ok()?;
+    // Existing-original identity wins: never rewrite a relative path that already
+    // resolves to an existing, confined file — even with literal garbage in it.
+    if relative_exists_confined(&canonical_root, value) {
+        return None;
+    }
+    // Candidate generation is capped; a longer raw value is left untouched.
+    if value.chars().count() > PATH_TRAILING_GARBAGE_MAX_SCALARS {
+        return None;
+    }
+
+    let mut raw_candidates: Vec<String> = Vec::new();
+    let add = |cand: String, out: &mut Vec<String>| {
+        if !cand.is_empty() && cand != value && !out.contains(&cand) {
+            out.push(cand);
+        }
+    };
+    // (a) outer Unicode-whitespace trim.
+    add(
+        value.trim_matches(|c: char| c.is_whitespace()).to_string(),
+        &mut raw_candidates,
+    );
+    // (b) prefix before the first literal `#`.
+    if let Some(idx) = value.find('#') {
+        add(value[..idx].to_string(), &mut raw_candidates);
+    }
+    // (c) trailing whitespace-run + `INVALID`.
+    if let Some(cand) = strip_final_ws_invalid(value) {
+        add(cand, &mut raw_candidates);
+    }
+    // (d) trailing whitespace-run + `INVALID` + one non-ASCII, non-whitespace run.
+    if let Some(cand) = strip_final_ws_invalid_trailing_nonascii(value) {
+        add(cand, &mut raw_candidates);
+    }
+
+    // Keep only candidates that contain no `..`, exist, and confine; dedup by
+    // canonical path so two spellings of the same file count once. Confinement
+    // reuses the shared sandbox check so it cannot drift from the sandbox
+    // boundary.
+    let mut confined: Vec<(PathBuf, String)> = Vec::new();
+    for cand in raw_candidates {
+        if Path::new(&cand)
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+        {
+            continue;
+        }
+        let joined = canonical_root.join(&cand);
+        if !crate::tools::sandbox::within_root(&canonical_root, &joined) {
+            continue;
+        }
+        // `within_root` proved the join canonicalizes and confines; recover the
+        // canonical path for dedup.
+        let Ok(canonical) = std::fs::canonicalize(&joined) else {
+            continue;
+        };
+        if confined.iter().all(|(existing, _)| existing != &canonical) {
+            confined.push((canonical, cand));
+        }
+    }
+    if confined.len() == 1 {
+        Some(confined.pop().expect("length checked").1)
+    } else {
+        None
+    }
+}
+
+/// Whether relative `value` resolves to an existing path at/under the already
+/// canonicalized `root`. A `..` component disqualifies it (never interpreted).
+/// Confinement reuses the shared sandbox check so it cannot drift.
+fn relative_exists_confined(canonical_root: &Path, value: &str) -> bool {
+    if Path::new(value)
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return false;
+    }
+    crate::tools::sandbox::within_root(canonical_root, &canonical_root.join(value))
+}
+
+/// `value` with a trailing Unicode-whitespace run immediately followed by the
+/// ASCII-uppercase token `INVALID` removed. `None` unless the value ends with
+/// `<whitespace-run>INVALID` (the whitespace run must be non-empty).
+fn strip_final_ws_invalid(value: &str) -> Option<String> {
+    let before_invalid = value.strip_suffix("INVALID")?;
+    let trimmed = before_invalid.trim_end_matches(|c: char| c.is_whitespace());
+    if trimmed.len() == before_invalid.len() {
+        return None; // no whitespace run separates the path from `INVALID`
+    }
+    Some(trimmed.to_string())
+}
+
+/// `value` with a trailing maximal run of non-ASCII, non-whitespace scalars, the
+/// ASCII-uppercase token `INVALID`, and one preceding Unicode-whitespace run
+/// removed. `None` unless the value ends with
+/// `<whitespace-run>INVALID<non-ASCII-non-whitespace-run>`.
+fn strip_final_ws_invalid_trailing_nonascii(value: &str) -> Option<String> {
+    let before_nonascii = value.trim_end_matches(|c: char| !c.is_ascii() && !c.is_whitespace());
+    if before_nonascii.len() == value.len() {
+        return None; // no trailing non-ASCII run
+    }
+    strip_final_ws_invalid(before_nonascii)
 }
 
 #[cfg(test)]
@@ -2773,17 +2922,222 @@ mod tests {
         assert_ne!(v["path"], json!("secret.rs"));
     }
 
+    /// Build a tempdir root and materialize each listed relative file on disk
+    /// (with parents). Returns the tempdir (kept alive by the caller).
+    fn root_with_files(files: &[&str]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        for f in files {
+            let p = tmp.path().join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "// file").unwrap();
+        }
+        tmp
+    }
+
+    fn norm_path(v: &Value) -> &str {
+        v.get("path").and_then(Value::as_str).unwrap()
+    }
+
+    /// Replaces the former `relative_path_is_left_to_cwd_resolution`, which
+    /// pinned that a relative path is ALWAYS left untouched. Under the new
+    /// `path_trailing_garbage_strip` stage a relative original that does not
+    /// exist under the tool CWD but whose single non-compositional candidate
+    /// does is salvaged. Each salvage assertion below fails against the old
+    /// "relative → untouched" behavior.
     #[test]
-    fn relative_path_is_left_to_cwd_resolution() {
-        // The fabricated-prefix mode is absolute-only; a relative path is
-        // never touched here (cwd resolution handles it downstream).
-        let tmp = project_root();
-        let mut v = json!({ "path": "src/tui/settings/mod.rs" });
+    fn relative_path_trailing_garbage_is_safely_salvaged() {
+        let tmp = root_with_files(&["src/tui/settings/mod.rs"]);
+        let root = tmp.path();
+        let good = "src/tui/settings/mod.rs";
+
+        // Precondition: the clean relative original exists and confines.
+        assert!(root.join(good).exists());
+
+        // (a) outer whitespace.
+        let mut v = json!({ "path": "  src/tui/settings/mod.rs  " });
+        let out = normalize_paths(&mut v, &schema(), root);
+        assert!(
+            matches!(out.recovery, Recovery::ShapeRepair { stage: "path_trailing_garbage_strip", .. }),
+            "outer whitespace should salvage via the new stage, got {:?}",
+            out.recovery
+        );
+        assert!(out.error.is_none());
+        assert_eq!(norm_path(&v), good);
+
+        // (b) fragment.
+        let mut v = json!({ "path": "src/tui/settings/mod.rs#L12" });
+        let out = normalize_paths(&mut v, &schema(), root);
+        assert!(matches!(
+            out.recovery,
+            Recovery::ShapeRepair { stage: "path_trailing_garbage_strip", .. }
+        ));
+        assert_eq!(norm_path(&v), good);
+
+        // (c) final ` INVALID`.
+        let mut v = json!({ "path": "src/tui/settings/mod.rs INVALID" });
+        let out = normalize_paths(&mut v, &schema(), root);
+        assert!(matches!(
+            out.recovery,
+            Recovery::ShapeRepair { stage: "path_trailing_garbage_strip", .. }
+        ));
+        assert_eq!(norm_path(&v), good);
+
+        // (d) the exact marker-following non-ASCII run (`INVALID✗`).
+        let mut v = json!({ "path": "src/tui/settings/mod.rs INVALID\u{2717}" });
+        let out = normalize_paths(&mut v, &schema(), root);
+        assert!(matches!(
+            out.recovery,
+            Recovery::ShapeRepair { stage: "path_trailing_garbage_strip", .. }
+        ));
+        assert_eq!(norm_path(&v), good);
+
+        // Stage/audit round-trip: the stage is a registered shape-repair stage,
+        // so `decode_recovery` reconstructs it rather than `Unknown`.
+        assert!(SHAPE_REPAIR_STAGES.contains(&"path_trailing_garbage_strip"));
+
+        // --- negatives ---
+
+        // Clean existing relative original: untouched.
+        let mut v = json!({ "path": good });
         let before = v.clone();
-        let out = normalize_paths(&mut v, &schema(), tmp.path());
+        let out = normalize_paths(&mut v, &schema(), root);
         assert_eq!(out.recovery, Recovery::Clean);
         assert!(out.error.is_none());
         assert_eq!(v, before);
+
+        // Missing original with no salvageable candidate: untouched, clean.
+        let mut v = json!({ "path": "src/tui/settings/nope.rs" });
+        let before = v.clone();
+        let out = normalize_paths(&mut v, &schema(), root);
+        assert_eq!(out.recovery, Recovery::Clean);
+        assert!(out.error.is_none());
+        assert_eq!(v, before);
+
+        // may-create target: never repaired (schema opts the field into creation).
+        let tmp_c = root_with_files(&["exists.rs"]);
+        let mut v = json!({ "path": "exists.rs INVALID", "content": "x" });
+        let before = v.clone();
+        let out = normalize_paths(&mut v, &create_path_schema(), tmp_c.path());
+        assert_eq!(out.recovery, Recovery::Clean);
+        assert_eq!(v, before, "may-create path must not be trailing-garbage-repaired");
+
+        // `..` / out-of-root: a candidate that would climb out is rejected;
+        // confinement preserved.
+        let tmp_o = root_with_files(&["inside.rs"]);
+        std::fs::write(tmp_o.path().parent().unwrap().join("secret.rs"), "// s").unwrap();
+        let mut v = json!({ "path": "../secret.rs INVALID" });
+        let out = normalize_paths(&mut v, &schema(), tmp_o.path());
+        assert!(
+            !matches!(out.recovery, Recovery::ShapeRepair { .. }),
+            "must not climb `..` out of root"
+        );
+        assert_ne!(norm_path(&v), "../secret.rs");
+
+        // Ambiguous: two distinct candidates both exist → untouched.
+        let tmp_a = root_with_files(&["dir/a", "dir/a#b"]);
+        let mut v = json!({ "path": "dir/a#b INVALID" });
+        let before = v.clone();
+        let out = normalize_paths(&mut v, &schema(), tmp_a.path());
+        assert_eq!(out.recovery, Recovery::Clean, "ambiguous salvage must not fire");
+        assert_eq!(v, before);
+
+        // Non-composition: only the c-candidate (`dir/a#b`) exists, the
+        // b-then-c composition target (`dir/a`) does NOT. Non-compositional
+        // generation yields exactly one existing candidate and salvages to it;
+        // a compositional implementation would target the missing `dir/a`.
+        let tmp_n = root_with_files(&["dir/a#b"]);
+        let mut v = json!({ "path": "dir/a#b INVALID" });
+        let out = normalize_paths(&mut v, &schema(), tmp_n.path());
+        assert!(matches!(
+            out.recovery,
+            Recovery::ShapeRepair { stage: "path_trailing_garbage_strip", .. }
+        ));
+        assert_eq!(norm_path(&v), "dir/a#b");
+
+        // Legitimate internal Unicode: an existing non-ASCII filename is left
+        // byte-for-byte untouched (path-internal Unicode is never altered).
+        let tmp_u = root_with_files(&["caf\u{e9}.rs"]);
+        let mut v = json!({ "path": "caf\u{e9}.rs" });
+        let before = v.clone();
+        let out = normalize_paths(&mut v, &schema(), tmp_u.path());
+        assert_eq!(out.recovery, Recovery::Clean);
+        assert_eq!(v, before);
+
+        // 256-scalar cap: a 250-char base file exists, but the raw value
+        // (base + ` INVALID`) exceeds 256 scalars, so no candidate is generated.
+        // A cap-less implementation would salvage it (the base exists).
+        let long_name = "d".repeat(250);
+        let tmp_l = root_with_files(&[long_name.as_str()]);
+        let raw = format!("{long_name} INVALID");
+        assert!(raw.chars().count() > 256);
+        assert!(tmp_l.path().join(&long_name).exists());
+        let mut v = json!({ "path": raw });
+        let before = v.clone();
+        let out = normalize_paths(&mut v, &schema(), tmp_l.path());
+        assert_eq!(out.recovery, Recovery::Clean, "over-cap value must be left untouched");
+        assert_eq!(v, before);
+    }
+
+    /// Existing-original identity wins before any candidate is generated: a
+    /// relative path that already resolves to an existing, confined file is
+    /// never rewritten, even when it literally contains `#`, ` INVALID`, or
+    /// trailing whitespace — including when a transformed candidate also exists.
+    #[test]
+    fn relative_existing_literal_suffixes_are_never_rewritten() {
+        let tmp = root_with_files(&[
+            // literal-suffix originals whose transformed candidate is MISSING
+            "weird#name.rs",
+            // literal-suffix originals whose transformed candidate ALSO EXISTS,
+            // one per candidate class:
+            "foo#bar",
+            "foo", // (b) prefix-before-`#`
+            "data INVALID",
+            "data", // (c) trailing ws + `INVALID`
+            "note.txt ",
+            "note.txt", // (a) outer whitespace
+            "report INVALID\u{2717}",
+            "report", // (d) ws + `INVALID` + non-ASCII run
+        ]);
+        let root = tmp.path();
+
+        // A literal-suffix original whose transformed candidate does NOT exist is
+        // still left untouched (existing-identity short-circuits before candidate
+        // generation).
+        assert!(root.join("weird#name.rs").exists());
+        assert!(!root.join("weird").exists());
+        let mut v = json!({ "path": "weird#name.rs" });
+        let before = v.clone();
+        let out = normalize_paths(&mut v, &schema(), root);
+        assert_eq!(out.recovery, Recovery::Clean);
+        assert!(out.error.is_none());
+        assert_eq!(v, before);
+
+        // For EVERY candidate class, an existing literal-suffix original whose
+        // transformed candidate ALSO exists is never rewritten — existing-original
+        // identity wins over an equally-valid transform.
+        let both_exist = [
+            ("foo#bar", "foo"),                   // (b) prefix-before-`#`
+            ("data INVALID", "data"),             // (c) ws + `INVALID`
+            ("note.txt ", "note.txt"),            // (a) outer whitespace
+            ("report INVALID\u{2717}", "report"), // (d) ws + `INVALID` + non-ASCII
+        ];
+        for (original, transformed) in both_exist {
+            assert!(root.join(original).exists(), "precondition: {original:?} exists");
+            assert!(
+                root.join(transformed).exists(),
+                "precondition: transformed {transformed:?} also exists"
+            );
+            let mut v = json!({ "path": original });
+            let before = v.clone();
+            let out = normalize_paths(&mut v, &schema(), root);
+            assert_eq!(
+                out.recovery,
+                Recovery::Clean,
+                "existing original must win over its transform: {original:?}"
+            );
+            assert!(out.error.is_none());
+            assert_eq!(v, before, "must not rewrite {original:?} to {transformed:?}");
+        }
     }
 
     #[test]

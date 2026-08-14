@@ -114,13 +114,20 @@ pub async fn generate_session_title(
         Ok(TitleOutcome::Titled(_)) => {}
         Ok(TitleOutcome::Deferred) => {
             // The eager pass got no usable slug from a working model
-            // (e.g. a trivial/slash-only first message). Not a failure.
+            // (e.g. a trivial/slash-only first message). Not a failure, but the
+            // session is still unnamed — arm the durable Monty title-recovery
+            // nudge so the main model can name it (eligibility enforced by the
+            // DB transition; already-titled/renamed/ephemeral sessions arm
+            // nothing).
             tracing::debug!("auto_title: no usable title this scheduled pass");
+            session.arm_title_recovery_nudge().await;
         }
         Err(e) => {
             // A genuine failure (model unset/erroring, empty response).
             // Surface it once per session. Missing `utility_model` is a normal
-            // setup state, so keep its process log one-shot and non-warning.
+            // setup state, so keep its process log one-shot and non-warning —
+            // and, being a setup state rather than a genuine automatic-title
+            // error, it does NOT arm title recovery.
             if is_utility_model_unset_error(&e) {
                 UTILITY_MODEL_UNSET_LOGGED.get_or_init(|| {
                     tracing::info!(
@@ -129,6 +136,9 @@ pub async fn generate_session_title(
                 });
             } else {
                 tracing::warn!(error = %e, "auto_title: pass failed");
+                // A configured utility model that erred is a genuine failure:
+                // arm the durable Monty title-recovery nudge.
+                session.arm_title_recovery_nudge().await;
             }
             if session.claim_title_failure_notice() {
                 let _ = tx
@@ -952,5 +962,195 @@ mod tests {
         )
         .await;
         assert!(rx2.try_recv().is_err(), "timeout Notice is one-per-session");
+    }
+
+    #[tokio::test]
+    async fn title_failure_arms_monty_rename_recovery() {
+        use crate::db::sessions::TitleRecoveryNudgeState;
+
+        fn mk_session() -> Arc<Session> {
+            let db = Db::open_in_memory().unwrap();
+            Arc::new(
+                Session::create(
+                    db,
+                    PathBuf::from("/x"),
+                    "a",
+                    crate::session::test_redaction_key_resolver(),
+                )
+                .unwrap(),
+            )
+        }
+
+        async fn nudge_state(session: &Session) -> TitleRecoveryNudgeState {
+            session
+                .db
+                .get_session(session.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .title_recovery_nudge_state
+        }
+
+        // --- (1) a genuine configured-utility-model failure arms recovery ---
+        let session = mk_session();
+        let msg = "Investigate the flaky harness retries";
+        let action = session.note_user_content(msg);
+        assert_eq!(action, TitleAction::Eager);
+        // Precondition: nothing armed yet.
+        assert_eq!(
+            nudge_state(&session).await,
+            TitleRecoveryNudgeState::None,
+            "precondition: unarmed"
+        );
+
+        let url = stub_model_server(None).await; // 500 → genuine failure
+        let (ext, prov, redact) = stub_configs(&url);
+        let (tx, mut rx) = mpsc::channel(8);
+        generate_session_title(
+            session.clone(),
+            ext,
+            prov,
+            redact,
+            msg.to_string(),
+            action,
+            None,
+            tx,
+        )
+        .await;
+        let _ = expect_notice(&mut rx); // the one-shot failure Notice
+        assert_eq!(
+            nudge_state(&session).await,
+            TitleRecoveryNudgeState::Pending,
+            "a genuine configured-model failure arms recovery"
+        );
+
+        // --- (2) resume preserves pending (it is a durable DB column) ---
+        assert_eq!(
+            nudge_state(&session).await,
+            TitleRecoveryNudgeState::Pending,
+            "pending survives a re-read"
+        );
+
+        // --- (3) one next eligible root+Monty turn claims and injects it ---
+        let injected = session
+            .title_recovery_nudge(true, true)
+            .await
+            .expect("eligible root+mcp turn claims the pending nudge");
+        assert!(injected.contains("mcp.invoke"), "{injected}");
+        assert!(injected.contains("rename_session"), "{injected}");
+        assert_eq!(nudge_state(&session).await, TitleRecoveryNudgeState::Consumed);
+
+        // --- (4) claim-before-send prevents duplication ---
+        assert!(
+            session.title_recovery_nudge(true, true).await.is_none(),
+            "a consumed latch never re-nudges"
+        );
+
+        // --- (5) an unusable generated slug (Deferred) also arms recovery ---
+        let s2 = mk_session();
+        let action2 = s2.note_user_content("/help");
+        assert_eq!(action2, TitleAction::Eager);
+        let url2 = stub_model_server(Some("!!!".to_string())).await; // no usable slug
+        let (e2, p2, r2) = stub_configs(&url2);
+        let (tx2, _rx2) = mpsc::channel(8);
+        generate_session_title(s2.clone(), e2, p2, r2, "/help".to_string(), action2, None, tx2)
+            .await;
+        assert_eq!(
+            nudge_state(&s2).await,
+            TitleRecoveryNudgeState::Pending,
+            "an unusable slug (Deferred) arms recovery"
+        );
+
+        // --- (6) user / auto / explicit-auto title writes clear the latch ---
+        // auto title
+        let s_auto = mk_session();
+        s_auto.arm_title_recovery_nudge().await;
+        assert_eq!(nudge_state(&s_auto).await, TitleRecoveryNudgeState::Pending);
+        assert!(s_auto.set_auto_title("named").unwrap());
+        assert_eq!(
+            nudge_state(&s_auto).await,
+            TitleRecoveryNudgeState::None,
+            "auto-title write clears the latch"
+        );
+        assert!(
+            s_auto.title_recovery_nudge(true, true).await.is_none(),
+            "a titled session is not nudged"
+        );
+        // explicit-auto title
+        let s_expl = mk_session();
+        s_expl.arm_title_recovery_nudge().await;
+        assert!(s_expl.set_explicit_auto_title("explicit").unwrap());
+        assert_eq!(
+            nudge_state(&s_expl).await,
+            TitleRecoveryNudgeState::None,
+            "explicit-auto-title write clears the latch"
+        );
+        // user rename
+        let s_user = mk_session();
+        s_user.arm_title_recovery_nudge().await;
+        s_user.db.rename_session(s_user.id, "mine").await.unwrap();
+        assert_eq!(
+            nudge_state(&s_user).await,
+            TitleRecoveryNudgeState::None,
+            "user rename clears the latch"
+        );
+
+        // --- (7) excluded frames never consume the latch ---
+        let s_excl = mk_session();
+        s_excl.arm_title_recovery_nudge().await;
+        assert!(
+            s_excl.title_recovery_nudge(true, false).await.is_none(),
+            "a subagent frame is never nudged"
+        );
+        assert_eq!(
+            nudge_state(&s_excl).await,
+            TitleRecoveryNudgeState::Pending,
+            "a subagent frame does not consume the latch"
+        );
+        assert!(
+            s_excl.title_recovery_nudge(false, true).await.is_none(),
+            "a no-Monty frame is never nudged"
+        );
+        assert_eq!(
+            nudge_state(&s_excl).await,
+            TitleRecoveryNudgeState::Pending,
+            "a no-Monty frame does not consume the latch"
+        );
+        // The preserved latch is still claimable by a genuinely eligible frame.
+        assert!(s_excl.title_recovery_nudge(true, true).await.is_some());
+
+        // --- (8) ineligible session states are never armed ---
+        let s_titled = mk_session();
+        assert!(s_titled.set_auto_title("already").unwrap());
+        s_titled.arm_title_recovery_nudge().await;
+        assert_eq!(
+            nudge_state(&s_titled).await,
+            TitleRecoveryNudgeState::None,
+            "an already-titled session is never armed"
+        );
+        let s_renamed = mk_session();
+        s_renamed.db.rename_session(s_renamed.id, "mine").await.unwrap();
+        s_renamed.arm_title_recovery_nudge().await;
+        assert_eq!(
+            nudge_state(&s_renamed).await,
+            TitleRecoveryNudgeState::None,
+            "a user-renamed session is never armed"
+        );
+
+        // --- (9) B8-c: an armed recovery nudge makes rename INVOCABLE even when
+        // auto-title is configured and the ordinary slot threshold is not yet
+        // reached, so the injected nudge instructs an action the harness accepts.
+        let s_early = mk_session();
+        // Baseline: unarmed, auto-title configured, below threshold → not yet
+        // invocable.
+        assert!(
+            !s_early.agent_rename_session_invoke_allowed(true),
+            "baseline: an unarmed early session cannot yet invoke rename"
+        );
+        s_early.arm_title_recovery_nudge().await;
+        assert!(
+            s_early.agent_rename_session_invoke_allowed(true),
+            "an armed recovery nudge makes rename invocable despite the threshold"
+        );
     }
 }

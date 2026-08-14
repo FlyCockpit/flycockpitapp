@@ -1,4 +1,4 @@
-use super::failure::InferenceErrorClass;
+use super::failure::{InferenceErrorClass, ProviderRecoverySignal};
 
 /// The provider error `code` that signals a model is not served over the
 /// endpoint that was tried. Used by both inference-time endpoint recovery and
@@ -207,6 +207,121 @@ pub(crate) fn is_endpoint_mismatch_error_text(message: &str) -> bool {
         || lower.contains("unsupported endpoint")
 }
 
+/// Parse the typed provider-recovery signal from a terminal completion error's
+/// body (issue #23). Centralized here at the model boundary so retry, failover,
+/// and the persisted failure record all read ONE classification (never
+/// re-derived in a driver/agent path). Case-insensitive over the error's display
+/// text; the closed sets are the ONLY signals — no fuzzy `quota` / `unavailable`
+/// matching. Billing takes precedence over overload when both appear.
+pub(crate) fn provider_recovery_signal(
+    err: &rig::completion::CompletionError,
+) -> ProviderRecoverySignal {
+    provider_recovery_signal_from_text(&recovery_scan_text(err))
+}
+
+/// The provider body text a recovery signal is scanned from. A `ProviderError`
+/// string and a status-with-message HTTP error carry the raw body directly;
+/// every other variant falls back to its Display (which never carries a body a
+/// signal would hide in).
+fn recovery_scan_text(err: &rig::completion::CompletionError) -> String {
+    match err {
+        rig::completion::CompletionError::ProviderError(msg) => msg.clone(),
+        rig::completion::CompletionError::HttpError(
+            rig::http_client::Error::InvalidStatusCodeWithMessage(_, msg),
+        ) => msg.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// A fully classified terminal failure: the semantic error class, the observed
+/// HTTP status retained SEPARATELY, and the typed provider-recovery signal.
+/// Billing overrides the class to `BillingOrQuotaExhausted` (its observed status
+/// — often `429` — is preserved on `observed_status`, never stuffed into the
+/// class). Overload keeps its natural HTTP/network class; the recovery signal
+/// distinguishes it from a status-only failure for the retry/failover policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClassifiedFailure {
+    pub class: InferenceErrorClass,
+    pub observed_status: Option<u16>,
+    pub recovery: ProviderRecoverySignal,
+}
+
+/// Classify a terminal completion error at the model boundary — the SINGLE
+/// production path that maps a raw error into `(class, observed_status,
+/// recovery)`. Both the live dispatch record and the retry/failover policy read
+/// from here so the classification is never re-derived elsewhere.
+pub(crate) fn classify_terminal_failure(
+    err: &rig::completion::CompletionError,
+) -> ClassifiedFailure {
+    classify_terminal_failure_with_floor(err, ProviderRecoverySignal::None)
+}
+
+/// As [`classify_terminal_failure`], but the terminal recovery signal is the
+/// STRONGER of this error's own signal and `floor` — the strongest signal
+/// observed across the whole retry chain (issue #23). This prevents a later
+/// generic error (e.g. a 500 on the retry) from masking an earlier billing or
+/// overload signal; a billing floor also overrides the class to
+/// `BillingOrQuotaExhausted`.
+pub(crate) fn classify_terminal_failure_with_floor(
+    err: &rig::completion::CompletionError,
+    floor: ProviderRecoverySignal,
+) -> ClassifiedFailure {
+    let own = provider_recovery_signal(err);
+    let recovery = if floor.rank() > own.rank() { floor } else { own };
+    let observed_status = http_status_of(err);
+    let base = classify_inference_failure(err);
+    let class = match recovery {
+        ProviderRecoverySignal::BillingExhausted => InferenceErrorClass::BillingOrQuotaExhausted,
+        ProviderRecoverySignal::Overloaded | ProviderRecoverySignal::None => base,
+    };
+    ClassifiedFailure {
+        class,
+        observed_status,
+        recovery,
+    }
+}
+
+pub(crate) fn provider_recovery_signal_from_text(text: &str) -> ProviderRecoverySignal {
+    let lower = text.to_ascii_lowercase();
+    if billing_signal_present(&lower) {
+        return ProviderRecoverySignal::BillingExhausted;
+    }
+    if lower.contains("server_is_overloaded") || lower.contains("service_unavailable_error") {
+        return ProviderRecoverySignal::Overloaded;
+    }
+    ProviderRecoverySignal::None
+}
+
+/// The closed, case-insensitive billing/quota-exhaustion set (already lowered).
+fn billing_signal_present(lower: &str) -> bool {
+    lower.contains("insufficient balance")
+        || lower.contains("no resource package")
+        || lower.contains("please recharge")
+        || lower.contains("exceeded your current quota")
+        || lower.contains("billing hard limit")
+        || contains_structured_code_1113(lower)
+}
+
+/// Whether the structured provider error code `1113` appears as a standalone
+/// token — never glued to a longer number (`11130` / `211137`) or an adjacent
+/// word (`error1113` / `1113suffix`). Neighboring ASCII alphanumerics on either
+/// side disqualify the match, so only a genuinely delimited `1113` counts.
+fn contains_structured_code_1113(lower: &str) -> bool {
+    let bytes = lower.as_bytes();
+    let mut search_from = 0;
+    while let Some(rel) = lower[search_from..].find("1113") {
+        let start = search_from + rel;
+        let end = start + 4;
+        let boundary_before = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+        let boundary_after = end >= bytes.len() || !bytes[end].is_ascii_alphanumeric();
+        if boundary_before && boundary_after {
+            return true;
+        }
+        search_from = start + 1;
+    }
+    false
+}
+
 /// Human-readable detail for the inline error. A pure timeout needs none; a
 /// network / HTTP failure carries the underlying message.
 pub(crate) fn failure_detail(
@@ -266,7 +381,9 @@ mod tests {
     use rig::completion::CompletionError;
 
     use super::*;
-    use crate::engine::model::{InferenceFailure, auth_failure_kind, failure_engages_backup};
+    use crate::engine::model::{
+        InferenceFailure, ProviderRecoverySignal, auth_failure_kind, failure_engages_backup,
+    };
 
     fn provider_error(message: &str) -> CompletionError {
         CompletionError::ProviderError(message.to_string())
@@ -459,6 +576,8 @@ mod tests {
             elapsed_ms: 0,
             retry_attempts: 1,
             detail: "client-side tools require entitlement `wrong_feature`".to_string(),
+            observed_status: None,
+            recovery: ProviderRecoverySignal::None,
         };
         assert_eq!(
             auth_failure_kind(&failure),

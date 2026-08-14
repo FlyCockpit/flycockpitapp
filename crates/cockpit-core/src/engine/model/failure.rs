@@ -108,6 +108,47 @@ pub(super) fn bump_phase(tracker: &std::sync::atomic::AtomicU8, phase: Inference
 /// up. Carries everything the inline error + the failure event need:
 /// provider/model, the phase reached, the error class, and elapsed-ms since
 /// dispatch.
+/// A typed provider-recovery signal parsed from a terminal failure's error
+/// body at the model boundary (issue #23). Core-internal (never a proto class):
+/// it drives the billing/overload retry + failover POLICY without stuffing the
+/// observed HTTP status into the semantic [`InferenceErrorClass`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProviderRecoverySignal {
+    /// No specialized provider-recovery signal in the error body — every
+    /// ordinary failure (timeouts, transport, generic HTTP status).
+    #[default]
+    None,
+    /// Billing / account-quota exhaustion (structured code `1113` or one of the
+    /// closed named phrases). Fail fast, then a different-provider backup only.
+    BillingExhausted,
+    /// Explicit provider overload (`server_is_overloaded` /
+    /// `service_unavailable_error`). Exactly one same-model retry, then a
+    /// cross-provider-preferred backup.
+    Overloaded,
+}
+
+impl ProviderRecoverySignal {
+    /// Monotonic significance rank used to accumulate the STRONGEST signal seen
+    /// across a retry chain (billing outranks overload outranks none), so a
+    /// later generic error cannot mask an earlier billing/overload signal.
+    pub(crate) fn rank(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Overloaded => 1,
+            Self::BillingExhausted => 2,
+        }
+    }
+
+    /// Inverse of [`Self::rank`].
+    pub(crate) fn from_rank(rank: u8) -> Self {
+        match rank {
+            0 => Self::None,
+            1 => Self::Overloaded,
+            _ => Self::BillingExhausted,
+        }
+    }
+}
+
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("inference failed ({class}) for {provider}/{model} after {elapsed_ms}ms at phase {phase}")]
 pub struct InferenceFailure {
@@ -121,6 +162,17 @@ pub struct InferenceFailure {
     /// in the inline error alongside provider/model. Empty for a pure
     /// timeout (the class + ceiling already say everything).
     pub detail: String,
+    /// The observed HTTP status the provider returned, retained SEPARATELY from
+    /// `class` (issue #23). A billing/overload class does not embed its status;
+    /// this preserves it for diagnostics (e.g. a billing failure observed as
+    /// `429`). `None` when no HTTP status was observed (pure timeout / transport
+    /// failure / pre-dispatch prep error).
+    pub observed_status: Option<u16>,
+    /// The typed provider-recovery signal parsed from the error body. Drives the
+    /// billing-fail-fast-cross-provider-only and overload-one-retry-then-
+    /// cross-provider policies; [`ProviderRecoverySignal::None`] for every
+    /// ordinary failure.
+    pub recovery: ProviderRecoverySignal,
 }
 
 /// Returns the [`InferenceFailure`] in `err`'s chain, if any — the seam the
@@ -184,16 +236,18 @@ pub fn failure_engages_backup(class: &InferenceErrorClass) -> bool {
         | InferenceErrorClass::TimeoutIdle
         | InferenceErrorClass::Network
         | InferenceErrorClass::MissingToolEntitlement { .. }
-        | InferenceErrorClass::ClientSideToolsUnsupported => true,
+        | InferenceErrorClass::ClientSideToolsUnsupported
+        // Billing/account-quota exhaustion DOES engage backup — but only a
+        // DIFFERENT PROVIDER can answer (the same provider's account is
+        // exhausted). `turn_with_backup` filters candidates to a different
+        // provider for a `ProviderRecoverySignal::BillingExhausted` failure; a
+        // same-provider backup is never tried for billing.
+        | InferenceErrorClass::BillingOrQuotaExhausted => true,
         InferenceErrorClass::Http(status) => (500..=599).contains(status),
         InferenceErrorClass::UtilityTimeout
         | InferenceErrorClass::ResponsesToolIdentity
         | InferenceErrorClass::ProviderNotConfigured
         | InferenceErrorClass::ProviderRateLimit
-        // Treated like its ProviderRateLimit/quota sibling pending
-        // harness-reliability-remediation's final policy: no backup model can
-        // restore an exhausted account balance/quota, so no backup is engaged.
-        | InferenceErrorClass::BillingOrQuotaExhausted
         // A non-renderable wire field fails the same way on any untrusted
         // target, so a different model cannot answer it — hard-fail, no backup.
         | InferenceErrorClass::UnrenderableWireField

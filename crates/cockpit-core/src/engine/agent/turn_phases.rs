@@ -1835,6 +1835,21 @@ async fn inject_turn_start_system_messages(
     {
         history.push(Message::System { content: nudge });
     }
+    // Durable one-shot title-recovery nudge (issue #23), distinct from the
+    // slot-8/16 unnamed-session nudge above. Armed by a failed automatic-title
+    // pass; claimed atomically here so exactly one eligible root turn injects it
+    // (claim-before-send prevents a duplicate across turns). Only a root frame
+    // carrying `mcp` (Monty present) claims — a subagent/no-Monty frame never
+    // consumes the latch.
+    if let Some(nudge) = session
+        .title_recovery_nudge(active_tool_names.contains(&"mcp"), is_root)
+        .await
+        && !history
+            .iter()
+            .any(|message| matches!(message, Message::System { content } if content == &nudge))
+    {
+        history.push(Message::System { content: nudge });
+    }
     if let Some(nudge) = session.compact_self_nudge(
         context_usage.ctx_pct,
         context_usage.compact_nudge_pct,

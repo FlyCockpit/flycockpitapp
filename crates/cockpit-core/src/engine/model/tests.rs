@@ -92,6 +92,124 @@ fn tandem_failure_response_preserves_kind_and_detail() {
     assert_eq!(value["error"]["detail"], "provider detail");
 }
 
+/// Behavior 9 fail-closed omission on the tandem / second-opinion path: a raw
+/// provider `CompletionError` must NOT be persisted verbatim into the tandem
+/// session record. The `tandem_provider_error_response` builder (used by the
+/// `complete_tandem` failure branch) routes the error through the same funnel:
+/// the persisted `detail` is the fixed marker, the raw provider body is
+/// dropped, and the typed observed-status/recovery metadata stays queryable.
+/// Non-vacuous: the sentinel appears in `err.to_string()` (asserted) but must
+/// be absent from the response — a verbatim persist would fail the check.
+#[test]
+fn tandem_provider_error_response_omits_raw_provider_detail() {
+    use rig::completion::CompletionError;
+    const SECRET: &str = "RAW_TANDEM_PROVIDER_BODY_9f3a_must_not_persist";
+    // A billing 429 whose body carries a secret the funnel must drop.
+    let err = CompletionError::HttpError(rig::http_client::Error::InvalidStatusCodeWithMessage(
+        reqwest::StatusCode::from_u16(429).unwrap(),
+        format!("{{\"error\":{{\"message\":\"insufficient balance {SECRET}\"}}}}"),
+    ));
+    // The raw error text carries the secret — proving the assertions below are
+    // non-vacuous.
+    assert!(err.to_string().contains(SECRET));
+
+    let response = tandem_provider_error_response(&err);
+    let response_str = response.to_string();
+    assert!(
+        !response_str.contains(SECRET),
+        "tandem provider error must not persist the raw provider body: {response_str}"
+    );
+    assert_eq!(
+        response["error"]["detail"],
+        json!(crate::engine::model::PROVIDER_DETAIL_OMITTED)
+    );
+    // Typed metadata stays queryable.
+    assert_eq!(response["error"]["observed_status"], json!(429));
+    assert_eq!(response["error"]["recovery"], json!("billing_exhausted"));
+
+    // The underlying funnel helper drops the text and keeps the metadata too.
+    let safe = crate::engine::model::safe_completion_error_detail(&err);
+    assert_eq!(safe.marker, crate::engine::model::PROVIDER_DETAIL_OMITTED);
+    assert_eq!(safe.observed_status, Some(429));
+    assert_eq!(
+        safe.recovery,
+        crate::engine::model::ProviderRecoverySignal::BillingExhausted
+    );
+    assert!(!serde_json::to_string(&safe).unwrap().contains(SECRET));
+}
+
+/// End-to-end proof through `complete_tandem`: the FAILURE branch omits the raw
+/// provider body from the persisted `TandemOutcome.response`, while the SUCCESS
+/// branch preserves a real tandem response body verbatim (the legitimate
+/// feature output, redacted only at export). Only the failure branch is
+/// omission-routed; the success body is untouched.
+#[tokio::test]
+async fn complete_tandem_failure_omits_body_while_success_is_preserved() {
+    use crate::config::providers::WireApi;
+    use crate::db::session_log::InferenceRequestStatus;
+    const SECRET: &str = "TANDEM_ERROR_BODY_do_not_export_5b21";
+    let params = ModelParams::default();
+
+    // FAILURE: a provider 429 whose body carries a secret. The persisted
+    // response must omit it (marker + typed metadata only).
+    let failing = ScriptedProvider::builder()
+        .turn(Turn::HttpError {
+            status: 429,
+            body: format!("{{\"error\":{{\"message\":\"insufficient balance {SECRET}\"}}}}"),
+        })
+        .start()
+        .await;
+    let fail_model = openai_model_at_with_wire(&failing.base_url(), WireApi::Completions, true);
+    let outcome = fail_model
+        .complete_tandem("system", &[], &Message::user("hi"), &[], &params)
+        .await;
+    assert_eq!(outcome.status, InferenceRequestStatus::Errored);
+    let response = outcome
+        .response
+        .expect("an errored tandem still records a response");
+    let response_str = response.to_string();
+    assert!(
+        !response_str.contains(SECRET),
+        "tandem failure leaked the raw provider body into the persisted response: {response_str}"
+    );
+    assert_eq!(
+        response["error"]["detail"],
+        json!(crate::engine::model::PROVIDER_DETAIL_OMITTED)
+    );
+    assert_eq!(response["error"]["observed_status"], json!(429));
+
+    // SUCCESS: a real tandem response body is preserved verbatim. A tandem call
+    // is single-shot / NON-streaming (`.send()`), so serve a JSON chat
+    // completion (not SSE) for it to parse.
+    let ok = ScriptedProvider::builder()
+        .turn(Turn::RawJson(json!({
+            "id": "cmpl-tandem",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "m",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "distinctive tandem answer body" },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3 }
+        })))
+        .start()
+        .await;
+    let ok_model = openai_model_at_with_wire(&ok.base_url(), WireApi::Completions, true);
+    let outcome = ok_model
+        .complete_tandem("system", &[], &Message::user("hi"), &[], &params)
+        .await;
+    assert_eq!(outcome.status, InferenceRequestStatus::Completed);
+    let response = outcome
+        .response
+        .expect("a successful tandem records its response body");
+    assert!(
+        response.to_string().contains("distinctive tandem answer body"),
+        "the successful tandem response body must be preserved: {response}"
+    );
+}
+
 // --- stream-timeout drain (TTFT / idle / long-streaming) -----------
 //
 // `drain_items` is exercised directly with `futures` fakes: a real

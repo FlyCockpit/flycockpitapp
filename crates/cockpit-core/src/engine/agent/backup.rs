@@ -339,12 +339,16 @@ pub async fn turn_with_backup(
                         .as_ref()
                         .filter(|_| crate::engine::model::failure_engages_backup(&class));
                     if !emit_failure_ui {
+                        // Route the raw provider detail through the omission
+                        // funnel: the user-facing reason is the fixed marker
+                        // (optionally prefixed to the advisory custody block),
+                        // never the provider body.
+                        let safe = crate::engine::model::safe_provider_detail(failure);
                         let detail = match applied_block {
-                            Some(block) if failure.detail.is_empty() => block.user_message(),
                             Some(block) => {
-                                format!("{}\n{}", failure.detail, block.user_message())
+                                format!("{}\n{}", safe.marker, block.user_message())
                             }
-                            None => failure.detail.clone(),
+                            None => safe.marker_string(),
                         };
                         let _ = tx
                             .send(TurnEvent::InferenceFailed {
@@ -561,9 +565,13 @@ pub(super) async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, er
                 "phase_reached": failure.phase,
                 "error_class": failure.class,
                 "elapsed_ms": failure.elapsed_ms,
-                "detail": failure.detail,
+                // Raw provider detail is omitted on the audit channel too; the
+                // funnel's fixed marker stands in for both the `detail` and the
+                // `provider_body_snippet` free-text fields.
+                "detail": crate::engine::model::PROVIDER_DETAIL_OMITTED,
                 "provider_status": diagnostics.provider_status,
                 "provider_body_snippet": diagnostics.provider_body_snippet,
+                "recovery": diagnostics.recovery,
                 "retry_attempts": diagnostics.retry_attempts,
                 "retry_final_decision": diagnostics.retry_final_decision,
                 "classification_rationale": diagnostics.classification_rationale,
@@ -592,7 +600,9 @@ pub(super) async fn record_inference_outcome(ctx: InferenceOutcomeRecord<'_>, er
                 provider: failure.provider.clone(),
                 model: failure.model.clone(),
                 error_class: failure.class.clone(),
-                detail: failure.detail.clone(),
+                // Raw provider detail is omitted; the red inline error shows the
+                // fixed marker (the typed `error_class` carries the real class).
+                detail: crate::engine::model::safe_provider_detail(failure).marker_string(),
                 auth_failure: crate::engine::model::auth_failure_kind(failure),
             })
             .await;
@@ -607,6 +617,9 @@ struct InferenceFailureDiagnostics {
     retry_final_decision: &'static str,
     classification_rationale: &'static str,
     recommended_action: &'static str,
+    /// Typed provider-recovery signal (queryable metadata that survives the
+    /// raw-detail omission).
+    recovery: &'static str,
 }
 
 fn inference_failure_diagnostics(
@@ -617,12 +630,15 @@ fn inference_failure_diagnostics(
     // uses the retained observed status so a billing failure reclassified to
     // `BillingOrQuotaExhausted` still reports its observed 429 (issue #23, B4).
     let class_status = failure.class.provider_status();
-    let observed_status = failure.observed_status.or(class_status);
-    let provider_body_snippet = crate::text::bounded_snippet(&failure.detail, 800);
+    // Route the raw provider body through the omission funnel: the audit
+    // record's diagnostic snippet is the fixed marker, never the provider text.
+    // The observed status class and recovery kind remain queryable.
+    let safe = crate::engine::model::safe_provider_detail(failure);
+    let provider_body_snippet = Some(safe.marker_string());
     let (retry_final_decision, classification_rationale) =
         crate::engine::retry::failure_retry_decision_and_rationale(&failure.class, class_status);
     InferenceFailureDiagnostics {
-        provider_status: observed_status,
+        provider_status: safe.observed_status,
         provider_body_snippet,
         retry_attempts: serde_json::json!({
             "known": true,
@@ -631,6 +647,7 @@ fn inference_failure_diagnostics(
         retry_final_decision,
         classification_rationale,
         recommended_action: suggested_action_for_failure_class(&failure.class),
+        recovery: safe.recovery.as_str(),
     }
 }
 

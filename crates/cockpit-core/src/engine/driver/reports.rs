@@ -27,18 +27,6 @@ pub(super) fn prompt_summary(msg: &Message, max_chars: usize) -> FailedTurnPromp
     }
 }
 
-pub(super) fn redacted_bounded_snippet(
-    detail: &str,
-    redact: &RedactionTable,
-    max_chars: usize,
-) -> Option<String> {
-    let trimmed = detail.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    crate::text::bounded_snippet(&redact.scrub(trimmed), max_chars)
-}
-
 /// Resolve and build the backup-model fallback for `model`, loading the
 /// providers config from the `cwd` config chain
 /// (implementation note). The shared seam every turn-runner

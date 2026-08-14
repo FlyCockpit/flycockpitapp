@@ -112,7 +112,7 @@ pub(super) fn bump_phase(tracker: &std::sync::atomic::AtomicU8, phase: Inference
 /// body at the model boundary (issue #23). Core-internal (never a proto class):
 /// it drives the billing/overload retry + failover POLICY without stuffing the
 /// observed HTTP status into the semantic [`InferenceErrorClass`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 pub enum ProviderRecoverySignal {
     /// No specialized provider-recovery signal in the error body — every
     /// ordinary failure (timeouts, transport, generic HTTP status).
@@ -146,6 +146,89 @@ impl ProviderRecoverySignal {
             1 => Self::Overloaded,
             _ => Self::BillingExhausted,
         }
+    }
+
+    /// Stable string form for the content-safe failure metadata carried on
+    /// events/reports/audit records (the typed recovery signal is queryable
+    /// even though the raw provider detail is omitted).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Overloaded => "overloaded",
+            Self::BillingExhausted => "billing_exhausted",
+        }
+    }
+}
+
+/// The fixed omission marker emitted in place of any raw provider failure
+/// detail. This constant is the SINGLE source of the marker string; no sink may
+/// substitute its own spelling. Security invariant (GOALS §14, wire-vs-user
+/// split): the raw provider text carried in [`InferenceFailure::detail`] must
+/// never cross any channel — turn event, subagent report, failure envelope,
+/// tracing log, or audit record. Every such sink projects the failure through
+/// [`safe_provider_detail`], which returns this marker instead of the body.
+pub const PROVIDER_DETAIL_OMITTED: &str = "provider_detail_omitted";
+
+/// Content-safe projection of a terminal [`InferenceFailure`]'s free-text
+/// detail. Carries the fixed [`PROVIDER_DETAIL_OMITTED`] marker in place of the
+/// raw provider body, plus the TYPED classification metadata that stays
+/// queryable across every sink: the observed HTTP status (issue #23) and the
+/// typed provider-recovery signal. Constructed ONLY by [`safe_provider_detail`]
+/// — the raw detail string is never read into it, so no holder can leak it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct SafeProviderDetail {
+    /// Always [`PROVIDER_DETAIL_OMITTED`]; never raw provider text.
+    pub marker: &'static str,
+    /// Observed HTTP status retained for diagnostics — the status the provider
+    /// returned, not the semantic error class. `None` for pure timeout /
+    /// transport / pre-dispatch failures.
+    pub observed_status: Option<u16>,
+    /// Typed provider-recovery signal parsed from the (now-omitted) error body.
+    pub recovery: ProviderRecoverySignal,
+}
+
+impl SafeProviderDetail {
+    /// The omission marker as an owned `String`, for the `detail: String`
+    /// free-text sinks (turn events, failure envelopes, rendered reports).
+    pub fn marker_string(&self) -> String {
+        self.marker.to_string()
+    }
+}
+
+/// THE single funnel every failure-detail sink routes through. Drops the raw
+/// `failure.detail` provider text — it is never read into the return value —
+/// and returns the fixed omission marker plus the typed classification metadata
+/// (observed status class + recovery kind). Because the raw text never leaves
+/// this function, no caller can leak it onto any channel.
+pub fn safe_provider_detail(failure: &InferenceFailure) -> SafeProviderDetail {
+    SafeProviderDetail {
+        marker: PROVIDER_DETAIL_OMITTED,
+        observed_status: failure
+            .observed_status
+            .or_else(|| failure.class.provider_status()),
+        recovery: failure.recovery,
+    }
+}
+
+/// The same omission funnel for a terminal failure path that holds a raw
+/// [`rig::completion::CompletionError`] rather than an already-built
+/// [`InferenceFailure`] — e.g. the single-shot tandem / second-opinion path.
+/// Classifies the error through the SINGLE model-boundary classifier
+/// ([`super::rig_boundary::classify_terminal_failure`]) to recover the typed
+/// `(class, observed_status, recovery)`, then returns the fixed omission marker
+/// plus that metadata. The raw error text (`err.to_string()`, an
+/// attacker-controllable provider body) is NEVER read into the result, so no
+/// caller can persist or emit it.
+pub fn safe_completion_error_detail(
+    err: &rig::completion::CompletionError,
+) -> SafeProviderDetail {
+    let classified = super::rig_boundary::classify_terminal_failure(err);
+    SafeProviderDetail {
+        marker: PROVIDER_DETAIL_OMITTED,
+        observed_status: classified
+            .observed_status
+            .or_else(|| classified.class.provider_status()),
+        recovery: classified.recovery,
     }
 }
 

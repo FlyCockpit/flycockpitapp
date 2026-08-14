@@ -106,8 +106,9 @@ pub use dispatch::TandemOutcome;
 #[allow(unused_imports)]
 pub use failure::{
     InferenceCancelled, InferenceErrorClass, InferenceFailure, InferenceGated, InferencePhase,
-    InferenceTiming, ProviderRecoverySignal, as_inference_failure, auth_failure_kind,
-    cancellation_phase, failure_engages_backup, is_cancelled, is_gated,
+    InferenceTiming, PROVIDER_DETAIL_OMITTED, ProviderRecoverySignal, SafeProviderDetail,
+    as_inference_failure, auth_failure_kind, cancellation_phase, failure_engages_backup,
+    is_cancelled, is_gated, safe_completion_error_detail, safe_provider_detail,
 };
 #[allow(unused_imports)]
 pub use http_client::UsageAliasHttpClient;

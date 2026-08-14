@@ -176,7 +176,9 @@ fn failed_report_renders_compact_deterministic_prose() {
             outcome: "failed",
         }],
         suggested_action: "retry_or_choose_another_model".to_string(),
-        detail: "no first token".to_string(),
+        detail: crate::engine::model::PROVIDER_DETAIL_OMITTED.to_string(),
+        observed_status: None,
+        recovery: crate::engine::model::ProviderRecoverySignal::None,
     };
     let progress = DelegationPartialProgress::default();
     let first = render_failed_subagent_failure(&envelope, &progress);

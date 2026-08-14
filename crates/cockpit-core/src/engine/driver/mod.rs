@@ -4336,14 +4336,17 @@ impl Driver {
         // reclassified to `BillingOrQuotaExhausted` still reports its observed 429
         // (issue #23, B4).
         let class_status = failure.class.provider_status();
-        let provider_status = failure.observed_status.or(class_status);
+        // Route the raw provider body through the omission funnel: the recovery
+        // record carries the fixed marker plus the queryable observed-status and
+        // recovery metadata, never the provider text.
+        let safe = crate::engine::model::safe_provider_detail(failure);
+        let provider_status = safe.observed_status;
         let (retry_final_decision, classification_rationale) =
             crate::engine::retry::failure_retry_decision_and_rationale(
                 &failure.class,
                 class_status,
             );
-        let provider_body_snippet =
-            redacted_bounded_snippet(&failure.detail, self.redact.as_ref(), 800);
+        let provider_body_snippet = safe.marker_string();
         let recovery_id = call_id.to_string();
         let data = serde_json::json!({
             "kind": "terminal_inference_failure",
@@ -4360,6 +4363,7 @@ impl Driver {
             "elapsed_ms": failure.elapsed_ms,
             "provider_status": provider_status,
             "provider_body_snippet": provider_body_snippet,
+            "recovery": safe.recovery.as_str(),
             "retry_attempts": {
                 "known": false,
                 "reason": "retry layer currently reports only terminal outcome"

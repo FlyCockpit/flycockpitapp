@@ -89,15 +89,30 @@ pub(in crate::engine::driver) struct SubagentFailureEnvelope {
     pub(in crate::engine::driver) elapsed_ms: u64,
     pub(in crate::engine::driver) fallback_tried: Vec<crate::engine::agent::FailoverAttempt>,
     pub(in crate::engine::driver) suggested_action: String,
+    /// Content-safe stand-in for the provider failure body. Always the fixed
+    /// `provider_detail_omitted` marker (via [`crate::engine::model::safe_provider_detail`]);
+    /// the raw provider text never enters this envelope, so it cannot leak
+    /// through the serialized `subagent_report` event or the rendered report.
     pub(in crate::engine::driver) detail: String,
+    /// Observed HTTP status class retained for diagnostics (queryable metadata
+    /// that survives the raw-detail omission). `None` for pure timeout /
+    /// transport failures.
+    pub(in crate::engine::driver) observed_status: Option<u16>,
+    /// Typed provider-recovery signal (queryable metadata that survives the
+    /// raw-detail omission).
+    pub(in crate::engine::driver) recovery: crate::engine::model::ProviderRecoverySignal,
 }
 
 impl SubagentFailureEnvelope {
-    fn from_error(
+    pub(in crate::engine::driver) fn from_error(
         source: &anyhow::Error,
         fallback_tried: Vec<crate::engine::agent::FailoverAttempt>,
     ) -> Option<Self> {
         let failure = crate::engine::model::as_inference_failure(source)?;
+        // Route the raw provider detail through the omission funnel: the
+        // envelope carries the fixed marker plus the typed classification
+        // metadata, never the provider body.
+        let safe = crate::engine::model::safe_provider_detail(failure);
         Some(Self {
             provider: failure.provider.clone(),
             model: failure.model.clone(),
@@ -108,7 +123,9 @@ impl SubagentFailureEnvelope {
                 &failure.class,
             )
             .to_string(),
-            detail: failure.detail.clone(),
+            detail: safe.marker_string(),
+            observed_status: safe.observed_status,
+            recovery: safe.recovery,
         })
     }
 }

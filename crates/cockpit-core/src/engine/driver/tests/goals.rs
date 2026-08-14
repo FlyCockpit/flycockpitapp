@@ -740,3 +740,188 @@ async fn failed_turn_continue_reuses_and_consumes_recovery_record() {
         "retry_started should prevent stale repeated continue"
     );
 }
+
+/// Behavior 9 goal-pause exclusion: a `BillingOrQuotaExhausted` failure — even
+/// when observed as HTTP 429, the same status a genuine provider rate-limit
+/// carries — must NOT usage-limit-pause an active goal. Topping up / switching
+/// provider is the fix, not waiting out a window. The decision keys on the
+/// error CLASS enum, never on the `observed_status` string: this failure sets
+/// `observed_status: Some(429)`, so if the pause keyed on the status it WOULD
+/// pause here (as `goal_usage_limit_failure_pauses_goal_and_arms_backoff`
+/// proves for a real 429), making this assertion non-vacuous.
+#[tokio::test]
+async fn billing_quota_does_not_pause_active_goal() {
+    let (mut driver, _tmp) = test_driver(1);
+    driver
+        .session
+        .db
+        .create_session_goal(
+            driver.session.id,
+            &driver.session.project_id,
+            "keep shipping through a billing failure",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+    let failure = crate::engine::model::InferenceFailure {
+        provider: "test-provider".to_string(),
+        model: "test-model".to_string(),
+        phase: "dispatch".to_string(),
+        // Billing class, but OBSERVED as 429 (the rate-limit status). The
+        // exclusion must key on the class, not the observed status.
+        class: crate::engine::model::InferenceErrorClass::BillingOrQuotaExhausted,
+        elapsed_ms: 12,
+        retry_attempts: 0,
+        detail: "insufficient account balance".to_string(),
+        observed_status: Some(429),
+        recovery: crate::engine::model::ProviderRecoverySignal::BillingExhausted,
+    };
+
+    // Not a usage limit → the handler declines to pause.
+    assert!(!driver.handle_goal_usage_limit_failure(&failure, &tx).await);
+
+    // The goal stays Running (never InfraPaused) and no auto-resume backoff arms.
+    let goal = driver
+        .session
+        .db
+        .current_session_goal(driver.session.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        goal.disposition,
+        crate::db::session_goals::GoalDisposition::Running,
+        "billing failure must not usage-limit-pause the active goal"
+    );
+    let mut watchdog = None;
+    driver.refresh_goal_watchdog(&mut watchdog).await;
+    assert!(
+        watchdog.is_none(),
+        "a non-usage-limit failure must not arm the usage-limit backoff"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "no usage-limit notice should be emitted for a billing failure"
+    );
+
+    // And the class-based decision is confirmed directly at the seam.
+    assert!(
+        !crate::engine::retry::is_usage_limit_failure(&failure.class, failure.observed_status),
+        "BillingOrQuotaExhausted is excluded from the usage-limit class even with observed 429"
+    );
+}
+
+/// Behavior 9 fail-closed omission: EVERY failure-detail sink routes the raw
+/// provider text through the single `safe_provider_detail` funnel, so the fixed
+/// `provider_detail_omitted` marker crosses each channel instead of the body —
+/// while the typed classification metadata (observed status class, recovery
+/// kind) stays queryable. Non-vacuous: the failure carries a distinctive secret
+/// detail string, and each sink is asserted to omit it; a sink that leaked
+/// `failure.detail` would fail the corresponding `!contains(SECRET)` check.
+#[tokio::test]
+async fn inference_failure_projection_omits_provider_detail_from_all_safe_sinks() {
+    // A sentinel that only appears if a sink leaked the raw provider body.
+    const SECRET: &str = "RAW_PROVIDER_BODY_MUST_NEVER_LEAK_9f3a";
+
+    let make_failure = || crate::engine::model::InferenceFailure {
+        provider: "acme".to_string(),
+        model: "acme-large".to_string(),
+        phase: "first_token".to_string(),
+        class: crate::engine::model::InferenceErrorClass::BillingOrQuotaExhausted,
+        elapsed_ms: 4_200,
+        retry_attempts: 1,
+        detail: format!("HTTP 429 from acme: {SECRET}"),
+        observed_status: Some(429),
+        recovery: crate::engine::model::ProviderRecoverySignal::BillingExhausted,
+    };
+
+    // Sink 0 — the funnel itself: fixed marker, no raw text, metadata retained.
+    let failure = make_failure();
+    let safe = crate::engine::model::safe_provider_detail(&failure);
+    assert_eq!(safe.marker, crate::engine::model::PROVIDER_DETAIL_OMITTED);
+    assert_eq!(safe.observed_status, Some(429));
+    assert_eq!(
+        safe.recovery,
+        crate::engine::model::ProviderRecoverySignal::BillingExhausted
+    );
+    let safe_json = serde_json::to_string(&safe).unwrap();
+    assert!(!safe_json.contains(SECRET), "funnel leaked raw detail: {safe_json}");
+
+    // Sinks 1-3 — the subagent failure envelope + its serialized
+    // `subagent_report` event + the rendered failure report. All flow from the
+    // one `from_error` construction that routes through the funnel.
+    let err = anyhow::Error::new(make_failure());
+    let envelope = SubagentFailureEnvelope::from_error(&err, Vec::new())
+        .expect("an inference failure yields a subagent failure envelope");
+    assert_eq!(envelope.detail, crate::engine::model::PROVIDER_DETAIL_OMITTED);
+    assert!(!envelope.detail.contains(SECRET));
+    // Typed metadata stays queryable on the envelope.
+    assert_eq!(envelope.observed_status, Some(429));
+    assert_eq!(
+        envelope.recovery,
+        crate::engine::model::ProviderRecoverySignal::BillingExhausted
+    );
+    // The serialized event (what `subagent_report` persists/emits) omits the
+    // secret but keeps the metadata.
+    let envelope_json = serde_json::to_value(&envelope).unwrap();
+    let envelope_json_str = envelope_json.to_string();
+    assert!(
+        !envelope_json_str.contains(SECRET),
+        "serialized subagent_report leaked raw detail: {envelope_json_str}"
+    );
+    assert_eq!(envelope_json["observed_status"], serde_json::json!(429));
+    assert_eq!(envelope_json["recovery"], serde_json::json!("BillingExhausted"));
+    // The rendered report handed to the parent model omits the secret too.
+    let report =
+        render_failed_subagent_failure(&envelope, &DelegationPartialProgress::default());
+    assert!(!report.contains(SECRET), "rendered subagent report leaked raw detail: {report}");
+
+    // Sink 4 — the driver's failed-turn recovery record. The recorded event's
+    // JSON must not carry the secret, while the observed-status + recovery
+    // metadata remain queryable.
+    let (mut driver, _tmp) = test_driver(1);
+    driver
+        .session
+        .db
+        .create_session_goal(
+            driver.session.id,
+            &driver.session.project_id,
+            "record the recovery without leaking detail",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let agent = driver.stack[0].agent.clone();
+    let attempted = Message::user("continue the failed turn");
+    let call_id = uuid::Uuid::new_v4();
+    let recovery_failure = make_failure();
+    let (tx, _rx) = mpsc::channel::<TurnEvent>(8);
+    driver
+        .record_failed_turn_recovery(&agent, &attempted, call_id, &recovery_failure, &tx)
+        .await;
+    let events = driver
+        .session
+        .db
+        .list_session_events(driver.session.id)
+        .await
+        .unwrap();
+    let recovery = events
+        .iter()
+        .find(|event| event.kind == "failed_turn_recovery")
+        .expect("failed_turn_recovery event recorded");
+    let recovery_str = recovery.data.to_string();
+    assert!(
+        !recovery_str.contains(SECRET),
+        "failed_turn_recovery leaked raw detail: {recovery_str}"
+    );
+    assert_eq!(
+        recovery.data["provider_body_snippet"],
+        serde_json::json!(crate::engine::model::PROVIDER_DETAIL_OMITTED)
+    );
+    // Typed metadata stays queryable on the recovery record.
+    assert_eq!(recovery.data["provider_status"], serde_json::json!(429));
+    assert_eq!(recovery.data["recovery"], serde_json::json!("billing_exhausted"));
+}

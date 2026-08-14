@@ -138,6 +138,17 @@ pub(crate) fn is_usage_limit_failure(
     class: &InferenceErrorClass,
     provider_status: Option<u16>,
 ) -> bool {
+    // Billing / account-quota exhaustion is NOT a transient provider usage
+    // limit even though it is frequently observed as HTTP 429: waiting out a
+    // window cannot restore balance/quota, so the goal must NOT be
+    // usage-limit-paused (topping up or switching provider is the fix, handled
+    // by the backup layer). The decision keys on the error CLASS enum, never on
+    // the observed_status string — this exclusion is checked FIRST so a
+    // preserved 429 `observed_status` cannot mis-route a billing failure onto
+    // the usage-limit goal-pause path.
+    if matches!(class, InferenceErrorClass::BillingOrQuotaExhausted) {
+        return false;
+    }
     provider_status == Some(429)
         || matches!(
             class,

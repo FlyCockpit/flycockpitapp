@@ -1562,7 +1562,9 @@ impl Model {
             }
             Ok(Err(e)) => TandemOutcome {
                 request,
-                response: Some(tandem_failure_response("error", e.to_string())),
+                // Omit the raw provider error text: route it through the funnel
+                // so only the fixed marker + typed metadata is persisted.
+                response: Some(tandem_provider_error_response(&e)),
                 usage: None,
                 status: InferenceRequestStatus::Errored,
             },
@@ -1845,6 +1847,28 @@ pub(super) fn tandem_failure_response(
         "error": {
             "kind": kind.into(),
             "detail": detail.into(),
+        }
+    })
+}
+
+/// Content-safe tandem failure response for a raw provider
+/// [`rig::completion::CompletionError`]. The attacker-controllable
+/// `err.to_string()` provider body is OMITTED — routed through the same funnel
+/// as every other provider-failure sink — so it never lands in the persisted
+/// tandem session record (`schedule/tandem.rs` writes `outcome.response`
+/// verbatim, and export redaction does not cover provider error text). The
+/// stored `detail` is the fixed `provider_detail_omitted` marker; the typed
+/// observed-status class and recovery kind remain queryable.
+pub(super) fn tandem_provider_error_response(
+    err: &rig::completion::CompletionError,
+) -> serde_json::Value {
+    let safe = crate::engine::model::safe_completion_error_detail(err);
+    serde_json::json!({
+        "error": {
+            "kind": "error",
+            "detail": safe.marker,
+            "observed_status": safe.observed_status,
+            "recovery": safe.recovery.as_str(),
         }
     })
 }

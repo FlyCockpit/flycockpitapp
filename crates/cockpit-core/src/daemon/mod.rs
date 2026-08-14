@@ -47,6 +47,7 @@ pub mod relay_envelope;
 pub mod remote_attempt;
 pub mod remote_audit_upload;
 pub(crate) mod remote_outbox_worker;
+pub mod remote_project_resolver;
 pub mod scheduler;
 pub mod server;
 pub mod session_continuity;

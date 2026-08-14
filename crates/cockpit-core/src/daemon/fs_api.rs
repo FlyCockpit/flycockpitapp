@@ -856,9 +856,7 @@ mod tests {
     #![allow(deprecated)]
 
     use super::*;
-    use crate::daemon::principal::{
-        ClientPrincipal, PrincipalGrant, PrincipalScope, RemotePrincipal,
-    };
+    use crate::daemon::principal::{ClientPrincipal, PrincipalGrant, PrincipalScope};
 
     fn test_ctx(root: &Path) -> crate::daemon::server::DaemonContext {
         let db = crate::db::Db::open_in_memory().expect("in-memory db");
@@ -891,14 +889,14 @@ mod tests {
     }
 
     fn remote_project_files(root: &Path) -> ClientPrincipal {
-        ClientPrincipal::Remote(RemotePrincipal {
-            user_id: "user-1".into(),
-            actor_binding: None,
-            grants: vec![PrincipalGrant {
+        ClientPrincipal::from_verified_remote(
+            "user-1".into(),
+            vec![PrincipalGrant {
                 scope: PrincipalScope::ProjectFiles,
                 project_root: Some(root.to_string_lossy().into_owned()),
             }],
-        })
+            None,
+        )
     }
 
     #[test]

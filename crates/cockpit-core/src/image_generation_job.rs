@@ -6207,21 +6207,21 @@ mod tests {
 
     #[test]
     fn owner_recovery_authority_rejects_every_remote_write_mode() {
-        use crate::daemon::principal::{PrincipalGrant, PrincipalScope, RemotePrincipal};
+        use crate::daemon::principal::{PrincipalGrant, PrincipalScope};
         for scope in [
             PrincipalScope::Agent,
             PrincipalScope::AgentReadonly,
             PrincipalScope::ProjectFiles,
             PrincipalScope::Terminal,
         ] {
-            let remote = ClientPrincipal::Remote(RemotePrincipal {
-                user_id: format!("remote-{scope:?}"),
-                grants: vec![PrincipalGrant {
+            let remote = ClientPrincipal::from_verified_remote(
+                format!("remote-{scope:?}"),
+                vec![PrincipalGrant {
                     scope,
                     project_root: Some("/project".into()),
                 }],
-                actor_binding: None,
-            });
+                None,
+            );
             assert!(DaemonLocalOwnerRecoveryAuthority::from_local_direct(&remote).is_err());
         }
         assert!(

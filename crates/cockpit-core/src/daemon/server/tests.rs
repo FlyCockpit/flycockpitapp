@@ -797,10 +797,12 @@ fn remote_principal() -> ClientPrincipal {
     ClientPrincipal::Remote(principal::RemotePrincipal {
         user_id: "remote-user".to_string(),
         actor_binding: None,
-        grants: vec![principal::PrincipalGrant {
-            scope: principal::PrincipalScope::AgentReadonly,
-            project_root: None,
-        }],
+        authorization: principal::RemoteAuthorization::LegacyRelayScopes(vec![
+            principal::PrincipalGrant {
+                scope: principal::PrincipalScope::AgentReadonly,
+                project_root: None,
+            },
+        ]),
     })
 }
 
@@ -821,7 +823,7 @@ fn remote_operation_gate_is_pre_dispatch_and_preserves_correlation() {
     let principal = |actor_binding| {
         ClientPrincipal::Remote(principal::RemotePrincipal {
             user_id: "remote-user".into(),
-            grants: Vec::new(),
+            authorization: principal::RemoteAuthorization::LegacyRelayScopes(Vec::new()),
             actor_binding,
         })
     };
@@ -1211,7 +1213,7 @@ async fn remote_operation_gate_controls_real_executor_paths_before_spawn() {
     let remote = |actor_binding| {
         ClientPrincipal::Remote(principal::RemotePrincipal {
             user_id: "remote-user".into(),
-            grants: Vec::new(),
+            authorization: principal::RemoteAuthorization::LegacyRelayScopes(Vec::new()),
             actor_binding,
         })
     };
@@ -1435,16 +1437,18 @@ async fn remote_queue_envelope_stamps_server_operation_context_into_worker() {
     let logical_attachment_id = Uuid::parse_str("22222222-2222-4222-8222-222222222225").unwrap();
     state.principal = ClientPrincipal::Remote(principal::RemotePrincipal {
         user_id: "queue-writer".into(),
-        grants: vec![principal::PrincipalGrant {
-            scope: principal::PrincipalScope::Agent,
-            project_root: Some(
-                root.path()
-                    .canonicalize()
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
-        }],
+        authorization: principal::RemoteAuthorization::LegacyRelayScopes(vec![
+            principal::PrincipalGrant {
+                scope: principal::PrincipalScope::Agent,
+                project_root: Some(
+                    root.path()
+                        .canonicalize()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            },
+        ]),
         actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
             schema_version: 1,
             device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333336").unwrap(),
@@ -1533,16 +1537,18 @@ async fn remote_cancel_turn_dispatches_once_then_replays_or_conflicts() {
     let logical_attachment_id = Uuid::parse_str("22222222-2222-4222-8222-222222222226").unwrap();
     state.principal = ClientPrincipal::Remote(principal::RemotePrincipal {
         user_id: "cancel-writer".into(),
-        grants: vec![principal::PrincipalGrant {
-            scope: principal::PrincipalScope::Agent,
-            project_root: Some(
-                root.path()
-                    .canonicalize()
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
-        }],
+        authorization: principal::RemoteAuthorization::LegacyRelayScopes(vec![
+            principal::PrincipalGrant {
+                scope: principal::PrincipalScope::Agent,
+                project_root: Some(
+                    root.path()
+                        .canonicalize()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            },
+        ]),
         actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
             schema_version: 1,
             device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333337").unwrap(),
@@ -1690,16 +1696,18 @@ async fn remote_cancel_turn_dispatches_once_then_replays_or_conflicts() {
     );
     state.principal = ClientPrincipal::Remote(principal::RemotePrincipal {
         user_id: "cancel-writer".into(),
-        grants: vec![principal::PrincipalGrant {
-            scope: principal::PrincipalScope::Agent,
-            project_root: Some(
-                root.path()
-                    .canonicalize()
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
-        }],
+        authorization: principal::RemoteAuthorization::LegacyRelayScopes(vec![
+            principal::PrincipalGrant {
+                scope: principal::PrincipalScope::Agent,
+                project_root: Some(
+                    root.path()
+                        .canonicalize()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            },
+        ]),
         actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
             schema_version: 1,
             device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333338").unwrap(),
@@ -1737,16 +1745,18 @@ async fn remote_session_note_applies_replays_and_conflicts_before_second_event()
     let logical_attachment_id = Uuid::parse_str("22222222-2222-4222-8222-222222222223").unwrap();
     state.principal = ClientPrincipal::Remote(principal::RemotePrincipal {
         user_id: "remote-writer".into(),
-        grants: vec![principal::PrincipalGrant {
-            scope: principal::PrincipalScope::Agent,
-            project_root: Some(
-                root.path()
-                    .canonicalize()
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
-        }],
+        authorization: principal::RemoteAuthorization::LegacyRelayScopes(vec![
+            principal::PrincipalGrant {
+                scope: principal::PrincipalScope::Agent,
+                project_root: Some(
+                    root.path()
+                        .canonicalize()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            },
+        ]),
         actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
             schema_version: 1,
             device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333334").unwrap(),
@@ -2214,10 +2224,12 @@ async fn remote_clear_goal_applies_replays_and_conflicts_before_other_goal() {
     let logical_attachment_id = Uuid::parse_str("22222222-2222-4222-8222-222222222224").unwrap();
     let principal = ClientPrincipal::Remote(principal::RemotePrincipal {
         user_id: "goal-writer".into(),
-        grants: vec![principal::PrincipalGrant {
-            scope: principal::PrincipalScope::Agent,
-            project_root: Some(root_text),
-        }],
+        authorization: principal::RemoteAuthorization::LegacyRelayScopes(vec![
+            principal::PrincipalGrant {
+                scope: principal::PrincipalScope::Agent,
+                project_root: Some(root_text),
+            },
+        ]),
         actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
             schema_version: 1,
             device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333335").unwrap(),
@@ -2901,10 +2913,12 @@ async fn remote_scheduler_mutation_is_local_only_before_ledger_or_domain_write()
     let operation_id = Uuid::parse_str("018f3f24-7a10-7cc2-8f55-dddddddddddd").unwrap();
     let principal = ClientPrincipal::Remote(principal::RemotePrincipal {
         user_id: "scheduler-remote".into(),
-        grants: vec![principal::PrincipalGrant {
-            scope: principal::PrincipalScope::Agent,
-            project_root: None,
-        }],
+        authorization: principal::RemoteAuthorization::LegacyRelayScopes(vec![
+            principal::PrincipalGrant {
+                scope: principal::PrincipalScope::Agent,
+                project_root: None,
+            },
+        ]),
         actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
             schema_version: 1,
             device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333336").unwrap(),
@@ -2972,10 +2986,12 @@ async fn remote_cancel_invocation_applies_replays_and_conflicts_once() {
     let logical_attachment_id = Uuid::parse_str("22222222-2222-4222-8222-222222222229").unwrap();
     let principal = ClientPrincipal::Remote(principal::RemotePrincipal {
         user_id: "invocation-writer".into(),
-        grants: vec![principal::PrincipalGrant {
-            scope: principal::PrincipalScope::Agent,
-            project_root: None,
-        }],
+        authorization: principal::RemoteAuthorization::LegacyRelayScopes(vec![
+            principal::PrincipalGrant {
+                scope: principal::PrincipalScope::Agent,
+                project_root: None,
+            },
+        ]),
         actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
             schema_version: 1,
             device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333339").unwrap(),
@@ -3169,7 +3185,7 @@ async fn remote_outbox_replay_is_actor_bound_ordered_and_token_correlated() {
     let principal_for = |device: &str| {
         ClientPrincipal::Remote(principal::RemotePrincipal {
             user_id: "replay-user".into(),
-            grants: vec![],
+            authorization: principal::RemoteAuthorization::LegacyRelayScopes(vec![]),
             actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
                 schema_version: 1,
                 device_id: Uuid::parse_str(device).unwrap(),
@@ -3972,10 +3988,12 @@ async fn remote_session_writer_cannot_persist_active_model_as_default() {
     state.principal = ClientPrincipal::Remote(crate::daemon::principal::RemotePrincipal {
         user_id: "writer".into(),
         actor_binding: None,
-        grants: vec![crate::daemon::principal::PrincipalGrant {
-            scope: crate::daemon::principal::PrincipalScope::Agent,
-            project_root: Some(tmp.path().to_string_lossy().into_owned()),
-        }],
+        authorization: crate::daemon::principal::RemoteAuthorization::LegacyRelayScopes(vec![
+            crate::daemon::principal::PrincipalGrant {
+                scope: crate::daemon::principal::PrincipalScope::Agent,
+                project_root: Some(tmp.path().to_string_lossy().into_owned()),
+            },
+        ]),
     });
     let request = |persist_as_default| Request::SetActiveModel {
         selection_id: Uuid::new_v4(),
@@ -4933,10 +4951,12 @@ async fn readonly_attach_environment_is_ignored_for_live_and_cold_workers() {
         let principal = ClientPrincipal::Remote(principal::RemotePrincipal {
             user_id: "readonly-env-test".to_string(),
             actor_binding: None,
-            grants: vec![principal::PrincipalGrant {
-                scope: principal::PrincipalScope::AgentReadonly,
-                project_root: Some(tmp.path().to_string_lossy().into_owned()),
-            }],
+            authorization: principal::RemoteAuthorization::LegacyRelayScopes(vec![
+                principal::PrincipalGrant {
+                    scope: principal::PrincipalScope::AgentReadonly,
+                    project_root: Some(tmp.path().to_string_lossy().into_owned()),
+                },
+            ]),
         });
 
         let response =
@@ -6076,7 +6096,7 @@ fn remote_state_with_grants(
         principal: ClientPrincipal::Remote(crate::daemon::principal::RemotePrincipal {
             user_id: "user-1".into(),
             actor_binding: None,
-            grants,
+            authorization: crate::daemon::principal::RemoteAuthorization::LegacyRelayScopes(grants),
         }),
         terminal_context: crate::daemon::terminal::AuthenticatedTerminalContext {
             principal_id: "flycockpit:user-1".into(),
@@ -9485,21 +9505,23 @@ fn authz_matrix_principal(level: AuthzLevel, project_root: &Path, kind: &str) ->
             ClientPrincipal::Remote(principal::RemotePrincipal {
                 user_id: "authz-writer".into(),
                 actor_binding: None,
-                grants,
+                authorization: principal::RemoteAuthorization::LegacyRelayScopes(grants),
             })
         }
         AuthzLevel::Readonly => ClientPrincipal::Remote(principal::RemotePrincipal {
             user_id: "authz-readonly".into(),
             actor_binding: None,
-            grants: vec![principal::PrincipalGrant {
-                scope: principal::PrincipalScope::AgentReadonly,
-                project_root: Some(project_root),
-            }],
+            authorization: principal::RemoteAuthorization::LegacyRelayScopes(vec![
+                principal::PrincipalGrant {
+                    scope: principal::PrincipalScope::AgentReadonly,
+                    project_root: Some(project_root),
+                },
+            ]),
         }),
         AuthzLevel::NoAccess => ClientPrincipal::Remote(principal::RemotePrincipal {
             user_id: "authz-none".into(),
             actor_binding: None,
-            grants: Vec::new(),
+            authorization: principal::RemoteAuthorization::LegacyRelayScopes(Vec::new()),
         }),
     }
 }
@@ -10454,7 +10476,7 @@ impl ReadonlyDispatchCaseKind {
                 // no row for a never-recorded operation).
                 let principal = ClientPrincipal::Remote(principal::RemotePrincipal {
                     user_id: "operation-status-reader".into(),
-                    grants: Vec::new(),
+                    authorization: principal::RemoteAuthorization::LegacyRelayScopes(Vec::new()),
                     actor_binding: Some(crate::daemon::relay_envelope::ClientActorBindingV1 {
                         schema_version: 1,
                         device_id: Uuid::now_v7(),

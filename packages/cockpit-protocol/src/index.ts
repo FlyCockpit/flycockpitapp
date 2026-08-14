@@ -194,8 +194,13 @@ export function generateRemoteOperationUuidV7(
       `UUIDv7 timestamp must be an integer in [0, ${MAX_UUID_V7_UNIX_MS}], got ${nowMs}`,
     );
   }
-  const attempts = Math.max(1, maxAttempts);
-  for (let attempt = 0; attempt < attempts; attempt++) {
+  // Bound the collision retry so the cap is genuinely fail-closed: a non-finite
+  // `maxAttempts` (e.g. Infinity) with an always-colliding `seen` would otherwise
+  // loop forever instead of throwing.
+  if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
+    throw new RangeError(`UUIDv7 maxAttempts must be a positive integer, got ${maxAttempts}`);
+  }
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const bytes = new Uint8Array(16);
     getRandomValues(bytes);
     // 48-bit big-endian Unix millisecond timestamp. Division avoids the 32-bit

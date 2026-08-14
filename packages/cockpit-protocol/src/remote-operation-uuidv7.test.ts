@@ -102,6 +102,19 @@ describe("generateRemoteOperationUuidV7", () => {
     ).toThrow(/collision-free/);
   });
 
+  it("rejects a non-finite / non-integer maxAttempts so the cap stays bounded", () => {
+    for (const bad of [Number.POSITIVE_INFINITY, 0, -1, 2.5, Number.NaN]) {
+      expect(() =>
+        generateRemoteOperationUuidV7({
+          nowMs: 1704067200000,
+          getRandomValues: fixedRandom("0123456789abcdeffedcba9876543210"),
+          seen: { has: () => true },
+          maxAttempts: bad,
+        }),
+      ).toThrow(/maxAttempts must be a positive integer/);
+    }
+  });
+
   it("produces schema-valid identities from a live clock and CSPRNG", () => {
     const id = generateRemoteOperationUuidV7({
       nowMs: Date.now(),

@@ -840,7 +840,13 @@ fn open_log_file() -> Option<RotatingLog> {
     open_log_file_at(dirs::cache_dir()?.join("cockpit"))
 }
 fn open_log_file_at(dir: PathBuf) -> Option<RotatingLog> {
-    cockpit_core::private_fs::ensure_private_dir(&dir).ok()?;
+    // Logging stays non-fatal: an insecure cache directory disables logging
+    // rather than aborting the CLI, but the typed error is logged, not
+    // silently discarded.
+    if let Err(error) = cockpit_core::private_fs::ensure_private_dir(&dir) {
+        tracing::warn!(%error, dir = %dir.display(), "log directory could not be secured; logging disabled");
+        return None;
+    }
     let path = dir.join("cockpit.log");
     let file = open_private_append(&path).ok()?;
     let len = file.metadata().ok()?.len();

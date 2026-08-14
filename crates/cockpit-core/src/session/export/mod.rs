@@ -443,8 +443,8 @@ pub async fn write_bundle_zip(
     if let Some(parent) = out_path.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating export directory `{}`", parent.display()))?;
+        crate::private_fs::ensure_output_parent_private(parent)
+            .with_context(|| format!("securing export directory `{}`", parent.display()))?;
     }
     crate::private_fs::write_private_file(out_path, &bundle.bytes)
         .with_context(|| format!("writing private export to `{}`", out_path.display()))?;
@@ -484,8 +484,8 @@ pub fn write_bundle_zip_blocking_for_sync_cli(
     if let Some(parent) = out_path.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating export directory `{}`", parent.display()))?;
+        crate::private_fs::ensure_output_parent_private(parent)
+            .with_context(|| format!("securing export directory `{}`", parent.display()))?;
     }
     crate::private_fs::write_private_file(out_path, &bundle.bytes)
         .with_context(|| format!("writing private export to `{}`", out_path.display()))?;

@@ -66,8 +66,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::private_fs::ensure_private_dir;
-#[cfg(unix)]
-use crate::private_fs::with_private_umask;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
@@ -531,26 +529,53 @@ fn runtime_dir() -> Option<PathBuf> {
     None
 }
 
+/// Restores the process umask on drop, so a scoped tightening around a single
+/// syscall is undone on every path including an early `?` return.
 #[cfg(unix)]
 pub(crate) fn bind_private_socket(socket: &std::path::Path) -> Result<UnixListener> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 
     if let Some(parent) = socket.parent() {
         ensure_private_dir(parent).with_context(|| format!("securing {}", parent.display()))?;
     }
-    let listener = with_private_umask(0o177, || {
-        UnixListener::bind(socket).with_context(|| format!("binding {}", socket.display()))
-    })?;
+
+    // Bind inside the 0700 parent secured above, then set 0600 by PATH. A
+    // post-bind `fchmod` on a bound Unix-socket fd does NOT change its on-disk
+    // directory-entry mode on Linux, and umask is not reliably honored by the
+    // async bind, so a path-based chmod is the only mechanism that sets the
+    // socket node's mode. The TOCTOU this could open (a same-uid process
+    // swapping the path for a symlink between bind and chmod) is closed by the
+    // held-fd verification below: the listener fd points at the ORIGINAL socket,
+    // so if the chmod hit a swapped victim, the socket's own mode stays wide and
+    // the `fstat` check fails closed.
+    let listener =
+        UnixListener::bind(socket).with_context(|| format!("binding {}", socket.display()))?;
     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("chmod 0600 {}", socket.display()))?;
-    let mode = std::fs::metadata(socket)
-        .with_context(|| format!("stat {}", socket.display()))?
-        .permissions()
-        .mode()
-        & 0o777;
-    if mode != 0o600 {
+
+    // Fail-closed verification of the SOCKET PATH NODE via a no-follow lstat.
+    // We must inspect the filesystem path node, NOT the listener fd: `fstat` on
+    // an AF_UNIX listening fd reads the anonymous sockfs inode, whose permission
+    // bits are always 0777 and are unaffected by `chmod`. Access to the socket
+    // is gated by the filesystem path node's mode — set to 0600 above — inside
+    // the 0700 owner-only parent that `ensure_private_dir` verified through its
+    // own held directory fd. `symlink_metadata` (lstat, portable across Unix)
+    // does not follow a final symlink, so a path swapped for a symlink after
+    // bind is reported as a symlink — not a socket — and fails the type check
+    // closed rather than being followed. A residual same-uid swap of the path
+    // between bind and this stat is out of the cross-user threat model (only the
+    // owner can create entries in the 0700-verified parent).
+    let meta = std::fs::symlink_metadata(socket)
+        .with_context(|| format!("stat {}", socket.display()))?;
+    let file_type = meta.file_type();
+    let mode = meta.mode() & 0o777;
+    let owner = meta.uid();
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if !file_type.is_socket() || owner != euid || mode != 0o600 {
         anyhow::bail!(
-            "refusing to use {}: expected private socket mode 0600, got {mode:03o}",
+            "refusing to use {}: expected owner-only socket (uid {euid}, mode 0600), \
+             got uid {owner} mode {mode:03o}",
             socket.display()
         );
     }

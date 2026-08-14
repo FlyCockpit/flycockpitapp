@@ -288,11 +288,15 @@ fn read_credential_file(path: &Path) -> Result<CredentialFile> {
 }
 
 fn read_credential_file_readonly(path: &Path) -> Result<CredentialFile> {
-    if !path.exists() {
+    // Fail-closed held-fd read: a symlinked, foreign-owned, hard-linked, or
+    // mode-wide credential file is a typed refusal (via `PrivateFsError`), never
+    // a silent read of an unprovable secret. A genuinely absent file is an empty
+    // store, not a compromise.
+    let Some(bytes) = crate::private_fs::read_private_file(path, "credential")? else {
         return Ok(CredentialFile::default());
-    }
-    let raw =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    };
+    let raw = String::from_utf8(bytes)
+        .with_context(|| format!("credential file {} is not valid UTF-8", path.display()))?;
     if raw.trim().is_empty() {
         return Ok(CredentialFile::default());
     }
@@ -343,54 +347,30 @@ fn open_private_lock_file(path: &Path) -> Result<std::fs::File> {
 }
 
 fn write_credential_file_atomic(path: &Path, data: &CredentialFile) -> Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let pretty = serde_json::to_string_pretty(data)?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("creating credential temp file in {}", parent.display()))?;
-    set_temp_file_private(temp.as_file(), temp.path())?;
-    temp.write_all(pretty.as_bytes())?;
-    temp.as_file_mut().write_all(b"\n")?;
-    temp.as_file_mut().flush()?;
-    temp.as_file().sync_all()?;
-    temp.persist(path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("atomically replacing {}", path.display()))?;
+    let mut pretty = serde_json::to_string_pretty(data)?;
+    pretty.push('\n');
+    // Route credential saves through the hardened private-write funnel: a
+    // crash-atomic temp created in the destination directory, moded 0600 before
+    // any bytes are written, fsynced, renamed over the target, with the held
+    // destination-directory fd fsynced after the rename. This replaces a bespoke
+    // temp/persist that skipped the directory durability barrier.
+    crate::private_fs::write_private_file(path, pretty.as_bytes())?;
+    // Post-write fail-closed verification: the persisted credential file must be
+    // provably private (self-owned, single-linked, exactly 0600, not a symlink),
+    // or this returns a typed refusal rather than leaving a suspect secret.
     repair_existing_file_permissions(path)?;
     Ok(())
 }
 
-#[cfg(unix)]
-fn set_temp_file_private(file: &std::fs::File, path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("chmod 0600 {}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn set_temp_file_private(_file: &std::fs::File, _path: &Path) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
 fn ensure_parent_dir_private(path: &Path) -> Result<()> {
-    crate::private_fs::ensure_parent_dir_private(path)
+    Ok(crate::private_fs::ensure_parent_dir_private(path)?)
 }
 
-#[cfg(not(unix))]
-fn ensure_parent_dir_private(path: &Path) -> Result<()> {
-    crate::private_fs::ensure_parent_dir_private(path)
-}
-
-#[cfg(unix)]
 fn repair_existing_file_permissions(path: &Path) -> Result<()> {
-    crate::private_fs::repair_private_file(path, "credential")
-}
-
-#[cfg(not(unix))]
-fn repair_existing_file_permissions(_path: &Path) -> Result<()> {
-    // Non-Unix platforms do not expose POSIX mode bits; credential protection
-    // follows the platform filesystem defaults.
-    Ok(())
+    // Fail closed: a credential file that cannot be proven private (symlink,
+    // foreign owner, hard link, or an unrepairable mode) is a typed refusal,
+    // not a warning the caller ignores. On non-Unix this is a documented no-op.
+    Ok(crate::private_fs::repair_private_file(path, "credential")?)
 }
 
 #[cfg(test)]

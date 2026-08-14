@@ -39,7 +39,8 @@ export {
   REMOTE_GATEWAY_MAX_QUEUED_BYTES,
   REMOTE_GATEWAY_MAX_SDP_BYTES,
   REMOTE_GATEWAY_MAX_UNACKED_EVENTS,
-  REMOTE_GATEWAY_PREAUTH_MAX_AGGREGATE_BYTES,
+  REMOTE_GATEWAY_PREAUTH_MAX_AGGREGATE_BYTES_CONTROL,
+  REMOTE_GATEWAY_PREAUTH_MAX_AGGREGATE_BYTES_SIGNAL,
   REMOTE_GATEWAY_PREAUTH_MAX_FRAMES,
   REMOTE_GATEWAY_PREAUTH_TIMEOUT_MS,
   REMOTE_GATEWAY_PRESENCE_EXPIRY_MS,
@@ -53,10 +54,16 @@ export {
   type RemoteGatewayOriginClass,
 } from "./close-codes";
 export {
+  DaemonCertificateVerificationError,
+  type DaemonCertificateVerifier,
+  daemonControlAuthPreimage,
+  RingDaemonCertificateVerifier,
+  type VerifiedDaemonIdentity,
+} from "./daemon-certificate-verifier";
+export {
   createRemoteSignalingGateway,
   RemoteSignalingGateway,
   type RemoteSignalingGatewayConfig,
-  resolveUpgradeClientIp,
   type SafeLogger,
 } from "./gateway";
 export {
@@ -72,3 +79,7 @@ export {
   TokenBucket,
   UnauthUpgradeRateLimiter,
 } from "./rate-limiters";
+export {
+  InMemoryRemoteSignalingWakeSubscription,
+  type RemoteSignalingWakeSubscription,
+} from "./wake-subscription";

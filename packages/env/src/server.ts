@@ -53,6 +53,10 @@ export const env = createEnv({
       .optional(),
     REMOTE_AUTHORITY_ISSUER: originUrl("REMOTE_AUTHORITY_ISSUER").optional(),
     REMOTE_GRANT_SIGNING_KEY_DIGESTS: z.string().optional(),
+    // Dedicated daemon identity-CA ring — the FCDA certificate trust anchor.
+    // MUST be a distinct key/digest group from REMOTE_GRANT_SIGNING_* (grants only).
+    REMOTE_DAEMON_IDENTITY_CA_KEY_FILE: z.string().optional(),
+    REMOTE_DAEMON_IDENTITY_CA_KEY_DIGESTS: z.string().optional(),
     REMOTE_FALLBACK_ROUTE_BINDING_KEYS_FILE: z.string().optional(),
     REMOTE_FALLBACK_ROUTE_BINDING_KEY_DIGEST: z
       .string()

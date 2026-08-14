@@ -11,6 +11,7 @@ import {
   encodeGatewayAck,
   encodeRemoteControlEventHeader,
   FCDA_MAGIC,
+  FCDA_MIN_BYTES,
   FCDC_BYTES,
   FCDC_MAGIC,
   FCRC_MAGIC,
@@ -318,5 +319,26 @@ describe("remote_gateway_binary_codec: gateway ACK", () => {
     const ack = encodeGatewayAck({ kind: 1, commandId: randomId(), committedSequence: 1n });
     ack[0] = 2;
     expect(() => decodeGatewayAck(ack)).toThrow(RemoteGatewayCodecError);
+  });
+});
+
+describe("remote_gateway_binary_codec: frame-cap arithmetic invariants", () => {
+  // Cross-module invariants (not literal echoes): the whole-frame caps must equal
+  // the fixed header/prefix size plus the variable-length body cap.
+  it("proves the max FCDA frame is the fixed prefix plus the max certificate JWS", () => {
+    // FCDA_MIN_BYTES is the 119-byte fixed structure (magic+version+len+nonce+seqs+sig).
+    expect(FCDA_MIN_BYTES).toBe(4 + 1 + 2 + 32 + 8 + 8 + 64);
+    expect(REMOTE_GATEWAY_MAX_FCDA_BYTES).toBe(
+      FCDA_MIN_BYTES + REMOTE_GATEWAY_MAX_CERTIFICATE_JWS_BYTES,
+    );
+  });
+
+  it("proves the max FCSA frame is the fixed prefix plus the max admission proof", () => {
+    // 55 = magic(4)+version(1)+ticketId(16)+ticketSecret(32)+proofLength(2).
+    const fcsaFixedPrefix = 4 + 1 + 16 + 32 + 2;
+    expect(fcsaFixedPrefix).toBe(55);
+    expect(REMOTE_GATEWAY_MAX_FCSA_BYTES).toBe(
+      fcsaFixedPrefix + REMOTE_GATEWAY_MAX_ADMISSION_PROOF_BYTES,
+    );
   });
 });

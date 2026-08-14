@@ -45,6 +45,10 @@ import { mountRelayRoutes } from "./relay-routes.js";
 import { mountRemoteAuthorityRoutes } from "./remote-authority-routes.js";
 import { createServerRemoteAuthority } from "./remote-authority-runtime.js";
 import { loadRemoteFallbackRouteBindingKeyRuntime } from "./remote-fallback-route-keys.js";
+import {
+  createServerRemoteSignalingGateway,
+  type InstalledRemoteSignalingGateway,
+} from "./remote-signaling-runtime.js";
 import { getRemoteVersionReadiness } from "./remote-version-readiness.js";
 import { validateSameSiteJsonRequest } from "./request-origin.js";
 import { mountSecurityHeaders } from "./security-headers.js";
@@ -178,6 +182,9 @@ app.get("/api/relay/jwks.json", (c) => c.json(getRelayJwks()));
 const redisConnection = getRedisConnection();
 const remoteAuthority = createServerRemoteAuthority({ env, prisma, redis: redisConnection });
 let remoteFallbackRouteKeysReady = !REMOTE_CONNECTION_CAPABILITIES.websocketData;
+// Installed after `serve(...)` (the gateway needs the HTTP server for upgrades).
+let remoteSignalingGateway: InstalledRemoteSignalingGateway | undefined;
+let remoteSignalingGatewayReady = false;
 app.use("/api/remote/*", createRateLimiterMiddleware(rpcLimiter));
 mountRemoteAuthorityRoutes(app, {
   snapshot: remoteAuthority.snapshot,
@@ -214,6 +221,7 @@ app.get("/ready", async (c) => {
     redis: false,
     remoteAuthority: remoteAuthority.runtime ? remoteAuthority.runtime.decision.ready : true,
     remoteFallbackRouteKeys: remoteFallbackRouteKeysReady,
+    remoteSignalingGateway: remoteSignalingGatewayReady,
   };
   try {
     await withTimeout(prisma.$queryRaw`SELECT 1`, 3000, "postgres readiness check");
@@ -227,6 +235,7 @@ app.get("/ready", async (c) => {
       : true;
     if (!checks.remoteAuthority) return c.json({ ok: false, checks }, 503);
     if (!checks.remoteFallbackRouteKeys) return c.json({ ok: false, checks }, 503);
+    if (!checks.remoteSignalingGateway) return c.json({ ok: false, checks }, 503);
 
     const remoteVersionReadiness = getRemoteVersionReadiness();
     return c.json({ ok: true, checks, remoteVersionReadiness });
@@ -580,6 +589,12 @@ const server = serve(
   },
 );
 
+// Install the remote signaling WebSocket gateway on the HTTP server's `upgrade`
+// event. Fails closed at startup when remote authority is enabled but the daemon
+// identity-CA ring is missing; a no-op (feature off) when neither is configured.
+remoteSignalingGateway = createServerRemoteSignalingGateway({ env, server });
+remoteSignalingGatewayReady = true;
+
 // ---------------------------------------------------------------------------
 // Graceful shutdown — drain in-flight requests, then close dependencies
 // ---------------------------------------------------------------------------
@@ -592,6 +607,9 @@ async function shutdown(signal: string) {
   console.log(`[server] Received ${signal} — starting graceful shutdown…`);
   if (remoteAuthorityTickTimer) clearInterval(remoteAuthorityTickTimer);
   await remoteAuthority.runtime?.drain().catch(() => false);
+  // Drain the signaling gateway (stop upgrades, close sockets 1001, close its
+  // Redis command/subscription connections) before HTTP/Prisma/Redis teardown.
+  await remoteSignalingGateway?.close().catch(() => {});
 
   // 1. Stop accepting new connections and drain in-flight requests.
   await new Promise<void>((resolve) => {

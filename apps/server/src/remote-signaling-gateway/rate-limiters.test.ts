@@ -149,6 +149,48 @@ describe("remote_gateway_rate_limit: ICE candidate cap", () => {
   });
 });
 
+describe("remote_gateway_rate_limit: limiter memory bound", () => {
+  it("evicts fully-refilled buckets on a clock-driven sweep", () => {
+    const clock = new FakeClock();
+    const limiter = new UnauthUpgradeRateLimiter(clock, undefined, {
+      maxBuckets: 10_000,
+      sweepIntervalMs: 1_000,
+    });
+    for (let i = 0; i < 100; i++) limiter.consume(`10.0.0.${i}`);
+    expect(limiter.bucketCount).toBe(100);
+    // Advance long enough for every idle bucket to refill to capacity, then the
+    // next consume triggers a sweep that evicts all of them.
+    clock.advance(60_000);
+    limiter.consume("198.51.100.1");
+    expect(limiter.bucketCount).toBe(1);
+    // Per-IP limiting still rejects an over-limit burst after the sweep.
+    for (let i = 0; i < 5; i++) expect(limiter.consume("203.0.113.7")).toBe(true);
+    expect(limiter.consume("203.0.113.7")).toBe(false);
+  });
+
+  it("caps the bucket map with oldest-eviction under N >> cap distinct IPs", () => {
+    const clock = new FakeClock();
+    const limiter = new UnauthUpgradeRateLimiter(clock, undefined, {
+      maxBuckets: 4,
+      sweepIntervalMs: 10_000,
+    });
+    for (let i = 0; i < 500; i++) limiter.consume(`8.8.${Math.floor(i / 256)}.${i % 256}`);
+    expect(limiter.bucketCount).toBeLessThanOrEqual(4);
+  });
+
+  it("bounds the ticket-creation limiter's device and account maps", () => {
+    const clock = new FakeClock();
+    const limiter = new TicketCreationRateLimiter(clock, undefined, {
+      maxBuckets: 4,
+      sweepIntervalMs: 10_000,
+    });
+    for (let i = 0; i < 200; i++) limiter.consume(`device-${i}`, `account-${i}`);
+    const counts = limiter.bucketCounts;
+    expect(counts.devices).toBeLessThanOrEqual(4);
+    expect(counts.accounts).toBeLessThanOrEqual(4);
+  });
+});
+
 describe("remote_gateway_rate_limit: concurrent socket caps", () => {
   it("proves 2 signaling sockets per device/attachment", () => {
     expect(REMOTE_GATEWAY_RATE.maxConcurrentSignalingSocketsPerDeviceAttachment).toBe(2);

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   daemonAdmissionOfferDigest,
   decodeRemoteSignalingEventRequestV1,
@@ -20,6 +21,8 @@ import {
 import { describe, expect, it, vi } from "vitest";
 import {
   MemoryRemoteSignalingAttemptStore,
+  REMOTE_SIGNALING_ADMISSION_TICKET_TTL_MS,
+  REMOTE_SIGNALING_SOCKET_LEASE_TTL_MS,
   RedisRemoteSignalingAttemptStore,
   RemoteSignalingStoreError,
 } from "./remote-signaling-store";
@@ -427,5 +430,305 @@ describe("remote signaling attempt store", () => {
       "redis unavailable",
     );
     expect(redis.eval).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("remote_signaling_socket_lease_cap", () => {
+  const leaseError = async (promise: Promise<unknown>) => {
+    const error = await promise.then(
+      () => undefined,
+      (reason: unknown) => reason,
+    );
+    return error;
+  };
+
+  it("admits two live signal sockets per attachment and conflicts on the third", async () => {
+    const store = new MemoryRemoteSignalingAttemptStore(
+      () => 1_000,
+      (out) => out.fill(7),
+    );
+    await store.acquireSignalingSocketLease("attach-A", "socket-1");
+    await store.acquireSignalingSocketLease("attach-A", "socket-2");
+    const error = await leaseError(store.acquireSignalingSocketLease("attach-A", "socket-3"));
+    expect(error).toBeInstanceOf(RemoteSignalingStoreError);
+    expect((error as RemoteSignalingStoreError).code).toBe("conflict");
+    // Re-acquiring a held lease refreshes it — it is not a third slot.
+    await store.acquireSignalingSocketLease("attach-A", "socket-1");
+    // A different attachment has its own independent budget.
+    await store.acquireSignalingSocketLease("attach-B", "socket-1");
+    await store.acquireSignalingSocketLease("attach-B", "socket-2");
+  });
+
+  it("frees a slot on release", async () => {
+    const store = new MemoryRemoteSignalingAttemptStore(
+      () => 1_000,
+      (out) => out.fill(7),
+    );
+    await store.acquireSignalingSocketLease("attach-A", "socket-1");
+    await store.acquireSignalingSocketLease("attach-A", "socket-2");
+    expect(
+      (
+        (await leaseError(
+          store.acquireSignalingSocketLease("attach-A", "socket-3"),
+        )) as RemoteSignalingStoreError
+      ).code,
+    ).toBe("conflict");
+    await store.releaseSignalingSocketLease("attach-A", "socket-1");
+    // The freed slot now admits a new socket.
+    await store.acquireSignalingSocketLease("attach-A", "socket-3");
+  });
+
+  it("frees a slot when a lease TTL expires under the injected clock", async () => {
+    let now = 1_000;
+    const store = new MemoryRemoteSignalingAttemptStore(
+      () => now,
+      (out) => out.fill(7),
+    );
+    await store.acquireSignalingSocketLease("attach-A", "socket-1");
+    await store.acquireSignalingSocketLease("attach-A", "socket-2");
+    expect(
+      (
+        (await leaseError(
+          store.acquireSignalingSocketLease("attach-A", "socket-3"),
+        )) as RemoteSignalingStoreError
+      ).code,
+    ).toBe("conflict");
+    now += REMOTE_SIGNALING_SOCKET_LEASE_TTL_MS + 1; // both leases expire
+    // The expired leases free their slots.
+    await store.acquireSignalingSocketLease("attach-A", "socket-3");
+    await store.acquireSignalingSocketLease("attach-A", "socket-4");
+  });
+
+  it("a renewed lease keeps holding its slot past the original TTL", async () => {
+    let now = 1_000;
+    const store = new MemoryRemoteSignalingAttemptStore(
+      () => now,
+      (out) => out.fill(7),
+    );
+    await store.acquireSignalingSocketLease("attach-A", "socket-1");
+    await store.acquireSignalingSocketLease("attach-A", "socket-2");
+    // Just before expiry, both live sockets renew (what the gateway's renewal
+    // timer does for the connection's whole lifetime).
+    now += REMOTE_SIGNALING_SOCKET_LEASE_TTL_MS - 1;
+    await store.acquireSignalingSocketLease("attach-A", "socket-1");
+    await store.acquireSignalingSocketLease("attach-A", "socket-2");
+    // Past the ORIGINAL TTL the renewed leases still occupy both slots, so a
+    // third live socket is refused — the cap holds for the connection lifetime,
+    // not just the first TTL window.
+    now += 2;
+    const error = await leaseError(store.acquireSignalingSocketLease("attach-A", "socket-3"));
+    expect((error as RemoteSignalingStoreError).code).toBe("conflict");
+  });
+});
+
+describe("remote_signaling_admission_tickets", () => {
+  const sha256 = (bytes: Uint8Array) => createHash("sha256").update(Buffer.from(bytes)).digest();
+  const sha256Hex = (bytes: Uint8Array) =>
+    createHash("sha256").update(Buffer.from(bytes)).digest("hex");
+  // The kind-3 client_admission_proof FCSE and the exact ClientAdmissionProofV1
+  // payload the client commits (matches the daemon offer committed below).
+  const proofRequest = () => request(3, 2);
+  const proofPayload = () => decodeRemoteSignalingEventRequestV1(proofRequest()).payload;
+  // A VALID kind-3 admission proof whose payload differs from the standard
+  // `proofPayload()` only in its `chosenTransport` (2 vs 1) — self-consistent
+  // with the envelope transport (so it passes the pre-auth structural checks) and
+  // bound to the same child id(1), but its digest does NOT match a ticket minted
+  // for the default proof. Presenting it (correct secret/origin) fails ONLY the
+  // proof-of-possession digest check, proving a wrong proof is rejected without
+  // consuming the ticket.
+  const wrongProofRequest = () => request(3, 2, 3, 2);
+
+  async function daemonOfferedAttempt(now: () => number) {
+    const store = new MemoryRemoteSignalingAttemptStore(now, (out) => out.fill(7));
+    await store.create(createInput, request(1, 1), actor("server"));
+    await store.commit(createInput.daemonInstanceId, id(1), request(2, 3), actor("daemon"));
+    return store;
+  }
+  const mint = (
+    store: MemoryRemoteSignalingAttemptStore,
+    overrides?: Partial<{ childAttemptId: Uint8Array; admissionProofSha256: Uint8Array }>,
+  ) =>
+    store.issueClientAdmissionTicket({
+      daemonInstanceId: createInput.daemonInstanceId,
+      childAttemptId: overrides?.childAttemptId ?? id(1),
+      originClass: "browser_same_origin",
+      accountId: "acct-1",
+      deviceAttachmentId: "attach-1",
+      deviceGeneration: 5n,
+      admissionProofSha256: overrides?.admissionProofSha256 ?? sha256(proofPayload()),
+    });
+
+  const admissionError = async (promise: Promise<unknown>) =>
+    promise.then(
+      () => undefined,
+      (reason: unknown) => reason as RemoteSignalingStoreError,
+    );
+
+  it("admits with a matching ticket, derives the actor from the ticket, and consumes it", async () => {
+    const store = await daemonOfferedAttempt(() => 1_000);
+    const { ticketId, secret } = await mint(store);
+    const result = await store.commitClientAdmission(
+      createInput.daemonInstanceId,
+      id(1),
+      proofRequest(),
+      {
+        ticketId,
+        secretSha256Hex: sha256Hex(secret),
+        originClass: "browser_same_origin",
+      },
+    );
+    expect(result.result.kind).toBe("committed");
+    // Actor is server-derived from the ticket, not from the client-declared proof bytes.
+    expect(result.actor).toEqual({ role: "client", actor: "attach-1", generation: 5n });
+    expect(result.deviceAttachmentId).toBe("attach-1");
+
+    // The ticket is consumed: a replay of the exact same authenticated FCSE now
+    // fails closed (the ticket is gone), rather than returning a second admission.
+    const replay = await admissionError(
+      store.commitClientAdmission(createInput.daemonInstanceId, id(1), proofRequest(), {
+        ticketId,
+        secretSha256Hex: sha256Hex(secret),
+        originClass: "browser_same_origin",
+      }),
+    );
+    expect(replay?.code).toBe("auth_failed");
+  });
+
+  it("rejects a replayed proof presented with a wrong secret after consumption (no second admission)", async () => {
+    const store = await daemonOfferedAttempt(() => 1_000);
+    const { ticketId, secret } = await mint(store);
+    // First socket admits with the correct secret.
+    const first = await store.commitClientAdmission(
+      createInput.daemonInstanceId,
+      id(1),
+      proofRequest(),
+      {
+        ticketId,
+        secretSha256Hex: sha256Hex(secret),
+        originClass: "browser_same_origin",
+      },
+    );
+    expect(first.result.kind).toBe("committed");
+    // A second socket replays the identical proof/event id with a WRONG secret.
+    // The old bug returned `replay` (ticket check ran after the idempotency
+    // short-circuit); it must now fail closed with no second admission.
+    const replay = await admissionError(
+      store.commitClientAdmission(createInput.daemonInstanceId, id(1), proofRequest(), {
+        ticketId,
+        secretSha256Hex: sha256Hex(new Uint8Array(32).fill(9)),
+        originClass: "browser_same_origin",
+      }),
+    );
+    expect(replay?.code).toBe("auth_failed");
+  });
+
+  it("rejects the same ticket on a second distinct admission (single use)", async () => {
+    const store = await daemonOfferedAttempt(() => 1_000);
+    const { ticketId, secret } = await mint(store);
+    await store.commitClientAdmission(createInput.daemonInstanceId, id(1), proofRequest(), {
+      ticketId,
+      secretSha256Hex: sha256Hex(secret),
+      originClass: "browser_same_origin",
+    });
+    // A concurrent second connection with a fresh (unseen) event id cannot reuse
+    // the consumed ticket: the idempotency short-circuit does not apply and the
+    // ticket is gone -> auth_failed.
+    const fresh = encodeRemoteSignalingEventRequestV1({
+      transport: 1,
+      producerRole: 2,
+      eventKind: 3,
+      childAttemptId: id(1),
+      eventId: id(250),
+      payload: proofPayload(),
+    });
+    const error = await admissionError(
+      store.commitClientAdmission(createInput.daemonInstanceId, id(1), fresh, {
+        ticketId,
+        secretSha256Hex: sha256Hex(secret),
+        originClass: "browser_same_origin",
+      }),
+    );
+    expect(error?.code).toBe("auth_failed");
+  });
+
+  it("rejects a wrong secret, origin class, child, and proof digest without consuming the ticket", async () => {
+    for (const bad of [
+      {
+        label: "secret",
+        ticketOverride: undefined,
+        proof: proofRequest(),
+        secretSha256Hex: sha256Hex(new Uint8Array(32).fill(1)),
+        originClass: "browser_same_origin",
+        child: id(1),
+      },
+      {
+        label: "origin",
+        ticketOverride: undefined,
+        proof: proofRequest(),
+        secretSha256Hex: undefined,
+        originClass: "native_no_origin",
+        child: id(1),
+      },
+      {
+        label: "proofDigest",
+        ticketOverride: undefined,
+        proof: wrongProofRequest(),
+        secretSha256Hex: undefined,
+        originClass: "browser_same_origin",
+        child: id(1),
+      },
+    ] as const) {
+      const store = await daemonOfferedAttempt(() => 1_000);
+      const { ticketId, secret } = await mint(store, bad.ticketOverride);
+      const error = await admissionError(
+        store.commitClientAdmission(createInput.daemonInstanceId, bad.child, bad.proof, {
+          ticketId,
+          secretSha256Hex: bad.secretSha256Hex ?? sha256Hex(secret),
+          originClass: bad.originClass,
+        }),
+      );
+      expect(error?.code, bad.label).toBe("auth_failed");
+      // The ticket survives the failure: a correct commit still admits.
+      const ok = await store.commitClientAdmission(
+        createInput.daemonInstanceId,
+        id(1),
+        proofRequest(),
+        {
+          ticketId,
+          secretSha256Hex: sha256Hex(secret),
+          originClass: "browser_same_origin",
+        },
+      );
+      expect(ok.result.kind, bad.label).toBe("committed");
+    }
+  });
+
+  it("rejects a ticket bound to a different child attempt", async () => {
+    const store = await daemonOfferedAttempt(() => 1_000);
+    // The ticket is bound to child id(2); the admission targets child id(1).
+    const { ticketId, secret } = await mint(store, { childAttemptId: id(2) });
+    const error = await admissionError(
+      store.commitClientAdmission(createInput.daemonInstanceId, id(1), proofRequest(), {
+        ticketId,
+        secretSha256Hex: sha256Hex(secret),
+        originClass: "browser_same_origin",
+      }),
+    );
+    expect(error?.code).toBe("auth_failed");
+  });
+
+  it("rejects an expired ticket after 30 seconds", async () => {
+    let now = 1_000;
+    const store = await daemonOfferedAttempt(() => now);
+    const { ticketId, secret } = await mint(store);
+    now += REMOTE_SIGNALING_ADMISSION_TICKET_TTL_MS + 1;
+    const error = await admissionError(
+      store.commitClientAdmission(createInput.daemonInstanceId, id(1), proofRequest(), {
+        ticketId,
+        secretSha256Hex: sha256Hex(secret),
+        originClass: "browser_same_origin",
+      }),
+    );
+    expect(error?.code).toBe("auth_failed");
   });
 });

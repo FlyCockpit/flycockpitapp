@@ -4,10 +4,69 @@
  * All limiters use injected monotonic time so tests are deterministic.
  * Tenant/service policy may only lower these limits, never raise them.
  */
-import { REMOTE_GATEWAY_RATE } from "./close-codes";
+import { REMOTE_GATEWAY_LIMITER_MAX_BUCKETS, REMOTE_GATEWAY_RATE } from "./close-codes";
 
 export interface MonotonicClock {
   nowMs(): number;
+}
+
+/** Memory bounds for per-key limiter maps (attacker-chosen keys must not grow unbounded). */
+export interface LimiterMemoryOptions {
+  /** Hard cap on live buckets; the least-recently-used bucket is evicted past it. */
+  maxBuckets?: number;
+  /** Minimum clock interval between eviction sweeps of fully-refilled buckets. */
+  sweepIntervalMs?: number;
+}
+
+/**
+ * A per-key token-bucket map that (a) evicts fully-refilled (idle) buckets on a
+ * clock-driven sweep and (b) enforces a hard size cap with LRU eviction. Both
+ * are driven by the injected {@link MonotonicClock} so growth keyed on
+ * attacker-chosen input (IP, device id) is bounded.
+ */
+class BoundedBucketMap {
+  private readonly buckets = new Map<string, TokenBucket>();
+  private readonly maxBuckets: number;
+  private readonly sweepIntervalMs: number;
+  private lastSweepMs: number;
+
+  constructor(
+    private readonly clock: MonotonicClock,
+    private readonly makeBucket: () => TokenBucket,
+    options?: LimiterMemoryOptions,
+  ) {
+    this.maxBuckets = Math.max(1, options?.maxBuckets ?? REMOTE_GATEWAY_LIMITER_MAX_BUCKETS);
+    this.sweepIntervalMs = Math.max(1, options?.sweepIntervalMs ?? 60_000);
+    this.lastSweepMs = clock.nowMs();
+  }
+
+  private sweep() {
+    const now = this.clock.nowMs();
+    if (now - this.lastSweepMs < this.sweepIntervalMs) return;
+    this.lastSweepMs = now;
+    for (const [key, bucket] of this.buckets)
+      if (bucket.available(this.clock) >= bucket.capacity) this.buckets.delete(key);
+  }
+
+  consume(key: string, cost = 1): boolean {
+    this.sweep();
+    let bucket = this.buckets.get(key);
+    if (bucket)
+      this.buckets.delete(key); // move to most-recently-used position
+    else bucket = this.makeBucket();
+    const allowed = bucket.consume(this.clock, cost);
+    this.buckets.set(key, bucket);
+    while (this.buckets.size > this.maxBuckets) {
+      const oldest = this.buckets.keys().next().value;
+      if (oldest === undefined) break;
+      this.buckets.delete(oldest);
+    }
+    return allowed;
+  }
+
+  get size(): number {
+    return this.buckets.size;
+  }
 }
 
 export class TokenBucket {
@@ -59,12 +118,13 @@ export class TokenBucket {
  * Keyed by IP address.
  */
 export class UnauthUpgradeRateLimiter {
-  private readonly buckets = new Map<string, TokenBucket>();
+  private readonly buckets: BoundedBucketMap;
   private readonly policyCeiling: { perMinute: number; burst: number };
 
   constructor(
-    private readonly clock: MonotonicClock,
+    clock: MonotonicClock,
     policy?: { perMinute: number; burst: number },
+    memory?: LimiterMemoryOptions,
   ) {
     // Policy may only lower the ceiling.
     this.policyCeiling = policy
@@ -73,19 +133,20 @@ export class UnauthUpgradeRateLimiter {
           burst: Math.min(policy.burst, REMOTE_GATEWAY_RATE.unauthUpgrade.burst),
         }
       : REMOTE_GATEWAY_RATE.unauthUpgrade;
+    this.buckets = new BoundedBucketMap(
+      clock,
+      () => new TokenBucket(this.policyCeiling.burst, this.policyCeiling.perMinute / 60, clock),
+      memory,
+    );
   }
 
   consume(ip: string): boolean {
-    let bucket = this.buckets.get(ip);
-    if (!bucket) {
-      bucket = new TokenBucket(
-        this.policyCeiling.burst,
-        this.policyCeiling.perMinute / 60,
-        this.clock,
-      );
-      this.buckets.set(ip, bucket);
-    }
-    return bucket.consume(this.clock);
+    return this.buckets.consume(ip);
+  }
+
+  /** Live bucket count (diagnostics / memory-bound tests only). */
+  get bucketCount(): number {
+    return this.buckets.size;
   }
 }
 
@@ -143,36 +204,39 @@ export class DaemonControlRateLimiter {
  * Ticket creation limiter: 10/minute per device, 30/minute per account.
  */
 export class TicketCreationRateLimiter {
-  private readonly deviceBuckets = new Map<string, TokenBucket>();
-  private readonly accountBuckets = new Map<string, TokenBucket>();
-  private readonly deviceCeiling: number;
-  private readonly accountCeiling: number;
+  private readonly deviceBuckets: BoundedBucketMap;
+  private readonly accountBuckets: BoundedBucketMap;
 
   constructor(
-    private readonly clock: MonotonicClock,
+    clock: MonotonicClock,
     policy?: { perMinuteDevice: number; perMinuteAccount: number },
+    memory?: LimiterMemoryOptions,
   ) {
-    this.deviceCeiling = policy
+    const deviceCeiling = policy
       ? Math.min(policy.perMinuteDevice, REMOTE_GATEWAY_RATE.ticketCreationPerMinuteDevice)
       : REMOTE_GATEWAY_RATE.ticketCreationPerMinuteDevice;
-    this.accountCeiling = policy
+    const accountCeiling = policy
       ? Math.min(policy.perMinuteAccount, REMOTE_GATEWAY_RATE.ticketCreationPerMinuteAccount)
       : REMOTE_GATEWAY_RATE.ticketCreationPerMinuteAccount;
+    this.deviceBuckets = new BoundedBucketMap(
+      clock,
+      () => new TokenBucket(deviceCeiling, deviceCeiling / 60, clock),
+      memory,
+    );
+    this.accountBuckets = new BoundedBucketMap(
+      clock,
+      () => new TokenBucket(accountCeiling, accountCeiling / 60, clock),
+      memory,
+    );
   }
 
   consume(deviceId: string, accountId: string): boolean {
-    let deviceBucket = this.deviceBuckets.get(deviceId);
-    if (!deviceBucket) {
-      deviceBucket = new TokenBucket(this.deviceCeiling, this.deviceCeiling / 60, this.clock);
-      this.deviceBuckets.set(deviceId, deviceBucket);
-    }
-    if (!deviceBucket.consume(this.clock)) return false;
+    if (!this.deviceBuckets.consume(deviceId)) return false;
+    return this.accountBuckets.consume(accountId);
+  }
 
-    let accountBucket = this.accountBuckets.get(accountId);
-    if (!accountBucket) {
-      accountBucket = new TokenBucket(this.accountCeiling, this.accountCeiling / 60, this.clock);
-      this.accountBuckets.set(accountId, accountBucket);
-    }
-    return accountBucket.consume(this.clock);
+  /** Live bucket counts (diagnostics / memory-bound tests only). */
+  get bucketCounts(): { devices: number; accounts: number } {
+    return { devices: this.deviceBuckets.size, accounts: this.accountBuckets.size };
   }
 }

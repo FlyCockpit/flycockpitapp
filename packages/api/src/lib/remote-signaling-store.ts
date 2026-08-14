@@ -1,7 +1,9 @@
+import { createHash } from "node:crypto";
 import {
   daemonAdmissionOfferDigest,
   decodeClientAdmissionProofV1,
   decodeDaemonAdmissionOfferV1,
+  decodeProtocolIdBase64Url,
   decodeRemoteChildAuthenticationBundleV1,
   decodeRemoteEndpointFinalProofV1,
   decodeRemoteFallbackNoiseCompleteV1,
@@ -29,9 +31,15 @@ import {
 } from "@flycockpit/cockpit-protocol";
 import { createRedisConnection } from "@flycockpit/queue/connection";
 import {
+  REMOTE_SIGNALING_COMMIT_ADMISSION_LUA,
   REMOTE_SIGNALING_COMMIT_LUA,
   REMOTE_SIGNALING_CREATE_LUA,
+  REMOTE_SIGNALING_ISSUE_ADMISSION_TICKET_LUA,
+  REMOTE_SIGNALING_SOCKET_LEASE_ACQUIRE_LUA,
 } from "./remote-signaling-store.lua";
+
+const sha256Hex = (bytes: Uint8Array) =>
+  createHash("sha256").update(Buffer.from(bytes)).digest("hex");
 
 type Redis = ReturnType<typeof createRedisConnection>;
 
@@ -113,11 +121,67 @@ export class RemoteSignalingStoreError extends Error {
       | "invalid_transition"
       | "limit"
       | "corrupt"
-      | "retry",
+      | "retry"
+      | "auth_failed",
     message = code,
   ) {
     super(message);
   }
+}
+
+/** Redis-owned single-use client admission ticket. TTL is 30 s from Redis `TIME` (memory parity via `now`). */
+export const REMOTE_SIGNALING_ADMISSION_TICKET_TTL_MS = 30_000;
+/** Live signal sockets allowed per device attachment (store-enforced, Redis + memory parity). */
+export const REMOTE_SIGNALING_MAX_SIGNALING_SOCKETS_PER_ATTACHMENT = 2;
+/**
+ * Per-attachment socket-lease TTL. The gateway renews it on a shorter interval
+ * for the whole life of an open socket, so this is only the crashed-replica
+ * safety net — a dead replica's lease frees a slot within this window.
+ */
+export const REMOTE_SIGNALING_SOCKET_LEASE_TTL_MS = 60_000;
+
+export type RemoteSignalingAdmissionOriginClass = "browser_same_origin" | "native_no_origin";
+
+export interface RemoteSignalingAdmissionTicketInput {
+  daemonInstanceId: string;
+  childAttemptId: Uint8Array;
+  originClass: RemoteSignalingAdmissionOriginClass;
+  accountId: string;
+  deviceAttachmentId: string;
+  deviceGeneration: bigint;
+  /** SHA-256 of the exact `ClientAdmissionProofV1` bytes the client commits at admission time. */
+  admissionProofSha256: Uint8Array;
+}
+export interface RemoteSignalingAdmissionTicketV1 {
+  ticketId: Uint8Array;
+  secret: Uint8Array;
+}
+/** The FCSA-side fields the gateway forwards to {@link RemoteSignalingAttemptStore.commitClientAdmission}. */
+export interface RemoteSignalingAdmissionTicketProof {
+  ticketId: Uint8Array;
+  /** Hex SHA-256 of the ticket secret the client presented (gateway-computed, never the raw secret). */
+  secretSha256Hex: string;
+  /** The socket's verified upgrade-time origin class. */
+  originClass: string;
+}
+export interface RemoteSignalingClientAdmissionResultV1 {
+  result: RemoteSignalingCommitResultV1;
+  /** Server-derived from the consumed ticket — never from client-declared bytes. */
+  actor: RemoteSignalingActorBindingV1;
+  childAttemptId: Uint8Array;
+  deviceAttachmentId: string;
+  deviceGeneration: bigint;
+}
+/**
+ * Non-consuming routing hint for an admission ticket: which daemon instance /
+ * child attempt this ticket targets, so the gateway can form the instance-scoped
+ * key for the atomic {@link RemoteSignalingAttemptStore.commitClientAdmission}.
+ * A forged/incorrect route can never admit — the atomic commit re-validates the
+ * secret, origin class, child, and proof digest against the real ticket.
+ */
+export interface RemoteSignalingAdmissionTicketRoute {
+  daemonInstanceId: string;
+  childAttemptId: Uint8Array;
 }
 export interface RemoteSignalingAttemptStore {
   create(
@@ -171,6 +235,48 @@ export interface RemoteSignalingAttemptStore {
     lease: RemoteInstanceWakeLeaseV1,
   ): Promise<void>;
   discoveryHighWater(daemonInstanceId: string, certificateGeneration: bigint): Promise<bigint>;
+  /**
+   * Mint a single-use admission ticket. Only `SHA-256(secret)` plus bindings are
+   * stored (never the raw secret), with a 30 s TTL. The plaintext secret is
+   * returned to the caller once and never persisted.
+   */
+  /**
+   * Allocate a cross-replica-monotonic control socket generation for
+   * `(daemonInstanceId, certificateGeneration)` (Redis `INCR`; memory parity).
+   */
+  allocateControlSocketGeneration(
+    daemonInstanceId: string,
+    certificateGeneration: bigint,
+  ): Promise<bigint>;
+  issueClientAdmissionTicket(
+    input: RemoteSignalingAdmissionTicketInput,
+  ): Promise<RemoteSignalingAdmissionTicketV1>;
+  /** Non-consuming lookup of a ticket's target instance/child for gateway routing. */
+  resolveAdmissionTicket(ticketId: Uint8Array): Promise<RemoteSignalingAdmissionTicketRoute | null>;
+  /**
+   * Atomically consume the ticket and apply the `client_admission_proof` (kind 3)
+   * transition. Ticket expiry, secret digest, origin class, child attempt, and
+   * `admissionProofSha256` vs `SHA-256(request payload)` are all checked in the
+   * same atomic step; any mismatch throws `auth_failed` WITHOUT consuming the
+   * ticket, and a consumed ticket is gone across replicas so a concurrent
+   * double-connect admits exactly one socket. The actor is derived from the
+   * ticket, never from client-declared bytes.
+   */
+  commitClientAdmission(
+    daemonInstanceId: string,
+    childAttemptId: Uint8Array,
+    requestBytes: Uint8Array,
+    ticket: RemoteSignalingAdmissionTicketProof,
+  ): Promise<RemoteSignalingClientAdmissionResultV1>;
+  /**
+   * Acquire one live signal-socket lease for a device attachment. Throws
+   * `conflict` when the attachment already holds
+   * `REMOTE_SIGNALING_MAX_SIGNALING_SOCKETS_PER_ATTACHMENT` unexpired leases.
+   * Re-acquiring an already-held `leaseId` refreshes it (idempotent).
+   */
+  acquireSignalingSocketLease(deviceAttachmentId: string, leaseId: string): Promise<void>;
+  /** Release a previously acquired signal-socket lease. Idempotent. */
+  releaseSignalingSocketLease(deviceAttachmentId: string, leaseId: string): Promise<void>;
   close(): Promise<void>;
 }
 interface Attempt {
@@ -195,6 +301,17 @@ interface Attempt {
   finalProofSetDigest?: Uint8Array;
   daemonOfferDigest?: Uint8Array;
   daemonOfferJti?: Uint8Array;
+}
+interface MemoryAdmissionTicket {
+  secretSha256Hex: string;
+  originClass: string;
+  childAttemptId: Uint8Array;
+  admissionProofSha256Hex: string;
+  daemonInstanceId: string;
+  accountId: string;
+  deviceAttachmentId: string;
+  deviceGeneration: bigint;
+  expiresAtMs: number;
 }
 interface MemoryDiscoveryGeneration {
   latest: bigint;
@@ -446,6 +563,13 @@ function applyTransition(attempt: Attempt, request: RemoteSignalingEventRequestV
 export class MemoryRemoteSignalingAttemptStore implements RemoteSignalingAttemptStore {
   private readonly attempts = new Map<string, Attempt>();
   private readonly discovery = new Map<string, MemoryDiscoveryGeneration>();
+  private readonly tickets = new Map<string, MemoryAdmissionTicket>();
+  private readonly ticketRoutes = new Map<
+    string,
+    { instance: string; child: Uint8Array; expiresAtMs: number }
+  >();
+  private readonly leases = new Map<string, Map<string, number>>();
+  private readonly socketGenerations = new Map<string, bigint>();
   constructor(
     private readonly now = () => Date.now(),
     private readonly random = (out: Uint8Array) =>
@@ -456,6 +580,14 @@ export class MemoryRemoteSignalingAttemptStore implements RemoteSignalingAttempt
     const now = this.now();
     for (const [storeKey, attempt] of this.attempts)
       if (now >= attempt.input.expiresAtMs) this.attempts.delete(storeKey);
+    for (const [ticketKey, ticket] of this.tickets)
+      if (now >= ticket.expiresAtMs) this.tickets.delete(ticketKey);
+    for (const [routeKey, route] of this.ticketRoutes)
+      if (now >= route.expiresAtMs) this.ticketRoutes.delete(routeKey);
+    for (const [attachment, held] of this.leases) {
+      for (const [leaseId, expiresAtMs] of held) if (now >= expiresAtMs) held.delete(leaseId);
+      if (held.size === 0) this.leases.delete(attachment);
+    }
     for (const generation of this.discovery.values()) {
       for (const [sequence, entry] of generation.entries)
         if (now >= entry.expiresAtMs) generation.entries.delete(sequence);
@@ -774,6 +906,124 @@ export class MemoryRemoteSignalingAttemptStore implements RemoteSignalingAttempt
   async discoveryHighWater(instance: string, certificateGeneration: bigint) {
     this.evictExpired();
     return this.discoveryGeneration(instance, certificateGeneration).highWater;
+  }
+  async allocateControlSocketGeneration(instance: string, certificateGeneration: bigint) {
+    const generationKey = `${instance}/${certificateGeneration}`;
+    const next = (this.socketGenerations.get(generationKey) ?? 0n) + 1n;
+    this.socketGenerations.set(generationKey, next);
+    return next;
+  }
+  async issueClientAdmissionTicket(
+    input: RemoteSignalingAdmissionTicketInput,
+  ): Promise<RemoteSignalingAdmissionTicketV1> {
+    this.evictExpired();
+    if (input.admissionProofSha256.length !== 32)
+      throw new RemoteSignalingStoreError("unavailable");
+    const ticketId = randomId(this.random);
+    const secret = new Uint8Array(32);
+    do this.random(secret);
+    while (secret.every((byte) => byte === 0));
+    const expiresAtMs = this.now() + REMOTE_SIGNALING_ADMISSION_TICKET_TTL_MS;
+    this.tickets.set(`${input.daemonInstanceId}/${hex(ticketId)}`, {
+      secretSha256Hex: sha256Hex(secret),
+      originClass: input.originClass,
+      childAttemptId: input.childAttemptId.slice(),
+      admissionProofSha256Hex: hex(input.admissionProofSha256),
+      daemonInstanceId: input.daemonInstanceId,
+      accountId: input.accountId,
+      deviceAttachmentId: input.deviceAttachmentId,
+      deviceGeneration: input.deviceGeneration,
+      expiresAtMs,
+    });
+    this.ticketRoutes.set(hex(ticketId), {
+      instance: input.daemonInstanceId,
+      child: input.childAttemptId.slice(),
+      expiresAtMs,
+    });
+    return { ticketId, secret };
+  }
+  async resolveAdmissionTicket(
+    ticketId: Uint8Array,
+  ): Promise<RemoteSignalingAdmissionTicketRoute | null> {
+    this.evictExpired();
+    const route = this.ticketRoutes.get(hex(ticketId));
+    if (!route || this.now() >= route.expiresAtMs) return null;
+    return { daemonInstanceId: route.instance, childAttemptId: route.child.slice() };
+  }
+  async commitClientAdmission(
+    instance: string,
+    child: Uint8Array,
+    requestBytes: Uint8Array,
+    ticket: RemoteSignalingAdmissionTicketProof,
+  ): Promise<RemoteSignalingClientAdmissionResultV1> {
+    this.evictExpired();
+    const request = decodeRemoteSignalingEventRequestV1(requestBytes);
+    validateTypedPayload(request);
+    if (request.eventKind !== 3 || !equal(request.childAttemptId, child))
+      throw new RemoteSignalingStoreError("unavailable");
+    // Ticket authentication FIRST — a wrong-secret / absent-ticket replay must
+    // fail closed, never reach the idempotency/replay path (which would let a
+    // second socket admit off one consumed ticket).
+    const ticketKey = `${instance}/${hex(ticket.ticketId)}`;
+    const stored = this.tickets.get(ticketKey);
+    if (
+      !stored ||
+      this.now() >= stored.expiresAtMs ||
+      stored.secretSha256Hex !== ticket.secretSha256Hex ||
+      stored.originClass !== ticket.originClass ||
+      !equal(stored.childAttemptId, child) ||
+      stored.admissionProofSha256Hex !== sha256Hex(request.payload)
+    )
+      throw new RemoteSignalingStoreError("auth_failed");
+    // Idempotent replay (reachable only while the ticket is still valid — a
+    // successful admission consumes it, so a genuine cross-call replay hits
+    // auth_failed above).
+    const attempt = this.attempts.get(key(instance, child));
+    const eventKey = hex(request.eventId);
+    const prior = attempt?.idempotency.get(eventKey);
+    if (prior) {
+      if (!equal(prior.bytes, requestBytes)) throw new RemoteSignalingStoreError("conflict");
+      return {
+        result: { ...prior.result, kind: "replay", ackBytes: prior.result.ackBytes.slice() },
+        actor: { ...prior.actor },
+        childAttemptId: child.slice(),
+        deviceAttachmentId: prior.actor.actor,
+        deviceGeneration: prior.actor.generation,
+      };
+    }
+    const actor: RemoteSignalingActorBindingV1 = {
+      role: "client",
+      actor: stored.deviceAttachmentId,
+      generation: stored.deviceGeneration,
+    };
+    // Apply the transition first; only a successful admission consumes the ticket.
+    const result = await this.commit(instance, child, requestBytes, actor);
+    this.tickets.delete(ticketKey);
+    return {
+      result,
+      actor,
+      childAttemptId: child.slice(),
+      deviceAttachmentId: stored.deviceAttachmentId,
+      deviceGeneration: stored.deviceGeneration,
+    };
+  }
+  async acquireSignalingSocketLease(deviceAttachmentId: string, leaseId: string): Promise<void> {
+    const now = this.now();
+    let held = this.leases.get(deviceAttachmentId);
+    if (!held) {
+      held = new Map();
+      this.leases.set(deviceAttachmentId, held);
+    }
+    for (const [id, expiresAtMs] of held) if (now >= expiresAtMs) held.delete(id);
+    if (!held.has(leaseId) && held.size >= REMOTE_SIGNALING_MAX_SIGNALING_SOCKETS_PER_ATTACHMENT)
+      throw new RemoteSignalingStoreError("conflict");
+    held.set(leaseId, now + REMOTE_SIGNALING_SOCKET_LEASE_TTL_MS);
+  }
+  async releaseSignalingSocketLease(deviceAttachmentId: string, leaseId: string): Promise<void> {
+    const held = this.leases.get(deviceAttachmentId);
+    if (!held) return;
+    held.delete(leaseId);
+    if (held.size === 0) this.leases.delete(deviceAttachmentId);
   }
   async close() {}
 }
@@ -1203,6 +1453,143 @@ export class RedisRemoteSignalingAttemptStore implements RemoteSignalingAttemptS
   async discoveryHighWater(instance: string, certificateGeneration: bigint) {
     const key = this.discoveryKeys(instance, certificateGeneration, 0n).cursor;
     return BigInt((await this.redis.hget(key, "highWater")) ?? "0");
+  }
+  private admissionTicketKey(instance: string, ticketId: Uint8Array) {
+    if (!/^[A-Za-z0-9_-]{22}$/.test(instance)) throw new RemoteSignalingStoreError("unavailable");
+    return `flycockpit:remote-signaling:{${instance}}:admission-ticket:${hex(ticketId)}`;
+  }
+  private socketLeaseKey(deviceAttachmentId: string) {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(deviceAttachmentId))
+      throw new RemoteSignalingStoreError("unavailable");
+    return `flycockpit:remote-signaling:socket-lease:{${deviceAttachmentId}}`;
+  }
+  async allocateControlSocketGeneration(instance: string, certificateGeneration: bigint) {
+    if (!/^[A-Za-z0-9_-]{22}$/.test(instance)) throw new RemoteSignalingStoreError("unavailable");
+    const generationKey = `flycockpit:remote-signaling:{${instance}}:socket-generation:${certificateGeneration}`;
+    return BigInt(await this.redis.incr(generationKey));
+  }
+  async issueClientAdmissionTicket(
+    input: RemoteSignalingAdmissionTicketInput,
+  ): Promise<RemoteSignalingAdmissionTicketV1> {
+    if (input.admissionProofSha256.length !== 32)
+      throw new RemoteSignalingStoreError("unavailable");
+    const ticketId = randomId(this.random);
+    const secret = new Uint8Array(32);
+    do this.random(secret);
+    while (secret.every((byte) => byte === 0));
+    const expires = Number(
+      (await this.redis.eval(
+        REMOTE_SIGNALING_ISSUE_ADMISSION_TICKET_LUA,
+        1,
+        this.admissionTicketKey(input.daemonInstanceId, ticketId),
+        sha256Hex(secret),
+        input.originClass,
+        encodeProtocolIdBase64Url(input.childAttemptId),
+        hex(input.admissionProofSha256),
+        input.daemonInstanceId,
+        input.accountId,
+        input.deviceAttachmentId,
+        input.deviceGeneration.toString(),
+      )) as string,
+    );
+    await this.redis.set(
+      `flycockpit:remote-signaling:admission-ticket-route:${hex(ticketId)}`,
+      JSON.stringify({
+        daemonInstanceId: input.daemonInstanceId,
+        childAttemptId: encodeProtocolIdBase64Url(input.childAttemptId),
+      }),
+      "PXAT",
+      expires,
+    );
+    return { ticketId, secret };
+  }
+  async resolveAdmissionTicket(
+    ticketId: Uint8Array,
+  ): Promise<RemoteSignalingAdmissionTicketRoute | null> {
+    const raw = await this.redis.get(
+      `flycockpit:remote-signaling:admission-ticket-route:${hex(ticketId)}`,
+    );
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { daemonInstanceId: string; childAttemptId: string };
+    return {
+      daemonInstanceId: parsed.daemonInstanceId,
+      childAttemptId: decodeProtocolIdBase64Url(parsed.childAttemptId),
+    };
+  }
+  async commitClientAdmission(
+    instance: string,
+    child: Uint8Array,
+    requestBytes: Uint8Array,
+    ticket: RemoteSignalingAdmissionTicketProof,
+  ): Promise<RemoteSignalingClientAdmissionResultV1> {
+    const request = decodeRemoteSignalingEventRequestV1(requestBytes);
+    validateTypedPayload(request);
+    if (request.eventKind !== 3 || !equal(request.childAttemptId, child))
+      throw new RemoteSignalingStoreError("unavailable");
+    const proof = decodeClientAdmissionProofV1(request.payload);
+    const keys = this.keys(instance, child);
+    const reply = (await this.redis.eval(
+      REMOTE_SIGNALING_COMMIT_ADMISSION_LUA,
+      4,
+      keys[0],
+      keys[1],
+      keys[2],
+      this.admissionTicketKey(instance, ticket.ticketId),
+      hex(request.eventId),
+      hex(requestBytes),
+      requestBytes.length.toString(),
+      Buffer.from(requestBytes),
+      encodeProtocolIdBase64Url(child),
+      hex(proof.daemonOfferDigest),
+      hex(proof.daemonOfferJti),
+      ticket.secretSha256Hex,
+      ticket.originClass,
+      sha256Hex(request.payload),
+      request.transport === 1 ? "webrtc" : "websocket_data",
+    )) as string[];
+    const status = reply[0];
+    if (status === "committed" || status === "replay") {
+      const actorJson = reply[2];
+      if (!actorJson) throw new RemoteSignalingStoreError("corrupt");
+      const parsed = JSON.parse(actorJson) as { role: "client"; actor: string; generation: string };
+      const actor: RemoteSignalingActorBindingV1 = {
+        role: parsed.role,
+        actor: parsed.actor,
+        generation: BigInt(parsed.generation),
+      };
+      return {
+        result: this.result(status, BigInt(reply[1]!), request, requestBytes),
+        actor,
+        childAttemptId: child.slice(),
+        deviceAttachmentId: parsed.actor,
+        deviceGeneration: actor.generation,
+      };
+    }
+    throw new RemoteSignalingStoreError(
+      status === "auth_failed"
+        ? "auth_failed"
+        : status === "conflict"
+          ? "conflict"
+          : status === "limit"
+            ? "limit"
+            : status === "invalid_transition"
+              ? "invalid_transition"
+              : "unavailable",
+    );
+  }
+  async acquireSignalingSocketLease(deviceAttachmentId: string, leaseId: string): Promise<void> {
+    const reply = (await this.redis.eval(
+      REMOTE_SIGNALING_SOCKET_LEASE_ACQUIRE_LUA,
+      1,
+      this.socketLeaseKey(deviceAttachmentId),
+      leaseId,
+      REMOTE_SIGNALING_SOCKET_LEASE_TTL_MS.toString(),
+      REMOTE_SIGNALING_MAX_SIGNALING_SOCKETS_PER_ATTACHMENT.toString(),
+    )) as string[];
+    if (reply[0] !== "ok") throw new RemoteSignalingStoreError("conflict");
+  }
+  async releaseSignalingSocketLease(deviceAttachmentId: string, leaseId: string): Promise<void> {
+    await this.redis.zrem(this.socketLeaseKey(deviceAttachmentId), leaseId);
   }
   async close() {
     await this.redis.quit();

@@ -36,14 +36,30 @@ import { isPrivateIp } from "./private-ip.js";
  * the socket peer and ignores `X-Forwarded-For`.
  */
 export function resolveClientIp(c: Context): string {
-  const socket = getConnInfo(c).remote.address;
-  const forwarded = (c.req.header("x-forwarded-for") ?? "")
+  return resolveClientIpFromParts(c.req.header("x-forwarded-for"), getConnInfo(c).remote.address);
+}
+
+/**
+ * The trusted-proxy IP-resolution core, taking the raw `X-Forwarded-For` header
+ * value and the TCP socket peer address. Both the Hono path
+ * ({@link resolveClientIp}) and the raw `IncomingMessage` WebSocket-upgrade path
+ * share this private-hop walk and `TRUST_PROXY_HOPS` behavior so neither can key
+ * rate limits on a client-forgeable leftmost `X-Forwarded-For` entry.
+ */
+export function resolveClientIpFromParts(
+  xForwardedForHeader: string | string[] | undefined,
+  socketRemoteAddress: string | undefined,
+): string {
+  const headerValue = Array.isArray(xForwardedForHeader)
+    ? xForwardedForHeader.join(",")
+    : (xForwardedForHeader ?? "");
+  const forwarded = headerValue
     .split(",")
     .map((part) => part.trim())
     .filter((part) => part.length > 0);
 
   // Hop chain, client-first: X-Forwarded-For entries, then the real socket peer.
-  const chain = [...forwarded, ...(socket ? [socket] : [])];
+  const chain = [...forwarded, ...(socketRemoteAddress ? [socketRemoteAddress] : [])];
   if (chain.length === 0) return "unknown";
 
   const hops = env.TRUST_PROXY_HOPS;

@@ -188,6 +188,13 @@ jobs:
           DATABASE_URL: postgresql://test:test@127.0.0.1:5432/test
         run: pnpm --filter @flycockpit/api exec vitest run --config vitest.redis.config.ts src/lib/remote-signaling-store.redis.test.ts
 
+      - name: Signaling gateway Redis integration
+        env:
+          TEST_REDIS_URL: redis://127.0.0.1:6379
+          REDIS_URL: redis://127.0.0.1:6379
+          DATABASE_URL: postgresql://test:test@127.0.0.1:5432/test
+        run: pnpm --filter server exec vitest run --config vitest.redis.config.ts src/remote-signaling-gateway/remote-signaling.redis.test.ts
+
   # ── Policy checks (grep-based, enforce AGENTS.md rules) ───────────
 
   policy-checks:

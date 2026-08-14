@@ -110,9 +110,9 @@ impl HostCapabilityProbeInputs {
 }
 
 /// Generation-tagged snapshot store. Late refreshes are discarded.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct HostCapabilitySnapshotStore {
-    inner: Mutex<StoreInner>,
+    inner: Arc<Mutex<StoreInner>>,
 }
 
 #[derive(Debug, Default)]

@@ -1357,6 +1357,10 @@ pub enum Event {
         #[serde(default)]
         container_network_enabled: bool,
         container_availability: ContainerAvailability,
+        /// Persisted `sandbox.defaultMode` after this call. Absent on older
+        /// peers; `mode` remains the session's effective mode.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        persisted_intent: Option<SandboxMode>,
     },
 
     /// Sandbox-escalation availability changed for the session. Broadcast to

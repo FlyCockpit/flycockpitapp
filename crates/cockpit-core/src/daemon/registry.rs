@@ -93,6 +93,9 @@ struct Inner {
     /// tests inject fixed configs so no attach/resume/worker path consults
     /// the machine's live layered config.
     config_source: crate::daemon::config_source::ConfigSource,
+    /// Shared host-capability snapshot. Late-installed after
+    /// [`crate::daemon::server::DaemonContext`] owns the store.
+    host_capabilities: Mutex<Option<crate::host_capabilities::HostCapabilitySnapshotStore>>,
 }
 
 struct WorkerState {
@@ -375,8 +378,23 @@ impl SessionRegistry {
                 shutdown,
                 global_bus: Mutex::new(None),
                 config_source,
+                host_capabilities: Mutex::new(None),
             }),
         }
+    }
+
+    pub fn set_host_capabilities(
+        &self,
+        store: crate::host_capabilities::HostCapabilitySnapshotStore,
+    ) {
+        *crate::sync::lock_or_recover(&self.inner.host_capabilities) = Some(store);
+    }
+
+    fn current_host_capabilities(&self) -> cockpit_proto::HostCapabilitySnapshot {
+        crate::sync::lock_or_recover(&self.inner.host_capabilities)
+            .as_ref()
+            .and_then(|store| store.current().map(|snapshot| (*snapshot).clone()))
+            .unwrap_or_else(session_worker::unpublished_host_capability_snapshot)
     }
 
     pub fn lsp_manager(&self) -> Arc<crate::daemon::lsp::LspManager> {
@@ -862,6 +880,7 @@ impl SessionRegistry {
                     extended_cfg.clone(),
                     hooks,
                 )
+                .with_host_capabilities(self.current_host_capabilities())
             },
         );
 

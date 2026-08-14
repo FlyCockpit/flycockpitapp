@@ -205,6 +205,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             enabled: _,
             container_network_enabled: _,
             container_availability: _,
+            persisted_intent: _,
         }
         | proto::Response::SandboxEscalationState { enabled: _ }
         | proto::Response::RedactionState {
@@ -594,6 +595,7 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             enabled: _,
             container_network_enabled: _,
             container_availability: _,
+            persisted_intent: _,
         }
         | proto::Event::SandboxEscalationState {
             session_id: _,
@@ -1987,6 +1989,8 @@ impl DaemonContext {
         if let Some(handle) = &scheduler {
             registry.set_scheduler(handle.clone());
         }
+        let host_capabilities = crate::host_capabilities::HostCapabilitySnapshotStore::new();
+        registry.set_host_capabilities(host_capabilities.clone());
         struct DaemonMediaClock(Instant);
         impl crate::media_reservation::MonotonicClock for DaemonMediaClock {
             fn now_ms(&self) -> u64 {
@@ -2049,7 +2053,7 @@ impl DaemonContext {
             remote_project_resolver: Arc::new(
                 crate::daemon::remote_project_resolver::StaticRemoteProjectResolver::new(),
             ),
-            host_capabilities: crate::host_capabilities::HostCapabilitySnapshotStore::new(),
+            host_capabilities,
             host_capability_probes: crate::host_capabilities::HostCapabilityProbeInputs::production(
                 canonical_cwd.clone(),
             ),

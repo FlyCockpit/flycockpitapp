@@ -3942,15 +3942,24 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     return Ok(response);
                 }
             }
-            let new = att
+            let caps = current_host_capability_snapshot(ctx);
+            let applied = att
                 .handle
-                .set_sandbox(mode, container_network_enabled)
-                .map_err(bad_request)?;
+                .set_sandbox(mode, container_network_enabled, &caps)
+                .map_err(|error| match error {
+                    crate::daemon::session_worker::SetSandboxError::CapabilityMissing(missing) => {
+                        sandbox_capability_missing(missing)
+                    }
+                    crate::daemon::session_worker::SetSandboxError::Persist(message) => {
+                        internal(message)
+                    }
+                })?;
             let response = Response::SandboxState {
-                mode: new,
-                enabled: new.enabled(),
+                mode: applied.effective,
+                enabled: applied.effective.enabled(),
                 container_network_enabled: att.handle.container_network_enabled(),
                 container_availability: crate::container::availability_snapshot(),
+                persisted_intent: Some(applied.persisted_intent),
             };
             match remote_operation {
                 Some(operation) => {
@@ -5813,6 +5822,22 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
     }
 }
 
+fn current_host_capability_snapshot(ctx: &DaemonContext) -> cockpit_proto::HostCapabilitySnapshot {
+    ctx.host_capabilities
+        .current()
+        .map(|snapshot| (*snapshot).clone())
+        .unwrap_or_else(crate::daemon::session_worker::unpublished_host_capability_snapshot)
+}
+
+fn sandbox_capability_missing(
+    missing: crate::daemon::session_worker::SandboxCapabilityMissing,
+) -> ErrorPayload {
+    ErrorPayload {
+        code: ErrorCode::SandboxCapabilityMissing,
+        message: missing.to_string(),
+    }
+}
+
 fn get_host_capabilities(ctx: &DaemonContext) -> std::result::Result<Response, ErrorPayload> {
     let snapshot = ctx
         .host_capabilities
@@ -6461,7 +6486,12 @@ pub(super) async fn attach(
         handle.persist_if_needed().map_err(internal)?;
     }
     if remote_readonly_attach {
-        let _ = handle.set_sandbox(Some(crate::tools::sandbox_mode::SandboxMode::Sandbox), None);
+        let caps = current_host_capability_snapshot(ctx);
+        let _ = handle.set_sandbox(
+            Some(crate::tools::sandbox_mode::SandboxMode::Sandbox),
+            None,
+            &caps,
+        );
         handle.set_approval_mode(crate::config::extended::ApprovalMode::Manual);
     }
 
@@ -6524,6 +6554,7 @@ pub(super) async fn attach(
             .map_err(internal)?;
         att.handle.broadcast_gitignore_allow();
         att.handle.broadcast_active_interrupt().await;
+        att.handle.broadcast_sandbox_state();
         att.handle.broadcast_sandbox_escalation();
         att.handle.broadcast_sandbox_unavailable_or_probe();
         att.handle.broadcast_config_snapshot();

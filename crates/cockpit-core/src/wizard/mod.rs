@@ -11,8 +11,9 @@ use anyhow::{Result, anyhow};
 mod apply;
 
 pub use apply::{
-    ModelAnswersOutcome, apply_model_answers, apply_security_answers, descriptor_for_cwd,
-    model_descriptor_for_cwd, security_config_path,
+    ModelAnswersOutcome, apply_model_answers, apply_security_answers,
+    apply_security_answers_with_caps, compose_wizard_host_capabilities, descriptor_for_cwd,
+    descriptor_for_cwd_with_caps, model_descriptor_for_cwd, security_config_path,
 };
 
 pub const PROVIDER_WIZARD_ID: &str = "provider";
@@ -1069,12 +1070,27 @@ pub fn provider_descriptor_with_template(default_template: Option<&str>) -> Wiza
 }
 
 pub fn security_descriptor() -> WizardDescriptor {
-    security_descriptor_for_config(&crate::config::extended::ExtendedConfig::default())
+    security_descriptor_for_config_with_caps(
+        &crate::config::extended::ExtendedConfig::default(),
+        &crate::daemon::session_worker::unpublished_host_capability_snapshot(),
+    )
 }
 
 pub fn security_descriptor_for_config(
     current: &crate::config::extended::ExtendedConfig,
 ) -> WizardDescriptor {
+    security_descriptor_for_config_with_caps(
+        current,
+        &crate::daemon::session_worker::unpublished_host_capability_snapshot(),
+    )
+}
+
+pub fn security_descriptor_for_config_with_caps(
+    current: &crate::config::extended::ExtendedConfig,
+    caps: &cockpit_proto::HostCapabilitySnapshot,
+) -> WizardDescriptor {
+    let (sandbox_options, sandbox_default) =
+        sandbox_select_options(current.sandbox.default_mode, caps);
     WizardDescriptor {
         id: SECURITY_WIZARD_ID,
         title: "Security posture",
@@ -1085,35 +1101,12 @@ pub fn security_descriptor_for_config(
             StepDescriptor {
                 id: "sandbox",
                 prompt: "How should Cockpit confine shell commands by default?",
-                help: "Keep the host shell sandbox unless you specifically need container isolation or unconfined commands. `off` means commands the model runs are unconfined.",
+                help: "Keep the host shell sandbox unless you specifically need container isolation or unconfined commands. `off` means commands the model runs are unconfined. Container rows are omitted when docker/podman is not available. Host sandbox is omitted when the host capability is down.",
                 help_hook: None,
                 kind: StepKind::Select {
-                    options: vec![
-                        SelectOption {
-                            id: sandbox_mode_id(current.sandbox.default_mode).into(),
-                            label: "Keep current sandbox setting".into(),
-                            description: "Recommended default is sandbox. Commands run inside the OS shell sandbox when available.".into(),
-                        },
-                        SelectOption {
-                            id: "container".into(),
-                            label: "container".into(),
-                            description: "Run commands in a Docker/Podman container. Shown even if docker/podman is not found.".into(),
-                        },
-                        SelectOption {
-                            id: "container-readonly".into(),
-                            label: "container-readonly".into(),
-                            description: "Run in a container with the project mounted read-only.".into(),
-                        },
-                        SelectOption {
-                            id: "off".into(),
-                            label: "off".into(),
-                            description: "Unconfined: commands the model runs are not sandboxed.".into(),
-                        },
-                    ],
+                    options: sandbox_options,
                 },
-                default_answer: Some(WizardAnswer::Select(
-                    sandbox_mode_id(current.sandbox.default_mode).to_string(),
-                )),
+                default_answer: Some(WizardAnswer::Select(sandbox_default)),
                 prefill: None,
                 validate: Some(validate_sandbox_mode),
                 write: None,
@@ -1193,6 +1186,76 @@ pub fn security_descriptor_for_config(
             },
         ],
     }
+}
+
+fn sandbox_select_options(
+    current: crate::tools::sandbox_mode::SandboxMode,
+    caps: &cockpit_proto::HostCapabilitySnapshot,
+) -> (Vec<SelectOption>, String) {
+    use crate::daemon::session_worker::sandbox_mode_selectable;
+    use crate::tools::sandbox_mode::SandboxMode;
+
+    let current_selectable = sandbox_mode_selectable(current, caps);
+    let host_on = sandbox_mode_selectable(SandboxMode::Sandbox, caps);
+    let container_on = sandbox_mode_selectable(SandboxMode::Container, caps);
+
+    let mut options = Vec::new();
+    if current_selectable {
+        options.push(SelectOption {
+            id: sandbox_mode_id(current).into(),
+            label: "Keep current sandbox setting".into(),
+            description: if current == SandboxMode::Sandbox {
+                "Recommended default is sandbox. Commands run inside the OS shell sandbox when available.".into()
+            } else {
+                "Keep the sandbox mode already stored in config.".into()
+            },
+        });
+    }
+    if host_on && current != SandboxMode::Sandbox {
+        options.push(SelectOption {
+            id: "sandbox".into(),
+            label: "sandbox".into(),
+            description: "Run commands inside the OS shell sandbox.".into(),
+        });
+    }
+    if container_on {
+        if current != SandboxMode::Container {
+            options.push(SelectOption {
+                id: "container".into(),
+                label: "container".into(),
+                description: "Run commands in a Docker/Podman container.".into(),
+            });
+        }
+        if current != SandboxMode::ContainerReadonly {
+            options.push(SelectOption {
+                id: "container-readonly".into(),
+                label: "container-readonly".into(),
+                description: "Run in a container with the project mounted read-only.".into(),
+            });
+        }
+    }
+    if current != SandboxMode::Off {
+        options.push(SelectOption {
+            id: "off".into(),
+            label: "off".into(),
+            description: "Unconfined: commands the model runs are not sandboxed.".into(),
+        });
+    } else if !current_selectable {
+        options.push(SelectOption {
+            id: "off".into(),
+            label: "off".into(),
+            description: "Unconfined: commands the model runs are not sandboxed.".into(),
+        });
+    }
+
+    let default_id = if current_selectable {
+        sandbox_mode_id(current).to_string()
+    } else if host_on {
+        "sandbox".to_string()
+    } else {
+        "off".to_string()
+    };
+    (options, default_id)
 }
 
 pub(crate) fn sandbox_mode_id(mode: crate::tools::sandbox_mode::SandboxMode) -> &'static str {
@@ -2322,7 +2385,12 @@ mod tests {
             },
             ..Default::default()
         };
-        let mut run = WizardRun::new(security_descriptor_for_config(&current)).unwrap();
+        let caps = crate::daemon::session_worker::sandbox_capability_snapshot(
+            cockpit_proto::FeatureCapabilityState::Available,
+            cockpit_proto::FeatureCapabilityState::Available,
+        );
+        let mut run =
+            WizardRun::new(security_descriptor_for_config_with_caps(&current, &caps)).unwrap();
 
         assert_eq!(
             run.prefill(),
@@ -2337,6 +2405,102 @@ mod tests {
         run.submit(WizardAnswer::Select("yolo".to_string()))
             .unwrap();
         assert_eq!(run.prefill(), Some(WizardAnswer::Text("17".to_string())));
+    }
+
+    fn sandbox_option_ids(descriptor: &WizardDescriptor) -> Vec<String> {
+        let sandbox = descriptor
+            .steps
+            .iter()
+            .find(|step| step.id == "sandbox")
+            .expect("sandbox step");
+        let StepKind::Select { options } = &sandbox.kind else {
+            panic!("sandbox step is select");
+        };
+        options.iter().map(|option| option.id.to_string()).collect()
+    }
+
+    fn sandbox_default_id(descriptor: &WizardDescriptor) -> String {
+        let sandbox = descriptor
+            .steps
+            .iter()
+            .find(|step| step.id == "sandbox")
+            .expect("sandbox step");
+        match &sandbox.default_answer {
+            Some(WizardAnswer::Select(id)) => id.clone(),
+            other => panic!("sandbox default should be select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn security_wizard_host_unavailable_defaults_off_and_omits_host_on() {
+        let caps = crate::daemon::session_worker::sandbox_capability_snapshot(
+            cockpit_proto::FeatureCapabilityState::Missing,
+            cockpit_proto::FeatureCapabilityState::Available,
+        );
+        let descriptor = security_descriptor_for_config_with_caps(
+            &crate::config::extended::ExtendedConfig::default(),
+            &caps,
+        );
+        let ids = sandbox_option_ids(&descriptor);
+        assert!(!ids.iter().any(|id| id == "sandbox"));
+        assert_eq!(sandbox_default_id(&descriptor), "off");
+    }
+
+    #[test]
+    fn security_wizard_container_unavailable_omits_container_rows() {
+        let caps = crate::daemon::session_worker::sandbox_capability_snapshot(
+            cockpit_proto::FeatureCapabilityState::Available,
+            cockpit_proto::FeatureCapabilityState::Missing,
+        );
+        let descriptor = security_descriptor_for_config_with_caps(
+            &crate::config::extended::ExtendedConfig::default(),
+            &caps,
+        );
+        let ids = sandbox_option_ids(&descriptor);
+        assert!(
+            !ids.iter()
+                .any(|id| id == "container" || id == "container-readonly")
+        );
+        assert!(ids.iter().any(|id| id == "sandbox"));
+        assert_eq!(sandbox_default_id(&descriptor), "sandbox");
+    }
+
+    #[test]
+    fn security_wizard_failed_or_timeout_treats_capability_as_unavailable() {
+        for state in [
+            cockpit_proto::FeatureCapabilityState::Failed,
+            cockpit_proto::FeatureCapabilityState::Missing,
+        ] {
+            let caps = crate::daemon::session_worker::sandbox_capability_snapshot(state, state);
+            let descriptor = security_descriptor_for_config_with_caps(
+                &crate::config::extended::ExtendedConfig::default(),
+                &caps,
+            );
+            let ids = sandbox_option_ids(&descriptor);
+            assert!(
+                !ids.iter()
+                    .any(|id| id == "sandbox" || id == "container" || id == "container-readonly"),
+                "state {state:?} must not offer unavailable rows"
+            );
+            assert_eq!(sandbox_default_id(&descriptor), "off");
+        }
+    }
+
+    #[test]
+    fn security_wizard_both_available_keeps_sandbox_default_and_container_rows() {
+        let caps = crate::daemon::session_worker::sandbox_capability_snapshot(
+            cockpit_proto::FeatureCapabilityState::Available,
+            cockpit_proto::FeatureCapabilityState::Available,
+        );
+        let descriptor = security_descriptor_for_config_with_caps(
+            &crate::config::extended::ExtendedConfig::default(),
+            &caps,
+        );
+        let ids = sandbox_option_ids(&descriptor);
+        assert!(ids.iter().any(|id| id == "sandbox"));
+        assert!(ids.iter().any(|id| id == "container"));
+        assert!(ids.iter().any(|id| id == "container-readonly"));
+        assert_eq!(sandbox_default_id(&descriptor), "sandbox");
     }
 
     #[test]

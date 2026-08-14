@@ -557,6 +557,7 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
                 enabled: mode.enabled(),
                 container_network_enabled,
                 container_availability,
+                persisted_intent: None,
             }]
         }
         TurnEvent::SandboxEscalationState { enabled } => {

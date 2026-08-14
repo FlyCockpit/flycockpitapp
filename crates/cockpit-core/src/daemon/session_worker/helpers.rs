@@ -279,23 +279,43 @@ pub(crate) fn daemon_no_sandbox() -> anyhow::Result<bool> {
     }
 }
 
+/// Persist sandbox intent (`sandbox.defaultMode`). Capability-missing
+/// `SetSandbox` must not call this.
+pub(super) fn persist_sandbox_intent(
+    project_root: &std::path::Path,
+    mode: crate::tools::sandbox_mode::SandboxMode,
+) -> anyhow::Result<()> {
+    use crate::config::dirs::{CONFIG_FILE, discover_config_dirs};
+    use crate::config::extended::ExtendedConfigDoc;
+    let target = discover_config_dirs(project_root)
+        .into_iter()
+        .map(|d| d.path.join(CONFIG_FILE))
+        .find(|p| p.exists())
+        .unwrap_or_else(|| project_root.join(".cockpit").join(CONFIG_FILE));
+    let mut doc = ExtendedConfigDoc::load(&target)?;
+    let mut cfg = doc.config();
+    if cfg.sandbox.default_mode == mode {
+        return Ok(());
+    }
+    cfg.sandbox.default_mode = mode;
+    doc.write(&cfg)?;
+    Ok(())
+}
+
 /// Pure precedence resolver (highest wins): daemon `--no-sandbox` ->
-/// client `--no-sandbox` -> sandbox mode. Factored out from
-/// [`resolve_sandbox_default`] so the precedence can be unit-tested without
-/// touching process env.
+/// client `--no-sandbox` -> [`super::effective_sandbox_mode`]. Factored out
+/// from session spawn so the precedence can be unit-tested without touching
+/// process env. Unavailable container is effective Off, never host Sandbox.
 pub(super) fn resolve_sandbox_default_with(
     daemon_no_sandbox: bool,
     client_no_sandbox: bool,
     configured_default: crate::tools::sandbox_mode::SandboxMode,
+    caps: &cockpit_proto::HostCapabilitySnapshot,
 ) -> crate::tools::sandbox_mode::SandboxMode {
     if daemon_no_sandbox || client_no_sandbox {
         return crate::tools::sandbox_mode::SandboxMode::Off;
     }
-    if configured_default.is_container() && !crate::container::availability_snapshot().available {
-        crate::tools::sandbox_mode::SandboxMode::Sandbox
-    } else {
-        configured_default
-    }
+    super::effective_sandbox_mode(configured_default, caps)
 }
 
 /// Resolve the per-session async-jobs concurrency cap (GOALS §22) from the

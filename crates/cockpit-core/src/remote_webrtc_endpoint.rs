@@ -36,7 +36,10 @@
 //! - No public/fixed listener, UPnP/NAT-PMP, privileged port, or Rust
 //!   WebSocket server.
 //! - Candidate work is capability-gated before any side effect.
-//! - A plain bool or client claim cannot construct the capability.
+//! - The [`VerifiedDirectCapability`] fields are private; a `DirectAllowed`
+//!   value cannot be forged by struct literal or a plain bool/client claim.
+//!   Its only `DirectAllowed` producer is `from_committed_begin`, which binds
+//!   a signed status envelope to a committed authorization.
 //! - TURN-required attempts never open/nominate host/srflx.
 //! - Logs/errors redact addresses/candidates/fingerprints/tokens/identities.
 //! - Late generation events are inert.
@@ -306,7 +309,7 @@ impl ConsentGatedResourceFactory {
         capability: &VerifiedDirectCapability,
         now: Instant,
     ) -> Result<str0m::Rtc, WebrtcEndpointError> {
-        match capability.capability {
+        match capability.capability() {
             ConsentCapability::DirectAllowed | ConsentCapability::RelayOnly => {
                 let rtc = new_rtc_with_rust_crypto(now);
                 self.rtc_instances_created += 1;
@@ -322,7 +325,7 @@ impl ConsentGatedResourceFactory {
         &mut self,
         capability: &VerifiedDirectCapability,
     ) -> Result<(), WebrtcEndpointError> {
-        match capability.capability {
+        match capability.capability() {
             ConsentCapability::DirectAllowed => {
                 self.direct_udp_sockets_opened += 1;
                 Ok(())
@@ -336,7 +339,7 @@ impl ConsentGatedResourceFactory {
         &mut self,
         capability: &VerifiedDirectCapability,
     ) -> Result<(), WebrtcEndpointError> {
-        match capability.capability {
+        match capability.capability() {
             ConsentCapability::DirectAllowed => {
                 self.interfaces_enumerated += 1;
                 Ok(())
@@ -350,7 +353,7 @@ impl ConsentGatedResourceFactory {
         &mut self,
         capability: &VerifiedDirectCapability,
     ) -> Result<(), WebrtcEndpointError> {
-        match capability.capability {
+        match capability.capability() {
             ConsentCapability::DirectAllowed => {
                 self.host_candidates_created += 1;
                 Ok(())
@@ -365,7 +368,7 @@ impl ConsentGatedResourceFactory {
         &mut self,
         capability: &VerifiedDirectCapability,
     ) -> Result<(), WebrtcEndpointError> {
-        match capability.capability {
+        match capability.capability() {
             ConsentCapability::DirectAllowed => {
                 self.srflx_candidates_created += 1;
                 Ok(())
@@ -379,7 +382,7 @@ impl ConsentGatedResourceFactory {
         &mut self,
         capability: &VerifiedDirectCapability,
     ) -> Result<(), WebrtcEndpointError> {
-        match capability.capability {
+        match capability.capability() {
             ConsentCapability::DirectAllowed => {
                 self.stun_requests_sent += 1;
                 Ok(())
@@ -394,7 +397,7 @@ impl ConsentGatedResourceFactory {
         &mut self,
         capability: &VerifiedDirectCapability,
     ) -> Result<(), WebrtcEndpointError> {
-        match capability.capability {
+        match capability.capability() {
             ConsentCapability::DirectAllowed => {
                 self.mixed_ice_configured = true;
                 Ok(())
@@ -415,7 +418,7 @@ impl ConsentGatedResourceFactory {
         &mut self,
         capability: &VerifiedDirectCapability,
     ) -> Result<(), WebrtcEndpointError> {
-        match capability.capability {
+        match capability.capability() {
             ConsentCapability::DirectAllowed | ConsentCapability::RelayOnly => {
                 self.turn_allocations_created += 1;
                 Ok(())
@@ -443,7 +446,7 @@ impl ConsentGatedResourceFactory {
         entry: &AuthorizedIceEntry,
         allocation_lifetime: Duration,
     ) -> Result<u64, WebrtcEndpointError> {
-        match capability.capability {
+        match capability.capability() {
             ConsentCapability::DirectAllowed | ConsentCapability::RelayOnly => {
                 // A real attempt is starting; reflect it in the counter even if
                 // the provider then fails closed.
@@ -461,7 +464,7 @@ impl ConsentGatedResourceFactory {
         &mut self,
         capability: &VerifiedDirectCapability,
     ) -> Result<(), WebrtcEndpointError> {
-        match capability.capability {
+        match capability.capability() {
             ConsentCapability::RelayOnly => {
                 self.relay_only_ice_configured = true;
                 Ok(())
@@ -828,7 +831,7 @@ impl ChildSupervisorState {
                     };
                 }
                 // Unavailable creates no Rtc network resource.
-                if self.generation.capability.capability == ConsentCapability::Unavailable {
+                if self.generation.capability.capability() == ConsentCapability::Unavailable {
                     self.generation.signaling_phase = SignalingPhase::Cancelled;
                     return SupervisorOutput::RejectOffer {
                         child_attempt_id: *child_attempt_id,
@@ -1395,19 +1398,82 @@ pub fn validate_commit_ack(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cockpit_proto::remote_ip_consent::{ConsentCapability, VerifiedDirectCapability};
+    use cockpit_proto::remote_ip_consent::{
+        ConsentCapability, DisclosureRegistryLease, GatherAuthorizationState,
+        RemoteDeviceRelationshipV1, RemoteDirectGatherAuthorization, RemoteIpConsentStatusBody,
+        RemoteIpConsentStatusEnvelope, VerifiedDirectCapability,
+    };
 
+    /// The relationship the direct-allowed test fixtures are bound to.
+    fn direct_relationship() -> RemoteDeviceRelationshipV1 {
+        RemoteDeviceRelationshipV1 {
+            tenant_id: [0x01; 16],
+            instance_id: [0x02; 16],
+            daemon_device_id: [0x03; 16],
+            daemon_generation: 1,
+            daemon_thumbprint: [0xAA; 32],
+            client_device_id: [0x04; 16],
+            client_generation: 1,
+            client_thumbprint: [0xBB; 32],
+        }
+    }
+
+    /// A verified `DirectAllowed` capability built only through the real
+    /// constructor path: a committed authorization plus the matching signed
+    /// status envelope it validated. There is no struct-literal forging — the
+    /// fields are private. The `|_, _| true` verifier stands in for the remote
+    /// authority ring (in-process misuse is out of the threat model); the
+    /// enforced property is that every binding field must match the presented
+    /// status envelope.
     fn direct_cap() -> VerifiedDirectCapability {
-        VerifiedDirectCapability {
-            capability: ConsentCapability::DirectAllowed,
-            server_sequence: 1,
-            relationship_hash: [0xaa; 32],
+        let rel = direct_relationship();
+        let sem = [0x5c; 32];
+        let issued_at: i64 = 1_700_000_000;
+        let valid_until = issued_at + 60;
+
+        let auth = RemoteDirectGatherAuthorization {
+            authorization_id: [0xbb; 16],
+            child_attempt_id: [0xcc; 16],
+            relationship_hash: rel.hash(),
             disclosure_version: 1,
+            semantic_digest: sem,
+            server_sequence: 1,
             policy_epoch: 1,
             authority_epoch: 1,
-            authorization_id: [0xbb; 16],
-            status_valid_until: 1_700_000_060,
-        }
+            status_valid_until: valid_until,
+            state: GatherAuthorizationState::Unused,
+        };
+        let status = RemoteIpConsentStatusEnvelope {
+            body: RemoteIpConsentStatusBody {
+                relationship: rel,
+                disclosure_version: 1,
+                semantic_digest: sem,
+                server_sequence: 1,
+                state: ConsentCapability::DirectAllowed,
+                policy_epoch: 1,
+                authority_epoch: 1,
+                issuer_kid: "k1".to_string(),
+                issued_at,
+                valid_until,
+            },
+            signature: [0x11; 64],
+        };
+        let reg_digest = [0x77; 32];
+        let lease = DisclosureRegistryLease {
+            accepted_registry_digest: reg_digest,
+            accepted_registry_version: 1,
+            ready: true,
+        };
+        VerifiedDirectCapability::from_committed_begin(
+            &auth,
+            &status,
+            &lease,
+            &reg_digest,
+            true,
+            issued_at + 30,
+            |_digest, _sig| true,
+        )
+        .expect("direct_cap builds a valid DirectAllowed capability")
     }
 
     fn relay_only_cap() -> VerifiedDirectCapability {

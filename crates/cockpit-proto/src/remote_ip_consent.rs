@@ -958,6 +958,7 @@ impl RemoteIpConsentStatusEnvelope {
     pub fn verify_binding(
         &self,
         expected_relationship_hash: &[u8; 32],
+        expected_server_sequence: u64,
         expected_disclosure_version: u16,
         expected_semantic_digest: &[u8; 32],
         expected_policy_epoch: u64,
@@ -968,6 +969,9 @@ impl RemoteIpConsentStatusEnvelope {
         let rel_hash = self.body.relationship.hash();
         if &rel_hash != expected_relationship_hash {
             return codec_err("status relationship hash does not match expected");
+        }
+        if self.body.server_sequence != expected_server_sequence {
+            return codec_err("status server sequence does not match expected");
         }
         if self.body.disclosure_version != expected_disclosure_version {
             return codec_err("status disclosure version does not match expected");
@@ -1256,6 +1260,10 @@ pub struct RemoteDirectGatherAuthorization {
     pub child_attempt_id: [u8; 16],
     pub relationship_hash: [u8; 32],
     pub disclosure_version: u16,
+    /// Semantic digest of the disclosure the validated status carried at
+    /// begin-commit time. Recorded from the status so every binding
+    /// expectation `from_committed_begin` enforces is authorization-sourced.
+    pub semantic_digest: [u8; 32],
     pub server_sequence: u64,
     pub policy_epoch: u64,
     pub authority_epoch: u64,
@@ -1408,6 +1416,9 @@ impl ConsentLinearization {
             child_attempt_id,
             relationship_hash: rel_hash,
             disclosure_version: self.state.disclosure_version,
+            // Copy the digest from the status validated above; never a zero or
+            // a caller-supplied free field that can disagree with the status.
+            semantic_digest: status.semantic_digest,
             server_sequence: self.state.server_sequence,
             policy_epoch: self.state.policy_epoch,
             authority_epoch: self.state.authority_epoch,
@@ -1512,35 +1523,77 @@ impl ConsentLinearization {
 // Candidate factory barrier
 // ─────────────────────────────────────────────────────────────────────────
 
-/// A typed verified direct-gather capability that candidate factories
-/// accept. It is nonconstructible without a verified status and committed
-/// begin; it carries the verified sequence/state and never a boolean.
+/// A typed verified direct-gather capability that candidate factories accept.
 ///
-/// Client and daemon candidate factories accept this typed verified status,
-/// never a boolean. `relay_only` configures only signed TURN URLs and
-/// relay-only ICE policy. `unavailable` creates no transport resources.
+/// The enforced invariant (in-process API-misuse resistance, not cryptographic
+/// protection against a hostile caller in the same address space): no
+/// `ConsentCapability::DirectAllowed` value of this type can exist without
+/// presenting, to [`from_committed_begin`](Self::from_committed_begin), a
+/// status envelope whose relationship hash, server sequence, disclosure
+/// version, semantic digest, policy epoch, authority epoch, validity window,
+/// and signature (per the supplied verifier) all match the committed
+/// authorization. All fields are private; the only constructors are
+/// `from_committed_begin` (the sole producer of `DirectAllowed`), `relay_only`,
+/// and `unavailable`. `relay_only`/`unavailable` authorize nothing direct.
+///
+/// The private fields cannot be forged by struct literal or reassigned from
+/// outside this module:
+///
+/// ```compile_fail
+/// use cockpit_proto::remote_ip_consent::{ConsentCapability, VerifiedDirectCapability};
+/// // Fields are private: struct-literal construction outside the module fails.
+/// let _forged = VerifiedDirectCapability {
+///     capability: ConsentCapability::DirectAllowed,
+///     server_sequence: 0,
+///     relationship_hash: [0u8; 32],
+///     disclosure_version: 0,
+///     policy_epoch: 0,
+///     authority_epoch: 0,
+///     authorization_id: [0u8; 16],
+///     status_valid_until: 0,
+/// };
+/// ```
+///
+/// ```compile_fail
+/// use cockpit_proto::remote_ip_consent::{ConsentCapability, VerifiedDirectCapability};
+/// let mut cap = VerifiedDirectCapability::relay_only([0u8; 32], 0, 0, 0);
+/// // The capability field is private: reassignment outside the module fails.
+/// cap.capability = ConsentCapability::DirectAllowed;
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedDirectCapability {
-    pub capability: ConsentCapability,
-    pub server_sequence: u64,
-    pub relationship_hash: [u8; 32],
-    pub disclosure_version: u16,
-    pub policy_epoch: u64,
-    pub authority_epoch: u64,
-    pub authorization_id: [u8; 16],
-    pub status_valid_until: i64,
+    capability: ConsentCapability,
+    server_sequence: u64,
+    relationship_hash: [u8; 32],
+    disclosure_version: u16,
+    policy_epoch: u64,
+    authority_epoch: u64,
+    authorization_id: [u8; 16],
+    status_valid_until: i64,
 }
 
 impl VerifiedDirectCapability {
     /// Construct a `direct_allowed` capability from a committed begin.
-    /// This is the only way to create a `DirectAllowed` capability.
+    ///
+    /// This is the only producer of a `DirectAllowed` capability. It keeps the
+    /// registry-lease, policy, and authorization-state checks, then binds the
+    /// signed status to the committed authorization: it requires
+    /// `status.body.state == DirectAllowed`,
+    /// `status.body.valid_until == authorization.status_valid_until`, and that
+    /// [`verify_binding`](RemoteIpConsentStatusEnvelope::verify_binding)
+    /// accepts the status against the authorization's relationship hash, server
+    /// sequence, disclosure version, semantic digest, policy epoch, authority
+    /// epoch, validity window, and signature. Every rejection is an error;
+    /// no partially initialized or downgraded capability is ever returned.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_committed_begin(
         authorization: &RemoteDirectGatherAuthorization,
-        status: &RemoteIpConsentStatusBody,
+        status: &RemoteIpConsentStatusEnvelope,
         registry_lease: &DisclosureRegistryLease,
         expected_registry_digest: &[u8; 32],
         policy_allows_direct: bool,
         now: i64,
+        verify_fn: impl FnOnce(&[u8; 32], &[u8; 64]) -> bool,
     ) -> Result<Self> {
         // Verify the registry lease is ready and matches.
         if !registry_lease.matches(expected_registry_digest) {
@@ -1560,15 +1613,33 @@ impl VerifiedDirectCapability {
                 "authorization is cancelled or completed".into(),
             ));
         }
-        // Verify the status is nonexpired and direct_allowed.
-        if status.state != ConsentCapability::DirectAllowed {
+        // The presented status must itself be direct_allowed.
+        if status.body.state != ConsentCapability::DirectAllowed {
             return Err(ConsentError::State("status is not direct_allowed".into()));
         }
-        if !status.is_valid_at(now) {
+        // The status lease presented must be the exact one the begin
+        // transaction recorded — any other lease, even a fresher one, fails
+        // and requires a new begin.
+        if status.body.valid_until != authorization.status_valid_until {
             return Err(ConsentError::State(
-                "status is expired or not yet valid".into(),
+                "status validity does not match the committed authorization".into(),
             ));
         }
+        // Bind the signed status to the committed authorization: relationship
+        // hash, server sequence, disclosure version, semantic digest, policy
+        // epoch, authority epoch, validity window, and signature must all match
+        // the authorization. A valid status for another relationship, a stale
+        // sequence, or any single differing field is rejected here.
+        status.verify_binding(
+            &authorization.relationship_hash,
+            authorization.server_sequence,
+            authorization.disclosure_version,
+            &authorization.semantic_digest,
+            authorization.policy_epoch,
+            authorization.authority_epoch,
+            now,
+            verify_fn,
+        )?;
         Ok(Self {
             capability: ConsentCapability::DirectAllowed,
             server_sequence: authorization.server_sequence,
@@ -1620,183 +1691,51 @@ impl VerifiedDirectCapability {
         }
     }
 
+    /// The verified capability tri-state.
+    pub fn capability(&self) -> ConsentCapability {
+        self.capability
+    }
+
+    /// The committed server sequence the capability was bound to.
+    pub fn server_sequence(&self) -> u64 {
+        self.server_sequence
+    }
+
+    /// The relationship hash the capability was bound to.
+    pub fn relationship_hash(&self) -> [u8; 32] {
+        self.relationship_hash
+    }
+
+    /// The disclosure version the capability was bound to.
+    pub fn disclosure_version(&self) -> u16 {
+        self.disclosure_version
+    }
+
+    /// The policy epoch the capability was bound to.
+    pub fn policy_epoch(&self) -> u64 {
+        self.policy_epoch
+    }
+
+    /// The authority epoch the capability was bound to.
+    pub fn authority_epoch(&self) -> u64 {
+        self.authority_epoch
+    }
+
+    /// The committed authorization id (`[0u8; 16]` for relay-only/unavailable).
+    pub fn authorization_id(&self) -> [u8; 16] {
+        self.authorization_id
+    }
+
+    /// The status lease expiry the capability was bound to (`0` for
+    /// relay-only/unavailable).
+    pub fn status_valid_until(&self) -> i64 {
+        self.status_valid_until
+    }
+
     /// True when direct candidate gathering is permitted.
     pub fn permits_direct(&self) -> bool {
         self.capability.permits_direct()
     }
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// Candidate factory instrumentation (test-only barrier)
-// ─────────────────────────────────────────────────────────────────────────
-
-/// A test-instrumented candidate factory that records every attempt to
-/// configure direct mode, emit/accept/nominate candidates, or request STUN.
-///
-/// This proves no configured direct mode/server, emitted or accepted
-/// host/srflx candidate, nominated non-relay pair, daemon direct socket, or
-/// FlyCockpit STUN request before committed begin.
-#[derive(Debug, Clone, Default)]
-pub struct InstrumentedCandidateFactory {
-    pub direct_mode_configured: bool,
-    pub stun_server_configured: bool,
-    pub host_candidates_emitted: u32,
-    pub srflx_candidates_emitted: u32,
-    pub non_relay_candidates_accepted: u32,
-    pub non_relay_pairs_nominated: u32,
-    pub daemon_direct_sockets: u32,
-    pub turn_servers_configured: u32,
-    pub relay_only_policy_configured: bool,
-    pub transport_resources_created: bool,
-}
-
-impl InstrumentedCandidateFactory {
-    /// Configure the factory from a verified capability.
-    ///
-    /// `direct_allowed` configures direct mode and STUN.
-    /// `relay_only` configures only TURN relay-only policy.
-    /// `unavailable` creates no transport resources.
-    pub fn configure(&mut self, capability: &VerifiedDirectCapability) {
-        match capability.capability {
-            ConsentCapability::DirectAllowed => {
-                self.direct_mode_configured = true;
-                self.stun_server_configured = true;
-                self.transport_resources_created = true;
-            }
-            ConsentCapability::RelayOnly => {
-                self.relay_only_policy_configured = true;
-                self.turn_servers_configured += 1;
-                // No direct mode, no STUN, no host/srflx candidates.
-            }
-            ConsentCapability::Unavailable => {
-                // No transport resources created.
-            }
-        }
-    }
-
-    /// Emit a candidate of the given type. Returns true if the candidate was
-    /// emitted (only relay candidates in relay_only mode).
-    pub fn emit_candidate(
-        &mut self,
-        candidate_type: CandidateType,
-        capability: &VerifiedDirectCapability,
-    ) -> bool {
-        match capability.capability {
-            ConsentCapability::DirectAllowed => {
-                match candidate_type {
-                    CandidateType::Host => self.host_candidates_emitted += 1,
-                    CandidateType::Srflx => self.srflx_candidates_emitted += 1,
-                    CandidateType::Relay => {}
-                }
-                true
-            }
-            ConsentCapability::RelayOnly => {
-                // Only relay candidates are emitted in relay_only mode.
-                matches!(candidate_type, CandidateType::Relay)
-            }
-            ConsentCapability::Unavailable => false,
-        }
-    }
-
-    /// Accept a candidate. Returns true if the candidate was accepted.
-    pub fn accept_candidate(
-        &mut self,
-        candidate_type: CandidateType,
-        capability: &VerifiedDirectCapability,
-    ) -> bool {
-        match capability.capability {
-            ConsentCapability::DirectAllowed => {
-                if !matches!(candidate_type, CandidateType::Relay) {
-                    self.non_relay_candidates_accepted += 1;
-                }
-                true
-            }
-            ConsentCapability::RelayOnly => {
-                // No non-relay candidate is accepted in relay_only mode.
-                matches!(candidate_type, CandidateType::Relay)
-            }
-            ConsentCapability::Unavailable => false,
-        }
-    }
-
-    /// Nominate a candidate pair. Returns true if the pair was nominated.
-    pub fn nominate_pair(
-        &mut self,
-        pair_type: CandidatePairType,
-        capability: &VerifiedDirectCapability,
-    ) -> bool {
-        match capability.capability {
-            ConsentCapability::DirectAllowed => {
-                if !matches!(pair_type, CandidatePairType::RelayRelay) {
-                    self.non_relay_pairs_nominated += 1;
-                }
-                true
-            }
-            ConsentCapability::RelayOnly => {
-                // Only relay-relay pairs are nominated in relay_only mode.
-                matches!(pair_type, CandidatePairType::RelayRelay)
-            }
-            ConsentCapability::Unavailable => false,
-        }
-    }
-
-    /// Open a daemon direct socket. Returns true if the socket was opened.
-    pub fn open_daemon_direct_socket(&mut self, capability: &VerifiedDirectCapability) -> bool {
-        match capability.capability {
-            ConsentCapability::DirectAllowed => {
-                self.daemon_direct_sockets += 1;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Assert no direct work was performed (for relay_only/unavailable).
-    pub fn assert_no_direct_work(&self) {
-        assert!(
-            !self.direct_mode_configured,
-            "direct mode must not be configured"
-        );
-        assert!(
-            !self.stun_server_configured,
-            "STUN server must not be configured"
-        );
-        assert_eq!(
-            self.host_candidates_emitted, 0,
-            "no host candidates emitted"
-        );
-        assert_eq!(
-            self.srflx_candidates_emitted, 0,
-            "no srflx candidates emitted"
-        );
-        assert_eq!(
-            self.non_relay_candidates_accepted, 0,
-            "no non-relay candidates accepted"
-        );
-        assert_eq!(
-            self.non_relay_pairs_nominated, 0,
-            "no non-relay pairs nominated"
-        );
-        assert_eq!(self.daemon_direct_sockets, 0, "no daemon direct sockets");
-    }
-}
-
-/// ICE candidate type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum CandidateType {
-    Host,
-    Srflx,
-    Relay,
-}
-
-/// Candidate pair type (local × remote).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum CandidatePairType {
-    HostHost,
-    HostSrflx,
-    SrflxHost,
-    SrflxSrflx,
-    RelayRelay,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -2389,11 +2328,13 @@ mod tests {
         let max_env_bytes = max_env.encode();
         assert_eq!(max_env_bytes.len(), STATUS_ENVELOPE_MAX_LEN);
 
-        // Verify binding: relationship hash, disclosure version, semantic
-        // digest, policy/authority epoch, 60-second max, validity, signature.
+        // Verify binding: relationship hash, server sequence, disclosure
+        // version, semantic digest, policy/authority epoch, 60-second max,
+        // validity, signature. The status body carries server_sequence == 5.
         let rel_hash = rel.hash();
         let result = envelope.verify_binding(
             &rel_hash,
+            5,
             1,
             &sem,
             1,
@@ -2405,17 +2346,25 @@ mod tests {
 
         // Wrong relationship hash fails.
         let result =
-            envelope.verify_binding(&[0xFF; 32], 1, &sem, 1, 1, 3_000_030, |_digest, _sig| true);
+            envelope.verify_binding(&[0xFF; 32], 5, 1, &sem, 1, 1, 3_000_030, |_digest, _sig| {
+                true
+            });
+        assert!(result.is_err());
+
+        // Wrong server sequence fails.
+        let result =
+            envelope.verify_binding(&rel_hash, 6, 1, &sem, 1, 1, 3_000_030, |_digest, _sig| true);
         assert!(result.is_err());
 
         // Wrong disclosure version fails.
         let result =
-            envelope.verify_binding(&rel_hash, 2, &sem, 1, 1, 3_000_030, |_digest, _sig| true);
+            envelope.verify_binding(&rel_hash, 5, 2, &sem, 1, 1, 3_000_030, |_digest, _sig| true);
         assert!(result.is_err());
 
         // Wrong semantic digest fails.
         let result = envelope.verify_binding(
             &rel_hash,
+            5,
             1,
             &[0xFF; 32],
             1,
@@ -2427,22 +2376,24 @@ mod tests {
 
         // Wrong policy epoch fails.
         let result =
-            envelope.verify_binding(&rel_hash, 1, &sem, 2, 1, 3_000_030, |_digest, _sig| true);
+            envelope.verify_binding(&rel_hash, 5, 1, &sem, 2, 1, 3_000_030, |_digest, _sig| true);
         assert!(result.is_err());
 
         // Wrong authority epoch fails.
         let result =
-            envelope.verify_binding(&rel_hash, 1, &sem, 1, 2, 3_000_030, |_digest, _sig| true);
+            envelope.verify_binding(&rel_hash, 5, 1, &sem, 1, 2, 3_000_030, |_digest, _sig| true);
         assert!(result.is_err());
 
         // Expired status fails.
         let result =
-            envelope.verify_binding(&rel_hash, 1, &sem, 1, 1, 3_000_100, |_digest, _sig| true);
+            envelope.verify_binding(&rel_hash, 5, 1, &sem, 1, 1, 3_000_100, |_digest, _sig| true);
         assert!(result.is_err());
 
         // Signature verification failure fails.
         let result =
-            envelope.verify_binding(&rel_hash, 1, &sem, 1, 1, 3_000_030, |_digest, _sig| false);
+            envelope.verify_binding(&rel_hash, 5, 1, &sem, 1, 1, 3_000_030, |_digest, _sig| {
+                false
+            });
         assert!(result.is_err());
 
         // No boolean bypass: the capability is a typed enum, not a boolean.
@@ -2478,112 +2429,6 @@ mod tests {
         // Truncate to remove the kid and trailing timestamps.
         let truncated = &zero_kid[..kid_len_offset + 1 + 16];
         assert!(RemoteIpConsentStatusBody::decode(truncated).is_err());
-    }
-
-    // ── AC5: remote_ip_consent_precedes_direct_work ──
-
-    #[test]
-    fn remote_ip_consent_precedes_direct_work() {
-        let rel = make_relationship();
-        let sem = make_semantic_digest();
-        let registry = make_registry();
-
-        // Before committed begin: no direct work.
-        let state =
-            RelationshipConsentState::new(&rel, 1, sem, registry.registry_digest, 1, true, true, 1);
-        let _lin = ConsentLinearization::new(state);
-        let cap = VerifiedDirectCapability::unavailable(rel.hash(), 1, 1, 1);
-        let mut factory = InstrumentedCandidateFactory::default();
-        factory.configure(&cap);
-        factory.assert_no_direct_work();
-        assert!(!factory.transport_resources_created);
-
-        // No candidate emitted before begin.
-        assert!(!factory.emit_candidate(CandidateType::Host, &cap));
-        assert!(!factory.emit_candidate(CandidateType::Srflx, &cap));
-        assert!(!factory.accept_candidate(CandidateType::Host, &cap));
-        assert!(!factory.nominate_pair(CandidatePairType::HostHost, &cap));
-        assert!(!factory.open_daemon_direct_socket(&cap));
-
-        // After committed begin with direct_allowed: direct work is permitted.
-        let mut state2 =
-            RelationshipConsentState::new(&rel, 1, sem, registry.registry_digest, 1, true, true, 1);
-        state2.daemon_accepted = true;
-        state2.client_accepted = true;
-        state2.server_sequence = 3;
-        let mut lin2 = ConsentLinearization::new(state2);
-
-        let status = RemoteIpConsentStatusBody {
-            relationship: rel.clone(),
-            disclosure_version: 1,
-            semantic_digest: sem,
-            server_sequence: 3,
-            state: ConsentCapability::DirectAllowed,
-            policy_epoch: 1,
-            authority_epoch: 1,
-            issuer_kid: "k1".to_string(),
-            issued_at: 3_000_000,
-            valid_until: 3_000_060,
-        };
-
-        let auth_id = [0x07; 16];
-        let attempt_id = [0x08; 16];
-        let seq = lin2
-            .begin_direct_gather(auth_id, attempt_id, &status, 3_000_030)
-            .unwrap();
-        assert_eq!(seq, 3);
-
-        let auth = &lin2.authorizations()[0];
-        let direct_cap = VerifiedDirectCapability {
-            capability: ConsentCapability::DirectAllowed,
-            server_sequence: auth.server_sequence,
-            relationship_hash: auth.relationship_hash,
-            disclosure_version: auth.disclosure_version,
-            policy_epoch: auth.policy_epoch,
-            authority_epoch: auth.authority_epoch,
-            authorization_id: auth.authorization_id,
-            status_valid_until: auth.status_valid_until,
-        };
-
-        let mut factory2 = InstrumentedCandidateFactory::default();
-        factory2.configure(&direct_cap);
-        assert!(factory2.direct_mode_configured);
-        assert!(factory2.stun_server_configured);
-        assert!(factory2.emit_candidate(CandidateType::Host, &direct_cap));
-        assert!(factory2.emit_candidate(CandidateType::Srflx, &direct_cap));
-        assert!(factory2.accept_candidate(CandidateType::Host, &direct_cap));
-        assert!(factory2.nominate_pair(CandidatePairType::HostHost, &direct_cap));
-        assert!(factory2.open_daemon_direct_socket(&direct_cap));
-    }
-
-    // ── AC6: remote_ip_consent_relay_only_path ──
-
-    #[test]
-    fn remote_ip_consent_relay_only_path() {
-        let rel = make_relationship();
-
-        // Relay-only capability: no consent needed.
-        let cap = VerifiedDirectCapability::relay_only(rel.hash(), 1, 1, 1);
-        let mut factory = InstrumentedCandidateFactory::default();
-        factory.configure(&cap);
-
-        // Only TURN relay-only policy configured.
-        assert!(factory.relay_only_policy_configured);
-        assert!(factory.turn_servers_configured > 0);
-        // No direct mode, no STUN, no host/srflx.
-        factory.assert_no_direct_work();
-
-        // Only relay candidates emitted/accepted/nominated.
-        assert!(!factory.emit_candidate(CandidateType::Host, &cap));
-        assert!(!factory.emit_candidate(CandidateType::Srflx, &cap));
-        assert!(factory.emit_candidate(CandidateType::Relay, &cap));
-        assert!(!factory.accept_candidate(CandidateType::Host, &cap));
-        assert!(!factory.accept_candidate(CandidateType::Srflx, &cap));
-        assert!(factory.accept_candidate(CandidateType::Relay, &cap));
-        assert!(!factory.nominate_pair(CandidatePairType::HostHost, &cap));
-        assert!(!factory.nominate_pair(CandidatePairType::SrflxSrflx, &cap));
-        assert!(factory.nominate_pair(CandidatePairType::RelayRelay, &cap));
-        assert!(!factory.open_daemon_direct_socket(&cap));
     }
 
     // ── AC7: remote_ip_consent_begin_revoke_linearization ──
@@ -3237,20 +3082,6 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_creates_no_transport_resources() {
-        let rel = make_relationship();
-        let cap = VerifiedDirectCapability::unavailable(rel.hash(), 1, 1, 1);
-        let mut factory = InstrumentedCandidateFactory::default();
-        factory.configure(&cap);
-        assert!(!factory.transport_resources_created);
-        assert!(!factory.direct_mode_configured);
-        assert!(!factory.stun_server_configured);
-        assert!(!factory.relay_only_policy_configured);
-        assert_eq!(factory.turn_servers_configured, 0);
-        factory.assert_no_direct_work();
-    }
-
-    #[test]
     fn shared_leg_evaluates_independently() {
         // Shared sessions evaluate each client-daemon leg independently.
         // Two relationships with different device IDs produce different
@@ -3325,5 +3156,348 @@ mod tests {
         let receipt_text = String::from_utf8_lossy(&receipt_bytes);
         assert!(!receipt_text.contains("192.168"));
         assert!(!receipt_text.contains("candidate:"));
+    }
+
+    // ── Status-binding / nonconstructible-capability helpers ──
+
+    /// A mutually-accepted, direct-allowed relationship state at `seq`.
+    fn make_direct_state(
+        rel: &RemoteDeviceRelationshipV1,
+        sem: [u8; 32],
+        registry: &IpDisclosureRegistry,
+        seq: u64,
+    ) -> RelationshipConsentState {
+        let mut state =
+            RelationshipConsentState::new(rel, 1, sem, registry.registry_digest, 1, true, true, 1);
+        state.daemon_accepted = true;
+        state.client_accepted = true;
+        state.server_sequence = seq;
+        state
+    }
+
+    /// A direct-allowed status body valid over `[3_000_000, 3_000_060)`.
+    fn make_direct_status_body(
+        rel: &RemoteDeviceRelationshipV1,
+        sem: [u8; 32],
+        seq: u64,
+    ) -> RemoteIpConsentStatusBody {
+        RemoteIpConsentStatusBody {
+            relationship: rel.clone(),
+            disclosure_version: 1,
+            semantic_digest: sem,
+            server_sequence: seq,
+            state: ConsentCapability::DirectAllowed,
+            policy_epoch: 1,
+            authority_epoch: 1,
+            issuer_kid: "k1".to_string(),
+            issued_at: 3_000_000,
+            valid_until: 3_000_060,
+        }
+    }
+
+    /// A deterministic P-256 test signing key (fixed nonzero scalar below n).
+    fn test_signing_key(seed: u8) -> p256::ecdsa::SigningKey {
+        p256::ecdsa::SigningKey::from_slice(&[seed | 0x01; 32]).expect("valid scalar")
+    }
+
+    /// Sign the status body's `signing_digest()` with a real P-256 key so the
+    /// signature branch is exercised end-to-end.
+    fn sign_status(
+        sk: &p256::ecdsa::SigningKey,
+        body: RemoteIpConsentStatusBody,
+    ) -> RemoteIpConsentStatusEnvelope {
+        use p256::ecdsa::signature::Signer;
+        let digest = body.signing_digest();
+        let sig: p256::ecdsa::Signature = sk.sign(digest.as_slice());
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(sig.to_bytes().as_slice());
+        RemoteIpConsentStatusEnvelope { body, signature }
+    }
+
+    /// A `verify_fn` that verifies a raw P-256 signature over the digest
+    /// against `vk`.
+    fn p256_verifier(vk: p256::ecdsa::VerifyingKey) -> impl FnOnce(&[u8; 32], &[u8; 64]) -> bool {
+        use p256::ecdsa::signature::Verifier;
+        move |digest: &[u8; 32], sig: &[u8; 64]| match p256::ecdsa::Signature::from_slice(sig) {
+            Ok(s) => vk.verify(digest.as_slice(), &s).is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    /// Drive `from_committed_begin` against `auth` with a freshly signed
+    /// envelope for `body`. `signer_seed == verifier_seed` yields a valid
+    /// signature; differing seeds force a genuine signature rejection.
+    fn attempt_begin(
+        auth: &RemoteDirectGatherAuthorization,
+        lease: &DisclosureRegistryLease,
+        reg_digest: &[u8; 32],
+        body: RemoteIpConsentStatusBody,
+        signer_seed: u8,
+        verifier_seed: u8,
+        now: i64,
+    ) -> Result<VerifiedDirectCapability> {
+        let sk = test_signing_key(signer_seed);
+        let envelope = sign_status(&sk, body);
+        let vk = test_signing_key(verifier_seed).verifying_key().clone();
+        VerifiedDirectCapability::from_committed_begin(
+            auth,
+            &envelope,
+            lease,
+            reg_digest,
+            true,
+            now,
+            p256_verifier(vk),
+        )
+    }
+
+    // ── remote_ip_consent_constructor_surface ──
+
+    #[test]
+    fn remote_ip_consent_constructor_surface() {
+        let rel = make_relationship();
+
+        // relay_only / unavailable never return DirectAllowed and permit no
+        // direct work; their accessors round-trip the constructor inputs.
+        let relay = VerifiedDirectCapability::relay_only(rel.hash(), 7, 3, 4);
+        assert_eq!(relay.capability(), ConsentCapability::RelayOnly);
+        assert!(!relay.permits_direct());
+        assert_eq!(relay.relationship_hash(), rel.hash());
+        assert_eq!(relay.disclosure_version(), 7);
+        assert_eq!(relay.policy_epoch(), 3);
+        assert_eq!(relay.authority_epoch(), 4);
+        assert_eq!(relay.server_sequence(), 0);
+        assert_eq!(relay.authorization_id(), [0u8; 16]);
+        assert_eq!(relay.status_valid_until(), 0);
+
+        let unavailable = VerifiedDirectCapability::unavailable(rel.hash(), 9, 5, 6);
+        assert_eq!(unavailable.capability(), ConsentCapability::Unavailable);
+        assert!(!unavailable.permits_direct());
+        assert_eq!(unavailable.disclosure_version(), 9);
+        assert_eq!(unavailable.policy_epoch(), 5);
+        assert_eq!(unavailable.authority_epoch(), 6);
+        assert_eq!(unavailable.authorization_id(), [0u8; 16]);
+        assert_eq!(unavailable.status_valid_until(), 0);
+
+        // The only DirectAllowed producer is from_committed_begin; the
+        // accessors round-trip the committed authorization inputs.
+        let sem = make_semantic_digest();
+        let registry = make_registry();
+        let mut lin = ConsentLinearization::new(make_direct_state(&rel, sem, &registry, 3));
+        let status_body = make_direct_status_body(&rel, sem, 3);
+        lin.begin_direct_gather([0x21; 16], [0x22; 16], &status_body, 3_000_030)
+            .unwrap();
+        let auth = lin.authorizations()[0].clone();
+        let lease = DisclosureRegistryLease::ready_for(&registry);
+        let cap = attempt_begin(
+            &auth,
+            &lease,
+            &registry.registry_digest,
+            status_body,
+            0x40,
+            0x40,
+            3_000_030,
+        )
+        .unwrap();
+        assert_eq!(cap.capability(), ConsentCapability::DirectAllowed);
+        assert!(cap.permits_direct());
+        assert_eq!(cap.server_sequence(), auth.server_sequence);
+        assert_eq!(cap.relationship_hash(), auth.relationship_hash);
+        assert_eq!(cap.disclosure_version(), auth.disclosure_version);
+        assert_eq!(cap.policy_epoch(), auth.policy_epoch);
+        assert_eq!(cap.authority_epoch(), auth.authority_epoch);
+        assert_eq!(cap.authorization_id(), auth.authorization_id);
+        assert_eq!(cap.status_valid_until(), auth.status_valid_until);
+    }
+
+    // ── remote_ip_consent_status_binding_rejects_sequence_mismatch ──
+
+    #[test]
+    fn remote_ip_consent_status_binding_rejects_sequence_mismatch() {
+        let rel = make_relationship();
+        let sem = make_semantic_digest();
+        let sk = test_signing_key(0x50);
+        // The status carries server_sequence == 5.
+        let envelope = sign_status(&sk, make_direct_status_body(&rel, sem, 5));
+        let rel_hash = rel.hash();
+
+        // Matching sequence verifies.
+        assert!(
+            envelope
+                .verify_binding(
+                    &rel_hash,
+                    5,
+                    1,
+                    &sem,
+                    1,
+                    1,
+                    3_000_030,
+                    p256_verifier(sk.verifying_key().clone())
+                )
+                .is_ok()
+        );
+
+        // A status differing only in server_sequence is rejected.
+        assert!(
+            envelope
+                .verify_binding(
+                    &rel_hash,
+                    6,
+                    1,
+                    &sem,
+                    1,
+                    1,
+                    3_000_030,
+                    p256_verifier(sk.verifying_key().clone())
+                )
+                .is_err()
+        );
+    }
+
+    // ── remote_ip_consent_begin_binding_rejects_foreign_status ──
+
+    #[test]
+    fn remote_ip_consent_begin_binding_rejects_foreign_status() {
+        let rel_a = make_relationship();
+        // Relationship B differs from A in a single device field.
+        let mut rel_b = make_relationship();
+        rel_b.client_device_id[0] ^= 1;
+        assert_ne!(rel_a.hash(), rel_b.hash());
+
+        let sem = make_semantic_digest();
+        let registry = make_registry();
+        let lease = DisclosureRegistryLease::ready_for(&registry);
+        let reg_digest = registry.registry_digest;
+
+        // A committed authorization for relationship A at sequence 5.
+        let auth = RemoteDirectGatherAuthorization {
+            authorization_id: [0x31; 16],
+            child_attempt_id: [0x32; 16],
+            relationship_hash: rel_a.hash(),
+            disclosure_version: 1,
+            semantic_digest: sem,
+            server_sequence: 5,
+            policy_epoch: 1,
+            authority_epoch: 1,
+            status_valid_until: 3_000_060,
+            state: GatherAuthorizationState::Unused,
+        };
+
+        // A validly-signed direct_allowed status for relationship B cannot
+        // authorize a begin for relationship A.
+        let foreign = make_direct_status_body(&rel_b, sem, 5);
+        assert!(attempt_begin(&auth, &lease, &reg_digest, foreign, 0x60, 0x60, 3_000_030).is_err());
+
+        // The exactly-matching envelope succeeds and yields DirectAllowed with
+        // accessor values equal to the authorization's.
+        let good = make_direct_status_body(&rel_a, sem, 5);
+        let cap = attempt_begin(&auth, &lease, &reg_digest, good, 0x60, 0x60, 3_000_030).unwrap();
+        assert_eq!(cap.capability(), ConsentCapability::DirectAllowed);
+        assert_eq!(cap.server_sequence(), auth.server_sequence);
+        assert_eq!(cap.relationship_hash(), auth.relationship_hash);
+        assert_eq!(cap.disclosure_version(), auth.disclosure_version);
+        assert_eq!(cap.policy_epoch(), auth.policy_epoch);
+        assert_eq!(cap.authority_epoch(), auth.authority_epoch);
+        assert_eq!(cap.authorization_id(), auth.authorization_id);
+        assert_eq!(cap.status_valid_until(), auth.status_valid_until);
+
+        // Each single-field divergence is rejected while the matching envelope
+        // succeeds.
+
+        // Mismatched server sequence.
+        let mut b = make_direct_status_body(&rel_a, sem, 6);
+        b.server_sequence = 6;
+        assert!(attempt_begin(&auth, &lease, &reg_digest, b, 0x60, 0x60, 3_000_030).is_err());
+
+        // Mismatched disclosure version.
+        let mut b = make_direct_status_body(&rel_a, sem, 5);
+        b.disclosure_version = 2;
+        assert!(attempt_begin(&auth, &lease, &reg_digest, b, 0x60, 0x60, 3_000_030).is_err());
+
+        // Mismatched semantic digest.
+        let mut b = make_direct_status_body(&rel_a, sem, 5);
+        b.semantic_digest = [0xAB; 32];
+        assert!(attempt_begin(&auth, &lease, &reg_digest, b, 0x60, 0x60, 3_000_030).is_err());
+
+        // Mismatched policy epoch.
+        let mut b = make_direct_status_body(&rel_a, sem, 5);
+        b.policy_epoch = 2;
+        assert!(attempt_begin(&auth, &lease, &reg_digest, b, 0x60, 0x60, 3_000_030).is_err());
+
+        // Mismatched authority epoch.
+        let mut b = make_direct_status_body(&rel_a, sem, 5);
+        b.authority_epoch = 2;
+        assert!(attempt_begin(&auth, &lease, &reg_digest, b, 0x60, 0x60, 3_000_030).is_err());
+
+        // valid_until != authorization.status_valid_until (still a live window).
+        let mut b = make_direct_status_body(&rel_a, sem, 5);
+        b.valid_until = 3_000_050;
+        assert!(attempt_begin(&auth, &lease, &reg_digest, b, 0x60, 0x60, 3_000_030).is_err());
+
+        // Expired status (matching valid_until, but `now` past the window).
+        let expired = make_direct_status_body(&rel_a, sem, 5);
+        assert!(attempt_begin(&auth, &lease, &reg_digest, expired, 0x60, 0x60, 3_000_100).is_err());
+
+        // Failed signature verification (verifier keyed to a different key).
+        let good = make_direct_status_body(&rel_a, sem, 5);
+        assert!(attempt_begin(&auth, &lease, &reg_digest, good, 0x60, 0x7e, 3_000_030).is_err());
+
+        // A non-direct_allowed status for the right relationship is rejected.
+        let mut relay = make_direct_status_body(&rel_a, sem, 5);
+        relay.state = ConsentCapability::RelayOnly;
+        assert!(attempt_begin(&auth, &lease, &reg_digest, relay, 0x60, 0x60, 3_000_030).is_err());
+    }
+
+    // ── remote_ip_consent_begin_records_semantic_digest ──
+
+    #[test]
+    fn remote_ip_consent_begin_records_semantic_digest() {
+        let rel = make_relationship();
+        let registry = make_registry();
+
+        // The state's digest and the status's digest deliberately differ so the
+        // test distinguishes "copied from the status" from "copied from state".
+        let state_sem = [0x01; 32];
+        let status_sem = make_semantic_digest();
+        assert_ne!(state_sem, status_sem);
+
+        let mut state = RelationshipConsentState::new(
+            &rel,
+            1,
+            state_sem,
+            registry.registry_digest,
+            1,
+            true,
+            true,
+            1,
+        );
+        state.daemon_accepted = true;
+        state.client_accepted = true;
+        state.server_sequence = 3;
+        let mut lin = ConsentLinearization::new(state);
+
+        let status_body = make_direct_status_body(&rel, status_sem, 3);
+        lin.begin_direct_gather([0x41; 16], [0x42; 16], &status_body, 3_000_030)
+            .unwrap();
+        let auth = lin.authorizations()[0].clone();
+
+        // The inserted authorization copies the digest from the validated
+        // status, not from the relationship state.
+        assert_eq!(auth.semantic_digest, status_sem);
+        assert_ne!(auth.semantic_digest, state_sem);
+
+        // A successful from_committed_begin can be driven from that
+        // authorization without hand-patching the digest field.
+        let lease = DisclosureRegistryLease::ready_for(&registry);
+        let cap = attempt_begin(
+            &auth,
+            &lease,
+            &registry.registry_digest,
+            status_body,
+            0x44,
+            0x44,
+            3_000_030,
+        )
+        .unwrap();
+        assert_eq!(cap.capability(), ConsentCapability::DirectAllowed);
     }
 }

@@ -782,7 +782,7 @@ fn remote_turn_socket_provider_endpoint_wire() {
 
     // relay_only capability drives a REAL provider allocation attempt.
     let cap = VerifiedDirectCapability::relay_only([0xaa; 32], 1, 1, 1);
-    assert_eq!(cap.capability, ConsentCapability::RelayOnly);
+    assert_eq!(cap.capability(), ConsentCapability::RelayOnly);
     let rec = Arc::new(RecordingConnector::success(Duration::from_secs(600)));
     let mut provider = provider_with(true, 1000, FakeDnsResolver::default(), rec.clone());
     let mut factory = ConsentGatedResourceFactory::default();

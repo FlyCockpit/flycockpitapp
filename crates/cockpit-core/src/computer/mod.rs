@@ -12,6 +12,7 @@
 #![allow(dead_code)]
 
 pub mod audit;
+pub mod authorizer;
 pub mod coordinator;
 pub mod frame;
 pub mod guidance;

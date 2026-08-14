@@ -1892,6 +1892,132 @@ mod tests {
         assert_eq!(ids, vec![ID_APPROVE_ONCE, ID_REJECT]);
     }
 
+    /// Build an approver whose shared session is in a specific global approval
+    /// mode (Manual/Auto/Yolo).
+    fn approver_with_mode(
+        cwd: &std::path::Path,
+        mode: crate::config::extended::ApprovalMode,
+    ) -> Approver {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Arc::new(
+            crate::session::Session::create(
+                db.clone(),
+                cwd.to_path_buf(),
+                "builder",
+                crate::session::test_redaction_key_resolver(),
+            )
+            .unwrap(),
+        );
+        let store = GrantStore::new(
+            db.clone(),
+            session.id,
+            cwd.to_path_buf(),
+            crate::daemon::session_worker::SessionConfigHandle::from_disk_for_tests(cwd),
+        );
+        let hub = Arc::new(InterruptHub::detached());
+        let approver = Approver::new_for_session(
+            store,
+            db,
+            session.clone(),
+            Arc::new(std::sync::RwLock::new(Arc::new(
+                crate::redact::RedactionTable::empty(),
+            ))),
+            "builder",
+            hub,
+        );
+        session.set_approval_mode(mode);
+        approver
+    }
+
+    fn computer_action_request_with_tier<'a>(
+        action_id: &'a str,
+        tier: &'a str,
+    ) -> AuthorizationRequest<'a> {
+        AuthorizationRequest::ComputerAction {
+            session_id: "session-1",
+            delegation_id: "delegation-1",
+            action_id,
+            tier,
+            action_label: "openai_call:1",
+            backend_kind: "virtual_display",
+            focus_generation: 1,
+            observation_generation: 1,
+            has_host_lease: false,
+        }
+    }
+
+    /// A `computer_use=ask` action must still prompt even when the *global*
+    /// session approval mode is YOLO. Only the computer effective tier `yolo`
+    /// auto-allows the computer path; global `ApprovalMode::Yolo` does not.
+    #[tokio::test]
+    async fn computer_action_ask_survives_global_yolo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let approver = approver_with_mode(tmp.path(), crate::config::extended::ApprovalMode::Yolo);
+        // Resolve the raised interrupt with Deny. If the fix regressed and the
+        // global YOLO short-circuited to Allow, `authorize` would return
+        // immediately without prompting and the assertion below fails fast
+        // (the resolver never observes an interrupt).
+        let resolver = resolve_sequence(&approver, &[ID_REJECT]);
+        let decision = approver
+            .authorize(computer_action_request("call-1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            decision,
+            Decision::Deny,
+            "ask-tier computer action must prompt under global YOLO, not auto-allow"
+        );
+        resolver.await.unwrap();
+    }
+
+    /// The computer effective tier `yolo` auto-allows with zero human requests
+    /// and — like every computer decision — writes no durable permission
+    /// record.
+    #[tokio::test]
+    async fn computer_action_yolo_tier_no_prompt_no_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (approver, _) = approver(tmp.path());
+        let decision = approver
+            .authorize(computer_action_request_with_tier("call-2", "yolo"))
+            .await
+            .unwrap();
+        assert_eq!(decision, Decision::Allow { scope: Scope::Once });
+
+        let open = approver
+            .db
+            .list_open_interrupts(approver.session_id)
+            .await
+            .unwrap();
+        assert!(open.is_empty(), "computer yolo tier must raise no interrupt");
+
+        let events = permission_events(&approver).await;
+        assert!(
+            events.iter().all(|e| e["tool"] != "computer_action"),
+            "computer actions must not write a durable permission record"
+        );
+    }
+
+    /// Even after an interactive Ask approval, the computer path records no
+    /// durable `permission_decision` row (no standing computer grant).
+    #[tokio::test]
+    async fn computer_action_ask_records_no_permission_decision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (approver, _) = approver(tmp.path());
+        let resolver = resolve_sequence(&approver, &[ID_APPROVE_ONCE]);
+        let decision = approver
+            .authorize(computer_action_request("call-3"))
+            .await
+            .unwrap();
+        assert_eq!(decision, Decision::Allow { scope: Scope::Once });
+        resolver.await.unwrap();
+
+        let events = permission_events(&approver).await;
+        assert!(
+            events.iter().all(|e| e["tool"] != "computer_action"),
+            "an approved computer action must not persist a permission record"
+        );
+    }
+
     #[tokio::test]
     async fn sandbox_escalation_grant_prompt_records_path_and_retries_confined_choice() {
         let tmp = tempfile::tempdir().unwrap();

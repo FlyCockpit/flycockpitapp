@@ -612,8 +612,13 @@ impl Approver {
         tier: &str,
         action_label: &str,
     ) -> Result<Decision> {
-        // Yolo tier: zero human requests, no semantic denial.
-        if tier == "yolo" || self.yolo_mode() {
+        // Yolo tier: zero human requests, no semantic denial. Only the
+        // *computer* effective tier grants this — the global session
+        // `ApprovalMode::Yolo` must NOT auto-allow a computer action under
+        // `computer_use=ask`. The computer path is gated independently of the
+        // global approval mode, so an ask-tier computer action still prompts
+        // even when the session is in global YOLO.
+        if tier == "yolo" {
             return Ok(Decision::Allow { scope: Scope::Once });
         }
 
@@ -650,14 +655,11 @@ impl Approver {
                 }
             })
             .await?;
-        self.record_permission_decision(
-            "computer_action",
-            action_id,
-            &[Scope::Once],
-            decision,
-            DecisionSource::UserPrompt,
-        )
-        .await;
+        // No durable permission record for computer actions. The delegation
+        // lease contract forbids standing computer grants: reuse of an Ask
+        // approval is only via the in-memory `AskDelegationLease`, never a
+        // persisted `permission_decision` row. (Contrast every other approval
+        // path, which records the decision here.)
         Ok(decision)
     }
 }

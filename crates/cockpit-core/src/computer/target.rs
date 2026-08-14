@@ -23,6 +23,21 @@ pub enum BackendKind {
     Unknown,
 }
 
+impl BackendKind {
+    /// A short, stable, safe diagnostic label for this backend kind. Carried
+    /// only as authorization metadata (never partitions the lease).
+    pub fn diagnostic_label(&self) -> &'static str {
+        match self {
+            BackendKind::VirtualDisplay => "virtual_display",
+            BackendKind::RealDesktopX11 => "real_desktop_x11",
+            BackendKind::RealDesktopMacOs => "real_desktop_macos",
+            BackendKind::RealDesktopWindows => "real_desktop_windows",
+            BackendKind::RealDesktopWayland => "real_desktop_wayland",
+            BackendKind::Unknown => "unknown",
+        }
+    }
+}
+
 /// Why a field or whole snapshot is unavailable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TargetUnavailableReason {

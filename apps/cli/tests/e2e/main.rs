@@ -31,3 +31,5 @@ mod tui_pty_mouse;
 mod tui_pty_osc52;
 #[cfg(unix)]
 mod tui_pty_paste;
+#[cfg(unix)]
+mod tui_pty_settings_button;

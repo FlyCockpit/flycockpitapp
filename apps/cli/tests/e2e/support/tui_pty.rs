@@ -58,6 +58,10 @@ pub struct SnapshotCell {
     pub inverse: bool,
     /// Indexed SGR foreground, when the cell is not the default color.
     pub fg_index: Option<u8>,
+    /// Indexed SGR background, when the cell is not the default color.
+    pub bg_index: Option<u8>,
+    pub fg_rgb: Option<(u8, u8, u8)>,
+    pub bg_rgb: Option<(u8, u8, u8)>,
 }
 
 impl ScreenSnapshot {
@@ -76,7 +80,8 @@ impl ScreenSnapshot {
         let mut cells = Vec::with_capacity(usize::from(rows) * usize::from(cols));
         for row in 0..rows {
             for col in 0..cols {
-                let (text, inverse, fg_index) = match screen.cell(row, col) {
+                let (text, inverse, fg_index, bg_index, fg_rgb, bg_rgb) = match screen.cell(row, col)
+                {
                     Some(cell) => (
                         cell.contents().to_string(),
                         cell.inverse(),
@@ -84,8 +89,20 @@ impl ScreenSnapshot {
                             vt100::Color::Idx(idx) => Some(idx),
                             _ => None,
                         },
+                        match cell.bgcolor() {
+                            vt100::Color::Idx(idx) => Some(idx),
+                            _ => None,
+                        },
+                        match cell.fgcolor() {
+                            vt100::Color::Rgb(r, g, b) => Some((r, g, b)),
+                            _ => None,
+                        },
+                        match cell.bgcolor() {
+                            vt100::Color::Rgb(r, g, b) => Some((r, g, b)),
+                            _ => None,
+                        },
                     ),
-                    None => (String::new(), false, None),
+                    None => (String::new(), false, None, None, None, None),
                 };
                 cells.push(SnapshotCell {
                     row,
@@ -93,6 +110,9 @@ impl ScreenSnapshot {
                     text,
                     inverse,
                     fg_index,
+                    bg_index,
+                    fg_rgb,
+                    bg_rgb,
                 });
             }
         }

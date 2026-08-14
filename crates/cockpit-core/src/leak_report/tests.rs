@@ -75,6 +75,16 @@ fn provenance() -> LeakProvenance {
     }
 }
 
+/// A **test-only** unkeyed SHA-256 hex digest of the plaintext. Production no
+/// longer computes any unkeyed literal fingerprint (the `sha256_hex` helper was
+/// deleted from `leak_report`); this helper exists purely to build the
+/// KNOWN-BAD oracle value so a test can prove the stored/dedup fingerprints are
+/// NOT equal to it — i.e. that the real fingerprint is the key-store keyed MAC.
+fn unkeyed_sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 // ---------------------------------------------------------------------------
 // Criterion: schema is ingress-only (no value id / read / grant / action)
 // ---------------------------------------------------------------------------
@@ -516,7 +526,7 @@ async fn leak_report_pending_record_is_not_listable() {
         .await
         .unwrap();
 
-    let literal_fp = sha256_hex(b"pending-secret");
+    let literal_fp = unkeyed_sha256_hex(b"pending-secret");
     let keyed_fp = keyed_leak_fingerprint(session_id(), LeakSource::Reasoning, &literal_fp);
 
     let input = InsertLeakRecordInput {
@@ -733,13 +743,41 @@ async fn leak_report_literal_never_in_model_output() {
 }
 
 // ---------------------------------------------------------------------------
-// Criterion: REPORT_LEAK_TOOL name is exact
+// AC0 correction (was `report_leak_tool_name_is_exact`, which constructed a
+// forbidden `ReportLeakTool` and asserted `Tool::name()`).
+//
+// The rejected landing exposed `report_leak` through `impl Tool for
+// ReportLeakTool`, whose `call(args: Value, _)` receives the plaintext secret
+// on the generic authorized-tool surface. That impl and the `ReportLeakTool`
+// type are DELETED. This corrected test asserts the *schema advertising* name
+// is exactly `report_leak` and that the sanctioned ingress is the
+// `decode_and_contain_report_leak` host entry — not a `Tool`.
+//
+// Compile-forced guard against regression: `ReportLeakTool` no longer exists as
+// a type. Re-adding `impl Tool for ReportLeakTool` requires re-introducing that
+// type, and the module docs + `decode_and_contain_report_leak` entry make the
+// generic-tool path the rejected design. (The generic-roster *registration*
+// assertion belongs with the provider-barrier wiring, which is deferred; see
+// the implementer report.)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn report_leak_tool_name_is_exact() {
-    let tool = ReportLeakTool::new();
-    assert_eq!(tool.name(), "report_leak");
+fn report_leak_advertising_name_is_exact_and_not_a_generic_tool() {
+    // The advertising name a provider decoder keys on is exactly `report_leak`.
+    assert_eq!(REPORT_LEAK_TOOL, "report_leak");
+
+    // The shared schema is an ingress-only object with no capability-bearing
+    // field; there is no `Tool`-shaped surface here.
+    let schema = report_leak_schema();
+    assert_eq!(
+        schema.get("type").and_then(|v| v.as_str()),
+        Some("object"),
+        "report_leak advertises only the closed ingress schema"
+    );
+    assert_eq!(
+        schema.get("additionalProperties").and_then(|v| v.as_bool()),
+        Some(false)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -790,7 +828,294 @@ async fn leak_containment_uses_sole_writer_api() {
     // The stored fingerprint is the keyed MAC, never the unkeyed SHA-256 of the
     // literal, and is what rehydrate reports back.
     assert_eq!(rehydrated.fingerprint(), row.fingerprint);
-    assert_ne!(row.fingerprint, sha256_hex(secret.as_bytes()));
+    assert_ne!(row.fingerprint, unkeyed_sha256_hex(secret.as_bytes()));
     assert_eq!(row.fingerprint.len(), 64);
     assert!(row.fingerprint.chars().all(|c| c.is_ascii_hexdigit()));
+}
+
+// ===========================================================================
+// AC-named tests driving the SOLE HOST INGRESS ENTRY (`decode_and_contain_
+// report_leak`) — the production path a provider decoder maps a `report_leak`
+// tool call into, replacing the deleted generic `impl Tool for ReportLeakTool`.
+//
+// Footprint scope note: these cover the parts of the ACs that are provable at
+// the `leak_report` layer (the ingress function, containment, storage, and the
+// no-oracle/no-second-cipher properties). The live-session redaction install,
+// the buffered provider turn state machine, and the trusted-child coordinator
+// require files outside this prompt's declared footprint and are deferred (see
+// the implementer report).
+// ===========================================================================
+
+/// AC2 (containment-only portion): the ingress function maps a raw decoded
+/// `report_leak` argument `Value` into the protected representation and returns
+/// only a content-free outcome. The plaintext secret never appears in the
+/// model-facing string nor in any safe leak projection, yet it is recoverable
+/// (encrypted) from protected storage — proving generic dispatch never receives
+/// the secret while containment persisted.
+#[tokio::test]
+async fn model_leak_report_precedes_generic_persistence() {
+    let db = test_db().await;
+    let resolver = test_resolver();
+
+    // A distinguishing marker withheld from every other path.
+    let marker = "SENTINEL-9c1f-do-not-leak";
+    let args = serde_json::json!({ "secret": marker, "source": "tool_output" });
+
+    let outcome = decode_and_contain_report_leak(
+        &db,
+        &resolver,
+        1_000_000,
+        provenance(),
+        session_id(),
+        &args,
+    )
+    .await;
+
+    // The model receives only the content-free `contained` string.
+    assert_eq!(outcome.to_model_string(), "contained");
+    assert!(!outcome.to_model_string().contains(marker));
+
+    // Protected storage committed exactly one leak record and one history row,
+    // and neither their safe projections nor their Debug carry the plaintext.
+    let records = db.protected_leak_records_list(session_id()).await.unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].status, LeakRecordStatus::Contained);
+    assert!(!format!("{:?}", records[0]).contains(marker));
+
+    let refs = db.protected_leak_records_refs(session_id()).await.unwrap();
+    assert_eq!(refs.len(), 1);
+    assert!(!format!("{refs:?}").contains(marker));
+
+    let history = db
+        .protected_redaction_history_list(session_id())
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 1);
+    assert_ne!(
+        history[0].ciphertext,
+        marker.as_bytes(),
+        "history ciphertext must not be the plaintext bytes"
+    );
+    assert!(!format!("{:?}", history[0]).contains(marker));
+
+    // The literal is nonetheless recoverable (encrypted) through the shared
+    // sole-writer rehydrate path — the containment is real, not a drop.
+    let history_api = ProtectedRedactionHistory::new(&db, &resolver);
+    let rehydrated = history_api
+        .rehydrate_by_history_id(&history[0].history_id)
+        .await
+        .expect("contained literal must rehydrate through the shared AEAD path");
+    assert_eq!(rehydrated.as_str().unwrap().as_str(), marker);
+}
+
+/// AC7: `ReportLeak` ingress is containment-only — closed source validation,
+/// host-derived provenance, pending→contained state, and no value id / read /
+/// grant / action capability returned to the model. A malformed/closed-source
+/// violation is Discarded with NO protected record.
+#[tokio::test]
+async fn untrusted_leak_report_is_containment_only() {
+    let db = test_db().await;
+    let resolver = test_resolver();
+
+    // Precondition: the bogus source really is rejected by the closed parser.
+    assert!(
+        parse_report_leak_args(&serde_json::json!({
+            "secret": "x", "source": "arbitrary_untrusted_source"
+        }))
+        .is_err(),
+        "closed `source` enum must reject an unknown value"
+    );
+
+    // A closed-source violation through the real ingress → Discarded (Failed),
+    // no protected record committed.
+    let bad = decode_and_contain_report_leak(
+        &db,
+        &resolver,
+        1_000_000,
+        provenance(),
+        session_id(),
+        &serde_json::json!({ "secret": "x", "source": "arbitrary_untrusted_source" }),
+    )
+    .await;
+    assert_eq!(bad, LeakReportOutcome::Failed);
+    assert!(
+        db.protected_leak_records_list(session_id())
+            .await
+            .unwrap()
+            .is_empty(),
+        "a rejected source must leave no protected record"
+    );
+
+    // A valid closed-source report: host-derived provenance is stamped (the
+    // model supplies none), the record lands `contained`, and the model string
+    // carries no id / value / capability.
+    let host_prov = LeakProvenance {
+        provider_id: Some("anthropic".to_owned()),
+        model_id: Some("claude-x".to_owned()),
+        generation: Some(7),
+        connector_id: Some("gh".to_owned()),
+    };
+    let outcome = decode_and_contain_report_leak(
+        &db,
+        &resolver,
+        1_000_000,
+        host_prov,
+        session_id(),
+        &serde_json::json!({ "secret": "leaked-cred", "source": "credential_leak" }),
+    )
+    .await;
+    assert_eq!(outcome.to_model_string(), "contained");
+    if let LeakReportOutcome::Contained { report_id } = &outcome {
+        // The report id is host-internal; the model never receives it.
+        assert!(!outcome.to_model_string().contains(report_id));
+    } else {
+        panic!("expected Contained, got {outcome:?}");
+    }
+
+    let records = db.protected_leak_records_list(session_id()).await.unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].source, LeakSource::CredentialLeak);
+    assert_eq!(records[0].status, LeakRecordStatus::Contained);
+    assert_eq!(records[0].provider_id.as_deref(), Some("anthropic"));
+    assert_eq!(records[0].model_id.as_deref(), Some("claude-x"));
+    assert_eq!(records[0].generation, Some(7));
+    assert_eq!(records[0].connector_id.as_deref(), Some("gh"));
+}
+
+/// AC8: encryption-only protected storage plus recovery, deduplication, and
+/// fail-closed key failure — all through the production ingress entry.
+#[tokio::test]
+async fn leak_protected_storage_and_recovery() {
+    let db = test_db().await;
+    let resolver = test_resolver();
+    let secret = "recoverable-protected-literal";
+
+    // Store via the ingress.
+    let first = decode_and_contain_report_leak(
+        &db,
+        &resolver,
+        1_000_000,
+        provenance(),
+        session_id(),
+        &serde_json::json!({ "secret": secret, "source": "model_output" }),
+    )
+    .await;
+    assert!(matches!(first, LeakReportOutcome::Contained { .. }));
+
+    // Recovery: the encrypted literal rehydrates through the shared AEAD path.
+    let history = db
+        .protected_redaction_history_list(session_id())
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 1);
+    let history_api = ProtectedRedactionHistory::new(&db, &resolver);
+    let rehydrated = history_api
+        .rehydrate_by_history_id(&history[0].history_id)
+        .await
+        .expect("rehydrate must succeed with the correct key");
+    assert_eq!(rehydrated.as_str().unwrap().as_str(), secret);
+
+    // Deduplication: the same literal re-reported does not create a second
+    // record or history row; seen metadata advances.
+    let second = decode_and_contain_report_leak(
+        &db,
+        &resolver,
+        1_000_000,
+        provenance(),
+        session_id(),
+        &serde_json::json!({ "secret": secret, "source": "model_output" }),
+    )
+    .await;
+    assert!(matches!(second, LeakReportOutcome::Deduplicated { .. }));
+    assert_eq!(second.to_model_string(), "contained");
+    let records = db.protected_leak_records_list(session_id()).await.unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].seen_count, 2);
+    assert_eq!(
+        db.protected_redaction_history_list(session_id())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Fail-closed on key failure: a resolver with no key commits nothing.
+    let db2 = test_db().await;
+    let empty = MapKeyResolver::new();
+    let failed = decode_and_contain_report_leak(
+        &db2,
+        &empty,
+        1_000_000,
+        provenance(),
+        session_id(),
+        &serde_json::json!({ "secret": "no-key-secret", "source": "model_output" }),
+    )
+    .await;
+    assert_eq!(failed, LeakReportOutcome::Failed);
+    assert!(
+        db2.protected_leak_records_list(session_id())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        db2.protected_redaction_history_list(session_id())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// AC9: no second cipher and no unkeyed oracle. The stored history fingerprint
+/// and the record dedup index are BOTH key-store keyed (differ from the unkeyed
+/// SHA-256 of the plaintext an offline attacker could compute), and the parsed
+/// request never prints the secret through `Debug`.
+#[tokio::test]
+async fn leak_report_no_second_cipher_or_unkeyed_oracle() {
+    let db = test_db().await;
+    let resolver = test_resolver();
+    let secret = "oracle-target-secret";
+
+    let outcome = decode_and_contain_report_leak(
+        &db,
+        &resolver,
+        1_000_000,
+        provenance(),
+        session_id(),
+        &serde_json::json!({ "secret": secret, "source": "model_output" }),
+    )
+    .await;
+    assert!(matches!(outcome, LeakReportOutcome::Contained { .. }));
+
+    let history = db
+        .protected_redaction_history_list(session_id())
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 1);
+    let stored_fp = &history[0].fingerprint;
+
+    // The known-bad offline oracle value: unkeyed SHA-256 of the plaintext.
+    let oracle = unkeyed_sha256_hex(secret.as_bytes());
+    assert_ne!(
+        stored_fp, &oracle,
+        "stored fingerprint must be the keyed MAC, not the unkeyed literal hash"
+    );
+
+    // The dedup index derived from the keyed MAC differs from the same index
+    // derived from the unkeyed oracle — the production index is not brute-forceable.
+    let real_index = keyed_leak_fingerprint(session_id(), LeakSource::ModelOutput, stored_fp);
+    let oracle_index = keyed_leak_fingerprint(session_id(), LeakSource::ModelOutput, &oracle);
+    assert_ne!(real_index, oracle_index);
+
+    // The parsed request never prints the secret through Debug.
+    let req = parse_report_leak_args(&serde_json::json!({
+        "secret": secret, "source": "model_output"
+    }))
+    .unwrap();
+    let dbg = format!("{req:?}");
+    assert!(!dbg.contains(secret), "Debug must not print the secret");
+    assert!(
+        dbg.contains("REDACTED"),
+        "Debug must render a redacted secret"
+    );
 }

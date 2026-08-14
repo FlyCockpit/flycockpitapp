@@ -24,14 +24,21 @@
 //!   fingerprint, appends the encrypted literal to protected-redaction-history,
 //!   installs the redaction entry, commits the protected leak record, and
 //!   returns only `contained` or content-free failure.
-//! * [`ReportLeakTool`] — the ingress-only tool wrapper exposing the closed
-//!   schema. It is **never** a generic registered/authorized tool: it is
-//!   advertised only on untrusted tool-capable provider routes, and every
-//!   provider decoder maps it to the protected representation before generic
-//!   dispatch.
 //! * [`report_leak_schema`] / [`parse_report_leak_args`] — the one shared
 //!   argument schema and strict parser, mirroring the `use_sealed_value`
-//!   pattern so the two surfaces cannot drift.
+//!   pattern so the two surfaces cannot drift. `report_leak` is **never** a
+//!   generic registered/authorized [`crate::engine::tool::Tool`]: no type in
+//!   this module implements `Tool`. The schema is advertised only on untrusted
+//!   tool-capable provider routes; the provider decoder maps a decoded call to
+//!   the protected representation via [`decode_and_contain_report_leak`] before
+//!   any generic tool dispatch, so `Tool::call` never receives a `Value`
+//!   carrying the plaintext secret.
+//! * [`decode_and_contain_report_leak`] — the sole host ingress entry point.
+//!   A provider decoder calls it with the raw decoded argument `Value`; it
+//!   consumes the literal into a [`Zeroizing`] frame, mints the single-use
+//!   [`ReportLeakAuthority`], drives [`LeakReportHandler::report`], and returns
+//!   only the closed [`LeakReportOutcome`] (whose model string is `contained`,
+//!   `rate_limited`, or `failed`).
 //!
 //! ## What this module does NOT own
 //!
@@ -58,17 +65,22 @@
 //! * Rate limit is 32 accepted leak reports/session/hour.
 //! * A report is deduplicated by protected keyed fingerprint without exposing
 //!   it; re-report updates safe `seen` metadata and clears rotation state.
-//! * Redaction install and protected persistence commit before
-//!   acknowledgement; recovery rehydrates protected literals before any
-//!   untrusted dispatch and fails closed on key failure.
-//! * Generic dispatch never sees the secret argument: the tool's `call`
-//!   consumes the literal into a zeroizing frame before the handler runs, and
-//!   the handler returns only `contained` or a content-free failure string.
-
-use std::sync::Arc;
+//! * Protected persistence (the AEAD history row + the leak record) commits
+//!   transactionally before the outcome is returned; recovery rehydrates
+//!   protected literals through the shared sole writer and fails closed on key
+//!   failure. Installing the forced-literal redaction into the *live* session
+//!   redaction table before acknowledgement is the responsibility of the
+//!   provider Contained transition that calls this module (that transition and
+//!   its live-session wiring are not yet landed — see the module's deferred
+//!   provider sensitive-turn barrier).
+//! * Generic dispatch never sees the secret argument: the decoder consumes the
+//!   raw `Value` into a zeroizing frame inside [`decode_and_contain_report_leak`]
+//!   before the handler runs, and the handler returns only `contained` or a
+//!   content-free failure string. No type here implements
+//!   [`crate::engine::tool::Tool`], so `report_leak` cannot reach the generic
+//!   authorized-tool roster.
 
 use anyhow::Result;
-use async_trait::async_trait;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -78,7 +90,6 @@ use crate::db::protected_leak_records::{
     InsertLeakRecordInput, InsertLeakResult, LeakCategory, LeakProvenance, LeakRecordStatus,
     LeakSource, insert_leak_record_conn, transition_leak_status_conn,
 };
-use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input};
 use crate::redact::protected_redaction_history::{
     MAX_LITERAL_LEN, ProtectedLiteral, ProtectedRedactionHistory, RedactionHistorySource,
     RedactionKeyResolver, append_and_attach_conn,
@@ -272,12 +283,14 @@ impl<'a> LeakReportHandler<'a> {
     /// the transaction commits or errors. The model receives only `contained`
     /// or content-free failure.
     ///
-    /// Redaction install is the caller's responsibility: the handler returns
-    /// the literal's fingerprint and (on success) the report id so the caller
-    /// can install the redaction entry via
-    /// [`crate::redact::RedactionTable::with_forced_literal`] before
-    /// acknowledging. The handler does install the protected persistence
-    /// before returning.
+    /// This handler commits the *protected persistence* (the AEAD history row
+    /// and the leak record) atomically. It does **not** install the
+    /// forced-literal redaction into the live session redaction table: that
+    /// must happen in the provider Contained transition (via
+    /// [`crate::redact::RedactionTable::with_forced_literal`]) before the turn
+    /// is acknowledged, so a contained secret cannot re-emit next turn. That
+    /// live-session wiring is deferred to the provider sensitive-turn barrier
+    /// and is not yet landed.
     pub async fn report(
         &self,
         authority: &ReportLeakAuthority,
@@ -288,14 +301,21 @@ impl<'a> LeakReportHandler<'a> {
         //    but we re-check the authority's source is a known variant).
         let source = authority.source();
 
-        // 2. Rate limit: 32 accepted reports/session/hour.
+        // 2. Rate limit: 32 accepted reports/session/hour. This is a
+        //    secret-leak containment boundary, so the count query FAILS CLOSED:
+        //    a DB error is NOT treated as "zero recent reports" (which would let
+        //    an attacker exceed the limit by inducing errors). On a count error
+        //    we return `Failed` with no protected record, never `unwrap_or(0)`.
         let session_id = authority.session_id().to_owned();
         let since_ms = self.now_ms - ONE_HOUR_MS;
-        let recent = self
+        let recent = match self
             .db
             .protected_leak_records_count_recent(&session_id, since_ms)
             .await
-            .unwrap_or(0);
+        {
+            Ok(count) => count,
+            Err(_) => return Ok(LeakReportOutcome::Failed),
+        };
         if recent >= LEAK_REPORT_RATE_LIMIT_PER_HOUR {
             return Ok(LeakReportOutcome::RateLimited);
         }
@@ -321,9 +341,9 @@ impl<'a> LeakReportHandler<'a> {
         };
 
         // 4. The leak record's dedup fingerprint is keyed: it is derived from
-        //    the prepared literal's keyed MAC (not an unkeyed SHA-256 of the
-        //    literal). Restructuring `keyed_leak_fingerprint` itself is left to
-        //    `implement-report-leak-provider-ingress-barrier`.
+        //    the prepared literal's key-store keyed MAC (`prepared.fingerprint()`),
+        //    never an unkeyed SHA-256 of the literal, so the dedup index is not an
+        //    offline guessing oracle. See `keyed_leak_fingerprint`.
         let keyed_fingerprint = keyed_leak_fingerprint(&session_id, source, prepared.fingerprint());
 
         let provenance = authority.provenance().clone();
@@ -389,138 +409,70 @@ impl<'a> LeakReportHandler<'a> {
     }
 }
 
-/// The ingress-only `report_leak` tool wrapper. It is **never** a generic
-/// registered/authorized tool: it is advertised only on untrusted tool-capable
-/// provider routes, and every provider decoder maps it to the protected
-/// representation before generic dispatch.
+/// The sole host ingress entry point for a decoded `report_leak` tool call.
 ///
-/// The tool consumes the `secret` argument into a [`Zeroizing`] frame before
-/// the handler runs, and returns only `contained` or content-free failure.
-/// Generic dispatch never sees the secret argument: the tool's `call` is the
-/// sole consumer of the literal.
-pub struct ReportLeakTool {
-    /// Pre-built handler dependencies, for tests and for hosts that compile
-    /// their own registry. `None` builds from the session's database and a
-    /// default key resolver.
-    runtime: Option<Arc<LeakReportToolRuntime>>,
-}
-
-/// Runtime dependencies for the leak report tool, injectable for tests.
-pub struct LeakReportToolRuntime {
-    pub key_resolver: Arc<dyn RedactionKeyResolver>,
-    /// Override for the current time, for deterministic tests. If 0, the tool
-    /// uses the real wall clock.
-    pub now_ms: i64,
-}
-
-impl LeakReportToolRuntime {
-    pub fn new(key_resolver: Arc<dyn RedactionKeyResolver>, now_ms: i64) -> Self {
-        Self {
-            key_resolver,
-            now_ms,
-        }
-    }
-
-    fn effective_now(&self) -> i64 {
-        if self.now_ms > 0 {
-            self.now_ms
-        } else {
-            chrono::Utc::now().timestamp_millis()
-        }
-    }
-}
-
-impl ReportLeakTool {
-    pub fn new() -> Self {
-        Self { runtime: None }
-    }
-
-    pub fn with_runtime(runtime: Arc<LeakReportToolRuntime>) -> Self {
-        Self {
-            runtime: Some(runtime),
-        }
-    }
-}
-
-impl Default for ReportLeakTool {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl Tool for ReportLeakTool {
-    fn name(&self) -> &str {
-        REPORT_LEAK_TOOL
-    }
-
-    fn description(&self) -> &str {
-        "Report a secret you accidentally received so it can be contained before your response is persisted or shown. You will only receive 'contained' or a content-free failure; this grants no value use."
-    }
-
-    fn defensive_description(&self) -> Option<String> {
-        Some(
-            "If you see a secret, token, key, password, or personal data that you should not have received, call this tool immediately with the literal value and a closed source classification. The host contains it: the value is encrypted into protected storage, redacted from all future output, and recorded for the Owner. You receive only 'contained', 'rate_limited', or 'failed'. You cannot read, use, list, or grant the value. Call this before producing any other output that contains the secret."
-                .to_owned(),
-        )
-    }
-
-    /// Ingress-only: the tool's only effect is containment. It is not a
-    /// registered/authorized tool and does not perform a dynamic action.
-    fn effect(&self) -> ToolEffect {
-        ToolEffect::Dynamic
-    }
-
-    fn parameters(&self) -> Value {
-        report_leak_schema()
-    }
-
-    async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-        // Parse the closed argument schema. This is the sole consumer of the
-        // literal; generic dispatch never sees the secret argument.
-        let request =
-            parse_report_leak_args(&args).map_err(|error| invalid_input(error.to_string()))?;
-
-        // The secret is consumed into a Zeroizing frame immediately.
-        let secret = Zeroizing::new(request.secret);
-
-        // Build the authority from the closed source and host-derived
-        // provenance. The model never supplies provenance. The active
-        // provider/model id is derived from the session's config snapshot
-        // where available; the generation is always available.
-        let generation = ctx.config.generation() as i64;
-        let provenance = LeakProvenance {
-            provider_id: None,
-            model_id: None,
-            generation: Some(generation),
-            connector_id: None,
-        };
-        let authority =
-            ReportLeakAuthority::new(request.source, provenance, ctx.session.id.to_string());
-
-        // Resolve the handler dependencies.
-        let (key_resolver, handler_now_ms) = if let Some(runtime) = &self.runtime {
-            (Arc::clone(&runtime.key_resolver), runtime.effective_now())
-        } else {
-            // Production: use a default key resolver. In practice the daemon
-            // injects the native secure key store resolver; for the tool's
-            // default path we fail closed if no resolver is available.
-            return Ok(ToolOutput::text(
-                LeakReportOutcome::Failed.to_model_string(),
-            ));
-        };
-
-        let handler =
-            LeakReportHandler::new(&ctx.session.db, key_resolver.as_ref(), handler_now_ms);
-        let outcome = handler.report(&authority, secret, request.category).await?;
-        Ok(ToolOutput::text(outcome.to_model_string()))
+/// `report_leak` is **never** a generic registered/authorized
+/// [`crate::engine::tool::Tool`]: there is deliberately no type in this module
+/// that implements `Tool`, so the closed argument object — which carries the
+/// plaintext `secret` — can never reach the generic authorized-tool roster,
+/// generic tool-call records, transcripts, events, or exports.
+///
+/// A provider sensitive-turn decoder, on classifying a buffered tool call as
+/// `report_leak`, calls this function with the raw decoded argument `Value`
+/// **before** any generic tool dispatch, history persistence, stream delivery,
+/// audit, or export. The function:
+///
+/// 1. Parses the closed schema, consuming the literal directly into a
+///    [`Zeroizing`] frame ([`ReportLeakRequest::secret`]); malformed args
+///    yield a content-free `Failed` with **no** protected record (the turn is
+///    Discarded).
+/// 2. Mints the single-use [`ReportLeakAuthority`] from the closed `source` and
+///    the **host-derived** provenance the decoder supplies (the model never
+///    supplies provenance).
+/// 3. Drives [`LeakReportHandler::report`], which fails closed on rate-limit
+///    count errors and on key-store/crypto failure.
+///
+/// It returns only the closed [`LeakReportOutcome`]; the model ever sees only
+/// its `to_model_string()` (`contained` / `rate_limited` / `failed`). Installing
+/// the forced-literal redaction into the live session before acknowledgement is
+/// the caller's Contained-transition responsibility (see [`LeakReportHandler`]).
+pub async fn decode_and_contain_report_leak(
+    db: &Db,
+    key_resolver: &dyn RedactionKeyResolver,
+    now_ms: i64,
+    provenance: LeakProvenance,
+    session_id: &str,
+    args: &Value,
+) -> LeakReportOutcome {
+    // Parse consumes the raw `Value` into a zeroizing frame. Generic dispatch
+    // never sees the secret argument: this is the only consumer of the literal.
+    let request = match parse_report_leak_args(args) {
+        Ok(r) => r,
+        // Malformed sensitive call → Discarded: no protected record, content-free
+        // failure to the model if a response is required.
+        Err(_) => return LeakReportOutcome::Failed,
+    };
+    let authority = ReportLeakAuthority::new(request.source, provenance, session_id.to_owned());
+    let handler = LeakReportHandler::new(db, key_resolver, now_ms);
+    match handler
+        .report(&authority, request.secret, request.category)
+        .await
+    {
+        Ok(outcome) => outcome,
+        // Any unexpected error fails closed to a content-free failure.
+        Err(_) => LeakReportOutcome::Failed,
     }
 }
 
 /// The parsed `report_leak` request.
-#[derive(Clone, PartialEq, Eq)]
+///
+/// The plaintext literal is held in a [`Zeroizing`] frame so it is wiped on
+/// drop, and the type deliberately does **not** derive `Clone`, `Display`, or a
+/// literal-printing `Debug` — see the manual [`std::fmt::Debug`] impl — so a
+/// stray copy or `{:?}` cannot defeat the containment guarantees.
+#[derive(PartialEq, Eq)]
 pub struct ReportLeakRequest {
-    pub secret: String,
+    pub secret: Zeroizing<String>,
     pub source: LeakSource,
     pub category: LeakCategory,
 }
@@ -622,7 +574,9 @@ pub fn parse_report_leak_args(args: &Value) -> Result<ReportLeakRequest> {
     };
 
     Ok(ReportLeakRequest {
-        secret: secret.to_owned(),
+        // Consume the literal into a zeroizing frame immediately; no plain
+        // `String` copy of the secret outlives this expression.
+        secret: Zeroizing::new(secret.to_owned()),
         source,
         category,
     })
@@ -630,14 +584,17 @@ pub fn parse_report_leak_args(args: &Value) -> Result<ReportLeakRequest> {
 
 // ---- Helpers ---------------------------------------------------------------
 
-/// SHA-256 hex digest of the input bytes.
-pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    digest.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Keyed leak fingerprint: SHA-256(session_id || source || literal_fingerprint).
-/// Safe to expose; does not reveal the literal. Used for deduplication.
+/// The per-record dedup index for a contained leak.
+///
+/// SHA-256(session_id || source || literal_fingerprint), where
+/// `literal_fingerprint` is the **key-store keyed MAC** of the literal produced
+/// by the shared protected-redaction-history writer
+/// ([`crate::redact::protected_redaction_history::PreparedAppend::fingerprint`]),
+/// never an unkeyed SHA-256 of the plaintext. Because the sole variable input
+/// derived from the secret is already a keyed MAC, this index is **not** an
+/// offline guessing oracle: without the key store an attacker cannot compute the
+/// literal fingerprint for a guessed secret, so they cannot compute this index.
+/// The value is safe to store and does not reveal the literal.
 pub fn keyed_leak_fingerprint(
     session_id: &str,
     source: LeakSource,

@@ -43,9 +43,11 @@
 //! ## What this module does NOT own
 //!
 //! * The provider decoder sensitive-turn state machine
-//!   (`Open -> Buffering -> Released|Contained|Discarded`) — that belongs to
-//!   the provider adapter layer. This module supplies the protected
-//!   representation the decoder maps to before generic dispatch.
+//!   (`Open -> Buffering -> Released|Contained|Discarded`) — that lives in
+//!   [`crate::engine::agent::sensitive_turn`], which drives this module's
+//!   [`decode_and_contain_report_leak`] ingress at the dispatch chokepoint. This
+//!   module supplies the protected representation the barrier maps to before
+//!   generic dispatch.
 //! * The trusted-child acquisition coordinator — that belongs to its own
 //!   coordinator prompt. This module supplies only the `ReportLeak` ingress
 //!   variant of `ProtectedSensitiveIngress`.
@@ -70,9 +72,10 @@
 //!   protected literals through the shared sole writer and fails closed on key
 //!   failure. Installing the forced-literal redaction into the *live* session
 //!   redaction table before acknowledgement is the responsibility of the
-//!   provider Contained transition that calls this module (that transition and
-//!   its live-session wiring are not yet landed — see the module's deferred
-//!   provider sensitive-turn barrier).
+//!   provider Contained transition that calls this module — the sensitive-turn
+//!   barrier [`crate::engine::agent::sensitive_turn`], which installs the forced
+//!   literal via [`crate::engine::interrupt::InterruptHub::install_contained_leak_literal`]
+//!   before the turn is acked.
 //! * Generic dispatch never sees the secret argument: the decoder consumes the
 //!   raw `Value` into a zeroizing frame inside [`decode_and_contain_report_leak`]
 //!   before the handler runs, and the handler returns only `contained` or a
@@ -286,11 +289,10 @@ impl<'a> LeakReportHandler<'a> {
     /// This handler commits the *protected persistence* (the AEAD history row
     /// and the leak record) atomically. It does **not** install the
     /// forced-literal redaction into the live session redaction table: that
-    /// must happen in the provider Contained transition (via
+    /// happens in the provider Contained transition (the sensitive-turn barrier
+    /// [`crate::engine::agent::sensitive_turn`], via
     /// [`crate::redact::RedactionTable::with_forced_literal`]) before the turn
-    /// is acknowledged, so a contained secret cannot re-emit next turn. That
-    /// live-session wiring is deferred to the provider sensitive-turn barrier
-    /// and is not yet landed.
+    /// is acknowledged, so a contained secret cannot re-emit next turn.
     pub async fn report(
         &self,
         authority: &ReportLeakAuthority,

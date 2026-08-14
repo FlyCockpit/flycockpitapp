@@ -436,6 +436,51 @@ impl InterruptHub {
         Ok(Some(table))
     }
 
+    /// Install a **contained-leak** literal into the worker's live egress
+    /// redaction table and persist it, BEFORE the provider turn that reported the
+    /// leak is acknowledged, so subsequent output for this and every later turn is
+    /// scrubbed of the reported secret (the leak-report Contained transition —
+    /// `provider-sensitive-turn barrier`, AC2).
+    ///
+    /// This is the live-session redaction install the leak-report handler
+    /// deliberately does NOT perform: [`crate::leak_report::LeakReportHandler`]
+    /// commits the encrypted protected-history row and the leak record, and this
+    /// method installs the forced literal so the *live* table scrubs it. The
+    /// encrypted protected-history journal is written by the handler, so — unlike
+    /// sealed adoption — this path only persists the redaction table and swaps the
+    /// live `Arc`; it never re-journals (mirroring
+    /// [`Self::register_approved_secret_file`]).
+    ///
+    /// H1: takes the same [`Self::redaction_table_write_lock`] as sealed adoption
+    /// and the per-turn refresh union, and reads the LATEST table under it, so a
+    /// concurrent refresh can neither read a stale table nor swap over the
+    /// just-installed contained literal. Fail-closed: a failed persist returns
+    /// `Err` with the previously-committed table still live — the live table is
+    /// never advanced ahead of the durable one, and the caller must then NOT ack
+    /// the report as contained. Detached hubs (tests / standalone shim) that own
+    /// no shared table return `Ok(None)`; the barrier's own module tests cover the
+    /// install-before-ack ordering directly.
+    pub async fn install_contained_leak_literal(
+        &self,
+        session: &crate::session::Session,
+        value: String,
+    ) -> anyhow::Result<Option<Arc<crate::redact::RedactionTable>>> {
+        let Some(redaction) = &self.redaction else {
+            return Ok(None);
+        };
+        let _guard = self.redaction_table_write_lock.lock().await;
+        // `with_forced_literal` is the leak-containment adoption seam (decision
+        // 11): its literals classify as `ContainedLeak`.
+        let table = current_redaction(redaction)
+            .with_forced_literal(value, "$leak:contained".to_string())?;
+        let table = Arc::new(table);
+        // Persist BEFORE swapping the live table (fail-closed): a persist failure
+        // must not leave the live table advanced ahead of the durable one.
+        session.persist_redaction_table(&table)?;
+        set_current_redaction(redaction, table.clone());
+        Ok(Some(table))
+    }
+
     /// Register parsed values from an approved secret-bearing file in the
     /// worker's live redaction table before its contents return to a model.
     /// Detached hubs return `None`; callers then retain a local table.

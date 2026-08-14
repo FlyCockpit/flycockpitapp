@@ -44,6 +44,7 @@ pub(crate) mod hooks;
 mod loop_guard;
 mod outcome;
 mod recheck;
+pub(crate) mod sensitive_turn;
 mod text_recovery;
 pub(crate) mod tool_dispatch;
 mod tool_timeout;

@@ -2039,9 +2039,9 @@ impl DaemonContext {
         let handle = actor.handle();
         // Build the one shared protected redaction-history key resolver over the
         // daemon's secure-key handle (decision 9.5.1) and install it on the
-        // registry so every session it builds shares this cache. LeaksService /
-        // LeakReportToolRuntime have no production call sites yet; when they land
-        // they pull the same resolver from here.
+        // registry so every session it builds shares this cache. The leak-report
+        // provider containment barrier reaches the same resolver per session via
+        // `Session::redaction_key_resolver`.
         let resolver: Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver> =
             Arc::new(crate::redact::secure_key_resolver::SecureKeyResolver::new(
                 handle.clone(),

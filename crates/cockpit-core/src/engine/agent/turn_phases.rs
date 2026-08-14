@@ -1349,7 +1349,7 @@ pub(crate) async fn run_turn(
     } else {
         ""
     };
-    let reasoning = match (channel_reasoning.is_empty(), inline_chip.is_empty()) {
+    let mut reasoning = match (channel_reasoning.is_empty(), inline_chip.is_empty()) {
         (true, _) => inline_chip.to_string(),
         (false, true) => channel_reasoning,
         (false, false) => format!("{channel_reasoning}\n{inline_chip}"),
@@ -1399,7 +1399,79 @@ pub(crate) async fn run_turn(
     // message that would poison every later request (defect B). The round's
     // `prompt` (the user/tool-result message) is always pushed; only the empty
     // assistant turn is dropped.
-    let mut calls: Vec<ToolCall> = collect_tool_calls(&choice);
+    // Provider sensitive-turn barrier (AC2/AC3/AC10). The provider adapters have
+    // already aggregated every streamed tool-call delta into this one buffered
+    // per-turn vector before any generic dispatch runs, so this is the single
+    // cross-decoder chokepoint. An ingress-only `report_leak` call is intercepted
+    // here — BEFORE it can reach generic tool dispatch, history persistence,
+    // stream-to-parent delivery, audit, or export — and routed through the
+    // fail-closed host ingress `decode_and_contain_report_leak`; the reported
+    // secret is installed into the LIVE redaction table BEFORE the turn is acked,
+    // and every other buffered item for the turn is then discarded. A turn with no
+    // sensitive-ingress call passes through byte-identically to before.
+    let buffered_calls: Vec<ToolCall> = collect_tool_calls(&choice);
+    let sensitive_turn_active = buffered_calls.iter().any(|tc| {
+        crate::engine::agent::sensitive_turn::is_sensitive_ingress_tool(&tc.function.name)
+    });
+    let mut calls: Vec<ToolCall> = if sensitive_turn_active {
+        // Host-derived provenance from the active route; the model never supplies it.
+        let provenance = crate::db::protected_leak_records::LeakProvenance {
+            provider_id: Some(model.provider_id().to_owned()),
+            model_id: Some(model.model_id_ref().to_owned()),
+            generation: None,
+            connector_id: None,
+        };
+        let key_resolver = session.redaction_key_resolver().clone();
+        let host = crate::engine::agent::sensitive_turn::LiveSensitiveContainmentHost {
+            db: &session.db,
+            key_resolver: key_resolver.as_ref(),
+            interrupts: interrupts.as_ref(),
+            session: session.as_ref(),
+            provenance,
+            session_id: session.id.to_string(),
+            now_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        let sensitive_outcome =
+            crate::engine::agent::sensitive_turn::run_sensitive_turn_barrier(&host, buffered_calls)
+                .await;
+        for result in &sensitive_outcome.sensitive_results {
+            // Content-free: `contained` / `rate_limited` / `failed`. Never plaintext.
+            tracing::info!(
+                target: "engine",
+                agent = %agent.name,
+                state = ?sensitive_outcome.state,
+                outcome = %result.model_output,
+                "report_leak containment barrier classified the turn"
+            );
+        }
+        // Collapse: no generic (ordinary) call survives a sensitive turn, so no
+        // buffered non-sensitive item reaches parent/UI/history/tool/audit/export.
+        sensitive_outcome.generic_calls
+    } else {
+        buffered_calls
+    };
+
+    if sensitive_turn_active {
+        // Fail closed: drop this turn's surviving assistant text and reasoning so
+        // they can never be persisted to durable history (which scrubs only with
+        // the stale pre-turn `model.session_redact_table()` snapshot, not the live
+        // post-install table) nor emitted to the client raw. On a Contained turn
+        // the reported secret IS installed into the live redaction table (so later
+        // turns are scrubbed) but this turn's own prose is sacrificed rather than
+        // re-scrubbed; on a Discarded turn nothing was installed, so it MUST be
+        // dropped. Blanking both makes the final AssistantMessage persist + the
+        // AssistantText client emit below skip entirely (their guard is
+        // `!text.trim().is_empty() || !reasoning.trim().is_empty()`).
+        //
+        // NOTE (deferred, see implementer report): this closes the durable-persist
+        // and final-emit paths, but the LIVE streaming AssistantTextDelta /
+        // ReasoningDelta already forwarded to the client DURING completion (before
+        // this classification point) is NOT yet buffered — true buffered stream
+        // delivery requires wrapping the per-turn `tx` at the completion call and
+        // is split to a follow-up.
+        text.clear();
+        reasoning.clear();
+    }
 
     // Harmony / ChatML special-token sanitizer
     // (implementation note): some local-template
@@ -1473,6 +1545,17 @@ pub(crate) async fn run_turn(
     } else {
         stored_assistant_choice(inline_think, &choice)
     };
+    // Sensitive-turn collapse (fail closed): drop the ENTIRE assistant turn from
+    // wire history. Its buffered tool calls (the `report_leak` ingress call and any
+    // other ordinary call) were withheld from generic dispatch, and its
+    // text/reasoning were blanked above, so persisting any part of the raw choice
+    // would either replay the plaintext `secret` argument of the report_leak call
+    // or leave a `tool_use` without a matching `tool_result`.
+    let stored_choice = if sensitive_turn_active {
+        None
+    } else {
+        stored_choice
+    };
     history.push(prompt);
     if let Some(stored_choice) = stored_choice {
         history.push(Message::Assistant {
@@ -1499,7 +1582,7 @@ pub(crate) async fn run_turn(
     // history after the AssistantText is emitted, so the block surfaces to the
     // user before the system nudge. `Some((notice, nudge))`.
     let mut available_nudge: Option<(String, String)> = None;
-    if should_attempt_text_recovery(calls.is_empty(), reasoning_rescue) {
+    if !sensitive_turn_active && should_attempt_text_recovery(calls.is_empty(), reasoning_rescue) {
         let mode = text_embedded_recovery_mode(&session, &config);
         match decide_text_recovery(&agent.tools, &text, mode) {
             TextRecoveryDecision::None => {}

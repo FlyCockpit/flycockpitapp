@@ -88,11 +88,9 @@ fn credential_record_exists(credential_ref: &str, store_path: Option<&Path>) -> 
     Ok(open_store(store_path)?.get(credential_ref).is_some())
 }
 
-fn open_store(store_path: Option<&Path>) -> Result<CredentialStore> {
-    match store_path {
-        Some(path) => CredentialStore::open(path.to_path_buf()),
-        None => CredentialStore::open_default(),
-    }
+fn open_store(_store_path: Option<&Path>) -> Result<CredentialStore> {
+    // Path-open is a leftover-file ratchet hole after vault activate.
+    CredentialStore::open_default()
 }
 
 async fn usage(args: ProvidersUsageArgs) -> Result<()> {

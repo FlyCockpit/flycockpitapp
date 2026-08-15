@@ -598,7 +598,7 @@ export COCKPIT_CONFIG=/path/to/config.json
 Runtime data:
 
 - SQLite database: `~/.local/share/cockpit/cockpit.db` or `$XDG_DATA_HOME/cockpit/cockpit.db`
-- Credentials: `~/.local/state/cockpit/credentials.json` or `$XDG_STATE_HOME/cockpit/credentials.json`
+- Wrap-key vault: SQLite AEAD ciphertext in `cockpit.db` (wrapped DEK). First-run KEK is a local `private_fs` file; an OS keyring holds the KEK only after an explicit Settings promotion. Older builds used plaintext `credentials.json`; current builds import it into the vault.
 - Logs: under the user cache directory, typically `~/.cache/cockpit/cockpit.log`
 - Price table: optional `~/.cockpit/prices.json` for `cockpit stats` cost columns.
 

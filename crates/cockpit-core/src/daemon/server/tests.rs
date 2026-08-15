@@ -15881,6 +15881,29 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             mutating: false,
         },
         CommandMetadataCase {
+            request: Request::GetHostCapabilities,
+            kind: "get_host_capabilities",
+            session_id: None,
+            audit_path: None,
+            mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::RefreshHostCapabilities,
+            kind: "refresh_host_capabilities",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::MigrateKekPlacement {
+                dest: cockpit_proto::SecretStorePlacement::Database,
+            },
+            kind: "migrate_kek_placement",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
             request: Request::RefreshEnv {
                 vars: HashMap::from([("PATH".into(), "/bin".into())]),
             },
@@ -16589,6 +16612,9 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         GuidanceEstimate,
         RestartIfIdle,
         StopDaemon,
+        GetHostCapabilities,
+        RefreshHostCapabilities,
+        MigrateKekPlacement,
     );
 
     let covered: HashSet<&'static str> = cases
@@ -20203,6 +20229,8 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         leak_reveal_state: base.leak_reveal_state.clone(),
         leak_cursor_key: base.leak_cursor_key,
         remote_project_resolver: base.remote_project_resolver.clone(),
+        host_capabilities: crate::host_capabilities::HostCapabilitySnapshotStore::new(),
+        host_capability_probes: base.host_capability_probes.clone(),
     });
     let client = crate::daemon::client::DaemonClient::from_in_process(ctx.clone());
 
@@ -20285,6 +20313,8 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         leak_reveal_state: base.leak_reveal_state.clone(),
         leak_cursor_key: base.leak_cursor_key,
         remote_project_resolver: base.remote_project_resolver.clone(),
+        host_capabilities: crate::host_capabilities::HostCapabilitySnapshotStore::new(),
+        host_capability_probes: base.host_capability_probes.clone(),
     });
     let client = crate::daemon::client::DaemonClient::from_in_process(ctx.clone());
 

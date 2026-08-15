@@ -838,6 +838,21 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
+        "get_host_capabilities",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "refresh_host_capabilities",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "migrate_kek_placement",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
         "operation_status",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
@@ -1322,6 +1337,11 @@ pub const RESPONSE_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
+        "host_capabilities",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
         "workspace_trust_set",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
@@ -1770,6 +1790,11 @@ pub const EVENT_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteMessageClass::Liveness,
         RemoteInlinePayloadBound::Bounded,
     ),
+    row(
+        "host_capabilities_changed",
+        RemoteMessageClass::BoundedEvent,
+        RemoteInlinePayloadBound::Bounded,
+    ),
 ];
 
 /// The committed inventory of variants whose pre-migration encoded payload
@@ -1992,9 +2017,9 @@ mod tests {
         }
 
         // Exact table sizes, so a silent shrink is caught.
-        assert_eq!(REQUEST_CLASSIFICATION.len(), 141);
-        assert_eq!(RESPONSE_CLASSIFICATION.len(), 92);
-        assert_eq!(EVENT_CLASSIFICATION.len(), 76);
+        assert_eq!(REQUEST_CLASSIFICATION.len(), 144);
+        assert_eq!(RESPONSE_CLASSIFICATION.len(), 93);
+        assert_eq!(EVENT_CLASSIFICATION.len(), 77);
     }
 
     #[test]

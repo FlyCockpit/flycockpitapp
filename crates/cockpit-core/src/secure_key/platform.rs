@@ -138,8 +138,187 @@ pub(crate) fn mark_worker_drained() {
     DRAIN_COMPLETE_AT.store(next_seq(), Ordering::SeqCst);
 }
 
+/// Shared keyring probe used by the daemon capability snapshot and later by
+/// `sqlite-native-key-store`. Boot and refresh must call this function; they
+/// must not treat [`set_default_platform_store`] as a second independent
+/// probe. Safe to call before the secure-key actor starts.
+///
+/// Construction is cached in-process. A later call returns the cached result
+/// unless [`probe_platform_keyring_refresh`] is used. On failure the process
+/// default store is unset so a failed construct cannot leak a registration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyringProbeResult {
+    pub state: cockpit_proto::FeatureCapabilityState,
+    pub reason: String,
+    pub fix_command: Option<String>,
+    pub remedy_text: Option<String>,
+}
+
+struct KeyringProbeCache {
+    result: Option<KeyringProbeResult>,
+    construct_count: usize,
+}
+
+static KEYRING_PROBE_CACHE: Mutex<KeyringProbeCache> = Mutex::new(KeyringProbeCache {
+    result: None,
+    construct_count: 0,
+});
+
+/// Probe whether a platform keyring store can be constructed for one wrapping KEK.
+pub fn probe_platform_keyring() -> KeyringProbeResult {
+    probe_platform_keyring_with(production_or_test_construct, false)
+}
+
+/// Re-run the platform keyring construct, replacing the cached result.
+pub fn probe_platform_keyring_refresh() -> KeyringProbeResult {
+    probe_platform_keyring_with(production_or_test_construct, true)
+}
+
+fn production_or_test_construct() -> Result<(), SecureKeyError> {
+    #[cfg(test)]
+    {
+        // Unit tests inject via [`probe_platform_keyring_with`]. The default
+        // construct never opens a real session bus.
+        return Err(SecureKeyError::Unavailable(
+            "test default: inject probe_platform_keyring_with".into(),
+        ));
+    }
+    #[cfg(not(test))]
+    {
+        set_default_platform_store()
+    }
+}
+
+/// Injectable construct seam. Tests pass a fake construct; production uses
+/// [`set_default_platform_store`].
+pub fn probe_platform_keyring_with(
+    construct: impl FnOnce() -> Result<(), SecureKeyError>,
+    refresh: bool,
+) -> KeyringProbeResult {
+    {
+        let cache = KEYRING_PROBE_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !refresh && let Some(result) = cache.result.clone() {
+            return result;
+        }
+    }
+    let result = run_keyring_construct(construct);
+    let mut cache = KEYRING_PROBE_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.construct_count = cache.construct_count.saturating_add(1);
+    cache.result = Some(result.clone());
+    result
+}
+
+fn run_keyring_construct(
+    construct: impl FnOnce() -> Result<(), SecureKeyError>,
+) -> KeyringProbeResult {
+    // Refresh can run after the secure-key actor has registered the live
+    // process-global store. Capture it first, then restore so a dry probe
+    // never leaves the actor pointing at an unset or probe-owned default.
+    let previous = keyring_core::get_default_store();
+    let outcome = construct();
+    match &outcome {
+        Ok(()) => {
+            // Keep a successful first construct registered so later KEK use
+            // does not construct the platform store a second time. Restore a
+            // previously registered actor store if one existed.
+            if let Some(previous) = previous {
+                keyring_core::set_default_store(previous);
+            }
+        }
+        Err(_) => {
+            if let Some(previous) = previous {
+                keyring_core::set_default_store(previous);
+            } else {
+                unset_default_platform_store();
+            }
+        }
+    }
+    match outcome {
+        Ok(()) => KeyringProbeResult {
+            state: cockpit_proto::FeatureCapabilityState::Available,
+            reason: "platform keyring can hold a wrapping key".into(),
+            fix_command: None,
+            remedy_text: None,
+        },
+        Err(error) => classify_keyring_error(&error),
+    }
+}
+
+fn classify_keyring_error(error: &SecureKeyError) -> KeyringProbeResult {
+    use cockpit_proto::FeatureCapabilityState;
+    let reason = error.to_string();
+    let (state, fix_command, remedy_text) = match error {
+        SecureKeyError::Unavailable(message)
+            if message.contains("no native") || message.contains("unsupported") =>
+        {
+            (
+                FeatureCapabilityState::Unsupported,
+                None,
+                Some("This platform has no OS keyring backend.".into()),
+            )
+        }
+        SecureKeyError::Unavailable(message) if message.contains("DBUS_SESSION_BUS_ADDRESS") => (
+            FeatureCapabilityState::Missing,
+            None,
+            Some(
+                "Set DBUS_SESSION_BUS_ADDRESS and run a Secret Service implementation such as gnome-keyring."
+                    .into(),
+            ),
+        ),
+        SecureKeyError::Unavailable(_) | SecureKeyError::NotFound(_) => (
+            FeatureCapabilityState::Missing,
+            None,
+            Some(keyring_missing_remedy_text()),
+        ),
+        _ => (
+            FeatureCapabilityState::Failed,
+            None,
+            Some(keyring_missing_remedy_text()),
+        ),
+    };
+    KeyringProbeResult {
+        state,
+        reason,
+        fix_command,
+        remedy_text,
+    }
+}
+
+fn keyring_missing_remedy_text() -> String {
+    "Install a platform keyring (Linux Secret Service, macOS Keychain, or Windows Credential Manager) and ensure a session bus is available.".into()
+}
+
+#[cfg(test)]
+pub fn keyring_probe_construct_count() -> usize {
+    KEYRING_PROBE_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .construct_count
+}
+
+#[cfg(test)]
+pub fn reset_keyring_probe_cache_for_test() {
+    let mut cache = KEYRING_PROBE_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.result = None;
+    cache.construct_count = 0;
+}
+
+#[cfg(test)]
+pub fn default_platform_store_is_registered() -> bool {
+    keyring_core::get_default_store().is_some()
+}
+
 /// Construct the process default store and register it. Call before accepting
 /// secure-key requests on the production path.
+///
+/// Not a capability probe. Callers that need availability must use
+/// [`probe_platform_keyring`] so boot/refresh share one construct.
 pub(crate) fn set_default_platform_store() -> Result<(), SecureKeyError> {
     SET_DEFAULT_AT.store(next_seq(), Ordering::SeqCst);
     if let Ok(mut g) = SET_DEFAULT_THREAD_NAME.lock() {

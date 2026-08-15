@@ -43,11 +43,8 @@ async fn seed_contained_leak(ctx: &DaemonContext, session_id: &str, secret: &str
     seed_session(&ctx.db, session_id).await;
     let resolver = ctx.redaction_key_resolver().expect("test resolver");
     let handler = LeakReportHandler::new(&ctx.db, resolver.as_ref(), 1_000_000);
-    let authority = ReportLeakAuthority::new(
-        LeakSource::ModelOutput,
-        provenance(),
-        session_id.to_owned(),
-    );
+    let authority =
+        ReportLeakAuthority::new(LeakSource::ModelOutput, provenance(), session_id.to_owned());
     let outcome = handler
         .report(
             &authority,
@@ -109,7 +106,9 @@ async fn leak_reveal_capability_single_use_and_expiry() {
 
     // Second reveal with the same capability -> consumed -> Unauthorized.
     assert_eq!(
-        consume_leak_reveal(&ctx, &cap.capability, now).await.unwrap_err(),
+        consume_leak_reveal(&ctx, &cap.capability, now)
+            .await
+            .unwrap_err(),
         LeakRevealDenied::Unauthorized
     );
 
@@ -294,13 +293,17 @@ async fn leak_reveal_rate_limit_three_per_minute() {
     }
 
     // A failed reveal does NOT count toward the limit (bad token at t).
-    let _ = consume_leak_reveal(&ctx, &"0".repeat(64), t).await.unwrap_err();
+    let _ = consume_leak_reveal(&ctx, &"0".repeat(64), t)
+        .await
+        .unwrap_err();
 
     // The 4th successful-path reveal inside 60s -> RateLimited only, and the
     // pending capability is NOT consumed.
     let hex = mint(&report_id);
     assert_eq!(
-        consume_leak_reveal(&ctx, &hex, t + 1_000).await.unwrap_err(),
+        consume_leak_reveal(&ctx, &hex, t + 1_000)
+            .await
+            .unwrap_err(),
         LeakRevealDenied::RateLimited
     );
     assert!(ctx.leak_reveal_state.lock().unwrap().pending_is_some());
@@ -343,7 +346,10 @@ async fn leak_reveal_channel_and_proto_surface() {
 
     // The revealed value never appears in its own Debug output.
     let dbg = format!("{revealed:?}");
-    assert!(!dbg.contains(secret), "RevealedLeakSecret Debug leaks plaintext");
+    assert!(
+        !dbg.contains(secret),
+        "RevealedLeakSecret Debug leaks plaintext"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -364,8 +370,8 @@ async fn leak_reveal_unix_peercred_end_to_end() {
     let listener = crate::daemon::bind_private_socket(&reveal_path).expect("bind reveal socket");
     let server_ctx = ctx.clone();
     let accept = tokio::spawn(async move {
-        let _ = crate::daemon::leak_reveal_socket::run_reveal_accept_loop(server_ctx, listener)
-            .await;
+        let _ =
+            crate::daemon::leak_reveal_socket::run_reveal_accept_loop(server_ctx, listener).await;
     });
 
     // A same-uid peer (this process) presenting the 64-char hex capability over
@@ -421,8 +427,8 @@ async fn leak_reveal_socket_rejects_trailing_bytes() {
     let listener = crate::daemon::bind_private_socket(&reveal_path).expect("bind reveal socket");
     let server_ctx = ctx.clone();
     let accept = tokio::spawn(async move {
-        let _ = crate::daemon::leak_reveal_socket::run_reveal_accept_loop(server_ctx, listener)
-            .await;
+        let _ =
+            crate::daemon::leak_reveal_socket::run_reveal_accept_loop(server_ctx, listener).await;
     });
 
     // A valid 67-byte request frame plus one trailing byte.
@@ -450,7 +456,10 @@ async fn leak_reveal_socket_rejects_trailing_bytes() {
     .expect("server must close (EOF) before the deadline — no pinned handler")
     .expect("read should observe a clean EOF, not an error");
     assert_eq!(bytes, 0, "trailing-byte request must receive no content");
-    assert!(resp.is_empty(), "trailing-byte request must receive no content");
+    assert!(
+        resp.is_empty(),
+        "trailing-byte request must receive no content"
+    );
 
     accept.abort();
 }
@@ -485,7 +494,9 @@ async fn leak_delete_prevents_future_reveal_and_is_idempotent() {
         .unwrap()
         .mint(token, report_id.clone(), 10_000_000);
     assert_eq!(
-        consume_leak_reveal(&ctx, &hex, 1_000_000).await.unwrap_err(),
+        consume_leak_reveal(&ctx, &hex, 1_000_000)
+            .await
+            .unwrap_err(),
         LeakRevealDenied::Unauthorized
     );
 

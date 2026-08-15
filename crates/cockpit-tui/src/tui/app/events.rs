@@ -191,6 +191,41 @@ impl App {
         }
     }
 
+    pub(super) fn refresh_host_capabilities(&mut self) -> cockpit_proto::HostCapabilitySnapshot {
+        self.capability_refresh_calls = self.capability_refresh_calls.saturating_add(1);
+        if let Some(next) = self.capability_refresh_queue.pop() {
+            self.apply_host_capabilities(next);
+            return self.host_capabilities.clone();
+        }
+        if self
+            .agent_runner
+            .as_ref()
+            .is_some_and(|runner| runner.is_ok())
+        {
+            self.send_daemon_request(
+                "/capabilities",
+                cockpit_core::daemon::proto::Request::RefreshHostCapabilities,
+                crate::tui::app::ControlApplied::None,
+            );
+        } else {
+            self.apply_host_capabilities(
+                crate::tui::capability_gate::local_host_capability_snapshot(),
+            );
+        }
+        self.host_capabilities.clone()
+    }
+
+    pub(super) fn apply_host_capabilities(
+        &mut self,
+        snapshot: cockpit_proto::HostCapabilitySnapshot,
+    ) {
+        self.host_capabilities = snapshot;
+        if let crate::tui::settings::Dialog::Settings(_) = &self.dialog {
+            self.dialog
+                .apply_host_capabilities(self.host_capabilities.clone(), true);
+        }
+    }
+
     pub(super) fn apply_sandbox_state(
         &mut self,
         mode: cockpit_core::tools::sandbox_mode::SandboxMode,
@@ -619,6 +654,9 @@ impl App {
                     );
                 }
                 self.dispatch_next_ready_paste_fence();
+            }
+            TurnEvent::HostCapabilitiesChanged { snapshot } => {
+                self.apply_host_capabilities(*snapshot);
             }
             TurnEvent::ConfigSnapshot { snapshot } => {
                 self.apply_config_snapshot(*snapshot);
@@ -1860,12 +1898,18 @@ impl App {
                 mode,
                 container_network_enabled,
                 container_availability,
-            } => self.apply_sandbox_state(
-                mode,
-                container_network_enabled,
-                container_availability,
-                cockpit_core::tools::shell_sandbox::shell_sandbox_supported(),
-            ),
+                persisted_intent,
+            } => {
+                if let Some(intent) = persisted_intent {
+                    self.sandbox_intent = intent;
+                }
+                self.apply_sandbox_state(
+                    mode,
+                    container_network_enabled,
+                    container_availability,
+                    cockpit_core::tools::shell_sandbox::shell_sandbox_supported(),
+                );
+            }
             TurnEvent::SandboxUnavailable {
                 remedy,
                 fix_command,

@@ -1150,6 +1150,20 @@ pub enum Request {
     /// Atomically request daemon restart only if no session worker is busy.
     RestartIfIdle,
 
+    /// Return the last daemon-owned [`HostCapabilitySnapshot`].
+    GetHostCapabilities,
+
+    /// Re-run the shared host-capability probes and publish a new snapshot
+    /// when the reserved generation is still current.
+    RefreshHostCapabilities,
+
+    /// Move the wrap-key vault KEK between OS keyring and `private_fs`.
+    /// Commits `secret_vault_authority` in the same SQLite transaction as
+    /// the migrate saga. Not a layered `secretStore` config key.
+    MigrateKekPlacement {
+        dest: SecretStorePlacement,
+    },
+
     #[serde(other)]
     Unknown,
 }
@@ -1441,6 +1455,9 @@ macro_rules! request_variants {
             (Request::FinalizeMediaUpload(..), "finalize_media_upload");
             (Request::StopDaemon { .. }, "stop_daemon");
             (Request::RestartIfIdle, "restart_if_idle");
+            (Request::GetHostCapabilities, "get_host_capabilities");
+            (Request::RefreshHostCapabilities, "refresh_host_capabilities");
+            (Request::MigrateKekPlacement { .. }, "migrate_kek_placement");
             (Request::Unknown, "__unknown");
         ] }
     };
@@ -1622,6 +1639,9 @@ macro_rules! command {
             (Request::FinalizeMediaUpload(..), "finalize_media_upload", public_read, none, true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "-", []);
             (Request::StopDaemon { grace_secs }, "stop_daemon", owner_only, none, true, local_only, none, serialized, none, "grace_secs:Option<u64>", [grace_secs: Option<u64> => param]);
             (Request::RestartIfIdle, "restart_if_idle", owner_only, none, true, local_only, none, serialized, none, "-", []);
+            (Request::GetHostCapabilities, "get_host_capabilities", public_read, none, false, read_only, none, concurrent, none, "-", []);
+            (Request::RefreshHostCapabilities, "refresh_host_capabilities", owner_only, none, true, local_only, none, serialized, none, "-", []);
+            (Request::MigrateKekPlacement { dest }, "migrate_kek_placement", owner_only, none, true, local_only, none, serialized, none, "dest:SecretStorePlacement", [dest: SecretStorePlacement => param]);
             (Request::Unknown, "unknown", owner_only, none, false, rejected, rejected_before_dispatch, serialized, none, "-", []);
         ] }
     };
@@ -1953,6 +1973,7 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
         | "LeakRotationDisposition"
         | "LlmMode"
         | "LspControlAction"
+        | "SecretStorePlacement"
         | "UsageKind"
         | "WorkspaceTrustMode"
         | "StatsRange" => "enum16",

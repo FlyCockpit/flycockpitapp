@@ -37,14 +37,41 @@ use crate::wizard::{
     sandbox_mode_answer,
 };
 
+/// Compose a daemon-less host-capability snapshot for the setup wizard.
+/// Callers inject this; the wizard never consults a process-global cache.
+pub async fn compose_wizard_host_capabilities(cwd: &Path) -> cockpit_proto::HostCapabilitySnapshot {
+    let probes = crate::host_capabilities::HostCapabilityProbeInputs::production(cwd.to_path_buf());
+    let collected = crate::host_capabilities::collect_shared_host_probes(&probes, false).await;
+    crate::host_capabilities::build_host_capability_snapshot(
+        1,
+        &collected,
+        cockpit_proto::SecretStoreSnapshot::unconfigured_placeholder(),
+    )
+}
+
 /// Build the descriptor for wizard `id`, seeded from the config effective
 /// at `cwd`. The security and model wizards are config-dependent (their
 /// steps show current values and provider/model lists); every other wizard
 /// is static and comes straight from the registry.
 pub fn descriptor_for_cwd(id: &str, cwd: &Path) -> Option<WizardDescriptor> {
+    descriptor_for_cwd_with_caps(id, cwd, None)
+}
+
+/// Like [`descriptor_for_cwd`], but the security wizard takes an injected
+/// [`cockpit_proto::HostCapabilitySnapshot`]. Missing snapshot is fail-closed
+/// (no host On, no container rows).
+pub fn descriptor_for_cwd_with_caps(
+    id: &str,
+    cwd: &Path,
+    caps: Option<&cockpit_proto::HostCapabilitySnapshot>,
+) -> Option<WizardDescriptor> {
     if id == crate::wizard::SECURITY_WIZARD_ID {
         let current = crate::config::extended::load_for_cwd(cwd);
-        return Some(crate::wizard::security_descriptor_for_config(&current));
+        let unpublished = crate::daemon::session_worker::unpublished_host_capability_snapshot();
+        let caps = caps.unwrap_or(&unpublished);
+        return Some(crate::wizard::security_descriptor_for_config_with_caps(
+            &current, caps,
+        ));
     }
     if id == crate::wizard::MODEL_WIZARD_ID {
         return Some(model_descriptor_for_cwd(cwd, None));
@@ -73,6 +100,16 @@ pub fn security_config_path(cwd: &Path) -> PathBuf {
 /// the effective value, so an all-defaults run writes nothing and returns
 /// `Ok(None)`; otherwise returns the config file that was written.
 pub fn apply_security_answers(cwd: &Path, run: &WizardRun) -> Result<Option<PathBuf>> {
+    apply_security_answers_with_caps(cwd, run, None)
+}
+
+/// Persist security-wizard answers. When `caps` is present, unavailable
+/// sandbox modes are refused and not written.
+pub fn apply_security_answers_with_caps(
+    cwd: &Path,
+    run: &WizardRun,
+    caps: Option<&cockpit_proto::HostCapabilitySnapshot>,
+) -> Result<Option<PathBuf>> {
     let effective = crate::config::extended::load_for_cwd(cwd);
     let target = security_config_path(cwd);
     let mut doc = ExtendedConfigDoc::load(&target)?;
@@ -82,6 +119,14 @@ pub fn apply_security_answers(cwd: &Path, run: &WizardRun) -> Result<Option<Path
     if let Some(mode) = sandbox_mode_answer(run)
         && mode != effective.sandbox.default_mode
     {
+        if let Some(caps) = caps
+            && !crate::daemon::session_worker::sandbox_mode_selectable(mode, caps)
+        {
+            return Err(anyhow!(
+                "sandbox mode `{}` is not available on this host",
+                crate::wizard::sandbox_mode_id(mode)
+            ));
+        }
         cfg.sandbox.default_mode = mode;
         changed = true;
     }
@@ -575,8 +620,18 @@ mod tests {
         }
     }
 
+    fn available_sandbox_caps() -> cockpit_proto::HostCapabilitySnapshot {
+        crate::daemon::session_worker::sandbox_capability_snapshot(
+            cockpit_proto::FeatureCapabilityState::Available,
+            cockpit_proto::FeatureCapabilityState::Available,
+        )
+    }
+
     fn security_run_for_cwd(cwd: &std::path::Path) -> WizardRun {
-        let descriptor = descriptor_for_cwd(crate::wizard::SECURITY_WIZARD_ID, cwd).unwrap();
+        let caps = available_sandbox_caps();
+        let descriptor =
+            descriptor_for_cwd_with_caps(crate::wizard::SECURITY_WIZARD_ID, cwd, Some(&caps))
+                .unwrap();
         WizardRun::new(descriptor).unwrap()
     }
 
@@ -633,6 +688,30 @@ mod tests {
         assert_eq!(raw["sandbox"]["defaultMode"], "container_readonly");
         assert!(raw.get("defaultApprovalMode").is_none());
         assert!(raw.get("redact").is_none());
+    }
+
+    #[test]
+    fn security_wizard_cannot_persist_unavailable_container() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("global-config.json");
+        let _guard = CockpitConfigEnvGuard::set(&config_path);
+        let caps = crate::daemon::session_worker::sandbox_capability_snapshot(
+            cockpit_proto::FeatureCapabilityState::Available,
+            cockpit_proto::FeatureCapabilityState::Missing,
+        );
+        let mut run = security_run_for_cwd(tmp.path());
+        submit_security_wizard_until_save(
+            &mut run,
+            &[(
+                "sandbox",
+                WizardAnswer::Select("container-readonly".to_string()),
+            )],
+        );
+
+        let err = apply_security_answers_with_caps(tmp.path(), &run, Some(&caps))
+            .expect_err("unavailable container must not persist");
+        assert!(err.to_string().contains("not available"));
+        assert!(!config_path.exists());
     }
 
     #[test]

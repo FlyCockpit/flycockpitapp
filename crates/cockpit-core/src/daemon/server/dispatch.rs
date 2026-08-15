@@ -3942,15 +3942,24 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     return Ok(response);
                 }
             }
-            let new = att
+            let caps = current_host_capability_snapshot(ctx);
+            let applied = att
                 .handle
-                .set_sandbox(mode, container_network_enabled)
-                .map_err(bad_request)?;
+                .set_sandbox(mode, container_network_enabled, &caps)
+                .map_err(|error| match error {
+                    crate::daemon::session_worker::SetSandboxError::CapabilityMissing(missing) => {
+                        sandbox_capability_missing(missing)
+                    }
+                    crate::daemon::session_worker::SetSandboxError::Persist(message) => {
+                        internal(message)
+                    }
+                })?;
             let response = Response::SandboxState {
-                mode: new,
-                enabled: new.enabled(),
+                mode: applied.effective,
+                enabled: applied.effective.enabled(),
                 container_network_enabled: att.handle.container_network_enabled(),
                 container_availability: crate::container::availability_snapshot(),
+                persisted_intent: Some(applied.persisted_intent),
             };
             match remote_operation {
                 Some(operation) => {
@@ -4422,6 +4431,9 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             effects.shutdown_after_response = true;
             Ok(Response::Ack)
         }
+        Request::GetHostCapabilities => get_host_capabilities(ctx),
+        Request::RefreshHostCapabilities => refresh_host_capabilities_request(ctx).await,
+        Request::MigrateKekPlacement { dest } => migrate_kek_placement_request(ctx, dest).await,
         Request::RestartIfIdle => {
             tracing::info!("RestartIfIdle requested via client");
             let _decision = crate::sync::lock_or_recover(&ctx.restart_decision);
@@ -5207,9 +5219,7 @@ fn leak_rotation_filter(
     rotation: Option<proto::LeakRotationState>,
 ) -> Option<crate::db::protected_leak_records::LeakRotation> {
     rotation.map(|r| match r {
-        proto::LeakRotationState::None => {
-            crate::db::protected_leak_records::LeakRotation::None
-        }
+        proto::LeakRotationState::None => crate::db::protected_leak_records::LeakRotation::None,
         proto::LeakRotationState::PendingUser => {
             crate::db::protected_leak_records::LeakRotation::PendingUser
         }
@@ -5261,11 +5271,16 @@ pub(super) async fn list_leak_reports(
         project_root,
         rotation: leak_rotation_filter(rotation),
     };
-    let page = crate::leaks::list_leak_reports(&ctx.db, &ctx.leak_cursor_key, filters, limit, cursor.as_deref())
-        .await
-        .map_err(leak_list_error)?;
-    let reports: Vec<proto::LeakReportMetadata> =
-        page.refs.iter().map(leak_ref_to_proto).collect();
+    let page = crate::leaks::list_leak_reports(
+        &ctx.db,
+        &ctx.leak_cursor_key,
+        filters,
+        limit,
+        cursor.as_deref(),
+    )
+    .await
+    .map_err(leak_list_error)?;
+    let reports: Vec<proto::LeakReportMetadata> = page.refs.iter().map(leak_ref_to_proto).collect();
     Ok(Response::LeakReports {
         page: proto::LeakReportsPage {
             reports,
@@ -5754,6 +5769,7 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
                 .unwrap_or_else(|| "<in-memory>".to_string()),
             schema_version: ctx.db.schema_version().await.map_err(internal)?,
         }),
+        Request::GetHostCapabilities => get_host_capabilities(&ctx),
         Request::GetUsageCounts { project_id } => {
             let since = chrono::Utc::now().timestamp() - crate::db::usage_events::USAGE_WINDOW_SECS;
             let models = ctx
@@ -5805,6 +5821,111 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
             message: format!("request `{request_kind}` is not marked concurrent"),
         }),
     }
+}
+
+fn current_host_capability_snapshot(ctx: &DaemonContext) -> cockpit_proto::HostCapabilitySnapshot {
+    ctx.host_capabilities
+        .current()
+        .map(|snapshot| (*snapshot).clone())
+        .unwrap_or_else(crate::daemon::session_worker::unpublished_host_capability_snapshot)
+}
+
+fn sandbox_capability_missing(
+    missing: crate::daemon::session_worker::SandboxCapabilityMissing,
+) -> ErrorPayload {
+    ErrorPayload {
+        code: ErrorCode::SandboxCapabilityMissing,
+        message: missing.to_string(),
+    }
+}
+
+fn get_host_capabilities(ctx: &DaemonContext) -> std::result::Result<Response, ErrorPayload> {
+    let snapshot = ctx
+        .host_capabilities
+        .current()
+        .ok_or_else(|| ErrorPayload {
+            code: ErrorCode::Internal,
+            message: "host capability snapshot has not been published".to_string(),
+        })?;
+    Ok(Response::HostCapabilities {
+        snapshot: (*snapshot).clone(),
+    })
+}
+
+async fn migrate_kek_placement_request(
+    ctx: &Arc<DaemonContext>,
+    dest: cockpit_proto::SecretStorePlacement,
+) -> std::result::Result<Response, ErrorPayload> {
+    if dest == cockpit_proto::SecretStorePlacement::Unavailable {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "cannot migrate the wrap-key vault to an unavailable placement".into(),
+        });
+    }
+    let probe = match ctx.host_capabilities.current().and_then(|snapshot| {
+        snapshot
+            .feature(crate::host_capabilities::FEATURE_SECRET_STORE_KEYRING)
+            .cloned()
+    }) {
+        Some(row) => crate::secure_key::KeyringProbeResult {
+            state: row.state,
+            reason: row.reason,
+            fix_command: row.fix_command,
+            remedy_text: row.remedy_text,
+        },
+        None => crate::secure_key::probe_platform_keyring(),
+    };
+    let db = ctx.db.clone();
+    let snapshot = tokio::task::spawn_blocking(move || {
+        crate::secure_key::migrate_installation_kek(
+            &db,
+            dest,
+            &probe,
+            crate::secure_key::SecretStoreInjected::default(),
+        )
+    })
+    .await
+    .map_err(|e| ErrorPayload {
+        code: ErrorCode::Internal,
+        message: format!("kek migrate task failed: {e}"),
+    })?
+    .map_err(|e| ErrorPayload {
+        code: ErrorCode::Internal,
+        message: e.to_string(),
+    })?;
+    let (host_snapshot, published) =
+        crate::host_capabilities::refresh_host_capabilities_with_secret_store(
+            &ctx.host_capabilities,
+            &ctx.host_capability_probes,
+            snapshot,
+        )
+        .await
+        .map_err(internal)?;
+    if published {
+        ctx.broadcast_global(proto::Event::HostCapabilitiesChanged {
+            snapshot: host_snapshot.clone(),
+        });
+    }
+    Ok(Response::HostCapabilities {
+        snapshot: host_snapshot,
+    })
+}
+
+async fn refresh_host_capabilities_request(
+    ctx: &Arc<DaemonContext>,
+) -> std::result::Result<Response, ErrorPayload> {
+    let (snapshot, published) = crate::host_capabilities::refresh_host_capabilities(
+        &ctx.host_capabilities,
+        &ctx.host_capability_probes,
+    )
+    .await
+    .map_err(internal)?;
+    if published {
+        ctx.broadcast_global(proto::Event::HostCapabilitiesChanged {
+            snapshot: snapshot.clone(),
+        });
+    }
+    Ok(Response::HostCapabilities { snapshot })
 }
 
 fn validate_request_semantics(request: &Request) -> std::result::Result<(), ErrorPayload> {
@@ -6425,7 +6546,12 @@ pub(super) async fn attach(
         handle.persist_if_needed().map_err(internal)?;
     }
     if remote_readonly_attach {
-        let _ = handle.set_sandbox(Some(crate::tools::sandbox_mode::SandboxMode::Sandbox), None);
+        let caps = current_host_capability_snapshot(ctx);
+        let _ = handle.set_sandbox(
+            Some(crate::tools::sandbox_mode::SandboxMode::Sandbox),
+            None,
+            &caps,
+        );
         handle.set_approval_mode(crate::config::extended::ApprovalMode::Manual);
     }
 
@@ -6488,6 +6614,7 @@ pub(super) async fn attach(
             .map_err(internal)?;
         att.handle.broadcast_gitignore_allow();
         att.handle.broadcast_active_interrupt().await;
+        att.handle.broadcast_sandbox_state();
         att.handle.broadcast_sandbox_escalation();
         att.handle.broadcast_sandbox_unavailable_or_probe();
         att.handle.broadcast_config_snapshot();
@@ -6970,13 +7097,10 @@ pub(super) async fn export_session_data(
             // the target session's project root and the durable
             // credential/environment journals, never the inference-time
             // provider-trust decision.
-            let export_redactor = db
-                .read(move |conn| {
-                    let env = crate::session::export::process_env_map_for_conn();
-                    crate::session::export::redaction_table_for_session_conn(conn, &target, &env)
-                })
-                .await
-                .map_err(internal)?;
+            let env = crate::session::export::process_env_map_for_conn();
+            let export_redactor =
+                crate::session::export::redaction_table_for_session(&db, &target, &env)
+                    .map_err(internal)?;
             let mut messages_value = serde_json::to_value(&messages).map_err(internal)?;
             crate::session::export::scrub_export_json_value(&mut messages_value, &export_redactor);
             let bytes = serde_json::to_vec_pretty(&messages_value).map_err(internal)?;

@@ -2258,14 +2258,20 @@ async fn assistant_session_root_agent_loads_assistant_definition() {
 #[tokio::test]
 async fn sandbox_default_precedence_daemon_wins() {
     use crate::tools::sandbox_mode::SandboxMode;
+    use cockpit_proto::FeatureCapabilityState;
+
+    let caps = crate::daemon::session_worker::sandbox_capability_snapshot(
+        FeatureCapabilityState::Available,
+        FeatureCapabilityState::Available,
+    );
 
     // (a) daemon `--no-sandbox` -> OFF regardless of the client flag.
     assert_eq!(
-        resolve_sandbox_default_with(true, false, SandboxMode::Sandbox),
+        resolve_sandbox_default_with(true, false, SandboxMode::Sandbox, &caps),
         SandboxMode::Off
     );
     assert_eq!(
-        resolve_sandbox_default_with(true, true, SandboxMode::Container),
+        resolve_sandbox_default_with(true, true, SandboxMode::Container, &caps),
         SandboxMode::Off
     );
 }
@@ -2273,17 +2279,75 @@ async fn sandbox_default_precedence_daemon_wins() {
 #[tokio::test]
 async fn sandbox_default_precedence_client_then_on() {
     use crate::tools::sandbox_mode::SandboxMode;
+    use cockpit_proto::FeatureCapabilityState;
+
+    let caps = crate::daemon::session_worker::sandbox_capability_snapshot(
+        FeatureCapabilityState::Available,
+        FeatureCapabilityState::Available,
+    );
 
     // (b) no daemon flag, client `--no-sandbox` -> OFF.
     assert_eq!(
-        resolve_sandbox_default_with(false, true, SandboxMode::Container),
+        resolve_sandbox_default_with(false, true, SandboxMode::Container, &caps),
         SandboxMode::Off
     );
-    // (c) neither flag -> ON.
+    // (c) neither flag -> effective intent (host Sandbox when available).
     assert_eq!(
-        resolve_sandbox_default_with(false, false, SandboxMode::Sandbox),
+        resolve_sandbox_default_with(false, false, SandboxMode::Sandbox, &caps),
         SandboxMode::Sandbox
     );
+}
+
+#[test]
+fn set_sandbox_rejects_unavailable_intent_does_not_persist() {
+    use crate::tools::sandbox_mode::SandboxMode;
+    use cockpit_proto::FeatureCapabilityState;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = crate::db::Db::open_in_memory().unwrap();
+    let session = crate::session::Session::create(
+        db.clone(),
+        tmp.path().to_path_buf(),
+        "Build",
+        crate::session::test_redaction_key_resolver(),
+    )
+    .unwrap();
+    session.set_sandbox_mode(SandboxMode::Off);
+    let locks = Arc::new(crate::locks::LockManager::in_memory(db));
+    let handle = SessionWorkerHandle::test_handle(Arc::new(session), locks);
+    let missing = crate::daemon::session_worker::sandbox_capability_snapshot(
+        FeatureCapabilityState::Missing,
+        FeatureCapabilityState::Missing,
+    );
+    let err = handle
+        .set_sandbox(Some(SandboxMode::Sandbox), None, &missing)
+        .expect_err("host Sandbox must reject when cap is missing");
+    assert!(matches!(
+        err,
+        crate::daemon::session_worker::SetSandboxError::CapabilityMissing(_)
+    ));
+    assert_eq!(handle.session().sandbox_mode(), SandboxMode::Off);
+    assert!(!tmp.path().join(".cockpit").join("config.json").exists());
+
+    let err = handle
+        .set_sandbox(Some(SandboxMode::Container), None, &missing)
+        .expect_err("container must reject when cap is missing");
+    assert!(matches!(
+        err,
+        crate::daemon::session_worker::SetSandboxError::CapabilityMissing(_)
+    ));
+    assert_eq!(handle.session().sandbox_mode(), SandboxMode::Off);
+
+    let available = crate::daemon::session_worker::sandbox_capability_snapshot(
+        FeatureCapabilityState::Available,
+        FeatureCapabilityState::Available,
+    );
+    let applied = handle
+        .set_sandbox(Some(SandboxMode::Sandbox), None, &available)
+        .expect("available Sandbox persists");
+    assert_eq!(applied.persisted_intent, SandboxMode::Sandbox);
+    assert_eq!(applied.effective, SandboxMode::Sandbox);
+    assert_eq!(handle.session().sandbox_mode(), SandboxMode::Sandbox);
 }
 
 #[test]

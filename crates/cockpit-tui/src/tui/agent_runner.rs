@@ -1761,6 +1761,7 @@ fn is_global_event(event: &proto::Event) -> bool {
             | proto::Event::InterruptRaised { .. }
             | proto::Event::InterruptResolved { .. }
             | proto::Event::InterruptQueueChanged { .. }
+            | proto::Event::HostCapabilitiesChanged { .. }
     )
 }
 
@@ -2470,6 +2471,9 @@ pub(crate) fn control_response_outcome(result: Result<Response, String>) -> Cont
             applied_generation,
             changed,
         },
+        Ok(Response::HostCapabilities { snapshot }) => ControlRequestOutcome::HostCapabilities {
+            snapshot: Box::new(snapshot),
+        },
         Ok(_) => ControlRequestOutcome::Applied,
         Err(error) => ControlRequestOutcome::Rejected(error),
     }
@@ -2709,7 +2713,9 @@ pub fn daemon_reveal_leak_blocking(
 > {
     let runtime = match tokio::runtime::Handle::try_current() {
         Ok(runtime) => runtime,
-        Err(_) => return Err(cockpit_core::daemon::leak_reveal::LeakRevealDenied::UnavailablePlatform),
+        Err(_) => {
+            return Err(cockpit_core::daemon::leak_reveal::LeakRevealDenied::UnavailablePlatform);
+        }
     };
     let socket = control_socket.to_path_buf();
     let capability = capability.to_owned();
@@ -3073,6 +3079,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | TerminalViewers { .. }
         | TerminalClosed { .. }
         | Osc52ProtocolViolation { .. }
+        | HostCapabilitiesChanged { .. }
         | LspNotice { .. }
         | EventStreamLagged {
             session_id: None, ..
@@ -3846,11 +3853,13 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             mode,
             container_network_enabled,
             container_availability,
+            persisted_intent,
             ..
         } => TurnEvent::SandboxState {
             mode,
             container_network_enabled,
             container_availability,
+            persisted_intent,
         },
         SandboxEscalationState { enabled, .. } => TurnEvent::SandboxEscalationState { enabled },
         SandboxUnavailable {
@@ -3954,6 +3963,9 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             interrupt_id,
         },
         ConfigSnapshot { snapshot } => TurnEvent::ConfigSnapshot { snapshot },
+        HostCapabilitiesChanged { snapshot } => TurnEvent::HostCapabilitiesChanged {
+            snapshot: Box::new(snapshot),
+        },
         InterruptRaised { .. }
         | EventStreamLagged { .. }
         | SessionEnded { .. }

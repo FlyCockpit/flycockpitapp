@@ -34,7 +34,8 @@ impl OwnerFixture {
             .await
             .expect("session row");
         let dir = tempfile::tempdir().expect("tempdir");
-        let compartment = SealedCompartment::at(dir.path().join("sealed-compartment.json"));
+        let vault = crate::secure_key::vault_for_db(&db).expect("in-memory vault");
+        let compartment = SealedCompartment::from_vault(vault);
         let directory = SealedValueDirectory::new(db, compartment);
         Self {
             directory,
@@ -750,10 +751,10 @@ async fn session_recover_reveals_bound_literal() {
 #[tokio::test]
 async fn concurrent_session_rotate_never_lets_recover_reveal_newer_value() {
     // Finding A regression: SESSION-scope recover must be atomic against a
-    // racing session rotate. `sealed_session_literal_for_action` was a two-read
-    // TOCTOU (version read then value read on a non-transactional connection);
-    // a session rotate committing between them would hand a v1 claim the v2
-    // plaintext. Interleave a session rotate to v2 with the recover apply of a
+    // racing session rotate. The version fence is a single SQLite snapshot
+    // and the plaintext is the vault item for that exact version; a rotate
+    // committing between them cannot hand a v1 claim the v2 plaintext.
+    // Interleave a session rotate to v2 with the recover apply of a
     // v1-bound capability; the recover may only reveal the bound v1 literal or
     // reject — never the v2 literal.
     use crate::sealed::tests::SealedFixture;
@@ -826,12 +827,10 @@ async fn concurrent_session_rotate_never_lets_recover_reveal_newer_value() {
 
 #[tokio::test]
 async fn session_literal_fence_rejects_stale_claimed_version() {
-    // Direct, deterministic proof of the single-query session fence predicate:
-    // once a session value is rotated past the claimed version, the atomic
-    // accessor returns None — never the newer literal — and the None is the
-    // fence rejecting, not the record vanishing (the live claim still resolves).
-    // Complements the concurrent race test, which cannot deterministically pin
-    // the interleaving against a single-statement query.
+    // Direct, deterministic proof of the session version fence: once a
+    // session value is rotated past the claimed version, the accessor
+    // returns None — never the newer literal — and the None is the fence
+    // rejecting, not the record vanishing (the live claim still resolves).
     use crate::sealed::tests::SealedFixture;
     const V2_LITERAL: &str = "session-v2-fence-secret-0123456789";
     let fx = SealedFixture::new().await;
@@ -854,8 +853,7 @@ async fn session_literal_fence_rejects_stale_claimed_version() {
 
     // v1 is live: the claim resolves to the v1 literal.
     assert_eq!(
-        fx.db
-            .sealed_session_literal_for_action(record_id.clone(), 1)
+        dir.session_literal_for_action(OwnerAuthority::for_test("owner"), record_id.clone(), 1)
             .await
             .unwrap()
             .as_deref(),
@@ -875,16 +873,14 @@ async fn session_literal_fence_rejects_stale_claimed_version() {
     // The stale v1 claim now returns None (the fence predicate rejects it) — and
     // not because the record vanished: the live v2 claim still resolves.
     assert!(
-        fx.db
-            .sealed_session_literal_for_action(record_id.clone(), 1)
+        dir.session_literal_for_action(OwnerAuthority::for_test("owner"), record_id.clone(), 1)
             .await
             .unwrap()
             .is_none(),
         "a claim for the superseded version must return None"
     );
     assert_eq!(
-        fx.db
-            .sealed_session_literal_for_action(record_id, 2)
+        dir.session_literal_for_action(OwnerAuthority::for_test("owner"), record_id, 2)
             .await
             .unwrap()
             .as_deref(),

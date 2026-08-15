@@ -638,6 +638,7 @@ impl App {
             sandbox_mode: self.sandbox_mode,
             container_network_enabled: self.container_network_enabled,
             container_availability: self.container_availability.clone(),
+            host_capabilities: self.host_capabilities.clone(),
             approval_mode: self.approval_mode,
             active_model: self.launch.active_model.clone(),
             prompt_cache_retention: self
@@ -848,6 +849,10 @@ impl App {
         match outcome {
             ControlRequestOutcome::Applied | ControlRequestOutcome::ConfigRefreshed { .. } => {
                 self.apply_control_success(pending.applied)
+            }
+            ControlRequestOutcome::HostCapabilities { snapshot } => {
+                self.apply_host_capabilities(*snapshot);
+                self.apply_control_success(pending.applied);
             }
             ControlRequestOutcome::Rejected(error) => {
                 let message = format!("{}: daemon rejected request: {error}", pending.label);

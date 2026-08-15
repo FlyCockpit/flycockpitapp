@@ -13,7 +13,8 @@ use crate::config::providers::{ConfigDoc, HeaderSpec, ModelMergePolicy, OnUnlist
 use crate::providers::models_fetch::{self, FetchOutcome};
 use crate::wizard::{
     StepKind, WizardAnswer, WizardDescriptor, WizardRun, apply_model_answers,
-    apply_security_answers, descriptor_for_cwd, provider_entry_from_answers, provider_id_answer,
+    apply_security_answers_with_caps, compose_wizard_host_capabilities, descriptor_for_cwd,
+    descriptor_for_cwd_with_caps, provider_entry_from_answers, provider_id_answer,
     selected_provider_template,
 };
 
@@ -21,12 +22,13 @@ pub async fn run(args: SetupArgs) -> Result<()> {
     let stdin_tty = io::stdin().is_terminal();
     let cwd = std::env::current_dir().context("getting cwd")?;
     let mut io = StdTerminalIo;
+    let host_capabilities = compose_wizard_host_capabilities(&cwd).await;
     let wizard = match args.wizard.as_deref() {
-        Some(id) => descriptor_for_cwd(id, &cwd)
+        Some(id) => descriptor_for_cwd_with_caps(id, &cwd, Some(&host_capabilities))
             .ok_or_else(|| anyhow!("unknown setup wizard `{id}`; run `cockpit setup` to list"))?,
-        None => choose_wizard(&mut io, stdin_tty, &cwd).await?,
+        None => choose_wizard(&mut io, stdin_tty, &cwd, &host_capabilities).await?,
     };
-    let mut actions = ProviderSetupActions::new(cwd);
+    let mut actions = ProviderSetupActions::new(cwd).with_host_capabilities(host_capabilities);
     run_terminal_wizard(wizard, &mut io, &stdin_tty, &mut actions).await?;
     Ok(())
 }
@@ -50,6 +52,7 @@ async fn choose_wizard(
     io: &mut dyn TerminalIo,
     tty: bool,
     cwd: &std::path::Path,
+    caps: &cockpit_proto::HostCapabilitySnapshot,
 ) -> Result<WizardDescriptor> {
     if !tty {
         bail!("cockpit setup requires an interactive stdin; run `cockpit` and use /setup instead");
@@ -66,19 +69,23 @@ async fn choose_wizard(
     loop {
         io.write("Choose a wizard: ")?;
         let input = io.read_line()?.trim().to_string();
-        if let Some(wizard) = resolve_wizard_choice(&input, cwd) {
+        if let Some(wizard) = resolve_wizard_choice(&input, cwd, Some(caps)) {
             return Ok(wizard);
         }
         io.write_line("Choose one of the listed wizard numbers or ids.")?;
     }
 }
 
-fn resolve_wizard_choice(input: &str, cwd: &std::path::Path) -> Option<WizardDescriptor> {
+fn resolve_wizard_choice(
+    input: &str,
+    cwd: &std::path::Path,
+    caps: Option<&cockpit_proto::HostCapabilitySnapshot>,
+) -> Option<WizardDescriptor> {
     if let Ok(number) = input.parse::<usize>() {
         let id = crate::wizard::registry().get(number.checked_sub(1)?)?.id;
-        return descriptor_for_cwd(id, cwd);
+        return descriptor_for_cwd_with_caps(id, cwd, caps);
     }
-    descriptor_for_cwd(input, cwd)
+    descriptor_for_cwd_with_caps(input, cwd, caps)
 }
 
 pub(crate) trait TerminalIo {
@@ -381,6 +388,7 @@ struct ProviderSetupActions {
     saved: Option<(String, PathBuf)>,
     security_saved: Option<PathBuf>,
     model_saved: Option<PathBuf>,
+    host_capabilities: Option<cockpit_proto::HostCapabilitySnapshot>,
 }
 
 impl ProviderSetupActions {
@@ -391,7 +399,13 @@ impl ProviderSetupActions {
             saved: None,
             security_saved: None,
             model_saved: None,
+            host_capabilities: None,
         }
+    }
+
+    fn with_host_capabilities(mut self, snapshot: cockpit_proto::HostCapabilitySnapshot) -> Self {
+        self.host_capabilities = Some(snapshot);
+        self
     }
 
     fn config_path(&self) -> PathBuf {
@@ -459,7 +473,11 @@ impl ProviderSetupActions {
             "test-key" => {
                 self.test_key(run, io).await?;
             }
-            "security-save" => match apply_security_answers(&self.cwd, run)? {
+            "security-save" => match apply_security_answers_with_caps(
+                &self.cwd,
+                run,
+                self.host_capabilities.as_ref(),
+            )? {
                 Some(path) => {
                     self.security_saved = Some(path.clone());
                     io.write_line(&format!("Saved security settings to {}.", path.display()))?;
@@ -1133,12 +1151,14 @@ mod tests {
         let raw = std::fs::read_to_string(provider_path).expect("provider file");
         assert!(raw.contains("$secret:openai"), "{raw}");
         assert!(!raw.contains(secret), "{raw}");
-        let store =
-            crate::credentials::CredentialStore::open(state_home.join("cockpit/credentials.json"))
-                .expect("credential store");
+        let store = crate::credentials::CredentialStore::open_default().expect("credential store");
         assert_eq!(
             store.named_secret("openai"),
             Some(&format!("Bearer {secret}")[..])
+        );
+        assert!(
+            !state_home.join("cockpit/credentials.json").exists(),
+            "setup must persist through the vault, not credentials.json"
         );
         assert!(!io.output.contains(secret), "secret leaked in output");
         assert!(io.output.contains("Stored 1 provider secret"));
@@ -1175,13 +1195,12 @@ mod tests {
             "{raw}"
         );
         assert!(!raw.contains(secret), "{raw}");
-        let store =
-            crate::credentials::CredentialStore::open(state_home.join("cockpit/credentials.json"))
-                .expect("credential store");
+        let store = crate::credentials::CredentialStore::open_default().expect("credential store");
         assert_eq!(
             store.named_secret("nous-research"),
             Some(&format!("Bearer {secret}")[..])
         );
+        assert!(!state_home.join("cockpit/credentials.json").exists());
         assert!(!io.output.contains(secret), "secret leaked in output");
     }
 
@@ -1211,14 +1230,13 @@ mod tests {
             assert!(raw.contains("$secret:baseten"), "{raw}");
             assert!(raw.contains("https://inference.baseten.co/v1"), "{raw}");
             assert!(!raw.contains(secret), "{raw}");
-            let store = crate::credentials::CredentialStore::open(
-                state_home.join("cockpit/credentials.json"),
-            )
-            .expect("credential store");
+            let store =
+                crate::credentials::CredentialStore::open_default().expect("credential store");
             assert_eq!(
                 store.named_secret("baseten"),
                 Some(&format!("Bearer {secret}")[..])
             );
+            assert!(!state_home.join("cockpit/credentials.json").exists());
             assert!(!io.output.contains(secret));
         }
 
@@ -1368,14 +1386,30 @@ mod tests {
         );
     }
 
+    fn available_sandbox_caps() -> cockpit_proto::HostCapabilitySnapshot {
+        cockpit_core::daemon::session_worker::sandbox_capability_snapshot(
+            cockpit_proto::FeatureCapabilityState::Available,
+            cockpit_proto::FeatureCapabilityState::Available,
+        )
+    }
+
     async fn run_security_script(
         cwd: &std::path::Path,
         lines: &[&str],
     ) -> (WizardRun, ScriptIo, ProviderSetupActions) {
-        let descriptor = descriptor_for_cwd(crate::wizard::SECURITY_WIZARD_ID, cwd)
-            .expect("security descriptor");
+        run_security_script_with_caps(cwd, lines, available_sandbox_caps()).await
+    }
+
+    async fn run_security_script_with_caps(
+        cwd: &std::path::Path,
+        lines: &[&str],
+        caps: cockpit_proto::HostCapabilitySnapshot,
+    ) -> (WizardRun, ScriptIo, ProviderSetupActions) {
+        let descriptor =
+            descriptor_for_cwd_with_caps(crate::wizard::SECURITY_WIZARD_ID, cwd, Some(&caps))
+                .expect("security descriptor");
         let mut io = ScriptIo::new(lines);
-        let mut actions = ProviderSetupActions::new(cwd.to_path_buf());
+        let mut actions = ProviderSetupActions::new(cwd.to_path_buf()).with_host_capabilities(caps);
         let run = run_terminal_wizard(descriptor, &mut io, &true, &mut actions)
             .await
             .unwrap();
@@ -1414,11 +1448,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn sandbox_step_omits_container_when_unavailable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _env = CockpitConfigEnvGuard::set_async(&tmp.path().join("config.json")).await;
+        let caps = cockpit_core::daemon::session_worker::sandbox_capability_snapshot(
+            cockpit_proto::FeatureCapabilityState::Available,
+            cockpit_proto::FeatureCapabilityState::Missing,
+        );
+
+        let (_, io, actions) = run_security_script_with_caps(
+            tmp.path(),
+            &["container-readonly", "", "", "", ""],
+            caps,
+        )
+        .await;
+
+        assert!(
+            actions.security_saved.is_none(),
+            "unavailable container must not persist"
+        );
+        assert!(
+            io.output
+                .contains("Choose one of the listed numbers or ids."),
+            "terminal wizard must not accept an omitted container row"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn sandbox_step_writes_mode() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _env = CockpitConfigEnvGuard::set_async(&tmp.path().join("config.json")).await;
 
-        let (_, _, actions) = run_security_script(tmp.path(), &["3", "", "", ""]).await;
+        let (_, _, actions) =
+            run_security_script(tmp.path(), &["container-readonly", "", "", ""]).await;
 
         let path = actions.security_saved.expect("security config saved");
         let raw: serde_json::Value =
@@ -1445,7 +1507,11 @@ mod tests {
 
     #[test]
     fn security_wizard_copy_mentions_unconfined_and_trust_command() {
-        let descriptor = crate::wizard::security_descriptor();
+        let caps = available_sandbox_caps();
+        let descriptor = crate::wizard::security_descriptor_for_config_with_caps(
+            &crate::config::extended::ExtendedConfig::default(),
+            &caps,
+        );
         let sandbox = descriptor
             .steps
             .iter()

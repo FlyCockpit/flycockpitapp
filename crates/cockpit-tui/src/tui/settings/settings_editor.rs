@@ -3789,6 +3789,10 @@ mod tests {
                 available: true,
                 reason: None,
             },
+            host_capabilities: crate::tui::capability_gate::snapshot_with_sandbox(
+                cockpit_proto::FeatureCapabilityState::Available,
+                cockpit_proto::FeatureCapabilityState::Available,
+            ),
             approval_mode: ApprovalMode::Manual,
             active_model: Some(("p".to_string(), "m1".to_string())),
             prompt_cache_retention: PromptCacheRetention::Default,

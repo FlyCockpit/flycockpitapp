@@ -396,6 +396,8 @@ async fn sealed_action_grant_authorization_precedes_lookup() {
         "builder(",
         "get_exact",
         "sealed_session_literal_for_action",
+        "sealed_session_version_fence",
+        "session_literal_for_action",
         "expose",
     ] {
         assert!(

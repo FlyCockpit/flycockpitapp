@@ -362,6 +362,13 @@ pub async fn sandbox_available(probe_cwd: &std::path::Path) -> &'static SandboxA
         .await
 }
 
+/// Uncached host-sandbox (zerobox) probe. The capability snapshot calls this
+/// on boot and refresh; [`sandbox_available`] keeps a process-lifetime cache
+/// for bash gating.
+pub async fn probe_host_sandbox(probe_cwd: &std::path::Path) -> SandboxAvailability {
+    probe_sandbox(probe_cwd).await
+}
+
 /// Run the actual probe (no caching). Split out so the cache wrapper stays
 /// trivial; the cwd fallback to a fresh temp dir lives here.
 async fn probe_sandbox(probe_cwd: &std::path::Path) -> SandboxAvailability {

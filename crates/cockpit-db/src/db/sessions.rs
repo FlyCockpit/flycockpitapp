@@ -1158,7 +1158,7 @@ impl Db {
                 title_recovery_nudge_state: TitleRecoveryNudgeState::None,
                 guidance_baseline_path: parent.guidance_baseline_path,
                 guidance_baseline_hash: parent.guidance_baseline_hash,
-                redaction_table_json: parent.redaction_table_json,
+                redaction_table_json: None,
                 model_system_prompt_snapshot_json: parent.model_system_prompt_snapshot_json,
                 created_by_principal: parent.created_by_principal,
                 shared_with_collaborators: false,
@@ -1270,7 +1270,7 @@ impl Db {
             title_recovery_nudge_state: TitleRecoveryNudgeState::None,
             guidance_baseline_path: parent.guidance_baseline_path,
             guidance_baseline_hash: parent.guidance_baseline_hash,
-            redaction_table_json: parent.redaction_table_json,
+            redaction_table_json: None,
             model_system_prompt_snapshot_json: parent.model_system_prompt_snapshot_json,
             created_by_principal: parent.created_by_principal,
             shared_with_collaborators: false,
@@ -1297,7 +1297,7 @@ impl Db {
         refuse_fork_with_scoped_sealed_values(&tx, parent_session_id)?;
         tx.execute(
             "INSERT INTO sealed_values (session_id, value_id, value, reason, origin, created_at)
-             SELECT ?1, value_id, value, reason, origin, created_at
+             SELECT ?1, value_id, NULL, reason, origin, created_at
              FROM sealed_values WHERE session_id = ?2",
             params![session_id.to_string(), parent_session_id.to_string()],
         )
@@ -3362,13 +3362,56 @@ mod tests {
             .unwrap(),
             model_selection
         );
-        assert_eq!(fork.redaction_table_json, parent.redaction_table_json);
-        assert_eq!(
-            fork.model_system_prompt_snapshot_json,
-            parent.model_system_prompt_snapshot_json
+        assert!(
+            fork.redaction_table_json
+                .as_deref()
+                .is_none_or(|json| !json.contains("fork-secret")),
+            "fork must not copy plaintext redaction literals"
         );
-        assert_ne!(fork.session_id, parent.session_id);
-        assert_ne!(fork.short_id, parent.short_id);
+    }
+
+    #[tokio::test]
+    async fn session_fork_copies_vault_sealed_and_redaction_without_plaintext() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = db.create_session("p", "/repo", "Build").await.unwrap();
+        db.upsert_sealed_value(
+            parent.session_id,
+            "prod_token",
+            "long-high-entropy-token",
+            "reason",
+            "user",
+        )
+        .await
+        .unwrap();
+        db.set_session_redaction_table_json(
+            parent.session_id,
+            Some(r#"{"entries":[{"value":"fork-secret"}]}"#.to_string()),
+        )
+        .await
+        .unwrap();
+        let fork = db.create_fork(parent.session_id, None).await.unwrap();
+        let child_value: Option<String> = db
+            .blocking_write_for_sync_maintenance({
+                let sid = fork.session_id.to_string();
+                move |conn| {
+                    Ok(conn.query_row(
+                        "SELECT value FROM sealed_values WHERE session_id = ?1 AND value_id = 'prod_token'",
+                        rusqlite::params![sid],
+                        |row| row.get(0),
+                    )?)
+                }
+            })
+            .unwrap();
+        assert!(
+            child_value
+                .as_deref()
+                .is_none_or(|raw| raw != "long-high-entropy-token")
+        );
+        assert!(
+            fork.redaction_table_json
+                .as_deref()
+                .is_none_or(|json| !json.contains("fork-secret"))
+        );
     }
 
     #[tokio::test]
@@ -3723,23 +3766,38 @@ mod tests {
 
         // Arm an eligible, untitled session: none -> pending, reports the move.
         assert!(db.arm_title_recovery_nudge(s.session_id).await.unwrap());
-        assert_eq!(nudge_of(&db, s.session_id).await, TitleRecoveryNudgeState::Pending);
+        assert_eq!(
+            nudge_of(&db, s.session_id).await,
+            TitleRecoveryNudgeState::Pending
+        );
 
         // Duplicate arm while pending is a no-op: reports false and leaves a
         // single pending state (repeated failures coalesce into one nudge).
         assert!(!db.arm_title_recovery_nudge(s.session_id).await.unwrap());
-        assert_eq!(nudge_of(&db, s.session_id).await, TitleRecoveryNudgeState::Pending);
+        assert_eq!(
+            nudge_of(&db, s.session_id).await,
+            TitleRecoveryNudgeState::Pending
+        );
 
         // Claim is exactly once: the first claim wins pending -> consumed.
         assert!(db.claim_title_recovery_nudge(s.session_id).await.unwrap());
-        assert_eq!(nudge_of(&db, s.session_id).await, TitleRecoveryNudgeState::Consumed);
+        assert_eq!(
+            nudge_of(&db, s.session_id).await,
+            TitleRecoveryNudgeState::Consumed
+        );
         // A second claim finds no pending state and reports false.
         assert!(!db.claim_title_recovery_nudge(s.session_id).await.unwrap());
-        assert_eq!(nudge_of(&db, s.session_id).await, TitleRecoveryNudgeState::Consumed);
+        assert_eq!(
+            nudge_of(&db, s.session_id).await,
+            TitleRecoveryNudgeState::Consumed
+        );
 
         // A later distinct failure re-arms a consumed, still-eligible session.
         assert!(db.arm_title_recovery_nudge(s.session_id).await.unwrap());
-        assert_eq!(nudge_of(&db, s.session_id).await, TitleRecoveryNudgeState::Pending);
+        assert_eq!(
+            nudge_of(&db, s.session_id).await,
+            TitleRecoveryNudgeState::Pending
+        );
 
         // Storing an automatic title clears the latch back to none.
         assert!(db.set_auto_title(s.session_id, "auto-name").await.unwrap());
@@ -3753,7 +3811,10 @@ mod tests {
 
         // A titled session is ineligible: arm refuses and the latch stays none.
         assert!(!db.arm_title_recovery_nudge(s.session_id).await.unwrap());
-        assert_eq!(nudge_of(&db, s.session_id).await, TitleRecoveryNudgeState::None);
+        assert_eq!(
+            nudge_of(&db, s.session_id).await,
+            TitleRecoveryNudgeState::None
+        );
         // Claiming a session with no pending nudge reports false.
         assert!(!db.claim_title_recovery_nudge(s.session_id).await.unwrap());
     }
@@ -3770,7 +3831,10 @@ mod tests {
                 .await
                 .unwrap()
         );
-        assert_eq!(nudge_of(&db, renamed.session_id).await, TitleRecoveryNudgeState::None);
+        assert_eq!(
+            nudge_of(&db, renamed.session_id).await,
+            TitleRecoveryNudgeState::None
+        );
 
         // Ephemeral `/side` fork: never nudged.
         let parent = db.create_session("p", "/x", "a").await.unwrap();
@@ -3780,7 +3844,10 @@ mod tests {
             .unwrap();
         assert!(side.ephemeral);
         assert!(!db.arm_title_recovery_nudge(side.session_id).await.unwrap());
-        assert_eq!(nudge_of(&db, side.session_id).await, TitleRecoveryNudgeState::None);
+        assert_eq!(
+            nudge_of(&db, side.session_id).await,
+            TitleRecoveryNudgeState::None
+        );
 
         // Already-titled (auto) session: ineligible because title is set.
         let autotitled = db.create_session("p", "/x", "a").await.unwrap();
@@ -3805,7 +3872,10 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "a").await.unwrap();
         assert!(db.arm_title_recovery_nudge(s.session_id).await.unwrap());
-        assert_eq!(nudge_of(&db, s.session_id).await, TitleRecoveryNudgeState::Pending);
+        assert_eq!(
+            nudge_of(&db, s.session_id).await,
+            TitleRecoveryNudgeState::Pending
+        );
 
         // Precondition: the session is now user-renamed but the latch is STILL
         // pending (the exact state the independent claim gate must reject).
@@ -3860,21 +3930,36 @@ mod tests {
         );
 
         let fork = db.create_fork(parent.session_id, None).await.unwrap();
-        assert_eq!(fork.title_recovery_nudge_state, TitleRecoveryNudgeState::None);
-        assert_eq!(nudge_of(&db, fork.session_id).await, TitleRecoveryNudgeState::None);
+        assert_eq!(
+            fork.title_recovery_nudge_state,
+            TitleRecoveryNudgeState::None
+        );
+        assert_eq!(
+            nudge_of(&db, fork.session_id).await,
+            TitleRecoveryNudgeState::None
+        );
 
         // Ephemeral `/side` fork from the pending parent: also none.
         let side = db
             .create_ephemeral_fork(parent.session_id, None)
             .await
             .unwrap();
-        assert_eq!(side.title_recovery_nudge_state, TitleRecoveryNudgeState::None);
-        assert_eq!(nudge_of(&db, side.session_id).await, TitleRecoveryNudgeState::None);
+        assert_eq!(
+            side.title_recovery_nudge_state,
+            TitleRecoveryNudgeState::None
+        );
+        assert_eq!(
+            nudge_of(&db, side.session_id).await,
+            TitleRecoveryNudgeState::None
+        );
 
         // Non-tangent `/btw` fork from the pending parent: also none.
         let btw = db.create_btw_fork(parent.session_id, false).await.unwrap();
         assert!(btw.created);
-        assert_eq!(nudge_of(&db, btw.info.session_id).await, TitleRecoveryNudgeState::None);
+        assert_eq!(
+            nudge_of(&db, btw.info.session_id).await,
+            TitleRecoveryNudgeState::None
+        );
 
         // Tangent `/btw` fork from a second pending parent: also none.
         let parent2 = db.create_session("p", "/proj", "Build").await.unwrap();
@@ -3885,7 +3970,10 @@ mod tests {
         );
         let tangent = db.create_btw_fork(parent2.session_id, true).await.unwrap();
         assert!(tangent.created);
-        assert_eq!(nudge_of(&db, tangent.info.session_id).await, TitleRecoveryNudgeState::None);
+        assert_eq!(
+            nudge_of(&db, tangent.info.session_id).await,
+            TitleRecoveryNudgeState::None
+        );
     }
 
     #[tokio::test]

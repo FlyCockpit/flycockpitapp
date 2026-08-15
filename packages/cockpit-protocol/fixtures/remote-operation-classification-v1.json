@@ -2731,6 +2731,39 @@
       "tag": "restart_if_idle"
     },
     {
+      "class": "read_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "none",
+      "tag": "get_host_capabilities"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "none",
+      "tag": "refresh_host_capabilities"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "dest:enum16:SecretStorePlacement",
+      "fcorRoles": [
+        {
+          "field": "dest",
+          "role": "param",
+          "type": "SecretStorePlacement"
+        }
+      ],
+      "fcorSchema": "dest:SecretStorePlacement",
+      "strategy": "none",
+      "tag": "migrate_kek_placement"
+    },
+    {
       "class": "rejected",
       "evidence": null,
       "fcorCanonicalSchema": "-",

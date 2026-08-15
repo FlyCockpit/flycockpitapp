@@ -23,11 +23,37 @@ Unknown platforms receive only the official link and verification commands.
 
 ## Linux shell sandbox
 
-Bubblewrap (`safety.bubblewrap`) strengthens the host shell sandbox on Linux.
-Its absence produces a warning but never makes installation fail and never
-runs a package manager. Follow https://github.com/containers/bubblewrap/blob/main/README.md, verify with
-`bwrap --version`, refresh dependency health, and uninstall using
-the system package source if it is no longer wanted.
+Bubblewrap (`safety.bubblewrap`) unlocks host filesystem Sandbox on Linux.
+Cockpit still starts without it; missing Bubblewrap makes host Sandbox
+unavailable and the **effective** mode Off. The option is not selectable
+until you install it and refresh capabilities in Settings. Absence is a
+warning and never makes installation fail. It never runs a package
+manager. Follow https://github.com/containers/bubblewrap/blob/main/README.md, verify with `bwrap --version`.
+`safety.bubblewrap` is Linux-only. Windows has no host filesystem sandbox
+(grant-or-ask). macOS uses zerobox and has no bubblewrap package.
+
+## Secret storage (OS keyring)
+
+`security.keyring` unlocks **keyring KEK placement**, not “every secret is a
+keyring item.” First-run is always database mode: a local `private_fs`
+owner-only KEK file plus encrypted SQLite (wrapped DEK + AEAD
+ciphertext), even when an OS keyring is already installed. Promotion to
+the keyring is an explicit Settings action after vault unification.
+Missing keyring only means the Settings keyring option stays disabled.
+Switching keyring → database is weaker, requires confirm, and moves the
+wrapping key to a local file. Linux: install `gnome-keyring` providing
+`org.freedesktop.secrets`. `libsecret` alone is not enough; a TTY session
+may need `gnome-keyring-daemon --start --components=secrets`. Verify with that command, Keychain, or
+Windows Credential Manager. Settings rechecks if you try to enable a
+disabled option.
+
+## Container sandbox
+
+`container.docker` / `container.podman` are any-of for container sandbox modes.
+Cockpit still starts without them. Missing both disables container /
+container-readonly and the **effective** mode is Off — never a silent
+fallback to host Sandbox. Verify with `docker version` or
+`podman version`. Install from https://docs.docker.com/engine/install/ or https://podman.io/docs/installation.
 
 ## Cockpit installation assets
 

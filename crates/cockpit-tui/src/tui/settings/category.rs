@@ -55,6 +55,8 @@ use super::shell::{
     push_label_value_row, push_wrapped_text, selected_style, settings_text_columns, warning_style,
 };
 use super::ui_page::{InstructionsPage, RedactPatternsPage, UtilityModelPicker};
+use cockpit_core::daemon::proto::Request;
+
 use super::{Nav, SettingsCx, SettingsPage, save_status};
 
 // ── Enum option labels + cycles ──────────────────────────────────────────
@@ -163,41 +165,11 @@ fn approval_mode_label(m: ApprovalMode) -> &'static str {
     }
 }
 
-fn sandbox_mode_setting_value(mode: cockpit_core::tools::sandbox_mode::SandboxMode) -> String {
-    let label = match mode {
-        cockpit_core::tools::sandbox_mode::SandboxMode::Off => "off",
-        cockpit_core::tools::sandbox_mode::SandboxMode::Sandbox => {
-            "on (default host filesystem sandbox)"
-        }
-        cockpit_core::tools::sandbox_mode::SandboxMode::Container => "container",
-        cockpit_core::tools::sandbox_mode::SandboxMode::ContainerReadonly => "container-readonly",
-    };
-    if mode.is_container() && !cockpit_core::container::availability_snapshot().available {
-        format!("{label} (unavailable here)")
-    } else {
-        label.to_string()
-    }
-}
-
-fn cycle_sandbox_mode(
+fn sandbox_mode_setting_value(
     mode: cockpit_core::tools::sandbox_mode::SandboxMode,
-) -> cockpit_core::tools::sandbox_mode::SandboxMode {
-    use cockpit_core::tools::sandbox_mode::SandboxMode;
-    let modes: &[SandboxMode] = if cockpit_core::container::availability_snapshot().available {
-        &[
-            SandboxMode::Off,
-            SandboxMode::Sandbox,
-            SandboxMode::Container,
-            SandboxMode::ContainerReadonly,
-        ]
-    } else {
-        &[SandboxMode::Off, SandboxMode::Sandbox]
-    };
-    let idx = modes
-        .iter()
-        .position(|candidate| *candidate == mode)
-        .unwrap_or(0);
-    modes[(idx + 1) % modes.len()]
+    caps: &cockpit_proto::HostCapabilitySnapshot,
+) -> String {
+    crate::tui::capability_gate::sandbox_mode_display(mode, caps)
 }
 
 fn predict_next_message_label(m: PredictNextMessage) -> &'static str {
@@ -431,6 +403,7 @@ pub(super) enum SettingId {
     // ── Privacy & Safety ─────────────────────────────────────────────
     SandboxDefaultMode,
     SandboxDockerfile,
+    SecretStore,
     RedactEnabled,
     RedactScanEnvironment,
     RedactScanDotenv,
@@ -525,6 +498,7 @@ pub(super) const ALL_SETTING_IDS: &[SettingId] = &[
     SettingId::AgentDirs,
     SettingId::SandboxDefaultMode,
     SettingId::SandboxDockerfile,
+    SettingId::SecretStore,
     SettingId::RedactEnabled,
     SettingId::RedactScanEnvironment,
     SettingId::RedactScanDotenv,
@@ -624,6 +598,7 @@ impl SettingId {
             SettingId::AgentDirs => "agent dirs",
             SettingId::SandboxDefaultMode => "default sandbox mode",
             SettingId::SandboxDockerfile => "sandbox Dockerfile",
+            SettingId::SecretStore => "secret storage",
             SettingId::RedactEnabled => "redaction",
             SettingId::RedactScanEnvironment => "environment variable redaction",
             SettingId::RedactScanDotenv => "environment file redaction",
@@ -992,11 +967,12 @@ impl SettingId {
                  edit, reorder, or remove entries."
             }
             SettingId::SandboxDefaultMode => {
-                "Which sandbox mode new sessions start in. `on` is the default host filesystem sandbox; `off` disables sandboxing; container modes run bash inside docker/podman when available. The --no-sandbox flag still forces off."
+                "Which sandbox mode new sessions start in. `on` is the default host filesystem sandbox; `off` disables sandboxing; container modes run bash inside docker/podman when available. The --no-sandbox flag still forces off. Host sandbox and container modes stay visible when unavailable and show the snapshot install/fix command; they are not persisted until the capability is present."
             }
             SettingId::SandboxDockerfile => {
                 "Optional Dockerfile path for container sandboxes. Blank uses the global default at ~/.config/cockpit/sandbox/Dockerfile. Project values only take effect for trusted workspaces."
             }
+            SettingId::SecretStore => crate::tui::capability_gate::SECRET_STORE_HELP,
             SettingId::RedactEnabled => {
                 "The master redaction switch. On (default) routes every outbound \
                  prompt through the scrubber so secrets are replaced with the \
@@ -1208,6 +1184,7 @@ pub(super) struct CategoryPage {
     pub(super) utility_picker: Option<Box<UtilityModelPicker>>,
     pub(super) utility_picker_target: Option<SettingId>,
     pub(super) shadowed_global: Option<ShadowedGlobalPrompt>,
+    pub(super) secret_store_confirm: Option<crate::tui::dialog::DialogState>,
 }
 
 pub(super) struct CategorySettingStore<'a, 'b> {
@@ -1622,6 +1599,7 @@ impl CategoryPage {
             utility_picker: None,
             utility_picker_target: None,
             shadowed_global: None,
+            secret_store_confirm: None,
         }
     }
 
@@ -1845,6 +1823,7 @@ fn category_rows(category: Category) -> Vec<Row> {
         Category::Privacy => vec![
             Setting(S::SandboxDefaultMode),
             Setting(S::SandboxDockerfile),
+            Setting(S::SecretStore),
             Setting(S::RedactEnabled),
             Setting(S::RedactScanEnvironment),
             Setting(S::RedactScanDotenv),
@@ -1892,7 +1871,7 @@ impl SettingsCx {
     /// The right-column display value for a setting, reflecting the current
     /// `self.extended` (or `self.config`) state. Enum rows show the active
     /// option spelled out; bool rows show on/off with the default noted.
-    fn category_value(&self, id: SettingId) -> String {
+    pub(super) fn category_value(&self, id: SettingId) -> String {
         use SettingId as S;
         let e = &self.extended;
         match id {
@@ -2104,7 +2083,12 @@ impl SettingsCx {
                         .join(", ")
                 }
             }
-            S::SandboxDefaultMode => sandbox_mode_setting_value(e.sandbox.default_mode),
+            S::SandboxDefaultMode => {
+                sandbox_mode_setting_value(e.sandbox.default_mode, &self.host_capabilities)
+            }
+            S::SecretStore => {
+                crate::tui::capability_gate::secret_store_row_value(&self.host_capabilities)
+            }
             S::SandboxDockerfile => e
                 .sandbox
                 .dockerfile
@@ -2423,6 +2407,30 @@ impl SettingsCx {
             return Nav::Stay;
         }
 
+        if p.secret_store_confirm.is_some() {
+            let outcome = p
+                .secret_store_confirm
+                .as_mut()
+                .expect("secret store confirm present")
+                .handle_key(key);
+            match outcome {
+                crate::tui::dialog::DialogOutcome::Continue => {}
+                crate::tui::dialog::DialogOutcome::Cancel => {
+                    self.finish_secret_store_confirm(p, false);
+                }
+                crate::tui::dialog::DialogOutcome::Submit(answers) => {
+                    let confirm = answers.first().is_some_and(|answer| match answer {
+                        crate::tui::dialog::Answer::Single { id } => {
+                            id == crate::tui::capability_gate::SECRET_STORE_CONFIRM_ID
+                        }
+                        _ => false,
+                    });
+                    self.finish_secret_store_confirm(p, confirm);
+                }
+            }
+            return Nav::Stay;
+        }
+
         if let Some(prompt) = p.shadowed_global.clone() {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
@@ -2685,8 +2693,9 @@ impl SettingsCx {
                 };
                 match id.descriptor().kind {
                     FieldKind::Cycle => {
-                        self.cycle_category_setting(id, p);
-                        self.finish_category_save(id, p);
+                        if self.cycle_category_setting(id, p) {
+                            self.finish_category_save(id, p);
+                        }
                     }
                     FieldKind::EditText | FieldKind::Numeric => {
                         let seed = self.category_edit_seed(id);
@@ -2719,9 +2728,17 @@ impl SettingsCx {
         Nav::Stay
     }
 
-    /// Cycle/toggle an in-place setting. Persisting is the caller's job.
-    fn cycle_category_setting(&mut self, id: SettingId, p: &mut CategoryPage) {
+    /// Cycle/toggle an in-place setting. Returns whether layered config
+    /// should be persisted. Secret-store placement is not a config key.
+    fn cycle_category_setting(&mut self, id: SettingId, p: &mut CategoryPage) -> bool {
         use SettingId as S;
+        if id == S::SandboxDefaultMode {
+            return self.cycle_sandbox_setting(p);
+        }
+        if id == S::SecretStore {
+            self.cycle_secret_store_setting(p);
+            return false;
+        }
         let e = &mut self.extended;
         match id {
             S::VimMode => e.tui.vim_mode = cycle_vim(e.tui.vim_mode),
@@ -2774,9 +2791,6 @@ impl SettingsCx {
                 e.schedule.allow_unbounded_loops = !e.schedule.allow_unbounded_loops
             }
             S::GoalSupervisionEnabled => e.goal_supervision.enabled = !e.goal_supervision.enabled,
-            S::SandboxDefaultMode => {
-                e.sandbox.default_mode = cycle_sandbox_mode(e.sandbox.default_mode)
-            }
             S::RedactEnabled => e.redact.enabled = !e.redact.enabled,
             S::RedactScanEnvironment => e.redact.scan_environment = !e.redact.scan_environment,
             S::RedactScanDotenv => e.redact.scan_dotenv = !e.redact.scan_dotenv,
@@ -2793,6 +2807,92 @@ impl SettingsCx {
             // Non-cycle ids never reach here.
             _ => {}
         }
+        true
+    }
+
+    fn cycle_sandbox_setting(&mut self, p: &mut CategoryPage) -> bool {
+        use crate::tui::capability_gate::{
+            RecheckApply, apply_sandbox_choice, next_settings_sandbox_mode,
+        };
+        let current = self.extended.sandbox.default_mode;
+        let requested = next_settings_sandbox_mode(current, &self.host_capabilities);
+        if requested == current {
+            p.status = Some("no other sandbox mode is available".into());
+            return false;
+        }
+        let snapshot = self.host_capabilities.clone();
+        let outcome =
+            apply_sandbox_choice(requested, &snapshot, || self.refresh_host_capabilities());
+        match outcome {
+            RecheckApply::Applied(mode) => {
+                self.extended.sandbox.default_mode = mode;
+                true
+            }
+            RecheckApply::Instruct(instruct) => {
+                p.status = Some(instruct.display());
+                false
+            }
+        }
+    }
+
+    fn cycle_secret_store_setting(&mut self, p: &mut CategoryPage) {
+        use crate::tui::capability_gate::{
+            RecheckApply, apply_keyring_choice, displayed_secret_store_placement,
+            next_secret_store_placement, secret_store_downgrade_dialog,
+            secret_store_switcher_enabled,
+        };
+        use cockpit_proto::SecretStorePlacement;
+
+        if !secret_store_switcher_enabled(&self.host_capabilities) {
+            p.status = Some(crate::tui::capability_gate::SECRET_STORE_PREPARING.to_string());
+            return;
+        }
+        let current = displayed_secret_store_placement(&self.host_capabilities);
+        let requested = next_secret_store_placement(current);
+        match requested {
+            SecretStorePlacement::Keyring => {
+                let snapshot = self.host_capabilities.clone();
+                match apply_keyring_choice(&snapshot, || self.refresh_host_capabilities()) {
+                    RecheckApply::Applied(_) => {
+                        p.status =
+                            Some(self.commit_secret_store_migrate(SecretStorePlacement::Keyring));
+                    }
+                    RecheckApply::Instruct(instruct) => {
+                        p.status = Some(instruct.display());
+                    }
+                }
+            }
+            SecretStorePlacement::Database => {
+                p.secret_store_confirm = Some(secret_store_downgrade_dialog());
+                p.status = Some("confirm moving the wrapping key off the OS keyring".into());
+            }
+            SecretStorePlacement::Unavailable => {}
+        }
+    }
+
+    fn commit_secret_store_migrate(&mut self, dest: cockpit_proto::SecretStorePlacement) -> String {
+        self.secret_store_migrate_calls = self.secret_store_migrate_calls.saturating_add(1);
+        if let Some(migrate) = self.secret_store_migrate.clone() {
+            return match migrate(dest) {
+                Ok(snapshot) => {
+                    self.host_capabilities.secret_store = snapshot;
+                    "saved".into()
+                }
+                Err(error) => format!("migrate failed: {error}"),
+            };
+        }
+        self.pending_daemon_request = Some(Request::MigrateKekPlacement { dest });
+        "migrating secret storage…".into()
+    }
+
+    fn finish_secret_store_confirm(&mut self, p: &mut CategoryPage, confirm: bool) {
+        p.secret_store_confirm = None;
+        if !confirm {
+            p.status = Some("kept OS keyring".into());
+            return;
+        }
+        p.status =
+            Some(self.commit_secret_store_migrate(cockpit_proto::SecretStorePlacement::Database));
     }
 
     /// The edit-buffer seed text for a text/number field.
@@ -3375,7 +3475,11 @@ fn remove_project_shadow_path(
 
 fn setting_json_path(id: SettingId) -> Option<&'static [&'static str]> {
     use SettingId as S;
+    if id == S::SecretStore {
+        return None;
+    }
     Some(match id {
+        S::SecretStore => return None,
         S::VimMode => &["tui", "vim_mode"],
         S::Thinking => &["tui", "thinking"],
         S::RenderAgentMarkdown => &["tui", "render_agent_markdown"],
@@ -3468,6 +3572,23 @@ fn setting_json_path(id: SettingId) -> Option<&'static [&'static str]> {
 
 impl SettingsCx {
     pub(super) fn render_category_page(&self, frame: &mut Frame, area: Rect, p: &CategoryPage) {
+        if let Some(confirm) = &p.secret_store_confirm {
+            let prompt = confirm
+                .pages()
+                .first()
+                .map(|page| page.prompt.as_str())
+                .unwrap_or(crate::tui::capability_gate::SECRET_STORE_DOWNGRADE_PROMPT);
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(prompt.to_string()),
+                    Line::default(),
+                    Line::from("[Confirm]  [Cancel]"),
+                ])
+                .wrap(Wrap { trim: false }),
+                area,
+            );
+            return;
+        }
         if let Some(prompt) = &p.shadowed_global {
             let label = prompt.setting.descriptor().label;
             frame.render_widget(
@@ -3847,10 +3968,13 @@ impl SettingsCx {
                     .fg(ratatui::style::Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             )));
-            help.push(Line::from(Span::styled(
-                id.descriptor().help.to_string(),
-                muted_style(),
-            )));
+            let help_text = if id == SettingId::SecretStore {
+                crate::tui::capability_gate::secret_store_row_help(&self.host_capabilities)
+                    .to_string()
+            } else {
+                id.descriptor().help.to_string()
+            };
+            help.push(Line::from(Span::styled(help_text, muted_style())));
         } else if Some(p.cursor) == p.reset_cursor()
             && let Some(label) = p.category.reset_label()
         {

@@ -486,6 +486,10 @@ pub enum Response {
         #[serde(default)]
         container_network_enabled: bool,
         container_availability: ContainerAvailability,
+        /// Persisted `sandbox.defaultMode` after this call. Absent on older
+        /// peers; `mode` remains the session's effective mode.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        persisted_intent: Option<SandboxMode>,
     },
 
     /// The resulting sandbox-escalation availability after
@@ -555,6 +559,12 @@ pub enum Response {
     /// Idempotent cancel result ([`Request::CancelRunInvocation`]).
     RunInvocationCancelResult {
         result: RunInvocationCancelResultV1,
+    },
+
+    /// Answer to [`Request::GetHostCapabilities`] / [`Request::RefreshHostCapabilities`]
+    /// / [`Request::MigrateKekPlacement`].
+    HostCapabilities {
+        snapshot: crate::HostCapabilitySnapshot,
     },
 
     #[serde(other)]
@@ -864,6 +874,7 @@ macro_rules! response_variants {
             (Response::RunInvocationStatus { .. }, "run_invocation_status");
             (Response::RemoteOperationStatus { .. }, "remote_operation_status");
             (Response::RunInvocationCancelResult { .. }, "run_invocation_cancel_result");
+            (Response::HostCapabilities { .. }, "host_capabilities");
             (Response::Unknown, "__unknown");
         ] }
     };

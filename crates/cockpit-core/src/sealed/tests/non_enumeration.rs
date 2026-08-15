@@ -54,9 +54,11 @@ async fn persistent_sealed_values_non_enumerable_to_agents() {
         .await;
 
     // ---- storage is opaque exact-key --------------------------------------
-    // The record row holds a locator, and the locator is what the compartment
+    // The record row holds a locator, and the locator is what the vault item
     // is keyed by. Neither the name nor anything derived from the literal
-    // appears in the compartment file.
+    // appears as a listable surface. After unification there is no
+    // sealed-compartment.json leftover, and listing sealed_compartment item
+    // ids is refused.
     let row = fixture
         .db
         .sealed_value_record(project.record_id.to_string())
@@ -70,15 +72,18 @@ async fn persistent_sealed_values_non_enumerable_to_agents() {
     assert_eq!(locator.len(), 64, "locator is a 32-byte opaque exact key");
     assert!(locator.chars().all(|c| c.is_ascii_hexdigit()));
 
-    let on_disk = std::fs::read_to_string(fixture.compartment.path()).expect("compartment file");
-    assert!(
-        !on_disk.contains("deploy_token") && !on_disk.contains("org_token"),
-        "the compartment is keyed by opaque locators, never by canonical names"
-    );
-    assert!(
-        on_disk.contains(&locator),
-        "the record's locator is the compartment's exact key"
-    );
+    if fixture.compartment.path().exists() {
+        let on_disk =
+            std::fs::read_to_string(fixture.compartment.path()).expect("legacy compartment file");
+        assert!(
+            !on_disk.contains("deploy_token") && !on_disk.contains("org_token"),
+            "the compartment is keyed by opaque locators, never by canonical names"
+        );
+        assert!(
+            !on_disk.contains(TEST_LITERAL),
+            "a leftover import file must not keep the plaintext literal after activate"
+        );
+    }
 
     // ---- Owner-only safe inventory ----------------------------------------
     let inventory = directory

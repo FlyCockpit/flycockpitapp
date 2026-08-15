@@ -2,6 +2,8 @@
 
 use std::path::Path;
 
+use rusqlite::OptionalExtension;
+
 use super::*;
 
 /// Required protected redaction-history key resolver threaded into every
@@ -9,6 +11,139 @@ use super::*;
 /// `SecureKeyResolver`; tests pass [`super::test_redaction_key_resolver`].
 type RedactionKeyResolverArc =
     Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>;
+
+fn copy_vault_session_secrets(
+    db: &crate::db::Db,
+    parent: uuid::Uuid,
+    child: uuid::Uuid,
+) -> Result<()> {
+    let vault = crate::secure_key::vault_for_db(db)
+        .map_err(|e| anyhow::anyhow!("opening vault for session fork: {e}"))?;
+    let parent_key = parent.to_string();
+    let child_key = child.to_string();
+    if let Ok(secret) = vault.get_item(
+        cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
+        &crate::secure_key::redaction_table_item_id(&parent_key),
+    ) {
+        vault
+            .put_item(
+                cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
+                &crate::secure_key::redaction_table_item_id(&child_key),
+                secret.as_slice(),
+            )
+            .map_err(|e| anyhow::anyhow!("copying redaction table vault item: {e}"))?;
+    }
+    let sealed_ids: Vec<(String, i64)> = db
+        .blocking_write_for_sync_maintenance({
+            let parent_key = parent_key.clone();
+            move |conn| {
+                let mut stmt =
+                    conn.prepare("SELECT value_id FROM sealed_values WHERE session_id = ?1")?;
+                let ids = stmt
+                    .query_map(rusqlite::params![parent_key], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let mut out = Vec::new();
+                for value_id in ids {
+                    let version: i64 = conn
+                        .query_row(
+                            "SELECT COALESCE(active_version, 1) FROM sealed_value_records
+                              WHERE scope = 'session' AND scope_key = ?1 AND name = ?2",
+                            rusqlite::params![parent_key, value_id],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(anyhow::Error::from)?
+                        .unwrap_or(1);
+                    out.push((value_id, version.max(1)));
+                }
+                Ok(out)
+            }
+        })
+        .context("listing parent sealed values for fork copy")?;
+    for (value_id, version) in sealed_ids {
+        let from = crate::secure_key::session_sealed_item_id(&parent_key, &value_id, version);
+        let to = crate::secure_key::session_sealed_item_id(&child_key, &value_id, version);
+        if let Ok(secret) = vault.get_item(
+            cockpit_db::secret_vault::SecretVaultKind::SessionSealedValue,
+            &from,
+        ) {
+            vault
+                .put_item(
+                    cockpit_db::secret_vault::SecretVaultKind::SessionSealedValue,
+                    &to,
+                    secret.as_slice(),
+                )
+                .map_err(|e| anyhow::anyhow!("copying session sealed vault item: {e}"))?;
+        }
+    }
+    db.blocking_write_for_sync_maintenance({
+        let child_key = child_key.clone();
+        move |conn| {
+            conn.execute(
+                "UPDATE sessions SET redaction_table_json = NULL WHERE session_id = ?1",
+                rusqlite::params![child_key],
+            )?;
+            conn.execute(
+                "UPDATE sealed_values SET value = NULL WHERE session_id = ?1",
+                rusqlite::params![child_key],
+            )?;
+            Ok(())
+        }
+    })
+    .context("clearing plaintext columns on forked session")?;
+    Ok(())
+}
+
+fn persist_redaction_table_to_vault(
+    db: &crate::db::Db,
+    session_id: uuid::Uuid,
+    json: &[u8],
+) -> Result<()> {
+    let vault = crate::secure_key::vault_for_db(db)
+        .map_err(|e| anyhow::anyhow!("opening vault for redaction table: {e}"))?;
+    let item_id = crate::secure_key::redaction_table_item_id(&session_id.to_string());
+    let json = json.to_vec();
+    let session_key = session_id.to_string();
+    db.blocking_write_for_sync_maintenance(move |conn| {
+        conn.execute(
+            "UPDATE sessions SET redaction_table_json = NULL WHERE session_id = ?1",
+            rusqlite::params![session_key],
+        )
+        .context("clearing plaintext session redaction column")?;
+        vault
+            .put_item_on_conn(
+                conn,
+                cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
+                &item_id,
+                &json,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(())
+    })
+    .context("persisting session redaction table")
+}
+
+pub(crate) fn load_redaction_table_from_vault(
+    db: &crate::db::Db,
+    session_id: uuid::Uuid,
+) -> Result<Option<String>> {
+    let vault = crate::secure_key::vault_for_db(db)
+        .map_err(|e| anyhow::anyhow!("opening vault for redaction table: {e}"))?;
+    let item_id = crate::secure_key::redaction_table_item_id(&session_id.to_string());
+    match vault.get_item(
+        cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
+        &item_id,
+    ) {
+        Ok(secret) => Ok(Some(
+            String::from_utf8(secret.as_slice().to_vec())
+                .context("redaction table vault item is not UTF-8")?,
+        )),
+        Err(crate::secure_key::SecureKeyError::NotFound(_)) => Ok(None),
+        Err(error) => Err(anyhow::anyhow!(
+            "reading redaction table vault item: {error}"
+        )),
+    }
+}
 
 fn capture_model_system_prompt_snapshot_json(project_root: &std::path::Path) -> String {
     let (_, providers) = crate::auto_title::load_configs_for(project_root);
@@ -226,6 +361,8 @@ impl Session {
                 )
             })
             .context("creating fork session row")?;
+        copy_vault_session_secrets(&db, parent_session_id, row.session_id)
+            .context("copying vault sealed values and redaction table into fork")?;
         let project_root = PathBuf::from(&row.project_root);
         Self::from_row(db, project_root, row, resolver)
     }
@@ -293,6 +430,11 @@ impl Session {
                 None
             }
         };
+        let redaction_table_json = match row.redaction_table_json.filter(|s| !s.is_empty()) {
+            Some(json) => Some(json),
+            None => load_redaction_table_from_vault(&db, row.session_id)
+                .context("loading vault redaction table while resuming session")?,
+        };
         Ok(Self {
             id: row.session_id,
             project_id: row.project_id,
@@ -315,7 +457,7 @@ impl Session {
             session_llm_mode: Mutex::new(row.session_llm_mode),
             tool_surface_override_json: Mutex::new(row.tool_surface_override_json),
             goal_settings_override_json: Mutex::new(row.goal_settings_override_json),
-            redaction_table_json: Mutex::new(row.redaction_table_json),
+            redaction_table_json: Mutex::new(redaction_table_json),
             secret_path_matcher: std::sync::OnceLock::new(),
             model_system_prompt_snapshot,
             last_time_prelude: Mutex::new(None),
@@ -443,37 +585,36 @@ impl Session {
         let json = table.to_persisted_json()?;
         *self.redaction_table_json.lock().unwrap() = Some(json.clone());
         if self.stage_pending_row(|row| {
-            row.redaction_table_json = Some(json.clone());
+            row.redaction_table_json = None;
         }) {
-            return Ok(());
+            return persist_redaction_table_to_vault(&self.db, self.id, json.as_bytes());
         }
-        let session_id = self.id;
-        self.db
-            .blocking_write_for_sync_maintenance(move |conn| {
-                conn.execute(
-                    "UPDATE sessions SET redaction_table_json = ?1 WHERE session_id = ?2",
-                    params![Some(json), session_id.to_string()],
-                )
-                .context("setting session redaction table")?;
-                Ok(())
-            })
-            .context("persisting session redaction table")
+        persist_redaction_table_to_vault(&self.db, self.id, json.as_bytes())
     }
 
     pub fn persisted_redaction_table(&self) -> Result<Option<crate::redact::RedactionTable>> {
-        let Some(json) = self.redaction_table_json.lock().unwrap().clone() else {
-            return Ok(None);
-        };
-        crate::redact::RedactionTable::from_persisted_json(&json)
-            .map(Some)
-            .context("loading persisted session redaction table")
+        if let Some(json) = self.redaction_table_json.lock().unwrap().clone() {
+            return crate::redact::RedactionTable::from_persisted_json(&json)
+                .map(Some)
+                .context("loading persisted session redaction table");
+        }
+        match load_redaction_table_from_vault(&self.db, self.id)? {
+            Some(json) => crate::redact::RedactionTable::from_persisted_json(&json)
+                .map(Some)
+                .context("loading vault session redaction table"),
+            None => Ok(None),
+        }
     }
 
     /// Legacy file-origin markers are used only to warn when a resumed
     /// session cannot rebuild coverage. They never reveal a secret value.
     pub fn persisted_disk_redaction_origins(&self) -> Result<Vec<String>> {
-        let Some(json) = self.redaction_table_json.lock().unwrap().clone() else {
-            return Ok(Vec::new());
+        let json = match self.redaction_table_json.lock().unwrap().clone() {
+            Some(json) => json,
+            None => match load_redaction_table_from_vault(&self.db, self.id)? {
+                Some(json) => json,
+                None => return Ok(Vec::new()),
+            },
         };
         crate::redact::RedactionTable::persisted_disk_derived_origins(&json)
             .context("loading persisted disk-derived redaction origins")
@@ -567,4 +708,57 @@ pub(crate) fn host_shim_bin_dir_for_data_dir(data_dir: &Path, session_id: Uuid) 
         .join("session-shims")
         .join(session_id.to_string())
         .join("bin")
+}
+
+#[cfg(test)]
+mod vault_unification_tests {
+    use super::*;
+
+    #[test]
+    fn redaction_table_not_plaintext_in_sessions_column() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Session::create(
+            db.clone(),
+            PathBuf::from("/repo"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let mut table = crate::redact::RedactionTable::empty();
+        table = table
+            .with_forced_sealed_literal(
+                "first-high-entropy-token".to_string(),
+                crate::sealed::identity::SealedRedactionIdentity {
+                    scope: crate::sealed::identity::SealedScopeKind::Session,
+                    record_id: None,
+                    name: crate::sealed::identity::SealedName::canonical("prod_token").unwrap(),
+                    version: 0,
+                },
+            )
+            .unwrap();
+        session.persist_redaction_table(&table).unwrap();
+        let column: Option<String> = db
+            .blocking_write_for_sync_maintenance({
+                let sid = session.id.to_string();
+                move |conn| {
+                    Ok(conn.query_row(
+                        "SELECT redaction_table_json FROM sessions WHERE session_id = ?1",
+                        rusqlite::params![sid],
+                        |row| row.get(0),
+                    )?)
+                }
+            })
+            .unwrap();
+        assert!(
+            column
+                .as_deref()
+                .is_none_or(|json| !json.contains("first-high-entropy-token"))
+        );
+        let loaded = session.persisted_redaction_table().unwrap().unwrap();
+        assert!(
+            !loaded
+                .scrub("first-high-entropy-token")
+                .contains("first-high-entropy-token")
+        );
+    }
 }

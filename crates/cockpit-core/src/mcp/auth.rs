@@ -519,4 +519,32 @@ mod tests {
         assert!(url.contains("scope=read%20write"));
         assert!(url.contains("response_type=code"));
     }
+
+    #[test]
+    fn mcp_secrets_use_injected_vault() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        let mut store = crate::credentials::CredentialStore::open_default().unwrap();
+        store.set(
+            "mcp-header-secret",
+            serde_json::json!("header-secret-value"),
+        );
+        store.save().unwrap();
+        assert!(
+            !crate::credentials::default_path().unwrap().exists(),
+            "MCP secrets must not recreate credentials.json"
+        );
+
+        let mut cfg = base_server();
+        cfg.auth = Auth::Header(HeaderAuth {
+            header: "X-Key".into(),
+            value: String::new(),
+            credential_ref: Some("mcp-header-secret".into()),
+        });
+        let resolved = resolve_static_for_server("example", &cfg);
+        assert_eq!(
+            resolved.headers.get("X-Key").map(String::as_str),
+            Some("header-secret-value")
+        );
+    }
 }

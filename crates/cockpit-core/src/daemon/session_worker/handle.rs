@@ -283,6 +283,10 @@ pub struct SessionConfigSnapshot {
     /// later turns only; no hook set changes between `preToolUse` and its
     /// matching post event.
     pub hooks: crate::config::extended::hooks::HookRegistry,
+    /// Injected host capabilities used to compute effective sandbox mode.
+    /// Unpublished (empty features) leaves host Sandbox usable; Refuse is
+    /// the fail-closed backstop.
+    pub host_capabilities: cockpit_proto::HostCapabilitySnapshot,
 }
 
 impl SessionConfigSnapshot {
@@ -296,6 +300,7 @@ impl SessionConfigSnapshot {
             providers,
             extended,
             hooks: crate::config::extended::hooks::HookRegistry::default(),
+            host_capabilities: super::unpublished_host_capability_snapshot(),
         }
     }
 
@@ -311,7 +316,16 @@ impl SessionConfigSnapshot {
             providers,
             extended,
             hooks,
+            host_capabilities: super::unpublished_host_capability_snapshot(),
         }
+    }
+
+    pub fn with_host_capabilities(
+        mut self,
+        host_capabilities: cockpit_proto::HostCapabilitySnapshot,
+    ) -> Self {
+        self.host_capabilities = host_capabilities;
+        self
     }
 
     /// The turn-pinned hook registry.
@@ -808,26 +822,40 @@ impl SessionWorkerHandle {
         );
     }
 
-    /// Set or toggle the session's sandbox mode. `None` toggles the legacy
-    /// off/sandbox state; explicit container modes are validated before storing.
+    /// Set or toggle the session's sandbox mode. Available modes persist as
+    /// intent and become this session's effective mode. Unavailable modes
+    /// return [`super::SandboxCapabilityMissing`] and do not persist.
     pub fn set_sandbox(
         &self,
         mode: Option<crate::tools::sandbox_mode::SandboxMode>,
         container_network_enabled: Option<bool>,
-    ) -> Result<crate::tools::sandbox_mode::SandboxMode, String> {
+        caps: &cockpit_proto::HostCapabilitySnapshot,
+    ) -> Result<super::SetSandboxApplied, super::SetSandboxError> {
         if let Some(enabled) = container_network_enabled {
             self.session.set_container_network_enabled(enabled);
         }
         let requested = mode.unwrap_or_else(|| self.session.sandbox_mode().toggled_legacy());
-        if requested.is_container() {
-            let availability = crate::container::availability_snapshot();
-            if !availability.available {
-                return Err(availability
-                    .unavailable_reason_text()
-                    .unwrap_or_else(|| "container sandbox is unavailable".to_string()));
-            }
+        let persisted_intent = self
+            .config_snapshot
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extended
+            .sandbox
+            .default_mode;
+        let applied = super::evaluate_set_sandbox(requested, persisted_intent, caps)
+            .map_err(super::SetSandboxError::CapabilityMissing)?;
+        persist_sandbox_intent(&self.project_root, applied.persisted_intent).map_err(|error| {
+            super::SetSandboxError::Persist(format!("persisting sandbox intent: {error:#}"))
+        })?;
+        {
+            let mut snapshot = self
+                .config_snapshot
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            snapshot.extended.sandbox.default_mode = applied.persisted_intent;
+            snapshot.host_capabilities = caps.clone();
         }
-        let new = self.session.set_sandbox_mode(requested);
+        let new = self.session.set_sandbox_mode(applied.effective);
         self.sandbox_notice_armed.store(false, Ordering::SeqCst);
         if !new.enabled() {
             *self
@@ -844,12 +872,13 @@ impl SessionWorkerHandle {
                 enabled: new.enabled(),
                 container_network_enabled: self.session.container_network_enabled(),
                 container_availability: crate::container::availability_snapshot(),
+                persisted_intent: Some(applied.persisted_intent),
             },
         );
         if new.enabled() {
             self.probe_sandbox_unavailable();
         }
-        Ok(new)
+        Ok(applied)
     }
 
     pub fn container_network_enabled(&self) -> bool {
@@ -1260,6 +1289,25 @@ impl SessionWorkerHandle {
         );
     }
 
+    /// Broadcast intent vs effective sandbox mode so attach/reconnect can
+    /// show "intent Sandbox, effective Off (missing bwrap)".
+    pub fn broadcast_sandbox_state(&self) {
+        let snapshot = self.config_snapshot();
+        let mode = self.session.sandbox_mode();
+        send_current_event(
+            &self.event_tx,
+            &self.redaction,
+            proto::Event::SandboxState {
+                session_id: self.session_id,
+                mode,
+                enabled: mode.enabled(),
+                container_network_enabled: self.session.container_network_enabled(),
+                container_availability: crate::container::availability_snapshot(),
+                persisted_intent: Some(snapshot.extended.sandbox.default_mode),
+            },
+        );
+    }
+
     /// Broadcast the current sandbox-escalation availability so late or
     /// reconnecting clients hydrate the daemon-owned session flag.
     pub fn broadcast_sandbox_escalation(&self) {
@@ -1619,12 +1667,14 @@ pub fn spawn(
     //   (a) daemon launched `--no-sandbox` → OFF for ALL sessions.
     //   (b) else this client passed `--no-sandbox` → OFF for the
     //       sessions it creates.
-    //   (c) else ON.
+    //   (c) else effective_sandbox_mode(persisted intent, host caps).
+    // Unavailable container is Off, never a silent rewrite to host Sandbox.
     // A later `/sandbox` flip overrides this for the session.
     session.set_sandbox_mode(resolve_sandbox_default_with(
         daemon_no_sandbox,
         client_no_sandbox,
         extended_cfg.sandbox.default_mode,
+        &config_snapshot.host_capabilities,
     ));
     session.set_sandbox_escalation_enabled(extended_cfg.sandbox_escalation_enabled);
     // Command-approval mode (implementation note): new

@@ -20,8 +20,8 @@ use super::probe::{
 };
 use super::registry::{ExternalRuntimeRegistry, RegistryError};
 use super::schema::{
-    Applicability, DependencyImportance, ExternalRuntimeDescriptor, HostPlatform, ProbePolicy,
-    RemedyKind, RequirementGroup, VersionParser,
+    Applicability, DependencyImportance, ExternalRuntimeDescriptor, ExternalRuntimeId,
+    HostPlatform, ProbePolicy, RemedyKind, RequirementGroup, VersionParser,
 };
 use crate::capabilities::ExecutionTarget;
 use crate::daemon::proto::{
@@ -32,6 +32,8 @@ use crate::daemon::proto::{
 
 /// Bubblewrap host sandbox binary (`bwrap`).
 pub const ID_BUBBLEWRAP: &str = "safety.bubblewrap";
+/// Platform keyring / Secret Service / Keychain / Credential Manager.
+pub const ID_KEYRING: &str = "security.keyring";
 /// Docker engine CLI with read-only version+info health.
 pub const ID_DOCKER: &str = "container.docker";
 /// Podman engine CLI with read-only version+info health.
@@ -49,6 +51,7 @@ pub const ID_IMPORT: &str = "computer.import";
 pub fn known_safety_adapter_ids() -> &'static [&'static str] {
     &[
         ID_BUBBLEWRAP,
+        ID_KEYRING,
         ID_DOCKER,
         ID_PODMAN,
         ID_XVFB,
@@ -65,7 +68,14 @@ pub fn known_safety_adapter_ids() -> &'static [&'static str] {
 /// with an explicit [`ContainerEngineMode`]. That keeps Disabled from spawning
 /// container probes during generic Settings/doctor refresh.
 pub fn known_global_safety_adapter_ids() -> &'static [&'static str] {
-    &[ID_BUBBLEWRAP, ID_XVFB, ID_XDOTOOL, ID_SCROT, ID_IMPORT]
+    &[
+        ID_BUBBLEWRAP,
+        ID_KEYRING,
+        ID_XVFB,
+        ID_XDOTOOL,
+        ID_SCROT,
+        ID_IMPORT,
+    ]
 }
 
 /// Mutating probe argv verbs that must never appear in read-only evidence probes.
@@ -223,6 +233,27 @@ fn bubblewrap_descriptor() -> Result<ExternalRuntimeDescriptor, super::schema::S
         .build()
 }
 
+fn keyring_descriptor() -> Result<ExternalRuntimeDescriptor, super::schema::SchemaError> {
+    ExternalRuntimeDescriptor::builder(ID_KEYRING)
+        .owner("cockpit-core", "secret_store.keyring")
+        .candidates(["cockpit-keyring-probe"])
+        .applicability(Applicability::Always)
+        .importance(DependencyImportance::RequiredWhenFeatureSelected)
+        .target(ExecutionTarget::Host)
+        .probe_policy(version_first_line())
+        .remedy(RemedyKind::platform_recipes(
+            "Install a platform keyring (Linux Secret Service, macOS Keychain, or Windows Credential Manager) and ensure a session bus is available.",
+            package_remedy_table(
+                "gnome-keyring",
+                "gnome-keyring",
+                "gnome-keyring",
+                "ignored",
+                None,
+            ),
+        ))
+        .build()
+}
+
 fn docker_descriptor() -> Result<ExternalRuntimeDescriptor, super::schema::SchemaError> {
     ExternalRuntimeDescriptor::builder(ID_DOCKER)
         .owner(
@@ -312,6 +343,7 @@ fn computer_leaf(
 pub fn safety_adapter_descriptors() -> Result<Vec<ExternalRuntimeDescriptor>, RegistryError> {
     Ok(vec![
         bubblewrap_descriptor()?,
+        keyring_descriptor()?,
         docker_descriptor()?,
         podman_descriptor()?,
         computer_leaf(
@@ -413,6 +445,43 @@ pub fn computer_use_requirement_group() -> RequirementGroup {
 /// Bubblewrap as a single-leaf required group when shell sandbox is selected.
 pub fn bubblewrap_requirement_group() -> RequirementGroup {
     RequirementGroup::leaf(ID_BUBBLEWRAP)
+}
+
+/// Catalog health row for [`ID_KEYRING`] from the shared platform probe.
+///
+/// The keyring descriptor is never evaluated as a PATH binary. Doctor and
+/// the daemon snapshot both use [`crate::secure_key::probe_platform_keyring`].
+pub fn keyring_health_entry(
+    probe: &crate::secure_key::KeyringProbeResult,
+    platform: HostPlatform,
+) -> HealthEntry {
+    use cockpit_proto::FeatureCapabilityState;
+    let state = match probe.state {
+        FeatureCapabilityState::Available => HealthState::Available {
+            resolved_path: None,
+            version_evidence: None,
+        },
+        FeatureCapabilityState::Missing => HealthState::Missing,
+        FeatureCapabilityState::Unsupported => HealthState::NotApplicable,
+        FeatureCapabilityState::Failed => HealthState::Failed {
+            cause: HealthCause::Internal {
+                message: probe.reason.clone(),
+            },
+        },
+    };
+    HealthEntry {
+        id: ExternalRuntimeId::new(ID_KEYRING),
+        state,
+        importance: DependencyImportance::RequiredWhenFeatureSelected,
+        target: ExecutionTarget::Host,
+        remedy: Some(RemedyKind::prose(
+            probe
+                .remedy_text
+                .clone()
+                .unwrap_or_else(|| probe.reason.clone()),
+        )),
+        platform,
+    }
 }
 
 /// True when sanitized version evidence looks like a real docker/podman engine.
@@ -719,7 +788,7 @@ pub(crate) fn refresh_safety_snapshot_with_observer(
             ContainerEngineMode::Docker => id == ID_PODMAN,
             ContainerEngineMode::Podman => id == ID_DOCKER,
             ContainerEngineMode::Auto => false,
-        };
+        } || id == ID_KEYRING;
         entries.insert(
             id.to_string(),
             HealthEntry {
@@ -772,6 +841,11 @@ pub(crate) fn refresh_safety_snapshot_with_observer(
     snapshot.groups.insert(
         "bubblewrap".into(),
         evaluate_requirement_group(&bubblewrap_requirement_group(), &snapshot),
+    );
+    let keyring = crate::secure_key::probe_platform_keyring();
+    snapshot.entries.insert(
+        ID_KEYRING.to_string(),
+        keyring_health_entry(&keyring, ctx.platform),
     );
     snapshot
 }

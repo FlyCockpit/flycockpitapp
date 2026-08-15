@@ -1,5 +1,7 @@
-//! Durable session-scoped sealed values.  Only the core session layer may
-//! resolve a literal; callers listing values receive metadata only.
+//! Durable session-scoped sealed metadata. The literal lives in the wrap-key
+//! vault (`session_sealed_value`); this table keeps only metadata. Callers
+//! listing values receive metadata only. A leftover plaintext `value` column
+//! is import-only and is nulled after a verified activation.
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -22,6 +24,7 @@ pub fn upsert_sealed_value_conn(
     reason: &str,
     origin: &str,
 ) -> Result<SealedValueMetadata> {
+    let _ = value;
     let now = Utc::now().timestamp();
     let scoped: i64 = conn
         .query_row(
@@ -44,7 +47,14 @@ pub fn upsert_sealed_value_conn(
          ON CONFLICT(session_id, value_id) DO UPDATE SET
            value = excluded.value, reason = excluded.reason, origin = excluded.origin,
            created_at = excluded.created_at",
-        params![session_id.to_string(), value_id, value, reason, origin, now],
+        params![
+            session_id.to_string(),
+            value_id,
+            Option::<String>::None,
+            reason,
+            origin,
+            now
+        ],
     )
     .context("upserting sealed value")?;
     Ok(SealedValueMetadata {
@@ -240,6 +250,39 @@ mod tests {
             db.sealed_value_exists(child.session_id, "prod_token")
                 .await
                 .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn session_sealed_value_not_plaintext_in_sql() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = db.create_session("p", "/repo", "Build").await.unwrap();
+        db.upsert_sealed_value(
+            parent.session_id,
+            "prod_token",
+            "long-high-entropy-token",
+            "deployment credential",
+            "user",
+        )
+        .await
+        .unwrap();
+        let value: Option<String> = db
+            .blocking_write_for_sync_maintenance({
+                let sid = parent.session_id.to_string();
+                move |conn| {
+                    Ok(conn.query_row(
+                        "SELECT value FROM sealed_values WHERE session_id = ?1 AND value_id = 'prod_token'",
+                        rusqlite::params![sid],
+                        |row| row.get(0),
+                    )?)
+                }
+            })
+            .unwrap();
+        assert!(
+            value
+                .as_deref()
+                .is_none_or(|raw| raw != "long-high-entropy-token"),
+            "sealed_values.value must not store the plaintext literal"
         );
     }
 }

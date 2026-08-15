@@ -691,9 +691,10 @@ async fn revalidate_scope_and_owner(
 /// version check is **fused with the authoritative literal read** so a rotation
 /// racing the recovery can never reveal a newer value:
 ///
-/// * Session scope: the literal read is gated on `expected_version` inside a
-///   single DB statement (`sealed_session_literal_for_action`), so a bumped
-///   record returns `None` → rejection, atomically.
+/// * Session scope: the version fence is a single DB statement
+///   (`sealed_session_version_fence`); the plaintext is then unwrapped from
+///   the vault item for that exact version, so a bumped record returns
+///   `None` → rejection, atomically.
 /// * Compartment scope: the record row is read once; if its `active_version` is
 ///   not `expected_version` the recovery rejects, and otherwise the locator from
 ///   that same snapshot is read. A committed rotation both advances the version
@@ -722,8 +723,8 @@ async fn resolve_literal_for_recover(
     match bound_scope.kind() {
         SealedScopeKind::Session => {
             let literal = directory
-                .db()
-                .sealed_session_literal_for_action(
+                .session_literal_for_action(
+                    owner,
                     record_id.to_string(),
                     i64::from(expected_version),
                 )

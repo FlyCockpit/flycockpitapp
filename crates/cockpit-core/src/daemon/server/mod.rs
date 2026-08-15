@@ -205,6 +205,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             enabled: _,
             container_network_enabled: _,
             container_availability: _,
+            persisted_intent: _,
         }
         | proto::Response::SandboxEscalationState { enabled: _ }
         | proto::Response::RedactionState {
@@ -520,6 +521,9 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         proto::Response::RunInvocationStatus { .. }
         | proto::Response::RunInvocationCancelResult { .. }
         | proto::Response::RemoteOperationStatus { .. } => {}
+        proto::Response::HostCapabilities { snapshot } => {
+            scrub_host_capability_snapshot(snapshot, redact);
+        }
         proto::Response::Unknown => {}
     }
 }
@@ -591,6 +595,7 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             enabled: _,
             container_network_enabled: _,
             container_availability: _,
+            persisted_intent: _,
         }
         | proto::Event::SandboxEscalationState {
             session_id: _,
@@ -1006,7 +1011,34 @@ fn scrub_event_free_text(event: &mut proto::Event, redact: &RedactionTable) {
             holder_agent: _,
             waiting: _,
         } => scrub_string(path, redact),
+        proto::Event::HostCapabilitiesChanged { snapshot } => {
+            scrub_host_capability_snapshot(snapshot, redact);
+        }
         proto::Event::Unknown => {}
+    }
+}
+
+fn scrub_host_capability_snapshot(
+    snapshot: &mut proto::HostCapabilitySnapshot,
+    redact: &RedactionTable,
+) {
+    for row in &mut snapshot.features {
+        scrub_string(&mut row.reason, redact);
+        if let Some(fix) = &mut row.fix_command {
+            scrub_string(fix, redact);
+        }
+        if let Some(remedy) = &mut row.remedy_text {
+            scrub_string(remedy, redact);
+        }
+    }
+    for row in &mut snapshot.dependencies {
+        scrub_string(&mut row.reason, redact);
+    }
+    if let Some(reason) = &mut snapshot.secret_store.fail_closed_reason {
+        scrub_string(reason, redact);
+    }
+    if let Some(fix) = &mut snapshot.secret_store.fix_command {
+        scrub_string(fix, redact);
     }
 }
 
@@ -1781,6 +1813,7 @@ pub struct DaemonContext {
     upload_accounting: Arc<StdMutex<UploadAccounting>>,
     connector_wake: watch::Sender<u64>,
     pub scheduler: Option<DaemonSchedulerHandle>,
+    #[allow(dead_code)]
     credential_store_path: Option<PathBuf>,
     /// Injectable config-resolution seam (`daemon-trust-test-isolation.md`):
     /// the single route by which request handling resolves layered
@@ -1834,6 +1867,11 @@ pub struct DaemonContext {
     /// transport-wiring prompts.
     pub remote_project_resolver:
         Arc<dyn crate::daemon::remote_project_resolver::RemoteProjectResolver>,
+    /// Daemon-owned host capability snapshot. Authority for feature gating.
+    /// The TUI in-process doctor compose is not this store.
+    pub(crate) host_capabilities: crate::host_capabilities::HostCapabilitySnapshotStore,
+    /// Probe sources used by boot and `RefreshHostCapabilities`.
+    pub(crate) host_capability_probes: crate::host_capabilities::HostCapabilityProbeInputs,
 }
 
 #[cfg(test)]
@@ -1952,6 +1990,8 @@ impl DaemonContext {
         if let Some(handle) = &scheduler {
             registry.set_scheduler(handle.clone());
         }
+        let host_capabilities = crate::host_capabilities::HostCapabilitySnapshotStore::new();
+        registry.set_host_capabilities(host_capabilities.clone());
         struct DaemonMediaClock(Instant);
         impl crate::media_reservation::MonotonicClock for DaemonMediaClock {
             fn now_ms(&self) -> u64 {
@@ -1978,7 +2018,7 @@ impl DaemonContext {
             media_admission_open: Arc::new(std::sync::atomic::AtomicBool::new(cfg!(test))),
             registry,
             paths,
-            canonical_cwd,
+            canonical_cwd: canonical_cwd.clone(),
             #[cfg(test)]
             fcor_resolver_calls: std::sync::atomic::AtomicUsize::new(0),
             started_at,
@@ -2014,6 +2054,10 @@ impl DaemonContext {
             remote_project_resolver: Arc::new(
                 crate::daemon::remote_project_resolver::StaticRemoteProjectResolver::new(),
             ),
+            host_capabilities,
+            host_capability_probes: crate::host_capabilities::HostCapabilityProbeInputs::production(
+                canonical_cwd.clone(),
+            ),
         }
     }
 
@@ -2030,10 +2074,10 @@ impl DaemonContext {
         self
     }
 
-    /// Install the secure-key actor after identity creation. Production calls
-    /// [`crate::secure_key::SecureKeyActor::start_production`] which registers
-    /// the platform store before intake. Failures are non-fatal for daemon
-    /// boot (typed Unavailable on later use); headless CI may lack Secret Service.
+    /// Install the secure-key actor after identity creation. Production always
+    /// resolves KEK placement and attaches the actor when placement can be
+    /// established. Keyring-down after `active_placement=keyring` is
+    /// `KekUnavailable` (no file-KEK fallback).
     #[cfg_attr(test, allow(dead_code))] // production boot only; tests skip native actor start
     pub(crate) fn attach_secure_key_actor(&mut self, actor: crate::secure_key::SecureKeyActor) {
         let handle = actor.handle();
@@ -2087,23 +2131,24 @@ impl DaemonContext {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_host_capability_probes(
+        mut self,
+        probes: crate::host_capabilities::HostCapabilityProbeInputs,
+    ) -> Self {
+        self.host_capability_probes = probes;
+        self
+    }
+
     pub(crate) fn store_flycockpit_credential(
         &self,
         credential: &crate::auth::flycockpit::StoredFlycockpitCredential,
     ) -> Result<()> {
-        if let Some(path) = &self.credential_store_path {
-            crate::auth::flycockpit::store_credential_at_path(path.clone(), credential)
-        } else {
-            crate::auth::flycockpit::store_credential(credential)
-        }
+        crate::auth::flycockpit::store_credential(credential)
     }
 
     pub(crate) fn clear_flycockpit_credential(&self) -> Result<()> {
-        if let Some(path) = &self.credential_store_path {
-            crate::auth::flycockpit::clear_credential_at_path(path.clone())
-        } else {
-            crate::auth::flycockpit::clear_credential()
-        }
+        crate::auth::flycockpit::clear_credential()
     }
 
     /// The daemon's graceful-shutdown gate. New-user-work rejection and the
@@ -2266,31 +2311,37 @@ pub(crate) async fn boot_with_db(
             .context("reconciling media cleanup intents")?;
     }
     timer.phase("media_upload_reconcile");
-    // Installation identity + secure-key actor: under single-instance lock
-    // (caller already holds pid/socket). Registration + keyring I/O stay on the
-    // dedicated actor OS thread. Boot handshake runs on a short-lived std thread
-    // (not Tokio blocking/core pool) so `blocking_recv` never pins a runtime worker.
+    // Shared host-capability probes run once here. The TUI in-process doctor
+    // snapshot is not the daemon's capability authority.
     //
-    // Unit tests skip production native registration (no real OS keyring; avoids
-    // D-Bus hangs that stall ephemeral idle-reap tests after the socket is bound).
+    // `probe_platform_keyring()` is the only keyring construct on this boot
+    // path. Vault start consumes that probe and must not construct the
+    // platform store a second time. Snapshot publish waits until after vault
+    // start so `secretStore` is filled from the authority row.
     #[cfg(not(test))]
     {
+        let probes = crate::host_capabilities::collect_shared_host_probes(
+            &ctx.host_capability_probes,
+            false,
+        )
+        .await;
         let db_for_keys = db.clone();
+        let keyring_probe = probes.keyring.clone();
         let (boot_tx, boot_rx) = tokio::sync::oneshot::channel();
         match std::thread::Builder::new()
             .name("cockpit-secure-key-boot".into())
             .spawn(move || {
-                // The journal is the first real secure-key consumer, so the
-                // actor gets a reconciler that resolves its kind against the
-                // capsule ledger instead of failing closed on it.
                 let reconciler = std::sync::Arc::new(
                     crate::external_journal::keys::ExternalJournalSpoolReconciler::new(
                         db_for_keys.clone(),
                     ),
                 );
-                let result = crate::secure_key::SecureKeyActor::start_production_with_reconciler(
+                let result = crate::secure_key::SecureKeyActor::start_production_resolved(
                     db_for_keys,
                     reconciler,
+                    &keyring_probe,
+                    None,
+                    crate::secure_key::SecretStoreInjected::default(),
                 );
                 let _ = boot_tx.send(result);
             }) {
@@ -2298,33 +2349,69 @@ pub(crate) async fn boot_with_db(
                 Ok(Ok(actor)) => {
                     ctx.attach_secure_key_actor(actor);
                     timer.phase("secure_key_actor");
+                    let generation = ctx.host_capabilities.begin_refresh();
+                    let authority = db
+                        .blocking_write_for_sync_maintenance(
+                            crate::db::secret_vault::load_authority_conn,
+                        )
+                        .ok()
+                        .flatten();
+                    let secret_store = crate::secure_key::project_secret_store_snapshot(
+                        authority.as_ref(),
+                        &probes.keyring,
+                    );
+                    let snapshot = crate::host_capabilities::build_host_capability_snapshot(
+                        generation,
+                        &probes,
+                        secret_store,
+                    );
+                    let _ = ctx.host_capabilities.publish(snapshot);
+                    timer.phase("host_capabilities");
                 }
                 Ok(Err(error)) => {
-                    tracing::warn!(
-                        error = %error,
-                        "secure key actor not started; native secure keys unavailable"
+                    let generation = ctx.host_capabilities.begin_refresh();
+                    let secret_store = match &error {
+                        crate::secure_key::SecureKeyError::KekUnavailable {
+                            reason,
+                            fix_command,
+                        } => cockpit_proto::SecretStoreSnapshot {
+                            intent: cockpit_proto::SecretStoreIntent::Keyring,
+                            effective_placement: cockpit_proto::SecretStorePlacement::Unavailable,
+                            fail_closed_reason: Some(reason.clone()),
+                            fix_command: fix_command.clone(),
+                            unification_complete: false,
+                        },
+                        _ => cockpit_proto::SecretStoreSnapshot::unconfigured_placeholder(),
+                    };
+                    let snapshot = crate::host_capabilities::build_host_capability_snapshot(
+                        generation,
+                        &probes,
+                        secret_store,
                     );
-                    timer.phase("secure_key_actor_skipped");
+                    let _ = ctx.host_capabilities.publish(snapshot);
+                    timer.phase("host_capabilities");
+                    return Err(anyhow::anyhow!("secure key vault: {error}"));
                 }
                 Err(_) => {
-                    tracing::warn!(
-                        "secure key actor boot channel dropped; native secure keys unavailable"
-                    );
-                    timer.phase("secure_key_actor_skipped");
+                    return Err(anyhow::anyhow!("secure key actor boot channel dropped"));
                 }
             },
             Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "secure key actor boot thread spawn failed; native secure keys unavailable"
-                );
-                timer.phase("secure_key_actor_skipped");
+                return Err(anyhow::anyhow!(
+                    "secure key actor boot thread spawn failed: {error}"
+                ));
             }
         }
     }
     #[cfg(test)]
     {
-        let _ = db;
+        let _ = &db;
+        crate::host_capabilities::publish_initial_host_capabilities(
+            &ctx.host_capabilities,
+            &ctx.host_capability_probes,
+        )
+        .await;
+        timer.phase("host_capabilities");
         timer.phase("secure_key_actor_skipped");
     }
     // Process containment actor: durable generation-bound descendant groups.
@@ -4406,12 +4493,16 @@ pub use run_invocation::{
     remaining_after_restart as run_invocation_remaining_after_restart,
     wall_ms_now as run_invocation_wall_ms_now,
 };
+#[cfg(test)]
+mod host_capabilities_tests;
 pub(crate) mod inventory;
+#[cfg(test)]
+mod leaks_tests;
+#[cfg(test)]
+mod secret_store_boot_tests;
 mod sessions;
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
-mod leaks_tests;
 
 pub use attachments::validate_png_attachment_blocking;
 pub use dispatch::request_shutdown;

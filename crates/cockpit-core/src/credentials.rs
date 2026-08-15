@@ -1,24 +1,28 @@
-#![allow(dead_code)]
-//! Credential storage at `$XDG_STATE_HOME/cockpit/credentials.json`
-//! (defaulting to `~/.local/state/cockpit/credentials.json`).
+//! Credential facade over the wrap-key vault.
 //!
-//! Why `state` rather than `share`: an auth token is mutable runtime
-//! data the program can regenerate (re-login, refresh). `~/.local/share`
-//! is for application data files the program does not regenerate.
+//! Production construction is [`CredentialStore::from_vault`]. Provider records,
+//! named secrets, and subscription-ack flags live as AEAD items
+//! (`credential_record`, `named_secret`, `subscription_ack`). A leftover
+//! `credentials.json` is import-only: the unification saga copies, verifies,
+//! activates, then deletes the file. After activate, `save` / `set` write
+//! vault rows only and must not recreate the JSON path.
 //!
-//! On Unix the file is created with mode `0600`. Provider records retain their
-//! historical top-level shape; named secrets live under the reserved
-//! `$secrets` object. Every mutation is a locked read-modify-write transaction
-//! followed by an atomic replace, so independently opened stores cannot erase
-//! one another's OAuth, account, API-key, or named-secret updates.
+//! Path-open remains for the import saga and for `#[cfg(test)]` fixtures that
+//! have not yet moved. Production login, refresh, logout, MCP, provider-header,
+//! `ask`, and setup paths use the injected vault handle.
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use cockpit_db::secret_vault::SecretVaultKind;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::secure_key::SecretVault;
+
+const SUBSCRIPTION_ACK_PREFIX: &str = "subscription-oauth-ack:";
 
 /// Default credentials path: `~/.local/state/cockpit/credentials.json`.
 /// Honors `XDG_STATE_HOME` per the XDG spec.
@@ -32,8 +36,13 @@ pub fn default_path() -> Option<PathBuf> {
     Some(home.join(".local/state/cockpit/credentials.json"))
 }
 
+enum CredentialBackend {
+    Vault(Arc<SecretVault>),
+    LegacyFile { path: PathBuf },
+}
+
 pub struct CredentialStore {
-    path: PathBuf,
+    backend: CredentialBackend,
     records: BTreeMap<String, Value>,
     secrets: BTreeMap<String, String>,
     record_mutations: Vec<RecordMutation>,
@@ -65,11 +74,34 @@ enum SecretMutation {
 }
 
 impl CredentialStore {
+    /// Production constructor: vault-backed facade.
+    pub fn from_vault(vault: Arc<SecretVault>) -> Result<Self> {
+        let (records, secrets) = load_from_vault(&vault)?;
+        Ok(Self {
+            backend: CredentialBackend::Vault(vault),
+            records,
+            secrets,
+            record_mutations: Vec::new(),
+            secret_mutations: Vec::new(),
+        })
+    }
+
+    /// Import-only / test fixtures. Production login, refresh, logout, MCP,
+    /// provider-header, `ask`, and setup paths must use [`Self::from_vault`]
+    /// or [`Self::open_default`].
+    #[cfg(any(test, feature = "test-support"))]
     pub fn open(path: PathBuf) -> Result<Self> {
-        ensure_parent_dir_private(&path)?;
+        Self::open_legacy_file(path)
+    }
+
+    /// Read a leftover `credentials.json` for the import saga.
+    pub(crate) fn open_legacy_file(path: PathBuf) -> Result<Self> {
+        if path.exists() {
+            ensure_parent_dir_private(&path)?;
+        }
         let data = read_credential_file(&path)?;
         Ok(Self {
-            path,
+            backend: CredentialBackend::LegacyFile { path },
             records: data.records,
             secrets: data.secrets,
             record_mutations: Vec::new(),
@@ -78,16 +110,20 @@ impl CredentialStore {
     }
 
     pub fn open_default() -> Result<Self> {
-        let path = default_path().context("could not locate $HOME for credentials path")?;
-        Self::open(path)
+        let db =
+            crate::db::Db::open_default().context("opening cockpit DB for credential vault")?;
+        let vault = crate::secure_key::vault_for_db(&db)
+            .map_err(|e| anyhow::anyhow!("opening secret vault for credentials: {e}"))?;
+        Self::from_vault(vault)
     }
 
     /// Open the credential store without creating parent directories, lock
-    /// files, or repairing permissions. Intended for read-only diagnostics.
+    /// files, or repairing permissions. Test / diagnostic fixtures only.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn open_readonly(path: PathBuf) -> Result<Self> {
         let data = read_credential_file_readonly(&path)?;
         Ok(Self {
-            path,
+            backend: CredentialBackend::LegacyFile { path },
             records: data.records,
             secrets: data.secrets,
             record_mutations: Vec::new(),
@@ -96,8 +132,15 @@ impl CredentialStore {
     }
 
     pub fn open_default_readonly() -> Result<Self> {
-        let path = default_path().context("could not locate $HOME for credentials path")?;
-        Self::open_readonly(path)
+        Self::open_default()
+    }
+
+    pub(crate) fn records_for_import(&self) -> impl Iterator<Item = (String, Value)> + '_ {
+        self.records.iter().map(|(k, v)| (k.clone(), v.clone()))
+    }
+
+    pub(crate) fn secrets_for_import(&self) -> impl Iterator<Item = (String, String)> + '_ {
+        self.secrets.iter().map(|(k, v)| (k.clone(), v.clone()))
     }
 
     pub fn get(&self, provider_id: &str) -> Option<&Value> {
@@ -181,52 +224,183 @@ impl CredentialStore {
     }
 
     pub fn save(&mut self) -> Result<()> {
-        ensure_parent_dir_private(&self.path)?;
-        let _lock = lock_credential_file(&self.path)?;
-        let mut latest = read_credential_file(&self.path)?;
-        for mutation in &self.record_mutations {
-            match mutation {
-                RecordMutation::Set(id, value) => {
-                    latest.records.insert(id.clone(), value.clone());
+        match &self.backend {
+            CredentialBackend::Vault(vault) => {
+                save_mutations_to_vault(vault, &self.record_mutations, &self.secret_mutations)?;
+                let (records, secrets) = load_from_vault(vault)?;
+                self.records = records;
+                self.secrets = secrets;
+                self.record_mutations.clear();
+                self.secret_mutations.clear();
+                Ok(())
+            }
+            CredentialBackend::LegacyFile { path } => {
+                // File writes are import-saga / test fixtures only. After
+                // vault activate, production construction is `from_vault` and
+                // never reaches this arm.
+                ensure_parent_dir_private(path)?;
+                let _lock = lock_credential_file(path)?;
+                let mut latest = read_credential_file(path)?;
+                for mutation in &self.record_mutations {
+                    match mutation {
+                        RecordMutation::Set(id, value) => {
+                            latest.records.insert(id.clone(), value.clone());
+                        }
+                        RecordMutation::Remove(id) => {
+                            latest.records.remove(id);
+                        }
+                    }
                 }
-                RecordMutation::Remove(id) => {
-                    latest.records.remove(id);
+                for mutation in &self.secret_mutations {
+                    match mutation {
+                        SecretMutation::Set(name, value) => {
+                            latest.secrets.insert(name.clone(), value.clone());
+                        }
+                        SecretMutation::Remove(name) => {
+                            latest.secrets.remove(name);
+                        }
+                    }
                 }
+                write_credential_file_atomic(path, &latest)?;
+                self.records = latest.records;
+                self.secrets = latest.secrets;
+                self.record_mutations.clear();
+                self.secret_mutations.clear();
+                Ok(())
             }
         }
-        for mutation in &self.secret_mutations {
-            match mutation {
-                SecretMutation::Set(name, value) => {
-                    latest.secrets.insert(name.clone(), value.clone());
-                }
-                SecretMutation::Remove(name) => {
-                    latest.secrets.remove(name);
-                }
-            }
-        }
-        write_credential_file_atomic(&self.path, &latest)?;
-        self.records = latest.records;
-        self.secrets = latest.secrets;
-        self.record_mutations.clear();
-        self.secret_mutations.clear();
-        Ok(())
     }
 
     pub fn save_record_merged(&self, provider_id: &str, value: Value) -> Result<()> {
-        let mut latest = Self::open(self.path.clone())?;
-        latest.set(provider_id, value);
-        latest.save()
+        match &self.backend {
+            CredentialBackend::Vault(vault) => {
+                let mut latest = Self::from_vault(vault.clone())?;
+                latest.set(provider_id, value);
+                latest.save()
+            }
+            CredentialBackend::LegacyFile { path } => {
+                let mut latest = Self::open_legacy_file(path.clone())?;
+                latest.set(provider_id, value);
+                latest.save()
+            }
+        }
     }
 
     pub fn remove_record_merged(&self, provider_id: &str) -> Result<()> {
-        let mut latest = Self::open(self.path.clone())?;
-        latest.remove(provider_id);
-        latest.save()
+        match &self.backend {
+            CredentialBackend::Vault(vault) => {
+                let mut latest = Self::from_vault(vault.clone())?;
+                latest.remove(provider_id);
+                latest.save()
+            }
+            CredentialBackend::LegacyFile { path } => {
+                let mut latest = Self::open_legacy_file(path.clone())?;
+                latest.remove(provider_id);
+                latest.save()
+            }
+        }
     }
 
     pub fn path(&self) -> &Path {
-        &self.path
+        match &self.backend {
+            CredentialBackend::LegacyFile { path } => path,
+            CredentialBackend::Vault(_) => {
+                static FALLBACK: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+                FALLBACK.get_or_init(|| {
+                    default_path().unwrap_or_else(|| PathBuf::from("credentials.json"))
+                })
+            }
+        }
     }
+
+    /// Reload this store from its backing vault or leftover import file.
+    pub(crate) fn reopen(&self) -> Result<Self> {
+        match &self.backend {
+            CredentialBackend::Vault(vault) => Self::from_vault(vault.clone()),
+            CredentialBackend::LegacyFile { path } => Self::open_legacy_file(path.clone()),
+        }
+    }
+}
+
+fn record_kind(id: &str) -> SecretVaultKind {
+    if id.starts_with(SUBSCRIPTION_ACK_PREFIX) {
+        SecretVaultKind::SubscriptionAck
+    } else {
+        SecretVaultKind::CredentialRecord
+    }
+}
+
+fn load_from_vault(
+    vault: &SecretVault,
+) -> Result<(BTreeMap<String, Value>, BTreeMap<String, String>)> {
+    let mut records = BTreeMap::new();
+    for kind in [
+        SecretVaultKind::CredentialRecord,
+        SecretVaultKind::SubscriptionAck,
+    ] {
+        for id in vault
+            .list_item_ids(kind)
+            .map_err(|e| anyhow::anyhow!("listing credential vault items: {e}"))?
+        {
+            let secret = vault
+                .get_item(kind, &id)
+                .map_err(|e| anyhow::anyhow!("reading credential vault item: {e}"))?;
+            let value: Value = serde_json::from_slice(secret.as_slice())
+                .with_context(|| format!("parsing vault credential {id}"))?;
+            records.insert(id, value);
+        }
+    }
+    let mut secrets = BTreeMap::new();
+    for id in vault
+        .list_item_ids(SecretVaultKind::NamedSecret)
+        .map_err(|e| anyhow::anyhow!("listing named-secret vault items: {e}"))?
+    {
+        let secret = vault
+            .get_item(SecretVaultKind::NamedSecret, &id)
+            .map_err(|e| anyhow::anyhow!("reading named-secret vault item: {e}"))?;
+        let value = String::from_utf8(secret.as_slice().to_vec())
+            .with_context(|| format!("named secret {id} is not UTF-8"))?;
+        secrets.insert(id, value);
+    }
+    Ok((records, secrets))
+}
+
+fn save_mutations_to_vault(
+    vault: &SecretVault,
+    record_mutations: &[RecordMutation],
+    secret_mutations: &[SecretMutation],
+) -> Result<()> {
+    for mutation in record_mutations {
+        match mutation {
+            RecordMutation::Set(id, value) => {
+                let bytes = serde_json::to_vec(value)
+                    .with_context(|| format!("serializing credential {id}"))?;
+                vault
+                    .put_item(record_kind(id), id, &bytes)
+                    .map_err(|e| anyhow::anyhow!("writing credential vault item: {e}"))?;
+            }
+            RecordMutation::Remove(id) => {
+                vault
+                    .delete_item(record_kind(id), id)
+                    .map_err(|e| anyhow::anyhow!("deleting credential vault item: {e}"))?;
+            }
+        }
+    }
+    for mutation in secret_mutations {
+        match mutation {
+            SecretMutation::Set(name, value) => {
+                vault
+                    .put_item(SecretVaultKind::NamedSecret, name, value.as_bytes())
+                    .map_err(|e| anyhow::anyhow!("writing named-secret vault item: {e}"))?;
+            }
+            SecretMutation::Remove(name) => {
+                vault
+                    .delete_item(SecretVaultKind::NamedSecret, name)
+                    .map_err(|e| anyhow::anyhow!("deleting named-secret vault item: {e}"))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Collect strings whose JSON key is secret-shaped from a provider record.
@@ -327,9 +501,9 @@ fn open_private_lock_file(path: &Path) -> Result<std::fs::File> {
     let parent = path.parent().ok_or_else(|| {
         anyhow::anyhow!("credential lock {} has no parent directory", path.display())
     })?;
-    let name = path.file_name().ok_or_else(|| {
-        anyhow::anyhow!("credential lock {} has no file name", path.display())
-    })?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("credential lock {} has no file name", path.display()))?;
     let file = crate::private_fs::open_private_file_at(
         parent,
         name,
@@ -616,5 +790,273 @@ mod tests {
         env.set_var("XDG_STATE_HOME", tmp.path());
         let path = default_path().unwrap();
         assert!(path.starts_with(tmp.path()));
+    }
+
+    fn test_vault() -> (tempfile::TempDir, crate::db::Db, Arc<SecretVault>) {
+        // Open without unify_remaining_stores: boot would no-op-activate an
+        // empty credentials store and hide fail-closed import faults.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = crate::db::Db::open(&tmp.path().join("cockpit.db")).unwrap();
+        let installation = db
+            .blocking_write_for_sync_maintenance(
+                crate::db::installation_identity::ensure_installation_identity_conn,
+            )
+            .unwrap();
+        let kek = Arc::new(crate::secure_key::MemoryKekStore::new(
+            cockpit_proto::SecretStorePlacement::Database,
+        ));
+        let vault = crate::secure_key::SecretVault::initialize(db.clone(), kek, installation, 1, 1)
+            .unwrap();
+        (tmp, db, Arc::new(vault))
+    }
+
+    #[test]
+    fn import_credentials_json_then_delete_file() {
+        let (tmp, _db, vault) = test_vault();
+        let path = tmp.path().join("credentials.json");
+        let mut seed = CredentialStore::open(path.clone()).unwrap();
+        seed.set(
+            "flycockpit",
+            serde_json::json!({
+                "server_url": "https://app.example",
+                "instance_id": "inst",
+                "instance_token": "fci_import_token",
+                "account": {"user_id": "u", "email": "u@example.test"}
+            }),
+        );
+        seed.set(
+            "codex-oauth",
+            serde_json::json!({
+                "access_token": "access-import-token",
+                "refresh_token": "refresh-import-token"
+            }),
+        );
+        seed.set_named_secret("provider-header", "named-import-secret");
+        seed.set(
+            "subscription-oauth-ack:codex-oauth",
+            serde_json::json!(true),
+        );
+        seed.save().unwrap();
+        assert!(path.exists());
+
+        crate::secure_key::import_credentials_from_path(
+            &vault,
+            &path,
+            &crate::secure_key::VaultFault::default(),
+        )
+        .unwrap();
+        assert!(
+            !path.exists(),
+            "credentials.json must be deleted after activate"
+        );
+
+        let store = CredentialStore::from_vault(vault).unwrap();
+        assert_eq!(
+            store
+                .get("flycockpit")
+                .and_then(|v| v.get("instance_token"))
+                .and_then(|v| v.as_str()),
+            Some("fci_import_token")
+        );
+        assert_eq!(
+            store
+                .get("codex-oauth")
+                .and_then(|v| v.get("refresh_token"))
+                .and_then(|v| v.as_str()),
+            Some("refresh-import-token")
+        );
+        assert_eq!(
+            store.named_secret("provider-header"),
+            Some("named-import-secret")
+        );
+        assert_eq!(
+            store
+                .get("subscription-oauth-ack:codex-oauth")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn import_credentials_fails_closed_before_activation() {
+        let (tmp, db, vault) = test_vault();
+        let path = tmp.path().join("credentials.json");
+        let mut seed = CredentialStore::open(path.clone()).unwrap();
+        seed.set_api_key("p", "secret-to-keep-on-disk");
+        seed.save().unwrap();
+
+        let err = crate::secure_key::import_credentials_from_path(
+            &vault,
+            &path,
+            &crate::secure_key::VaultFault::at(
+                crate::secure_key::VaultFaultPoint::BeforeActivation,
+            ),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("injected vault fault"));
+        assert!(
+            path.exists(),
+            "file must remain when activation never commits"
+        );
+        let authoritative = crate::secure_key::store_is_vault_authoritative(
+            &db,
+            cockpit_db::secret_vault::SecretVaultStore::Credentials,
+        )
+        .unwrap();
+        assert!(!authoritative, "vault must not become authoritative");
+    }
+
+    #[test]
+    fn import_credentials_resumes_after_activation() {
+        let (tmp, _db, vault) = test_vault();
+        let path = tmp.path().join("credentials.json");
+        let mut seed = CredentialStore::open(path.clone()).unwrap();
+        seed.set_api_key("p", "resume-after-activate");
+        seed.save().unwrap();
+
+        crate::secure_key::import_credentials_from_path(
+            &vault,
+            &path,
+            &crate::secure_key::VaultFault::at(crate::secure_key::VaultFaultPoint::AfterActivation),
+        )
+        .unwrap_err();
+        assert!(path.exists(), "source leftover after activation crash");
+
+        crate::secure_key::resume_credentials_import_after_activation(
+            &vault,
+            &path,
+            &crate::secure_key::VaultFault::default(),
+        )
+        .unwrap();
+        assert!(
+            !path.exists(),
+            "resume after activate deletes leftover file"
+        );
+        let store = CredentialStore::from_vault(vault).unwrap();
+        assert_eq!(store.api_key("p").as_deref(), Some("resume-after-activate"));
+    }
+
+    #[test]
+    fn import_credentials_activation_txn_rollback() {
+        let (tmp, db, vault) = test_vault();
+        let path = tmp.path().join("credentials.json");
+        let mut seed = CredentialStore::open(path.clone()).unwrap();
+        seed.set_api_key("p", "rollback-token");
+        seed.save().unwrap();
+
+        let err = crate::secure_key::import_credentials_from_path(
+            &vault,
+            &path,
+            &crate::secure_key::VaultFault::at(
+                crate::secure_key::VaultFaultPoint::InsideActivation,
+            ),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("injected vault fault"));
+        assert!(path.exists());
+        let authoritative = crate::secure_key::store_is_vault_authoritative(
+            &db,
+            cockpit_db::secret_vault::SecretVaultStore::Credentials,
+        )
+        .unwrap();
+        assert!(!authoritative);
+    }
+
+    #[test]
+    fn import_credentials_resumes_after_source_delete() {
+        let (tmp, _db, vault) = test_vault();
+        let path = tmp.path().join("credentials.json");
+        let mut seed = CredentialStore::open(path.clone()).unwrap();
+        seed.set_api_key("p", "after-delete");
+        seed.save().unwrap();
+
+        crate::secure_key::import_credentials_from_path(
+            &vault,
+            &path,
+            &crate::secure_key::VaultFault::at(
+                crate::secure_key::VaultFaultPoint::AfterSourceDelete,
+            ),
+        )
+        .unwrap_err();
+        assert!(!path.exists(), "source already deleted");
+
+        crate::secure_key::resume_credentials_import_after_activation(
+            &vault,
+            &path,
+            &crate::secure_key::VaultFault::default(),
+        )
+        .unwrap();
+        let store = CredentialStore::from_vault(vault).unwrap();
+        assert_eq!(store.api_key("p").as_deref(), Some("after-delete"));
+    }
+
+    #[test]
+    fn credentials_json_not_recreated_after_vault_activate() {
+        let (tmp, _db, vault) = test_vault();
+        let path = tmp.path().join("credentials.json");
+        let mut seed = CredentialStore::open(path.clone()).unwrap();
+        seed.set_api_key("p", "initial");
+        seed.save().unwrap();
+        crate::secure_key::import_credentials_from_path(
+            &vault,
+            &path,
+            &crate::secure_key::VaultFault::default(),
+        )
+        .unwrap();
+        assert!(!path.exists());
+
+        let mut store = CredentialStore::from_vault(vault).unwrap();
+        store.set_api_key("p", "updated-after-activate");
+        store.set_named_secret("extra", "named-after-activate");
+        store.save().unwrap();
+        assert!(!path.exists(), "save must not recreate credentials.json");
+        assert!(!path.with_extension("json.lock").exists());
+        let parent = path.parent().unwrap();
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                assert!(
+                    !name.contains("credentials.json"),
+                    "production save recreated {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn production_credentials_and_flycockpit_do_not_recreate_json_after_activate() {
+        let credentials_src = include_str!("credentials.rs");
+        assert!(
+            credentials_src.contains("from_vault"),
+            "production constructor is from_vault"
+        );
+        assert!(
+            credentials_src.contains("#[cfg(any(test, feature = \"test-support\"))]")
+                && credentials_src.contains("pub fn open(path: PathBuf)"),
+            "path-open must stay cfg-gated so production cannot recreate credentials.json"
+        );
+        // Split the needle so this assertion does not match itself.
+        let vault_save_writes_json = credentials_src.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed.contains("CredentialBackend::Vault")
+                && trimmed.contains("write_credential_file_atomic")
+        }) || credentials_src.contains(&format!(
+            "{}{}",
+            "write_credential_file_atomic(&self.", "path"
+        ));
+        assert!(
+            !vault_save_writes_json,
+            "vault save must not write the JSON path"
+        );
+        let flycockpit_src = include_str!("../../../apps/cli/src/commands/flycockpit.rs");
+        assert!(
+            !flycockpit_src.contains("store_credential_via_daemon_or_direct"),
+            "Flycockpit direct-file fallback must be gone"
+        );
+        assert!(
+            !flycockpit_src.contains("falling back to direct credential file write"),
+            "Flycockpit must fail closed instead of writing credentials.json"
+        );
     }
 }

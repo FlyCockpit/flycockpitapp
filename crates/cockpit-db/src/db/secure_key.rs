@@ -1,8 +1,10 @@
 //! SQLite coordination for the daemon-owned native secure key store.
 //!
-//! Key bytes never live here — only version/saga/reference metadata and safe
-//! digests. Consumer ciphertext tables integrate via transaction-scoped
-//! reference methods on the same connection.
+//! Coordination tables (`secure_key_namespaces`, `secure_key_versions`, sagas,
+//! refs) never hold key bytes — only version/saga/reference metadata and safe
+//! digests. Vault tables (`secret_vault_*`) hold **AEAD ciphertext and wrapped
+//! DEKs only**. KEK bytes never live in SQLite. Consumer ciphertext tables
+//! integrate via transaction-scoped reference methods on the same connection.
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;

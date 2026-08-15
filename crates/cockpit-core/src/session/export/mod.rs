@@ -417,6 +417,7 @@ pub async fn build_bundle_zip_bytes(
 ) -> Result<BundleBytes> {
     let db_for_files = db.clone();
     let target_id = target.session_id;
+    let vault = export_vault(db)?;
     db.read(move |conn| {
         let env = process_env_map();
         assemble_bundle_snapshot_conn(
@@ -428,6 +429,7 @@ pub async fn build_bundle_zip_bytes(
                 redacted: true,
             },
             &env,
+            Some(&vault),
         )
     })
     .await
@@ -464,6 +466,7 @@ pub async fn build_bundle_zip_bytes_raw_local(
                 redacted: false,
             },
             &env,
+            None,
         )
     })
     .await
@@ -523,6 +526,7 @@ pub fn write_bundle_zip_blocking_for_sync_cli(
 
     let db_for_files = db.clone();
     let target_id = target.session_id;
+    let vault = export_vault(db)?;
     let bundle = db.blocking_for_sync_cli(move |conn| {
         let env = process_env_map();
         assemble_bundle_snapshot_conn(
@@ -534,6 +538,7 @@ pub fn write_bundle_zip_blocking_for_sync_cli(
                 redacted: true,
             },
             &env,
+            Some(&vault),
         )
     })?;
 
@@ -596,8 +601,17 @@ fn assemble_bundle_snapshot_conn(
     target_id: Uuid,
     options: ExportBundleOptions,
     env: &HashMap<String, String>,
+    vault: Option<&crate::secure_key::SecretVault>,
 ) -> Result<BundleBytes> {
-    assemble_bundle_snapshot_conn_with_after_collect(db, conn, target_id, options, env, || Ok(()))
+    assemble_bundle_snapshot_conn_with_after_collect(
+        db,
+        conn,
+        target_id,
+        options,
+        env,
+        vault,
+        || Ok(()),
+    )
 }
 
 fn assemble_bundle_snapshot_conn_with_after_collect<F>(
@@ -606,6 +620,7 @@ fn assemble_bundle_snapshot_conn_with_after_collect<F>(
     target_id: Uuid,
     options: ExportBundleOptions,
     env: &HashMap<String, String>,
+    vault: Option<&crate::secure_key::SecretVault>,
     after_collect: F,
 ) -> Result<BundleBytes>
 where
@@ -626,7 +641,8 @@ where
     // bundle discovery but before the export's later event/manifest queries.
     after_collect()?;
 
-    let bytes = build_zip_with_options_and_env_conn(db, &tx, &target, &bundle, options, env)?;
+    let bytes =
+        build_zip_with_options_and_env_conn(db, &tx, &target, &bundle, options, env, vault)?;
     let summary = BundleSummary {
         session_count: bundle.len(),
         byte_len: bytes.len(),
@@ -782,6 +798,11 @@ async fn build_zip_with_options_and_env(
     let target = target.clone();
     let bundle = bundle.to_vec();
     let env = env.clone();
+    let vault = if options.redacted {
+        Some(export_vault(db)?)
+    } else {
+        None
+    };
     let trust_policy = crate::config::trust::current_workspace_trust_policy();
     db.read(move |conn| {
         let build = || {
@@ -792,6 +813,7 @@ async fn build_zip_with_options_and_env(
                 &bundle,
                 options,
                 &env,
+                vault.as_deref(),
             )
         };
         match trust_policy {
@@ -809,12 +831,13 @@ fn build_zip_with_options_and_env_conn(
     bundle: &[SessionRow],
     options: ExportBundleOptions,
     env: &HashMap<String, String>,
+    vault: Option<&crate::secure_key::SecretVault>,
 ) -> Result<Vec<u8>> {
     let export_redactor = if options.redacted {
         // Non-bypassable default: the enforced table unioned across every
-        // bundled session's persisted redaction-table union. Fails closed if a
-        // persisted table cannot be parsed.
-        export_redaction_table_for_bundle(target, bundle, env)?
+        // bundled session's persisted redaction-table union (column or vault).
+        // Fails closed if a persisted or vault table cannot be parsed.
+        export_redaction_table_for_bundle(vault, Some(conn), target, bundle, env)?
     } else {
         // Explicit local raw export: a no-op table so every member body and
         // member path is emitted exactly as stored. No journal rehydration and
@@ -1709,30 +1732,42 @@ pub fn process_env_map_for_conn() -> HashMap<String, String> {
     process_env_map()
 }
 
-/// Build the export redaction table for a single session inside a read
-/// connection. This is the same non-bypassable redactor used by the debug ZIP
-/// path; the transcript JSON export shares it so both artifacts consume one
-/// portable redaction policy.
+/// Build the export redaction table for a single session. This is the same
+/// non-bypassable redactor used by the debug ZIP path; the transcript JSON
+/// export shares it so both artifacts consume one portable redaction policy.
 ///
 /// The table is built from the target session's project root (its live
 /// dotenv / SSH-key / stored-credential scan) and the environment map passed
-/// in, unioned with the session's own persisted redaction-table union
-/// (`SessionRow::redaction_table_json`), and returned as the **enforced** view
-/// so `redact.enabled = false` never disables export scrubbing and the
-/// inference-time provider-trust decision never relaxes it. Fails closed if the
-/// persisted table JSON cannot be parsed.
+/// in, unioned with the session's persisted redaction-table union (the
+/// `sessions.redaction_table_json` column, or the `redaction_table` vault item
+/// after activation), and returned as the **enforced** view so
+/// `redact.enabled = false` never disables export scrubbing and the
+/// inference-time provider-trust decision never relaxes it. Fails closed if
+/// the persisted or vault JSON cannot be parsed.
 ///
 /// NOTE: `protected_redaction_history` journal rows are not yet folded in here.
 /// Doing so requires threading a `RedactionKeyResolver` through the export read
 /// transaction (and, for the RPC path, moving transcript assembly out of
 /// dispatch); that journal-backed inventory is a follow-up. Rotated/deleted
 /// secrets are covered here only insofar as they remain in the persisted union.
+pub fn redaction_table_for_session(
+    db: &Db,
+    target: &SessionRow,
+    env: &HashMap<String, String>,
+) -> Result<RedactionTable> {
+    let vault = export_vault(db)?;
+    export_redaction_table_with_env(Some(vault.as_ref()), None, target, env)
+}
+
+/// Compatibility wrapper: vault load happens on `db`, not the open connection,
+/// so this must not be called while holding a `db.read` lock.
 pub fn redaction_table_for_session_conn(
+    db: &Db,
     _conn: &Connection,
     target: &SessionRow,
     env: &HashMap<String, String>,
 ) -> Result<RedactionTable> {
-    export_redaction_table_with_env(target, env)
+    redaction_table_for_session(db, target, env)
 }
 
 /// Recursively scrub every JSON string value (and nested object/array value)
@@ -1743,11 +1778,58 @@ pub fn scrub_export_json_value(value: &mut Value, redactor: &RedactionTable) {
     redact_value_for_export(value, redactor);
 }
 
+fn export_vault(db: &Db) -> Result<std::sync::Arc<crate::secure_key::SecretVault>> {
+    crate::secure_key::vault_for_db(db)
+        .map_err(|e| anyhow::anyhow!("opening vault for export redaction: {e}"))
+}
+
+fn session_persisted_or_vault_redaction_json(
+    vault: Option<&crate::secure_key::SecretVault>,
+    conn: Option<&Connection>,
+    session: &SessionRow,
+) -> Result<Option<String>> {
+    if let Some(json) = session
+        .redaction_table_json
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
+        return Ok(Some(json.to_string()));
+    }
+    let Some(vault) = vault else {
+        return Ok(None);
+    };
+    let item_id = crate::secure_key::redaction_table_item_id(&session.session_id.to_string());
+    let loaded = match conn {
+        Some(conn) => vault.get_item_on_conn(
+            conn,
+            cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
+            &item_id,
+        ),
+        None => vault.get_item(
+            cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
+            &item_id,
+        ),
+    };
+    match loaded {
+        Ok(secret) => {
+            let json = String::from_utf8(secret.as_slice().to_vec())
+                .context("redaction table vault item is not UTF-8")?;
+            Ok(Some(json))
+        }
+        Err(crate::secure_key::SecureKeyError::NotFound(_)) => Ok(None),
+        Err(error) => Err(anyhow::anyhow!(
+            "reading redaction table vault item: {error}"
+        )),
+    }
+}
+
 fn export_redaction_table_with_env(
+    vault: Option<&crate::secure_key::SecretVault>,
+    conn: Option<&Connection>,
     target: &SessionRow,
     env: &HashMap<String, String>,
 ) -> Result<RedactionTable> {
-    export_redaction_table_for_sessions(target, std::slice::from_ref(target), env)
+    export_redaction_table_for_sessions(vault, conn, target, std::slice::from_ref(target), env)
 }
 
 /// The non-bypassable export redactor for a whole bundle: the target project's
@@ -1757,14 +1839,18 @@ fn export_redaction_table_with_env(
 /// if it has since been rotated out of the live environment. Fails closed on
 /// any unparseable persisted table.
 fn export_redaction_table_for_bundle(
+    vault: Option<&crate::secure_key::SecretVault>,
+    conn: Option<&Connection>,
     target: &SessionRow,
     bundle: &[SessionRow],
     env: &HashMap<String, String>,
 ) -> Result<RedactionTable> {
-    export_redaction_table_for_sessions(target, bundle, env)
+    export_redaction_table_for_sessions(vault, conn, target, bundle, env)
 }
 
 fn export_redaction_table_for_sessions(
+    vault: Option<&crate::secure_key::SecretVault>,
+    conn: Option<&Connection>,
     target: &SessionRow,
     sessions: &[SessionRow],
     env: &HashMap<String, String>,
@@ -1774,12 +1860,12 @@ fn export_redaction_table_for_sessions(
     let mut table = RedactionTable::build_with_env_and_store(&extended.redact, &cwd, env)
         .context("building export redaction table")?;
     for session in sessions {
-        let Some(json) = session.redaction_table_json.as_deref() else {
+        let Some(json) = session_persisted_or_vault_redaction_json(vault, conn, session)? else {
             continue;
         };
-        // Fail closed: a persisted table that cannot be parsed aborts the
-        // export rather than silently dropping historically-classified secrets.
-        let persisted = RedactionTable::from_persisted_json(json).with_context(|| {
+        // Fail closed: a persisted or vault table that cannot be parsed aborts
+        // the export rather than silently dropping historically-classified secrets.
+        let persisted = RedactionTable::from_persisted_json(&json).with_context(|| {
             format!(
                 "parsing persisted redaction table for session {}",
                 session.session_id

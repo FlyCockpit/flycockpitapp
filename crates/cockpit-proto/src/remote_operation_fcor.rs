@@ -327,6 +327,11 @@ canonical_unit_enum16!(crate::LeakRotationState, {
     Rotated = 3,
     NotApplicable = 4,
 });
+canonical_unit_enum16!(crate::SecretStorePlacement, {
+    Unavailable = 1,
+    Database = 2,
+    Keyring = 3,
+});
 
 macro_rules! canonical_struct {
     ($ty:ty, $value:ident, $out:ident, [$($field:ident),+ $(,)?]) => {

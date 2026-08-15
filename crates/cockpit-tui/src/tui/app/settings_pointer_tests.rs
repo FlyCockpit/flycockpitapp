@@ -307,6 +307,7 @@ pub(crate) fn run_tui_button_pointer_dispatch_matrix() {
                     sandbox_mode: app.sandbox_mode,
                     container_network_enabled: app.container_network_enabled,
                     container_availability: app.container_availability.clone(),
+                    host_capabilities: app.host_capabilities.clone(),
                     approval_mode: app.approval_mode,
                     active_model: None,
                     prompt_cache_retention: Default::default(),

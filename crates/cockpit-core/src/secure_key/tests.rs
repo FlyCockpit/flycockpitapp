@@ -26,8 +26,8 @@ use super::namespace::{
     manifest_account, version_account,
 };
 use super::platform::{
-    last_set_default_thread_name, platform_link_token, platform_store_kind,
-    reachable_native_store_crate, registration_order_snapshot, reset_registration_order_for_test,
+    platform_link_token, platform_store_kind, reachable_native_store_crate,
+    registration_order_snapshot, reset_registration_order_for_test,
     set_test_skip_real_default_store,
 };
 use super::worker::Worker;
@@ -1401,30 +1401,37 @@ fn secure_key_platform_compile_and_fake_injection() {
     assert!(store.call_counts().0 >= 1);
     actor.shutdown();
 
-    // Production path: registration runs on the dedicated actor OS thread
-    // (TEST_SKIP_REAL_DEFAULT avoids real OS keyring), then intake, then drain/unset.
+    // First-run production is always database: no platform store registration.
     reset_registration_order_for_test();
     set_test_skip_real_default_store(true);
-    let db = Db::open_in_memory().unwrap();
-    let actor = SecureKeyActor::start_production(db).unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+    let kek = std::sync::Arc::new(super::MemoryKekStore::new(
+        cockpit_proto::SecretStorePlacement::Database,
+    ));
+    let actor = SecureKeyActor::start_production_resolved(
+        db,
+        std::sync::Arc::new(super::FailClosedReconciler),
+        &crate::secure_key::KeyringProbeResult {
+            state: cockpit_proto::FeatureCapabilityState::Available,
+            reason: "injected available".into(),
+            fix_command: None,
+            remedy_text: None,
+        },
+        Some(tmp.path().join("secret-vault")),
+        super::SecretStoreInjected {
+            file_kek: Some(kek),
+            keyring_kek: None,
+            legacy_keyring: None,
+        },
+    )
+    .unwrap();
     let snap_mid = registration_order_snapshot();
-    assert!(
-        snap_mid.set_default_at > 0 && snap_mid.actor_intake_at > snap_mid.set_default_at,
-        "set_default must precede actor intake: {snap_mid:?}"
-    );
     assert_eq!(
-        last_set_default_thread_name().as_deref(),
-        Some("cockpit-secure-key"),
-        "set_default_platform_store must run on actor OS thread"
+        snap_mid.set_default_at, 0,
+        "first-run database must not register the platform store: {snap_mid:?}"
     );
     actor.shutdown();
-    let snap = registration_order_snapshot();
-    assert!(
-        snap.drain_complete_at > 0
-            && snap.unset_default_at > snap.drain_complete_at
-            && snap.drain_complete_at > snap.actor_intake_at,
-        "drain before unset: {snap:?}"
-    );
     set_test_skip_real_default_store(false);
     reset_registration_order_for_test();
 

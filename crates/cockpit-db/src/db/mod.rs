@@ -70,6 +70,7 @@ pub mod run_invocations;
 pub mod scheduler;
 pub mod sealed_scope;
 pub mod sealed_values;
+pub mod secret_vault;
 pub mod secure_key;
 pub mod session_goals;
 pub mod session_log;
@@ -757,6 +758,14 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         name: "0003_media_resource_reservation_ledger.sql",
         sql: include_str!("migrations/0003_media_resource_reservation_ledger.sql"),
+    },
+    Migration {
+        name: "0004_secret_vault.sql",
+        sql: include_str!("migrations/0004_secret_vault.sql"),
+    },
+    Migration {
+        name: "0005_secret_vault_unification.sql",
+        sql: include_str!("migrations/0005_secret_vault_unification.sql"),
     },
 ];
 

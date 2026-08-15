@@ -564,6 +564,60 @@ fn powershell_fixture_covers_missing_localappdata_and_cleans_staging() {
     assert!(fs::read_dir(s).unwrap().next().is_none());
 }
 
+fn extract_capability_prerequisite_ids(text: &str) -> std::collections::BTreeSet<String> {
+    let mut ids = std::collections::BTreeSet::new();
+    for prefix in ["security.", "safety.", "container.", "media."] {
+        let mut rest = text;
+        while let Some(offset) = rest.find(prefix) {
+            let slice = &rest[offset..];
+            let end = slice
+                .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '_' || c == '-'))
+                .unwrap_or(slice.len());
+            let id = &slice[..end];
+            if id.bytes().filter(|b| *b == b'.').count() == 1 {
+                ids.insert(id.to_string());
+            }
+            rest = &slice[prefix.len()..];
+        }
+    }
+    ids
+}
+
+#[test]
+fn capability_prerequisite_subset_set_equality() {
+    use std::collections::BTreeSet;
+    const TOML: &str = include_str!("../runtime-prerequisites.toml");
+    const NOTICE: &str = include_str!("../generated/runtime-prerequisites.txt");
+    let expected: BTreeSet<String> = [
+        "security.keyring",
+        "safety.bubblewrap",
+        "container.docker",
+        "container.podman",
+        "media.ffmpeg",
+        "media.ffprobe",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    let marked: BTreeSet<String> = cockpit_core::external_runtime::RUNTIME_PREREQUISITE_IDS
+        .iter()
+        .map(|id| (*id).to_string())
+        .collect();
+    let toml_ids = extract_capability_prerequisite_ids(TOML);
+    let docs_ids = extract_capability_prerequisite_ids(DOCS);
+    let notice_ids = extract_capability_prerequisite_ids(NOTICE);
+    assert_eq!(marked, expected, "RUNTIME_PREREQUISITE_IDS drifted");
+    assert_eq!(toml_ids, expected, "TOML capability IDs drifted");
+    assert_eq!(docs_ids, expected, "generated docs capability IDs drifted");
+    assert_eq!(notice_ids, expected, "installer notice capability IDs drifted");
+    assert_eq!(marked.len(), 6);
+    assert!(DOCS.contains("Linux-only"));
+    assert!(DOCS.contains("effective") && DOCS.contains("Off"));
+    assert!(DOCS.to_ascii_lowercase().contains("silent"));
+    assert!(!DOCS.contains("Cockpit does not use an OS keyring"));
+    assert!(!DOCS.to_ascii_lowercase().contains("plaintext json"));
+}
+
 #[test]
 fn runtime_docs_catalog_drift() {
     for value in [

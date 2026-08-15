@@ -51,9 +51,9 @@
     }
   ],
   "counts": {
-    "event": 76,
-    "request": 141,
-    "response": 92
+    "event": 77,
+    "request": 144,
+    "response": 93
   },
   "messages": {
     "event": [
@@ -512,6 +512,12 @@
         "inlinePayloadBound": "bounded",
         "lane": "control",
         "tag": "waiting_for_lock"
+      },
+      {
+        "class": "bounded_event",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "host_capabilities_changed"
       }
     ],
     "request": [
@@ -1263,6 +1269,24 @@
         "class": "bounded_request_response",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
+        "tag": "get_host_capabilities"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "refresh_host_capabilities"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "migrate_kek_placement"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
         "tag": "operation_status"
       },
       {
@@ -1836,6 +1860,12 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "remote_operation_status"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "host_capabilities"
       },
       {
         "class": "bounded_request_response",

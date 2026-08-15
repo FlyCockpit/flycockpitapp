@@ -25,13 +25,21 @@ async fn resolvable_with_literal(fixture: &SealedFixture, record_id: SealedRecor
         return false;
     }
     let Some(raw) = row.compartment_key.as_deref() else {
-        // Session scope: literal lives in SQLite alongside the record.
-        return fixture
-            .db
-            .sealed_session_literal_for_action(record_id.to_string(), row.active_version)
-            .await
-            .expect("session literal read")
-            .is_some();
+        // Session scope: literal lives in the wrap-key vault; metadata stays in SQLite.
+        let Some(vault) = fixture.compartment.vault() else {
+            return false;
+        };
+        let item_id = crate::secure_key::session_sealed_item_id(
+            &row.scope_key,
+            &row.name,
+            row.active_version,
+        );
+        return vault
+            .get_item(
+                cockpit_db::secret_vault::SecretVaultKind::SessionSealedValue,
+                &item_id,
+            )
+            .is_ok();
     };
     let key = SealedCompartmentKey::parse(raw).expect("locator parses");
     fixture
@@ -625,8 +633,8 @@ async fn sealed_cross_store_lifecycle_sagas() {
         // A claim pinned to v1 is denied, not silently handed the v2 literal.
         assert!(
             fixture
-                .db
-                .sealed_session_literal_for_action(seeded.record_id.to_string(), 1)
+                .directory()
+                .session_literal_for_action(owner, seeded.record_id.to_string(), 1)
                 .await
                 .expect("session literal read")
                 .is_none(),
@@ -635,8 +643,8 @@ async fn sealed_cross_store_lifecycle_sagas() {
         // v2 still resolves for a caller that claimed v2.
         assert_eq!(
             fixture
-                .db
-                .sealed_session_literal_for_action(seeded.record_id.to_string(), 2)
+                .directory()
+                .session_literal_for_action(owner, seeded.record_id.to_string(), 2)
                 .await
                 .expect("session literal read")
                 .as_deref(),
@@ -682,9 +690,8 @@ async fn sealed_cross_store_lifecycle_sagas() {
             .expect("session rotate");
         assert_eq!(rotated.version, 2);
         assert_eq!(
-            fixture
-                .db
-                .sealed_session_literal_for_action(seeded.record_id.to_string(), 2)
+            directory
+                .session_literal_for_action(owner, seeded.record_id.to_string(), 2)
                 .await
                 .expect("session literal read")
                 .as_deref(),
@@ -698,9 +705,8 @@ async fn sealed_cross_store_lifecycle_sagas() {
                 .expect("session delete")
         );
         assert!(
-            fixture
-                .db
-                .sealed_session_literal_for_action(seeded.record_id.to_string(), 2)
+            directory
+                .session_literal_for_action(owner, seeded.record_id.to_string(), 2)
                 .await
                 .expect("session literal read")
                 .is_none(),

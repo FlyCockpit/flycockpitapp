@@ -3305,3 +3305,110 @@ mod image_generation {
         );
     }
 }
+
+#[test]
+fn extended_config_ignores_secret_store_key() {
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(project.join(".cockpit")).unwrap();
+    std::fs::write(
+        project.join(".cockpit/config.json"),
+        r#"{"secretStore":"keyring","name":"kept"}"#,
+    )
+    .unwrap();
+    let cfg = trusted_load_for_cwd(&project);
+    assert_eq!(cfg.name.as_deref(), Some("kept"));
+    let serialized = serde_json::to_value(&cfg).unwrap();
+    assert!(
+        serialized.get("secretStore").is_none(),
+        "secretStore must not exist on ExtendedConfig: {serialized}"
+    );
+    let doc = ExtendedConfigDoc::load(&project.join(".cockpit/config.json")).unwrap();
+    assert!(doc.raw_field("secretStore").is_none());
+    let mut doc = doc;
+    doc.write(&cfg).unwrap();
+    let raw: Value = serde_json::from_str(
+        &std::fs::read_to_string(project.join(".cockpit/config.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(raw.get("secretStore").is_none());
+    assert_eq!(raw["name"], "kept");
+}
+
+#[test]
+fn two_projects_conflicting_layered_secret_store_cannot_override_authority() {
+    let tmp = TempDir::new().unwrap();
+    let db = crate::db::Db::open(&tmp.path().join("cockpit.db")).unwrap();
+    db.blocking_write_for_sync_maintenance(|conn| {
+        crate::db::secret_vault::upsert_authority_conn(
+            conn,
+            crate::db::secret_vault::SecretVaultPlacement::Database,
+            crate::db::secret_vault::SecretVaultPlacement::Database,
+            "fingerprint",
+            1,
+            1,
+            false,
+        )
+    })
+    .unwrap();
+
+    let project_a = tmp.path().join("a");
+    let project_b = tmp.path().join("b");
+    std::fs::create_dir_all(project_a.join(".cockpit")).unwrap();
+    std::fs::create_dir_all(project_b.join(".cockpit")).unwrap();
+    std::fs::write(
+        project_a.join(".cockpit/config.json"),
+        r#"{"secretStore":"keyring"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project_b.join(".cockpit/config.json"),
+        r#"{"secretStore":"database"}"#,
+    )
+    .unwrap();
+    let _ = trusted_load_for_cwd(&project_a);
+    let _ = trusted_load_for_cwd(&project_b);
+    let row = db
+        .blocking_write_for_sync_maintenance(crate::db::secret_vault::load_authority_conn)
+        .unwrap()
+        .expect("authority");
+    assert_eq!(
+        row.active_placement,
+        crate::db::secret_vault::SecretVaultPlacement::Database
+    );
+    assert_eq!(
+        row.intent,
+        crate::db::secret_vault::SecretVaultPlacement::Database
+    );
+}
+
+#[test]
+fn remote_layer_cannot_force_secret_store_downgrade() {
+    let tmp = TempDir::new().unwrap();
+    let db = crate::db::Db::open(&tmp.path().join("cockpit.db")).unwrap();
+    db.blocking_write_for_sync_maintenance(|conn| {
+        crate::db::secret_vault::upsert_authority_conn(
+            conn,
+            crate::db::secret_vault::SecretVaultPlacement::Keyring,
+            crate::db::secret_vault::SecretVaultPlacement::Keyring,
+            "fingerprint",
+            1,
+            1,
+            false,
+        )
+    })
+    .unwrap();
+    let remote = ExtendedConfigDoc::from_remote_layer(serde_json::json!({
+        "secretStore": "database",
+        "name": "remote"
+    }));
+    assert!(remote.raw_field("secretStore").is_none());
+    let row = db
+        .blocking_write_for_sync_maintenance(crate::db::secret_vault::load_authority_conn)
+        .unwrap()
+        .expect("authority");
+    assert_eq!(
+        row.active_placement,
+        crate::db::secret_vault::SecretVaultPlacement::Keyring
+    );
+}

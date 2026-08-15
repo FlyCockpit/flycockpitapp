@@ -476,11 +476,11 @@ pub struct SecureKeyActor {
 }
 
 impl SecureKeyActor {
-    /// Production composition: ensure identity, then spawn the dedicated actor
-    /// OS thread which constructs/registers the platform store (set_default)
-    /// before intake. Call under the daemon single-instance lock.
+    /// Production composition: resolve KEK placement (first-run is always
+    /// database), start the wrap-key vault, then spawn the dedicated actor
+    /// thread. Call under the daemon single-instance lock.
     pub fn start_production(db: Db) -> Result<Self, SecureKeyError> {
-        Self::start_inner(db, None, Arc::new(FailClosedReconciler), true)
+        Self::start_production_with_reconciler(db, Arc::new(FailClosedReconciler))
     }
 
     /// Production composition with a reconciler that knows the consumer kinds
@@ -495,7 +495,40 @@ impl SecureKeyActor {
         db: Db,
         reconciler: Arc<dyn ConsumerReconciler>,
     ) -> Result<Self, SecureKeyError> {
-        Self::start_inner(db, None, reconciler, true)
+        Self::start_production_resolved(
+            db,
+            reconciler,
+            &super::platform::probe_platform_keyring(),
+            None,
+            super::resolve::SecretStoreInjected::default(),
+        )
+    }
+
+    /// Shared boot path for daemon and `cockpit ask`. First-run always persists
+    /// database placement; does not construct the platform store a second time.
+    pub fn start_production_resolved(
+        db: Db,
+        reconciler: Arc<dyn ConsumerReconciler>,
+        keyring_probe: &super::platform::KeyringProbeResult,
+        kek_dir: Option<std::path::PathBuf>,
+        injected: super::resolve::SecretStoreInjected,
+    ) -> Result<Self, SecureKeyError> {
+        let kek_dir = match kek_dir {
+            Some(dir) => dir,
+            None => super::resolve::kek_dir_for_db(&db)?,
+        };
+        let effective =
+            super::resolve::ensure_secret_vault(&db, keyring_probe, &kek_dir, injected)?;
+        let owns_default_store =
+            effective.placement == cockpit_proto::SecretStorePlacement::Keyring;
+        Self::start_inner(
+            db,
+            Some(Box::new(super::vault_store::VaultNativeStore::new(
+                effective.vault,
+            ))),
+            reconciler,
+            owns_default_store,
+        )
     }
 
     /// Test/injection path: never registers or unsets the process-global default store.

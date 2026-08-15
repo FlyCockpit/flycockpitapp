@@ -39,6 +39,7 @@ pub mod git;
 pub mod gitignore;
 pub mod goal_scratch;
 pub mod harness;
+pub mod host_capabilities;
 pub mod image_generation;
 pub mod image_generation_agent_tools;
 pub mod image_generation_artifact_routes;

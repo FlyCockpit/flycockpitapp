@@ -1,9 +1,10 @@
 //! Versioned spool HMAC key material.
 //!
-//! Keys come from the daemon-owned native secure store through a journal
-//! consumer reference. They are exactly 32 bytes and never appear in SQLite,
-//! filenames, spool bytes, logs, export, or diagnostics: this module resolves
-//! them once into a memory-only ring and hands out borrows.
+//! Keys come from the daemon-owned wrap-key vault through a journal consumer
+//! reference. They are exactly 32 bytes. No plaintext key, DEK, or KEK bytes
+//! appear in SQLite coordination tables, filenames, spool bytes, logs, export,
+//! or diagnostics: this module resolves them once into a memory-only ring and
+//! hands out borrows. Vault tables may hold AEAD ciphertext of the same root.
 //!
 //! The consumer-reference lifecycle is the load-bearing half. A version is
 //! reserved here, activated in the same SQLite transaction that writes the

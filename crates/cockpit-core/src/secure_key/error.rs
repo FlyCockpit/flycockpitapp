@@ -1,4 +1,5 @@
-//! Typed secure-key failures. No plaintext fallback.
+//! Typed secure-key failures. No plaintext secret bytes and no unwrapped KEK
+//! in SQLite; database backend is a `private_fs` file KEK plus wrap-key vault.
 
 use std::fmt;
 
@@ -38,6 +39,12 @@ pub enum SecureKeyError {
     },
     /// Internal coordination failure (safe message only).
     Internal(String),
+    /// KEK placement cannot be established. No file-KEK fallback when
+    /// `active_placement` is keyring. Messages are nonsecret.
+    KekUnavailable {
+        reason: String,
+        fix_command: Option<String>,
+    },
 }
 
 impl SecureKeyError {
@@ -55,6 +62,7 @@ impl SecureKeyError {
             Self::ActiveVersion { .. } => "ActiveVersion",
             Self::Conflict { .. } => "Conflict",
             Self::Internal(_) => "Internal",
+            Self::KekUnavailable { .. } => "KekUnavailable",
         }
     }
 }
@@ -107,6 +115,14 @@ impl fmt::Debug for SecureKeyError {
                 .field("degraded", degraded)
                 .finish(),
             Self::Internal(m) => f.debug_tuple("Internal").field(m).finish(),
+            Self::KekUnavailable {
+                reason,
+                fix_command,
+            } => f
+                .debug_struct("KekUnavailable")
+                .field("reason", reason)
+                .field("fix_command", fix_command)
+                .finish(),
         }
     }
 }
@@ -145,6 +161,13 @@ impl fmt::Display for SecureKeyError {
                 "sealed state conflict for {namespace} (generation {generation}, key v{key_version})"
             ),
             Self::Internal(m) => write!(f, "secure key internal error: {m}"),
+            Self::KekUnavailable {
+                reason,
+                fix_command,
+            } => match fix_command {
+                Some(fix) => write!(f, "KEK unavailable: {reason} ({fix})"),
+                None => write!(f, "KEK unavailable: {reason}"),
+            },
         }
     }
 }

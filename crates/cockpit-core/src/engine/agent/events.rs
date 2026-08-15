@@ -22,6 +22,9 @@ pub enum ControlRequestOutcome {
         applied_generation: u64,
         changed: bool,
     },
+    HostCapabilities {
+        snapshot: Box<crate::daemon::proto::HostCapabilitySnapshot>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -91,6 +94,12 @@ pub enum TurnEvent {
     /// TUI-inbound only — never emitted from a `TurnEvent` back onto the wire.
     ConfigSnapshot {
         snapshot: Box<crate::daemon::proto::ConfigSnapshot>,
+    },
+    /// Authoritative daemon-owned host capability snapshot. Delivered on
+    /// `GetHostCapabilities` / `RefreshHostCapabilities` / KEK migrate and
+    /// whenever the daemon republishes probes.
+    HostCapabilitiesChanged {
+        snapshot: Box<crate::daemon::proto::HostCapabilitySnapshot>,
     },
     /// Model inference started; nothing has been emitted yet. The TUI
     /// shows a "Thinking…" placeholder until the first text delta
@@ -597,6 +606,7 @@ pub enum TurnEvent {
         mode: crate::tools::sandbox_mode::SandboxMode,
         container_network_enabled: bool,
         container_availability: crate::container::ContainerAvailability,
+        persisted_intent: Option<crate::tools::sandbox_mode::SandboxMode>,
     },
 
     /// Sandbox-escalation availability changed for the live session. UI-only:

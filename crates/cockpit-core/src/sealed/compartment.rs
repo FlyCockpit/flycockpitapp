@@ -1,11 +1,13 @@
 //! The sealed-value-only credential compartment.
 //!
 //! Project and Global literals live here, **not** in the generic named-secret
-//! namespace of [`crate::credentials::CredentialStore`]. Keeping them in a
-//! separate file with a separate API is what makes the non-enumeration claim
-//! structural rather than conventional: there is no list, count, prefix,
-//! existence, status, debug, doctor, or export path into this compartment.
-//! The entire read surface is one exact-key lookup.
+//! namespace of [`crate::credentials::CredentialStore`]. After vault
+//! unification they are wrap-key vault items (`sealed_compartment`), keyed by
+//! the same opaque locator. Non-enumeration is structural: there is no list,
+//! count, prefix, existence, status, debug, doctor, or export path into this
+//! compartment, and `SecretVault::list_item_ids` refuses this kind. The entire
+//! read surface is one exact-key lookup. A leftover `sealed-compartment.json`
+//! is import-only and is deleted after a verified activation.
 //!
 //! Keys are random opaque 32-byte values drawn from the OS CSPRNG. A key is a
 //! *locator*, never key material and never derived from the literal, so
@@ -16,10 +18,14 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use cockpit_db::secret_vault::SecretVaultKind;
 use rand::Rng;
 use zeroize::Zeroizing;
+
+use crate::secure_key::SecretVault;
 
 /// Opaque exact key length in bytes.
 pub const SEALED_COMPARTMENT_KEY_BYTES: usize = 32;
@@ -193,26 +199,51 @@ pub fn default_compartment_path() -> Option<PathBuf> {
 #[derive(Clone)]
 pub struct SealedCompartment {
     path: PathBuf,
+    vault: Option<Arc<SecretVault>>,
 }
 
 impl SealedCompartment {
     pub fn at(path: PathBuf) -> Self {
-        Self { path }
+        Self { path, vault: None }
+    }
+
+    pub fn from_vault(vault: Arc<SecretVault>) -> Self {
+        let path =
+            default_compartment_path().unwrap_or_else(|| PathBuf::from("sealed-compartment.json"));
+        Self {
+            path,
+            vault: Some(vault),
+        }
     }
 
     pub fn open_default() -> Result<Self> {
-        let path =
-            default_compartment_path().context("could not locate $HOME for sealed compartment")?;
-        Ok(Self::at(path))
+        let db = crate::db::Db::open_default().context("opening cockpit DB for sealed vault")?;
+        let vault = crate::secure_key::vault_for_db(&db)
+            .map_err(|e| anyhow::anyhow!("opening secret vault for sealed compartment: {e}"))?;
+        Ok(Self::from_vault(vault))
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    pub(crate) fn vault(&self) -> Option<&Arc<SecretVault>> {
+        self.vault.as_ref()
+    }
+
     /// Store a literal under an exact locator. Idempotent by locator, so a
     /// resumed saga may re-run it safely.
     pub(crate) fn put(&self, key: &SealedCompartmentKey, literal: &SealedLiteral) -> Result<()> {
+        if let Some(vault) = &self.vault {
+            vault
+                .put_item(
+                    SecretVaultKind::SealedCompartment,
+                    key.as_str(),
+                    literal.expose_for_redaction().as_bytes(),
+                )
+                .map_err(|e| anyhow::anyhow!("writing sealed compartment vault item: {e}"))?;
+            return Ok(());
+        }
         let _guard = self.lock_exclusive()?;
         let mut entries = self.load()?;
         entries.insert(
@@ -227,6 +258,19 @@ impl SealedCompartment {
     /// A miss is `None` — indistinguishable from every other miss, and callers
     /// fold it into the single content-free denial rather than branching on it.
     pub(crate) fn get_exact(&self, key: &SealedCompartmentKey) -> Result<Option<SealedLiteral>> {
+        if let Some(vault) = &self.vault {
+            return match vault.get_item(SecretVaultKind::SealedCompartment, key.as_str()) {
+                Ok(secret) => {
+                    let text = String::from_utf8(secret.as_slice().to_vec())
+                        .context("sealed compartment vault item is not UTF-8")?;
+                    Ok(Some(SealedLiteral::new(text)))
+                }
+                Err(crate::secure_key::SecureKeyError::NotFound(_)) => Ok(None),
+                Err(error) => Err(anyhow::anyhow!(
+                    "reading sealed compartment vault item: {error}"
+                )),
+            };
+        }
         let _guard = self.lock_exclusive()?;
         let entries = self.load()?;
         // `SealedLiteral::new` takes ownership of a fresh `String` that it holds
@@ -247,6 +291,19 @@ impl SealedCompartment {
         &self,
         key: &SealedCompartmentKey,
     ) -> Result<Option<zeroize::Zeroizing<String>>> {
+        if let Some(vault) = &self.vault {
+            return match vault.get_item(SecretVaultKind::SealedCompartment, key.as_str()) {
+                Ok(secret) => {
+                    let text = String::from_utf8(secret.as_slice().to_vec())
+                        .context("sealed compartment vault item is not UTF-8")?;
+                    Ok(Some(Zeroizing::new(text)))
+                }
+                Err(crate::secure_key::SecureKeyError::NotFound(_)) => Ok(None),
+                Err(error) => Err(anyhow::anyhow!(
+                    "reading sealed compartment vault item: {error}"
+                )),
+            };
+        }
         let _guard = self.lock_exclusive()?;
         let mut entries = self.load()?;
         // Every loaded value is already in zeroizing custody; `remove` moves the
@@ -256,12 +313,24 @@ impl SealedCompartment {
 
     /// Reclaim one locator. Idempotent, so saga cleanup may re-run it.
     pub(crate) fn remove(&self, key: &SealedCompartmentKey) -> Result<()> {
+        if let Some(vault) = &self.vault {
+            vault
+                .delete_item(SecretVaultKind::SealedCompartment, key.as_str())
+                .map_err(|e| anyhow::anyhow!("deleting sealed compartment vault item: {e}"))?;
+            return Ok(());
+        }
         let _guard = self.lock_exclusive()?;
         let mut entries = self.load()?;
         if entries.remove(key.as_str()).is_some() {
             self.store(&entries)?;
         }
         Ok(())
+    }
+
+    /// Import-only: load leftover plaintext entries from the legacy file.
+    pub(crate) fn load_for_import(&self) -> Result<Vec<(String, Zeroizing<String>)>> {
+        let entries = self.load()?;
+        Ok(entries.into_iter().collect())
     }
 
     /// Remove orphaned temp files left by a crash between write and rename.
@@ -275,6 +344,9 @@ impl SealedCompartment {
     /// to a dead process. Only names matching this compartment's strict
     /// `<basename>.<pid>.<64 hex>.tmp` pattern are touched.
     pub(crate) fn reclaim_stale_temporaries(&self) -> Result<usize> {
+        if self.vault.is_some() && !self.path.exists() {
+            return Ok(0);
+        }
         let _guard = self.lock_exclusive()?;
         self.sweep_temporaries()
     }

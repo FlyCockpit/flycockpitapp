@@ -3440,10 +3440,11 @@ mod tests {
 
         // The external-journal schema lives entirely in `0001_initial.sql`;
         // later migrations (`0002_goal_inference_provenance`,
-        // `0003_media_resource_reservation_ledger`) add unrelated tables. Three
-        // migration files ship in this build, so the expected schema version is
-        // three. Adding a fourth migration must update this literal.
-        assert_eq!(crate::db::EXPECTED_SCHEMA_VERSION, 3);
+        // `0003_media_resource_reservation_ledger`, `0004_secret_vault`) add
+        // unrelated tables. Four migration files ship in this build, so the
+        // expected schema version is four. Adding a fifth migration must update
+        // this literal.
+        assert_eq!(crate::db::EXPECTED_SCHEMA_VERSION, 4);
 
         let db = Db::open_in_memory().unwrap();
         let tables = db

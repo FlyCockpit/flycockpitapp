@@ -60,17 +60,27 @@ pub use projection::{
     current_dependency_context_line, current_startup_dependency_policy,
     freeze_pending_as_timed_out, project_dependencies, startup_dependency_policy,
 };
+/// Capability-gated optional runtimes documented by `runtime-prerequisites.toml`.
+/// This is a closed subset of the doctor catalog (git, harnesses, LSP stay out).
+pub const RUNTIME_PREREQUISITE_IDS: &[&str] = &[
+    crate::external_runtime::safety_adapters::ID_KEYRING,
+    crate::external_runtime::safety_adapters::ID_BUBBLEWRAP,
+    crate::external_runtime::safety_adapters::ID_DOCKER,
+    crate::external_runtime::safety_adapters::ID_PODMAN,
+    crate::external_runtime::adapters::ID_MEDIA_FFMPEG,
+    crate::external_runtime::adapters::ID_MEDIA_FFPROBE,
+];
 pub use safety_adapters::{
     ContainerEngineMode, ContainerEngineSelection, ContainerRuntime as SafetyContainerRuntime,
-    FORBIDDEN_MUTATING_PROBE_VERBS, ID_BUBBLEWRAP, ID_DOCKER, ID_IMPORT, ID_PODMAN, ID_SCROT,
-    ID_XDOTOOL, ID_XVFB, bubblewrap_requirement_group, classify_container_daemon_failure,
+    FORBIDDEN_MUTATING_PROBE_VERBS, ID_BUBBLEWRAP, ID_DOCKER, ID_IMPORT, ID_KEYRING, ID_PODMAN,
+    ID_SCROT, ID_XDOTOOL, ID_XVFB, bubblewrap_requirement_group, classify_container_daemon_failure,
     computer_use_requirement_group, container_probe_argv_is_readonly, container_reason_from_health,
     container_version_evidence_is_valid, current_container_engine_mode,
     detect_container_runtime_health, ensure_container_engine_adapters_registered,
-    ensure_safety_adapters_registered, known_global_safety_adapter_ids, known_safety_adapter_ids,
-    probe_argv_forbids_mutation, publish_safety_refresh, refresh_safety_snapshot,
-    register_safety_adapters, resolve_container_engine, safety_adapter_descriptors,
-    set_container_engine_mode,
+    ensure_safety_adapters_registered, keyring_health_entry, known_global_safety_adapter_ids,
+    known_safety_adapter_ids, probe_argv_forbids_mutation, publish_safety_refresh,
+    refresh_safety_snapshot, register_safety_adapters, resolve_container_engine,
+    safety_adapter_descriptors, set_container_engine_mode,
 };
 // SystemProbeExecutor is used by container::detect_runtime production path.
 // CancelToken is re-exported above for launch-gate callers.

@@ -614,6 +614,56 @@ pub struct SettingsCx {
     /// Correlation id of a staged `SetDefaultModel`, so the app can match the
     /// terminal `DefaultModelUpdateResult` to this exact operation.
     pub(super) pending_default_model_update_id: Option<uuid::Uuid>,
+    /// Last known host-capability snapshot. Tests inject; production copies
+    /// from the App after Settings opens.
+    pub(super) host_capabilities: cockpit_proto::HostCapabilitySnapshot,
+    /// Next refresh results, consumed in order. Empty means "refresh left
+    /// the snapshot unchanged."
+    pub(super) capability_refresh_queue: Vec<cockpit_proto::HostCapabilitySnapshot>,
+    pub(super) capability_refresh_calls: usize,
+    pub(super) capability_refresh_in_flight: bool,
+    pub(super) daemon_attached: bool,
+    pub(super) pending_refresh_host_capabilities: bool,
+    pub(super) secret_store_migrate: Option<
+        std::sync::Arc<
+            dyn Fn(
+                    cockpit_proto::SecretStorePlacement,
+                ) -> Result<cockpit_proto::SecretStoreSnapshot, String>
+                + Send
+                + Sync,
+        >,
+    >,
+    pub(super) secret_store_migrate_calls: usize,
+    pub(super) dependency_refresh_calls: usize,
+    pub(super) dependency_refresh: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl SettingsCx {
+    pub(super) fn refresh_host_capabilities(&mut self) -> cockpit_proto::HostCapabilitySnapshot {
+        if self.capability_refresh_in_flight {
+            return self.host_capabilities.clone();
+        }
+        self.capability_refresh_in_flight = true;
+        self.capability_refresh_calls = self.capability_refresh_calls.saturating_add(1);
+        if self.daemon_attached {
+            self.pending_refresh_host_capabilities = true;
+            self.pending_daemon_request = Some(Request::RefreshHostCapabilities);
+        }
+        if let Some(next) = self.capability_refresh_queue.pop() {
+            self.host_capabilities = next;
+        }
+        self.capability_refresh_in_flight = false;
+        self.host_capabilities.clone()
+    }
+
+    pub(super) fn apply_host_capabilities(
+        &mut self,
+        snapshot: cockpit_proto::HostCapabilitySnapshot,
+        daemon_attached: bool,
+    ) {
+        self.host_capabilities = snapshot;
+        self.daemon_attached = daemon_attached;
+    }
 }
 
 fn root_page(cursor: usize) -> PageBox {
@@ -1615,6 +1665,16 @@ impl Dialog {
         }
     }
 
+    pub fn apply_host_capabilities(
+        &mut self,
+        snapshot: cockpit_proto::HostCapabilitySnapshot,
+        daemon_attached: bool,
+    ) {
+        if let Dialog::Settings(s) = self {
+            s.apply_host_capabilities(snapshot, daemon_attached);
+        }
+    }
+
     /// Correlation id of the default-model request most recently staged by
     /// this dialog, taken alongside the request itself.
     pub fn take_pending_default_model_update_id(&mut self) -> Option<uuid::Uuid> {
@@ -2075,6 +2135,16 @@ impl SettingsDialog {
                 pending_oauth_action: None,
                 pending_default_model_picker: false,
                 pending_default_model_update_id: None,
+                host_capabilities: crate::tui::capability_gate::empty_capability_snapshot(),
+                capability_refresh_queue: Vec::new(),
+                capability_refresh_calls: 0,
+                capability_refresh_in_flight: false,
+                daemon_attached: false,
+                pending_refresh_host_capabilities: false,
+                secret_store_migrate: None,
+                secret_store_migrate_calls: 0,
+                dependency_refresh_calls: 0,
+                dependency_refresh: None,
             },
         }
     }
@@ -2103,6 +2173,20 @@ impl SettingsDialog {
         let mut doc = ExtendedConfigDoc::load(&self.extended_path).map_err(|e| e.to_string())?;
         doc.write(&self.extended).map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn category_value_for_test(&self, id: category::SettingId) -> String {
+        self.category_value(id)
+    }
+
+    #[cfg(test)]
+    pub(super) fn enter_dependencies_for_test(&mut self) {
+        let cwd = self
+            .picker_cwd
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        self.page = dependencies_page::page_after_first_paint(cwd, self.sandbox_enabled);
     }
 
     fn enter_providers(&mut self) {
@@ -2204,11 +2288,8 @@ impl SettingsDialog {
             return Ok(0);
         }
 
-        let mut store = match &self.credential_store_path {
-            Some(path) => cockpit_core::credentials::CredentialStore::open(path.clone()),
-            None => cockpit_core::credentials::CredentialStore::open_default(),
-        }
-        .map_err(|error| format!("provider deleted; stored-secret cleanup failed: {error}"))?;
+        let mut store = cockpit_core::credentials::CredentialStore::open_default()
+            .map_err(|error| format!("provider deleted; stored-secret cleanup failed: {error}"))?;
         for name in &names {
             store.remove_named_secret(name);
         }
@@ -3292,11 +3373,8 @@ impl SettingsCx {
             return Ok(0);
         }
 
-        let mut store = match &self.credential_store_path {
-            Some(path) => cockpit_core::credentials::CredentialStore::open(path.clone()),
-            None => cockpit_core::credentials::CredentialStore::open_default(),
-        }
-        .map_err(|error| format!("provider deleted; stored-secret cleanup failed: {error}"))?;
+        let mut store = cockpit_core::credentials::CredentialStore::open_default()
+            .map_err(|error| format!("provider deleted; stored-secret cleanup failed: {error}"))?;
         for name in &names {
             store.remove_named_secret(name);
         }

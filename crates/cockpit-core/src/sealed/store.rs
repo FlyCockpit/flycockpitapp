@@ -23,6 +23,7 @@ use cockpit_db::db::sealed_scope::{
     SealedScopeKind, SealedValueRecordRow, create_session_sealed_value_conn,
     rotate_session_sealed_value_conn,
 };
+use cockpit_db::secret_vault::SecretVaultKind;
 use uuid::Uuid;
 
 use crate::redact::protected_redaction_history::{
@@ -190,6 +191,43 @@ impl SealedValueDirectory {
         &self.compartment
     }
 
+    /// Resolve a session-scoped sealed literal for a claimed version.
+    ///
+    /// The version fence is a single SQLite snapshot (`active_version` must
+    /// equal `claimed_version`). The plaintext is then unwrapped from the
+    /// wrap-key vault item for that exact version, so a rotate that advances
+    /// the row cannot hand a stale claim the newer literal.
+    pub async fn session_literal_for_action(
+        &self,
+        _owner: OwnerAuthority,
+        record_id: String,
+        claimed_version: i64,
+    ) -> Result<Option<String>> {
+        let Some((scope_key, name)) = self
+            .db
+            .sealed_session_version_fence(record_id, claimed_version)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let vault = self
+            .compartment
+            .vault()
+            .context("session sealed literal resolve requires a vault-backed compartment")?;
+        let item_id = crate::secure_key::session_sealed_item_id(&scope_key, &name, claimed_version);
+        match vault.get_item(SecretVaultKind::SessionSealedValue, &item_id) {
+            Ok(secret) => {
+                let literal = String::from_utf8(secret.as_slice().to_vec())
+                    .context("session sealed vault item is not UTF-8")?;
+                Ok(Some(literal))
+            }
+            Err(crate::secure_key::SecureKeyError::NotFound(_)) => Ok(None),
+            Err(error) => Err(anyhow::anyhow!(
+                "unwrapping session sealed vault item: {error}"
+            )),
+        }
+    }
+
     /// Owner-only safe inventory for one scope.
     ///
     /// This is the only listing surface *in the scoped subsystem*, it is
@@ -300,6 +338,10 @@ impl SealedValueDirectory {
         // failure of either rolls back both, so a sealed value never persists
         // half-journaled. Zero artifact refs — the session-scope adoption is
         // itself the durability event.
+        let vault = self.compartment.vault().cloned().ok_or_else(|| {
+            anyhow::anyhow!("session sealed create requires a vault-backed compartment")
+        })?;
+        let item_id = crate::secure_key::session_sealed_item_id(&record.scope_key, &record.name, 1);
         let row = self
             .db
             .transaction(move |conn| {
@@ -310,6 +352,14 @@ impl SealedValueDirectory {
                     &reason,
                     &origin,
                 )?;
+                vault
+                    .put_item_on_conn(
+                        conn,
+                        SecretVaultKind::SessionSealedValue,
+                        &item_id,
+                        literal_str.as_bytes(),
+                    )
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
                 append_and_attach_conn(conn, &prepared, &[])?;
                 Ok(row)
             })
@@ -444,6 +494,11 @@ impl SealedValueDirectory {
             // history row can never carry a stale version. The loser retries
             // against the advanced row.
             let record_id_str = record_id.to_string();
+            let vault = self.compartment.vault().cloned().ok_or_else(|| {
+                anyhow::anyhow!("session sealed rotate requires a vault-backed compartment")
+            })?;
+            let session_key = row.scope_key.clone();
+            let name = row.name.clone();
             let rotated = self
                 .db
                 .transaction(move |conn| {
@@ -461,6 +516,19 @@ impl SealedValueDirectory {
                             rotated.active_version
                         );
                     }
+                    let item_id = crate::secure_key::session_sealed_item_id(
+                        &session_key,
+                        &name,
+                        rotated.active_version,
+                    );
+                    vault
+                        .put_item_on_conn(
+                            conn,
+                            SecretVaultKind::SessionSealedValue,
+                            &item_id,
+                            literal_str.as_bytes(),
+                        )
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
                     append_and_attach_conn(conn, &prepared, &[])?;
                     Ok(rotated)
                 })
@@ -531,6 +599,11 @@ impl SealedValueDirectory {
             let prepared = history.prepare_append(&session_id, protected).await?;
 
             let record_id_str = record_id.to_string();
+            let vault = self.compartment.vault().cloned().ok_or_else(|| {
+                anyhow::anyhow!("session sealed rotate requires a vault-backed compartment")
+            })?;
+            let session_key = row.scope_key.clone();
+            let name = row.name.clone();
             let rotated = self
                 .db
                 .transaction(move |conn| {
@@ -552,6 +625,19 @@ impl SealedValueDirectory {
                             rotated.active_version.saturating_sub(1)
                         );
                     }
+                    let item_id = crate::secure_key::session_sealed_item_id(
+                        &session_key,
+                        &name,
+                        rotated.active_version,
+                    );
+                    vault
+                        .put_item_on_conn(
+                            conn,
+                            SecretVaultKind::SessionSealedValue,
+                            &item_id,
+                            literal_str.as_bytes(),
+                        )
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
                     append_and_attach_conn(conn, &prepared, &[])?;
                     Ok(rotated)
                 })
@@ -637,10 +723,32 @@ impl SealedValueDirectory {
             return Ok(false);
         };
         if row.scope == SealedScopeKind::Session {
-            return self
+            let deleted = self
                 .db
                 .delete_session_sealed_value(record_id.to_string(), now_ms)
-                .await;
+                .await?;
+            if deleted && let Some(vault) = self.compartment.vault() {
+                let max_version = row.active_version.max(1);
+                for version in 1..=max_version {
+                    let item_id = crate::secure_key::session_sealed_item_id(
+                        &row.scope_key,
+                        &row.name,
+                        version,
+                    );
+                    match vault.delete_item(
+                        cockpit_db::secret_vault::SecretVaultKind::SessionSealedValue,
+                        &item_id,
+                    ) {
+                        Ok(()) | Err(crate::secure_key::SecureKeyError::NotFound(_)) => {}
+                        Err(error) => {
+                            return Err(anyhow::anyhow!(
+                                "deleting session sealed vault item: {error}"
+                            ));
+                        }
+                    }
+                }
+            }
+            return Ok(deleted);
         }
         let ticket = self.prepare_delete(owner, record_id, now_ms).await?;
         self.commit_delete(owner, &ticket, now_ms).await?;

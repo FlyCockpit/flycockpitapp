@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::credentials::{CredentialStore, default_path};
+use crate::credentials::CredentialStore;
 
 type RefreshLock = Arc<tokio::sync::Mutex<()>>;
 type RefreshLockMap = Mutex<HashMap<&'static str, RefreshLock>>;
@@ -50,8 +50,8 @@ where
     Terminal: Fn(&anyhow::Error) -> bool,
     TerminalMessage: Fn(anyhow::Error) -> anyhow::Error,
 {
-    credential_with_refresh_from_path(
-        default_path().context("could not locate $HOME for credentials path")?,
+    credential_with_refresh_from_store(
+        CredentialStore::open_default()?,
         key,
         parse_context,
         missing_auth_error,
@@ -65,6 +65,7 @@ where
     .await
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn credential_with_refresh_from_path<
     T,
@@ -93,7 +94,51 @@ where
     Terminal: Fn(&anyhow::Error) -> bool,
     TerminalMessage: Fn(anyhow::Error) -> anyhow::Error,
 {
-    let tokens = load_tokens(&path, key, parse_context, missing_auth_error)?;
+    let store = CredentialStore::open(path)?;
+    credential_with_refresh_from_store(
+        store,
+        key,
+        parse_context,
+        missing_auth_error,
+        needs_refresh,
+        refresh_token,
+        merge_refresh,
+        refresh,
+        is_terminal_refresh_error,
+        terminal_message,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn credential_with_refresh_from_store<
+    T,
+    Refresh,
+    RefreshFuture,
+    Missing,
+    Terminal,
+    TerminalMessage,
+>(
+    store: CredentialStore,
+    key: &'static str,
+    parse_context: &'static str,
+    missing_auth_error: Missing,
+    needs_refresh: fn(&T, i64) -> bool,
+    refresh_token: fn(&T) -> &str,
+    merge_refresh: fn(&T, T) -> T,
+    refresh: Refresh,
+    is_terminal_refresh_error: Terminal,
+    terminal_message: TerminalMessage,
+) -> Result<T>
+where
+    T: Clone + DeserializeOwned + Serialize,
+    Refresh: Fn(T) -> RefreshFuture,
+    RefreshFuture: Future<Output = Result<T>>,
+    Missing: Fn() -> anyhow::Error + Copy,
+    Terminal: Fn(&anyhow::Error) -> bool,
+    TerminalMessage: Fn(anyhow::Error) -> anyhow::Error,
+{
+    let tokens = load_tokens_from_store(&store, key, parse_context, missing_auth_error)?;
     let now = unix_now();
     if !needs_refresh(&tokens, now) {
         return Ok(tokens);
@@ -102,7 +147,8 @@ where
     let lock = lock_for(key);
     let _guard = lock.lock().await;
 
-    let tokens = load_tokens(&path, key, parse_context, missing_auth_error)?;
+    let store = store.reopen()?;
+    let tokens = load_tokens_from_store(&store, key, parse_context, missing_auth_error)?;
     let now = unix_now();
     if !needs_refresh(&tokens, now) {
         return Ok(tokens);
@@ -111,15 +157,16 @@ where
     let attempted_refresh_token = refresh_token(&tokens).to_string();
     match refresh(tokens.clone()).await {
         Ok(fresh) => {
-            let latest = load_tokens(&path, key, parse_context, missing_auth_error).ok();
+            let store = store.reopen()?;
+            let latest =
+                load_tokens_from_store(&store, key, parse_context, missing_auth_error).ok();
             let previous = latest.as_ref().unwrap_or(&tokens);
             let merged = merge_refresh(previous, fresh);
-            let store = CredentialStore::open(path)?;
             store.save_record_merged(key, serde_json::to_value(&merged)?)?;
             Ok(merged)
         }
         Err(e) if is_terminal_refresh_error(&e) => {
-            let store = CredentialStore::open(path)?;
+            let store = store.reopen()?;
             let latest = store
                 .get(key)
                 .and_then(|raw| serde_json::from_value::<T>(raw.clone()).ok());
@@ -139,8 +186,8 @@ where
     }
 }
 
-fn load_tokens<T, Missing>(
-    path: &std::path::Path,
+fn load_tokens_from_store<T, Missing>(
+    store: &CredentialStore,
     key: &str,
     parse_context: &'static str,
     missing_auth_error: Missing,
@@ -149,7 +196,6 @@ where
     T: DeserializeOwned,
     Missing: Fn() -> anyhow::Error,
 {
-    let store = CredentialStore::open(path.to_path_buf())?;
     let raw = store.get(key).ok_or_else(missing_auth_error)?;
     serde_json::from_value(raw.clone()).context(parse_context)
 }
@@ -332,8 +378,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(tokens.access_token, "other-fresh");
+        let store = CredentialStore::open(path).unwrap();
         let saved: TestTokens =
-            load_tokens(&path, "test-oauth", "parse test tokens", missing).unwrap();
+            load_tokens_from_store(&store, "test-oauth", "parse test tokens", missing).unwrap();
         assert_eq!(saved.refresh_token, "refresh-2");
     }
 

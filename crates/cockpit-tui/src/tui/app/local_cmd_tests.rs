@@ -250,30 +250,40 @@ fn parse_sandbox_escalation_arg_maps_to_actions() {
 #[test]
 fn next_sandbox_mode_skips_unavailable_container_modes() {
     use super::next_sandbox_mode;
-    use cockpit_core::container::{ContainerAvailability, ContainerUnavailableReason};
     use cockpit_core::tools::sandbox_mode::SandboxMode;
+    use cockpit_proto::FeatureCapabilityState;
 
-    let unavailable = ContainerAvailability {
-        runtime: None,
-        harness_in_container: false,
-        available: false,
-        reason: Some(ContainerUnavailableReason::NoRuntime),
-    };
-    assert_eq!(
-        next_sandbox_mode(SandboxMode::Off, &unavailable),
-        SandboxMode::Sandbox
+    let host_down = crate::tui::capability_gate::snapshot_with_sandbox(
+        FeatureCapabilityState::Missing,
+        FeatureCapabilityState::Missing,
     );
     assert_eq!(
-        next_sandbox_mode(SandboxMode::Sandbox, &unavailable),
+        next_sandbox_mode(SandboxMode::Off, &host_down),
+        SandboxMode::Off,
+        "host Sandbox is skipped when sandbox.host is not available"
+    );
+    assert_eq!(
+        next_sandbox_mode(SandboxMode::Sandbox, &host_down),
         SandboxMode::Off
     );
 
-    let available = ContainerAvailability {
-        runtime: Some(cockpit_core::container::ContainerRuntimeKind::Docker),
-        harness_in_container: false,
-        available: true,
-        reason: None,
-    };
+    let container_down = crate::tui::capability_gate::snapshot_with_sandbox(
+        FeatureCapabilityState::Available,
+        FeatureCapabilityState::Missing,
+    );
+    assert_eq!(
+        next_sandbox_mode(SandboxMode::Off, &container_down),
+        SandboxMode::Sandbox
+    );
+    assert_eq!(
+        next_sandbox_mode(SandboxMode::Sandbox, &container_down),
+        SandboxMode::Off
+    );
+
+    let available = crate::tui::capability_gate::snapshot_with_sandbox(
+        FeatureCapabilityState::Available,
+        FeatureCapabilityState::Available,
+    );
     assert_eq!(
         next_sandbox_mode(SandboxMode::Sandbox, &available),
         SandboxMode::Container
@@ -282,6 +292,47 @@ fn next_sandbox_mode_skips_unavailable_container_modes() {
         next_sandbox_mode(SandboxMode::Container, &available),
         SandboxMode::ContainerReadonly
     );
+}
+
+#[test]
+fn slash_sandbox_on_recheck_then_reject_when_host_missing() {
+    use super::decide_sandbox_set;
+    use cockpit_core::tools::sandbox_mode::SandboxMode;
+    use cockpit_proto::FeatureCapabilityState;
+
+    let missing = crate::tui::capability_gate::snapshot_with_sandbox_reasons(
+        FeatureCapabilityState::Missing,
+        FeatureCapabilityState::Available,
+        "bwrap is not installed",
+        Some("sudo apt-get install bubblewrap"),
+    );
+    let err = decide_sandbox_set(SandboxMode::Sandbox, &missing, || missing.clone())
+        .expect_err("/sandbox on must recheck then reject when host cap is missing");
+    assert!(err.message.contains("bwrap"), "{err:?}");
+    assert_eq!(
+        err.fix_command.as_deref(),
+        Some("sudo apt-get install bubblewrap")
+    );
+
+    let available = crate::tui::capability_gate::snapshot_with_sandbox(
+        FeatureCapabilityState::Available,
+        FeatureCapabilityState::Missing,
+    );
+    let applied = decide_sandbox_set(SandboxMode::Sandbox, &missing, || available.clone())
+        .expect("recheck that flips host available must apply");
+    assert_eq!(applied, SandboxMode::Sandbox);
+
+    let container_missing = crate::tui::capability_gate::snapshot_with_sandbox_reasons(
+        FeatureCapabilityState::Available,
+        FeatureCapabilityState::Missing,
+        "host sandbox is available",
+        None,
+    );
+    let err = decide_sandbox_set(SandboxMode::Container, &container_missing, || {
+        container_missing.clone()
+    })
+    .expect_err("/sandbox container must include a remedy and not apply");
+    assert!(!err.message.is_empty());
 }
 
 #[test]

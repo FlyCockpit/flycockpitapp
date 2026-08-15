@@ -25,6 +25,12 @@
 //! refuse envelopes whose `v` is outside the supported range.
 
 pub mod es256;
+pub mod host_capabilities;
+pub use host_capabilities::{
+    CatalogDependencyImportance, CatalogDependencyRow, CatalogDependencyState,
+    CatalogExecutionTarget, FeatureCapabilityRow, FeatureCapabilityState, HostCapabilitySnapshot,
+    SecretStoreIntent, SecretStorePlacement, SecretStoreSnapshot,
+};
 pub mod remote_connection_metadata;
 pub mod remote_device_identity_enrollment;
 pub mod remote_enterprise_connection_policy;
@@ -1398,6 +1404,8 @@ pub enum ErrorCode {
     IngressPathUnavailable,
     /// The operation belongs to a terminal generation that no longer exists.
     TerminalGenerationGone,
+    /// `SetSandbox` asked for a mode the host capability snapshot cannot honor.
+    SandboxCapabilityMissing,
     /// Anything else.
     Internal,
     /// Error code from a future peer that this binary does not know yet.
@@ -1452,6 +1460,7 @@ impl<'de> Deserialize<'de> for ErrorCode {
             "ingress_conflict" => Self::IngressConflict,
             "ingress_path_unavailable" => Self::IngressPathUnavailable,
             "terminal_generation_gone" => Self::TerminalGenerationGone,
+            "sandbox_capability_missing" => Self::SandboxCapabilityMissing,
             "internal" => Self::Internal,
             _ => Self::Other(raw),
         })
@@ -1493,6 +1502,7 @@ impl std::fmt::Display for ErrorCode {
             Self::IngressConflict => "ingress_conflict",
             Self::IngressPathUnavailable => "ingress_path_unavailable",
             Self::TerminalGenerationGone => "terminal_generation_gone",
+            Self::SandboxCapabilityMissing => "sandbox_capability_missing",
             Self::Internal => "internal",
             Self::Other(raw) => raw,
         };

@@ -2459,6 +2459,7 @@ mod tests {
         let env = crate::test_env::lock_async().await;
         let tmp = tempfile::tempdir().unwrap();
         env.set_var("XDG_STATE_HOME", tmp.path());
+        env.set_var("XDG_DATA_HOME", tmp.path().join("data"));
         let mut store = crate::credentials::CredentialStore::open_default().unwrap();
         store.set(
             crate::auth::xai_oauth::CREDENTIAL_KEY,
@@ -2508,6 +2509,7 @@ mod tests {
         let env = crate::test_env::lock_async().await;
         let tmp = tempfile::tempdir().unwrap();
         env.set_var("XDG_STATE_HOME", tmp.path());
+        env.set_var("XDG_DATA_HOME", tmp.path().join("data"));
         let mut store = crate::credentials::CredentialStore::open_default().unwrap();
         store.set(
             crate::auth::codex_oauth::CREDENTIAL_KEY,
@@ -2574,6 +2576,7 @@ mod tests {
 
     fn install_codex_tokens(env: &crate::test_env::TestEnvGuard, tmp: &tempfile::TempDir) {
         env.set_var("XDG_STATE_HOME", tmp.path());
+        env.set_var("XDG_DATA_HOME", tmp.path().join("data"));
         let mut store = crate::credentials::CredentialStore::open_default().unwrap();
         store.set(
             crate::auth::codex_oauth::CREDENTIAL_KEY,
@@ -2586,6 +2589,27 @@ mod tests {
             }),
         );
         store.save().unwrap();
+    }
+
+    #[test]
+    fn provider_headers_use_injected_vault() {
+        let env = crate::test_env::lock();
+        let tmp = tempfile::tempdir().unwrap();
+        env.set_var("XDG_STATE_HOME", tmp.path());
+        env.set_var("XDG_DATA_HOME", tmp.path().join("data"));
+        let mut store = crate::credentials::CredentialStore::open_default().unwrap();
+        store.set_named_secret("hdr", "sk-models-fetch-header-secret");
+        store.save().unwrap();
+        let (headers, missing) = resolve_headers(&[crate::config::providers::HeaderSpec {
+            name: "Authorization".into(),
+            value: "$secret:hdr".into(),
+        }]);
+        assert!(missing.is_empty());
+        assert_eq!(headers[0].value, "sk-models-fetch-header-secret");
+        assert!(
+            !crate::credentials::default_path().unwrap().exists(),
+            "models_fetch must read named secrets from the vault"
+        );
     }
 
     struct TestModelResponse {

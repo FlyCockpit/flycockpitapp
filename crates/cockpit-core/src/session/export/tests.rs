@@ -3056,6 +3056,7 @@ async fn bundle_export_is_one_wal_snapshot_across_all_query_phases() {
     });
 
     let db_for_files = db.clone();
+    let vault = crate::secure_key::vault_for_db(&db).unwrap();
     let exported = db
         .read(move |conn| {
             assemble_bundle_snapshot_conn_with_after_collect(
@@ -3067,6 +3068,7 @@ async fn bundle_export_is_one_wal_snapshot_across_all_query_phases() {
                     redacted: true,
                 },
                 &test_export_env(),
+                Some(vault.as_ref()),
                 move || {
                     start_writer_tx
                         .send(())

@@ -516,6 +516,7 @@ pub fn store_credential(credential: &StoredFlycockpitCredential) -> Result<()> {
     store_credential_in_store(&mut store, credential)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn store_credential_at_path(
     path: std::path::PathBuf,
     credential: &StoredFlycockpitCredential,
@@ -547,11 +548,6 @@ pub fn store_relay_choice(
 
 pub fn clear_credential() -> Result<()> {
     let mut store = CredentialStore::open_default()?;
-    clear_credential_in_store(&mut store)
-}
-
-pub(crate) fn clear_credential_at_path(path: std::path::PathBuf) -> Result<()> {
-    let mut store = CredentialStore::open(path)?;
     clear_credential_in_store(&mut store)
 }
 
@@ -957,6 +953,42 @@ mod tests {
         let store = CredentialStore::open_default().unwrap();
         assert!(store.get(CREDENTIAL_KEY).is_none());
         assert_eq!(store.api_key("other").as_deref(), Some("keep"));
+    }
+
+    #[test]
+    fn flycockpit_login_refresh_logout_use_vault() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        let credential = StoredFlycockpitCredential {
+            server_url: "https://app.example".into(),
+            instance_id: "inst-1".into(),
+            instance_token: "fci_vault_token".into(),
+            account: AccountInfo {
+                user_id: "u".into(),
+                email: "u@example.test".into(),
+            },
+            display_name: None,
+            relay_choice: None,
+        };
+        store_credential(&credential).unwrap();
+        let creds_path = crate::credentials::default_path().unwrap();
+        assert!(
+            !creds_path.exists(),
+            "login must not write credentials.json"
+        );
+        let loaded = load_credential().unwrap();
+        assert_eq!(loaded.instance_token, "fci_vault_token");
+        let mut refreshed = loaded.clone();
+        refreshed.instance_token = "fci_refreshed_token".into();
+        store_credential(&refreshed).unwrap();
+        assert!(!creds_path.exists());
+        assert_eq!(
+            load_credential().unwrap().instance_token,
+            "fci_refreshed_token"
+        );
+        clear_credential().unwrap();
+        assert!(load_credential().is_err());
+        assert!(!creds_path.exists());
     }
 
     async fn start_test_server(

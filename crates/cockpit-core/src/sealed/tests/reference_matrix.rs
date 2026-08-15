@@ -80,7 +80,8 @@ async fn built_in_and_monty_use_paths_return_no_literal() {
         .await
         .expect("workspace trusted");
 
-    let compartment = SealedCompartment::at(tmp.path().join("sealed-compartment.json"));
+    let vault = crate::secure_key::vault_for_db(&ctx.session.db).expect("vault");
+    let compartment = SealedCompartment::from_vault(vault);
     let directory = SealedValueDirectory::new(ctx.session.db.clone(), compartment.clone());
     let project_key = SealedProjectKey::from_canonical(ctx.session.project_id.clone());
     let seeded = directory

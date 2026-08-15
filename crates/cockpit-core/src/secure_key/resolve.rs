@@ -238,6 +238,14 @@ pub fn ensure_secret_vault(
         })?;
     }
 
+    super::unify::unify_remaining_stores(&vault, &super::migrate::VaultFault::default()).map_err(
+        |e| KekUnavailable {
+            reason: format!("unifying remaining secret stores: {e}"),
+            fix_command: None,
+            intent: placement_intent(placement),
+        },
+    )?;
+
     let snapshot = SecretStoreSnapshot {
         intent: placement_intent(placement),
         effective_placement: placement_effective(placement),
@@ -354,9 +362,7 @@ pub fn import_legacy_secure_key_roots(
             // of FakeNativeStore / injected Arc at the caller.
             return import_from_store(vault, legacy);
         }
-        None if keyring_available(keyring_probe)
-            && keyring_core::get_default_store().is_some() =>
-        {
+        None if keyring_available(keyring_probe) && keyring_core::get_default_store().is_some() => {
             Box::new(KeyringNativeStore)
         }
         None => return Ok(()),
@@ -396,6 +402,54 @@ fn import_from_store(
         store.delete_secret(SECURE_KEY_SERVICE, &account)?;
     }
     Ok(())
+}
+
+/// Open or initialize the wrap-key vault for this database.
+///
+/// File-backed DBs use the installation KEK directory. In-memory DBs use a
+/// process-local `MemoryKekStore` keyed by installation identity so tests can
+/// persist vault items without a path.
+pub fn vault_for_db(db: &Db) -> Result<Arc<SecretVault>, SecureKeyError> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    use cockpit_db::installation_identity::ensure_installation_identity_conn;
+    use cockpit_proto::SecretStorePlacement;
+
+    use super::kek_store::MemoryKekStore;
+
+    if db.path().is_some() {
+        let kek_dir = kek_dir_for_db(db)?;
+        let probe = super::platform::probe_platform_keyring();
+        return Ok(
+            ensure_secret_vault(db, &probe, &kek_dir, SecretStoreInjected::default())?.vault,
+        );
+    }
+
+    static MEMORY_KEKS: OnceLock<Mutex<HashMap<String, Arc<MemoryKekStore>>>> = OnceLock::new();
+    let installation = db
+        .blocking_write_for_sync_maintenance(ensure_installation_identity_conn)
+        .map_err(|e| SecureKeyError::Internal(e.to_string()))?;
+    let hex = installation.as_hex().to_string();
+    let kek = {
+        let map = MEMORY_KEKS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut guard = map.lock().unwrap_or_else(|p| p.into_inner());
+        guard
+            .entry(hex)
+            .or_insert_with(|| Arc::new(MemoryKekStore::new(SecretStorePlacement::Database)))
+            .clone()
+    };
+    match SecretVault::open(db.clone(), kek.clone(), installation.clone()) {
+        Ok(vault) => {
+            super::unify::unify_remaining_stores(&vault, &super::migrate::VaultFault::default())?;
+            Ok(Arc::new(vault))
+        }
+        Err(_) => {
+            let vault = SecretVault::initialize(db.clone(), kek, installation, 1, 1)?;
+            super::unify::unify_remaining_stores(&vault, &super::migrate::VaultFault::default())?;
+            Ok(Arc::new(vault))
+        }
+    }
 }
 
 fn known_legacy_accounts(installation: &str) -> Result<Vec<String>, SecureKeyError> {

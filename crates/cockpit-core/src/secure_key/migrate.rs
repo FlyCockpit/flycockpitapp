@@ -43,7 +43,7 @@ impl VaultFault {
         }
     }
 
-    fn check(&self, point: VaultFaultPoint) -> Result<(), SecureKeyError> {
+    pub(crate) fn check(&self, point: VaultFaultPoint) -> Result<(), SecureKeyError> {
         if self.fail_at == Some(point) {
             return Err(SecureKeyError::Internal(format!(
                 "injected vault fault at {point:?}"
@@ -170,6 +170,9 @@ fn run_migrate_from_prepared(
         move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE;")?;
             let result = (|| {
+                let existing_complete = load_authority_conn(conn)?
+                    .map(|row| row.unification_complete)
+                    .unwrap_or(false);
                 upsert_authority_conn(
                     conn,
                     dest_placement,
@@ -177,7 +180,7 @@ fn run_migrate_from_prepared(
                     &fingerprint,
                     authority_kek_version,
                     1,
-                    false,
+                    existing_complete,
                 )?;
                 set_saga_phase_conn(conn, &op_id, SecretVaultSagaPhase::Activated)?;
                 fault

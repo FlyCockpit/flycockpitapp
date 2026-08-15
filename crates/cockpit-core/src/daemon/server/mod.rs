@@ -1813,6 +1813,7 @@ pub struct DaemonContext {
     upload_accounting: Arc<StdMutex<UploadAccounting>>,
     connector_wake: watch::Sender<u64>,
     pub scheduler: Option<DaemonSchedulerHandle>,
+    #[allow(dead_code)]
     credential_store_path: Option<PathBuf>,
     /// Injectable config-resolution seam (`daemon-trust-test-isolation.md`):
     /// the single route by which request handling resolves layered
@@ -2143,19 +2144,11 @@ impl DaemonContext {
         &self,
         credential: &crate::auth::flycockpit::StoredFlycockpitCredential,
     ) -> Result<()> {
-        if let Some(path) = &self.credential_store_path {
-            crate::auth::flycockpit::store_credential_at_path(path.clone(), credential)
-        } else {
-            crate::auth::flycockpit::store_credential(credential)
-        }
+        crate::auth::flycockpit::store_credential(credential)
     }
 
     pub(crate) fn clear_flycockpit_credential(&self) -> Result<()> {
-        if let Some(path) = &self.credential_store_path {
-            crate::auth::flycockpit::clear_credential_at_path(path.clone())
-        } else {
-            crate::auth::flycockpit::clear_credential()
-        }
+        crate::auth::flycockpit::clear_credential()
     }
 
     /// The daemon's graceful-shutdown gate. New-user-work rejection and the

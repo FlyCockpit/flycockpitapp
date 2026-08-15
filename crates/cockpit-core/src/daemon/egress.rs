@@ -80,8 +80,12 @@ pub(crate) async fn redaction_for_session(
     let Some(session) = db.get_session(session_id).await? else {
         return Ok(None);
     };
-    let Some(json) = session.redaction_table_json else {
-        return Ok(None);
+    let json = match session.redaction_table_json.filter(|s| !s.is_empty()) {
+        Some(json) => json,
+        None => match crate::session::lifecycle::load_redaction_table_from_vault(db, session_id)? {
+            Some(json) => json,
+            None => return Ok(None),
+        },
     };
     crate::redact::RedactionTable::from_persisted_json(&json)
         .map(Some)

@@ -34,7 +34,8 @@ impl OwnerFixture {
             .await
             .expect("session row");
         let dir = tempfile::tempdir().expect("tempdir");
-        let compartment = SealedCompartment::at(dir.path().join("sealed-compartment.json"));
+        let vault = crate::secure_key::vault_for_db(&db).expect("in-memory vault");
+        let compartment = SealedCompartment::from_vault(vault);
         let directory = SealedValueDirectory::new(db, compartment);
         Self {
             directory,

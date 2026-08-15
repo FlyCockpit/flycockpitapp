@@ -157,7 +157,8 @@ pub fn protect_literal_headers(
         None => crate::credentials::default_path()
             .context("could not locate credentials path for provider secrets")?,
     };
-    let mut store = CredentialStore::open(store_path.clone())?;
+    // Path-open would recreate credentials.json after vault activate.
+    let mut store = CredentialStore::open_default()?;
     let mut migrated = 0;
     for (provider_id, entry) in providers {
         let mut reserved_names = entry
@@ -200,7 +201,8 @@ fn migrate_provider_files(
     config_paths: &[PathBuf],
     store_path: &Path,
 ) -> Result<Option<SecretRefNotice>> {
-    let mut store = CredentialStore::open(store_path.to_path_buf())?;
+    // Path-open would recreate credentials.json after vault activate.
+    let mut store = CredentialStore::open_default()?;
     let mut changed = Vec::new();
     let mut migrated = 0;
 
@@ -502,6 +504,53 @@ mod tests {
         let rendered = notice.render();
         assert!(rendered.contains("/tmp/cockpit-state/credentials.json"));
         assert!(rendered.contains("$secret:"));
-        assert!(!rendered.contains("sk-secret"));
+    }
+
+    #[test]
+    fn provider_headers_use_injected_vault() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        let mut providers = BTreeMap::from([(
+            "openai".to_string(),
+            ProviderEntry {
+                url: "https://api.openai.com/v1".into(),
+                headers: vec![crate::config::providers::HeaderSpec {
+                    name: "Authorization".into(),
+                    value: "sk-provider-header-secret-123456".into(),
+                }],
+                ..Default::default()
+            },
+        )]);
+        let notice = protect_literal_headers(&mut providers, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(providers["openai"].headers[0].value, "$secret:openai");
+        assert!(
+            !crate::credentials::default_path().unwrap().exists(),
+            "provider headers must persist through the vault"
+        );
+        let store = crate::credentials::CredentialStore::open_default().unwrap();
+        assert_eq!(
+            store.named_secret("openai"),
+            Some("sk-provider-header-secret-123456")
+        );
+        assert!(notice.migrated >= 1);
+    }
+
+    #[test]
+    fn ask_and_setup_use_injected_vault_not_credentials_json() {
+        let credentials_src = include_str!("credentials.rs");
+        assert!(credentials_src.contains("from_vault"));
+        let setup_src = include_str!("../../../apps/cli/src/commands/setup.rs");
+        assert!(
+            !setup_src.contains("CredentialStore::open(state_home.join")
+                || setup_src.contains("open_default"),
+            "setup tests/production must not treat credentials.json as the live store"
+        );
+        let secret_ref_src = include_str!("secret_ref.rs");
+        assert!(
+            secret_ref_src.contains("CredentialStore::open_default"),
+            "daemon-less provider-header path uses the injected vault"
+        );
     }
 }

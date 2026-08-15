@@ -7037,13 +7037,10 @@ pub(super) async fn export_session_data(
             // the target session's project root and the durable
             // credential/environment journals, never the inference-time
             // provider-trust decision.
-            let export_redactor = db
-                .read(move |conn| {
-                    let env = crate::session::export::process_env_map_for_conn();
-                    crate::session::export::redaction_table_for_session_conn(conn, &target, &env)
-                })
-                .await
-                .map_err(internal)?;
+            let env = crate::session::export::process_env_map_for_conn();
+            let export_redactor =
+                crate::session::export::redaction_table_for_session(&db, &target, &env)
+                    .map_err(internal)?;
             let mut messages_value = serde_json::to_value(&messages).map_err(internal)?;
             crate::session::export::scrub_export_json_value(&mut messages_value, &export_redactor);
             let bytes = serde_json::to_vec_pretty(&messages_value).map_err(internal)?;

@@ -163,6 +163,101 @@ impl SecretVault {
         self.put_item_with_nonce(kind, item_id, plaintext, None)
     }
 
+    /// Encrypt and upsert on an already-open connection so callers can compose
+    /// vault writes with sealed-scope / journal rows in one SQLite transaction.
+    pub fn put_item_on_conn(
+        &self,
+        conn: &rusqlite::Connection,
+        kind: SecretVaultKind,
+        item_id: &str,
+        plaintext: &[u8],
+    ) -> Result<(), SecureKeyError> {
+        self.put_item_on_conn_with_nonce(conn, kind, item_id, plaintext, None)
+    }
+
+    pub fn put_item_on_conn_with_nonce(
+        &self,
+        conn: &rusqlite::Connection,
+        kind: SecretVaultKind,
+        item_id: &str,
+        plaintext: &[u8],
+        forced_nonce: Option<[u8; VAULT_NONCE_LEN]>,
+    ) -> Result<(), SecureKeyError> {
+        let aad = item_aad(
+            kind,
+            item_id,
+            self.key_version,
+            self.kek_version,
+            self.installation.as_hex(),
+        );
+        for attempt in 0..NONCE_RETRY_LIMIT {
+            let nonce = match forced_nonce {
+                Some(n) if attempt == 0 => n,
+                Some(_) => {
+                    return Err(SecureKeyError::Corrupt("vault item nonce reuse".into()));
+                }
+                None => random_nonce(),
+            };
+            let ciphertext = aead_encrypt(self.dek.as_array(), &nonce, &aad, plaintext)?;
+            let nonce_taken: bool = conn
+                .query_row(
+                    "SELECT 1 FROM secret_vault_items
+                     WHERE key_version = ?1 AND nonce = ?2",
+                    rusqlite::params![self.key_version, nonce.as_slice()],
+                    |_| Ok(true),
+                )
+                .optional()
+                .map_err(|e| SecureKeyError::Internal(e.to_string()))?
+                .unwrap_or(false);
+            if nonce_taken {
+                continue;
+            }
+            match upsert_item_conn(conn, kind, item_id, self.key_version, &nonce, &ciphertext) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    if error
+                        .downcast_ref::<rusqlite::Error>()
+                        .is_some_and(is_unique_constraint)
+                        || error.to_string().contains("UNIQUE")
+                    {
+                        continue;
+                    }
+                    return Err(map_db_err(error));
+                }
+            }
+        }
+        Err(SecureKeyError::Corrupt("vault item nonce reuse".into()))
+    }
+
+    pub fn get_item_on_conn(
+        &self,
+        conn: &rusqlite::Connection,
+        kind: SecretVaultKind,
+        item_id: &str,
+    ) -> Result<TempSecret, SecureKeyError> {
+        let row = load_item_conn(conn, kind, item_id)
+            .map_err(map_db_err)?
+            .ok_or_else(|| SecureKeyError::NotFound(format!("vault item {item_id}")))?;
+        let aad = item_aad(
+            kind,
+            item_id,
+            row.key_version,
+            self.kek_version,
+            self.installation.as_hex(),
+        );
+        decrypt_item(&self.dek, &row.nonce, &row.ciphertext, &aad)
+    }
+
+    pub fn delete_item_on_conn(
+        &self,
+        conn: &rusqlite::Connection,
+        kind: SecretVaultKind,
+        item_id: &str,
+    ) -> Result<(), SecureKeyError> {
+        delete_item_conn(conn, kind, item_id).map_err(map_db_err)?;
+        Ok(())
+    }
+
     pub fn put_item_with_nonce(
         &self,
         kind: SecretVaultKind,
@@ -291,6 +386,11 @@ impl SecretVault {
     }
 
     pub fn list_item_ids(&self, kind: SecretVaultKind) -> Result<Vec<String>, SecureKeyError> {
+        if kind == SecretVaultKind::SealedCompartment {
+            return Err(SecureKeyError::Internal(
+                "sealed compartment listing is not exposed".into(),
+            ));
+        }
         self.db
             .blocking_write_for_sync_maintenance(move |conn| list_item_ids_conn(conn, kind))
             .map_err(map_db_err)

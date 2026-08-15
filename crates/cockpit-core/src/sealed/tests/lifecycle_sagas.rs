@@ -25,13 +25,21 @@ async fn resolvable_with_literal(fixture: &SealedFixture, record_id: SealedRecor
         return false;
     }
     let Some(raw) = row.compartment_key.as_deref() else {
-        // Session scope: literal lives in SQLite alongside the record.
-        return fixture
-            .db
-            .sealed_session_literal_for_action(record_id.to_string(), row.active_version)
-            .await
-            .expect("session literal read")
-            .is_some();
+        // Session scope: literal lives in the wrap-key vault; metadata stays in SQLite.
+        let Some(vault) = fixture.compartment.vault() else {
+            return false;
+        };
+        let item_id = crate::secure_key::session_sealed_item_id(
+            &row.scope_key,
+            &row.name,
+            row.active_version,
+        );
+        return vault
+            .get_item(
+                cockpit_db::secret_vault::SecretVaultKind::SessionSealedValue,
+                &item_id,
+            )
+            .is_ok();
     };
     let key = SealedCompartmentKey::parse(raw).expect("locator parses");
     fixture

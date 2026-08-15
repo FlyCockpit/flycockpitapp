@@ -4900,14 +4900,11 @@ pub(super) fn valid_url(s: &str) -> bool {
 /// Store a Copilot token in Cockpit credentials so the provider resolver can
 /// use it immediately without mutating the running process environment.
 fn store_copilot_token(
-    credential_store_path: Option<&std::path::Path>,
+    _credential_store_path: Option<&std::path::Path>,
     token: String,
 ) -> Result<(), String> {
-    let mut store = match credential_store_path {
-        Some(path) => cockpit_core::credentials::CredentialStore::open(path.to_path_buf()),
-        None => cockpit_core::credentials::CredentialStore::open_default(),
-    }
-    .map_err(|error| format!("could not open Cockpit credential store: {error}"))?;
+    let mut store = cockpit_core::credentials::CredentialStore::open_default()
+        .map_err(|error| format!("could not open Cockpit credential store: {error}"))?;
     store.set_named_secret(
         cockpit_core::providers::models_fetch::COPILOT_TOKEN_CREDENTIAL_KEY,
         token,

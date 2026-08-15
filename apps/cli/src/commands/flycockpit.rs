@@ -74,7 +74,7 @@ pub async fn login(args: LoginArgs) -> Result<()> {
             println!("Remote access: disabled (use `cockpit connect on` to enable)");
         }
     }
-    store_credential_via_daemon_or_direct(&credential).await?;
+    store_credential_via_daemon_or_vault(&credential).await?;
     if let Some(db) = db.as_ref() {
         match crate::daemon::org_sync::sync_current_credential_once(db).await {
             Ok(crate::daemon::org_sync::OrgSyncOnceOutcome::EnrollmentRequired { org_id }) => {
@@ -106,7 +106,7 @@ pub async fn logout() -> Result<()> {
     {
         tracing::warn!(error = %error, "FlyCockpit account logout: best-effort instance revoke failed");
     }
-    clear_credential_via_daemon_or_direct().await?;
+    clear_credential_via_daemon_or_vault().await?;
     if let Ok(db) = crate::db::Db::open_default()
         && let Err(error) = db.mark_org_sync_disabled(&credential.server_url).await
     {
@@ -124,16 +124,14 @@ async fn running_persistent_daemon_client() -> Result<Option<DaemonClient>> {
     match DaemonClient::connect(&discovered.paths.socket).await {
         Ok(client) => Ok(Some(client)),
         Err(error) => {
-            tracing::warn!(error = %error, "FlyCockpit credential RPC: running daemon disappeared; falling back to direct credential file write");
-            eprintln!(
-                "FlyCockpit credential RPC failed because the daemon disappeared; writing credentials directly."
-            );
-            Ok(None)
+            anyhow::bail!(
+                "FlyCockpit credential RPC failed because the daemon disappeared: {error}"
+            )
         }
     }
 }
 
-async fn store_credential_via_daemon_or_direct(
+async fn store_credential_via_daemon_or_vault(
     credential: &StoredFlycockpitCredential,
 ) -> Result<()> {
     if let Some(client) = running_persistent_daemon_client().await? {
@@ -151,15 +149,15 @@ async fn store_credential_via_daemon_or_direct(
                 anyhow::bail!("daemon rejected FlyCockpit credential store: {error}")
             }
             Err(error) => {
-                tracing::warn!(error = %error, "FlyCockpit credential RPC failed; falling back to direct credential file write");
-                eprintln!("FlyCockpit credential RPC failed; writing credentials directly.");
+                anyhow::bail!("FlyCockpit credential RPC failed: {error}")
             }
         }
     }
+    // Daemon-less: in-process vault handle. Never recreate credentials.json.
     store_credential(credential).context("storing FlyCockpit credentials")
 }
 
-async fn clear_credential_via_daemon_or_direct() -> Result<()> {
+async fn clear_credential_via_daemon_or_vault() -> Result<()> {
     if let Some(client) = running_persistent_daemon_client().await? {
         match client.request(Request::ClearFlycockpitCredential).await {
             Ok(Ok(Response::Ack)) => return Ok(()),
@@ -170,8 +168,7 @@ async fn clear_credential_via_daemon_or_direct() -> Result<()> {
                 anyhow::bail!("daemon rejected FlyCockpit credential clear: {error}")
             }
             Err(error) => {
-                tracing::warn!(error = %error, "FlyCockpit credential clear RPC failed; falling back to direct credential file write");
-                eprintln!("FlyCockpit credential clear RPC failed; clearing credentials directly.");
+                anyhow::bail!("FlyCockpit credential clear RPC failed: {error}")
             }
         }
     }
@@ -371,17 +368,20 @@ mod tests {
     }
 
     impl EnvRestore {
-        async fn isolate_daemon_and_credentials_async(root: &std::path::Path) -> Self {
-            let guard = crate::test_env::lock_async().await;
+        fn isolate_daemon_and_credentials(root: &std::path::Path) -> Self {
+            let guard = crate::test_env::lock();
             Self::from_guard(root, guard)
         }
 
         fn from_guard(root: &std::path::Path, guard: crate::test_env::TestEnvGuard) -> Self {
             let state_home = root.join("state");
+            let data_home = root.join("data");
             let runtime_dir = root.join("runtime");
             std::fs::create_dir_all(&state_home).unwrap();
+            std::fs::create_dir_all(&data_home).unwrap();
             std::fs::create_dir_all(&runtime_dir).unwrap();
             guard.set_var("XDG_STATE_HOME", state_home);
+            guard.set_var("XDG_DATA_HOME", data_home);
             guard.set_var("XDG_RUNTIME_DIR", runtime_dir);
             Self { _guard: guard }
         }
@@ -401,23 +401,56 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn store_and_clear_credential_fall_back_to_direct_write_without_daemon() {
+    #[test]
+    fn flycockpit_login_refresh_logout_use_vault() {
         let tmp = tempfile::tempdir().unwrap();
-        let _env = EnvRestore::isolate_daemon_and_credentials_async(tmp.path()).await;
+        let _env = EnvRestore::isolate_daemon_and_credentials(tmp.path());
         let credential_path = tmp.path().join("state/cockpit/credentials.json");
         let credential = credential();
 
-        store_credential_via_daemon_or_direct(&credential)
-            .await
-            .unwrap();
+        // Daemon-less: the vault helper is the production in-process path.
+        crate::auth::flycockpit::store_credential(&credential).unwrap();
+        assert!(
+            !credential_path.exists(),
+            "daemon-less login must use the vault, not credentials.json"
+        );
+        let loaded = crate::auth::flycockpit::load_credential().unwrap();
+        assert_eq!(loaded.instance_token, credential.instance_token);
+
+        let mut refreshed = credential.clone();
+        refreshed.instance_token = "fci_refreshed".to_string();
+        crate::auth::flycockpit::store_credential(&refreshed).unwrap();
+        assert!(!credential_path.exists());
         assert_eq!(
-            crate::auth::flycockpit::load_credential_from_path(credential_path.clone()).unwrap(),
-            credential
+            crate::auth::flycockpit::load_credential()
+                .unwrap()
+                .instance_token,
+            "fci_refreshed"
         );
 
-        clear_credential_via_daemon_or_direct().await.unwrap();
-        assert!(crate::auth::flycockpit::load_credential_from_path(credential_path).is_err());
+        crate::auth::flycockpit::clear_credential().unwrap();
+        assert!(crate::auth::flycockpit::load_credential().is_err());
+        assert!(!credential_path.exists());
+    }
+
+    #[test]
+    fn flycockpit_daemon_down_does_not_write_credentials_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = EnvRestore::isolate_daemon_and_credentials(tmp.path());
+        let credential_path = tmp.path().join("state/cockpit/credentials.json");
+        let runtime = tmp.path().join("runtime/cockpit");
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::write(runtime.join("daemon.lock"), b"stale").unwrap();
+
+        crate::auth::flycockpit::store_credential(&credential()).unwrap();
+        assert!(
+            !credential_path.exists(),
+            "daemon-down must not recreate credentials.json"
+        );
+        assert!(
+            !std::fs::read_to_string(tmp.path().join("state/cockpit/credentials.json.lock"))
+                .is_ok()
+        );
     }
 
     #[test]

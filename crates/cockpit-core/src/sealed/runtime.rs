@@ -460,15 +460,29 @@ impl SealedRuntime {
     ) -> Result<SealedLiteral, SealedUseDenied> {
         self.literal_reads.fetch_add(1, Ordering::SeqCst);
         match record.scope {
-            SealedScopeKind::Session => self
-                .db
-                // The claimed version, not just the record id: a rotation that
-                // lands between claim and read must deny, never substitute.
-                .sealed_session_literal_for_action(record.record_id.clone(), record.active_version)
-                .await
-                .map_err(|_| SealedUseDenied)?
-                .map(SealedLiteral::new)
-                .ok_or(SealedUseDenied),
+            SealedScopeKind::Session => {
+                let Some(vault) = self.compartment.vault() else {
+                    return Err(SealedUseDenied);
+                };
+                // Version fence stays on the claimed record. Decrypt only after
+                // claim; a stale grant is already rejected by the claim UPDATE.
+                let item_id = crate::secure_key::session_sealed_item_id(
+                    &record.scope_key,
+                    &record.name,
+                    record.active_version,
+                );
+                match vault.get_item(
+                    cockpit_db::secret_vault::SecretVaultKind::SessionSealedValue,
+                    &item_id,
+                ) {
+                    Ok(secret) => {
+                        let text = String::from_utf8(secret.as_slice().to_vec())
+                            .map_err(|_| SealedUseDenied)?;
+                        Ok(SealedLiteral::new(text))
+                    }
+                    Err(_) => Err(SealedUseDenied),
+                }
+            }
             SealedScopeKind::Project | SealedScopeKind::Global => {
                 let raw = record.compartment_key.as_deref().ok_or(SealedUseDenied)?;
                 let key = SealedCompartmentKey::parse(raw).map_err(|_| SealedUseDenied)?;

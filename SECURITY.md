@@ -18,22 +18,22 @@ security fixes; if you self-host, pull updates regularly.
 The Rust CLI (`apps/cli`) is a local coding harness with a persistent daemon.
 Its security boundaries and limitations are deliberately explicit:
 
-- Credentials are plaintext JSON in `credentials.json` under the XDG state
-  directory (`$XDG_STATE_HOME/cockpit/`, normally `~/.local/state/cockpit/`).
-  On Unix, the directory is kept at `0700` and the file at `0600`; writes are
-  atomic and opening the store repairs broad permissions. Windows does not
-  provide these Unix permission guarantees. This JSON store remains plaintext
-  until the encrypted-secret-vault import lands.
-- Cockpit-owned durable key roots (redaction-history, journal spool, reserved
-  leak-report, sealed-state slots) live in SQLite as ChaCha20-Poly1305
-  ciphertext under a wrapped DEK. The wrapping KEK is a `private_fs` owner-only
-  file on every unconfigured first run. The OS keyring holds the KEK only after
-  an explicit Settings promotion and a successful migrate. First-run never
-  auto-selects keyring, even when a keyring probe is available. Database mode
-  is weaker than keyring mode: the KEK is another local file. A copy of
-  `cockpit.db` (including WAL) is ciphertext-only; decrypting it requires the
-  file KEK (database mode) or a compromised keyring (keyring mode). DEK and KEK
-  plaintext never persist in SQLite.
+- Provider credentials, named secrets, subscription-ack flags, sealed
+  compartment literals, session sealed values, and session redaction tables
+  live in the wrap-key vault: ChaCha20-Poly1305 ciphertext in SQLite under a
+  DEK wrapped by a KEK. Older builds stored some of those values as plaintext
+  `credentials.json` / `sealed-compartment.json` or plaintext SQLite columns;
+  current builds import those leftovers and delete them. After import,
+  production code does not recreate `credentials.json`.
+- The wrapping KEK is a `private_fs` owner-only file on every unconfigured
+  first run. The OS keyring holds the KEK only after an explicit Settings
+  promotion and a successful migrate. First-run never auto-selects keyring,
+  even when a keyring probe is available. Database mode is weaker than
+  keyring mode: the KEK is another local file. A copy of `cockpit.db`
+  (including WAL) is ciphertext-only; decrypting it requires the file KEK
+  (database mode) or a compromised keyring (keyring mode). DEK and KEK
+  plaintext never persist in SQLite. Remote daemon identity P-256 stays on
+  the platform adapter and is not copied into the vault.
 - Agent-run shell commands receive the session environment. Unconfined commands
   clear and reconstruct that environment, excluding explicit and name-matched
   sensitive variables; this is a heuristic, not an isolation boundary. Confined

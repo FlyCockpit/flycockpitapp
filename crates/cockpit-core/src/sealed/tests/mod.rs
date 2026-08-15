@@ -12,6 +12,7 @@ mod non_oracular_use;
 mod orthogonality;
 mod redaction_history_adoption;
 mod reference_matrix;
+mod vault_unification;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -60,7 +61,8 @@ impl SealedFixture {
             .await
             .expect("session row");
         let dir = tempfile::tempdir().expect("tempdir");
-        let compartment = SealedCompartment::at(dir.path().join("sealed-compartment.json"));
+        let vault = crate::secure_key::vault_for_db(&db).expect("in-memory vault");
+        let compartment = SealedCompartment::from_vault(vault);
         Self {
             db,
             compartment,

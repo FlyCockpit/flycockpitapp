@@ -1151,12 +1151,14 @@ mod tests {
         let raw = std::fs::read_to_string(provider_path).expect("provider file");
         assert!(raw.contains("$secret:openai"), "{raw}");
         assert!(!raw.contains(secret), "{raw}");
-        let store =
-            crate::credentials::CredentialStore::open(state_home.join("cockpit/credentials.json"))
-                .expect("credential store");
+        let store = crate::credentials::CredentialStore::open_default().expect("credential store");
         assert_eq!(
             store.named_secret("openai"),
             Some(&format!("Bearer {secret}")[..])
+        );
+        assert!(
+            !state_home.join("cockpit/credentials.json").exists(),
+            "setup must persist through the vault, not credentials.json"
         );
         assert!(!io.output.contains(secret), "secret leaked in output");
         assert!(io.output.contains("Stored 1 provider secret"));
@@ -1193,13 +1195,12 @@ mod tests {
             "{raw}"
         );
         assert!(!raw.contains(secret), "{raw}");
-        let store =
-            crate::credentials::CredentialStore::open(state_home.join("cockpit/credentials.json"))
-                .expect("credential store");
+        let store = crate::credentials::CredentialStore::open_default().expect("credential store");
         assert_eq!(
             store.named_secret("nous-research"),
             Some(&format!("Bearer {secret}")[..])
         );
+        assert!(!state_home.join("cockpit/credentials.json").exists());
         assert!(!io.output.contains(secret), "secret leaked in output");
     }
 
@@ -1229,14 +1230,13 @@ mod tests {
             assert!(raw.contains("$secret:baseten"), "{raw}");
             assert!(raw.contains("https://inference.baseten.co/v1"), "{raw}");
             assert!(!raw.contains(secret), "{raw}");
-            let store = crate::credentials::CredentialStore::open(
-                state_home.join("cockpit/credentials.json"),
-            )
-            .expect("credential store");
+            let store =
+                crate::credentials::CredentialStore::open_default().expect("credential store");
             assert_eq!(
                 store.named_secret("baseten"),
                 Some(&format!("Bearer {secret}")[..])
             );
+            assert!(!state_home.join("cockpit/credentials.json").exists());
             assert!(!io.output.contains(secret));
         }
 

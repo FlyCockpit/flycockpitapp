@@ -763,6 +763,10 @@ const MIGRATIONS: &[Migration] = &[
         name: "0004_secret_vault.sql",
         sql: include_str!("migrations/0004_secret_vault.sql"),
     },
+    Migration {
+        name: "0005_secret_vault_unification.sql",
+        sql: include_str!("migrations/0005_secret_vault_unification.sql"),
+    },
 ];
 
 /// Latest schema version understood by this build.

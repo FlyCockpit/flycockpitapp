@@ -23,6 +23,7 @@ mod platform;
 mod resolve;
 mod sealed_ops;
 mod sealed_state;
+mod unify;
 mod vault;
 mod vault_store;
 mod worker;
@@ -59,6 +60,16 @@ pub use namespace::{
 pub use resolve::{
     DEFAULT_FIX_COMMAND, EffectiveSecretStore, KekUnavailable, SecretStoreInjected,
     ensure_secret_vault, kek_dir_for_db, project_secret_store_snapshot, resolve_secret_store,
+    vault_for_db,
+};
+#[cfg(test)]
+pub use unify::{
+    import_credentials_from_path, import_sealed_compartment_from_path,
+    resume_credentials_import_after_activation,
+};
+pub use unify::{
+    redaction_table_item_id, session_sealed_item_id, store_is_vault_authoritative,
+    unify_remaining_stores,
 };
 pub use vault::SecretVault;
 pub use vault_store::VaultNativeStore;

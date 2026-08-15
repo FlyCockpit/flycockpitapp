@@ -115,9 +115,39 @@ impl Session {
         // that persists the union. Honor the unjournaled-inference opt-out.
         if self.unjournaled_inference_allowed() {
             self.persist_redaction_table(&unioned)?;
+            let vault = crate::secure_key::vault_for_db(&self.db)
+                .map_err(|e| anyhow::anyhow!("opening vault for unjournaled sealed value: {e}"))?;
+            let session_id = self.id;
+            let value_id_owned = value_id.to_owned();
+            let value_owned = value.to_owned();
+            let reason_owned = reason.to_owned();
+            let origin_owned = origin.to_owned();
             return self
                 .db
-                .upsert_sealed_value(self.id, value_id, value, reason, origin)
+                .transaction(move |conn| {
+                    let meta = crate::db::sealed_values::upsert_sealed_value_conn(
+                        conn,
+                        session_id,
+                        &value_id_owned,
+                        &value_owned,
+                        &reason_owned,
+                        &origin_owned,
+                    )?;
+                    let item_id = crate::secure_key::session_sealed_item_id(
+                        &session_id.to_string(),
+                        &value_id_owned,
+                        1,
+                    );
+                    vault
+                        .put_item_on_conn(
+                            conn,
+                            cockpit_db::secret_vault::SecretVaultKind::SessionSealedValue,
+                            &item_id,
+                            value_owned.as_bytes(),
+                        )
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    Ok(meta)
+                })
                 .await;
         }
 
@@ -211,12 +241,14 @@ impl Session {
         let json = table.to_persisted_json()?;
         let session_id = self.id;
         let write_json = json.clone();
+        let vault = crate::secure_key::vault_for_db(&self.db)
+            .map_err(|e| anyhow::anyhow!("opening vault for sealed journal: {e}"))?;
         let metadata = self
             .db
             .transaction(move |conn| {
                 let updated = conn.execute(
-                    "UPDATE sessions SET redaction_table_json = ?1 WHERE session_id = ?2",
-                    rusqlite::params![Some(write_json), session_id.to_string()],
+                    "UPDATE sessions SET redaction_table_json = NULL WHERE session_id = ?1",
+                    rusqlite::params![session_id.to_string()],
                 )?;
                 if updated == 0 {
                     // A sealed adoption requires a persisted session row: the
@@ -226,16 +258,41 @@ impl Session {
                         "cannot journal sealed adoption: session {session_id} is not persisted"
                     );
                 }
+                let table_id = crate::secure_key::redaction_table_item_id(&session_id.to_string());
+                vault
+                    .put_item_on_conn(
+                        conn,
+                        cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
+                        &table_id,
+                        write_json.as_bytes(),
+                    )
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
                 append_and_attach_conn(conn, &prepared, &[])?;
                 let metadata = match &legacy_upsert {
-                    Some(upsert) => Some(crate::db::sealed_values::upsert_sealed_value_conn(
-                        conn,
-                        session_id,
-                        &upsert.value_id,
-                        &upsert.value,
-                        &upsert.reason,
-                        &upsert.origin,
-                    )?),
+                    Some(upsert) => {
+                        let meta = crate::db::sealed_values::upsert_sealed_value_conn(
+                            conn,
+                            session_id,
+                            &upsert.value_id,
+                            &upsert.value,
+                            &upsert.reason,
+                            &upsert.origin,
+                        )?;
+                        let item_id = crate::secure_key::session_sealed_item_id(
+                            &session_id.to_string(),
+                            &upsert.value_id,
+                            1,
+                        );
+                        vault
+                            .put_item_on_conn(
+                                conn,
+                                cockpit_db::secret_vault::SecretVaultKind::SessionSealedValue,
+                                &item_id,
+                                upsert.value.as_bytes(),
+                            )
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        Some(meta)
+                    }
                     None => None,
                 };
                 Ok(metadata)
@@ -456,6 +513,179 @@ mod tests {
                 .sealed_value_exists(crate::sealed::OwnerAuthority::for_test("owner"), "after")
                 .await
                 .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn session_sealed_value_not_plaintext_in_sql() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Session::create(
+            db.clone(),
+            PathBuf::from("/repo"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        session
+            .set_sealed_value(
+                crate::sealed::OwnerAuthority::for_test("owner"),
+                &crate::redact::RedactionTable::empty(),
+                "prod_token",
+                "first-high-entropy-token",
+                "deploy",
+                "user",
+            )
+            .await
+            .unwrap();
+        let raw: Option<String> = db
+            .blocking_write_for_sync_maintenance({
+                let sid = session.id.to_string();
+                move |conn| {
+                    Ok(conn.query_row(
+                        "SELECT value FROM sealed_values WHERE session_id = ?1 AND value_id = 'prod_token'",
+                        rusqlite::params![sid],
+                        |row| row.get(0),
+                    )?)
+                }
+            })
+            .unwrap();
+        assert!(
+            raw.as_deref()
+                .is_none_or(|value| value != "first-high-entropy-token"),
+            "sealed_values.value must not store the literal"
+        );
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        let item_id =
+            crate::secure_key::session_sealed_item_id(&session.id.to_string(), "prod_token", 1);
+        let got = vault
+            .get_item(
+                cockpit_db::secret_vault::SecretVaultKind::SessionSealedValue,
+                &item_id,
+            )
+            .unwrap();
+        assert_eq!(got.as_slice(), b"first-high-entropy-token");
+    }
+
+    #[tokio::test]
+    async fn redaction_table_not_plaintext_in_sessions_column() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = Session::create(
+            db.clone(),
+            PathBuf::from("/repo"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        session
+            .set_sealed_value(
+                crate::sealed::OwnerAuthority::for_test("owner"),
+                &crate::redact::RedactionTable::empty(),
+                "prod_token",
+                "first-high-entropy-token",
+                "deploy",
+                "user",
+            )
+            .await
+            .unwrap();
+        let column: Option<String> = db
+            .blocking_write_for_sync_maintenance({
+                let sid = session.id.to_string();
+                move |conn| {
+                    Ok(conn.query_row(
+                        "SELECT redaction_table_json FROM sessions WHERE session_id = ?1",
+                        rusqlite::params![sid],
+                        |row| row.get(0),
+                    )?)
+                }
+            })
+            .unwrap();
+        assert!(
+            column
+                .as_deref()
+                .is_none_or(|json| !json.contains("first-high-entropy-token")),
+            "sessions.redaction_table_json must not hold plaintext literals"
+        );
+        let table = session.persisted_redaction_table().unwrap().unwrap();
+        assert!(
+            !table
+                .scrub("first-high-entropy-token")
+                .contains("first-high-entropy-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_fork_copies_vault_sealed_and_redaction_without_plaintext() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let parent = Session::create(
+            db.clone(),
+            PathBuf::from("/repo"),
+            "Build",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        parent
+            .set_sealed_value(
+                crate::sealed::OwnerAuthority::for_test("owner"),
+                &crate::redact::RedactionTable::empty(),
+                "before",
+                "before-high-entropy-token",
+                "test",
+                "user",
+            )
+            .await
+            .unwrap();
+        let child = Session::create_fork(
+            db.clone(),
+            parent.id,
+            None,
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        let child_value: Option<String> = db
+            .blocking_write_for_sync_maintenance({
+                let sid = child.id.to_string();
+                move |conn| {
+                    Ok(conn.query_row(
+                        "SELECT value FROM sealed_values WHERE session_id = ?1 AND value_id = 'before'",
+                        rusqlite::params![sid],
+                        |row| row.get(0),
+                    )?)
+                }
+            })
+            .unwrap();
+        assert!(
+            child_value
+                .as_deref()
+                .is_none_or(|value| value != "before-high-entropy-token")
+        );
+        let child_table: Option<String> = db
+            .blocking_write_for_sync_maintenance({
+                let sid = child.id.to_string();
+                move |conn| {
+                    Ok(conn.query_row(
+                        "SELECT redaction_table_json FROM sessions WHERE session_id = ?1",
+                        rusqlite::params![sid],
+                        |row| row.get(0),
+                    )?)
+                }
+            })
+            .unwrap();
+        assert!(
+            child_table
+                .as_deref()
+                .is_none_or(|json| !json.contains("before-high-entropy-token"))
+        );
+        assert!(
+            child
+                .sealed_value_exists(crate::sealed::OwnerAuthority::for_test("owner"), "before")
+                .await
+                .unwrap()
+        );
+        let table = child.persisted_redaction_table().unwrap().unwrap();
+        assert!(
+            !table
+                .scrub("before-high-entropy-token")
+                .contains("before-high-entropy-token")
         );
     }
 

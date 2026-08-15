@@ -100,6 +100,39 @@ fn assert_no_plaintext_bytes(db: &Db, needle: &[u8]) {
 }
 
 #[test]
+fn vault_unification_complete_only_after_all_stores() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+    let kek = Arc::new(MemoryKekStore::new(SecretStorePlacement::Database));
+    let vault = init_vault(&db, kek);
+    assert!(
+        !db.blocking_write_for_sync_maintenance(load_authority_conn)
+            .unwrap()
+            .unwrap()
+            .unification_complete
+    );
+    crate::secure_key::unify_remaining_stores(
+        &vault,
+        &VaultFault::at(VaultFaultPoint::BeforeComplete),
+    )
+    .unwrap_err();
+    let mid = db
+        .blocking_write_for_sync_maintenance(load_authority_conn)
+        .unwrap()
+        .unwrap();
+    assert!(
+        !mid.unification_complete,
+        "a boot that crashes before every store completes stays 0"
+    );
+    crate::secure_key::unify_remaining_stores(&vault, &VaultFault::default()).unwrap();
+    let row = db
+        .blocking_write_for_sync_maintenance(load_authority_conn)
+        .unwrap()
+        .unwrap();
+    assert!(row.unification_complete);
+}
+
+#[test]
 fn wrap_key_vault_round_trip_and_aead() {
     let (_tmp, db, kek) = file_env();
     let vault = init_vault(&db, kek);
@@ -382,8 +415,8 @@ fn first_run_persists_database_even_when_keyring_available() {
     assert_eq!(row.intent, SecretVaultPlacement::Database);
     assert_eq!(row.active_placement, SecretVaultPlacement::Database);
     assert!(
-        !row.unification_complete,
-        "actor-root import must leave unification_complete = 0"
+        row.unification_complete,
+        "empty leftover stores no-op activate and set unification_complete = 1"
     );
 }
 
@@ -625,7 +658,10 @@ fn secret_store_migrate_to_keyring_removes_file_kek() {
         .blocking_write_for_sync_maintenance(load_authority_conn)
         .unwrap()
         .unwrap();
-    assert!(!row.unification_complete);
+    assert!(
+        row.unification_complete,
+        "KEK migrate must preserve unification_complete"
+    );
 }
 
 #[test]

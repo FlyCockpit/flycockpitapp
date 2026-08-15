@@ -168,8 +168,9 @@ fn check_component(name: &str) -> Result<(), ExternalJournalError> {
 #[cfg(unix)]
 mod imp {
     use super::*;
+    use crate::private_fs::held_fd;
     use std::ffi::CString;
-    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
 
     /// A held, no-follow directory handle.
@@ -240,31 +241,25 @@ mod imp {
         create: bool,
     ) -> Result<(File, bool), ExternalJournalError> {
         let parent_fd = parent.map_or(libc::AT_FDCWD, |file| file.as_raw_fd());
+        // O_NOFOLLOW rejects a symlink at the final component, which is the
+        // containment guarantee.
         let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
         for attempt in 0..2 {
-            // SAFETY: `parent_fd` is a live descriptor (or AT_FDCWD) and
-            // `name` stays alive for the call. O_NOFOLLOW rejects a symlink at
-            // the final component, which is the containment guarantee.
-            let fd = unsafe { libc::openat(parent_fd, name.as_ptr(), flags) };
-            if fd >= 0 {
-                // SAFETY: `fd` was just returned by openat and is uniquely owned.
-                return Ok((unsafe { File::from_raw_fd(fd) }, attempt > 0));
-            }
-            let error = std::io::Error::last_os_error();
-            if attempt == 0 && create && error.kind() == std::io::ErrorKind::NotFound {
-                // SAFETY: same liveness argument; mkdirat creates one component.
-                let made = unsafe {
-                    libc::mkdirat(parent_fd, name.as_ptr(), SPOOL_DIR_MODE as libc::mode_t)
-                };
-                if made != 0 {
-                    let error = std::io::Error::last_os_error();
-                    if error.kind() != std::io::ErrorKind::AlreadyExists {
-                        return Err(io("creating spool directory", error));
+            match held_fd::openat(parent_fd, name, flags) {
+                Ok(file) => return Ok((file, attempt > 0)),
+                Err(error) => {
+                    if attempt == 0 && create && error.kind() == std::io::ErrorKind::NotFound {
+                        if let Err(made) =
+                            held_fd::mkdirat(parent_fd, name, SPOOL_DIR_MODE as libc::mode_t)
+                            && made.kind() != std::io::ErrorKind::AlreadyExists
+                        {
+                            return Err(io("creating spool directory", made));
+                        }
+                        continue;
                     }
+                    return Err(io("opening spool directory", error));
                 }
-                continue;
             }
-            return Err(io("opening spool directory", error));
         }
         Err(ExternalJournalError::Containment(
             "spool directory could not be opened after creation".to_string(),
@@ -272,14 +267,8 @@ mod imp {
     }
 
     fn enforce_dir_mode(dir: &File, path: &Path) -> Result<(), ExternalJournalError> {
-        // SAFETY: the descriptor is live for the call.
-        let result = unsafe { libc::fchmod(dir.as_raw_fd(), SPOOL_DIR_MODE as libc::mode_t) };
-        if result != 0 {
-            return Err(io(
-                "chmod 0700 spool directory",
-                std::io::Error::last_os_error(),
-            ));
-        }
+        held_fd::fchmod(dir.as_raw_fd(), SPOOL_DIR_MODE as libc::mode_t)
+            .map_err(|error| io("chmod 0700 spool directory", error))?;
         let mode = dir
             .metadata()
             .map_err(|error| io("stat spool directory", error))?
@@ -316,16 +305,8 @@ mod imp {
                     path.display()
                 )));
             }
-            let fd = unsafe {
-                libc::open(
-                    c"/".as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-            if fd < 0 {
-                return Err(io("opening spool root", std::io::Error::last_os_error()));
-            }
-            let mut dir = unsafe { File::from_raw_fd(fd) };
+            let mut dir =
+                held_fd::open_fs_root().map_err(|error| io("opening spool root", error))?;
             let mut walked = PathBuf::from("/");
             before_walk();
             for component in path.components() {
@@ -381,17 +362,12 @@ mod imp {
         ) -> Result<HeldEntryIdentity, ExternalJournalError> {
             check_component(name)?;
             let name = cstring(name)?;
-            let fd = unsafe {
-                libc::openat(
-                    self.dir.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-            if fd < 0 {
-                return Err(io("opening held entry", std::io::Error::last_os_error()));
-            }
-            let file = unsafe { File::from_raw_fd(fd) };
+            let file = held_fd::openat(
+                self.dir.as_raw_fd(),
+                &name,
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+            .map_err(|error| io("opening held entry", error))?;
             identity(
                 &file
                     .metadata()
@@ -402,25 +378,13 @@ mod imp {
         pub fn require_entry_absent(&self, name: &str) -> Result<(), ExternalJournalError> {
             check_component(name)?;
             let name = cstring(name)?;
-            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-            let result = unsafe {
-                libc::fstatat(
-                    self.dir.as_raw_fd(),
-                    name.as_ptr(),
-                    stat.as_mut_ptr(),
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            };
-            if result == 0 {
-                return Err(ExternalJournalError::QuarantineNameTaken(
+            match held_fd::fstatat_nofollow(self.dir.as_raw_fd(), &name) {
+                Ok(_) => Err(ExternalJournalError::QuarantineNameTaken(
                     name.to_string_lossy().into_owned(),
-                ));
+                )),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(io("checking held target absence", error)),
             }
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::NotFound {
-                return Ok(());
-            }
-            Err(io("checking held target absence", error))
         }
 
         pub fn require_same_filesystem(
@@ -471,48 +435,38 @@ mod imp {
                 ));
             }
             before_syscall();
-            #[cfg(target_os = "linux")]
-            let result = unsafe {
-                libc::syscall(
-                    libc::SYS_renameat2,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                match held_fd::rename_noreplace(
                     self.dir.as_raw_fd(),
-                    from.as_ptr(),
+                    &from,
                     target.dir.as_raw_fd(),
-                    to.as_ptr(),
-                    1_u32,
-                ) as libc::c_int
-            };
-            #[cfg(target_os = "macos")]
-            let result = unsafe {
-                libc::renameatx_np(
-                    self.dir.as_raw_fd(),
-                    from.as_ptr(),
-                    target.dir.as_raw_fd(),
-                    to.as_ptr(),
-                    libc::RENAME_EXCL,
-                )
-            };
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            let result: libc::c_int = return Err(ExternalJournalError::Containment(
-                "held atomic no-replace rename is unsupported on this platform".into(),
-            ));
-            if result == 0 {
-                let observed_target = target.open_entry_identity(target_name)?;
-                if observed_target != expected_source {
-                    return Ok(HeldRenameEffect::AppliedIdentityMismatch {
-                        expected: expected_source,
-                        observed: observed_target,
-                    });
+                    &to,
+                ) {
+                    Ok(()) => {
+                        let observed_target = target.open_entry_identity(target_name)?;
+                        if observed_target != expected_source {
+                            Ok(HeldRenameEffect::AppliedIdentityMismatch {
+                                expected: expected_source,
+                                observed: observed_target,
+                            })
+                        } else {
+                            Ok(HeldRenameEffect::Applied(observed_target))
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(
+                        ExternalJournalError::QuarantineNameTaken(target_name.to_owned()),
+                    ),
+                    Err(error) => Err(io("held atomic no-replace rename", error)),
                 }
-                return Ok(HeldRenameEffect::Applied(observed_target));
             }
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                return Err(ExternalJournalError::QuarantineNameTaken(
-                    target_name.to_owned(),
-                ));
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                let _ = (&from, &to, target_name, expected_source);
+                Err(ExternalJournalError::Containment(
+                    "held atomic no-replace rename is unsupported on this platform".into(),
+                ))
             }
-            Err(io("held atomic no-replace rename", error))
         }
 
         /// Verify the held directory still carries exactly `0700`.
@@ -538,31 +492,14 @@ mod imp {
             let cname = cstring(name)?;
             let flags =
                 libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-            // SAFETY: dirfd and name are live; openat is variadic so the mode
-            // is promoted to c_uint explicitly.
-            let fd = unsafe {
-                libc::openat(
-                    self.dir.as_raw_fd(),
-                    cname.as_ptr(),
-                    flags,
-                    SPOOL_FILE_MODE as libc::c_uint,
-                )
-            };
-            if fd < 0 {
-                return Err(io("creating capsule file", std::io::Error::last_os_error()));
-            }
-            // SAFETY: `fd` was just returned by openat and is uniquely owned.
-            let file = unsafe { File::from_raw_fd(fd) };
+            let file =
+                held_fd::openat_mode(self.dir.as_raw_fd(), &cname, flags, SPOOL_FILE_MODE)
+                    .map_err(|error| io("creating capsule file", error))?;
             // `openat` mode bits are masked by the process umask, so a
             // permissive umask would leave a group/world-readable capsule.
             // fchmod the descriptor we already hold, then verify.
-            // SAFETY: the descriptor is live for the call.
-            if unsafe { libc::fchmod(file.as_raw_fd(), SPOOL_FILE_MODE as libc::mode_t) } != 0 {
-                return Err(io(
-                    "chmod 0600 capsule file",
-                    std::io::Error::last_os_error(),
-                ));
-            }
+            held_fd::fchmod(file.as_raw_fd(), SPOOL_FILE_MODE as libc::mode_t)
+                .map_err(|error| io("chmod 0600 capsule file", error))?;
             let mode = file
                 .metadata()
                 .map_err(|error| io("stat new capsule file", error))?
@@ -593,21 +530,17 @@ mod imp {
             check_component(name)?;
             let cname = cstring(name)?;
             let flags = libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-            // SAFETY: dirfd and name are live for the call.
-            let fd = unsafe { libc::openat(self.dir.as_raw_fd(), cname.as_ptr(), flags) };
-            if fd < 0 {
-                let error = std::io::Error::last_os_error();
+            let file = held_fd::openat(self.dir.as_raw_fd(), &cname, flags).map_err(|error| {
                 // A genuinely absent entry is a different fact from one that
                 // exists but fails verification, and the two must not be
                 // conflated: the first means the durable medium is gone, the
                 // second means the spool is compromised.
                 if error.kind() == std::io::ErrorKind::NotFound {
-                    return Err(ExternalJournalError::CapsuleMissing(name.to_string()));
+                    ExternalJournalError::CapsuleMissing(name.to_string())
+                } else {
+                    io("opening capsule file", error)
                 }
-                return Err(io("opening capsule file", error));
-            }
-            // SAFETY: `fd` was just returned by openat and is uniquely owned.
-            let file = unsafe { File::from_raw_fd(fd) };
+            })?;
             let metadata = file
                 .metadata()
                 .map_err(|error| io("stat capsule file", error))?;
@@ -634,12 +567,8 @@ mod imp {
         pub fn remove_file(&self, name: &str) -> Result<(), ExternalJournalError> {
             check_component(name)?;
             let name = cstring(name)?;
-            // SAFETY: dirfd and name are live for the call.
-            let result = unsafe { libc::unlinkat(self.dir.as_raw_fd(), name.as_ptr(), 0) };
-            if result != 0 {
-                return Err(io("removing capsule file", std::io::Error::last_os_error()));
-            }
-            Ok(())
+            held_fd::unlinkat(self.dir.as_raw_fd(), &name, 0)
+                .map_err(|error| io("removing capsule file", error))
         }
 
         /// Move a file into another held directory, refusing to replace an
@@ -663,65 +592,41 @@ mod imp {
 
             #[cfg(target_os = "linux")]
             {
-                const RENAME_NOREPLACE: libc::c_uint = 1;
-                // SAFETY: both dirfds and both names stay live for the call.
-                let result = unsafe {
-                    libc::syscall(
-                        libc::SYS_renameat2,
-                        self.dir.as_raw_fd(),
-                        from.as_ptr(),
-                        target.dir.as_raw_fd(),
-                        to.as_ptr(),
-                        RENAME_NOREPLACE,
-                    )
-                };
-                if result == 0 {
-                    return Ok(());
-                }
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    return Err(ExternalJournalError::QuarantineNameTaken(
-                        target_name.to_string(),
-                    ));
-                }
-                // ENOSYS/EINVAL: the filesystem or kernel lacks renameat2, so
-                // fall through to the portable two-step below.
-                if !matches!(
-                    error.raw_os_error(),
-                    Some(libc::ENOSYS) | Some(libc::EINVAL)
+                match held_fd::rename_noreplace(
+                    self.dir.as_raw_fd(),
+                    &from,
+                    target.dir.as_raw_fd(),
+                    &to,
                 ) {
-                    return Err(io("quarantining capsule file", error));
+                    Ok(()) => return Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        return Err(ExternalJournalError::QuarantineNameTaken(
+                            target_name.to_string(),
+                        ));
+                    }
+                    // ENOSYS/EINVAL: the filesystem or kernel lacks renameat2, so
+                    // fall through to the portable two-step below.
+                    Err(error)
+                        if matches!(
+                            error.raw_os_error(),
+                            Some(libc::ENOSYS) | Some(libc::EINVAL)
+                        ) => {}
+                    Err(error) => return Err(io("quarantining capsule file", error)),
                 }
             }
 
-            // SAFETY: both dirfds and both names stay live for the call.
             // `linkat` never replaces: it fails with EEXIST.
-            let linked = unsafe {
-                libc::linkat(
-                    self.dir.as_raw_fd(),
-                    from.as_ptr(),
-                    target.dir.as_raw_fd(),
-                    to.as_ptr(),
-                    0,
-                )
-            };
-            if linked != 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    return Err(ExternalJournalError::QuarantineNameTaken(
-                        target_name.to_string(),
-                    ));
-                }
-                return Err(io("linking capsule into quarantine", error));
-            }
-            // SAFETY: the directory descriptor and name are live for the call.
-            let unlinked = unsafe { libc::unlinkat(self.dir.as_raw_fd(), from.as_ptr(), 0) };
-            if unlinked != 0 {
-                return Err(io(
-                    "unlinking capsule after quarantine link",
-                    std::io::Error::last_os_error(),
-                ));
-            }
+            held_fd::linkat(self.dir.as_raw_fd(), &from, target.dir.as_raw_fd(), &to, 0).map_err(
+                |error| {
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        ExternalJournalError::QuarantineNameTaken(target_name.to_string())
+                    } else {
+                        io("linking capsule into quarantine", error)
+                    }
+                },
+            )?;
+            held_fd::unlinkat(self.dir.as_raw_fd(), &from, 0)
+                .map_err(|error| io("unlinking capsule after quarantine link", error))?;
             Ok(())
         }
 

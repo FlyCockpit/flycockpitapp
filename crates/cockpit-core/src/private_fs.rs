@@ -31,6 +31,13 @@ use anyhow::{Context, Result};
 
 pub(crate) mod held_directory;
 
+/// Canonical Unix held-fd syscalls (`openat`/`mkdirat`/`fchmod`/`unlinkat`/
+/// `linkat`/`renameat2`/`fstatat`) shared by this module, the external-journal
+/// spool `DirGuard`, and the held-directory authority, so the no-follow
+/// fd-anchored discipline is implemented in exactly one place.
+#[cfg(unix)]
+pub(crate) mod held_fd;
+
 // ------------------------------------------------------------------------
 // Typed, matchable, fail-closed errors
 // ------------------------------------------------------------------------
@@ -404,10 +411,7 @@ fn walk_private_dir(path: &Path, create: bool) -> Result<std::fs::File, PrivateF
                 use std::os::unix::fs::MetadataExt;
                 let pmeta = dir.metadata().map_err(|e| {
                     PrivateFsError::io(
-                        format!(
-                            "stat parent of component {name:?} under {}",
-                            path.display()
-                        ),
+                        format!("stat parent of component {name:?} under {}", path.display()),
                         e,
                     )
                 })?;
@@ -441,9 +445,7 @@ fn walk_private_dir(path: &Path, create: bool) -> Result<std::fs::File, PrivateF
                 }
                 // SAFETY: `fstatat` returned 0, so `stat` is initialised.
                 let stat = unsafe { stat.assume_init() };
-                if u32::from(stat.st_mode) & u32::from(libc::S_IFMT)
-                    != u32::from(libc::S_IFLNK)
-                {
+                if u32::from(stat.st_mode) & u32::from(libc::S_IFMT) != u32::from(libc::S_IFLNK) {
                     return Err(PrivateFsError::Containment(format!(
                         "component {name:?} under {} is not a directory",
                         path.display()
@@ -786,7 +788,10 @@ pub fn read_private_file(path: &Path, _label: &str) -> Result<Option<Vec<u8>>, P
     match std::fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(PrivateFsError::io(format!("reading {}", path.display()), error)),
+        Err(error) => Err(PrivateFsError::io(
+            format!("reading {}", path.display()),
+            error,
+        )),
     }
 }
 
@@ -861,7 +866,10 @@ fn create_temp_in(
             }
         }
     }
-    anyhow::bail!("could not create a unique temp file for {}", target.display())
+    anyhow::bail!(
+        "could not create a unique temp file for {}",
+        target.display()
+    )
 }
 
 /// Best-effort `unlinkat` cleanup of a temp entry beneath the held fd. Errors
@@ -943,7 +951,10 @@ pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
 
     let dir = atomic_write_dir(path);
     let final_name = path.file_name().ok_or_else(|| {
-        anyhow::anyhow!("write target {} has no final path component", path.display())
+        anyhow::anyhow!(
+            "write target {} has no final path component",
+            path.display()
+        )
     })?;
     let final_c = std::ffi::CString::new(final_name.as_bytes())
         .with_context(|| format!("write target {} name contains NUL", path.display()))?;
@@ -1647,7 +1658,9 @@ mod tests {
             "the pre-existing secret must be byte-identical after a failed write"
         );
         assert!(
-            !after.windows(b"NEW-SECRET-PAYLOAD".len()).any(|w| w == b"NEW-SECRET-PAYLOAD"),
+            !after
+                .windows(b"NEW-SECRET-PAYLOAD".len())
+                .any(|w| w == b"NEW-SECRET-PAYLOAD"),
             "the new secret must never be written into the victim on a failed write"
         );
     }

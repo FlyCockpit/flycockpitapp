@@ -445,11 +445,12 @@ fn digest(parts: &[&[u8]]) -> String {
 #[cfg(unix)]
 mod imp {
     use std::ffi::{CString, OsStr};
-    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::MetadataExt as _;
 
     use super::*;
+    use crate::private_fs::held_fd;
 
     #[derive(Debug)]
     pub(super) struct HeldDirectory {
@@ -476,22 +477,17 @@ mod imp {
             let mut walked = PathBuf::from("/");
             for bytes in &names {
                 let name = CString::new(bytes.as_slice()).context("directory component has NUL")?;
-                let fd = unsafe {
-                    libc::openat(
-                        dir.as_raw_fd(),
-                        name.as_ptr(),
-                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                dir = held_fd::openat(
+                    dir.as_raw_fd(),
+                    &name,
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+                .with_context(|| {
+                    format!(
+                        "opening held directory component {:?}",
+                        OsStr::from_bytes(bytes)
                     )
-                };
-                if fd < 0 {
-                    return Err(std::io::Error::last_os_error()).with_context(|| {
-                        format!(
-                            "opening held directory component {:?}",
-                            OsStr::from_bytes(bytes)
-                        )
-                    });
-                }
-                dir = unsafe { File::from_raw_fd(fd) };
+                })?;
                 walked.push(OsStr::from_bytes(bytes));
             }
             let metadata = dir.metadata()?;
@@ -547,30 +543,14 @@ mod imp {
         pub(super) fn create_file_exclusive(&self, name: &str) -> Result<(File, String, String)> {
             self.verify_directory_security()?;
             let name = CString::new(name)?;
-            let fd = unsafe {
-                libc::openat(
-                    self.dir.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_RDWR
-                        | libc::O_CREAT
-                        | libc::O_EXCL
-                        | libc::O_NOFOLLOW
-                        | libc::O_CLOEXEC,
-                    // Variadic `openat` mode: promote to `c_uint` (mode_t is u16 on
-                    // Apple targets, which cannot be passed to a C variadic directly).
-                    0o600 as libc::c_uint,
-                )
-            };
-            if fd < 0 {
-                return Err(std::io::Error::last_os_error())
-                    .context("exclusive held-directory create");
-            }
-            let file = unsafe { File::from_raw_fd(fd) };
-            ensure!(
-                unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } == 0,
-                "fchmod 0600 failed: {}",
-                std::io::Error::last_os_error()
-            );
+            let file = held_fd::openat_mode(
+                self.dir.as_raw_fd(),
+                &name,
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+            .context("exclusive held-directory create")?;
+            held_fd::fchmod(file.as_raw_fd(), 0o600).context("fchmod 0600 failed")?;
             let (identity, security) = file_evidence(&file)?;
             Ok((file, identity, security))
         }
@@ -620,17 +600,13 @@ mod imp {
                         true,
                     ));
                 }
-                let linked = unsafe {
-                    libc::linkat(
-                        libc::AT_FDCWD,
-                        proc_source.as_ptr(),
-                        self.dir.as_raw_fd(),
-                        target.as_ptr(),
-                        libc::AT_SYMLINK_FOLLOW,
-                    )
-                };
-                if linked != 0 {
-                    let error = std::io::Error::last_os_error();
+                if let Err(error) = held_fd::linkat(
+                    libc::AT_FDCWD,
+                    &proc_source,
+                    self.dir.as_raw_fd(),
+                    &target,
+                    libc::AT_SYMLINK_FOLLOW,
+                ) {
                     if error.kind() == std::io::ErrorKind::AlreadyExists {
                         return Ok(HeldDirectoryEffectOutcome::ProvenNotApplied(artifact));
                     }
@@ -653,7 +629,7 @@ mod imp {
                     }
                 };
                 if take_forced_cleanup_failure()
-                    || unsafe { libc::unlinkat(self.dir.as_raw_fd(), source.as_ptr(), 0) } != 0
+                    || held_fd::unlinkat(self.dir.as_raw_fd(), &source, 0).is_err()
                 {
                     return Ok(unknown_recovery(
                         Some(to.to_owned()),
@@ -695,7 +671,7 @@ mod imp {
         ) -> Result<HeldDirectoryEffectOutcome> {
             self.verify_directory_security()?;
             let name = CString::new(artifact.name.as_str())?;
-            if unsafe { libc::unlinkat(self.dir.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            if held_fd::unlinkat(self.dir.as_raw_fd(), &name, 0).is_err() {
                 if let Ok(mut source) = open_named(&self.dir, name.to_str()?)
                     && verify_expected_file(&source, &artifact.evidence, true).is_ok()
                     && validate_contents(&mut source, &artifact.evidence).is_ok()
@@ -824,9 +800,7 @@ mod imp {
                                     ));
                                 }
                             };
-                            if unsafe { libc::unlinkat(self.dir.as_raw_fd(), name.as_ptr(), 0) }
-                                != 0
-                            {
+                            if held_fd::unlinkat(self.dir.as_raw_fd(), &name, 0).is_err() {
                                 return Ok(HeldDirectoryEffectOutcome::AppliedUnknown(
                                     recovery.clone(),
                                 ));
@@ -948,38 +922,21 @@ mod imp {
 
     pub(super) fn open_named(dir: &File, name: &str) -> Result<File> {
         let name = CString::new(name)?;
-        let fd = unsafe {
-            libc::openat(
-                dir.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error()).context("reopening held artifact");
-        }
-        Ok(unsafe { File::from_raw_fd(fd) })
+        held_fd::openat(
+            dir.as_raw_fd(),
+            &name,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+        .context("reopening held artifact")
     }
 
     pub(super) fn entry_absent(dir: &File, name: &str) -> Result<bool> {
         let name = CString::new(name)?;
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-        let result = unsafe {
-            libc::fstatat(
-                dir.as_raw_fd(),
-                name.as_ptr(),
-                stat.as_mut_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        };
-        if result == 0 {
-            return Ok(false);
+        match held_fd::fstatat_nofollow(dir.as_raw_fd(), &name) {
+            Ok(_) => Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(error) => Err(error).context("checking held-directory entry absence"),
         }
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::NotFound {
-            return Ok(true);
-        }
-        Err(error).context("checking held-directory entry absence")
     }
 
     fn is_exact_not_found(error: &anyhow::Error) -> bool {
@@ -1009,16 +966,7 @@ mod imp {
     }
 
     fn open_absolute_root() -> Result<File> {
-        let fd = unsafe {
-            libc::open(
-                c"/".as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error()).context("opening filesystem root");
-        }
-        Ok(unsafe { File::from_raw_fd(fd) })
+        held_fd::open_fs_root().context("opening filesystem root")
     }
 }
 

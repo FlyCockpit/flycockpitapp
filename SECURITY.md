@@ -26,14 +26,20 @@ Its security boundaries and limitations are deliberately explicit:
   current builds import those leftovers and delete them. After import,
   production code does not recreate `credentials.json`.
 - The wrapping KEK is a `private_fs` owner-only file on every unconfigured
-  first run. The OS keyring holds the KEK only after an explicit Settings
-  promotion and a successful migrate. First-run never auto-selects keyring,
-  even when a keyring probe is available. Database mode is weaker than
-  keyring mode: the KEK is another local file. A copy of `cockpit.db`
-  (including WAL) is ciphertext-only; decrypting it requires the file KEK
+  first run (Unix `0600`; Windows owner-only DACL). Database mode is not
+  shipped with an unprotected KEK file. The OS keyring holds the KEK only
+  after an explicit Settings promotion and a successful migrate. First-run
+  never auto-selects keyring, even when a keyring probe is available.
+  Placement is installation-scoped (`cockpit.db` authority row), not a
+  project or remote `config.json` key. Database mode is weaker than keyring
+  mode: the KEK is another local file. A copy of `cockpit.db` (including WAL
+  and backups) is ciphertext-only; decrypting it requires the file KEK
   (database mode) or a compromised keyring (keyring mode). DEK and KEK
-  plaintext never persist in SQLite. Remote daemon identity P-256 stays on
-  the platform adapter and is not copied into the vault.
+  plaintext never persist in SQLite. `protected_redaction_history` remains
+  AEAD keyed by the vault-held redaction-history root. Remote daemon
+  identity P-256 stays on the platform adapter and is not copied into the
+  vault. Switching keyring → database requires a TUI confirm. Settings
+  rechecks capabilities if you try to enable a disabled option.
 - Agent-run shell commands receive the session environment. Unconfined commands
   clear and reconstruct that environment, excluding explicit and name-matched
   sensitive variables; this is a heuristic, not an isolation boundary. Confined

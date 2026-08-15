@@ -19,6 +19,23 @@ id = "safety.bubblewrap"
 install_url = "https://github.com/containers/bubblewrap/blob/main/README.md"
 verify_command = "bwrap --version"
 
+[keyring]
+id = "security.keyring"
+install_url = "https://wiki.gnome.org/Projects/GnomeKeyring"
+verify_commands = [
+    "gnome-keyring-daemon --start --components=secrets",
+    "security find-generic-password -a $USER -s cockpit 2>/dev/null || true",
+]
+linux_package = "gnome-keyring"
+
+[container]
+ids = ["container.docker", "container.podman"]
+any_of = true
+docker_verify = "docker version"
+podman_verify = "podman version"
+docker_url = "https://docs.docker.com/engine/install/"
+podman_url = "https://podman.io/docs/installation"
+
 [release_assets]
 completions = ["cockpit.bash", "_cockpit", "cockpit.fish"]
 man_pages = ["cockpit.1"]

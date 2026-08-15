@@ -14,3 +14,9 @@ required and discovered versions when known, typed safe cause/remedy data, and
 the same bounded `reason` displayed by Settings and text doctor output. The
 document never includes raw probe output, environment variables, credentials,
 or configured command arguments.
+
+Capability-gated optional runtimes (a closed subset of this catalog) are
+`security.keyring`, `safety.bubblewrap`, `container.docker`,
+`container.podman`, `media.ffmpeg`, and `media.ffprobe`. Missing one disables
+that feature; it does not fail installation or daemon start. See
+[runtime prerequisites](./runtime-prerequisites.md).

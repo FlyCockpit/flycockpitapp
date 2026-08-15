@@ -60,6 +60,16 @@ pub use projection::{
     current_dependency_context_line, current_startup_dependency_policy,
     freeze_pending_as_timed_out, project_dependencies, startup_dependency_policy,
 };
+/// Capability-gated optional runtimes documented by `runtime-prerequisites.toml`.
+/// This is a closed subset of the doctor catalog (git, harnesses, LSP stay out).
+pub const RUNTIME_PREREQUISITE_IDS: &[&str] = &[
+    crate::external_runtime::safety_adapters::ID_KEYRING,
+    crate::external_runtime::safety_adapters::ID_BUBBLEWRAP,
+    crate::external_runtime::safety_adapters::ID_DOCKER,
+    crate::external_runtime::safety_adapters::ID_PODMAN,
+    crate::external_runtime::adapters::ID_MEDIA_FFMPEG,
+    crate::external_runtime::adapters::ID_MEDIA_FFPROBE,
+];
 pub use safety_adapters::{
     ContainerEngineMode, ContainerEngineSelection, ContainerRuntime as SafetyContainerRuntime,
     FORBIDDEN_MUTATING_PROBE_VERBS, ID_BUBBLEWRAP, ID_DOCKER, ID_IMPORT, ID_KEYRING, ID_PODMAN,

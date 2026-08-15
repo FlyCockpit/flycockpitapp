@@ -17,7 +17,14 @@ ROOT = Path(__file__).resolve().parents[3]
 CATALOG = ROOT / "crates/cockpit-core/src/external_runtime/adapters.rs"
 DOC = ROOT / "apps/docs/src/content/docs/reference/runtime-prerequisites.md"
 WARNING = ROOT / "apps/cli/generated/runtime-prerequisites.txt"
-IDS = ("ID_MEDIA_FFMPEG", "ID_MEDIA_FFPROBE", "ID_BUBBLEWRAP")
+IDS = (
+    "ID_MEDIA_FFMPEG",
+    "ID_MEDIA_FFPROBE",
+    "ID_BUBBLEWRAP",
+    "ID_KEYRING",
+    "ID_DOCKER",
+    "ID_PODMAN",
+)
 METADATA = ROOT / "apps/cli/runtime-prerequisites.toml"
 
 DOCUMENT_TEMPLATE = """---
@@ -45,11 +52,37 @@ Unknown platforms receive only the official link and verification commands.
 
 ## Linux shell sandbox
 
-Bubblewrap (`{bubblewrap_id}`) strengthens the host shell sandbox on Linux.
-Its absence produces a warning but never makes installation fail and never
-runs a package manager. Follow {bubblewrap_url}, verify with
-`{bubblewrap_verify}`, refresh dependency health, and uninstall using
-the system package source if it is no longer wanted.
+Bubblewrap (`{bubblewrap_id}`) unlocks host filesystem Sandbox on Linux.
+Cockpit still starts without it; missing Bubblewrap makes host Sandbox
+unavailable and the **effective** mode Off. The option is not selectable
+until you install it and refresh capabilities in Settings. Absence is a
+warning and never makes installation fail. It never runs a package
+manager. Follow {bubblewrap_url}, verify with `{bubblewrap_verify}`.
+`safety.bubblewrap` is Linux-only. Windows has no host filesystem sandbox
+(grant-or-ask). macOS uses zerobox and has no bubblewrap package.
+
+## Secret storage (OS keyring)
+
+`{keyring_id}` unlocks **keyring KEK placement**, not “every secret is a
+keyring item.” First-run is always database mode: a local `private_fs`
+owner-only KEK file plus encrypted SQLite (wrapped DEK + AEAD
+ciphertext), even when an OS keyring is already installed. Promotion to
+the keyring is an explicit Settings action after vault unification.
+Missing keyring only means the Settings keyring option stays disabled.
+Switching keyring → database is weaker, requires confirm, and moves the
+wrapping key to a local file. Linux: install `gnome-keyring` providing
+`org.freedesktop.secrets`. `libsecret` alone is not enough; a TTY session
+may need `{keyring_verify}`. Verify with that command, Keychain, or
+Windows Credential Manager. Settings rechecks if you try to enable a
+disabled option.
+
+## Container sandbox
+
+`{docker_id}` / `{podman_id}` are any-of for container sandbox modes.
+Cockpit still starts without them. Missing both disables container /
+container-readonly and the **effective** mode is Off — never a silent
+fallback to host Sandbox. Verify with `{docker_verify}` or
+`{podman_verify}`. Install from {docker_url} or {podman_url}.
 
 ## Cockpit installation assets
 
@@ -64,9 +97,14 @@ CLI README for installation and removal steps.
 
 WARNING_TEMPLATE = """Cockpit external runtime notice
 
-Cockpit does not install host dependencies. Missing Bubblewrap is a warning and
-does not fail installation. Selected audio/video inputs require a compatible
-FFmpeg and FFprobe pair; images decode natively. Diagnose with:
+Cockpit does not install host dependencies. Missing security.keyring,
+safety.bubblewrap, container.docker, container.podman, media.ffmpeg, or
+media.ffprobe never fails installation. First-run secret storage is always
+a local file KEK plus encrypted SQLite. Missing Bubblewrap makes host
+Sandbox effective Off. Missing docker/podman disables container modes
+(effective Off, never host Sandbox fallback). Selected audio/video inputs
+require a compatible FFmpeg and FFprobe pair; images decode natively.
+Settings rechecks a disabled feature if you try to enable it. Diagnose with:
   {doctor_command}
 Documentation: {docs_url}
 """
@@ -74,19 +112,26 @@ Documentation: {docs_url}
 
 def catalog_values(metadata: dict) -> dict[str, str]:
     source = CATALOG.read_text()
-    missing = [item for item in IDS[:2] if source.count(item) < 3]
     safety = (CATALOG.parent / "safety_adapters.rs").read_text()
-    if IDS[2] not in safety:
-        missing.append(IDS[2])
+    missing = [item for item in IDS[:2] if source.count(item) < 3]
+    for name in IDS[2:]:
+        if name not in safety:
+            missing.append(name)
     if missing:
         raise SystemExit(f"runtime catalog is missing registered IDs: {', '.join(missing)}")
     values: dict[str, str] = {}
-    for name, text in ((IDS[0], source), (IDS[1], source), (IDS[2], safety)):
+    for name in IDS:
+        text = source if name.startswith("ID_MEDIA_") else safety
         match = re.search(rf'pub const {name}: &str = "([^"]+)";', text)
         if not match:
             raise SystemExit(f"could not read catalog value for {name}")
         values[name] = match.group(1)
-    expected = [*metadata["media"]["ids"], metadata["bubblewrap"]["id"]]
+    expected = [
+        *metadata["media"]["ids"],
+        metadata["bubblewrap"]["id"],
+        metadata["keyring"]["id"],
+        *metadata["container"]["ids"],
+    ]
     if list(values.values()) != expected:
         raise SystemExit("runtime metadata IDs do not match the registered Rust catalog")
     if metadata["media"]["rule_id"] not in source:
@@ -103,14 +148,19 @@ def main() -> int:
     surface = metadata["surface"]
     media = metadata["media"]
     bubblewrap = metadata["bubblewrap"]
+    keyring = metadata["keyring"]
+    container = metadata["container"]
     document = DOCUMENT_TEMPLATE.format(
         title=surface["title"],
         description=surface["description"],
         settings_label=surface["settings_label"],
         doctor_command=surface["doctor_command"],
-        ffmpeg_id=values[IDS[0]],
-        ffprobe_id=values[IDS[1]],
-        bubblewrap_id=values[IDS[2]],
+        ffmpeg_id=values["ID_MEDIA_FFMPEG"],
+        ffprobe_id=values["ID_MEDIA_FFPROBE"],
+        bubblewrap_id=values["ID_BUBBLEWRAP"],
+        keyring_id=values["ID_KEYRING"],
+        docker_id=values["ID_DOCKER"],
+        podman_id=values["ID_PODMAN"],
         native_formats=", ".join(media["native_formats"]),
         audio_formats=", ".join(media["external_audio_formats"]),
         video_formats=", ".join(media["external_video_formats"]),
@@ -119,6 +169,11 @@ def main() -> int:
         ffprobe_verify=media["verify_commands"][1],
         bubblewrap_url=bubblewrap["install_url"],
         bubblewrap_verify=bubblewrap["verify_command"],
+        keyring_verify=keyring["verify_commands"][0],
+        docker_verify=container["docker_verify"],
+        podman_verify=container["podman_verify"],
+        docker_url=container["docker_url"],
+        podman_url=container["podman_url"],
     )
     warning = WARNING_TEMPLATE.format(**surface)
     if args.check:

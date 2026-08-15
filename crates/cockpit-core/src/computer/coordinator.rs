@@ -41,6 +41,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use tokio::sync::oneshot;
 
 use super::frame::{
     ActionId, CaptureEpoch, FrameDimensions, InMemoryReservationHandle, LiveComputerFrame,
@@ -151,8 +152,244 @@ impl std::fmt::Display for HostLockError {
 
 impl std::error::Error for HostLockError {}
 
+/// Production OS-level advisory lock: one lock file per [`PhysicalTargetKey`]
+/// under the private Cockpit data root.
+///
+/// On Unix each key maps to a `0o600`, no-symlink-follow lock file on which an
+/// exclusive, non-blocking `flock(LOCK_EX | LOCK_NB)` is taken and **held for
+/// the lease lifetime** — the owning [`std::fs::File`] descriptor lives in
+/// [`FileAdvisoryLock::held`], so the kernel lock is released exactly when the
+/// arbiter releases (drops the fd). Because `flock` locks attach to the open
+/// file *description*, two independent `FileAdvisoryLock` instances that each
+/// `open` the same path obtain separate descriptions and therefore genuinely
+/// contend — even inside a single process — which is precisely the harness the
+/// FIFO/contention tests rely on.
+///
+/// On non-Unix targets there is no `flock`; the lock is the atomic
+/// exclusive **existence** of the lock file (`create_new`), mirroring the
+/// sealed-compartment / host-identity Windows idiom already in the tree. It is
+/// removed when the lock is released. This path is `cfg`-gated and is never
+/// exercised on Unix.
+pub struct FileAdvisoryLock {
+    /// Directory that holds the per-key lock files.
+    root: std::path::PathBuf,
+    /// Locks currently held by this instance, keyed by the arbiter key string.
+    /// The value owns the live descriptor (Unix) / lock-file path (non-Unix);
+    /// dropping/removing it releases the OS lock.
+    held: HashMap<String, HeldFileLock>,
+}
+
+/// A single held OS lock file. The owned descriptor keeps the `flock` alive on
+/// Unix; the path allows the exclusive-create lock file to be removed on
+/// release on non-Unix targets (where there is no `flock`).
+struct HeldFileLock {
+    _file: std::fs::File,
+    #[cfg(not(unix))]
+    path: std::path::PathBuf,
+}
+
+impl std::fmt::Debug for FileAdvisoryLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileAdvisoryLock")
+            .field("root", &self.root)
+            .field("held", &self.held.len())
+            .finish()
+    }
+}
+
+impl FileAdvisoryLock {
+    /// Open a production lock rooted at the private Cockpit data directory.
+    pub fn new() -> Result<Self, HostLockError> {
+        let root = crate::config::resolve::cockpit_data_dir()
+            .map_err(|err| HostLockError::LockFileIo(err.to_string()))?;
+        Self::with_root(root)
+    }
+
+    /// Open a lock rooted at an explicit directory. Tests inject a private
+    /// temp root; production uses [`FileAdvisoryLock::new`]. The directory is
+    /// created (owner-only on Unix) if it does not exist.
+    pub fn with_root(root: std::path::PathBuf) -> Result<Self, HostLockError> {
+        ensure_lock_root(&root)?;
+        Ok(Self {
+            root,
+            held: HashMap::new(),
+        })
+    }
+
+    /// The lock-file path for a physical key. Derived from the canonical key
+    /// string so that any two instances contending on the same key resolve to
+    /// the same file, while staying filesystem-safe and bounded in length.
+    fn lock_path(&self, key: &PhysicalTargetKey) -> std::path::PathBuf {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        HostInputArbiter::key_string(key).hash(&mut hasher);
+        let digest = hasher.finish();
+        self.root.join(format!("computer-host-input-{digest:016x}.lock"))
+    }
+
+    /// Test-only accessor for the per-key lock-file path, so tests can
+    /// pre-create a lock file (e.g. with broad permissions) at the exact path
+    /// this instance will open.
+    #[cfg(test)]
+    pub(crate) fn lock_path_for_test(&self, key: &PhysicalTargetKey) -> std::path::PathBuf {
+        self.lock_path(key)
+    }
+}
+
+/// Ensure the lock root directory exists (owner-only on Unix).
+#[cfg(unix)]
+fn ensure_lock_root(root: &std::path::Path) -> Result<(), HostLockError> {
+    use std::os::unix::fs::PermissionsExt;
+    if !root.exists() {
+        std::fs::create_dir_all(root).map_err(|err| HostLockError::LockFileIo(err.to_string()))?;
+        let _ = std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_lock_root(root: &std::path::Path) -> Result<(), HostLockError> {
+    if !root.exists() {
+        std::fs::create_dir_all(root).map_err(|err| HostLockError::LockFileIo(err.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Acquire the OS lock file for `path` exclusively and non-blocking.
+///
+/// Returns `Ok(file)` with the descriptor to hold for the lease lifetime,
+/// `Err(ContendedByOtherProcess)` if the lock is already held (by another
+/// process or another open description in this process), or `Err(LockFileIo)`
+/// on any other I/O failure.
+#[cfg(unix)]
+fn os_lock_file(path: &std::path::Path) -> Result<std::fs::File, HostLockError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::io::AsRawFd;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|err| HostLockError::LockFileIo(err.to_string()))?;
+
+    // `.mode(0o600)` only applies to a NEWLY created file; a pre-existing lock
+    // file may carry broader permissions or a foreign owner. Verify and tighten
+    // the held fd (fstat/fchmod — no path re-resolution, so no TOCTOU) before
+    // taking the lock; fail closed on anything we cannot make owner-private.
+    let meta = file
+        .metadata()
+        .map_err(|err| HostLockError::LockFileIo(err.to_string()))?;
+    if !meta.file_type().is_file() {
+        return Err(HostLockError::LockFileIo(
+            "lock path is not a regular file".to_string(),
+        ));
+    }
+    // SAFETY: `geteuid` is always safe.
+    let euid = unsafe { libc::geteuid() };
+    if meta.uid() != euid {
+        return Err(HostLockError::LockFileIo(
+            "lock file owned by another user".to_string(),
+        ));
+    }
+    if meta.mode() & 0o777 != 0o600 {
+        // `File::set_permissions` is `fchmod` on the held fd.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|err| HostLockError::LockFileIo(err.to_string()))?;
+        let remeta = file
+            .metadata()
+            .map_err(|err| HostLockError::LockFileIo(err.to_string()))?;
+        if remeta.mode() & 0o777 != 0o600 {
+            return Err(HostLockError::LockFileIo(
+                "could not tighten lock file to 0o600".to_string(),
+            ));
+        }
+    }
+
+    // SAFETY: `file` owns a live descriptor for the duration of this call.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        // EWOULDBLOCK (== EAGAIN) means the exclusive lock is held elsewhere.
+        return match err.raw_os_error() {
+            Some(code) if code == libc::EWOULDBLOCK => {
+                Err(HostLockError::ContendedByOtherProcess)
+            }
+            _ => Err(HostLockError::LockFileIo(err.to_string())),
+        };
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn os_lock_file(path: &std::path::Path) -> Result<std::fs::File, HostLockError> {
+    // Windows/non-Unix: no `flock`. The atomic exclusive create of the lock
+    // file itself is the lock (mirrors the sealed-compartment idiom). The file
+    // is removed on release so the next acquirer can create it.
+    match std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(file) => Ok(file),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(HostLockError::ContendedByOtherProcess)
+        }
+        Err(err) => Err(HostLockError::LockFileIo(err.to_string())),
+    }
+}
+
+impl OsAdvisoryLock for FileAdvisoryLock {
+    fn try_lock(&mut self, key: &PhysicalTargetKey) -> Result<(), HostLockError> {
+        let key_str = HostInputArbiter::key_string(key);
+        // A held key must be released before re-acquiring; the arbiter always
+        // releases before promotion, so this only guards against misuse.
+        if self.held.contains_key(&key_str) {
+            return Ok(());
+        }
+        let path = self.lock_path(key);
+        let file = os_lock_file(&path)?;
+        self.held.insert(
+            key_str,
+            HeldFileLock {
+                _file: file,
+                #[cfg(not(unix))]
+                path,
+            },
+        );
+        Ok(())
+    }
+
+    fn release(&mut self, key: &PhysicalTargetKey) {
+        let key_str = HostInputArbiter::key_string(key);
+        if let Some(held) = self.held.remove(&key_str) {
+            // Unix: dropping the descriptor releases the `flock`; the lock file
+            // is intentionally left in place (like the host-identity lock).
+            // Non-Unix: remove the exclusive-create lock file after closing it.
+            #[cfg(not(unix))]
+            {
+                let HeldFileLock { _file, path } = held;
+                drop(_file);
+                let _ = std::fs::remove_file(&path);
+            }
+            #[cfg(unix)]
+            {
+                drop(held);
+            }
+        }
+    }
+
+    fn is_locked(&self, key: &PhysicalTargetKey) -> bool {
+        let key_str = HostInputArbiter::key_string(key);
+        self.held.contains_key(&key_str)
+    }
+}
+
 /// In-memory OS advisory lock for hermetic tests. Simulates cross-process
 /// contention by sharing state across clones of the arbiter.
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub struct InMemoryOsAdvisoryLock {
     locked_keys: Arc<std::sync::Mutex<HashMap<String, OwnerInstance>>>,
@@ -163,6 +400,7 @@ pub struct InMemoryOsAdvisoryLock {
     pub force_failure: Option<HostLockError>,
 }
 
+#[cfg(test)]
 impl InMemoryOsAdvisoryLock {
     pub fn new() -> Self {
         Self::default()
@@ -186,6 +424,7 @@ impl InMemoryOsAdvisoryLock {
     }
 }
 
+#[cfg(test)]
 impl OsAdvisoryLock for InMemoryOsAdvisoryLock {
     fn try_lock(&mut self, key: &PhysicalTargetKey) -> Result<(), HostLockError> {
         if let Some(err) = &self.force_failure {
@@ -218,15 +457,88 @@ impl OsAdvisoryLock for InMemoryOsAdvisoryLock {
     }
 }
 
+/// Monotonic identifier for a queued FIFO waiter, unique within an arbiter.
+/// Lets a [`WaitHandle`] be cancelled precisely even if two waiters share a
+/// delegation id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct WaiterId(u64);
+
 /// A waiter in the process-local FIFO queue.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct ArbiterWaiter {
+    id: WaiterId,
     target_key: PhysicalTargetKey,
     owner_instance: OwnerInstance,
     delegation: DelegationId,
     /// Set to true when this waiter has been cancelled. Cancelled waiters
     /// are removed without transferring their generation.
     cancelled: bool,
+    /// Delivery channel for the promoted lease token. `release` sends the
+    /// minted token here; the owning [`WaitHandle::await_token`] receives it.
+    /// `None` once the token (or a failure) has been delivered.
+    sender: Option<oneshot::Sender<Result<HostLeaseToken, WaitFailed>>>,
+}
+
+/// Why an awaited FIFO promotion failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WaitFailed {
+    /// The waiter was cancelled (or its handle abandoned) before promotion.
+    Cancelled,
+    /// The arbiter/target was invalidated before the waiter could be promoted.
+    Invalidated,
+    /// The OS-level lock could not be re-acquired for the promoted waiter.
+    OsLockFailed(HostLockError),
+}
+
+impl std::fmt::Display for WaitFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => f.write_str("host lease wait cancelled"),
+            Self::Invalidated => f.write_str("host lease wait invalidated"),
+            Self::OsLockFailed(err) => write!(f, "host lease wait OS lock failed: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for WaitFailed {}
+
+/// A handle to a queued FIFO waiter. The holder either [`await_token`]s the
+/// promoted lease after the current holder releases, or abandons the wait by
+/// dropping the handle (and, for in-process abandonment, having the arbiter
+/// [`cancel_waiter_by_id`] it so no ghost lease is promoted).
+///
+/// [`await_token`]: WaitHandle::await_token
+/// [`cancel_waiter_by_id`]: HostInputArbiter::cancel_waiter_by_id
+#[derive(Debug)]
+pub struct WaitHandle {
+    id: WaiterId,
+    target_key: PhysicalTargetKey,
+    delegation: DelegationId,
+    receiver: oneshot::Receiver<Result<HostLeaseToken, WaitFailed>>,
+}
+
+impl WaitHandle {
+    /// Await promotion. Resolves to the promoted [`HostLeaseToken`] (with a new
+    /// generation) once the prior holder releases, or [`WaitFailed`] if the
+    /// waiter was cancelled/abandoned, invalidated, or the OS lock failed.
+    pub async fn await_token(self) -> Result<HostLeaseToken, WaitFailed> {
+        match self.receiver.await {
+            Ok(result) => result,
+            // The sender was dropped without delivering — the waiter was
+            // removed (cancelled/abandoned) without a promotion.
+            Err(_) => Err(WaitFailed::Cancelled),
+        }
+    }
+
+    /// The physical key this waiter is queued on.
+    pub fn target_key(&self) -> &PhysicalTargetKey {
+        &self.target_key
+    }
+
+    /// The delegation this waiter serves.
+    pub fn delegation(&self) -> &DelegationId {
+        &self.delegation
+    }
 }
 
 /// The host-global input arbiter. Serializes every real physical target across
@@ -246,6 +558,8 @@ pub struct HostInputArbiter {
     current_lease: HashMap<String, HostLeaseToken>,
     /// Monotonic generation counter per physical key.
     next_generation: HashMap<String, u64>,
+    /// Monotonic waiter-id counter (unique across all keys in this arbiter).
+    next_waiter_id: u64,
     /// The owner instance for this arbiter (this process).
     owner_instance: OwnerInstance,
 }
@@ -261,14 +575,18 @@ impl std::fmt::Debug for HostInputArbiter {
 }
 
 /// Result of attempting to acquire a host input lease.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Not `Clone`/`Eq`: [`AcquireResult::Queued`] carries a [`WaitHandle`] that
+/// owns a single-use delivery channel and therefore cannot be duplicated.
+#[derive(Debug)]
 pub enum AcquireResult {
     /// The lease was acquired immediately.
     Acquired(HostLeaseToken),
-    /// The lease was queued behind an existing holder. The waiter is
-    /// registered in the FIFO and will be notified when the current holder
-    /// releases.
-    Queued,
+    /// The lease was queued behind an existing holder. The returned
+    /// [`WaitHandle`] is registered in the FIFO; awaiting it yields the
+    /// promoted token when the current holder releases, and dropping it (with
+    /// an accompanying `cancel_waiter`) abandons the wait with no ghost lease.
+    Queued(WaitHandle),
     /// The OS-level lock could not be acquired (another process holds it).
     OsLockFailed(HostLockError),
 }
@@ -282,6 +600,7 @@ impl HostInputArbiter {
             queues: HashMap::new(),
             current_lease: HashMap::new(),
             next_generation: HashMap::new(),
+            next_waiter_id: 0,
             owner_instance,
         }
     }
@@ -307,18 +626,38 @@ impl HostInputArbiter {
     ) -> AcquireResult {
         let key_str = Self::key_string(target_key);
 
-        // If there is already a current lease holder in this process, queue.
-        if self.current_lease.contains_key(&key_str) {
+        // Queue if there is already a current holder, OR if non-cancelled
+        // waiters are already queued ahead: a new acquirer must never leapfrog
+        // a non-empty FIFO (e.g. one left after a promotion whose OS-lock
+        // re-acquire failed). FIFO order is respected; fail closed to Queued.
+        let has_live_waiters = self
+            .queues
+            .get(&key_str)
+            .map(|q| q.iter().any(|w| !w.cancelled))
+            .unwrap_or(false);
+        if self.current_lease.contains_key(&key_str) || has_live_waiters {
+            let waiter_id = {
+                self.next_waiter_id += 1;
+                WaiterId(self.next_waiter_id)
+            };
+            let (sender, receiver) = oneshot::channel();
             self.queues
                 .entry(key_str.clone())
                 .or_default()
                 .push(ArbiterWaiter {
+                    id: waiter_id,
                     target_key: *target_key,
                     owner_instance: self.owner_instance,
-                    delegation,
+                    delegation: delegation.clone(),
                     cancelled: false,
+                    sender: Some(sender),
                 });
-            return AcquireResult::Queued;
+            return AcquireResult::Queued(WaitHandle {
+                id: waiter_id,
+                target_key: *target_key,
+                delegation,
+                receiver,
+            });
         }
 
         // Try the OS-level lock.
@@ -368,18 +707,20 @@ impl HostInputArbiter {
         // Remove the current lease.
         self.current_lease.remove(&key_str);
 
-        // Promote the next non-cancelled waiter with a NEW generation.
-        let queue = self.queues.get_mut(&key_str);
-        if let Some(waiters) = queue {
+        // Promote the next non-cancelled waiter with a NEW generation, and
+        // deliver the minted token through the waiter's channel. Cancelled
+        // waiters are skipped WITHOUT transferring a generation.
+        if let Some(waiters) = self.queues.get_mut(&key_str) {
             while let Some(next) = waiters.first() {
                 if next.cancelled {
                     waiters.remove(0);
                     continue;
                 }
+                let target_key = next.target_key;
                 // Re-acquire the OS lock for the promoted waiter.
-                match self.os_lock.try_lock(&next.target_key) {
+                match self.os_lock.try_lock(&target_key) {
                     Ok(()) => {
-                        let waiter = waiters.remove(0);
+                        let mut waiter = waiters.remove(0);
                         let lease_gen = {
                             let counter = self.next_generation.entry(key_str.clone()).or_insert(0);
                             *counter += 1;
@@ -389,15 +730,44 @@ impl HostInputArbiter {
                             target_key: waiter.target_key,
                             generation: lease_gen,
                             owner_instance: waiter.owner_instance,
-                            delegation: waiter.delegation,
+                            delegation: waiter.delegation.clone(),
                         };
-                        self.current_lease.insert(key_str, new_token);
-                        return true;
+                        // Deliver the token to the awaiting owner. If the
+                        // receiver is gone (handle dropped without an explicit
+                        // cancel), there is no owner for this lease — roll back
+                        // rather than install an unowned ghost lease, and try
+                        // the next waiter.
+                        match waiter.sender.take() {
+                            Some(sender) => match sender.send(Ok(new_token.clone())) {
+                                Ok(()) => {
+                                    self.current_lease.insert(key_str, new_token);
+                                    return true;
+                                }
+                                Err(_) => {
+                                    self.os_lock.release(&target_key);
+                                    continue;
+                                }
+                            },
+                            None => {
+                                self.os_lock.release(&target_key);
+                                continue;
+                            }
+                        }
                     }
-                    Err(_) => {
-                        // OS lock failed — the waiter cannot be promoted.
-                        // Leave the queue; the caller can retry.
-                        break;
+                    Err(err) => {
+                        // OS lock re-acquisition failed for the head waiter.
+                        // Deliver `OsLockFailed` to it (so `await_token` never
+                        // hangs) and drop it, then CONTINUE down the FIFO —
+                        // never strand the remaining waiters with no holder to
+                        // trigger a later promotion. If the OS lock is
+                        // genuinely unavailable, every subsequent waiter also
+                        // fails and the queue drains to empty (fail closed);
+                        // if a later waiter can acquire, it is promoted.
+                        let mut waiter = waiters.remove(0);
+                        if let Some(sender) = waiter.sender.take() {
+                            let _ = sender.send(Err(WaitFailed::OsLockFailed(err)));
+                        }
+                        continue;
                     }
                 }
             }
@@ -429,6 +799,33 @@ impl HostInputArbiter {
                 waiter.cancelled = true;
                 return true;
             }
+        }
+        false
+    }
+
+    /// Cancel a queued waiter identified by its [`WaitHandle`]. The waiter is
+    /// removed from the FIFO immediately (not merely flagged) and its delivery
+    /// channel is dropped, so a subsequent [`release`](Self::release) cannot
+    /// promote a ghost lease into `current_lease` with no owner. Used by
+    /// `ComputerActionCoordinator::open` to fail closed on a contended lock.
+    ///
+    /// Returns `true` if the waiter was found and removed.
+    pub fn cancel_waiter_handle(&mut self, handle: &WaitHandle) -> bool {
+        self.cancel_waiter_by_id(&handle.target_key, handle.id)
+    }
+
+    fn cancel_waiter_by_id(&mut self, target_key: &PhysicalTargetKey, id: WaiterId) -> bool {
+        let key_str = Self::key_string(target_key);
+        let Some(waiters) = self.queues.get_mut(&key_str) else {
+            return false;
+        };
+        if let Some(pos) = waiters.iter().position(|w| w.id == id) {
+            // Remove outright (dropping the sender) so no promotion targets it.
+            waiters.remove(pos);
+            if waiters.is_empty() {
+                self.queues.remove(&key_str);
+            }
+            return true;
         }
         false
     }
@@ -494,6 +891,23 @@ impl HostInputArbiter {
         }
         released
     }
+}
+
+/// Lock the shared host-arbiter mutex, recovering the guard if the mutex was
+/// poisoned by a panic in another holder.
+///
+/// The arbiter's state is a plain bookkeeping map; a poisoned critical section
+/// leaves it structurally valid (at worst an in-flight bookkeeping update was
+/// interrupted, which the subsequent operation re-derives). Panicking on the
+/// host-lock/release path would tear down the whole delegation on an unrelated
+/// panic, so recover the guard and continue (fail-safe) rather than propagate
+/// the poison — no `.unwrap()`/panic on the lock path.
+fn lock_poison_safe(
+    arbiter: &Arc<std::sync::Mutex<HostInputArbiter>>,
+) -> std::sync::MutexGuard<'_, HostInputArbiter> {
+    arbiter
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 // ---------------------------------------------------------------------------
@@ -1519,17 +1933,40 @@ impl ComputerActionCoordinator {
                     // physical targets this stays `None` (they scope by host
                     // lease).
                     virtual_display_uuid = evidence.virtual_display_uuid;
-                    // If physical (not virtual), try to acquire the host lock.
+                    // If physical (not virtual) AND an arbiter is present, take
+                    // the host lock now and hold it for the coordinator's
+                    // lifetime.
+                    //
+                    // DEFERRED ENFORCEMENT (AC5/AC20 — live-loop production
+                    // wiring): *requiring* that a physical open hold the host
+                    // arbiter lock (i.e. failing closed when `host_arbiter` is
+                    // `None`) belongs to the live open-before-advertise path,
+                    // not to this lock-mechanism increment. This increment lands
+                    // the `FileAdvisoryLock` + FIFO `WaitHandle` MECHANISM
+                    // additively — exactly like the already-landed AC9
+                    // authorization increment (mechanism now, enforcement when
+                    // the live open-path lands). Until then, a physical open
+                    // with no arbiter proceeds unlocked (no caller regression);
+                    // callers that DO pass an arbiter get real serialization,
+                    // FIFO promotion, and fail-closed-on-queue below.
                     if evidence.virtual_display_uuid.is_none()
                         && let Ok(physical_key) = evidence.physical_target_key()
                         && let Some(arbiter) = &params.host_arbiter
                     {
-                        let mut arbiter = arbiter.lock().unwrap();
+                        let mut arbiter = lock_poison_safe(arbiter);
                         match arbiter.try_acquire(&physical_key, params.delegation_id.clone()) {
                             AcquireResult::Acquired(token) => {
                                 host_lease = Some(token);
                             }
-                            AcquireResult::Queued => {
+                            AcquireResult::Queued(handle) => {
+                                // SECURITY-CRITICAL fail-closed: production
+                                // `open` never awaits the FIFO. Abandon the
+                                // waiter before returning — remove its FIFO
+                                // entry and drop the handle — so a later
+                                // `release` cannot promote a ghost lease into
+                                // `current_lease` with no owner.
+                                arbiter.cancel_waiter_handle(&handle);
+                                drop(handle);
                                 return Err(CoordinatorOpenError::HostLockQueued);
                             }
                             AcquireResult::OsLockFailed(err) => {
@@ -1605,7 +2042,7 @@ impl ComputerActionCoordinator {
         if let Some(token) = self.host_lease.take()
             && let Some(arbiter) = &self.host_arbiter
         {
-            let mut arbiter = arbiter.lock().unwrap();
+            let mut arbiter = lock_poison_safe(arbiter);
             arbiter.release(&token);
         }
         let _ = reason; // recorded in the outcome
@@ -1617,7 +2054,7 @@ impl ComputerActionCoordinator {
             return true; // No host lease for virtual displays.
         };
         if let Some(arbiter) = &self.host_arbiter {
-            let mut arbiter = arbiter.lock().unwrap();
+            let mut arbiter = lock_poison_safe(arbiter);
             if arbiter.detect_lock_loss(token) {
                 self.host_lease = None;
                 self.invalidated = true;
@@ -2556,7 +2993,7 @@ impl ComputerActionCoordinator {
         if let Some(token) = self.host_lease.take()
             && let Some(arbiter) = &self.host_arbiter
         {
-            let mut arbiter = arbiter.lock().unwrap();
+            let mut arbiter = lock_poison_safe(arbiter);
             arbiter.release(&token);
         }
     }
@@ -2571,7 +3008,7 @@ impl ComputerActionCoordinator {
         if let Some(token) = self.host_lease.take()
             && let Some(arbiter) = &self.host_arbiter
         {
-            let mut arbiter = arbiter.lock().unwrap();
+            let mut arbiter = lock_poison_safe(arbiter);
             arbiter.release(&token);
         }
         // Release all backend resources.
@@ -3163,7 +3600,8 @@ mod tests {
     /// adapter whose snapshot carries a nonzero focus generation, so a
     /// coordinator opened with it satisfies the focus-generation gate for
     /// type/key actions. `host_arbiter` stays `None`, so `open` acquires no
-    /// host lock (see `open`'s no-arbiter path).
+    /// host lock (physical-open lock enforcement is deferred to the live-loop
+    /// wiring — see the deferral note at `open`).
     fn make_coordinator_params_with_focus(
         authorizer: Arc<dyn ComputerAuthorizer>,
     ) -> CoordinatorParams {
@@ -3372,7 +3810,7 @@ mod tests {
 
         // Second acquire queues (process-local FIFO).
         let result_b = arbiter.try_acquire(&key, delegation_b.clone());
-        assert!(matches!(result_b, AcquireResult::Queued));
+        assert!(matches!(result_b, AcquireResult::Queued(_)));
         assert_eq!(arbiter.waiter_count(&key), 1);
 
         // Release the first — the second is promoted with a NEW generation.
@@ -3388,7 +3826,7 @@ mod tests {
         // internally. Let's verify is_held and waiter_count.
         assert!(arbiter.is_held(&key));
         // The new acquisition should queue behind the promoted holder.
-        if let AcquireResult::Queued = result_a2 {
+        if let AcquireResult::Queued(_) = result_a2 {
             // Expected: queued behind the promoted delegation_b.
         } else {
             // If acquired, that means the promoted holder was already released.
@@ -3522,7 +3960,7 @@ mod tests {
 
         // B queues.
         let result_b = arbiter.try_acquire(&key, delegation_b.clone());
-        assert!(matches!(result_b, AcquireResult::Queued));
+        assert!(matches!(result_b, AcquireResult::Queued(_)));
         assert_eq!(arbiter.waiter_count(&key), 1);
 
         // Cancel B's waiter — removed without transferring generation.
@@ -3557,6 +3995,289 @@ mod tests {
         let lost = arbiter.detect_lock_loss(&token);
         assert!(lost);
         assert!(!arbiter.is_lease_valid(&token));
+    }
+
+    // =====================================================================
+    // Host arbiter: REAL OS file lock (flock) + async FIFO promotion.
+    // These exercise `FileAdvisoryLock` (not the in-memory test double) so
+    // contention is a genuine kernel `flock`, and the FIFO waiter promotion
+    // is delivered through a real async channel — no sleeps, no races.
+    // =====================================================================
+
+    /// AC7: a real `FileAdvisoryLock` under a temp data root. Two independent
+    /// lock instances (separate open file descriptions) contend on the same
+    /// physical key via genuine `flock`; releasing the first lets the second
+    /// acquire; the lock file is a regular file with mode `0o600` (Unix).
+    #[test]
+    fn computer_host_lock_file_advisory() {
+        let tmp = tempfile::tempdir().expect("temp data root");
+        let root = tmp.path().to_path_buf();
+        let key = physical_key();
+
+        let mut lock_a = FileAdvisoryLock::with_root(root.clone()).expect("open lock a");
+        let mut lock_b = FileAdvisoryLock::with_root(root.clone()).expect("open lock b");
+
+        // First instance takes the real OS lock.
+        assert!(lock_a.try_lock(&key).is_ok());
+        assert!(lock_a.is_locked(&key));
+
+        // Second instance opens the SAME path as a separate file description
+        // and genuinely contends on the exclusive `flock`.
+        assert_eq!(
+            lock_b.try_lock(&key),
+            Err(HostLockError::ContendedByOtherProcess)
+        );
+        assert!(!lock_b.is_locked(&key));
+
+        // The backing lock file is a regular file, mode 0o600 (Unix).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let mut found = false;
+            for entry in std::fs::read_dir(&root).expect("read data root") {
+                let entry = entry.expect("dir entry");
+                let name = entry.file_name();
+                if !name
+                    .to_string_lossy()
+                    .starts_with("computer-host-input-")
+                {
+                    continue;
+                }
+                let meta = std::fs::symlink_metadata(entry.path()).expect("lock file meta");
+                assert!(meta.file_type().is_file(), "lock file must be regular");
+                assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+                found = true;
+            }
+            assert!(found, "expected a computer-host-input lock file on disk");
+        }
+
+        // Releasing the first frees the real lock; the second can now acquire.
+        lock_a.release(&key);
+        assert!(!lock_a.is_locked(&key));
+        assert!(lock_b.try_lock(&key).is_ok());
+        assert!(lock_b.is_locked(&key));
+        lock_b.release(&key);
+
+        // A PRE-EXISTING lock file with broad permissions is tightened to
+        // 0o600 on acquire (held-fd fchmod + verify) — `.mode(0o600)` only
+        // covers newly created files, so stale-perms would otherwise persist.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let key2 =
+                PhysicalTargetKey::new(HostInstallationId([9u8; 32]), [9u8; 32], [9u8; 32]);
+            let mut lock_c = FileAdvisoryLock::with_root(root.clone()).expect("open lock c");
+            let stale = lock_c.lock_path_for_test(&key2);
+            std::fs::write(&stale, b"").expect("pre-create stale lock file");
+            std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644))
+                .expect("widen stale perms");
+            assert_eq!(
+                std::fs::metadata(&stale).unwrap().permissions().mode() & 0o777,
+                0o644
+            );
+
+            assert!(lock_c.try_lock(&key2).is_ok());
+            assert_eq!(
+                std::fs::metadata(&stale).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "a pre-existing lock file must be tightened to 0o600"
+            );
+            lock_c.release(&key2);
+        }
+    }
+
+    /// AC8: FIFO promotion over the REAL file lock. First holder `Acquired`;
+    /// second `Queued(WaitHandle)` and `await_token`s the promoted token (a
+    /// NEW generation) after the first releases; a cancelled waiter is skipped
+    /// without any generation transfer.
+    #[tokio::test]
+    async fn computer_host_lock_fifo_promotes_waiter() {
+        let tmp = tempfile::tempdir().expect("temp data root");
+        let os_lock = FileAdvisoryLock::with_root(tmp.path().to_path_buf()).expect("open file lock");
+        let mut arbiter = HostInputArbiter::new(Box::new(os_lock), OwnerInstance(1));
+
+        let key = physical_key();
+        let delegation_a = DelegationId("delegation-a".to_string());
+        let delegation_b = DelegationId("delegation-b".to_string());
+
+        // First holder acquires through a genuine `flock`.
+        let token_a = match arbiter.try_acquire(&key, delegation_a) {
+            AcquireResult::Acquired(t) => t,
+            other => panic!("expected Acquired, got {other:?}"),
+        };
+        assert_eq!(token_a.generation, LeaseGeneration(1));
+
+        // Second holder queues and receives a wait handle.
+        let handle_b = match arbiter.try_acquire(&key, delegation_b.clone()) {
+            AcquireResult::Queued(handle) => handle,
+            other => panic!("expected Queued, got {other:?}"),
+        };
+        assert_eq!(arbiter.waiter_count(&key), 1);
+
+        // Release the first: the real `flock` is dropped and re-taken for the
+        // promoted waiter, whose token is delivered through the channel.
+        assert!(arbiter.release(&token_a));
+
+        // The waiter awaits its promoted token — a NEW generation.
+        let token_b = handle_b.await_token().await.expect("promotion delivered");
+        assert_eq!(token_b.delegation, delegation_b);
+        assert_ne!(token_b.generation, token_a.generation);
+        assert_eq!(token_b.generation, LeaseGeneration(2));
+        assert!(arbiter.is_lease_valid(&token_b));
+
+        // A cancelled waiter is skipped WITHOUT generation transfer.
+        let handle_c = match arbiter.try_acquire(&key, DelegationId("delegation-c".to_string())) {
+            AcquireResult::Queued(handle) => handle,
+            other => panic!("expected Queued, got {other:?}"),
+        };
+        assert!(arbiter.cancel_waiter_handle(&handle_c));
+        assert_eq!(arbiter.waiter_count(&key), 0);
+
+        // Releasing B promotes no one (C was cancelled) — the key is now free
+        // and no generation was transferred to the cancelled waiter.
+        assert!(arbiter.release(&token_b));
+        assert!(!arbiter.is_held(&key));
+
+        // The cancelled handle resolves to `Cancelled` (never a stray token).
+        assert_eq!(handle_c.await_token().await, Err(WaitFailed::Cancelled));
+    }
+
+    /// AC19: production `open` fails closed on a contended host lock. When
+    /// `open` maps contention to `HostLockQueued` it must abandon the FIFO
+    /// waiter before returning, so after the first holder releases there is no
+    /// ghost promotion and `current_lease` is not left held by an unowned
+    /// token.
+    #[tokio::test]
+    async fn computer_host_lock_open_queued_cancels_waiter() {
+        let tmp = tempfile::tempdir().expect("temp data root");
+        let os_lock = FileAdvisoryLock::with_root(tmp.path().to_path_buf()).expect("open file lock");
+        let arbiter = Arc::new(std::sync::Mutex::new(HostInputArbiter::new(
+            Box::new(os_lock),
+            OwnerInstance(1),
+        )));
+        let key = physical_key();
+
+        // First delegation opens and acquires the host lease via a real lock.
+        let params_a = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-a".to_string()),
+            tier: ComputerApprovalTier::Yolo,
+            owner_instance: OwnerInstance(1),
+            authorizer: Arc::new(FakeComputerAuthorizer::always_allow()),
+            host_arbiter: Some(arbiter.clone()),
+            target_adapter: Some(Box::new(FakeTargetEvidenceAdapter::new(physical_evidence()))),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+        };
+        let mut coordinator_a =
+            ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params_a)
+                .await
+                .expect("first open acquires the host lease");
+        assert!(arbiter.lock().unwrap().is_held(&key));
+
+        // Second delegation contends: `open` maps it to `HostLockQueued` and
+        // must remove the FIFO waiter before returning.
+        let params_b = CoordinatorParams {
+            session_id: "session-1".to_string(),
+            delegation_id: DelegationId("delegation-b".to_string()),
+            tier: ComputerApprovalTier::Yolo,
+            owner_instance: OwnerInstance(1),
+            authorizer: Arc::new(FakeComputerAuthorizer::always_allow()),
+            host_arbiter: Some(arbiter.clone()),
+            target_adapter: Some(Box::new(FakeTargetEvidenceAdapter::new(physical_evidence()))),
+            provider_id: ProviderId("openai".to_string()),
+            model_id: ModelId("gpt-5".to_string()),
+        };
+        let result_b = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params_b).await;
+        assert!(matches!(result_b, Err(CoordinatorOpenError::HostLockQueued)));
+
+        // The FIFO entry is GONE — the abandoned waiter was removed.
+        assert_eq!(arbiter.lock().unwrap().waiter_count(&key), 0);
+
+        // The first holder releases: there must be NO ghost promotion and no
+        // unowned lease left installed.
+        coordinator_a.invalidate(TargetUnavailableReason::LockOrSecureDesktop);
+        let arb = arbiter.lock().unwrap();
+        assert!(
+            !arb.is_held(&key),
+            "no unowned lease may remain after the holder releases"
+        );
+        assert_eq!(arb.waiter_count(&key), 0);
+    }
+
+    /// A test OS lock that grants the first `ok_count` acquisitions and then
+    /// fails every subsequent one — models an OS lock that becomes unavailable
+    /// exactly at promotion (re-acquire) time.
+    struct FlakyOsLock {
+        attempts: usize,
+        ok_count: usize,
+    }
+
+    impl OsAdvisoryLock for FlakyOsLock {
+        fn try_lock(&mut self, _key: &PhysicalTargetKey) -> Result<(), HostLockError> {
+            self.attempts += 1;
+            if self.attempts <= self.ok_count {
+                Ok(())
+            } else {
+                Err(HostLockError::ContendedByOtherProcess)
+            }
+        }
+        fn release(&mut self, _key: &PhysicalTargetKey) {}
+        fn is_locked(&self, _key: &PhysicalTargetKey) -> bool {
+            true
+        }
+    }
+
+    /// Security regression: if OS-lock RE-ACQUISITION fails while promoting the
+    /// head waiter after a release, the queue must not be stranded — every
+    /// awaiter is delivered `OsLockFailed` (no hang), the FIFO drains, and no
+    /// unowned lease is installed.
+    #[tokio::test]
+    async fn computer_host_lock_promotion_os_failure_no_hang() {
+        // Only the first acquire (holder A) succeeds; every promotion
+        // re-acquire fails.
+        let os_lock = FlakyOsLock {
+            attempts: 0,
+            ok_count: 1,
+        };
+        let mut arbiter = HostInputArbiter::new(Box::new(os_lock), OwnerInstance(1));
+        let key = physical_key();
+
+        let token_a = match arbiter.try_acquire(&key, DelegationId("a".to_string())) {
+            AcquireResult::Acquired(t) => t,
+            other => panic!("expected Acquired, got {other:?}"),
+        };
+
+        // Two waiters queue behind A.
+        let handle_b = match arbiter.try_acquire(&key, DelegationId("b".to_string())) {
+            AcquireResult::Queued(h) => h,
+            other => panic!("expected Queued, got {other:?}"),
+        };
+        let handle_c = match arbiter.try_acquire(&key, DelegationId("c".to_string())) {
+            AcquireResult::Queued(h) => h,
+            other => panic!("expected Queued, got {other:?}"),
+        };
+        assert_eq!(arbiter.waiter_count(&key), 2);
+
+        // Release A: promotion re-acquire fails for both waiters. Neither
+        // awaiter may hang; the queue must fully drain; no ghost lease remains.
+        assert!(arbiter.release(&token_a));
+        assert!(!arbiter.is_held(&key));
+        assert_eq!(arbiter.waiter_count(&key), 0);
+
+        assert!(matches!(
+            handle_b.await_token().await,
+            Err(WaitFailed::OsLockFailed(_))
+        ));
+        assert!(matches!(
+            handle_c.await_token().await,
+            Err(WaitFailed::OsLockFailed(_))
+        ));
+
+        // With the queue drained, a fresh acquirer does not leapfrog a stranded
+        // queue; the still-unavailable OS lock makes it fail closed.
+        let after = arbiter.try_acquire(&key, DelegationId("d".to_string()));
+        assert!(matches!(after, AcquireResult::OsLockFailed(_)));
     }
 
     // =====================================================================
@@ -4553,7 +5274,7 @@ mod tests {
             let mut arb = arbiter.lock().unwrap();
             arb.try_acquire(&key, delegation_b.clone())
         };
-        assert!(matches!(result_b, AcquireResult::Queued));
+        assert!(matches!(result_b, AcquireResult::Queued(_)));
     }
 
     // =====================================================================
@@ -5799,7 +6520,7 @@ mod tests {
             let mut arb = arbiter.lock().unwrap();
             arb.try_acquire(&key, delegation_b.clone())
         };
-        assert!(matches!(result_b, AcquireResult::Queued));
+        assert!(matches!(result_b, AcquireResult::Queued(_)));
 
         // No overlap: only one lease is held at a time.
         assert!(arbiter.lock().unwrap().is_held(&key));

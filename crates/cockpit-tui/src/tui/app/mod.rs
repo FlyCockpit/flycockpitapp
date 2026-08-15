@@ -69,6 +69,8 @@ use input::accepts_key;
 use mouse::{extract_selection_plaintext_shaped, extract_selection_semantic_shaped};
 use render::{extract_selection_plaintext, extract_selection_semantic, is_edit_tool};
 #[cfg(test)]
+pub(super) use slash::decide_sandbox_set;
+#[cfg(test)]
 use slash::{
     AgentCommandOutcome, CopyCommand, CopyFormat, McpAction, SLASH_COMMANDS, SandboxCommand,
     SandboxEscalationCommand, SkillDispatch, agent_command_outcome, builtin_slash_name_taken,
@@ -1445,11 +1447,33 @@ pub(super) struct CommandCapabilityNotice {
     pub fix_command: Option<String>,
 }
 
+#[cfg(test)]
 fn sandbox_down_notice_text(remedy: &str, fix_command: Option<&str>, copy_chip: bool) -> String {
+    sandbox_down_notice_text_with_intent(remedy, fix_command, copy_chip, None)
+}
+
+pub(super) fn sandbox_down_notice_text_with_intent(
+    remedy: &str,
+    fix_command: Option<&str>,
+    copy_chip: bool,
+    intent: Option<cockpit_core::tools::sandbox_mode::SandboxMode>,
+) -> String {
+    let selected = match intent {
+        Some(cockpit_core::tools::sandbox_mode::SandboxMode::Sandbox) => {
+            "Sandbox is selected but effective Off"
+        }
+        Some(cockpit_core::tools::sandbox_mode::SandboxMode::Container) => {
+            "Container is selected but effective Off"
+        }
+        Some(cockpit_core::tools::sandbox_mode::SandboxMode::ContainerReadonly) => {
+            "Container-readonly is selected but effective Off"
+        }
+        _ => "shell sandbox can't start",
+    };
     let mut text = if copy_chip && fix_command.is_some() {
-        format!("[copy] ⚠ shell sandbox can't start: {remedy}.")
+        format!("[copy] ⚠ {selected}: {remedy}.")
     } else {
-        format!("⚠ shell sandbox can't start: {remedy}.")
+        format!("⚠ {selected}: {remedy}.")
     };
     if let Some(command) = fix_command
         && !copy_chip
@@ -2369,8 +2393,12 @@ pub struct App {
     /// `--no-sandbox`, which wins). A `/sandbox` flip still overrides.
     pub(super) no_sandbox: bool,
     pub(super) sandbox_mode: cockpit_core::tools::sandbox_mode::SandboxMode,
+    pub(super) sandbox_intent: cockpit_core::tools::sandbox_mode::SandboxMode,
     pub(super) container_network_enabled: bool,
     pub(super) container_availability: cockpit_core::container::ContainerAvailability,
+    pub(super) host_capabilities: cockpit_proto::HostCapabilitySnapshot,
+    pub(super) capability_refresh_queue: Vec<cockpit_proto::HostCapabilitySnapshot>,
+    pub(super) capability_refresh_calls: usize,
     /// Daemon-broadcast caffeination state (`/caffeinate`). Drives the `☕`
     /// chrome glyph; set/cleared from the daemon-global `CaffeinateState`
     /// event so it stays in sync across all clients (incl. until-idle
@@ -3494,8 +3522,14 @@ impl App {
             ctrl_c_armed_at: None,
             no_sandbox,
             sandbox_mode: cockpit_core::tools::sandbox_mode::SandboxMode::from_enabled(!no_sandbox),
+            sandbox_intent: cockpit_core::tools::sandbox_mode::SandboxMode::from_enabled(
+                !no_sandbox,
+            ),
             container_network_enabled: false,
             container_availability: cockpit_core::container::initial_availability_unknown(),
+            host_capabilities: crate::tui::capability_gate::empty_capability_snapshot(),
+            capability_refresh_queue: Vec::new(),
+            capability_refresh_calls: 0,
             caffeinate_active: false,
             attention,
             attention_state: crate::tui::attention::AttentionState::new(),

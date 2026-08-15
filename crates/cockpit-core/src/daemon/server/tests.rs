@@ -15895,6 +15895,15 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             mutating: true,
         },
         CommandMetadataCase {
+            request: Request::MigrateKekPlacement {
+                dest: cockpit_proto::SecretStorePlacement::Database,
+            },
+            kind: "migrate_kek_placement",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
+        },
+        CommandMetadataCase {
             request: Request::RefreshEnv {
                 vars: HashMap::from([("PATH".into(), "/bin".into())]),
             },
@@ -16605,6 +16614,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         StopDaemon,
         GetHostCapabilities,
         RefreshHostCapabilities,
+        MigrateKekPlacement,
     );
 
     let covered: HashSet<&'static str> = cases

@@ -217,6 +217,11 @@ impl App {
         }
         if refresh_skills {
             self.refresh_skill_commands();
+            self.send_daemon_request(
+                "/capabilities",
+                cockpit_core::daemon::proto::Request::GetHostCapabilities,
+                crate::tui::app::ControlApplied::None,
+            );
         }
     }
 

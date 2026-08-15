@@ -324,6 +324,7 @@ fn reconcile_secret_store_with_probe(
                     .fix_command
                     .clone()
                     .or_else(|| Some(crate::secure_key::DEFAULT_FIX_COMMAND.to_string())),
+                unification_complete: previous.unification_complete,
             }
         }
         cockpit_proto::SecretStoreIntent::Keyring if probe.state.is_available() => {
@@ -332,6 +333,7 @@ fn reconcile_secret_store_with_probe(
                 effective_placement: cockpit_proto::SecretStorePlacement::Keyring,
                 fail_closed_reason: None,
                 fix_command: None,
+                unification_complete: previous.unification_complete,
             }
         }
         _ => previous,

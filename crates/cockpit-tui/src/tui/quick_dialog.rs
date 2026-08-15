@@ -40,6 +40,7 @@ pub struct QuickCurrent {
     pub sandbox_mode: SandboxMode,
     pub container_network_enabled: bool,
     pub container_availability: cockpit_core::container::ContainerAvailability,
+    pub host_capabilities: cockpit_proto::HostCapabilitySnapshot,
     pub approval_mode: ApprovalMode,
     pub active_model: Option<(String, String)>,
     pub prompt_cache_retention: PromptCacheRetention,
@@ -100,6 +101,7 @@ pub struct QuickDialog {
     staged_approval_mode: Option<ApprovalMode>,
     staged_prompt_cache_retention: Option<PromptCacheRetention>,
     staged_model: Option<usize>,
+    status: Option<String>,
 }
 
 impl QuickDialog {
@@ -155,6 +157,7 @@ impl QuickDialog {
             staged_approval_mode: None,
             staged_prompt_cache_retention: None,
             staged_model: None,
+            status: None,
         };
         dialog.align_cursors_to_current();
         dialog
@@ -236,6 +239,10 @@ impl QuickDialog {
             for span in line.spans {
                 out.push_str(span.content.as_ref());
             }
+        }
+        if let Some(status) = &self.status {
+            out.push('\n');
+            out.push_str(status);
         }
         out
     }
@@ -324,10 +331,19 @@ impl QuickDialog {
                 let cursor = self.cursors[self.tab];
                 let modes = sandbox_mode_options();
                 if let Some(mode) = modes.get(cursor).copied() {
-                    if mode.is_container() && !self.current.container_availability.available {
-                        return;
+                    match crate::tui::capability_gate::apply_sandbox_choice(
+                        mode,
+                        &self.current.host_capabilities,
+                        || self.current.host_capabilities.clone(),
+                    ) {
+                        crate::tui::capability_gate::RecheckApply::Applied(mode) => {
+                            self.staged_sandbox_mode = Some(mode);
+                            self.status = None;
+                        }
+                        crate::tui::capability_gate::RecheckApply::Instruct(instruct) => {
+                            self.status = Some(instruct.display());
+                        }
                     }
-                    self.staged_sandbox_mode = Some(mode);
                 } else {
                     let active_mode = self
                         .staged_sandbox_mode
@@ -794,6 +810,10 @@ mod tests {
                 available: true,
                 reason: None,
             },
+            host_capabilities: crate::tui::capability_gate::snapshot_with_sandbox(
+                cockpit_proto::FeatureCapabilityState::Available,
+                cockpit_proto::FeatureCapabilityState::Available,
+            ),
             approval_mode: ApprovalMode::Manual,
             active_model: Some(("p".to_string(), "a".to_string())),
             prompt_cache_retention: PromptCacheRetention::Default,
@@ -1010,6 +1030,12 @@ mod tests {
             available: false,
             reason: Some(cockpit_core::container::ContainerUnavailableReason::NoRuntime),
         };
+        current.host_capabilities = crate::tui::capability_gate::snapshot_with_sandbox_reasons(
+            cockpit_proto::FeatureCapabilityState::Available,
+            cockpit_proto::FeatureCapabilityState::Missing,
+            "host sandbox is available",
+            None,
+        );
         let mut dialog = QuickDialog::open(current, vec![model("p/a")]);
         for _ in 0..2 {
             dialog.handle_key(key(KeyCode::Tab));

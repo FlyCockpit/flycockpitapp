@@ -59,9 +59,12 @@ pub use namespace::{
 };
 pub use resolve::{
     DEFAULT_FIX_COMMAND, EffectiveSecretStore, KekUnavailable, SecretStoreInjected,
-    ensure_secret_vault, kek_dir_for_db, project_secret_store_snapshot, resolve_secret_store,
-    vault_for_db,
+    ensure_secret_vault, kek_dir_for_db, migrate_installation_kek, project_secret_store_snapshot,
+    resolve_secret_store, vault_for_db,
 };
+
+#[cfg(feature = "test-support")]
+pub use resolve::{TestInjectedVault, test_available_keyring_probe, test_open_db};
 #[cfg(test)]
 pub use unify::{
     import_credentials_from_path, import_sealed_compartment_from_path,

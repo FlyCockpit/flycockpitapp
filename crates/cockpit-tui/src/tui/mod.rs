@@ -19,6 +19,7 @@ pub mod attention;
 pub mod auth_failure;
 pub mod banner_box;
 pub(crate) mod button;
+pub(crate) mod capability_gate;
 pub mod chat;
 pub mod chrome;
 pub mod composer;

@@ -2379,6 +2379,7 @@ pub(crate) async fn boot_with_db(
                             effective_placement: cockpit_proto::SecretStorePlacement::Unavailable,
                             fail_closed_reason: Some(reason.clone()),
                             fix_command: fix_command.clone(),
+                            unification_complete: false,
                         },
                         _ => cockpit_proto::SecretStoreSnapshot::unconfigured_placeholder(),
                     };

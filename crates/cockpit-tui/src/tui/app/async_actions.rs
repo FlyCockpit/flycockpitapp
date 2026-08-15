@@ -237,7 +237,18 @@ impl App {
                         true,
                     );
                 }
-                Err(_) => self.show_toast("Paste unavailable", ToastKind::Error),
+                Err(_) => {
+                    let caps = self.refresh_host_capabilities();
+                    let media = caps.feature(cockpit_core::host_capabilities::FEATURE_MEDIA_DECODE);
+                    if media.is_none_or(|row| !row.state.is_available()) {
+                        self.show_toast(
+                            crate::tui::capability_gate::media_decode_instruct(&caps).display(),
+                            ToastKind::Error,
+                        );
+                    } else {
+                        self.show_toast("Paste unavailable", ToastKind::Error);
+                    }
+                }
                 Ok(_) => {}
             },
             AsyncActionKind::Internal("paste.native_image") => match result.payload {

@@ -53,6 +53,7 @@ impl KekUnavailable {
             effective_placement: SecretStorePlacement::Unavailable,
             fail_closed_reason: Some(self.reason.clone()),
             fix_command: self.fix_command.clone(),
+            unification_complete: false,
         }
     }
 
@@ -86,6 +87,61 @@ pub fn keyring_available(probe: &KeyringProbeResult) -> bool {
     probe.state.is_available()
 }
 
+/// Durable KEK migrate used by Settings and the daemon request.
+///
+/// Opens the current vault from the authority row, writes the destination
+/// KEK, verifies unwrap, activates `secret_vault_authority`, and purges the
+/// source. Does not write a layered `secretStore` config key.
+pub fn secret_store_dest_placement(
+    dest: SecretStorePlacement,
+) -> Result<SecretVaultPlacement, SecureKeyError> {
+    match dest {
+        SecretStorePlacement::Database => Ok(SecretVaultPlacement::Database),
+        SecretStorePlacement::Keyring => Ok(SecretVaultPlacement::Keyring),
+        SecretStorePlacement::Unavailable => Err(SecureKeyError::Internal(
+            "cannot migrate the wrap-key vault to an unavailable placement".into(),
+        )),
+    }
+}
+
+pub fn migrate_installation_kek(
+    db: &Db,
+    dest: SecretStorePlacement,
+    probe: &KeyringProbeResult,
+    injected: SecretStoreInjected,
+) -> Result<SecretStoreSnapshot, SecureKeyError> {
+    let dest = secret_store_dest_placement(dest)?;
+    let kek_dir = kek_dir_for_db(db)?;
+    let current = ensure_secret_vault(
+        db,
+        probe,
+        &kek_dir,
+        SecretStoreInjected {
+            file_kek: injected.file_kek.clone(),
+            keyring_kek: injected.keyring_kek.clone(),
+            legacy_keyring: None,
+        },
+    )
+    .map_err(SecureKeyError::from)?;
+    let installation = crate::db::installation_identity::InstallationIdentity::from_hex_checked(
+        current.vault.installation_hex(),
+    )
+    .map_err(|e| SecureKeyError::Internal(e.to_string()))?;
+    let dest_store = kek_store_for_placement(dest, &kek_dir, &installation, &injected, false)
+        .map_err(SecureKeyError::from)?;
+    let _ = super::migrate::migrate_kek_placement(
+        &current.vault,
+        dest_store,
+        dest,
+        probe,
+        &super::migrate::VaultFault::default(),
+    )?;
+    let authority = db
+        .blocking_write_for_sync_maintenance(load_authority_conn)
+        .map_err(|e| SecureKeyError::Internal(e.to_string()))?;
+    Ok(project_secret_store_snapshot(authority.as_ref(), probe))
+}
+
 fn placement_intent(placement: SecretVaultPlacement) -> SecretStoreIntent {
     match placement {
         SecretVaultPlacement::Database => SecretStoreIntent::Database,
@@ -113,12 +169,14 @@ pub fn project_secret_store_snapshot(
             effective_placement: SecretStorePlacement::Database,
             fail_closed_reason: None,
             fix_command: None,
+            unification_complete: row.unification_complete,
         },
         SecretVaultPlacement::Keyring if keyring_available(probe) => SecretStoreSnapshot {
             intent: SecretStoreIntent::Keyring,
             effective_placement: SecretStorePlacement::Keyring,
             fail_closed_reason: None,
             fix_command: None,
+            unification_complete: row.unification_complete,
         },
         SecretVaultPlacement::Keyring => SecretStoreSnapshot {
             intent: SecretStoreIntent::Keyring,
@@ -128,6 +186,7 @@ pub fn project_secret_store_snapshot(
                 .fix_command
                 .clone()
                 .or_else(|| Some(DEFAULT_FIX_COMMAND.to_string())),
+            unification_complete: row.unification_complete,
         },
     }
 }
@@ -246,12 +305,14 @@ pub fn ensure_secret_vault(
         },
     )?;
 
-    let snapshot = SecretStoreSnapshot {
-        intent: placement_intent(placement),
-        effective_placement: placement_effective(placement),
-        fail_closed_reason: None,
-        fix_command: None,
-    };
+    let authority = db
+        .blocking_write_for_sync_maintenance(load_authority_conn)
+        .map_err(|e| KekUnavailable {
+            reason: format!("reading secret vault authority: {e}"),
+            fix_command: None,
+            intent: placement_intent(placement),
+        })?;
+    let snapshot = project_secret_store_snapshot(authority.as_ref(), keyring_probe);
     Ok(EffectiveSecretStore {
         vault: Arc::new(vault),
         snapshot,
@@ -474,4 +535,93 @@ fn known_legacy_accounts(installation: &str) -> Result<Vec<String>, SecureKeyErr
         )?);
     }
     Ok(out)
+}
+
+#[cfg(feature = "test-support")]
+pub fn test_open_db(path: &std::path::Path) -> Db {
+    Db::open(path).expect("test db")
+}
+
+#[cfg(feature = "test-support")]
+pub fn test_available_keyring_probe() -> KeyringProbeResult {
+    KeyringProbeResult {
+        state: cockpit_proto::FeatureCapabilityState::Available,
+        reason: "platform keyring can hold a wrapping key".into(),
+        fix_command: None,
+        remedy_text: None,
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub struct TestInjectedVault {
+    db: Db,
+    pub file_kek: std::sync::Arc<super::kek_store::MemoryKekStore>,
+    pub keyring_kek: std::sync::Arc<super::kek_store::MemoryKekStore>,
+    kek_dir: std::path::PathBuf,
+}
+
+#[cfg(feature = "test-support")]
+impl TestInjectedVault {
+    pub fn first_run_database(tmp: &std::path::Path) -> Self {
+        use super::kek_store::MemoryKekStore;
+        let db = test_open_db(&tmp.join("cockpit.db"));
+        let file_kek = std::sync::Arc::new(MemoryKekStore::new(SecretStorePlacement::Database));
+        let keyring_kek = std::sync::Arc::new(MemoryKekStore::new(SecretStorePlacement::Keyring));
+        let kek_dir = tmp.join("secret-vault");
+        let _ = ensure_secret_vault(
+            &db,
+            &test_available_keyring_probe(),
+            &kek_dir,
+            SecretStoreInjected {
+                file_kek: Some(file_kek.clone()),
+                keyring_kek: Some(keyring_kek.clone()),
+                legacy_keyring: None,
+            },
+        )
+        .expect("first-run database vault");
+        Self {
+            db,
+            file_kek,
+            keyring_kek,
+            kek_dir,
+        }
+    }
+
+    pub fn promote_to_keyring(&self) {
+        let current = ensure_secret_vault(
+            &self.db,
+            &test_available_keyring_probe(),
+            &self.kek_dir,
+            self.injected(),
+        )
+        .expect("open vault for promote");
+        let _ = super::migrate::migrate_kek_placement(
+            &current.vault,
+            self.keyring_kek.clone(),
+            SecretVaultPlacement::Keyring,
+            &test_available_keyring_probe(),
+            &super::migrate::VaultFault::default(),
+        )
+        .expect("promote to keyring");
+    }
+
+    pub fn injected(&self) -> SecretStoreInjected {
+        SecretStoreInjected {
+            file_kek: Some(self.file_kek.clone()),
+            keyring_kek: Some(self.keyring_kek.clone()),
+            legacy_keyring: None,
+        }
+    }
+
+    pub fn migrate(
+        &self,
+        dest: SecretStorePlacement,
+    ) -> Result<SecretStoreSnapshot, SecureKeyError> {
+        migrate_installation_kek(
+            &self.db,
+            dest,
+            &test_available_keyring_probe(),
+            self.injected(),
+        )
+    }
 }

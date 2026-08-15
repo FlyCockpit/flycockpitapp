@@ -1557,6 +1557,7 @@ fn dispatch_enabled_category_descriptor_actions() {
         (Category::Behavior, SettingId::LlmMode),
         (Category::Privacy, SettingId::SandboxDefaultMode),
         (Category::Privacy, SettingId::SandboxDockerfile),
+        (Category::Privacy, SettingId::SecretStore),
         (Category::Privacy, SettingId::RedactEnabled),
         (Category::Privacy, SettingId::RedactScanEnvironment),
         (Category::Privacy, SettingId::RedactScanDotenv),

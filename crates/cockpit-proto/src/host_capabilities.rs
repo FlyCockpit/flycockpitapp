@@ -113,6 +113,10 @@ pub struct SecretStoreSnapshot {
     pub fail_closed_reason: Option<String>,
     #[serde(default)]
     pub fix_command: Option<String>,
+    /// `secret_vault_authority.unification_complete`. Settings must not
+    /// enable backend switching until this is true.
+    #[serde(default)]
+    pub unification_complete: bool,
 }
 
 impl SecretStoreSnapshot {
@@ -123,6 +127,7 @@ impl SecretStoreSnapshot {
             effective_placement: SecretStorePlacement::Unavailable,
             fail_closed_reason: None,
             fix_command: None,
+            unification_complete: false,
         }
     }
 }

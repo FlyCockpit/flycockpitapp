@@ -4433,6 +4433,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
         }
         Request::GetHostCapabilities => get_host_capabilities(ctx),
         Request::RefreshHostCapabilities => refresh_host_capabilities_request(ctx).await,
+        Request::MigrateKekPlacement { dest } => migrate_kek_placement_request(ctx, dest).await,
         Request::RestartIfIdle => {
             tracing::info!("RestartIfIdle requested via client");
             let _decision = crate::sync::lock_or_recover(&ctx.restart_decision);
@@ -5848,6 +5849,65 @@ fn get_host_capabilities(ctx: &DaemonContext) -> std::result::Result<Response, E
         })?;
     Ok(Response::HostCapabilities {
         snapshot: (*snapshot).clone(),
+    })
+}
+
+async fn migrate_kek_placement_request(
+    ctx: &Arc<DaemonContext>,
+    dest: cockpit_proto::SecretStorePlacement,
+) -> std::result::Result<Response, ErrorPayload> {
+    if dest == cockpit_proto::SecretStorePlacement::Unavailable {
+        return Err(ErrorPayload {
+            code: ErrorCode::BadRequest,
+            message: "cannot migrate the wrap-key vault to an unavailable placement".into(),
+        });
+    }
+    let probe = match ctx.host_capabilities.current().and_then(|snapshot| {
+        snapshot
+            .feature(crate::host_capabilities::FEATURE_SECRET_STORE_KEYRING)
+            .cloned()
+    }) {
+        Some(row) => crate::secure_key::KeyringProbeResult {
+            state: row.state,
+            reason: row.reason,
+            fix_command: row.fix_command,
+            remedy_text: row.remedy_text,
+        },
+        None => crate::secure_key::probe_platform_keyring(),
+    };
+    let db = ctx.db.clone();
+    let snapshot = tokio::task::spawn_blocking(move || {
+        crate::secure_key::migrate_installation_kek(
+            &db,
+            dest,
+            &probe,
+            crate::secure_key::SecretStoreInjected::default(),
+        )
+    })
+    .await
+    .map_err(|e| ErrorPayload {
+        code: ErrorCode::Internal,
+        message: format!("kek migrate task failed: {e}"),
+    })?
+    .map_err(|e| ErrorPayload {
+        code: ErrorCode::Internal,
+        message: e.to_string(),
+    })?;
+    let (host_snapshot, published) = crate::host_capabilities::refresh_host_capabilities(
+        &ctx.host_capabilities,
+        &ctx.host_capability_probes,
+    )
+    .await
+    .map_err(internal)?;
+    let mut host_snapshot = host_snapshot;
+    host_snapshot.secret_store = snapshot;
+    if published {
+        ctx.broadcast_global(proto::Event::HostCapabilitiesChanged {
+            snapshot: host_snapshot.clone(),
+        });
+    }
+    Ok(Response::HostCapabilities {
+        snapshot: host_snapshot,
     })
 }
 

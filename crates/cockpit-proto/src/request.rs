@@ -1157,6 +1157,13 @@ pub enum Request {
     /// when the reserved generation is still current.
     RefreshHostCapabilities,
 
+    /// Move the wrap-key vault KEK between OS keyring and `private_fs`.
+    /// Commits `secret_vault_authority` in the same SQLite transaction as
+    /// the migrate saga. Not a layered `secretStore` config key.
+    MigrateKekPlacement {
+        dest: crate::SecretStorePlacement,
+    },
+
     #[serde(other)]
     Unknown,
 }
@@ -1450,6 +1457,7 @@ macro_rules! request_variants {
             (Request::RestartIfIdle, "restart_if_idle");
             (Request::GetHostCapabilities, "get_host_capabilities");
             (Request::RefreshHostCapabilities, "refresh_host_capabilities");
+            (Request::MigrateKekPlacement { .. }, "migrate_kek_placement");
             (Request::Unknown, "__unknown");
         ] }
     };
@@ -1633,6 +1641,7 @@ macro_rules! command {
             (Request::RestartIfIdle, "restart_if_idle", owner_only, none, true, local_only, none, serialized, none, "-", []);
             (Request::GetHostCapabilities, "get_host_capabilities", public_read, none, false, read_only, none, concurrent, none, "-", []);
             (Request::RefreshHostCapabilities, "refresh_host_capabilities", public_read, none, true, local_only, none, serialized, none, "-", []);
+            (Request::MigrateKekPlacement { .. }, "migrate_kek_placement", owner_only, none, true, local_only, none, serialized, none, "dest:SecretStorePlacement", []);
             (Request::Unknown, "unknown", owner_only, none, false, rejected, rejected_before_dispatch, serialized, none, "-", []);
         ] }
     };

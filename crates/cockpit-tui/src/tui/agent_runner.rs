@@ -2471,6 +2471,9 @@ pub(crate) fn control_response_outcome(result: Result<Response, String>) -> Cont
             applied_generation,
             changed,
         },
+        Ok(Response::HostCapabilities { snapshot }) => ControlRequestOutcome::HostCapabilities {
+            snapshot: Box::new(snapshot),
+        },
         Ok(_) => ControlRequestOutcome::Applied,
         Err(error) => ControlRequestOutcome::Rejected(error),
     }
@@ -3850,11 +3853,13 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             mode,
             container_network_enabled,
             container_availability,
+            persisted_intent,
             ..
         } => TurnEvent::SandboxState {
             mode,
             container_network_enabled,
             container_availability,
+            persisted_intent,
         },
         SandboxEscalationState { enabled, .. } => TurnEvent::SandboxEscalationState { enabled },
         SandboxUnavailable {
@@ -3958,6 +3963,9 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             interrupt_id,
         },
         ConfigSnapshot { snapshot } => TurnEvent::ConfigSnapshot { snapshot },
+        HostCapabilitiesChanged { snapshot } => TurnEvent::HostCapabilitiesChanged {
+            snapshot: Box::new(snapshot),
+        },
         InterruptRaised { .. }
         | EventStreamLagged { .. }
         | SessionEnded { .. }
@@ -3966,7 +3974,6 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         | TerminalViewers { .. }
         | TerminalClosed { .. }
         | Osc52ProtocolViolation { .. }
-        | HostCapabilitiesChanged { .. }
         | Unknown => return None,
         // The chrome's active-agent slot is updated directly in
         // `update_active_agent`; the swap needs no history-stream entry.

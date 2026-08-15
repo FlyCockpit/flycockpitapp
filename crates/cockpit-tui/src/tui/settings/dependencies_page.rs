@@ -17,9 +17,34 @@ use std::{
 type DependencyRefreshResult = Result<cockpit_core::external_runtime::DependencyProjection, String>;
 type PendingDependencyRefresh = Option<(u64, mpsc::Receiver<DependencyRefreshResult>)>;
 
+#[cfg(test)]
+pub(super) fn page_after_first_paint(cwd: PathBuf, sandbox_enabled: bool) -> PageBox {
+    let store = cockpit_core::external_runtime::global_health_store();
+    let state = match store.current_complete_bundle() {
+        Some((snapshot, descriptors)) => {
+            cockpit_core::external_runtime::DependenciesPageState::first_paint(
+                Some(snapshot.as_ref()),
+                &descriptors,
+            )
+        }
+        None => cockpit_core::external_runtime::DependenciesPageState::first_paint(
+            None,
+            &cockpit_core::external_runtime::global_registry().descriptors(),
+        ),
+    };
+    Box::new(DependenciesPage {
+        state: Mutex::new(state),
+        refresh: Mutex::new(None),
+        scroll: 0,
+        cwd,
+        sandbox_enabled,
+        refresh_after_paint: false,
+    })
+}
+
 pub(super) fn page(cwd: PathBuf, sandbox_enabled: bool) -> PageBox {
     let store = cockpit_core::external_runtime::global_health_store();
-    let mut state = match store.current_complete_bundle() {
+    let state = match store.current_complete_bundle() {
         Some((snapshot, descriptors)) => {
             cockpit_core::external_runtime::DependenciesPageState::first_paint(
                 Some(snapshot.as_ref()),
@@ -47,22 +72,13 @@ pub(super) fn page(cwd: PathBuf, sandbox_enabled: bool) -> PageBox {
             )
         }
     };
-    let generation = state.begin_refresh();
-    let (tx, rx) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let result =
-            cockpit_core::diagnostics::dependency_projection_with_deadline_and_publish_for_run(
-                cwd,
-                std::time::Duration::from_secs(2),
-                sandbox_enabled,
-            )
-            .map_err(|error| error.to_string());
-        let _ = tx.send(result);
-    });
     Box::new(DependenciesPage {
         state: Mutex::new(state),
-        refresh: Mutex::new(Some((generation, rx))),
+        refresh: Mutex::new(None),
         scroll: 0,
+        cwd,
+        sandbox_enabled,
+        refresh_after_paint: true,
     })
 }
 
@@ -70,10 +86,17 @@ pub(super) struct DependenciesPage {
     state: Mutex<cockpit_core::external_runtime::DependenciesPageState>,
     refresh: Mutex<PendingDependencyRefresh>,
     scroll: u16,
+    cwd: PathBuf,
+    sandbox_enabled: bool,
+    refresh_after_paint: bool,
 }
 
 impl DependenciesPage {
     pub(super) fn tick(&mut self) {
+        if self.refresh_after_paint {
+            self.refresh_after_paint = false;
+            self.start_in_process_refresh_without_cx();
+        }
         let mut refresh = self.refresh.lock().unwrap_or_else(|p| p.into_inner());
         let completed = refresh
             .as_ref()
@@ -98,6 +121,36 @@ impl DependenciesPage {
             *refresh = None;
         }
     }
+
+    fn start_in_process_refresh_without_cx(&mut self) {
+        if self
+            .refresh
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
+        {
+            return;
+        }
+        let generation = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .begin_refresh();
+        let (tx, rx) = mpsc::sync_channel(1);
+        let cwd = self.cwd.clone();
+        let sandbox_enabled = self.sandbox_enabled;
+        std::thread::spawn(move || {
+            let result =
+                cockpit_core::diagnostics::dependency_projection_with_deadline_and_publish_for_run(
+                    cwd,
+                    std::time::Duration::from_secs(2),
+                    sandbox_enabled,
+                )
+                .map_err(|error| error.to_string());
+            let _ = tx.send(result);
+        });
+        *self.refresh.lock().unwrap_or_else(|p| p.into_inner()) = Some((generation, rx));
+    }
 }
 
 impl SettingsPage for DependenciesPage {
@@ -105,7 +158,7 @@ impl SettingsPage for DependenciesPage {
         super::SettingsPointerSurfaceKind::Dependencies
     }
 
-    fn handle_key(&mut self, _cx: &mut SettingsCx, key: KeyEvent) -> Nav {
+    fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left | KeyCode::Char('h') => {
                 self.state.lock().unwrap_or_else(|p| p.into_inner()).close();
@@ -117,6 +170,29 @@ impl SettingsPage for DependenciesPage {
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.scroll = self.scroll.saturating_add(1);
+                Nav::Stay
+            }
+            KeyCode::Char('r') => {
+                if self
+                    .refresh
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_some()
+                {
+                    return Nav::Stay;
+                }
+                cx.dependency_refresh_calls = cx.dependency_refresh_calls.saturating_add(1);
+                if let Some(hook) = cx.dependency_refresh.clone() {
+                    hook();
+                    let (tx, rx) = mpsc::sync_channel(1);
+                    drop(tx);
+                    *self.refresh.lock().unwrap_or_else(|p| p.into_inner()) = Some((0, rx));
+                } else if cx.daemon_attached {
+                    let _ = cx.refresh_host_capabilities();
+                    self.start_in_process_refresh_without_cx();
+                } else {
+                    self.start_in_process_refresh_without_cx();
+                }
                 Nav::Stay
             }
             _ => Nav::Stay,
@@ -175,7 +251,7 @@ impl SettingsPage for DependenciesPage {
         "Dependencies".to_owned()
     }
     fn help_text(&self, _cx: &SettingsCx) -> &'static str {
-        "↑/↓: scroll  h/esc: back  read-only"
+        "↑/↓: scroll  r: refresh  h/esc: back"
     }
     fn as_any(&self) -> &dyn Any {
         self

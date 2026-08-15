@@ -270,10 +270,23 @@ impl App {
     /// or any inference request.
     pub(super) fn sandbox_down_notice_text(&self) -> Option<String> {
         self.sandbox_down_notice.as_ref().map(|notice| {
-            sandbox_down_notice_text(
+            if let Some(banner) = crate::tui::capability_gate::sandbox_intent_effective_banner(
+                self.sandbox_intent,
+                self.sandbox_mode,
+                &self.host_capabilities,
+            ) {
+                return banner;
+            }
+            let intent = if self.sandbox_intent != self.sandbox_mode {
+                Some(self.sandbox_intent)
+            } else {
+                None
+            };
+            super::sandbox_down_notice_text_with_intent(
                 &notice.remedy,
                 notice.fix_command.as_deref(),
                 notice.fix_command.is_some(),
+                intent,
             )
         })
     }

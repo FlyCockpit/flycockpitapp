@@ -817,6 +817,8 @@ fn run_git(app: &mut App, args: &str) -> bool {
 
 fn run_settings(app: &mut App, _: &str) -> bool {
     app.dialog = Dialog::open(&app.launch.cwd);
+    app.dialog
+        .apply_host_capabilities(app.host_capabilities.clone(), app.agent_runner.is_some());
     false
 }
 
@@ -1995,19 +1997,19 @@ impl App {
             SandboxCommand::Cycle => (
                 Some(next_sandbox_mode(
                     self.sandbox_mode,
-                    &self.container_availability,
+                    &self.host_capabilities,
                 )),
                 None,
             ),
             SandboxCommand::Set(mode) => {
-                if mode.is_container() && !self.container_availability.available {
-                    self.push_plain(format!(
-                        "/sandbox: container modes unavailable: {}",
-                        container_unavailable_label(&self.container_availability)
-                    ));
-                    return;
+                let snapshot = self.host_capabilities.clone();
+                match decide_sandbox_set(mode, &snapshot, || self.refresh_host_capabilities()) {
+                    Ok(mode) => (Some(mode), None),
+                    Err(instruct) => {
+                        self.push_plain(format!("/sandbox: {}", instruct.display()));
+                        return;
+                    }
                 }
-                (Some(mode), None)
             }
             SandboxCommand::Network(enabled) => {
                 if !self.sandbox_mode.is_container() {
@@ -2622,25 +2624,26 @@ pub(super) fn sandbox_mode_label(
 
 pub(super) fn next_sandbox_mode(
     current: cockpit_core::tools::sandbox_mode::SandboxMode,
-    availability: &cockpit_core::container::ContainerAvailability,
+    caps: &cockpit_proto::HostCapabilitySnapshot,
 ) -> cockpit_core::tools::sandbox_mode::SandboxMode {
-    let modes: &[cockpit_core::tools::sandbox_mode::SandboxMode] = if availability.available {
-        &[
-            cockpit_core::tools::sandbox_mode::SandboxMode::Off,
-            cockpit_core::tools::sandbox_mode::SandboxMode::Sandbox,
-            cockpit_core::tools::sandbox_mode::SandboxMode::Container,
-            cockpit_core::tools::sandbox_mode::SandboxMode::ContainerReadonly,
-        ]
-    } else {
-        &[
-            cockpit_core::tools::sandbox_mode::SandboxMode::Off,
-            cockpit_core::tools::sandbox_mode::SandboxMode::Sandbox,
-        ]
-    };
-    let idx = modes.iter().position(|mode| *mode == current).unwrap_or(0);
-    modes[(idx + 1) % modes.len()]
+    crate::tui::capability_gate::next_available_sandbox_mode(current, caps)
 }
 
+pub fn decide_sandbox_set(
+    mode: cockpit_core::tools::sandbox_mode::SandboxMode,
+    caps: &cockpit_proto::HostCapabilitySnapshot,
+    refresh: impl FnOnce() -> cockpit_proto::HostCapabilitySnapshot,
+) -> Result<
+    cockpit_core::tools::sandbox_mode::SandboxMode,
+    crate::tui::capability_gate::CapabilityInstruct,
+> {
+    match crate::tui::capability_gate::apply_sandbox_choice(mode, caps, refresh) {
+        crate::tui::capability_gate::RecheckApply::Applied(mode) => Ok(mode),
+        crate::tui::capability_gate::RecheckApply::Instruct(instruct) => Err(instruct),
+    }
+}
+
+#[allow(dead_code)]
 fn container_unavailable_label(
     availability: &cockpit_core::container::ContainerAvailability,
 ) -> &'static str {

@@ -79,6 +79,7 @@ fn unavailable_raises_persistent_notice_and_sandbox_off_clears_it() {
         mode: cockpit_core::tools::sandbox_mode::SandboxMode::Off,
         container_network_enabled: false,
         container_availability: cockpit_core::container::availability_snapshot(),
+        persisted_intent: Some(cockpit_core::tools::sandbox_mode::SandboxMode::Off),
     });
     assert!(app.sandbox_down_notice.is_none());
     assert_eq!(app.sandbox_notice_lines(), 0);
@@ -88,6 +89,7 @@ fn unavailable_raises_persistent_notice_and_sandbox_off_clears_it() {
         mode: cockpit_core::tools::sandbox_mode::SandboxMode::Sandbox,
         container_network_enabled: false,
         container_availability: cockpit_core::container::availability_snapshot(),
+        persisted_intent: Some(cockpit_core::tools::sandbox_mode::SandboxMode::Sandbox),
     });
     assert!(app.sandbox_down_notice.is_none());
 }

@@ -561,7 +561,8 @@ pub enum Response {
         result: RunInvocationCancelResultV1,
     },
 
-    /// Answer to [`Request::GetHostCapabilities`] / [`Request::RefreshHostCapabilities`].
+    /// Answer to [`Request::GetHostCapabilities`] / [`Request::RefreshHostCapabilities`]
+    /// / [`Request::MigrateKekPlacement`].
     HostCapabilities {
         snapshot: crate::HostCapabilitySnapshot,
     },

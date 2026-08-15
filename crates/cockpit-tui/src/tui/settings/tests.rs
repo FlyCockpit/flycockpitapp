@@ -4402,9 +4402,14 @@ fn behavior_jobs_max_concurrent_rejects_zero() {
 fn privacy_sandbox_rows_cycle_edit_and_persist() {
     use cockpit_config::extended::ExtendedConfigDoc;
     use cockpit_core::tools::sandbox_mode::SandboxMode;
+    use cockpit_proto::FeatureCapabilityState;
 
     let tmp = TempDir::new().unwrap();
     let mut d = fresh_dialog(&tmp);
+    d.host_capabilities = crate::tui::capability_gate::snapshot_with_sandbox(
+        FeatureCapabilityState::Available,
+        FeatureCapabilityState::Missing,
+    );
     d.extended.sandbox.default_mode = SandboxMode::Off;
     d.save_extended().unwrap();
 
@@ -4440,6 +4445,424 @@ fn privacy_sandbox_rows_cycle_edit_and_persist() {
     assert_eq!(
         reloaded.sandbox.dockerfile,
         Some(std::path::PathBuf::from("Dockerfile"))
+    );
+}
+
+fn inject_missing_host_sandbox(d: &mut SettingsDialog, fix: &str) {
+    d.host_capabilities = crate::tui::capability_gate::snapshot_with_sandbox_reasons(
+        cockpit_proto::FeatureCapabilityState::Missing,
+        cockpit_proto::FeatureCapabilityState::Available,
+        "bwrap is not installed",
+        Some(fix),
+    );
+}
+
+fn inject_secret_store(
+    d: &mut SettingsDialog,
+    intent: cockpit_proto::SecretStoreIntent,
+    placement: cockpit_proto::SecretStorePlacement,
+    unified: bool,
+    keyring: cockpit_proto::FeatureCapabilityState,
+) {
+    let mut store = crate::tui::capability_gate::unified_secret_store(intent, placement);
+    store.unification_complete = unified;
+    if keyring != cockpit_proto::FeatureCapabilityState::Available {
+        store.fail_closed_reason = Some("secret service unavailable".into());
+        store.fix_command = Some("install gnome-keyring".into());
+    }
+    d.host_capabilities = crate::tui::capability_gate::with_secret_store(
+        crate::tui::capability_gate::snapshot_with_sandbox(
+            cockpit_proto::FeatureCapabilityState::Available,
+            cockpit_proto::FeatureCapabilityState::Missing,
+        ),
+        store,
+        keyring,
+        if keyring == cockpit_proto::FeatureCapabilityState::Available {
+            "platform keyring can hold a wrapping key"
+        } else {
+            "secret service unavailable"
+        },
+        (keyring != cockpit_proto::FeatureCapabilityState::Available)
+            .then_some("install gnome-keyring"),
+    );
+}
+
+#[test]
+fn privacy_sandbox_on_blocked_when_host_cap_missing() {
+    use cockpit_config::extended::ExtendedConfigDoc;
+    use cockpit_core::tools::sandbox_mode::SandboxMode;
+
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    inject_missing_host_sandbox(&mut d, "sudo apt-get install bubblewrap");
+    d.extended.sandbox.default_mode = SandboxMode::Off;
+    d.save_extended().unwrap();
+
+    open_category_on(&mut d, Category::Privacy, SettingId::SandboxDefaultMode);
+    d.handle_key(press(KeyCode::Enter));
+    assert_eq!(d.extended.sandbox.default_mode, SandboxMode::Off);
+    match d.test_page() {
+        TestPageRef::Category(p) => {
+            let status = p.status.as_deref().unwrap_or("");
+            assert!(
+                status.contains("sudo apt-get install bubblewrap") || status.contains("bwrap"),
+                "blocked on must show snapshot remedy, got {status:?}"
+            );
+        }
+        _ => panic!("not on category page"),
+    }
+    let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
+    assert_eq!(reloaded.sandbox.default_mode, SandboxMode::Off);
+}
+
+#[test]
+fn sandbox_on_recheck_then_instruct() {
+    use cockpit_config::extended::ExtendedConfigDoc;
+    use cockpit_core::tools::sandbox_mode::SandboxMode;
+
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    inject_missing_host_sandbox(&mut d, "sudo apt-get install bubblewrap");
+    d.extended.sandbox.default_mode = SandboxMode::Off;
+    d.save_extended().unwrap();
+
+    open_category_on(&mut d, Category::Privacy, SettingId::SandboxDefaultMode);
+    d.handle_key(press(KeyCode::Enter));
+    assert_eq!(d.capability_refresh_calls, 1);
+    assert_eq!(d.extended.sandbox.default_mode, SandboxMode::Off);
+    match d.test_page() {
+        TestPageRef::Category(p) => {
+            let status = p.status.as_deref().unwrap_or("");
+            assert!(
+                status.contains("sudo apt-get install bubblewrap"),
+                "{status:?}"
+            );
+        }
+        _ => panic!("not on category page"),
+    }
+
+    d.capability_refresh_queue
+        .push(crate::tui::capability_gate::snapshot_with_sandbox(
+            cockpit_proto::FeatureCapabilityState::Available,
+            cockpit_proto::FeatureCapabilityState::Missing,
+        ));
+    d.handle_key(press(KeyCode::Enter));
+    assert_eq!(d.extended.sandbox.default_mode, SandboxMode::Sandbox);
+    let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
+    assert_eq!(reloaded.sandbox.default_mode, SandboxMode::Sandbox);
+}
+
+#[test]
+fn secret_store_row_hidden_until_vault_unification() {
+    use cockpit_proto::{SecretStoreIntent, SecretStorePlacement};
+
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    inject_secret_store(
+        &mut d,
+        SecretStoreIntent::Database,
+        SecretStorePlacement::Database,
+        false,
+        cockpit_proto::FeatureCapabilityState::Available,
+    );
+    open_category_on(&mut d, Category::Privacy, SettingId::SecretStore);
+    assert_eq!(
+        d.category_value_for_test(SettingId::SecretStore),
+        crate::tui::capability_gate::SECRET_STORE_PREPARING
+    );
+    d.handle_key(press(KeyCode::Enter));
+    assert_eq!(d.secret_store_migrate_calls, 0);
+    assert!(d.pending_daemon_request.is_none());
+    match d.test_page() {
+        TestPageRef::Category(p) => {
+            assert!(p.secret_store_confirm.is_none());
+            assert!(
+                !p.status
+                    .as_deref()
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+                    .contains("keyring")
+                    || p.status
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains(crate::tui::capability_gate::SECRET_STORE_PREPARING)
+            );
+        }
+        _ => panic!("not on category page"),
+    }
+}
+
+#[test]
+fn secret_store_row_first_run_shows_database_when_keyring_available() {
+    use cockpit_proto::{SecretStoreIntent, SecretStorePlacement};
+
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    inject_secret_store(
+        &mut d,
+        SecretStoreIntent::Unconfigured,
+        SecretStorePlacement::Database,
+        true,
+        cockpit_proto::FeatureCapabilityState::Available,
+    );
+    open_category_on(&mut d, Category::Privacy, SettingId::SecretStore);
+    assert_eq!(
+        d.category_value_for_test(SettingId::SecretStore),
+        crate::tui::capability_gate::SECRET_STORE_DATABASE_LABEL
+    );
+}
+
+#[test]
+fn secret_store_row_rejects_keyring_when_missing() {
+    use cockpit_proto::{SecretStoreIntent, SecretStorePlacement};
+
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    inject_secret_store(
+        &mut d,
+        SecretStoreIntent::Database,
+        SecretStorePlacement::Database,
+        true,
+        cockpit_proto::FeatureCapabilityState::Missing,
+    );
+    open_category_on(&mut d, Category::Privacy, SettingId::SecretStore);
+    d.handle_key(press(KeyCode::Enter));
+    assert_eq!(d.secret_store_migrate_calls, 0);
+    match d.test_page() {
+        TestPageRef::Category(p) => {
+            let status = p.status.as_deref().unwrap_or("");
+            assert!(
+                status.contains("install gnome-keyring") || status.contains("unavailable"),
+                "{status:?}"
+            );
+        }
+        _ => panic!("not on category page"),
+    }
+    assert_eq!(
+        d.host_capabilities.secret_store.effective_placement,
+        SecretStorePlacement::Database
+    );
+}
+
+#[test]
+fn secret_store_row_applies_keyring_after_recheck() {
+    use cockpit_proto::{SecretStoreIntent, SecretStorePlacement};
+
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    inject_secret_store(
+        &mut d,
+        SecretStoreIntent::Database,
+        SecretStorePlacement::Database,
+        true,
+        cockpit_proto::FeatureCapabilityState::Missing,
+    );
+    let mut available = d.host_capabilities.clone();
+    if let Some(row) = available
+        .features
+        .iter_mut()
+        .find(|row| row.id == cockpit_core::host_capabilities::FEATURE_SECRET_STORE_KEYRING)
+    {
+        row.state = cockpit_proto::FeatureCapabilityState::Available;
+        row.reason = "platform keyring can hold a wrapping key".into();
+        row.fix_command = None;
+    }
+    available.secret_store = crate::tui::capability_gate::unified_secret_store(
+        SecretStoreIntent::Database,
+        SecretStorePlacement::Database,
+    );
+    d.capability_refresh_queue.push(available);
+    d.secret_store_migrate = Some(std::sync::Arc::new(|dest| {
+        Ok(crate::tui::capability_gate::unified_secret_store(
+            match dest {
+                SecretStorePlacement::Keyring => SecretStoreIntent::Keyring,
+                _ => SecretStoreIntent::Database,
+            },
+            dest,
+        ))
+    }));
+    open_category_on(&mut d, Category::Privacy, SettingId::SecretStore);
+    d.handle_key(press(KeyCode::Enter));
+    assert_eq!(d.secret_store_migrate_calls, 1);
+    assert_eq!(
+        d.host_capabilities.secret_store.effective_placement,
+        SecretStorePlacement::Keyring
+    );
+}
+
+#[test]
+fn secret_store_row_does_not_write_layered_config() {
+    use cockpit_config::extended::ExtendedConfigDoc;
+    use cockpit_proto::{SecretStoreIntent, SecretStorePlacement};
+
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    inject_secret_store(
+        &mut d,
+        SecretStoreIntent::Database,
+        SecretStorePlacement::Database,
+        true,
+        cockpit_proto::FeatureCapabilityState::Available,
+    );
+    d.secret_store_migrate = Some(std::sync::Arc::new(|dest| {
+        Ok(crate::tui::capability_gate::unified_secret_store(
+            SecretStoreIntent::Keyring,
+            dest,
+        ))
+    }));
+    open_category_on(&mut d, Category::Privacy, SettingId::SecretStore);
+    d.handle_key(press(KeyCode::Enter));
+    let raw = std::fs::read_to_string(&d.extended_path).unwrap();
+    assert!(
+        !raw.contains("secretStore") && !raw.contains("secret_store"),
+        "settings must not write secretStore into layered config: {raw}"
+    );
+    let doc = ExtendedConfigDoc::load(&d.extended_path).unwrap();
+    assert!(doc.raw_field("secretStore").is_none());
+}
+
+#[test]
+fn secret_store_row_help_mentions_encrypted_sqlite_and_is_weaker() {
+    use cockpit_proto::{SecretStoreIntent, SecretStorePlacement};
+
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    inject_secret_store(
+        &mut d,
+        SecretStoreIntent::Database,
+        SecretStorePlacement::Database,
+        true,
+        cockpit_proto::FeatureCapabilityState::Available,
+    );
+    let help = crate::tui::capability_gate::secret_store_row_help(&d.host_capabilities);
+    let lower = help.to_ascii_lowercase();
+    assert!(help.contains("encrypted SQLite") || lower.contains("encrypted sqlite"));
+    assert!(lower.contains("kek"));
+    assert!(lower.contains("weaker"));
+    assert!(!lower.contains("plaintext"));
+}
+
+#[test]
+fn secret_store_downgrade_cancel_leaves_keyring() {
+    use cockpit_core::secure_key::TestInjectedVault;
+    use cockpit_proto::{FeatureCapabilityState, SecretStoreIntent, SecretStorePlacement};
+
+    let tmp = TempDir::new().unwrap();
+    let vault = TestInjectedVault::first_run_database(tmp.path());
+    vault.promote_to_keyring();
+    assert_eq!(vault.keyring_kek.len(), 1);
+    assert_eq!(vault.file_kek.len(), 0);
+
+    let mut d = fresh_dialog(&tmp);
+    inject_secret_store(
+        &mut d,
+        SecretStoreIntent::Keyring,
+        SecretStorePlacement::Keyring,
+        true,
+        FeatureCapabilityState::Available,
+    );
+    d.secret_store_migrate = Some(std::sync::Arc::new(move |_| {
+        panic!("cancel must not migrate");
+    }));
+    open_category_on(&mut d, Category::Privacy, SettingId::SecretStore);
+    d.handle_key(press(KeyCode::Enter));
+    match d.test_page() {
+        TestPageRef::Category(p) => {
+            let confirm = p.secret_store_confirm.as_ref().expect("downgrade confirm");
+            let prompt = confirm.pages()[0].prompt.clone();
+            assert!(prompt.to_ascii_lowercase().contains("weaker"));
+            assert!(
+                prompt.to_ascii_lowercase().contains("leave the os keyring")
+                    || prompt.contains("leave the OS keyring")
+            );
+            assert!(
+                prompt.contains("private_fs")
+                    && prompt.to_ascii_lowercase().contains("encrypted sqlite")
+            );
+            assert!(!prompt.to_ascii_lowercase().contains("plaintext"));
+        }
+        _ => panic!("not on category page"),
+    }
+    d.handle_key(press(KeyCode::Esc));
+    assert_eq!(d.secret_store_migrate_calls, 0);
+    assert_eq!(
+        d.host_capabilities.secret_store.intent,
+        SecretStoreIntent::Keyring
+    );
+    assert_eq!(vault.keyring_kek.len(), 1);
+    assert_eq!(vault.file_kek.len(), 0);
+}
+
+#[test]
+fn secret_store_downgrade_confirm_migrates_kek() {
+    use cockpit_core::secure_key::TestInjectedVault;
+    use cockpit_proto::{FeatureCapabilityState, SecretStoreIntent, SecretStorePlacement};
+
+    let tmp = TempDir::new().unwrap();
+    let vault = std::sync::Arc::new(TestInjectedVault::first_run_database(tmp.path()));
+    vault.promote_to_keyring();
+
+    let mut d = fresh_dialog(&tmp);
+    inject_secret_store(
+        &mut d,
+        SecretStoreIntent::Keyring,
+        SecretStorePlacement::Keyring,
+        true,
+        FeatureCapabilityState::Available,
+    );
+    let vault_m = vault.clone();
+    d.secret_store_migrate = Some(std::sync::Arc::new(move |dest| {
+        vault_m.migrate(dest).map_err(|e| e.to_string())
+    }));
+    open_category_on(&mut d, Category::Privacy, SettingId::SecretStore);
+    d.handle_key(press(KeyCode::Enter));
+    match d.test_page() {
+        TestPageRef::Category(p) => {
+            let prompt = p.secret_store_confirm.as_ref().expect("confirm").pages()[0]
+                .prompt
+                .clone();
+            assert!(prompt.to_ascii_lowercase().contains("weaker"));
+            assert!(
+                prompt.contains("leave the OS keyring") || prompt.contains("leave the os keyring")
+            );
+            assert!(prompt.contains("local private_fs KEK file") || prompt.contains("private_fs"));
+            assert!(prompt.to_ascii_lowercase().contains("encrypted sqlite"));
+        }
+        _ => panic!("not on category page"),
+    }
+    d.handle_key(press(KeyCode::Enter));
+    assert_eq!(d.secret_store_migrate_calls, 1);
+    assert_eq!(
+        d.host_capabilities.secret_store.effective_placement,
+        SecretStorePlacement::Database
+    );
+    assert!(
+        vault.file_kek.len() >= 1,
+        "file KEK must exist after confirm"
+    );
+    assert_eq!(vault.keyring_kek.len(), 0, "keyring KEK must be gone");
+}
+
+#[test]
+fn dependencies_page_refresh_after_first_paint() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let hook_calls = calls.clone();
+    d.dependency_refresh = Some(std::sync::Arc::new(move || {
+        hook_calls.fetch_add(1, Ordering::SeqCst);
+    }));
+    d.enter_dependencies_for_test();
+    assert_eq!(d.dependency_refresh_calls, 0);
+    d.handle_key(press(KeyCode::Char('r')));
+    assert_eq!(d.dependency_refresh_calls, 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    d.handle_key(press(KeyCode::Char('r')));
+    assert_eq!(
+        d.dependency_refresh_calls, 1,
+        "in-flight refresh must not stack"
     );
 }
 

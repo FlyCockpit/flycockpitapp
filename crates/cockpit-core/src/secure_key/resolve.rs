@@ -476,7 +476,7 @@ fn import_from_store(
 /// File-backed DBs use the installation KEK directory. In-memory DBs use a
 /// process-local `MemoryKekStore` keyed by installation identity so tests can
 /// persist vault items without a path.
-pub fn vault_for_db(db: &Db) -> Result<Arc<SecretVault>, SecureKeyError> {
+pub fn open_for_db(db: &Db) -> Result<Arc<SecretVault>, SecureKeyError> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
 
@@ -487,10 +487,10 @@ pub fn vault_for_db(db: &Db) -> Result<Arc<SecretVault>, SecureKeyError> {
 
     if db.path().is_some() {
         let kek_dir = kek_dir_for_db(db)?;
-        let probe = if std::env::var_os("COCKPIT_TEST_NO_KEYRING").is_some() {
+        let probe = if cfg!(test) || std::env::var_os("COCKPIT_TEST_NO_KEYRING").is_some() {
             super::platform::KeyringProbeResult {
                 state: cockpit_proto::FeatureCapabilityState::Missing,
-                reason: "COCKPIT_TEST_NO_KEYRING: tests must not use the host OS keyring".into(),
+                reason: "tests must not use the host OS keyring".into(),
                 fix_command: None,
                 remedy_text: None,
             }
@@ -529,6 +529,10 @@ pub fn vault_for_db(db: &Db) -> Result<Arc<SecretVault>, SecureKeyError> {
             Ok(Arc::new(vault))
         }
     }
+}
+
+pub fn vault_for_db(db: &Db) -> Result<Arc<SecretVault>, SecureKeyError> {
+    open_for_db(db)
 }
 
 fn known_legacy_accounts(installation: &str) -> Result<Vec<String>, SecureKeyError> {

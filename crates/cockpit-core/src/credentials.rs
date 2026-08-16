@@ -22,6 +22,9 @@ use serde_json::Value;
 
 use crate::secure_key::SecretVault;
 
+#[cfg(any(test, feature = "test-support"))]
+include!("credentials_test_open.rs");
+
 const SUBSCRIPTION_ACK_PREFIX: &str = "subscription-oauth-ack:";
 
 /// Default credentials path: `~/.local/state/cockpit/credentials.json`.
@@ -36,11 +39,16 @@ pub fn default_path() -> Option<PathBuf> {
     Some(home.join(".local/state/cockpit/credentials.json"))
 }
 
+#[derive(Clone)]
 enum CredentialBackend {
     Vault(Arc<SecretVault>),
-    LegacyFile { path: PathBuf },
+    #[cfg(any(test, feature = "test-support"))]
+    LegacyFile {
+        path: PathBuf,
+    },
 }
 
+#[derive(Clone)]
 pub struct CredentialStore {
     backend: CredentialBackend,
     records: BTreeMap<String, Value>,
@@ -94,7 +102,8 @@ impl CredentialStore {
         Self::open_legacy_file(path)
     }
 
-    /// Read a leftover `credentials.json` for the import saga.
+    /// Read a leftover `credentials.json` for test fixtures only.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn open_legacy_file(path: PathBuf) -> Result<Self> {
         ensure_parent_dir_private(&path)?;
         let data = read_credential_file(&path)?;
@@ -107,22 +116,13 @@ impl CredentialStore {
         })
     }
 
-    pub fn open_default() -> Result<Self> {
-        let db =
-            crate::db::Db::open_default().context("opening cockpit DB for credential vault")?;
-        let vault = crate::secure_key::vault_for_db(&db)
-            .map_err(|e| anyhow::anyhow!("opening secret vault for credentials: {e}"))?;
-        Self::from_vault(vault)
-    }
-
     /// Settings/test fixtures pass an explicit leftover JSON path. Production
-    /// construction with `None` stays on the process vault.
+    /// construction with `None` is not a product API.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn open_for_path_or_default(path: Option<&Path>) -> Result<Self> {
-        #[cfg(any(test, feature = "test-support"))]
         if let Some(path) = path {
             return Self::open(path.to_path_buf());
         }
-        let _ = path;
         Self::open_default()
     }
 
@@ -138,10 +138,6 @@ impl CredentialStore {
             record_mutations: Vec::new(),
             secret_mutations: Vec::new(),
         })
-    }
-
-    pub fn open_default_readonly() -> Result<Self> {
-        Self::open_default()
     }
 
     pub fn get(&self, provider_id: &str) -> Option<&Value> {
@@ -235,6 +231,7 @@ impl CredentialStore {
                 self.secret_mutations.clear();
                 Ok(())
             }
+            #[cfg(any(test, feature = "test-support"))]
             CredentialBackend::LegacyFile { path } => {
                 // File writes are import-saga / test fixtures only. After
                 // vault activate, production construction is `from_vault` and
@@ -279,6 +276,7 @@ impl CredentialStore {
                 latest.set(provider_id, value);
                 latest.save()
             }
+            #[cfg(any(test, feature = "test-support"))]
             CredentialBackend::LegacyFile { path } => {
                 let mut latest = Self::open_legacy_file(path.clone())?;
                 latest.set(provider_id, value);
@@ -294,6 +292,7 @@ impl CredentialStore {
                 latest.remove(provider_id);
                 latest.save()
             }
+            #[cfg(any(test, feature = "test-support"))]
             CredentialBackend::LegacyFile { path } => {
                 let mut latest = Self::open_legacy_file(path.clone())?;
                 latest.remove(provider_id);
@@ -304,6 +303,7 @@ impl CredentialStore {
 
     pub fn path(&self) -> &Path {
         match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
             CredentialBackend::LegacyFile { path } => path,
             CredentialBackend::Vault(_) => {
                 static FALLBACK: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
@@ -318,6 +318,7 @@ impl CredentialStore {
     pub(crate) fn reopen(&self) -> Result<Self> {
         match &self.backend {
             CredentialBackend::Vault(vault) => Self::from_vault(vault.clone()),
+            #[cfg(any(test, feature = "test-support"))]
             CredentialBackend::LegacyFile { path } => Self::open_legacy_file(path.clone()),
         }
     }

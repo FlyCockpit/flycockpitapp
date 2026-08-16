@@ -16,7 +16,7 @@ use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::auth::flycockpit::{StoredFlycockpitCredential, maybe_load_credential};
+use crate::auth::flycockpit::StoredFlycockpitCredential;
 use crate::daemon::egress::{FirstPartyEgressClient, redaction_for_session};
 use crate::daemon::server::DaemonContext;
 use crate::db::Db;
@@ -36,7 +36,7 @@ pub fn spawn_background(ctx: Arc<DaemonContext>) -> tokio::task::JoinHandle<()> 
             if ctx.shutdown_signal().is_draining() {
                 break;
             }
-            if let Err(error) = sync_current_credential_once(&ctx.db).await {
+            if let Err(error) = sync_current_credential_once(&ctx).await {
                 tracing::warn!(error = %error, "enterprise session-log sync failed");
             }
             tokio::select! {
@@ -53,16 +53,33 @@ async fn wait_for_shutdown(ctx: Arc<DaemonContext>) {
     }
 }
 
-pub async fn sync_current_credential_once(db: &Db) -> Result<OrgSyncOnceOutcome> {
-    let Some(credential) = maybe_load_credential() else {
+pub async fn sync_current_credential_once(ctx: &DaemonContext) -> Result<OrgSyncOnceOutcome> {
+    let Some(credential) = ctx.load_flycockpit_credential()? else {
         return Ok(OrgSyncOnceOutcome::NoCredential);
     };
+    sync_credential_once_with_vault(&ctx.db, credential, Some(&ctx.secret_vault)).await
+}
+
+/// Org-sync using an already-held credential. Callers that just completed
+/// device-code login must use this so the CLI process does not reopen the vault.
+pub async fn sync_credential_once(
+    db: &Db,
+    credential: crate::auth::flycockpit::StoredFlycockpitCredential,
+) -> Result<OrgSyncOnceOutcome> {
+    sync_credential_once_with_vault(db, credential, None).await
+}
+
+async fn sync_credential_once_with_vault(
+    db: &Db,
+    credential: crate::auth::flycockpit::StoredFlycockpitCredential,
+    vault: Option<&crate::secure_key::SecretVault>,
+) -> Result<OrgSyncOnceOutcome> {
     let Some(client) = FirstPartyEgressClient::connect(db.clone(), credential.clone()).await?
     else {
         return Ok(OrgSyncOnceOutcome::Disabled);
     };
     let mut sleeper = |duration| -> SleepFuture { Box::pin(tokio::time::sleep(duration)) };
-    sync_once_with_client(db, &credential, &client, &mut sleeper).await
+    sync_once_with_client_and_vault(db, &credential, &client, &mut sleeper, vault).await
 }
 
 pub type SleepFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -193,6 +210,16 @@ async fn sync_once_with_client(
     client: &FirstPartyEgressClient,
     sleep: SleepFn<'_>,
 ) -> Result<OrgSyncOnceOutcome> {
+    sync_once_with_client_and_vault(db, credential, client, sleep, None).await
+}
+
+async fn sync_once_with_client_and_vault(
+    db: &Db,
+    credential: &StoredFlycockpitCredential,
+    client: &FirstPartyEgressClient,
+    sleep: SleepFn<'_>,
+    vault: Option<&crate::secure_key::SecretVault>,
+) -> Result<OrgSyncOnceOutcome> {
     let policy = match fetch_policy(client).await? {
         PolicyFetchOutcome::Active(policy) => policy,
         PolicyFetchOutcome::Disabled => {
@@ -226,7 +253,7 @@ async fn sync_once_with_client(
         .org_sync_state(&credential.server_url, &policy.org_id)
         .await?
         .ok_or_else(|| anyhow!("org sync state missing after policy upsert"))?;
-    let built = build_batch(db, credential, &policy, state.cursor_seq).await?;
+    let built = build_batch(db, credential, &policy, state.cursor_seq, vault).await?;
     match built {
         BatchBuild::Idle => Ok(OrgSyncOnceOutcome::Idle),
         BatchBuild::Filtered { cursor_seq } => {
@@ -287,6 +314,7 @@ async fn build_batch(
     credential: &StoredFlycockpitCredential,
     policy: &OrgLogSyncPolicy,
     cursor_seq: i64,
+    vault: Option<&crate::secure_key::SecretVault>,
 ) -> Result<BatchBuild> {
     let rows = db
         .list_org_sync_events_after(cursor_seq, MAX_BATCH_EVENTS)
@@ -308,7 +336,15 @@ async fn build_batch(
             batch_cursor_seq = row.seq;
             continue;
         }
-        let Some(event) = sync_event_json(db, row).await? else {
+        let Some(event) = sync_event_json(db, vault, row).await? else {
+            if vault.is_none() {
+                tracing::warn!(
+                    session_id = %row.session_id,
+                    seq = row.seq,
+                    "deferring org sync event until a vault-backed redaction load is available"
+                );
+                break;
+            }
             batch_cursor_seq = row.seq;
             tracing::warn!(session_id = %row.session_id, seq = row.seq, "skipping org sync event without a loadable session redaction table");
             continue;
@@ -346,8 +382,12 @@ async fn build_batch(
     })
 }
 
-async fn sync_event_json(db: &Db, row: &SessionEventRow) -> Result<Option<Value>> {
-    let Some(redaction) = redaction_for_session(db, row.session_id).await? else {
+async fn sync_event_json(
+    db: &Db,
+    vault: Option<&crate::secure_key::SecretVault>,
+    row: &SessionEventRow,
+) -> Result<Option<Value>> {
+    let Some(redaction) = redaction_for_session(db, vault, row.session_id).await? else {
         return Ok(None);
     };
     let mut event = json!({
@@ -515,6 +555,25 @@ mod tests {
             display_name: Some("Devbox".to_string()),
             relay_choice: None,
         }
+    }
+
+    #[tokio::test]
+    async fn sync_credential_once_does_not_reload_vault() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(home.path()).await;
+        assert!(
+            crate::auth::flycockpit::maybe_load_credential().is_none(),
+            "isolated home must not expose a host FlyCockpit credential"
+        );
+        let db = Db::open_in_memory().unwrap();
+        let outcome = sync_credential_once(&db, credential("https://app.example.test".into()))
+            .await
+            .unwrap();
+        assert_ne!(
+            outcome,
+            OrgSyncOnceOutcome::NoCredential,
+            "explicit-credential org-sync must not consult maybe_load_credential"
+        );
     }
 
     fn active_policy() -> String {
@@ -947,7 +1006,9 @@ mod tests {
             raw: json!({}),
         };
         let credential = credential("http://localhost:1".to_string());
-        let built = build_batch(&db, &credential, &policy, 0).await.unwrap();
+        let built = build_batch(&db, &credential, &policy, 0, None)
+            .await
+            .unwrap();
         match built {
             BatchBuild::Ready {
                 cursor_seq,
@@ -1104,6 +1165,62 @@ mod tests {
         let ingest = seen.iter().find(|r| r.starts_with("POST ")).unwrap();
         assert!(!ingest.contains("fci_instance_secret"));
         assert!(ingest.contains("REDACT"));
+    }
+
+    #[tokio::test]
+    async fn vault_only_redaction_table_is_loaded_for_org_sync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let session = crate::session::Session::create_for_test(
+            db.clone(),
+            tmp.path().to_path_buf(),
+            "builder",
+            crate::session::test_redaction_key_resolver(),
+        )
+        .unwrap();
+        session
+            .persist_redaction_table(&RedactionTable::empty())
+            .unwrap();
+        db.insert_session_event(
+            session.id,
+            SessionEventKind::UserMessage,
+            Some("builder"),
+            None,
+            &json!({"text": "vault-backed event"}),
+        )
+        .await
+        .unwrap();
+        let policy = OrgLogSyncPolicy {
+            org_id: "org-1".to_string(),
+            policy_version: Some("v1".to_string()),
+            include_event_kinds: Vec::new(),
+            exclude_event_kinds: Vec::new(),
+            include_local_model_transcripts: true,
+            raw: json!({}),
+        };
+        let credential = credential("http://localhost:1".to_string());
+        let skipped = build_batch(&db, &credential, &policy, 0, None)
+            .await
+            .unwrap();
+        match skipped {
+            BatchBuild::Idle => {}
+            BatchBuild::Filtered { cursor_seq } => assert_eq!(
+                cursor_seq, 0,
+                "vault-less load must not advance past unread vault-backed events"
+            ),
+            BatchBuild::Ready { event_count, .. } => {
+                panic!("vault-less load must skip vault-only tables, got {event_count} events")
+            }
+        }
+        let loaded = build_batch(&db, &credential, &policy, 0, Some(session.secret_vault()))
+            .await
+            .unwrap();
+        match loaded {
+            BatchBuild::Ready { event_count, .. } => assert_eq!(event_count, 1),
+            BatchBuild::Idle | BatchBuild::Filtered { .. } => {
+                panic!("expected ready batch with vault")
+            }
+        }
     }
 
     #[test]

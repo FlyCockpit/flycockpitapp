@@ -571,7 +571,13 @@ fn extract_capability_prerequisite_ids(text: &str) -> std::collections::BTreeSet
         while let Some(offset) = rest.find(prefix) {
             let slice = &rest[offset..];
             let end = slice
-                .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '_' || c == '-'))
+                .find(|c: char| {
+                    !(c.is_ascii_lowercase()
+                        || c.is_ascii_digit()
+                        || c == '.'
+                        || c == '_'
+                        || c == '-')
+                })
                 .unwrap_or(slice.len());
             let id = &slice[..end];
             if id.bytes().filter(|b| *b == b'.').count() == 1 {
@@ -609,7 +615,10 @@ fn capability_prerequisite_subset_set_equality() {
     assert_eq!(marked, expected, "RUNTIME_PREREQUISITE_IDS drifted");
     assert_eq!(toml_ids, expected, "TOML capability IDs drifted");
     assert_eq!(docs_ids, expected, "generated docs capability IDs drifted");
-    assert_eq!(notice_ids, expected, "installer notice capability IDs drifted");
+    assert_eq!(
+        notice_ids, expected,
+        "installer notice capability IDs drifted"
+    );
     assert_eq!(marked.len(), 6);
     assert!(DOCS.contains("Linux-only"));
     assert!(DOCS.contains("effective") && DOCS.contains("Off"));

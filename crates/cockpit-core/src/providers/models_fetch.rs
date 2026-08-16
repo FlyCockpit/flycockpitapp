@@ -90,17 +90,7 @@ impl fmt::Debug for ResolvedRequest {
 /// Resolve environment and named-secret references in every header, collecting
 /// missing references into one list. Caller decides whether to abort or warn.
 pub fn resolve_headers(headers: &[HeaderSpec]) -> (Vec<ResolvedHeader>, Vec<String>) {
-    let store = crate::credentials::CredentialStore::open_default_readonly().ok();
-    resolve_headers_with_sources(
-        headers,
-        |name| std::env::var(name).ok(),
-        |name| {
-            store
-                .as_ref()
-                .and_then(|store| store.named_secret(name))
-                .map(str::to_string)
-        },
-    )
+    resolve_headers_with_sources(headers, |name| std::env::var(name).ok(), |_| None)
 }
 
 pub fn resolve_headers_with_env<F>(
@@ -193,21 +183,45 @@ pub async fn resolve_provider_request_async(
     entry: &ProviderEntry,
 ) -> Result<ResolvedRequest> {
     let registry = ProviderRegistry::standard();
+    if registry
+        .provider_for(provider_id, entry)
+        .credential_kind()
+        .is_some()
+    {
+        anyhow::bail!("Codex/Grok OAuth requires an injected credential store");
+    }
+    registry
+        .provider_for(provider_id, entry)
+        .request(provider_id, entry, None, &|name| std::env::var(name).ok())
+}
+
+pub async fn resolve_provider_request_async_with_store(
+    provider_id: &str,
+    entry: &ProviderEntry,
+    store: crate::credentials::CredentialStore,
+    env_lookup: impl Fn(&str) -> Option<String>,
+) -> Result<ResolvedRequest> {
+    let registry = ProviderRegistry::standard();
     let credential_kind = registry.provider_for(provider_id, entry).credential_kind();
     let credential = match credential_kind {
         Some(ProviderCredentialKind::CodexOAuth) => Some(OAuthCredential::Codex(
-            crate::auth::codex_oauth::credential().await?,
+            crate::auth::codex_oauth::credential_from_store(store.clone()).await?,
         )),
         Some(ProviderCredentialKind::XaiOAuth) => Some(OAuthCredential::Bearer(
-            crate::auth::xai_oauth::bearer_token().await?,
+            crate::auth::xai_oauth::bearer_token_from_store(store.clone()).await?,
         )),
         None => None,
     };
-    registry
-        .provider_for(provider_id, entry)
-        .request(provider_id, entry, credential, &|name| {
-            std::env::var(name).ok()
-        })
+    let env_lookup = |name: &str| env_lookup(name);
+    let secret_lookup = |name: &str| store.named_secret(name).map(str::to_string);
+    resolve_provider_request_inner_with_sources(
+        provider_id,
+        entry,
+        credential,
+        registry.provider_for(provider_id, entry).request_kind(),
+        &env_lookup,
+        &secret_lookup,
+    )
 }
 
 async fn resolve_model_list_request_async(
@@ -215,16 +229,31 @@ async fn resolve_model_list_request_async(
     entry: &ProviderEntry,
     resolved: &ResolvedRequest,
 ) -> Result<ResolvedRequest> {
+    resolve_model_list_request_async_with_store(provider_id, entry, resolved, None).await
+}
+
+async fn resolve_model_list_request_async_with_store(
+    provider_id: &str,
+    entry: &ProviderEntry,
+    resolved: &ResolvedRequest,
+    store: Option<crate::credentials::CredentialStore>,
+) -> Result<ResolvedRequest> {
     let registry = ProviderRegistry::standard();
     let credential_kind = registry.provider_for(provider_id, entry).credential_kind();
-    let credential = match credential_kind {
-        Some(ProviderCredentialKind::CodexOAuth) => Some(OAuthCredential::Codex(
-            crate::auth::codex_oauth::credential().await?,
+    let credential = match (credential_kind, store) {
+        (Some(ProviderCredentialKind::CodexOAuth), Some(store)) => Some(OAuthCredential::Codex(
+            crate::auth::codex_oauth::credential_from_store(store).await?,
         )),
-        Some(ProviderCredentialKind::XaiOAuth) => Some(OAuthCredential::Bearer(
-            crate::auth::xai_oauth::bearer_token().await?,
+        (Some(ProviderCredentialKind::XaiOAuth), Some(store)) => Some(OAuthCredential::Bearer(
+            crate::auth::xai_oauth::bearer_token_from_store(store).await?,
         )),
-        None => None,
+        (Some(ProviderCredentialKind::CodexOAuth), None) => {
+            anyhow::bail!("Codex OAuth requires an injected credential store")
+        }
+        (Some(ProviderCredentialKind::XaiOAuth), None) => {
+            anyhow::bail!("Grok OAuth requires an injected credential store")
+        }
+        (None, _) => None,
     };
     registry
         .provider_for(provider_id, entry)
@@ -284,15 +313,86 @@ pub fn resolve_provider_request_blocking_with_env<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
+    resolve_provider_request_blocking_with_sources(provider_id, entry, lookup, |_| None)
+}
+
+pub fn resolve_provider_request_blocking_with_sources<F, S>(
+    provider_id: &str,
+    entry: &ProviderEntry,
+    lookup: F,
+    secret_lookup: S,
+) -> Result<ResolvedRequest>
+where
+    F: Fn(&str) -> Option<String>,
+    S: Fn(&str) -> Option<String>,
+{
     let registry = ProviderRegistry::standard();
     if registry
         .provider_for(provider_id, entry)
         .credential_kind()
         .is_none()
     {
-        return resolve_provider_request_with_env(provider_id, entry, lookup);
+        return resolve_provider_request_with_sources(provider_id, entry, lookup, secret_lookup);
     }
     resolve_provider_request_blocking(provider_id, entry)
+}
+
+pub fn resolve_provider_request_blocking_with_store<F>(
+    provider_id: &str,
+    entry: &ProviderEntry,
+    lookup: F,
+    store: crate::credentials::CredentialStore,
+) -> Result<ResolvedRequest>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let registry = ProviderRegistry::standard();
+    if registry
+        .provider_for(provider_id, entry)
+        .credential_kind()
+        .is_none()
+    {
+        let secret_lookup = |name: &str| store.named_secret(name).map(str::to_string);
+        return resolve_provider_request_with_sources(provider_id, entry, lookup, secret_lookup);
+    }
+    let provider_id_owned = provider_id.to_owned();
+    let entry = entry.clone();
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| {
+                handle.block_on(resolve_provider_request_async_with_store(
+                    &provider_id_owned,
+                    &entry,
+                    store,
+                    |name| lookup(name),
+                ))
+            })
+        }
+        Ok(_) => std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("build subscription-auth runtime")?
+                .block_on(resolve_provider_request_async_with_store(
+                    &provider_id_owned,
+                    &entry,
+                    store,
+                    |name| std::env::var(name).ok(),
+                ))
+        })
+        .join()
+        .map_err(|_| anyhow!("subscription-auth worker panicked"))?,
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("build subscription-auth runtime")?
+            .block_on(resolve_provider_request_async_with_store(
+                &provider_id_owned,
+                &entry,
+                store,
+                |name| lookup(name),
+            )),
+    }
 }
 
 pub(crate) fn resolve_provider_request_inner(
@@ -302,19 +402,13 @@ pub(crate) fn resolve_provider_request_inner(
     request_kind: ProviderRequestKind,
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ResolvedRequest> {
-    let secret_store = crate::credentials::CredentialStore::open_default_readonly().ok();
     resolve_provider_request_inner_with_sources(
         provider_id,
         entry,
         oauth_credential,
         request_kind,
         lookup,
-        &|name| {
-            secret_store
-                .as_ref()
-                .and_then(|store| store.named_secret(name))
-                .map(str::to_string)
-        },
+        &|_| None,
     )
 }
 
@@ -678,7 +772,18 @@ pub async fn fetch_models_for_provider(
     resolved: &ResolvedRequest,
     timeout: Duration,
 ) -> Result<FetchOutcome> {
-    let request = resolve_model_list_request_async(provider_id, entry, resolved).await?;
+    fetch_models_for_provider_with_store(provider_id, entry, resolved, timeout, None).await
+}
+
+pub async fn fetch_models_for_provider_with_store(
+    provider_id: &str,
+    entry: &ProviderEntry,
+    resolved: &ResolvedRequest,
+    timeout: Duration,
+    store: Option<crate::credentials::CredentialStore>,
+) -> Result<FetchOutcome> {
+    let request =
+        resolve_model_list_request_async_with_store(provider_id, entry, resolved, store).await?;
     let registry = ProviderRegistry::standard();
     let provider = registry.provider_for(provider_id, entry);
     let url = provider.models_url(entry, &request.base_url);
@@ -1441,16 +1546,7 @@ fn is_loopback_or_local_url(url: &Url) -> bool {
 }
 
 fn resolve_copilot_token() -> Result<Option<String>> {
-    let store = crate::credentials::CredentialStore::open_default_readonly().ok();
-    resolve_copilot_token_with_sources(
-        |name| std::env::var(name).ok(),
-        |name| {
-            store
-                .as_ref()
-                .and_then(|store| store.named_secret(name))
-                .map(str::to_string)
-        },
-    )
+    resolve_copilot_token_with_sources(|name| std::env::var(name).ok(), |_| None)
 }
 
 fn resolve_copilot_token_with_env<F>(lookup: F) -> Result<Option<String>>
@@ -2476,7 +2572,10 @@ mod tests {
             credential_ref: Some(crate::auth::xai_oauth::CREDENTIAL_KEY.to_string()),
             ..ProviderEntry::default()
         };
-        let resolved = resolve_provider_request_async("grok-oauth", &entry)
+        let resolved =
+            resolve_provider_request_async_with_store("grok-oauth", &entry, store, |name| {
+                std::env::var(name).ok()
+            })
             .await
             .unwrap();
         let auth = resolved
@@ -2528,7 +2627,10 @@ mod tests {
             credential_ref: Some(crate::auth::codex_oauth::CREDENTIAL_KEY.to_string()),
             ..ProviderEntry::default()
         };
-        let resolved = resolve_provider_request_async("codex-oauth", &entry)
+        let resolved =
+            resolve_provider_request_async_with_store("codex-oauth", &entry, store, |name| {
+                std::env::var(name).ok()
+            })
             .await
             .unwrap();
         let auth = resolved
@@ -2600,12 +2702,48 @@ mod tests {
         let mut store = crate::credentials::CredentialStore::open_default().unwrap();
         store.set_named_secret("hdr", "sk-models-fetch-header-secret");
         store.save().unwrap();
-        let (headers, missing) = resolve_headers(&[crate::config::providers::HeaderSpec {
-            name: "Authorization".into(),
-            value: "$secret:hdr".into(),
-        }]);
+        let (headers, missing) = resolve_headers_with_sources(
+            &[crate::config::providers::HeaderSpec {
+                name: "Authorization".into(),
+                value: "$secret:hdr".into(),
+            }],
+            |_| None,
+            |name| store.named_secret(name).map(str::to_string),
+        );
         assert!(missing.is_empty());
         assert_eq!(headers[0].value, "sk-models-fetch-header-secret");
+        assert!(
+            !crate::credentials::default_path().unwrap().exists(),
+            "models_fetch must read named secrets from the vault"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_with_store_resolves_named_secret_headers() {
+        let env = crate::test_env::lock_async().await;
+        let tmp = tempfile::tempdir().unwrap();
+        env.set_var("XDG_STATE_HOME", tmp.path());
+        env.set_var("XDG_DATA_HOME", tmp.path().join("data"));
+        let mut store = crate::credentials::CredentialStore::open_default().unwrap();
+        store.set_named_secret("hdr", "sk-async-store-header-secret");
+        store.save().unwrap();
+        let entry = crate::config::providers::ProviderEntry {
+            url: "https://example.test/v1".into(),
+            headers: vec![crate::config::providers::HeaderSpec {
+                name: "Authorization".into(),
+                value: "$secret:hdr".into(),
+            }],
+            ..crate::config::providers::ProviderEntry::default()
+        };
+        let resolved = resolve_provider_request_async_with_store("openai", &entry, store, |_| None)
+            .await
+            .unwrap();
+        let auth = resolved
+            .headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case("authorization"))
+            .unwrap();
+        assert_eq!(auth.value, "sk-async-store-header-secret");
         assert!(
             !crate::credentials::default_path().unwrap().exists(),
             "models_fetch must read named secrets from the vault"

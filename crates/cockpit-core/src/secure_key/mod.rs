@@ -59,8 +59,8 @@ pub use namespace::{
 };
 pub use resolve::{
     DEFAULT_FIX_COMMAND, EffectiveSecretStore, KekUnavailable, SecretStoreInjected,
-    ensure_secret_vault, kek_dir_for_db, migrate_installation_kek, project_secret_store_snapshot,
-    resolve_secret_store, vault_for_db,
+    ensure_secret_vault, kek_dir_for_db, migrate_installation_kek, open_for_db,
+    project_secret_store_snapshot, resolve_secret_store, vault_for_db,
 };
 
 #[cfg(feature = "test-support")]

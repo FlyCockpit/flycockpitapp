@@ -242,7 +242,7 @@ fn lifecycle(name: &str, s: &ServerConfig) -> ServerLifecycle {
         }
         Auth::Oauth(_) => {
             // OAuth is ready iff a token is stored for `mcp:<name>`.
-            let stored = cockpit_core::credentials::CredentialStore::open_default()
+            let stored = crate::tui::settings::cockpit_credential_store()
                 .ok()
                 .and_then(|store| store.get(&cockpit_core::mcp::auth::cred_key(name)).cloned())
                 .is_some();
@@ -344,8 +344,11 @@ impl SettingsCx {
                         let name = name.clone();
                         let server = server.clone();
                         let res = tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current()
-                                .block_on(cockpit_core::mcp::auth::run_oauth_flow(&name, &server))
+                            tokio::runtime::Handle::current().block_on(async {
+                                let mut store = crate::tui::settings::cockpit_credential_store()?;
+                                cockpit_core::mcp::auth::run_oauth_flow(&name, &server, &mut store)
+                                    .await
+                            })
                         });
                         s.status = Some(match res {
                             Ok(_) => format!("authenticated `{name}`"),
@@ -1179,12 +1182,12 @@ fn is_env_reference(value: &str) -> bool {
 }
 
 fn store_secret(key: &str, value: &str) -> anyhow::Result<()> {
-    let store = cockpit_core::credentials::CredentialStore::open_default()?;
+    let store = crate::tui::settings::cockpit_credential_store()?;
     store.save_record_merged(key, serde_json::json!({ "secret": value }))
 }
 
 fn remove_credential_refs(refs: &BTreeSet<String>) -> anyhow::Result<()> {
-    let store = cockpit_core::credentials::CredentialStore::open_default()?;
+    let store = crate::tui::settings::cockpit_credential_store()?;
     for key in refs {
         store.remove_record_merged(key)?;
     }

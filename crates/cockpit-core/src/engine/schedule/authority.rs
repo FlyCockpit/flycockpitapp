@@ -911,7 +911,7 @@ mod tests {
         let root = tmp.path().to_path_buf();
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = Arc::new(
-            crate::session::Session::create(
+            crate::session::Session::create_for_test(
                 db.clone(),
                 root.clone(),
                 "builder",

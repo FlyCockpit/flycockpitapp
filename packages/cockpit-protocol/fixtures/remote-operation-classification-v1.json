@@ -848,6 +848,21 @@
       ],
       "fcorSchema": "project_root:String",
       "strategy": "none",
+      "tag": "get_workspace_trust"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "project_root:string",
+      "fcorRoles": [
+        {
+          "field": "project_root",
+          "role": "project_root",
+          "type": "String"
+        }
+      ],
+      "fcorSchema": "project_root:String",
+      "strategy": "none",
       "tag": "get_startup_disclosures"
     },
     {
@@ -2463,15 +2478,20 @@
     {
       "class": "local_only",
       "evidence": null,
-      "fcorCanonicalSchema": "credential:struct:StoredFlycockpitCredential:v1",
+      "fcorCanonicalSchema": "credential:struct:StoredFlycockpitCredential:v1|force:bool",
       "fcorRoles": [
         {
           "field": "credential",
           "role": "param",
           "type": "StoredFlycockpitCredential"
+        },
+        {
+          "field": "force",
+          "role": "param",
+          "type": "bool"
         }
       ],
-      "fcorSchema": "credential:StoredFlycockpitCredential",
+      "fcorSchema": "credential:StoredFlycockpitCredential|force:bool",
       "strategy": "none",
       "tag": "store_flycockpit_credential"
     },

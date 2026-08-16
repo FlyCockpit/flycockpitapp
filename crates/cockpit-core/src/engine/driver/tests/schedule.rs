@@ -343,7 +343,8 @@ fn schedule_journaling_driver(
     let root = tmp.path().to_path_buf();
     write_schedule_trust_provider(&root);
     let db = crate::db::Db::open_in_memory().unwrap();
-    let session = Arc::new(Session::create(db.clone(), root.clone(), "Build", resolver).unwrap());
+    let session =
+        Arc::new(Session::create_for_test(db.clone(), root.clone(), "Build", resolver).unwrap());
     let locks = Arc::new(crate::locks::LockManager::in_memory(db));
 
     let env = std::collections::HashMap::from([("DEPLOY_TOKEN".to_string(), lit.to_string())]);

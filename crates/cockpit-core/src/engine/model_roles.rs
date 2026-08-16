@@ -200,12 +200,28 @@ pub fn resolve_spawn_selector(
     providers: &ProvidersConfig,
     session_model: &Arc<Model>,
 ) -> Result<(Arc<Model>, DelegationCustody), SelectorResolution> {
+    resolve_spawn_selector_with_store(
+        selector,
+        agent_name,
+        extended,
+        providers,
+        session_model,
+        None,
+    )
+}
+
+pub fn resolve_spawn_selector_with_store(
+    selector: &str,
+    agent_name: &str,
+    extended: &ExtendedConfig,
+    providers: &ProvidersConfig,
+    session_model: &Arc<Model>,
+    store: Option<crate::credentials::CredentialStore>,
+) -> Result<(Arc<Model>, DelegationCustody), SelectorResolution> {
     let selector = selector.trim();
     if selector.is_empty() {
         return Err(SelectorResolution::Unset);
     }
-    // A role name resolves through host config, but the *choice* to use it is
-    // still model-originated, so the custody filter stays forced.
     let target = match CodingModelRole::from_name(selector) {
         Some(role) => match role.configured_ref(extended) {
             Some(model_ref) => model_ref.to_string(),
@@ -224,7 +240,7 @@ pub fn resolve_spawn_selector(
         availability: AvailabilityScope::Discovery,
         global_mode: extended.llm_mode,
     };
-    build_redacted_policy_model(criteria, providers, session_model)
+    build_redacted_policy_model(criteria, providers, session_model, store)
 }
 
 /// Resolve a **host-config** spawn model selector.
@@ -238,6 +254,24 @@ pub fn resolve_host_config_spawn_selector(
     extended: &ExtendedConfig,
     providers: &ProvidersConfig,
     session_model: &Arc<Model>,
+) -> Result<(Arc<Model>, DelegationCustody), SelectorResolution> {
+    resolve_host_config_spawn_selector_with_store(
+        selector,
+        agent_name,
+        extended,
+        providers,
+        session_model,
+        None,
+    )
+}
+
+pub fn resolve_host_config_spawn_selector_with_store(
+    selector: &str,
+    agent_name: &str,
+    extended: &ExtendedConfig,
+    providers: &ProvidersConfig,
+    session_model: &Arc<Model>,
+    store: Option<crate::credentials::CredentialStore>,
 ) -> Result<(Arc<Model>, DelegationCustody), SelectorResolution> {
     let selector = selector.trim();
     if selector.is_empty() {
@@ -258,6 +292,7 @@ pub fn resolve_host_config_spawn_selector(
         extended,
         providers,
         session_model,
+        store,
     )
 }
 
@@ -267,6 +302,24 @@ pub fn resolve_policy_selector(
     extended: &ExtendedConfig,
     providers: &ProvidersConfig,
     session_model: &Arc<Model>,
+) -> Result<(Arc<Model>, DelegationCustody), SelectorResolution> {
+    resolve_policy_selector_with_store(
+        selector,
+        agent_name,
+        extended,
+        providers,
+        session_model,
+        None,
+    )
+}
+
+pub fn resolve_policy_selector_with_store(
+    selector: &DelegationModelSelector,
+    agent_name: &str,
+    extended: &ExtendedConfig,
+    providers: &ProvidersConfig,
+    session_model: &Arc<Model>,
+    store: Option<crate::credentials::CredentialStore>,
 ) -> Result<(Arc<Model>, DelegationCustody), SelectorResolution> {
     let default_category = default_role_for_agent(agent_name).map(CodingModelRole::as_str);
     let mut default_required = default_required_capabilities_for_agent(agent_name);
@@ -334,7 +387,7 @@ pub fn resolve_policy_selector(
             }
         }
     };
-    build_redacted_policy_model(criteria, providers, session_model)
+    build_redacted_policy_model(criteria, providers, session_model, store)
 }
 
 pub fn resolve_delegated_model(
@@ -345,6 +398,26 @@ pub fn resolve_delegated_model(
     providers: &ProvidersConfig,
     session_model: &Arc<Model>,
 ) -> Result<Arc<Model>, SelectorResolution> {
+    resolve_delegated_model_with_store(
+        agent_name,
+        frontmatter_model,
+        caller_model,
+        extended,
+        providers,
+        session_model,
+        None,
+    )
+}
+
+pub fn resolve_delegated_model_with_store(
+    agent_name: &str,
+    frontmatter_model: Option<&str>,
+    caller_model: Option<&DelegationModelSelector>,
+    extended: &ExtendedConfig,
+    providers: &ProvidersConfig,
+    session_model: &Arc<Model>,
+    store: Option<crate::credentials::CredentialStore>,
+) -> Result<Arc<Model>, SelectorResolution> {
     resolve_delegated_model_with_custody(
         agent_name,
         frontmatter_model,
@@ -352,6 +425,7 @@ pub fn resolve_delegated_model(
         extended,
         providers,
         session_model,
+        store,
     )
     .map(|(model, custody)| {
         for diagnostic in custody.diagnostics() {
@@ -377,6 +451,7 @@ pub fn resolve_delegated_model_with_custody(
     extended: &ExtendedConfig,
     providers: &ProvidersConfig,
     session_model: &Arc<Model>,
+    store: Option<crate::credentials::CredentialStore>,
 ) -> Result<(Arc<Model>, DelegationCustody), SelectorResolution> {
     let mut diagnostics = Vec::new();
 
@@ -391,6 +466,7 @@ pub fn resolve_delegated_model_with_custody(
             extended,
             providers,
             session_model,
+            store.clone(),
         )
         .map_err(|_| SelectorResolution::InvalidLiteral(selector.to_string()))
         .map(|(model, mut custody)| {
@@ -403,7 +479,14 @@ pub fn resolve_delegated_model_with_custody(
     if extended.agent_chooses_subagent_model
         && let Some(selector) = caller_model
     {
-        match resolve_policy_selector(selector, agent_name, extended, providers, session_model) {
+        match resolve_policy_selector_with_store(
+            selector,
+            agent_name,
+            extended,
+            providers,
+            session_model,
+            store.clone(),
+        ) {
             Ok((model, mut custody)) => {
                 custody.prepend_diagnostics(diagnostics);
                 return Ok((model, custody));
@@ -425,6 +508,7 @@ pub fn resolve_delegated_model_with_custody(
             extended,
             providers,
             session_model,
+            store.clone(),
         ) {
             Ok((model, mut custody)) => {
                 custody.prepend_diagnostics(diagnostics);
@@ -456,7 +540,7 @@ pub fn resolve_delegated_model_with_custody(
             availability: AvailabilityScope::Discovery,
             global_mode: extended.llm_mode,
         };
-        match build_redacted_policy_model(criteria, providers, session_model) {
+        match build_redacted_policy_model(criteria, providers, session_model, store.clone()) {
             Ok((model, mut custody)) => {
                 custody.prepend_diagnostics(diagnostics);
                 return Ok((model, custody));
@@ -500,6 +584,7 @@ pub fn resolve_trusted_child_model(
     extended: &ExtendedConfig,
     providers: &ProvidersConfig,
     session_model: &Arc<Model>,
+    store: Option<crate::credentials::CredentialStore>,
 ) -> Result<(Arc<Model>, TrustedCustodyGrant), SelectorResolution> {
     let criteria = ModelPolicyCriteria {
         selector: if category.is_empty() {
@@ -534,11 +619,12 @@ pub fn resolve_trusted_child_model(
             "trusted-child selection did not produce a trusted custody grant".to_string(),
         )
     })?;
-    let model = Model::for_provider(
+    let model = Model::for_provider_optional_store(
         providers,
         &resolved.policy.provider,
         &resolved.policy.model,
         session_model.session_redact_table(),
+        store,
     )
     .map(Arc::new)
     .map_err(|e| SelectorResolution::InvalidLiteral(format!("{e:#}")))?;
@@ -712,6 +798,7 @@ fn build_redacted_policy_model(
     criteria: ModelPolicyCriteria<'_>,
     providers: &ProvidersConfig,
     session_model: &Arc<Model>,
+    store: Option<crate::credentials::CredentialStore>,
 ) -> Result<(Arc<Model>, DelegationCustody), SelectorResolution> {
     let session_redact = session_model.session_redact_table();
     let payload = SensitivePayload::redacted_for_untrusted_custody(Arc::new(
@@ -723,11 +810,12 @@ fn build_redacted_policy_model(
         .resolve_sensitive_model_policy(&request)
         .map_err(policy_error_message)
         .map_err(SelectorResolution::InvalidLiteral)?;
-    let model = Model::for_provider(
+    let model = Model::for_provider_optional_store(
         providers,
         &resolved.policy.provider,
         &resolved.policy.model,
         session_redact.clone(),
+        store,
     )
     .map(Arc::new)
     .map_err(|e| SelectorResolution::InvalidLiteral(format!("{e:#}")))?;
@@ -793,6 +881,7 @@ fn build_host_selected_policy_model(
     extended: &ExtendedConfig,
     providers: &ProvidersConfig,
     session_model: &Arc<Model>,
+    store: Option<crate::credentials::CredentialStore>,
 ) -> Result<(Arc<Model>, DelegationCustody), SelectorResolution> {
     let Some((provider, model_id)) = split_selector(selector) else {
         return Err(SelectorResolution::InvalidLiteral(format!(
@@ -825,11 +914,12 @@ fn build_host_selected_policy_model(
         .resolve_sensitive_model_policy(&request)
         .map_err(policy_error_message)
         .map_err(SelectorResolution::InvalidLiteral)?;
-    let model = Model::for_provider(
+    let model = Model::for_provider_optional_store(
         providers,
         &resolved.policy.provider,
         &resolved.policy.model,
         session_redact.clone(),
+        store,
     )
     .map(Arc::new)
     .map_err(|e| SelectorResolution::InvalidLiteral(format!("{e:#}")))?;
@@ -1417,6 +1507,47 @@ mod tests {
     }
 
     #[test]
+    fn delegated_frontmatter_model_resolves_vault_named_secret() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        let mut store = crate::credentials::CredentialStore::from_vault(vault).unwrap();
+        store.set_named_secret("child-token", "vault-only-delegated-secret-xyz");
+        store.save().unwrap();
+
+        let mut providers = providers();
+        let session = session_model(&providers);
+        providers.providers.get_mut("minimax").unwrap().headers =
+            vec![crate::config::providers::HeaderSpec {
+                name: "Authorization".into(),
+                value: "Bearer $secret:child-token".into(),
+            }];
+        assert!(
+            resolve_delegated_model(
+                "explore",
+                Some("minimax:MiniMax-M2"),
+                None,
+                &ExtendedConfig::default(),
+                &providers,
+                &session,
+            )
+            .is_err(),
+            "frontmatter $secret model must fail without a store"
+        );
+        let model = resolve_delegated_model_with_store(
+            "explore",
+            Some("minimax:MiniMax-M2"),
+            None,
+            &ExtendedConfig::default(),
+            &providers,
+            &session,
+            Some(store),
+        )
+        .expect("frontmatter $secret model must resolve through the injected store");
+        assert_eq!(model.provider_id(), "minimax");
+        assert_eq!(model.model_id_ref(), "MiniMax-M2");
+    }
+
+    #[test]
     fn resolver_ladder_frontmatter_choice_slot_session() {
         let mut providers = providers();
         providers.category_defaults.insert(
@@ -1888,9 +2019,15 @@ mod tests {
 
         // 4. Only the separately host-authorized coordinator may take the
         //    trusted child, and it is the sole minter of a custody grant.
-        let (trusted, grant) =
-            resolve_trusted_child_model("reasoning", "deepthink", &extended, &providers, &session)
-                .unwrap();
+        let (trusted, grant) = resolve_trusted_child_model(
+            "reasoning",
+            "deepthink",
+            &extended,
+            &providers,
+            &session,
+            None,
+        )
+        .unwrap();
         assert_eq!(trusted.model_id_ref(), "trusted-reasoning");
         assert_eq!(grant.provider(), "minimax");
         assert_eq!(grant.model(), "trusted-reasoning");
@@ -2069,6 +2206,7 @@ mod tests {
                 &extended,
                 &providers,
                 &session,
+                None,
             )
             .expect("untrusted delegation resolves");
             assert_eq!(model.model_id_ref(), "MiniMax-M2");
@@ -2089,6 +2227,7 @@ mod tests {
                 &extended,
                 &providers,
                 &session,
+                None,
             )
             .expect("host-authored trusted delegation resolves");
             assert_eq!(trusted_child.model_id_ref(), "trusted-code");
@@ -2291,6 +2430,7 @@ mod tests {
             &extended,
             &providers,
             &session,
+            None,
         )
         .unwrap();
 
@@ -2404,6 +2544,7 @@ mod tests {
             &ExtendedConfig::default(),
             &providers,
             &session,
+            None,
         )
         .unwrap();
 
@@ -2454,6 +2595,7 @@ mod tests {
             &ExtendedConfig::default(),
             &providers,
             &session,
+            None,
         )
         .unwrap();
         assert_eq!(model.model_id_ref(), "trusted-code");
@@ -2470,7 +2612,7 @@ mod tests {
             ..ExtendedConfig::default()
         };
         let (model, custody) = resolve_delegated_model_with_custody(
-            "explore", None, None, &extended, &providers, &session,
+            "explore", None, None, &extended, &providers, &session, None,
         )
         .unwrap();
         assert_eq!(model.model_id_ref(), "trusted-code");
@@ -2502,6 +2644,7 @@ mod tests {
             &ExtendedConfig::default(),
             &scoped,
             &scoped_session,
+            None,
         )
         .expect("a category-scoped model is still resolvable by exact host reference");
         assert_eq!(model.model_id_ref(), "MiniMax-M2");
@@ -2518,6 +2661,7 @@ mod tests {
             },
             &scoped,
             &scoped_session,
+            None,
         )
         .expect("a category-scoped role default is still resolvable");
         assert_eq!(model.model_id_ref(), "trusted-code");

@@ -22,6 +22,36 @@ impl Model {
     where
         F: Fn(&str) -> Option<String>,
     {
+        Self::from_config_with_sources(cfg, redact, lookup, |_| None, None)
+    }
+
+    pub fn from_config_with_store<F>(
+        cfg: &ProvidersConfig,
+        redact: Arc<RedactionTable>,
+        lookup: F,
+        store: crate::credentials::CredentialStore,
+    ) -> Result<Self>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let secret_lookup = {
+            let store = store.clone();
+            move |name: &str| store.named_secret(name).map(str::to_string)
+        };
+        Self::from_config_with_sources(cfg, redact, lookup, secret_lookup, Some(store))
+    }
+
+    pub fn from_config_with_sources<F, S>(
+        cfg: &ProvidersConfig,
+        redact: Arc<RedactionTable>,
+        lookup: F,
+        secret_lookup: S,
+        store: Option<crate::credentials::CredentialStore>,
+    ) -> Result<Self>
+    where
+        F: Fn(&str) -> Option<String>,
+        S: Fn(&str) -> Option<String>,
+    {
         let active: &ActiveModelRef = cfg.active_model.as_ref().context(
             "no active model selected — run /model or set COCKPIT_PROVIDER/COCKPIT_MODEL",
         )?;
@@ -90,6 +120,8 @@ impl Model {
             redact,
             effective_redact,
             lookup,
+            secret_lookup,
+            store,
         )
     }
     /// Build a `Model` from a `"provider:model-id"` reference, erroring on
@@ -127,6 +159,26 @@ impl Model {
         })
     }
 
+    pub fn for_provider_optional_store(
+        cfg: &ProvidersConfig,
+        provider_id: &str,
+        model_id: &str,
+        redact: Arc<RedactionTable>,
+        store: Option<crate::credentials::CredentialStore>,
+    ) -> Result<Self> {
+        match store {
+            Some(store) => Self::for_provider_with_store(
+                cfg,
+                provider_id,
+                model_id,
+                redact,
+                |name| std::env::var(name).ok(),
+                store,
+            ),
+            None => Self::for_provider(cfg, provider_id, model_id, redact),
+        }
+    }
+
     pub fn for_provider_with_env<F>(
         cfg: &ProvidersConfig,
         provider_id: &str,
@@ -136,6 +188,48 @@ impl Model {
     ) -> Result<Self>
     where
         F: Fn(&str) -> Option<String>,
+    {
+        Self::for_provider_with_sources(cfg, provider_id, model_id, redact, lookup, |_| None, None)
+    }
+
+    pub fn for_provider_with_store<F>(
+        cfg: &ProvidersConfig,
+        provider_id: &str,
+        model_id: &str,
+        redact: Arc<RedactionTable>,
+        lookup: F,
+        store: crate::credentials::CredentialStore,
+    ) -> Result<Self>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let secret_lookup = {
+            let store = store.clone();
+            move |name: &str| store.named_secret(name).map(str::to_string)
+        };
+        Self::for_provider_with_sources(
+            cfg,
+            provider_id,
+            model_id,
+            redact,
+            lookup,
+            secret_lookup,
+            Some(store),
+        )
+    }
+
+    pub fn for_provider_with_sources<F, S>(
+        cfg: &ProvidersConfig,
+        provider_id: &str,
+        model_id: &str,
+        redact: Arc<RedactionTable>,
+        lookup: F,
+        secret_lookup: S,
+        store: Option<crate::credentials::CredentialStore>,
+    ) -> Result<Self>
+    where
+        F: Fn(&str) -> Option<String>,
+        S: Fn(&str) -> Option<String>,
     {
         let entry = cfg
             .providers
@@ -186,6 +280,8 @@ impl Model {
             redact,
             effective_redact,
             lookup,
+            secret_lookup,
+            store,
         )
     }
 }
@@ -240,6 +336,8 @@ pub(super) fn build_model(
         session_redact,
         redact,
         lookup,
+        |_| None,
+        None,
     )
 }
 
@@ -264,6 +362,8 @@ pub(super) fn build_model_with_can_delegate(
     session_redact: Arc<RedactionTable>,
     redact: Arc<RedactionTable>,
     lookup: impl Fn(&str) -> Option<String>,
+    secret_lookup: impl Fn(&str) -> Option<String>,
+    store: Option<crate::credentials::CredentialStore>,
 ) -> Result<Model> {
     let registry = crate::providers::ProviderRegistry::standard();
     let is_codex_oauth =
@@ -274,8 +374,20 @@ pub(super) fn build_model_with_can_delegate(
         );
     }
 
-    let resolved =
-        models_fetch::resolve_provider_request_blocking_with_env(provider_id, entry, lookup)?;
+    let resolved = match store {
+        Some(store) => models_fetch::resolve_provider_request_blocking_with_store(
+            provider_id,
+            entry,
+            lookup,
+            store,
+        )?,
+        None => models_fetch::resolve_provider_request_blocking_with_sources(
+            provider_id,
+            entry,
+            lookup,
+            secret_lookup,
+        )?,
+    };
     let utility_token_limit = resolve_utility_token_limit(entry, model_id);
     if is_codex_oauth {
         build_chatgpt_model_with_utility_limit(

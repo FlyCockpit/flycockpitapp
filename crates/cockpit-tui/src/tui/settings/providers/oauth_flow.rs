@@ -467,10 +467,20 @@ impl OAuthFlowState {
         self.session = OAuthSession::Device(login);
     }
 
+    fn vault_logged_in(provider: OAuthProvider) -> bool {
+        let Ok(store) = crate::tui::settings::cockpit_credential_store() else {
+            return false;
+        };
+        match provider {
+            OAuthProvider::Grok => xai_oauth::is_logged_in_in(&store),
+            OAuthProvider::Codex => codex_oauth::is_logged_in_in(&store),
+        }
+    }
+
     pub(super) fn new_with_effects(provider: OAuthProvider, effects: OAuthEffects) -> Self {
         let (shape, logged_in) = match provider {
-            OAuthProvider::Grok => (FlowShape::BrowserCallback, xai_oauth::is_logged_in()),
-            OAuthProvider::Codex => (FlowShape::DeviceCode, codex_oauth::is_logged_in()),
+            OAuthProvider::Grok => (FlowShape::BrowserCallback, Self::vault_logged_in(provider)),
+            OAuthProvider::Codex => (FlowShape::DeviceCode, Self::vault_logged_in(provider)),
         };
         Self {
             flow_id: OAuthFlowId(NEXT_OAUTH_FLOW_ID.fetch_add(1, Ordering::Relaxed)),
@@ -739,7 +749,7 @@ impl OAuthFlowState {
             OAuthProvider::Codex => {
                 self.polling = false;
                 self.logged_in = result.as_ref().copied().unwrap_or(false)
-                    || cockpit_core::auth::codex_oauth::is_logged_in();
+                    || Self::vault_logged_in(OAuthProvider::Codex);
                 self.status = Some(result.map(|_| "Codex OAuth login complete".to_string()));
                 if self.logged_in {
                     self.session = OAuthSession::None;
@@ -748,7 +758,7 @@ impl OAuthFlowState {
             OAuthProvider::Grok => {
                 self.pending = false;
                 self.logged_in = result.as_ref().copied().unwrap_or(false)
-                    || cockpit_core::auth::xai_oauth::is_logged_in();
+                    || Self::vault_logged_in(OAuthProvider::Grok);
                 self.status = Some(result.map(|_| "xAI OAuth login complete".to_string()));
                 if self.logged_in {
                     self.paste_focused = false;
@@ -959,9 +969,12 @@ fn handle_oauth_enter(s: &mut OAuthFlowState, host: OAuthHost) -> OAuthKeyOutcom
 
     match (s.provider, option) {
         (_, OAuthOption::Acknowledge) => {
-            match cockpit_core::auth::subscription_ack::record(oauth_acknowledgement_provider(
-                s.provider,
-            )) {
+            match crate::tui::settings::cockpit_credential_store().and_then(|mut store| {
+                cockpit_core::auth::subscription_ack::record_in(
+                    &mut store,
+                    oauth_acknowledgement_provider(s.provider),
+                )
+            }) {
                 Ok(()) => {
                     s.acknowledgement_required = false;
                     s.status = Some(Ok("Subscription OAuth risk acknowledged.".to_string()));
@@ -1048,8 +1061,14 @@ fn oauth_acknowledgement_provider(provider: OAuthProvider) -> &'static str {
 }
 
 fn acknowledgement_required(provider: OAuthProvider) -> bool {
-    !cockpit_core::auth::subscription_ack::acknowledged(oauth_acknowledgement_provider(provider))
-        .unwrap_or(false)
+    crate::tui::settings::cockpit_credential_store()
+        .map(|store| {
+            !cockpit_core::auth::subscription_ack::acknowledged_in(
+                &store,
+                oauth_acknowledgement_provider(provider),
+            )
+        })
+        .unwrap_or(true)
 }
 
 fn selected_oauth_option(s: &mut OAuthFlowState, host: OAuthHost) -> Option<OAuthOption> {

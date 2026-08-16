@@ -879,6 +879,7 @@ mod tests {
             None,
             crate::daemon::config_source::ConfigSource::production(),
         );
+        registry.set_secret_vault(crate::secure_key::vault_for_db(&db).expect("test vault"));
         let executor = Arc::new(crate::daemon::scheduler::ProductionJobExecutor::new(
             db.clone(),
             registry,

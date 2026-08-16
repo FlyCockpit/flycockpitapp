@@ -306,7 +306,7 @@ mod loop_collapse_tests {
     async fn db_rows_kept_one_per_attempt() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = crate::session::Session::create(
+        let session = crate::session::Session::create_for_test(
             db,
             tmp.path().to_path_buf(),
             "Build",
@@ -369,7 +369,7 @@ mod loop_collapse_tests {
     async fn repeated_recoverable_tree_call_is_short_circuited_before_dispatch() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = crate::session::Session::create(
+        let session = crate::session::Session::create_for_test(
             db,
             tmp.path().to_path_buf(),
             "Build",

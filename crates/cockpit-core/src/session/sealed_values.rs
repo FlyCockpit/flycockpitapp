@@ -115,8 +115,7 @@ impl Session {
         // that persists the union. Honor the unjournaled-inference opt-out.
         if self.unjournaled_inference_allowed() {
             self.persist_redaction_table(&unioned)?;
-            let vault = crate::secure_key::vault_for_db(&self.db)
-                .map_err(|e| anyhow::anyhow!("opening vault for unjournaled sealed value: {e}"))?;
+            let vault = self.secret_vault.clone();
             let session_id = self.id;
             let value_id_owned = value_id.to_owned();
             let value_owned = value.to_owned();
@@ -241,8 +240,7 @@ impl Session {
         let json = table.to_persisted_json()?;
         let session_id = self.id;
         let write_json = json.clone();
-        let vault = crate::secure_key::vault_for_db(&self.db)
-            .map_err(|e| anyhow::anyhow!("opening vault for sealed journal: {e}"))?;
+        let vault = self.secret_vault.clone();
         let metadata = self
             .db
             .transaction(move |conn| {
@@ -377,7 +375,7 @@ mod tests {
     #[tokio::test]
     async fn create_overwrite_delete_and_resume_keep_redaction_union_only() {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = Session::create(
+        let session = Session::create_for_test(
             db.clone(),
             PathBuf::from("/repo"),
             "Build",
@@ -444,7 +442,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let resumed = Session::resume(
+        let resumed = Session::resume_for_test(
             db,
             session.id,
             crate::session::test_redaction_key_resolver(),
@@ -464,7 +462,7 @@ mod tests {
     #[tokio::test]
     async fn fork_inherits_preexisting_value_but_not_later_parent_value() {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let parent = Session::create(
+        let parent = Session::create_for_test(
             db.clone(),
             PathBuf::from("/repo"),
             "Build",
@@ -483,7 +481,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let child = Session::create_fork(
+        let child = Session::create_fork_for_test(
             db,
             parent.id,
             None,
@@ -519,7 +517,7 @@ mod tests {
     #[tokio::test]
     async fn session_sealed_value_not_plaintext_in_sql() {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = Session::create(
+        let session = Session::create_for_test(
             db.clone(),
             PathBuf::from("/repo"),
             "Build",
@@ -569,7 +567,7 @@ mod tests {
     #[tokio::test]
     async fn redaction_table_not_plaintext_in_sessions_column() {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = Session::create(
+        let session = Session::create_for_test(
             db.clone(),
             PathBuf::from("/repo"),
             "Build",
@@ -616,7 +614,7 @@ mod tests {
     #[tokio::test]
     async fn session_fork_copies_vault_sealed_and_redaction_without_plaintext() {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let parent = Session::create(
+        let parent = Session::create_for_test(
             db.clone(),
             PathBuf::from("/repo"),
             "Build",
@@ -634,7 +632,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let child = Session::create_fork(
+        let child = Session::create_fork_for_test(
             db.clone(),
             parent.id,
             None,

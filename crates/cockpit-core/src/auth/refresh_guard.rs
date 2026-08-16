@@ -32,6 +32,7 @@ pub async fn credential_with_refresh<
     Terminal,
     TerminalMessage,
 >(
+    store: crate::credentials::CredentialStore,
     key: &'static str,
     parse_context: &'static str,
     missing_auth_error: Missing,
@@ -51,7 +52,7 @@ where
     TerminalMessage: Fn(anyhow::Error) -> anyhow::Error,
 {
     credential_with_refresh_from_store(
-        CredentialStore::open_default()?,
+        store,
         key,
         parse_context,
         missing_auth_error,

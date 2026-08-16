@@ -35,15 +35,41 @@ pub async fn check_provider_auth(
     template: &ProviderTemplate,
     timeout: Duration,
 ) -> Result<AuthCheckSuccess, AuthCheckError> {
-    let resolved = models_fetch::resolve_provider_request_async(provider_id, entry)
-        .await
-        .map_err(|error| AuthCheckError::Other(error.to_string()))?;
+    check_provider_auth_with_store(provider_id, entry, template, timeout, None).await
+}
+
+pub async fn check_provider_auth_with_store(
+    provider_id: &str,
+    entry: &ProviderEntry,
+    template: &ProviderTemplate,
+    timeout: Duration,
+    store: Option<crate::credentials::CredentialStore>,
+) -> Result<AuthCheckSuccess, AuthCheckError> {
+    let fetch_store = store.clone();
+    let resolved = match store {
+        Some(store) => {
+            models_fetch::resolve_provider_request_async_with_store(
+                provider_id,
+                entry,
+                store,
+                |name| std::env::var(name).ok(),
+            )
+            .await
+        }
+        None => models_fetch::resolve_provider_request_async(provider_id, entry).await,
+    }
+    .map_err(|error| AuthCheckError::Other(error.to_string()))?;
     match template.auth_check {
         AuthCheckKind::ModelsEndpoint => {
-            let outcome =
-                models_fetch::fetch_models_for_provider(provider_id, entry, &resolved, timeout)
-                    .await
-                    .map_err(classify_error)?;
+            let outcome = models_fetch::fetch_models_for_provider_with_store(
+                provider_id,
+                entry,
+                &resolved,
+                timeout,
+                fetch_store,
+            )
+            .await
+            .map_err(classify_error)?;
             match outcome {
                 FetchOutcome::Models { models, catalog }
                 | FetchOutcome::FallbackAvailable {

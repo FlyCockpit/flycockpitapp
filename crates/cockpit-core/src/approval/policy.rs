@@ -693,7 +693,7 @@ mod approval_mode_tests {
         let tmp = tempfile::tempdir().unwrap();
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = Arc::new(
-            crate::session::Session::create(
+            crate::session::Session::create_for_test(
                 db.clone(),
                 tmp.path().to_path_buf(),
                 "builder",

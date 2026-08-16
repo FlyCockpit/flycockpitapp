@@ -694,7 +694,7 @@ async fn unknown_trusted_sensitive_artifact_fails_closed() {
     let env = std::collections::HashMap::from([("DEPLOY_TOKEN".to_string(), in_table.to_string())]);
     let table = RedactionTable::build_with_env(&cfg, std::path::Path::new("."), &env).unwrap();
 
-    let session = Session::create(
+    let session = Session::create_for_test(
         db.clone(),
         std::path::PathBuf::from("/proj"),
         "Build",

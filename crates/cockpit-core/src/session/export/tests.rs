@@ -182,7 +182,7 @@ async fn export_redaction_helper_scrubs_with_no_bypass() {
 
 async fn responses_session_with_intro() -> Session {
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(
+    let session = Session::create_for_test(
         db,
         PathBuf::from("/proj"),
         "Build",
@@ -213,7 +213,7 @@ async fn responses_session_with_intro() -> Session {
 
 fn transcript_session() -> Session {
     let db = Db::open_in_memory().unwrap();
-    Session::create(
+    Session::create_for_test(
         db,
         PathBuf::from("/proj"),
         "Build",
@@ -1319,7 +1319,7 @@ async fn export_responses_interactive_subagent_has_provider_identity_without_res
 #[tokio::test]
 async fn export_rejects_invalid_responses_provider_identity() {
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(
+    let session = Session::create_for_test(
         db,
         PathBuf::from("/proj"),
         "Build",
@@ -1460,7 +1460,7 @@ async fn export_sanitizes_inference_request_call_id_filename_segment() {
 async fn export_includes_context_pruned_before_next_inference_request() {
     use crate::session::Session;
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(
+    let session = Session::create_for_test(
         db.clone(),
         PathBuf::from("/proj"),
         "builder",
@@ -1534,7 +1534,7 @@ async fn export_includes_context_pruned_before_next_inference_request() {
 async fn export_includes_goal_progress_diagnostic() {
     use crate::session::Session;
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(
+    let session = Session::create_for_test(
         db.clone(),
         PathBuf::from("/proj"),
         "builder",
@@ -1572,7 +1572,7 @@ async fn export_includes_goal_progress_diagnostic() {
 async fn export_includes_queued_user_fold_metadata() {
     use crate::session::Session;
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(
+    let session = Session::create_for_test(
         db.clone(),
         PathBuf::from("/proj"),
         "builder",
@@ -1624,7 +1624,7 @@ async fn export_includes_queued_user_fold_metadata() {
 async fn export_of_hung_turn_has_inference_record_and_failure_event() {
     use crate::session::Session;
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(
+    let session = Session::create_for_test(
         db.clone(),
         PathBuf::from("/proj"),
         "builder",
@@ -1694,7 +1694,7 @@ async fn export_of_hung_turn_has_inference_record_and_failure_event() {
 async fn export_follows_session_compacted_successor() {
     use crate::session::Session;
     let db = Db::open_in_memory().unwrap();
-    let pred = Session::create(
+    let pred = Session::create_for_test(
         db.clone(),
         PathBuf::from("/proj"),
         "builder",
@@ -1702,7 +1702,7 @@ async fn export_follows_session_compacted_successor() {
     )
     .unwrap();
     // The successor is a fresh session (NOT a fork — no parent link).
-    let succ = Session::create(
+    let succ = Session::create_for_test(
         db.clone(),
         PathBuf::from("/proj"),
         "builder",
@@ -1867,7 +1867,7 @@ async fn export_includes_persisted_approval_grants_snapshot() {
 async fn export_includes_tool_rejected_event() {
     use crate::session::Session;
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(
+    let session = Session::create_for_test(
         db.clone(),
         PathBuf::from("/proj"),
         "Build",
@@ -1939,7 +1939,7 @@ async fn export_includes_tool_rejected_event() {
 async fn export_includes_primary_swap_event_both_halves() {
     use crate::session::Session;
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(
+    let session = Session::create_for_test(
         db.clone(),
         PathBuf::from("/proj"),
         "Auto",
@@ -2010,7 +2010,7 @@ async fn build_model_switch_zip(
     error: Option<&str>,
 ) -> Vec<u8> {
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(
+    let session = Session::create_for_test(
         db.clone(),
         PathBuf::from("/proj"),
         "Build",
@@ -2137,7 +2137,7 @@ async fn export_includes_model_switch_noop_event() {
 #[tokio::test]
 async fn export_model_switch_event_records_all_triggers() {
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(
+    let session = Session::create_for_test(
         db.clone(),
         PathBuf::from("/proj"),
         "Build",
@@ -2311,7 +2311,7 @@ async fn export_tool_lifecycle_events_distinguish_start_and_completion() {
 #[tokio::test]
 async fn export_includes_notice_events() {
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(
+    let session = Session::create_for_test(
         db.clone(),
         PathBuf::from("/proj"),
         "Build",
@@ -2967,9 +2967,14 @@ async fn bundle_export_reloads_a_stale_caller_target_inside_its_snapshot() {
     let after = manifest_active_model("provider-after", "model-after");
     set_test_session_active_model(&db, session.session_id, &after).await;
 
-    let bundle = build_bundle_zip_bytes(&db, &stale_target, false)
-        .await
-        .expect("export reloads its target by session id");
+    let bundle = build_bundle_zip_bytes(
+        &db,
+        &stale_target,
+        false,
+        &crate::secure_key::vault_for_db(&db).unwrap(),
+    )
+    .await
+    .expect("export reloads its target by session id");
     let manifest: Value =
         serde_json::from_str(&read_zip_entry(&bundle.bytes, "manifest.json").unwrap()).unwrap();
     let expected = serde_json::to_value(&after).unwrap();
@@ -3057,6 +3062,7 @@ async fn bundle_export_is_one_wal_snapshot_across_all_query_phases() {
 
     let db_for_files = db.clone();
     let vault = crate::secure_key::vault_for_db(&db).unwrap();
+    let store = crate::credentials::CredentialStore::from_vault(vault.clone()).unwrap();
     let exported = db
         .read(move |conn| {
             assemble_bundle_snapshot_conn_with_after_collect(
@@ -3069,6 +3075,7 @@ async fn bundle_export_is_one_wal_snapshot_across_all_query_phases() {
                 },
                 &test_export_env(),
                 Some(vault.as_ref()),
+                Some(&store),
                 move || {
                     start_writer_tx
                         .send(())
@@ -3174,23 +3181,44 @@ async fn write_bundle_zip_overwrite_mode_vs_clobber_guard() {
     assert!(!out.parent().unwrap().exists());
 
     // First write succeeds and creates the directory.
-    let summary = write_bundle_zip(&db, &target, &out, false, false)
-        .await
-        .unwrap();
+    let summary = write_bundle_zip(
+        &db,
+        &target,
+        &out,
+        false,
+        false,
+        &crate::secure_key::vault_for_db(&db).unwrap(),
+    )
+    .await
+    .unwrap();
     assert_eq!(summary.session_count, 1);
     assert!(summary.byte_len > 0);
     assert!(out.exists());
 
     // Clobber guard: a second write with `overwrite = false` is refused.
-    let err = write_bundle_zip(&db, &target, &out, false, false)
-        .await
-        .unwrap_err();
+    let err = write_bundle_zip(
+        &db,
+        &target,
+        &out,
+        false,
+        false,
+        &crate::secure_key::vault_for_db(&db).unwrap(),
+    )
+    .await
+    .unwrap_err();
     assert!(err.to_string().contains("already exists"));
 
     // Overwrite mode replaces the file unconditionally (TUI path).
-    let again = write_bundle_zip(&db, &target, &out, true, false)
-        .await
-        .unwrap();
+    let again = write_bundle_zip(
+        &db,
+        &target,
+        &out,
+        true,
+        false,
+        &crate::secure_key::vault_for_db(&db).unwrap(),
+    )
+    .await
+    .unwrap();
     assert_eq!(again.session_count, 1);
     assert!(out.exists());
 }
@@ -3212,9 +3240,16 @@ async fn archive_is_private() {
     let target = get_test_session(&db, session.session_id).await;
     let out = tmp.path().join("export.zip");
 
-    write_bundle_zip(&db, &target, &out, false, false)
-        .await
-        .expect("export succeeds");
+    write_bundle_zip(
+        &db,
+        &target,
+        &out,
+        false,
+        false,
+        &crate::secure_key::vault_for_db(&db).unwrap(),
+    )
+    .await
+    .expect("export succeeds");
 
     assert_eq!(
         std::fs::metadata(&out).unwrap().permissions().mode() & 0o777,
@@ -3768,7 +3803,7 @@ async fn export_manifest_includes_session_and_config_active_model() {
     let active_model = manifest_active_model("provider-a", "model-a");
     write_manifest_active_model_config(tmp.path(), &active_model);
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(
+    let session = Session::create_for_test(
         db.clone(),
         tmp.path().to_path_buf(),
         "Build",
@@ -3815,7 +3850,7 @@ async fn export_manifest_flags_active_model_divergence() {
     config_active_model.thinking_mode = Some(crate::config::providers::ThinkingMode::Low);
     write_manifest_active_model_config(tmp.path(), &config_active_model);
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(
+    let session = Session::create_for_test(
         db.clone(),
         tmp.path().to_path_buf(),
         "Build",
@@ -3853,7 +3888,7 @@ async fn export_manifest_flags_active_model_divergence() {
 async fn export_manifest_active_model_without_config_is_divergent() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(
+    let session = Session::create_for_test(
         db.clone(),
         tmp.path().to_path_buf(),
         "Build",
@@ -3887,7 +3922,7 @@ async fn export_manifest_active_model_without_config_is_divergent() {
 async fn export_rejects_provider_model_only_session_rows() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(
+    let session = Session::create_for_test(
         db.clone(),
         tmp.path().to_path_buf(),
         "Build",
@@ -4397,7 +4432,14 @@ async fn export_redaction_ignores_config_opt_out() {
 
     // Default (non-bypassable) export: sentinel scrubbed from every member even
     // though `redact.enabled = false`.
-    let redacted = build_bundle_zip_bytes(&db, &target, false).await.unwrap();
+    let redacted = build_bundle_zip_bytes(
+        &db,
+        &target,
+        false,
+        &crate::secure_key::vault_for_db(&db).unwrap(),
+    )
+    .await
+    .unwrap();
     let mut saw_member = false;
     for name in entry_names(&redacted.bytes) {
         if let Some(body) = read_zip_entry(&redacted.bytes, &name) {
@@ -4481,7 +4523,14 @@ async fn export_json_key_collision_is_terminal_and_uniform() {
     .unwrap();
 
     let target = get_test_session(&db, sid).await;
-    let bundle = build_bundle_zip_bytes(&db, &target, false).await.unwrap();
+    let bundle = build_bundle_zip_bytes(
+        &db,
+        &target,
+        false,
+        &crate::secure_key::vault_for_db(&db).unwrap(),
+    )
+    .await
+    .unwrap();
     let events = read_zip_entry(&bundle.bytes, "events.json").unwrap();
 
     assert!(
@@ -4589,9 +4638,16 @@ async fn include_sensitive_export_is_explicit_raw_local_and_marked() {
 
     // Default path on the same fixture: redacted archive, marked true.
     let red_out = tmp.path().join("redacted-export.zip");
-    write_bundle_zip(&db, &target, &red_out, false, false)
-        .await
-        .unwrap();
+    write_bundle_zip(
+        &db,
+        &target,
+        &red_out,
+        false,
+        false,
+        &crate::secure_key::vault_for_db(&db).unwrap(),
+    )
+    .await
+    .unwrap();
     let red_bytes = std::fs::read(&red_out).unwrap();
     let red_manifest = read_zip_entry(&red_bytes, "manifest.json").unwrap();
     assert!(red_manifest.contains("\"redacted\": true"));

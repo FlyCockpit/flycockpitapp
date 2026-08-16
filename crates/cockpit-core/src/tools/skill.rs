@@ -81,7 +81,7 @@ impl Tool for SkillTool {
         let activation = crate::skills::ActivationContext::from_tool_names(
             ctx.available_tools.iter().map(String::as_str),
         );
-        let store = crate::credentials::CredentialStore::open_default().ok();
+        let store = ctx.session.credential_store().ok();
         let output = load_skill_for_session(
             name,
             path,

@@ -135,7 +135,30 @@ pub async fn begin_device_code_login() -> Result<DeviceLogin> {
     })
 }
 
+pub fn store_tokens_in(store: &mut CredentialStore, tokens: &StoredTokens) -> Result<()> {
+    store.set(
+        CREDENTIAL_KEY,
+        serde_json::to_value(tokens).context("serializing Codex OAuth tokens")?,
+    );
+    store.save()
+}
+
 pub async fn complete_device_code_login(login: DeviceLogin) -> Result<StoredTokens> {
+    let tokens = complete_device_code_login_tokens(login).await?;
+    store_tokens_fail_closed(&tokens)?;
+    Ok(tokens)
+}
+
+pub async fn complete_device_code_login_in(
+    login: DeviceLogin,
+    store: &mut CredentialStore,
+) -> Result<StoredTokens> {
+    let tokens = complete_device_code_login_tokens(login).await?;
+    store_tokens_in(store, &tokens)?;
+    Ok(tokens)
+}
+
+async fn complete_device_code_login_tokens(login: DeviceLogin) -> Result<StoredTokens> {
     let started = std::time::Instant::now();
     let mut interval = login.interval_secs;
     loop {
@@ -160,7 +183,6 @@ pub async fn complete_device_code_login(login: DeviceLogin) -> Result<StoredToke
             let tokens =
                 exchange_authorization_code(&approved.authorization_code, &approved.code_verifier)
                     .await?;
-            store_tokens(&tokens)?;
             return Ok(tokens);
         }
         let error_code = serde_json::from_str::<serde_json::Value>(&body)
@@ -180,15 +202,18 @@ pub async fn complete_device_code_login(login: DeviceLogin) -> Result<StoredToke
     }
 }
 
-pub async fn credential() -> Result<StoredTokens> {
+pub async fn credential_from_store(
+    store: crate::credentials::CredentialStore,
+) -> Result<StoredTokens> {
     crate::auth::refresh_guard::credential_with_refresh(
+        store,
         CREDENTIAL_KEY,
         "parsing stored Codex OAuth tokens",
         missing_auth_error,
         StoredTokens::needs_refresh,
         StoredTokens::refresh_token,
         merge_refresh_tokens,
-        |tokens| async move { refresh_tokens(&tokens.refresh_token).await },
+        |tokens| async move { refresh_tokens(&tokens.refresh_token.clone(), &tokens).await },
         is_terminal_refresh_error,
         codex_terminal_refresh_error,
     )
@@ -199,33 +224,42 @@ pub fn is_logged_in() -> bool {
     is_logged_in_at(None)
 }
 
+pub fn is_logged_in_in(store: &CredentialStore) -> bool {
+    store
+        .get(CREDENTIAL_KEY)
+        .and_then(|raw| serde_json::from_value::<StoredTokens>(raw.clone()).ok())
+        .is_some()
+}
+
 pub fn is_logged_in_at(store_path: Option<&Path>) -> bool {
     open_store(store_path)
         .ok()
-        .and_then(|store| {
-            store
-                .get(CREDENTIAL_KEY)
-                .and_then(|raw| serde_json::from_value::<StoredTokens>(raw.clone()).ok())
-        })
-        .is_some()
+        .map(|store| is_logged_in_in(&store))
+        .unwrap_or(false)
 }
 
 pub fn logout() -> Result<()> {
     logout_at(None)
 }
 
-pub fn logout_at(store_path: Option<&Path>) -> Result<()> {
-    let mut store = open_store(store_path)?;
+pub fn logout_in(store: &mut CredentialStore) -> Result<()> {
     store.remove(CREDENTIAL_KEY);
     store.save()
 }
 
-fn open_store(store_path: Option<&Path>) -> Result<CredentialStore> {
-    match store_path {
-        Some(path) => CredentialStore::open_legacy_file(path.to_path_buf()),
-        None => CredentialStore::open_default(),
-    }
+pub fn logout_at(store_path: Option<&Path>) -> Result<()> {
+    let mut store = open_store(store_path)?;
+    logout_in(&mut store)
 }
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn open_store(store_path: Option<&Path>) -> Result<CredentialStore> {
+    let _ = store_path;
+    anyhow::bail!("OAuth store path-open is test-only; inject a vault-backed store")
+}
+
+#[cfg(any(test, feature = "test-support"))]
+include!("codex_oauth_test_open.rs");
 
 fn missing_auth_error() -> anyhow::Error {
     anyhow!("Codex subscription auth required — set up OAuth in /settings → Providers.")
@@ -248,8 +282,7 @@ async fn exchange_authorization_code(code: &str, verifier: &str) -> Result<Store
     token_request(&params, None).await
 }
 
-async fn refresh_tokens(refresh_token: &str) -> Result<StoredTokens> {
-    let previous = load_tokens()?;
+async fn refresh_tokens(refresh_token: &str, previous: &StoredTokens) -> Result<StoredTokens> {
     let params = [
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token),
@@ -372,16 +405,8 @@ fn device_poll_is_pending(status: StatusCode, error_code: &str) -> bool {
         || error_code == "authorization_pending"
 }
 
-fn store_tokens(tokens: &StoredTokens) -> Result<()> {
-    let mut store = CredentialStore::open_default()?;
-    store.set(CREDENTIAL_KEY, serde_json::to_value(tokens)?);
-    store.save()
-}
-
-fn load_tokens() -> Result<StoredTokens> {
-    let store = CredentialStore::open_default()?;
-    let raw = store.get(CREDENTIAL_KEY).ok_or_else(missing_auth_error)?;
-    serde_json::from_value(raw.clone()).context("parsing stored Codex OAuth tokens")
+fn store_tokens_fail_closed(_tokens: &StoredTokens) -> Result<()> {
+    anyhow::bail!("OAuth persist requires an injected vault-backed store")
 }
 
 fn jwt_exp(token: &str) -> Option<i64> {

@@ -6182,6 +6182,7 @@ async fn persistent_daemon_stores_flycockpit_credential_and_wakes_connector() {
         "{:?}",
         Request::StoreFlycockpitCredential {
             credential: credential.clone(),
+            force: false,
         }
     );
     assert!(!debug.contains(&credential.instance_token));
@@ -6190,13 +6191,14 @@ async fn persistent_daemon_stores_flycockpit_credential_and_wakes_connector() {
     let response = handle_request(
         Request::StoreFlycockpitCredential {
             credential: credential.clone(),
+            force: false,
         },
         &mut state,
         &ctx,
     )
     .await
     .expect("credential store succeeds");
-    assert!(matches!(response, Response::Ack));
+    assert!(matches!(response, Response::FlycockpitStored));
     tokio::time::timeout(Duration::from_millis(100), wake_rx.changed())
         .await
         .expect("connector wake delivered")
@@ -6235,7 +6237,7 @@ async fn persistent_daemon_clears_flycockpit_credential_and_wakes_connector() {
     let response = handle_request(Request::ClearFlycockpitCredential, &mut state, &ctx)
         .await
         .expect("credential clear succeeds");
-    assert!(matches!(response, Response::Ack));
+    assert!(matches!(response, Response::FlycockpitCleared { .. }));
     tokio::time::timeout(Duration::from_millis(100), wake_rx.changed())
         .await
         .expect("connector wake delivered")
@@ -6259,6 +6261,7 @@ async fn ephemeral_daemon_rejects_flycockpit_credential_writes() {
     let err = handle_request(
         Request::StoreFlycockpitCredential {
             credential: flycockpit_credential(),
+            force: false,
         },
         &mut state,
         &ctx,
@@ -6273,6 +6276,307 @@ async fn ephemeral_daemon_rejects_flycockpit_credential_writes() {
         .expect_err("ephemeral daemon must reject credential clears");
     assert_eq!(err.code, ErrorCode::BadRequest);
     assert!(crate::auth::flycockpit::load_credential_from_path(credential_path).is_err());
+}
+
+#[tokio::test]
+async fn ephemeral_daemon_rejects_persistent_secret_writes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let credential_path = tmp.path().join("state/cockpit/credentials.json");
+    let ctx = test_ctx_with_credential_path(credential_path);
+    let mut state = owner_state();
+    let err = handle_request(
+        Request::StoreFlycockpitCredential {
+            credential: flycockpit_credential(),
+            force: true,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("ephemeral daemon must reject forced persistent secret writes");
+    assert_eq!(err.code, ErrorCode::BadRequest);
+    assert!(err.message.contains("ephemeral daemons"));
+}
+
+#[tokio::test]
+async fn store_without_force_returns_already_logged_in_without_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = persistent_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
+    let planted = flycockpit_credential();
+    let vault = crate::secure_key::vault_for_db(&ctx.db).expect("ctx vault");
+    crate::auth::flycockpit::store_credential_in_vault(vault, &planted).unwrap();
+    let mut state = owner_state();
+
+    let mut replacement = planted.clone();
+    replacement.instance_token = "fci_replacement_must_not_land".to_string();
+    let response = handle_request(
+        Request::StoreFlycockpitCredential {
+            credential: replacement,
+            force: false,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("already-logged-in is a typed success");
+    let debug = format!("{response:?}");
+    assert!(!debug.contains("fci_instance_secret_rpc"));
+    assert!(!debug.contains("fci_replacement_must_not_land"));
+    match response {
+        Response::FlycockpitAlreadyLoggedIn { email, server_url } => {
+            assert_eq!(email, planted.account.email);
+            assert_eq!(server_url, planted.server_url);
+        }
+        other => panic!("expected AlreadyLoggedIn, got {other:?}"),
+    }
+    let vault = crate::secure_key::vault_for_db(&ctx.db).expect("ctx vault");
+    let stored: crate::auth::flycockpit::StoredFlycockpitCredential = serde_json::from_value(
+        crate::credentials::CredentialStore::from_vault(vault)
+            .unwrap()
+            .get("flycockpit")
+            .cloned()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stored.instance_token, planted.instance_token);
+}
+
+#[tokio::test]
+async fn store_with_force_replaces_vault_credential() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = persistent_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
+    let vault = crate::secure_key::vault_for_db(&ctx.db).expect("ctx vault");
+    crate::auth::flycockpit::store_credential_in_vault(vault, &flycockpit_credential()).unwrap();
+    let mut state = owner_state();
+    let mut replacement = flycockpit_credential();
+    replacement.instance_token = "fci_forced".to_string();
+    let response = handle_request(
+        Request::StoreFlycockpitCredential {
+            credential: replacement.clone(),
+            force: true,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("force store replaces");
+    assert!(matches!(response, Response::FlycockpitStored));
+    let vault = crate::secure_key::vault_for_db(&ctx.db).expect("ctx vault");
+    let stored: crate::auth::flycockpit::StoredFlycockpitCredential = serde_json::from_value(
+        crate::credentials::CredentialStore::from_vault(vault)
+            .unwrap()
+            .get("flycockpit")
+            .cloned()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stored.instance_token, "fci_forced");
+}
+
+#[tokio::test]
+async fn clear_revokes_from_daemon_vault() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let request_log = seen.clone();
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = vec![0_u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            request_log
+                .lock()
+                .await
+                .push(String::from_utf8_lossy(&buf[..n]).to_string());
+            let body = r#"{"json":{}}"#;
+            let raw = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(raw.as_bytes()).await;
+        }
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = persistent_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
+    let planted = crate::auth::flycockpit::StoredFlycockpitCredential {
+        server_url: format!("http://{addr}"),
+        instance_id: "inst-revoked".to_string(),
+        instance_token: "fci_vault_only_token".to_string(),
+        account: crate::auth::flycockpit::AccountInfo {
+            user_id: "user-1".to_string(),
+            email: "user@example.test".to_string(),
+        },
+        display_name: Some("Devbox".to_string()),
+        relay_choice: None,
+    };
+    let vault = crate::secure_key::vault_for_db(&ctx.db).expect("ctx vault");
+    crate::auth::flycockpit::store_credential_in_vault(vault, &planted).unwrap();
+    let mut state = owner_state();
+    let response = handle_request(Request::ClearFlycockpitCredential, &mut state, &ctx)
+        .await
+        .expect("clear planted vault credential");
+    let debug = format!("{response:?}");
+    assert!(!debug.contains("fci_vault_only_token"));
+    match response {
+        Response::FlycockpitCleared { server_url } => {
+            assert_eq!(server_url, planted.server_url);
+        }
+        other => panic!("expected Cleared, got {other:?}"),
+    }
+    let vault = crate::secure_key::vault_for_db(&ctx.db).expect("ctx vault");
+    assert!(
+        crate::credentials::CredentialStore::from_vault(vault)
+            .unwrap()
+            .get("flycockpit")
+            .is_none()
+    );
+    let logged = seen.lock().await;
+    assert!(
+        logged
+            .iter()
+            .any(|request| request.contains("/rpc/instances/revoke")),
+        "daemon must revoke with the vault-held credential: {logged:?}"
+    );
+    assert!(
+        logged
+            .iter()
+            .any(|request| request.contains("inst-revoked")),
+        "revoke must use the planted instance id: {logged:?}"
+    );
+    assert!(
+        logged
+            .iter()
+            .any(|request| { request.contains(r#""instanceToken":"fci_vault_only_token""#) }),
+        "revoke must send the vault-held instance token: {logged:?}"
+    );
+}
+
+#[tokio::test]
+async fn credentials_json_is_not_read_or_written() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(tmp.path()).await;
+    let leftover = tmp.path().join("credentials.json");
+    std::fs::write(
+        &leftover,
+        r#"{"flycockpit":{"server_url":"https://leftover.test","instance_id":"leftover-inst","instance_token":"fci_leftover_unique_token","account":{"user_id":"u","email":"leftover@example.test"}}}"#,
+    )
+    .unwrap();
+    let ctx = persistent_test_ctx_with_credential_path(leftover.clone());
+    assert!(
+        ctx.load_flycockpit_credential().unwrap().is_none(),
+        "daemon must ignore leftover credentials.json"
+    );
+    let mut state = owner_state();
+    handle_request(
+        Request::StoreFlycockpitCredential {
+            credential: flycockpit_credential(),
+            force: false,
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("store through injected vault");
+    let stored = ctx.load_flycockpit_credential().unwrap().unwrap();
+    assert_eq!(stored.instance_token, "fci_instance_secret_rpc");
+    assert_ne!(stored.instance_token, "fci_leftover_unique_token");
+    let leftover_raw = std::fs::read_to_string(&leftover).unwrap();
+    assert!(leftover_raw.contains("fci_leftover_unique_token"));
+    assert!(!leftover_raw.contains("fci_instance_secret_rpc"));
+    let default = crate::credentials::default_path().expect("isolated default path");
+    assert!(
+        default.starts_with(tmp.path()),
+        "default path must be under the isolated home: {}",
+        default.display()
+    );
+    assert!(
+        !default.exists() || default == leftover,
+        "production must not recreate credentials.json at {}",
+        default.display()
+    );
+}
+
+#[test]
+fn daemon_store_uses_injected_vault() {
+    let source = include_str!("mod.rs");
+    let store = source
+        .split("fn store_flycockpit_credential")
+        .nth(1)
+        .and_then(|rest| rest.split("fn clear_flycockpit_credential").next())
+        .expect("store helper");
+    assert!(
+        !store.contains("Db::open_default"),
+        "store_flycockpit_credential must not open SQLite via open_default"
+    );
+    assert!(
+        store.contains("secret_vault"),
+        "store must use the daemon-held vault handle"
+    );
+}
+
+#[test]
+fn unify_remaining_stores_stays_gone() {
+    for rel in [
+        "secure_key/mod.rs",
+        "secure_key/resolve.rs",
+        "secure_key/vault.rs",
+        "credentials.rs",
+        "db/secret_vault.rs",
+    ] {
+        let path = format!(
+            "{}/src/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            rel.replace("db/", "../../../cockpit-db/src/db/")
+        );
+        let path = if rel.starts_with("db/") {
+            format!(
+                "{}/../cockpit-db/src/{}",
+                env!("CARGO_MANIFEST_DIR"),
+                rel.trim_start_matches("db/")
+            )
+        } else {
+            format!("{}/src/{rel}", env!("CARGO_MANIFEST_DIR"))
+        };
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        assert!(
+            !source.contains("unify_remaining_stores"),
+            "{rel} must not revive unify_remaining_stores"
+        );
+    }
+}
+
+#[tokio::test]
+async fn get_workspace_trust_reads_persisted_mode() {
+    let ctx = test_ctx();
+    let tmp = tempfile::tempdir().unwrap();
+    ctx.db
+        .set_workspace_trust(
+            tmp.path(),
+            crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        )
+        .await
+        .unwrap();
+    let mut state = owner_state();
+    let response = handle_request(
+        Request::GetWorkspaceTrust {
+            project_root: tmp.path().display().to_string(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("get workspace trust");
+    match response {
+        Response::WorkspaceTrust { mode, .. } => {
+            assert_eq!(mode, Some(proto::WorkspaceTrustMode::Trust));
+        }
+        other => panic!("expected WorkspaceTrust, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -7485,7 +7789,7 @@ async fn attached_state_with_worker_receiver(
         .await
         .unwrap();
     let session = Arc::new(
-        Session::resume(
+        Session::resume_for_test(
             ctx.db.clone(),
             session_row.session_id,
             crate::session::test_redaction_key_resolver(),
@@ -8583,6 +8887,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "get_usage_counts"
         | "stats_rollup"
         | "create_goal"
+        | "get_workspace_trust"
         | "get_startup_disclosures"
         | "get_app_flag"
         | "mark_app_flag_seen"
@@ -8814,6 +9119,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("record_usage"),
         authz_owner_only("get_usage_counts"),
         authz_owner_only("stats_rollup"),
+        authz_owner_only("get_workspace_trust"),
         authz_owner_only("get_startup_disclosures"),
         authz_owner_only("get_app_flag"),
         authz_owner_only("mark_app_flag_seen"),
@@ -10018,6 +10324,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         },
         "store_flycockpit_credential" => Request::StoreFlycockpitCredential {
             credential: flycockpit_credential(),
+            force: false,
         },
         "clear_flycockpit_credential" => Request::ClearFlycockpitCredential,
         "refresh_host_capabilities" => Request::RefreshHostCapabilities,
@@ -10039,6 +10346,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             range: proto::StatsRange::Last7Days,
             by_role: false,
         },
+        "get_workspace_trust" => Request::GetWorkspaceTrust { project_root: root },
         "get_startup_disclosures" => Request::GetStartupDisclosures { project_root: root },
         "get_app_flag" => Request::GetAppFlag {
             key: proto::AppFlagKey::DaemonAutostartNotice,
@@ -11403,6 +11711,7 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
             let request = if case.kind == "store_flycockpit_credential" {
                 Request::StoreFlycockpitCredential {
                     credential: flycockpit_credential(),
+                    force: false,
                 }
             } else {
                 Request::ClearFlycockpitCredential
@@ -11505,7 +11814,7 @@ async fn live_worker_with_receiver(
         .await
         .unwrap();
     let session = Arc::new(
-        Session::resume(
+        Session::resume_for_test(
             ctx.db.clone(),
             row.session_id,
             crate::session::test_redaction_key_resolver(),
@@ -14592,19 +14901,33 @@ async fn assert_in_memory_or_global_mutating_happy(kind: &str) {
                 &ctx,
                 Request::StoreFlycockpitCredential {
                     credential: flycockpit_credential(),
+                    force: false,
                 },
             )
             .await
             .expect("store credential");
-            assert!(matches!(response, Response::Ack));
-            assert!(path.exists());
+            assert!(matches!(response, Response::FlycockpitStored));
+            let vault = crate::secure_key::vault_for_db(&ctx.db).expect("ctx vault");
+            assert!(
+                crate::credentials::CredentialStore::from_vault(vault)
+                    .unwrap()
+                    .get("flycockpit")
+                    .is_some()
+            );
             if kind == "clear_flycockpit_credential" {
                 let response = dispatch_matrix_request(&ctx, Request::ClearFlycockpitCredential)
                     .await
                     .expect("clear credential");
-                assert!(matches!(response, Response::Ack));
-                assert!(crate::auth::flycockpit::load_credential_from_path(path).is_err());
+                assert!(matches!(response, Response::FlycockpitCleared { .. }));
+                let vault = crate::secure_key::vault_for_db(&ctx.db).expect("ctx vault");
+                assert!(
+                    crate::credentials::CredentialStore::from_vault(vault)
+                        .unwrap()
+                        .get("flycockpit")
+                        .is_none()
+                );
             }
+            let _ = path;
         }
         "stop_daemon" => {
             let ctx = test_ctx();
@@ -14745,7 +15068,10 @@ async fn dispatch_invalid_reresolve_keeps_last_good_snapshot() {
         move |_cwd| {
             // First load (worker spawn) succeeds with a good snapshot; the
             // re-resolution triggered by RefreshConfig fails.
-            if calls_for_load.fetch_add(1, Ordering::SeqCst) == 0 {
+            // Construction now loads redact config once before attach. The
+            // first two loads (daemon boot + worker spawn) must succeed;
+            // RefreshConfig is the failing re-resolution.
+            if calls_for_load.fetch_add(1, Ordering::SeqCst) < 2 {
                 let mut providers = crate::config::providers::ProvidersConfig::default();
                 providers.providers.insert(
                     "p".to_string(),
@@ -15928,6 +16254,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase {
             request: Request::StoreFlycockpitCredential {
                 credential: flycockpit_credential(),
+                force: false,
             },
             kind: "store_flycockpit_credential",
             session_id: None,
@@ -16221,6 +16548,15 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             session_id: None,
             audit_path: Some("/repo"),
             mutating: true,
+        },
+        CommandMetadataCase {
+            request: Request::GetWorkspaceTrust {
+                project_root: project_root.clone(),
+            },
+            kind: "get_workspace_trust",
+            session_id: None,
+            audit_path: Some("/repo"),
+            mutating: false,
         },
         CommandMetadataCase {
             request: Request::GetStartupDisclosures {
@@ -16592,6 +16928,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         RenameProjectNote,
         DeleteProjectNote,
         SetWorkspaceTrust,
+        GetWorkspaceTrust,
         GetStartupDisclosures,
         GetAppFlag,
         MarkAppFlagSeen,
@@ -18117,7 +18454,7 @@ async fn peer_uid_rejects_mismatched_uid() {
 
 fn insert_hung_worker(ctx: &Arc<DaemonContext>, session_id: Uuid) {
     let session = Arc::new(
-        Session::resume(
+        Session::resume_for_test(
             ctx.db.clone(),
             session_id,
             crate::session::test_redaction_key_resolver(),
@@ -19417,7 +19754,7 @@ async fn serialized_requests_apply_in_receipt_order() {
         .await
         .unwrap();
     let live_session = Arc::new(
-        Session::resume(
+        Session::resume_for_test(
             ctx.db.clone(),
             session.session_id,
             crate::session::test_redaction_key_resolver(),
@@ -19956,7 +20293,7 @@ async fn attach_replay_precedes_live_events_under_task_split() {
         .await
         .unwrap();
     let live_session = Arc::new(
-        Session::resume(
+        Session::resume_for_test(
             ctx.db.clone(),
             session.session_id,
             crate::session::test_redaction_key_resolver(),
@@ -20051,7 +20388,7 @@ async fn attach_replay_precedes_live_events_under_concurrency() {
         .await
         .unwrap();
     let live_session = Arc::new(
-        Session::resume(
+        Session::resume_for_test(
             ctx.db.clone(),
             session.session_id,
             crate::session::test_redaction_key_resolver(),
@@ -20321,6 +20658,7 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         connector_wake: base.connector_wake.clone(),
         scheduler: base.scheduler.clone(),
         credential_store_path: None,
+        secret_vault: base.secret_vault.clone(),
         config_source: base.config_source.clone(),
         secure_key: None,
         _secure_key_actor: None,
@@ -20405,6 +20743,7 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         connector_wake: base.connector_wake.clone(),
         scheduler: base.scheduler.clone(),
         credential_store_path: None,
+        secret_vault: base.secret_vault.clone(),
         config_source: base.config_source.clone(),
         secure_key: None,
         _secure_key_actor: None,
@@ -20622,7 +20961,7 @@ async fn btw_concurrent_with_parent_turn() {
         .await
         .unwrap();
     let parent_session = Arc::new(
-        Session::resume(
+        Session::resume_for_test(
             ctx.db.clone(),
             parent_row.session_id,
             crate::session::test_redaction_key_resolver(),
@@ -20685,7 +21024,7 @@ async fn btw_concurrent_with_parent_turn() {
         .await
         .unwrap();
     let btw_session = Arc::new(
-        Session::resume(
+        Session::resume_for_test(
             ctx.db.clone(),
             created.info.session_id,
             crate::session::test_redaction_key_resolver(),
@@ -20824,7 +21163,7 @@ async fn btw_rehydrate_reports_live_fork() {
         .await
         .unwrap();
     let live_session = Arc::new(
-        Session::resume(
+        Session::resume_for_test(
             ctx.db.clone(),
             parent.session_id,
             crate::session::test_redaction_key_resolver(),
@@ -20972,7 +21311,7 @@ async fn insert_busy_test_worker(ctx: &Arc<DaemonContext>) {
         .await
         .expect("create session");
     let live_session = Arc::new(
-        Session::resume(
+        Session::resume_for_test(
             ctx.db.clone(),
             session.session_id,
             crate::session::test_redaction_key_resolver(),
@@ -21200,7 +21539,7 @@ async fn attach_replays_drain_state_after_attached_response() {
         .await
         .unwrap();
     let live_session = Arc::new(
-        Session::resume(
+        Session::resume_for_test(
             ctx.db.clone(),
             session.session_id,
             crate::session::test_redaction_key_resolver(),
@@ -21314,7 +21653,7 @@ async fn attach_since_seq_queues_history_replay_and_leaves_attached_history_empt
         .await
         .unwrap();
     let live_session = Arc::new(
-        Session::resume(
+        Session::resume_for_test(
             ctx.db.clone(),
             session.session_id,
             crate::session::test_redaction_key_resolver(),

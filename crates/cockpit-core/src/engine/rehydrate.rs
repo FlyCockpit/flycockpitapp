@@ -2041,7 +2041,7 @@ mod tests {
 
     fn root_session() -> Session {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db,
             PathBuf::from("/x"),
             "Build",
@@ -4550,7 +4550,7 @@ mod tests {
             .create_btw_fork(parent.id, true)
             .await
             .expect("btw fork");
-        let btw_session = Session::resume(
+        let btw_session = Session::resume_for_test(
             parent.db.clone(),
             btw.info.session_id,
             crate::session::test_redaction_key_resolver(),

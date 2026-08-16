@@ -6338,7 +6338,9 @@ mod render_history_spacing_tests {
 
         // The sentinel never entered transcript/history/message state.
         assert!(
-            !app.history.iter().any(|entry| format!("{entry:?}").contains(SENTINEL)),
+            !app.history
+                .iter()
+                .any(|entry| format!("{entry:?}").contains(SENTINEL)),
             "sentinel must not appear in history/transcript state"
         );
 

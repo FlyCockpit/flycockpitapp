@@ -4,7 +4,7 @@
 use std::io::Read;
 use std::sync::{Arc, RwLock};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde_json::json;
 
 use crate::cli::AskArgs;
@@ -62,8 +62,16 @@ async fn run_docs_ask(package_id: &str, question: &str) -> Result<String> {
     // body runs in an inner future and the actor is dropped off-worker on every
     // exit path (success or `?`), mirroring the daemon's off-worker actor lifecycle.
     let result: Result<String> = async move {
-        let session = Session::create(db.clone(), cwd.clone(), "docs", redaction_key_resolver)
-            .context("creating docs ask session")?;
+        let vault = cockpit_core::secure_key::vault_for_db(&db)
+            .map_err(|e| anyhow!("opening docs ask session vault: {e}"))?;
+        let session = Session::create(
+            db.clone(),
+            cwd.clone(),
+            "docs",
+            redaction_key_resolver,
+            vault,
+        )
+        .context("creating docs ask session")?;
         // This legacy read-only, daemon-less command cannot safely open the
         // daemon-owned recovery spool concurrently. Its inference remains on the
         // existing primary-row audit path; daemon/session-worker turns are always
@@ -124,6 +132,7 @@ async fn run_docs_ask(package_id: &str, question: &str) -> Result<String> {
             granted_tools: Vec::new(),
             lock_identity: None,
             write_scope: None,
+            credential_store: None,
         };
         let locks = Arc::new(
             crate::locks::LockManager::from_db(db)
@@ -251,8 +260,15 @@ mod tests {
         let db = crate::db::Db::open_in_memory().unwrap();
         let (_secure_key_actor, resolver) =
             crate::redact::start_fake_redaction_key_resolver(&db).unwrap();
-        let session =
-            Session::create(db, std::path::PathBuf::from("/docs"), "docs", resolver).unwrap();
+        let vault = cockpit_core::secure_key::vault_for_db(&db).unwrap();
+        let session = Session::create(
+            db,
+            std::path::PathBuf::from("/docs"),
+            "docs",
+            resolver,
+            vault,
+        )
+        .unwrap();
         let selection = crate::config::providers::ActiveModelRef {
             provider: "anthropic".to_string(),
             model: "claude-opus-4-7".to_string(),

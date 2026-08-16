@@ -271,7 +271,10 @@ impl std::fmt::Debug for MapKeyResolver {
     /// active version so `{:?}`/panic diagnostics never print key material.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MapKeyResolver")
-            .field("keys", &format_args!("[REDACTED; {} keys]", self.keys.len()))
+            .field(
+                "keys",
+                &format_args!("[REDACTED; {} keys]", self.keys.len()),
+            )
             .field("active", &self.active)
             .finish()
     }

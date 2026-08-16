@@ -75,6 +75,7 @@ impl FirstPartyEgressClient {
 
 pub(crate) async fn redaction_for_session(
     db: &Db,
+    vault: Option<&crate::secure_key::SecretVault>,
     session_id: Uuid,
 ) -> Result<Option<crate::redact::RedactionTable>> {
     let Some(session) = db.get_session(session_id).await? else {
@@ -82,8 +83,14 @@ pub(crate) async fn redaction_for_session(
     };
     let json = match session.redaction_table_json.filter(|s| !s.is_empty()) {
         Some(json) => json,
-        None => match crate::session::lifecycle::load_redaction_table_from_vault(db, session_id)? {
-            Some(json) => json,
+        None => match vault {
+            Some(vault) => {
+                match crate::session::lifecycle::load_redaction_table_from_vault(vault, session_id)?
+                {
+                    Some(json) => json,
+                    None => return Ok(None),
+                }
+            }
             None => return Ok(None),
         },
     };
@@ -150,7 +157,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let loaded = redaction_for_session(&db, session.session_id)
+        let loaded = redaction_for_session(&db, None, session.session_id)
             .await
             .unwrap()
             .unwrap();
@@ -168,7 +175,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            redaction_for_session(&db, session.session_id)
+            redaction_for_session(&db, None, session.session_id)
                 .await
                 .is_err()
         );

@@ -388,6 +388,9 @@ pub enum Request {
         mode: WorkspaceTrustMode,
         expected_config_generation: u64,
     },
+    GetWorkspaceTrust {
+        project_root: String,
+    },
     GetStartupDisclosures {
         project_root: String,
     },
@@ -1042,16 +1045,21 @@ pub enum Request {
         text: String,
     },
 
-    /// Store Flycockpit instance credentials in the daemon-owned credential file
-    /// and wake the relay connector immediately. Owner-only; ephemeral daemons
-    /// reject it because they must not own persistent credentials.
+    /// Store Flycockpit instance credentials in the daemon vault (ciphertext
+    /// in SQLite; the daemon holds the unwrapped key in memory) and wake the
+    /// relay connector immediately. Owner-only; ephemeral daemons reject it
+    /// because they must not own persistent credentials.
     StoreFlycockpitCredential {
         credential: StoredFlycockpitCredential,
+        /// When false, a vault hit returns [`crate::Response::FlycockpitAlreadyLoggedIn`]
+        /// instead of replacing the stored credential.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        force: bool,
     },
 
-    /// Clear Flycockpit instance credentials from the daemon-owned credential
-    /// file and wake the relay connector so active sockets stop promptly.
-    /// Owner-only; ephemeral daemons reject it.
+    /// Clear Flycockpit instance credentials from the daemon vault and wake
+    /// the relay connector so active sockets stop promptly. Owner-only;
+    /// ephemeral daemons reject it.
     ClearFlycockpitCredential,
 
     /// Cheap liveness probe. Replaces the legacy `"ok\n"` greeting.
@@ -1354,6 +1362,7 @@ macro_rules! request_variants {
             (Request::RenameProjectNote { .. }, "rename_project_note");
             (Request::DeleteProjectNote { .. }, "delete_project_note");
             (Request::SetWorkspaceTrust { .. }, "set_workspace_trust");
+            (Request::GetWorkspaceTrust { .. }, "get_workspace_trust");
             (Request::GetStartupDisclosures { .. }, "get_startup_disclosures");
             (Request::GetAppFlag { .. }, "get_app_flag");
             (Request::MarkAppFlagSeen { .. }, "mark_app_flag_seen");
@@ -1538,6 +1547,7 @@ macro_rules! command {
             (Request::RenameProjectNote { project_root, id, name }, "rename_project_note", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|id:Uuid|name:String", [project_root: String => project_root, id: Uuid => param, name: String => param]);
             (Request::DeleteProjectNote { project_root, id }, "delete_project_note", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|id:Uuid", [project_root: String => project_root, id: Uuid => param]);
             (Request::SetWorkspaceTrust { project_root, mode, expected_config_generation }, "set_workspace_trust", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|mode:WorkspaceTrustMode|expected_config_generation:u64", [project_root: String => project_root, mode: WorkspaceTrustMode => param, expected_config_generation: u64 => param]);
+            (Request::GetWorkspaceTrust { project_root }, "get_workspace_trust", owner_only, none, false, local_only, none, serialized, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::GetStartupDisclosures { project_root }, "get_startup_disclosures", owner_only, none, false, local_only, none, serialized, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::GetAppFlag { key }, "get_app_flag", owner_only, none, false, local_only, none, serialized, none, "key:AppFlagKey", [key: AppFlagKey => param]);
             (Request::MarkAppFlagSeen { key, expected_version }, "mark_app_flag_seen", owner_only, none, true, local_only, none, serialized, none, "key:AppFlagKey|expected_version:u64", [key: AppFlagKey => param, expected_version: u64 => param]);
@@ -1617,7 +1627,7 @@ macro_rules! command {
             (Request::Prune, "prune", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
             (Request::Compact, "compact", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "-", []);
             (Request::Pin { text }, "pin", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "text:String", [text: String => param]);
-            (Request::StoreFlycockpitCredential { credential }, "store_flycockpit_credential", owner_only, none, true, local_only, none, serialized, none, "credential:StoredFlycockpitCredential", [credential: StoredFlycockpitCredential => param]);
+            (Request::StoreFlycockpitCredential { credential, force }, "store_flycockpit_credential", owner_only, none, true, local_only, none, serialized, none, "credential:StoredFlycockpitCredential|force:bool", [credential: StoredFlycockpitCredential => param, force: bool => param]);
             (Request::ClearFlycockpitCredential, "clear_flycockpit_credential", owner_only, none, true, local_only, none, serialized, none, "-", []);
             (Request::DaemonStatus, "daemon_status", public_read, none, false, read_only, none, concurrent, none, "-", []);
             (Request::RefreshEnv { vars }, "refresh_env", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "vars:HashMap<String,String>", [vars: HashMap<String,String> => param]);

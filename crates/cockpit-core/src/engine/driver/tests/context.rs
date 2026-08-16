@@ -802,7 +802,7 @@ async fn ephemeral_session_writes_no_rows() {
         .await
         .unwrap();
     let session = Arc::new(
-        Session::resume(
+        Session::resume_for_test(
             parent.session.db.clone(),
             row.session_id,
             crate::session::test_redaction_key_resolver(),
@@ -2265,7 +2265,7 @@ async fn sealed_value_survives_compaction_and_resume() {
     drop(tx);
     while rx.recv().await.is_some() {}
 
-    let resumed = Session::resume(
+    let resumed = Session::resume_for_test(
         db,
         session_id,
         crate::session::test_redaction_key_resolver(),

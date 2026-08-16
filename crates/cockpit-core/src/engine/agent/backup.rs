@@ -188,8 +188,7 @@ pub async fn turn_with_backup(
     // choice; `billing_backup_used` enforces the single-different-provider-backup
     // cap for billing.
     let primary_provider = agent.model.provider_id().to_string();
-    let candidate_providers: Vec<&str> =
-        candidates.iter().map(|c| c.provider_id()).collect();
+    let candidate_providers: Vec<&str> = candidates.iter().map(|c| c.provider_id()).collect();
     let mut current: Option<usize> = None;
     let mut tried: Vec<usize> = Vec::new();
     let mut strategy = crate::engine::model::ProviderRecoverySignal::None;
@@ -664,7 +663,7 @@ mod inference_outcome_tests {
     fn in_memory_session(root: &std::path::Path) -> Arc<Session> {
         let db = crate::db::Db::open_in_memory().unwrap();
         Arc::new(
-            crate::session::Session::create(
+            crate::session::Session::create_for_test(
                 db,
                 root.to_path_buf(),
                 "builder",
@@ -1095,7 +1094,7 @@ mod backup_fallback_tests {
     fn in_memory_session(root: &std::path::Path) -> Arc<Session> {
         let db = crate::db::Db::open_in_memory().unwrap();
         Arc::new(
-            crate::session::Session::create(
+            crate::session::Session::create_for_test(
                 db,
                 root.to_path_buf(),
                 "Build",
@@ -2054,6 +2053,60 @@ mod backup_fallback_tests {
         assert_eq!(backup.model_id_ref(), "backup-model");
     }
 
+    #[test]
+    fn backup_model_resolves_vault_named_secret_headers() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        let mut store = crate::credentials::CredentialStore::from_vault(vault).unwrap();
+        store.set_named_secret("backup-token", "vault-only-backup-secret-xyz");
+        store.save().unwrap();
+
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers.insert(
+            "flaky".into(),
+            ProviderEntry {
+                url: "http://localhost:9/v1".into(),
+                backup: Some(BackupConfig {
+                    provider: "reliable".into(),
+                    model: "backup-model".into(),
+                }),
+                ..ProviderEntry::default()
+            },
+        );
+        cfg.providers.insert(
+            "reliable".into(),
+            ProviderEntry {
+                url: "http://localhost:8/v1".into(),
+                headers: vec![crate::config::providers::HeaderSpec {
+                    name: "Authorization".into(),
+                    value: "Bearer $secret:backup-token".into(),
+                }],
+                models: vec![ModelEntry {
+                    id: "backup-model".into(),
+                    subagent_invokable: Some(true),
+                    ..ModelEntry::default()
+                }],
+                ..ProviderEntry::default()
+            },
+        );
+        let running = Model::for_provider(
+            &cfg,
+            "flaky",
+            "primary-model",
+            std::sync::Arc::new(RedactionTable::empty()),
+        )
+        .unwrap();
+        assert!(
+            crate::engine::driver::build_backup_model(&cfg, &running).is_none(),
+            "backup with vault-only $secret must not build without a store"
+        );
+        let backup =
+            crate::engine::driver::build_backup_model_with_store(&cfg, &running, Some(store))
+                .expect("backup with injected vault store must resolve $secret headers");
+        assert_eq!(backup.provider_id(), "reliable");
+        assert_eq!(backup.model_id_ref(), "backup-model");
+    }
+
     /// Decision (B), untrusted primary: failover may upgrade onto a trusted
     /// (self-hosted / no-log) endpoint, and may stay untrusted. Nothing is
     /// refused, so no custody diagnostic is recorded.
@@ -2407,7 +2460,9 @@ mod billing_overload_policy_tests {
     use crate::engine::model::rig_boundary::{
         classify_terminal_failure, provider_recovery_signal_from_text,
     };
-    use crate::engine::model::{InferenceErrorClass, ProviderRecoverySignal, failure_engages_backup};
+    use crate::engine::model::{
+        InferenceErrorClass, ProviderRecoverySignal, failure_engages_backup,
+    };
     use crate::engine::retry::{RetryDecision, classify, wait_for_decision};
     use rig::completion::CompletionError;
 
@@ -2447,7 +2502,10 @@ mod billing_overload_policy_tests {
                 InferenceErrorClass::BillingOrQuotaExhausted,
                 "{body:?}"
             );
-            assert_eq!(classified.recovery, ProviderRecoverySignal::BillingExhausted);
+            assert_eq!(
+                classified.recovery,
+                ProviderRecoverySignal::BillingExhausted
+            );
             assert_eq!(
                 classify(&provider_err(body)),
                 RetryDecision::FailFast,
@@ -2478,20 +2536,25 @@ mod billing_overload_policy_tests {
 
         // (b) The observed 429 is preserved in diagnostics, separately from the
         //     class (billing observed as HTTP 429 with a billing body).
-        let http_429_billing = CompletionError::HttpError(
-            rig::http_client::Error::InvalidStatusCodeWithMessage(
+        let http_429_billing =
+            CompletionError::HttpError(rig::http_client::Error::InvalidStatusCodeWithMessage(
                 reqwest::StatusCode::from_u16(429).unwrap(),
                 "insufficient balance".into(),
-            ),
-        );
+            ));
         let classified = classify_terminal_failure(&http_429_billing);
-        assert_eq!(classified.class, InferenceErrorClass::BillingOrQuotaExhausted);
+        assert_eq!(
+            classified.class,
+            InferenceErrorClass::BillingOrQuotaExhausted
+        );
         assert_eq!(
             classified.observed_status,
             Some(429),
             "observed 429 retained separately from the class"
         );
-        assert_eq!(classified.recovery, ProviderRecoverySignal::BillingExhausted);
+        assert_eq!(
+            classified.recovery,
+            ProviderRecoverySignal::BillingExhausted
+        );
 
         // (c) Backup engages; the action is top-up-or-switch-provider.
         assert!(failure_engages_backup(

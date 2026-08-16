@@ -13,7 +13,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 
@@ -81,11 +81,27 @@ pub struct ConfigSource {
     daemon_load: Arc<DaemonLoadFn>,
     write_target: Arc<WriteTargetFn>,
     watch_paths: Arc<WatchPathsFn>,
+    vault: Arc<Mutex<Option<Arc<crate::secure_key::SecretVault>>>>,
 }
 
 impl std::fmt::Debug for ConfigSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConfigSource").finish_non_exhaustive()
+    }
+}
+
+fn installed_store(
+    slot: &Mutex<Option<Arc<crate::secure_key::SecretVault>>>,
+) -> Result<Option<crate::credentials::CredentialStore>> {
+    let vault = slot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    match vault {
+        Some(vault) => Ok(Some(crate::credentials::CredentialStore::from_vault(
+            vault,
+        )?)),
+        None => Ok(None),
     }
 }
 
@@ -113,6 +129,7 @@ impl ConfigSource {
             load,
             write_target: Arc::new(write_target),
             watch_paths: Arc::new(watch_paths),
+            vault: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -130,6 +147,7 @@ impl ConfigSource {
             daemon_load: Arc::new(daemon_load),
             write_target: Arc::new(write_target),
             watch_paths: Arc::new(watch_paths),
+            vault: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -139,17 +157,20 @@ impl ConfigSource {
     /// (GOALS §2a), and is the daemon's **only** route to
     /// `secret_ref::load_effective` / `extended::load_for_cwd`.
     pub fn production() -> Self {
-        let load = Arc::new(|cwd: &Path| {
-            // Fail closed: a layer with an unmaskable pending default-model
-            // transaction must surface as a typed error, never as an
-            // ambiguous snapshot the daemon then serves to clients.
+        let vault = Arc::new(Mutex::new(None));
+        let load_vault = vault.clone();
+        let load = Arc::new(move |cwd: &Path| {
+            let store = installed_store(&load_vault)?;
+            crate::secret_ref::prepare_effective_layers_with_store(cwd, store)?;
             Ok((
                 crate::secret_ref::try_load_effective(cwd)?,
                 crate::config::extended::load_for_cwd(cwd),
             ))
         }) as Arc<LoadFn>;
-        let daemon_load = Arc::new(|cwd: &Path| {
-            crate::secret_ref::prepare_effective_layers(cwd);
+        let daemon_vault = vault.clone();
+        let daemon_load = Arc::new(move |cwd: &Path| {
+            let store = installed_store(&daemon_vault)?;
+            crate::secret_ref::prepare_effective_layers_with_store(cwd, store)?;
             let extended = crate::config::extended::load_for_cwd_for_daemon_contract(cwd)?;
             Ok(DaemonConfigLoad {
                 providers: extended.providers,
@@ -173,7 +194,15 @@ impl ConfigSource {
                     .collect();
                 ConfigWatchPaths::new(config_files, provider_dirs)
             }),
+            vault,
         }
+    }
+
+    pub fn install_vault(&self, vault: Arc<crate::secure_key::SecretVault>) {
+        *self
+            .vault
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(vault);
     }
 
     /// A source returning fixed in-memory configs regardless of project
@@ -317,5 +346,89 @@ mod tests {
 
         assert!(!rendered.contains("mcp.json"), "{rendered}");
         assert!(!rendered.contains("agents"), "{rendered}");
+    }
+
+    #[test]
+    fn production_load_does_not_skip_migration_before_vault_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        let layer = tmp.path().join(".cockpit");
+        std::fs::create_dir_all(layer.join("providers")).unwrap();
+        std::fs::write(layer.join("config.json"), "{}\n").unwrap();
+        let literal = "Bearer sk-pre-vault-secret-1234567890";
+        let provider_path = layer.join("providers/openai.json");
+        std::fs::write(
+            &provider_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "url": "https://example.test/v1",
+                "headers": [{ "name": "Authorization", "value": literal }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        let source = ConfigSource::production();
+        crate::config::trust::with_workspace_trust_policy(policy.clone(), || {
+            let _ = source.load(tmp.path());
+        });
+        let raw = std::fs::read_to_string(&provider_path).unwrap();
+        assert!(
+            raw.contains(literal),
+            "vault-less production load must not rewrite or mark: {raw}"
+        );
+
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let vault = crate::secure_key::open_for_db(&db).unwrap();
+        source.install_vault(vault);
+        crate::config::trust::with_workspace_trust_policy(policy, || {
+            source.load(tmp.path()).expect("vault-backed load")
+        });
+        let raw = std::fs::read_to_string(&provider_path).unwrap();
+        assert!(raw.contains("$secret:openai"), "{raw}");
+        assert!(!raw.contains(literal), "{raw}");
+    }
+
+    #[test]
+    fn production_load_fails_closed_when_vault_backed_migration_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        let layer = tmp.path().join(".cockpit");
+        std::fs::create_dir_all(layer.join("providers")).unwrap();
+        std::fs::write(layer.join("config.json"), "{}\n").unwrap();
+        let provider_path = layer.join("providers/openai.json");
+        std::fs::write(
+            &provider_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "url": "https://example.test/v1",
+                "headers": [{
+                    "name": "Authorization",
+                    "value": "Bearer sk-migration-fail-secret-123456"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::remove_file(&provider_path).unwrap();
+        std::fs::create_dir(&provider_path).unwrap();
+
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        let source = ConfigSource::production();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let vault = crate::secure_key::open_for_db(&db).unwrap();
+        source.install_vault(vault);
+        let err =
+            crate::config::trust::with_workspace_trust_policy(policy, || source.load(tmp.path()))
+                .expect_err("migration must fail closed");
+        assert!(
+            !err.to_string().is_empty(),
+            "vault-backed migration failure must surface"
+        );
     }
 }

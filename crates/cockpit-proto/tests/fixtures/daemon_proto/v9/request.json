@@ -11,6 +11,12 @@
     },
     "request": "get_startup_disclosures"
   },
+  "get_workspace_trust": {
+    "params": {
+      "project_root": "/tmp/project"
+    },
+    "request": "get_workspace_trust"
+  },
   "mark_app_flag_seen": {
     "params": {
       "expected_version": 7,

@@ -1535,7 +1535,11 @@ mod tests {
             "hook_run with a field outside the closed audit projection must be rejected"
         );
         assert!(
-            db_forbidden.get_session(forbidden_id).await.unwrap().is_none(),
+            db_forbidden
+                .get_session(forbidden_id)
+                .await
+                .unwrap()
+                .is_none(),
             "a rejected hook_run import leaves no partial session"
         );
 

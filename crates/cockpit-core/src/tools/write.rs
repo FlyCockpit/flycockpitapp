@@ -349,7 +349,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let session = crate::session::Session::resume(
+        let session = crate::session::Session::resume_for_test(
             db.clone(),
             session_row.session_id,
             crate::session::test_redaction_key_resolver(),
@@ -1256,7 +1256,7 @@ mod tests {
         let mut ctx_b = ctx_a.clone();
         ctx_b.lock_identity = "writer-b".to_string();
         ctx_b.session = Arc::new(
-            crate::session::Session::resume(
+            crate::session::Session::resume_for_test(
                 db.clone(),
                 s_b.session_id,
                 crate::session::test_redaction_key_resolver(),

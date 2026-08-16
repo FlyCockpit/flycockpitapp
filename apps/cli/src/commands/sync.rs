@@ -2,7 +2,6 @@
 
 use anyhow::{Context, Result};
 
-use crate::auth::flycockpit::maybe_load_credential;
 use crate::cli::SyncCommand;
 use crate::db::Db;
 
@@ -16,7 +15,9 @@ async fn status() -> Result<()> {
     let db = Db::open_default().context("opening cockpit DB")?;
     let org_states = db.list_org_sync_states().await?;
     let audit_states = db.list_remote_audit_upload_states().await?;
-    let credential = maybe_load_credential();
+    let credential = cockpit_core::secure_key::vault_for_db(&db)
+        .ok()
+        .and_then(crate::auth::flycockpit::maybe_load_credential_from_vault);
 
     if org_states.is_empty() {
         println!("session log sync: inactive");

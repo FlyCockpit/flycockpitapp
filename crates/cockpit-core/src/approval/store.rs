@@ -1761,7 +1761,7 @@ mod tests {
     /// approval dirs pointed at temp dirs so scopes are exercised hermetically.
     pub(super) fn test_store(project: &Path, global: PathBuf) -> (GrantStore, uuid::Uuid) {
         let db = Db::open_in_memory().unwrap();
-        let session = crate::session::Session::create(
+        let session = crate::session::Session::create_for_test(
             db.clone(),
             project.to_path_buf(),
             "builder",
@@ -2016,7 +2016,7 @@ mod tests {
         };
         crate::config::trust::scope_workspace_trust_policy(policy, async {
             let db = Db::open_in_memory().unwrap();
-            let session = crate::session::Session::create(
+            let session = crate::session::Session::create_for_test(
                 db.clone(),
                 project.path().to_path_buf(),
                 "builder",
@@ -2134,7 +2134,7 @@ mod tests {
         .unwrap();
 
         let db = Db::open_in_memory().unwrap();
-        let session = crate::session::Session::create(
+        let session = crate::session::Session::create_for_test(
             db.clone(),
             tmp.path().to_path_buf(),
             "builder",
@@ -2987,7 +2987,7 @@ mod tests {
         // Seed one of each bucket through the normal store write paths so
         // the file shape is exactly what production records.
         let db = Db::open_in_memory().unwrap();
-        let session = crate::session::Session::create(
+        let session = crate::session::Session::create_for_test(
             db.clone(),
             dir.path().to_path_buf(),
             "builder",
@@ -3056,7 +3056,7 @@ mod tests {
     async fn managed_grants_expose_command_tier() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
-        let session = crate::session::Session::create(
+        let session = crate::session::Session::create_for_test(
             db.clone(),
             dir.path().to_path_buf(),
             "builder",
@@ -3098,7 +3098,7 @@ mod tests {
     async fn delete_managed_grant_removes_one_leaves_others() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
-        let session = crate::session::Session::create(
+        let session = crate::session::Session::create_for_test(
             db.clone(),
             dir.path().to_path_buf(),
             "builder",
@@ -3172,7 +3172,7 @@ mod tests {
     async fn delete_managed_grant_handles_each_kind() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
-        let session = crate::session::Session::create(
+        let session = crate::session::Session::create_for_test(
             db.clone(),
             dir.path().to_path_buf(),
             "builder",
@@ -3302,7 +3302,7 @@ mod tests {
         initial: ApprovalPolicyConfig,
     ) -> (GrantStore, Arc<RwLock<SessionConfigSnapshot>>) {
         let db = Db::open_in_memory().unwrap();
-        let session = crate::session::Session::create(
+        let session = crate::session::Session::create_for_test(
             db.clone(),
             tmp.to_path_buf(),
             "builder",

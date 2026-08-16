@@ -57,7 +57,7 @@ fn test_driver_with_url(max_schedules: usize, provider_url: String) -> (Driver, 
     let root = tmp.path().to_path_buf();
     let db = crate::db::Db::open_in_memory().unwrap();
     let session = Arc::new(
-        Session::create(
+        Session::create_for_test(
             db.clone(),
             root.clone(),
             "Build",
@@ -259,7 +259,7 @@ fn learn_driver(
     });
     let db = crate::db::Db::open_in_memory().unwrap();
     let session = Arc::new(
-        Session::create(
+        Session::create_for_test(
             db.clone(),
             tmp.path().to_path_buf(),
             "Build",

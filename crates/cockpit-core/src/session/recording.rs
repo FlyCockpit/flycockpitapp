@@ -721,10 +721,12 @@ impl Session {
                 if journal_fault::should_fail_after_artifact_row() {
                     anyhow::bail!("injected mid-transaction tool_call journal fault (test seam)");
                 }
-                let refs = [crate::redact::protected_redaction_history::ArtifactRef::new(
-                    crate::redact::protected_redaction_history::RedactionArtifactKind::Tool,
-                    artifact_id,
-                )];
+                let refs = [
+                    crate::redact::protected_redaction_history::ArtifactRef::new(
+                        crate::redact::protected_redaction_history::RedactionArtifactKind::Tool,
+                        artifact_id,
+                    ),
+                ];
                 for prepared in &prepared {
                     crate::redact::protected_redaction_history::append_and_attach_conn(
                         conn, prepared, &refs,
@@ -2356,7 +2358,7 @@ mod notice_tests {
     #[tokio::test]
     async fn notice_records_typed_severity_and_source() {
         let db = Db::open_in_memory().unwrap();
-        let session = Session::create(
+        let session = Session::create_for_test(
             db,
             std::path::PathBuf::from("/proj"),
             "Build",
@@ -2388,7 +2390,7 @@ mod notice_tests {
     #[tokio::test]
     async fn unclassified_notice_defaults_to_info_and_is_not_dropped() {
         let db = Db::open_in_memory().unwrap();
-        let session = Session::create(
+        let session = Session::create_for_test(
             db,
             std::path::PathBuf::from("/proj"),
             "Build",
@@ -2440,7 +2442,7 @@ mod session_event_provenance_tests {
         let tmp = tempfile::tempdir().unwrap();
         write_provider(tmp.path(), "openai", "gpt-5", "trusted", "frontier");
         let db = Db::open_in_memory().unwrap();
-        let session = Session::create(
+        let session = Session::create_for_test(
             db,
             tmp.path().to_path_buf(),
             "Build",
@@ -2500,7 +2502,7 @@ mod session_event_provenance_tests {
         write_provider(tmp.path(), "root", "root-model", "untrusted", "defensive");
         write_provider(tmp.path(), "child", "child-model", "trusted", "normal");
         let db = Db::open_in_memory().unwrap();
-        let session = Session::create(
+        let session = Session::create_for_test(
             db,
             tmp.path().to_path_buf(),
             "Build",
@@ -2547,7 +2549,7 @@ mod session_event_provenance_tests {
         let tmp = tempfile::tempdir().unwrap();
         write_provider(tmp.path(), "openai", "gpt-5", "trusted", "frontier");
         let db = Db::open_in_memory().unwrap();
-        let session = Session::create(
+        let session = Session::create_for_test(
             db,
             tmp.path().to_path_buf(),
             "Build",
@@ -2656,7 +2658,7 @@ mod trusted_journaling_tests {
     }
 
     fn new_session(db: Db) -> Session {
-        Session::create(
+        Session::create_for_test(
             db,
             PathBuf::from("/proj"),
             "Build",
@@ -2828,7 +2830,7 @@ mod trusted_journaling_tests {
         let tmp = tempfile::tempdir().unwrap();
         write_trusted_provider(tmp.path());
         let db = Db::open_in_memory().unwrap();
-        let session = Session::create(
+        let session = Session::create_for_test(
             db.clone(),
             tmp.path().to_path_buf(),
             "Build",
@@ -2949,7 +2951,7 @@ mod trusted_journaling_tests {
         let tmp = tempfile::tempdir().unwrap();
         write_trusted_provider(tmp.path());
         let db = Db::open_in_memory().unwrap();
-        let session = Session::create(
+        let session = Session::create_for_test(
             db.clone(),
             tmp.path().to_path_buf(),
             "Build",
@@ -3177,7 +3179,8 @@ mod trusted_journaling_tests {
             actor.handle(),
         ));
         let session =
-            Session::create(db.clone(), PathBuf::from("/proj"), "Build", resolver).unwrap();
+            Session::create_for_test(db.clone(), PathBuf::from("/proj"), "Build", resolver)
+                .unwrap();
         let table = env_credential_table();
         let call_id = Uuid::new_v4();
         let payload = serde_json::json!({
@@ -3282,7 +3285,8 @@ mod trusted_journaling_tests {
             actor.handle(),
         ));
         let session =
-            Session::create(db.clone(), PathBuf::from("/proj"), "Build", resolver).unwrap();
+            Session::create_for_test(db.clone(), PathBuf::from("/proj"), "Build", resolver)
+                .unwrap();
         (session, actor)
     }
 
@@ -3764,7 +3768,7 @@ mod trusted_journaling_tests {
         let tmp = tempfile::tempdir().unwrap();
         write_trusted_and_untrusted_providers(tmp.path());
         let db = Db::open_in_memory().unwrap();
-        let session = Session::create(
+        let session = Session::create_for_test(
             db.clone(),
             tmp.path().to_path_buf(),
             "Build",
@@ -4338,7 +4342,7 @@ mod trusted_journaling_tests {
         )
         .unwrap();
         let db = Db::open_in_memory().unwrap();
-        let session = Session::create(
+        let session = Session::create_for_test(
             db.clone(),
             tmp.path().to_path_buf(),
             "Build",

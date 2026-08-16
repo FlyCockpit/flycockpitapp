@@ -1004,7 +1004,7 @@ pub(crate) async fn inject_knowledge_for_turn(
     if bundles.is_empty() {
         return;
     }
-    match production_embedder(&extended, config, redact.clone()).await {
+    match production_embedder(&extended, config, redact.clone(), session).await {
         Ok(Some(embedder)) => {
             match search_bundles(&bundles, embedder, query, DEFAULT_SEARCH_LIMIT).await {
                 Ok(results) => {
@@ -1028,6 +1028,7 @@ async fn production_embedder(
     extended: &ExtendedConfig,
     config: &crate::daemon::session_worker::SessionConfigHandle,
     redact: Arc<RedactionTable>,
+    session: &Session,
 ) -> Result<Option<Arc<dyn Embedder>>> {
     let providers = config.providers();
     let resolved = match providers.resolve_embedding_model(extended) {
@@ -1038,7 +1039,10 @@ async fn production_embedder(
         }
         Err(error) => return Err(error).context("resolving embedding model for knowledge"),
     };
-    let embedder = OpenAiCompatEmbedder::for_resolved_model(&providers, &resolved, redact).await?;
+    let store = session.credential_store()?;
+    let embedder =
+        OpenAiCompatEmbedder::for_resolved_model_with_store(&providers, &resolved, redact, store)
+            .await?;
     Ok(Some(Arc::new(embedder)))
 }
 
@@ -1175,7 +1179,7 @@ impl Tool for MemorySearchTool {
             ));
         }
         let Some(embedder) =
-            production_embedder(&extended, &ctx.config, ctx.redact.clone()).await?
+            production_embedder(&extended, &ctx.config, ctx.redact.clone(), &ctx.session).await?
         else {
             return Ok(ToolOutput::text(
                 "No embedding_model is configured, so memory_search cannot build the knowledge index.",
@@ -1665,7 +1669,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
             })
             .await
             .unwrap();
-        Session::resume(
+        Session::resume_for_test(
             db,
             row.session_id,
             crate::session::test_redaction_key_resolver(),

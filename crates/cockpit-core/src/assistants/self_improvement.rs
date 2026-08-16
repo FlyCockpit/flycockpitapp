@@ -320,11 +320,14 @@ fn scratch_session(
     resolver: Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
 ) -> Result<Arc<crate::session::Session>> {
     let db = crate::db::Db::open_in_memory()?;
+    let vault = crate::secure_key::open_for_db(&db)
+        .map_err(|e| anyhow::anyhow!("opening isolated review vault: {e}"))?;
     Ok(Arc::new(crate::session::Session::create(
         db,
         cwd.to_path_buf(),
         "background_review",
         resolver,
+        vault,
     )?))
 }
 
@@ -357,7 +360,7 @@ mod tests {
     async fn review_scratch_not_persisted() {
         let tmp = tempfile::tempdir().unwrap();
         let real_db = crate::db::Db::open_in_memory().unwrap();
-        let real = crate::session::Session::create(
+        let real = crate::session::Session::create_for_test(
             real_db.clone(),
             tmp.path().to_path_buf(),
             "helper",

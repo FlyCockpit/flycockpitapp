@@ -70,6 +70,7 @@ pub async fn run_forked_loop(run: LoopRunCtx) {
         ctx.session.id,
         None,
         ctx.session.redaction_key_resolver().clone(),
+        ctx.session.secret_vault().clone(),
     ) {
         Ok(s) => {
             s.set_external_journal(ctx.session.external_journal());

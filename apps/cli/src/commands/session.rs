@@ -542,7 +542,8 @@ mod tests {
             .unwrap()
             .unwrap()
         };
-        let session = Session::create(db.clone(), std::env::temp_dir(), "Build", resolver).unwrap();
+        let session =
+            Session::create_for_test(db.clone(), std::env::temp_dir(), "Build", resolver).unwrap();
         let set = InterruptQuestionSet {
             questions: vec![InterruptQuestion::Single {
                 prompt: "Pick".into(),

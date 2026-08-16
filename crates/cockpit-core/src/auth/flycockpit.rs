@@ -10,6 +10,12 @@ use serde_json::{Value, json};
 
 use crate::credentials::CredentialStore;
 
+#[cfg(any(test, feature = "test-support"))]
+#[path = "flycockpit_test_helpers.rs"]
+mod flycockpit_test_helpers;
+#[cfg(any(test, feature = "test-support"))]
+pub use flycockpit_test_helpers::*;
+
 pub use crate::daemon::proto::{AccountInfo, RelayChoice, StoredFlycockpitCredential};
 
 pub const CREDENTIAL_KEY: &str = "flycockpit";
@@ -359,7 +365,12 @@ impl FlycockpitClient {
             .http
             .post(url)
             .header("x-csrf-token", CLIENT_ID)
-            .json(&json!({ "json": { "instanceId": credential.instance_id } }))
+            .json(&json!({
+                "json": {
+                    "instanceId": credential.instance_id,
+                    "instanceToken": credential.instance_token,
+                }
+            }))
             .send()
             .await
             .context("revoking Flycockpit instance")?;
@@ -445,7 +456,7 @@ impl FlycockpitClient {
             });
         }
         if is_revoked_error(&body) {
-            let _ = clear_credential();
+            // Caller (daemon connector) clears the vault-held credential.
         }
         Err(classify_http_error("connector token", status, &body))
     }
@@ -486,34 +497,32 @@ impl FlycockpitClient {
     }
 }
 
-pub fn load_credential() -> Result<StoredFlycockpitCredential> {
-    let store = CredentialStore::open_default()?;
-    load_credential_from_store(&store)
-}
-
-#[cfg(any(test, feature = "test-support"))]
-pub fn load_credential_from_path(path: std::path::PathBuf) -> Result<StoredFlycockpitCredential> {
-    let store = CredentialStore::open(path)?;
-    load_credential_from_store(&store)
-}
-
-fn load_credential_from_store(store: &CredentialStore) -> Result<StoredFlycockpitCredential> {
+pub fn load_credential_from_store(store: &CredentialStore) -> Result<StoredFlycockpitCredential> {
     let raw = store
         .get(CREDENTIAL_KEY)
         .ok_or_else(|| anyhow!("not logged in to Flycockpit; run `cockpit account login`"))?;
     serde_json::from_value(raw.clone()).context("parsing stored Flycockpit account credential")
 }
 
-pub fn maybe_load_credential() -> Option<StoredFlycockpitCredential> {
-    CredentialStore::open_default()
-        .ok()
-        .and_then(|store| store.get(CREDENTIAL_KEY).cloned())
+pub fn load_credential_from_vault(
+    vault: std::sync::Arc<crate::secure_key::SecretVault>,
+) -> Result<StoredFlycockpitCredential> {
+    load_credential_from_store(&CredentialStore::from_vault(vault)?)
+}
+
+pub fn maybe_load_credential_from_store(
+    store: &CredentialStore,
+) -> Option<StoredFlycockpitCredential> {
+    store
+        .get(CREDENTIAL_KEY)
+        .cloned()
         .and_then(|raw| serde_json::from_value(raw).ok())
 }
 
-pub fn store_credential(credential: &StoredFlycockpitCredential) -> Result<()> {
-    let mut store = CredentialStore::open_default()?;
-    store_credential_in_store(&mut store, credential)
+pub fn maybe_load_credential_from_vault(
+    vault: std::sync::Arc<crate::secure_key::SecretVault>,
+) -> Option<StoredFlycockpitCredential> {
+    maybe_load_credential_from_store(&CredentialStore::from_vault(vault).ok()?)
 }
 
 pub fn store_credential_in_vault(
@@ -535,19 +544,15 @@ fn store_credential_in_store(
     Ok(())
 }
 
-pub fn store_relay_choice(
+pub fn store_relay_choice_in_vault(
+    vault: std::sync::Arc<crate::secure_key::SecretVault>,
     credential: &StoredFlycockpitCredential,
     choice: Option<RelayChoice>,
 ) -> Result<StoredFlycockpitCredential> {
     let mut next = credential.clone();
     next.relay_choice = choice;
-    store_credential(&next)?;
+    store_credential_in_vault(vault, &next)?;
     Ok(next)
-}
-
-pub fn clear_credential() -> Result<()> {
-    let mut store = CredentialStore::open_default()?;
-    clear_credential_in_store(&mut store)
 }
 
 pub fn clear_credential_in_vault(
@@ -595,7 +600,7 @@ pub fn stored_instance_token_for_redaction() -> Option<String> {
 
     #[cfg(not(test))]
     {
-        maybe_load_credential().map(|credential| credential.instance_token)
+        None
     }
 }
 

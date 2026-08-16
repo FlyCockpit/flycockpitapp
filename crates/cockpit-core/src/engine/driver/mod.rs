@@ -41,9 +41,10 @@ use reports::*;
 #[allow(unused_imports)]
 pub(crate) use reports::{
     FailoverCustodyBlocked, FailoverCustodyRefusal, FailoverRefusalKind, build_backup_model,
-    build_backup_model_with_diagnostics, build_failover_models,
-    build_failover_models_with_diagnostics, failover_custody_block, resolve_backup_model_for,
-    resolve_failover_models_for,
+    build_backup_model_with_diagnostics, build_backup_model_with_store, build_failover_models,
+    build_failover_models_with_diagnostics, build_failover_models_with_store,
+    failover_custody_block, resolve_backup_model_for_with_store,
+    resolve_failover_models_for_with_store,
 };
 use skills_seed::SkillPair;
 
@@ -1890,8 +1891,12 @@ impl Driver {
         if let Some(v) = scan_ssh_keys_override {
             cfg.scan_ssh_keys = v;
         }
-        match tokio::task::spawn_blocking(move || {
-            RedactionTable::build_with_env_and_store(&cfg, &cwd, &session_env)
+        let store = self.session.credential_store().ok();
+        match tokio::task::spawn_blocking(move || match store.as_ref() {
+            Some(store) => {
+                RedactionTable::build_with_env_and_credential_store(&cfg, &cwd, &session_env, store)
+            }
+            None => RedactionTable::build_with_env_and_store(&cfg, &cwd, &session_env),
         })
         .await
         {
@@ -5529,22 +5534,24 @@ impl Driver {
     ) -> Option<Arc<crate::engine::model::Model>> {
         // Honor the test-injected providers config when present (mirrors
         // `active_providers_config`), else load from the cwd config chain.
+        let store = self.session.credential_store().ok();
         #[cfg(test)]
         if let Some((providers, _, _)) = &self.test_providers_override {
-            return build_backup_model(providers, model);
+            return build_backup_model_with_store(providers, model, store);
         }
-        resolve_backup_model_for(&self.config, model)
+        resolve_backup_model_for_with_store(&self.config, model, store)
     }
 
     fn resolve_failover_models(
         &self,
         model: &crate::engine::model::Model,
     ) -> Vec<Arc<crate::engine::model::Model>> {
+        let store = self.session.credential_store().ok();
         #[cfg(test)]
         if let Some((providers, _, _)) = &self.test_providers_override {
-            return build_failover_models(providers, model);
+            return build_failover_models_with_store(providers, model, store);
         }
-        resolve_failover_models_for(&self.config, model)
+        resolve_failover_models_for_with_store(&self.config, model, store)
     }
 
     /// Load the layered providers config plus the session's active
@@ -7992,6 +7999,7 @@ impl Driver {
             granted_tools: Vec::new(),
             lock_identity: None,
             write_scope: None,
+            credential_store: self.session.credential_store().ok(),
         }
     }
 

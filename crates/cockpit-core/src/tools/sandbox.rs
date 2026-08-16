@@ -524,7 +524,7 @@ mod tests {
     /// resolved from a sibling task.
     fn sandboxed_ctx(cwd: &std::path::Path) -> ToolCtx {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = crate::session::Session::create(
+        let session = crate::session::Session::create_for_test(
             db.clone(),
             cwd.to_path_buf(),
             "builder",

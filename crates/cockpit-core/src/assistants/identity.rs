@@ -434,7 +434,7 @@ mod tests {
                 )
             })
             .unwrap();
-        let session = crate::session::Session::resume(
+        let session = crate::session::Session::resume_for_test(
             db.clone(),
             session_row.session_id,
             crate::session::test_redaction_key_resolver(),

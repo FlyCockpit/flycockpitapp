@@ -11,7 +11,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::auth;
-use super::config::{ServerConfig, Transport};
+use super::config::{Auth, ServerConfig, Transport};
 use super::protocol::McpClient;
 use super::transport::timeout::McpTimeouts;
 use super::transport::{
@@ -26,6 +26,7 @@ pub struct McpConnectContext {
     stdio_abandon_scope: Option<StdioAbandonScope>,
     approver: Option<Arc<Approver>>,
     approval_mode: ApprovalMode,
+    vault: Option<Arc<crate::secure_key::SecretVault>>,
 }
 
 impl McpConnectContext {
@@ -38,6 +39,7 @@ impl McpConnectContext {
             }),
             approver: ctx.approver.clone(),
             approval_mode: ctx.session.approval_mode(),
+            vault: Some(ctx.session.secret_vault().clone()),
         }
     }
 
@@ -82,6 +84,18 @@ impl McpConnectContext {
     }
 }
 
+fn server_requires_secret_store(cfg: &ServerConfig) -> bool {
+    if !cfg.env_credential_refs.is_empty() {
+        return true;
+    }
+    match &cfg.auth {
+        Auth::Header(header) => header.credential_ref.is_some(),
+        Auth::Env(env) => !env.credential_refs.is_empty(),
+        Auth::Oauth(_) => true,
+        Auth::None => false,
+    }
+}
+
 /// Build and `initialize` a client for `server`, applying its auth.
 /// Remote transports get resolved headers (including a refreshed OAuth
 /// bearer); stdio gets the merged env.
@@ -95,9 +109,18 @@ pub async fn connect_with_context(
     context: McpConnectContext,
 ) -> Result<Box<dyn McpClient>> {
     context.authorize_connect(name, cfg).await?;
-    let mut resolved = auth::resolve_static_for_server(name, cfg);
+    let mut store = match context.vault.as_ref() {
+        Some(vault) => Some(crate::credentials::CredentialStore::from_vault(
+            vault.clone(),
+        )?),
+        None => None,
+    };
+    if store.is_none() && server_requires_secret_store(cfg) {
+        bail!("MCP server `{name}` requires an injected vault-backed store for credential refs");
+    }
+    let mut resolved = auth::resolve_static_for_server_with_store(name, cfg, store.as_ref());
     // OAuth bearer (async; refreshes if expired) → Authorization header.
-    if let Some(bearer) = auth::oauth_bearer(name, cfg).await? {
+    if let Some(bearer) = auth::oauth_bearer_with_store(name, cfg, store.as_mut()).await? {
         resolved.headers.insert("Authorization".to_string(), bearer);
     }
 
@@ -210,6 +233,24 @@ mod tests {
             connect_timeout_secs: None,
             timeout_secs: None,
         }
+    }
+
+    #[tokio::test]
+    async fn connect_without_vault_fails_closed_on_credential_ref() {
+        let mut cfg = remote_server_with_header("fallback-must-not-be-used");
+        if let Auth::Header(header) = &mut cfg.auth {
+            header.credential_ref = Some("mcp-header-secret".into());
+        }
+        let error = match connect_with_context("example", &cfg, McpConnectContext::yolo_for_tests())
+            .await
+        {
+            Ok(_) => panic!("credential-ref MCP connect must not proceed without a vault"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("injected vault-backed store"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

@@ -55,11 +55,17 @@ pub(crate) fn logout_configured_provider(
     match credential_ref {
         crate::auth::xai_oauth::CREDENTIAL_KEY => match store_path {
             Some(path) => crate::auth::xai_oauth::logout_at(Some(path))?,
-            None => crate::auth::xai_oauth::logout()?,
+            None => {
+                let mut store = open_store(None)?;
+                crate::auth::xai_oauth::logout_in(&mut store)?;
+            }
         },
         crate::auth::codex_oauth::CREDENTIAL_KEY => match store_path {
             Some(path) => crate::auth::codex_oauth::logout_at(Some(path))?,
-            None => crate::auth::codex_oauth::logout()?,
+            None => {
+                let mut store = open_store(None)?;
+                crate::auth::codex_oauth::logout_in(&mut store)?;
+            }
         },
         other => {
             let mut store = open_store(store_path)?;
@@ -89,28 +95,33 @@ fn credential_record_exists(credential_ref: &str, store_path: Option<&Path>) -> 
 }
 
 fn open_store(store_path: Option<&Path>) -> Result<CredentialStore> {
-    match store_path {
-        Some(path) => {
-            #[cfg(any(test, feature = "test-support"))]
-            {
-                CredentialStore::open(path.to_path_buf())
-            }
-            #[cfg(not(any(test, feature = "test-support")))]
-            {
-                let _ = path;
-                anyhow::bail!("explicit credential store path is test-only")
-            }
+    if let Some(path) = store_path {
+        #[cfg(test)]
+        {
+            return CredentialStore::open(path.to_path_buf());
         }
-        None => CredentialStore::open_default(),
+        #[cfg(not(test))]
+        {
+            let _ = path;
+            anyhow::bail!("explicit credential store path is test-only")
+        }
     }
+    let db = crate::db::Db::open_default()?;
+    let vault = cockpit_core::secure_key::open_for_db(&db)
+        .map_err(|e| anyhow::anyhow!("opening providers vault: {e}"))?;
+    CredentialStore::from_vault(vault)
 }
 
 async fn usage(args: ProvidersUsageArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let cfg = crate::secret_ref::load_effective(&cwd);
-    let rows =
-        crate::providers::usage::probes::fetch_all_provider_usage(&cfg, args.provider.as_deref())
-            .await?;
+    let store = open_store(None).ok();
+    let rows = crate::providers::usage::probes::fetch_all_provider_usage_with_store(
+        &cfg,
+        args.provider.as_deref(),
+        store,
+    )
+    .await?;
     for (idx, row) in rows.iter().enumerate() {
         if idx > 0 {
             println!();

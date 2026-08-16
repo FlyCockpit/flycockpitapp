@@ -2005,7 +2005,7 @@ mod tests {
     fn test_session(root: &std::path::Path) -> Arc<Session> {
         let db = crate::db::Db::open_in_memory().unwrap();
         Arc::new(
-            Session::create(
+            Session::create_for_test(
                 db,
                 root.to_path_buf(),
                 "Build",

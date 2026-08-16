@@ -218,6 +218,9 @@ pub struct SpawnArgs {
     /// Optional write-confined subtree for delegated children. Native writes
     /// and shell sandboxes enforce this; reads remain cwd-wide.
     pub write_scope: Option<std::path::PathBuf>,
+    /// Vault-backed credential store for delegated model construction.
+    /// Production session/driver spawns pass `Some`; tests may leave `None`.
+    pub credential_store: Option<crate::credentials::CredentialStore>,
 }
 
 impl SpawnArgs {
@@ -2472,13 +2475,14 @@ fn resolve_agent_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Resul
         return Ok(model.clone());
     }
     let (extended, providers) = crate::engine::model_roles::load_model_role_config(&args.config);
-    match crate::engine::model_roles::resolve_delegated_model(
+    match crate::engine::model_roles::resolve_delegated_model_with_store(
         &def.name,
         def.model.as_deref(),
         args.delegation_model.as_ref(),
         &extended,
         &providers,
         &args.model,
+        args.credential_store.clone(),
     ) {
         Ok(model) => Ok(model),
         Err(crate::engine::model_roles::SelectorResolution::InvalidLiteral(message)) => {
@@ -2707,11 +2711,12 @@ pub fn computer(args: &SpawnArgs) -> Result<Agent> {
         routing = %serde_json::to_string(&resolved.policy.routing_diagnostics()).unwrap_or_default(),
         "computer-use subagent custody"
     );
-    let model = Arc::new(crate::engine::model::Model::for_provider(
+    let model = Arc::new(crate::engine::model::Model::for_provider_optional_store(
         &providers,
         &provider_id,
         &model_id,
         session_redact,
+        args.credential_store.clone(),
     )?);
     let caps = providers.resolve_effective_model_capabilities(
         model.provider_id(),
@@ -3280,6 +3285,7 @@ mod tests {
             granted_tools: Vec::new(),
             lock_identity: None,
             write_scope: None,
+            credential_store: None,
         }
     }
 
@@ -6011,7 +6017,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args_with_provider_can_delegate(tmp.path(), Some(false));
         let agent = build(&args);
-        let session = crate::session::Session::create(
+        let session = crate::session::Session::create_for_test(
             crate::db::Db::open_in_memory().unwrap(),
             tmp.path().to_path_buf(),
             "Build",
@@ -6037,7 +6043,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let args = test_spawn_args_with_provider_can_delegate(tmp.path(), None);
         let agent = build(&args);
-        let session = crate::session::Session::create(
+        let session = crate::session::Session::create_for_test(
             crate::db::Db::open_in_memory().unwrap(),
             tmp.path().to_path_buf(),
             "Build",
@@ -6066,7 +6072,7 @@ mod tests {
         let mut args = test_spawn_args_with_provider_can_delegate(tmp.path(), Some(false));
         args.delegated = true;
         let agent = bee(&args);
-        let session = crate::session::Session::create(
+        let session = crate::session::Session::create_for_test(
             crate::db::Db::open_in_memory().unwrap(),
             tmp.path().to_path_buf(),
             "bee",

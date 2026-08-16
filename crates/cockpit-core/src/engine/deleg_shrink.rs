@@ -392,7 +392,7 @@ mod tests {
     fn child_note_send_does_not_mask_parent_cold() {
         use crate::session::Session;
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = Session::create(
+        let session = Session::create_for_test(
             db,
             std::path::PathBuf::from("/tmp"),
             "builder",

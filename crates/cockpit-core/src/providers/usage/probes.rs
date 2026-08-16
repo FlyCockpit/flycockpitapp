@@ -25,14 +25,36 @@ pub async fn fetch_all_provider_usage(
     config: &ProvidersConfig,
     provider_filter: Option<&str>,
 ) -> Result<Vec<ProviderUsageSnapshot>> {
-    fetch_all_provider_usage_with_registry(config, provider_filter, ProviderRegistry::standard())
-        .await
+    fetch_all_provider_usage_with_store(config, provider_filter, None).await
+}
+
+pub async fn fetch_all_provider_usage_with_store(
+    config: &ProvidersConfig,
+    provider_filter: Option<&str>,
+    store: Option<crate::credentials::CredentialStore>,
+) -> Result<Vec<ProviderUsageSnapshot>> {
+    fetch_all_provider_usage_with_registry_and_store(
+        config,
+        provider_filter,
+        ProviderRegistry::standard(),
+        store,
+    )
+    .await
 }
 
 pub async fn fetch_all_provider_usage_with_registry(
     config: &ProvidersConfig,
     provider_filter: Option<&str>,
     registry: ProviderRegistry,
+) -> Result<Vec<ProviderUsageSnapshot>> {
+    fetch_all_provider_usage_with_registry_and_store(config, provider_filter, registry, None).await
+}
+
+async fn fetch_all_provider_usage_with_registry_and_store(
+    config: &ProvidersConfig,
+    provider_filter: Option<&str>,
+    registry: ProviderRegistry,
+    store: Option<crate::credentials::CredentialStore>,
 ) -> Result<Vec<ProviderUsageSnapshot>> {
     let providers: Vec<(String, ProviderEntry)> = if let Some(filter) = provider_filter {
         let Some((id, entry)) = config.providers.get_key_value(filter) else {
@@ -61,9 +83,33 @@ pub async fn fetch_all_provider_usage_with_registry(
     let mut pending = FuturesUnordered::new();
     for (provider_id, entry) in providers {
         let registry = registry.clone();
+        let store = store.clone();
         pending.push(async move {
             let usage = async {
-                if let Some(probe) = registry.provider_for(&provider_id, &entry).usage_probe() {
+                if registry.provider_for(&provider_id, &entry).id()
+                    == crate::auth::codex_oauth::CREDENTIAL_KEY
+                {
+                    match fetch_codex_usage_with_store(&provider_id, &entry, store).await {
+                        Ok((plan, windows, details)) => fetched_snapshot(
+                            &provider_id,
+                            &entry,
+                            "oauth_usage_api",
+                            plan,
+                            windows,
+                            details,
+                        ),
+                        Err(e) => error_snapshot(
+                            &provider_id,
+                            &entry,
+                            &format!(
+                                "{} Run Codex subscription login in `/settings` -> Providers.",
+                                e
+                            ),
+                        ),
+                    }
+                } else if let Some(probe) =
+                    registry.provider_for(&provider_id, &entry).usage_probe()
+                {
                     probe.fetch(&provider_id, &entry).await
                 } else {
                     unsupported_snapshot(&provider_id, &entry)
@@ -114,7 +160,26 @@ async fn fetch_codex_usage(
     provider_id: &str,
     entry: &ProviderEntry,
 ) -> Result<(Option<String>, Vec<UsageWindow>, Vec<String>)> {
-    let resolved = models_fetch::resolve_provider_request_async(provider_id, entry).await?;
+    fetch_codex_usage_with_store(provider_id, entry, None).await
+}
+
+async fn fetch_codex_usage_with_store(
+    provider_id: &str,
+    entry: &ProviderEntry,
+    store: Option<crate::credentials::CredentialStore>,
+) -> Result<(Option<String>, Vec<UsageWindow>, Vec<String>)> {
+    let resolved = match store {
+        Some(store) => {
+            models_fetch::resolve_provider_request_async_with_store(
+                provider_id,
+                entry,
+                store,
+                |name| std::env::var(name).ok(),
+            )
+            .await?
+        }
+        None => models_fetch::resolve_provider_request_async(provider_id, entry).await?,
+    };
     let url = resolve_codex_usage_url(&resolved.base_url);
     let client = reqwest::Client::builder()
         .timeout(DEFAULT_TIMEOUT)

@@ -39,13 +39,36 @@ impl OpenAiCompatEmbedder {
             .providers
             .get(&resolved.provider)
             .with_context(|| format!("unknown embedding provider `{}`", resolved.provider))?;
-        Self::for_provider_entry(
+        Self::for_provider_entry_with_store(
             providers,
             &resolved.provider,
             entry,
             &resolved.model,
             resolved.embedding_dimensions,
             session_redact,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn for_resolved_model_with_store(
+        providers: &ProvidersConfig,
+        resolved: &ResolvedEmbeddingModel,
+        session_redact: Arc<RedactionTable>,
+        store: crate::credentials::CredentialStore,
+    ) -> Result<Self> {
+        let entry = providers
+            .providers
+            .get(&resolved.provider)
+            .with_context(|| format!("unknown embedding provider `{}`", resolved.provider))?;
+        Self::for_provider_entry_with_store(
+            providers,
+            &resolved.provider,
+            entry,
+            &resolved.model,
+            resolved.embedding_dimensions,
+            session_redact,
+            Some(store),
         )
         .await
     }
@@ -59,7 +82,39 @@ impl OpenAiCompatEmbedder {
         expected_dimensions: Option<u32>,
         session_redact: Arc<RedactionTable>,
     ) -> Result<Self> {
-        let request = models_fetch::resolve_provider_request_async(provider_id, entry).await?;
+        Self::for_provider_entry_with_store(
+            providers,
+            provider_id,
+            entry,
+            model,
+            expected_dimensions,
+            session_redact,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn for_provider_entry_with_store(
+        providers: &ProvidersConfig,
+        provider_id: &str,
+        entry: &ProviderEntry,
+        model: &str,
+        expected_dimensions: Option<u32>,
+        session_redact: Arc<RedactionTable>,
+        store: Option<crate::credentials::CredentialStore>,
+    ) -> Result<Self> {
+        let request = match store {
+            Some(store) => {
+                models_fetch::resolve_provider_request_async_with_store(
+                    provider_id,
+                    entry,
+                    store,
+                    |name| std::env::var(name).ok(),
+                )
+                .await?
+            }
+            None => models_fetch::resolve_provider_request_async(provider_id, entry).await?,
+        };
         // AC4: the embedding send boundary is a potentially sensitive caller.
         // Its custody class is host-owned (the *configured* embedding model
         // fixes it, no caller may ask for `Trusted`), but it still may not

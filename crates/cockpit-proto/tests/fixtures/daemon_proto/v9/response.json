@@ -43,6 +43,27 @@
     "data": { "config_generation": 8 },
     "response": "workspace_trust_set"
   },
+  "workspace_trust": {
+    "data": { "config_generation": 8, "mode": "trust" },
+    "response": "workspace_trust"
+  },
+  "flycockpit_stored": {
+    "response": "flycockpit_stored"
+  },
+  "flycockpit_already_logged_in": {
+    "data": {
+      "email": "user@example.test",
+      "server_url": "https://example.test"
+    },
+    "response": "flycockpit_already_logged_in"
+  },
+  "flycockpit_cleared": {
+    "data": { "server_url": "https://example.test" },
+    "response": "flycockpit_cleared"
+  },
+  "flycockpit_not_logged_in": {
+    "response": "flycockpit_not_logged_in"
+  },
   "ack": {
     "response": "ack"
   },

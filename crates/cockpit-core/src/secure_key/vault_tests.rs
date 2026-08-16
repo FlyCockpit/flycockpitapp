@@ -413,6 +413,11 @@ fn initialize_deletes_kek_when_authority_txn_fails() {
 }
 
 #[test]
+fn first_run_keyring_first_not_file_first() {
+    first_run_persists_keyring_when_available();
+}
+
+#[test]
 fn first_run_persists_keyring_when_available() {
     // Old production persisted dest=database on first-run even with an
     // available probe. This expectation rejects that path: an available

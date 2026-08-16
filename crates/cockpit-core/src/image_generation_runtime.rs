@@ -943,13 +943,39 @@ pub struct ImageRuntimeRegistry {
     clock: Arc<dyn RuntimeClock>,
     dns: Arc<dyn DnsResolver>,
     connector: Arc<dyn BoundConnector>,
+    store: Option<crate::credentials::CredentialStore>,
 }
 
 impl ImageRuntimeRegistry {
-    fn resolve_ephemeral_headers(
+    fn secret_lookup(&self, name: &str) -> Option<String> {
+        let store = self.store.as_ref()?;
+        if let Some(value) = store.named_secret(name) {
+            return Some(value.to_string());
+        }
+        if let Some(value) = store.api_key(name) {
+            return Some(value);
+        }
+        let record = store.get(name)?;
+        if let Some(value) = record.as_str() {
+            return Some(value.to_string());
+        }
+        for field in ["instance_token", "access_token", "token", "api_key"] {
+            if let Some(value) = record.get(field).and_then(|value| value.as_str()) {
+                return Some(value.to_string());
+            }
+        }
+        None
+    }
+
+    pub(crate) fn resolve_ephemeral_headers(
+        &self,
         endpoint: &ImageEndpoint,
     ) -> Result<reqwest::header::HeaderMap, RuntimeError> {
-        let (headers, missing) = crate::providers::models_fetch::resolve_headers(&endpoint.headers);
+        let (headers, missing) = crate::providers::models_fetch::resolve_headers_with_sources(
+            &endpoint.headers,
+            |name| std::env::var(name).ok(),
+            |name| self.secret_lookup(name),
+        );
         if !missing.is_empty() {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::Authentication,
@@ -978,28 +1004,23 @@ impl ImageRuntimeRegistry {
                 ));
             }
         }
-        if let Some(reference) = &endpoint.credential_ref
-            && !resolved.contains_key(reqwest::header::AUTHORIZATION)
-        {
-            let store =
-                crate::credentials::CredentialStore::open_default_readonly().map_err(|_| {
-                    RuntimeError::new(
-                        RuntimeErrorCode::Authentication,
-                        "Check the configured credential reference.",
-                    )
-                })?;
-            let secret = store.named_secret(reference).ok_or(RuntimeError::new(
-                RuntimeErrorCode::Authentication,
-                "Check the configured credential reference.",
-            ))?;
-            let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {secret}"))
-                .map_err(|_| {
-                    RuntimeError::new(
-                        RuntimeErrorCode::Authentication,
-                        "Check the configured credential reference.",
-                    )
-                })?;
-            resolved.insert(reqwest::header::AUTHORIZATION, value);
+        if let Some(credential_ref) = endpoint.credential_ref.as_deref() {
+            let Some(token) = self.secret_lookup(credential_ref) else {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::Authentication,
+                    "Check the configured credential reference.",
+                ));
+            };
+            if !resolved.contains_key(reqwest::header::AUTHORIZATION) {
+                let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                    .map_err(|_| {
+                        RuntimeError::new(
+                            RuntimeErrorCode::Authentication,
+                            "Correct the configured credential reference.",
+                        )
+                    })?;
+                resolved.insert(reqwest::header::AUTHORIZATION, value);
+            }
         }
         Ok(resolved)
     }
@@ -1037,7 +1058,13 @@ impl ImageRuntimeRegistry {
             clock,
             dns,
             connector,
+            store: None,
         })
+    }
+
+    pub fn with_store(mut self, store: crate::credentials::CredentialStore) -> Self {
+        self.store = Some(store);
+        self
     }
     pub fn standard(adapters: StandardImageRuntimeAdapters) -> Result<Self, RuntimeError> {
         let dns: Arc<dyn DnsResolver> = Arc::new(TokioDnsResolver);
@@ -1516,7 +1543,7 @@ impl ImageRuntimeRegistry {
             request_id,
             kind,
             credential_identity_digest: credential_identity_digest.clone(),
-            resolved_headers: Self::resolve_ephemeral_headers(&endpoint)?,
+            resolved_headers: self.resolve_ephemeral_headers(&endpoint)?,
             limits,
         };
         let request = adapter.request(&probe)?;
@@ -1970,7 +1997,7 @@ impl ImageRuntimeRegistry {
         let proof = tokio::time::timeout_at(
             deadline,
             self.connector.execute(
-                ReadOnlyProbeRequest::new(url.clone(), Self::resolve_ephemeral_headers(endpoint)?),
+                ReadOnlyProbeRequest::new(url.clone(), self.resolve_ephemeral_headers(endpoint)?),
                 &allowed,
                 class,
                 ProbeLimits::health(),

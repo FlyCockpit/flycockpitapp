@@ -80,20 +80,28 @@ pub struct ResolvedAuth {
 /// the (async, possibly-refreshing) token fetch isn't on this sync path.
 #[allow(dead_code)]
 pub fn resolve_static(cfg: &ServerConfig) -> ResolvedAuth {
-    resolve_static_inner(None, cfg)
+    resolve_static_inner(None, "", cfg)
 }
 
 pub fn resolve_static_for_server(server: &str, cfg: &ServerConfig) -> ResolvedAuth {
-    let store = crate::credentials::CredentialStore::open_default().ok();
-    resolve_static_inner(Some((&store, server)), cfg)
+    resolve_static_for_server_with_store(server, cfg, None)
+}
+
+pub fn resolve_static_for_server_with_store(
+    server: &str,
+    cfg: &ServerConfig,
+    store: Option<&crate::credentials::CredentialStore>,
+) -> ResolvedAuth {
+    resolve_static_inner(store, server, cfg)
 }
 
 fn resolve_static_inner(
-    credential_context: Option<(&Option<crate::credentials::CredentialStore>, &str)>,
+    store: Option<&crate::credentials::CredentialStore>,
+    _server: &str,
     cfg: &ServerConfig,
 ) -> ResolvedAuth {
     let mut out = ResolvedAuth::default();
-    if let Some((store, _server)) = credential_context {
+    if let Some(store) = store {
         for (k, credential_ref) in &cfg.env_credential_refs {
             if let Some(value) = credential_value(store, credential_ref) {
                 out.env.insert(k.clone(), value);
@@ -112,7 +120,7 @@ fn resolve_static_inner(
     match &cfg.auth {
         Auth::Header(h) => {
             if let Some(credential_ref) = h.credential_ref.as_deref()
-                && let Some((store, _server)) = credential_context
+                && let Some(store) = store
             {
                 if let Some(value) = credential_value(store, credential_ref) {
                     out.headers.insert(h.header.clone(), value);
@@ -141,7 +149,7 @@ fn resolve_static_inner(
             }
         }
         Auth::Env(e) => {
-            if let Some((store, _server)) = credential_context {
+            if let Some(store) = store {
                 for (k, credential_ref) in &e.credential_refs {
                     if let Some(value) = credential_value(store, credential_ref) {
                         out.env.insert(k.clone(), value);
@@ -165,10 +173,10 @@ fn resolve_static_inner(
 }
 
 fn credential_value(
-    store: &Option<crate::credentials::CredentialStore>,
+    store: &crate::credentials::CredentialStore,
     credential_ref: &str,
 ) -> Option<String> {
-    let value = store.as_ref()?.get(credential_ref)?;
+    let value = store.get(credential_ref)?;
     if let Some(s) = value.as_str() {
         return Some(s.to_string());
     }
@@ -185,10 +193,21 @@ fn credential_value(
 /// `Ok(None)` when the server's auth isn't OAuth. Errors when OAuth is
 /// configured but no token is stored (the user must authenticate first).
 pub async fn oauth_bearer(server: &str, cfg: &ServerConfig) -> Result<Option<String>> {
+    oauth_bearer_with_store(server, cfg, None).await
+}
+
+pub async fn oauth_bearer_with_store(
+    server: &str,
+    cfg: &ServerConfig,
+    store: Option<&mut crate::credentials::CredentialStore>,
+) -> Result<Option<String>> {
     let Auth::Oauth(oauth) = &cfg.auth else {
         return Ok(None);
     };
-    let mut store = crate::credentials::CredentialStore::open_default()?;
+    let store = match store {
+        Some(store) => store,
+        None => anyhow::bail!("MCP server `{server}` requires an injected credential store"),
+    };
     let key = cred_key(server);
     let Some(raw) = store.get(&key).cloned() else {
         bail!("MCP server `{server}` requires OAuth — run `authenticate` in /settings → MCP first");
@@ -353,7 +372,11 @@ async fn refresh_token(oauth: &OauthAuth, refresh: &str) -> Result<StoredTokens>
 /// loopback redirect listener, open the browser to the authorize URL,
 /// capture the code, exchange it, and persist the tokens under
 /// `mcp:<server>`. Returns the stored access token's summary.
-pub async fn run_oauth_flow(server: &str, cfg: &ServerConfig) -> Result<StoredTokens> {
+pub async fn run_oauth_flow(
+    server: &str,
+    cfg: &ServerConfig,
+    store: &mut crate::credentials::CredentialStore,
+) -> Result<StoredTokens> {
     let Auth::Oauth(oauth) = &cfg.auth else {
         bail!("MCP server `{server}` is not configured for OAuth");
     };
@@ -379,7 +402,6 @@ pub async fn run_oauth_flow(server: &str, cfg: &ServerConfig) -> Result<StoredTo
     }
     let tokens = exchange_code(oauth, &code, &pkce.verifier, &redirect_uri).await?;
 
-    let mut store = crate::credentials::CredentialStore::open_default()?;
     store.set(cred_key(server), serde_json::to_value(&tokens)?);
     store.save()?;
     Ok(tokens)
@@ -541,7 +563,7 @@ mod tests {
             value: String::new(),
             credential_ref: Some("mcp-header-secret".into()),
         });
-        let resolved = resolve_static_for_server("example", &cfg);
+        let resolved = resolve_static_for_server_with_store("example", &cfg, Some(&store));
         assert_eq!(
             resolved.headers.get("X-Key").map(String::as_str),
             Some("header-secret-value")

@@ -605,6 +605,20 @@ pub struct ConnectedDaemon {
     pub startup_notice: Option<String>,
 }
 
+/// Attach to the canonical persistent daemon, spawning one if needed.
+///
+/// Product CLI commands that need installation state must go through this
+/// helper. Spawn failure is fail-closed: callers must not open SQLite.
+pub async fn ensure_persistent_daemon() -> Result<ConnectedDaemon> {
+    let connected = probe_or_spawn(LifecycleMode::AttachOrAutoPromote).await?;
+    if connected.owns_daemon {
+        anyhow::bail!(
+            "persistent daemon attach produced an ephemeral instance; refusing secret or workspace writes"
+        );
+    }
+    Ok(connected)
+}
+
 /// Find the daemon socket, optionally spawn the daemon, return a
 /// connected client. Honors [`LifecycleMode`].
 pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
@@ -766,6 +780,13 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
         // sandboxing part 2 precedence). Only an explicit
         // `cockpit daemon start --no-sandbox` sets the daemon-level flag.
         let canonical = DaemonPaths::resolve_canonical()?;
+        #[cfg(any(test, feature = "test-support"))]
+        let pid = if crate::daemon::in_process_auto_promote_enabled() {
+            crate::daemon::auto_promote_in_process_persistent().await?
+        } else {
+            spawn_detached(false)?
+        };
+        #[cfg(not(any(test, feature = "test-support")))]
         let pid = spawn_detached(false)?;
         (canonical, pid)
     };
@@ -833,7 +854,7 @@ async fn wait_for_daemon(socket: &Path) -> Result<DaemonClient> {
     let mut backoff = Duration::from_millis(2);
 
     loop {
-        if socket.exists() {
+        if crate::daemon::server::in_process_context(socket).is_some() || socket.exists() {
             // A connect error just means the socket exists but accept hasn't
             // started yet — fall through to the backoff retry.
             if let Ok(client) = DaemonClient::connect(socket).await {

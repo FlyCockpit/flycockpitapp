@@ -87,6 +87,14 @@ use cockpit_config::extended::{ExtendedConfig, ExtendedConfigDoc};
 use cockpit_config::providers::{
     AuthKind, ConfigDoc, OnUnlistedModelsFetch, ProviderEntry, ProvidersConfig,
 };
+
+pub(crate) fn cockpit_credential_store()
+-> anyhow::Result<cockpit_core::credentials::CredentialStore> {
+    let db = cockpit_core::db::Db::open_default()?;
+    let vault = cockpit_core::secure_key::open_for_db(&db)
+        .map_err(|error| anyhow::anyhow!("opening settings vault: {error}"))?;
+    cockpit_core::credentials::CredentialStore::from_vault(vault)
+}
 use cockpit_core::daemon::proto::Request;
 use cockpit_core::providers::models_fetch::FetchOutcome;
 use shell::{
@@ -2223,11 +2231,7 @@ impl SettingsDialog {
             )
             .map_err(|error| error.to_string())?;
         }
-        let notice = cockpit_core::secret_ref::protect_literal_headers(
-            &mut merged.providers,
-            self.credential_store_path.as_deref(),
-        )
-        .map_err(|e| e.to_string())?;
+        let notice = self.protect_provider_literal_headers(&mut merged.providers)?;
         // The layer-wide default is never part of this file write; it goes to
         // the daemon's authoritative effective-default operation, and the
         // dialog only shows the new value once that verified result arrives.
@@ -2288,10 +2292,8 @@ impl SettingsDialog {
             return Ok(0);
         }
 
-        let mut store = cockpit_core::credentials::CredentialStore::open_for_path_or_default(
-            self.credential_store_path.as_deref(),
-        )
-        .map_err(|error| format!("provider deleted; stored-secret cleanup failed: {error}"))?;
+        let mut store = cockpit_credential_store()
+            .map_err(|error| format!("provider deleted; stored-secret cleanup failed: {error}"))?;
         for name in &names {
             store.remove_named_secret(name);
         }
@@ -3306,15 +3308,25 @@ impl SettingsCx {
         Ok(())
     }
 
+    fn protect_provider_literal_headers(
+        &self,
+        providers: &mut std::collections::BTreeMap<String, ProviderEntry>,
+    ) -> Result<Option<cockpit_core::secret_ref::SecretRefNotice>, String> {
+        #[cfg(test)]
+        if let Some(path) = self.credential_store_path.as_deref() {
+            return cockpit_core::secret_ref::protect_literal_headers(providers, Some(path))
+                .map_err(|e| e.to_string());
+        }
+        let mut store = cockpit_credential_store().map_err(|e| e.to_string())?;
+        cockpit_core::secret_ref::protect_literal_headers_in_store(providers, &mut store)
+            .map_err(|e| e.to_string())
+    }
+
     fn save_config(&mut self) -> Result<(), String> {
         let mut doc = ConfigDoc::load(&self.config_path).map_err(|e| e.to_string())?;
         let mut merged = doc.providers();
         merge_dialog_provider_config(&mut merged, &self.original_config, &self.config);
-        let notice = cockpit_core::secret_ref::protect_literal_headers(
-            &mut merged.providers,
-            self.credential_store_path.as_deref(),
-        )
-        .map_err(|e| e.to_string())?;
+        let notice = self.protect_provider_literal_headers(&mut merged.providers)?;
         // The layer-wide default is never part of this file write; it goes to
         // the daemon's authoritative effective-default operation, and the
         // dialog only shows the new value once that verified result arrives.
@@ -3375,10 +3387,8 @@ impl SettingsCx {
             return Ok(0);
         }
 
-        let mut store = cockpit_core::credentials::CredentialStore::open_for_path_or_default(
-            self.credential_store_path.as_deref(),
-        )
-        .map_err(|error| format!("provider deleted; stored-secret cleanup failed: {error}"))?;
+        let mut store = cockpit_credential_store()
+            .map_err(|error| format!("provider deleted; stored-secret cleanup failed: {error}"))?;
         for name in &names {
             store.remove_named_secret(name);
         }

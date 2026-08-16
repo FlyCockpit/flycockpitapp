@@ -70,7 +70,7 @@ impl UseSealedValueTool {
         }
         Ok(Arc::new(SealedRuntime::new(
             ctx.session.db.clone(),
-            SealedCompartment::open_default()?,
+            SealedCompartment::from_vault(ctx.session.secret_vault().clone()),
             crate::sealed::action::installed_sealed_action_registry(),
         )))
     }

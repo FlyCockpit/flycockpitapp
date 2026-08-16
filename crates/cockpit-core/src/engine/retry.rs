@@ -111,9 +111,10 @@ pub(crate) fn failure_retry_decision_and_rationale(
         // 429 does not mis-route it onto the retryable-rate-limit path. The
         // recovery action is to top up or switch provider; the backup layer
         // routes to a different provider.
-        InferenceErrorClass::BillingOrQuotaExhausted => {
-            ("fail_fast", "billing_or_quota_exhausted_top_up_or_switch_provider")
-        }
+        InferenceErrorClass::BillingOrQuotaExhausted => (
+            "fail_fast",
+            "billing_or_quota_exhausted_top_up_or_switch_provider",
+        ),
         _ if provider_status.is_some_and(|status| status == 429 || status == 503) => (
             "terminal_after_retry_layer",
             "retryable_http_status_terminal",
@@ -383,9 +384,7 @@ pub(crate) fn wait_for_decision(
         RetryDecision::Retry => {
             (!overload_retry_used).then(|| backoff_for(failures, jitter_factor()))
         }
-        RetryDecision::RetryAfter(Some(d)) => {
-            (!overload_retry_used).then(|| d.min(BACKOFF_CAP))
-        }
+        RetryDecision::RetryAfter(Some(d)) => (!overload_retry_used).then(|| d.min(BACKOFF_CAP)),
         RetryDecision::RetryAfter(None) => {
             (!overload_retry_used).then(|| backoff_for(failures, jitter_factor()))
         }
@@ -643,8 +642,8 @@ where
                 // terminal `InferenceFailure.recovery` reflects the chain, not
                 // just the last attempt (issue #23).
                 if let Some(acc) = recovery_out {
-                    let rank = crate::engine::model::rig_boundary::provider_recovery_signal(&err)
-                        .rank();
+                    let rank =
+                        crate::engine::model::rig_boundary::provider_recovery_signal(&err).rank();
                     acc.fetch_max(rank, std::sync::atomic::Ordering::SeqCst);
                 }
                 let decision = classify(&err);
@@ -1285,7 +1284,11 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "overload retried once, then 400");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "overload retried once, then 400"
+        );
         assert_eq!(
             crate::engine::model::ProviderRecoverySignal::from_rank(
                 recovery.load(Ordering::SeqCst)

@@ -236,7 +236,7 @@ async fn sealed_session_adoption_journals_protected_history() {
     //     id / version) and journals one Sealed row.
     {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = Session::create(
+        let session = Session::create_for_test(
             db.clone(),
             std::path::PathBuf::from("/proj"),
             "Build",
@@ -273,7 +273,7 @@ async fn sealed_session_adoption_journals_protected_history() {
     //     version from the identity.
     {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = Session::create(
+        let session = Session::create_for_test(
             db.clone(),
             std::path::PathBuf::from("/proj"),
             "Build",
@@ -385,7 +385,7 @@ async fn sealed_session_adoption_journals_protected_history() {
 
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = std::sync::Arc::new(
-            Session::create(
+            Session::create_for_test(
                 db.clone(),
                 std::path::PathBuf::from("/proj"),
                 "Build",
@@ -487,7 +487,7 @@ async fn sealed_session_adoption_journals_protected_history() {
 
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = std::sync::Arc::new(
-            Session::create(
+            Session::create_for_test(
                 db.clone(),
                 std::path::PathBuf::from("/proj"),
                 "Build",
@@ -595,7 +595,7 @@ async fn concurrent_sealed_adoption_and_secret_file_registration_lose_neither_li
         delay: std::time::Duration::from_millis(150),
     });
     let session = std::sync::Arc::new(
-        Session::create(db.clone(), tmp.path().to_path_buf(), "Build", resolver).unwrap(),
+        Session::create_for_test(db.clone(), tmp.path().to_path_buf(), "Build", resolver).unwrap(),
     );
     let redaction: crate::daemon::SharedRedactionTable = std::sync::Arc::new(
         std::sync::RwLock::new(std::sync::Arc::new(RedactionTable::empty())),

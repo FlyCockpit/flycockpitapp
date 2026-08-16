@@ -414,10 +414,13 @@ pub async fn build_bundle_zip_bytes(
     db: &Db,
     target: &SessionRow,
     include_generated_artifacts: bool,
+    vault: &crate::secure_key::SecretVault,
 ) -> Result<BundleBytes> {
     let db_for_files = db.clone();
     let target_id = target.session_id;
-    let vault = export_vault(db)?;
+    let vault = vault.clone();
+    let store =
+        crate::credentials::CredentialStore::from_vault(std::sync::Arc::new(vault.clone()))?;
     db.read(move |conn| {
         let env = process_env_map();
         assemble_bundle_snapshot_conn(
@@ -430,6 +433,7 @@ pub async fn build_bundle_zip_bytes(
             },
             &env,
             Some(&vault),
+            Some(&store),
         )
     })
     .await
@@ -467,6 +471,7 @@ pub async fn build_bundle_zip_bytes_raw_local(
             },
             &env,
             None,
+            None,
         )
     })
     .await
@@ -488,6 +493,7 @@ pub async fn write_bundle_zip(
     out_path: &std::path::Path,
     overwrite: bool,
     include_generated_artifacts: bool,
+    vault: &crate::secure_key::SecretVault,
 ) -> Result<BundleSummary> {
     if out_path.exists() && !overwrite {
         anyhow::bail!(
@@ -496,7 +502,7 @@ pub async fn write_bundle_zip(
         );
     }
 
-    let bundle = build_bundle_zip_bytes(db, target, include_generated_artifacts).await?;
+    let bundle = build_bundle_zip_bytes(db, target, include_generated_artifacts, vault).await?;
 
     if let Some(parent) = out_path.parent()
         && !parent.as_os_str().is_empty()
@@ -516,6 +522,7 @@ pub fn write_bundle_zip_blocking_for_sync_cli(
     out_path: &std::path::Path,
     overwrite: bool,
     include_generated_artifacts: bool,
+    vault: &crate::secure_key::SecretVault,
 ) -> Result<BundleSummary> {
     if out_path.exists() && !overwrite {
         anyhow::bail!(
@@ -526,7 +533,9 @@ pub fn write_bundle_zip_blocking_for_sync_cli(
 
     let db_for_files = db.clone();
     let target_id = target.session_id;
-    let vault = export_vault(db)?;
+    let vault = vault.clone();
+    let store =
+        crate::credentials::CredentialStore::from_vault(std::sync::Arc::new(vault.clone()))?;
     let bundle = db.blocking_for_sync_cli(move |conn| {
         let env = process_env_map();
         assemble_bundle_snapshot_conn(
@@ -539,6 +548,7 @@ pub fn write_bundle_zip_blocking_for_sync_cli(
             },
             &env,
             Some(&vault),
+            Some(&store),
         )
     })?;
 
@@ -602,6 +612,7 @@ fn assemble_bundle_snapshot_conn(
     options: ExportBundleOptions,
     env: &HashMap<String, String>,
     vault: Option<&crate::secure_key::SecretVault>,
+    store: Option<&crate::credentials::CredentialStore>,
 ) -> Result<BundleBytes> {
     assemble_bundle_snapshot_conn_with_after_collect(
         db,
@@ -610,6 +621,7 @@ fn assemble_bundle_snapshot_conn(
         options,
         env,
         vault,
+        store,
         || Ok(()),
     )
 }
@@ -621,6 +633,7 @@ fn assemble_bundle_snapshot_conn_with_after_collect<F>(
     options: ExportBundleOptions,
     env: &HashMap<String, String>,
     vault: Option<&crate::secure_key::SecretVault>,
+    store: Option<&crate::credentials::CredentialStore>,
     after_collect: F,
 ) -> Result<BundleBytes>
 where
@@ -642,7 +655,7 @@ where
     after_collect()?;
 
     let bytes =
-        build_zip_with_options_and_env_conn(db, &tx, &target, &bundle, options, env, vault)?;
+        build_zip_with_options_and_env_conn(db, &tx, &target, &bundle, options, env, vault, store)?;
     let summary = BundleSummary {
         session_count: bundle.len(),
         byte_len: bytes.len(),
@@ -799,10 +812,16 @@ async fn build_zip_with_options_and_env(
     let bundle = bundle.to_vec();
     let env = env.clone();
     let vault = if options.redacted {
-        Some(export_vault(db)?)
+        Some(crate::secure_key::vault_for_db(db).map_err(|e| anyhow::anyhow!("{e}"))?)
     } else {
         None
     };
+    let store = vault
+        .as_ref()
+        .map(|vault| {
+            crate::credentials::CredentialStore::from_vault(std::sync::Arc::clone(vault))
+        })
+        .transpose()?;
     let trust_policy = crate::config::trust::current_workspace_trust_policy();
     db.read(move |conn| {
         let build = || {
@@ -814,6 +833,7 @@ async fn build_zip_with_options_and_env(
                 options,
                 &env,
                 vault.as_deref(),
+                store.as_ref(),
             )
         };
         match trust_policy {
@@ -832,12 +852,13 @@ fn build_zip_with_options_and_env_conn(
     options: ExportBundleOptions,
     env: &HashMap<String, String>,
     vault: Option<&crate::secure_key::SecretVault>,
+    store: Option<&crate::credentials::CredentialStore>,
 ) -> Result<Vec<u8>> {
     let export_redactor = if options.redacted {
         // Non-bypassable default: the enforced table unioned across every
         // bundled session's persisted redaction-table union (column or vault).
         // Fails closed if a persisted or vault table cannot be parsed.
-        export_redaction_table_for_bundle(vault, Some(conn), target, bundle, env)?
+        export_redaction_table_for_bundle(vault, store, Some(conn), target, bundle, env)?
     } else {
         // Explicit local raw export: a no-op table so every member body and
         // member path is emitted exactly as stored. No journal rehydration and
@@ -1754,9 +1775,11 @@ pub fn redaction_table_for_session(
     db: &Db,
     target: &SessionRow,
     env: &HashMap<String, String>,
+    vault: &crate::secure_key::SecretVault,
 ) -> Result<RedactionTable> {
-    let vault = export_vault(db)?;
-    export_redaction_table_with_env(Some(vault.as_ref()), None, target, env)
+    let store =
+        crate::credentials::CredentialStore::from_vault(std::sync::Arc::new(vault.clone()))?;
+    export_redaction_table_with_env(Some(vault), Some(&store), None, target, env)
 }
 
 /// Compatibility wrapper: vault load happens on `db`, not the open connection,
@@ -1766,8 +1789,9 @@ pub fn redaction_table_for_session_conn(
     _conn: &Connection,
     target: &SessionRow,
     env: &HashMap<String, String>,
+    vault: &crate::secure_key::SecretVault,
 ) -> Result<RedactionTable> {
-    redaction_table_for_session(db, target, env)
+    redaction_table_for_session(db, target, env, vault)
 }
 
 /// Recursively scrub every JSON string value (and nested object/array value)
@@ -1776,11 +1800,6 @@ pub fn redaction_table_for_session_conn(
 /// payload is redacted before base64/staging.
 pub fn scrub_export_json_value(value: &mut Value, redactor: &RedactionTable) {
     redact_value_for_export(value, redactor);
-}
-
-fn export_vault(db: &Db) -> Result<std::sync::Arc<crate::secure_key::SecretVault>> {
-    crate::secure_key::vault_for_db(db)
-        .map_err(|e| anyhow::anyhow!("opening vault for export redaction: {e}"))
 }
 
 fn session_persisted_or_vault_redaction_json(
@@ -1825,11 +1844,19 @@ fn session_persisted_or_vault_redaction_json(
 
 fn export_redaction_table_with_env(
     vault: Option<&crate::secure_key::SecretVault>,
+    store: Option<&crate::credentials::CredentialStore>,
     conn: Option<&Connection>,
     target: &SessionRow,
     env: &HashMap<String, String>,
 ) -> Result<RedactionTable> {
-    export_redaction_table_for_sessions(vault, conn, target, std::slice::from_ref(target), env)
+    export_redaction_table_for_sessions(
+        vault,
+        store,
+        conn,
+        target,
+        std::slice::from_ref(target),
+        env,
+    )
 }
 
 /// The non-bypassable export redactor for a whole bundle: the target project's
@@ -1840,16 +1867,18 @@ fn export_redaction_table_with_env(
 /// any unparseable persisted table.
 fn export_redaction_table_for_bundle(
     vault: Option<&crate::secure_key::SecretVault>,
+    store: Option<&crate::credentials::CredentialStore>,
     conn: Option<&Connection>,
     target: &SessionRow,
     bundle: &[SessionRow],
     env: &HashMap<String, String>,
 ) -> Result<RedactionTable> {
-    export_redaction_table_for_sessions(vault, conn, target, bundle, env)
+    export_redaction_table_for_sessions(vault, store, conn, target, bundle, env)
 }
 
 fn export_redaction_table_for_sessions(
     vault: Option<&crate::secure_key::SecretVault>,
+    store: Option<&crate::credentials::CredentialStore>,
     conn: Option<&Connection>,
     target: &SessionRow,
     sessions: &[SessionRow],
@@ -1857,8 +1886,13 @@ fn export_redaction_table_for_sessions(
 ) -> Result<RedactionTable> {
     let cwd = PathBuf::from(&target.project_root);
     let extended = crate::config::extended::load_for_cwd(&cwd);
-    let mut table = RedactionTable::build_with_env_and_store(&extended.redact, &cwd, env)
-        .context("building export redaction table")?;
+    let mut table = match store {
+        Some(store) => {
+            RedactionTable::build_with_env_and_credential_store(&extended.redact, &cwd, env, store)
+        }
+        None => RedactionTable::build_with_env_and_store(&extended.redact, &cwd, env),
+    }
+    .context("building export redaction table")?;
     for session in sessions {
         let Some(json) = session_persisted_or_vault_redaction_json(vault, conn, session)? else {
             continue;

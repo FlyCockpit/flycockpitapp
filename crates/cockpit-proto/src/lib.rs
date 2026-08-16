@@ -1850,6 +1850,13 @@ mod tui_ownership_rpc_contract_tests {
         assert_eq!(trust["params"]["mode"], "ignore_config");
         assert_eq!(trust["params"]["expected_config_generation"], 9);
 
+        let get_trust = serde_json::to_value(Request::GetWorkspaceTrust {
+            project_root: "/workspace".into(),
+        })
+        .unwrap();
+        assert_eq!(get_trust["request"], "get_workspace_trust");
+        assert_eq!(get_trust["params"]["project_root"], "/workspace");
+
         let assistant = serde_json::to_value(Request::ResolveAssistantSession {
             assistant_id: "helper".into(),
             project_root: "/workspace".into(),

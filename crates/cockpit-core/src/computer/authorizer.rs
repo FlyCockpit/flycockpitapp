@@ -109,7 +109,7 @@ mod tests {
 
     fn build_approver(cwd: &std::path::Path) -> (Arc<Approver>, crate::db::Db, uuid::Uuid) {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = crate::session::Session::create(
+        let session = crate::session::Session::create_for_test(
             db.clone(),
             cwd.to_path_buf(),
             "builder",

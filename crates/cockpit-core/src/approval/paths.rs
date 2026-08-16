@@ -504,7 +504,7 @@ mod file_write_grant_tests {
 
     fn approver(cwd: &std::path::Path) -> Arc<Approver> {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = crate::session::Session::create(
+        let session = crate::session::Session::create_for_test(
             db.clone(),
             cwd.to_path_buf(),
             "builder",

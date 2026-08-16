@@ -2,27 +2,15 @@ use anyhow::{Context, Result};
 
 use crate::auth::flycockpit::{
     ConnectionStatus, DEFAULT_SERVER_URL, FlycockpitClient, StoredFlycockpitCredential,
-    clear_credential, default_display_name, load_credential, maybe_load_credential,
-    store_credential,
+    default_display_name, load_credential_from_vault,
 };
 use crate::cli::LoginArgs;
-use crate::daemon::DaemonStatus;
-use crate::daemon::client::DaemonClient;
+use crate::daemon::client::ensure_persistent_daemon;
 use crate::daemon::proto::{Request, Response};
 use crate::db::connector::ConnectorDisclosure;
 use crate::db::org_sync::OrgSyncDisclosure;
 
 pub async fn login(args: LoginArgs) -> Result<()> {
-    if let Some(existing) = maybe_load_credential()
-        && !args.force
-    {
-        anyhow::bail!(
-            "already logged in to FlyCockpit as {} on {}; run `cockpit account logout` first or pass `--force`",
-            existing.account.email,
-            existing.server_url
-        );
-    }
-
     let client = FlycockpitClient::new(if args.server.trim().is_empty() {
         DEFAULT_SERVER_URL
     } else {
@@ -35,7 +23,6 @@ pub async fn login(args: LoginArgs) -> Result<()> {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .unwrap_or_else(default_display_name);
-    let existing_instance_id = maybe_load_credential().map(|credential| credential.instance_id);
 
     let login = client.begin_device_code_login().await?;
     eprintln!("Open this URL to authorize FlyCockpit account access:");
@@ -49,8 +36,22 @@ pub async fn login(args: LoginArgs) -> Result<()> {
     }
 
     let credential = client
-        .complete_device_code_login_without_store(login, Some(display_name), existing_instance_id)
+        .complete_device_code_login_without_store(login, Some(display_name), None)
         .await?;
+    match store_credential_via_daemon(&credential, args.force).await? {
+        StoreCredentialOutcome::AlreadyLoggedIn { email, server_url } => {
+            if let Err(error) = client.revoke_instance(&credential).await {
+                tracing::warn!(
+                    error = %error,
+                    "FlyCockpit account login: best-effort revoke of unpersisted instance failed"
+                );
+            }
+            anyhow::bail!(
+                "already logged in to FlyCockpit as {email} on {server_url}; run `cockpit account logout` first or pass `--force`"
+            );
+        }
+        StoreCredentialOutcome::Stored => {}
+    }
     println!(
         "Logged in to FlyCockpit as {} on {}",
         credential.account.email, credential.server_url
@@ -74,14 +75,14 @@ pub async fn login(args: LoginArgs) -> Result<()> {
             println!("Remote access: disabled (use `cockpit connect on` to enable)");
         }
     }
-    store_credential_via_daemon_or_vault(&credential).await?;
     if let Some(db) = db.as_ref() {
-        match crate::daemon::org_sync::sync_current_credential_once(db).await {
+        match crate::daemon::org_sync::sync_credential_once(db, credential.clone()).await {
             Ok(crate::daemon::org_sync::OrgSyncOnceOutcome::EnrollmentRequired { org_id }) => {
                 if org_logging_enrollment_choice()? {
                     db.set_org_sync_enrolled(&credential.server_url, &org_id)
                         .await?;
-                    let _ = crate::daemon::org_sync::sync_current_credential_once(db).await?;
+                    let _ = crate::daemon::org_sync::sync_credential_once(db, credential.clone())
+                        .await?;
                 }
             }
             Ok(_) => {}
@@ -94,89 +95,90 @@ pub async fn login(args: LoginArgs) -> Result<()> {
 }
 
 pub async fn logout() -> Result<()> {
-    let credential = match load_credential() {
-        Ok(credential) => credential,
-        Err(_) => {
+    match clear_credential_via_daemon().await? {
+        ClearCredentialOutcome::NotLoggedIn => {
             println!("Not logged in to FlyCockpit.");
-            return Ok(());
+            Ok(())
         }
-    };
-    if let Ok(client) = FlycockpitClient::new(&credential.server_url)
-        && let Err(error) = client.revoke_instance(&credential).await
-    {
-        tracing::warn!(error = %error, "FlyCockpit account logout: best-effort instance revoke failed");
-    }
-    clear_credential_via_daemon_or_vault().await?;
-    if let Ok(db) = crate::db::Db::open_default()
-        && let Err(error) = db.mark_org_sync_disabled(&credential.server_url).await
-    {
-        tracing::warn!(error = %error, "FlyCockpit account logout: disabling org sync state failed");
-    }
-    println!("Logged out of FlyCockpit.");
-    Ok(())
-}
-
-async fn running_persistent_daemon_client() -> Result<Option<DaemonClient>> {
-    let discovered = crate::daemon::discover().await;
-    if !matches!(discovered.status, DaemonStatus::Running) {
-        return Ok(None);
-    }
-    match DaemonClient::connect(&discovered.paths.socket).await {
-        Ok(client) => Ok(Some(client)),
-        Err(error) => {
-            anyhow::bail!(
-                "FlyCockpit credential RPC failed because the daemon disappeared: {error}"
-            )
+        ClearCredentialOutcome::Cleared { server_url } => {
+            if let Ok(db) = crate::db::Db::open_default()
+                && let Err(error) = db.mark_org_sync_disabled(&server_url).await
+            {
+                tracing::warn!(error = %error, "FlyCockpit account logout: disabling org sync state failed");
+            }
+            println!("Logged out of FlyCockpit.");
+            Ok(())
         }
     }
 }
 
-async fn store_credential_via_daemon_or_vault(
+fn open_cli_flycockpit_credential() -> Result<StoredFlycockpitCredential> {
+    let db = crate::db::Db::open_default().context("opening cockpit DB for whoami")?;
+    let vault = cockpit_core::secure_key::vault_for_db(&db)
+        .map_err(|e| anyhow::anyhow!("opening whoami vault: {e}"))?;
+    load_credential_from_vault(vault)
+}
+
+enum StoreCredentialOutcome {
+    Stored,
+    AlreadyLoggedIn { email: String, server_url: String },
+}
+
+enum ClearCredentialOutcome {
+    Cleared { server_url: String },
+    NotLoggedIn,
+}
+
+async fn store_credential_via_daemon(
     credential: &StoredFlycockpitCredential,
-) -> Result<()> {
-    if let Some(client) = running_persistent_daemon_client().await? {
-        match client
-            .request(Request::StoreFlycockpitCredential {
-                credential: credential.clone(),
-            })
-            .await
-        {
-            Ok(Ok(Response::Ack)) => return Ok(()),
-            Ok(Ok(other)) => anyhow::bail!(
-                "daemon returned unexpected response to FlyCockpit credential store: {other:?}"
-            ),
-            Ok(Err(error)) => {
-                anyhow::bail!("daemon rejected FlyCockpit credential store: {error}")
-            }
-            Err(error) => {
-                anyhow::bail!("FlyCockpit credential RPC failed: {error}")
-            }
+    force: bool,
+) -> Result<StoreCredentialOutcome> {
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for FlyCockpit login")?;
+    match daemon
+        .client
+        .request(Request::StoreFlycockpitCredential {
+            credential: credential.clone(),
+            force,
+        })
+        .await
+    {
+        Ok(Ok(Response::FlycockpitStored)) => Ok(StoreCredentialOutcome::Stored),
+        Ok(Ok(Response::FlycockpitAlreadyLoggedIn { email, server_url })) => {
+            Ok(StoreCredentialOutcome::AlreadyLoggedIn { email, server_url })
         }
+        Ok(Ok(other)) => anyhow::bail!(
+            "daemon returned unexpected response to FlyCockpit credential store: {other:?}"
+        ),
+        Ok(Err(error)) => anyhow::bail!("daemon rejected FlyCockpit credential store: {error}"),
+        Err(error) => anyhow::bail!("FlyCockpit credential RPC failed: {error}"),
     }
-    // Daemon-less: in-process vault handle. Never recreate credentials.json.
-    store_credential(credential).context("storing FlyCockpit credentials")
 }
 
-async fn clear_credential_via_daemon_or_vault() -> Result<()> {
-    if let Some(client) = running_persistent_daemon_client().await? {
-        match client.request(Request::ClearFlycockpitCredential).await {
-            Ok(Ok(Response::Ack)) => return Ok(()),
-            Ok(Ok(other)) => anyhow::bail!(
-                "daemon returned unexpected response to FlyCockpit credential clear: {other:?}"
-            ),
-            Ok(Err(error)) => {
-                anyhow::bail!("daemon rejected FlyCockpit credential clear: {error}")
-            }
-            Err(error) => {
-                anyhow::bail!("FlyCockpit credential clear RPC failed: {error}")
-            }
+async fn clear_credential_via_daemon() -> Result<ClearCredentialOutcome> {
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for FlyCockpit logout")?;
+    match daemon
+        .client
+        .request(Request::ClearFlycockpitCredential)
+        .await
+    {
+        Ok(Ok(Response::FlycockpitCleared { server_url })) => {
+            Ok(ClearCredentialOutcome::Cleared { server_url })
         }
+        Ok(Ok(Response::FlycockpitNotLoggedIn)) => Ok(ClearCredentialOutcome::NotLoggedIn),
+        Ok(Ok(other)) => anyhow::bail!(
+            "daemon returned unexpected response to FlyCockpit credential clear: {other:?}"
+        ),
+        Ok(Err(error)) => anyhow::bail!("daemon rejected FlyCockpit credential clear: {error}"),
+        Err(error) => anyhow::bail!("FlyCockpit credential clear RPC failed: {error}"),
     }
-    clear_credential().context("clearing FlyCockpit credentials")
 }
 
 pub async fn whoami() -> Result<()> {
-    let credential = match load_credential() {
+    let credential = match open_cli_flycockpit_credential() {
         Ok(credential) => credential,
         Err(_) => {
             println!("Not logged in to FlyCockpit.");
@@ -368,8 +370,14 @@ mod tests {
     }
 
     impl EnvRestore {
+        #[allow(dead_code)]
         fn isolate_daemon_and_credentials(root: &std::path::Path) -> Self {
             let guard = crate::test_env::lock();
+            Self::from_guard(root, guard)
+        }
+
+        async fn isolate_daemon_and_credentials_async(root: &std::path::Path) -> Self {
+            let guard = crate::test_env::lock_async().await;
             Self::from_guard(root, guard)
         }
 
@@ -401,56 +409,129 @@ mod tests {
         }
     }
 
-    #[test]
-    fn flycockpit_login_refresh_logout_use_vault() {
+    #[tokio::test]
+    async fn login_without_running_daemon_starts_persistent_daemon() {
         let tmp = tempfile::tempdir().unwrap();
-        let _env = EnvRestore::isolate_daemon_and_credentials(tmp.path());
+        let _env = EnvRestore::isolate_daemon_and_credentials_async(tmp.path()).await;
         let credential_path = tmp.path().join("state/cockpit/credentials.json");
-        let credential = credential();
+        let discovered = crate::daemon::discover().await;
+        assert!(
+            !matches!(discovered.status, crate::daemon::DaemonStatus::Running),
+            "precondition: no daemon is running"
+        );
 
-        // Daemon-less: the vault helper is the production in-process path.
-        crate::auth::flycockpit::store_credential(&credential).unwrap();
+        let _promote = crate::daemon::enable_in_process_auto_promote();
+        store_credential_via_daemon(&credential(), false)
+            .await
+            .expect("login persist must attach through the spawned daemon");
+
+        let discovered = crate::daemon::discover().await;
+        assert!(
+            matches!(discovered.status, crate::daemon::DaemonStatus::Running),
+            "login must leave the canonical daemon running, got {:?}",
+            discovered.status
+        );
         assert!(
             !credential_path.exists(),
-            "daemon-less login must use the vault, not credentials.json"
+            "login must not write credentials.json"
         );
-        let loaded = crate::auth::flycockpit::load_credential().unwrap();
-        assert_eq!(loaded.instance_token, credential.instance_token);
-
-        let mut refreshed = credential.clone();
-        refreshed.instance_token = "fci_refreshed".to_string();
-        crate::auth::flycockpit::store_credential(&refreshed).unwrap();
-        assert!(!credential_path.exists());
-        assert_eq!(
-            crate::auth::flycockpit::load_credential()
-                .unwrap()
-                .instance_token,
-            "fci_refreshed"
-        );
-
-        crate::auth::flycockpit::clear_credential().unwrap();
-        assert!(crate::auth::flycockpit::load_credential().is_err());
-        assert!(!credential_path.exists());
+        match store_credential_via_daemon(&credential(), false)
+            .await
+            .expect("second store probes the daemon vault")
+        {
+            StoreCredentialOutcome::AlreadyLoggedIn { email, server_url } => {
+                assert_eq!(email, "user@example.test");
+                assert_eq!(server_url, "https://app.example.test");
+            }
+            StoreCredentialOutcome::Stored => {
+                panic!("daemon vault must already hold the login credential")
+            }
+        }
     }
 
     #[test]
-    fn flycockpit_daemon_down_does_not_write_credentials_json() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _env = EnvRestore::isolate_daemon_and_credentials(tmp.path());
-        let credential_path = tmp.path().join("state/cockpit/credentials.json");
-        let runtime = tmp.path().join("runtime/cockpit");
-        std::fs::create_dir_all(&runtime).unwrap();
-        std::fs::write(runtime.join("daemon.lock"), b"stale").unwrap();
+    fn no_daemon_fallback_deleted() {
+        let source = include_str!("flycockpit.rs");
+        let production = source
+            .split("mod tests {")
+            .next()
+            .expect("production source");
+        assert!(!production.contains(concat!("store_credential_via_daemon", "_or_vault")));
+        assert!(!production.contains(concat!("clear_credential_via_daemon", "_or_vault")));
+        assert!(!production.contains(concat!("Daemon-less: in-process vault ", "handle")));
+    }
 
-        crate::auth::flycockpit::store_credential(&credential()).unwrap();
+    #[test]
+    fn login_logout_use_store_clear_rpcs() {
+        let source = include_str!("flycockpit.rs");
+        let production = source
+            .split("mod tests {")
+            .next()
+            .expect("production source");
+        let login = production
+            .split("pub async fn login(")
+            .nth(1)
+            .and_then(|rest| rest.split("pub async fn logout(").next())
+            .expect("login body");
+        let logout = production
+            .split("pub async fn logout(")
+            .nth(1)
+            .and_then(|rest| rest.split("pub async fn whoami(").next())
+            .expect("logout body");
+        for (label, body) in [("login", login), ("logout", logout)] {
+            for forbidden in [
+                "maybe_load_credential",
+                "CredentialStore::open",
+                "flycockpit::store_credential",
+                "flycockpit::clear_credential",
+                "load_credential()",
+            ] {
+                assert!(
+                    !body.contains(forbidden),
+                    "{label} persist-clear must not call {forbidden}"
+                );
+            }
+        }
+        assert!(production.contains("StoreFlycockpitCredential"));
+        assert!(production.contains("ClearFlycockpitCredential"));
+        assert!(production.contains("FlycockpitAlreadyLoggedIn"));
+        assert!(production.contains("Db::open_default"));
+        let login_body = production
+            .split("pub async fn login(")
+            .nth(1)
+            .and_then(|rest| rest.split("pub async fn logout(").next())
+            .expect("login body");
         assert!(
-            !credential_path.exists(),
-            "daemon-down must not recreate credentials.json"
+            login_body.contains("sync_credential_once"),
+            "login org-sync must use the in-memory credential"
         );
         assert!(
-            !std::fs::read_to_string(tmp.path().join("state/cockpit/credentials.json.lock"))
-                .is_ok()
+            !login_body.contains("sync_current_credential_once"),
+            "login must not reload the vault via org-sync"
         );
+        assert!(
+            login_body.contains("revoke_instance"),
+            "unforced AlreadyLoggedIn must revoke the just-registered instance"
+        );
+        let whoami = production
+            .split("pub async fn whoami()")
+            .nth(1)
+            .expect("whoami remains");
+        assert!(whoami.contains("open_cli_flycockpit_credential"));
+    }
+
+    #[test]
+    fn whoami_stays_on_allow_list() {
+        let source = include_str!("flycockpit.rs");
+        assert!(source.contains("pub async fn whoami()"));
+        assert!(source.contains("load_credential_from_vault"));
+        assert!(!source.contains(concat!("GetFlycockpit", "Account")));
+        let whoami = source
+            .split("pub async fn whoami()")
+            .nth(1)
+            .and_then(|rest| rest.split("pub fn render_whoami").next())
+            .expect("whoami body");
+        assert!(whoami.contains("Db::open_default"));
     }
 
     #[test]

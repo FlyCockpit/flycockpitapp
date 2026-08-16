@@ -13,7 +13,7 @@ use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 use crate::cli::FetchModelsArgs;
 use crate::config::dirs::most_specific_config_write_target;
@@ -24,6 +24,27 @@ use crate::config::providers::{
 };
 use crate::providers::models_fetch::{self, FetchOutcome, persist_provider};
 use crate::providers::{ProviderTemplate, template_by_id};
+
+async fn resolve_request_via_vault(
+    provider_id: &str,
+    entry: &crate::config::providers::ProviderEntry,
+) -> Result<(
+    models_fetch::ResolvedRequest,
+    crate::credentials::CredentialStore,
+)> {
+    let db = crate::db::Db::open_default().context("opening cockpit DB")?;
+    let vault = cockpit_core::secure_key::open_for_db(&db)
+        .map_err(|e| anyhow!("opening fetch-models vault: {e}"))?;
+    let store = crate::credentials::CredentialStore::from_vault(vault)?;
+    let resolved = models_fetch::resolve_provider_request_async_with_store(
+        provider_id,
+        entry,
+        store.clone(),
+        |name| std::env::var(name).ok(),
+    )
+    .await?;
+    Ok((resolved, store))
+}
 
 /// Exact CLI line when a selected provider's effective template has no
 /// published `/models` endpoint (no HTTP, no config write).
@@ -109,8 +130,8 @@ pub async fn run(args: FetchModelsArgs) -> Result<()> {
             continue;
         }
 
-        let resolved = match models_fetch::resolve_provider_request_async(id, &entry).await {
-            Ok(r) => r,
+        let (resolved, store) = match resolve_request_via_vault(id, &entry).await {
+            Ok(pair) => pair,
             Err(e) => {
                 println!("  ⚠ skipped: {e}");
                 summaries.push((id.clone(), Err(e)));
@@ -118,9 +139,14 @@ pub async fn run(args: FetchModelsArgs) -> Result<()> {
             }
         };
 
-        let outcome =
-            models_fetch::fetch_models_for_provider(id, &entry, &resolved, Duration::from_secs(15))
-                .await;
+        let outcome = models_fetch::fetch_models_for_provider_with_store(
+            id,
+            &entry,
+            &resolved,
+            Duration::from_secs(15),
+            Some(store),
+        )
+        .await;
 
         print_fetch_outcome(&outcome, args.allow_fallback);
         summaries.push((id.clone(), outcome));
@@ -291,7 +317,7 @@ async fn run_deepfetch(
             .get(&target.provider_id)
             .expect("target came from config")
             .clone();
-        let request = models_fetch::resolve_provider_request_async(&target.provider_id, &entry)
+        let (request, _store) = resolve_request_via_vault(&target.provider_id, &entry)
             .await
             .with_context(|| format!("resolving provider `{}`", target.provider_id))?;
         resolved.insert(target.provider_id.clone(), request);
@@ -450,21 +476,19 @@ async fn resolve_interactive_fallbacks(
                         .clone();
                     println!("→ {provider_id} ({})", entry.url);
                     println!("  retrying live /models...");
-                    let outcome =
-                        match models_fetch::resolve_provider_request_async(&provider_id, &entry)
+                    let outcome = match resolve_request_via_vault(&provider_id, &entry).await {
+                        Ok((resolved, store)) => {
+                            models_fetch::fetch_models_for_provider_with_store(
+                                &provider_id,
+                                &entry,
+                                &resolved,
+                                Duration::from_secs(15),
+                                Some(store),
+                            )
                             .await
-                        {
-                            Ok(resolved) => {
-                                models_fetch::fetch_models_for_provider(
-                                    &provider_id,
-                                    &entry,
-                                    &resolved,
-                                    Duration::from_secs(15),
-                                )
-                                .await
-                            }
-                            Err(error) => Err(error),
-                        };
+                        }
+                        Err(error) => Err(error),
+                    };
                     print_fetch_outcome(&outcome, false);
                     *outcome_slot = outcome;
                 }

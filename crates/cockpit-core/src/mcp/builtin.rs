@@ -612,32 +612,36 @@ impl McpChildEventRecorder {
             .authoring_frame()
             .is_some_and(|frame| frame.resolved_trusted());
         self.session
-            .record_tool_call_journaled(ToolCallRow {
-                event_id: Uuid::new_v4(),
-                timestamp: Utc::now(),
-                agent: self.agent.clone(),
-                call_id: span.call_id.clone(),
-                parent_call_id: Some(self.parent_call_id.clone()),
-                parent_child_index: Some(span.index),
-                identity: ToolCallProviderIdentity::synthetic_cockpit_call(&span.call_id, None),
-                tool: span.dispatch.tool.clone(),
-                mcp_server: span.dispatch.server.clone(),
-                path: None,
-                original_input_json: span.dispatch.args.clone(),
-                wire_input_json: span.dispatch.args.clone(),
-                recovery: crate::db::tool_calls::Recovery::Clean,
-                hard_fail,
-                exit_code: None,
-                sandbox_enabled: false,
-                sandboxed: false,
-                sandbox_unavailable_reason: None,
-                output: output.to_string(),
-                truncated: false,
-                duration_ms,
-                llm_mode: self.llm_mode,
-                shape_fingerprint: None,
-                hint: None,
-            }, self.session_table.as_ref(), target_trusted)
+            .record_tool_call_journaled(
+                ToolCallRow {
+                    event_id: Uuid::new_v4(),
+                    timestamp: Utc::now(),
+                    agent: self.agent.clone(),
+                    call_id: span.call_id.clone(),
+                    parent_call_id: Some(self.parent_call_id.clone()),
+                    parent_child_index: Some(span.index),
+                    identity: ToolCallProviderIdentity::synthetic_cockpit_call(&span.call_id, None),
+                    tool: span.dispatch.tool.clone(),
+                    mcp_server: span.dispatch.server.clone(),
+                    path: None,
+                    original_input_json: span.dispatch.args.clone(),
+                    wire_input_json: span.dispatch.args.clone(),
+                    recovery: crate::db::tool_calls::Recovery::Clean,
+                    hard_fail,
+                    exit_code: None,
+                    sandbox_enabled: false,
+                    sandboxed: false,
+                    sandbox_unavailable_reason: None,
+                    output: output.to_string(),
+                    truncated: false,
+                    duration_ms,
+                    llm_mode: self.llm_mode,
+                    shape_fingerprint: None,
+                    hint: None,
+                },
+                self.session_table.as_ref(),
+                target_trusted,
+            )
             .await
     }
 }
@@ -2818,7 +2822,7 @@ mod tests {
         assert!(err.to_string().contains("manually named"), "{err}");
 
         let db = crate::db::Db::open_in_memory().unwrap();
-        let parent = crate::session::Session::create(
+        let parent = crate::session::Session::create_for_test(
             db.clone(),
             tmp.path().to_path_buf(),
             "Build",
@@ -2827,7 +2831,7 @@ mod tests {
         .unwrap();
         let side = db.create_ephemeral_fork(parent.id, None).await.unwrap();
         let session = Arc::new(
-            crate::session::Session::resume(
+            crate::session::Session::resume_for_test(
                 db,
                 side.session_id,
                 crate::session::test_redaction_key_resolver(),
@@ -2917,7 +2921,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), r#"{ "utility_model": "openai:gpt-4.1-mini" }"#);
         let db = crate::db::Db::open_in_memory().unwrap();
-        let parent = crate::session::Session::create(
+        let parent = crate::session::Session::create_for_test(
             db.clone(),
             tmp.path().to_path_buf(),
             "Build",
@@ -2926,7 +2930,7 @@ mod tests {
         .unwrap();
         let side = db.create_ephemeral_fork(parent.id, None).await.unwrap();
         let session = Arc::new(
-            crate::session::Session::resume(
+            crate::session::Session::resume_for_test(
                 db,
                 side.session_id,
                 crate::session::test_redaction_key_resolver(),
@@ -3098,7 +3102,7 @@ mod tests {
         write_trusted_openai_provider(tmp.path(), "trusted");
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = Arc::new(
-            crate::session::Session::create(
+            crate::session::Session::create_for_test(
                 db.clone(),
                 tmp.path().to_path_buf(),
                 "Build",
@@ -3199,7 +3203,7 @@ mod tests {
         .unwrap();
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = Arc::new(
-            crate::session::Session::create(
+            crate::session::Session::create_for_test(
                 db.clone(),
                 tmp.path().to_path_buf(),
                 "Build",

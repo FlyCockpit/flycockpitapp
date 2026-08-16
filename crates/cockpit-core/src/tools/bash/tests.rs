@@ -545,7 +545,7 @@ use crate::daemon::proto::ResolveResponse;
 fn ctx_with_store(cwd: &std::path::Path) -> ToolCtx {
     let db = crate::db::Db::open_in_memory().unwrap();
     let session = Arc::new(
-        crate::session::Session::create(
+        crate::session::Session::create_for_test(
             db.clone(),
             cwd.to_path_buf(),
             "builder",

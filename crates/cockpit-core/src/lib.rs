@@ -67,6 +67,8 @@ pub mod path_containment;
 pub mod private_fs;
 pub mod process;
 pub mod process_containment;
+#[cfg(test)]
+mod production_path_ratchet;
 pub mod providers;
 pub mod redact;
 pub mod remote_daemon_identity_custody;
@@ -93,5 +95,5 @@ pub mod welcome;
 pub mod wizard;
 pub mod write_scope;
 
-pub(crate) use cockpit_db as db;
+pub use cockpit_db as db;
 pub use cockpit_proto as proto_crate;

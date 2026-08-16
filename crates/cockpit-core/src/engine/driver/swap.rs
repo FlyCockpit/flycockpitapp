@@ -1126,7 +1126,8 @@ impl Driver {
         let mut providers = self.live_providers_config()?;
         providers.active_model = Some(active.clone());
         let env_overlay = self.stack[0].agent.env_overlay.clone();
-        let mut built = crate::engine::model::Model::for_provider_with_env(
+        let store = self.session.credential_store()?;
+        let mut built = crate::engine::model::Model::for_provider_with_store(
             &providers,
             &active.provider,
             &active.model,
@@ -1138,6 +1139,7 @@ impl Driver {
                     .get(name)
                     .cloned()
             },
+            store,
         )?
         .with_shutdown_gate(running.shutdown_gate());
         if running.provider_id() == active.provider && running.model_id_ref() == active.model {

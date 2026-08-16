@@ -149,11 +149,16 @@ async fn run_deep_fetch(
     let entry = config.providers.get(&provider_id).cloned().ok_or_else(|| {
         format!("deep fetch failed: provider `{provider_id}` disappeared from config")
     })?;
-    let resolved = models_fetch::resolve_provider_request_async(&provider_id, &entry)
-        .await
-        .map_err(|error| {
-            format!("deep fetch failed: resolving provider `{provider_id}`: {error}")
-        })?;
+    let store = crate::tui::settings::cockpit_credential_store()
+        .map_err(|error| format!("deep fetch failed: opening vault: {error}"))?;
+    let resolved = models_fetch::resolve_provider_request_async_with_store(
+        &provider_id,
+        &entry,
+        store,
+        |name| std::env::var(name).ok(),
+    )
+    .await
+    .map_err(|error| format!("deep fetch failed: resolving provider `{provider_id}`: {error}"))?;
     let mut resolved_by_provider = BTreeMap::new();
     resolved_by_provider.insert(provider_id.clone(), resolved);
     let mut client = HttpDeepfetchProbeClient::new(resolved_by_provider, Duration::from_secs(20));

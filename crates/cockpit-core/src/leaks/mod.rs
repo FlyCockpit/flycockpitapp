@@ -608,7 +608,8 @@ pub fn decode_leak_cursor(
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(payload);
     // Constant-time verification of the 32-byte tag.
-    mac.verify_slice(tag).map_err(|_| LeakListError::InvalidCursor)?;
+    mac.verify_slice(tag)
+        .map_err(|_| LeakListError::InvalidCursor)?;
     let parsed = decode_cursor_payload_bytes(payload).ok_or(LeakListError::InvalidCursor)?;
     if parsed.session_filter != filters.session_filter
         || parsed.project_root != filters.project_root

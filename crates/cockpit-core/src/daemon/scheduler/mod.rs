@@ -1673,6 +1673,7 @@ mod tests {
 
     fn production_registry(db: Db) -> SessionRegistry {
         let locks = Arc::new(LockManager::in_memory(db.clone()));
+        let vault = crate::secure_key::vault_for_db(&db).expect("test vault");
         let reg = SessionRegistry::new(
             db,
             locks,
@@ -1681,6 +1682,7 @@ mod tests {
             ConfigSource::fixed(ProvidersConfig::default(), ExtendedConfig::default()),
         );
         reg.set_redaction_key_resolver(crate::session::test_redaction_key_resolver());
+        reg.set_secret_vault(vault);
         reg
     }
 
@@ -1698,7 +1700,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let registry = production_registry(db.clone());
         let session = Arc::new(
-            Session::create(
+            Session::create_for_test(
                 db.clone(),
                 tmp.path().to_path_buf(),
                 "Build",

@@ -599,7 +599,7 @@ mod tests {
         assert_eq!(doc.revision, 2);
         assert_eq!(doc.content, "# Plan\n\n- build the better thing");
 
-        let resumed = crate::session::Session::resume(
+        let resumed = crate::session::Session::resume_for_test(
             db.clone(),
             ctx.session.id,
             crate::session::test_redaction_key_resolver(),

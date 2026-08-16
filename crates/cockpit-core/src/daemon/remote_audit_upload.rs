@@ -10,7 +10,7 @@ use reqwest::header::RETRY_AFTER;
 use reqwest::{Method, StatusCode};
 use serde_json::{Map, Value, json};
 
-use crate::auth::flycockpit::{StoredFlycockpitCredential, maybe_load_credential};
+use crate::auth::flycockpit::StoredFlycockpitCredential;
 use crate::daemon::egress::{FirstPartyEgressClient, connector_enabled};
 use crate::daemon::server::DaemonContext;
 use crate::db::Db;
@@ -30,7 +30,7 @@ pub fn spawn_background(ctx: Arc<DaemonContext>) -> tokio::task::JoinHandle<()> 
                 break;
             }
             let mut wait_for_relogin = false;
-            match sync_current_credential_once(&ctx.db).await {
+            match sync_current_credential_once(&ctx).await {
                 Ok(RemoteAuditUploadOnceOutcome::Revoked) => {
                     wait_for_relogin = true;
                     tracing::warn!("remote audit upload stopped until Flycockpit re-login");
@@ -75,16 +75,26 @@ async fn wait_for_shutdown(ctx: Arc<DaemonContext>) {
     }
 }
 
-pub async fn sync_current_credential_once(db: &Db) -> Result<RemoteAuditUploadOnceOutcome> {
-    let Some(credential) = maybe_load_credential() else {
+pub async fn sync_current_credential_once(
+    ctx: &DaemonContext,
+) -> Result<RemoteAuditUploadOnceOutcome> {
+    let Some(credential) = ctx.load_flycockpit_credential()? else {
         return Ok(RemoteAuditUploadOnceOutcome::NoCredential);
     };
+    let db = &ctx.db;
     let Some(client) = FirstPartyEgressClient::connect(db.clone(), credential.clone()).await?
     else {
         return Ok(RemoteAuditUploadOnceOutcome::Disabled);
     };
     let mut sleeper = |duration| -> SleepFuture { Box::pin(tokio::time::sleep(duration)) };
-    sync_once_with_client(db, &credential, &client, &mut sleeper).await
+    sync_once_with_client_and_vault(
+        db,
+        &credential,
+        &client,
+        &mut sleeper,
+        Some(&ctx.secret_vault),
+    )
+    .await
 }
 
 pub type SleepFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -151,6 +161,16 @@ async fn sync_once_with_client(
     client: &FirstPartyEgressClient,
     sleep: SleepFn<'_>,
 ) -> Result<RemoteAuditUploadOnceOutcome> {
+    sync_once_with_client_and_vault(db, credential, client, sleep, None).await
+}
+
+async fn sync_once_with_client_and_vault(
+    db: &Db,
+    credential: &StoredFlycockpitCredential,
+    client: &FirstPartyEgressClient,
+    sleep: SleepFn<'_>,
+    vault: Option<&crate::secure_key::SecretVault>,
+) -> Result<RemoteAuditUploadOnceOutcome> {
     if !audit_upload_enabled(db, credential).await? {
         return Ok(RemoteAuditUploadOnceOutcome::Disabled);
     }
@@ -160,7 +180,7 @@ async fn sync_once_with_client(
         .remote_audit_upload_state(&credential.server_url, &credential.instance_id)
         .await?
         .ok_or_else(|| anyhow!("remote audit upload state missing after upsert"))?;
-    let built = build_batch(db, credential, state.cursor_audit_id).await?;
+    let built = build_batch(db, credential, state.cursor_audit_id, vault).await?;
     match built {
         BatchBuild::Idle => Ok(RemoteAuditUploadOnceOutcome::Idle),
         BatchBuild::Skipped { cursor_audit_id } => {
@@ -232,6 +252,7 @@ async fn build_batch(
     db: &Db,
     credential: &StoredFlycockpitCredential,
     cursor_audit_id: i64,
+    vault: Option<&crate::secure_key::SecretVault>,
 ) -> Result<BatchBuild> {
     let rows = db
         .list_remote_audit_after(cursor_audit_id, MAX_BATCH_EVENTS)
@@ -242,9 +263,16 @@ async fn build_batch(
     let mut batch_cursor = cursor_audit_id;
     let mut events = Vec::new();
     for row in &rows {
-        let event = match audit_event_json(db, credential, row).await {
+        let event = match audit_event_json(db, credential, row, vault).await {
             Ok(Some(event)) => event,
             Ok(None) => {
+                if vault.is_none() {
+                    tracing::warn!(
+                        audit_id = row.audit_id,
+                        "deferring remote audit row until a vault-backed redaction load is available"
+                    );
+                    break;
+                }
                 batch_cursor = row.audit_id;
                 tracing::warn!(
                     audit_id = row.audit_id,
@@ -307,11 +335,13 @@ async fn audit_event_json(
     db: &Db,
     credential: &StoredFlycockpitCredential,
     row: &RemoteAuditRow,
+    vault: Option<&crate::secure_key::SecretVault>,
 ) -> Result<Option<Value>> {
     let Some(session_id) = row.session_id else {
         return Ok(None);
     };
-    let Some(redaction) = crate::daemon::egress::redaction_for_session(db, session_id).await?
+    let Some(redaction) =
+        crate::daemon::egress::redaction_for_session(db, vault, session_id).await?
     else {
         return Ok(None);
     };
@@ -583,7 +613,7 @@ mod tests {
         }
         let credential = credential("http://127.0.0.1:1".to_string());
         let rows = db.list_remote_audit_after(0, 101).await.unwrap();
-        let built = build_batch(&db, &credential, 0).await.unwrap();
+        let built = build_batch(&db, &credential, 0, None).await.unwrap();
         match built {
             BatchBuild::Ready {
                 payload,
@@ -621,7 +651,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let built = build_batch(&db, &credential, 0).await.unwrap();
+        let built = build_batch(&db, &credential, 0, None).await.unwrap();
         match built {
             BatchBuild::Ready { payload, .. } => {
                 let body = payload.to_string();
@@ -637,7 +667,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let audit_id = insert_remote(&db, "", None).await;
         let credential = credential("http://127.0.0.1:1".to_string());
-        let built = build_batch(&db, &credential, 0).await.unwrap();
+        let built = build_batch(&db, &credential, 0, None).await.unwrap();
         match built {
             BatchBuild::Skipped { cursor_audit_id } => assert_eq!(cursor_audit_id, audit_id),
             BatchBuild::Idle | BatchBuild::Ready { .. } => panic!("expected skipped row"),

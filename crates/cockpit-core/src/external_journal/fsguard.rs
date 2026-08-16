@@ -492,9 +492,8 @@ mod imp {
             let cname = cstring(name)?;
             let flags =
                 libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-            let file =
-                held_fd::openat_mode(self.dir.as_raw_fd(), &cname, flags, SPOOL_FILE_MODE)
-                    .map_err(|error| io("creating capsule file", error))?;
+            let file = held_fd::openat_mode(self.dir.as_raw_fd(), &cname, flags, SPOOL_FILE_MODE)
+                .map_err(|error| io("creating capsule file", error))?;
             // `openat` mode bits are masked by the process umask, so a
             // permissive umask would leave a group/world-readable capsule.
             // fchmod the descriptor we already hold, then verify.

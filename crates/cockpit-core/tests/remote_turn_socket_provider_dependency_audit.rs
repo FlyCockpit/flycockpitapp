@@ -112,7 +112,8 @@ fn remote_turn_socket_provider_dependency_audit() {
         "turn-client-rustls must be pinned =0.1.0 with default-features off + std only"
     );
     assert!(
-        manifest.contains("rustls-native-certs = { version = \"=0.8.4\", default-features = false }"),
+        manifest
+            .contains("rustls-native-certs = { version = \"=0.8.4\", default-features = false }"),
         "rustls-native-certs must be an exact =0.8.4 pin (no caret)"
     );
     // No openssl / native-tls / alternate TURN or WebRTC stack as a direct dep.
@@ -133,13 +134,7 @@ fn remote_turn_socket_provider_dependency_audit() {
 
     // 3. License + provenance + MSRV via cargo metadata (offline; CI pre-fetches).
     let out = Command::new(env!("CARGO"))
-        .args([
-            "metadata",
-            "--locked",
-            "--offline",
-            "--format-version",
-            "1",
-        ])
+        .args(["metadata", "--locked", "--offline", "--format-version", "1"])
         .current_dir(&root)
         .output()
         .expect("cargo metadata");

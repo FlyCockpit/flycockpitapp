@@ -13,8 +13,8 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 
 use crate::auth::flycockpit::{
-    FlycockpitClient, RelayCandidate, RelayChoice, StoredFlycockpitCredential, clear_credential,
-    maybe_load_credential, store_relay_choice,
+    FlycockpitClient, RelayCandidate, RelayChoice, StoredFlycockpitCredential,
+    clear_credential_in_vault, store_relay_choice_in_vault,
 };
 use crate::daemon::principal::{ClientPrincipal, PrincipalGrant, PrincipalScope};
 use crate::daemon::proto::{self, Body, Envelope, Event, InterruptQuestion};
@@ -91,7 +91,7 @@ async fn sync_once(
     ctx: Arc<DaemonContext>,
     wake_rx: &mut watch::Receiver<u64>,
 ) -> Result<ConnectorRunOutcome> {
-    let Some(credential) = maybe_load_credential() else {
+    let Some(credential) = ctx.load_flycockpit_credential()? else {
         return Ok(ConnectorRunOutcome::Disabled);
     };
     let Some(state) = ctx
@@ -232,7 +232,7 @@ async fn run_enabled_connector(
                     )
                     .await;
                     if is_terminal_auth_error(&message) {
-                        let _ = clear_credential();
+                        let _ = clear_credential_in_vault(ctx.secret_vault.clone());
                         let _ = ctx
                             .db
                             .set_connector_enabled(
@@ -274,7 +274,7 @@ async fn run_enabled_connector(
                 {
                     stale_cache_retry = true;
                     first_connect = false;
-                    match store_relay_choice(&credential, None) {
+                    match store_relay_choice_in_vault(ctx.secret_vault.clone(), &credential, None) {
                         Ok(next) => credential = next,
                         Err(store_error) => {
                             tracing::warn!(error = %store_error, "clearing cached relay choice failed");
@@ -299,7 +299,7 @@ async fn run_enabled_connector(
                     )
                     .await;
                     if is_terminal_auth_error(&message) {
-                        let _ = clear_credential();
+                        let _ = clear_credential_in_vault(ctx.secret_vault.clone());
                         let _ = ctx
                             .db
                             .set_connector_enabled(
@@ -331,7 +331,11 @@ async fn run_enabled_connector(
         };
 
         first_connect = false;
-        match store_relay_choice(&credential, Some(choice.clone())) {
+        match store_relay_choice_in_vault(
+            ctx.secret_vault.clone(),
+            &credential,
+            Some(choice.clone()),
+        ) {
             Ok(next) => credential = next,
             Err(error) => tracing::warn!(error = %error, "storing cached relay choice failed"),
         }

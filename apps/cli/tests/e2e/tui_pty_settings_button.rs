@@ -88,11 +88,8 @@ fn wait_for_hover_on_span(
     loop {
         let snapshot = session.snapshot();
         let hovers = hover_cells(&snapshot);
-        let covers = (start.col..=end.col).all(|col| {
-            hovers
-                .iter()
-                .any(|(row, c)| *row == start.row && *c == col)
-        });
+        let covers = (start.col..=end.col)
+            .all(|col| hovers.iter().any(|(row, c)| *row == start.row && *c == col));
         let only = hovers
             .iter()
             .all(|(row, col)| *row == start.row && *col >= start.col && *col <= end.col);
@@ -228,10 +225,7 @@ fn tui_pty_settings_button_activation_is_exact() {
         .or_else(|| snapshot.find_text_span("Choose default"))
         .or_else(|| snapshot.find_text_span("[Choose"))
         .or_else(|| snapshot.find_text_span("Choose"))
-        .unwrap_or((
-            CellPos { row: 1, col: 1 },
-            CellPos { row: 1, col: 8 },
-        ));
+        .unwrap_or((CellPos { row: 1, col: 1 }, CellPos { row: 1, col: 8 }));
     let absent_suffix = CellPos {
         row: partial_start.row,
         col: 22,

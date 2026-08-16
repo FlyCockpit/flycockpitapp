@@ -1154,7 +1154,7 @@ mod tests {
 
     fn approver(cwd: &std::path::Path) -> (Approver, uuid::Uuid) {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = crate::session::Session::create(
+        let session = crate::session::Session::create_for_test(
             db.clone(),
             cwd.to_path_buf(),
             "builder",
@@ -1186,7 +1186,7 @@ mod tests {
         policy: crate::config::extended::ApprovalPolicyConfig,
     ) -> Approver {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = crate::session::Session::create(
+        let session = crate::session::Session::create_for_test(
             db.clone(),
             cwd.to_path_buf(),
             "builder",
@@ -1900,7 +1900,7 @@ mod tests {
     ) -> Approver {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = Arc::new(
-            crate::session::Session::create(
+            crate::session::Session::create_for_test(
                 db.clone(),
                 cwd.to_path_buf(),
                 "builder",
@@ -1988,7 +1988,10 @@ mod tests {
             .list_open_interrupts(approver.session_id)
             .await
             .unwrap();
-        assert!(open.is_empty(), "computer yolo tier must raise no interrupt");
+        assert!(
+            open.is_empty(),
+            "computer yolo tier must raise no interrupt"
+        );
 
         let events = permission_events(&approver).await;
         assert!(

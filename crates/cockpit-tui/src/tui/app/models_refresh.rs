@@ -48,7 +48,20 @@ impl App {
             let ids: Vec<String> = cfg.providers.keys().cloned().collect();
             for id in &ids {
                 let entry = cfg.providers.get(id).cloned().unwrap();
-                let resolved = match models_fetch::resolve_provider_request_async(id, &entry).await
+                let store = match crate::tui::settings::cockpit_credential_store() {
+                    Ok(store) => store,
+                    Err(e) => {
+                        push(&progress, format!("/fetch-models: {id} skipped — {e}"));
+                        continue;
+                    }
+                };
+                let resolved = match models_fetch::resolve_provider_request_async_with_store(
+                    id,
+                    &entry,
+                    store.clone(),
+                    |name| std::env::var(name).ok(),
+                )
+                .await
                 {
                     Ok(r) => r,
                     Err(e) => {
@@ -56,11 +69,12 @@ impl App {
                         continue;
                     }
                 };
-                match models_fetch::fetch_models_for_provider(
+                match models_fetch::fetch_models_for_provider_with_store(
                     id,
                     &entry,
                     &resolved,
                     Duration::from_secs(15),
+                    Some(store),
                 )
                 .await
                 {

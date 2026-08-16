@@ -267,7 +267,11 @@ pub(crate) fn classify_terminal_failure_with_floor(
     floor: ProviderRecoverySignal,
 ) -> ClassifiedFailure {
     let own = provider_recovery_signal(err);
-    let recovery = if floor.rank() > own.rank() { floor } else { own };
+    let recovery = if floor.rank() > own.rank() {
+        floor
+    } else {
+        own
+    };
     let observed_status = http_status_of(err);
     let base = classify_inference_failure(err);
     let class = match recovery {

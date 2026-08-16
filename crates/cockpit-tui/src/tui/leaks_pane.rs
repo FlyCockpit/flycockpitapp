@@ -56,7 +56,10 @@ impl std::fmt::Debug for LeaksPaneRevealBuffer {
             }
         }
         f.debug_struct("LeaksPaneRevealBuffer")
-            .field("plaintext", &Redacted(self.plaintext.as_ref().map(|p| p.len())))
+            .field(
+                "plaintext",
+                &Redacted(self.plaintext.as_ref().map(|p| p.len())),
+            )
             .field("report_id", &self.report_id)
             .field("generation", &self.generation)
             .field("active", &self.plaintext.is_some())
@@ -106,7 +109,12 @@ impl LeaksPaneRevealBuffer {
     }
 
     /// Install using the real clock.
-    pub fn install(&mut self, plaintext: Zeroizing<String>, report_id: String, generation: u64) -> bool {
+    pub fn install(
+        &mut self,
+        plaintext: Zeroizing<String>,
+        report_id: String,
+        generation: u64,
+    ) -> bool {
         self.install_at(plaintext, report_id, generation, Instant::now())
     }
 
@@ -201,7 +209,10 @@ pub enum LeaksOutcome {
     /// Begin the reveal of `report_id`; the App performs it off the async
     /// payload path and installs the plaintext into this pane's buffer at
     /// `generation`.
-    Reveal { report_id: String, generation: u64 },
+    Reveal {
+        report_id: String,
+        generation: u64,
+    },
     /// The buffer was just zeroized mid-session; the App must force a full
     /// clear-and-redraw so no stale plaintext cells survive.
     ForceClear,
@@ -242,9 +253,7 @@ pub struct LeaksRpcResult {
 impl LeaksRpcAction {
     pub async fn run(self) -> Result<LeaksRpcResult, String> {
         let socket = self.daemon_socket;
-        let send = |request| {
-            crate::tui::agent_runner::daemon_request_at_blocking(&socket, request)
-        };
+        let send = |request| crate::tui::agent_runner::daemon_request_at_blocking(&socket, request);
         match self.kind {
             LeaksRpcKind::List {
                 cursor,
@@ -406,7 +415,8 @@ impl LeaksPane {
             // on drop here; never installed.
             return;
         }
-        self.reveal.install(plaintext, report_id, expected_generation);
+        self.reveal
+            .install(plaintext, report_id, expected_generation);
         self.reveal_error = None;
     }
 
@@ -574,7 +584,9 @@ impl LeaksPane {
             // into any cached Text/history/message.
             lines.push(Line::from(Span::styled(
                 format!("revealed [{}]:", self.reveal.report_id().unwrap_or("")),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             )));
             // Borrow the plaintext straight from the zeroizing buffer — no owned
             // `String`/`Span` copy is created (an owned copy would not be
@@ -590,9 +602,7 @@ impl LeaksPane {
         } else {
             match &self.state {
                 LeaksPaneState::Loading => lines.push(Line::from("loading…")),
-                LeaksPaneState::Empty => {
-                    lines.push(Line::from("no contained leak reports"))
-                }
+                LeaksPaneState::Empty => lines.push(Line::from("no contained leak reports")),
                 LeaksPaneState::FilteredEmpty => {
                     lines.push(Line::from("no reports match the active filter"))
                 }
@@ -707,7 +717,11 @@ mod tests {
     #[test]
     fn leaks_pane_install_reveal_is_sole_owner() {
         let mut pane = LeaksPane::open(Some(PathBuf::from("/test.sock")));
-        pane.install_reveal(sample_secret(), "r1".into(), pane.reveal_buffer().generation());
+        pane.install_reveal(
+            sample_secret(),
+            "r1".into(),
+            pane.reveal_buffer().generation(),
+        );
         assert!(pane.reveal_buffer().is_active());
         assert_eq!(
             pane.reveal_buffer().plaintext().unwrap().as_str(),
@@ -724,7 +738,11 @@ mod tests {
     #[test]
     fn leaks_pane_ttl_expiry_flags_clear() {
         let mut pane = LeaksPane::open(Some(PathBuf::from("/t.sock")));
-        pane.install_reveal(sample_secret(), "r1".into(), pane.reveal_buffer().generation());
+        pane.install_reveal(
+            sample_secret(),
+            "r1".into(),
+            pane.reveal_buffer().generation(),
+        );
         assert!(pane.reveal_buffer().is_active());
         let base = Instant::now();
 
@@ -735,8 +753,14 @@ mod tests {
 
         // At the TTL: zeroize + flag a full clear.
         assert!(pane.tick_at(base + Duration::from_secs(30)));
-        assert!(!pane.reveal_buffer().is_active(), "TTL must zeroize the buffer");
-        assert!(pane.take_pending_clear(), "TTL expiry must flag a full clear");
+        assert!(
+            !pane.reveal_buffer().is_active(),
+            "TTL must zeroize the buffer"
+        );
+        assert!(
+            pane.take_pending_clear(),
+            "TTL expiry must flag a full clear"
+        );
         // The flag is one-shot.
         assert!(!pane.take_pending_clear());
     }

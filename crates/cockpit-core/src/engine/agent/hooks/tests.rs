@@ -1249,8 +1249,9 @@ async fn pre_tool_hook_explicit_deny_blocks_dispatch() {
         BTreeMap::new(),
         5,
     )]);
-    let runner =
-        FakeCommandRunner::new(successful_output(r#"{"decision":"deny","reason":"too risky"}"#));
+    let runner = FakeCommandRunner::new(successful_output(
+        r#"{"decision":"deny","reason":"too risky"}"#,
+    ));
     let env = FakeProcessEnv::with_default_resolution();
 
     let outcome = run_pre_tool_hooks(
@@ -1330,8 +1331,14 @@ async fn pre_tool_hook_failures_are_fail_open() {
         ("spawn failure", spawn_failed_output()),
         ("nonzero exit / child crash", failed_output()),
         ("malformed JSON", successful_output("not json at all")),
-        ("unknown decision", successful_output(r#"{"decision":"maybe"}"#)),
-        ("oversized malformed stdout", successful_output(&big_malformed)),
+        (
+            "unknown decision",
+            successful_output(r#"{"decision":"maybe"}"#),
+        ),
+        (
+            "oversized malformed stdout",
+            successful_output(&big_malformed),
+        ),
     ];
     for (label, output) in failure_cases {
         let (outcome, statuses) = run_case(&resolves, output).await;
@@ -1352,8 +1359,7 @@ async fn pre_tool_hook_failures_are_fail_open() {
     // Missing executable: resolution fails before the runner is consulted, so
     // even a would-be deny payload cannot deny — fail-open failed row.
     let missing = FakeProcessEnv::default();
-    let (outcome, statuses) =
-        run_case(&missing, successful_output(r#"{"decision":"deny"}"#)).await;
+    let (outcome, statuses) = run_case(&missing, successful_output(r#"{"decision":"deny"}"#)).await;
     assert_eq!(outcome, PreHookOutcome::Allow);
     assert_eq!(statuses, vec!["failed".to_string()]);
 }
@@ -1475,7 +1481,10 @@ async fn tool_hook_matcher_and_ordering() {
     let reg = registry(vec![exact, wildcard]);
     assert_eq!(matching_hooks(&reg, HookEvent::PreToolUse, "bash").len(), 2);
     assert_eq!(matching_hooks(&reg, HookEvent::PreToolUse, "read").len(), 1);
-    assert_eq!(matching_hooks(&reg, HookEvent::PostToolUse, "bash").len(), 0);
+    assert_eq!(
+        matching_hooks(&reg, HookEvent::PostToolUse, "bash").len(),
+        0
+    );
 
     // Pre first-deny short-circuits later pre hooks.
     {
@@ -1496,7 +1505,8 @@ async fn tool_hook_matcher_and_ordering() {
                 5,
             ),
         ]);
-        let runner = FakeCommandRunner::new(successful_output(r#"{"decision":"deny","reason":"no"}"#));
+        let runner =
+            FakeCommandRunner::new(successful_output(r#"{"decision":"deny","reason":"no"}"#));
         let outcome = run_pre_tool_hooks(
             &runner,
             &env,
@@ -1520,7 +1530,10 @@ async fn tool_hook_matcher_and_ordering() {
             1,
             "first deny must short-circuit later pre hooks"
         );
-        assert_eq!(hook_run_statuses(&db, sid).await, vec!["denied".to_string()]);
+        assert_eq!(
+            hook_run_statuses(&db, sid).await,
+            vec!["denied".to_string()]
+        );
     }
 
     // All matching observer hooks run sequentially despite an earlier failure.
@@ -1634,7 +1647,10 @@ async fn stop_hook_continuation_state_machine() {
         );
         assert_eq!(state.continuation_count, 1);
         assert!(state.stop_hook_active);
-        assert_eq!(hook_run_statuses(&db, sid).await, vec!["blocked".to_string()]);
+        assert_eq!(
+            hook_run_statuses(&db, sid).await,
+            vec!["blocked".to_string()]
+        );
     }
 
     // `{"continue":false}` wins over aggregation → ForcedEnd.
@@ -1663,7 +1679,8 @@ async fn stop_hook_continuation_state_machine() {
     // without recording a new ledger row.
     {
         let (db, sid) = db_session().await;
-        let runner = FakeCommandRunner::new(successful_output(r#"{"decision":"block","reason":"x"}"#));
+        let runner =
+            FakeCommandRunner::new(successful_output(r#"{"decision":"block","reason":"x"}"#));
         let mut state = StopGateState {
             continuation_count: STOP_HOOK_MAX_CONTINUATIONS,
             stop_hook_active: false,
@@ -1708,7 +1725,10 @@ async fn stop_hook_continuation_state_machine() {
         .await;
         assert_eq!(outcome, StopHookOutcome::End);
         assert_eq!(state.continuation_count, 0);
-        assert_eq!(hook_run_statuses(&db, sid).await, vec!["failed".to_string()]);
+        assert_eq!(
+            hook_run_statuses(&db, sid).await,
+            vec!["failed".to_string()]
+        );
     }
 }
 

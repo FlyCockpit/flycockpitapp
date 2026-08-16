@@ -52,8 +52,8 @@
   ],
   "counts": {
     "event": 77,
-    "request": 144,
-    "response": 93
+    "request": 145,
+    "response": 98
   },
   "messages": {
     "event": [
@@ -1299,6 +1299,12 @@
         "class": "bounded_request_response",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
+        "tag": "get_workspace_trust"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
         "tag": "get_startup_disclosures"
       },
       {
@@ -1872,6 +1878,36 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "workspace_trust_set"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "workspace_trust"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "flycockpit_stored"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "flycockpit_already_logged_in"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "flycockpit_cleared"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "flycockpit_not_logged_in"
       },
       {
         "class": "bounded_request_response",

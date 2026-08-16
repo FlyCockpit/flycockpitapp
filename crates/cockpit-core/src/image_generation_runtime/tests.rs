@@ -1148,3 +1148,80 @@ async fn image_generation_refresh_waiter_drop_cancels_only_the_last_waiter() {
     assert!(registry.snapshot(&endpoint.id, "target").is_none());
     assert!(registry.inner.inflight.lock().unwrap().is_empty());
 }
+
+fn vault_store_with_named_secret(name: &str, value: &str) -> crate::credentials::CredentialStore {
+    let db = crate::db::Db::open_in_memory().expect("in-memory db");
+    let vault = crate::secure_key::vault_for_db(&db).expect("test vault");
+    let mut store = crate::credentials::CredentialStore::from_vault(vault).expect("store");
+    store.set_named_secret(name, value);
+    store.save().expect("persist named secret");
+    store
+}
+
+fn header_test_registry() -> ImageRuntimeRegistry {
+    registry(
+        Arc::new(Clock(AtomicU64::new(0))),
+        Arc::new(Adapter {
+            kind: ImageAdapterKind::OpenaiImages,
+            calls: AtomicUsize::new(0),
+        }),
+    )
+}
+
+#[test]
+fn resolve_ephemeral_headers_expands_vault_secret_refs() {
+    let token = "vault-only-image-header-secret-xyz";
+    let store = vault_store_with_named_secret("img-token", token);
+    let registry = header_test_registry().with_store(store);
+    let mut endpoint = endpoint();
+    endpoint.headers = vec![cockpit_config::config::providers::HeaderSpec {
+        name: "X-Token".into(),
+        value: "$secret:img-token".into(),
+    }];
+    let headers = registry
+        .resolve_ephemeral_headers(&endpoint)
+        .expect("vault $secret header resolves");
+    assert_eq!(
+        headers.get("X-Token").and_then(|value| value.to_str().ok()),
+        Some(token)
+    );
+}
+
+#[test]
+fn resolve_ephemeral_headers_uses_vault_credential_ref() {
+    let token = "vault-only-image-bearer-secret-xyz";
+    let store = vault_store_with_named_secret("img-bearer", token);
+    let registry = header_test_registry().with_store(store);
+    let mut endpoint = endpoint();
+    endpoint.credential_ref = Some("img-bearer".into());
+    let headers = registry
+        .resolve_ephemeral_headers(&endpoint)
+        .expect("vault credential_ref resolves");
+    assert_eq!(
+        headers
+            .get(reqwest::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok()),
+        Some(format!("Bearer {token}").as_str())
+    );
+}
+
+#[test]
+fn resolve_ephemeral_headers_fail_closed_without_store() {
+    let registry = header_test_registry();
+    let mut endpoint = endpoint();
+    endpoint.headers = vec![cockpit_config::config::providers::HeaderSpec {
+        name: "X-Token".into(),
+        value: "$secret:img-token".into(),
+    }];
+    let err = registry
+        .resolve_ephemeral_headers(&endpoint)
+        .expect_err("missing vault secret must fail closed");
+    assert_eq!(err.code, RuntimeErrorCode::Authentication);
+
+    endpoint.headers.clear();
+    endpoint.credential_ref = Some("img-bearer".into());
+    let err = registry
+        .resolve_ephemeral_headers(&endpoint)
+        .expect_err("missing credential_ref must fail closed");
+    assert_eq!(err.code, RuntimeErrorCode::Authentication);
+}

@@ -770,6 +770,7 @@ pub(super) async fn run_worker(
         granted_tools: Vec::new(),
         lock_identity: None,
         write_scope: None,
+        credential_store: session.credential_store().ok(),
     };
     let tool_surface_override = stored_tool_surface_override(&session);
     let _goal_settings_override = stored_goal_settings_override(&session);
@@ -2723,11 +2724,14 @@ pub(super) async fn run_worker(
                         .read()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .clone();
-                    match crate::redact::RedactionTable::build_with_env_and_store(
-                        &effective_redact,
-                        &project_root,
-                        &session_env,
-                    ) {
+                    match session.credential_store().and_then(|store| {
+                        crate::redact::RedactionTable::build_with_env_and_credential_store(
+                            &effective_redact,
+                            &project_root,
+                            &session_env,
+                            &store,
+                        )
+                    }) {
                         Ok(new_table) => {
                             // H1: read the LATEST table, union, persist, and swap
                             // under the per-session redaction-table write lock so
@@ -2944,12 +2948,31 @@ pub(super) async fn run_worker(
                             .read()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .clone();
-                        match crate::engine::model::Model::for_provider_with_env(
+                        let store = match session.credential_store() {
+                            Ok(store) => store,
+                            Err(e) => {
+                                send_current_session_event(
+                                    &session,
+                                    &event_tx,
+                                    &redaction,
+                                    proto::Event::Notice {
+                                        session_id,
+                                        text: format!(
+                                            "model-comparison: skipping `{provider}/{model_id}` — {e:#}"
+                                        ),
+                                    },
+                                    NoticeSource::DaemonDirect,
+                                );
+                                continue;
+                            }
+                        };
+                        match crate::engine::model::Model::for_provider_with_store(
                             &providers_cfg,
                             provider,
                             model_id,
                             tandem_redact.clone(),
                             |name| session_env.get(name).cloned(),
+                            store,
                         ) {
                             Ok(m) => {
                                 let m = m.with_shutdown_gate(shutdown_gate.clone());

@@ -863,6 +863,11 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
+        "get_workspace_trust",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
         "get_startup_disclosures",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
@@ -1343,6 +1348,31 @@ pub const RESPONSE_CLASSIFICATION: &[RemoteMessageClassification] = &[
     ),
     row(
         "workspace_trust_set",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "workspace_trust",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "flycockpit_stored",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "flycockpit_already_logged_in",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "flycockpit_cleared",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "flycockpit_not_logged_in",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
@@ -2017,8 +2047,8 @@ mod tests {
         }
 
         // Exact table sizes, so a silent shrink is caught.
-        assert_eq!(REQUEST_CLASSIFICATION.len(), 144);
-        assert_eq!(RESPONSE_CLASSIFICATION.len(), 93);
+        assert_eq!(REQUEST_CLASSIFICATION.len(), 145);
+        assert_eq!(RESPONSE_CLASSIFICATION.len(), 98);
         assert_eq!(EVENT_CLASSIFICATION.len(), 77);
     }
 

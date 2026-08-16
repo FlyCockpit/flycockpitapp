@@ -34,16 +34,29 @@ impl FetchHandle {
         let state_w = Arc::clone(&state);
         let pid = provider_id.clone();
         tokio::spawn(async move {
-            let result = match models_fetch::resolve_provider_request_async(&pid, &entry).await {
+            let result = match crate::tui::settings::cockpit_credential_store() {
                 Err(e) => Err(e.to_string()),
-                Ok(r) => models_fetch::fetch_models_for_provider(
-                    &pid,
-                    &entry,
-                    &r,
-                    Duration::from_secs(15),
-                )
-                .await
-                .map_err(|e| e.to_string()),
+                Ok(store) => {
+                    match models_fetch::resolve_provider_request_async_with_store(
+                        &pid,
+                        &entry,
+                        store.clone(),
+                        |name| std::env::var(name).ok(),
+                    )
+                    .await
+                    {
+                        Err(e) => Err(e.to_string()),
+                        Ok(r) => models_fetch::fetch_models_for_provider_with_store(
+                            &pid,
+                            &entry,
+                            &r,
+                            Duration::from_secs(15),
+                            Some(store),
+                        )
+                        .await
+                        .map_err(|e| e.to_string()),
+                    }
+                }
             };
             if let Ok(mut s) = state_w.lock() {
                 *s = FetchState::Done(result);

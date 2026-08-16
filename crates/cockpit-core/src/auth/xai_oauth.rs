@@ -103,23 +103,44 @@ pub async fn begin_manual_login() -> Result<ManualLogin> {
     })
 }
 
+pub fn store_tokens_in(store: &mut CredentialStore, tokens: &StoredTokens) -> Result<()> {
+    store.set(
+        CREDENTIAL_KEY,
+        serde_json::to_value(tokens).context("serializing xAI OAuth tokens")?,
+    );
+    store.save()
+}
+
 pub async fn complete_manual_login(login: ManualLogin, input: &str) -> Result<StoredTokens> {
-    complete_login(login, input, CallbackSource::ManualPaste).await
+    complete_login(login, input, CallbackSource::ManualPaste, None).await
+}
+
+pub async fn complete_manual_login_in(
+    login: ManualLogin,
+    input: &str,
+    store: &mut CredentialStore,
+) -> Result<StoredTokens> {
+    complete_login(login, input, CallbackSource::ManualPaste, Some(store)).await
 }
 
 async fn complete_login(
     login: ManualLogin,
     input: &str,
     source: CallbackSource,
+    store: Option<&mut CredentialStore>,
 ) -> Result<StoredTokens> {
     let code = parse_callback_input(input, &login.state, source)?;
     let tokens = exchange_code(&login.token_endpoint, &code, &login.verifier).await?;
-    store_tokens(&tokens)?;
+    match store {
+        Some(store) => store_tokens_in(store, &tokens)?,
+        None => store_tokens_fail_closed(&tokens)?,
+    }
     Ok(tokens)
 }
 
-pub async fn bearer_token() -> Result<String> {
+pub async fn bearer_token_from_store(store: crate::credentials::CredentialStore) -> Result<String> {
     let tokens = crate::auth::refresh_guard::credential_with_refresh(
+        store,
         CREDENTIAL_KEY,
         "parsing stored xAI OAuth tokens",
         missing_auth_error,
@@ -141,33 +162,42 @@ pub fn is_logged_in() -> bool {
     is_logged_in_at(None)
 }
 
+pub fn is_logged_in_in(store: &CredentialStore) -> bool {
+    store
+        .get(CREDENTIAL_KEY)
+        .and_then(|raw| serde_json::from_value::<StoredTokens>(raw.clone()).ok())
+        .is_some()
+}
+
 pub fn is_logged_in_at(store_path: Option<&Path>) -> bool {
     open_store(store_path)
         .ok()
-        .and_then(|store| {
-            store
-                .get(CREDENTIAL_KEY)
-                .and_then(|raw| serde_json::from_value::<StoredTokens>(raw.clone()).ok())
-        })
-        .is_some()
+        .map(|store| is_logged_in_in(&store))
+        .unwrap_or(false)
 }
 
 pub fn logout() -> Result<()> {
     logout_at(None)
 }
 
-pub fn logout_at(store_path: Option<&Path>) -> Result<()> {
-    let mut store = open_store(store_path)?;
+pub fn logout_in(store: &mut CredentialStore) -> Result<()> {
     store.remove(CREDENTIAL_KEY);
     store.save()
 }
 
-fn open_store(store_path: Option<&Path>) -> Result<CredentialStore> {
-    match store_path {
-        Some(path) => CredentialStore::open_legacy_file(path.to_path_buf()),
-        None => CredentialStore::open_default(),
-    }
+pub fn logout_at(store_path: Option<&Path>) -> Result<()> {
+    let mut store = open_store(store_path)?;
+    logout_in(&mut store)
 }
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn open_store(store_path: Option<&Path>) -> Result<CredentialStore> {
+    let _ = store_path;
+    anyhow::bail!("OAuth store path-open is test-only; inject a vault-backed store")
+}
+
+#[cfg(any(test, feature = "test-support"))]
+include!("xai_oauth_test_open.rs");
 
 fn missing_auth_error() -> anyhow::Error {
     anyhow!("Grok subscription auth required — set up OAuth in /settings → Providers.")
@@ -310,10 +340,8 @@ impl StoredTokens {
     }
 }
 
-fn store_tokens(tokens: &StoredTokens) -> Result<()> {
-    let mut store = CredentialStore::open_default()?;
-    store.set(CREDENTIAL_KEY, serde_json::to_value(tokens)?);
-    store.save()
+fn store_tokens_fail_closed(_tokens: &StoredTokens) -> Result<()> {
+    anyhow::bail!("OAuth persist requires an injected vault-backed store")
 }
 
 pub fn bind_callback_listener(port: u16) -> Result<tokio::net::TcpListener> {
@@ -448,8 +476,24 @@ pub async fn complete_local_callback_login(
     login: ManualLogin,
     listener: tokio::net::TcpListener,
 ) -> Result<StoredTokens> {
+    complete_local_callback_login_in_store(login, listener, None).await
+}
+
+pub async fn complete_local_callback_login_in(
+    login: ManualLogin,
+    listener: tokio::net::TcpListener,
+    store: &mut CredentialStore,
+) -> Result<StoredTokens> {
+    complete_local_callback_login_in_store(login, listener, Some(store)).await
+}
+
+async fn complete_local_callback_login_in_store(
+    login: ManualLogin,
+    listener: tokio::net::TcpListener,
+    store: Option<&mut CredentialStore>,
+) -> Result<StoredTokens> {
     let callback = wait_for_callback_async(&listener).await?;
-    complete_login(login, &callback, CallbackSource::LocalListener).await
+    complete_login(login, &callback, CallbackSource::LocalListener, store).await
 }
 
 fn parse_callback_input(

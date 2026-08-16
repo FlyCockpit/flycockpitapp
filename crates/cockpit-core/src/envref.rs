@@ -41,17 +41,28 @@ impl Resolved {
     }
 }
 
-/// Expand environment references from the process and named-secret references
-/// from the private credential store. An unreadable/missing store behaves like
-/// an absent secret and never makes request construction crash.
+/// Expand environment references from the process. Named-secret references
+/// stay unresolved on this path — production secret expansion uses
+/// [`resolve_with_sources`] with a daemon-injected lookup.
 pub fn resolve(input: &str) -> Resolved {
-    let store = crate::credentials::CredentialStore::open_default().ok();
+    resolve_with_sources_and_home(
+        input,
+        |k| env::var(k).ok(),
+        |_| None,
+        env::var("HOME").ok().as_deref(),
+    )
+}
+
+/// Expand env and named-secret references from an injected credential store.
+pub fn resolve_with_store(
+    input: &str,
+    store: Option<&crate::credentials::CredentialStore>,
+) -> Resolved {
     resolve_with_sources_and_home(
         input,
         |k| env::var(k).ok(),
         |name| {
             store
-                .as_ref()
                 .and_then(|store| store.named_secret(name))
                 .map(str::to_string)
         },

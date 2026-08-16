@@ -100,7 +100,11 @@ fn leak_rotation_proposal_derivation_is_closed_vocabulary() {
         LeakRotationPlan::derive(LeakSource::ModelOutput, LeakCategory::Token, Some("c1")),
         LeakRotationPlan::RevokeConnectorCredential
     );
-    for cat in [LeakCategory::Secret, LeakCategory::Key, LeakCategory::Password] {
+    for cat in [
+        LeakCategory::Secret,
+        LeakCategory::Key,
+        LeakCategory::Password,
+    ] {
         assert_eq!(
             LeakRotationPlan::derive(LeakSource::ModelOutput, cat, None),
             LeakRotationPlan::RotateNamedSecret
@@ -147,7 +151,10 @@ fn leak_list_row_debug_has_no_secret_fields() {
         "nonce:",
         "literal:",
     ] {
-        assert!(!debug.contains(forbidden), "debug leaks field `{forbidden}`");
+        assert!(
+            !debug.contains(forbidden),
+            "debug leaks field `{forbidden}`"
+        );
     }
 }
 
@@ -159,7 +166,10 @@ fn leak_list_row_debug_has_no_secret_fields() {
 fn leak_reveal_state_mint_replaces_and_rate_window_slides() {
     let mut state = LeakRevealState::new();
     // No capability -> NoCapability (unauthorized), rate untouched.
-    assert!(matches!(state.begin_reveal(1000), RevealStart::NoCapability));
+    assert!(matches!(
+        state.begin_reveal(1000),
+        RevealStart::NoCapability
+    ));
 
     // Mint, then a second mint replaces (invalidates) the first: only the
     // second token survives in the single slot.
@@ -173,7 +183,10 @@ fn leak_reveal_state_mint_replaces_and_rate_window_slides() {
         other => panic!("expected Consumed, got {other:?}"),
     }
     // Single-use: the slot is now empty.
-    assert!(matches!(state.begin_reveal(1000), RevealStart::NoCapability));
+    assert!(matches!(
+        state.begin_reveal(1000),
+        RevealStart::NoCapability
+    ));
 
     // Rate window: 3 successes exhaust the limit; a 4th begin is RateLimited
     // (and does not consume a freshly minted capability).
@@ -238,7 +251,10 @@ fn leak_reveal_state_stalled_reservations_are_not_aged_out() {
     // reservations are not aged out. This fails against a limiter that ages
     // reservations by their reserve time (which would free the slots here).
     state.mint([1u8; 32], "r".into(), 1_000_000);
-    assert!(matches!(state.begin_reveal(70_000), RevealStart::RateLimited));
+    assert!(matches!(
+        state.begin_reveal(70_000),
+        RevealStart::RateLimited
+    ));
 
     // The stalled three finally confirm, recorded at the CONFIRM time (70_000).
     for _ in 0..3 {
@@ -246,11 +262,17 @@ fn leak_reveal_state_stalled_reservations_are_not_aged_out() {
     }
     // A 4th within a minute of their confirm is still RateLimited.
     state.mint([1u8; 32], "r".into(), 1_000_000);
-    assert!(matches!(state.begin_reveal(80_000), RevealStart::RateLimited));
+    assert!(matches!(
+        state.begin_reveal(80_000),
+        RevealStart::RateLimited
+    ));
 
     // Only a full minute past their confirm reopens the budget.
     state.mint([1u8; 32], "r".into(), 1_000_000);
-    assert!(matches!(state.begin_reveal(131_000), RevealStart::Consumed(_)));
+    assert!(matches!(
+        state.begin_reveal(131_000),
+        RevealStart::Consumed(_)
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -311,8 +333,11 @@ fn leak_list_cursor_mac_rejects_tamper() {
     );
 
     // Truncated frame -> rejected.
-    let truncated = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(cursor.as_bytes()).unwrap()[..10]);
+    let truncated = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(cursor.as_bytes())
+            .unwrap()[..10],
+    );
     assert_eq!(
         decode_leak_cursor(&key, &truncated, &filters),
         Err(LeakListError::InvalidCursor)
@@ -369,9 +394,36 @@ async fn leak_list_snapshot_watermark_and_has_more() {
     let key = cursor_key();
 
     // Three rows, distinct last_reported timestamps.
-    insert_contained_leak(&db, &resolver, session_a(), "s1", LeakSource::ModelOutput, LeakCategory::Token, 1_000_000).await;
-    insert_contained_leak(&db, &resolver, session_a(), "s2", LeakSource::ToolOutput, LeakCategory::Key, 2_000_000).await;
-    let r3 = insert_contained_leak(&db, &resolver, session_a(), "s3", LeakSource::Reasoning, LeakCategory::Password, 3_000_000).await;
+    insert_contained_leak(
+        &db,
+        &resolver,
+        session_a(),
+        "s1",
+        LeakSource::ModelOutput,
+        LeakCategory::Token,
+        1_000_000,
+    )
+    .await;
+    insert_contained_leak(
+        &db,
+        &resolver,
+        session_a(),
+        "s2",
+        LeakSource::ToolOutput,
+        LeakCategory::Key,
+        2_000_000,
+    )
+    .await;
+    let r3 = insert_contained_leak(
+        &db,
+        &resolver,
+        session_a(),
+        "s3",
+        LeakSource::Reasoning,
+        LeakCategory::Password,
+        3_000_000,
+    )
+    .await;
 
     // Page 1 (limit 2): newest first, has_more true, cursor present.
     let page1 = list_leak_reports(&db, &key, LeakListFilters::default(), 2, None)
@@ -385,15 +437,37 @@ async fn leak_list_snapshot_watermark_and_has_more() {
 
     // Insert a NEW row and RE-REPORT r3 (bumping its last_reported_ms above the
     // snapshot watermark) before fetching page 2. Neither may appear.
-    insert_contained_leak(&db, &resolver, session_a(), "s4", LeakSource::EnvLeak, LeakCategory::Secret, 4_000_000).await;
+    insert_contained_leak(
+        &db,
+        &resolver,
+        session_a(),
+        "s4",
+        LeakSource::EnvLeak,
+        LeakCategory::Secret,
+        4_000_000,
+    )
+    .await;
     // Re-report r3's secret with a later timestamp -> dedup bumps last_reported.
-    let _ = insert_contained_leak(&db, &resolver, session_a(), "s3", LeakSource::Reasoning, LeakCategory::Password, 5_000_000).await;
+    let _ = insert_contained_leak(
+        &db,
+        &resolver,
+        session_a(),
+        "s3",
+        LeakSource::Reasoning,
+        LeakCategory::Password,
+        5_000_000,
+    )
+    .await;
 
     let page2 = list_leak_reports(&db, &key, LeakListFilters::default(), 2, Some(&cursor))
         .await
         .unwrap();
     // Only the original oldest row (s1) remains in this snapshot chain.
-    assert_eq!(page2.refs.len(), 1, "re-reported/new rows must not appear mid-chain");
+    assert_eq!(
+        page2.refs.len(),
+        1,
+        "re-reported/new rows must not appear mid-chain"
+    );
     assert_eq!(page2.refs[0].last_reported_ms, 1_000_000);
     assert!(!page2.has_more);
     assert!(page2.next_cursor.is_none());
@@ -416,7 +490,16 @@ async fn leak_list_exact_multiple_page_has_no_cursor() {
     let resolver = test_resolver();
     let key = cursor_key();
     for i in 0..2 {
-        insert_contained_leak(&db, &resolver, session_a(), &format!("x{i}"), LeakSource::ModelOutput, LeakCategory::Token, 1_000_000 + i).await;
+        insert_contained_leak(
+            &db,
+            &resolver,
+            session_a(),
+            &format!("x{i}"),
+            LeakSource::ModelOutput,
+            LeakCategory::Token,
+            1_000_000 + i,
+        )
+        .await;
     }
     // Exactly `limit` rows -> has_more false, no cursor (regression for the old
     // `refs.len() == limit` bug that emitted a cursor to an empty next page).
@@ -452,7 +535,14 @@ async fn leak_list_invalid_limit_and_cursor() {
         Err(LeakListError::InvalidLimit)
     );
     assert_eq!(
-        list_leak_reports(&db, &key, LeakListFilters::default(), 10, Some("not-a-valid-cursor")).await,
+        list_leak_reports(
+            &db,
+            &key,
+            LeakListFilters::default(),
+            10,
+            Some("not-a-valid-cursor")
+        )
+        .await,
         Err(LeakListError::InvalidCursor)
     );
 }
@@ -467,8 +557,26 @@ async fn leak_list_project_root_and_rotation_filters() {
     let resolver = test_resolver();
     let key = cursor_key();
 
-    let ra = insert_contained_leak(&db, &resolver, session_a(), "sa", LeakSource::ModelOutput, LeakCategory::Token, 1_000_000).await;
-    let rb = insert_contained_leak(&db, &resolver, session_b(), "sb", LeakSource::ToolOutput, LeakCategory::Key, 2_000_000).await;
+    let ra = insert_contained_leak(
+        &db,
+        &resolver,
+        session_a(),
+        "sa",
+        LeakSource::ModelOutput,
+        LeakCategory::Token,
+        1_000_000,
+    )
+    .await;
+    let rb = insert_contained_leak(
+        &db,
+        &resolver,
+        session_b(),
+        "sb",
+        LeakSource::ToolOutput,
+        LeakCategory::Key,
+        2_000_000,
+    )
+    .await;
 
     // Machine-wide default includes both.
     let all = list_leak_reports(&db, &key, LeakListFilters::default(), 100, None)
@@ -517,8 +625,12 @@ async fn leak_list_project_root_and_rotation_filters() {
 
     // Rotation-state filter exact-matches each of the four states. Set ra's
     // rotation to PendingUser and mark rb Rotated.
-    update_rotation(&db, &ra, LeakRotationAction::Accept).await.unwrap();
-    update_rotation(&db, &rb, LeakRotationAction::MarkRotated).await.unwrap();
+    update_rotation(&db, &ra, LeakRotationAction::Accept)
+        .await
+        .unwrap();
+    update_rotation(&db, &rb, LeakRotationAction::MarkRotated)
+        .await
+        .unwrap();
     let cases = [
         (LeakRotation::None, 0),
         (LeakRotation::PendingUser, 1),

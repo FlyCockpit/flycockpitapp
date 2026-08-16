@@ -628,24 +628,53 @@ async fn install_cli_trust_policy(project: Option<&Path>) -> anyhow::Result<()> 
         None => std::env::current_dir().context("resolving workspace for trust policy")?,
     };
     let root = config::trust::resolve_trust_root(&opened)?;
-    let mode = match db::Db::open_default() {
-        Ok(db) => match db.workspace_trust_by_root(&root.root).await {
-            Ok(Some(decision))
-                if decision.mode != db::workspace_trust::WorkspaceTrustMode::Untrusted =>
-            {
-                decision.mode
-            }
-            Ok(_) => db::workspace_trust::WorkspaceTrustMode::IgnoreConfig,
-            Err(error) => {
-                tracing::warn!(error = %error, "reading workspace trust policy; ignoring project config");
-                db::workspace_trust::WorkspaceTrustMode::IgnoreConfig
-            }
-        },
-        Err(error) => {
-            tracing::warn!(error = %error, "opening workspace trust database; ignoring project config");
+    let daemon = daemon::client::ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for workspace trust")?;
+    let project_root = root.root.display().to_string();
+    let response = daemon
+        .client
+        .request(daemon::proto::Request::GetWorkspaceTrust {
+            project_root: project_root.clone(),
+        })
+        .await
+        .context("requesting workspace trust")?
+        .map_err(|error| anyhow::anyhow!("daemon rejected workspace trust read: {error}"))?;
+    let (stored_mode, config_generation) = match response {
+        daemon::proto::Response::WorkspaceTrust {
+            mode,
+            config_generation,
+        } => (mode, config_generation),
+        other => anyhow::bail!("daemon returned unexpected workspace trust response: {other:?}"),
+    };
+    let mode = match stored_mode {
+        Some(daemon::proto::WorkspaceTrustMode::Trust) => {
+            db::workspace_trust::WorkspaceTrustMode::Trust
+        }
+        Some(daemon::proto::WorkspaceTrustMode::IgnoreConfig) => {
+            db::workspace_trust::WorkspaceTrustMode::IgnoreConfig
+        }
+        Some(daemon::proto::WorkspaceTrustMode::Untrusted) | None => {
             db::workspace_trust::WorkspaceTrustMode::IgnoreConfig
         }
     };
+    if stored_mode.is_none() {
+        let response = daemon
+            .client
+            .request(daemon::proto::Request::SetWorkspaceTrust {
+                project_root,
+                mode: daemon::proto::WorkspaceTrustMode::IgnoreConfig,
+                expected_config_generation: config_generation,
+            })
+            .await
+            .context("persisting default workspace trust")?
+            .map_err(|error| anyhow::anyhow!("daemon rejected workspace trust persist: {error}"))?;
+        if !matches!(response, daemon::proto::Response::WorkspaceTrustSet { .. }) {
+            anyhow::bail!(
+                "daemon returned unexpected workspace trust persist response: {response:?}"
+            );
+        }
+    }
     config::trust::set_runtime_policy(root, mode);
     Ok(())
 }
@@ -659,6 +688,15 @@ fn command_requires_workspace_trust(command: Option<&Command>) -> bool {
                 crate::cli::DaemonCommand::Status { .. }
                     | crate::cli::DaemonCommand::Start { .. }
                     | crate::cli::DaemonCommand::Stop { .. }
+            ))
+            | Some(Command::Jq(_))
+            | Some(Command::Completion { .. })
+            | Some(Command::BashHints(_))
+            | Some(Command::Agent(
+                crate::cli::AgentCommand::Create { .. } | crate::cli::AgentCommand::List
+            ))
+            | Some(Command::Mcp(
+                crate::cli::McpCommand::Add(_) | crate::cli::McpCommand::List
             ))
     )
 }
@@ -985,21 +1023,72 @@ fn open_private_append(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 #[cfg(test)]
+mod production_path_ratchet;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn trust_free_commands_do_not_prompt() {
+    fn lib_trust_policy_does_not_open_db() {
+        let source = include_str!("lib.rs");
+        let production = source
+            .split("mod tests {")
+            .next()
+            .expect("production lib.rs");
+        assert!(
+            !production.contains("Db::open_default"),
+            "install_cli_trust_policy must not open SQLite"
+        );
+        assert!(production.contains("GetWorkspaceTrust"));
+        assert!(production.contains("SetWorkspaceTrust"));
+        assert!(!production.contains("GetStartupDisclosures"));
+    }
+
+    #[test]
+    fn get_workspace_trust_exists_and_is_used_by_lib() {
+        assert!(
+            include_str!("lib.rs").contains("GetWorkspaceTrust"),
+            "lib trust policy must consume GetWorkspaceTrust"
+        );
+        let proto = include_str!("../../../crates/cockpit-proto/src/request.rs");
+        assert!(
+            proto.contains("GetWorkspaceTrust"),
+            "GetWorkspaceTrust must exist as an owner RPC"
+        );
+        let disclosures =
+            include_str!("../../../crates/cockpit-core/src/daemon/server/dispatch.rs");
+        let get_startup = disclosures
+            .split("Request::GetStartupDisclosures")
+            .nth(1)
+            .expect("GetStartupDisclosures handler remains");
+        assert!(
+            get_startup.contains("org_sync") && get_startup.contains("connector"),
+            "GetStartupDisclosures stays org-sync/connector/config generation only"
+        );
+        assert!(
+            !get_startup
+                .split("Request::")
+                .next()
+                .unwrap_or("")
+                .contains("workspace_trust_by_root"),
+            "GetStartupDisclosures must not become the trust read"
+        );
+    }
+
+    #[tokio::test]
+    async fn trust_free_commands_do_not_prompt() {
         let tmp = tempfile::tempdir().unwrap();
-        let _env = crate::test_env::lock();
+        let _env = crate::test_env::lock_async().await;
         _env.set_var("XDG_DATA_HOME", tmp.path().join("data"));
         _env.set_var("XDG_STATE_HOME", tmp.path().join("state"));
+        _env.set_var("XDG_RUNTIME_DIR", tmp.path().join("runtime"));
         crate::config::trust::clear_runtime_policy_for_tests();
 
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(install_cli_trust_policy(Some(tmp.path())))
-            .unwrap();
+        let _ctx = crate::daemon::boot_test_persistent_daemon()
+            .await
+            .expect("boot trust-policy daemon");
+        install_cli_trust_policy(Some(tmp.path())).await.unwrap();
         assert_eq!(
             crate::config::trust::runtime_policy().unwrap().mode,
             db::workspace_trust::WorkspaceTrustMode::IgnoreConfig
@@ -1015,6 +1104,29 @@ mod tests {
         assert!(command_requires_workspace_trust(None));
         assert!(command_requires_workspace_trust(Some(&Command::Debug(
             crate::cli::DebugCommand::Config,
+        ))));
+    }
+
+    #[test]
+    fn file_only_commands_do_not_require_workspace_trust() {
+        assert!(!command_requires_workspace_trust(Some(&Command::Jq(
+            crate::cli::JqArgs { args: Vec::new() }
+        ))));
+        assert!(!command_requires_workspace_trust(Some(
+            &Command::BashHints(crate::cli::BashHintsCommand::List)
+        )));
+        assert!(!command_requires_workspace_trust(Some(&Command::Agent(
+            crate::cli::AgentCommand::List
+        ))));
+        assert!(!command_requires_workspace_trust(Some(&Command::Mcp(
+            crate::cli::McpCommand::List
+        ))));
+        assert!(command_requires_workspace_trust(Some(&Command::Doctor(
+            crate::cli::DoctorArgs {
+                path: None,
+                offline: false,
+                dependencies_json: false,
+            }
         ))));
     }
 

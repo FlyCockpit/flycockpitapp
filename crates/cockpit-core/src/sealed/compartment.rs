@@ -216,13 +216,6 @@ impl SealedCompartment {
         }
     }
 
-    pub fn open_default() -> Result<Self> {
-        let db = crate::db::Db::open_default().context("opening cockpit DB for sealed vault")?;
-        let vault = crate::secure_key::vault_for_db(&db)
-            .map_err(|e| anyhow::anyhow!("opening secret vault for sealed compartment: {e}"))?;
-        Ok(Self::from_vault(vault))
-    }
-
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -635,9 +628,47 @@ fn restrict_handle_to_owner(_file: &std::fs::File) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-support"))]
+include!("compartment_test_open.rs");
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sealed_compartment_json_is_not_read_or_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let leftover = dir.path().join("sealed-compartment.json");
+        let leftover_key = SealedCompartmentKey::generate();
+        std::fs::write(
+            &leftover,
+            format!(
+                r#"{{"{}":"leftover-sealed-unique-secret"}}"#,
+                leftover_key.as_str()
+            ),
+        )
+        .unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let vault = crate::secure_key::vault_for_db(&db).unwrap();
+        let compartment = SealedCompartment::from_vault(vault);
+        assert!(
+            compartment.get_exact(&leftover_key).unwrap().is_none(),
+            "vault-backed compartment must ignore leftover sealed-compartment.json"
+        );
+        let live_key = SealedCompartmentKey::generate();
+        compartment
+            .put(&live_key, &SealedLiteral::new("vault-only-literal"))
+            .unwrap();
+        let leftover_raw = std::fs::read_to_string(&leftover).unwrap();
+        assert!(leftover_raw.contains("leftover-sealed-unique-secret"));
+        assert!(!leftover_raw.contains("vault-only-literal"));
+        if let Some(path) = default_compartment_path() {
+            assert!(
+                !path.exists() || path == leftover,
+                "production must not recreate sealed-compartment.json"
+            );
+        }
+    }
 
     #[test]
     fn locators_are_opaque_random_and_never_printed() {

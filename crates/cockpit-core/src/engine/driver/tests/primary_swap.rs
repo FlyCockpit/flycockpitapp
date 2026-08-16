@@ -880,7 +880,7 @@ async fn fresh_driver_rehydrates_persisted_pruned_context() {
     // A brand-new driver for the SAME session (a fresh worker after an
     // unclean restart) rehydrates automatically.
     let s2 = Arc::new(
-        Session::resume(
+        Session::resume_for_test(
             db.clone(),
             sid,
             crate::session::test_redaction_key_resolver(),

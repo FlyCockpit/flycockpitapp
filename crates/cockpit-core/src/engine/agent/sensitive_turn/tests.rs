@@ -77,7 +77,10 @@ impl SensitiveContainmentHost for FakeHost {
 
     async fn install_redaction(&self, secret: &Zeroizing<String>) -> anyhow::Result<()> {
         self.events.lock().unwrap().push("install");
-        self.installed.lock().unwrap().push(secret.as_str().to_owned());
+        self.installed
+            .lock()
+            .unwrap()
+            .push(secret.as_str().to_owned());
         if self.install_ok {
             Ok(())
         } else {
@@ -359,8 +362,15 @@ async fn provider_sensitive_turn_state_machine_contains_multiple_reports() {
 
     assert_eq!(out.state, SensitiveTurnState::Contained);
     assert_eq!(out.sensitive_results.len(), 2);
-    assert!(out.sensitive_results.iter().all(|r| r.model_output == "contained"));
-    assert_eq!(host.installed(), vec!["secret-a".to_string(), "secret-b".to_string()]);
+    assert!(
+        out.sensitive_results
+            .iter()
+            .all(|r| r.model_output == "contained")
+    );
+    assert_eq!(
+        host.installed(),
+        vec!["secret-a".to_string(), "secret-b".to_string()]
+    );
 }
 
 // ---------------------------------------------------------------------------

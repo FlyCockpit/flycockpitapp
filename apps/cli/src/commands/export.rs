@@ -7,7 +7,7 @@
 //! zip-assembly implementation shared with the TUI `/export debug`
 //! command.
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 
 use cockpit_core::session::export::{
     default_output_path, resolve_session, write_bundle_zip, write_bundle_zip_raw_local,
@@ -47,7 +47,19 @@ pub async fn run(args: ExportArgs) -> Result<()> {
         eprintln!("{}", raw_export_stderr_warning(&out_path));
         summary
     } else {
-        write_bundle_zip(&db, &target, &out_path, args.force, args.include_generated).await?
+        {
+            let vault = cockpit_core::secure_key::vault_for_db(&db)
+                .map_err(|e| anyhow!("opening export vault: {e}"))?;
+            write_bundle_zip(
+                &db,
+                &target,
+                &out_path,
+                args.force,
+                args.include_generated,
+                &vault,
+            )
+            .await?
+        }
     };
 
     println!(

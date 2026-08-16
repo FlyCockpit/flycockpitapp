@@ -219,9 +219,7 @@ pub fn safe_provider_detail(failure: &InferenceFailure) -> SafeProviderDetail {
 /// plus that metadata. The raw error text (`err.to_string()`, an
 /// attacker-controllable provider body) is NEVER read into the result, so no
 /// caller can persist or emit it.
-pub fn safe_completion_error_detail(
-    err: &rig::completion::CompletionError,
-) -> SafeProviderDetail {
+pub fn safe_completion_error_detail(err: &rig::completion::CompletionError) -> SafeProviderDetail {
     let classified = super::rig_boundary::classify_terminal_failure(err);
     SafeProviderDetail {
         marker: PROVIDER_DETAIL_OMITTED,

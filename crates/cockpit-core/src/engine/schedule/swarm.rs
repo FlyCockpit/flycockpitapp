@@ -282,8 +282,14 @@ async fn run_swarm_loop(
     // Resolve backup/failover under the child's PINNED config (never live
     // `ctx.config`), so failover/reposture/dispatch share the same generation the
     // child's identity/posture were built under.
-    let backup_model = crate::engine::driver::resolve_backup_model_for(&pinned, &agent.model);
-    let fallback_models = crate::engine::driver::resolve_failover_models_for(&pinned, &agent.model);
+    let store = ctx.session.credential_store().ok();
+    let backup_model = crate::engine::driver::resolve_backup_model_for_with_store(
+        &pinned,
+        &agent.model,
+        store.clone(),
+    );
+    let fallback_models =
+        crate::engine::driver::resolve_failover_models_for_with_store(&pinned, &agent.model, store);
 
     for _ in 0..SWARM_MAX_TURNS {
         let outcome = crate::engine::agent::turn_with_backup(
@@ -493,22 +499,26 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
             // Host config named this target (e.g. `goalSupervision.coldSkepticModel`):
             // it keeps its own configured custody class.
             SpawnModelOrigin::HostConfig => {
-                crate::engine::model_roles::resolve_host_config_spawn_selector(
+                crate::engine::model_roles::resolve_host_config_spawn_selector_with_store(
                     selector,
                     worker_agent,
                     &extended,
                     &providers,
                     &ctx.agent.model,
+                    ctx.session.credential_store().ok(),
                 )
             }
             // A model wrote this selector: forced redacted-untrusted custody.
-            SpawnModelOrigin::ModelDirected => crate::engine::model_roles::resolve_spawn_selector(
-                selector,
-                worker_agent,
-                &extended,
-                &providers,
-                &ctx.agent.model,
-            ),
+            SpawnModelOrigin::ModelDirected => {
+                crate::engine::model_roles::resolve_spawn_selector_with_store(
+                    selector,
+                    worker_agent,
+                    &extended,
+                    &providers,
+                    &ctx.agent.model,
+                    ctx.session.credential_store().ok(),
+                )
+            }
         }
         .map_err(|error| {
             anyhow::anyhow!(
@@ -557,6 +567,7 @@ fn build_swarm_child(spec: &SpawnSpec, ctx: &ScheduleContext) -> anyhow::Result<
         granted_tools: Vec::new(),
         lock_identity: None,
         write_scope: None,
+        credential_store: ctx.session.credential_store().ok(),
     };
     // The recursive worker unit is `bee` (GOALS §24/§26): a noninteractive,
     // write-capable, parallel worker that may itself fan out deeper `bee`
@@ -889,7 +900,7 @@ mod tests {
 
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = Arc::new(
-            crate::session::Session::create(
+            crate::session::Session::create_for_test(
                 db,
                 tmp.path().to_path_buf(),
                 "Swarm",

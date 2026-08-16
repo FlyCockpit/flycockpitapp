@@ -750,6 +750,10 @@ pub async fn discover() -> DaemonProbe {
         }
     };
 
+    if crate::daemon::server::in_process_context(&canonical.socket).is_some() {
+        return DaemonProbe::new(DaemonStatus::Running, canonical);
+    }
+
     if let Some(record) = read_endpoint_record()
         && record.kind == DaemonEndpointKind::Persistent
     {
@@ -804,6 +808,10 @@ pub fn discover_blocking() -> DaemonProbe {
             );
         }
     };
+
+    if crate::daemon::server::in_process_context(&canonical.socket).is_some() {
+        return DaemonProbe::new(DaemonStatus::Running, canonical);
+    }
 
     if let Some(record) = read_endpoint_record()
         && record.kind == DaemonEndpointKind::Persistent
@@ -1126,6 +1134,72 @@ pub(crate) async fn boot_in_process(
     }
     server::register_in_process_context(ctx.clone());
     Ok(ctx)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn boot_test_persistent_daemon() -> Result<std::sync::Arc<server::DaemonContext>> {
+    let paths = DaemonPaths::resolve_canonical()?;
+    if let Some(ctx) = server::in_process_context(&paths.socket) {
+        return Ok(ctx);
+    }
+    let db = crate::db::Db::open_in_memory().context("opening isolated test daemon DB")?;
+    let locks = Arc::new(crate::locks::LockManager::in_memory(db.clone()));
+    let ctx = tokio::task::spawn_blocking(move || {
+        std::sync::Arc::new(server::DaemonContext::new(
+            db,
+            locks,
+            paths,
+            terminal::default_host_factory(),
+            config_source::ConfigSource::fixed(Default::default(), Default::default()),
+        ))
+    })
+    .await
+    .context("building isolated test daemon")?;
+    server::register_in_process_context(ctx.clone());
+    Ok(ctx)
+}
+
+/// Test seam for first-run auto-promote: `probe_or_spawn(AttachOrAutoPromote)`
+/// boots an in-process canonical daemon instead of spawning a child.
+#[cfg(any(test, feature = "test-support"))]
+static IN_PROCESS_AUTO_PROMOTE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(any(test, feature = "test-support"))]
+static AUTO_PROMOTED_DAEMON: std::sync::Mutex<Option<Arc<server::DaemonContext>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(any(test, feature = "test-support"))]
+pub struct InProcessAutoPromoteGuard;
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for InProcessAutoPromoteGuard {
+    fn drop(&mut self) {
+        IN_PROCESS_AUTO_PROMOTE.store(false, std::sync::atomic::Ordering::SeqCst);
+        *AUTO_PROMOTED_DAEMON
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn enable_in_process_auto_promote() -> InProcessAutoPromoteGuard {
+    IN_PROCESS_AUTO_PROMOTE.store(true, std::sync::atomic::Ordering::SeqCst);
+    InProcessAutoPromoteGuard
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn in_process_auto_promote_enabled() -> bool {
+    IN_PROCESS_AUTO_PROMOTE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) async fn auto_promote_in_process_persistent() -> Result<u32> {
+    let ctx = boot_test_persistent_daemon().await?;
+    *AUTO_PROMOTED_DAEMON
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ctx);
+    Ok(std::process::id())
 }
 
 #[cfg(test)]
@@ -2508,7 +2582,7 @@ mod tests {
         // the first user message has. This is what the (suspected) lingering
         // bug pinned on; it must NOT keep the owned daemon alive.
         {
-            let session = Session::create(
+            let session = Session::create_for_test(
                 harness.db.clone(),
                 std::env::temp_dir(),
                 "Build",

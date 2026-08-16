@@ -552,7 +552,8 @@ fn primary_paste_held_connection_contract() {
             if name.contains("primary_paste_tests.rs") {
                 return;
             }
-            let on_primary_route = name.contains("primary_paste.rs") || name.ends_with("app/mouse.rs");
+            let on_primary_route =
+                name.contains("primary_paste.rs") || name.ends_with("app/mouse.rs");
             if !on_primary_route {
                 return;
             }

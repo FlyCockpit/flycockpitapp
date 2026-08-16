@@ -251,6 +251,20 @@ pub enum Response {
     WorkspaceTrustSet {
         config_generation: u64,
     },
+    WorkspaceTrust {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<WorkspaceTrustMode>,
+        config_generation: u64,
+    },
+    FlycockpitStored,
+    FlycockpitAlreadyLoggedIn {
+        email: String,
+        server_url: String,
+    },
+    FlycockpitCleared {
+        server_url: String,
+    },
+    FlycockpitNotLoggedIn,
     StartupDisclosures {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         org_sync: Option<OrgSyncDisclosure>,
@@ -827,6 +841,11 @@ macro_rules! response_variants {
             (Response::ProjectNoteCreated { .. }, "project_note_created");
             (Response::ProjectNoteRenamed { .. }, "project_note_renamed");
             (Response::WorkspaceTrustSet { .. }, "workspace_trust_set");
+            (Response::WorkspaceTrust { .. }, "workspace_trust");
+            (Response::FlycockpitStored, "flycockpit_stored");
+            (Response::FlycockpitAlreadyLoggedIn { .. }, "flycockpit_already_logged_in");
+            (Response::FlycockpitCleared { .. }, "flycockpit_cleared");
+            (Response::FlycockpitNotLoggedIn, "flycockpit_not_logged_in");
             (Response::StartupDisclosures { .. }, "startup_disclosures");
             (Response::AppFlag { .. }, "app_flag");
             (Response::AppFlagSeen { .. }, "app_flag_seen");

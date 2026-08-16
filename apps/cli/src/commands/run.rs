@@ -49,7 +49,10 @@ struct RunUsageError(String);
 struct RunTurnFailure(String);
 
 async fn emit_org_logging_indicator(db: &crate::db::Db) {
-    let Some(credential) = crate::auth::flycockpit::maybe_load_credential() else {
+    let Some(credential) = cockpit_core::secure_key::vault_for_db(db)
+        .ok()
+        .and_then(crate::auth::flycockpit::maybe_load_credential_from_vault)
+    else {
         return;
     };
     match db

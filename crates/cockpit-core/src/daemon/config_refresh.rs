@@ -207,7 +207,7 @@ mod tests {
         .await
         .unwrap();
         let session = Arc::new(
-            Session::create(
+            Session::create_for_test(
                 db.clone(),
                 tmp.path().to_path_buf(),
                 "Build",
@@ -264,7 +264,7 @@ mod tests {
             .unwrap();
 
         let live = Arc::new(
-            Session::create(
+            Session::create_for_test(
                 db.clone(),
                 tmp.path().to_path_buf(),
                 "Build",
@@ -327,7 +327,7 @@ mod tests {
         .await
         .unwrap();
         let session = Arc::new(
-            Session::create(
+            Session::create_for_test(
                 db.clone(),
                 tmp.path().to_path_buf(),
                 "Build",
@@ -384,7 +384,7 @@ mod tests {
         .await
         .unwrap();
         let session = Arc::new(
-            Session::create(
+            Session::create_for_test(
                 db.clone(),
                 project,
                 "Build",

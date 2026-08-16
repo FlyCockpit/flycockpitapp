@@ -565,7 +565,11 @@ fn capped_text(text: String) -> ToolOutput {
 }
 
 fn select_backend(web: &WebConfig, ctx: &ToolCtx) -> SelectedBackend {
-    select_backend_with(web, |name| lookup_env(ctx, name), credential_api_key)
+    select_backend_with(
+        web,
+        |name| lookup_env(ctx, name),
+        |provider_id| credential_api_key(ctx, provider_id),
+    )
 }
 
 pub(crate) fn select_backend_with<E, S>(web: &WebConfig, env: E, store: S) -> SelectedBackend
@@ -648,8 +652,9 @@ fn lookup_env(ctx: &ToolCtx, name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
-fn credential_api_key(provider_id: &str) -> Option<String> {
-    crate::credentials::CredentialStore::open_default()
+fn credential_api_key(ctx: &ToolCtx, provider_id: &str) -> Option<String> {
+    ctx.session
+        .credential_store()
         .ok()
         .and_then(|store| store.api_key(provider_id))
 }
@@ -684,7 +689,7 @@ fn provider_key_resolvable(ctx: &ToolCtx, provider: WebProviderRuntime) -> bool 
     lookup_env(ctx, provider_key_env(provider))
         .and_then(ApiKey::new)
         .is_some()
-        || credential_api_key(provider_id(provider))
+        || credential_api_key(ctx, provider_id(provider))
             .and_then(ApiKey::new)
             .is_some()
 }
@@ -778,7 +783,9 @@ async fn maybe_capture_web_key(ctx: &ToolCtx, err: &WebToolError, tool: &str) ->
         suppress_web_key_prompt(ctx, err.provider);
         return Ok(false);
     };
-    let saved = crate::credentials::CredentialStore::open_default()
+    let saved = ctx
+        .session
+        .credential_store()
         .and_then(|store| {
             store.save_record_merged(
                 provider_id(err.provider),

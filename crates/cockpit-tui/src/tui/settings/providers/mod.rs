@@ -1755,14 +1755,22 @@ impl SettingsCx {
         active.prompt_cache_retention = (!retention.is_default()).then_some(retention);
     }
 
+    fn provider_oauth_store(&self) -> Result<cockpit_core::credentials::CredentialStore, String> {
+        #[cfg(test)]
+        if let Some(path) = self.credential_store_path.as_deref() {
+            return cockpit_core::credentials::CredentialStore::open(path.to_path_buf())
+                .map_err(|e| e.to_string());
+        }
+        super::cockpit_credential_store().map_err(|e| e.to_string())
+    }
+
     fn provider_oauth_logged_in(&self, provider: OAuthProvider) -> bool {
+        let Ok(store) = self.provider_oauth_store() else {
+            return false;
+        };
         match provider {
-            OAuthProvider::Grok => {
-                xai_oauth::is_logged_in_at(self.credential_store_path.as_deref())
-            }
-            OAuthProvider::Codex => {
-                codex_oauth::is_logged_in_at(self.credential_store_path.as_deref())
-            }
+            OAuthProvider::Grok => xai_oauth::is_logged_in_in(&store),
+            OAuthProvider::Codex => codex_oauth::is_logged_in_in(&store),
         }
     }
 
@@ -1776,9 +1784,10 @@ impl SettingsCx {
     }
 
     fn logout_provider_oauth(&self, provider: OAuthProvider) -> Result<(), String> {
+        let mut store = self.provider_oauth_store()?;
         match provider {
-            OAuthProvider::Grok => xai_oauth::logout_at(self.credential_store_path.as_deref()),
-            OAuthProvider::Codex => codex_oauth::logout_at(self.credential_store_path.as_deref()),
+            OAuthProvider::Grok => xai_oauth::logout_in(&mut store),
+            OAuthProvider::Codex => codex_oauth::logout_in(&mut store),
         }
         .map_err(|error| error.to_string())
     }
@@ -4903,9 +4912,8 @@ fn store_copilot_token(
     credential_store_path: Option<&std::path::Path>,
     token: String,
 ) -> Result<(), String> {
-    let mut store =
-        cockpit_core::credentials::CredentialStore::open_for_path_or_default(credential_store_path)
-            .map_err(|error| format!("could not open Cockpit credential store: {error}"))?;
+    let mut store = crate::tui::settings::cockpit_credential_store()
+        .map_err(|error| format!("could not open Cockpit credential store: {error}"))?;
     store.set_named_secret(
         cockpit_core::providers::models_fetch::COPILOT_TOKEN_CREDENTIAL_KEY,
         token,

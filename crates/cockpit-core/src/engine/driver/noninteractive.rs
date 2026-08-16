@@ -808,6 +808,7 @@ impl Driver {
             self.session.id,
             fork_point,
             self.session.redaction_key_resolver().clone(),
+            self.session.secret_vault().clone(),
         )
         .context("creating forked task session")?;
         session.set_external_journal(self.session.external_journal());
@@ -4635,8 +4636,9 @@ pub(crate) async fn run_noninteractive_resumable(
     // (here, its own `agent.model`). Resolved once for the run — the model is
     // fixed for the subagent's lifetime, and resolution is per-turn-equivalent
     // (the subagent always tries its primary model first each turn).
-    let backup_model = resolve_backup_model_for(&config, &agent.model);
-    let fallback_models = resolve_failover_models_for(&config, &agent.model);
+    let store = session.credential_store().ok();
+    let backup_model = resolve_backup_model_for_with_store(&config, &agent.model, store.clone());
+    let fallback_models = resolve_failover_models_for_with_store(&config, &agent.model, store);
     // Rehydration: a follow-up starts from the subagent's prior transcript,
     // so it answers with full knowledge of what it already did (GOALS §3c).
     let mut history: Vec<Message> = prior_history;

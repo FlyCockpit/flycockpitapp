@@ -61,9 +61,14 @@ pub fn try_load_effective(cwd: &Path) -> anyhow::Result<ProvidersConfig> {
 /// Complete the best-effort provider credential migration before another
 /// subsystem captures configuration layers for an effective resolution.
 pub(crate) fn prepare_effective_layers(cwd: &Path) {
-    if let Err(error) = migrate_effective_layers_once(cwd) {
-        tracing::warn!(%error, "provider secret migration could not complete");
-    }
+    let _ = prepare_effective_layers_with_store(cwd, None);
+}
+
+pub(crate) fn prepare_effective_layers_with_store(
+    cwd: &Path,
+    mut store: Option<CredentialStore>,
+) -> Result<()> {
+    migrate_effective_layers_once_with_store(cwd, store.as_mut())
 }
 
 /// Project a resolved [`ProvidersConfig`] to the redacted view the daemon
@@ -112,6 +117,18 @@ pub fn redact_provider_view(
 }
 
 fn migrate_effective_layers_once(cwd: &Path) -> Result<()> {
+    migrate_effective_layers_once_with_store(cwd, None)
+}
+
+fn migrate_effective_layers_once_with_store(
+    cwd: &Path,
+    store: Option<&mut CredentialStore>,
+) -> Result<()> {
+    let Some(store) = store else {
+        // No vault yet: leave layers unmarked so a later vault-backed load
+        // can still migrate literal headers.
+        return Ok(());
+    };
     let paths = crate::config::dirs::config_file_paths_for_load(cwd);
     let seen = MIGRATED_LAYERS.get_or_init(|| Mutex::new(HashSet::new()));
     let mut seen = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -123,9 +140,7 @@ fn migrate_effective_layers_once(cwd: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let store_path = crate::credentials::default_path()
-        .context("could not locate credentials path for provider secret migration")?;
-    match load_paths_with_secret_migration(&pending, &store_path) {
+    match load_paths_with_secret_migration_store(&pending, Some(store)) {
         Ok((_, Some(notice))) => eprintln!("{}", notice.render()),
         Ok((_, None)) => {}
         Err(error) => return Err(error),
@@ -136,15 +151,35 @@ fn migrate_effective_layers_once(cwd: &Path) -> Result<()> {
     Ok(())
 }
 
-fn open_secret_store(store_path: &Path) -> Result<CredentialStore> {
-    CredentialStore::open_for_path_or_default(Some(store_path))
+fn open_secret_store(store_path: Option<&Path>) -> Result<CredentialStore> {
+    open_secret_store_impl(store_path)
 }
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn open_secret_store_impl(store_path: Option<&Path>) -> Result<CredentialStore> {
+    let _ = store_path;
+    anyhow::bail!("secret-ref path-open is test-only; production must inject a vault-backed store")
+}
+
+#[cfg(any(test, feature = "test-support"))]
+include!("secret_ref_test_open.rs");
 
 fn load_paths_with_secret_migration(
     config_paths: &[PathBuf],
-    store_path: &Path,
+    store_path: Option<&Path>,
 ) -> Result<(ProvidersConfig, Option<SecretRefNotice>)> {
-    let notice = migrate_provider_files(config_paths, store_path)?;
+    let mut store = open_secret_store(store_path)?;
+    load_paths_with_secret_migration_store(config_paths, Some(&mut store))
+}
+
+fn load_paths_with_secret_migration_store(
+    config_paths: &[PathBuf],
+    store: Option<&mut CredentialStore>,
+) -> Result<(ProvidersConfig, Option<SecretRefNotice>)> {
+    let notice = match store {
+        Some(store) => migrate_provider_files_in_store(config_paths, store)?,
+        None => None,
+    };
     // Same barrier as every other effective resolution, and fallible here so
     // the daemon's config source reports a typed error rather than serving an
     // ambiguous snapshot behind an unmaskable pending transaction.
@@ -156,13 +191,40 @@ pub fn protect_literal_headers(
     providers: &mut BTreeMap<String, ProviderEntry>,
     store_path: Option<&Path>,
 ) -> Result<Option<SecretRefNotice>> {
+    if !has_literal_secret_candidates(providers) {
+        return Ok(None);
+    }
     let notice_path = match store_path {
         Some(path) => path.to_path_buf(),
-        None => crate::credentials::default_path()
-            .context("could not locate credentials path for provider secrets")?,
+        None => PathBuf::from("vault"),
     };
-    // `None` is the production vault. An explicit path is a test fixture.
-    let mut store = crate::credentials::CredentialStore::open_for_path_or_default(store_path)?;
+    // Path-open is test-only. Production callers inject a vault-backed store
+    // via [`protect_literal_headers_in_store`].
+    let mut store = open_secret_store(store_path)?;
+    protect_literal_headers_in_store_with_notice(providers, &mut store, notice_path)
+}
+
+pub fn protect_literal_headers_in_store(
+    providers: &mut BTreeMap<String, ProviderEntry>,
+    store: &mut CredentialStore,
+) -> Result<Option<SecretRefNotice>> {
+    protect_literal_headers_in_store_with_notice(providers, store, PathBuf::from("vault"))
+}
+
+fn has_literal_secret_candidates(providers: &BTreeMap<String, ProviderEntry>) -> bool {
+    providers.values().any(|entry| {
+        entry
+            .headers
+            .iter()
+            .any(|header| literal_secret_candidate(&header.value))
+    })
+}
+
+fn protect_literal_headers_in_store_with_notice(
+    providers: &mut BTreeMap<String, ProviderEntry>,
+    store: &mut CredentialStore,
+    notice_path: PathBuf,
+) -> Result<Option<SecretRefNotice>> {
     let mut migrated = 0;
     for (provider_id, entry) in providers {
         let mut reserved_names = entry
@@ -203,9 +265,16 @@ pub fn protect_literal_headers(
 
 fn migrate_provider_files(
     config_paths: &[PathBuf],
-    store_path: &Path,
+    store_path: Option<&Path>,
 ) -> Result<Option<SecretRefNotice>> {
     let mut store = open_secret_store(store_path)?;
+    migrate_provider_files_in_store(config_paths, &mut store)
+}
+
+fn migrate_provider_files_in_store(
+    config_paths: &[PathBuf],
+    store: &mut CredentialStore,
+) -> Result<Option<SecretRefNotice>> {
     let mut changed = Vec::new();
     let mut migrated = 0;
 
@@ -278,7 +347,7 @@ fn migrate_provider_files(
     }
     Ok(Some(SecretRefNotice {
         migrated,
-        store_path: store_path.to_path_buf(),
+        store_path: PathBuf::from("vault"),
     }))
 }
 
@@ -347,7 +416,7 @@ mod tests {
         let provider_path = write_provider(&config_path, "openai", literal);
 
         let (loaded, notice) =
-            load_paths_with_secret_migration(std::slice::from_ref(&config_path), &store_path)
+            load_paths_with_secret_migration(std::slice::from_ref(&config_path), Some(&store_path))
                 .unwrap();
         let notice = notice.unwrap();
         assert_eq!(notice.migrated, 1);
@@ -375,13 +444,13 @@ mod tests {
         let provider_path = write_provider(&config_path, "openai", literal);
 
         assert!(
-            migrate_provider_files(std::slice::from_ref(&config_path), &store_path)
+            migrate_provider_files(std::slice::from_ref(&config_path), Some(&store_path))
                 .unwrap()
                 .is_some()
         );
         let after_first = std::fs::read_to_string(&provider_path).unwrap();
         assert!(
-            migrate_provider_files(&[config_path], &store_path)
+            migrate_provider_files(&[config_path], Some(&store_path))
                 .unwrap()
                 .is_none()
         );
@@ -546,14 +615,101 @@ mod tests {
         assert!(credentials_src.contains("from_vault"));
         let setup_src = include_str!("../../../apps/cli/src/commands/setup.rs");
         assert!(
-            !setup_src.contains("CredentialStore::open(state_home.join")
-                || setup_src.contains("open_default"),
+            setup_src.contains("protect_literal_headers_in_store"),
+            "setup must inject a vault-backed store rather than path-open"
+        );
+        assert!(
+            !setup_src.contains("CredentialStore::open(state_home.join"),
             "setup tests/production must not treat credentials.json as the live store"
         );
         let secret_ref_src = include_str!("secret_ref.rs");
         assert!(
-            secret_ref_src.contains("CredentialStore::open_default"),
-            "daemon-less provider-header path uses the injected vault"
+            secret_ref_src.contains("protect_literal_headers_in_store"),
+            "provider-header protection must accept an injected store"
         );
+        assert!(
+            secret_ref_src.contains(
+                "secret-ref path-open is test-only; production must inject a vault-backed store"
+            ),
+            "production path-open must fail closed"
+        );
+    }
+
+    #[test]
+    fn protect_literal_headers_without_candidates_does_not_open_store() {
+        let mut providers = BTreeMap::from([(
+            "openai".to_string(),
+            ProviderEntry {
+                url: "https://api.openai.com/v1".into(),
+                headers: vec![HeaderSpec {
+                    name: "Authorization".into(),
+                    value: "$secret:openai".into(),
+                }],
+                ..Default::default()
+            },
+        )]);
+        let notice = protect_literal_headers(&mut providers, None).unwrap();
+        assert!(notice.is_none());
+        assert_eq!(providers["openai"].headers[0].value, "$secret:openai");
+    }
+
+    #[test]
+    fn protect_literal_headers_in_store_uses_injected_vault() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let vault = crate::secure_key::open_for_db(&db).unwrap();
+        let mut store = CredentialStore::from_vault(vault).unwrap();
+        let literal = "sk-injected-store-secret-123456";
+        let mut providers = BTreeMap::from([(
+            "openai".to_string(),
+            ProviderEntry {
+                url: "https://api.openai.com/v1".into(),
+                headers: vec![HeaderSpec {
+                    name: "Authorization".into(),
+                    value: literal.into(),
+                }],
+                ..Default::default()
+            },
+        )]);
+        let notice = protect_literal_headers_in_store(&mut providers, &mut store)
+            .unwrap()
+            .unwrap();
+        assert_eq!(providers["openai"].headers[0].value, "$secret:openai");
+        assert_eq!(store.named_secret("openai"), Some(literal));
+        assert_eq!(notice.migrated, 1);
+        assert!(!crate::credentials::default_path().unwrap().exists());
+    }
+
+    #[test]
+    fn no_store_prepare_does_not_mark_layers_migrated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+        let config_path = tmp.path().join(".cockpit/config.json");
+        let literal = "Bearer sk-unmarked-layer-secret-123456";
+        let provider_path = write_provider(&config_path, "openai", literal);
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(tmp.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        crate::config::trust::with_workspace_trust_policy(policy.clone(), || {
+            prepare_effective_layers(tmp.path());
+        });
+        let raw = std::fs::read_to_string(&provider_path).unwrap();
+        assert!(
+            raw.contains(literal),
+            "no-store prepare must not rewrite: {raw}"
+        );
+
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let vault = crate::secure_key::open_for_db(&db).unwrap();
+        let store = CredentialStore::from_vault(vault).unwrap();
+        crate::config::trust::with_workspace_trust_policy(policy, || {
+            prepare_effective_layers_with_store(tmp.path(), Some(store))
+                .expect("vault-backed prepare");
+        });
+        let raw = std::fs::read_to_string(&provider_path).unwrap();
+        assert!(raw.contains("$secret:openai"), "{raw}");
+        assert!(!raw.contains(literal), "{raw}");
     }
 }

@@ -37,9 +37,8 @@ impl App {
     /// Open the `/leaks` pane (replacing the interim transcript list) and kick
     /// off the first-page metadata load.
     pub(super) fn open_leaks_pane(&mut self) {
-        let pane = crate::tui::leaks_pane::LeaksPane::open(
-            self.startup_background.daemon_socket.clone(),
-        );
+        let pane =
+            crate::tui::leaks_pane::LeaksPane::open(self.startup_background.daemon_socket.clone());
         let action = pane.initial_load_action();
         self.overlay = Overlay::Leaks(pane);
         if let Some(action) = action {

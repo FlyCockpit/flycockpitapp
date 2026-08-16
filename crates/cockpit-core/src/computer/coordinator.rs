@@ -224,7 +224,8 @@ impl FileAdvisoryLock {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         HostInputArbiter::key_string(key).hash(&mut hasher);
         let digest = hasher.finish();
-        self.root.join(format!("computer-host-input-{digest:016x}.lock"))
+        self.root
+            .join(format!("computer-host-input-{digest:016x}.lock"))
     }
 
     /// Test-only accessor for the per-key lock-file path, so tests can
@@ -314,9 +315,7 @@ fn os_lock_file(path: &std::path::Path) -> Result<std::fs::File, HostLockError> 
         let err = std::io::Error::last_os_error();
         // EWOULDBLOCK (== EAGAIN) means the exclusive lock is held elsewhere.
         return match err.raw_os_error() {
-            Some(code) if code == libc::EWOULDBLOCK => {
-                Err(HostLockError::ContendedByOtherProcess)
-            }
+            Some(code) if code == libc::EWOULDBLOCK => Err(HostLockError::ContendedByOtherProcess),
             _ => Err(HostLockError::LockFileIo(err.to_string())),
         };
     }
@@ -2291,9 +2290,10 @@ impl ComputerActionCoordinator {
         let pre_capture: Option<Result<(u64, Option<[u8; 16]>), ()>> =
             if let Some(adapter) = self.target_adapter.as_mut() {
                 match adapter.capture_snapshot() {
-                    Ok(evidence) => {
-                        Some(Ok((evidence.focus_generation, evidence.virtual_display_uuid)))
-                    }
+                    Ok(evidence) => Some(Ok((
+                        evidence.focus_generation,
+                        evidence.virtual_display_uuid,
+                    ))),
                     Err(_reason) => Some(Err(())),
                 }
             } else {
@@ -3516,10 +3516,10 @@ mod tests {
     };
     use super::super::{
         Anthropic20250124ComputerAction, Anthropic20251124ComputerAction, ClickCount,
-        ComputerAction, ComputerActionOutcome, ComputerBackend, ComputerError, ComputerToolContract,
-        CoordinateSpace, DisplayGeometry, Easing, FakeBackend, KeyChord, LogicalSize, Modifiers,
-        MouseButton, OpenAiComputerAction, PixelSize, Point, ProviderPointerButton, Rect,
-        ScaleFactor,
+        ComputerAction, ComputerActionOutcome, ComputerBackend, ComputerError,
+        ComputerToolContract, CoordinateSpace, DisplayGeometry, Easing, FakeBackend, KeyChord,
+        LogicalSize, Modifiers, MouseButton, OpenAiComputerAction, PixelSize, Point,
+        ProviderPointerButton, Rect, ScaleFactor,
     };
     use super::*;
     use std::sync::Arc;
@@ -4037,10 +4037,7 @@ mod tests {
             for entry in std::fs::read_dir(&root).expect("read data root") {
                 let entry = entry.expect("dir entry");
                 let name = entry.file_name();
-                if !name
-                    .to_string_lossy()
-                    .starts_with("computer-host-input-")
-                {
+                if !name.to_string_lossy().starts_with("computer-host-input-") {
                     continue;
                 }
                 let meta = std::fs::symlink_metadata(entry.path()).expect("lock file meta");
@@ -4064,8 +4061,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let key2 =
-                PhysicalTargetKey::new(HostInstallationId([9u8; 32]), [9u8; 32], [9u8; 32]);
+            let key2 = PhysicalTargetKey::new(HostInstallationId([9u8; 32]), [9u8; 32], [9u8; 32]);
             let mut lock_c = FileAdvisoryLock::with_root(root.clone()).expect("open lock c");
             let stale = lock_c.lock_path_for_test(&key2);
             std::fs::write(&stale, b"").expect("pre-create stale lock file");
@@ -4093,7 +4089,8 @@ mod tests {
     #[tokio::test]
     async fn computer_host_lock_fifo_promotes_waiter() {
         let tmp = tempfile::tempdir().expect("temp data root");
-        let os_lock = FileAdvisoryLock::with_root(tmp.path().to_path_buf()).expect("open file lock");
+        let os_lock =
+            FileAdvisoryLock::with_root(tmp.path().to_path_buf()).expect("open file lock");
         let mut arbiter = HostInputArbiter::new(Box::new(os_lock), OwnerInstance(1));
 
         let key = physical_key();
@@ -4150,7 +4147,8 @@ mod tests {
     #[tokio::test]
     async fn computer_host_lock_open_queued_cancels_waiter() {
         let tmp = tempfile::tempdir().expect("temp data root");
-        let os_lock = FileAdvisoryLock::with_root(tmp.path().to_path_buf()).expect("open file lock");
+        let os_lock =
+            FileAdvisoryLock::with_root(tmp.path().to_path_buf()).expect("open file lock");
         let arbiter = Arc::new(std::sync::Mutex::new(HostInputArbiter::new(
             Box::new(os_lock),
             OwnerInstance(1),
@@ -4165,7 +4163,9 @@ mod tests {
             owner_instance: OwnerInstance(1),
             authorizer: Arc::new(FakeComputerAuthorizer::always_allow()),
             host_arbiter: Some(arbiter.clone()),
-            target_adapter: Some(Box::new(FakeTargetEvidenceAdapter::new(physical_evidence()))),
+            target_adapter: Some(Box::new(
+                FakeTargetEvidenceAdapter::new(physical_evidence()),
+            )),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
         };
@@ -4184,12 +4184,18 @@ mod tests {
             owner_instance: OwnerInstance(1),
             authorizer: Arc::new(FakeComputerAuthorizer::always_allow()),
             host_arbiter: Some(arbiter.clone()),
-            target_adapter: Some(Box::new(FakeTargetEvidenceAdapter::new(physical_evidence()))),
+            target_adapter: Some(Box::new(
+                FakeTargetEvidenceAdapter::new(physical_evidence()),
+            )),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
         };
-        let result_b = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params_b).await;
-        assert!(matches!(result_b, Err(CoordinatorOpenError::HostLockQueued)));
+        let result_b =
+            ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params_b).await;
+        assert!(matches!(
+            result_b,
+            Err(CoordinatorOpenError::HostLockQueued)
+        ));
 
         // The FIFO entry is GONE — the abandoned waiter was removed.
         assert_eq!(arbiter.lock().unwrap().waiter_count(&key), 0);
@@ -5427,7 +5433,10 @@ mod tests {
 
         let mut store_a = AskDelegationLeaseStore::new();
         let va = store_a.begin_approval_wait(&key);
-        assert_eq!(store_a.install(&key, va), AskAuthorizationOutcome::Installed);
+        assert_eq!(
+            store_a.install(&key, va),
+            AskAuthorizationOutcome::Installed
+        );
         let lease_a = store_a.lease(&key).unwrap().clone();
 
         let mut store_b = AskDelegationLeaseStore::new();
@@ -5435,7 +5444,10 @@ mod tests {
         // Precondition: the two stores drew the SAME approval-version sequence,
         // so only the random token can distinguish the leases.
         assert_eq!(va, vb, "identical approval-version sequence");
-        assert_eq!(store_b.install(&key, vb), AskAuthorizationOutcome::Installed);
+        assert_eq!(
+            store_b.install(&key, vb),
+            AskAuthorizationOutcome::Installed
+        );
         let lease_b = store_b.lease(&key).unwrap().clone();
 
         assert_eq!(lease_a.key(), lease_b.key());
@@ -5556,7 +5568,9 @@ mod tests {
             owner_instance: OwnerInstance(1),
             authorizer,
             host_arbiter: Some(arbiter.clone()),
-            target_adapter: Some(Box::new(FakeTargetEvidenceAdapter::new(physical_evidence()))),
+            target_adapter: Some(Box::new(
+                FakeTargetEvidenceAdapter::new(physical_evidence()),
+            )),
             provider_id: ProviderId("openai".to_string()),
             model_id: ModelId("gpt-5".to_string()),
         };
@@ -5573,7 +5587,10 @@ mod tests {
             matches!(outcome, CoordinatedOutcome::Invalidated { .. }),
             "host-lease loss during the await must discard the answer, got {outcome:?}"
         );
-        assert!(coordinator.ask_lease_store().is_empty(), "no lease installed");
+        assert!(
+            coordinator.ask_lease_store().is_empty(),
+            "no lease installed"
+        );
         assert_eq!(
             input_actions.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -5632,7 +5649,10 @@ mod tests {
             !matches!(outcome, CoordinatedOutcome::Completed { .. }),
             "drift must discard the answer, got {outcome:?}"
         );
-        assert!(coordinator.ask_lease_store().is_empty(), "no lease installed");
+        assert!(
+            coordinator.ask_lease_store().is_empty(),
+            "no lease installed"
+        );
         assert_eq!(
             input_actions.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -5719,9 +5739,10 @@ mod tests {
         let authorizer2 = Arc::new(FakeComputerAuthorizer::always_allow());
         let mut params2 = make_ask_coordinator_params(authorizer2.clone(), "openai", "gpt-5");
         params2.delegation_id = DelegationId("delegation-2".to_string());
-        let mut coordinator2 = ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params2)
-            .await
-            .expect("coordinator open");
+        let mut coordinator2 =
+            ComputerActionCoordinator::open(Box::new(FakeBackend::new()), params2)
+                .await
+                .expect("coordinator open");
         let fresh = coordinator2.execute_openai_call("call-1", &openai).await;
         assert!(matches!(fresh, CoordinatedOutcome::Completed { .. }));
         assert_eq!(authorizer2.call_count(), 1);

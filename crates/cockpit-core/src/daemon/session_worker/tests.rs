@@ -54,7 +54,7 @@ fn remote_queue_receipt_is_closed_secret_free_and_consistent() {
 async fn remote_queue_receipt_and_terminal_disposition_commit_and_replay_together() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(
+    let session = Session::create_for_test(
         db.clone(),
         tmp.path().to_path_buf(),
         "Build",
@@ -265,7 +265,7 @@ fn test_session_handle() -> SessionWorkerHandle {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
     let session = Arc::new(
-        Session::create(
+        Session::create_for_test(
             db.clone(),
             tmp.path().to_path_buf(),
             "Build",
@@ -281,7 +281,7 @@ fn test_session_handle() -> SessionWorkerHandle {
 async fn terminal_receipt_write_failure_returns_promptly_and_holds_the_exact_queue_item() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(
+    let session = Session::create_for_test(
         db.clone(),
         tmp.path().to_path_buf(),
         "Build",
@@ -435,7 +435,7 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let session = Arc::new(
-            Session::create(
+            Session::create_for_test(
                 db.clone(),
                 tmp.path().to_path_buf(),
                 "Build",
@@ -763,7 +763,7 @@ async fn worker_delete_removes_the_scoped_sealed_value_completely() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
     let session = Arc::new(
-        Session::create(
+        Session::create_for_test(
             db.clone(),
             tmp.path().to_path_buf(),
             "Build",
@@ -1112,7 +1112,7 @@ async fn stream_delta_coalescer_timer_flushes_after_window() {
 async fn steer_side_channel_stores_raw_and_stamps_origin() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(
+    let session = Session::create_for_test(
         db.clone(),
         tmp.path().to_path_buf(),
         "Build",
@@ -1172,7 +1172,7 @@ async fn steer_side_channel_stores_raw_and_stamps_origin() {
 async fn steer_side_channel_rejects_non_running_child_without_enqueue() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(
+    let session = Session::create_for_test(
         db.clone(),
         tmp.path().to_path_buf(),
         "Build",
@@ -1235,7 +1235,7 @@ async fn turn_refresh_sends_rebuilt_redaction_table_to_driver() {
         "SESSION_REFRESH_SECRET=worker-secret\n",
     )
     .unwrap();
-    let session = Session::create(
+    let session = Session::create_for_test(
         Db::open_in_memory().unwrap(),
         tmp.path().to_path_buf(),
         "Build",
@@ -1298,7 +1298,7 @@ async fn persisted_notice_text(session: &Session) -> String {
 
 #[tokio::test]
 async fn engine_notice_is_recorded_as_durable_session_event() {
-    let session = Session::create(
+    let session = Session::create_for_test(
         Db::open_in_memory().unwrap(),
         PathBuf::from("/proj"),
         "Build",
@@ -1333,7 +1333,7 @@ async fn engine_notice_is_recorded_as_durable_session_event() {
 
 #[tokio::test]
 async fn notice_is_recorded_exactly_once_across_both_paths() {
-    let session = Session::create(
+    let session = Session::create_for_test(
         Db::open_in_memory().unwrap(),
         PathBuf::from("/proj"),
         "Build",
@@ -1361,7 +1361,7 @@ async fn notice_is_recorded_exactly_once_across_both_paths() {
 
 #[tokio::test]
 async fn daemon_direct_notice_is_recorded_as_durable_session_event() {
-    let session = Session::create(
+    let session = Session::create_for_test(
         Db::open_in_memory().unwrap(),
         PathBuf::from("/proj"),
         "Build",
@@ -1413,7 +1413,7 @@ async fn recorded_notice_text_is_redacted() {
         ..Default::default()
     };
     let table = Arc::new(RedactionTable::build(&cfg, tmp.path()).unwrap());
-    let session = Session::create(
+    let session = Session::create_for_test(
         Db::open_in_memory().unwrap(),
         tmp.path().to_path_buf(),
         "Build",
@@ -1504,7 +1504,7 @@ async fn absent_scheduler_is_not_an_error() {
     let db = Db::open_in_memory().unwrap();
     let locks = Arc::new(LockManager::in_memory(db.clone()));
     let session = Arc::new(
-        Session::create(
+        Session::create_for_test(
             db,
             tmp.path().to_path_buf(),
             "Build",
@@ -1603,7 +1603,7 @@ async fn worker_driver_respects_attached_ignore_config_policy() {
 
     let db = Db::open_in_memory().unwrap();
     let session = Arc::new(
-        Session::create(
+        Session::create_for_test(
             db.clone(),
             project.clone(),
             "Build",
@@ -1743,7 +1743,7 @@ async fn resumed_worker_rederives_disk_redaction_markers_and_warns_when_source_d
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
     let session = Arc::new(
-        Session::create(
+        Session::create_for_test(
             db.clone(),
             tmp.path().to_path_buf(),
             "Build",
@@ -1814,7 +1814,7 @@ async fn resumed_worker_rederives_disk_redaction_markers_and_warns_when_source_d
     };
 
     let resumed = Arc::new(
-        Session::resume(
+        Session::resume_for_test(
             db.clone(),
             session.id,
             crate::session::test_redaction_key_resolver(),
@@ -1840,7 +1840,7 @@ async fn resumed_worker_rederives_disk_redaction_markers_and_warns_when_source_d
 
     std::fs::remove_file(&env_path).unwrap();
     let resumed = Arc::new(
-        Session::resume(
+        Session::resume_for_test(
             db.clone(),
             session.id,
             crate::session::test_redaction_key_resolver(),
@@ -1976,6 +1976,7 @@ fn test_spawn_args(cwd: &std::path::Path) -> crate::engine::builtin::SpawnArgs {
         granted_tools: Vec::new(),
         lock_identity: None,
         write_scope: None,
+        credential_store: None,
     }
 }
 
@@ -2305,7 +2306,7 @@ fn set_sandbox_rejects_unavailable_intent_does_not_persist() {
 
     let tmp = tempfile::TempDir::new().unwrap();
     let db = crate::db::Db::open_in_memory().unwrap();
-    let session = crate::session::Session::create(
+    let session = crate::session::Session::create_for_test(
         db.clone(),
         tmp.path().to_path_buf(),
         "Build",
@@ -2690,7 +2691,7 @@ async fn command_capability_unavailable_maps_to_broadcast_with_fix_command() {
 async fn sandbox_unavailable_hydration_rebroadcasts_remembered_notice() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(
+    let session = Session::create_for_test(
         db.clone(),
         tmp.path().to_path_buf(),
         "Build",
@@ -2735,7 +2736,7 @@ async fn sandbox_unavailable_hydration_rebroadcasts_remembered_notice() {
 async fn active_interrupt_hydration_rebroadcasts_with_rehydration_reason() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(
+    let session = Session::create_for_test(
         db.clone(),
         tmp.path().to_path_buf(),
         "Build",
@@ -2800,7 +2801,7 @@ async fn active_interrupt_hydration_rebroadcasts_with_rehydration_reason() {
 async fn shutdown_activity_snapshot_counts_open_and_parked_interrupts_as_pending_paused_work() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(
+    let session = Session::create_for_test(
         db.clone(),
         tmp.path().to_path_buf(),
         "Build",
@@ -3541,7 +3542,7 @@ async fn config_reresolve_does_not_mutate_inflight_turn_view() {
 async fn llm_mode_reads_are_consistent_within_a_generation() {
     let tmp = tempfile::tempdir().unwrap();
     let snapshot = snapshot_for_tests();
-    let session = Session::create(
+    let session = Session::create_for_test(
         Db::open_in_memory().unwrap(),
         tmp.path().to_path_buf(),
         "Build",
@@ -3584,7 +3585,7 @@ async fn stored_session_llm_mode_restores_before_startup_resolution() {
 
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let created = Session::create(
+    let created = Session::create_for_test(
         db.clone(),
         tmp.path().to_path_buf(),
         "Build",
@@ -3593,7 +3594,7 @@ async fn stored_session_llm_mode_restores_before_startup_resolution() {
     .unwrap();
     created.set_session_llm_mode(LlmMode::Frontier).unwrap();
 
-    let resumed = Session::resume(
+    let resumed = Session::resume_for_test(
         db,
         created.id,
         crate::session::test_redaction_key_resolver(),
@@ -3607,7 +3608,7 @@ async fn stored_session_llm_mode_restores_before_startup_resolution() {
 async fn invalid_stored_session_llm_mode_is_rejected_by_the_database() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let created = Session::create(
+    let created = Session::create_for_test(
         db.clone(),
         tmp.path().to_path_buf(),
         "Build",
@@ -3628,7 +3629,7 @@ async fn invalid_stored_session_llm_mode_is_rejected_by_the_database() {
 async fn stored_tool_surface_override_decodes_for_startup() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(
+    let session = Session::create_for_test(
         db,
         tmp.path().to_path_buf(),
         "Build",
@@ -3661,7 +3662,7 @@ async fn stored_tool_surface_override_decodes_for_startup() {
 async fn invalid_stored_tool_surface_override_falls_back() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let session = Session::create(
+    let session = Session::create_for_test(
         db,
         tmp.path().to_path_buf(),
         "Build",
@@ -3679,7 +3680,7 @@ async fn invalid_stored_tool_surface_override_falls_back() {
 async fn resume_reapplies_goal_settings_override() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let created = Session::create(
+    let created = Session::create_for_test(
         db.clone(),
         tmp.path().to_path_buf(),
         "Build",
@@ -3692,7 +3693,7 @@ async fn resume_reapplies_goal_settings_override() {
         ))
         .unwrap();
 
-    let resumed = Session::resume(
+    let resumed = Session::resume_for_test(
         db,
         created.id,
         crate::session::test_redaction_key_resolver(),
@@ -3709,7 +3710,7 @@ async fn resume_reapplies_goal_settings_override() {
 async fn resume_ignores_invalid_goal_settings_override() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
-    let created = Session::create(
+    let created = Session::create_for_test(
         db.clone(),
         tmp.path().to_path_buf(),
         "Build",
@@ -3720,7 +3721,7 @@ async fn resume_ignores_invalid_goal_settings_override() {
         .set_goal_settings_override_json(Some(r#"{"coldSkepticCount":0}"#.to_string()))
         .unwrap();
 
-    let resumed = Session::resume(
+    let resumed = Session::resume_for_test(
         db,
         created.id,
         crate::session::test_redaction_key_resolver(),
@@ -3735,7 +3736,7 @@ async fn resume_ignores_invalid_goal_settings_override() {
 async fn worker_uses_registry_resolved_config_snapshot() {
     let tmp = tempfile::tempdir().unwrap();
     let snapshot = snapshot_for_tests();
-    let session = Session::create(
+    let session = Session::create_for_test(
         Db::open_in_memory().unwrap(),
         tmp.path().to_path_buf(),
         "Build",
@@ -3753,7 +3754,7 @@ async fn worker_broadcast_delivers_config_snapshot_to_subscriber() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
     let session = Arc::new(
-        Session::create(
+        Session::create_for_test(
             db.clone(),
             tmp.path().to_path_buf(),
             "Build",
@@ -3801,7 +3802,7 @@ async fn dispatch_reresolve_fans_out_to_all_attached_clients() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
     let session = Arc::new(
-        Session::create(
+        Session::create_for_test(
             db.clone(),
             tmp.path().to_path_buf(),
             "Build",

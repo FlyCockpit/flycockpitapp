@@ -205,7 +205,9 @@ async fn complete_tandem_failure_omits_body_while_success_is_preserved() {
         .response
         .expect("a successful tandem records its response body");
     assert!(
-        response.to_string().contains("distinctive tandem answer body"),
+        response
+            .to_string()
+            .contains("distinctive tandem answer body"),
         "the successful tandem response body must be preserved: {response}"
     );
 }
@@ -2362,7 +2364,9 @@ fn failure_engages_backup_trigger_set() {
         &InferenceErrorClass::BillingOrQuotaExhausted
     ));
     // A true rate limit stays on the same provider (retry layer), never this seam.
-    assert!(!failure_engages_backup(&InferenceErrorClass::ProviderRateLimit));
+    assert!(!failure_engages_backup(
+        &InferenceErrorClass::ProviderRateLimit
+    ));
     // 4xx → hard-fail, no fallback (request/auth/config errors).
     assert!(!failure_engages_backup(&InferenceErrorClass::Http(400)));
     assert!(!failure_engages_backup(&InferenceErrorClass::Http(401)));

@@ -63,20 +63,46 @@ const MAX_CONCURRENT_CLIENT_REQUESTS: usize = 16;
 static IN_PROCESS_CONTEXTS: OnceLock<StdMutex<HashMap<PathBuf, Weak<DaemonContext>>>> =
     OnceLock::new();
 
-fn build_daemon_redaction_table() -> Arc<RedactionTable> {
+fn daemon_process_env() -> HashMap<String, String> {
+    std::env::vars_os()
+        .map(|(name, value)| {
+            (
+                name.to_string_lossy().into_owned(),
+                value.to_string_lossy().into_owned(),
+            )
+        })
+        .collect()
+}
+
+fn build_daemon_redaction_table(
+    config_source: &crate::daemon::config_source::ConfigSource,
+    vault: &Arc<crate::secure_key::SecretVault>,
+) -> Arc<RedactionTable> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-    let cfg = ConfigSource::production()
+    let cfg = config_source
         .load(&cwd)
         .map(|(_, extended)| extended.redact)
         .unwrap_or_default();
-    Arc::new(RedactionTable::build(&cfg, &cwd).unwrap_or_else(|error| {
+    let env = daemon_process_env();
+    let built = match crate::credentials::CredentialStore::from_vault(vault.clone()) {
+        Ok(store) => RedactionTable::build_with_env_and_credential_store(&cfg, &cwd, &env, &store),
+        Err(error) => {
+            tracing::warn!(error = %error, "opening daemon vault for redaction failed");
+            RedactionTable::build_with_env(&cfg, &cwd, &env)
+        }
+    };
+    Arc::new(built.unwrap_or_else(|error| {
         tracing::warn!(error = %error, "building daemon redaction table failed");
         RedactionTable::empty()
     }))
 }
 
-fn refresh_global_redaction_table(shared: &SharedRedactionTable) -> Arc<RedactionTable> {
-    let fresh = build_daemon_redaction_table();
+fn refresh_global_redaction_table(
+    shared: &SharedRedactionTable,
+    config_source: &crate::daemon::config_source::ConfigSource,
+    vault: &Arc<crate::secure_key::SecretVault>,
+) -> Arc<RedactionTable> {
+    let fresh = build_daemon_redaction_table(config_source, vault);
     let table = match current_redaction(shared).union(&fresh) {
         Ok(table) => Arc::new(table),
         Err(error) => {
@@ -484,8 +510,18 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         proto::Response::WorkspaceTrustSet {
             config_generation: _,
         }
+        | proto::Response::WorkspaceTrust { .. }
+        | proto::Response::FlycockpitStored
+        | proto::Response::FlycockpitNotLoggedIn
         | proto::Response::AppFlag { .. }
         | proto::Response::AppFlagSeen { .. } => {}
+        proto::Response::FlycockpitAlreadyLoggedIn { email, server_url } => {
+            scrub_string(email, redact);
+            scrub_string(server_url, redact);
+        }
+        proto::Response::FlycockpitCleared { server_url } => {
+            scrub_string(server_url, redact);
+        }
         proto::Response::StartupDisclosures {
             org_sync,
             connector,
@@ -1815,6 +1851,9 @@ pub struct DaemonContext {
     pub scheduler: Option<DaemonSchedulerHandle>,
     #[allow(dead_code)]
     credential_store_path: Option<PathBuf>,
+    /// Daemon-held wrap-key vault. Flycockpit credential persist uses this
+    /// handle; leftover `credentials.json` is never consulted.
+    pub(crate) secret_vault: Arc<crate::secure_key::SecretVault>,
     /// Injectable config-resolution seam (`daemon-trust-test-isolation.md`):
     /// the single route by which request handling resolves layered
     /// provider/extended config. Shared with the registry so attach-create,
@@ -1960,7 +1999,14 @@ impl DaemonContext {
         let (client_count, _) = tokio::sync::watch::channel(0usize);
         let (connector_wake, _) = watch::channel(0u64);
         let (global_events, _) = broadcast::channel(GLOBAL_EVENT_CAPACITY);
-        let global_redaction = Arc::new(std::sync::RwLock::new(build_daemon_redaction_table()));
+        let secret_vault = crate::secure_key::open_for_db(&db)
+            .unwrap_or_else(|error| panic!("daemon vault required at construction: {error}"));
+        registry.set_secret_vault(secret_vault.clone());
+        config_source.install_vault(secret_vault.clone());
+        let global_redaction = Arc::new(std::sync::RwLock::new(build_daemon_redaction_table(
+            &config_source,
+            &secret_vault,
+        )));
         let terminal_host = terminal_factory.build(
             global_events.clone(),
             global_redaction.clone(),
@@ -2037,6 +2083,7 @@ impl DaemonContext {
             connector_wake,
             scheduler,
             credential_store_path: None,
+            secret_vault,
             config_source,
             secure_key: None,
             _secure_key_actor: None,
@@ -2140,19 +2187,27 @@ impl DaemonContext {
         self
     }
 
+    pub(crate) fn load_flycockpit_credential(
+        &self,
+    ) -> Result<Option<crate::auth::flycockpit::StoredFlycockpitCredential>> {
+        let store = crate::credentials::CredentialStore::from_vault(self.secret_vault.clone())?;
+        let Some(raw) = store.get(crate::auth::flycockpit::CREDENTIAL_KEY) else {
+            return Ok(None);
+        };
+        serde_json::from_value(raw.clone())
+            .context("parsing stored Flycockpit account credential")
+            .map(Some)
+    }
+
     pub(crate) fn store_flycockpit_credential(
         &self,
         credential: &crate::auth::flycockpit::StoredFlycockpitCredential,
     ) -> Result<()> {
-        let vault = crate::secure_key::vault_for_db(&self.db)
-            .map_err(|e| anyhow::anyhow!("opening daemon vault for credentials: {e}"))?;
-        crate::auth::flycockpit::store_credential_in_vault(vault, credential)
+        crate::auth::flycockpit::store_credential_in_vault(self.secret_vault.clone(), credential)
     }
 
     pub(crate) fn clear_flycockpit_credential(&self) -> Result<()> {
-        let vault = crate::secure_key::vault_for_db(&self.db)
-            .map_err(|e| anyhow::anyhow!("opening daemon vault for credentials: {e}"))?;
-        crate::auth::flycockpit::clear_credential_in_vault(vault)
+        crate::auth::flycockpit::clear_credential_in_vault(self.secret_vault.clone())
     }
 
     /// The daemon's graceful-shutdown gate. New-user-work rejection and the
@@ -2177,7 +2232,11 @@ impl DaemonContext {
 
     /// Broadcast a daemon-global event to all connected clients.
     pub fn broadcast_global(&self, event: proto::Event) {
-        let table = refresh_global_redaction_table(&self.global_redaction);
+        let table = refresh_global_redaction_table(
+            &self.global_redaction,
+            &self.config_source,
+            &self.secret_vault,
+        );
         send_event(&self.global_events, &table, event);
     }
 

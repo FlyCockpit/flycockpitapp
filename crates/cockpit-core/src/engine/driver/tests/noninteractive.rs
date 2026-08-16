@@ -3066,7 +3066,7 @@ async fn docs_finalizer_report_model_frame_journals_table_literal() {
     let tmp = tempfile::tempdir().unwrap();
     write_docs_report_trusted_provider(tmp.path());
     let db = crate::db::Db::open_in_memory().unwrap();
-    let session = Session::create(
+    let session = Session::create_for_test(
         db.clone(),
         tmp.path().to_path_buf(),
         "Build",
@@ -3237,7 +3237,7 @@ async fn docs_faulted_journaling_session(
     > = std::sync::Arc::new(crate::redact::secure_key_resolver::SecureKeyResolver::new(
         actor.handle(),
     ));
-    let session = Session::create(
+    let session = Session::create_for_test(
         db.clone(),
         std::path::PathBuf::from("/proj"),
         "Build",

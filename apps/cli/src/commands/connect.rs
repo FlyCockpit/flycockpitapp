@@ -1,11 +1,13 @@
 use anyhow::{Context, Result};
 
-use crate::auth::flycockpit::load_credential;
+use crate::auth::flycockpit::load_credential_from_vault;
 use crate::cli::{ConnectArgs, ConnectCommand};
 
 pub async fn run(args: ConnectArgs) -> Result<()> {
-    let credential = load_credential()?;
     let db = crate::db::Db::open_default().context("opening cockpit database")?;
+    let vault = cockpit_core::secure_key::vault_for_db(&db)
+        .map_err(|e| anyhow::anyhow!("opening connect vault: {e}"))?;
+    let credential = load_credential_from_vault(vault)?;
     match args.command.unwrap_or(ConnectCommand::Status) {
         ConnectCommand::On => {
             db.set_connector_enabled(&credential.server_url, &credential.instance_id, true)

@@ -1911,7 +1911,10 @@ impl std::fmt::Debug for TandemOutcome {
     /// the (non-body) terminal status.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TandemOutcome")
-            .field("request", &format_args!("{}", redacted_json_debug(&self.request)))
+            .field(
+                "request",
+                &format_args!("{}", redacted_json_debug(&self.request)),
+            )
             .field(
                 "response",
                 &format_args!(

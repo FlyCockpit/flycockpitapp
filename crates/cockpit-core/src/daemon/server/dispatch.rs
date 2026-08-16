@@ -7,6 +7,7 @@ use super::*;
 use crate::db::protected_leak_records::ProtectedLeakRecordRef;
 
 static WORKSPACE_TRUST_RPC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static FLYCOCKPIT_CREDENTIAL_RPC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Debug)]
 struct AppFlagVersionConflict;
@@ -55,6 +56,20 @@ fn workspace_trust_mode_to_db(
         }
         proto::WorkspaceTrustMode::Untrusted => {
             crate::db::workspace_trust::WorkspaceTrustMode::Untrusted
+        }
+    }
+}
+
+fn workspace_trust_mode_from_db(
+    mode: crate::db::workspace_trust::WorkspaceTrustMode,
+) -> proto::WorkspaceTrustMode {
+    match mode {
+        crate::db::workspace_trust::WorkspaceTrustMode::Trust => proto::WorkspaceTrustMode::Trust,
+        crate::db::workspace_trust::WorkspaceTrustMode::IgnoreConfig => {
+            proto::WorkspaceTrustMode::IgnoreConfig
+        }
+        crate::db::workspace_trust::WorkspaceTrustMode::Untrusted => {
+            proto::WorkspaceTrustMode::Untrusted
         }
     }
 }
@@ -1112,6 +1127,7 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                         ctx.db.clone(),
                         session_id,
                         ctx.redaction_key_resolver().map_err(internal)?,
+                        ctx.secret_vault.clone(),
                     )
                     .map_err(internal)?
                     .ok_or_else(|| ErrorPayload {
@@ -2304,9 +2320,21 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                 })?;
             Ok(Response::WorkspaceTrustSet { config_generation })
         }
+        Request::GetWorkspaceTrust { project_root } => {
+            let _guard = WORKSPACE_TRUST_RPC_LOCK.lock().await;
+            let decision = ctx
+                .db
+                .workspace_trust_by_root(PathBuf::from(&project_root).as_path())
+                .await
+                .map_err(internal)?;
+            Ok(Response::WorkspaceTrust {
+                mode: decision.map(|decision| workspace_trust_mode_from_db(decision.mode)),
+                config_generation: inventory::current_config_generation(),
+            })
+        }
         Request::GetStartupDisclosures { project_root: _ } => {
             let (org_sync, connector) =
-                if let Some(credential) = crate::auth::flycockpit::maybe_load_credential() {
+                if let Some(credential) = ctx.load_flycockpit_credential().map_err(internal)? {
                     let org = ctx
                         .db
                         .org_sync_disclosure_for_server(&credential.server_url)
@@ -4218,16 +4246,23 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
             }
         }
 
-        Request::StoreFlycockpitCredential { credential } => {
+        Request::StoreFlycockpitCredential { credential, force } => {
             if ctx.paths.ephemeral {
                 return Err(bad_request(
                     "ephemeral daemons do not accept Flycockpit credential writes",
                 ));
             }
+            let _credential_lock = FLYCOCKPIT_CREDENTIAL_RPC_LOCK.lock().await;
+            if !force && let Some(existing) = ctx.load_flycockpit_credential().map_err(internal)? {
+                return Ok(Response::FlycockpitAlreadyLoggedIn {
+                    email: existing.account.email,
+                    server_url: existing.server_url,
+                });
+            }
             ctx.store_flycockpit_credential(&credential)
                 .map_err(internal)?;
             ctx.wake_connector();
-            Ok(Response::Ack)
+            Ok(Response::FlycockpitStored)
         }
 
         Request::ClearFlycockpitCredential => {
@@ -4236,9 +4271,24 @@ pub(super) async fn handle_serialized_request_with_remote_operation(
                     "ephemeral daemons do not accept Flycockpit credential writes",
                 ));
             }
+            let _credential_lock = FLYCOCKPIT_CREDENTIAL_RPC_LOCK.lock().await;
+            let Some(credential) = ctx.load_flycockpit_credential().map_err(internal)? else {
+                return Ok(Response::FlycockpitNotLoggedIn);
+            };
+            if let Ok(client) =
+                crate::auth::flycockpit::FlycockpitClient::new(&credential.server_url)
+                && let Err(error) = client.revoke_instance(&credential).await
+            {
+                tracing::warn!(
+                    error = %error,
+                    "FlyCockpit credential clear: best-effort instance revoke failed"
+                );
+            }
             ctx.clear_flycockpit_credential().map_err(internal)?;
             ctx.wake_connector();
-            Ok(Response::Ack)
+            Ok(Response::FlycockpitCleared {
+                server_url: credential.server_url,
+            })
         }
 
         Request::DaemonStatus => Ok(Response::DaemonStatus {
@@ -5455,6 +5505,7 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
                         ctx.db.clone(),
                         session_id,
                         ctx.redaction_key_resolver().map_err(internal)?,
+                        ctx.secret_vault.clone(),
                     )
                     .map_err(internal)?
                     .ok_or_else(|| ErrorPayload {
@@ -7117,9 +7168,13 @@ pub(super) async fn export_session_data(
             // credential/environment journals, never the inference-time
             // provider-trust decision.
             let env = crate::session::export::process_env_map_for_conn();
-            let export_redactor =
-                crate::session::export::redaction_table_for_session(&db, &target, &env)
-                    .map_err(internal)?;
+            let export_redactor = crate::session::export::redaction_table_for_session(
+                &db,
+                &target,
+                &env,
+                &ctx.secret_vault,
+            )
+            .map_err(internal)?;
             let mut messages_value = serde_json::to_value(&messages).map_err(internal)?;
             crate::session::export::scrub_export_json_value(&mut messages_value, &export_redactor);
             let bytes = serde_json::to_vec_pretty(&messages_value).map_err(internal)?;
@@ -7139,6 +7194,7 @@ pub(super) async fn export_session_data(
                 &db,
                 &target,
                 include_generated_artifacts,
+                &ctx.secret_vault,
             )
             .await
             .map_err(internal)?;
@@ -7170,6 +7226,7 @@ pub(super) async fn auto_title_request(
                 ctx.db.clone(),
                 session_id,
                 ctx.redaction_key_resolver().map_err(internal)?,
+                ctx.secret_vault.clone(),
             )
             .map_err(internal)?
             .ok_or_else(|| ErrorPayload {

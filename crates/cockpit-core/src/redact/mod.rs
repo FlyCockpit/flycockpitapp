@@ -974,17 +974,21 @@ impl RedactionTable {
         cwd: &Path,
         env: &HashMap<String, String>,
     ) -> Result<Self> {
-        let stored_secrets = crate::credentials::CredentialStore::open_default()
-            .map(|store| {
-                let mut entries = store
-                    .named_secret_entries()
-                    .map(|(name, value)| (name.to_string(), value.to_string()))
-                    .collect::<Vec<_>>();
-                entries.extend(store.provider_credential_entries());
-                entries
-            })
-            .unwrap_or_default();
-        Self::build_with_env_and_secrets(cfg, cwd, env, stored_secrets)
+        Self::build_with_env_and_secrets(cfg, cwd, env, std::iter::empty())
+    }
+
+    pub fn build_with_env_and_credential_store(
+        cfg: &RedactConfig,
+        cwd: &Path,
+        env: &HashMap<String, String>,
+        store: &crate::credentials::CredentialStore,
+    ) -> Result<Self> {
+        let mut entries = store
+            .named_secret_entries()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect::<Vec<_>>();
+        entries.extend(store.provider_credential_entries());
+        Self::build_with_env_and_secrets(cfg, cwd, env, entries)
     }
 
     /// Hermetic table builder with an injected named-secret source. Production

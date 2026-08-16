@@ -1098,9 +1098,13 @@ impl App {
                                 AsyncActionKind::Internal("oauth.grok.complete"),
                                 AsyncActionPolicy::Replace(AsyncActionKey::new("oauth.grok")),
                                 async move {
-                                    cockpit_core::auth::xai_oauth::complete_local_callback_login(
+                                    let mut store =
+                                        crate::tui::settings::cockpit_credential_store()
+                                            .map_err(|e| e.to_string())?;
+                                    cockpit_core::auth::xai_oauth::complete_local_callback_login_in(
                                         listener_login,
                                         listener,
+                                        &mut store,
                                     )
                                     .await
                                     .map(|_| AsyncActionPayload::OAuthGrokComplete {
@@ -1413,10 +1417,14 @@ impl App {
                         AsyncActionKind::Internal("oauth.codex.poll"),
                         AsyncActionPolicy::Replace(AsyncActionKey::new("oauth.codex")),
                         async move {
-                            cockpit_core::auth::codex_oauth::complete_device_code_login(login)
-                                .await
-                                .map(|_| AsyncActionPayload::OAuthCodexComplete { logged_in: true })
-                                .map_err(|e| e.to_string())
+                            let mut store = crate::tui::settings::cockpit_credential_store()
+                                .map_err(|e| e.to_string())?;
+                            cockpit_core::auth::codex_oauth::complete_device_code_login_in(
+                                login, &mut store,
+                            )
+                            .await
+                            .map(|_| AsyncActionPayload::OAuthCodexComplete { logged_in: true })
+                            .map_err(|e| e.to_string())
                         },
                     );
                 }
@@ -1441,10 +1449,14 @@ impl App {
                         AsyncActionKind::Internal("oauth.grok.complete"),
                         AsyncActionPolicy::Replace(AsyncActionKey::new("oauth.grok")),
                         async move {
-                            cockpit_core::auth::xai_oauth::complete_manual_login(login, &input)
-                                .await
-                                .map(|_| AsyncActionPayload::OAuthGrokComplete { logged_in: true })
-                                .map_err(|e| e.to_string())
+                            let mut store = crate::tui::settings::cockpit_credential_store()
+                                .map_err(|e| e.to_string())?;
+                            cockpit_core::auth::xai_oauth::complete_manual_login_in(
+                                login, &input, &mut store,
+                            )
+                            .await
+                            .map(|_| AsyncActionPayload::OAuthGrokComplete { logged_in: true })
+                            .map_err(|e| e.to_string())
                         },
                     );
                 }
@@ -1592,9 +1604,11 @@ impl App {
                 // request-construction time in core, never in TUI state.
                 let paths = cockpit_config::dirs::config_file_paths_for_load(&cwd);
                 let cfg = cockpit_config::providers::ConfigDoc::providers_from_paths(&paths);
-                cockpit_core::providers::usage::probes::fetch_all_provider_usage(
+                let store = crate::tui::settings::cockpit_credential_store().ok();
+                cockpit_core::providers::usage::probes::fetch_all_provider_usage_with_store(
                     &cfg,
                     filter.as_deref(),
+                    store,
                 )
                 .await
                 .map(AsyncActionPayload::ProviderUsage)

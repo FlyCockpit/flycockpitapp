@@ -449,7 +449,9 @@ impl ProviderSetupActions {
                 }
                 io.write("Paste the callback URL or code: ")?;
                 let input = io.read_line().context("reading Grok OAuth callback")?;
-                crate::auth::xai_oauth::complete_manual_login(login, input.trim()).await?;
+                let mut store = setup_credential_store()?;
+                crate::auth::xai_oauth::complete_manual_login_in(login, input.trim(), &mut store)
+                    .await?;
                 io.write_line("Grok OAuth login complete.")?;
             }
             "codex-oauth" => {
@@ -461,7 +463,8 @@ impl ProviderSetupActions {
                 if !crate::sysinfo::is_ssh() {
                     let _ = crate::browser::open(&login.verification_uri);
                 }
-                crate::auth::codex_oauth::complete_device_code_login(login).await?;
+                let mut store = setup_credential_store()?;
+                crate::auth::codex_oauth::complete_device_code_login_in(login, &mut store).await?;
                 io.write_line("Codex OAuth login complete.")?;
             }
             "saving" => {
@@ -518,7 +521,9 @@ impl ProviderSetupActions {
         let mut doc = ConfigDoc::load(&config_path)?;
         let mut cfg = doc.providers();
         let mut providers = std::collections::BTreeMap::from([(id.clone(), entry.clone())]);
-        let notice = crate::secret_ref::protect_literal_headers(&mut providers, None)?;
+        let mut store = setup_credential_store()?;
+        let notice =
+            crate::secret_ref::protect_literal_headers_in_store(&mut providers, &mut store)?;
         entry = providers
             .remove(&id)
             .expect("provider inserted for secret protection");
@@ -549,11 +554,13 @@ impl ProviderSetupActions {
         let Some(entry) = cfg.providers.get(&id).cloned() else {
             return Ok(());
         };
-        match crate::providers::auth_check::check_provider_auth(
+        let store = setup_credential_store().ok();
+        match crate::providers::auth_check::check_provider_auth_with_store(
             &id,
             &entry,
             template,
             Duration::from_secs(15),
+            store,
         )
         .await
         {
@@ -619,18 +626,33 @@ impl ProviderSetupActions {
         let Some(entry) = cfg.providers.get(&id).cloned() else {
             return Ok(());
         };
-        let resolved = match models_fetch::resolve_provider_request_async(&id, &entry).await {
+        let store = match setup_credential_store() {
+            Ok(store) => store,
+            Err(error) => {
+                io.write_line(&format!("Skipped model fetch: {error}"))?;
+                return Ok(());
+            }
+        };
+        let resolved = match models_fetch::resolve_provider_request_async_with_store(
+            &id,
+            &entry,
+            store.clone(),
+            |name| std::env::var(name).ok(),
+        )
+        .await
+        {
             Ok(resolved) => resolved,
             Err(error) => {
                 io.write_line(&format!("Skipped model fetch: {error}"))?;
                 return Ok(());
             }
         };
-        let outcome = models_fetch::fetch_models_for_provider(
+        let outcome = models_fetch::fetch_models_for_provider_with_store(
             &id,
             &entry,
             &resolved,
             Duration::from_secs(15),
+            Some(store),
         )
         .await;
         let Some(entry) = cfg.providers.get_mut(&id) else {
@@ -750,11 +772,19 @@ fn require_oauth_acknowledgement(step_id: &str, io: &mut dyn TerminalIo) -> Resu
     require_subscription_oauth_acknowledgement(provider, io)
 }
 
+fn setup_credential_store() -> Result<crate::credentials::CredentialStore> {
+    let db = crate::db::Db::open_default().context("opening cockpit DB")?;
+    let vault = cockpit_core::secure_key::open_for_db(&db)
+        .map_err(|e| anyhow::anyhow!("opening setup vault: {e}"))?;
+    crate::credentials::CredentialStore::from_vault(vault)
+}
+
 fn require_subscription_oauth_acknowledgement(
     provider: &str,
     io: &mut dyn TerminalIo,
 ) -> Result<()> {
-    if crate::auth::subscription_ack::acknowledged(provider)? {
+    let mut store = setup_credential_store()?;
+    if crate::auth::subscription_ack::acknowledged_in(&store, provider) {
         return Ok(());
     }
 
@@ -764,7 +794,7 @@ fn require_subscription_oauth_acknowledgement(
         .read_line()
         .context("reading subscription OAuth acknowledgement")?;
     if response.trim().eq_ignore_ascii_case("I acknowledge") {
-        crate::auth::subscription_ack::record(provider)?;
+        crate::auth::subscription_ack::record_in(&mut store, provider)?;
         return Ok(());
     }
 

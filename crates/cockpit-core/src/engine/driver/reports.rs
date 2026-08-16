@@ -35,20 +35,22 @@ pub(super) fn prompt_summary(msg: &Message, max_chars: usize) -> FailedTurnPromp
 /// a hard-coded model. `None` when no backup is configured, the config can't be
 /// loaded, or the backup `(provider, model)` can't be built (each ⇒ no
 /// fallback / hard-fail, never a crash).
-pub(crate) fn resolve_backup_model_for(
+pub(crate) fn resolve_backup_model_for_with_store(
     config: &crate::daemon::session_worker::SessionConfigHandle,
     model: &crate::engine::model::Model,
+    store: Option<crate::credentials::CredentialStore>,
 ) -> Option<Arc<crate::engine::model::Model>> {
     let providers = config.providers();
-    build_backup_model(&providers, model)
+    build_backup_model_with_store(&providers, model, store)
 }
 
-pub(crate) fn resolve_failover_models_for(
+pub(crate) fn resolve_failover_models_for_with_store(
     config: &crate::daemon::session_worker::SessionConfigHandle,
     model: &crate::engine::model::Model,
+    store: Option<crate::credentials::CredentialStore>,
 ) -> Vec<Arc<crate::engine::model::Model>> {
     let providers = config.providers();
-    build_failover_models(&providers, model)
+    build_failover_models_with_store(&providers, model, store)
 }
 
 /// Why a failover candidate was rejected. The custody decision and ordinary
@@ -225,7 +227,15 @@ pub(crate) fn build_backup_model(
     providers: &crate::config::providers::ProvidersConfig,
     model: &crate::engine::model::Model,
 ) -> Option<Arc<crate::engine::model::Model>> {
-    build_backup_model_with_diagnostics(providers, model).0
+    build_backup_model_with_store(providers, model, None)
+}
+
+pub(crate) fn build_backup_model_with_store(
+    providers: &crate::config::providers::ProvidersConfig,
+    model: &crate::engine::model::Model,
+    store: Option<crate::credentials::CredentialStore>,
+) -> Option<Arc<crate::engine::model::Model>> {
+    build_backup_model_with_diagnostics_and_store(providers, model, store).0
 }
 
 /// [`build_backup_model`] plus the custody refusal, when the configured backup
@@ -233,6 +243,17 @@ pub(crate) fn build_backup_model(
 pub(crate) fn build_backup_model_with_diagnostics(
     providers: &crate::config::providers::ProvidersConfig,
     model: &crate::engine::model::Model,
+) -> (
+    Option<Arc<crate::engine::model::Model>>,
+    Option<FailoverCustodyRefusal>,
+) {
+    build_backup_model_with_diagnostics_and_store(providers, model, None)
+}
+
+pub(crate) fn build_backup_model_with_diagnostics_and_store(
+    providers: &crate::config::providers::ProvidersConfig,
+    model: &crate::engine::model::Model,
+    store: Option<crate::credentials::CredentialStore>,
 ) -> (
     Option<Arc<crate::engine::model::Model>>,
     Option<FailoverCustodyRefusal>,
@@ -273,13 +294,14 @@ pub(crate) fn build_backup_model_with_diagnostics(
         }
         return (None, Some(refusal));
     }
-    let Some(built) = crate::engine::model::Model::for_provider(
+    let Some(built) = crate::engine::model::Model::for_provider_optional_store(
         providers,
         &backup.provider,
         &backup.model,
         // Start from the primary's session redaction table, then let the
         // backup target resolve its own trust policy.
         session_redact,
+        store,
     )
     .ok() else {
         return (None, None);
@@ -298,7 +320,15 @@ pub(crate) fn build_failover_models(
     providers: &crate::config::providers::ProvidersConfig,
     model: &crate::engine::model::Model,
 ) -> Vec<Arc<crate::engine::model::Model>> {
-    build_failover_models_with_diagnostics(providers, model).0
+    build_failover_models_with_store(providers, model, None)
+}
+
+pub(crate) fn build_failover_models_with_store(
+    providers: &crate::config::providers::ProvidersConfig,
+    model: &crate::engine::model::Model,
+    store: Option<crate::credentials::CredentialStore>,
+) -> Vec<Arc<crate::engine::model::Model>> {
+    build_failover_models_with_diagnostics_and_store(providers, model, store).0
 }
 
 /// [`build_failover_models`] plus every candidate refused on custody grounds.
@@ -311,6 +341,17 @@ pub(crate) fn build_failover_models(
 pub(crate) fn build_failover_models_with_diagnostics(
     providers: &crate::config::providers::ProvidersConfig,
     model: &crate::engine::model::Model,
+) -> (
+    Vec<Arc<crate::engine::model::Model>>,
+    Vec<FailoverCustodyRefusal>,
+) {
+    build_failover_models_with_diagnostics_and_store(providers, model, None)
+}
+
+pub(crate) fn build_failover_models_with_diagnostics_and_store(
+    providers: &crate::config::providers::ProvidersConfig,
+    model: &crate::engine::model::Model,
+    store: Option<crate::credentials::CredentialStore>,
 ) -> (
     Vec<Arc<crate::engine::model::Model>>,
     Vec<FailoverCustodyRefusal>,
@@ -398,11 +439,12 @@ pub(crate) fn build_failover_models_with_diagnostics(
     let built = admitted
         .into_iter()
         .filter_map(|(provider, model_id)| {
-            let built = crate::engine::model::Model::for_provider(
+            let built = crate::engine::model::Model::for_provider_optional_store(
                 providers,
                 &provider,
                 &model_id,
                 session_redact.clone(),
+                store.clone(),
             )
             .ok()?;
             let built = built.with_shutdown_gate(model.shutdown_gate());

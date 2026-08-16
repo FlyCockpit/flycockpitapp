@@ -943,41 +943,45 @@ pub(crate) async fn execute_ordinary_call(
     let audit_target_trusted = tool_frame().resolved_trusted();
     if let Err(e) = env
         .session
-        .record_tool_call_journaled(ToolCallRow {
-            event_id: Uuid::new_v4(),
-            timestamp: Utc::now(),
-            agent: env.agent.name.clone(),
-            call_id: tc.id.clone(),
-            parent_call_id: None,
-            parent_child_index: None,
-            identity: crate::session::ToolCallProviderIdentity::from_provider_call(
-                active_provider.as_deref(),
-                active_model.as_deref(),
-                Some(&providers),
-                Some(env.model.current_wire_api()),
-                tc.id.clone(),
-                tc.call_id.clone(),
-            ),
-            tool: resolved_name.to_string(),
-            path: tool_path,
-            mcp_server: None,
-            original_input_json: original.clone(),
-            wire_input_json: args.clone(),
-            recovery: recovery.clone(),
-            hard_fail,
-            exit_code,
-            sandbox_enabled: sandbox_meta.as_ref().is_some_and(|m| m.enabled),
-            sandboxed: sandbox_meta.as_ref().is_some_and(|m| m.confined),
-            sandbox_unavailable_reason: sandbox_meta
-                .as_ref()
-                .and_then(|m| m.unavailable_reason.clone()),
-            output: output_str.clone(),
-            truncated,
-            duration_ms,
-            llm_mode: env.agent.llm_mode,
-            shape_fingerprint: repair_fingerprint.clone(),
-            hint: hint_value.clone(),
-        }, tool_session_table.as_ref(), audit_target_trusted)
+        .record_tool_call_journaled(
+            ToolCallRow {
+                event_id: Uuid::new_v4(),
+                timestamp: Utc::now(),
+                agent: env.agent.name.clone(),
+                call_id: tc.id.clone(),
+                parent_call_id: None,
+                parent_child_index: None,
+                identity: crate::session::ToolCallProviderIdentity::from_provider_call(
+                    active_provider.as_deref(),
+                    active_model.as_deref(),
+                    Some(&providers),
+                    Some(env.model.current_wire_api()),
+                    tc.id.clone(),
+                    tc.call_id.clone(),
+                ),
+                tool: resolved_name.to_string(),
+                path: tool_path,
+                mcp_server: None,
+                original_input_json: original.clone(),
+                wire_input_json: args.clone(),
+                recovery: recovery.clone(),
+                hard_fail,
+                exit_code,
+                sandbox_enabled: sandbox_meta.as_ref().is_some_and(|m| m.enabled),
+                sandboxed: sandbox_meta.as_ref().is_some_and(|m| m.confined),
+                sandbox_unavailable_reason: sandbox_meta
+                    .as_ref()
+                    .and_then(|m| m.unavailable_reason.clone()),
+                output: output_str.clone(),
+                truncated,
+                duration_ms,
+                llm_mode: env.agent.llm_mode,
+                shape_fingerprint: repair_fingerprint.clone(),
+                hint: hint_value.clone(),
+            },
+            tool_session_table.as_ref(),
+            audit_target_trusted,
+        )
         .await
     {
         // Auditing must not break the live conversation. Log and
@@ -1884,7 +1888,7 @@ mod tests {
     fn test_session(root: &std::path::Path) -> Arc<Session> {
         let db = crate::db::Db::open_in_memory().unwrap();
         Arc::new(
-            Session::create(
+            Session::create_for_test(
                 db,
                 root.to_path_buf(),
                 "Build",
@@ -1914,7 +1918,7 @@ mod tests {
 
     async fn test_btw_session(root: &std::path::Path) -> Arc<Session> {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let parent = Session::create(
+        let parent = Session::create_for_test(
             db.clone(),
             root.to_path_buf(),
             "Build",
@@ -1927,7 +1931,7 @@ mod tests {
             .expect("btw fork")
             .info;
         Arc::new(
-            Session::resume(
+            Session::resume_for_test(
                 db,
                 fork.session_id,
                 crate::session::test_redaction_key_resolver(),
@@ -2492,7 +2496,10 @@ mod tests {
             hooks: &crate::config::extended::hooks::HookRegistry::default(),
             cwd: tmp.path(),
         };
-        let call = tool_call("echo", serde_json::json!({ "text": format!("deploy {SECRET}") }));
+        let call = tool_call(
+            "echo",
+            serde_json::json!({ "text": format!("deploy {SECRET}") }),
+        );
         let mut history = Vec::new();
         push_assistant_call(&mut history, &call);
 
@@ -3711,7 +3718,7 @@ mod tests {
     #[tokio::test]
     async fn recheck_modified_output_does_not_store_unrechecked_body() {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = Session::create(
+        let session = Session::create_for_test(
             db,
             std::path::PathBuf::from("/x"),
             "Build",

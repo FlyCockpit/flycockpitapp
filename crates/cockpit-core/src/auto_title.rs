@@ -575,7 +575,7 @@ mod tests {
     async fn eager_titles_first_short_message_no_token_gate() {
         let db = Db::open_in_memory().unwrap();
         let session = Arc::new(
-            Session::create(
+            Session::create_for_test(
                 db,
                 PathBuf::from("/x"),
                 "a",
@@ -617,7 +617,7 @@ mod tests {
         // scheduled slot gets the next chance (no failure Notice).
         let db = Db::open_in_memory().unwrap();
         let session = Arc::new(
-            Session::create(
+            Session::create_for_test(
                 db,
                 PathBuf::from("/x"),
                 "a",
@@ -652,7 +652,7 @@ mod tests {
     async fn refine_overwrites_eager_title() {
         let db = Db::open_in_memory().unwrap();
         let session = Arc::new(
-            Session::create(
+            Session::create_for_test(
                 db,
                 PathBuf::from("/x"),
                 "a",
@@ -689,7 +689,7 @@ mod tests {
     async fn refine_does_not_overwrite_user_set_title() {
         let db = Db::open_in_memory().unwrap();
         let session = Arc::new(
-            Session::create(
+            Session::create_for_test(
                 db,
                 PathBuf::from("/x"),
                 "a",
@@ -724,7 +724,7 @@ mod tests {
     async fn explicit_generated_title_replaces_manual_title_as_auto() {
         let db = Db::open_in_memory().unwrap();
         let session = Arc::new(
-            Session::create(
+            Session::create_for_test(
                 db,
                 PathBuf::from("/x"),
                 "a",
@@ -771,7 +771,7 @@ mod tests {
     async fn reasoning_output_is_think_stripped_before_slugify() {
         let db = Db::open_in_memory().unwrap();
         let session = Arc::new(
-            Session::create(
+            Session::create_for_test(
                 db,
                 PathBuf::from("/x"),
                 "a",
@@ -809,7 +809,7 @@ mod tests {
     async fn missing_utility_model_emits_setup_notice_once() {
         let db = Db::open_in_memory().unwrap();
         let session = Arc::new(
-            Session::create(
+            Session::create_for_test(
                 db,
                 PathBuf::from("/x"),
                 "a",
@@ -845,7 +845,7 @@ mod tests {
     async fn configured_model_failure_emits_generic_notice_once_without_raw_error() {
         let db = Db::open_in_memory().unwrap();
         let session = Arc::new(
-            Session::create(
+            Session::create_for_test(
                 db,
                 PathBuf::from("/x"),
                 "a",
@@ -907,7 +907,7 @@ mod tests {
     async fn configured_model_timeout_emits_timeout_notice_once() {
         let db = Db::open_in_memory().unwrap();
         let session = Arc::new(
-            Session::create(
+            Session::create_for_test(
                 db,
                 PathBuf::from("/x"),
                 "a",
@@ -971,7 +971,7 @@ mod tests {
         fn mk_session() -> Arc<Session> {
             let db = Db::open_in_memory().unwrap();
             Arc::new(
-                Session::create(
+                Session::create_for_test(
                     db,
                     PathBuf::from("/x"),
                     "a",
@@ -1038,7 +1038,10 @@ mod tests {
             .expect("eligible root+mcp turn claims the pending nudge");
         assert!(injected.contains("mcp.invoke"), "{injected}");
         assert!(injected.contains("rename_session"), "{injected}");
-        assert_eq!(nudge_state(&session).await, TitleRecoveryNudgeState::Consumed);
+        assert_eq!(
+            nudge_state(&session).await,
+            TitleRecoveryNudgeState::Consumed
+        );
 
         // --- (4) claim-before-send prevents duplication ---
         assert!(
@@ -1053,8 +1056,17 @@ mod tests {
         let url2 = stub_model_server(Some("!!!".to_string())).await; // no usable slug
         let (e2, p2, r2) = stub_configs(&url2);
         let (tx2, _rx2) = mpsc::channel(8);
-        generate_session_title(s2.clone(), e2, p2, r2, "/help".to_string(), action2, None, tx2)
-            .await;
+        generate_session_title(
+            s2.clone(),
+            e2,
+            p2,
+            r2,
+            "/help".to_string(),
+            action2,
+            None,
+            tx2,
+        )
+        .await;
         assert_eq!(
             nudge_state(&s2).await,
             TitleRecoveryNudgeState::Pending,
@@ -1129,7 +1141,11 @@ mod tests {
             "an already-titled session is never armed"
         );
         let s_renamed = mk_session();
-        s_renamed.db.rename_session(s_renamed.id, "mine").await.unwrap();
+        s_renamed
+            .db
+            .rename_session(s_renamed.id, "mine")
+            .await
+            .unwrap();
         s_renamed.arm_title_recovery_nudge().await;
         assert_eq!(
             nudge_state(&s_renamed).await,

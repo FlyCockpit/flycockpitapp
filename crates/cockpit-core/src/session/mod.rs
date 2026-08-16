@@ -44,6 +44,8 @@ pub mod import;
 pub(crate) mod lifecycle;
 mod recording;
 pub mod sealed_values;
+#[cfg(any(test, feature = "test-support"))]
+mod test_constructors;
 pub(crate) use recording::notice_severity;
 pub use recording::{
     ModelSwitchAudit, ModelSwitchOutcome, ModelSwitchTrigger, SessionEventModelFrame,
@@ -123,6 +125,9 @@ pub struct Session {
     #[allow(dead_code)]
     pub started_at: DateTime<Utc>,
     pub db: Db,
+    /// Daemon-injected wrap-key vault. Session fork, sealed persist, and
+    /// redaction-table load use this handle instead of opening a second vault.
+    secret_vault: Arc<crate::secure_key::SecretVault>,
     /// Daemon-owned external side-effect journal. Installed by the registry
     /// before the worker starts; absent in isolated unit sessions.
     external_journal: Mutex<Option<Arc<crate::external_journal::ExternalJournal>>>,
@@ -380,6 +385,14 @@ impl Session {
         &self,
     ) -> &Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver> {
         &self.redaction_key_resolver
+    }
+
+    pub(crate) fn secret_vault(&self) -> &Arc<crate::secure_key::SecretVault> {
+        &self.secret_vault
+    }
+
+    pub(crate) fn credential_store(&self) -> anyhow::Result<crate::credentials::CredentialStore> {
+        crate::credentials::CredentialStore::from_vault(self.secret_vault.clone())
     }
 
     pub fn allow_unjournaled_inference(&self) {
@@ -1163,7 +1176,7 @@ mod tests {
     #[tokio::test]
     async fn create_and_resume_round_trip() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db.clone(),
             PathBuf::from("/x"),
             "Build",
@@ -1173,7 +1186,7 @@ mod tests {
         let id = s.id;
         let short = s.short_id.clone();
         drop(s);
-        let s2 = Session::resume(db, id, crate::session::test_redaction_key_resolver())
+        let s2 = Session::resume_for_test(db, id, crate::session::test_redaction_key_resolver())
             .unwrap()
             .unwrap();
         assert_eq!(s2.id, id);
@@ -1186,7 +1199,7 @@ mod tests {
     #[tokio::test]
     async fn fork_inherits_parent_metadata() {
         let db = Db::open_in_memory().unwrap();
-        let parent = Session::create(
+        let parent = Session::create_for_test(
             db.clone(),
             PathBuf::from("/x"),
             "Build",
@@ -1203,7 +1216,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let fork = Session::create_fork(
+        let fork = Session::create_fork_for_test(
             db.clone(),
             parent.id,
             Some(fork_point.to_string()),
@@ -1226,7 +1239,7 @@ mod tests {
     #[tokio::test]
     async fn rename_persists_and_blocks_auto_title() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db.clone(),
             PathBuf::from("/x"),
             "a",
@@ -1243,7 +1256,7 @@ mod tests {
     #[tokio::test]
     async fn time_prelude_fires_on_first_call() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db,
             PathBuf::from("/x"),
             "a",
@@ -1260,7 +1273,7 @@ mod tests {
     #[tokio::test]
     async fn time_prelude_suppressed_within_interval() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db,
             PathBuf::from("/x"),
             "a",
@@ -1279,7 +1292,7 @@ mod tests {
         // A 0-minute interval is the "always inject" config, mainly for
         // tests. Two back-to-back calls both fire.
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db,
             PathBuf::from("/x"),
             "a",
@@ -1306,7 +1319,7 @@ mod tests {
     #[tokio::test]
     async fn note_user_content_eager_fires_on_first_short_message() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db,
             PathBuf::from("/x"),
             "a",
@@ -1323,7 +1336,7 @@ mod tests {
     #[tokio::test]
     async fn note_user_content_uses_bounded_turn_slots() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db,
             PathBuf::from("/x"),
             "a",
@@ -1353,7 +1366,7 @@ mod tests {
     #[tokio::test]
     async fn scheduled_slot_is_consumed_even_without_title_success() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db,
             PathBuf::from("/x"),
             "a",
@@ -1372,7 +1385,7 @@ mod tests {
     #[tokio::test]
     async fn nudge_fires_at_slot_8_and_16_only_when_untitled() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db,
             PathBuf::from("/x"),
             "a",
@@ -1397,7 +1410,7 @@ mod tests {
     #[tokio::test]
     async fn nudge_does_not_fire_once_titled() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db,
             PathBuf::from("/x"),
             "a",
@@ -1421,7 +1434,7 @@ mod tests {
     #[tokio::test]
     async fn resumed_session_does_not_renudge_a_passed_slot() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db.clone(),
             PathBuf::from("/x"),
             "a",
@@ -1443,9 +1456,10 @@ mod tests {
         assert_eq!(s.title_stage(), 8);
         drop(s);
 
-        let resumed = Session::resume(db, id, crate::session::test_redaction_key_resolver())
-            .unwrap()
-            .unwrap();
+        let resumed =
+            Session::resume_for_test(db, id, crate::session::test_redaction_key_resolver())
+                .unwrap()
+                .unwrap();
         assert_eq!(resumed.user_content_turns(), 8);
         assert_eq!(resumed.title_stage(), 8);
         assert!(
@@ -1468,7 +1482,7 @@ mod tests {
     #[tokio::test]
     async fn compact_self_nudge_two_shot_latch() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db,
             PathBuf::from("/x"),
             "a",
@@ -1510,7 +1524,7 @@ mod tests {
     #[tokio::test]
     async fn compact_self_nudge_suppressed_when_unactionable() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db,
             PathBuf::from("/x"),
             "a",
@@ -1536,7 +1550,7 @@ mod tests {
     #[tokio::test]
     async fn compact_self_nudge_latch_reset_only_on_compaction() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db,
             PathBuf::from("/x"),
             "a",
@@ -1566,7 +1580,7 @@ mod tests {
     #[tokio::test]
     async fn note_user_content_skips_when_user_renamed() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db,
             PathBuf::from("/x"),
             "a",
@@ -1583,7 +1597,7 @@ mod tests {
     #[tokio::test]
     async fn note_user_content_empty_is_noop() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db,
             PathBuf::from("/x"),
             "a",
@@ -1598,7 +1612,7 @@ mod tests {
     #[tokio::test]
     async fn non_slot_turns_do_not_fire_even_with_large_content() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db,
             PathBuf::from("/x"),
             "a",
@@ -1614,7 +1628,7 @@ mod tests {
     #[tokio::test]
     async fn title_progress_survives_resume() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db.clone(),
             PathBuf::from("/x"),
             "a",
@@ -1635,9 +1649,10 @@ mod tests {
         assert_eq!(s.title_stage(), 1);
         drop(s);
 
-        let resumed = Session::resume(db, id, crate::session::test_redaction_key_resolver())
-            .unwrap()
-            .unwrap();
+        let resumed =
+            Session::resume_for_test(db, id, crate::session::test_redaction_key_resolver())
+                .unwrap()
+                .unwrap();
         assert_eq!(
             resumed.user_content_tokens(),
             carried,
@@ -1656,7 +1671,7 @@ mod tests {
     async fn note_user_content_refine_skips_when_user_renamed_after_eager() {
         // A /rename after an eager title wins and blocks later scheduled slots.
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db,
             PathBuf::from("/x"),
             "a",
@@ -1673,7 +1688,7 @@ mod tests {
     #[tokio::test]
     async fn title_failure_notice_is_one_per_session() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db,
             PathBuf::from("/x"),
             "a",
@@ -1690,7 +1705,7 @@ mod tests {
     #[tokio::test]
     async fn redaction_placeholder_notice_is_one_per_session() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db,
             PathBuf::from("/x"),
             "a",
@@ -1707,7 +1722,7 @@ mod tests {
     #[tokio::test]
     async fn fork_inherits_user_content_counter() {
         let db = Db::open_in_memory().unwrap();
-        let parent = Session::create(
+        let parent = Session::create_for_test(
             db.clone(),
             PathBuf::from("/x"),
             "a",
@@ -1715,7 +1730,7 @@ mod tests {
         )
         .unwrap();
         let _ = parent.note_user_content(&"x".repeat(1000));
-        let fork = Session::create_fork(
+        let fork = Session::create_fork_for_test(
             db,
             parent.id,
             None,
@@ -1730,14 +1745,14 @@ mod tests {
         // Two sessions get distinct private tmp dirs (sandboxing part 2),
         // so neither can read the other's scratch.
         let db = Db::open_in_memory().unwrap();
-        let a = Session::create(
+        let a = Session::create_for_test(
             db.clone(),
             PathBuf::from("/x"),
             "builder",
             crate::session::test_redaction_key_resolver(),
         )
         .unwrap();
-        let b = Session::create(
+        let b = Session::create_for_test(
             db,
             PathBuf::from("/x"),
             "builder",
@@ -1756,7 +1771,7 @@ mod tests {
     #[tokio::test]
     async fn tmp_dir_removed_on_end() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db,
             PathBuf::from("/x"),
             "builder",
@@ -1791,7 +1806,7 @@ mod tests {
     async fn host_shim_dir_removed_on_end() {
         let temp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db,
             PathBuf::from("/x"),
             "builder",
@@ -1815,7 +1830,7 @@ mod tests {
     async fn tmp_dir_removed_on_drop() {
         let db = Db::open_in_memory().unwrap();
         let dir = {
-            let s = Session::create(
+            let s = Session::create_for_test(
                 db,
                 PathBuf::from("/x"),
                 "builder",
@@ -1832,7 +1847,7 @@ mod tests {
     #[tokio::test]
     async fn sandbox_flag_defaults_on_and_toggles() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db,
             PathBuf::from("/x"),
             "builder",
@@ -1856,7 +1871,7 @@ mod tests {
     async fn approval_mode_defaults_manual_and_round_trips() {
         use crate::config::extended::ApprovalMode;
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db,
             PathBuf::from("/x"),
             "builder",
@@ -1876,7 +1891,7 @@ mod tests {
     async fn session_mode_unchanged() {
         use crate::config::extended::ApprovalMode;
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db,
             PathBuf::from("/x"),
             "builder",
@@ -1925,7 +1940,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let s = Arc::new(
-            Session::create(
+            Session::create_for_test(
                 db.clone(),
                 tmp.path().to_path_buf(),
                 "builder",
@@ -1969,7 +1984,7 @@ mod tests {
     async fn yolo_hard_gates() {
         use crate::config::extended::ApprovalMode;
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db,
             PathBuf::from("/x"),
             "builder",
@@ -2000,7 +2015,7 @@ mod tests {
     #[tokio::test]
     async fn bump_consecutive_counts_back_to_back_repeats() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db,
             PathBuf::from("/x"),
             "builder",
@@ -2018,7 +2033,7 @@ mod tests {
     #[tokio::test]
     async fn bump_consecutive_resets_on_a_different_call() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db,
             PathBuf::from("/x"),
             "builder",
@@ -2038,7 +2053,7 @@ mod tests {
     #[tokio::test]
     async fn repeated_recoverable_tool_call_message_matches_and_clears_on_difference() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db,
             PathBuf::from("/x"),
             "builder",
@@ -2062,7 +2077,7 @@ mod tests {
     #[tokio::test]
     async fn clear_recoverable_tool_call_drops_memory() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db,
             PathBuf::from("/x"),
             "builder",
@@ -2082,7 +2097,7 @@ mod tests {
         // and short_id in memory but no `sessions` row, and never appears in
         // listings until persisted.
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create_deferred(
+        let s = Session::create_deferred_for_test(
             db.clone(),
             PathBuf::from("/x"),
             "Build",
@@ -2116,7 +2131,7 @@ mod tests {
         // A model picked before the first message survives the deferred
         // write as one atomic value, including inference preferences.
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create_deferred(
+        let s = Session::create_deferred_for_test(
             db.clone(),
             PathBuf::from("/x"),
             "Build",
@@ -2163,7 +2178,7 @@ mod tests {
         );
         let row = db.insert_session_row(&row).await.unwrap();
 
-        let error = Session::resume(
+        let error = Session::resume_for_test(
             db,
             row.session_id,
             crate::session::test_redaction_key_resolver(),
@@ -2182,7 +2197,7 @@ mod tests {
         row.model = Some("projection-model".to_string());
         let row = db.insert_session_row(&row).await.unwrap();
 
-        let error = Session::resume(
+        let error = Session::resume_for_test(
             db,
             row.session_id,
             crate::session::test_redaction_key_resolver(),
@@ -2196,7 +2211,7 @@ mod tests {
     #[tokio::test]
     async fn deferred_persist_carries_session_overrides() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create_deferred(
+        let s = Session::create_deferred_for_test(
             db.clone(),
             PathBuf::from("/x"),
             "Build",
@@ -2230,7 +2245,7 @@ mod tests {
     #[tokio::test]
     async fn deferred_persist_carries_agent_touch_and_viewed() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create_deferred(
+        let s = Session::create_deferred_for_test(
             db.clone(),
             PathBuf::from("/x"),
             "Build",
@@ -2259,7 +2274,7 @@ mod tests {
         // The non-deferred constructor writes the row up front, so
         // persist_if_needed is a no-op and is_persisted is true.
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db.clone(),
             PathBuf::from("/x"),
             "builder",
@@ -2274,7 +2289,7 @@ mod tests {
     #[tokio::test]
     async fn record_tool_call_writes_row() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db.clone(),
             PathBuf::from("/x"),
             "builder",
@@ -2319,7 +2334,7 @@ mod tests {
     #[tokio::test]
     async fn record_tool_call_persists_provider_identity_separately() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db.clone(),
             PathBuf::from("/x"),
             "builder",
@@ -2391,7 +2406,7 @@ mod tests {
         let path = tmp.path().join("AGENTS.md");
         std::fs::write(&path, body).unwrap();
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db,
             tmp.path().to_path_buf(),
             "Build",
@@ -2427,7 +2442,7 @@ mod tests {
         let path = tmp.path().join("AGENTS.md");
         std::fs::write(&path, "RULE A\nRULE B\n").unwrap();
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create_deferred(
+        let s = Session::create_deferred_for_test(
             db.clone(),
             tmp.path().to_path_buf(),
             "Build",
@@ -2457,7 +2472,7 @@ mod tests {
         let path = tmp.path().join("AGENTS.md");
         std::fs::write(&path, "line one\nline two\nline three\n").unwrap();
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create_deferred(
+        let s = Session::create_deferred_for_test(
             db,
             tmp.path().to_path_buf(),
             "Build",
@@ -2485,7 +2500,7 @@ mod tests {
     async fn resumed_session_guidance_baseline_still_updates() {
         let (s, tmp, path) = guidance_session("v1\n");
         s.snapshot_guidance_baseline(tmp.path()).await;
-        let resumed = Session::resume(
+        let resumed = Session::resume_for_test(
             s.db.clone(),
             s.id,
             crate::session::test_redaction_key_resolver(),
@@ -2514,7 +2529,7 @@ mod tests {
     async fn snapshot_with_no_guidance_file_leaves_null_baseline() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(
+        let s = Session::create_for_test(
             db,
             tmp.path().to_path_buf(),
             "Build",

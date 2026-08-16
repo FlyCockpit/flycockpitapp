@@ -2957,7 +2957,13 @@ mod tests {
         let mut v = json!({ "path": "  src/tui/settings/mod.rs  " });
         let out = normalize_paths(&mut v, &schema(), root);
         assert!(
-            matches!(out.recovery, Recovery::ShapeRepair { stage: "path_trailing_garbage_strip", .. }),
+            matches!(
+                out.recovery,
+                Recovery::ShapeRepair {
+                    stage: "path_trailing_garbage_strip",
+                    ..
+                }
+            ),
             "outer whitespace should salvage via the new stage, got {:?}",
             out.recovery
         );
@@ -2969,7 +2975,10 @@ mod tests {
         let out = normalize_paths(&mut v, &schema(), root);
         assert!(matches!(
             out.recovery,
-            Recovery::ShapeRepair { stage: "path_trailing_garbage_strip", .. }
+            Recovery::ShapeRepair {
+                stage: "path_trailing_garbage_strip",
+                ..
+            }
         ));
         assert_eq!(norm_path(&v), good);
 
@@ -2978,7 +2987,10 @@ mod tests {
         let out = normalize_paths(&mut v, &schema(), root);
         assert!(matches!(
             out.recovery,
-            Recovery::ShapeRepair { stage: "path_trailing_garbage_strip", .. }
+            Recovery::ShapeRepair {
+                stage: "path_trailing_garbage_strip",
+                ..
+            }
         ));
         assert_eq!(norm_path(&v), good);
 
@@ -2987,7 +2999,10 @@ mod tests {
         let out = normalize_paths(&mut v, &schema(), root);
         assert!(matches!(
             out.recovery,
-            Recovery::ShapeRepair { stage: "path_trailing_garbage_strip", .. }
+            Recovery::ShapeRepair {
+                stage: "path_trailing_garbage_strip",
+                ..
+            }
         ));
         assert_eq!(norm_path(&v), good);
 
@@ -3019,7 +3034,10 @@ mod tests {
         let before = v.clone();
         let out = normalize_paths(&mut v, &create_path_schema(), tmp_c.path());
         assert_eq!(out.recovery, Recovery::Clean);
-        assert_eq!(v, before, "may-create path must not be trailing-garbage-repaired");
+        assert_eq!(
+            v, before,
+            "may-create path must not be trailing-garbage-repaired"
+        );
 
         // `..` / out-of-root: a candidate that would climb out is rejected;
         // confinement preserved.
@@ -3038,7 +3056,11 @@ mod tests {
         let mut v = json!({ "path": "dir/a#b INVALID" });
         let before = v.clone();
         let out = normalize_paths(&mut v, &schema(), tmp_a.path());
-        assert_eq!(out.recovery, Recovery::Clean, "ambiguous salvage must not fire");
+        assert_eq!(
+            out.recovery,
+            Recovery::Clean,
+            "ambiguous salvage must not fire"
+        );
         assert_eq!(v, before);
 
         // Non-composition: only the c-candidate (`dir/a#b`) exists, the
@@ -3050,7 +3072,10 @@ mod tests {
         let out = normalize_paths(&mut v, &schema(), tmp_n.path());
         assert!(matches!(
             out.recovery,
-            Recovery::ShapeRepair { stage: "path_trailing_garbage_strip", .. }
+            Recovery::ShapeRepair {
+                stage: "path_trailing_garbage_strip",
+                ..
+            }
         ));
         assert_eq!(norm_path(&v), "dir/a#b");
 
@@ -3074,7 +3099,11 @@ mod tests {
         let mut v = json!({ "path": raw });
         let before = v.clone();
         let out = normalize_paths(&mut v, &schema(), tmp_l.path());
-        assert_eq!(out.recovery, Recovery::Clean, "over-cap value must be left untouched");
+        assert_eq!(
+            out.recovery,
+            Recovery::Clean,
+            "over-cap value must be left untouched"
+        );
         assert_eq!(v, before);
     }
 
@@ -3122,7 +3151,10 @@ mod tests {
             ("report INVALID\u{2717}", "report"), // (d) ws + `INVALID` + non-ASCII
         ];
         for (original, transformed) in both_exist {
-            assert!(root.join(original).exists(), "precondition: {original:?} exists");
+            assert!(
+                root.join(original).exists(),
+                "precondition: {original:?} exists"
+            );
             assert!(
                 root.join(transformed).exists(),
                 "precondition: transformed {transformed:?} also exists"
@@ -3136,7 +3168,10 @@ mod tests {
                 "existing original must win over its transform: {original:?}"
             );
             assert!(out.error.is_none());
-            assert_eq!(v, before, "must not rewrite {original:?} to {transformed:?}");
+            assert_eq!(
+                v, before,
+                "must not rewrite {original:?} to {transformed:?}"
+            );
         }
     }
 

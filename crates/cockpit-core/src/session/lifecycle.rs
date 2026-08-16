@@ -9,16 +9,15 @@ use super::*;
 /// Required protected redaction-history key resolver threaded into every
 /// `Session` constructor (decision 16). Production installs the daemon's
 /// `SecureKeyResolver`; tests pass [`super::test_redaction_key_resolver`].
-type RedactionKeyResolverArc =
+pub(crate) type RedactionKeyResolverArc =
     Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>;
 
 fn copy_vault_session_secrets(
     db: &crate::db::Db,
+    vault: &crate::secure_key::SecretVault,
     parent: uuid::Uuid,
     child: uuid::Uuid,
 ) -> Result<()> {
-    let vault = crate::secure_key::vault_for_db(db)
-        .map_err(|e| anyhow::anyhow!("opening vault for session fork: {e}"))?;
     let parent_key = parent.to_string();
     let child_key = child.to_string();
     if let Ok(secret) = vault.get_item(
@@ -96,14 +95,14 @@ fn copy_vault_session_secrets(
 
 fn persist_redaction_table_to_vault(
     db: &crate::db::Db,
+    vault: &Arc<crate::secure_key::SecretVault>,
     session_id: uuid::Uuid,
     json: &[u8],
 ) -> Result<()> {
-    let vault = crate::secure_key::vault_for_db(db)
-        .map_err(|e| anyhow::anyhow!("opening vault for redaction table: {e}"))?;
     let item_id = crate::secure_key::redaction_table_item_id(&session_id.to_string());
     let json = json.to_vec();
     let session_key = session_id.to_string();
+    let vault = vault.clone();
     db.blocking_write_for_sync_maintenance(move |conn| {
         conn.execute(
             "UPDATE sessions SET redaction_table_json = NULL WHERE session_id = ?1",
@@ -124,11 +123,9 @@ fn persist_redaction_table_to_vault(
 }
 
 pub(crate) fn load_redaction_table_from_vault(
-    db: &crate::db::Db,
+    vault: &crate::secure_key::SecretVault,
     session_id: uuid::Uuid,
 ) -> Result<Option<String>> {
-    let vault = crate::secure_key::vault_for_db(db)
-        .map_err(|e| anyhow::anyhow!("opening vault for redaction table: {e}"))?;
     let item_id = crate::secure_key::redaction_table_item_id(&session_id.to_string());
     match vault.get_item(
         cockpit_db::secret_vault::SecretVaultKind::RedactionTable,
@@ -158,6 +155,7 @@ impl Session {
         project_root: PathBuf,
         active_agent: &str,
         resolver: RedactionKeyResolverArc,
+        vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Self> {
         let project_id = project_id_for(&project_root);
         let project_root_str = project_root.to_string_lossy().into_owned();
@@ -180,7 +178,7 @@ impl Session {
                 crate::db::Db::insert_session_row_conn(conn, &row_for_db)
             })
             .context("creating session row")?;
-        Self::from_row(db, project_root, row, resolver)
+        Self::from_row(db, project_root, row, resolver, vault)
     }
 
     /// Create a brand-new session held **in memory only** — its `sessions`
@@ -194,6 +192,7 @@ impl Session {
         project_root: PathBuf,
         active_agent: &str,
         resolver: RedactionKeyResolverArc,
+        vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Self> {
         let project_id = project_id_for(&project_root);
         let project_root_str = project_root.to_string_lossy().into_owned();
@@ -212,7 +211,7 @@ impl Session {
             .context("building deferred session row")?;
         row.model_system_prompt_snapshot_json =
             capture_model_system_prompt_snapshot_json(&project_root);
-        let session = Self::from_row(db, project_root, row.clone(), resolver)?;
+        let session = Self::from_row(db, project_root, row.clone(), resolver, vault)?;
         *session.pending_row.lock().unwrap() = Some(row);
         Ok(session)
     }
@@ -227,6 +226,7 @@ impl Session {
         active_agent: &str,
         assistant_name: &str,
         resolver: RedactionKeyResolverArc,
+        vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Self> {
         let project_id = project_id_for(&project_root);
         let project_root_str = project_root.to_string_lossy().into_owned();
@@ -247,7 +247,7 @@ impl Session {
             .context("building deferred assistant session row")?;
         row.model_system_prompt_snapshot_json =
             capture_model_system_prompt_snapshot_json(&project_root);
-        let session = Self::from_row(db, project_root, row.clone(), resolver)?;
+        let session = Self::from_row(db, project_root, row.clone(), resolver, vault)?;
         *session.pending_row.lock().unwrap() = Some(row);
         Ok(session)
     }
@@ -348,6 +348,7 @@ impl Session {
         parent_session_id: Uuid,
         fork_point_turn_id: Option<String>,
         resolver: RedactionKeyResolverArc,
+        vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Self> {
         let row = db
             .blocking_write_for_sync_maintenance(move |conn| {
@@ -361,10 +362,10 @@ impl Session {
                 )
             })
             .context("creating fork session row")?;
-        copy_vault_session_secrets(&db, parent_session_id, row.session_id)
+        copy_vault_session_secrets(&db, &vault, parent_session_id, row.session_id)
             .context("copying vault sealed values and redaction table into fork")?;
         let project_root = PathBuf::from(&row.project_root);
-        Self::from_row(db, project_root, row, resolver)
+        Self::from_row(db, project_root, row, resolver, vault)
     }
 
     /// Resume an existing session. Returns `None` if the id is unknown.
@@ -373,6 +374,7 @@ impl Session {
         db: Db,
         session_id: Uuid,
         resolver: RedactionKeyResolverArc,
+        vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Option<Self>> {
         let Some(row) = db
             .blocking_write_for_sync_maintenance(move |conn| {
@@ -383,7 +385,13 @@ impl Session {
             return Ok(None);
         };
         let project_root = PathBuf::from(&row.project_root);
-        Ok(Some(Self::from_row(db, project_root, row, resolver)?))
+        Ok(Some(Self::from_row(
+            db,
+            project_root,
+            row,
+            resolver,
+            vault,
+        )?))
     }
 
     fn from_row(
@@ -391,6 +399,7 @@ impl Session {
         project_root: PathBuf,
         row: SessionRow,
         resolver: RedactionKeyResolverArc,
+        vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Self> {
         let started_at =
             DateTime::<Utc>::from_timestamp(row.started_at, 0).unwrap_or_else(Utc::now);
@@ -432,7 +441,7 @@ impl Session {
         };
         let redaction_table_json = match row.redaction_table_json.filter(|s| !s.is_empty()) {
             Some(json) => Some(json),
-            None => load_redaction_table_from_vault(&db, row.session_id)
+            None => load_redaction_table_from_vault(&vault, row.session_id)
                 .context("loading vault redaction table while resuming session")?,
         };
         Ok(Self {
@@ -442,6 +451,7 @@ impl Session {
             assistant_name: row.assistant_name,
             started_at,
             db,
+            secret_vault: vault,
             external_journal: Mutex::new(None),
             redaction_key_resolver: resolver,
             allow_unjournaled_inference: std::sync::atomic::AtomicBool::new(false),
@@ -587,9 +597,14 @@ impl Session {
         if self.stage_pending_row(|row| {
             row.redaction_table_json = None;
         }) {
-            return persist_redaction_table_to_vault(&self.db, self.id, json.as_bytes());
+            return persist_redaction_table_to_vault(
+                &self.db,
+                &self.secret_vault,
+                self.id,
+                json.as_bytes(),
+            );
         }
-        persist_redaction_table_to_vault(&self.db, self.id, json.as_bytes())
+        persist_redaction_table_to_vault(&self.db, &self.secret_vault, self.id, json.as_bytes())
     }
 
     pub fn persisted_redaction_table(&self) -> Result<Option<crate::redact::RedactionTable>> {
@@ -598,7 +613,7 @@ impl Session {
                 .map(Some)
                 .context("loading persisted session redaction table");
         }
-        match load_redaction_table_from_vault(&self.db, self.id)? {
+        match load_redaction_table_from_vault(&self.secret_vault, self.id)? {
             Some(json) => crate::redact::RedactionTable::from_persisted_json(&json)
                 .map(Some)
                 .context("loading vault session redaction table"),
@@ -611,7 +626,7 @@ impl Session {
     pub fn persisted_disk_redaction_origins(&self) -> Result<Vec<String>> {
         let json = match self.redaction_table_json.lock().unwrap().clone() {
             Some(json) => json,
-            None => match load_redaction_table_from_vault(&self.db, self.id)? {
+            None => match load_redaction_table_from_vault(&self.secret_vault, self.id)? {
                 Some(json) => json,
                 None => return Ok(Vec::new()),
             },
@@ -717,7 +732,7 @@ mod vault_unification_tests {
     #[test]
     fn redaction_table_not_plaintext_in_sessions_column() {
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session = Session::create(
+        let session = Session::create_for_test(
             db.clone(),
             PathBuf::from("/repo"),
             "Build",

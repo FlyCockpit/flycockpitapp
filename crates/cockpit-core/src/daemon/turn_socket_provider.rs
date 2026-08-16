@@ -1215,10 +1215,7 @@ impl TurnSocketProvider {
     /// `max_addresses` (≤ [`MAX_DNS_ADDRESSES`]) and `lookup_deadline`
     /// (≤ [`DNS_LOOKUP_DEADLINE`]) bounds, then family-interleaved per
     /// RFC 8305.
-    pub fn plan_connection(
-        &self,
-        entry: &AuthorizedIceEntry,
-    ) -> Result<ConnectionPlan, PlanError> {
+    pub fn plan_connection(&self, entry: &AuthorizedIceEntry) -> Result<ConnectionPlan, PlanError> {
         let url = &entry.server_url;
         let transport = url.transport_class();
         let port = url.port();
@@ -1329,7 +1326,11 @@ impl TurnSocketProvider {
         if self.current.as_ref().is_some_and(TurnAllocation::is_closed) {
             self.current = None;
         }
-        if self.noncurrent.as_ref().is_some_and(TurnAllocation::is_closed) {
+        if self
+            .noncurrent
+            .as_ref()
+            .is_some_and(TurnAllocation::is_closed)
+        {
             self.noncurrent = None;
         }
     }
@@ -1378,9 +1379,7 @@ impl TurnSocketProvider {
             return Err(AllocateError::NoncurrentExists);
         }
         // Build the admitted DNS / IP-literal plan on the production path.
-        let plan = self
-            .plan_connection(entry)
-            .map_err(AllocateError::Plan)?;
+        let plan = self.plan_connection(entry).map_err(AllocateError::Plan)?;
         // Open the relay through the sole socket-opening seam. No direct/host/
         // srflx socket is reachable from here; a failure fails closed and
         // creates no allocation.

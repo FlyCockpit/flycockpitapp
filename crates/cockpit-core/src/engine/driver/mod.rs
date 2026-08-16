@@ -274,7 +274,6 @@ pub enum ParkedReplayOutcome {
 /// hit this cap, extras stay in the channel for the *next* fold.
 const MAX_FOLD: usize = 16;
 const GOAL_WATCHDOG_DELAY: Duration = Duration::from_secs(600);
-const GOAL_NO_PROGRESS_NUDGE_BOUND: u16 = 2;
 /// Finite continuation cap for goals created without an explicit token budget.
 /// Large enough for ordinary multi-turn runs, but not unbounded if the agent
 /// repeatedly fails to make durable progress.
@@ -609,9 +608,6 @@ pub struct Driver {
     shadow_brief_generation: u64,
     self_improvement_review: Option<crate::assistants::self_improvement::RunningReview>,
     self_improvement_schedule: crate::assistants::self_improvement::ReviewSchedule,
-    goal_no_tool_idle_count: u8,
-    goal_turns_since_mutating_action: u16,
-    goal_turns_since_goal_context_delta: u16,
     goal_progress_last_seq: i64,
     /// Latches after the active-goal no-tool idle guard stops automatic
     /// continuation. Cleared when a real user turn or a non-prose/toolful state
@@ -1301,9 +1297,6 @@ impl Driver {
             self_improvement_review: None,
             self_improvement_schedule: crate::assistants::self_improvement::ReviewSchedule::default(
             ),
-            goal_no_tool_idle_count: 0,
-            goal_turns_since_mutating_action: self.goal_turns_since_mutating_action,
-            goal_turns_since_goal_context_delta: self.goal_turns_since_goal_context_delta,
             goal_progress_last_seq: self.goal_progress_last_seq,
             goal_idle_intervention_pending: false,
             goal_idle_intervention_code: None,
@@ -1618,9 +1611,6 @@ impl Driver {
             self_improvement_review: None,
             self_improvement_schedule: crate::assistants::self_improvement::ReviewSchedule::default(
             ),
-            goal_no_tool_idle_count: 0,
-            goal_turns_since_mutating_action: 0,
-            goal_turns_since_goal_context_delta: 0,
             goal_progress_last_seq: -1,
             goal_idle_intervention_pending: false,
             goal_idle_intervention_code: None,
@@ -3585,10 +3575,6 @@ impl Driver {
         self.goal_was_active_recently = true;
         self.goal_usage_limit_auto_resume_attempts = 0;
         if goal.tokens_used >= goal.token_budget {
-            if self.goal_stall_budget_context_active() {
-                self.emit_goal_no_progress_budget_exhausted(&goal, tx).await;
-                return Ok(());
-            }
             let _ = self
                 .session
                 .db
@@ -3888,63 +3874,12 @@ impl Driver {
     }
 
     async fn reset_goal_progress_tracking(&mut self) {
-        self.goal_no_tool_idle_count = 0;
-        self.goal_turns_since_mutating_action = 0;
-        self.goal_turns_since_goal_context_delta = 0;
         self.goal_progress_last_seq = self.latest_session_event_seq().await;
     }
 
     fn clear_goal_idle_intervention(&mut self) {
         self.goal_idle_intervention_pending = false;
         self.goal_idle_intervention_code = None;
-    }
-
-    fn goal_stall_budget_context_active(&self) -> bool {
-        self.goal_no_tool_idle_count > 0
-            || self.goal_turns_since_mutating_action >= GOAL_NO_PROGRESS_NUDGE_BOUND
-            || self.goal_turns_since_goal_context_delta >= GOAL_NO_PROGRESS_NUDGE_BOUND
-    }
-
-    async fn emit_goal_no_progress_budget_exhausted(
-        &mut self,
-        goal: &crate::db::session_goals::SessionGoal,
-        tx: &mpsc::Sender<TurnEvent>,
-    ) {
-        let code = "agent_failed_to_progress_budget_exhausted";
-        let data = serde_json::json!({
-            "kind": "goal_no_progress_budget_exhausted",
-            "goal_id": goal.id.to_string(),
-            "turns_since_mutating_action": self.goal_turns_since_mutating_action,
-            "turns_since_goal_context_delta": self.goal_turns_since_goal_context_delta,
-            "tokens_used": goal.tokens_used,
-            "token_budget": goal.token_budget,
-        });
-        // Host-generated goal telemetry (goal id, host-tracked turn counters, token
-        // usage/budget) — no model-authored free text, so no session-table literal.
-        // Frame-less `record_event` is correct; nothing to journal.
-        if let Err(e) = self
-            .session
-            .record_event(
-                crate::db::session_log::SessionEventKind::GoalProgressDiagnostic,
-                Some(self.active_agent()),
-                None,
-                &data,
-            )
-            .await
-        {
-            tracing::warn!(error = %e, "recording goal no-progress budget diagnostic failed");
-        }
-        let _ = tx
-            .send(TurnEvent::Notice {
-                text: "goal: needs intervention — agent_failed_to_progress_budget_exhausted; run `/goal resume` after adding direction or budget".to_string(),
-            })
-            .await;
-        self.reset_goal_progress_tracking().await;
-        self.goal_idle_intervention_pending = true;
-        self.goal_idle_intervention_code = Some(code);
-        self.pending_idle_reason = Some(crate::engine::IdleReason::NeedsIntervention {
-            code: code.to_string(),
-        });
     }
 
     fn inference_failure_provider_status(
@@ -4080,21 +4015,6 @@ impl Driver {
             .goal_progress_observation_since(self.goal_progress_last_seq)
             .await?;
         self.goal_progress_last_seq = latest_seq;
-        if !observation.observed_turn {
-            return Ok(observation);
-        }
-        if observation.mutating_action {
-            self.goal_turns_since_mutating_action = 0;
-        } else {
-            self.goal_turns_since_mutating_action =
-                self.goal_turns_since_mutating_action.saturating_add(1);
-        }
-        if observation.context_delta {
-            self.goal_turns_since_goal_context_delta = 0;
-        } else {
-            self.goal_turns_since_goal_context_delta =
-                self.goal_turns_since_goal_context_delta.saturating_add(1);
-        }
         Ok(observation)
     }
 

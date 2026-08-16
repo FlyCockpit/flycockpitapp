@@ -1204,7 +1204,10 @@ mod tests {
             .unwrap();
         assert!(after.retired_at_ms.is_some());
         assert_eq!(after.ciphertext.len(), before.ciphertext.len());
-        assert!(after.ciphertext.iter().all(|&b| b == 0), "ciphertext zeroed");
+        assert!(
+            after.ciphertext.iter().all(|&b| b == 0),
+            "ciphertext zeroed"
+        );
         assert_eq!(after.nonce, vec![0u8; 12]);
         assert_eq!(after.fingerprint, "0".repeat(64));
         // Schema invariant: a retired row carries ref_count 0 even though it was

@@ -7,7 +7,8 @@
 
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
@@ -212,6 +213,16 @@ impl IsolatedHome {
         self.extra_env.push((key.into(), value.into()));
     }
 
+    /// IsolatedHome unsets `DBUS_SESSION_BUS_ADDRESS` so detach cannot hang
+    /// in Secret Service. Doctor treats a missing required keyring as a
+    /// failed check; tests that need exit 0 must attach a private bus.
+    #[cfg(target_os = "linux")]
+    pub fn enable_mock_keyring(&mut self) -> MockSecretService {
+        let service = start_mock_secret_service();
+        self.set_env("DBUS_SESSION_BUS_ADDRESS", service.address.clone());
+        service
+    }
+
     fn apply_env(&self, cmd: &mut Command) {
         cmd.env("XDG_CONFIG_HOME", &self.config_home)
             .env("XDG_DATA_HOME", &self.data_home)
@@ -220,7 +231,8 @@ impl IsolatedHome {
             .env("XDG_CACHE_HOME", &self.cache_home)
             .env("HOME", self._root.path())
             .env_remove("COCKPIT_CONFIG")
-            .env_remove("COCKPIT_LOG");
+            .env_remove("COCKPIT_LOG")
+            .env_remove("DBUS_SESSION_BUS_ADDRESS");
         for (key, value) in &self.extra_env {
             cmd.env(key, value);
         }
@@ -244,25 +256,11 @@ impl SpawnedDaemon {
         let output = home
             .cockpit()
             .args(["daemon", "start", "--detach"])
+            .env("COCKPIT_LOG", "warn,cockpit::startup=info")
             .output()
             .expect("spawn daemon start command");
         assert_success("cockpit daemon start --detach", &output, &home);
-        wait_until_with_home(
-            "daemon status handshake",
-            Duration::from_secs(5),
-            &home,
-            || {
-                let status = home
-                    .cockpit()
-                    .args(["daemon", "status"])
-                    .output()
-                    .expect("daemon status probe");
-                async move {
-                    status.status.success() && output_text(&status).contains("daemon: running")
-                }
-            },
-        )
-        .await;
+        wait_for_status_handshake(&home, DAEMON_START_HANDSHAKE_TIMEOUT).await;
         Self { home }
     }
 
@@ -335,23 +333,7 @@ impl SpawnedDaemon {
     }
 
     pub async fn wait_for_handshake(&self) {
-        wait_until_with_home(
-            "daemon status handshake",
-            Duration::from_secs(5),
-            &self.home,
-            || {
-                let status = self
-                    .home
-                    .cockpit()
-                    .args(["daemon", "status"])
-                    .output()
-                    .expect("daemon status probe");
-                async move {
-                    status.status.success() && output_text(&status).contains("daemon: running")
-                }
-            },
-        )
-        .await;
+        wait_for_status_handshake(&self.home, DAEMON_RESTART_HANDSHAKE_TIMEOUT).await;
     }
 
     #[cfg(unix)]
@@ -434,6 +416,96 @@ pub fn output_text(output: &Output) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )
+}
+
+const DAEMON_START_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(90);
+const DAEMON_RESTART_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Cheap liveness check: connect and read the daemon hello line.
+///
+/// Handshake waits must not exec the debug `cockpit` binary in a tight loop.
+/// Each status probe pages in a ~700MB binary and, while boot has bound the
+/// socket but not yet entered the accept loop, sits on a 500ms hello timeout.
+/// Under nextest load that starves the detached child so it never reaches
+/// `daemon: running`.
+#[cfg(unix)]
+fn socket_answers_hello(socket: &Path) -> bool {
+    use std::os::unix::net::UnixStream;
+
+    if !socket.exists() {
+        return false;
+    }
+    let Ok(stream) = UnixStream::connect(socket) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).is_ok() && !line.trim().is_empty()
+}
+
+#[cfg(not(unix))]
+fn socket_answers_hello(socket: &Path) -> bool {
+    socket.exists()
+}
+
+fn handshake_debug(home: &IsolatedHome) -> String {
+    let pid_raw = std::fs::read_to_string(home.pid_file()).ok();
+    let pid = pid_raw
+        .as_deref()
+        .and_then(|value| value.trim().parse::<u32>().ok());
+    let live = {
+        #[cfg(unix)]
+        {
+            pid.map(pid_is_live)
+        }
+        #[cfg(not(unix))]
+        {
+            None::<bool>
+        }
+    };
+    let socket = home.socket_path();
+    let log = home.log_file();
+    let log_bytes = std::fs::metadata(&log).ok().map(|meta| meta.len());
+    format!(
+        "pid_file={} pid_raw={:?} live={:?} socket_exists={} hello={} log={} log_bytes={:?}\nlog tail:\n{}",
+        home.pid_file().display(),
+        pid_raw,
+        live,
+        socket.exists(),
+        socket_answers_hello(&socket),
+        log.display(),
+        log_bytes,
+        log_tail(home),
+    )
+}
+
+async fn wait_for_status_handshake(home: &IsolatedHome, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    let mut delay = Duration::from_millis(20);
+    loop {
+        if socket_answers_hello(&home.socket_path()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for daemon status handshake\n{}",
+            handshake_debug(home)
+        );
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_millis(200));
+    }
+    let status = home
+        .cockpit()
+        .args(["daemon", "status"])
+        .output()
+        .expect("daemon status after hello");
+    assert!(
+        status.status.success() && output_text(&status).contains("daemon: running"),
+        "daemon status after hello was not running\nstdout:\n{}\nstderr:\n{}\n{}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr),
+        handshake_debug(home)
+    );
 }
 
 pub async fn wait_until<F, Fut>(label: &str, timeout: Duration, mut probe: F)

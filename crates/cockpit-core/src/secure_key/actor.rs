@@ -476,9 +476,10 @@ pub struct SecureKeyActor {
 }
 
 impl SecureKeyActor {
-    /// Production composition: resolve KEK placement (first-run is always
-    /// database), start the wrap-key vault, then spawn the dedicated actor
-    /// thread. Call under the daemon single-instance lock.
+    /// Production composition: resolve KEK placement (first-run is keyring
+    /// when the probe is available, otherwise database), start the wrap-key
+    /// vault, then spawn the dedicated actor thread. Call under the daemon
+    /// single-instance lock.
     pub fn start_production(db: Db) -> Result<Self, SecureKeyError> {
         Self::start_production_with_reconciler(db, Arc::new(FailClosedReconciler))
     }
@@ -504,8 +505,9 @@ impl SecureKeyActor {
         )
     }
 
-    /// Shared boot path for daemon and `cockpit ask`. First-run always persists
-    /// database placement; does not construct the platform store a second time.
+    /// Shared boot path for daemon and `cockpit ask`. First-run persists
+    /// keyring when the probe is available, otherwise database. Does not
+    /// construct the platform store a second time.
     pub fn start_production_resolved(
         db: Db,
         reconciler: Arc<dyn ConsumerReconciler>,
@@ -698,6 +700,24 @@ impl Drop for SecureKeyActor {
     fn drop(&mut self) {
         let (reply, rx) = oneshot::channel();
         let _ = self.shutdown_tx.send(Op::Shutdown { reply });
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let _ = std::thread::Builder::new()
+                .name("cockpit-secure-key-drop".into())
+                .spawn(move || {
+                    let _ = rx.blocking_recv();
+                });
+            if let Ok(mut g) = self.join.lock()
+                && let Some(j) = g.take()
+            {
+                let _ = j.join();
+            }
+            if self.owns_default_store {
+                mark_worker_drained();
+                unset_default_platform_store();
+                self.owns_default_store = false;
+            }
+            return;
+        }
         let _ = rx.blocking_recv();
         if let Ok(mut g) = self.join.lock()
             && let Some(j) = g.take()

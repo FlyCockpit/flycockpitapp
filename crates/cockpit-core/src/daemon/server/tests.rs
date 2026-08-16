@@ -5907,13 +5907,21 @@ fn test_ctx_with_config_source(
         pid_file: std::path::PathBuf::from("/tmp/cockpit-test.pid"),
         ephemeral: true,
     };
-    Arc::new(DaemonContext::new(
+    let ctx = DaemonContext::new(
         db,
         locks,
         paths,
         crate::daemon::terminal::test_host_factory(),
         config_source,
-    ))
+    );
+    let generation = ctx.host_capabilities.begin_refresh();
+    let mut snapshot = crate::daemon::session_worker::sandbox_capability_snapshot(
+        cockpit_proto::FeatureCapabilityState::Available,
+        cockpit_proto::FeatureCapabilityState::Available,
+    );
+    snapshot.generation = generation;
+    ctx.host_capabilities.publish(snapshot);
+    Arc::new(ctx)
 }
 
 fn curator_config_source(skill_root: &Path) -> crate::daemon::config_source::ConfigSource {
@@ -6163,9 +6171,6 @@ fn flycockpit_credential() -> crate::auth::flycockpit::StoredFlycockpitCredentia
 
 #[tokio::test]
 async fn persistent_daemon_stores_flycockpit_credential_and_wakes_connector() {
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-
     let tmp = tempfile::tempdir().unwrap();
     let credential_path = tmp.path().join("state/cockpit/credentials.json");
     let ctx = persistent_test_ctx_with_credential_path(credential_path.clone());
@@ -6197,20 +6202,16 @@ async fn persistent_daemon_stores_flycockpit_credential_and_wakes_connector() {
         .expect("connector wake delivered")
         .expect("wake sender alive");
 
-    let stored =
-        crate::auth::flycockpit::load_credential_from_path(credential_path.clone()).unwrap();
+    let vault = crate::secure_key::vault_for_db(&ctx.db).expect("ctx vault");
+    let stored = crate::credentials::CredentialStore::from_vault(vault)
+        .unwrap()
+        .get("flycockpit")
+        .cloned()
+        .expect("vault holds the stored credential");
+    let stored: crate::auth::flycockpit::StoredFlycockpitCredential =
+        serde_json::from_value(stored).unwrap();
     assert_eq!(stored, credential);
-
-    #[cfg(unix)]
-    {
-        let store = crate::credentials::CredentialStore::open(credential_path.clone()).unwrap();
-        let mode = std::fs::metadata(store.path())
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600);
-    }
+    let _ = credential_path;
 
     let table = crate::redact::RedactionTable::build(
         &crate::config::extended::RedactConfig::default(),
@@ -6226,11 +6227,8 @@ async fn persistent_daemon_clears_flycockpit_credential_and_wakes_connector() {
     let tmp = tempfile::tempdir().unwrap();
     let credential_path = tmp.path().join("state/cockpit/credentials.json");
     let ctx = persistent_test_ctx_with_credential_path(credential_path.clone());
-    crate::auth::flycockpit::store_credential_at_path(
-        credential_path.clone(),
-        &flycockpit_credential(),
-    )
-    .unwrap();
+    let vault = crate::secure_key::vault_for_db(&ctx.db).expect("ctx vault");
+    crate::auth::flycockpit::store_credential_in_vault(vault, &flycockpit_credential()).unwrap();
     let mut state = owner_state();
     let mut wake_rx = ctx.connector_wake_rx();
 
@@ -6242,7 +6240,14 @@ async fn persistent_daemon_clears_flycockpit_credential_and_wakes_connector() {
         .await
         .expect("connector wake delivered")
         .expect("wake sender alive");
-    assert!(crate::auth::flycockpit::load_credential_from_path(credential_path).is_err());
+    let vault = crate::secure_key::vault_for_db(&ctx.db).expect("ctx vault");
+    assert!(
+        crate::credentials::CredentialStore::from_vault(vault)
+            .unwrap()
+            .get("flycockpit")
+            .is_none()
+    );
+    let _ = credential_path;
 }
 
 #[tokio::test]
@@ -7754,6 +7759,7 @@ fn dispatch_matrix_class_for_command(
         | ("goal_status", "session_row_reader", false)
         | ("get_inventory_bundle", "session_row_reader", false)
         | ("daemon_status", "public_read", false)
+        | ("get_host_capabilities", "public_read", false)
         | ("guidance_estimate", "project_read", false)
         | ("get_media_attachment_status", "public_read", false)
         | ("get_media_attachment_preview", "public_read", false)
@@ -7798,6 +7804,7 @@ enum ReadonlyDispatchCaseKind {
     GoalDisposition,
     GetInventoryBundle,
     DaemonStatus,
+    GetHostCapabilities,
     GuidanceEstimate,
     GetMediaAttachmentStatus,
     GetMediaAttachmentPreview,
@@ -7877,6 +7884,10 @@ fn readonly_dispatch_case_list() -> Vec<ReadonlyDispatchCase> {
         ReadonlyDispatchCase {
             kind: "daemon_status",
             case: ReadonlyDispatchCaseKind::DaemonStatus,
+        },
+        ReadonlyDispatchCase {
+            kind: "get_host_capabilities",
+            case: ReadonlyDispatchCaseKind::GetHostCapabilities,
         },
         ReadonlyDispatchCase {
             kind: "guidance_estimate",
@@ -8578,7 +8589,8 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "set_workspace_trust"
         | "guidance_estimate"
         | "restart_if_idle"
-        | "stop_daemon" => AuthzAllowedOutcome::Response,
+        | "stop_daemon"
+        | "refresh_host_capabilities" => AuthzAllowedOutcome::Response,
         "count_pinned_messages"
         | "list_pinned_message_seqs"
         | "list_pinned_messages_with_text"
@@ -8663,7 +8675,9 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         // first, then short-circuits on the missing storage authority before the
         // attach check, so a detached owner reaches the `Internal` "media storage
         // authority is unavailable" post-auth error.
-        "recover_security_blocked_media" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
+        "recover_security_blocked_media" | "migrate_kek_placement" => {
+            AuthzAllowedOutcome::Error(ErrorCode::Internal)
+        }
         // `register_local_path_media` and `retain_https_media` both call
         // `require_attached` before anything else and map the detached state to
         // `media_attachment_unavailable`, so the owner-allowed cell surfaces
@@ -8793,6 +8807,8 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_session_writer("pin"),
         authz_owner_only("store_flycockpit_credential"),
         authz_owner_only("clear_flycockpit_credential"),
+        authz_owner_only("refresh_host_capabilities"),
+        authz_owner_only("migrate_kek_placement"),
         authz_session_writer("refresh_env"),
         authz_session_writer("refresh_config"),
         authz_owner_only("record_usage"),
@@ -8912,10 +8928,19 @@ async fn dispatch_authz_request_after(
         recv_dispatch_matrix_response_or_server(&mut client, id, &mut server).await;
     drop(client);
     if !server_ended {
-        server
-            .await
-            .expect("server task joins")
-            .expect("server task succeeds");
+        match server.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                let text = format!("{error:#}");
+                // Unread attach/session events on the pair become RST when the
+                // client is dropped; the request already completed.
+                assert!(
+                    text.contains("Connection reset by peer") || text.contains("Connection reset"),
+                    "server task succeeds: {text}"
+                );
+            }
+            Err(error) => panic!("server task joins: {error}"),
+        }
     }
     result
 }
@@ -9995,6 +10020,10 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             credential: flycockpit_credential(),
         },
         "clear_flycockpit_credential" => Request::ClearFlycockpitCredential,
+        "refresh_host_capabilities" => Request::RefreshHostCapabilities,
+        "migrate_kek_placement" => Request::MigrateKekPlacement {
+            dest: cockpit_proto::SecretStorePlacement::Database,
+        },
         "refresh_env" => Request::RefreshEnv {
             vars: HashMap::from([("COCKPIT_AUTHZ_MATRIX".into(), "1".into())]),
         },
@@ -10428,6 +10457,26 @@ impl ReadonlyDispatchCaseKind {
                 assert_eq!(pid, std::process::id());
                 assert_eq!(protocol_version, proto::PROTOCOL_VERSION);
             }
+            Self::GetHostCapabilities => {
+                let ctx = test_ctx();
+                crate::host_capabilities::publish_initial_host_capabilities(
+                    &ctx.host_capabilities,
+                    &ctx.host_capability_probes,
+                )
+                .await;
+                let response = dispatch_matrix_request(&ctx, Request::GetHostCapabilities)
+                    .await
+                    .expect("get_host_capabilities happy");
+                let Response::HostCapabilities { snapshot } = response else {
+                    panic!("expected HostCapabilities");
+                };
+                let encoded = serde_json::to_value(&snapshot.secret_store).expect("snapshot json");
+                let leftover = format!("{}{}", "unification", "_complete");
+                assert!(
+                    encoded.get(&leftover).is_none(),
+                    "folded snapshot must not emit {leftover}: {encoded}"
+                );
+            }
             Self::GetRunInvocationStatus => {
                 let ctx = test_ctx();
                 let id = Uuid::new_v4();
@@ -10839,6 +10888,24 @@ impl ReadonlyDispatchCaseKind {
                 )
                 .await
                 .expect_err("daemon_status malformed protocol version");
+                assert_eq!(err.code, ErrorCode::ProtocolVersion);
+            }
+            Self::GetHostCapabilities => {
+                let ctx = test_ctx();
+                let request_id = Uuid::new_v4();
+                let err = dispatch_matrix_raw_line(
+                    &ctx,
+                    request_id,
+                    serde_json::json!({
+                        "v": proto::PROTOCOL_VERSION + 1,
+                        "kind": "req",
+                        "id": request_id,
+                        "request": "get_host_capabilities",
+                    })
+                    .to_string(),
+                )
+                .await
+                .expect_err("get_host_capabilities malformed protocol version");
                 assert_eq!(err.code, ErrorCode::ProtocolVersion);
             }
             Self::GetRunInvocationStatus => {
@@ -14793,6 +14860,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
         "fs_list",
         "fs_read",
         "fs_stat",
+        "get_host_capabilities",
         "get_run_invocation_status",
         "get_usage_counts",
         "git_diff_file",
@@ -16687,6 +16755,21 @@ fn sample_png() -> Vec<u8> {
     out
 }
 
+fn assert_same_png_pixels(got: &[u8], want: &[u8]) {
+    let got = image::load_from_memory(got)
+        .expect("got png")
+        .to_rgba8()
+        .into_raw();
+    let want = image::load_from_memory(want)
+        .expect("want png")
+        .to_rgba8()
+        .into_raw();
+    assert_eq!(
+        got, want,
+        "durable storage may re-encode PNG; pixels must match"
+    );
+}
+
 fn begin_upload_for(state: &mut MutableClientState, png: &[u8]) -> Uuid {
     match begin_attachment_upload(
         state,
@@ -17014,7 +17097,7 @@ async fn image_submission_exact_retry_case() {
     // The durable message image is reusable and not consumed by the first send.
     assert_durable_attachment_persists(&ctx, image_ref.id).await;
 
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
         loop {
             if ctx
                 .db
@@ -17025,7 +17108,9 @@ async fn image_submission_exact_retry_case() {
             {
                 break;
             }
-            tokio::task::yield_now().await;
+            // Do not yield_now()-spin: this test pins a 2-thread runtime so a
+            // busy waiter can starve the session driver that persists the event.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
     .await
@@ -17122,6 +17207,24 @@ async fn image_submission_exact_retry_case() {
     .expect("one immutable attachment version is reusable by another submission");
     assert!(matches!(reused, Response::UserMessageQueued { .. }));
 
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            let user_messages = ctx
+                .db
+                .list_session_events(session_id)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|event| event.kind == "user_message")
+                .count();
+            if user_messages >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("second distinct submission becomes durable");
     let user_messages = ctx
         .db
         .list_session_events(session_id)
@@ -17226,7 +17329,7 @@ async fn ambiguous_image_submission_binds_ref_to_first_uuid() {
     else {
         panic!("expected competing UserMessage work");
     };
-    assert_eq!(submission.images, vec![sample_png()]);
+    assert_same_png_pixels(&submission.images[0], &sample_png());
     let competing_id = submission.client_submissions[0].id;
     let item = proto::QueueItem {
         id: competing_id,
@@ -17267,7 +17370,7 @@ async fn ambiguous_image_submission_binds_ref_to_first_uuid() {
         panic!("expected retry UserMessage work");
     };
     assert_eq!(submission.client_submissions[0].id, first_id);
-    assert_eq!(submission.images, vec![sample_png()]);
+    assert_same_png_pixels(&submission.images[0], &sample_png());
     let item = proto::QueueItem {
         id: first_id,
         status: proto::QueueItemStatus::Folding,

@@ -2633,13 +2633,19 @@ mod tests {
         let name = |s: PolicyRowState| serde_json::to_string(&s).unwrap();
         assert_eq!(name(PolicyRowState::Scheduled), "\"scheduled\"");
         assert_eq!(name(PolicyRowState::Preparing), "\"preparing\"");
-        assert_eq!(name(PolicyRowState::ActiveConverging), "\"active_converging\"");
+        assert_eq!(
+            name(PolicyRowState::ActiveConverging),
+            "\"active_converging\""
+        );
         assert_eq!(name(PolicyRowState::Active), "\"active\"");
         assert_eq!(
             name(PolicyRowState::ActiveConvergenceFailed),
             "\"active_convergence_failed\""
         );
-        assert_eq!(name(PolicyRowState::ScheduledFailed), "\"scheduled_failed\"");
+        assert_eq!(
+            name(PolicyRowState::ScheduledFailed),
+            "\"scheduled_failed\""
+        );
         assert_eq!(CONVERGENCE_TIMEOUT_SECONDS, 300);
         assert_eq!(REPLICA_LEASE_RENEW_SECONDS, 15);
         assert_eq!(REPLICA_LEASE_TTL_SECONDS, 45);
@@ -2868,13 +2874,7 @@ mod tests {
         kid: &str,
         role: JwkRole,
         payload: &Value,
-    ) -> (
-        p256::ecdsa::SigningKey,
-        String,
-        String,
-        PolicyJwk,
-    ) {
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
+    ) -> (p256::ecdsa::SigningKey, String, String, PolicyJwk) {
         let sk = p256::ecdsa::SigningKey::from_slice(&[seed | 0x01; 32]).expect("valid scalar");
         let vk = sk.verifying_key();
         let point = vk.to_encoded_point(false);
@@ -2922,10 +2922,8 @@ mod tests {
     #[test]
     fn verify_policy_jws_previous_key_reverify_only() {
         let payload = serde_json::json!({"policy": "v1"});
-        let (_csk, _ch, _cp, current) =
-            signed_parts(0x22, "k-current", JwkRole::Current, &payload);
-        let (psk, h, p, previous) =
-            signed_parts(0x33, "k-previous", JwkRole::Previous, &payload);
+        let (_csk, _ch, _cp, current) = signed_parts(0x22, "k-current", JwkRole::Current, &payload);
+        let (psk, h, p, previous) = signed_parts(0x33, "k-previous", JwkRole::Previous, &payload);
         let sig = low_s_sig_b64(&psk, &format!("{h}.{p}"));
         let compact = assemble(&h, &p, &sig);
         let ring = PolicyJwksRing {
@@ -2940,8 +2938,7 @@ mod tests {
     #[test]
     fn verify_policy_jws_next_key_never_verifies() {
         let payload = serde_json::json!({"policy": "v1"});
-        let (_csk, _ch, _cp, current) =
-            signed_parts(0x44, "k-current", JwkRole::Current, &payload);
+        let (_csk, _ch, _cp, current) = signed_parts(0x44, "k-current", JwkRole::Current, &payload);
         let (nsk, h, p, next) = signed_parts(0x55, "k-next", JwkRole::Next, &payload);
         let sig = low_s_sig_b64(&nsk, &format!("{h}.{p}"));
         let compact = assemble(&h, &p, &sig);
@@ -2958,8 +2955,7 @@ mod tests {
         let payload = serde_json::json!({"policy": "v1"});
         // Sign with a key whose kid is not present in the ring.
         let (sk, h, p, _absent) = signed_parts(0x66, "k-absent", JwkRole::Current, &payload);
-        let (_rk, _rh, _rp, ring_key) =
-            signed_parts(0x77, "k-ring", JwkRole::Current, &payload);
+        let (_rk, _rh, _rp, ring_key) = signed_parts(0x77, "k-ring", JwkRole::Current, &payload);
         let sig = low_s_sig_b64(&sk, &format!("{h}.{p}"));
         let compact = assemble(&h, &p, &sig);
         let ring = PolicyJwksRing {
@@ -2973,9 +2969,7 @@ mod tests {
         let payload = serde_json::json!({"policy": "v1"});
         let (sk, h, p, jwk) = signed_parts(0x88, "k-current", JwkRole::Current, &payload);
         let sig = low_s_sig_b64(&sk, &format!("{h}.{p}"));
-        let ring = PolicyJwksRing {
-            keys: vec![jwk],
-        };
+        let ring = PolicyJwksRing { keys: vec![jwk] };
 
         // Tampered payload: re-encode a different payload but keep the old sig.
         let other = serde_json::json!({"policy": "v2"});
@@ -2997,15 +2991,15 @@ mod tests {
         let payload = serde_json::json!({"policy": "v1"});
         let (sk, h, p, jwk) = signed_parts(0x99, "k-current", JwkRole::Current, &payload);
         let signing_input = format!("{h}.{p}");
-        let ring = PolicyJwksRing {
-            keys: vec![jwk],
-        };
+        let ring = PolicyJwksRing { keys: vec![jwk] };
 
         // DER-encoded signature (not 64 raw bytes) is rejected.
         let raw: p256::ecdsa::Signature = sk.sign(signing_input.as_bytes());
         let sig = raw.normalize_s().unwrap_or(raw);
         let der_b64 = URL_SAFE_NO_PAD.encode(sig.to_der().as_bytes());
-        assert!(verify_policy_jws(&assemble(&h, &p, &der_b64), &ring, PolicyKeyUsage::Import).is_err());
+        assert!(
+            verify_policy_jws(&assemble(&h, &p, &der_b64), &ring, PolicyKeyUsage::Import).is_err()
+        );
 
         // 64 zero bytes (r=0, s=0) is rejected.
         let zero_b64 = URL_SAFE_NO_PAD.encode([0u8; 64]);
@@ -3051,9 +3045,7 @@ mod tests {
         // the point import at verification time fails closed.
         jwk.x = URL_SAFE_NO_PAD.encode([0x01u8; 32]);
         jwk.y = URL_SAFE_NO_PAD.encode([0x01u8; 32]);
-        let ring = PolicyJwksRing {
-            keys: vec![jwk],
-        };
+        let ring = PolicyJwksRing { keys: vec![jwk] };
         assert!(verify_policy_jws(&compact, &ring, PolicyKeyUsage::Import).is_err());
     }
 
@@ -3139,7 +3131,8 @@ mod tests {
         collect_rs_files(&repo_root.join("apps").join("cli").join("src"), &mut files);
         assert!(!files.is_empty(), "ownership scan found no source files");
         for file in &files {
-            if file.file_name().and_then(|n| n.to_str()) == Some("remote_public_service_policy.rs") {
+            if file.file_name().and_then(|n| n.to_str()) == Some("remote_public_service_policy.rs")
+            {
                 continue; // the sole definition site
             }
             let content = std::fs::read_to_string(file).unwrap_or_default();

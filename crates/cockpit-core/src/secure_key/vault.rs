@@ -6,10 +6,10 @@ use std::sync::Arc;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use cockpit_db::secret_vault::{
-    SecretVaultKind, VAULT_ALGORITHM, VAULT_NONCE_LEN, VAULT_TAG_LEN, VAULT_WRAP_VERSION,
-    VAULT_WRAPPED_DEK_LEN, count_active_keys_conn, deactivate_key_conn, delete_item_conn,
-    insert_key_conn, is_unique_constraint, list_item_ids_conn, load_active_key_conn,
-    load_authority_conn, load_item_conn, upsert_item_conn,
+    SecretVaultKind, SecretVaultPlacement, VAULT_ALGORITHM, VAULT_NONCE_LEN, VAULT_TAG_LEN,
+    VAULT_WRAP_VERSION, VAULT_WRAPPED_DEK_LEN, count_active_keys_conn, deactivate_key_conn,
+    delete_item_conn, insert_key_conn, is_unique_constraint, list_item_ids_conn,
+    load_active_key_conn, load_authority_conn, load_item_conn, upsert_item_conn,
 };
 use rand::Rng;
 use rusqlite::OptionalExtension;
@@ -81,77 +81,100 @@ impl SecretVault {
         Self::open_from_parts(db, kek_store, installation)
     }
 
-    /// First-run: write file/memory KEK, persist authority + wrapped DEK.
+    /// First-run: write the chosen placement's KEK, persist authority + wrapped DEK.
     pub fn initialize(
         db: Db,
         kek_store: Arc<dyn KekStore>,
         installation: InstallationIdentity,
         kek_version: i64,
         key_version: i64,
+        placement: SecretVaultPlacement,
     ) -> Result<Self, SecureKeyError> {
         let kek = generate_key_bytes();
         kek_store.write_kek_exclusive(kek_version, kek.as_ref())?;
-        let dek = generate_key_bytes();
-        let wrap_nonce = random_nonce();
-        let wrap_aad = wrap_aad(
-            kek_version,
-            VAULT_WRAP_VERSION,
-            key_version,
-            installation.as_hex(),
-        );
-        let wrapped = aead_encrypt(kek.as_array(), &wrap_nonce, &wrap_aad, dek.as_ref())?;
-        if wrapped.len() != VAULT_WRAPPED_DEK_LEN {
-            return Err(SecureKeyError::Corrupt(format!(
-                "wrapped DEK length {} != {VAULT_WRAPPED_DEK_LEN}",
-                wrapped.len()
-            )));
-        }
-        let fingerprint = fingerprint_key(&kek);
-        db.blocking_write_for_sync_maintenance({
-            let fingerprint = fingerprint.clone();
-            move |conn| {
-                conn.execute_batch("BEGIN IMMEDIATE;")?;
-                let result = (|| {
-                    if count_active_keys_conn(conn)? != 0 {
-                        anyhow::bail!("vault already has an active DEK");
-                    }
-                    if load_authority_conn(conn)?.is_some() {
-                        anyhow::bail!("secret vault authority already exists");
-                    }
-                    cockpit_db::secret_vault::upsert_authority_conn(
-                        conn,
-                        cockpit_db::secret_vault::SecretVaultPlacement::Database,
-                        cockpit_db::secret_vault::SecretVaultPlacement::Database,
-                        &fingerprint,
-                        kek_version,
-                        VAULT_WRAP_VERSION,
-                        false,
-                    )?;
-                    insert_key_conn(conn, key_version, kek_version, &wrap_nonce, &wrapped, true)?;
-                    Ok(())
-                })();
-                match result {
-                    Ok(()) => {
-                        conn.execute_batch("COMMIT;")?;
+        let kek_store_for_cleanup = kek_store.clone();
+        let db_for_cleanup = db.clone();
+        let ours = fingerprint_key(&kek);
+        let built = (|| -> Result<Self, SecureKeyError> {
+            let dek = generate_key_bytes();
+            let wrap_nonce = random_nonce();
+            let wrap_aad = wrap_aad(
+                kek_version,
+                VAULT_WRAP_VERSION,
+                key_version,
+                installation.as_hex(),
+            );
+            let wrapped = aead_encrypt(kek.as_array(), &wrap_nonce, &wrap_aad, dek.as_ref())?;
+            if wrapped.len() != VAULT_WRAPPED_DEK_LEN {
+                return Err(SecureKeyError::Corrupt(format!(
+                    "wrapped DEK length {} != {VAULT_WRAPPED_DEK_LEN}",
+                    wrapped.len()
+                )));
+            }
+            let fingerprint = fingerprint_key(&kek);
+            db.blocking_write_for_sync_maintenance({
+                let fingerprint = fingerprint.clone();
+                move |conn| {
+                    conn.execute_batch("BEGIN IMMEDIATE;")?;
+                    let result = (|| {
+                        if count_active_keys_conn(conn)? != 0 {
+                            anyhow::bail!("vault already has an active DEK");
+                        }
+                        if load_authority_conn(conn)?.is_some() {
+                            anyhow::bail!("secret vault authority already exists");
+                        }
+                        cockpit_db::secret_vault::upsert_authority_conn(
+                            conn,
+                            placement,
+                            placement,
+                            &fingerprint,
+                            kek_version,
+                            VAULT_WRAP_VERSION,
+                        )?;
+                        insert_key_conn(
+                            conn,
+                            key_version,
+                            kek_version,
+                            &wrap_nonce,
+                            &wrapped,
+                            true,
+                        )?;
                         Ok(())
-                    }
-                    Err(error) => {
-                        let _ = conn.execute_batch("ROLLBACK;");
-                        Err(error)
+                    })();
+                    match result {
+                        Ok(()) => {
+                            conn.execute_batch("COMMIT;")?;
+                            Ok(())
+                        }
+                        Err(error) => {
+                            let _ = conn.execute_batch("ROLLBACK;");
+                            Err(error)
+                        }
                     }
                 }
+            })
+            .map_err(map_db_err)?;
+            Ok(Self {
+                db,
+                kek_store,
+                installation,
+                kek,
+                dek,
+                kek_version,
+                key_version,
+            })
+        })();
+        if built.is_err() {
+            // Do not delete a KEK that another first-run already committed.
+            let committed = db_for_cleanup
+                .blocking_write_for_sync_maintenance(load_authority_conn)
+                .ok()
+                .flatten();
+            if committed.is_none_or(|row| row.kek_fingerprint != ours) {
+                let _ = kek_store_for_cleanup.delete_kek(kek_version);
             }
-        })
-        .map_err(map_db_err)?;
-        Ok(Self {
-            db,
-            kek_store,
-            installation,
-            kek,
-            dek,
-            kek_version,
-            key_version,
-        })
+        }
+        built
     }
 
     pub fn put_item(
@@ -691,4 +714,12 @@ pub fn substitute_item_ciphertext(
         Ok(())
     })
     .map_err(map_db_err)
+}
+
+pub fn session_sealed_item_id(session_id: &str, value_id: &str, version: i64) -> String {
+    format!("{session_id}/{value_id}/v{version}")
+}
+
+pub fn redaction_table_item_id(session_id: &str) -> String {
+    session_id.to_string()
 }

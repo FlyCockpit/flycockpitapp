@@ -165,7 +165,10 @@ fn remote_turn_socket_provider_transport_matrix() {
         vec!["192.0.2.1:3478".parse::<std::net::SocketAddr>().unwrap()]
     );
     assert_eq!(rec.attempt_count(), 1);
-    assert_eq!(provider.current_metadata().unwrap().route_class, RouteClass::Relay);
+    assert_eq!(
+        provider.current_metadata().unwrap().route_class,
+        RouteClass::Relay
+    );
 
     // TCP literal allocation.
     let rec = Arc::new(RecordingConnector::success(Duration::from_secs(600)));
@@ -260,14 +263,19 @@ fn remote_turn_socket_provider_transport_matrix() {
         p.allocate(&unsigned, Duration::from_secs(600)).unwrap_err(),
         AllocateError::Plan(PlanError::IpLiteralNotAdmitted)
     );
-    assert_eq!(rec.attempt_count(), 0, "no socket opened for unadmitted literal");
+    assert_eq!(
+        rec.attempt_count(),
+        0,
+        "no socket opened for unadmitted literal"
+    );
 
     // allow_ip_literals=false also rejects even when digest matches.
     let mut p = make_provider(true, 1000);
     let mut noliteral = test_entry("turn:198.51.100.1:3478", true, 9_999_999_999);
     noliteral.allow_ip_literals = false;
     assert_eq!(
-        p.allocate(&noliteral, Duration::from_secs(600)).unwrap_err(),
+        p.allocate(&noliteral, Duration::from_secs(600))
+            .unwrap_err(),
         AllocateError::Plan(PlanError::IpLiteralNotAdmitted)
     );
 
@@ -276,7 +284,9 @@ fn remote_turn_socket_provider_transport_matrix() {
         true,
         1000,
         FakeDnsResolver::default(),
-        Arc::new(RecordingConnector::failing(ConnectError::TlsValidationFailed)),
+        Arc::new(RecordingConnector::failing(
+            ConnectError::TlsValidationFailed,
+        )),
     );
     let tls = test_entry("turns:[2001:db8::1]:443", true, 9_999_999_999);
     assert_eq!(
@@ -319,7 +329,10 @@ fn remote_turn_socket_provider_lifecycle() {
     assert!(provider.has_current());
 
     let event = provider.poll_event().unwrap();
-    assert!(matches!(event, LifecycleEvent::Current { generation: 1, .. }));
+    assert!(matches!(
+        event,
+        LifecycleEvent::Current { generation: 1, .. }
+    ));
 
     let meta = provider.current_metadata().unwrap();
     assert_eq!(meta.generation, 1);
@@ -517,7 +530,10 @@ fn remote_turn_socket_provider_tls_plan_carries_policy() {
     assert!(plan.enterprise_root_ders.is_empty());
 
     // Hostname `turns:` keeps the SNI name for DNS-name verification.
-    let resolver = resolver_with("turn.example.com", vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9))]);
+    let resolver = resolver_with(
+        "turn.example.com",
+        vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9))],
+    );
     let ph = provider_with(
         true,
         1000,
@@ -797,7 +813,9 @@ fn remote_turn_socket_provider_endpoint_wire() {
 
     // A fail-closed connector still reflects the real attempt and creates no
     // allocation (relay-only cannot fall back to a direct socket).
-    let rec = Arc::new(RecordingConnector::failing(ConnectError::LiveInfrastructureRequired));
+    let rec = Arc::new(RecordingConnector::failing(
+        ConnectError::LiveInfrastructureRequired,
+    ));
     let mut provider = provider_with(true, 1000, FakeDnsResolver::default(), rec.clone());
     let mut factory = ConsentGatedResourceFactory::default();
     let err = factory

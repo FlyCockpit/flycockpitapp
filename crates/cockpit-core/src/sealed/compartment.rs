@@ -327,12 +327,6 @@ impl SealedCompartment {
         Ok(())
     }
 
-    /// Import-only: load leftover plaintext entries from the legacy file.
-    pub(crate) fn load_for_import(&self) -> Result<Vec<(String, Zeroizing<String>)>> {
-        let entries = self.load()?;
-        Ok(entries.into_iter().collect())
-    }
-
     /// Remove orphaned temp files left by a crash between write and rename.
     ///
     /// A temp file holds the **whole compartment**, including a staged

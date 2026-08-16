@@ -592,8 +592,7 @@
           "effective_placement": "unavailable",
           "fail_closed_reason": null,
           "fix_command": null,
-          "intent": "unconfigured",
-          "unification_complete": false
+          "intent": "unconfigured"
         }
       }
     },

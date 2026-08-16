@@ -2844,7 +2844,7 @@ impl SettingsCx {
         use cockpit_proto::SecretStorePlacement;
 
         if !secret_store_switcher_enabled(&self.host_capabilities) {
-            p.status = Some(crate::tui::capability_gate::SECRET_STORE_PREPARING.to_string());
+            p.status = Some("secret store is not configured yet".into());
             return;
         }
         let current = displayed_secret_store_placement(&self.host_capabilities);
@@ -2863,6 +2863,16 @@ impl SettingsCx {
                 }
             }
             SecretStorePlacement::Database => {
+                let keyring_available = self
+                    .host_capabilities
+                    .feature(cockpit_core::host_capabilities::FEATURE_SECRET_STORE_KEYRING)
+                    .is_some_and(|row| row.state.is_available());
+                if keyring_available {
+                    p.status = Some(
+                        crate::tui::capability_gate::SECRET_STORE_DATABASE_REJECTED.to_string(),
+                    );
+                    return;
+                }
                 p.secret_store_confirm = Some(secret_store_downgrade_dialog());
                 p.status = Some("confirm moving the wrapping key off the OS keyring".into());
             }

@@ -55,7 +55,15 @@ fn init_vault(db: &Db, kek: Arc<MemoryKekStore>) -> SecretVault {
     let installation = db
         .blocking_write_for_sync_maintenance(ensure_installation_identity_conn)
         .unwrap();
-    SecretVault::initialize(db.clone(), kek, installation, 1, 1).unwrap()
+    SecretVault::initialize(
+        db.clone(),
+        kek,
+        installation,
+        1,
+        1,
+        SecretVaultPlacement::Database,
+    )
+    .unwrap()
 }
 
 fn assert_no_plaintext_bytes(db: &Db, needle: &[u8]) {
@@ -97,39 +105,6 @@ fn assert_no_plaintext_bytes(db: &Db, needle: &[u8]) {
         }
     })
     .unwrap();
-}
-
-#[test]
-fn vault_unification_complete_only_after_all_stores() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
-    let kek = Arc::new(MemoryKekStore::new(SecretStorePlacement::Database));
-    let vault = init_vault(&db, kek);
-    assert!(
-        !db.blocking_write_for_sync_maintenance(load_authority_conn)
-            .unwrap()
-            .unwrap()
-            .unification_complete
-    );
-    crate::secure_key::unify_remaining_stores(
-        &vault,
-        &VaultFault::at(VaultFaultPoint::BeforeComplete),
-    )
-    .unwrap_err();
-    let mid = db
-        .blocking_write_for_sync_maintenance(load_authority_conn)
-        .unwrap()
-        .unwrap();
-    assert!(
-        !mid.unification_complete,
-        "a boot that crashes before every store completes stays 0"
-    );
-    crate::secure_key::unify_remaining_stores(&vault, &VaultFault::default()).unwrap();
-    let row = db
-        .blocking_write_for_sync_maintenance(load_authority_conn)
-        .unwrap()
-        .unwrap();
-    assert!(row.unification_complete);
 }
 
 #[test]
@@ -333,7 +308,15 @@ fn vault_unix_owner_only_modes() {
     let installation = db
         .blocking_write_for_sync_maintenance(ensure_installation_identity_conn)
         .unwrap();
-    let vault = SecretVault::initialize(db.clone(), file_kek, installation, 1, 1).unwrap();
+    let vault = SecretVault::initialize(
+        db.clone(),
+        file_kek,
+        installation,
+        1,
+        1,
+        SecretVaultPlacement::Database,
+    )
+    .unwrap();
     vault
         .put_item(SecretVaultKind::SecureKeyRoot, "a", b"root-bytes")
         .unwrap();
@@ -385,7 +368,55 @@ fn vault_windows_refuses_database_mode_without_dacl() {
 }
 
 #[test]
-fn first_run_persists_database_even_when_keyring_available() {
+fn initialize_deletes_kek_when_authority_txn_fails() {
+    // First initialize commits authority. A second initialize against a
+    // fresh store writes a KEK then fails the authority txn. Cleanup must
+    // delete that untracked KEK so a later open of the first vault works.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+    let first = Arc::new(MemoryKekStore::new(SecretStorePlacement::Database));
+    let first_vault = init_vault(&db, first.clone());
+    first_vault
+        .put_item(SecretVaultKind::SecureKeyRoot, "canary", b"payload")
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    let orphan = Arc::new(MemoryKekStore::new(SecretStorePlacement::Keyring));
+    let installation = db
+        .blocking_write_for_sync_maintenance(ensure_installation_identity_conn)
+        .unwrap();
+    let err = SecretVault::initialize(
+        db.clone(),
+        orphan.clone(),
+        installation,
+        1,
+        1,
+        SecretVaultPlacement::Keyring,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("already"),
+        "second initialize must fail the authority txn: {err:?}"
+    );
+    assert_eq!(orphan.len(), 0, "failed initialize must not leave a KEK");
+    assert_eq!(first.len(), 1);
+    let reopened = SecretVault::open(
+        db.clone(),
+        first.clone(),
+        db.blocking_write_for_sync_maintenance(ensure_installation_identity_conn)
+            .unwrap(),
+    )
+    .unwrap();
+    let got = reopened
+        .get_item(SecretVaultKind::SecureKeyRoot, "canary")
+        .unwrap();
+    assert_eq!(got.as_slice(), b"payload");
+}
+
+#[test]
+fn first_run_persists_keyring_when_available() {
+    // Old production persisted dest=database on first-run even with an
+    // available probe. This expectation rejects that path: an available
+    // injected probe plus keyring KekStore must persist keyring.
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
     let file_kek = Arc::new(MemoryKekStore::new(SecretStorePlacement::Database));
@@ -401,23 +432,19 @@ fn first_run_persists_database_even_when_keyring_available() {
         },
     )
     .unwrap();
-    assert_eq!(effective.snapshot.intent, SecretStoreIntent::Database);
+    assert_eq!(effective.snapshot.intent, SecretStoreIntent::Keyring);
     assert_eq!(
         effective.snapshot.effective_placement,
-        SecretStorePlacement::Database
+        SecretStorePlacement::Keyring
     );
-    assert_eq!(file_kek.len(), 1);
-    assert_eq!(keyring_kek.len(), 0);
+    assert_eq!(keyring_kek.len(), 1);
+    assert_eq!(file_kek.len(), 0);
     let row = db
         .blocking_write_for_sync_maintenance(load_authority_conn)
         .unwrap()
         .unwrap();
-    assert_eq!(row.intent, SecretVaultPlacement::Database);
-    assert_eq!(row.active_placement, SecretVaultPlacement::Database);
-    assert!(
-        row.unification_complete,
-        "empty leftover stores no-op activate and set unification_complete = 1"
-    );
+    assert_eq!(row.intent, SecretVaultPlacement::Keyring);
+    assert_eq!(row.active_placement, SecretVaultPlacement::Keyring);
 }
 
 #[test]
@@ -435,11 +462,18 @@ fn first_run_persists_database_when_keyring_missing() {
         },
     )
     .unwrap();
+    assert_eq!(effective.snapshot.intent, SecretStoreIntent::Database);
     assert_eq!(
         effective.snapshot.effective_placement,
         SecretStorePlacement::Database
     );
     assert_eq!(file_kek.len(), 1);
+    let row = db
+        .blocking_write_for_sync_maintenance(load_authority_conn)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.intent, SecretVaultPlacement::Database);
+    assert_eq!(row.active_placement, SecretVaultPlacement::Database);
 }
 
 #[test]
@@ -459,15 +493,11 @@ fn keyring_mode_fails_closed_when_keyring_drops() {
         },
     )
     .unwrap();
-    let vault = migrate_kek_placement(
-        &first.vault,
-        keyring_kek.clone(),
-        SecretVaultPlacement::Keyring,
-        &available_probe(),
-        &VaultFault::default(),
-    )
-    .unwrap();
-    drop(vault);
+    assert_eq!(
+        first.snapshot.effective_placement,
+        SecretStorePlacement::Keyring
+    );
+    drop(first);
     let file_before = file_kek.len();
     let err = match ensure_secret_vault(
         &db,
@@ -624,6 +654,127 @@ fn secret_store_migrate_resumes_after_source_delete() {
 }
 
 #[test]
+fn resume_activated_database_migrate_rejects_available_keyring() {
+    // dest=database activate then crash. Resume with an available probe
+    // must reject before deleting the keyring source KEK.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+    let file_kek = Arc::new(MemoryKekStore::new(SecretStorePlacement::Database));
+    let keyring_kek = Arc::new(MemoryKekStore::new(SecretStorePlacement::Keyring));
+    let first = ensure_secret_vault(
+        &db,
+        &available_probe(),
+        &tmp.path().join("secret-vault"),
+        SecretStoreInjected {
+            file_kek: Some(file_kek.clone()),
+            keyring_kek: Some(keyring_kek.clone()),
+            legacy_keyring: None,
+        },
+    )
+    .unwrap();
+    let vault = first.vault.as_ref();
+    let err = migrate_kek_placement(
+        vault,
+        file_kek.clone(),
+        SecretVaultPlacement::Database,
+        &missing_probe(),
+        &VaultFault::at(VaultFaultPoint::AfterActivation),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("injected vault fault"), "{err}");
+    let row = db
+        .blocking_write_for_sync_maintenance(load_authority_conn)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.active_placement, SecretVaultPlacement::Database);
+    assert_eq!(keyring_kek.len(), 1);
+    assert_eq!(file_kek.len(), 1);
+    let err = resume_kek_migrate(
+        &db,
+        keyring_kek.clone(),
+        file_kek.clone(),
+        SecretVaultPlacement::Database,
+        &available_probe(),
+        &VaultFault::default(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, SecureKeyError::Invalid(ref m) if m.contains("database") && m.contains("keyring")),
+        "{err:?}"
+    );
+    assert_eq!(keyring_kek.len(), 1);
+    assert_eq!(file_kek.len(), 1);
+    let row = db
+        .blocking_write_for_sync_maintenance(load_authority_conn)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.active_placement, SecretVaultPlacement::Database);
+}
+
+#[test]
+fn ensure_secret_vault_reloads_authority_after_resume() {
+    // Prepared saga (dest KEK written, authority still database). Resume
+    // activates keyring and deletes the file KEK. Boot must re-read
+    // authority before open; the stale Database row would open the
+    // deleted file store and fail.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+    let kek_dir = tmp.path().join("secret-vault");
+    let file_kek = Arc::new(MemoryKekStore::new(SecretStorePlacement::Database));
+    let keyring_kek = Arc::new(MemoryKekStore::new(SecretStorePlacement::Keyring));
+    let vault = init_vault(&db, file_kek.clone());
+    vault
+        .put_item(SecretVaultKind::SecureKeyRoot, "canary", b"payload")
+        .unwrap();
+    let err = migrate_kek_placement(
+        &vault,
+        keyring_kek.clone(),
+        SecretVaultPlacement::Keyring,
+        &available_probe(),
+        &VaultFault::at(VaultFaultPoint::AfterDestWrite),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("injected vault fault"), "{err}");
+    let row = db
+        .blocking_write_for_sync_maintenance(load_authority_conn)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.active_placement, SecretVaultPlacement::Database);
+    assert_eq!(file_kek.len(), 1);
+    assert_eq!(keyring_kek.len(), 1);
+
+    let effective = ensure_secret_vault(
+        &db,
+        &available_probe(),
+        &kek_dir,
+        SecretStoreInjected {
+            file_kek: Some(file_kek.clone()),
+            keyring_kek: Some(keyring_kek.clone()),
+            legacy_keyring: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(effective.snapshot.intent, SecretStoreIntent::Keyring);
+    assert_eq!(
+        effective.snapshot.effective_placement,
+        SecretStorePlacement::Keyring
+    );
+    assert_eq!(file_kek.len(), 0);
+    assert_eq!(keyring_kek.len(), 1);
+    let got = effective
+        .vault
+        .get_item(SecretVaultKind::SecureKeyRoot, "canary")
+        .unwrap();
+    assert_eq!(got.as_slice(), b"payload");
+    let row = db
+        .blocking_write_for_sync_maintenance(load_authority_conn)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.intent, SecretVaultPlacement::Keyring);
+    assert_eq!(row.active_placement, SecretVaultPlacement::Keyring);
+}
+
+#[test]
 fn secret_store_migrate_to_keyring_removes_file_kek() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
@@ -633,11 +784,18 @@ fn secret_store_migrate_to_keyring_removes_file_kek() {
     let installation = db
         .blocking_write_for_sync_maintenance(ensure_installation_identity_conn)
         .unwrap();
-    let vault = SecretVault::initialize(db.clone(), file_kek.clone(), installation, 1, 1).unwrap();
+    let vault = SecretVault::initialize(
+        db.clone(),
+        file_kek.clone(),
+        installation,
+        1,
+        1,
+        SecretVaultPlacement::Database,
+    )
+    .unwrap();
     vault
         .put_item(SecretVaultKind::SecureKeyRoot, "canary", b"payload")
         .unwrap();
-    crate::secure_key::unify_remaining_stores(&vault, &VaultFault::default()).unwrap();
     let migrated = migrate_kek_placement(
         &vault,
         keyring_kek.clone(),
@@ -659,14 +817,110 @@ fn secret_store_migrate_to_keyring_removes_file_kek() {
         .blocking_write_for_sync_maintenance(load_authority_conn)
         .unwrap()
         .unwrap();
-    assert!(
-        row.unification_complete,
-        "KEK migrate must preserve unification_complete"
-    );
+    assert_eq!(row.active_placement, SecretVaultPlacement::Keyring);
 }
 
 #[test]
-fn secret_store_migrate_to_database_removes_keyring_kek() {
+fn available_keyring_rejects_database_kek_placement() {
+    // Old production allowed dest=database beside an available keyring.
+    // Decision 6 rejects that: intent/active must stay keyring.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+    let file_kek = Arc::new(MemoryKekStore::new(SecretStorePlacement::Database));
+    let keyring_kek = Arc::new(MemoryKekStore::new(SecretStorePlacement::Keyring));
+    let first = ensure_secret_vault(
+        &db,
+        &available_probe(),
+        &tmp.path().join("secret-vault"),
+        SecretStoreInjected {
+            file_kek: Some(file_kek.clone()),
+            keyring_kek: Some(keyring_kek.clone()),
+            legacy_keyring: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        first.snapshot.effective_placement,
+        SecretStorePlacement::Keyring
+    );
+    let err = crate::secure_key::migrate_installation_kek(
+        &db,
+        SecretStorePlacement::Database,
+        &available_probe(),
+        SecretStoreInjected {
+            file_kek: Some(file_kek.clone()),
+            keyring_kek: Some(keyring_kek.clone()),
+            legacy_keyring: None,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, SecureKeyError::Invalid(ref m) if m.contains("database") && m.contains("keyring")),
+        "{err:?}"
+    );
+    assert_eq!(keyring_kek.len(), 1);
+    assert_eq!(file_kek.len(), 0);
+    let row = db
+        .blocking_write_for_sync_maintenance(load_authority_conn)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.intent, SecretVaultPlacement::Keyring);
+    assert_eq!(row.active_placement, SecretVaultPlacement::Keyring);
+}
+
+#[test]
+fn available_keyring_rejects_noop_database_kek_placement() {
+    // First-run without a keyring persists database. Once the probe is
+    // available, dest=database must still be a typed reject — even when
+    // active_placement is already database. The old same-placement early
+    // return accepted that request and left the file KEK in place.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+    let file_kek = Arc::new(MemoryKekStore::new(SecretStorePlacement::Database));
+    let keyring_kek = Arc::new(MemoryKekStore::new(SecretStorePlacement::Keyring));
+    let first = ensure_secret_vault(
+        &db,
+        &missing_probe(),
+        &tmp.path().join("secret-vault"),
+        SecretStoreInjected {
+            file_kek: Some(file_kek.clone()),
+            keyring_kek: Some(keyring_kek.clone()),
+            legacy_keyring: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        first.snapshot.effective_placement,
+        SecretStorePlacement::Database
+    );
+    assert_eq!(file_kek.len(), 1);
+    let err = crate::secure_key::migrate_installation_kek(
+        &db,
+        SecretStorePlacement::Database,
+        &available_probe(),
+        SecretStoreInjected {
+            file_kek: Some(file_kek.clone()),
+            keyring_kek: Some(keyring_kek.clone()),
+            legacy_keyring: None,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, SecureKeyError::Invalid(ref m) if m.contains("database") && m.contains("keyring")),
+        "{err:?}"
+    );
+    assert_eq!(file_kek.len(), 1);
+    assert_eq!(keyring_kek.len(), 0);
+    let row = db
+        .blocking_write_for_sync_maintenance(load_authority_conn)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.intent, SecretVaultPlacement::Database);
+    assert_eq!(row.active_placement, SecretVaultPlacement::Database);
+}
+
+#[test]
+fn secret_store_migrate_to_database_rejected_when_keyring_available() {
     let (_tmp, db, file_kek) = file_env();
     let keyring_kek = Arc::new(MemoryKekStore::new(SecretStorePlacement::Keyring));
     let vault = init_vault(&db, file_kek.clone());
@@ -681,19 +935,26 @@ fn secret_store_migrate_to_database_removes_keyring_kek() {
         &VaultFault::default(),
     )
     .unwrap();
-    let back = migrate_kek_placement(
+    let err = migrate_kek_placement(
         &on_keyring,
         file_kek.clone(),
         SecretVaultPlacement::Database,
         &available_probe(),
         &VaultFault::default(),
     )
-    .unwrap();
-    assert_eq!(keyring_kek.len(), 0);
-    let got = back
-        .get_item(SecretVaultKind::SecureKeyRoot, "canary")
+    .unwrap_err();
+    assert!(
+        matches!(err, SecureKeyError::Invalid(ref m) if m.contains("database") && m.contains("keyring")),
+        "available keyring must reject dest=database: {err:?}"
+    );
+    assert_eq!(keyring_kek.len(), 1);
+    assert_eq!(file_kek.len(), 0);
+    let row = db
+        .blocking_write_for_sync_maintenance(load_authority_conn)
+        .unwrap()
         .unwrap();
-    assert_eq!(got.as_slice(), b"payload");
+    assert_eq!(row.intent, SecretVaultPlacement::Keyring);
+    assert_eq!(row.active_placement, SecretVaultPlacement::Keyring);
 }
 
 #[test]
@@ -729,11 +990,15 @@ fn import_legacy_secure_key_roots_then_drop_keyring_items() {
         .unwrap();
     assert_eq!(got.as_slice(), root.as_ref());
     assert!(legacy.get_secret(SECURE_KEY_SERVICE, &account).is_err());
-    assert_eq!(keyring_kek.len(), 0);
+    assert_eq!(keyring_kek.len(), 1);
+    assert_eq!(
+        effective.snapshot.effective_placement,
+        SecretStorePlacement::Keyring
+    );
 }
 
 #[test]
-fn ask_first_run_uses_database_when_keyring_available() {
+fn ask_first_run_uses_keyring_when_available() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
     let file_kek = Arc::new(MemoryKekStore::new(SecretStorePlacement::Database));
@@ -754,9 +1019,9 @@ fn ask_first_run_uses_database_when_keyring_available() {
         .blocking_write_for_sync_maintenance(load_authority_conn)
         .unwrap()
         .unwrap();
-    assert_eq!(row.active_placement, SecretVaultPlacement::Database);
-    assert_eq!(file_kek.len(), 1);
-    assert_eq!(keyring_kek.len(), 0);
+    assert_eq!(row.active_placement, SecretVaultPlacement::Keyring);
+    assert_eq!(keyring_kek.len(), 1);
+    assert_eq!(file_kek.len(), 0);
 }
 
 #[test]
@@ -794,14 +1059,11 @@ fn ask_keyring_mode_fails_closed_without_file_kek() {
         },
     )
     .unwrap();
-    let _ = migrate_kek_placement(
-        &first.vault,
-        keyring_kek.clone(),
-        SecretVaultPlacement::Keyring,
-        &available_probe(),
-        &VaultFault::default(),
-    )
-    .unwrap();
+    assert_eq!(
+        first.snapshot.effective_placement,
+        SecretStorePlacement::Keyring
+    );
+    drop(first);
     let before = file_kek.len();
     let err = match start_standalone_redaction_key_resolver_with(
         &db,
@@ -863,8 +1125,14 @@ fn persisted_database_never_opens_platform_store() {
 }
 
 #[test]
-fn resolve_first_run_is_always_database() {
+fn resolve_first_run_is_keyring_when_available() {
     let decision = resolve_secret_store(None, &available_probe()).unwrap();
+    assert_eq!(decision, SecretVaultPlacement::Keyring);
+}
+
+#[test]
+fn resolve_first_run_is_database_when_keyring_missing() {
+    let decision = resolve_secret_store(None, &missing_probe()).unwrap();
     assert_eq!(decision, SecretVaultPlacement::Database);
 }
 
@@ -903,4 +1171,107 @@ fn debug_does_not_print_key_bytes() {
         Ok(())
     })
     .unwrap();
+}
+
+#[test]
+fn ensure_secret_vault_boots_on_folded_schema() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
+    let file_kek = Arc::new(MemoryKekStore::new(SecretStorePlacement::Database));
+    let keyring_kek = Arc::new(MemoryKekStore::new(SecretStorePlacement::Keyring));
+    let effective = ensure_secret_vault(
+        &db,
+        &available_probe(),
+        &tmp.path().join("secret-vault"),
+        SecretStoreInjected {
+            file_kek: Some(file_kek),
+            keyring_kek: Some(keyring_kek),
+            legacy_keyring: None,
+        },
+    )
+    .expect("fresh 0001-only DB must boot the vault");
+    assert_eq!(
+        effective.snapshot.effective_placement,
+        SecretStorePlacement::Keyring
+    );
+    db.blocking_write_for_sync_maintenance(|conn| {
+        let leftover_state = format!("{}{}", "secret_vault_store", "_state");
+        let leftover_import = format!("{}{}", "secret_vault_import", "_sagas");
+        for table in [leftover_state, leftover_import] {
+            let exists: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [table.as_str()],
+                |row| row.get(0),
+            )?;
+            assert_eq!(exists, 0, "{table} must not exist after boot");
+        }
+        Ok(())
+    })
+    .unwrap();
+    let memory = Db::open_in_memory().unwrap();
+    crate::secure_key::vault_for_db(&memory).expect("in-memory vault_for_db boots folded schema");
+}
+
+#[test]
+fn unify_remaining_stores_removed_before_table_drop() {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("repo root");
+    let needles = [
+        format!("{}{}", "unify_remaining", "_stores"),
+        format!("{}{}", "secret_vault_store", "_state"),
+        format!("{}{}", "secret_vault_import", "_sagas"),
+        format!("{}{}", "upsert_store_state", "_conn"),
+        format!("{}{}", "import_credentials_from", "_path"),
+        format!("{}{}", "resume_credentials_import_after", "_activation"),
+        format!("{}{}", "import_sealed_compartment_from", "_path"),
+        format!("{}{}", "store_is_vault", "_authoritative"),
+    ];
+    let mut hits = Vec::new();
+    for crate_rel in ["crates/cockpit-core", "crates/cockpit-db"] {
+        walk_skipping_comments(&repo.join(crate_rel), &needles, &mut hits);
+    }
+    assert!(
+        hits.is_empty(),
+        "dual-store importer symbols must be gone: {hits:?}"
+    );
+}
+
+fn walk_skipping_comments(root: &std::path::Path, needles: &[String], hits: &mut Vec<String>) {
+    let entries = std::fs::read_dir(root)
+        .unwrap_or_else(|e| panic!("required scan root unreadable {}: {e}", root.display()));
+    for entry in entries {
+        let entry = entry
+            .unwrap_or_else(|e| panic!("required scan dirent unreadable {}: {e}", root.display()));
+        let path = entry.path();
+        if path.is_dir() {
+            if entry.file_name() == "target" {
+                continue;
+            }
+            walk_skipping_comments(&path, needles, hits);
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("rs")
+            && path.extension().and_then(|e| e.to_str()) != Some("sql")
+        {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("required scan file unreadable {}: {e}", path.display()));
+        for (idx, line) in text.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") || trimmed.starts_with("//!") {
+                continue;
+            }
+            if trimmed.starts_with("fn ") && trimmed.contains("removed_before_table_drop") {
+                continue;
+            }
+            for needle in needles {
+                if trimmed.contains(needle.as_str()) {
+                    hits.push(format!("{}:{}:{trimmed}", path.display(), idx + 1));
+                }
+            }
+        }
+    }
 }

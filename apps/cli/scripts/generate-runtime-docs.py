@@ -64,13 +64,11 @@ manager. Follow {bubblewrap_url}, verify with `{bubblewrap_verify}`.
 ## Secret storage (OS keyring)
 
 `{keyring_id}` unlocks **keyring KEK placement**, not “every secret is a
-keyring item.” First-run is always database mode: a local `private_fs`
-owner-only KEK file plus encrypted SQLite (wrapped DEK + AEAD
-ciphertext), even when an OS keyring is already installed. Promotion to
-the keyring is an explicit Settings action after vault unification.
-Missing keyring only means the Settings keyring option stays disabled.
-Switching keyring → database is weaker, requires confirm, and moves the
-wrapping key to a local file. Linux: install `gnome-keyring` providing
+keyring item.” First-run persists a keyring wrap key when the OS keyring
+probe is available; a local `private_fs` owner-only file KEK is used only
+when the probe is missing or disabled. Encrypted SQLite holds the wrapped
+DEK and AEAD ciphertext in either case. `MigrateKekPlacement` dest=database
+is rejected while the keyring is available. Linux: install `gnome-keyring` providing
 `org.freedesktop.secrets`. `libsecret` alone is not enough; a TTY session
 may need `{keyring_verify}`. Verify with that command, Keychain, or
 Windows Credential Manager. Settings rechecks if you try to enable a
@@ -99,8 +97,9 @@ WARNING_TEMPLATE = """Cockpit external runtime notice
 
 Cockpit does not install host dependencies. Missing security.keyring,
 safety.bubblewrap, container.docker, container.podman, media.ffmpeg, or
-media.ffprobe never fails installation. First-run secret storage is always
-a local file KEK plus encrypted SQLite. Missing Bubblewrap makes host
+media.ffprobe never fails installation. First-run secret storage uses the
+OS keyring when available; a local file KEK is only the fallback when the
+keyring probe is missing or disabled. Missing Bubblewrap makes host
 Sandbox effective Off. Missing docker/podman disables container modes
 (effective Off, never host Sandbox fallback). Selected audio/video inputs
 require a compatible FFmpeg and FFprobe pair; images decode natively.

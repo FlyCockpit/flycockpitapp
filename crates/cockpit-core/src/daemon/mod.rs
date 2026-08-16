@@ -1019,8 +1019,15 @@ fn spawn_detached_inner(
         .arg("start")
         .arg("--foreground")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::null());
+    match open_detach_child_log() {
+        Some(file) => {
+            command.stderr(file);
+        }
+        None => {
+            command.stderr(Stdio::null());
+        }
+    }
     if no_sandbox {
         command.arg("--no-sandbox");
     }
@@ -1036,6 +1043,17 @@ fn spawn_detached_inner(
     command.process_group(0);
     let child = command.spawn().context("spawning daemon child")?;
     Ok(child.id())
+}
+
+#[cfg(unix)]
+fn open_detach_child_log() -> Option<std::fs::File> {
+    let dir = dirs::cache_dir()?.join("cockpit");
+    crate::private_fs::ensure_private_dir(&dir).ok()?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("cockpit.log"))
+        .ok()
 }
 
 #[cfg(not(unix))]
@@ -2394,9 +2412,11 @@ mod tests {
             .await
         });
 
-        // Wait for it to come up.
         wait_until(|| eph.socket.exists(), Duration::from_secs(2)).await;
         assert!(eph.pid_file.exists(), "ephemeral pid file written");
+        // Bind happens before boot. Give boot real time to arm the idle
+        // watchdog; pausing the clock immediately freezes boot forever.
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
         tokio::time::pause();
 

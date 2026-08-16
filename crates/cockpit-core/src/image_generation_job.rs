@@ -30,7 +30,7 @@ use cockpit_db::db::image_generation::{
     ImageGenerationLatePublicationEvidenceV1, ImageGenerationLatePublicationState,
     PreparedImageGenerationDispatch, ReserveImageGenerationLatePublication,
     TransitionImageGenerationArtifact, TransitionImageGenerationArtifactComponent,
-    image_generation_component_set_binding,
+    image_generation_attempt_media_reservation_id, image_generation_component_set_binding,
 };
 use cockpit_db::db::sealed_scope::SealedActionGrantRow;
 use cockpit_db::image_spend::{AttemptMaximum, ImageSpendDispatchEvidence, SpendReservation};
@@ -446,6 +446,7 @@ impl ImageGenerationDispatcher {
         adapter: &A,
         worker_boot_id: Uuid,
         now_unix_ms: i64,
+        now_monotonic_ms: u64,
         limit: u32,
     ) -> Result<u32> {
         ensure!(
@@ -527,10 +528,14 @@ impl ImageGenerationDispatcher {
             self.db.transaction(move|conn|{
                 let disposition=cockpit_db::Db::reconcile_image_generation_attempt_conn(conn,&proof)?;
                 match disposition {
-                    cockpit_db::db::image_generation::ImageGenerationReconciliationDisposition::RetryQueued{external_operation_id,media_reservation_id,media_reservation_version,current_media_plan,current_media_plan_digest,next_media_plan,next_media_plan_digest}=>{
+                    cockpit_db::db::image_generation::ImageGenerationReconciliationDisposition::RetryQueued{external_operation_id,media_reservation_id,media_reservation_version,sealed_media_reservation_id,current_media_plan,current_media_plan_digest,next_media_plan,next_media_plan_digest}=>{
                         let current=decode_media_plan_snapshot(&current_media_plan,&current_media_plan_digest)?;
                         let next=decode_media_plan_snapshot(&next_media_plan,&next_media_plan_digest)?;
-                        definitive_rejection_retry_conn(conn,&media_reservation_id,media_reservation_version,&external_operation_id.to_string(),&[current],&[next],u64::try_from(now_unix_ms)?)?;
+                        let next_reservation_id=image_generation_attempt_media_reservation_id(&sealed_media_reservation_id,slot_id,attempt_number.checked_add(1).context("image generation retry attempt overflow")?);
+                        if let Err(error)=definitive_rejection_retry_conn(conn,&media_reservation_id,media_reservation_version,&external_operation_id.to_string(),&[current],&[next],u64::try_from(now_unix_ms)?,&next_reservation_id,now_monotonic_ms) {
+                            if !error.to_string().contains("deadline_expired") { return Err(error); }
+                            finish_external_handoff_conn(conn,&media_reservation_id,media_reservation_version,&external_operation_id.to_string(),MediaExternalHandoffOutcome::DefinitivelyRejected)?;
+                        }
                     }
                     cockpit_db::db::image_generation::ImageGenerationReconciliationDisposition::Settled{external_operation_id,media_reservation_id,media_reservation_version,outcome:cockpit_db::db::image_generation::ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance}=>{
                         finish_external_handoff_conn(conn,&media_reservation_id,media_reservation_version,&external_operation_id.to_string(),MediaExternalHandoffOutcome::DefinitivelyRejected)?;
@@ -677,7 +682,8 @@ impl ImageGenerationDispatcher {
             let c=&candidate.candidate;
             ensure!(conn.query_row("SELECT EXISTS(SELECT 1 FROM image_generation_scheduler_claims WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND worker_boot_id=?4 AND claim_generation=?5 AND expires_at_unix_ms>CAST(unixepoch('subsec')*1000 AS INTEGER))",params![c.job_id.to_string(),c.slot_id.to_string(),i64::from(c.attempt_number),worker_boot_id.to_string(),i64::try_from(claim_generation)?],|row|row.get::<_,bool>(0))?,"image generation scheduler claim is stale");
             let attempt=candidate.plan.targets.iter().flat_map(|target|target.slots.iter()).find(|slot|slot.slot_id==c.slot_id).and_then(|slot|slot.attempts.iter().find(|attempt|attempt.attempt_number==c.attempt_number)).context("scheduler attempt is absent from immutable plan")?;
-            let media_id=candidate.plan.central_resources.first().context("scheduler media reservation is absent")?.reservation_identity.clone();
+            let sealed_media_id=candidate.plan.central_resources.first().context("scheduler media reservation is absent")?.reservation_identity.clone();
+            let media_id=image_generation_attempt_media_reservation_id(&sealed_media_id,c.slot_id,c.attempt_number);
             let media_version=u64::try_from(conn.query_row::<i64,_,_>("SELECT version FROM media_reservations WHERE reservation_id=?1 AND state='executing_local' AND owner_session_key=?2 AND deadline_monotonic_ms>?3",params![media_id,candidate.plan.owner_session_id.to_string(),i64::try_from(now_monotonic_ms)?],|row|row.get(0))?)?;
             let spend_exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM image_spend_reservations r JOIN image_spend_attempts a USING(reservation_id) WHERE r.reservation_id=?1 AND a.attempt_id=?2 AND r.state='reserved')",params![candidate.plan.spend.reservation_id,attempt.provider_idempotency_identity],|row|row.get(0))?;
             ensure!(spend_exists,"scheduler spend reservation is unavailable");
@@ -841,10 +847,12 @@ impl ImageGenerationDispatcher {
         prior_handoff_plans: Vec<MediaReservationPlan>,
         at_unix_ms: i64,
         media_wall_ms: u64,
+        now_monotonic_ms: u64,
     ) -> Result<()> {
         let operation_id = dispatching.operation().operation_id.to_string();
         let (reservation_id, reservation_version) = dispatching.media_reservation();
         let reservation_id = reservation_id.to_owned();
+        let (job_id, slot_id, _, _) = dispatching.identity();
         let media_outcome = match evidence {
             ImageSpendDispatchEvidence::Accepted => MediaExternalHandoffOutcome::Accepted,
             ImageSpendDispatchEvidence::DefinitivelyRejected => {
@@ -867,13 +875,30 @@ impl ImageGenerationDispatcher {
                 )?;
                 match disposition {
                     ImageGenerationHandoffFinishDisposition::RetryQueued {
+                        next_attempt_number,
                         canonical_media_plan,
                         media_plan_digest,
-                        ..
                     } => {
                         let next =
                             decode_media_plan_snapshot(&canonical_media_plan, &media_plan_digest)?;
-                        definitive_rejection_retry_conn(
+                        let (canonical_plan, plan_digest): (Vec<u8>, String) = conn.query_row(
+                            "SELECT canonical_plan,plan_digest FROM image_generation_plans WHERE job_id=?1",
+                            [job_id.to_string()],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )?;
+                        let plan = ImageGenerationPlanV1::from_canonical(&canonical_plan, &plan_digest)?;
+                        let sealed = plan
+                            .central_resources
+                            .first()
+                            .context("image generation sealed media reservation is absent")?
+                            .reservation_identity
+                            .clone();
+                        let next_reservation_id = image_generation_attempt_media_reservation_id(
+                            &sealed,
+                            slot_id,
+                            next_attempt_number,
+                        );
+                        if let Err(error) = definitive_rejection_retry_conn(
                             conn,
                             &reservation_id,
                             reservation_version,
@@ -881,7 +906,20 @@ impl ImageGenerationDispatcher {
                             &prior_handoff_plans,
                             &[next],
                             media_wall_ms,
-                        )?;
+                            &next_reservation_id,
+                            now_monotonic_ms,
+                        ) {
+                            if !error.to_string().contains("deadline_expired") {
+                                return Err(error);
+                            }
+                            finish_external_handoff_conn(
+                                conn,
+                                &reservation_id,
+                                reservation_version,
+                                &operation_id,
+                                MediaExternalHandoffOutcome::DefinitivelyRejected,
+                            )?;
+                        }
                     }
                     ImageGenerationHandoffFinishDisposition::Settled => {
                         finish_external_handoff_conn(
@@ -948,6 +986,7 @@ impl ImageGenerationDispatcher {
             prior_handoff_plans_for_finish,
             at_unix_ms,
             media_wall_ms,
+            now_monotonic_ms,
         )
         .await?;
         Ok(result)
@@ -3120,7 +3159,11 @@ pub fn retain_accepted_image_response_conn(
             expected_width: target.resolved.width,
             expected_height: target.resolved.height,
             bytes: &input.bytes,
-            resource_reservation_id: plan.central_resources[0].reservation_identity.clone(),
+            resource_reservation_id: image_generation_attempt_media_reservation_id(
+                &plan.central_resources[0].reservation_identity,
+                input.slot_id,
+                input.attempt_number,
+            ),
             release_operation_id: input.release_operation_id,
             late_quarantined: after_cancel,
             now_unix_ms: input.now_unix_ms,
@@ -4393,7 +4436,11 @@ mod tests {
             let states=conn.prepare("SELECT attempt_number,state FROM image_generation_attempts WHERE job_id=?1 ORDER BY attempt_number")?.query_map([fixture.job_id.to_string()],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
             assert_eq!(states,vec![(1,"rejected_not_accepted".into()),(2,"rejected_not_accepted".into()),(3,"accepted".into())]);
             let activations:i64=conn.query_row("SELECT count(*) FROM image_generation_attempt_activation_facts WHERE job_id=?1",[fixture.job_id.to_string()],|row|row.get(0))?; assert_eq!(activations,3);
-            let media:String=conn.query_row("SELECT state FROM media_reservations WHERE reservation_id=?1",[fixture.media_reservation_id],|row|row.get(0))?; assert_eq!(media,"external_pending");
+            let original:String=conn.query_row("SELECT state FROM media_reservations WHERE reservation_id=?1",[fixture.media_reservation_id.clone()],|row|row.get(0))?;
+            assert_eq!(original,"released");
+            let retry_id=cockpit_db::db::image_generation::image_generation_attempt_media_reservation_id(&fixture.media_reservation_id,fixture.slot_id,3);
+            let latest:String=conn.query_row("SELECT state FROM media_reservations WHERE reservation_id=?1",[&retry_id],|row|row.get(0))?;
+            assert_eq!(latest,"external_pending");
             Ok(())
         }).await.unwrap();
 
@@ -4622,6 +4669,51 @@ mod tests {
             assert_eq!(fact.spend_reservation_id,spend_id);
             Ok(())
         }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deadline_expiry_after_retry_binds_live_attempt_reservation() {
+        let fixture = setup_real_ledger_scheduler_job_with_attempts(
+            cockpit_db::Db::open_in_memory().unwrap(),
+            "deadline-retry",
+            2,
+        )
+        .await;
+        let job_id = fixture.job_id;
+        let sealed = fixture.media_reservation_id.clone();
+        let adapter = DeterministicImageGenerationAdapter::new(vec![
+            ImageGenerationHandoffResult::DefinitivelyRejected {
+                evidence: b"reject-then-expire".to_vec(),
+            },
+        ]);
+        ImageGenerationDispatcher::new(fixture.db.clone())
+            .run_scheduler_pass(&adapter, deadline_boot(), 100, 2, 2, 8)
+            .await
+            .unwrap();
+        let fact = fixture
+            .db
+            .write(move |conn| {
+                cockpit_db::Db::record_image_generation_deadline_expiry_conn(
+                    conn,
+                    job_id,
+                    cockpit_db::db::image_generation::DeadlineObservationV1::new(
+                        deadline_boot(),
+                        400,
+                    )?,
+                    9,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            fact.media_reservation_id,
+            cockpit_db::db::image_generation::image_generation_attempt_media_reservation_id(
+                &sealed,
+                fixture.slot_id,
+                2,
+            )
+        );
+        assert_ne!(fact.media_reservation_id, sealed);
     }
 
     #[tokio::test]
@@ -4870,6 +4962,130 @@ mod tests {
             0
         );
         fixture.db.read(move|conn|{let row:(String,i64)=conn.query_row("SELECT state,(SELECT count(*) FROM image_generation_artifact_components WHERE artifact_id=i.artifact_id) FROM image_generation_response_publication_intents i WHERE job_id=?1",[fixture.job_id.to_string()],|row|Ok((row.get(0)?,row.get(1)?)))?;assert_eq!(row,("applied".into(),1));Ok(())}).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retain_accepted_retry_attempt_binds_attempt_reservation() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = setup_real_ledger_scheduler_job_with_attempts(
+            cockpit_db::Db::open_in_memory().unwrap(),
+            "retain-retry",
+            2,
+        )
+        .await;
+        let sealed = fixture.media_reservation_id.clone();
+        let adapter = DeterministicImageGenerationAdapter::new(vec![
+            ImageGenerationHandoffResult::DefinitivelyRejected {
+                evidence: b"reject-1".to_vec(),
+            },
+            ImageGenerationHandoffResult::Accepted {
+                evidence: b"accept-2".to_vec(),
+            },
+        ]);
+        let dispatcher = ImageGenerationDispatcher::new(fixture.db.clone());
+        for at in 2..=3 {
+            let pass = dispatcher
+                .run_scheduler_pass(&adapter, deadline_boot(), 100, at, at as u64, 8)
+                .await
+                .unwrap();
+            assert_eq!(pass.dispatched, 1, "{pass:#?}");
+        }
+        let request = adapter
+            .requests()
+            .into_iter()
+            .find(|request| request.attempt_number == 2)
+            .expect("accepted retry attempt");
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(512, 512)
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .unwrap();
+        let bytes = cursor.into_inner();
+        let fetcher = ScriptedAcceptedResponseFetcher::new(
+            vec![AcceptedImageResponseFetchOutcome::Fetched {
+                bytes: bytes.clone(),
+                evidence: b"retry-fetch-proof".to_vec(),
+            }],
+            vec![],
+        );
+        fetch_accepted_image_response(
+            fixture.db.clone(),
+            &fetcher,
+            fixture.job_id,
+            fixture.slot_id,
+            2,
+            10,
+        )
+        .await
+        .unwrap();
+        let job_id = fixture.job_id;
+        let slot_id = fixture.slot_id;
+        let versions = fixture
+            .db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT j.version,s.version,a.version,o.version FROM image_generation_jobs j JOIN image_generation_slots s USING(job_id) JOIN image_generation_attempts a USING(job_id,slot_id) JOIN external_journal_operations o ON o.operation_id=a.external_operation_id WHERE j.job_id=?1 AND s.slot_id=?2 AND a.attempt_number=2",
+                    rusqlite::params![job_id.to_string(), slot_id.to_string()],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let managed = temp.path().join("managed");
+        std::fs::create_dir(&managed).unwrap();
+        std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let root = std::sync::Arc::new(open_image_generation_artifact_root(&managed).unwrap());
+        let progress = coordinate_persisted_accepted_image_response(
+            fixture.db.clone(),
+            root,
+            CoordinateAcceptedImageResponse {
+                job_id: fixture.job_id,
+                slot_id: fixture.slot_id,
+                attempt_number: 2,
+                expected_job_version: u64::try_from(versions.0).unwrap(),
+                expected_slot_version: u64::try_from(versions.1).unwrap(),
+                expected_attempt_version: u64::try_from(versions.2).unwrap(),
+                external_operation_id: request.external_operation_id,
+                expected_journal_version: u64::try_from(versions.3).unwrap(),
+                component_id: Uuid::now_v7(),
+                release_operation_id: Uuid::now_v7(),
+                bytes,
+                now_unix_ms: 11,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(progress, AcceptedImageResponseProgress::Retained);
+        let stored = fixture
+            .db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT resource_reservation_id FROM image_generation_artifact_components WHERE artifact_id=?1",
+                    [fixture.artifact_id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            stored,
+            cockpit_db::db::image_generation::image_generation_attempt_media_reservation_id(
+                &sealed,
+                fixture.slot_id,
+                2,
+            )
+        );
+        assert_ne!(stored, sealed);
     }
 
     #[cfg(unix)]
@@ -5296,7 +5512,7 @@ mod tests {
         let dispatcher = ImageGenerationDispatcher::new(reopened.clone());
         assert_eq!(
             dispatcher
-                .run_reconciliation_pass(&recovery, Uuid::now_v7(), 10, 8)
+                .run_reconciliation_pass(&recovery, Uuid::now_v7(), 10, 0, 8)
                 .await
                 .unwrap(),
             1
@@ -5366,16 +5582,29 @@ mod tests {
         );
         assert_eq!(
             dispatcher
-                .run_reconciliation_pass(&recovery, Uuid::now_v7(), 10, 8)
+                .run_reconciliation_pass(&recovery, Uuid::now_v7(), 10, 0, 8)
                 .await
                 .unwrap(),
             1
         );
         assert_eq!(handoff.requests().len(), 1);
         assert_eq!(recovery.reconciliation_requests().len(), 1);
+        let retry_media_id =
+            cockpit_db::db::image_generation::image_generation_attempt_media_reservation_id(
+                &media_id, slot_id, 2,
+            );
+        let original_media_id = media_id.clone();
         fixture.db.read(move|conn|{
             let row:(String,String,String,String,i64)=conn.query_row("SELECT a.state,s.state,m.state,b.state,(SELECT COUNT(*) FROM image_generation_attempt_activation_facts f WHERE f.job_id=a.job_id AND f.slot_id=a.slot_id AND f.attempt_number=2) FROM image_generation_attempts a JOIN image_generation_slots s USING(job_id,slot_id) JOIN media_reservations m ON m.reservation_id=?3 JOIN image_spend_reservations b ON b.reservation_id=?4 WHERE a.job_id=?1 AND a.slot_id=?2 AND a.attempt_number=1",rusqlite::params![job_id.to_string(),slot_id.to_string(),media_id,spend_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;
-            assert_eq!(row,("rejected_not_accepted".into(),"queued".into(),"executing_local".into(),"reserved".into(),1));
+            assert_eq!(row.0,"rejected_not_accepted");
+            assert_eq!(row.1,"queued");
+            assert_eq!(row.2,"released");
+            assert_eq!(row.3,"reserved");
+            assert_eq!(row.4,1);
+            let retry:(String,String)=conn.query_row("SELECT reservation_id,state FROM media_reservations WHERE reservation_id=?1",[&retry_media_id],|row|Ok((row.get(0)?,row.get(1)?)))?;
+            assert_eq!(retry.0,retry_media_id);
+            assert_ne!(retry.0,original_media_id);
+            assert_eq!(retry.1,"executing_local");
             Ok(())
         }).await.unwrap();
     }
@@ -5436,7 +5665,7 @@ mod tests {
             );
             assert!(
                 ImageGenerationDispatcher::new(fixture.db.clone())
-                    .run_reconciliation_pass(&recovery, Uuid::now_v7(), 10, 8)
+                    .run_reconciliation_pass(&recovery, Uuid::now_v7(), 10, 0, 8)
                     .await
                     .is_err(),
                 "{name} cut committed"
@@ -5451,7 +5680,7 @@ mod tests {
             assert_eq!(reopened_snapshot, after, "{name}");
             assert_eq!(
                 ImageGenerationDispatcher::new(reopened.clone())
-                    .run_reconciliation_pass(&recovery, Uuid::now_v7(), 60_010, 8)
+                    .run_reconciliation_pass(&recovery, Uuid::now_v7(), 60_010, 0, 8)
                     .await
                     .unwrap(),
                 1,
@@ -5520,7 +5749,7 @@ mod tests {
                     DeterministicImageGenerationAdapter::with_recovery(vec![outcome], Vec::new());
                 assert_eq!(
                     dispatcher
-                        .run_reconciliation_pass(&recovery, Uuid::now_v7(), 10, 8)
+                        .run_reconciliation_pass(&recovery, Uuid::now_v7(), 10, 0, 8)
                         .await
                         .unwrap(),
                     1,

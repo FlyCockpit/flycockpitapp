@@ -66,6 +66,18 @@ pub fn reject_keyring_if_unavailable(probe: &KeyringProbeResult) -> Result<(), S
     Ok(())
 }
 
+pub fn reject_database_kek_if_keyring_available(
+    probe: &KeyringProbeResult,
+) -> Result<(), SecureKeyError> {
+    if probe.state == FeatureCapabilityState::Available {
+        return Err(SecureKeyError::Invalid(
+            "cannot place the wrap-key KEK in the database while the OS keyring is available"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn migrate_kek_placement(
     vault: &SecretVault,
     dest: Arc<dyn KekStore>,
@@ -75,6 +87,9 @@ pub fn migrate_kek_placement(
 ) -> Result<SecretVault, SecureKeyError> {
     if dest_placement == SecretVaultPlacement::Keyring {
         reject_keyring_if_unavailable(probe)?;
+    }
+    if dest_placement == SecretVaultPlacement::Database {
+        reject_database_kek_if_keyring_available(probe)?;
     }
     let authority = vault
         .db()
@@ -170,9 +185,6 @@ fn run_migrate_from_prepared(
         move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE;")?;
             let result = (|| {
-                let existing_complete = load_authority_conn(conn)?
-                    .map(|row| row.unification_complete)
-                    .unwrap_or(false);
                 upsert_authority_conn(
                     conn,
                     dest_placement,
@@ -180,7 +192,6 @@ fn run_migrate_from_prepared(
                     &fingerprint,
                     authority_kek_version,
                     1,
-                    existing_complete,
                 )?;
                 set_saga_phase_conn(conn, &op_id, SecretVaultSagaPhase::Activated)?;
                 fault
@@ -252,6 +263,9 @@ pub fn resume_kek_migrate(
     if saga.dest_placement == SecretVaultPlacement::Keyring {
         reject_keyring_if_unavailable(probe)?;
     }
+    if saga.dest_placement == SecretVaultPlacement::Database {
+        reject_database_kek_if_keyring_available(probe)?;
+    }
     let authority = db
         .blocking_write_for_sync_maintenance(load_authority_conn)
         .map_err(|e| SecureKeyError::Internal(e.to_string()))?
@@ -284,6 +298,11 @@ pub fn resume_kek_migrate(
         }
         SecretVaultSagaPhase::Activated => {
             source.delete_kek(kek_version)?;
+            if source.kek_present(kek_version)? {
+                return Err(SecureKeyError::Corrupt(
+                    "source KEK still present after delete".into(),
+                ));
+            }
             db.blocking_write_for_sync_maintenance({
                 let op_id = saga.op_id.clone();
                 move |conn| set_saga_phase_conn(conn, &op_id, SecretVaultSagaPhase::SourceDeleted)

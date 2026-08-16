@@ -21,14 +21,15 @@ use cockpit_proto::{
 
 use crate::tui::dialog::{DialogOption, DialogState, Page};
 
-pub const SECRET_STORE_PREPARING: &str = "Preparing encrypted secret storage…";
 pub const SECRET_STORE_KEYRING_LABEL: &str = "OS keyring";
 pub const SECRET_STORE_DATABASE_LABEL: &str = "Database (encrypted, local KEK file)";
 pub const SECRET_STORE_HELP: &str = "Where the wrapping key for encrypted secret storage lives. \
      OS keyring keeps the wrapping key in the platform store. Database mode \
      is weaker than the OS keyring: it uses a local private_fs KEK file plus \
-     encrypted SQLite (wrapped DEK + AEAD ciphertext). First-run is always \
-     Database; promoting to the OS keyring is an explicit choice.";
+     encrypted SQLite (wrapped DEK + AEAD ciphertext). First-run persists \
+     the OS keyring when the probe is available, otherwise database.";
+pub const SECRET_STORE_DATABASE_REJECTED: &str =
+    "cannot place the wrapping key in the database while the OS keyring is available";
 pub const SECRET_STORE_DOWNGRADE_PROMPT: &str = "Move secret storage off the OS keyring?\n\n\
      This is weaker than the OS keyring.\n\
      The wrapping key will leave the OS keyring.\n\
@@ -270,13 +271,10 @@ pub fn sandbox_mode_display(mode: SandboxMode, caps: &HostCapabilitySnapshot) ->
 }
 
 pub fn secret_store_switcher_enabled(caps: &HostCapabilitySnapshot) -> bool {
-    caps.secret_store.unification_complete
+    !matches!(caps.secret_store.intent, SecretStoreIntent::Unconfigured)
 }
 
 pub fn secret_store_row_value(caps: &HostCapabilitySnapshot) -> String {
-    if !caps.secret_store.unification_complete {
-        return SECRET_STORE_PREPARING.to_string();
-    }
     match (
         caps.secret_store.intent,
         caps.secret_store.effective_placement,
@@ -299,12 +297,8 @@ pub fn secret_store_row_value(caps: &HostCapabilitySnapshot) -> String {
     }
 }
 
-pub fn secret_store_row_help(caps: &HostCapabilitySnapshot) -> &'static str {
-    if caps.secret_store.unification_complete {
-        SECRET_STORE_HELP
-    } else {
-        "Encrypted secret storage is still importing remaining stores. Backend switching is not available yet."
-    }
+pub fn secret_store_row_help(_caps: &HostCapabilitySnapshot) -> &'static str {
+    SECRET_STORE_HELP
 }
 
 pub fn displayed_secret_store_placement(caps: &HostCapabilitySnapshot) -> SecretStorePlacement {
@@ -462,6 +456,5 @@ pub fn unified_secret_store(
         effective_placement: placement,
         fail_closed_reason: None,
         fix_command: None,
-        unification_complete: true,
     }
 }

@@ -494,6 +494,8 @@ mod tests {
             let guard = crate::test_env::lock();
             guard.set_var(COCKPIT_CONFIG_ENV, path);
             guard.set_var("XDG_STATE_HOME", state_home);
+            guard.set_var("XDG_DATA_HOME", state_home);
+            guard.set_var("COCKPIT_TEST_NO_KEYRING", "1");
             Self { _guard: guard }
         }
 

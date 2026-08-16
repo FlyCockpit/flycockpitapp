@@ -2,8 +2,9 @@
 //!
 //! One actor thread serializes create/rotate/retire against the wrap-key vault
 //! (and, for tests, an injected [`fake::FakeNativeStore`]). Production KEK
-//! placement is a `private_fs` file on first-run, or the OS keyring after an
-//! explicit Settings migrate. Tests never touch real OS keyrings or mutate
+//! placement is the OS keyring on first-run when the probe is available,
+//! otherwise a `private_fs` file. dest=database is rejected while the probe
+//! is available. Tests never touch real OS keyrings or mutate
 //! the process-global default store.
 //!
 //! Consumer ciphertext tables integrate via transaction-scoped hooks
@@ -23,7 +24,6 @@ mod platform;
 mod resolve;
 mod sealed_ops;
 mod sealed_state;
-mod unify;
 mod vault;
 mod vault_store;
 mod worker;
@@ -64,17 +64,10 @@ pub use resolve::{
 };
 
 #[cfg(feature = "test-support")]
-pub use resolve::{TestInjectedVault, test_available_keyring_probe, test_open_db};
-#[cfg(test)]
-pub use unify::{
-    import_credentials_from_path, import_sealed_compartment_from_path,
-    resume_credentials_import_after_activation,
+pub use resolve::{
+    TestInjectedVault, test_available_keyring_probe, test_missing_keyring_probe, test_open_db,
 };
-pub use unify::{
-    redaction_table_item_id, session_sealed_item_id, store_is_vault_authoritative,
-    unify_remaining_stores,
-};
-pub use vault::SecretVault;
+pub use vault::{SecretVault, redaction_table_item_id, session_sealed_item_id};
 pub use vault_store::VaultNativeStore;
 // set_default / unset_default are actor-owned only (`pub(crate)` in platform.rs).
 pub use platform::{

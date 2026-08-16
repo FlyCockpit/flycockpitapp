@@ -5770,6 +5770,25 @@ pub(super) async fn handle_concurrent_request_with_remote_operation(
             schema_version: ctx.db.schema_version().await.map_err(internal)?,
         }),
         Request::GetHostCapabilities => get_host_capabilities(&ctx),
+        Request::ListLeakReports {
+            cursor,
+            limit,
+            project_root,
+            session_id,
+            rotation,
+        } => list_leak_reports(&ctx, cursor, limit, project_root, session_id, rotation).await,
+        Request::TerminalIngressStatus {
+            terminal_id,
+            binding,
+            operation_id,
+        } => {
+            if shared.terminal_views.get(&terminal_id) != Some(&binding) {
+                return Err(invalid_terminal_ingress());
+            }
+            shared
+                .terminal_host
+                .ingress_status(terminal_id, binding, operation_id)
+        }
         Request::GetUsageCounts { project_id } => {
             let since = chrono::Utc::now().timestamp() - crate::db::usage_events::USAGE_WINDOW_SECS;
             let models = ctx

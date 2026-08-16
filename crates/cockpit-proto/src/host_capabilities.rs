@@ -113,10 +113,6 @@ pub struct SecretStoreSnapshot {
     pub fail_closed_reason: Option<String>,
     #[serde(default)]
     pub fix_command: Option<String>,
-    /// `secret_vault_authority.unification_complete`. Settings must not
-    /// enable backend switching until this is true.
-    #[serde(default)]
-    pub unification_complete: bool,
 }
 
 impl SecretStoreSnapshot {
@@ -127,7 +123,6 @@ impl SecretStoreSnapshot {
             effective_placement: SecretStorePlacement::Unavailable,
             fail_closed_reason: None,
             fix_command: None,
-            unification_complete: false,
         }
     }
 }
@@ -152,5 +147,82 @@ impl HostCapabilitySnapshot {
 
     pub fn dependency(&self, id: &str) -> Option<&CatalogDependencyRow> {
         self.dependencies.iter().find(|row| row.id == id)
+    }
+}
+
+#[cfg(test)]
+mod snapshot_shape_tests {
+    use super::*;
+
+    #[test]
+    fn unification_complete_absent_from_wire_and_core() {
+        let snapshot = SecretStoreSnapshot::unconfigured_placeholder();
+        let encoded = serde_json::to_value(&snapshot).expect("serialize snapshot");
+        let leftover = format!("{}{}", "unification", "_complete");
+        assert!(
+            encoded.get(&leftover).is_none(),
+            "SecretStoreSnapshot must not emit {leftover}"
+        );
+        assert!(
+            encoded.get("intent").is_some() && encoded.get("effective_placement").is_some(),
+            "intent/placement stay on the wire: {encoded}"
+        );
+
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("repo root");
+        let mut hits = Vec::new();
+        for rel in [
+            "crates/cockpit-db",
+            "crates/cockpit-core",
+            "crates/cockpit-proto",
+            "crates/cockpit-tui",
+            "packages/cockpit-protocol/fixtures",
+        ] {
+            walk_for_needle(&repo.join(rel), &leftover, &mut hits);
+        }
+        assert!(
+            hits.is_empty(),
+            "{leftover} must not remain in wire/core/TUI/fixtures: {hits:?}"
+        );
+    }
+
+    fn walk_for_needle(root: &std::path::Path, needle: &str, hits: &mut Vec<String>) {
+        let entries = std::fs::read_dir(root)
+            .unwrap_or_else(|e| panic!("required scan root unreadable {}: {e}", root.display()));
+        for entry in entries {
+            let entry = entry.unwrap_or_else(|e| {
+                panic!("required scan dirent unreadable {}: {e}", root.display())
+            });
+            let path = entry.path();
+            if path.is_dir() {
+                let name = entry.file_name();
+                if name == "target" || name == "node_modules" || name == "dist" {
+                    continue;
+                }
+                walk_for_needle(&path, needle, hits);
+                continue;
+            }
+            let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+                continue;
+            };
+            if !matches!(ext, "rs" | "sql" | "json" | "ts") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                panic!("required scan file unreadable {}: {e}", path.display())
+            });
+            for (idx, line) in text.lines().enumerate() {
+                if !line.contains(needle) {
+                    continue;
+                }
+                let trimmed = line.trim();
+                if trimmed.starts_with("fn ") && trimmed.contains("absent_from_wire") {
+                    continue;
+                }
+                hits.push(format!("{}:{}:{trimmed}", path.display(), idx + 1));
+            }
+        }
     }
 }

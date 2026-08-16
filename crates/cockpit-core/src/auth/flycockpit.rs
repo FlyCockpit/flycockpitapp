@@ -516,12 +516,11 @@ pub fn store_credential(credential: &StoredFlycockpitCredential) -> Result<()> {
     store_credential_in_store(&mut store, credential)
 }
 
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) fn store_credential_at_path(
-    path: std::path::PathBuf,
+pub fn store_credential_in_vault(
+    vault: std::sync::Arc<crate::secure_key::SecretVault>,
     credential: &StoredFlycockpitCredential,
 ) -> Result<()> {
-    let mut store = CredentialStore::open(path)?;
+    let mut store = CredentialStore::from_vault(vault)?;
     store_credential_in_store(&mut store, credential)
 }
 
@@ -548,6 +547,13 @@ pub fn store_relay_choice(
 
 pub fn clear_credential() -> Result<()> {
     let mut store = CredentialStore::open_default()?;
+    clear_credential_in_store(&mut store)
+}
+
+pub fn clear_credential_in_vault(
+    vault: std::sync::Arc<crate::secure_key::SecretVault>,
+) -> Result<()> {
+    let mut store = CredentialStore::from_vault(vault)?;
     clear_credential_in_store(&mut store)
 }
 

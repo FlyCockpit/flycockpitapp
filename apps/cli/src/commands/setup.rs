@@ -871,6 +871,8 @@ mod tests {
             let guard = crate::test_env::lock_async().await;
             guard.set_var(COCKPIT_CONFIG_ENV, path);
             guard.set_var("XDG_STATE_HOME", state_home);
+            guard.set_var("XDG_DATA_HOME", state_home);
+            guard.set_var("COCKPIT_TEST_NO_KEYRING", "1");
             Self { _guard: guard }
         }
     }
@@ -1204,7 +1206,7 @@ mod tests {
         assert!(!io.output.contains(secret), "secret leaked in output");
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn baseten_provider_wizard_materializes_secret_reference() {
         let secret = "bt-provider-secret-abcdefghijklmnopqrstuvwxyz";
         {
@@ -1214,13 +1216,17 @@ mod tests {
             let _env = CockpitConfigEnvGuard::set_with_state_async(&config_path, &state_home).await;
             let mut io = ScriptIo::new(&["baseten", "", "", "paste-key", secret, "skip-test"]);
             let mut actions = ProviderSetupActions::new(tmp.path().to_path_buf());
-            let run = run_terminal_wizard(
-                crate::wizard::provider_descriptor(),
-                &mut io,
-                &true,
-                &mut actions,
+            let run = tokio::time::timeout(
+                Duration::from_secs(30),
+                run_terminal_wizard(
+                    crate::wizard::provider_descriptor(),
+                    &mut io,
+                    &true,
+                    &mut actions,
+                ),
             )
             .await
+            .unwrap_or_else(|_| panic!("paste-key wizard timed out; output={}", io.output))
             .expect("wizard completes");
             assert!(run.is_complete(), "output={}", io.output);
             let provider_path =
@@ -1249,13 +1255,17 @@ mod tests {
             let mut io2 =
                 ScriptIo::new(&["baseten", "", "", "env-var", "BASETEN_API_KEY", "skip-test"]);
             let mut actions2 = ProviderSetupActions::new(tmp2.path().to_path_buf());
-            run_terminal_wizard(
-                crate::wizard::provider_descriptor(),
-                &mut io2,
-                &true,
-                &mut actions2,
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                run_terminal_wizard(
+                    crate::wizard::provider_descriptor(),
+                    &mut io2,
+                    &true,
+                    &mut actions2,
+                ),
             )
             .await
+            .unwrap_or_else(|_| panic!("env-var wizard timed out; output={}", io2.output))
             .expect("env wizard");
             let raw2 = std::fs::read_to_string(
                 crate::config::providers::provider_file_path_for_config(&config_path2, "baseten")

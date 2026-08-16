@@ -616,6 +616,171 @@ CREATE TABLE local_media_operation_audit(local_operation_id TEXT PRIMARY KEY,out
 CREATE TABLE media_creation_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),next_value INTEGER NOT NULL);
 INSERT INTO media_creation_sequence(singleton,next_value) VALUES(1,1);
 
+-- Durable authority for media admission. Limits are deliberately absent:
+-- every acquisition carries the evaluated config-policy plan/version.
+CREATE TABLE media_reservations (
+    reservation_id TEXT PRIMARY KEY,
+    policy_version INTEGER NOT NULL CHECK(policy_version > 0),
+    project_id TEXT NOT NULL,
+    owner_session_key TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    recovery_id TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL CHECK(state IN ('reserved_queued','executing_local','dispatching_external','external_pending','reconciling_external','cancellation_requested','overage_quarantined','settling','released','accounting_corrupt')),
+    version INTEGER NOT NULL CHECK(version >= 1),
+    queue_sequence INTEGER NOT NULL UNIQUE CHECK(queue_sequence >= 1),
+    deadline_monotonic_ms INTEGER NOT NULL CHECK(deadline_monotonic_ms >= 0),
+    created_wall_ms INTEGER NOT NULL,
+    external_operation_id TEXT UNIQUE REFERENCES external_journal_operations(operation_id),
+    quarantined INTEGER NOT NULL DEFAULT 0 CHECK(quarantined IN (0,1)),
+    published INTEGER NOT NULL DEFAULT 0 CHECK(published IN (0,1)),
+    cancellation_requested INTEGER NOT NULL DEFAULT 0 CHECK(cancellation_requested IN (0,1))
+);
+CREATE INDEX idx_media_reservation_owner_purpose ON media_reservations(project_id, owner_session_key, purpose, state);
+-- Backstop for ReservationState::allows. Same-state no-ops are rejected;
+-- dispatching_external cannot return to executing_local.
+CREATE TRIGGER media_reservation_state_graph BEFORE UPDATE OF state ON media_reservations
+WHEN (OLD.state || '>' || NEW.state) NOT IN (
+    'reserved_queued>executing_local',
+    'reserved_queued>dispatching_external',
+    'reserved_queued>cancellation_requested',
+    'reserved_queued>settling',
+    'executing_local>dispatching_external',
+    'executing_local>cancellation_requested',
+    'executing_local>settling',
+    'executing_local>overage_quarantined',
+    'executing_local>accounting_corrupt',
+    'dispatching_external>external_pending',
+    'dispatching_external>cancellation_requested',
+    'dispatching_external>settling',
+    'dispatching_external>overage_quarantined',
+    'dispatching_external>accounting_corrupt',
+    'external_pending>reconciling_external',
+    'external_pending>cancellation_requested',
+    'external_pending>settling',
+    'external_pending>overage_quarantined',
+    'external_pending>accounting_corrupt',
+    'reconciling_external>external_pending',
+    'reconciling_external>cancellation_requested',
+    'reconciling_external>settling',
+    'reconciling_external>overage_quarantined',
+    'reconciling_external>accounting_corrupt',
+    'cancellation_requested>external_pending',
+    'cancellation_requested>reconciling_external',
+    'cancellation_requested>settling',
+    'cancellation_requested>overage_quarantined',
+    'cancellation_requested>accounting_corrupt',
+    'overage_quarantined>settling',
+    'overage_quarantined>accounting_corrupt',
+    'settling>released',
+    'settling>overage_quarantined',
+    'settling>accounting_corrupt'
+)
+BEGIN SELECT RAISE(ABORT, 'illegal media reservation state transition'); END;
+CREATE TABLE media_reservation_plan_facts (
+    reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id),
+    dimension TEXT NOT NULL,
+    plan_json TEXT NOT NULL,
+    PRIMARY KEY(reservation_id, dimension)
+);
+CREATE TRIGGER media_plan_fact_immutable_update BEFORE UPDATE ON media_reservation_plan_facts BEGIN SELECT RAISE(ABORT,'media plan facts are immutable'); END;
+CREATE TRIGGER media_plan_fact_immutable_delete BEFORE DELETE ON media_reservation_plan_facts BEGIN SELECT RAISE(ABORT,'media plan facts are immutable'); END;
+CREATE TABLE media_reservation_versions (
+    reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id),
+    version INTEGER NOT NULL CHECK(version >= 1),
+    state TEXT NOT NULL,
+    recorded_wall_ms INTEGER NOT NULL,
+    PRIMARY KEY(reservation_id, version)
+);
+CREATE TRIGGER media_reservation_version_insert AFTER INSERT ON media_reservations BEGIN
+    INSERT INTO media_reservation_versions(reservation_id,version,state,recorded_wall_ms) VALUES(NEW.reservation_id,NEW.version,NEW.state,NEW.created_wall_ms);
+END;
+CREATE TRIGGER media_reservation_version_update AFTER UPDATE OF version ON media_reservations BEGIN
+    INSERT INTO media_reservation_versions(reservation_id,version,state,recorded_wall_ms) VALUES(NEW.reservation_id,NEW.version,NEW.state,CAST(strftime('%s','now') AS INTEGER)*1000);
+END;
+CREATE TABLE media_queue_sequence (singleton INTEGER PRIMARY KEY CHECK(singleton=1), next_value INTEGER NOT NULL CHECK(next_value >= 1));
+INSERT INTO media_queue_sequence(singleton,next_value) VALUES(1,1);
+CREATE TABLE media_scheduler_cursor (singleton INTEGER PRIMARY KEY CHECK(singleton=1), last_session_id TEXT);
+INSERT INTO media_scheduler_cursor(singleton,last_session_id) VALUES(1,NULL);
+-- A reservation is schedulable only after its owner has finished collecting
+-- input. Keeping readiness durable lets the atomic fair claimant distinguish
+-- a slow upload from work that is actually waiting for an execution permit.
+CREATE TABLE media_execution_ready (
+    reservation_id TEXT PRIMARY KEY REFERENCES media_reservations(reservation_id),
+    ready_wall_ms INTEGER NOT NULL
+);
+CREATE TABLE media_reservation_deltas (
+    delta_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id),
+    reservation_version INTEGER NOT NULL CHECK(reservation_version >= 1),
+    dimension TEXT NOT NULL, scope_kind TEXT NOT NULL, scope_id TEXT NOT NULL,
+    estimated INTEGER NOT NULL CHECK(estimated >= 0), delta INTEGER NOT NULL,
+    charged_after INTEGER NOT NULL CHECK(charged_after >= 0),
+    fact_kind TEXT NOT NULL CHECK(fact_kind IN ('reserve','promote','release','actual','overage','durable_invocation','cleanup')),
+    created_wall_ms INTEGER NOT NULL,
+    UNIQUE(reservation_id, reservation_version, dimension, fact_kind)
+);
+CREATE INDEX idx_media_delta_owner ON media_reservation_deltas(scope_kind, scope_id, dimension);
+CREATE TRIGGER media_delta_immutable_update BEFORE UPDATE ON media_reservation_deltas BEGIN SELECT RAISE(ABORT,'media delta facts are immutable'); END;
+CREATE TRIGGER media_delta_immutable_delete BEFORE DELETE ON media_reservation_deltas BEGIN SELECT RAISE(ABORT,'media delta facts are immutable'); END;
+CREATE TABLE media_resource_counters (
+    scope_kind TEXT NOT NULL, scope_id TEXT NOT NULL, dimension TEXT NOT NULL,
+    charged INTEGER NOT NULL CHECK(charged >= 0), generation INTEGER NOT NULL CHECK(generation >= 0),
+    PRIMARY KEY(scope_kind, scope_id, dimension)
+);
+CREATE TABLE media_accounting_blocks (
+    scope_kind TEXT NOT NULL, scope_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(generation >= 1), reason TEXT NOT NULL,
+    PRIMARY KEY(scope_kind, scope_id)
+);
+CREATE TABLE media_artifact_facts (
+    artifact_id TEXT PRIMARY KEY, reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id),
+    dimension TEXT NOT NULL, byte_count INTEGER NOT NULL CHECK(byte_count >= 0), checksum TEXT NOT NULL,
+    quarantined INTEGER NOT NULL CHECK(quarantined IN (0,1)), deletion_tombstone_checksum TEXT
+);
+CREATE TRIGGER media_artifact_immutable_delete BEFORE DELETE ON media_artifact_facts BEGIN SELECT RAISE(ABORT,'media artifact facts are immutable'); END;
+CREATE TRIGGER media_artifact_immutable_update BEFORE UPDATE ON media_artifact_facts
+WHEN NEW.artifact_id!=OLD.artifact_id OR NEW.reservation_id!=OLD.reservation_id OR NEW.dimension!=OLD.dimension OR NEW.byte_count!=OLD.byte_count OR NEW.checksum!=OLD.checksum OR NEW.quarantined!=OLD.quarantined OR OLD.deletion_tombstone_checksum IS NOT NULL OR NEW.deletion_tombstone_checksum IS NULL
+BEGIN SELECT RAISE(ABORT,'media artifact facts are immutable'); END;
+CREATE TABLE media_cleanup_attestations (
+    reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id), dimension TEXT NOT NULL,
+    attestation_kind TEXT NOT NULL CHECK(attestation_kind='zero_materialized_or_verified_cleaned'),
+    checksum TEXT NOT NULL, created_wall_ms INTEGER NOT NULL, PRIMARY KEY(reservation_id,dimension)
+);
+CREATE TRIGGER media_cleanup_attestation_immutable_update BEFORE UPDATE ON media_cleanup_attestations BEGIN SELECT RAISE(ABORT,'media cleanup attestations are immutable'); END;
+CREATE TRIGGER media_cleanup_attestation_immutable_delete BEFORE DELETE ON media_cleanup_attestations BEGIN SELECT RAISE(ABORT,'media cleanup attestations are immutable'); END;
+CREATE TABLE media_accounting_corruption_facts (
+    reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id), reservation_version INTEGER NOT NULL CHECK(reservation_version >= 1),
+    dimension TEXT NOT NULL, unrepresentable_actual TEXT NOT NULL, reason TEXT NOT NULL, created_wall_ms INTEGER NOT NULL,
+    PRIMARY KEY(reservation_id, reservation_version, dimension)
+);
+CREATE TRIGGER media_corruption_fact_immutable_update BEFORE UPDATE ON media_accounting_corruption_facts BEGIN SELECT RAISE(ABORT,'media corruption facts are immutable'); END;
+CREATE TRIGGER media_corruption_fact_immutable_delete BEFORE DELETE ON media_accounting_corruption_facts BEGIN SELECT RAISE(ABORT,'media corruption facts are immutable'); END;
+CREATE TABLE media_repair_attempts (
+    attempt_id TEXT PRIMARY KEY, scope_kind TEXT NOT NULL, scope_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE, request_digest TEXT NOT NULL, plan_digest TEXT NOT NULL,
+    expected_block_generation INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('planned','rebuilding','verifying','committed','failed')),
+    outcome TEXT, current_counter_digest TEXT NOT NULL, rebuilt_counter_digest TEXT,
+    created_wall_ms INTEGER NOT NULL, updated_wall_ms INTEGER NOT NULL
+);
+CREATE INDEX idx_media_repair_scope ON media_repair_attempts(scope_kind, scope_id, created_wall_ms);
+CREATE TRIGGER media_repair_state_graph BEFORE UPDATE OF state ON media_repair_attempts WHEN NOT (
+    (OLD.state='planned' AND NEW.state='rebuilding') OR (OLD.state='rebuilding' AND NEW.state='verifying') OR
+    (OLD.state='verifying' AND NEW.state IN ('committed','failed')) OR OLD.state=NEW.state
+) BEGIN SELECT RAISE(ABORT, 'invalid media repair state transition'); END;
+CREATE TABLE media_counter_shadow (
+    attempt_id TEXT NOT NULL REFERENCES media_repair_attempts(attempt_id) ON DELETE CASCADE,
+    dimension TEXT NOT NULL, charged INTEGER NOT NULL CHECK(charged >= 0), PRIMARY KEY(attempt_id, dimension)
+);
+CREATE TABLE media_downstream_ownership (
+    reservation_id TEXT PRIMARY KEY REFERENCES media_reservations(reservation_id),
+    invocation_id TEXT NOT NULL,
+    bound_wall_ms INTEGER NOT NULL,
+    released_wall_ms INTEGER
+);
+CREATE INDEX idx_media_downstream_invocation ON media_downstream_ownership(invocation_id);
+
 CREATE INDEX idx_sessions_project_started ON sessions (project_id, started_at DESC);
 CREATE INDEX idx_sessions_last_active     ON sessions (last_active_at DESC);
 CREATE INDEX idx_sessions_open            ON sessions (ended_at) WHERE ended_at IS NULL;
@@ -638,12 +803,12 @@ CREATE INDEX idx_sessions_assistant ON sessions (assistant_name, last_active_at 
   WHERE assistant_name IS NOT NULL;
 
 -- ---- sealed_values ---------------------------------------------------------
--- Session-owned write-only values.  The literal is deliberately kept in the
--- private session database, like persisted transcript and redaction data.
+-- Session-owned write-only values. The literal column is nullable so a vault
+-- item can replace the plaintext without a rebuild dance.
 CREATE TABLE sealed_values (
     session_id TEXT NOT NULL,
     value_id   TEXT NOT NULL,
-    value      TEXT NOT NULL,
+    value      TEXT,
     reason     TEXT NOT NULL,
     origin     TEXT NOT NULL,
     created_at INTEGER NOT NULL,
@@ -1084,11 +1249,15 @@ CREATE TABLE inference_requests (
     first_token_ms INTEGER,                     -- phase: dispatch -> first token (ms)
     completed_ms   INTEGER,                     -- phase: dispatch -> completion (ms)
     failed_ms      INTEGER,                     -- phase: dispatch -> failure/timeout (ms)
+    goal_id TEXT,                               -- immutable host-goal attribution at dispatch
+    goal_attempt_generation INTEGER,            -- attempt generation captured with goal_id
     PRIMARY KEY (call_id, ordinal),
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
 
 CREATE INDEX idx_ireq_session ON inference_requests (session_id);
+CREATE INDEX idx_ireq_goal_provenance
+    ON inference_requests (goal_id, goal_attempt_generation);
 
 CREATE TABLE session_events (
     seq         INTEGER PRIMARY KEY AUTOINCREMENT, -- globally monotonic order
@@ -1748,6 +1917,8 @@ CREATE INDEX idx_task_todo_assignments_session
     ON task_todo_assignments(session_id, task_call_id, label, created_at);
 
 -- ---- session_goals (`/goal`) --------------------------------------------------------------
+-- Host-supervised goal loop: disposition/phase lifecycle plus durable
+-- control-job and root-turn tables. Pre-release: this is the only definition.
 
 CREATE TABLE session_goals (
     id TEXT PRIMARY KEY,
@@ -1755,24 +1926,73 @@ CREATE TABLE session_goals (
     project_id TEXT NOT NULL,
     objective TEXT NOT NULL,
     context TEXT,
-    status TEXT NOT NULL CHECK (status IN ('active', 'paused', 'blocked', 'pending_verification', 'complete', 'budget_limited', 'usage_limited')),
-    token_budget INTEGER,
+    disposition TEXT NOT NULL CHECK (disposition IN ('running', 'user_paused', 'infra_paused', 'blocked', 'no_progress_paused', 'budget_limited', 'complete', 'cleared')),
+    phase TEXT CHECK (phase IS NULL OR phase IN ('planning', 'executing', 'evaluating', 'verifying')),
+    resume_phase TEXT CHECK (resume_phase IS NULL OR resume_phase IN ('planning', 'executing', 'evaluating', 'verifying')),
+    pause_reason TEXT,
+    attempt_generation INTEGER NOT NULL DEFAULT 0 CHECK (attempt_generation >= 0),
+    contract_json TEXT,
+    resolved_policy_json TEXT NOT NULL,
+    evaluator_outcome_json TEXT,
+    verifier_outcome_json TEXT,
+    unresolved_gaps_json TEXT NOT NULL DEFAULT '[]',
+    gap_fingerprints_json TEXT NOT NULL DEFAULT '[]',
+    previous_gap_set_hash TEXT,
+    blocker_key TEXT,
+    blocker_key_streak INTEGER NOT NULL DEFAULT 0,
+    token_budget INTEGER NOT NULL CHECK (token_budget > 0),
+    token_accounting_baseline INTEGER NOT NULL DEFAULT 0,
     tokens_used INTEGER NOT NULL DEFAULT 0,
+    elapsed_active_ms INTEGER NOT NULL DEFAULT 0 CHECK (elapsed_active_ms >= 0),
+    active_since INTEGER,
+    lifecycle_history_json TEXT NOT NULL DEFAULT '[]',
     blocked_attempts INTEGER NOT NULL DEFAULT 0,
     completion_evidence TEXT,
     verification_rounds INTEGER NOT NULL DEFAULT 0,
     last_read_at INTEGER,
+    cleared_at INTEGER,
     created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    CHECK ((disposition = 'running' AND phase IS NOT NULL AND resume_phase IS NULL)
+        OR (disposition <> 'running' AND phase IS NULL)),
+    CHECK ((disposition IN ('complete', 'cleared') AND resume_phase IS NULL)
+        OR disposition NOT IN ('complete', 'cleared'))
 );
 
--- At most one goal in a non-terminal status per session.
 CREATE UNIQUE INDEX idx_session_goals_one_open
     ON session_goals(session_id)
-    WHERE status IN ('active', 'paused', 'blocked', 'pending_verification', 'budget_limited', 'usage_limited');
-
+    WHERE disposition IN ('running', 'user_paused', 'infra_paused', 'blocked', 'no_progress_paused', 'budget_limited');
 CREATE INDEX idx_session_goals_session_status
-    ON session_goals(session_id, status, updated_at DESC);
+    ON session_goals(session_id, disposition, updated_at DESC);
+
+CREATE TABLE goal_control_jobs (
+    job_id TEXT PRIMARY KEY,
+    goal_id TEXT NOT NULL REFERENCES session_goals(id) ON DELETE CASCADE,
+    attempt_generation INTEGER NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('planner', 'evaluator', 'gatekeeper', 'cold_skeptic')),
+    slot INTEGER NOT NULL CHECK (slot >= 0),
+    request_json TEXT NOT NULL,
+    result_json TEXT,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'leased', 'finished', 'cancelled')),
+    lease_expires_at INTEGER,
+    cancel_reason TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(goal_id, attempt_generation, role, slot)
+);
+CREATE INDEX idx_goal_control_jobs_registered
+    ON goal_control_jobs(goal_id, state, attempt_generation);
+
+CREATE TABLE goal_root_turns (
+    goal_id TEXT NOT NULL REFERENCES session_goals(id) ON DELETE CASCADE,
+    attempt_generation INTEGER NOT NULL,
+    turn_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'leased', 'finished', 'cancelled')),
+    audit_excerpt TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(goal_id, attempt_generation, turn_id)
+);
 
 -- ---- compressed_tool_results ------------------------------------------------------------
 -- Durable retrieval records for compressed/truncated non-file tool
@@ -4723,4 +4943,74 @@ CREATE TABLE remote_daemon_custody_records (
     public_key_y     BLOB    NOT NULL CHECK (length(public_key_y) = 32),
     evidence_digest  BLOB    NOT NULL CHECK (length(evidence_digest) = 32),
     created_at       INTEGER NOT NULL
+);
+
+-- ---- wrap-key secret vault -------------------------------------------------
+-- Coordination + AEAD ciphertext + wrapped DEKs only. KEK bytes and DEK
+-- plaintext never live in SQLite. First-run persists intent=keyring /
+-- active_placement=keyring when the OS keyring probe is available, else
+-- database. dest=database is rejected while the probe is available.
+
+-- Installation-scoped authority singleton. No secret bytes.
+CREATE TABLE secret_vault_authority (
+    id                    INTEGER PRIMARY KEY CHECK (id = 1),
+    intent                TEXT    NOT NULL CHECK (intent IN ('database', 'keyring')),
+    active_placement      TEXT    NOT NULL CHECK (active_placement IN ('database', 'keyring')),
+    kek_fingerprint       TEXT    NOT NULL,
+    kek_version           INTEGER NOT NULL CHECK (kek_version >= 1),
+    wrap_version          INTEGER NOT NULL CHECK (wrap_version = 1),
+    updated_at            INTEGER NOT NULL
+);
+
+-- Wrapped DEKs. No KEK bytes. No DEK plaintext.
+CREATE TABLE secret_vault_keys (
+    key_version   INTEGER PRIMARY KEY CHECK (key_version >= 1),
+    kek_version   INTEGER NOT NULL CHECK (kek_version >= 1),
+    wrap_version  INTEGER NOT NULL CHECK (wrap_version = 1),
+    algorithm     TEXT    NOT NULL CHECK (algorithm = 'chacha20poly1305'),
+    wrap_nonce    BLOB    NOT NULL CHECK (length(wrap_nonce) = 12),
+    wrapped_dek   BLOB    NOT NULL CHECK (length(wrapped_dek) = 48),
+    active        INTEGER NOT NULL CHECK (active IN (0, 1)),
+    created_at    INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX secret_vault_keys_wrap_nonce ON secret_vault_keys(wrap_nonce);
+CREATE UNIQUE INDEX secret_vault_keys_one_active ON secret_vault_keys(active) WHERE active = 1;
+
+-- AEAD items. AAD is rebuilt from columns + installation_identity; no stored AAD blob.
+CREATE TABLE secret_vault_items (
+    kind          TEXT    NOT NULL CHECK (kind IN (
+        'secure_key_root',
+        'secure_key_manifest',
+        'sealed_state',
+        'credential_record',
+        'named_secret',
+        'subscription_ack',
+        'sealed_compartment',
+        'session_sealed_value',
+        'redaction_table'
+    )),
+    item_id       TEXT    NOT NULL,
+    key_version   INTEGER NOT NULL REFERENCES secret_vault_keys(key_version),
+    nonce         BLOB    NOT NULL CHECK (length(nonce) = 12),
+    ciphertext    BLOB    NOT NULL CHECK (length(ciphertext) >= 16),
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL,
+    PRIMARY KEY (kind, item_id)
+);
+CREATE UNIQUE INDEX secret_vault_items_key_nonce ON secret_vault_items(key_version, nonce);
+
+-- Durable KEK-placement migrate. Coordination only; no secret bytes.
+CREATE TABLE secret_vault_sagas (
+    op_id              TEXT    PRIMARY KEY,
+    source_placement   TEXT    NOT NULL CHECK (source_placement IN ('database', 'keyring')),
+    dest_placement     TEXT    NOT NULL CHECK (dest_placement IN ('database', 'keyring')),
+    kek_fingerprint    TEXT    NOT NULL,
+    phase              TEXT    NOT NULL CHECK (phase IN (
+        'prepared',
+        'activated',
+        'source_deleted',
+        'complete'
+    )),
+    created_at         INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL
 );

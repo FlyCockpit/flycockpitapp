@@ -54,6 +54,12 @@ pub struct DependencyProjection {
 impl DependencyProjection {
     pub fn has_required_failures(&self) -> bool {
         self.rows.iter().any(|row| {
+            // Missing keyring is dest=Database fallback, not a failed doctor
+            // check. IsolatedHome unsets DBUS so detach cannot hang in
+            // Secret Service; doctor must still exit 0 when the rest is clean.
+            if row.id == super::ID_KEYRING && matches!(row.state, DependencyViewState::Missing) {
+                return false;
+            }
             is_required(row.importance)
                 && !matches!(
                     row.state,

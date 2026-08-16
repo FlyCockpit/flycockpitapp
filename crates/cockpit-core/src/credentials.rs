@@ -3,13 +3,13 @@
 //! Production construction is [`CredentialStore::from_vault`]. Provider records,
 //! named secrets, and subscription-ack flags live as AEAD items
 //! (`credential_record`, `named_secret`, `subscription_ack`). A leftover
-//! `credentials.json` is import-only: the unification saga copies, verifies,
-//! activates, then deletes the file. After activate, `save` / `set` write
-//! vault rows only and must not recreate the JSON path.
+//! `credentials.json` may still exist on disk. After the vault is the
+//! authority, `save` / `set` write vault rows only and must not recreate the
+//! JSON path.
 //!
-//! Path-open remains for the import saga and for `#[cfg(test)]` fixtures that
-//! have not yet moved. Production login, refresh, logout, MCP, provider-header,
-//! `ask`, and setup paths use the injected vault handle.
+//! Path-open remains for `#[cfg(test)]` fixtures that have not yet moved.
+//! Production login, refresh, logout, MCP, provider-header, `ask`, and setup
+//! paths use the injected vault handle.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -96,9 +96,7 @@ impl CredentialStore {
 
     /// Read a leftover `credentials.json` for the import saga.
     pub(crate) fn open_legacy_file(path: PathBuf) -> Result<Self> {
-        if path.exists() {
-            ensure_parent_dir_private(&path)?;
-        }
+        ensure_parent_dir_private(&path)?;
         let data = read_credential_file(&path)?;
         Ok(Self {
             backend: CredentialBackend::LegacyFile { path },
@@ -117,6 +115,17 @@ impl CredentialStore {
         Self::from_vault(vault)
     }
 
+    /// Settings/test fixtures pass an explicit leftover JSON path. Production
+    /// construction with `None` stays on the process vault.
+    pub fn open_for_path_or_default(path: Option<&Path>) -> Result<Self> {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(path) = path {
+            return Self::open(path.to_path_buf());
+        }
+        let _ = path;
+        Self::open_default()
+    }
+
     /// Open the credential store without creating parent directories, lock
     /// files, or repairing permissions. Test / diagnostic fixtures only.
     #[cfg(any(test, feature = "test-support"))]
@@ -133,14 +142,6 @@ impl CredentialStore {
 
     pub fn open_default_readonly() -> Result<Self> {
         Self::open_default()
-    }
-
-    pub(crate) fn records_for_import(&self) -> impl Iterator<Item = (String, Value)> + '_ {
-        self.records.iter().map(|(k, v)| (k.clone(), v.clone()))
-    }
-
-    pub(crate) fn secrets_for_import(&self) -> impl Iterator<Item = (String, String)> + '_ {
-        self.secrets.iter().map(|(k, v)| (k.clone(), v.clone()))
     }
 
     pub fn get(&self, provider_id: &str) -> Option<&Value> {
@@ -790,238 +791,6 @@ mod tests {
         env.set_var("XDG_STATE_HOME", tmp.path());
         let path = default_path().unwrap();
         assert!(path.starts_with(tmp.path()));
-    }
-
-    fn test_vault() -> (tempfile::TempDir, crate::db::Db, Arc<SecretVault>) {
-        // Open without unify_remaining_stores: boot would no-op-activate an
-        // empty credentials store and hide fail-closed import faults.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let db = crate::db::Db::open(&tmp.path().join("cockpit.db")).unwrap();
-        let installation = db
-            .blocking_write_for_sync_maintenance(
-                crate::db::installation_identity::ensure_installation_identity_conn,
-            )
-            .unwrap();
-        let kek = Arc::new(crate::secure_key::MemoryKekStore::new(
-            cockpit_proto::SecretStorePlacement::Database,
-        ));
-        let vault = crate::secure_key::SecretVault::initialize(db.clone(), kek, installation, 1, 1)
-            .unwrap();
-        (tmp, db, Arc::new(vault))
-    }
-
-    #[test]
-    fn import_credentials_json_then_delete_file() {
-        let (tmp, _db, vault) = test_vault();
-        let path = tmp.path().join("credentials.json");
-        let mut seed = CredentialStore::open(path.clone()).unwrap();
-        seed.set(
-            "flycockpit",
-            serde_json::json!({
-                "server_url": "https://app.example",
-                "instance_id": "inst",
-                "instance_token": "fci_import_token",
-                "account": {"user_id": "u", "email": "u@example.test"}
-            }),
-        );
-        seed.set(
-            "codex-oauth",
-            serde_json::json!({
-                "access_token": "access-import-token",
-                "refresh_token": "refresh-import-token"
-            }),
-        );
-        seed.set_named_secret("provider-header", "named-import-secret");
-        seed.set(
-            "subscription-oauth-ack:codex-oauth",
-            serde_json::json!(true),
-        );
-        seed.save().unwrap();
-        assert!(path.exists());
-
-        crate::secure_key::import_credentials_from_path(
-            &vault,
-            &path,
-            &crate::secure_key::VaultFault::default(),
-        )
-        .unwrap();
-        assert!(
-            !path.exists(),
-            "credentials.json must be deleted after activate"
-        );
-
-        let store = CredentialStore::from_vault(vault).unwrap();
-        assert_eq!(
-            store
-                .get("flycockpit")
-                .and_then(|v| v.get("instance_token"))
-                .and_then(|v| v.as_str()),
-            Some("fci_import_token")
-        );
-        assert_eq!(
-            store
-                .get("codex-oauth")
-                .and_then(|v| v.get("refresh_token"))
-                .and_then(|v| v.as_str()),
-            Some("refresh-import-token")
-        );
-        assert_eq!(
-            store.named_secret("provider-header"),
-            Some("named-import-secret")
-        );
-        assert_eq!(
-            store
-                .get("subscription-oauth-ack:codex-oauth")
-                .and_then(|v| v.as_bool()),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn import_credentials_fails_closed_before_activation() {
-        let (tmp, db, vault) = test_vault();
-        let path = tmp.path().join("credentials.json");
-        let mut seed = CredentialStore::open(path.clone()).unwrap();
-        seed.set_api_key("p", "secret-to-keep-on-disk");
-        seed.save().unwrap();
-
-        let err = crate::secure_key::import_credentials_from_path(
-            &vault,
-            &path,
-            &crate::secure_key::VaultFault::at(
-                crate::secure_key::VaultFaultPoint::BeforeActivation,
-            ),
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("injected vault fault"));
-        assert!(
-            path.exists(),
-            "file must remain when activation never commits"
-        );
-        let authoritative = crate::secure_key::store_is_vault_authoritative(
-            &db,
-            cockpit_db::secret_vault::SecretVaultStore::Credentials,
-        )
-        .unwrap();
-        assert!(!authoritative, "vault must not become authoritative");
-    }
-
-    #[test]
-    fn import_credentials_resumes_after_activation() {
-        let (tmp, _db, vault) = test_vault();
-        let path = tmp.path().join("credentials.json");
-        let mut seed = CredentialStore::open(path.clone()).unwrap();
-        seed.set_api_key("p", "resume-after-activate");
-        seed.save().unwrap();
-
-        crate::secure_key::import_credentials_from_path(
-            &vault,
-            &path,
-            &crate::secure_key::VaultFault::at(crate::secure_key::VaultFaultPoint::AfterActivation),
-        )
-        .unwrap_err();
-        assert!(path.exists(), "source leftover after activation crash");
-
-        crate::secure_key::resume_credentials_import_after_activation(
-            &vault,
-            &path,
-            &crate::secure_key::VaultFault::default(),
-        )
-        .unwrap();
-        assert!(
-            !path.exists(),
-            "resume after activate deletes leftover file"
-        );
-        let store = CredentialStore::from_vault(vault).unwrap();
-        assert_eq!(store.api_key("p").as_deref(), Some("resume-after-activate"));
-    }
-
-    #[test]
-    fn import_credentials_activation_txn_rollback() {
-        let (tmp, db, vault) = test_vault();
-        let path = tmp.path().join("credentials.json");
-        let mut seed = CredentialStore::open(path.clone()).unwrap();
-        seed.set_api_key("p", "rollback-token");
-        seed.save().unwrap();
-
-        let err = crate::secure_key::import_credentials_from_path(
-            &vault,
-            &path,
-            &crate::secure_key::VaultFault::at(
-                crate::secure_key::VaultFaultPoint::InsideActivation,
-            ),
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("injected vault fault"));
-        assert!(path.exists());
-        let authoritative = crate::secure_key::store_is_vault_authoritative(
-            &db,
-            cockpit_db::secret_vault::SecretVaultStore::Credentials,
-        )
-        .unwrap();
-        assert!(!authoritative);
-    }
-
-    #[test]
-    fn import_credentials_resumes_after_source_delete() {
-        let (tmp, _db, vault) = test_vault();
-        let path = tmp.path().join("credentials.json");
-        let mut seed = CredentialStore::open(path.clone()).unwrap();
-        seed.set_api_key("p", "after-delete");
-        seed.save().unwrap();
-
-        crate::secure_key::import_credentials_from_path(
-            &vault,
-            &path,
-            &crate::secure_key::VaultFault::at(
-                crate::secure_key::VaultFaultPoint::AfterSourceDelete,
-            ),
-        )
-        .unwrap_err();
-        assert!(!path.exists(), "source already deleted");
-
-        crate::secure_key::resume_credentials_import_after_activation(
-            &vault,
-            &path,
-            &crate::secure_key::VaultFault::default(),
-        )
-        .unwrap();
-        let store = CredentialStore::from_vault(vault).unwrap();
-        assert_eq!(store.api_key("p").as_deref(), Some("after-delete"));
-    }
-
-    #[test]
-    fn credentials_json_not_recreated_after_vault_activate() {
-        let (tmp, _db, vault) = test_vault();
-        let path = tmp.path().join("credentials.json");
-        let mut seed = CredentialStore::open(path.clone()).unwrap();
-        seed.set_api_key("p", "initial");
-        seed.save().unwrap();
-        crate::secure_key::import_credentials_from_path(
-            &vault,
-            &path,
-            &crate::secure_key::VaultFault::default(),
-        )
-        .unwrap();
-        assert!(!path.exists());
-
-        let mut store = CredentialStore::from_vault(vault).unwrap();
-        store.set_api_key("p", "updated-after-activate");
-        store.set_named_secret("extra", "named-after-activate");
-        store.save().unwrap();
-        assert!(!path.exists(), "save must not recreate credentials.json");
-        assert!(!path.with_extension("json.lock").exists());
-        let parent = path.parent().unwrap();
-        if let Ok(entries) = std::fs::read_dir(parent) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                assert!(
-                    !name.contains("credentials.json"),
-                    "production save recreated {name}"
-                );
-            }
-        }
     }
 
     #[test]

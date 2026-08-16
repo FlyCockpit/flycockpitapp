@@ -20,6 +20,22 @@ test-group = "daemon-lifecycle-replay"
 filter = "test(=daemon::server::tests::in_process_full_event_queue_emits_lag_marker)"
 slow-timeout = { period = "90s", terminate-after = 3 }
 
+# Socket-per-cell authz matrix; ~2min once every controlled kind is covered.
+[[profile.default.overrides]]
+filter = "test(=daemon::server::tests::authz_dispatch_matrix_covers_every_controlled_kind)"
+slow-timeout = { period = "90s", terminate-after = 4 }
+
+# Detached IsolatedHome boot applies 0001 + vault before accept; handshake
+# waits up to 90s for the hello line rather than execing status in a loop.
+[[profile.default.overrides]]
+filter = "package(cockpit-cli) & binary(e2e) & test(/daemon_lifecycle/)"
+slow-timeout = { period = "90s", terminate-after = 3 }
+
+# Two sequential vault-backed provider wizards; first apply is ~60s.
+[[profile.default.overrides]]
+filter = "test(=commands::setup::tests::baseten_provider_wizard_materializes_secret_reference)"
+slow-timeout = { period = "90s", terminate-after = 3 }
+
 # Inner-loop profile for iterative agent runs. Skips only apps/cli's
 # integration-test binary (`kind(test)`), which spawns the real `cockpit`
 # binary and live daemons — the most expensive link + runtime in the

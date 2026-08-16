@@ -1,31 +1,5 @@
 use super::*;
-use crate::sealed::SealedCompartmentKey;
 use cockpit_db::db::sealed_scope::{NewSealedValueRecord, stage_session_sealed_create_conn};
-use cockpit_db::secret_vault::SecretVaultKind;
-
-#[tokio::test]
-async fn import_sealed_compartment_then_delete_file() {
-    let tmp = tempfile::tempdir().unwrap();
-    let db = crate::db::Db::open(&tmp.path().join("cockpit.db")).unwrap();
-    let vault = crate::secure_key::vault_for_db(&db).unwrap();
-    let path = tmp.path().join("sealed-compartment.json");
-    let file = SealedCompartment::at(path.clone());
-    let key = SealedCompartmentKey::generate();
-    file.put(&key, &SealedLiteral::new(TEST_LITERAL)).unwrap();
-    assert!(path.exists());
-
-    crate::secure_key::import_sealed_compartment_from_path(
-        &vault,
-        &path,
-        &crate::secure_key::VaultFault::default(),
-    )
-    .unwrap();
-    assert!(!path.exists(), "sealed-compartment.json must be deleted");
-
-    let compartment = SealedCompartment::from_vault(vault);
-    let got = compartment.get_exact(&key).unwrap().unwrap();
-    assert_eq!(got.handle().expose(), TEST_LITERAL);
-}
 
 #[tokio::test]
 async fn sealed_vault_create_rotate_delete_preserves_invariants() {
@@ -244,61 +218,4 @@ async fn sealed_vault_crash_recovery_delete_rolls_forward() {
         .await
         .unwrap();
     assert_eq!(tombstoned, 1);
-}
-
-#[tokio::test]
-async fn sealed_vault_legacy_adoption() {
-    let tmp = tempfile::tempdir().unwrap();
-    let db = crate::db::Db::open(&tmp.path().join("cockpit.db")).unwrap();
-    let session = db.create_session("p", "/repo", "Build").await.unwrap();
-    db.blocking_write_for_sync_maintenance({
-        let sid = session.session_id.to_string();
-        move |conn| {
-            conn.execute(
-                "INSERT INTO sealed_values (session_id, value_id, value, reason, origin, created_at)
-                 VALUES (?1, 'legacy', 'legacy-plaintext-literal', 'r', 'user', 1)",
-                rusqlite::params![sid],
-            )?;
-            Ok(())
-        }
-    })
-    .unwrap();
-    let path = tmp.path().join("sealed-compartment.json");
-    let file = SealedCompartment::at(path.clone());
-    let key = SealedCompartmentKey::generate();
-    file.put(&key, &SealedLiteral::new(TEST_LITERAL)).unwrap();
-
-    let vault = crate::secure_key::vault_for_db(&db).unwrap();
-    crate::secure_key::unify_remaining_stores(&vault, &crate::secure_key::VaultFault::default())
-        .unwrap();
-
-    let raw: Option<String> = db
-        .blocking_write_for_sync_maintenance({
-            let sid = session.session_id.to_string();
-            move |conn| {
-                Ok(conn.query_row(
-                    "SELECT value FROM sealed_values WHERE session_id = ?1 AND value_id = 'legacy'",
-                    rusqlite::params![sid],
-                    |row| row.get(0),
-                )?)
-            }
-        })
-        .unwrap();
-    assert!(
-        raw.as_deref()
-            .is_none_or(|v| v != "legacy-plaintext-literal"),
-        "raw SQL value must not stay plaintext"
-    );
-    assert!(
-        !path.exists()
-            || !std::fs::read_to_string(&path)
-                .unwrap()
-                .contains(TEST_LITERAL)
-    );
-    let item_id =
-        crate::secure_key::session_sealed_item_id(&session.session_id.to_string(), "legacy", 1);
-    let got = vault
-        .get_item(SecretVaultKind::SessionSealedValue, &item_id)
-        .unwrap();
-    assert_eq!(got.as_slice(), b"legacy-plaintext-literal");
 }

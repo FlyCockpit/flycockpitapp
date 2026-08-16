@@ -1401,13 +1401,17 @@ fn secure_key_platform_compile_and_fake_injection() {
     assert!(store.call_counts().0 >= 1);
     actor.shutdown();
 
-    // First-run production is always database: no platform store registration.
+    // First-run production is keyring when the probe is available.
+    // Injected MemoryKekStores must not register the platform store.
     reset_registration_order_for_test();
     set_test_skip_real_default_store(true);
     let tmp = tempfile::TempDir::new().unwrap();
     let db = Db::open(&tmp.path().join("cockpit.db")).unwrap();
-    let kek = std::sync::Arc::new(super::MemoryKekStore::new(
+    let file_kek = std::sync::Arc::new(super::MemoryKekStore::new(
         cockpit_proto::SecretStorePlacement::Database,
+    ));
+    let keyring_kek = std::sync::Arc::new(super::MemoryKekStore::new(
+        cockpit_proto::SecretStorePlacement::Keyring,
     ));
     let actor = SecureKeyActor::start_production_resolved(
         db,
@@ -1420,8 +1424,8 @@ fn secure_key_platform_compile_and_fake_injection() {
         },
         Some(tmp.path().join("secret-vault")),
         super::SecretStoreInjected {
-            file_kek: Some(kek),
-            keyring_kek: None,
+            file_kek: Some(file_kek.clone()),
+            keyring_kek: Some(keyring_kek.clone()),
             legacy_keyring: None,
         },
     )
@@ -1429,8 +1433,10 @@ fn secure_key_platform_compile_and_fake_injection() {
     let snap_mid = registration_order_snapshot();
     assert_eq!(
         snap_mid.set_default_at, 0,
-        "first-run database must not register the platform store: {snap_mid:?}"
+        "injected keyring first-run must not register the platform store: {snap_mid:?}"
     );
+    assert_eq!(keyring_kek.len(), 1);
+    assert_eq!(file_kek.len(), 0);
     actor.shutdown();
     set_test_skip_real_default_store(false);
     reset_registration_order_for_test();

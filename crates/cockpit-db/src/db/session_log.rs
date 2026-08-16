@@ -480,7 +480,10 @@ impl std::fmt::Debug for InferenceRequestRow {
             .field("ordinal", &self.ordinal)
             .field("session_id", &self.session_id)
             .field("ts_ms", &self.ts_ms)
-            .field("payload", &format_args!("{}", redacted_json_debug(&self.payload)))
+            .field(
+                "payload",
+                &format_args!("{}", redacted_json_debug(&self.payload)),
+            )
             .field("status", &self.status)
             .field("provider", &self.provider)
             .field("model", &self.model)
@@ -519,7 +522,10 @@ impl std::fmt::Debug for ImportedInferenceRequest<'_> {
             .field("ordinal", &self.ordinal)
             .field("session_id", &self.session_id)
             .field("ts_ms", &self.ts_ms)
-            .field("payload", &format_args!("{}", redacted_json_debug(self.payload)))
+            .field(
+                "payload",
+                &format_args!("{}", redacted_json_debug(self.payload)),
+            )
             .field("status", &self.status)
             .field("provider", &self.provider)
             .field("model", &self.model)
@@ -1797,12 +1803,19 @@ mod tests {
             1,
             "tool_call_scheduling must appear exactly once in ALL"
         );
-        assert_eq!(SessionEventKind::ToolCallScheduling.as_str(), "tool_call_scheduling");
+        assert_eq!(
+            SessionEventKind::ToolCallScheduling.as_str(),
+            "tool_call_scheduling"
+        );
         // The kind grew the inventory to 28 (appended, not substituted) and
         // every wire string is distinct.
         assert_eq!(SessionEventKind::ALL.len(), 28);
         let unique: std::collections::BTreeSet<&str> = kinds.iter().copied().collect();
-        assert_eq!(unique.len(), kinds.len(), "event-kind strings must be distinct");
+        assert_eq!(
+            unique.len(),
+            kinds.len(),
+            "event-kind strings must be distinct"
+        );
     }
 
     #[tokio::test]
@@ -3918,7 +3931,10 @@ mod tests {
         assert!(rendered.contains("REDACTED"), "missing marker: {rendered}");
         // Non-body metadata stays visible.
         assert!(rendered.contains("call-1"), "dropped call_id: {rendered}");
-        assert!(rendered.contains("anthropic"), "dropped provider: {rendered}");
+        assert!(
+            rendered.contains("anthropic"),
+            "dropped provider: {rendered}"
+        );
     }
 
     #[test]

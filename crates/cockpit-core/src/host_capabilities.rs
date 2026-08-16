@@ -100,6 +100,41 @@ impl HostCapabilityProbeInputs {
         }
     }
 
+    /// In-process unit tests must not exec host ffmpeg/docker/keyring probes.
+    #[cfg(test)]
+    pub fn for_unit_tests(cwd: PathBuf) -> Self {
+        Self {
+            keyring: KeyringProbeSource::Injected {
+                result: KeyringProbeResult {
+                    state: FeatureCapabilityState::Missing,
+                    reason: "unit test: no host keyring".into(),
+                    fix_command: None,
+                    remedy_text: None,
+                },
+                calls: Arc::new(AtomicUsize::new(0)),
+            },
+            sandbox: SandboxProbeSource::Injected(SandboxAvailability::Unavailable {
+                reason: "unit test: no sandbox".into(),
+                fix_command: None,
+            }),
+            container: ContainerProbeSource::Injected {
+                availability: ContainerAvailability {
+                    runtime: None,
+                    harness_in_container: false,
+                    available: false,
+                    reason: Some(ContainerUnavailableReason::NoRuntime),
+                },
+                detect_calls: Arc::new(AtomicUsize::new(0)),
+            },
+            catalog: CatalogProbeSource::Injected(ExternalRuntimeSnapshot::empty(
+                1,
+                detect_host_platform(),
+            )),
+            platform: detect_host_platform(),
+            cwd,
+        }
+    }
+
     pub fn for_refresh(&self) -> Self {
         let mut next = self.clone();
         if matches!(next.container, ContainerProbeSource::ReuseSnapshot) {
@@ -345,7 +380,6 @@ fn reconcile_secret_store_with_probe(
                     .fix_command
                     .clone()
                     .or_else(|| Some(crate::secure_key::DEFAULT_FIX_COMMAND.to_string())),
-                unification_complete: previous.unification_complete,
             }
         }
         cockpit_proto::SecretStoreIntent::Keyring if probe.state.is_available() => {
@@ -354,7 +388,6 @@ fn reconcile_secret_store_with_probe(
                 effective_placement: cockpit_proto::SecretStorePlacement::Keyring,
                 fail_closed_reason: None,
                 fix_command: None,
-                unification_complete: previous.unification_complete,
             }
         }
         _ => previous,

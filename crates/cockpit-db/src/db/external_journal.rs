@@ -3438,13 +3438,10 @@ mod tests {
             );
         }
 
-        // The external-journal schema lives entirely in `0001_initial.sql`;
-        // later migrations (`0002_goal_inference_provenance`,
-        // `0003_media_resource_reservation_ledger`, `0004_secret_vault`) add
-        // unrelated tables. Four migration files ship in this build, so the
-        // expected schema version is four. Adding a fifth migration must update
-        // this literal.
-        assert_eq!(crate::db::EXPECTED_SCHEMA_VERSION, 4);
+        // The external-journal schema lives entirely in `0001_initial.sql`.
+        // Pre-release: fold schema changes into that file. Do not append
+        // `0002_*`. The expected schema version is one.
+        assert_eq!(crate::db::EXPECTED_SCHEMA_VERSION, 1);
 
         let db = Db::open_in_memory().unwrap();
         let tables = db

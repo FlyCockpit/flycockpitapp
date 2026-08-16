@@ -1,5 +1,7 @@
 use sha2::{Digest, Sha256};
-use snow::{Builder, HandshakeState, TransportState, params::NoiseParams};
+#[cfg(feature = "test-entropy")]
+use snow::params::NoiseParams;
+use snow::{Builder, HandshakeState, TransportState};
 use zeroize::Zeroize;
 
 use crate::frame::{HandshakeFrame, MAX_HANDSHAKE_MESSAGE};

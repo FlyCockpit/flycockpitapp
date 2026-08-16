@@ -342,10 +342,15 @@ impl Db {
         apply_connection_pragmas(&conn, true)
             .with_context(|| format!("setting pragmas on {}", path.display()))?;
         repair_db_file_permissions(path);
-        // Remove in 0.2.0: carries only pre-0.1.0 databases whose old squash used user_version > 1.
-        if sqlite_schema_version(&conn)? > MIGRATIONS.len() as i64
-            && current_schema_version(&conn)? <= 1
-        {
+        // Pre-release recreate. Covers (1) pre-0.1.0 databases whose old
+        // squash used user_version > 1 with a 1-row ledger, and (2) DBs that
+        // still have the deleted 0002–0005 ledger *names* after this squash.
+        // A future ledger (including version 2 named `future`) still fails closed.
+        let ledger = current_schema_version(&conn)?;
+        let obsolete_pre_release =
+            sqlite_schema_version(&conn)? > MIGRATIONS.len() as i64 && ledger <= 1;
+        let folded_away_v2_ledger = is_folded_away_pre_squash_ledger(&conn)?;
+        if obsolete_pre_release || folded_away_v2_ledger {
             drop(conn);
             let stamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -744,30 +749,12 @@ struct Migration {
     sql: &'static str,
 }
 
-/// All schema migrations in version order. Append the exact filename and SQL;
-/// never derive names from the numeric position.
-const MIGRATIONS: &[Migration] = &[
-    Migration {
-        name: "0001_initial.sql",
-        sql: include_str!("migrations/0001_initial.sql"),
-    },
-    Migration {
-        name: "0002_goal_inference_provenance.sql",
-        sql: include_str!("migrations/0002_goal_inference_provenance.sql"),
-    },
-    Migration {
-        name: "0003_media_resource_reservation_ledger.sql",
-        sql: include_str!("migrations/0003_media_resource_reservation_ledger.sql"),
-    },
-    Migration {
-        name: "0004_secret_vault.sql",
-        sql: include_str!("migrations/0004_secret_vault.sql"),
-    },
-    Migration {
-        name: "0005_secret_vault_unification.sql",
-        sql: include_str!("migrations/0005_secret_vault_unification.sql"),
-    },
-];
+/// All schema migrations in version order. Pre-release: fold schema changes
+/// into `0001_initial.sql`. Do not append `0002_*`.
+const MIGRATIONS: &[Migration] = &[Migration {
+    name: "0001_initial.sql",
+    sql: include_str!("migrations/0001_initial.sql"),
+}];
 
 /// Latest schema version understood by this build.
 ///
@@ -974,6 +961,38 @@ fn current_schema_version(conn: &Connection) -> Result<i64> {
     .context("reading current schema version")
 }
 
+/// Deleted 0002–0005 files that were folded into `0001_initial.sql`.
+const FOLDED_AWAY_MIGRATION_NAMES: &[&str] = &[
+    "0002_goal_inference_provenance.sql",
+    "0003_media_resource_reservation_ledger.sql",
+    "0004_secret_vault.sql",
+    "0005_secret_vault_unification.sql",
+];
+
+/// True only when extra ledger rows are the known folded-away 0002–0005 files.
+/// A same-number future row (`2, 'future'`) must fail closed, not recreate.
+fn is_folded_away_pre_squash_ledger(conn: &Connection) -> Result<bool> {
+    if MIGRATIONS.len() != 1 || !table_exists(conn, "schema_version")? {
+        return Ok(false);
+    }
+    let ledger = current_schema_version(conn)?;
+    if !(2..=5).contains(&ledger) {
+        return Ok(false);
+    }
+    let mut stmt = conn
+        .prepare("SELECT name FROM schema_version WHERE version > 1")
+        .context("reading folded-away ledger names")?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .context("mapping folded-away ledger names")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("collecting folded-away ledger names")?;
+    Ok(!names.is_empty()
+        && names
+            .iter()
+            .all(|name| FOLDED_AWAY_MIGRATION_NAMES.contains(&name.as_str())))
+}
+
 fn sqlite_schema_version(conn: &Connection) -> Result<i64> {
     conn.pragma_query_value(None, "user_version", |row| row.get(0))
         .context("reading SQLite schema version")
@@ -1153,6 +1172,35 @@ mod tests {
     }
 
     #[test]
+    fn pre_squash_v2_ledger_is_recreated() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cockpit.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            migrate_with(&conn, MIGRATIONS).unwrap();
+            conn.execute(
+                "INSERT INTO schema_version (version, name, sha256, applied_at)
+                 VALUES (5, '0005_secret_vault_unification.sql', 'folded', 'now')",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 5_i64).unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        drop(db);
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 1);
+        drop(conn);
+        assert!(
+            temp.path()
+                .read_dir()
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().contains("pre-0.1.0"))
+        );
+    }
+
+    #[test]
     fn pre_reset_database_is_recreated_and_old_path_reported() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("cockpit.db");
@@ -1256,34 +1304,32 @@ mod tests {
         assert!(error.to_string().contains("0001_initial.sql"));
     }
 
+    /// Pre-release DBs are recreated. The old 0003 append-only upgrade
+    /// onto a v2 (0001+0002) database is rejected. Applying only 0001
+    /// must create the media reservation ledger; an ALTER-only leftover
+    /// in a later file would fail this 0001-only apply.
     #[test]
     fn media_ledger_is_an_append_only_upgrade_for_existing_v2_databases() {
         let conn = Connection::open_in_memory().unwrap();
-        migrate_with(&conn, &MIGRATIONS[..2]).unwrap();
-        let existing_checksums = conn
-            .prepare("SELECT sha256 FROM schema_version ORDER BY version")
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-
-        migrate_with(&conn, MIGRATIONS).unwrap();
-
-        let upgraded_checksums = conn
-            .prepare("SELECT sha256 FROM schema_version ORDER BY version")
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert_eq!(&upgraded_checksums[..2], existing_checksums);
-        assert_eq!(upgraded_checksums.len(), 3);
-        assert_eq!(current_schema_version(&conn).unwrap(), 3);
+        migrate_with(&conn, &MIGRATIONS[..1]).unwrap();
+        assert_eq!(
+            current_schema_version(&conn).unwrap(),
+            1,
+            "folded media ledger lives in 0001; there is no v2→v3 upgrade"
+        );
+        assert_eq!(MIGRATIONS.len(), 1, "squash leaves only 0001_initial.sql");
         conn.query_row("SELECT COUNT(*) FROM media_reservations", [], |_| Ok(()))
             .unwrap();
         conn.query_row("SELECT COUNT(*) FROM media_execution_ready", [], |_| Ok(()))
             .unwrap();
+        let trigger: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name = 'media_reservation_state_graph'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(trigger, "media_reservation_state_graph");
     }
 
     #[test]
@@ -1296,6 +1342,36 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("newer")
+        );
+    }
+
+    #[test]
+    fn future_v2_ledger_is_refused_not_recreated() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cockpit.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            migrate_with(&conn, MIGRATIONS).unwrap();
+            conn.execute(
+                "INSERT INTO schema_version (version, name, sha256, applied_at)
+                 VALUES (2, 'future', 'future', 'now')",
+                [],
+            )
+            .unwrap();
+        }
+        let err = Db::open(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("newer than this binary"),
+            "future v2 must fail closed, not recreate: {err}"
+        );
+        assert!(
+            !temp
+                .path()
+                .read_dir()
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().contains("pre-0.1.0")),
+            "future v2 must not be treated as a folded 0002–0005 ledger"
         );
     }
 
@@ -1318,58 +1394,83 @@ mod tests {
         assert_eq!(names, vec!["0001_test.sql", "0002_test.sql"]);
     }
 
+    /// Pre-release DBs are recreated; the old v1 `status` column and 0002
+    /// upgrade INSERT are rejected. A fresh 0001 schema already has
+    /// disposition/phase plus control-job tables, and a new goal leases a
+    /// planner before any root turn.
     #[tokio::test]
     async fn goal_upgrade_preserves_v1_rows_and_validates_migration_ledger() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("v1-goal.sqlite");
-        {
-            let conn = Connection::open(&path).unwrap();
-            migrate_with(&conn, &MIGRATIONS[..1]).unwrap();
-            conn.execute(
-                "INSERT INTO sessions (session_id, project_id, project_root, started_at, last_active_at)
-                 VALUES ('00000000-0000-0000-0000-000000000001', 'project-v1', '/tmp/v1', 10, 20)",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO session_goals
-                   (id, session_id, project_id, objective, context, status, token_budget,
-                    tokens_used, blocked_attempts, completion_evidence, verification_rounds,
-                    last_read_at, created_at, updated_at)
-                 VALUES ('00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001', 'project-v1', 'preserve me', 'legacy context',
-                         'active', NULL, 37, 2, NULL, 1, 19, 10, 20)",
-                [],
-            )
-            .unwrap();
-        }
-
-        let db = Db::open(&path).unwrap();
-        let session_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001")
-            .unwrap_or_else(|_| unreachable!());
-        let migrated: (String, String, String, String, String, i64, i64, i64) = db
+        let db = Db::open_in_memory().unwrap();
+        let columns: Vec<String> = db
             .read(|conn| {
-                Ok(conn.query_row(
-                    "SELECT objective, context, disposition, resume_phase, pause_reason, token_budget, tokens_used, blocked_attempts
-                       FROM session_goals WHERE id = '00000000-0000-0000-0000-000000000002'",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
-                )?)
+                let mut stmt = conn.prepare("PRAGMA table_info(session_goals)")?;
+                let names = stmt
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(names)
+            })
+            .await
+            .unwrap();
+        assert!(
+            columns.iter().any(|name| name == "disposition"),
+            "folded session_goals must have disposition: {columns:?}"
+        );
+        assert!(
+            columns.iter().any(|name| name == "phase"),
+            "folded session_goals must have phase: {columns:?}"
+        );
+        assert!(
+            !columns.iter().any(|name| name == "status"),
+            "v1 status column must not exist after the 0002 fold: {columns:?}"
+        );
+        let tables: Vec<String> = db
+            .read(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'
+                     AND name IN ('goal_control_jobs', 'goal_root_turns')
+                     ORDER BY name",
+                )?;
+                let names = stmt
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(names)
             })
             .await
             .unwrap();
         assert_eq!(
-            migrated,
-            (
-                "preserve me".into(),
-                "legacy context".into(),
-                "user_paused".into(),
-                "planning".into(),
-                "restart".into(),
-                200_000,
-                37,
-                2,
-            )
+            tables,
+            vec![
+                "goal_control_jobs".to_string(),
+                "goal_root_turns".to_string()
+            ]
         );
+
+        let session = db
+            .create_session("project-v1", "/tmp/v1", "Build")
+            .await
+            .unwrap();
+        let created = db
+            .create_session_goal(
+                session.session_id,
+                &session.project_id,
+                "preserve me",
+                Some("legacy context"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            created.disposition,
+            crate::db::session_goals::GoalDisposition::Running
+        );
+        assert_eq!(
+            created.phase,
+            Some(crate::db::session_goals::GoalPhase::Planning)
+        );
+        assert_eq!(created.objective, "preserve me");
+        assert_eq!(created.context.as_deref(), Some("legacy context"));
+        assert_eq!(created.token_budget, 200_000);
+
         let (schema, mirror) = db
             .read(|conn| Ok((current_schema_version(conn)?, sqlite_schema_version(conn)?)))
             .await
@@ -1377,8 +1478,6 @@ mod tests {
         assert_eq!(schema, MIGRATIONS.len() as i64);
         assert_eq!(mirror, MIGRATIONS.len() as i64);
         db.read(foreign_key_check).await.unwrap();
-        // Re-opening against the same immutable ledger validates both stored
-        // checksums instead of silently accepting a rewritten v1 migration.
         db.write(|conn| migrate_with(conn, MIGRATIONS))
             .await
             .unwrap();
@@ -1390,33 +1489,88 @@ mod tests {
             .unwrap();
         assert_eq!(ledger_rows, MIGRATIONS.len() as i64);
 
-        let resumed = db
-            .set_session_goal_status(
-                session_id,
-                crate::db::session_goals::GoalDisposition::Running,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            resumed.phase,
-            Some(crate::db::session_goals::GoalPhase::Planning)
-        );
-        assert!(resumed.contract.is_none());
         let planner = db
-            .lease_goal_control_job(resumed.id, resumed.attempt_generation, 30, 60)
+            .lease_goal_control_job(created.id, created.attempt_generation, 30, 60)
             .await
             .unwrap()
-            .expect("resuming a legacy goal must register a planner");
+            .expect("a fresh goal must register a planner");
         assert_eq!(
             planner.role,
             crate::db::session_goals::GoalControlRole::Planner
         );
         assert!(
-            db.begin_goal_root_turn(resumed.id, resumed.attempt_generation)
+            db.begin_goal_root_turn(created.id, created.attempt_generation)
                 .await
                 .is_err(),
-            "a migrated goal cannot dispatch root work before planner acceptance"
+            "a goal cannot dispatch root work before planner acceptance"
         );
+    }
+
+    /// Goal provenance lives on the 0001 `CREATE TABLE inference_requests`,
+    /// not a later ALTER. Applying only 0001 must expose the columns + index,
+    /// and a production insert that sets them must round-trip.
+    #[tokio::test]
+    async fn inference_requests_goal_provenance_is_in_0001_create() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_with(&conn, &MIGRATIONS[..1]).unwrap();
+        let columns: Vec<String> = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(inference_requests)")
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert!(
+            columns.iter().any(|name| name == "goal_id"),
+            "0001 CREATE must include goal_id: {columns:?}"
+        );
+        assert!(
+            columns.iter().any(|name| name == "goal_attempt_generation"),
+            "0001 CREATE must include goal_attempt_generation: {columns:?}"
+        );
+        let index_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_ireq_goal_provenance'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            index_sql.contains("goal_id") && index_sql.contains("goal_attempt_generation"),
+            "idx_ireq_goal_provenance missing provenance columns: {index_sql}"
+        );
+
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/tmp/ireq", "Build").await.unwrap();
+        let goal = db
+            .create_session_goal(session.session_id, &session.project_id, "ship", None, None)
+            .await
+            .unwrap();
+        let call_id = Uuid::new_v4().to_string();
+        db.insert_inference_request(
+            &call_id,
+            0,
+            session.session_id,
+            &serde_json::json!({}),
+            crate::db::session_log::InferenceAttemptMeta::default(),
+            Some((goal.id, goal.attempt_generation)),
+        )
+        .await
+        .unwrap();
+        let stored: (String, i64) = db
+            .read(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT goal_id, goal_attempt_generation FROM inference_requests WHERE call_id = ?1",
+                    rusqlite::params![call_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(stored.0, goal.id.to_string());
+        assert_eq!(stored.1, goal.attempt_generation);
     }
 
     #[tokio::test]
@@ -2585,10 +2739,9 @@ mod tests {
 
     #[test]
     fn migration_files_on_disk_match_expected_set() {
-        // Migrations are append-only: the `.sql` files on disk must be exactly
-        // the registered set, with no orphaned or missing file. The expected
-        // list is an independent literal so a stray file (or a deletion) is
-        // caught rather than mirrored back from the `MIGRATIONS` registry.
+        // Pre-release: `migrations/` is exactly `0001_initial.sql`. The
+        // expected list is an independent literal so a stray file (or a
+        // deletion) is caught rather than mirrored from `MIGRATIONS`.
         let migrations_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src")
             .join("db")
@@ -2600,13 +2753,6 @@ mod tests {
             .collect();
         migrations.sort();
 
-        assert_eq!(
-            migrations,
-            vec![
-                "0001_initial.sql".to_string(),
-                "0002_goal_inference_provenance.sql".to_string(),
-                "0003_media_resource_reservation_ledger.sql".to_string(),
-            ]
-        );
+        assert_eq!(migrations, vec!["0001_initial.sql".to_string()]);
     }
 }

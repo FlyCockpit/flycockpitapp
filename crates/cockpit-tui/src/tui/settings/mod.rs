@@ -2288,8 +2288,10 @@ impl SettingsDialog {
             return Ok(0);
         }
 
-        let mut store = cockpit_core::credentials::CredentialStore::open_default()
-            .map_err(|error| format!("provider deleted; stored-secret cleanup failed: {error}"))?;
+        let mut store = cockpit_core::credentials::CredentialStore::open_for_path_or_default(
+            self.credential_store_path.as_deref(),
+        )
+        .map_err(|error| format!("provider deleted; stored-secret cleanup failed: {error}"))?;
         for name in &names {
             store.remove_named_secret(name);
         }
@@ -3373,8 +3375,10 @@ impl SettingsCx {
             return Ok(0);
         }
 
-        let mut store = cockpit_core::credentials::CredentialStore::open_default()
-            .map_err(|error| format!("provider deleted; stored-secret cleanup failed: {error}"))?;
+        let mut store = cockpit_core::credentials::CredentialStore::open_for_path_or_default(
+            self.credential_store_path.as_deref(),
+        )
+        .map_err(|error| format!("provider deleted; stored-secret cleanup failed: {error}"))?;
         for name in &names {
             store.remove_named_secret(name);
         }

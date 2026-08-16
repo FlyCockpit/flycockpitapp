@@ -88,9 +88,21 @@ fn credential_record_exists(credential_ref: &str, store_path: Option<&Path>) -> 
     Ok(open_store(store_path)?.get(credential_ref).is_some())
 }
 
-fn open_store(_store_path: Option<&Path>) -> Result<CredentialStore> {
-    // Path-open is a leftover-file ratchet hole after vault activate.
-    CredentialStore::open_default()
+fn open_store(store_path: Option<&Path>) -> Result<CredentialStore> {
+    match store_path {
+        Some(path) => {
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                CredentialStore::open(path.to_path_buf())
+            }
+            #[cfg(not(any(test, feature = "test-support")))]
+            {
+                let _ = path;
+                anyhow::bail!("explicit credential store path is test-only")
+            }
+        }
+        None => CredentialStore::open_default(),
+    }
 }
 
 async fn usage(args: ProvidersUsageArgs) -> Result<()> {

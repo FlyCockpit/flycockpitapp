@@ -136,6 +136,10 @@ fn migrate_effective_layers_once(cwd: &Path) -> Result<()> {
     Ok(())
 }
 
+fn open_secret_store(store_path: &Path) -> Result<CredentialStore> {
+    CredentialStore::open_for_path_or_default(Some(store_path))
+}
+
 fn load_paths_with_secret_migration(
     config_paths: &[PathBuf],
     store_path: &Path,
@@ -152,13 +156,13 @@ pub fn protect_literal_headers(
     providers: &mut BTreeMap<String, ProviderEntry>,
     store_path: Option<&Path>,
 ) -> Result<Option<SecretRefNotice>> {
-    let store_path = match store_path {
+    let notice_path = match store_path {
         Some(path) => path.to_path_buf(),
         None => crate::credentials::default_path()
             .context("could not locate credentials path for provider secrets")?,
     };
-    // Path-open would recreate credentials.json after vault activate.
-    let mut store = CredentialStore::open_default()?;
+    // `None` is the production vault. An explicit path is a test fixture.
+    let mut store = crate::credentials::CredentialStore::open_for_path_or_default(store_path)?;
     let mut migrated = 0;
     for (provider_id, entry) in providers {
         let mut reserved_names = entry
@@ -193,7 +197,7 @@ pub fn protect_literal_headers(
     store.save()?;
     Ok(Some(SecretRefNotice {
         migrated,
-        store_path,
+        store_path: notice_path,
     }))
 }
 
@@ -201,8 +205,7 @@ fn migrate_provider_files(
     config_paths: &[PathBuf],
     store_path: &Path,
 ) -> Result<Option<SecretRefNotice>> {
-    // Path-open would recreate credentials.json after vault activate.
-    let mut store = CredentialStore::open_default()?;
+    let mut store = open_secret_store(store_path)?;
     let mut changed = Vec::new();
     let mut migrated = 0;
 

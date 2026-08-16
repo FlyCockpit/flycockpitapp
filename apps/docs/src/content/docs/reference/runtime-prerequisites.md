@@ -35,13 +35,11 @@ manager. Follow https://github.com/containers/bubblewrap/blob/main/README.md, ve
 ## Secret storage (OS keyring)
 
 `security.keyring` unlocks **keyring KEK placement**, not “every secret is a
-keyring item.” First-run is always database mode: a local `private_fs`
-owner-only KEK file plus encrypted SQLite (wrapped DEK + AEAD
-ciphertext), even when an OS keyring is already installed. Promotion to
-the keyring is an explicit Settings action after vault unification.
-Missing keyring only means the Settings keyring option stays disabled.
-Switching keyring → database is weaker, requires confirm, and moves the
-wrapping key to a local file. Linux: install `gnome-keyring` providing
+keyring item.” First-run persists a keyring wrap key when the OS keyring
+probe is available; a local `private_fs` owner-only file KEK is used only
+when the probe is missing or disabled. Encrypted SQLite holds the wrapped
+DEK and AEAD ciphertext in either case. `MigrateKekPlacement` dest=database
+is rejected while the keyring is available. Linux: install `gnome-keyring` providing
 `org.freedesktop.secrets`. `libsecret` alone is not enough; a TTY session
 may need `gnome-keyring-daemon --start --components=secrets`. Verify with that command, Keychain, or
 Windows Credential Manager. Settings rechecks if you try to enable a

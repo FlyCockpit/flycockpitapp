@@ -53,7 +53,6 @@ impl KekUnavailable {
             effective_placement: SecretStorePlacement::Unavailable,
             fail_closed_reason: Some(self.reason.clone()),
             fix_command: self.fix_command.clone(),
-            unification_complete: false,
         }
     }
 
@@ -169,14 +168,12 @@ pub fn project_secret_store_snapshot(
             effective_placement: SecretStorePlacement::Database,
             fail_closed_reason: None,
             fix_command: None,
-            unification_complete: row.unification_complete,
         },
         SecretVaultPlacement::Keyring if keyring_available(probe) => SecretStoreSnapshot {
             intent: SecretStoreIntent::Keyring,
             effective_placement: SecretStorePlacement::Keyring,
             fail_closed_reason: None,
             fix_command: None,
-            unification_complete: row.unification_complete,
         },
         SecretVaultPlacement::Keyring => SecretStoreSnapshot {
             intent: SecretStoreIntent::Keyring,
@@ -186,17 +183,18 @@ pub fn project_secret_store_snapshot(
                 .fix_command
                 .clone()
                 .or_else(|| Some(DEFAULT_FIX_COMMAND.to_string())),
-            unification_complete: row.unification_complete,
         },
     }
 }
 
-/// Pure placement decision. First-run (no row) is always database.
+/// Pure placement decision. First-run (no row) is keyring when the probe is
+/// available, otherwise database.
 pub fn resolve_secret_store(
     authority: Option<&SecretVaultAuthorityRow>,
     keyring_probe: &KeyringProbeResult,
 ) -> Result<SecretVaultPlacement, KekUnavailable> {
     match authority {
+        None if keyring_available(keyring_probe) => Ok(SecretVaultPlacement::Keyring),
         None => Ok(SecretVaultPlacement::Database),
         Some(row) => match row.active_placement {
             SecretVaultPlacement::Database => Ok(SecretVaultPlacement::Database),
@@ -239,7 +237,7 @@ pub fn ensure_secret_vault(
             intent: SecretStoreIntent::Unconfigured,
         })?;
 
-    let authority = db
+    let mut authority = db
         .blocking_write_for_sync_maintenance(load_authority_conn)
         .map_err(|e| KekUnavailable {
             reason: format!("reading secret vault authority: {e}"),
@@ -249,6 +247,15 @@ pub fn ensure_secret_vault(
 
     if let Some(auth) = authority.as_ref() {
         resume_open_kek_migrate(db, kek_dir, &installation, &injected, keyring_probe, auth)?;
+        // Resume may activate a new placement and delete the source KEK.
+        // Re-read before resolve/open so we do not open the deleted store.
+        authority = db
+            .blocking_write_for_sync_maintenance(load_authority_conn)
+            .map_err(|e| KekUnavailable {
+                reason: format!("reloading secret vault authority after resume: {e}"),
+                fix_command: None,
+                intent: SecretStoreIntent::Unconfigured,
+            })?;
     }
 
     let first_run = authority.is_none();
@@ -258,14 +265,21 @@ pub fn ensure_secret_vault(
         kek_store_for_placement(placement, kek_dir, &installation, &injected, first_run)?;
 
     let vault = if first_run {
-        match SecretVault::initialize(db.clone(), kek_store.clone(), installation.clone(), 1, 1) {
+        match SecretVault::initialize(
+            db.clone(),
+            kek_store.clone(),
+            installation.clone(),
+            1,
+            1,
+            placement,
+        ) {
             Ok(vault) => vault,
             Err(error) if error.to_string().contains("already") => {
                 SecretVault::open(db.clone(), kek_store, installation).map_err(|e| {
                     KekUnavailable {
                         reason: e.to_string(),
                         fix_command: None,
-                        intent: SecretStoreIntent::Database,
+                        intent: placement_intent(placement),
                     }
                 })?
             }
@@ -273,7 +287,7 @@ pub fn ensure_secret_vault(
                 return Err(KekUnavailable {
                     reason: error.to_string(),
                     fix_command: None,
-                    intent: SecretStoreIntent::Database,
+                    intent: placement_intent(placement),
                 });
             }
         }
@@ -293,17 +307,9 @@ pub fn ensure_secret_vault(
             .map_err(|e| KekUnavailable {
             reason: format!("importing legacy secure-key roots: {e}"),
             fix_command: None,
-            intent: SecretStoreIntent::Database,
+            intent: placement_intent(placement),
         })?;
     }
-
-    super::unify::unify_remaining_stores(&vault, &super::migrate::VaultFault::default()).map_err(
-        |e| KekUnavailable {
-            reason: format!("unifying remaining secret stores: {e}"),
-            fix_command: None,
-            intent: placement_intent(placement),
-        },
-    )?;
 
     let authority = db
         .blocking_write_for_sync_maintenance(load_authority_conn)
@@ -481,7 +487,16 @@ pub fn vault_for_db(db: &Db) -> Result<Arc<SecretVault>, SecureKeyError> {
 
     if db.path().is_some() {
         let kek_dir = kek_dir_for_db(db)?;
-        let probe = super::platform::probe_platform_keyring();
+        let probe = if std::env::var_os("COCKPIT_TEST_NO_KEYRING").is_some() {
+            super::platform::KeyringProbeResult {
+                state: cockpit_proto::FeatureCapabilityState::Missing,
+                reason: "COCKPIT_TEST_NO_KEYRING: tests must not use the host OS keyring".into(),
+                fix_command: None,
+                remedy_text: None,
+            }
+        } else {
+            super::platform::probe_platform_keyring()
+        };
         return Ok(
             ensure_secret_vault(db, &probe, &kek_dir, SecretStoreInjected::default())?.vault,
         );
@@ -501,13 +516,16 @@ pub fn vault_for_db(db: &Db) -> Result<Arc<SecretVault>, SecureKeyError> {
             .clone()
     };
     match SecretVault::open(db.clone(), kek.clone(), installation.clone()) {
-        Ok(vault) => {
-            super::unify::unify_remaining_stores(&vault, &super::migrate::VaultFault::default())?;
-            Ok(Arc::new(vault))
-        }
+        Ok(vault) => Ok(Arc::new(vault)),
         Err(_) => {
-            let vault = SecretVault::initialize(db.clone(), kek, installation, 1, 1)?;
-            super::unify::unify_remaining_stores(&vault, &super::migrate::VaultFault::default())?;
+            let vault = SecretVault::initialize(
+                db.clone(),
+                kek,
+                installation,
+                1,
+                1,
+                SecretVaultPlacement::Database,
+            )?;
             Ok(Arc::new(vault))
         }
     }
@@ -553,6 +571,16 @@ pub fn test_available_keyring_probe() -> KeyringProbeResult {
 }
 
 #[cfg(feature = "test-support")]
+pub fn test_missing_keyring_probe() -> KeyringProbeResult {
+    KeyringProbeResult {
+        state: cockpit_proto::FeatureCapabilityState::Missing,
+        reason: "secret service unavailable".into(),
+        fix_command: Some("install gnome-keyring".into()),
+        remedy_text: None,
+    }
+}
+
+#[cfg(feature = "test-support")]
 pub struct TestInjectedVault {
     db: Db,
     pub file_kek: std::sync::Arc<super::kek_store::MemoryKekStore>,
@@ -570,7 +598,7 @@ impl TestInjectedVault {
         let kek_dir = tmp.join("secret-vault");
         let _ = ensure_secret_vault(
             &db,
-            &test_available_keyring_probe(),
+            &test_missing_keyring_probe(),
             &kek_dir,
             SecretStoreInjected {
                 file_kek: Some(file_kek.clone()),

@@ -80,30 +80,30 @@ impl ScreenSnapshot {
         let mut cells = Vec::with_capacity(usize::from(rows) * usize::from(cols));
         for row in 0..rows {
             for col in 0..cols {
-                let (text, inverse, fg_index, bg_index, fg_rgb, bg_rgb) = match screen.cell(row, col)
-                {
-                    Some(cell) => (
-                        cell.contents().to_string(),
-                        cell.inverse(),
-                        match cell.fgcolor() {
-                            vt100::Color::Idx(idx) => Some(idx),
-                            _ => None,
-                        },
-                        match cell.bgcolor() {
-                            vt100::Color::Idx(idx) => Some(idx),
-                            _ => None,
-                        },
-                        match cell.fgcolor() {
-                            vt100::Color::Rgb(r, g, b) => Some((r, g, b)),
-                            _ => None,
-                        },
-                        match cell.bgcolor() {
-                            vt100::Color::Rgb(r, g, b) => Some((r, g, b)),
-                            _ => None,
-                        },
-                    ),
-                    None => (String::new(), false, None, None, None, None),
-                };
+                let (text, inverse, fg_index, bg_index, fg_rgb, bg_rgb) =
+                    match screen.cell(row, col) {
+                        Some(cell) => (
+                            cell.contents().to_string(),
+                            cell.inverse(),
+                            match cell.fgcolor() {
+                                vt100::Color::Idx(idx) => Some(idx),
+                                _ => None,
+                            },
+                            match cell.bgcolor() {
+                                vt100::Color::Idx(idx) => Some(idx),
+                                _ => None,
+                            },
+                            match cell.fgcolor() {
+                                vt100::Color::Rgb(r, g, b) => Some((r, g, b)),
+                                _ => None,
+                            },
+                            match cell.bgcolor() {
+                                vt100::Color::Rgb(r, g, b) => Some((r, g, b)),
+                                _ => None,
+                            },
+                        ),
+                        None => (String::new(), false, None, None, None, None),
+                    };
                 cells.push(SnapshotCell {
                     row,
                     col,

@@ -4461,11 +4461,9 @@ fn inject_secret_store(
     d: &mut SettingsDialog,
     intent: cockpit_proto::SecretStoreIntent,
     placement: cockpit_proto::SecretStorePlacement,
-    unified: bool,
     keyring: cockpit_proto::FeatureCapabilityState,
 ) {
     let mut store = crate::tui::capability_gate::unified_secret_store(intent, placement);
-    store.unification_complete = unified;
     if keyring != cockpit_proto::FeatureCapabilityState::Available {
         store.fail_closed_reason = Some("secret service unavailable".into());
         store.fix_command = Some("install gnome-keyring".into());
@@ -4553,7 +4551,7 @@ fn sandbox_on_recheck_then_instruct() {
 }
 
 #[test]
-fn secret_store_row_hidden_until_vault_unification() {
+fn secret_store_row_shows_intent_without_preparing_gate() {
     use cockpit_proto::{SecretStoreIntent, SecretStorePlacement};
 
     let tmp = TempDir::new().unwrap();
@@ -4562,53 +4560,31 @@ fn secret_store_row_hidden_until_vault_unification() {
         &mut d,
         SecretStoreIntent::Database,
         SecretStorePlacement::Database,
-        false,
-        cockpit_proto::FeatureCapabilityState::Available,
-    );
-    open_category_on(&mut d, Category::Privacy, SettingId::SecretStore);
-    assert_eq!(
-        d.category_value_for_test(SettingId::SecretStore),
-        crate::tui::capability_gate::SECRET_STORE_PREPARING
-    );
-    d.handle_key(press(KeyCode::Enter));
-    assert_eq!(d.secret_store_migrate_calls, 0);
-    assert!(d.pending_daemon_request.is_none());
-    match d.test_page() {
-        TestPageRef::Category(p) => {
-            assert!(p.secret_store_confirm.is_none());
-            assert!(
-                !p.status
-                    .as_deref()
-                    .unwrap_or("")
-                    .to_ascii_lowercase()
-                    .contains("keyring")
-                    || p.status
-                        .as_deref()
-                        .unwrap_or("")
-                        .contains(crate::tui::capability_gate::SECRET_STORE_PREPARING)
-            );
-        }
-        _ => panic!("not on category page"),
-    }
-}
-
-#[test]
-fn secret_store_row_first_run_shows_database_when_keyring_available() {
-    use cockpit_proto::{SecretStoreIntent, SecretStorePlacement};
-
-    let tmp = TempDir::new().unwrap();
-    let mut d = fresh_dialog(&tmp);
-    inject_secret_store(
-        &mut d,
-        SecretStoreIntent::Unconfigured,
-        SecretStorePlacement::Database,
-        true,
         cockpit_proto::FeatureCapabilityState::Available,
     );
     open_category_on(&mut d, Category::Privacy, SettingId::SecretStore);
     assert_eq!(
         d.category_value_for_test(SettingId::SecretStore),
         crate::tui::capability_gate::SECRET_STORE_DATABASE_LABEL
+    );
+}
+
+#[test]
+fn secret_store_row_first_run_shows_keyring_when_available() {
+    use cockpit_proto::{SecretStoreIntent, SecretStorePlacement};
+
+    let tmp = TempDir::new().unwrap();
+    let mut d = fresh_dialog(&tmp);
+    inject_secret_store(
+        &mut d,
+        SecretStoreIntent::Keyring,
+        SecretStorePlacement::Keyring,
+        cockpit_proto::FeatureCapabilityState::Available,
+    );
+    open_category_on(&mut d, Category::Privacy, SettingId::SecretStore);
+    assert_eq!(
+        d.category_value_for_test(SettingId::SecretStore),
+        crate::tui::capability_gate::SECRET_STORE_KEYRING_LABEL
     );
 }
 
@@ -4622,7 +4598,6 @@ fn secret_store_row_rejects_keyring_when_missing() {
         &mut d,
         SecretStoreIntent::Database,
         SecretStorePlacement::Database,
-        true,
         cockpit_proto::FeatureCapabilityState::Missing,
     );
     open_category_on(&mut d, Category::Privacy, SettingId::SecretStore);
@@ -4654,7 +4629,6 @@ fn secret_store_row_applies_keyring_after_recheck() {
         &mut d,
         SecretStoreIntent::Database,
         SecretStorePlacement::Database,
-        true,
         cockpit_proto::FeatureCapabilityState::Missing,
     );
     let mut available = d.host_capabilities.clone();
@@ -4701,7 +4675,6 @@ fn secret_store_row_does_not_write_layered_config() {
         &mut d,
         SecretStoreIntent::Database,
         SecretStorePlacement::Database,
-        true,
         cockpit_proto::FeatureCapabilityState::Available,
     );
     d.secret_store_migrate = Some(std::sync::Arc::new(|dest| {
@@ -4731,7 +4704,6 @@ fn secret_store_row_help_mentions_encrypted_sqlite_and_is_weaker() {
         &mut d,
         SecretStoreIntent::Database,
         SecretStorePlacement::Database,
-        true,
         cockpit_proto::FeatureCapabilityState::Available,
     );
     let help = crate::tui::capability_gate::secret_store_row_help(&d.host_capabilities);
@@ -4743,7 +4715,7 @@ fn secret_store_row_help_mentions_encrypted_sqlite_and_is_weaker() {
 }
 
 #[test]
-fn secret_store_downgrade_cancel_leaves_keyring() {
+fn secret_store_available_keyring_rejects_database_placement() {
     use cockpit_core::secure_key::TestInjectedVault;
     use cockpit_proto::{FeatureCapabilityState, SecretStoreIntent, SecretStorePlacement};
 
@@ -4758,89 +4730,35 @@ fn secret_store_downgrade_cancel_leaves_keyring() {
         &mut d,
         SecretStoreIntent::Keyring,
         SecretStorePlacement::Keyring,
-        true,
         FeatureCapabilityState::Available,
     );
     d.secret_store_migrate = Some(std::sync::Arc::new(move |_| {
-        panic!("cancel must not migrate");
+        panic!("available keyring must not migrate dest=database");
     }));
     open_category_on(&mut d, Category::Privacy, SettingId::SecretStore);
     d.handle_key(press(KeyCode::Enter));
+    assert_eq!(d.secret_store_migrate_calls, 0);
     match d.test_page() {
         TestPageRef::Category(p) => {
-            let confirm = p.secret_store_confirm.as_ref().expect("downgrade confirm");
-            let prompt = confirm.pages()[0].prompt.clone();
-            assert!(prompt.to_ascii_lowercase().contains("weaker"));
+            assert!(p.secret_store_confirm.is_none());
+            let status = p.status.as_deref().unwrap_or("");
             assert!(
-                prompt.to_ascii_lowercase().contains("leave the os keyring")
-                    || prompt.contains("leave the OS keyring")
+                status.contains("database") && status.contains("keyring"),
+                "switcher must reject dest=database: {status:?}"
             );
-            assert!(
-                prompt.contains("private_fs")
-                    && prompt.to_ascii_lowercase().contains("encrypted sqlite")
-            );
-            assert!(!prompt.to_ascii_lowercase().contains("plaintext"));
         }
         _ => panic!("not on category page"),
     }
-    d.handle_key(press(KeyCode::Esc));
-    assert_eq!(d.secret_store_migrate_calls, 0);
     assert_eq!(
         d.host_capabilities.secret_store.intent,
         SecretStoreIntent::Keyring
     );
-    assert_eq!(vault.keyring_kek.len(), 1);
-    assert_eq!(vault.file_kek.len(), 0);
-}
-
-#[test]
-fn secret_store_downgrade_confirm_migrates_kek() {
-    use cockpit_core::secure_key::TestInjectedVault;
-    use cockpit_proto::{FeatureCapabilityState, SecretStoreIntent, SecretStorePlacement};
-
-    let tmp = TempDir::new().unwrap();
-    let vault = std::sync::Arc::new(TestInjectedVault::first_run_database(tmp.path()));
-    vault.promote_to_keyring();
-
-    let mut d = fresh_dialog(&tmp);
-    inject_secret_store(
-        &mut d,
-        SecretStoreIntent::Keyring,
-        SecretStorePlacement::Keyring,
-        true,
-        FeatureCapabilityState::Available,
-    );
-    let vault_m = vault.clone();
-    d.secret_store_migrate = Some(std::sync::Arc::new(move |dest| {
-        vault_m.migrate(dest).map_err(|e| e.to_string())
-    }));
-    open_category_on(&mut d, Category::Privacy, SettingId::SecretStore);
-    d.handle_key(press(KeyCode::Enter));
-    match d.test_page() {
-        TestPageRef::Category(p) => {
-            let prompt = p.secret_store_confirm.as_ref().expect("confirm").pages()[0]
-                .prompt
-                .clone();
-            assert!(prompt.to_ascii_lowercase().contains("weaker"));
-            assert!(
-                prompt.contains("leave the OS keyring") || prompt.contains("leave the os keyring")
-            );
-            assert!(prompt.contains("local private_fs KEK file") || prompt.contains("private_fs"));
-            assert!(prompt.to_ascii_lowercase().contains("encrypted sqlite"));
-        }
-        _ => panic!("not on category page"),
-    }
-    d.handle_key(press(KeyCode::Enter));
-    assert_eq!(d.secret_store_migrate_calls, 1);
     assert_eq!(
         d.host_capabilities.secret_store.effective_placement,
-        SecretStorePlacement::Database
+        SecretStorePlacement::Keyring
     );
-    assert!(
-        vault.file_kek.len() >= 1,
-        "file KEK must exist after confirm"
-    );
-    assert_eq!(vault.keyring_kek.len(), 0, "keyring KEK must be gone");
+    assert_eq!(vault.keyring_kek.len(), 1);
+    assert_eq!(vault.file_kek.len(), 0);
 }
 
 #[test]

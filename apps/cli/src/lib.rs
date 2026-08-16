@@ -653,7 +653,13 @@ async fn install_cli_trust_policy(project: Option<&Path>) -> anyhow::Result<()> 
 fn command_requires_workspace_trust(command: Option<&Command>) -> bool {
     !matches!(
         command,
-        Some(Command::Debug(crate::cli::DebugCommand::Paths)) | Some(Command::Invocation(_))
+        Some(Command::Debug(crate::cli::DebugCommand::Paths))
+            | Some(Command::Invocation(_))
+            | Some(Command::Daemon(
+                crate::cli::DaemonCommand::Status { .. }
+                    | crate::cli::DaemonCommand::Start { .. }
+                    | crate::cli::DaemonCommand::Stop { .. }
+            ))
     )
 }
 

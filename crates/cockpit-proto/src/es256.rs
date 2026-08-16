@@ -101,7 +101,6 @@ mod tests {
     use super::*;
     use p256::ecdsa::SigningKey;
     use p256::ecdsa::signature::Signer;
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
 
     /// P-256 group order n, big-endian.
     const N_BE: [u8; 32] = [
@@ -224,10 +223,7 @@ mod tests {
         let mut high = [0u8; 64];
         high[0..32].copy_from_slice(&low[0..32]);
         high[32..64].copy_from_slice(&high_s);
-        assert_eq!(
-            verify_es256_p1363(&pk, msg, &high),
-            Err(Es256Error::HighS)
-        );
+        assert_eq!(verify_es256_p1363(&pk, msg, &high), Err(Es256Error::HighS));
     }
 
     #[test]

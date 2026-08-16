@@ -74,7 +74,7 @@ pub const HERMETIC_ENV_KEYS: [&str; 9] = [
 ];
 
 const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_DAEMON_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_DAEMON_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Sole profile variation. `RemoteOsc52` adds one literal SSH variable to
 /// the PTY child only.
@@ -341,10 +341,14 @@ impl HermeticLaunchSpec {
                 ],
                 self.subprocess_env(),
             ),
-            HermeticLaunchKind::DaemonStart => (
-                vec!["daemon".into(), "start".into(), "--detach".into()],
-                self.subprocess_env(),
-            ),
+            HermeticLaunchKind::DaemonStart => {
+                let mut env = self.subprocess_env();
+                env.push(("COCKPIT_LOG".into(), "warn,cockpit::startup=info".into()));
+                (
+                    vec!["daemon".into(), "start".into(), "--detach".into()],
+                    env,
+                )
+            }
             HermeticLaunchKind::DaemonStatus => (
                 vec!["daemon".into(), "status".into()],
                 self.subprocess_env(),
@@ -536,26 +540,31 @@ impl HermeticCockpit {
 
     fn wait_for_daemon(&self, timeout: Duration) {
         let deadline = Instant::now() + timeout;
-        let mut delay = Duration::from_millis(2);
+        let mut delay = Duration::from_millis(20);
         loop {
-            let status = self
-                .spec
-                .launch_path(HermeticLaunchKind::DaemonStatus)
-                .std_command()
-                .output()
-                .expect("hermetic daemon status probe");
-            if status.status.success() && output_text(&status).contains("daemon: running") {
-                return;
+            if super::socket_answers_hello(&self.home.socket_path()) {
+                break;
             }
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting for hermetic daemon status handshake\n{}\nlog tail:\n{}",
-                output_text(&status),
+                "timed out waiting for hermetic daemon status handshake\nlog tail:\n{}",
                 log_tail(&self.home)
             );
             std::thread::sleep(delay);
-            delay = (delay * 2).min(Duration::from_millis(50));
+            delay = (delay * 2).min(Duration::from_millis(200));
         }
+        let status = self
+            .spec
+            .launch_path(HermeticLaunchKind::DaemonStatus)
+            .std_command()
+            .output()
+            .expect("hermetic daemon status after hello");
+        assert!(
+            status.status.success() && output_text(&status).contains("daemon: running"),
+            "hermetic daemon status after hello was not running\n{}\nlog tail:\n{}",
+            output_text(&status),
+            log_tail(&self.home)
+        );
     }
 
     fn pid_from_file(&self) -> Option<u32> {

@@ -2144,11 +2144,15 @@ impl DaemonContext {
         &self,
         credential: &crate::auth::flycockpit::StoredFlycockpitCredential,
     ) -> Result<()> {
-        crate::auth::flycockpit::store_credential(credential)
+        let vault = crate::secure_key::vault_for_db(&self.db)
+            .map_err(|e| anyhow::anyhow!("opening daemon vault for credentials: {e}"))?;
+        crate::auth::flycockpit::store_credential_in_vault(vault, credential)
     }
 
     pub(crate) fn clear_flycockpit_credential(&self) -> Result<()> {
-        crate::auth::flycockpit::clear_credential()
+        let vault = crate::secure_key::vault_for_db(&self.db)
+            .map_err(|e| anyhow::anyhow!("opening daemon vault for credentials: {e}"))?;
+        crate::auth::flycockpit::clear_credential_in_vault(vault)
     }
 
     /// The daemon's graceful-shutdown gate. New-user-work rejection and the
@@ -2379,7 +2383,6 @@ pub(crate) async fn boot_with_db(
                             effective_placement: cockpit_proto::SecretStorePlacement::Unavailable,
                             fail_closed_reason: Some(reason.clone()),
                             fix_command: fix_command.clone(),
-                            unification_complete: false,
                         },
                         _ => cockpit_proto::SecretStoreSnapshot::unconfigured_placeholder(),
                     };
@@ -2889,6 +2892,7 @@ pub(super) struct SharedClientState {
     upload_accounting: Arc<StdMutex<UploadAccounting>>,
     #[allow(dead_code)]
     terminal_host: crate::daemon::terminal::TerminalHostHandle,
+    terminal_views: HashMap<Uuid, proto::terminal::TerminalBinding>,
     attached: Option<SharedAttachedSession>,
 }
 
@@ -2985,6 +2989,7 @@ impl MutableClientState {
             principal: self.principal.clone(),
             upload_accounting: self.upload_accounting.clone(),
             terminal_host: self.terminal_host.clone(),
+            terminal_views: self.terminal_views.clone(),
             attached: self.attached.as_ref().map(|att| SharedAttachedSession {
                 session_id: att.handle.session_id,
                 project_root: att.handle.project_root.clone(),

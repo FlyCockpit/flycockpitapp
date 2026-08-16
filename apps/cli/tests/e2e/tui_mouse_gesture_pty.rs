@@ -42,7 +42,6 @@ fn launch_scrolled_gesture_session() -> (ScriptedProvider, HermeticCockpit) {
     session
         .home()
         .write_scripted_provider_with_tui_mouse(&provider.base_url());
-    session.enable_isolated_secret_service();
     session.start_trusted_daemon();
     session
         .spawn_pty(INITIAL_PTY_COLS, INITIAL_PTY_ROWS)
@@ -617,10 +616,7 @@ fn tui_mouse_drag_auto_copy_pty() {
         "post-copy motion checkpoint",
     );
     let after = session.osc52();
-    assert_eq!(
-        osc_generation(&after),
-        (osc_before.0 + 1, osc_before.1 + 1)
-    );
+    assert_eq!(osc_generation(&after), (osc_before.0 + 1, osc_before.1 + 1));
     let (len, sha) = last_copy_meta(&after).expect("retained selector-c frame");
     let (expected_len, expected_sha) = expected_head_copy_meta();
     assert_eq!(len, expected_len, "copy length changed after checkpoint");

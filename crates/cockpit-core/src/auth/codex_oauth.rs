@@ -220,9 +220,11 @@ pub fn logout_at(store_path: Option<&Path>) -> Result<()> {
     store.save()
 }
 
-fn open_store(_store_path: Option<&Path>) -> Result<CredentialStore> {
-    // Path-open is a leftover-file ratchet hole after vault activate.
-    CredentialStore::open_default()
+fn open_store(store_path: Option<&Path>) -> Result<CredentialStore> {
+    match store_path {
+        Some(path) => CredentialStore::open_legacy_file(path.to_path_buf()),
+        None => CredentialStore::open_default(),
+    }
 }
 
 fn missing_auth_error() -> anyhow::Error {

@@ -3238,7 +3238,7 @@ mod tests {
     ) -> Result<VerifiedDirectCapability> {
         let sk = test_signing_key(signer_seed);
         let envelope = sign_status(&sk, body);
-        let vk = test_signing_key(verifier_seed).verifying_key().clone();
+        let vk = *test_signing_key(verifier_seed).verifying_key();
         VerifiedDirectCapability::from_committed_begin(
             auth,
             &envelope,
@@ -3331,7 +3331,7 @@ mod tests {
                     1,
                     1,
                     3_000_030,
-                    p256_verifier(sk.verifying_key().clone())
+                    p256_verifier(*sk.verifying_key())
                 )
                 .is_ok()
         );
@@ -3347,7 +3347,7 @@ mod tests {
                     1,
                     1,
                     3_000_030,
-                    p256_verifier(sk.verifying_key().clone())
+                    p256_verifier(*sk.verifying_key())
                 )
                 .is_err()
         );

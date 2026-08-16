@@ -896,7 +896,8 @@ impl MediaStorageRecovery {
                             consumer_id: &db_consumer_id,
                             now_unix_ms,
                         },
-                    )?;
+                    )
+                    .context("media_attachment_unavailable")?;
                     let authority = cockpit_db::Db::acquire_media_component_lease_conn(
                         conn,
                         cockpit_db::media_attachments::AcquireMediaComponentLeaseInput {
@@ -908,7 +909,8 @@ impl MediaStorageRecovery {
                             kind: MediaComponentLeaseKind::Model,
                             now_unix_ms,
                         },
-                    )?;
+                    )
+                    .context("media_attachment_unavailable")?;
                     total_bytes = total_bytes
                         .checked_add(authority.component.byte_length)
                         .context("media_attachment_unavailable")?;
@@ -931,20 +933,26 @@ impl MediaStorageRecovery {
             .bind_downstream_ownership(reservations, &consumer_id, u64::try_from(now_unix_ms)?)
             .await
         {
-            let compensation = acquired
-                .iter()
-                .map(|(reference, authority)| (reference.clone(), authority.lease_id))
-                .collect::<Vec<(AcquiredMediaReference, Uuid)>>();
-            self.db.transaction(move |conn| {
-                for (reference, lease_id) in compensation {
-                    conn.execute("UPDATE media_attachment_component_leases SET released_at_unix_ms=?1 WHERE lease_id=?2 AND released_at_unix_ms IS NULL", params![now_unix_ms, lease_id.to_string()])?;
-                    if reference.inserted {
-                        conn.execute("DELETE FROM media_attachment_references WHERE reference_id=?1 AND released_at_unix_ms IS NULL", [reference.reference_id.to_string()])?;
+            let text = error.to_string();
+            // A published ready attachment may be claimed by many submissions.
+            // The first consumer binds the reservation; later consumers keep
+            // their own references and leases.
+            if !text.contains("downstream_ownership_conflict") {
+                let compensation = acquired
+                    .iter()
+                    .map(|(reference, authority)| (reference.clone(), authority.lease_id))
+                    .collect::<Vec<(AcquiredMediaReference, Uuid)>>();
+                self.db.transaction(move |conn| {
+                    for (reference, lease_id) in compensation {
+                        conn.execute("UPDATE media_attachment_component_leases SET released_at_unix_ms=?1 WHERE lease_id=?2 AND released_at_unix_ms IS NULL", params![now_unix_ms, lease_id.to_string()])?;
+                        if reference.inserted {
+                            conn.execute("DELETE FROM media_attachment_references WHERE reference_id=?1 AND released_at_unix_ms IS NULL", [reference.reference_id.to_string()])?;
+                        }
                     }
-                }
-                Ok(())
-            }).await?;
-            return Err(anyhow::anyhow!(error.to_string()).context("media_attachment_unavailable"));
+                    Ok(())
+                }).await?;
+                return Err(anyhow::anyhow!(text).context("media_attachment_unavailable"));
+            }
         }
         let inserted_references = acquired
             .iter()
@@ -2204,7 +2212,8 @@ impl MediaStorageRecovery {
 
         if final_availability==MediaAvailability::Failed{conn.execute("INSERT INTO media_attachment_failure_reasons(attachment_id,reason,recorded_at_unix_ms) VALUES(?1,'normalization_failed',?2)",params![attachment.to_string(),now_unix_ms])?;}
 
-        if processed{let mut availability=MediaAvailability::Quarantined;let mut available_generation=1;for next_state in [MediaAvailability::Probing,MediaAvailability::Decoding,MediaAvailability::Normalizing,final_availability]{cockpit_db::Db::transition_media_attachment_conn(conn,attachment,1,available_generation,next_state,now_unix_ms)?;let next_generation=available_generation.checked_add(1).context("availability generation overflow")?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![attachment.to_string(),next_generation.to_string(),availability.as_str(),next_state.as_str(),transition_operation_id.to_string(),now_unix_ms])?;availability=next_state;available_generation=next_generation;}ensure!(availability==final_availability,"media terminal transition failed");}conn.execute("INSERT INTO media_attachment_upload_origins(attachment_id,client_draft_id,upload_id,upload_generation) VALUES(?1,?2,?3,?4)",params![attachment.to_string(),draft.to_string(),upload.to_string(),next.to_string()])?;let changed=conn.execute("UPDATE media_uploads SET state='materialized',upload_generation=?1,next_chunk_index=NULL,attachment_id=?2,attachment_version='1',last_transition_json=?3,updated_at_unix_ms=?4 WHERE upload_id=?5 AND upload_generation=?6 AND state='open'",params![next.to_string(),attachment.to_string(),serde_json::to_string(&transition)?,now_unix_ms,upload.to_string(),generation.to_string()])?;ensure!(changed==1,"upload finalize lost compare-and-swap");let receipt=LocalMediaMutationReceiptV1{schema_version:1,kind:"localMediaMutationReceipt".into(),receipt_id:Uuid::now_v7(),local_operation_id:mutation.local_operation_id,actor_principal_digest:mutation.actor_principal_digest,action:"finalize".into(),subject_kind:LocalMediaSubjectKindV1::Upload,subject_id:upload,operation_request_digest:request_digest.clone(),semantic_command_digest:semantic_digest.clone(),outcome:LocalMediaMutationOutcomeV1::Applied,transition:LocalMediaMutationTransitionV1::UploadToAttachment{upload_generation_before:generation,upload_generation_after:next,attachment_version:1,availability_generation:if processed{5}else{1},reference_generation:1},discard_result:None,discard_result_digest:None,committed_at_unix_ms:now_unix_ms};commit_local_operation(conn,&receipt,"finalize",&domain,&request_digest,&semantic_digest,now_unix_ms)?;Ok((receipt,true))}).await;
+        if processed{let mut availability=MediaAvailability::Quarantined;let mut available_generation=1;for next_state in [MediaAvailability::Probing,MediaAvailability::Decoding,MediaAvailability::Normalizing,final_availability]{cockpit_db::Db::transition_media_attachment_conn(conn,attachment,1,available_generation,next_state,now_unix_ms)?;let next_generation=available_generation.checked_add(1).context("availability generation overflow")?;conn.execute("INSERT INTO media_attachment_transition_evidence(attachment_id,availability_generation,from_state,to_state,operation_id,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",params![attachment.to_string(),next_generation.to_string(),availability.as_str(),next_state.as_str(),transition_operation_id.to_string(),now_unix_ms])?;availability=next_state;available_generation=next_generation;}ensure!(availability==final_availability,"media terminal transition failed");}
+        if processed && final_availability==MediaAvailability::Ready {crate::media_reservation::settle_and_publish_conn(conn,&reservation_id)?;}conn.execute("INSERT INTO media_attachment_upload_origins(attachment_id,client_draft_id,upload_id,upload_generation) VALUES(?1,?2,?3,?4)",params![attachment.to_string(),draft.to_string(),upload.to_string(),next.to_string()])?;let changed=conn.execute("UPDATE media_uploads SET state='materialized',upload_generation=?1,next_chunk_index=NULL,attachment_id=?2,attachment_version='1',last_transition_json=?3,updated_at_unix_ms=?4 WHERE upload_id=?5 AND upload_generation=?6 AND state='open'",params![next.to_string(),attachment.to_string(),serde_json::to_string(&transition)?,now_unix_ms,upload.to_string(),generation.to_string()])?;ensure!(changed==1,"upload finalize lost compare-and-swap");let receipt=LocalMediaMutationReceiptV1{schema_version:1,kind:"localMediaMutationReceipt".into(),receipt_id:Uuid::now_v7(),local_operation_id:mutation.local_operation_id,actor_principal_digest:mutation.actor_principal_digest,action:"finalize".into(),subject_kind:LocalMediaSubjectKindV1::Upload,subject_id:upload,operation_request_digest:request_digest.clone(),semantic_command_digest:semantic_digest.clone(),outcome:LocalMediaMutationOutcomeV1::Applied,transition:LocalMediaMutationTransitionV1::UploadToAttachment{upload_generation_before:generation,upload_generation_after:next,attachment_version:1,availability_generation:if processed{5}else{1},reference_generation:1},discard_result:None,discard_result_digest:None,committed_at_unix_ms:now_unix_ms};commit_local_operation(conn,&receipt,"finalize",&domain,&request_digest,&semantic_digest,now_unix_ms)?;Ok((receipt,true))}).await;
         if result.as_ref().is_err() || result.as_ref().is_ok_and(|(_, applied)| !*applied) {
             self.owned_root
                 .rename_into_noreplace(&target, &self.owned_root, &snapshot.0)

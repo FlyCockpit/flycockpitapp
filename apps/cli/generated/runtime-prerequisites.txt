@@ -2,8 +2,9 @@ Cockpit external runtime notice
 
 Cockpit does not install host dependencies. Missing security.keyring,
 safety.bubblewrap, container.docker, container.podman, media.ffmpeg, or
-media.ffprobe never fails installation. First-run secret storage is always
-a local file KEK plus encrypted SQLite. Missing Bubblewrap makes host
+media.ffprobe never fails installation. First-run secret storage uses the
+OS keyring when available; a local file KEK is only the fallback when the
+keyring probe is missing or disabled. Missing Bubblewrap makes host
 Sandbox effective Off. Missing docker/podman disables container modes
 (effective Off, never host Sandbox fallback). Selected audio/video inputs
 require a compatible FFmpeg and FFprobe pair; images decode natively.

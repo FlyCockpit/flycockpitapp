@@ -30,6 +30,36 @@ fn reconciliation_evidence_digest(bytes: &[u8]) -> Result<String> {
     Ok(hex_lower(&Sha256::digest(bytes)))
 }
 
+/// Sealed-plan reservation identity for attempt 1; later attempts attach a
+/// distinct per-slot retry reservation so the immutable plan digest is not
+/// rewritten and two slots cannot collide on `{sealed}:retry:{attempt}`.
+pub fn image_generation_attempt_media_reservation_id(
+    sealed_reservation_id: &str,
+    slot_id: Uuid,
+    attempt_number: u32,
+) -> String {
+    if attempt_number <= 1 {
+        sealed_reservation_id.to_owned()
+    } else {
+        format!("{sealed_reservation_id}:retry:{slot_id}:{attempt_number}")
+    }
+}
+
+fn live_image_generation_attempt(conn: &Connection, job_id: Uuid) -> Result<(Uuid, u32)> {
+    let (slot, attempt): (String, i64) = conn
+        .query_row(
+            "SELECT a.slot_id,a.attempt_number FROM image_generation_attempts a JOIN image_generation_attempt_activation_facts f ON f.job_id=a.job_id AND f.slot_id=a.slot_id AND f.attempt_number=a.attempt_number WHERE a.job_id=?1 AND a.state NOT IN ('failed_not_submitted','rejected_not_accepted','cancelled','succeeded','completed_after_cancel','failed_after_acceptance') ORDER BY a.attempt_number DESC, a.slot_id LIMIT 1",
+            [job_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .context("image generation live attempt is absent")?;
+    Ok((
+        Uuid::parse_str(&slot).context("image generation live slot is invalid")?,
+        u32::try_from(attempt).context("image generation live attempt is invalid")?,
+    ))
+}
+
 macro_rules! state_enum {
     ($name:ident { $($variant:ident => $text:literal),+ $(,)? }) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1134,6 +1164,7 @@ pub enum ImageGenerationReconciliationDisposition {
         external_operation_id: Uuid,
         media_reservation_id: String,
         media_reservation_version: u64,
+        sealed_media_reservation_id: String,
         current_media_plan: Vec<u8>,
         current_media_plan_digest: String,
         next_media_plan: Vec<u8>,
@@ -1423,7 +1454,12 @@ impl Db {
             let plan = ImageGenerationPlanV1::from_canonical(&canonical, &projection.3)?;
             ensure!(
                 plan.central_resources.iter().any(|resource| {
-                    resource.reservation_identity == input.media_reservation_id
+                    input.media_reservation_id
+                        == image_generation_attempt_media_reservation_id(
+                            &resource.reservation_identity,
+                            input.slot_id,
+                            input.attempt_number,
+                        )
                 }),
                 "image generation media reservation differs from sealed plan"
             );
@@ -1685,12 +1721,17 @@ impl Db {
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )?;
                 let plan = ImageGenerationPlanV1::from_canonical(&canonical_plan, &plan_digest)?;
-                let media_reservation_id = plan
+                let sealed_media_reservation_id = plan
                     .central_resources
                     .first()
                     .context("image generation central media reservation is absent")?
                     .reservation_identity
                     .clone();
+                let media_reservation_id = image_generation_attempt_media_reservation_id(
+                    &sealed_media_reservation_id,
+                    input.slot_id,
+                    input.attempt_number,
+                );
                 let media_reservation_version = u64::try_from(conn.query_row::<i64, _, _>(
                     "SELECT version FROM media_reservations WHERE reservation_id=?1",
                     [&media_reservation_id],
@@ -1705,13 +1746,19 @@ impl Db {
                     media_reservation_id,
                     media_reservation_version,
                     current_media,
+                    sealed_media_reservation_id,
                 )
             })
         } else {
             None
         };
-        let (media_reservation_id, media_reservation_version, current_media) =
-            media_authority.unwrap_or_else(|| (String::new(), 0, (Vec::new(), String::new())));
+        let (
+            media_reservation_id,
+            media_reservation_version,
+            current_media,
+            sealed_media_reservation_id,
+        ) = media_authority
+            .unwrap_or_else(|| (String::new(), 0, (Vec::new(), String::new()), String::new()));
         let cancellation: Option<i64> = conn.query_row(
             "SELECT applied_cancellation_version FROM image_generation_attempts WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3",
             params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number)],
@@ -1862,6 +1909,7 @@ impl Db {
                     external_operation_id: input.external_operation_id,
                     media_reservation_id,
                     media_reservation_version,
+                    sealed_media_reservation_id,
                     current_media_plan: current_media.0,
                     current_media_plan_digest: current_media.1,
                     next_media_plan,
@@ -2363,12 +2411,31 @@ impl Db {
                 "image generation operation deadline has not expired"
             );
             let plan = ImageGenerationPlanV1::from_canonical(&canonical, &plan_digest)?;
-            let media_reservation_id = plan
+            let sealed_media_reservation_id = plan
                 .central_resources
                 .first()
                 .context("image generation central reservation is absent")?
                 .reservation_identity
                 .clone();
+            let sealed_state: Option<String> = conn
+                .query_row(
+                    "SELECT state FROM media_reservations WHERE reservation_id=?1",
+                    [&sealed_media_reservation_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let media_reservation_id = match sealed_state.as_deref() {
+                Some("released") | Some("accounting_corrupt") | None => {
+                    let (live_slot_id, live_attempt_number) =
+                        live_image_generation_attempt(conn, job_id)?;
+                    image_generation_attempt_media_reservation_id(
+                        &sealed_media_reservation_id,
+                        live_slot_id,
+                        live_attempt_number,
+                    )
+                }
+                Some(_) => sealed_media_reservation_id.clone(),
+            };
             let media_reservation_version: i64 = conn.query_row(
                 "SELECT version FROM media_reservations WHERE reservation_id=?1",
                 [&media_reservation_id],
@@ -4085,6 +4152,26 @@ pub fn image_generation_component_set_binding(
 mod tests {
     use super::*;
     use crate::db::image_generation_plan::*;
+
+    #[test]
+    fn attempt_media_reservation_ids_are_slot_scoped_and_do_not_parse_sealed_suffix() {
+        let slot_a = Uuid::from_u128(1);
+        let slot_b = Uuid::from_u128(2);
+        let sealed = "gpu:batch:retry:2";
+        let first = image_generation_attempt_media_reservation_id(sealed, slot_a, 1);
+        let retry_a = image_generation_attempt_media_reservation_id(sealed, slot_a, 2);
+        let retry_b = image_generation_attempt_media_reservation_id(sealed, slot_b, 2);
+        assert_eq!(first, sealed);
+        assert_ne!(retry_a, retry_b);
+        assert_ne!(retry_a, sealed);
+        assert_ne!(retry_b, sealed);
+        assert!(retry_a.contains(&slot_a.to_string()));
+        assert!(retry_b.contains(&slot_b.to_string()));
+        assert_eq!(
+            image_generation_attempt_media_reservation_id(sealed, slot_a, 3),
+            format!("{sealed}:retry:{slot_a}:3")
+        );
+    }
 
     #[test]
     fn reconciliation_evidence_has_exact_closed_bounds() {

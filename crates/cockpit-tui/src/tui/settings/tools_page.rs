@@ -432,7 +432,8 @@ impl SettingsCx {
     }
 
     fn credential_store(&self) -> Result<CredentialStore, String> {
-        CredentialStore::open_default().map_err(|e| e.to_string())
+        CredentialStore::open_for_path_or_default(self.credential_store_path.as_deref())
+            .map_err(|e| e.to_string())
     }
 
     fn stored_web_key(&self, provider: WebKeyProvider) -> Option<String> {

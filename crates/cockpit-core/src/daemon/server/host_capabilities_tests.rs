@@ -246,7 +246,6 @@ async fn migrate_refresh_publishes_post_migrate_secret_store() {
         effective_placement: SecretStorePlacement::Database,
         fail_closed_reason: None,
         fix_command: None,
-        unification_complete: true,
     };
     let (snapshot, published) =
         refresh_host_capabilities_with_secret_store(&store, &probes, migrated.clone())

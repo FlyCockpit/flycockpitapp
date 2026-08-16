@@ -23,9 +23,7 @@ use std::path::Path;
 use zeroize::Zeroizing;
 
 use crate::daemon::server::DaemonContext;
-use crate::leaks::{
-    LEAK_REVEAL_MAX_PLAINTEXT_BYTES, RevealStart, ct_eq_32, decode_hex_32,
-};
+use crate::leaks::{LEAK_REVEAL_MAX_PLAINTEXT_BYTES, RevealStart, ct_eq_32, decode_hex_32};
 use crate::redact::protected_redaction_history::ProtectedRedactionHistory;
 
 /// A revealed leak secret handed by value to the caller. Holds the plaintext in
@@ -171,8 +169,7 @@ pub async fn reveal_leak_secret(
     }
     #[cfg(unix)]
     {
-        let reveal_socket =
-            crate::daemon::DaemonPaths::leak_reveal_socket_path(control_socket);
+        let reveal_socket = crate::daemon::DaemonPaths::leak_reveal_socket_path(control_socket);
         crate::daemon::leak_reveal_socket::reveal_leak_secret_over_socket(
             &reveal_socket,
             capability,

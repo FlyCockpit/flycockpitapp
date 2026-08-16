@@ -166,6 +166,14 @@ static KEYRING_PROBE_CACHE: Mutex<KeyringProbeCache> = Mutex::new(KeyringProbeCa
 
 /// Probe whether a platform keyring store can be constructed for one wrapping KEK.
 pub fn probe_platform_keyring() -> KeyringProbeResult {
+    if std::env::var_os("COCKPIT_TEST_NO_KEYRING").is_some() {
+        return KeyringProbeResult {
+            state: cockpit_proto::FeatureCapabilityState::Missing,
+            reason: "COCKPIT_TEST_NO_KEYRING: tests must not use the host OS keyring".into(),
+            fix_command: None,
+            remedy_text: None,
+        };
+    }
     probe_platform_keyring_with(production_or_test_construct, false)
 }
 
@@ -351,10 +359,10 @@ pub(crate) fn set_default_platform_store() -> Result<(), SecureKeyError> {
                 "DBUS_SESSION_BUS_ADDRESS unset; secret service unavailable".into(),
             ));
         }
-        let store = zbus_secret_service_keyring_store::Store::new()
-            .map_err(|e| SecureKeyError::Unavailable(format!("secret service store: {e}")))?;
-        keyring_core::set_default_store(store);
-        Ok(())
+        // Store::new uses zbus's blocking Connection::session, which creates a
+        // nested Tokio runtime. Always construct off-thread so doctor, daemon
+        // boot, and IsolatedHome mock buses never nest.
+        construct_linux_secret_service_store()
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
@@ -362,6 +370,26 @@ pub(crate) fn set_default_platform_store() -> Result<(), SecureKeyError> {
             "no native secure key store on this target".into(),
         ))
     }
+}
+
+#[cfg(target_os = "linux")]
+fn construct_linux_secret_service_store() -> Result<(), SecureKeyError> {
+    fn construct() -> Result<(), SecureKeyError> {
+        let store = zbus_secret_service_keyring_store::Store::new()
+            .map_err(|e| SecureKeyError::Unavailable(format!("secret service store: {e}")))?;
+        keyring_core::set_default_store(store);
+        Ok(())
+    }
+    std::thread::Builder::new()
+        .name("cockpit-keyring-construct".into())
+        .spawn(construct)
+        .map_err(|e| SecureKeyError::Unavailable(format!("keyring construct thread: {e}")))?
+        .join()
+        .unwrap_or_else(|_| {
+            Err(SecureKeyError::Unavailable(
+                "keyring construct thread panicked".into(),
+            ))
+        })
 }
 
 pub(crate) fn unset_default_platform_store() {

@@ -2552,8 +2552,10 @@ mod image_generation {
                 .is_empty()
         );
 
-        let mut cfg = ExtendedConfig::default();
-        cfg.image_generation = registry_a();
+        let cfg = ExtendedConfig {
+            image_generation: registry_a(),
+            ..Default::default()
+        };
         let json = serde_json::to_string(&cfg).unwrap();
         let decoded: ExtendedConfig = serde_json::from_str(&json).unwrap();
 
@@ -3347,7 +3349,6 @@ fn two_projects_conflicting_layered_secret_store_cannot_override_authority() {
             "fingerprint",
             1,
             1,
-            false,
         )
     })
     .unwrap();
@@ -3394,7 +3395,6 @@ fn remote_layer_cannot_force_secret_store_downgrade() {
             "fingerprint",
             1,
             1,
-            false,
         )
     })
     .unwrap();

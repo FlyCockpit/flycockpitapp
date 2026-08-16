@@ -169,8 +169,8 @@ pub fn decode_response(buf: &[u8]) -> Result<LeakRevealSocketResponse, FrameErro
         return Err(FrameError);
     }
     let rid_end = pos.checked_add(report_id_len).ok_or(FrameError)?;
-    let report_id =
-        String::from_utf8(buf.get(pos..rid_end).ok_or(FrameError)?.to_vec()).map_err(|_| FrameError)?;
+    let report_id = String::from_utf8(buf.get(pos..rid_end).ok_or(FrameError)?.to_vec())
+        .map_err(|_| FrameError)?;
     pos = rid_end;
     let gen_end = pos.checked_add(8).ok_or(FrameError)?;
     let gen_slice = buf.get(pos..gen_end).ok_or(FrameError)?;
@@ -178,14 +178,16 @@ pub fn decode_response(buf: &[u8]) -> Result<LeakRevealSocketResponse, FrameErro
     pos = gen_end;
     let pt_len_end = pos.checked_add(4).ok_or(FrameError)?;
     let pt_len_slice = buf.get(pos..pt_len_end).ok_or(FrameError)?;
-    let plaintext_len = u32::from_be_bytes(pt_len_slice.try_into().map_err(|_| FrameError)?) as usize;
+    let plaintext_len =
+        u32::from_be_bytes(pt_len_slice.try_into().map_err(|_| FrameError)?) as usize;
     pos = pt_len_end;
     if plaintext_len > LEAK_REVEAL_MAX_PLAINTEXT_BYTES {
         return Err(FrameError);
     }
     let pt_end = pos.checked_add(plaintext_len).ok_or(FrameError)?;
     let plaintext = Zeroizing::new(
-        String::from_utf8(buf.get(pos..pt_end).ok_or(FrameError)?.to_vec()).map_err(|_| FrameError)?,
+        String::from_utf8(buf.get(pos..pt_end).ok_or(FrameError)?.to_vec())
+            .map_err(|_| FrameError)?,
     );
     pos = pt_end;
     if pos != buf.len() {

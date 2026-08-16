@@ -60,7 +60,10 @@ impl std::fmt::Debug for TandemRecord {
             .field("provider", &self.provider)
             .field("model", &self.model)
             .field("ts_ms", &self.ts_ms)
-            .field("request", &format_args!("{}", redacted_json_debug(&self.request)))
+            .field(
+                "request",
+                &format_args!("{}", redacted_json_debug(&self.request)),
+            )
             .field(
                 "response",
                 &format_args!(
@@ -384,6 +387,9 @@ mod tests {
             rendered.contains("parent-call"),
             "dropped parent_call_id: {rendered}"
         );
-        assert!(rendered.contains("openrouter"), "dropped provider: {rendered}");
+        assert!(
+            rendered.contains("openrouter"),
+            "dropped provider: {rendered}"
+        );
     }
 }

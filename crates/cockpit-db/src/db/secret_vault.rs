@@ -118,7 +118,6 @@ pub struct SecretVaultAuthorityRow {
     pub kek_fingerprint: String,
     pub kek_version: i64,
     pub wrap_version: i64,
-    pub unification_complete: bool,
     pub updated_at: i64,
 }
 
@@ -156,83 +155,6 @@ pub struct SecretVaultSagaRow {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SecretVaultStore {
-    Credentials,
-    SealedCompartment,
-    SessionSealedValue,
-    RedactionTable,
-}
-
-impl SecretVaultStore {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Credentials => "credentials",
-            Self::SealedCompartment => "sealed_compartment",
-            Self::SessionSealedValue => "session_sealed_value",
-            Self::RedactionTable => "redaction_table",
-        }
-    }
-
-    pub fn parse(raw: &str) -> Result<Self> {
-        match raw {
-            "credentials" => Ok(Self::Credentials),
-            "sealed_compartment" => Ok(Self::SealedCompartment),
-            "session_sealed_value" => Ok(Self::SessionSealedValue),
-            "redaction_table" => Ok(Self::RedactionTable),
-            other => bail!("unknown secret vault store: {other}"),
-        }
-    }
-
-    pub fn all() -> [Self; 4] {
-        [
-            Self::Credentials,
-            Self::SealedCompartment,
-            Self::SessionSealedValue,
-            Self::RedactionTable,
-        ]
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SecretVaultStoreAuthority {
-    Legacy,
-    Vault,
-}
-
-impl SecretVaultStoreAuthority {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Legacy => "legacy",
-            Self::Vault => "vault",
-        }
-    }
-
-    pub fn parse(raw: &str) -> Result<Self> {
-        match raw {
-            "legacy" => Ok(Self::Legacy),
-            "vault" => Ok(Self::Vault),
-            other => bail!("unknown secret vault store authority: {other}"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SecretVaultStoreStateRow {
-    pub store: SecretVaultStore,
-    pub authoritative: SecretVaultStoreAuthority,
-    pub updated_at: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SecretVaultImportSagaRow {
-    pub op_id: String,
-    pub store: SecretVaultStore,
-    pub phase: SecretVaultSagaPhase,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
-
 impl Db {
     pub async fn secret_vault_load_authority(&self) -> Result<Option<SecretVaultAuthorityRow>> {
         self.read(load_authority_conn).await
@@ -242,7 +164,7 @@ impl Db {
 pub fn load_authority_conn(conn: &rusqlite::Connection) -> Result<Option<SecretVaultAuthorityRow>> {
     conn.query_row(
         "SELECT intent, active_placement, kek_fingerprint, kek_version, wrap_version,
-                unification_complete, updated_at
+                updated_at
          FROM secret_vault_authority WHERE id = 1",
         [],
         map_authority_row,
@@ -254,7 +176,6 @@ pub fn load_authority_conn(conn: &rusqlite::Connection) -> Result<Option<SecretV
 fn map_authority_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SecretVaultAuthorityRow> {
     let intent: String = row.get(0)?;
     let placement: String = row.get(1)?;
-    let complete: i64 = row.get(5)?;
     Ok(SecretVaultAuthorityRow {
         intent: SecretVaultPlacement::parse(&intent).map_err(|e| {
             rusqlite::Error::FromSqlConversionFailure(
@@ -273,8 +194,7 @@ fn map_authority_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SecretVaultAut
         kek_fingerprint: row.get(2)?,
         kek_version: row.get(3)?,
         wrap_version: row.get(4)?,
-        unification_complete: complete != 0,
-        updated_at: row.get(6)?,
+        updated_at: row.get(5)?,
     })
 }
 
@@ -285,21 +205,19 @@ pub fn upsert_authority_conn(
     kek_fingerprint: &str,
     kek_version: i64,
     wrap_version: i64,
-    unification_complete: bool,
 ) -> Result<()> {
     let now = Utc::now().timestamp();
     conn.execute(
         "INSERT INTO secret_vault_authority
             (id, intent, active_placement, kek_fingerprint, kek_version, wrap_version,
-             unification_complete, updated_at)
-         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             updated_at)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(id) DO UPDATE SET
             intent = excluded.intent,
             active_placement = excluded.active_placement,
             kek_fingerprint = excluded.kek_fingerprint,
             kek_version = excluded.kek_version,
             wrap_version = excluded.wrap_version,
-            unification_complete = excluded.unification_complete,
             updated_at = excluded.updated_at",
         params![
             intent.as_str(),
@@ -307,7 +225,6 @@ pub fn upsert_authority_conn(
             kek_fingerprint,
             kek_version,
             wrap_version,
-            if unification_complete { 1 } else { 0 },
             now
         ],
     )
@@ -608,197 +525,6 @@ fn map_saga_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SecretVaultSagaRow>
     })
 }
 
-pub fn upsert_store_state_conn(
-    conn: &rusqlite::Connection,
-    store: SecretVaultStore,
-    authoritative: SecretVaultStoreAuthority,
-) -> Result<()> {
-    let now = Utc::now().timestamp();
-    conn.execute(
-        "INSERT INTO secret_vault_store_state (store, authoritative, updated_at)
-         VALUES (?1, ?2, ?3)
-         ON CONFLICT(store) DO UPDATE SET
-            authoritative = excluded.authoritative,
-            updated_at = excluded.updated_at",
-        params![store.as_str(), authoritative.as_str(), now],
-    )
-    .context("upserting secret vault store state")?;
-    Ok(())
-}
-
-pub fn load_store_state_conn(
-    conn: &rusqlite::Connection,
-    store: SecretVaultStore,
-) -> Result<Option<SecretVaultStoreStateRow>> {
-    conn.query_row(
-        "SELECT store, authoritative, updated_at FROM secret_vault_store_state WHERE store = ?1",
-        [store.as_str()],
-        map_store_state_row,
-    )
-    .optional()
-    .context("loading secret vault store state")
-}
-
-pub fn list_store_states_conn(
-    conn: &rusqlite::Connection,
-) -> Result<Vec<SecretVaultStoreStateRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT store, authoritative, updated_at FROM secret_vault_store_state ORDER BY store ASC",
-    )?;
-    let rows = stmt.query_map([], map_store_state_row)?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .context("listing secret vault store states")
-}
-
-fn map_store_state_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SecretVaultStoreStateRow> {
-    let store: String = row.get(0)?;
-    let authoritative: String = row.get(1)?;
-    Ok(SecretVaultStoreStateRow {
-        store: SecretVaultStore::parse(&store).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(
-                0,
-                rusqlite::types::Type::Text,
-                Box::new(std::io::Error::other(e.to_string())),
-            )
-        })?,
-        authoritative: SecretVaultStoreAuthority::parse(&authoritative).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(
-                1,
-                rusqlite::types::Type::Text,
-                Box::new(std::io::Error::other(e.to_string())),
-            )
-        })?,
-        updated_at: row.get(2)?,
-    })
-}
-
-pub fn insert_import_saga_conn(
-    conn: &rusqlite::Connection,
-    op_id: &str,
-    store: SecretVaultStore,
-    phase: SecretVaultSagaPhase,
-) -> Result<()> {
-    let now = Utc::now().timestamp();
-    conn.execute(
-        "INSERT INTO secret_vault_import_sagas (op_id, store, phase, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?4)",
-        params![op_id, store.as_str(), phase.as_str(), now],
-    )
-    .context("inserting secret vault import saga")?;
-    Ok(())
-}
-
-pub fn load_import_saga_conn(
-    conn: &rusqlite::Connection,
-    op_id: &str,
-) -> Result<Option<SecretVaultImportSagaRow>> {
-    conn.query_row(
-        "SELECT op_id, store, phase, created_at, updated_at
-         FROM secret_vault_import_sagas WHERE op_id = ?1",
-        [op_id],
-        map_import_saga_row,
-    )
-    .optional()
-    .context("loading secret vault import saga")
-}
-
-pub fn load_import_saga_for_store_conn(
-    conn: &rusqlite::Connection,
-    store: SecretVaultStore,
-) -> Result<Option<SecretVaultImportSagaRow>> {
-    conn.query_row(
-        "SELECT op_id, store, phase, created_at, updated_at
-         FROM secret_vault_import_sagas
-         WHERE store = ?1
-         ORDER BY created_at DESC, op_id DESC
-         LIMIT 1",
-        [store.as_str()],
-        map_import_saga_row,
-    )
-    .optional()
-    .context("loading secret vault import saga for store")
-}
-
-pub fn list_open_import_sagas_conn(
-    conn: &rusqlite::Connection,
-) -> Result<Vec<SecretVaultImportSagaRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT op_id, store, phase, created_at, updated_at
-         FROM secret_vault_import_sagas
-         WHERE phase != 'complete'
-         ORDER BY created_at ASC, op_id ASC",
-    )?;
-    let rows = stmt.query_map([], map_import_saga_row)?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .context("listing open secret vault import sagas")
-}
-
-pub fn set_import_saga_phase_conn(
-    conn: &rusqlite::Connection,
-    op_id: &str,
-    phase: SecretVaultSagaPhase,
-) -> Result<()> {
-    let now = Utc::now().timestamp();
-    let n = conn
-        .execute(
-            "UPDATE secret_vault_import_sagas SET phase = ?1, updated_at = ?2 WHERE op_id = ?3",
-            params![phase.as_str(), now, op_id],
-        )
-        .context("updating secret vault import saga phase")?;
-    if n == 0 {
-        bail!("secret vault import saga not found: {op_id}");
-    }
-    Ok(())
-}
-
-fn map_import_saga_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SecretVaultImportSagaRow> {
-    let store: String = row.get(1)?;
-    let phase: String = row.get(2)?;
-    Ok(SecretVaultImportSagaRow {
-        op_id: row.get(0)?,
-        store: SecretVaultStore::parse(&store).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(
-                1,
-                rusqlite::types::Type::Text,
-                Box::new(std::io::Error::other(e.to_string())),
-            )
-        })?,
-        phase: SecretVaultSagaPhase::parse(&phase).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(
-                2,
-                rusqlite::types::Type::Text,
-                Box::new(std::io::Error::other(e.to_string())),
-            )
-        })?,
-        created_at: row.get(3)?,
-        updated_at: row.get(4)?,
-    })
-}
-
-pub fn set_unification_complete_conn(conn: &rusqlite::Connection, complete: bool) -> Result<()> {
-    let now = Utc::now().timestamp();
-    let n = conn
-        .execute(
-            "UPDATE secret_vault_authority SET unification_complete = ?1, updated_at = ?2 WHERE id = 1",
-            params![if complete { 1 } else { 0 }, now],
-        )
-        .context("updating secret vault unification_complete")?;
-    if n == 0 {
-        bail!("secret vault authority missing");
-    }
-    Ok(())
-}
-
-pub fn all_stores_vault_authoritative_conn(conn: &rusqlite::Connection) -> Result<bool> {
-    for store in SecretVaultStore::all() {
-        match load_store_state_conn(conn, store)? {
-            Some(row) if row.authoritative == SecretVaultStoreAuthority::Vault => {}
-            _ => return Ok(false),
-        }
-    }
-    Ok(true)
-}
-
 pub fn is_unique_constraint(err: &rusqlite::Error) -> bool {
     match err {
         rusqlite::Error::SqliteFailure(info, _) => {
@@ -824,17 +550,15 @@ mod tests {
                 "abc",
                 1,
                 1,
-                false,
             )?;
             let row = load_authority_conn(conn)?.expect("authority");
             assert_eq!(row.intent, SecretVaultPlacement::Database);
             assert_eq!(row.active_placement, SecretVaultPlacement::Database);
-            assert!(!row.unification_complete);
             let err = conn.execute(
                 "INSERT INTO secret_vault_authority
                     (id, intent, active_placement, kek_fingerprint, kek_version, wrap_version,
-                     unification_complete, updated_at)
-                 VALUES (2, 'database', 'database', 'x', 1, 1, 0, 0)",
+                     updated_at)
+                 VALUES (2, 'database', 'database', 'x', 1, 1, 0)",
                 [],
             );
             assert!(err.is_err(), "id != 1 must fail");
@@ -880,6 +604,103 @@ mod tests {
                     assert!(!lower.contains("plaintext"), "{table}.{col}");
                 }
             }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn vault_schema_lives_only_in_0001() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/db/migrations");
+        let mut saw_initial = false;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".sql") {
+                continue;
+            }
+            let sql = std::fs::read_to_string(entry.path()).unwrap();
+            if name == "0001_initial.sql" {
+                saw_initial = true;
+                assert!(sql.contains("CREATE TABLE secret_vault_authority"));
+                assert!(sql.contains("CREATE TABLE secret_vault_keys"));
+                assert!(sql.contains("CREATE TABLE secret_vault_items"));
+                assert!(sql.contains("CREATE TABLE secret_vault_sagas"));
+                assert!(
+                    !sql.contains(&format!("{}{}", "secret_vault_store", "_state")),
+                    "0001 must not define leftover dual-store tables"
+                );
+                assert!(
+                    !sql.contains(&format!("{}{}", "secret_vault_import", "_sagas")),
+                    "0001 must not define leftover import sagas"
+                );
+            } else {
+                assert!(
+                    !sql.contains("secret_vault_"),
+                    "{name} must not define vault objects"
+                );
+                assert!(
+                    !name.contains("0004") && !name.contains("0005"),
+                    "folded vault migrations must not remain on disk: {name}"
+                );
+            }
+        }
+        assert!(saw_initial, "0001_initial.sql must exist");
+    }
+
+    #[test]
+    fn sealed_values_value_is_nullable_in_0001() {
+        let db = Db::open_in_memory().unwrap();
+        db.blocking_write_for_sync_maintenance(|conn| {
+            conn.execute(
+                "INSERT INTO sessions (session_id, project_id, project_root, started_at, last_active_at)
+                 VALUES ('s', 'p', '/p', 1, 1)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO sealed_values (session_id, value_id, value, reason, origin, created_at)
+                 VALUES ('s', 'v', NULL, 'r', 'user', 1)",
+                [],
+            )?;
+            let stored: Option<String> = conn.query_row(
+                "SELECT value FROM sealed_values WHERE session_id = 's' AND value_id = 'v'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert!(stored.is_none(), "fresh 0001 must accept a NULL sealed value");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn unification_tables_do_not_exist() {
+        let db = Db::open_in_memory().unwrap();
+        db.blocking_write_for_sync_maintenance(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")?;
+            let tables: Vec<String> = stmt
+                .query_map([], |row| row.get(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let leftover_state = format!("{}{}", "secret_vault_store", "_state");
+            let leftover_import = format!("{}{}", "secret_vault_import", "_sagas");
+            assert!(
+                !tables.iter().any(|name| name == &leftover_state),
+                "folded schema must not create {leftover_state}"
+            );
+            assert!(
+                !tables.iter().any(|name| name == &leftover_import),
+                "folded schema must not create {leftover_import}"
+            );
+            let mut info = conn.prepare("PRAGMA table_info(secret_vault_authority)")?;
+            let cols: Vec<String> = info
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let leftover_col = format!("{}{}", "unification", "_complete");
+            assert!(
+                !cols.iter().any(|col| col == &leftover_col),
+                "authority must not keep {leftover_col}"
+            );
             Ok(())
         })
         .unwrap();

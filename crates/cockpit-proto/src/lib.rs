@@ -1092,12 +1092,12 @@ impl<'de> Deserialize<'de> for RemoteOperationIdentityV1 {
 
 mod request;
 pub use request::{
-    ActiveModelSwitchTrigger, AttachmentPurpose, LspControlAction, RemoteAdapterEvidenceV1,
-    RemoteAdapterRecoveryContractV1, RemoteAdapterRecoveryStrategy, RemoteOperationClass, Request,
-    RunInvocationOptions, UnknownRemoteOperationClass, UsageKind,
+    ActiveModelSwitchTrigger, AttachmentPurpose, LspControlAction, MAX_UUID_V7_UNIX_MS,
+    RemoteAdapterEvidenceV1, RemoteAdapterRecoveryContractV1, RemoteAdapterRecoveryStrategy,
+    RemoteOperationClass, Request, RunInvocationOptions, UnknownRemoteOperationClass, UsageKind,
     canonical_remote_operation_fcor_schema_for_tag, remote_adapter_recovery_contract_for_tag,
     remote_adapter_recovery_strategy_for_tag, remote_operation_class_for_tag,
-    remote_operation_fcor_schema_for_tag,
+    remote_operation_fcor_schema_for_tag, remote_operation_uuid_v7_from_parts,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

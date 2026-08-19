@@ -42,6 +42,7 @@ use std::sync::{Arc, Mutex};
 use crate::sync::lock_or_recover;
 
 use tokio::sync::oneshot;
+use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::daemon::proto::{self, InterruptQuestionSet, ResolveResponse};
@@ -273,6 +274,221 @@ pub fn is_parked(err: &anyhow::Error) -> bool {
     err.downcast_ref::<InterruptParked>().is_some()
 }
 
+/// Terminal outcome of awaiting a worker's shutdown park-commit
+/// (`daemon-lifecycle-replay-timing-robustness.md`). The drain path awaits
+/// this **before** releasing the daemon's pid/socket, so a graceful restart
+/// never reports success while a registered interrupt waiter's park is still
+/// un-committed. Distinguishing `Committed` from the two forced terminals is
+/// what keeps `metadata_guard.cleanup()` truthful on the success path while
+/// still allowing a wedged/failed park to release the process for a
+/// successor (see the terminal-state table in the prompt).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ParkCommitTerminal {
+    /// Every registered park landed durably (or there were none to park).
+    Committed,
+    /// A `park_interrupt` write returned `Err` — a real DB failure, not a
+    /// scheduling delay. Shutdown proceeds (`drained_clean = false`) so a
+    /// successor can bind, but this is not a clean park success.
+    KnownFailedWrite,
+    /// The park-commit signal did not resolve within
+    /// `INTERRUPT_PARK_COMMIT_DEADLINE`. Shutdown still proceeds (same
+    /// process-replacement reason) but is not a clean park success.
+    DeadlineUnresolved,
+}
+
+impl ParkCommitTerminal {
+    /// A clean park success — the only terminal that may take the
+    /// clean-`"daemon: restarted"` path and leave pid/socket released as a
+    /// truthful signal that every registered park committed.
+    pub fn is_clean(self) -> bool {
+        matches!(self, ParkCommitTerminal::Committed)
+    }
+}
+
+/// Internal shutdown-park state published by the worker task and observed by
+/// the drain path. `Pending` until the worker's `SessionWork::Shutdown` arm
+/// runs `park_all_registered`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ShutdownParkState {
+    Pending,
+    Committed,
+    FailedWrite,
+}
+
+/// Shared park-commit rendezvous for a single session worker
+/// (`daemon-lifecycle-replay-timing-robustness.md`). Created in
+/// [`crate::daemon::session_worker::spawn`], stored on the worker handle, and
+/// wired into that worker's [`InterruptHub`]. It carries **two** independent
+/// happens-before edges, both about the same "an interrupt park committed to
+/// SQLite" fact, consumed at two lifecycle sites:
+///
+/// 1. **Shutdown drain** ([`Self::await_shutdown_commit`]): the drain path
+///    waits for every worker that has a registered interrupt waiter to durably
+///    park before `metadata_guard.cleanup()` releases pid/socket. This closes
+///    the confirmed production race where a starved worker task was aborted at
+///    the grace deadline before its `park_interrupt` write landed, silently
+///    downgrading the settled "zero-grace instant park" of
+///    `daemon-drain-grace-and-activity-state` into an `Open` row.
+/// 2. **Attach reconciliation** ([`Self::await_startup_reconciled`]): a
+///    resumed worker flips a crash-surviving `Open` interrupt to `Parked` in
+///    its startup pass; the attach path waits for that pass before returning,
+///    so a client cannot observe a stale `Open` row (the same
+///    missing-synchronization class as (1), settled as in scope by the prompt).
+///
+/// The deadline caps only guarantee shutdown/attach cannot hang forever on a
+/// wedged worker; the normal path resolves as soon as the park commits, so
+/// this is a completion signal, not a widened timeout.
+#[derive(Clone)]
+pub struct ParkCommit {
+    inner: Arc<ParkCommitInner>,
+}
+
+struct ParkCommitInner {
+    /// Count of currently-registered interrupt waiters (live
+    /// [`PendingInterrupt`] guards). Read once at drain start to decide
+    /// whether this worker owes a shutdown park-commit.
+    registered: AtomicUsize,
+    shutdown: watch::Sender<ShutdownParkState>,
+    startup_reconciled: watch::Sender<bool>,
+}
+
+impl Default for ParkCommit {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ParkCommit {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(ParkCommitInner {
+                registered: AtomicUsize::new(0),
+                shutdown: watch::channel(ShutdownParkState::Pending).0,
+                startup_reconciled: watch::channel(false).0,
+            }),
+        }
+    }
+
+    /// Bump the registered-waiter count. Called from [`InterruptHub::register`]
+    /// exactly once per waiter; balanced by [`Self::on_unregister`] in the
+    /// guard's `Drop`.
+    fn on_register(&self) {
+        self.inner.registered.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Drop one registered-waiter count. Saturating so a double-drop (which
+    /// cannot happen — one guard, one `Drop`) can never underflow.
+    fn on_unregister(&self) {
+        let _ = self
+            .inner
+            .registered
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                Some(n.saturating_sub(1))
+            });
+    }
+
+    /// Whether this worker currently has at least one interrupt waiter blocked
+    /// on a human decision — i.e. whether it owes a shutdown park-commit. Read
+    /// lock-free at drain start (after `begin_drain` has closed new dispatch).
+    pub fn has_registered_waiters(&self) -> bool {
+        self.inner.registered.load(Ordering::SeqCst) > 0
+    }
+
+    /// Producer (worker `SessionWork::Shutdown` arm): every registered park
+    /// landed durably (or there were none). `send_replace` always updates the
+    /// stored value (even if the drain path has not subscribed yet — the worker
+    /// can report before or after the drain awaits), so a later subscriber sees
+    /// the terminal via `borrow`, never a lost update.
+    pub fn report_shutdown_committed(&self) {
+        let _ = self
+            .inner
+            .shutdown
+            .send_replace(ShutdownParkState::Committed);
+    }
+
+    /// Producer: at least one park write returned `Err`.
+    pub fn report_shutdown_failed_write(&self) {
+        let _ = self
+            .inner
+            .shutdown
+            .send_replace(ShutdownParkState::FailedWrite);
+    }
+
+    /// Producer (worker startup): the crash-reconciliation pass finished; any
+    /// stale `Open` interrupt has been flipped to `Parked` (or none needed it).
+    pub fn report_startup_reconciled(&self) {
+        let _ = self.inner.startup_reconciled.send_replace(true);
+    }
+
+    /// Consumer (drain): await the shutdown park-commit, bounded by `deadline`.
+    /// Resolves the instant the worker reports a terminal state; the deadline
+    /// only bounds a wedged worker (→ [`ParkCommitTerminal::DeadlineUnresolved`])
+    /// so shutdown can still release pid/socket for a successor.
+    pub async fn await_shutdown_commit(&self, deadline: std::time::Duration) -> ParkCommitTerminal {
+        let mut rx = self.inner.shutdown.subscribe();
+        match *rx.borrow_and_update() {
+            ShutdownParkState::Committed => return ParkCommitTerminal::Committed,
+            ShutdownParkState::FailedWrite => return ParkCommitTerminal::KnownFailedWrite,
+            ShutdownParkState::Pending => {}
+        }
+        let resolved = tokio::time::timeout(deadline, async {
+            loop {
+                if rx.changed().await.is_err() {
+                    // Sender dropped without a terminal report: treat as
+                    // unresolved so shutdown does not claim a clean success.
+                    return ShutdownParkState::Pending;
+                }
+                match *rx.borrow_and_update() {
+                    ShutdownParkState::Pending => continue,
+                    other => return other,
+                }
+            }
+        })
+        .await;
+        match resolved {
+            Ok(ShutdownParkState::Committed) => ParkCommitTerminal::Committed,
+            Ok(ShutdownParkState::FailedWrite) => ParkCommitTerminal::KnownFailedWrite,
+            Ok(ShutdownParkState::Pending) | Err(_) => ParkCommitTerminal::DeadlineUnresolved,
+        }
+    }
+
+    /// Consumer (attach): await the worker's startup reconciliation pass,
+    /// bounded by `deadline`. Returns `true` if the pass committed within the
+    /// deadline, `false` if the worker wedged (attach then proceeds anyway —
+    /// the reconciliation is idempotent and re-runs on the next attach).
+    pub async fn await_startup_reconciled(&self, deadline: std::time::Duration) -> bool {
+        let mut rx = self.inner.startup_reconciled.subscribe();
+        if *rx.borrow_and_update() {
+            return true;
+        }
+        let resolved = tokio::time::timeout(deadline, async {
+            loop {
+                if rx.changed().await.is_err() {
+                    return false;
+                }
+                if *rx.borrow_and_update() {
+                    return true;
+                }
+            }
+        })
+        .await;
+        matches!(resolved, Ok(true))
+    }
+
+    /// Test-only: simulate a worker registering an interrupt waiter without a
+    /// full [`InterruptHub`], so drain-path tests can mark a worker as owing a
+    /// park-commit. Balanced by [`Self::test_drop_registered`].
+    #[cfg(test)]
+    pub(crate) fn test_add_registered(&self) {
+        self.on_register();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_registered_count(&self) -> usize {
+        self.inner.registered.load(Ordering::SeqCst)
+    }
+}
+
 /// Shared interrupt rendezvous. Cheap to clone via `Arc`.
 pub struct InterruptHub {
     /// Pending wakeups keyed by interrupt id. A sender is inserted by
@@ -316,9 +532,24 @@ pub struct InterruptHub {
     /// that could touch the table happens outside it. All writers are async, so
     /// they all serialize on this one `tokio` mutex without a sync/async split.
     redaction_table_write_lock: tokio::sync::Mutex<()>,
+    /// Shared park-commit rendezvous for the worker that owns this hub, or
+    /// `None` for the many non-daemon hubs (tests, standalone shims) that have
+    /// no drain/attach lifecycle. Only the daemon session worker installs one
+    /// (via [`Self::with_park_commit`]); when present, `register`/`park`
+    /// maintain its registered-waiter count and shutdown park-commit signal.
+    park_commit: Option<ParkCommit>,
 }
 
 impl InterruptHub {
+    /// Install the shared [`ParkCommit`] created by
+    /// [`crate::daemon::session_worker::spawn`] so this hub's waiter
+    /// registration and shutdown park land the drain/attach synchronization
+    /// signals. Consumed at construction (before the hub is wrapped in `Arc`).
+    #[must_use]
+    pub fn with_park_commit(mut self, park_commit: ParkCommit) -> Self {
+        self.park_commit = Some(park_commit);
+        self
+    }
     /// Build a hub wired to the worker's client event fan-out, sharing an
     /// externally-owned interactive-client counter so the daemon's attach
     /// lifecycle and the hub read the same cell. The session worker owns
@@ -340,6 +571,7 @@ impl InterruptHub {
             session_id: Some(session_id),
             interactive_clients,
             redaction_table_write_lock: tokio::sync::Mutex::new(()),
+            park_commit: None,
         }
     }
 
@@ -355,6 +587,7 @@ impl InterruptHub {
             session_id: None,
             interactive_clients: Arc::new(AtomicUsize::new(0)),
             redaction_table_write_lock: tokio::sync::Mutex::new(()),
+            park_commit: None,
         }
     }
 
@@ -583,6 +816,9 @@ impl InterruptHub {
     pub fn register(&self, interrupt_id: Uuid) -> PendingInterrupt<'_> {
         let (tx, rx) = oneshot::channel();
         lock_or_recover(&self.waiters).insert(interrupt_id, tx);
+        if let Some(park_commit) = &self.park_commit {
+            park_commit.on_register();
+        }
         PendingInterrupt {
             hub: self,
             interrupt_id,
@@ -746,34 +982,104 @@ impl InterruptHub {
     }
 
     pub async fn park(&self, interrupt_id: Uuid) -> bool {
-        let parked = self
-            .db
-            .as_ref()
-            .map(|db| async move { db.park_interrupt(interrupt_id).await.ok() });
-        let parked = match parked {
-            Some(parked) => parked.await.unwrap_or(false),
+        self.park_inner(interrupt_id).await.woke
+    }
+
+    /// Park one interrupt, reporting both whether a local waiter was woken
+    /// (`woke`, the historical [`Self::park`] return) and whether the durable
+    /// `park_interrupt` write committed (`write_committed`). The two are
+    /// distinct: a waiter is always woken with `Parked` for correctness even
+    /// when the DB write fails, but a failed write must be surfaced to the
+    /// shutdown park-commit signal as [`ParkCommitTerminal::KnownFailedWrite`]
+    /// rather than impersonating a clean commit.
+    async fn park_inner(&self, interrupt_id: Uuid) -> ParkOutcome {
+        let write_committed = match self.db.as_ref() {
+            Some(db) => db.park_interrupt(interrupt_id).await.is_ok(),
             None => false,
         };
         let Some(tx) = lock_or_recover(&self.waiters).remove(&interrupt_id) else {
-            return parked;
+            // No live waiter: preserve the historical `park` contract of
+            // returning the write result as `woke`.
+            return ParkOutcome {
+                woke: write_committed,
+                write_committed,
+            };
         };
         let _ = tx.send(InterruptOutcome::Parked);
-        true
+        ParkOutcome {
+            woke: true,
+            write_committed,
+        }
     }
 
-    pub async fn park_all_registered(&self) -> usize {
+    /// Park every currently-registered interrupt waiter WITHOUT publishing the
+    /// shutdown park-commit terminal. The worker's `SessionWork::Shutdown` drain
+    /// calls this repeatedly — re-parking any interrupt the in-flight turn
+    /// registered after an earlier sweep (`daemon-lifecycle-replay-timing-
+    /// robustness.md`, finding 2) — and only reports once, via
+    /// [`Self::report_shutdown_commit`], after the driver task has exited and no
+    /// further registration is possible. Returns the woken count and whether
+    /// every `park_interrupt` write in this sweep committed.
+    pub async fn park_all_registered_collect(&self) -> ParkSweep {
         let interrupt_ids = {
             let guard = lock_or_recover(&self.waiters);
             guard.keys().copied().collect::<Vec<_>>()
         };
         let mut count = 0;
+        let mut all_committed = true;
         for interrupt_id in interrupt_ids {
-            if self.park(interrupt_id).await {
+            let outcome = self.park_inner(interrupt_id).await;
+            if outcome.woke {
                 count += 1;
             }
+            if !outcome.write_committed {
+                all_committed = false;
+            }
         }
-        count
+        ParkSweep {
+            count,
+            all_committed,
+        }
     }
+
+    /// Park every currently-registered interrupt waiter and publish the
+    /// shutdown park-commit terminal in one shot. Retained for non-drain
+    /// callers (loop/skill runners, tests) whose hubs carry no [`ParkCommit`]
+    /// so the report is a no-op; the worker's graceful drain instead uses
+    /// [`Self::park_all_registered_collect`] + a deferred
+    /// [`Self::report_shutdown_commit`].
+    pub async fn park_all_registered(&self) -> usize {
+        let sweep = self.park_all_registered_collect().await;
+        self.report_shutdown_commit(sweep.all_committed);
+        sweep.count
+    }
+
+    /// Publish the shutdown park-commit terminal for this worker (no-op when no
+    /// [`ParkCommit`] is installed): `Committed` when every registered park has
+    /// landed durably (or there were none), `FailedWrite` when a `park_interrupt`
+    /// write returned `Err`. Called once, after the driver task has quiesced.
+    pub fn report_shutdown_commit(&self, all_committed: bool) {
+        if let Some(park_commit) = &self.park_commit {
+            if all_committed {
+                park_commit.report_shutdown_committed();
+            } else {
+                park_commit.report_shutdown_failed_write();
+            }
+        }
+    }
+}
+
+/// Result of [`InterruptHub::park_inner`] — see its doc comment.
+struct ParkOutcome {
+    woke: bool,
+    write_committed: bool,
+}
+
+/// Result of [`InterruptHub::park_all_registered_collect`]: how many waiters
+/// were woken this sweep and whether every durable park write committed.
+pub struct ParkSweep {
+    pub count: usize,
+    pub all_committed: bool,
 }
 
 /// Guard returned by [`InterruptHub::register`]. Awaiting it (via
@@ -805,6 +1111,12 @@ impl Drop for PendingInterrupt<'_> {
     fn drop(&mut self) {
         // Idempotent: `resolve`/`park` already removed it on the happy path.
         let _ = lock_or_recover(&self.hub.waiters).remove(&self.interrupt_id);
+        // Balance the `on_register` bump: one guard, one drop, so the
+        // registered-waiter count tracks live waiters regardless of whether
+        // this interrupt was resolved, parked, or cancelled.
+        if let Some(park_commit) = &self.hub.park_commit {
+            park_commit.on_unregister();
+        }
     }
 }
 
@@ -1487,5 +1799,174 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    // --- ParkCommit (daemon-lifecycle-replay-timing-robustness.md) ---
+
+    #[tokio::test]
+    async fn park_commit_registered_count_tracks_live_waiters() {
+        // A hub with an installed ParkCommit bumps the registered count on
+        // `register` and drops it when the guard drops — so the drain path can
+        // read `has_registered_waiters()` to tell which workers owe a park.
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
+        let (hub, _events) = attached_hub(db.clone(), session.session_id);
+        let park_commit = ParkCommit::new();
+        let hub = InterruptHub::with_park_commit(hub, park_commit.clone());
+        assert!(!park_commit.has_registered_waiters());
+
+        let interrupt_id = db
+            .raise_interrupt_questions(session.session_id, "a", "first", &question_set())
+            .await
+            .unwrap();
+        let pending = hub.register(interrupt_id);
+        assert!(park_commit.has_registered_waiters());
+        assert_eq!(park_commit.test_registered_count(), 1);
+
+        drop(pending);
+        assert!(!park_commit.has_registered_waiters());
+    }
+
+    #[tokio::test]
+    async fn park_all_registered_reports_committed_to_park_commit() {
+        // The real shutdown path: `park_all_registered` on a hub with a
+        // ParkCommit publishes `Committed` once every registered park has
+        // landed durably, which the drain path then observes.
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
+        let (hub, _events) = attached_hub(db.clone(), session.session_id);
+        let park_commit = ParkCommit::new();
+        let hub = InterruptHub::with_park_commit(hub, park_commit.clone());
+        let interrupt_id = db
+            .raise_interrupt_questions(session.session_id, "a", "first", &question_set())
+            .await
+            .unwrap();
+        let _pending = hub.register(interrupt_id);
+
+        assert_eq!(hub.park_all_registered().await, 1);
+        assert_eq!(
+            park_commit
+                .await_shutdown_commit(std::time::Duration::from_secs(1))
+                .await,
+            ParkCommitTerminal::Committed
+        );
+    }
+
+    #[tokio::test]
+    async fn park_all_registered_collect_reparks_late_registration_without_reporting() {
+        // The worker's graceful-drain park-drain loop (finding 2) relies on a
+        // fresh sweep catching an interrupt registered AFTER an earlier sweep,
+        // and on `collect` NOT publishing the park-commit (that is deferred to
+        // `report_shutdown_commit`, called only once the driver has quiesced).
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "builder").await.unwrap();
+        let (hub, _events) = attached_hub(db.clone(), session.session_id);
+        let park_commit = ParkCommit::new();
+        let hub = InterruptHub::with_park_commit(hub, park_commit.clone());
+
+        // Initial sweep: nothing is registered yet.
+        assert_eq!(hub.park_all_registered_collect().await.count, 0);
+
+        // A turn registers an interrupt AFTER that initial sweep.
+        let interrupt_id = db
+            .raise_interrupt_questions(session.session_id, "a", "late", &question_set())
+            .await
+            .unwrap();
+        let _pending = hub.register(interrupt_id);
+
+        // A subsequent sweep catches the late registration and parks it durably,
+        // still WITHOUT publishing the shutdown park-commit.
+        let sweep = hub.park_all_registered_collect().await;
+        assert_eq!(sweep.count, 1);
+        assert!(sweep.all_committed);
+        assert_eq!(
+            park_commit
+                .await_shutdown_commit(std::time::Duration::ZERO)
+                .await,
+            ParkCommitTerminal::DeadlineUnresolved,
+            "collect must not publish the commit; it stays Pending until the deferred report"
+        );
+        assert_eq!(
+            db.get_interrupt(interrupt_id)
+                .await
+                .unwrap()
+                .expect("row")
+                .state,
+            crate::db::needs_attention::InterruptState::Parked
+        );
+
+        // The deferred report (after the driver quiesces) publishes Committed.
+        hub.report_shutdown_commit(true);
+        assert_eq!(
+            park_commit
+                .await_shutdown_commit(std::time::Duration::from_secs(1))
+                .await,
+            ParkCommitTerminal::Committed
+        );
+    }
+
+    #[tokio::test]
+    async fn await_shutdown_commit_resolves_only_after_report() {
+        // The consumer blocks until the producer reports a terminal state —
+        // this is the happens-before the drain path relies on to gate
+        // metadata cleanup, not a widened timeout.
+        let park_commit = ParkCommit::new();
+        park_commit.test_add_registered();
+        let consumer = {
+            let park_commit = park_commit.clone();
+            tokio::spawn(async move {
+                park_commit
+                    .await_shutdown_commit(std::time::Duration::from_secs(5))
+                    .await
+            })
+        };
+        // Give the consumer a chance to observe `Pending` and block.
+        tokio::task::yield_now().await;
+        assert!(!consumer.is_finished(), "must block until a report lands");
+        park_commit.report_shutdown_committed();
+        assert_eq!(consumer.await.unwrap(), ParkCommitTerminal::Committed);
+    }
+
+    #[tokio::test]
+    async fn await_shutdown_commit_surfaces_failed_write() {
+        let park_commit = ParkCommit::new();
+        park_commit.report_shutdown_failed_write();
+        assert_eq!(
+            park_commit
+                .await_shutdown_commit(std::time::Duration::from_secs(1))
+                .await,
+            ParkCommitTerminal::KnownFailedWrite
+        );
+        assert!(!ParkCommitTerminal::KnownFailedWrite.is_clean());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn await_shutdown_commit_unresolved_at_expired_deadline() {
+        // An expired/zero deadline yields `DeadlineUnresolved` with no
+        // real-time sleep — the injectable deadline criterion 5b relies on.
+        let park_commit = ParkCommit::new();
+        assert_eq!(
+            park_commit
+                .await_shutdown_commit(std::time::Duration::ZERO)
+                .await,
+            ParkCommitTerminal::DeadlineUnresolved
+        );
+    }
+
+    #[tokio::test]
+    async fn await_startup_reconciled_gates_on_report() {
+        let park_commit = ParkCommit::new();
+        let consumer = {
+            let park_commit = park_commit.clone();
+            tokio::spawn(async move {
+                park_commit
+                    .await_startup_reconciled(std::time::Duration::from_secs(5))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!consumer.is_finished());
+        park_commit.report_startup_reconciled();
+        assert!(consumer.await.unwrap());
     }
 }

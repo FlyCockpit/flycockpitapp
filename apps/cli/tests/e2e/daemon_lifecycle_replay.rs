@@ -1,3 +1,17 @@
+//! Daemon lifecycle replay e2e (`daemon-lifecycle-replay-e2e.md`).
+//!
+//! Timing-budget policy (`daemon-lifecycle-replay-timing-robustness.md`,
+//! criterion 6): every `wait_until`/`next_event` below is a legitimate
+//! condition-poll for something asynchronous *from the client's point of view*
+//! — an out-of-process daemon the test does not control finishing its boot,
+//! rehydration, crash-reconciliation, or replay — never a "wait long enough"
+//! window, and none of these budgets is widened here. The three former
+//! `sleep(100ms)` negative-assertion windows have been replaced with the
+//! deterministic [`wait_for_duplicate_resolve_processed`] happens-before
+//! barrier. The drain/restart park-commit race the three `create_parked_session_
+//! with_shutdown_park_delay` tests exercise is forced deterministically via an
+//! injected debug-build pause, not by host CPU contention.
+
 use std::future::Future;
 use std::path::Path;
 use std::sync::{LazyLock, Mutex};
@@ -354,6 +368,125 @@ async fn create_auto_gate_parked_session()
     create_auto_gate_parked_session_with_hook(false).await
 }
 
+/// Milliseconds the injected shutdown-park delay holds the graceful drain's
+/// interrupt park (`COCKPIT_TEST_DELAY_SHUTDOWN_PARK_MS`,
+/// `daemon-lifecycle-replay-timing-robustness.md`). Chosen strictly greater than
+/// the `--grace 2` (2000ms) window these tests restart with — so the pre-fix
+/// drain, which released pid/socket at the grace deadline, would leave the row
+/// `open` — and strictly less than the 5000ms product-owned
+/// `INTERRUPT_PARK_COMMIT_DEADLINE`, so the fixed drain path observes a clean
+/// committed park rather than the forced deadline terminal. This forces the
+/// worst-case interleaving deterministically instead of relying on host CPU
+/// starvation (criteria 2, 3, 8).
+const INJECTED_SHUTDOWN_PARK_DELAY_MS: &str = "3000";
+
+/// Like [`create_parked_session`], but the spawned daemon runs with the injected
+/// shutdown-park delay above so its next graceful restart deterministically
+/// exercises the drain/restart park-commit race (criteria 3, 8). The delay is
+/// debug-build + env-gated inside the daemon; it fires only on a worker's
+/// `SessionWork::Shutdown` arm.
+async fn create_parked_session_with_shutdown_park_delay()
+-> (ScriptedProvider, SpawnedDaemon, AttachedSession, Uuid) {
+    // Keep the provider alive for the daemon lifetime; dropping it closes the listener.
+    let provider = lifecycle_provider().await;
+    let mut home = IsolatedHome::new();
+    home.set_env(
+        "COCKPIT_TEST_DELAY_SHUTDOWN_PARK_MS",
+        INJECTED_SHUTDOWN_PARK_DELAY_MS,
+    );
+    home.write_local_provider_config(&provider.base_url());
+    home.trust_project();
+    let daemon = SpawnedDaemon::start_with_home(home).await;
+    let client = daemon.client().await;
+    let attached = client
+        .attach(daemon.project_path(), None, None, true)
+        .await
+        .expect("attach session");
+
+    client
+        .send_user_message("trigger lifecycle approval")
+        .await
+        .expect("send user message");
+    let interrupt_id =
+        wait_for_interrupt(&client, &daemon, attached.session_id, Some("initial")).await;
+
+    (provider, daemon, attached, interrupt_id)
+}
+
+/// Milliseconds the injected attach-reconciliation delay
+/// (`COCKPIT_TEST_DELAY_STARTUP_RECONCILE_MS`) holds a resumed worker's
+/// crash-reconciliation park. Chosen well below the 5000ms
+/// `INTERRUPT_PARK_COMMIT_DEADLINE` so the fixed attach path — which awaits the
+/// startup park-commit signal — still returns with a committed park, while
+/// leaving a wide window in which a non-awaiting (pre-fix) attach would expose a
+/// stale `open` row (criterion 1).
+const INJECTED_STARTUP_RECONCILE_DELAY_MS: &str = "2000";
+
+/// Like [`create_parked_session`], but the daemon runs with the injected
+/// attach-reconciliation delay so a later resumed-worker attach deterministically
+/// exercises the attach/reconciliation park-commit gap (criterion 1). The
+/// interrupt is left `open` (no graceful park) for a crash + resume to reconcile.
+async fn create_open_interrupt_session_with_reconcile_delay()
+-> (ScriptedProvider, SpawnedDaemon, AttachedSession, Uuid) {
+    // Keep the provider alive for the daemon lifetime; dropping it closes the listener.
+    let provider = lifecycle_provider().await;
+    let mut home = IsolatedHome::new();
+    home.set_env(
+        "COCKPIT_TEST_DELAY_STARTUP_RECONCILE_MS",
+        INJECTED_STARTUP_RECONCILE_DELAY_MS,
+    );
+    home.write_local_provider_config(&provider.base_url());
+    home.trust_project();
+    let daemon = SpawnedDaemon::start_with_home(home).await;
+    let client = daemon.client().await;
+    let attached = client
+        .attach(daemon.project_path(), None, None, true)
+        .await
+        .expect("attach session");
+
+    client
+        .send_user_message("trigger lifecycle approval")
+        .await
+        .expect("send user message");
+    let interrupt_id =
+        wait_for_interrupt(&client, &daemon, attached.session_id, Some("initial")).await;
+
+    (provider, daemon, attached, interrupt_id)
+}
+
+/// Deterministic happens-before for a duplicate-resolve negative assertion
+/// (criterion 6c). A `ResolveInterrupt` request is dispatched to the session
+/// worker via `send_work`, whose `Ack` returns at ENQUEUE time, not after the
+/// worker processes it — so the former `sleep(100ms)` was a wall-clock window
+/// hoping a stray second execution would surface. Instead, enqueue a benign
+/// follow-up user-message turn BEHIND the duplicate on the worker's FIFO queue
+/// and condition-poll the DURABLE `session_events` for that turn's persisted
+/// rows. Because the worker drains its queue in order, the new rows prove the
+/// duplicate was fully processed (and, having no `parked` row to claim, could
+/// not have re-executed the replay). This is a happens-before via durable
+/// observation — not a wall-clock absence window and immune to event-stream
+/// buffering — after which the caller asserts exactly-once execution state.
+async fn wait_for_duplicate_resolve_processed(
+    client: &cockpit_cli::integration::DaemonClient,
+    daemon: &SpawnedDaemon,
+    session_id: Uuid,
+) {
+    let before = session_event_rows(&daemon.db_path(), session_id).len();
+    client
+        .send_user_message("lifecycle duplicate-resolve sync barrier")
+        .await
+        .expect("send duplicate-resolve sync-barrier user message");
+    wait_until(
+        "duplicate-resolve barrier turn persisted",
+        Duration::from_secs(20),
+        || {
+            let db_path = daemon.db_path();
+            async move { session_event_rows(&db_path, session_id).len() > before }
+        },
+    )
+    .await;
+}
+
 async fn restart_daemon_gracefully(daemon: &SpawnedDaemon) {
     let output = daemon
         .command()
@@ -435,7 +568,7 @@ fn lifecycle_graceful_park_round_trip_replays_once() {
             .approve_interrupt_once(interrupt_id)
             .await
             .expect("duplicate approve request");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        wait_for_duplicate_resolve_processed(&client, &daemon, attached.session_id).await;
         assert_eq!(tool_call_count(&daemon.db_path(), attached.session_id), 1);
         assert!(
             provider.request_count() >= 2,
@@ -495,8 +628,56 @@ fn lifecycle_sigkill_open_interrupt_reconciles_and_replays_once() {
             .approve_interrupt_once(interrupt_id)
             .await
             .expect("duplicate approve request");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        wait_for_duplicate_resolve_processed(&client, &daemon, attached.session_id).await;
         assert_eq!(tool_call_count(&daemon.db_path(), attached.session_id), 1);
+    });
+}
+
+/// Criterion 1: a resumed-worker attach must await the SAME park-commit signal
+/// as the drain path before a client can observe the interrupt. With the
+/// attach-reconciliation park injected-delayed past normal, a single-shot read
+/// right after `attach` returns must already see `parked` — proving `attach`
+/// blocked on the worker's startup reconciliation commit. Fails against the
+/// pre-fix code, whose `attach` returned as soon as the worker was spawned.
+#[test]
+fn lifecycle_attach_park_commits_before_interrupt_visible() {
+    run_daemon_replay_test(async {
+        let (_provider, daemon, attached, interrupt_id) =
+            create_open_interrupt_session_with_reconcile_delay().await;
+        // Crash before any graceful park: the row is durably `open`.
+        assert_eq!(interrupt_row(&daemon.db_path(), interrupt_id).state, "open");
+
+        daemon.sigkill().await;
+        daemon.restart_same_home().await;
+
+        let client = daemon.client().await;
+        // The resumed-worker attach must not return until the delayed startup
+        // crash-reconciliation park has committed. Single-shot read, zero retry
+        // budget — no `wait_until`.
+        client
+            .attach(daemon.project_path(), Some(attached.session_id), None, true)
+            .await
+            .expect("reattach session");
+        assert_eq!(
+            interrupt_row(&daemon.db_path(), interrupt_id).state,
+            "parked",
+            "attach must await the startup park-commit before returning"
+        );
+
+        // The rehydration interrupt is still delivered and resolves cleanly.
+        assert_eq!(
+            wait_for_interrupt(&client, &daemon, attached.session_id, Some("rehydration")).await,
+            interrupt_id
+        );
+        client
+            .approve_interrupt_project(interrupt_id)
+            .await
+            .expect("approve parked interrupt");
+        wait_for_resolved(&client, attached.session_id, interrupt_id).await;
+        assert_eq!(
+            interrupt_row(&daemon.db_path(), interrupt_id).state,
+            "resolved"
+        );
     });
 }
 
@@ -599,7 +780,13 @@ fn lifecycle_auto_gate_unavailable_sigkill_park_replay_runs_approved_command() {
 #[test]
 fn lifecycle_deny_round_trip_resolves_without_broadened_rerun() {
     run_daemon_replay_test(async {
-        let (_provider, daemon, attached, interrupt_id) = create_parked_session().await;
+        // Injected worst-case interleaving (criterion 3): the daemon's graceful
+        // park is delayed past the `--grace 2` window. The single-shot
+        // `state == "parked"` read below (no `wait_until`, zero retry budget) is
+        // the executable spec that the drain path now gates pid/socket release
+        // on the park commit — it must still hold, unmodified, under this pause.
+        let (_provider, daemon, attached, interrupt_id) =
+            create_parked_session_with_shutdown_park_delay().await;
 
         restart_daemon_gracefully(&daemon).await;
         assert_eq!(
@@ -742,7 +929,7 @@ fn lifecycle_sigkill_executing_interrupt_reconciles_to_interrupted_without_reexe
             .approve_interrupt_once(interrupt_id)
             .await
             .expect("late duplicate approve request");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        wait_for_duplicate_resolve_processed(&client, &daemon, attached.session_id).await;
         assert!(
             tool_call_count(&daemon.db_path(), attached.session_id) <= 1,
             "executing crash must not re-execute parked replay"
@@ -753,7 +940,11 @@ fn lifecycle_sigkill_executing_interrupt_reconciles_to_interrupted_without_reexe
 #[test]
 fn lifecycle_attach_replay_across_restart_delivers_persisted_events_once_in_order() {
     run_daemon_replay_test(async {
-        let (_provider, daemon, attached, interrupt_id) = create_parked_session().await;
+        // Injected worst-case interleaving (criterion 8): graceful park delayed
+        // past `--grace 2`, forcing the drain/restart park-commit race before
+        // the exactly-once ordered-replay assertions below.
+        let (_provider, daemon, attached, interrupt_id) =
+            create_parked_session_with_shutdown_park_delay().await;
 
         restart_daemon_gracefully(&daemon).await;
 

@@ -47,7 +47,91 @@ const START_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const START_WAIT_TIMEOUT: Duration = Duration::from_millis(50);
 
+/// Product-owned upper bound on how long shutdown/attach waits for every
+/// registered interrupt's park to commit to SQLite
+/// (`daemon-lifecycle-replay-timing-robustness.md`). This is **not** `--grace`:
+/// `--grace` bounds genuinely in-flight tool/inference work (settled by
+/// `daemon-drain-grace-and-activity-state`), whereas an interrupt park is the
+/// "zero-grace instant park" that same prompt kept separate. The deadline only
+/// caps a wedged worker so shutdown can still release pid/socket for a
+/// successor; the normal path resolves the instant the park commits, so this is
+/// a completion signal, not a widened timeout.
+pub(crate) const INTERRUPT_PARK_COMMIT_DEADLINE: Duration = Duration::from_secs(5);
+
 type WorkerGeneration = u64;
+
+/// Outcome of [`SessionRegistry::drain_all`]. Splits the two independent
+/// shutdown guarantees the drain path now enforces
+/// (`daemon-lifecycle-replay-timing-robustness.md`): the historical
+/// grace-bounded drain of genuinely in-flight work, and the decoupled
+/// interrupt-park commit that gates pid/socket release.
+#[derive(Clone, Copy, Debug)]
+pub struct DrainOutcome {
+    /// Genuinely in-flight tool/inference work drained within `--grace`. This
+    /// is the historical `drain_all` boolean: `false` when the grace deadline
+    /// forced a worker abort.
+    pub running_work_clean: bool,
+    /// Terminal state of the interrupt-park commit wait — the new signal that
+    /// keeps `metadata_guard.cleanup()`/`"daemon: restarted"` truthful.
+    pub park_commit: crate::engine::interrupt::ParkCommitTerminal,
+}
+
+impl DrainOutcome {
+    /// A fully clean shutdown: in-flight work drained AND every registered
+    /// interrupt park committed. Only this may take the clean-success path.
+    pub fn is_clean(self) -> bool {
+        self.running_work_clean && self.park_commit.is_clean()
+    }
+}
+
+/// Outcome of trying to hand a worker its graceful-shutdown `Shutdown` message
+/// under a bounded deadline (`daemon-lifecycle-replay-timing-robustness.md`,
+/// finding 1). Distinguishes a benign already-exited worker from a wedged one
+/// whose full queue would otherwise block drain forever.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ShutdownDispatch {
+    /// Accepted onto the worker's queue.
+    Delivered,
+    /// Send errored because the worker already exited (receiver dropped).
+    WorkerGone,
+    /// Send timed out — queue full and the worker not receiving; force-abort.
+    Wedged,
+}
+
+/// Await the shutdown park-commit of every worker that owed one, each bounded
+/// by `deadline`, and aggregate to a single terminal
+/// (`daemon-lifecycle-replay-timing-robustness.md`). Mirrors `drain_all`'s
+/// `join_all` fan-out: the signal aggregates across *every* live worker with a
+/// registered waiter, not just the first. An empty obligation set resolves
+/// immediately to `Committed` (proven none) so a no-waiter drain never waits.
+async fn await_park_commits(
+    obligations: &[crate::engine::interrupt::ParkCommit],
+    deadline: Duration,
+) -> crate::engine::interrupt::ParkCommitTerminal {
+    use crate::engine::interrupt::ParkCommitTerminal;
+    if obligations.is_empty() {
+        return ParkCommitTerminal::Committed;
+    }
+    let results = futures::future::join_all(
+        obligations
+            .iter()
+            .map(|park_commit| park_commit.await_shutdown_commit(deadline)),
+    )
+    .await;
+    // A real failed write is the most informative non-clean terminal; an
+    // unresolved deadline is the fallback. Either makes `is_clean()` false.
+    let mut terminal = ParkCommitTerminal::Committed;
+    for result in results {
+        match result {
+            ParkCommitTerminal::Committed => {}
+            ParkCommitTerminal::KnownFailedWrite => return ParkCommitTerminal::KnownFailedWrite,
+            ParkCommitTerminal::DeadlineUnresolved => {
+                terminal = ParkCommitTerminal::DeadlineUnresolved;
+            }
+        }
+    }
+    terminal
+}
 
 /// Daemon-wide registry of active session workers.
 #[derive(Clone)]
@@ -509,7 +593,11 @@ impl SessionRegistry {
     ) -> Result<SessionWorkerHandle> {
         // Resume path.
         if let Some(id) = session_id {
-            match self.claim_attach(id) {
+            // Resolve the handle for whichever claim path this attach takes.
+            // The reconciliation gate below is applied UNIFORMLY afterwards
+            // (finding 3) so no claim path can slip a pre-reconciliation handle
+            // back to a client.
+            let handle = match self.claim_attach(id) {
                 AttachClaim::Live(handle) => {
                     // Reattach to a still-alive worker (the worker outlives client
                     // disconnects, GOALS §8b). Re-acquire any locks released when
@@ -517,37 +605,85 @@ impl SessionRegistry {
                     // (implementation note). A no-op when no
                     // release snapshot exists — so a second concurrent attach to an
                     // already-attached session triggers nothing.
-                    self.resume_session_locks(id);
-                    return Ok(*handle);
+                    *handle
                 }
-                AttachClaim::Starting(slot) => {
-                    let handle = wait_for_start(slot)
-                        .await
-                        .context("waiting for session worker start")?;
-                    self.resume_session_locks(id);
-                    return Ok(handle);
-                }
+                AttachClaim::Starting(slot) => Box::pin(wait_for_start(slot))
+                    .await
+                    .context("waiting for session worker start")?,
                 AttachClaim::Start(ticket) => {
                     let generation = ticket.generation();
                     self.inner.db.restore_supervised_goals(id).await?;
-                    let result = self
-                        .start_resumed_worker(
-                            id,
-                            initial_model,
-                            client_no_sandbox,
-                            env_snapshot,
-                            generation,
-                        )
-                        .await;
+                    // Box the heavy resume sub-future: it synchronously calls
+                    // `Session::resume` (a large stack frame) and threads config
+                    // loading, so keeping its state on the heap rather than
+                    // inlined into `attach`'s future is what keeps the enclosing
+                    // future small enough to poll without overflowing the worker
+                    // stack (`daemon-lifecycle-replay-timing-robustness.md`).
+                    let result = Box::pin(self.start_resumed_worker(
+                        id,
+                        initial_model,
+                        client_no_sandbox,
+                        env_snapshot,
+                        generation,
+                    ))
+                    .await;
                     self.finish_attach_start(ticket, &result);
-                    let handle = result?;
-                    self.resume_session_locks(id);
-                    return Ok(handle);
+                    result?
                 }
-            }
+            };
+            // Reconciliation gate (`daemon-lifecycle-replay-timing-robustness.md`,
+            // §3 / finding 3): `start_worker` publishes the handle into
+            // `workers.live` BEFORE the resumed worker's startup
+            // crash-reconciliation pass (`Open → Parked` for an interrupt whose
+            // graceful park did not land) completes. That pass runs
+            // asynchronously inside the worker task, so a concurrent
+            // `AttachClaim::Live` — or the `Start` owner itself — could return
+            // while the row is still `Open`. Awaiting the shared park-commit
+            // signal here for EVERY resume-claim path (not just `Start`) closes
+            // that window: no attach observes the pre-reconciliation `Open` row.
+            // Idempotent and immediate once reconciliation has landed; bounded
+            // by the product-owned deadline, after which attach still proceeds
+            // (the reconciliation is idempotent and re-runs on the next attach),
+            // so it can never deadlock against a worker that is being torn down.
+            // Box the reconciliation-gate await so its (handle-holding) state
+            // does not inline into `attach`'s future.
+            Box::pin(
+                handle
+                    .park_commit()
+                    .await_startup_reconciled(INTERRUPT_PARK_COMMIT_DEADLINE),
+            )
+            .await;
+            self.resume_session_locks(id);
+            return Ok(handle);
         }
 
-        // Create path.
+        // Create path — boxed (`daemon-lifecycle-replay-timing-robustness.md`):
+        // this branch builds a session + config + worker and is the largest
+        // await-point state in `attach`. Keeping it behind a `Box::pin` heap-
+        // allocates that state instead of inflating the enclosing `attach`
+        // future (which the resume path above already keeps small), so the whole
+        // future stays comfortably within the worker stack.
+        Box::pin(self.attach_create_session(
+            project_root,
+            initial_model,
+            client_no_sandbox,
+            model_override,
+            env_snapshot,
+        ))
+        .await
+    }
+
+    /// The create-a-new-session branch of [`Self::attach`], factored out and
+    /// awaited behind a `Box::pin` so its (large) local state lives on the heap
+    /// and does not inflate the `attach` future's on-stack size.
+    async fn attach_create_session(
+        &self,
+        project_root: Option<PathBuf>,
+        initial_model: Option<ActiveModelRef>,
+        client_no_sandbox: bool,
+        model_override: Option<&ActiveModelRef>,
+        env_snapshot: EnvSnapshot,
+    ) -> Result<SessionWorkerHandle> {
         let Some(project_root) = project_root else {
             bail!("attach requires either session_id or project_root");
         };
@@ -997,10 +1133,26 @@ impl SessionRegistry {
     /// (`shutdown.begin_drain()`) before calling this, so no fresh provider
     /// dispatch slips out while we drain.
     ///
-    /// Returns `true` when every worker drained cleanly within `grace`, and
-    /// `false` when the deadline forced an abort — the caller surfaces the
-    /// "shutdown was forced" note from that.
-    pub async fn drain_all(&self, grace: Duration) -> bool {
+    /// Returns a [`DrainOutcome`] carrying both the historical grace-bounded
+    /// running-work result (`running_work_clean`) and the decoupled
+    /// interrupt-park commit terminal (`park_commit`)
+    /// (`daemon-lifecycle-replay-timing-robustness.md`). The caller
+    /// (`daemon/mod.rs`) must gate `metadata_guard.cleanup()` on
+    /// [`DrainOutcome::is_clean`]-vs-forced so pid/socket release and
+    /// `"daemon: restarted"` never falsely claim a clean park success.
+    pub async fn drain_all(&self, grace: Duration) -> DrainOutcome {
+        self.drain_all_inner(grace, INTERRUPT_PARK_COMMIT_DEADLINE)
+            .await
+    }
+
+    /// [`Self::drain_all`] with an injectable park-commit deadline so tests can
+    /// force the `DeadlineUnresolved` terminal without a real 5-second sleep
+    /// (criterion 5b). Production always uses [`INTERRUPT_PARK_COMMIT_DEADLINE`].
+    async fn drain_all_inner(
+        &self,
+        grace: Duration,
+        park_commit_deadline: Duration,
+    ) -> DrainOutcome {
         // Snapshot + take the join handles. Taking them out of the map means
         // a worker that exits on its own mid-drain (and calls `forget`)
         // can't race us for its handle.
@@ -1026,31 +1178,111 @@ impl SessionRegistry {
                 .collect()
         };
 
-        // Ask each worker to stop: closes its driver input so the current
-        // turn (if any) drains, then the worker task ends.
-        for h in &handles {
-            let _ = h
-                .send_work(crate::daemon::session_worker::SessionWork::Shutdown {
-                    pause_for_resume: true,
-                })
-                .await;
+        // Ask each worker to stop, with a BOUNDED, abort-aware dispatch
+        // (finding 1). A worker's work queue is bounded; if it stopped
+        // receiving (wedged) while its queue is full, an unbounded
+        // `send(...).await` would block drain forever and never reach the
+        // park-commit / grace / abort phases below — defeating every deadline.
+        // So bound each send by the lifecycle deadline and force-abort any
+        // worker we cannot even hand the Shutdown to. Sent concurrently so the
+        // whole dispatch step is one deadline, not one per worker.
+        let abort_handles_by_id: std::collections::HashMap<Uuid, tokio::task::AbortHandle> = joins
+            .iter()
+            .map(|(id, entry)| (*id, entry.join.abort_handle()))
+            .collect();
+        let send_deadline = park_commit_deadline.max(grace);
+        let dispatch: Vec<ShutdownDispatch> = futures::future::join_all(handles.iter().map(|h| {
+            let h = h.clone();
+            async move {
+                match tokio::time::timeout(
+                    send_deadline,
+                    h.send_work(crate::daemon::session_worker::SessionWork::Shutdown {
+                        pause_for_resume: true,
+                    }),
+                )
+                .await
+                {
+                    // Accepted onto the worker's queue.
+                    Ok(Ok(())) => ShutdownDispatch::Delivered,
+                    // Send errored (receiver dropped) — the worker task has
+                    // already exited. Benign: its join completes immediately and
+                    // it owes no park. NOT the finding-1 hang.
+                    Ok(Err(_)) => ShutdownDispatch::WorkerGone,
+                    // Timed out with the queue full and the worker not
+                    // receiving: this is the wedged case finding 1 targets — an
+                    // unbounded send here would block drain forever.
+                    Err(_) => ShutdownDispatch::Wedged,
+                }
+            }
+        }))
+        .await;
+        // Force-abort only the WEDGED workers (finding 1): a worker that never
+        // accepted Shutdown because its queue is full and it stopped receiving
+        // will neither drain nor park, so awaiting it would only burn the
+        // deadline. Aborting now keeps the pre-abort path provably bounded. An
+        // already-gone worker (send errored) needs no abort — it has exited.
+        let mut any_wedged = false;
+        for (h, d) in handles.iter().zip(dispatch.iter()) {
+            if *d == ShutdownDispatch::Wedged {
+                any_wedged = true;
+                tracing::warn!(
+                    session_id = %h.session_id,
+                    "daemon drain: worker did not accept shutdown within deadline (wedged queue); forcing abort"
+                );
+                if let Some(ah) = abort_handles_by_id.get(&h.session_id) {
+                    ah.abort();
+                }
+            }
         }
         if grace.is_zero() {
             tokio::task::yield_now().await;
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        // Await all worker tasks concurrently, racing the shared grace
-        // deadline. We wait for ALL to finish (or the deadline), never just
-        // the first — `join_all` resolves only when every future has. The
-        // `abort_handle`s let the deadline arm force-abort whatever's left.
+        // Interrupt-park obligations: EVERY worker we delivered a Shutdown to is
+        // an obligation — drain awaits its ParkCommit terminal unconditionally
+        // (`daemon-lifecycle-replay-timing-robustness.md`, finding 2 residual).
+        // The obligation MUST be established at DISPATCH time, never inferred
+        // from post-dispatch live `has_registered_waiters()`/`processing` state:
+        // a worker whose INITIAL park write FAILS wakes/removes its waiter and
+        // lets its driver exit, clearing BOTH bits before we could sample them —
+        // yet it durably reports `FailedWrite`. Sampling live state would drop
+        // that obligation and let drain aggregate `Committed`, releasing metadata
+        // as if a failed durable park had succeeded. Every delivered worker's
+        // park-drain loop reports a terminal for both pause paths, and a
+        // no-waiter/idle worker reports `Committed` promptly (its driver exits as
+        // soon as the input closes, so the loop's first poll observes exit), so
+        // awaiting all of them stays bounded and adds no real latency. Only
+        // `WorkerGone` (already exited) and `Wedged` (force-aborted) owe nothing.
+        let park_obligations: Vec<crate::engine::interrupt::ParkCommit> = handles
+            .iter()
+            .zip(dispatch.iter())
+            .filter(|(_, d)| **d == ShutdownDispatch::Delivered)
+            .map(|(handle, _)| handle.park_commit())
+            .collect();
+
+        // Phase 1 — interrupt-park commit, on its OWN product-owned deadline,
+        // BEFORE the grace-bounded abort below. Awaiting here (not sharing the
+        // `--grace` deadline, and never abort-racing it) is the fix: the abort
+        // arm would otherwise kill a worker's `park_interrupt` write before it
+        // committed under a starved scheduler, leaving the row `Open` while the
+        // restart reported success. A worker with no registered waiter resolves
+        // immediately (see `await_park_commits`), so genuinely-running work is
+        // never delayed by this phase.
+        let park_commit = await_park_commits(&park_obligations, park_commit_deadline).await;
+
+        // Phase 2 — grace-bounded drain + force-abort of genuinely in-flight
+        // tool/inference work, UNCHANGED from `daemon-drain-grace-and-activity-
+        // state`: wait for ALL worker tasks (never just the first — `join_all`
+        // resolves only when every future has); on the deadline, force-abort
+        // whatever's left so the daemon can exit regardless.
         let abort_handles: Vec<tokio::task::AbortHandle> = joins
             .iter()
             .map(|(_, entry)| entry.join.abort_handle())
             .collect();
         let drain = futures::future::join_all(joins.into_iter().map(|(_, entry)| entry.join));
 
-        let clean = match tokio::time::timeout(grace, drain).await {
+        let phase2_clean = match tokio::time::timeout(grace, drain).await {
             Ok(_) => true,
             Err(_) => {
                 // Grace exhausted with work still outstanding: force-abort
@@ -1078,8 +1310,14 @@ impl SessionRegistry {
                 false
             }
         };
+        // A worker we had to force-abort at the dispatch step (a wedged queue,
+        // finding 1) is a forced shutdown, not a clean drain.
+        let running_work_clean = phase2_clean && !any_wedged;
         self.forget_generations(drained_generations);
-        clean
+        DrainOutcome {
+            running_work_clean,
+            park_commit,
+        }
     }
 
     async fn record_forced_drain_interruption(
@@ -1466,6 +1704,46 @@ mod tests {
 
     fn test_handle(reg: &SessionRegistry, session: Arc<Session>) -> SessionWorkerHandle {
         session_worker::SessionWorkerHandle::test_handle(session, reg.inner.locks.clone())
+    }
+
+    /// Regression guard (`daemon-lifecycle-replay-timing-robustness.md`): the
+    /// `attach` future must stay small on the stack. The reconciliation gate +
+    /// resume/create sub-futures are `Box::pin`ned so their state lives on the
+    /// heap; without that, `attach`'s future ballooned and overflowed the tokio
+    /// worker stack at the synchronous `Session::resume` frame (SIGABRT /
+    /// pathologically large). This asserts the future stays well under a worker
+    /// stack budget so that regression cannot silently return.
+    #[test]
+    fn attach_future_stays_small_on_stack() {
+        let reg = test_registry();
+        let env = EnvSnapshot::new(
+            crate::env_snapshot::EnvSnapshotSource::DaemonStart,
+            Default::default(),
+        );
+        let fut = reg.attach(Some(Uuid::new_v4()), None, None, false, None, env);
+        let size = std::mem::size_of_val(&fut);
+        assert!(
+            size < 4096,
+            "attach future grew to {size} bytes; box the heavy sub-futures to keep it small"
+        );
+    }
+
+    /// A test handle whose work queue keeps a LIVE receiver, so drain's bounded
+    /// Shutdown dispatch (finding 1) succeeds and the worker counts as
+    /// "delivered". The returned receiver must be kept alive for the duration of
+    /// the test; dropping it closes the queue and drain will treat the worker as
+    /// undelivered and force-abort it.
+    fn test_handle_with_rx(
+        reg: &SessionRegistry,
+        session: Arc<Session>,
+    ) -> (
+        SessionWorkerHandle,
+        tokio::sync::mpsc::Receiver<session_worker::SessionWork>,
+    ) {
+        session_worker::SessionWorkerHandle::test_handle_with_receiver(
+            session,
+            reg.inner.locks.clone(),
+        )
     }
 
     struct NoopSchedulerExecutor;
@@ -2416,7 +2694,10 @@ mod tests {
         reg.insert_test_join(Uuid::new_v4(), join);
 
         // Generous grace: the in-flight work finishes well inside it.
-        let clean = reg.drain_all(Duration::from_secs(5)).await;
+        let clean = reg
+            .drain_all(Duration::from_secs(5))
+            .await
+            .running_work_clean;
         assert!(
             clean,
             "drain should report clean when work finishes in grace"
@@ -2451,7 +2732,10 @@ mod tests {
         reg.insert_test_join(Uuid::new_v4(), join);
 
         let start = std::time::Instant::now();
-        let clean = reg.drain_all(Duration::from_millis(120)).await;
+        let clean = reg
+            .drain_all(Duration::from_millis(120))
+            .await
+            .running_work_clean;
         assert!(
             !clean,
             "a hung worker must yield a forced (non-clean) drain"
@@ -2474,11 +2758,312 @@ mod tests {
     async fn idle_drain_is_fast_and_clean() {
         let reg = test_registry();
         let start = std::time::Instant::now();
-        let clean = reg.drain_all(Duration::from_secs(30)).await;
+        let clean = reg
+            .drain_all(Duration::from_secs(30))
+            .await
+            .running_work_clean;
         assert!(clean, "idle drain is clean");
         assert!(
             start.elapsed() < Duration::from_secs(1),
             "idle drain must not wait out the grace"
+        );
+    }
+
+    // --- Interrupt park-commit gating
+    // (daemon-lifecycle-replay-timing-robustness.md) ---
+
+    use crate::engine::interrupt::ParkCommitTerminal;
+
+    /// Criterion 2: with a registered interrupt waiter, `drain_all` must not
+    /// return (so `metadata_guard.cleanup()` cannot release pid/socket) until
+    /// the worker's park commits — even though its running-work join already
+    /// finished. Fails against pre-fix code, which returned as soon as the join
+    /// drained regardless of the un-committed park.
+    #[tokio::test]
+    async fn drain_park_commits_before_metadata_release() {
+        let reg = test_registry();
+        let session = test_session(&reg);
+        let (handle, _rx) = test_handle_with_rx(&reg, session);
+        let park_commit = handle.park_commit();
+        park_commit.test_add_registered(); // a turn blocked on a human decision
+        // Running work already drained: the join completes immediately, so only
+        // the park-commit could hold the drain open.
+        reg.insert_test_worker(handle, tokio::spawn(async {}));
+
+        let reg_drain = reg.clone();
+        let drain = tokio::spawn(async move { reg_drain.drain_all(Duration::from_secs(5)).await });
+        // Let the drain reach its park-commit await.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !drain.is_finished(),
+            "drain (→ metadata cleanup) must block until the registered park commits"
+        );
+
+        // Release: the worker reports its park committed durably.
+        park_commit.report_shutdown_committed();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), drain)
+            .await
+            .expect("drain must complete once the park commits")
+            .expect("drain task join");
+        assert_eq!(outcome.park_commit, ParkCommitTerminal::Committed);
+        assert!(outcome.is_clean());
+    }
+
+    /// Finding 2: a DELIVERED worker with no registered interrupt waiter is
+    /// STILL awaited by drain — every delivered worker is an obligation, because
+    /// an in-flight turn could register one during the drain window and its
+    /// post-quiescence commit must gate metadata release. Non-vacuous: the drain
+    /// must block until the (initially-Pending) commit lands.
+    #[tokio::test]
+    async fn drain_awaits_in_flight_worker_without_registered_waiter() {
+        let reg = test_registry();
+        let session = test_session(&reg);
+        let (handle, _rx) = test_handle_with_rx(&reg, session);
+        let park_commit = handle.park_commit();
+        // Mid-turn, but no interrupt registered yet — the finding-2 window.
+        handle.set_processing_for_test(true);
+        assert!(
+            !park_commit.has_registered_waiters(),
+            "precondition: no waiter registered at the drain snapshot"
+        );
+        reg.insert_test_worker(handle, tokio::spawn(async {}));
+
+        let reg_drain = reg.clone();
+        let drain = tokio::spawn(async move { reg_drain.drain_all(Duration::from_secs(5)).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !drain.is_finished(),
+            "drain must await a processing worker's post-quiescence park-commit"
+        );
+
+        park_commit.report_shutdown_committed();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), drain)
+            .await
+            .expect("drain completes once the in-flight worker's park commits")
+            .expect("drain task join");
+        assert!(outcome.is_clean());
+    }
+
+    /// Criterion 4: a worker with no registered interrupt waiter owes no park,
+    /// so the park-commit signal resolves `Committed` immediately — it does not
+    /// wait on the (here force-aborted) running-work drain. Uses an injected
+    /// short park deadline so a regressed filter (awaiting every worker) fails
+    /// fast as `DeadlineUnresolved` instead of hanging.
+    #[tokio::test]
+    async fn drain_no_waiter_park_resolves_without_running_work_drain() {
+        let reg = test_registry();
+        let session = test_session(&reg);
+        let (handle, _rx) = test_handle_with_rx(&reg, session);
+        let park_commit = handle.park_commit();
+        assert!(!park_commit.has_registered_waiters());
+        // A no-waiter/idle worker's park-drain loop reports `Committed` promptly
+        // (its driver exits as soon as the input closes) — independent of any
+        // running-work drain. Simulate that prompt report, then leave running
+        // work pending.
+        park_commit.report_shutdown_committed();
+        reg.insert_test_worker(handle, tokio::spawn(std::future::pending::<()>()));
+
+        // Generous park deadline: it resolves immediately (the report is already
+        // present), NOT after the running-work grace — proving the two are
+        // decoupled by state, not by a wall-clock race.
+        let outcome = reg
+            .drain_all_inner(Duration::from_millis(50), Duration::from_secs(5))
+            .await;
+        assert_eq!(
+            outcome.park_commit,
+            ParkCommitTerminal::Committed,
+            "no-waiter park resolves via its prompt report, not the running-work drain"
+        );
+        assert!(
+            !outcome.running_work_clean,
+            "running work was force-aborted at grace, independent of the park signal"
+        );
+    }
+
+    /// Finding 2 (residual): a DELIVERED worker whose INITIAL park write FAILS
+    /// wakes/removes its waiter and lets its driver exit, so by the time the
+    /// registry samples live state NEITHER `has_registered_waiters()` NOR
+    /// `processing` is observable — yet the worker durably reports `FailedWrite`.
+    /// Because the obligation is established at DISPATCH (every delivered worker
+    /// is awaited), that terminal is observed and the drain is NOT clean. This
+    /// FAILS against the previous post-dispatch `has_registered_waiters() ||
+    /// processing` filter, which would drop the obligation and spuriously report
+    /// `Committed`, releasing metadata over a failed durable park.
+    #[tokio::test]
+    async fn drain_observes_failed_initial_park_even_after_waiter_cleared() {
+        let reg = test_registry();
+        let session = test_session(&reg);
+        let (handle, _rx) = test_handle_with_rx(&reg, session);
+        let park_commit = handle.park_commit();
+        // The failed initial park has already woken/removed the waiter and the
+        // driver has exited: no live waiter, not processing — but FailedWrite.
+        park_commit.report_shutdown_failed_write();
+        assert!(
+            !park_commit.has_registered_waiters(),
+            "precondition: the failed park cleared the waiter"
+        );
+        assert!(
+            !handle.live_status().1,
+            "precondition: the worker is no longer processing"
+        );
+        reg.insert_test_worker(handle, tokio::spawn(async {}));
+
+        let outcome = reg
+            .drain_all_inner(Duration::from_millis(50), Duration::from_millis(200))
+            .await;
+        assert_eq!(
+            outcome.park_commit,
+            ParkCommitTerminal::KnownFailedWrite,
+            "a delivered worker's FailedWrite must be observed even after its waiter/processing cleared"
+        );
+        assert!(
+            !outcome.is_clean(),
+            "the metadata-release gate must see non-clean over a failed durable park"
+        );
+    }
+
+    /// Criterion 5: a failed park write (`report_shutdown_failed_write`, what
+    /// `park_all_registered` publishes on a real `park_interrupt` `Err`) is a
+    /// non-clean terminal, yet drain still COMPLETES (does not hang) so
+    /// `metadata_guard.cleanup()` runs and a successor can bind.
+    #[tokio::test]
+    async fn drain_park_failed_write_is_forced_not_clean() {
+        let reg = test_registry();
+        let session = test_session(&reg);
+        let (handle, _rx) = test_handle_with_rx(&reg, session);
+        let park_commit = handle.park_commit();
+        park_commit.test_add_registered();
+        park_commit.report_shutdown_failed_write();
+        reg.insert_test_worker(handle, tokio::spawn(async {}));
+
+        let outcome = reg
+            .drain_all_inner(Duration::from_millis(50), Duration::from_secs(1))
+            .await;
+        assert_eq!(outcome.park_commit, ParkCommitTerminal::KnownFailedWrite);
+        assert!(
+            !outcome.is_clean(),
+            "a known-failed write must not impersonate a clean park success"
+        );
+    }
+
+    /// Criterion 5b: an unresolved park-commit takes the `DeadlineUnresolved`
+    /// terminal via an injected expired (zero) deadline — no 5-second sleep,
+    /// no wall-clock assertion. Non-clean, but drain still completes so cleanup
+    /// runs.
+    #[tokio::test]
+    async fn drain_park_commit_deadline_is_forced_not_clean() {
+        let reg = test_registry();
+        let session = test_session(&reg);
+        let (handle, _rx) = test_handle_with_rx(&reg, session);
+        handle.park_commit().test_add_registered(); // owes a park; never reports
+        reg.insert_test_worker(handle, tokio::spawn(async {}));
+
+        let outcome = reg
+            .drain_all_inner(Duration::from_millis(50), Duration::ZERO)
+            .await;
+        assert_eq!(outcome.park_commit, ParkCommitTerminal::DeadlineUnresolved);
+        assert!(!outcome.is_clean());
+    }
+
+    /// The aggregate signal spans every live worker with a waiter, not just the
+    /// first: two owed parks, drain resolves clean only once BOTH commit.
+    #[tokio::test]
+    async fn drain_park_commit_aggregates_across_workers() {
+        let reg = test_registry();
+        let (handle_a, _rx_a) = test_handle_with_rx(&reg, test_session(&reg));
+        let (handle_b, _rx_b) = test_handle_with_rx(&reg, test_session(&reg));
+        let park_a = handle_a.park_commit();
+        let park_b = handle_b.park_commit();
+        park_a.test_add_registered();
+        park_b.test_add_registered();
+        reg.insert_test_worker(handle_a, tokio::spawn(async {}));
+        reg.insert_test_worker(handle_b, tokio::spawn(async {}));
+
+        let reg_drain = reg.clone();
+        let drain = tokio::spawn(async move { reg_drain.drain_all(Duration::from_secs(5)).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        park_a.report_shutdown_committed();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !drain.is_finished(),
+            "drain must still block on the second worker's park"
+        );
+        park_b.report_shutdown_committed();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), drain)
+            .await
+            .expect("drain completes once both parks commit")
+            .expect("drain task join");
+        assert!(outcome.is_clean());
+    }
+
+    /// Finding 1: a worker whose work queue can never receive the Shutdown
+    /// (closed receiver) is treated as undelivered — force-aborted and EXCLUDED
+    /// from the park obligations — so drain's pre-abort path cannot block on a
+    /// park-commit the dead worker will never produce. Non-vacuous via state,
+    /// not wall-clock: were the undelivered worker (which carries a registered
+    /// waiter) still awaited, the park terminal would be `DeadlineUnresolved`;
+    /// with finding 1 it is `Committed` (no obligations) and the drain is
+    /// `running_work_clean = false` (a forced abort).
+    #[tokio::test]
+    async fn drain_force_aborts_worker_with_a_wedged_full_queue() {
+        let reg = test_registry();
+        let session = test_session(&reg);
+        // Keep the receiver alive but NEVER drain it, then fill the bounded
+        // queue so the drain's Shutdown send has nowhere to go — the wedged
+        // case finding 1 targets (an unbounded send would block drain forever).
+        let (handle, _rx) = test_handle_with_rx(&reg, session);
+        loop {
+            if tokio::time::timeout(
+                Duration::from_millis(50),
+                handle.send_work(session_worker::SessionWork::Cancel),
+            )
+            .await
+            .is_err()
+            {
+                break; // queue is now full: further sends block
+            }
+        }
+        handle.park_commit().test_add_registered(); // would owe a park if it could receive
+
+        let aborted = Arc::new(AtomicBool::new(false));
+        struct AbortFlag(Arc<AtomicBool>);
+        impl Drop for AbortFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let flag = AbortFlag(aborted.clone());
+        let join = tokio::spawn(async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+        });
+        reg.insert_test_worker(handle, join);
+
+        // Bounded: with a short injected send/park deadline the wedged send
+        // times out and the worker is force-aborted instead of blocking drain.
+        let reg_drain = reg.clone();
+        let drain = tokio::spawn(async move {
+            reg_drain
+                .drain_all_inner(Duration::from_millis(50), Duration::from_millis(150))
+                .await
+        });
+        let outcome = tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .expect("drain must stay bounded despite a wedged worker")
+            .expect("drain task join");
+        assert_eq!(
+            outcome.park_commit,
+            ParkCommitTerminal::Committed,
+            "a wedged worker is excluded from park obligations, not awaited"
+        );
+        assert!(
+            !outcome.running_work_clean,
+            "force-aborting a wedged worker is not a clean drain"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            aborted.load(Ordering::SeqCst),
+            "the wedged worker must be force-aborted"
         );
     }
 
@@ -2493,7 +3078,10 @@ mod tests {
         });
         reg.insert_test_worker(handle, join);
 
-        let clean = reg.drain_all(Duration::from_secs(1)).await;
+        let clean = reg
+            .drain_all(Duration::from_secs(1))
+            .await
+            .running_work_clean;
 
         assert!(clean);
         assert_no_live_worker(&reg, id);
@@ -2508,17 +3096,21 @@ mod tests {
             session,
             reg.inner.locks.clone(),
         );
+        // Simulate the real worker: on Shutdown it parks and reports Committed
+        // (every delivered worker is an obligation drain now awaits).
+        let park_commit = handle.park_commit();
         let join = tokio::spawn(async move {
             match work_rx.recv().await {
                 Some(session_worker::SessionWork::Shutdown { pause_for_resume }) => {
                     assert!(pause_for_resume);
+                    park_commit.report_shutdown_committed();
                 }
                 other => panic!("expected shutdown work before zero-grace force, got {other:?}"),
             }
         });
         reg.insert_test_worker(handle, join);
 
-        let clean = reg.drain_all(Duration::ZERO).await;
+        let clean = reg.drain_all(Duration::ZERO).await.running_work_clean;
 
         assert!(
             clean,
@@ -2538,7 +3130,10 @@ mod tests {
         });
         reg.insert_test_worker(handle, join);
 
-        let clean = reg.drain_all(Duration::from_millis(20)).await;
+        let clean = reg
+            .drain_all(Duration::from_millis(20))
+            .await
+            .running_work_clean;
 
         assert!(!clean);
         assert_no_live_worker(&reg, id);
@@ -2556,7 +3151,10 @@ mod tests {
         });
         reg.insert_test_worker(handle, join);
 
-        let clean = reg.drain_all(Duration::from_millis(20)).await;
+        let clean = reg
+            .drain_all(Duration::from_millis(20))
+            .await
+            .running_work_clean;
 
         assert!(!clean);
         let summaries = reg
@@ -2592,10 +3190,15 @@ mod tests {
                 blocked,
                 reg.inner.locks.clone(),
             );
+        // The blocked worker parks and reports Committed on Shutdown (a delivered
+        // worker drain now awaits); the long-running worker below is closed
+        // (WorkerGone) and force-aborted at grace.
+        let blocked_park_commit = blocked_handle.park_commit();
         let blocked_join = tokio::spawn(async move {
             match blocked_rx.recv().await {
                 Some(session_worker::SessionWork::Shutdown { pause_for_resume }) => {
                     assert!(pause_for_resume);
+                    blocked_park_commit.report_shutdown_committed();
                 }
                 other => panic!("expected blocked worker shutdown, got {other:?}"),
             }
@@ -2620,7 +3223,10 @@ mod tests {
         });
         reg.insert_test_worker(long_running_handle, long_running_join);
 
-        let clean = reg.drain_all(Duration::from_millis(20)).await;
+        let clean = reg
+            .drain_all(Duration::from_millis(20))
+            .await
+            .running_work_clean;
 
         assert!(!clean, "long-running tool worker should exhaust grace");
         assert_no_live_worker(&reg, blocked_id);
@@ -2656,7 +3262,10 @@ mod tests {
         });
         reg.insert_test_worker(handle, join);
 
-        let clean = reg.drain_all(Duration::from_millis(20)).await;
+        let clean = reg
+            .drain_all(Duration::from_millis(20))
+            .await
+            .running_work_clean;
 
         assert!(!clean);
         let summaries = reg
@@ -2683,7 +3292,10 @@ mod tests {
         let join = tokio::spawn(async {});
         reg.insert_test_worker(handle, join);
 
-        let clean = reg.drain_all(Duration::from_secs(1)).await;
+        let clean = reg
+            .drain_all(Duration::from_secs(1))
+            .await
+            .running_work_clean;
 
         assert!(clean);
         assert_no_live_worker(&reg, id);

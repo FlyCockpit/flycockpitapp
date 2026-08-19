@@ -443,6 +443,9 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
             )
             .unwrap(),
         );
+        // Production workers boot with a daemon-owned journal installed; the
+        // barrier is non-optional, so mirror that for this live-worker test.
+        session.install_test_external_journal();
         session
             .set_active_model("lmstudio", "session-model")
             .unwrap();

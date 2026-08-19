@@ -1237,3 +1237,102 @@ async fn turn_loop_emits_usage_event_from_provider_reported_usage() {
     assert_eq!(rows[0].5, 0);
     assert_eq!(rows[0].6, 0);
 }
+
+// ── Inference journal barrier (make-inference-journal-barrier-testable) ──
+
+/// AC2: driving the real turn loop, the journal's durable `dispatching` commit
+/// is authorized BEFORE any provider handoff. With the journal parked inside
+/// `begin_dispatch`, the counting provider has received zero requests; only once
+/// the commit is released does exactly one handoff occur. If the provider call
+/// were reordered ahead of the journal commit, the parked observation would see
+/// a non-zero request count and fail.
+#[tokio::test]
+async fn inference_journal_commit_precedes_provider_handoff() {
+    let provider = ScriptedProvider::builder()
+        .dialect(WireDialect::ChatCompletions)
+        .turn(Turn::Text("gated reply".into()))
+        .start()
+        .await;
+    let (mut driver, _tmp) = scripted_driver(&provider);
+    let journal = driver
+        .session
+        .external_journal()
+        .expect("the test driver installs a production-shaped journal");
+    let gate = journal.install_dispatch_gate();
+    let (queue, tx, _rx) = event_harness();
+
+    let run = driver.run_user_input(UserSubmission::text("hello"), &queue, &tx);
+    let observe = async {
+        gate.wait_until_reached().await;
+        assert_eq!(
+            provider.request_count(),
+            0,
+            "no provider handoff may happen before the journal authorizes it"
+        );
+        gate.release();
+    };
+    let (result, ()) = tokio::join!(run, observe);
+    result.unwrap();
+
+    assert_eq!(
+        provider.request_count(),
+        1,
+        "exactly one provider call happens once the journal authorizes the handoff"
+    );
+}
+
+/// AC4: when a session has no durable journal AND the primary audit-row write
+/// fails, nothing records the inference, so the provider handoff is refused —
+/// no "warn and continue". The control run proves the harness dispatches
+/// normally (so the refusal's zero count is not vacuous).
+#[tokio::test]
+async fn dual_audit_failure_refuses_provider_handoff() {
+    // Control: an unjournaled session whose primary audit row writes cleanly
+    // still reaches the provider.
+    {
+        let provider = ScriptedProvider::builder()
+            .dialect(WireDialect::ChatCompletions)
+            .turn(Turn::Text("control reply".into()))
+            .start()
+            .await;
+        let (mut driver, _tmp) = scripted_driver(&provider);
+        driver.session.set_external_journal(None);
+        driver.session.allow_unjournaled_inference(
+            crate::session::UnjournaledInferenceReason::CagedSelfReviewUtility,
+        );
+        let (queue, tx, _rx) = event_harness();
+        let _ = driver
+            .run_user_input(UserSubmission::text("hello"), &queue, &tx)
+            .await;
+        assert_eq!(
+            provider.request_count(),
+            1,
+            "control: an unjournaled session with a good primary row reaches the provider"
+        );
+    }
+
+    // Dual failure: no journal AND the primary audit write fails ⇒ zero handoff.
+    {
+        let provider = ScriptedProvider::builder()
+            .dialect(WireDialect::ChatCompletions)
+            .turn(Turn::Text("must-not-send".into()))
+            .start()
+            .await;
+        let (mut driver, _tmp) = scripted_driver(&provider);
+        driver.session.set_external_journal(None);
+        driver.session.allow_unjournaled_inference(
+            crate::session::UnjournaledInferenceReason::CagedSelfReviewUtility,
+        );
+        crate::session::journal_fault::set_fail_primary_inference_insert(true);
+        let (queue, tx, _rx) = event_harness();
+        let _ = driver
+            .run_user_input(UserSubmission::text("hello"), &queue, &tx)
+            .await;
+        crate::session::journal_fault::set_fail_primary_inference_insert(false);
+        assert_eq!(
+            provider.request_count(),
+            0,
+            "dual failure (no journal + failed primary write) must refuse the handoff"
+        );
+    }
+}

@@ -46,6 +46,10 @@ mod recording;
 pub mod sealed_values;
 #[cfg(any(test, feature = "test-support"))]
 mod test_constructors;
+/// Crate-wide re-export of the mid-transaction audit-write fault seam so tests
+/// outside the `session` module (e.g. the driver dual-failure test) can arm it.
+#[cfg(test)]
+pub(crate) use recording::journal_fault;
 pub(crate) use recording::notice_severity;
 pub use recording::{
     ModelSwitchAudit, ModelSwitchOutcome, ModelSwitchTrigger, SessionEventModelFrame,
@@ -113,6 +117,50 @@ pub enum TitleAction {
     Explicit,
 }
 
+/// Process-wide audit counter: how many times any session waived the
+/// durable-before-handoff inference journal barrier. Read by doctor / audit
+/// surfaces; never reset in production. `nextest` runs each test in its own
+/// process, so tests observe only their own increments.
+static UNJOURNALED_INFERENCE_OPTOUTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Total number of audited unjournaled-inference opt-outs taken this process.
+pub fn unjournaled_inference_optout_count() -> u64 {
+    UNJOURNALED_INFERENCE_OPTOUTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The exhaustive, audited set of reasons a session may waive the
+/// durable-before-provider-handoff inference journal barrier.
+///
+/// Waiving the barrier is never a silent boolean: a caller must name one of
+/// these justifications, every one of which corresponds to a session that
+/// provably cannot attach the daemon-owned recovery journal. Ordinary
+/// daemon/session-worker sessions never opt out and so keep the barrier as a
+/// hard invariant. Adding a variant is adding an audited escape hatch — do so
+/// only with an equally narrow, justified caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnjournaledInferenceReason {
+    /// The daemon-less `cockpit ask` docs command (`apps/cli`): a standalone,
+    /// read-only session that cannot safely open the daemon-owned recovery
+    /// spool concurrently, so its inference stays on the primary-row audit path.
+    DaemonlessDocsAsk,
+    /// The caged background self-improvement / skills review utility
+    /// (`assistants/self_improvement.rs`): intentionally retains an isolated
+    /// in-memory database, to which a daemon journal (bound to a different DB)
+    /// cannot be attached.
+    CagedSelfReviewUtility,
+}
+
+impl UnjournaledInferenceReason {
+    /// Stable, free-text-free label for logs, doctor, and audit surfaces.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DaemonlessDocsAsk => "daemonless_docs_ask",
+            Self::CagedSelfReviewUtility => "caged_self_review_utility",
+        }
+    }
+}
+
 /// Per-conversation session state. Cloned through `Arc` into every
 /// tool invocation. Owns a clone of the `Db` handle (the underlying
 /// connection is shared).
@@ -138,7 +186,16 @@ pub struct Session {
     /// inference-request / event journaling chokepoints in `recording.rs`.
     redaction_key_resolver:
         Arc<dyn crate::redact::protected_redaction_history::RedactionKeyResolver>,
+    /// Durable-before-handoff inference journaling is a hard invariant. This
+    /// flag is the ONLY sanctioned opt-out, set exclusively through the audited
+    /// [`Session::allow_unjournaled_inference`] funnel (a reason is required and
+    /// the global audit counter increments). It exists for the narrow set of
+    /// daemon-less / isolated-DB sessions that provably cannot attach the
+    /// daemon-owned journal (enumerated by [`UnjournaledInferenceReason`]).
     allow_unjournaled_inference: std::sync::atomic::AtomicBool,
+    /// The audited justification for the opt-out above, retained for doctor /
+    /// audit surfaces. `None` until (and unless) the opt-out is taken.
+    unjournaled_inference_reason: Mutex<Option<UnjournaledInferenceReason>>,
     /// Private per-session tmp dir under the system temp location
     /// (sandboxing part 2). Read+write inside the sandboxed shell and
     /// counted as "inside the boundary" for native-tool path checks, so
@@ -421,14 +478,56 @@ impl Session {
         )
     }
 
-    pub fn allow_unjournaled_inference(&self) {
+    /// Take the audited opt-out from the durable-before-handoff inference
+    /// journal barrier.
+    ///
+    /// This is deliberately NOT a silent boolean toggle: every opt-out must name
+    /// a [`UnjournaledInferenceReason`] (enumerating exactly the sessions that
+    /// provably cannot attach the daemon-owned journal), and each call bumps the
+    /// process-wide audit counter ([`unjournaled_inference_optout_count`]) so
+    /// doctor / audit surfaces can observe how often the barrier was waived.
+    ///
+    /// The barrier itself remains non-optional for every ordinary
+    /// (daemon/session-worker) session — those never call this and so a missing
+    /// journal refuses the provider handoff (see
+    /// `engine::agent::turn_phases::prepare_inference_journal`).
+    pub fn allow_unjournaled_inference(&self, reason: UnjournaledInferenceReason) {
+        *self.unjournaled_inference_reason.lock().unwrap() = Some(reason);
+        // Publish the reason before the fast-path flag so any reader that sees
+        // the flag set also sees the justification.
         self.allow_unjournaled_inference
             .store(true, std::sync::atomic::Ordering::Release);
+        UNJOURNALED_INFERENCE_OPTOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(
+            reason = reason.as_str(),
+            "inference journal barrier waived for this session (audited unjournaled opt-out)"
+        );
     }
 
     pub(crate) fn unjournaled_inference_allowed(&self) -> bool {
         self.allow_unjournaled_inference
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The audited justification recorded for this session's opt-out, if any.
+    /// Exposed for doctor / audit rendering; never carries free text.
+    pub fn unjournaled_inference_reason(&self) -> Option<UnjournaledInferenceReason> {
+        *self.unjournaled_inference_reason.lock().unwrap()
+    }
+
+    /// Install a production-shaped in-process external journal so tests exercise
+    /// the real durable-before-handoff barrier instead of bypassing it. The
+    /// spool lives under the session's project root (kept alive by the test's
+    /// own tempdir). This mirrors the daemon's boot-time install; the barrier is
+    /// non-optional in test builds, so any test that drives inference must call
+    /// this (or take the audited `allow_unjournaled_inference` opt-out).
+    #[cfg(test)]
+    pub(crate) fn install_test_external_journal(&self) {
+        std::fs::create_dir_all(&self.project_root).ok();
+        let spool_root = self.project_root.join("cockpit-test-external-journal");
+        let journal =
+            crate::external_journal::ExternalJournal::for_test_at(self.db.clone(), &spool_root);
+        self.set_external_journal(Some(Arc::new(journal)));
     }
 
     pub fn set_active_tool_names<'a>(

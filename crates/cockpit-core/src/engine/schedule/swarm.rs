@@ -919,6 +919,9 @@ mod tests {
             )
             .unwrap(),
         );
+        // The durable-before-handoff barrier is non-optional; install a
+        // production-shaped journal so swarm-child inference is exercised.
+        session.install_test_external_journal();
         let locks = Arc::new(crate::locks::LockManager::in_memory(
             crate::db::Db::open_in_memory().unwrap(),
         ));

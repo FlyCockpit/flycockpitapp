@@ -76,7 +76,9 @@ async fn run_docs_ask(package_id: &str, question: &str) -> Result<String> {
         // daemon-owned recovery spool concurrently. Its inference remains on the
         // existing primary-row audit path; daemon/session-worker turns are always
         // journal-required.
-        session.allow_unjournaled_inference();
+        session.allow_unjournaled_inference(
+            crate::session::UnjournaledInferenceReason::DaemonlessDocsAsk,
+        );
         session.set_sandbox_enabled(true);
         session.set_approval_mode(extended.default_approval_mode);
         session.set_shell_compression(extended.shell_compression);

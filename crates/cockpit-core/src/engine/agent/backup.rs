@@ -662,7 +662,7 @@ mod inference_outcome_tests {
 
     fn in_memory_session(root: &std::path::Path) -> Arc<Session> {
         let db = crate::db::Db::open_in_memory().unwrap();
-        Arc::new(
+        let session = Arc::new(
             crate::session::Session::create_for_test(
                 db,
                 root.to_path_buf(),
@@ -670,7 +670,11 @@ mod inference_outcome_tests {
                 crate::session::test_redaction_key_resolver(),
             )
             .unwrap(),
-        )
+        );
+        // The durable-before-handoff barrier is non-optional; install a
+        // production-shaped journal so backup/failover dispatch is exercised.
+        session.install_test_external_journal();
+        session
     }
 
     async fn emitted_auth_failure(
@@ -1093,7 +1097,7 @@ mod backup_fallback_tests {
 
     fn in_memory_session(root: &std::path::Path) -> Arc<Session> {
         let db = crate::db::Db::open_in_memory().unwrap();
-        Arc::new(
+        let session = Arc::new(
             crate::session::Session::create_for_test(
                 db,
                 root.to_path_buf(),
@@ -1101,7 +1105,11 @@ mod backup_fallback_tests {
                 crate::session::test_redaction_key_resolver(),
             )
             .unwrap(),
-        )
+        );
+        // The durable-before-handoff barrier is non-optional; install a
+        // production-shaped journal so backup/failover dispatch is exercised.
+        session.install_test_external_journal();
+        session
     }
 
     fn ctx() -> (

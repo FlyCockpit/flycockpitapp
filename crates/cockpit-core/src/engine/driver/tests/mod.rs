@@ -65,6 +65,7 @@ fn test_driver_with_url(max_schedules: usize, provider_url: String) -> (Driver, 
         )
         .unwrap(),
     );
+    session.install_test_external_journal();
     let locks = Arc::new(crate::locks::LockManager::in_memory(db));
     let rcfg = crate::config::extended::RedactConfig::default();
     let redact = Arc::new(RedactionTable::build(&rcfg, &root).unwrap());
@@ -267,6 +268,7 @@ fn learn_driver(
         )
         .unwrap(),
     );
+    session.install_test_external_journal();
     let locks = Arc::new(crate::locks::LockManager::in_memory(db));
     let redact = Arc::new(RedactionTable::empty());
     let mut driver =

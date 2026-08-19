@@ -12,14 +12,18 @@ async fn prepare_inference_journal(
     model: &Model,
     payload: &Value,
     call_id: Uuid,
+    ordinal: i64,
 ) -> Result<Option<InferenceJournalAttempt>> {
     let Some(journal) = session.external_journal() else {
         if session.unjournaled_inference_allowed() {
             return Ok(None);
         }
-        #[cfg(test)]
-        return Ok(None);
-        #[cfg(not(test))]
+        // The durable-before-handoff barrier is a HARD invariant in every build,
+        // test included: with no journal and no audited opt-out there is no way
+        // to record the pending inference, so the provider handoff is refused.
+        // Tests that exercise inference install a production-shaped journal via
+        // the session harness (`Session::install_test_external_journal`) or take
+        // the audited `allow_unjournaled_inference` opt-out.
         anyhow::bail!("inference audit journal is unavailable; provider handoff refused");
     };
     let encoded = serde_json::to_vec(payload).context("encoding redacted inference audit")?;
@@ -33,9 +37,16 @@ async fn prepare_inference_journal(
         },
     );
     let owner = crate::external_journal::projection::SafeToken::for_session(session.id);
-    let idempotency =
-        crate::external_journal::projection::SafeToken::parse(&call_id.hyphenated().to_string())
-            .context("building inference journal idempotency key")?;
+    // Each dispatched-target attempt (primary, then every backup/failover step)
+    // shares the logical `call_id` but carries a distinct `ordinal`. The journal
+    // identity triple must therefore include the ordinal — otherwise the backup
+    // attempt collides with the primary's already-settled operation and its
+    // `begin_dispatch` is refused, breaking failover for every journaled session.
+    let idempotency = crate::external_journal::projection::SafeToken::parse(&format!(
+        "{}-{ordinal}",
+        call_id.hyphenated()
+    ))
+    .context("building inference journal idempotency key")?;
     let now = chrono::Utc::now().timestamp_millis();
     let prepared = journal
         .prepare(&owner, &idempotency, &projection, now)
@@ -1135,7 +1146,7 @@ pub(crate) async fn run_turn(
         }),
     };
     let mut journal_attempt =
-        prepare_inference_journal(&session, model, &dispatch_payload, call_id).await?;
+        prepare_inference_journal(&session, model, &dispatch_payload, call_id, ordinal).await?;
     // Pre-policy session table + target trust for protected-history journaling
     // (decision 10.2). Journaling scans the PRE-policy table, never the
     // trusted-empty effective table, and only journals for a trusted target.
@@ -1153,7 +1164,21 @@ pub(crate) async fn run_turn(
         .await
         .is_err();
     if pending_write_failed {
-        tracing::warn!("primary inference audit write failed; durable journal recovery is active");
+        if journal_attempt.is_none() {
+            // Dual failure: the primary audit row could not be written AND no
+            // durable journal is installed for this session, so NOTHING records
+            // this inference. Fail closed — refuse the provider handoff rather
+            // than dispatch an unaudited call. (When a journal IS present, its
+            // `dispatching` commit already durably authorized this one handoff,
+            // so a primary-row failure is the recoverable degraded path below.)
+            anyhow::bail!(
+                "inference audit unavailable: primary audit write failed and no durable journal \
+                 is installed; provider handoff refused"
+            );
+        }
+        tracing::warn!(
+            "primary inference audit write failed; the durable journal holds the pending record"
+        );
     }
     // Normal provider retry/recovery policy remains unchanged. Only the
     // journal-backed degraded path is limited to the single handoff that the
@@ -2319,5 +2344,120 @@ mod tests {
         .unwrap();
 
         assert!(matches!(flow, ControlFlow::Continue(())));
+    }
+
+    // ── Inference journal barrier (make-inference-journal-barrier-testable) ──
+
+    fn inference_payload(marker: &str) -> Value {
+        serde_json::json!({
+            "messages": [{ "role": "user", "content": marker }]
+        })
+    }
+
+    /// AC1: with the `#[cfg(test)] return Ok(None)` escape deleted, the barrier
+    /// is a HARD invariant even in test builds. A session with no journal and no
+    /// audited opt-out refuses the provider handoff instead of silently
+    /// proceeding (the old escape would have returned `Ok(None)` here).
+    #[tokio::test]
+    async fn inference_journal_barrier_is_non_optional_in_test_builds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = test_session(tmp.path());
+        let model = test_model();
+        let call_id = Uuid::new_v4();
+
+        let err =
+            match prepare_inference_journal(&session, &model, &inference_payload("hi"), call_id, 0)
+                .await
+            {
+                Ok(_) => panic!("no journal + no opt-out must refuse the handoff"),
+                Err(err) => err,
+            };
+        assert!(
+            err.to_string().contains("journal is unavailable"),
+            "unexpected error: {err}"
+        );
+
+        // The audited opt-out is the ONLY way to proceed without a journal.
+        session.allow_unjournaled_inference(
+            crate::session::UnjournaledInferenceReason::CagedSelfReviewUtility,
+        );
+        let attempt =
+            prepare_inference_journal(&session, &model, &inference_payload("hi"), call_id, 0)
+                .await
+                .expect("audited opt-out proceeds without a journal");
+        assert!(
+            attempt.is_none(),
+            "opt-out yields no journal attempt (nothing to settle)"
+        );
+    }
+
+    /// AC1 + AC5: with a production-shaped journal installed, the barrier
+    /// durably commits `dispatching` BEFORE returning — the only state that
+    /// authorizes a provider handoff — and the persisted record is a
+    /// digest-only projection that never carries the raw prompt body.
+    #[tokio::test]
+    async fn inference_journal_barrier_commits_dispatching_without_raw_body() {
+        const SENTINEL: &str = "SENTINEL-INFERENCE-PROMPT-BODY";
+        let tmp = tempfile::tempdir().unwrap();
+        let session = test_session(tmp.path());
+        session.install_test_external_journal();
+        let model = test_model();
+        let call_id = Uuid::new_v4();
+        let payload = inference_payload(SENTINEL);
+        // Precondition: the raw payload really carries the sentinel, so the
+        // sentinel assertions below cannot pass vacuously.
+        assert!(serde_json::to_string(&payload).unwrap().contains(SENTINEL));
+
+        let attempt = prepare_inference_journal(&session, &model, &payload, call_id, 0)
+            .await
+            .expect("journal installed → barrier succeeds")
+            .expect("journal installed → a durable attempt is produced");
+
+        let record = session
+            .db
+            .external_operation(attempt.ticket.operation_id)
+            .await
+            .unwrap()
+            .expect("durable journal record exists after the barrier");
+        assert_eq!(
+            record.state,
+            crate::db::external_journal::ExternalJournalState::Dispatching,
+            "returning from the barrier means `dispatching` is durably committed"
+        );
+        // AC5 sentinel: the persisted record projects only digests — the raw
+        // prompt body never reaches the DB / doctor / audit surface.
+        assert!(
+            !format!("{record:?}").contains(SENTINEL),
+            "raw inference body leaked into the persisted journal record: {record:?}"
+        );
+    }
+
+    /// AC3: the opt-out is audited — every call names a reason and bumps the
+    /// process-wide counter (nextest isolates each test in its own process).
+    #[tokio::test]
+    async fn unjournaled_opt_out_is_audited_with_reason_and_counter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = test_session(tmp.path());
+        assert!(session.unjournaled_inference_reason().is_none());
+        let before = crate::session::unjournaled_inference_optout_count();
+
+        session.allow_unjournaled_inference(
+            crate::session::UnjournaledInferenceReason::DaemonlessDocsAsk,
+        );
+
+        assert!(session.unjournaled_inference_allowed());
+        assert_eq!(
+            session.unjournaled_inference_reason(),
+            Some(crate::session::UnjournaledInferenceReason::DaemonlessDocsAsk)
+        );
+        assert_eq!(
+            crate::session::unjournaled_inference_optout_count(),
+            before + 1,
+            "each opt-out increments the audit counter exactly once"
+        );
+        assert_eq!(
+            crate::session::UnjournaledInferenceReason::DaemonlessDocsAsk.as_str(),
+            "daemonless_docs_ask"
+        );
     }
 }

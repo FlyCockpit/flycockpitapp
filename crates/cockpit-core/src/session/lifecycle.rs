@@ -455,6 +455,7 @@ impl Session {
             external_journal: Mutex::new(None),
             redaction_key_resolver: resolver,
             allow_unjournaled_inference: std::sync::atomic::AtomicBool::new(false),
+            unjournaled_inference_reason: Mutex::new(None),
             short_id,
             parent_session_id: row.parent_session_id,
             fork_point_turn_id: row.fork_point_turn_id,
